@@ -1,0 +1,25 @@
+# Read-only explorer API for gnb-smh.com, in front of the local GnB node.
+[Unit]
+Description=GnB explorer API (read-only)
+After=gnb-node.service
+Wants=gnb-node.service
+
+[Service]
+User=gnb
+Group=gnb
+Environment=GNB_RPC_URL=http://127.0.0.1:17210/
+Environment=GNB_API_BIND=0.0.0.0
+Environment=GNB_API_PORT=2086
+Environment=GNB_API_KEY_FILE=/etc/gnb/explorer-api.key
+Environment=GNB_CARRYOVER=/opt/gnb/carryover.tsv
+ExecStart=/usr/bin/python3 -I /opt/gnb/bin/gnb_explorer_api.py
+Restart=always
+RestartSec=3
+MemoryMax=1G
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
