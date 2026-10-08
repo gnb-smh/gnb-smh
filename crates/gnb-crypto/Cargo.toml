@@ -40,6 +40,9 @@ wallet-cli = ["dep:clap", "dep:rpassword"]
 # the guard bites only when a mainnet artifact is cut:
 #   cargo test -p gnb-crypto --features mainnet canonical_k_activation_height_is_set_for_mainnet
 mainnet = []
+# TESTS ONLY: every expected target is the pow limit. Consensus-breaking; the
+# node binary refuses to start with it. Enabled through node dev-dependencies.
+test-pow-limit = []
 # `auxpow-rehearsal` is an EMPTY marker feature (no deps). It ONLY lowers
 # AUXPOW_ACTIVATION_HEIGHT to 0 (core/mod.rs) so a LOCAL, off-mainnet build
 # accepts merged-mined (AuxPoW) blocks — for exercising the end-to-end BTC↔Bloch

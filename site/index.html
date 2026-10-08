@@ -536,12 +536,12 @@ valid = out < target</pre></li>
 <section id="fork" aria-labelledby="fork-title">
   <div class="wrap">
     <div class="sec-head"><p class="eyebrow">Fork</p><h2 id="fork-title">GnB is a hard fork of Bloch</h2>
-      <p class="lead">GnB starts from a new genesis whose ledger is the live Bloch state at a snapshot height, converted at a fixed rate. Every Bloch holder keeps their keys and their share; from genesis on, GnB is its own network with its own proof-of-work.</p></div>
+      <p class="lead">GnB starts from a new genesis whose ledger is the Bloch Genesis-3 terminal snapshot, converted at a fixed rate. Every holder keeps their keys and their share; from genesis on, GnB is its own network with its own proof-of-work.</p></div>
     <div class="fork-grid">
       <div class="fork-col">
         <h3>Carried over from Bloch</h3>
         <ul>
-          <li>Every balance at the snapshot height &mdash; spendable outputs, validator bonds, delegations and pending rewards &mdash; converted proportionally into 1,000,000 GNB, to the same owner</li>
+          <li>Every output of the Genesis-3 terminal snapshot (452,726 outputs, 3,810,744,000 BLCH) converted proportionally into 1,000,000 GNB, to the same owner</li>
           <li>Keys and wallets: <code>bloch1q&hellip;</code> becomes <code>gnb1q&hellip;</code> with the same hash</li>
           <li>ML-DSA-65 &Vert; Falcon-1024 post-quantum signatures</li>
           <li>GhostDAG block ordering, exact colouring from genesis</li>
@@ -560,7 +560,7 @@ valid = out < target</pre></li>
         </ul>
       </div>
     </div>
-    <p class="forkheight">Snapshot height <b>to be announced</b></p>
+    <p class="forkheight">Carryover <b>Bloch Genesis-3 terminal snapshot, height 39,918</b></p>
   </div>
 </section>
 

@@ -177,6 +177,7 @@ ciborium    = { version = "0.2", optional = true }
 sev = { version = "8", default-features = false, features = ["snp"], optional = true }
 
 [dev-dependencies]
+gnb-crypto = { path = "../crates/gnb-crypto", features = ["test-pow-limit"] }
 tempfile = "3"
 # test-util enables tokio::test(start_paused) for the stratum session
 # lifetime tests (virtual clock through the 600s read-poll windows).

@@ -141,6 +141,11 @@ pub const SIG_SIZE:     usize = 4 + 3309 + 1462; // 4775
 // block is a pure function of its selected parent's height and timestamp, so
 // miner and validator agree regardless of arrival order.
 
+/// True when built with the `test-pow-limit` feature, which pins every
+/// expected target to the pow limit so tests do not depend on the wall clock.
+/// Consensus-breaking; the node refuses to start when this is set.
+pub const TEST_POW_LIMIT: bool = cfg!(feature = "test-pow-limit");
+
 /// Easiest target the chain accepts (≈ one evaluation per block).
 pub const POW_LIMIT_BITS: u32 = 0x2100_FFFF;
 /// ASERT half-life: two hours (240 blocks at 30 s).
@@ -185,6 +190,12 @@ pub fn difficulty_parent_timestamp<I: IntoIterator<Item = u64>>(parent_timestamp
 /// latest timestamp is `parent_timestamp` (see `difficulty_parent_timestamp`). Single source of truth for the
 /// validator, the internal miner and every block-template producer.
 pub fn expected_bits(parent_timestamp: u64, height: u64) -> Result<u32, String> {
+    #[cfg(feature = "test-pow-limit")]
+    {
+        let _ = (parent_timestamp, height);
+        return Ok(target_to_bits(&bits_to_target(POW_LIMIT_BITS)));
+    }
+    #[allow(unreachable_code)]
     let parent_time = i64::try_from(parent_timestamp)
         .map_err(|_| format!("parent timestamp {parent_timestamp} out of range"))?;
     gnb_smh::difficulty::asert_next_bits(&asert_params(), &asert_anchor(), parent_time, height)
@@ -1146,23 +1157,24 @@ impl UndoData {
 
 /// Coinbase text of the genesis block.
 pub const GENESIS_COINBASE_TEXT: &str =
-    "GnB genesis 2026-10-07: Godel and Bell, GnB-SMH memory-hard PoW, 10M GNB cap. \
+    "GnB genesis 2026-10-08: Godel and Bell, GnB-SMH memory-hard PoW, 10M GNB cap. \
 Carryover Bloch G3 terminal snapshot sha3 3d67246e94881a17d302b464f79fee55886d8068794e76fed43081117fbe308d \
 3810744000 BLCH -> 1000000 GNB.";
-/// Unix time of the genesis block (2026-10-07 00:00:00 UTC). Also the ASERT
-/// anchor timestamp.
-pub const GENESIS_TIMESTAMP: u64 = 1_791_331_200;
-/// Genesis difficulty (≈ 256 evaluations) and the ASERT anchor bits.
-pub const GENESIS_BITS:      u32 = 0x2000_FFFF;
+/// Unix time of the genesis block (2026-10-08 03:11:32 UTC), the launch moment. Also the
+/// ASERT anchor timestamp.
+pub const GENESIS_TIMESTAMP: u64 = 1791429092;
+/// Genesis difficulty and ASERT anchor bits: ≈ 4,500 evaluations per block,
+/// i.e. 30 s at the launch hashrate (7 hosts × 11 threads ≈ 150 evaluations/s).
+pub const GENESIS_BITS:      u32 = 0x1F0E_9036;
 /// GnB-SMH nonce of the genesis block.
-pub const GENESIS_NONCE:     u64 = 1042;
+pub const GENESIS_NONCE:     u64 = 482;
 /// `block_hash()` of the genesis block:
-/// 9851495b319c9177afec1b4c12b0efe74ff02b462ba2da19545ebb49e4d6b78b.
+/// 837f7d5c832ae28370cd52baa969528753f619be2a4dd07d814a1a986c4201cd.
 pub const GENESIS_EXPECTED_HASH: [u8; 32] = [
-    0x98, 0x51, 0x49, 0x5b, 0x31, 0x9c, 0x91, 0x77,
-    0xaf, 0xec, 0x1b, 0x4c, 0x12, 0xb0, 0xef, 0xe7,
-    0x4f, 0xf0, 0x2b, 0x46, 0x2b, 0xa2, 0xda, 0x19,
-    0x54, 0x5e, 0xbb, 0x49, 0xe4, 0xd6, 0xb7, 0x8b,
+    0x83, 0x7f, 0x7d, 0x5c, 0x83, 0x2a, 0xe2, 0x83,
+    0x70, 0xcd, 0x52, 0xba, 0xa9, 0x69, 0x52, 0x87,
+    0x53, 0xf6, 0x19, 0xbe, 0x2a, 0x4d, 0xd0, 0x7d,
+    0x81, 0x4a, 0x1a, 0x98, 0x6c, 0x42, 0x01, 0xcd,
 ];
 
 /// Genesis block with explicit header parameters (used by the mining tool).
@@ -1282,6 +1294,7 @@ mod difficulty_tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "test-pow-limit", ignore = "test-pow-limit pins expected bits")]
     fn expected_bits_at_schedule_is_genesis_bits() {
         assert_eq!(expected_bits(GENESIS_TIMESTAMP, 1).unwrap(), GENESIS_BITS);
         assert_eq!(expected_bits(GENESIS_TIMESTAMP + 30 * 99, 100).unwrap(), GENESIS_BITS);

@@ -248,6 +248,11 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    if core::TEST_POW_LIMIT {
+        eprintln!("❌ this binary was built with gnb-crypto/test-pow-limit (tests only); refusing to run a node.");
+        std::process::exit(2);
+    }
+
     // Roadmap #8: wire the node-level chain-id ONCE at startup from the runtime
     // network selection, before any validation runs. The miner and every
     // validator read core::node_chain_id() (design §4.3 invariant 6); without
