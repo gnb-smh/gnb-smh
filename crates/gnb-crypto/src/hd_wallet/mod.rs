@@ -474,7 +474,9 @@ impl HdWallet {
         let mut addresses = Vec::with_capacity(wallet.addresses.len());
         let mut imported = BTreeSet::new();
         let mut seed = hd_seed_owner(&mnemonic, passphrase.unwrap_or(""));
-        for addr in wallet.addresses {
+        for mut addr in wallet.addresses {
+            // Bloch wallet files record bloch1q/bloch1t addresses: same key.
+            addr.address = crate::address::normalize_legacy_address(&addr.address);
             // Consume the authenticated plaintext inside a short-lived
             // parsing boundary. Only the decoded keys survive into address
             // authentication and the potentially expensive derivation check.

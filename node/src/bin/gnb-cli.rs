@@ -282,6 +282,9 @@ fn rpc_call(host: &str, port: u16, method: &str, params: &serde_json::Value) -> 
 
 // ── Send command ────────────────────────────────────────────────────────────
 
+/// Mempool admission limit (node/src/mempool MAX_TX_SIZE).
+const MAX_TX_BYTES: usize = 400 * 1024;
+
 fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     let wallet_path = params[0];
     let to_address = params[1];
@@ -308,9 +311,17 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     // Load wallet
     let password = read_password("Wallet password: ");
     let path = std::path::Path::new(wallet_path);
+    // Bloch/GnB keystore v2 first (address field; bloch1q… accepted), then
+    // the v1 keyfile format (address derived from the public key).
     let keypair = match gnb::wallet::Keypair::load_encrypted(path, &password) {
         Ok(kp) => kp,
-        Err(e) => { eprintln!("Failed to load wallet: {}", e); process::exit(1); }
+        Err(e2) => match gnb::wallet::Wallet::load_encrypted(path, &password) {
+            Ok(w) => w.into_keypair(),
+            Err(e1) => {
+                eprintln!("Failed to load wallet: {} (keystore v2) / {} (keyfile v1)", e2, e1);
+                process::exit(1);
+            }
+        },
     };
 
     println!("From: {}", keypair.address);
@@ -341,12 +352,36 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     let to_addr_hex = checked_destination(to_address, &keypair.address).unwrap_or_else(|message| die(message));
 
     // Build and sign TX
-    let tx = match gnb::wallet::TxBuilder::build(
-        &keypair, &available_utxos, &to_addr_hex, amount_sats, fee_sats,
-    ) {
-        Ok(tx) => tx,
-        Err(e) => { eprintln!("TX build failed: {}", e); process::exit(1); }
-    };
+    // Every input carries a ~8.5 kB hybrid signature + public key, so the
+    // consensus minimum fee depends on how many inputs coin selection picks.
+    // Build, measure, and rebuild with max(requested, minimum) until stable.
+    let mut fee_sats = fee_sats;
+    let mut tx = None;
+    for _ in 0..4 {
+        let built = match gnb::wallet::TxBuilder::build(
+            &keypair, &available_utxos, &to_addr_hex, amount_sats, fee_sats,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => { eprintln!("TX build failed: {}", e); process::exit(1); }
+        };
+        let size = built.to_wire_bytes(true).len();
+        let min = gnb::core::tokenomics::min_tx_fee_sat(size);
+        if fee_sats >= min {
+            tx = Some(built);
+            break;
+        }
+        println!("Fee raised to the consensus minimum for {} bytes: {} GNB", size, min as f64 / 1e8);
+        fee_sats = min;
+    }
+    let tx = tx.unwrap_or_else(|| die("could not settle the fee for this transaction"));
+    let size = tx.to_wire_bytes(true).len();
+    if size > MAX_TX_BYTES {
+        die(&format!(
+            "transaction is {} bytes with {} inputs; the mempool limit is {} bytes. \
+             Send a smaller amount (each input carries ~8.5 kB) and repeat.",
+            size, tx.inputs.len(), MAX_TX_BYTES));
+    }
+    println!("Inputs: {} · Size: {} bytes · Fee: {} GNB", tx.inputs.len(), size, fee_sats as f64 / 1e8);
 
     let txid = hex::encode(tx.txid());
     println!("TXID: {}", txid);

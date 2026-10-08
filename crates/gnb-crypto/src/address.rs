@@ -16,6 +16,23 @@ use thiserror::Error;
 
 use crate::core::{MAINNET_PREFIX, TESTNET_PREFIX};
 
+/// Bloch address prefixes. A Bloch address and a GnB address with the same
+/// 20-byte hash and checksum belong to the same key.
+pub const LEGACY_BLOCH_MAINNET_PREFIX: &str = "bloch1q";
+pub const LEGACY_BLOCH_TESTNET_PREFIX: &str = "bloch1t";
+
+/// Map a Bloch address string to its GnB form (same hash and checksum);
+/// anything else is returned unchanged.
+pub fn normalize_legacy_address(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(LEGACY_BLOCH_MAINNET_PREFIX) {
+        format!("{MAINNET_PREFIX}{rest}")
+    } else if let Some(rest) = s.strip_prefix(LEGACY_BLOCH_TESTNET_PREFIX) {
+        format!("{TESTNET_PREFIX}{rest}")
+    } else {
+        s.to_string()
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -60,9 +77,13 @@ impl Address {
         Self { hash, network }
     }
 
-    /// Parse a user-facing address string (gnb1q... or gnb1t...).
+    /// Parse a user-facing address string (gnb1q... or gnb1t...). Bloch
+    /// addresses (bloch1q... / bloch1t...) name the same owner — the checksum
+    /// covers only the hash — and are accepted as their GnB equivalent.
     /// Validates: prefix, hex format, length, and checksum.
     pub fn parse(s: &str) -> Result<Self, AddressError> {
+        let normalized = normalize_legacy_address(s);
+        let s = normalized.as_str();
         let (network, payload) = if let Some(rest) = s.strip_prefix(MAINNET_PREFIX) {
             (Network::Mainnet, rest)
         } else if let Some(rest) = s.strip_prefix(TESTNET_PREFIX) {

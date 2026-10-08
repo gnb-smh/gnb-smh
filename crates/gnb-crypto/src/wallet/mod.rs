@@ -278,6 +278,15 @@ impl Wallet {
         })
     }
 
+    /// The signing keypair of this wallet, for the transaction builder.
+    pub fn into_keypair(mut self) -> Keypair {
+        Keypair {
+            private_key: std::mem::take(&mut self.keypair.secret),
+            public_key: std::mem::take(&mut self.keypair.public),
+            address: self.address.to_string(),
+        }
+    }
+
     /// Save wallet to an encrypted keyfile.
     ///
     /// Uses AES-GCM with Argon2id KDF (configurable params in `encryption::KdfParams`).
@@ -959,10 +968,13 @@ impl Keypair {
 
         let (mut private_key, public_key) = decode_legacy_keystore_payload(plain)?;
 
-        let testnet = ks.address.starts_with(TESTNET_PREFIX);
+        // Bloch keystores record a bloch1q/bloch1t address: same key, same
+        // hash, GnB prefix.
+        let address = crate::address::normalize_legacy_address(&ks.address);
+        let testnet = address.starts_with(TESTNET_PREFIX);
         let derived = crypto::address_from_pubkey(&public_key, testnet);
-        if derived != ks.address { return Err("address mismatch — keystore may be tampered".into()); }
-        Ok(Keypair { private_key: std::mem::take(&mut *private_key), public_key, address: ks.address })
+        if derived != address { return Err("address mismatch — keystore may be tampered".into()); }
+        Ok(Keypair { private_key: std::mem::take(&mut *private_key), public_key, address })
     }
 }
 
@@ -1953,5 +1965,51 @@ mod audit_exact_decimal_amounts {
             "999999999999999999999999999", "１", "1,000"] {
             assert!(parse_bloch_satoshis(invalid).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod bloch_keystore_compat_tests {
+    use super::*;
+
+    /// A Bloch keystore records a bloch1q… address. Loading it in GnB yields
+    /// the same key under the gnb1q… address with the same hash; a keystore
+    /// whose address names a different hash is still rejected.
+    #[test]
+    fn bloch_keystore_loads_under_its_gnb_address() {
+        let dir = tempfile_dir();
+        let kp = generate_keypair(false);
+        let gnb_path = dir.join("gnb.json");
+        kp.save_encrypted(&gnb_path, "correct horse battery 9!").unwrap();
+
+        let json = std::fs::read_to_string(&gnb_path).unwrap();
+        let body = kp.address.strip_prefix(crate::core::MAINNET_PREFIX).unwrap();
+        let bloch_path = dir.join("bloch.json");
+        std::fs::write(&bloch_path, json.replace(&kp.address, &format!("bloch1q{body}"))).unwrap();
+        let loaded = Keypair::load_encrypted(&bloch_path, "correct horse battery 9!").unwrap();
+        assert_eq!(loaded.address, kp.address);
+        assert_eq!(loaded.public_key, kp.public_key);
+
+        let mut other = body.to_string();
+        let last = other.pop().unwrap();
+        other.push(if last == '0' { '1' } else { '0' });
+        let bad_path = dir.join("bad.json");
+        std::fs::write(&bad_path, json.replace(&kp.address, &format!("bloch1q{other}"))).unwrap();
+        assert!(Keypair::load_encrypted(&bad_path, "correct horse battery 9!").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bloch_address_strings_parse_as_the_same_owner() {
+        let gnb = crate::address::Address::from_hash([9u8; 20], crate::address::Network::Mainnet).to_string();
+        let bloch = format!("bloch1q{}", &gnb[crate::core::MAINNET_PREFIX.len()..]);
+        assert_eq!(crate::address::Address::parse(&bloch).unwrap().hash(), &[9u8; 20]);
+        assert_eq!(crate::address::Address::parse(&bloch).unwrap().to_string(), gnb);
+    }
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("gnb-bloch-ks-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 }
