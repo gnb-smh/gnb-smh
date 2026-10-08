@@ -1,0 +1,29 @@
+# systemd unit for a GnB mining node.
+#   /opt/gnb/bin/gnb          node binary
+#   /var/lib/gnb              data dir (owned by user gnb)
+#   /etc/gnb/gnb.env          GNB_MINER_ADDRESS, GNB_MINE_THREADS, GNB_PEERS (space-separated
+#                             multiaddrs), GNB_CARRYOVER (path to the uncompressed snapshot)
+[Unit]
+Description=GnB node (GnB-SMH proof of work)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=gnb
+Group=gnb
+EnvironmentFile=/etc/gnb/gnb.env
+ExecStart=/opt/gnb/bin/gnb-launch
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+# 64 MiB per mining thread plus ~1-2 GB for the node.
+MemoryMax=6G
+Nice=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gnb
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

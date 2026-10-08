@@ -1,0 +1,40 @@
+pqcrypto-internals (GroundState fork)
+=====================================
+
+This crate is a fork of the upstream `pqcrypto-internals` crate
+(rustpq/pqcrypto, https://github.com/rustpq/pqcrypto), version 0.2.11,
+dual-licensed under the MIT license (LICENSE-MIT) and the Apache License,
+Version 2.0 (LICENSE-APACHE), at your option — the same terms as upstream
+(see Cargo.toml `license = "MIT OR Apache-2.0"`).
+
+Fork scope (CR-09 correction): local modifications include src/lib.rs,
+Cargo.toml, build.rs, tests and provenance documentation. In particular the
+build script has WASI-specific handling for libc include paths. The fork is
+not a Rust-shim-only change. See README.md for scope and current limitations.
+
+VENDOR.toml and tests/vendor_pin.rs record and verify this repository's
+baseline for cfiles/ and include/. They neither pin the build script nor prove
+identity to an independently authenticated upstream 0.2.11 release. No such
+external provenance verification is claimed by this correction.
+
+Vendored third-party C sources
+-------------------------------
+
+The files under `cfiles/` and `include/` are PQClean reference and optimized
+implementations (SHA3/SHAKE, Keccak, AES, NIST DRBG seed expander, random-byte
+generation, and the SP 800-185 constructions), carried into this crate by
+upstream `pqcrypto-internals` as its C support layer for the pqcrypto family
+of post-quantum algorithm crates. Their contents are pinned by `VENDOR.toml`; this correction changes no file
+under `cfiles/` or `include/`. External upstream identity remains unverified.
+
+PQClean (https://github.com/PQClean/PQClean) states that its reference/
+optimized implementations are, per algorithm, released into the public
+domain (CC0-1.0) or under a permissive license (MIT-style) by their original
+authors; upstream `pqcrypto-internals` redistributes them under its own
+overall MIT OR Apache-2.0 crate license. This NOTICE does not itself
+re-derive or re-verify each individual upstream author's license grant per
+file — it records the provenance and licensing basis as
+documented by the crate this fork is taken from, so that basis is visible
+in-tree rather than only implied by an unstated "same as upstream" comment.
+Anyone redistributing this crate should independently confirm the current
+upstream PQClean/pqcrypto license terms for the specific algorithms in use.

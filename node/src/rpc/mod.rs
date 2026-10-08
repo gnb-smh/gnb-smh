@@ -1,0 +1,2194 @@
+//! Bloch-SIS Protocol — JSON-RPC over HTTP (axum)
+//!
+//! Methods:
+//!   getnetworkinfo, getblockcount, getmempoolinfo,
+//!   getblockhash, getblock, getblockbyheight, getrecentblocks,
+//!   gettransaction, getbalance, getutxos,
+//!   sendrawtransaction,
+//!   validateaddress, estimatefee, getrawmempool,
+//!   decoderawtransaction, getdaginfo, listtransactions, getpeerinfo
+
+pub mod auth;
+
+
+use std::sync::Arc;
+use parking_lot::RwLock;
+use log::{info, error};
+use axum::{routing::post, Router, extract::State, extract::DefaultBodyLimit, http::StatusCode, Json};
+use tower_http::cors::CorsLayer;
+use tower_http::timeout::TimeoutLayer;
+use tower::limit::GlobalConcurrencyLimitLayer;
+
+/// P0 RPC hardening (roadmap §1.6 / §4.3).
+/// Max request body: JSON-RPC calls are tiny; 1 MiB is generous and tighter
+/// than axum's 2 MiB default. Blocks oversized-payload memory abuse.
+const RPC_MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Global cap on concurrently in-flight RPC handlers, shared across all
+/// connections (GlobalConcurrencyLimitLayer holds one Arc'd semaphore). Bounds
+/// how many expensive storage-scanning methods can pile up at once. Value is a
+/// conservative default — needs load-testing to tune (not yet done).
+const RPC_MAX_CONCURRENCY: usize = 256;
+/// Per-request wall-clock timeout (returns 408). Kills slow-loris / stuck
+/// handlers so they can't hold a concurrency slot forever.
+const RPC_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// L-9 (audit): the dispatch-level timeout `handle_rpc` races its
+/// `spawn_blocking` `JoinHandle` against, strictly SHORTER than
+/// `RPC_REQUEST_TIMEOUT_SECS` so this one fires first and gets the chance to
+/// `abort()` the handle — the outer `TimeoutLayer` only ever dropped the
+/// response future, which never cancelled the underlying blocking task. See
+/// the long comment at the `tokio::select!` call site for what `.abort()`
+/// can and cannot stop.
+const DISPATCH_INNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(RPC_REQUEST_TIMEOUT_SECS - 5);
+use serde_json::{json, Value};
+use crate::storage::{Storage, StorageError};
+use crate::mempool::Mempool;
+use crate::consensus::GhostDAG;
+use crate::core::{Transaction, PROTOCOL_VERSION, MAINNET_PREFIX, TESTNET_PREFIX};
+use tokio::sync::mpsc;
+use crate::network::NetworkMessage;
+
+#[derive(Clone, Debug, Default)]
+pub struct NodeState {
+    pub tip_blue_score: u64,
+    pub block_count:    u64,
+    pub peer_count:     u32,
+    pub mempool_size:   usize,
+    pub is_syncing:     bool,
+    /// Highest tip blue-score any peer has announced (via PeerTip). Used to
+    /// release the IBD latch: is_syncing clears once tip_blue_score catches up
+    /// to this. (The old code only cleared on an empty Headers message, which
+    /// no peer ever sends, so is_syncing — and the miner pause — latched
+    /// forever and joining miners synced but never mined.)
+    pub best_seen_blue_score: u64,
+    /// Set once the node has processed at least one remote PeerTip. The
+    /// fresh-miner fork guard waits for this so a joining miner never mines a
+    /// genesis fork in the window between "connected" and "evaluated a tip".
+    pub seen_first_tip: bool,
+    /// Honest-RPC fix: highest blue_score announced by a CONNECTED peer,
+    /// refreshed by every maybe_release_ibd re-test (event-driven + 30s
+    /// nudge). UNTRUSTED wire hint — never gates consensus or the IBD latch;
+    /// it exists so `getnetworkinfo` can report `best_announced`/`behind_by`
+    /// and a lagging node SAYS it is lagging instead of just `syncing:false`.
+    /// Differs from `best_seen_blue_score` (lifetime max over any peer ever,
+    /// including long-gone ones): this one tracks currently-connected peers.
+    pub best_announced_blue_score: u64,
+    pub peer_addresses: Vec<String>,
+    pub version:        String,
+}
+
+/// Block-submission hook — the B5f pool seam.
+///
+/// Stratum V1/V2 cannot carry the Module-SIS solution vector in their share
+/// messages (see main.rs B5f), so external pools mine full SIS blocks and
+/// hand them in over RPC instead. main.rs wires this with a closure that
+/// mirrors the gossipsub NewBlock path: `Block::block_hash()` identity,
+/// `validate_structure()` (PoW witness + merkle + coinbase), then the same
+/// `accept_block` consensus pipeline, then network broadcast.
+///
+/// `None` (tests, or callers that don't wire it) makes `submitblock` return
+/// a "not wired" error instead of silently accepting.
+pub type SubmitBlockFn = dyn Fn(crate::core::Block) -> Result<String, String> + Send + Sync;
+
+#[derive(Clone, Debug)]
+pub struct RpcConfig {
+    pub bind_address:              String,
+    pub port:                      u16,
+    /// Sprint M: shared-secret API key. None = no auth layer.
+    pub api_key:                   Option<String>,
+    /// Sprint M: require X-API-Key for write methods (sendrawtransaction).
+    pub require_auth_for_writes:   bool,
+    /// Sprint M: per-IP read rate limit, requests/minute.
+    pub rate_limit_reads_per_min:  u32,
+    /// Sprint M: per-IP write rate limit, requests/minute.
+    pub rate_limit_writes_per_min: u32,
+    /// Sprint M-patch1: also trust RFC1918/ULA ranges as loopback.
+    /// Needed when node runs in Docker with default bridge networking.
+    /// SECURITY: only set true on trusted single-tenant hosts.
+    pub trust_private_ranges:      bool,
+    /// R3-audit H-R3-5: browser origins allowed to call this RPC (exact
+    /// `scheme://host[:port]` values). Empty (default) = no browser origin is
+    /// allowed: no CORS grants are emitted and any request carrying an
+    /// `Origin` header is refused. `"*"` allows any origin for READ methods
+    /// only — write methods never honour the wildcard.
+    pub allowed_origins:           Vec<String>,
+    /// R3-audit H-R3-5: extra hostnames accepted in the `Host` header
+    /// (anti-DNS-rebinding). IP literals and `localhost` are always accepted;
+    /// a reverse-proxy / tunnel hostname must be listed here. `"*"` disables
+    /// the check.
+    pub allowed_hosts:             Vec<String>,
+    /// R3-audit H-R3-5: restore the historical "loopback bypasses auth"
+    /// behaviour. Default false: loopback keeps its rate-limit exemption but
+    /// must satisfy the same API-key policy as remote callers (a browser on
+    /// the operator's machine connects from 127.0.0.1 — the blanket bypass
+    /// made every local web page an authenticated operator).
+    pub trust_loopback:            bool,
+}
+
+impl Default for RpcConfig {
+    fn default() -> Self {
+        Self {
+            bind_address:              "127.0.0.1".into(),
+            port:                      17210,
+            api_key:                   None,
+            require_auth_for_writes:   false,
+            rate_limit_reads_per_min:  60,
+            rate_limit_writes_per_min: 5,
+            trust_private_ranges:      false,
+            allowed_origins:           Vec::new(),
+            allowed_hosts:             Vec::new(),
+            trust_loopback:            false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AppState {
+    node_state:              Arc<RwLock<NodeState>>,
+    store:                   Arc<Storage>,
+    mempool:                 Arc<Mempool>,
+    dag:                     Arc<RwLock<GhostDAG>>,
+    outbound_tx:             mpsc::Sender<NetworkMessage>,
+    // Sprint M additions:
+    api_key:                 Option<String>,
+    require_auth_for_writes: bool,
+    // M-1 (audit): `--rpc-require-auth-for-reads` mode. This is a
+    // `RpcConfig`/CLI-flag-shaped concern, but the flag parser lives in
+    // `main.rs`, which is outside this change's ownership — read directly
+    // from the environment instead (see `start_rpc_server` below), matching
+    // the same env-var-not-main.rs-touching pattern used for M-6 in
+    // `network/mod.rs`. `GNB_RPC_REQUIRE_AUTH_FOR_READS=1` (or `true`)
+    // turns it on; unset/anything else leaves the historical
+    // "reads are public" default untouched. A future change should promote
+    // this to a proper `RpcConfig` field + `--rpc-require-auth-for-reads`
+    // CLI flag wired in `main.rs`, mirroring `require_auth_for_writes`.
+    require_auth_for_reads:  bool,
+    rate_limiter:            Arc<auth::RateLimiterSet>,
+    trust_private_ranges:    bool,
+    // R3-audit H-R3-5: browser gate + loopback-auth policy + heavy-read bound.
+    allowed_origins:         Arc<Vec<String>>,
+    allowed_hosts:           Arc<Vec<String>>,
+    trust_loopback:          bool,
+    heavy_gate:              Arc<HeavyGate>,
+    // B5f pool seam: submitblock hook (None = method returns "not wired").
+    submit_block:            Option<Arc<SubmitBlockFn>>,
+}
+
+// ─── R3-audit H-R3-5 / L-8: bound the expensive analytics + template RPCs ───
+//
+// These methods do expensive per-call work — `supply_distribution` and
+// `chain_stats` iterate EVERY block (twice, for the former), the per-address
+// history walks grow with the chain, and `getblocktemplate` (L-8) reads the
+// DAG twice, walks parent ancestry to derive `bits`, and drains + serialises
+// up to 2000 mempool transactions — on a port that, for the analytics
+// methods, has no auth and, for loopback/private callers, no rate limit
+// either, so a request loop stacks that cost without bound. The bound is
+// structural: results are served from a short TTL cache, and at most ONE
+// cache-missing computation runs at a time — a second concurrent caller gets
+// an immediate "busy" error instead of stacking another full computation.
+const HEAVY_READ_METHODS: &[&str] = &[
+    "getsupplydistribution",
+    "getchainstats",
+    "gethashrate",
+    "getaddresscount",
+    "getaddressbalance_at_height",
+    // L-8 (audit): `getblocktemplate` is expensive and stateful: it is
+    // privileged (see
+    // `auth::WRITE_METHODS`) and now shares the same short-TTL/single-flight
+    // discipline as the analytics methods above, closing the "poll it in a
+    // loop and force a fresh mempool drain + ancestry walk every time" cost.
+    "getblocktemplate",
+];
+
+/// TTL for cached heavy-read results. Analytics freshness of ~1 block is fine.
+const HEAVY_READ_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Cap on distinct cached keys (parameterised methods could otherwise grow
+/// the map unboundedly — the exact DoS shape this gate exists to close).
+const HEAVY_READ_CACHE_MAX_KEYS: usize = 64;
+
+pub struct HeavyGate {
+    ttl:   std::time::Duration,
+    cache: parking_lot::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>,
+    /// Held for the duration of a scan; `try_lock` makes concurrency-1 a hard
+    /// bound with no queueing (queueing would just move the pile-up).
+    scan:  parking_lot::Mutex<()>,
+}
+
+impl HeavyGate {
+    pub fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            scan:  parking_lot::Mutex::new(()),
+        }
+    }
+
+    pub fn is_heavy(method: &str) -> bool {
+        HEAVY_READ_METHODS.contains(&method)
+    }
+
+    /// Serve `key` from cache when fresh; otherwise run `f` under the single
+    /// scan permit. A caller that can neither hit the cache nor take the
+    /// permit gets an error Value immediately (bounded, non-queueing).
+    pub fn run<F: FnOnce() -> Value>(&self, key: String, f: F) -> Value {
+        let now = std::time::Instant::now();
+        if let Some((at, v)) = self.cache.lock().get(&key) {
+            if now.duration_since(*at) < self.ttl {
+                return v.clone();
+            }
+        }
+        match self.scan.try_lock() {
+            Some(_permit) => {
+                let v = f();
+                let mut cache = self.cache.lock();
+                if cache.len() >= HEAVY_READ_CACHE_MAX_KEYS {
+                    // Evict stale entries first; if still full, drop the map —
+                    // correctness is unaffected (it is a cache).
+                    cache.retain(|_, (at, _)| now.duration_since(*at) < self.ttl);
+                    if cache.len() >= HEAVY_READ_CACHE_MAX_KEYS {
+                        cache.clear();
+                    }
+                }
+                cache.insert(key, (std::time::Instant::now(), v.clone()));
+                v
+            }
+            None => json!({
+                "error": "busy: another heavy analytics scan is in flight; retry shortly",
+            }),
+        }
+    }
+}
+
+/// R3-audit H-R3-5: the CORS layer this server actually mounts.
+///
+/// Replaces `CorsLayer::permissive()`, which reflected EVERY origin (with
+/// methods and headers) and thereby let any web page preflight its way into
+/// `sendrawtransaction`. Policy:
+///   - empty allowlist (default): `CorsLayer::new()` — no CORS grants at all;
+///   - `"*"`: any origin may make CORS requests, but the per-request Origin
+///     gate in `handle_rpc` still refuses write methods (wildcard never
+///     applies to writes);
+///   - otherwise: exactly the listed origins.
+/// Credentials are never allowed; the API key travels in explicit headers.
+fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
+    use axum::http::{HeaderValue, Method, header};
+    let base = CorsLayer::new()
+        .allow_methods([Method::POST])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            header::HeaderName::from_static("x-api-key"),
+        ]);
+    if allowed_origins.is_empty() {
+        // No allow-origin is ever emitted; browsers refuse the response.
+        CorsLayer::new()
+    } else if allowed_origins.iter().any(|o| o == "*") {
+        base.allow_origin(tower_http::cors::Any)
+    } else {
+        let origins: Vec<HeaderValue> = allowed_origins
+            .iter()
+            .filter_map(|o| HeaderValue::from_str(o.trim_end_matches('/')).ok())
+            .collect();
+        base.allow_origin(tower_http::cors::AllowOrigin::list(origins))
+    }
+}
+
+pub async fn start_rpc_server(
+    config:      RpcConfig,
+    state:       Arc<RwLock<NodeState>>,
+    store:       Arc<Storage>,
+    mempool:     Arc<Mempool>,
+    dag:         Arc<RwLock<GhostDAG>>,
+    outbound_tx: mpsc::Sender<NetworkMessage>,
+    // B5f pool seam — see `SubmitBlockFn`.
+    submit_block: Option<Arc<SubmitBlockFn>>,
+) {
+    let addr = format!("{}:{}", config.bind_address, config.port);
+
+    // L-6 (audit): validate the configured key BEFORE it is ever compared
+    // against anything, regardless of how the caller sourced it
+    // (`--rpc-api-key` directly, or `--rpc-api-key-file` read by main.rs).
+    // Nothing previously prevented `--rpc-api-key x` (a one-character
+    // "secret" the constant-time comparison then faithfully protects) or a
+    // key containing control characters (a header-injection primitive
+    // wherever it is later interpolated into raw text — see `bin/gnb-cli.rs`'s
+    // M-11 fix). Refuse to start the RPC service on an invalid key rather
+    // than silently running with one that provides no real protection, or
+    // silently treating it as "no key" (which would DISABLE auth instead).
+    if let Some(k) = &config.api_key {
+        if let Err(reason) = auth::validate_api_key(k) {
+            error!("RPC: configured API key is invalid ({}); refusing to start the RPC service. \
+                    Fix --rpc-api-key / --rpc-api-key-file and restart.", reason);
+            return;
+        }
+    }
+
+    let rate_limiter = Arc::new(auth::RateLimiterSet::new(
+        config.rate_limit_reads_per_min,
+        config.rate_limit_writes_per_min,
+    ));
+
+    // M-1: see the field doc on `AppState::require_auth_for_reads`.
+    let require_auth_for_reads = std::env::var("GNB_RPC_REQUIRE_AUTH_FOR_READS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if require_auth_for_reads && config.api_key.is_none() {
+        // Fail-safe, loudly: the auth layer itself refuses every
+        // non-trusted read in this configuration (see
+        // `auth::authorize_with_read_policy`'s fail-safe doc), but an
+        // operator who set the flag almost certainly meant to configure a
+        // key too — say so instead of silently locking the RPC surface.
+        log::warn!(
+            "GNB_RPC_REQUIRE_AUTH_FOR_READS is set but no --rpc-api-key is \
+             configured: every non-trusted read will be refused (fail-safe, \
+             not a bug) until a key is configured"
+        );
+    }
+
+    let app_state = AppState {
+        node_state: state,
+        store,
+        mempool,
+        dag,
+        outbound_tx,
+        api_key:                 config.api_key.clone(),
+        require_auth_for_writes: config.require_auth_for_writes,
+        require_auth_for_reads,
+        rate_limiter,
+        trust_private_ranges:    config.trust_private_ranges,
+        allowed_origins:         Arc::new(config.allowed_origins.clone()),
+        allowed_hosts:           Arc::new(config.allowed_hosts.clone()),
+        trust_loopback:          config.trust_loopback,
+        heavy_gate:              Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
+        submit_block,
+    };
+
+    // P0 RPC hardening (roadmap §1.6 / §4.3): body-size cap, global
+    // concurrency limit, and a per-request timeout on top of the existing
+    // per-IP auth/rate-limit.
+    // R3-audit H-R3-5: the CORS layer is restrictive (see build_cors_layer);
+    // Host/Origin are additionally checked per request in handle_rpc.
+    let app = Router::new()
+        .route("/", post(handle_rpc))
+        .layer(build_cors_layer(&config.allowed_origins))
+        .layer(DefaultBodyLimit::max(RPC_MAX_BODY_BYTES))
+        .layer(GlobalConcurrencyLimitLayer::new(RPC_MAX_CONCURRENCY))
+        .layer(TimeoutLayer::new(std::time::Duration::from_secs(RPC_REQUEST_TIMEOUT_SECS)))
+        .with_state(app_state);
+
+    info!("RPC on {} (auth={}, require_auth_writes={}, trust_private={}, trust_loopback={}, origins={:?}, hosts={:?}, limits: {}r/min, {}w/min)",
+        addr,
+        config.api_key.is_some(),
+        config.require_auth_for_writes,
+        config.trust_private_ranges,
+        config.trust_loopback,
+        config.allowed_origins,
+        config.allowed_hosts,
+        config.rate_limit_reads_per_min,
+        config.rate_limit_writes_per_min,
+    );
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l)  => l,
+        Err(e) => { error!("RPC bind: {}", e); return; }
+    };
+    // Sprint M: connect_info makes the client IP available to handlers.
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    ).await {
+        error!("RPC error: {}", e);
+    }
+}
+
+/// L-5 (audit): storage errors used to be returned to RPC callers verbatim
+/// (`json!({ "error": e.to_string() })`) at every one of this file's ~13
+/// `state.store.*` call sites. `StorageError::ReadFailed` / `OpenFailed` /
+/// `WriteFailed` wrap the underlying RocksDB error message
+/// (`storage/mod.rs`'s `From<rocksdb::Error>` / explicit `.map_err`s), which
+/// can include filesystem paths and column-family/engine internals — none of
+/// which an unauthenticated caller (see M-1: reads are public by default) has
+/// any business receiving. INVARIANT (L-5): the detail is logged
+/// server-side, at a level an operator will see; the caller gets a stable,
+/// content-free error code and message, identical across every storage
+/// failure mode so nothing about the underlying condition leaks through
+/// message shape either.
+/// L-10 (audit): max bytes an echoed JSON-RPC `id` string may occupy in the
+/// response. JSON-RPC 2.0 ids are meant to be short correlation tokens, not
+/// payload; nothing legitimate needs anywhere near this much.
+const MAX_ECHOED_ID_LEN: usize = 256;
+
+/// L-10: normalize the request's `id` to a shape and size safe to echo back
+/// unconditionally. A string is truncated (UTF-8-safely — see
+/// `network::truncate_utf8`) rather than rejected outright, so a client
+/// using a slightly-too-long-but-otherwise-legitimate correlation id still
+/// gets a response, just a truncated echo of what it sent (a client cannot
+/// reasonably rely on more than JSON-RPC 2.0 itself promises, which is
+/// "echo the id", not "echo it losslessly at any length"). A `bool`,
+/// `array`, or `object` id is not spec-compliant at all and is replaced with
+/// `null` rather than echoed.
+/// L-11 (audit): the JSON-RPC 2.0 error body for an unsupported batch
+/// (top-level JSON array) request. Extracted so the exact code/shape is
+/// unit-testable without constructing axum extractors.
+fn batch_not_supported_response() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id":      Value::Null,
+        "error":   { "code": -32600, "message": "Invalid Request: batch requests are not supported" },
+    })
+}
+
+fn cap_echoed_id(id: Value) -> Value {
+    match id {
+        Value::String(s) => {
+            Value::String(crate::network::truncate_utf8(&s, MAX_ECHOED_ID_LEN).to_string())
+        }
+        v @ (Value::Number(_) | Value::Null) => v,
+        _ => Value::Null,
+    }
+}
+
+fn storage_err_response(e: &StorageError) -> Value {
+    log::warn!("rpc: storage error (detail withheld from caller): {}", e);
+    json!({ "error": "internal storage error", "code": "STORAGE_ERROR" })
+}
+
+/// Height of the selected tip — the number a confirmation count is relative to.
+///
+/// # Why this exists as a function
+///
+/// Three call sites computed confirmations as `node_state.block_count - height`,
+/// subtracting a block's **height** from the DAG's **block count**. In a chain
+/// those two numbers are the same and the bug is invisible; in a BlockDAG they
+/// are not, because parallel blocks are kept rather than orphaned. Measured on
+/// mainnet 2026-08-13: chain height 39,837, DAG block count 50,606 — an offset
+/// of 10,769.
+///
+/// The consequence was not a cosmetic off-by-N. `gettxstatus` calls anything
+/// with 100+ confirmations `final`, so **every mined transaction reported
+/// final immediately**, and an exchange gating deposits on that field would
+/// have credited at depth 1 while believing it waited. The failure was silent
+/// and in the direction that costs the integrator money.
+///
+/// One definition, called three times — not three call sites each free to pick
+/// a plausible-looking counter.
+fn selected_tip_height(state: &AppState) -> u64 {
+    let dag = state.dag.read();
+    dag.selected_tip()
+        .and_then(|h| dag.get_block_data(&h).map(|d| d.height))
+        .unwrap_or(0)
+}
+
+async fn handle_rpc(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(req):    Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    // L-11 (audit): a top-level JSON ARRAY (a JSON-RPC 2.0 batch request,
+    // which this server does not implement) used to fall through silently:
+    // `req["method"]` on a `Value::Array` indexes to `Null` (the `&str`
+    // `Index` impl only matches objects), so `method` became the empty
+    // string and dispatch's catch-all returned `"unknown method: "` with
+    // HTTP 200 — a standards-conformant client sees a "success" response
+    // that is actually nonsensical. Detect the shape explicitly and answer
+    // with the JSON-RPC 2.0 code for it.
+    if req.is_array() {
+        crate::metrics::inc_rpc_request("batch", "invalid_request");
+        log::info!("rpc denied ip={} reason=batch_request_unsupported", addr.ip());
+        return (StatusCode::BAD_REQUEST, Json(batch_not_supported_response()));
+    }
+
+    let method = req["method"].as_str().unwrap_or("");
+    // L-10 (audit): the `id` used to be echoed back completely unbounded —
+    // a ~1 MiB `id` string in the request produced a ~1 MiB response, at
+    // zero cost to the attacker and real memory pressure for the node.
+    // JSON-RPC 2.0 itself expects `id` to be a string, number, or null;
+    // `cap_echoed_id` enforces exactly that shape and bounds the string case.
+    let id     = cap_echoed_id(req.get("id").cloned().unwrap_or(json!(null)));
+    let params = req.get("params");
+
+    let client_ip = addr.ip();
+    let presented_key = auth::extract_api_key(&headers);
+
+    // R3-audit H-R3-5: Host + Origin gate BEFORE auth/rate-limit. Refuses
+    // DNS-rebinding (hostile hostname in Host) and browser-borne CSRF (an
+    // Origin the operator did not allowlist; wildcard never covers writes).
+    let host_hdr   = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok());
+    let origin_hdr = headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok());
+    if let Err(refusal) = auth::gate_browser_request(
+        host_hdr,
+        origin_hdr,
+        method,
+        &state.allowed_hosts,
+        &state.allowed_origins,
+    ) {
+        crate::metrics::inc_rpc_request(method, "forbidden");
+        log::info!("rpc denied ip={} method={} reason={:?} host={:?} origin={:?}",
+            client_ip, method, refusal, host_hdr, origin_hdr);
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id":      id,
+                "error":   { "code": -32003, "message": "forbidden: request refused by Host/Origin policy" },
+            })),
+        );
+    }
+
+    let decision = auth::authorize_with_read_policy(
+        client_ip,
+        method,
+        presented_key,
+        state.api_key.as_deref(),
+        state.require_auth_for_writes,
+        state.require_auth_for_reads,
+        state.trust_private_ranges,
+        state.trust_loopback,
+        &state.rate_limiter,
+    );
+
+    match decision {
+        auth::AuthDecision::Allow => {
+            let start = std::time::Instant::now();
+            // P1 (roadmap §2): per-request tracing span, correlated with the
+            // existing `rpc_requests{method,status}` metric so a slow method is
+            // traceable to a client. `.instrument()` (not an entered guard) is
+            // the correct form across the `dispatch` await. Inert unless a
+            // subscriber is installed (init lives in main.rs, not owned here).
+            use tracing::Instrument;
+            // The dispatch arms below do their work INLINE and BLOCKING:
+            // parking_lot acquisitions on `node_state`/`dag` and synchronous
+            // RocksDB reads, none of which yield. Running that directly on a
+            // tokio worker means a writer holding `node_state` (main.rs:2303,
+            // :2352, :2910, :3080) parks the worker for as long as it holds the
+            // lock. With `#[tokio::main]` defaulting worker_threads to the core
+            // count — 2 on the production box — two stalled requests park the
+            // WHOLE runtime, so it stops accepting connections at all.
+            //
+            // Measured on the producer, 2026-08-09: getblockcount took 30.01s
+            // and 20.42s back to back while createauxblock returned in 0.01s.
+            // The pool proxy times out at 10s and retries ~1/s, so the accept
+            // queue filled (129 pending against a backlog of 128) and the node
+            // never recovered on its own — only a restart cleared it, which is
+            // why a watchdog was papering over this.
+            //
+            // Hand the whole dispatch to the blocking pool so worker threads
+            // stay free to accept and poll. `block_on` is legal here precisely
+            // because a spawn_blocking thread is not a runtime worker.
+            let d_state  = state.clone();
+            let d_method = method.to_string();
+            let d_params = params.cloned();
+            let d_handle = tokio::runtime::Handle::current();
+            let join_handle = tokio::task::spawn_blocking(move || {
+                // R3-audit H-R3-5: heavy O(chain) analytics reads go through
+                // the HeavyGate — TTL cache + at most one scan in flight.
+                if HeavyGate::is_heavy(&d_method) {
+                    let key = format!(
+                        "{}|{}",
+                        d_method,
+                        d_params.as_ref().map(|p| p.to_string()).unwrap_or_default(),
+                    );
+                    d_state.heavy_gate.clone().run(key, || {
+                        d_handle.block_on(dispatch(&d_method, d_params.as_ref(), &d_state))
+                    })
+                } else {
+                    d_handle.block_on(dispatch(&d_method, d_params.as_ref(), &d_state))
+                }
+            });
+            // L-9 (audit): the outer `TimeoutLayer` (tower-http) previously
+            // was the ONLY thing standing between a stuck dispatch and a
+            // permanently-occupied blocking-pool slot — and it drops the
+            // RESPONSE future, which drops the `JoinHandle` value inline
+            // above without ever calling `.abort()`. Dropping a
+            // `tokio::task::JoinHandle` does NOT cancel the task it points
+            // to: for `spawn_blocking`, the closure keeps running on its
+            // blocking thread to completion regardless, so a timed-out
+            // `getsupplydistribution` (H-6) kept loading the chain while a
+            // fresh request was admitted in its place — the exact
+            // "watchdog is papering over an unbounded background cost"
+            // shape this file's own comments elsewhere warn about.
+            //
+            // Fix: race the dispatch against an INNER timeout, strictly
+            // shorter than the outer `RPC_REQUEST_TIMEOUT_SECS`, so this
+            // arm — not the outer layer's unconditional drop — is what
+            // decides the outcome and can act on it. `abort_handle()` is
+            // taken before the handle is consumed by `.instrument()` below,
+            // so it stays independently usable to cancel from the other
+            // `select!` arm.
+            //
+            // HONESTY: `.abort()` on an ALREADY-RUNNING blocking closure
+            // cannot preempt it mid-execution (the OS thread runs the
+            // closure to completion regardless — this is a `spawn_blocking`
+            // limitation, not a bug in this fix); the queued case is where
+            // this has full effect: a task that has not yet started
+            // executing on the blocking pool is guaranteed to never run at
+            // all once aborted. Either way, THIS request's response path
+            // returns immediately at the inner deadline instead of holding
+            // the connection until the outer layer's drop.
+            let abort_handle = join_handle.abort_handle();
+            let result = tokio::select! {
+                r = join_handle.instrument(tracing::info_span!(
+                    "rpc_request",
+                    method,
+                    client_ip = %client_ip,
+                    id = %id,
+                )) => {
+                    r.unwrap_or_else(|e| {
+                        log::error!("rpc dispatch task failed: {}", e);
+                        json!({ "error": "internal dispatch failure" })
+                    })
+                }
+                _ = tokio::time::sleep(DISPATCH_INNER_TIMEOUT) => {
+                    abort_handle.abort();
+                    log::warn!(
+                        "rpc dispatch timed out for method={} ip={} after {:?}; aborted \
+                         (queued work is cancelled; already-running work finishes in the \
+                         background but this response does not wait for it)",
+                        method, client_ip, DISPATCH_INNER_TIMEOUT
+                    );
+                    json!({ "error": "internal dispatch timeout" })
+                }
+            };
+            let elapsed = start.elapsed();
+            let elapsed_ms = elapsed.as_millis();
+            crate::metrics::observe_rpc_latency(method, elapsed.as_secs_f64());
+            crate::metrics::inc_rpc_request(method, "ok");
+            log::debug!("rpc ok ip={} method={} took={}ms", client_ip, method, elapsed_ms);
+            (
+                StatusCode::OK,
+                Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
+            )
+        }
+        auth::AuthDecision::Unauthorized => {
+            crate::metrics::inc_rpc_request(method, "unauthorized");
+            log::info!("rpc denied ip={} method={} reason=unauthorized", client_ip, method);
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id":      id,
+                    "error":   { "code": -32001, "message": "unauthorized: valid X-API-Key required" },
+                })),
+            )
+        }
+        auth::AuthDecision::RateLimited => {
+            crate::metrics::inc_rpc_request(method, "rate_limited");
+            log::info!("rpc denied ip={} method={} reason=rate_limited", client_ip, method);
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id":      id,
+                    "error":   { "code": -32002, "message": "rate limit exceeded; retry after a minute" },
+                })),
+            )
+        }
+    }
+}
+
+async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Value {
+    match method {
+        "getnetworkinfo" => {
+            let s = state.node_state.read();
+            let pruned_h = state.store.pruned_height();
+            json!({
+                "network":         "mainnet",
+                "version":         s.version,
+                "protocol":        PROTOCOL_VERSION,
+                "net_protocol":    crate::network::PROTOCOL_VERSION,
+                "blue_score":      s.tip_blue_score,
+                "blocks":          s.block_count,
+                "peers":           s.peer_count,
+                "mempool":         s.mempool_size,
+                "syncing":         s.is_syncing,
+                // Honest-lag fields: `best_announced` is the highest blue_score
+                // any CONNECTED peer claims (untrusted hint); `behind_by` is how
+                // far our selected tip trails it. A node that gave up on an
+                // unreachable frontier used to report syncing:false and NOTHING
+                // else — operators and the explorer could not see real lag.
+                // behind_by > 0 with syncing:false means "released by the lag
+                // tolerance or gave up", not "provably at the network tip".
+                "best_announced":  s.best_announced_blue_score,
+                "behind_by":       s.best_announced_blue_score.saturating_sub(s.tip_blue_score),
+                "chain":           "bloch-sis",
+                "pruned_height":   pruned_h,
+            })
+        }
+        "getblockcount"  => json!(state.node_state.read().block_count),
+        "getmempoolinfo" => json!({ "size": state.node_state.read().mempool_size }),
+
+        "getblockhash" => {
+            let height = params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(0);
+            match state.store.get_block_hash_at_height(height) {
+                Ok(Some(h)) => json!(hex::encode(h)),
+                Ok(None)    => json!({ "error": "height not found" }),
+                Err(e)      => storage_err_response(&e),
+            }
+        }
+
+        // ── Block explorer: full block with transaction details ──────
+        "getblock" => {
+            let hash_hex = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            let verbose  = params.and_then(|p| p.get(1)).and_then(|v| v.as_bool()).unwrap_or(false);
+            match hex::decode(hash_hex).ok().and_then(|b| <[u8;32]>::try_from(b).ok()) {
+                Some(hash) => match state.store.get_block(&hash) {
+                    Ok(Some(b)) => {
+                        let mut result = json!({
+                            "hash":        hash_hex,
+                            "height":      b.height,
+                            "blue_score":  b.blue_score,
+                            "tx_count":    b.transactions.len(),
+                            "timestamp":   b.header.timestamp,
+                            "bits":        format!("0x{:08x}", b.header.bits),
+                            "nonce":       b.header.nonce,
+                            "parents":     b.header.parents.iter().map(|p| hex::encode(p)).collect::<Vec<_>>(),
+                            "merkle_root": hex::encode(b.header.merkle_root),
+                            "size":        b.size_bytes(),
+                        });
+                        if verbose {
+                            result["transactions"] = json!(b.transactions.iter().map(|tx| {
+                                format_tx(tx)
+                            }).collect::<Vec<_>>());
+                        } else {
+                            result["txids"] = json!(b.transactions.iter().map(|tx| {
+                                hex::encode(tx.txid())
+                            }).collect::<Vec<_>>());
+                        }
+                        result
+                    },
+                    Ok(None)  => json!({ "error": "not found" }),
+                    Err(e)    => storage_err_response(&e),
+                },
+                None => json!({ "error": "invalid hash" }),
+            }
+        }
+
+        // ── Block explorer: get block by height ──────────────────────
+        "getblockbyheight" => {
+            let height = params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(0);
+            let verbose = params.and_then(|p| p.get(1)).and_then(|v| v.as_bool()).unwrap_or(false);
+            match state.store.get_block_hash_at_height(height) {
+                Ok(Some(hash)) => match state.store.get_block(&hash) {
+                    Ok(Some(b)) => {
+                        let mut result = json!({
+                            "hash":        hex::encode(hash),
+                            "height":      b.height,
+                            "blue_score":  b.blue_score,
+                            "tx_count":    b.transactions.len(),
+                            "timestamp":   b.header.timestamp,
+                            "bits":        format!("0x{:08x}", b.header.bits),
+                            "nonce":       b.header.nonce,
+                            "parents":     b.header.parents.iter().map(|p| hex::encode(p)).collect::<Vec<_>>(),
+                            "merkle_root": hex::encode(b.header.merkle_root),
+                            "size":        b.size_bytes(),
+                        });
+                        if verbose {
+                            result["transactions"] = json!(b.transactions.iter().map(|tx| {
+                                format_tx(tx)
+                            }).collect::<Vec<_>>());
+                        } else {
+                            result["txids"] = json!(b.transactions.iter().map(|tx| {
+                                hex::encode(tx.txid())
+                            }).collect::<Vec<_>>());
+                        }
+                        result
+                    },
+                    Ok(None)  => json!({ "error": "block data not found" }),
+                    Err(e)    => storage_err_response(&e),
+                },
+                Ok(None) => json!({ "error": "height not found" }),
+                Err(e)   => storage_err_response(&e),
+            }
+        }
+
+        // ── Block explorer: recent blocks list ───────────────────────
+        "getrecentblocks" => {
+            let count = params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(10)
+                .min(50); // cap at 50
+            // The DAG's block count is not a height: it counts parallel blocks
+            // too, and on 2026-08-13 exceeded the chain height by 10,769. Using
+            // it here made the scan start ~10k heights above anything that
+            // exists and walk down through nothing.
+            let tip_height = selected_tip_height(&state).saturating_add(1);
+            let mut blocks = Vec::new();
+            // Iterate ALL heights until we find enough blocks (DAG may have gaps)
+            for h in (0..tip_height).rev() {
+                if blocks.len() >= count as usize { break; }
+                if let Ok(Some(hash)) = state.store.get_block_hash_at_height(h) {
+                    if let Ok(Some(b)) = state.store.get_block(&hash) {
+                        blocks.push(json!({
+                            "hash":      hex::encode(hash),
+                            "height":    b.height,
+                            "tx_count":  b.transactions.len(),
+                            "timestamp": b.header.timestamp,
+                            "size":      b.size_bytes(),
+                            "bits":      b.header.bits,
+                        }));
+                    }
+                }
+            }
+            json!(blocks)
+        }
+
+        // ── Block explorer: transaction lookup (O(1) via TX index) ────
+        "gettransaction" => {
+            let txid_hex = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            let txid_bytes = match hex::decode(txid_hex).ok().and_then(|b| <[u8;32]>::try_from(b).ok()) {
+                Some(b) => b,
+                None    => return json!({ "error": "invalid txid" }),
+            };
+            // O(1) lookup via CF_TX_INDEX
+            match state.store.get_tx_location(&txid_bytes) {
+                Ok(Some((block_hash, height))) => {
+                    let tip = selected_tip_height(&state);
+                    match state.store.get_block(&block_hash) {
+                        Ok(Some(block)) => {
+                            let tx = block.transactions.iter().find(|t| t.txid() == txid_bytes);
+                            match tx {
+                                Some(tx) => json!({
+                                    "txid":          txid_hex,
+                                    "block_hash":    hex::encode(block_hash),
+                                    "block_height":  height,
+                                    "timestamp":     block.header.timestamp,
+                                    "confirmations": tip.saturating_sub(height),
+                                    "transaction":   format_tx(tx),
+                                }),
+                                None => json!({ "error": "tx index stale" }),
+                            }
+                        },
+                        Ok(None) => json!({ "error": "block not found" }),
+                        Err(e)   => storage_err_response(&e),
+                    }
+                },
+                Ok(None) => json!({ "error": "transaction not found" }),
+                Err(e)   => storage_err_response(&e),
+            }
+        }
+
+        // ── Wallet: balance query ────────────────────────────────────
+        "getbalance" => {
+            let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            let addr_bytes = parse_address(addr);
+            match addr_bytes {
+                Some(ab) => match state.store.get_balance(&ab) {
+                    // R3 (docs/specs/BLOCH-RPC-V4.md): satoshi amounts are
+                    // decimal STRINGS on the wire — V4's supply exceeds both
+                    // i64::MAX and JS Number.MAX_SAFE_INTEGER. Display-only
+                    // `*_bloch` floats stay JSON numbers (documented lossy).
+                    Ok((sats, utxo_count)) => json!({
+                        "satoshis":   sats.to_string(),
+                        "gnb":       sats as f64 / 1e8,
+                        "utxo_count": utxo_count,
+                        "address":    addr,
+                    }),
+                    Err(e) => storage_err_response(&e),
+                },
+                None => json!({ "error": "invalid address" }),
+            }
+        }
+
+        // ── Chain: distinct on-chain wallets (addresses with a balance) ──
+        "getaddresscount" => {
+            match state.store.count_addresses_with_balance() {
+                Ok((addrs, utxos)) => json!({
+                    "addresses_with_balance": addrs,
+                    "utxo_entries":           utxos,
+                    "note": "distinct addresses currently holding >=1 UTXO (on-chain wallets with a non-zero balance); addresses that spent to zero or never held a UTXO are not counted",
+                }),
+                Err(e) => storage_err_response(&e),
+            }
+        }
+
+        // ── Wallet: list UTXOs for address (needed by wallet CLI) ────
+        "getutxos" => {
+            let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            // Optional 2nd param: max UTXOs to return. A wallet with hundreds of
+            // thousands of UTXOs (e.g. the carry-over founder set) otherwise serializes
+            // a multi-MB response that overflows clients; a spender only needs enough
+            // UTXOs to cover the amount, so it can pass a small limit.
+            let limit = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).map(|n| n as usize);
+            let addr_bytes = parse_address(addr);
+            match addr_bytes {
+                Some(ab) => match state.store.get_utxos_for_address(&ab) {
+                    Ok(utxos) => {
+                        let total: u64 = utxos.iter().map(|(_, _, o)| o.value).sum();
+                        let full_count = utxos.len();
+                        let iter = utxos.iter();
+                        let list: Vec<Value> = match limit {
+                            // R3: `value` is a satoshi amount → decimal string.
+                            Some(n) => iter.take(n).map(|(txid, idx, out)| json!({
+                                "txid": hex::encode(txid), "index": idx,
+                                "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
+                            })).collect(),
+                            None => iter.map(|(txid, idx, out)| json!({
+                                "txid": hex::encode(txid), "index": idx,
+                                "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
+                            })).collect(),
+                        };
+                        json!({
+                            "address":    addr,
+                            "utxo_count": full_count,
+                            "returned":   list.len(),
+                            "satoshis":   total.to_string(),
+                            "gnb":       total as f64 / 1e8,
+                            "utxos":      list,
+                        })
+                    },
+                    Err(e) => storage_err_response(&e),
+                },
+                None => json!({ "error": "invalid address" }),
+            }
+        }
+
+        "sendrawtransaction" => {
+            let hex_tx = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            match hex::decode(hex_tx) {
+                Err(_)   => json!({ "error": "invalid hex" }),
+                // Sprint 1.d: Bitcoin-format tx bytes (replaces bincode).
+                // Wallet clients now send stratum_bytes(include_script_sig=true).
+                Ok(raw)  => match Transaction::from_wire_bytes(&raw) {
+                    Err(_)  => json!({ "error": "deserialise failed" }),
+                    Ok(tx)  => {
+                        if tx.is_coinbase() { return json!({ "error": "coinbase not accepted" }); }
+                        // MUST be a height. This fed check_coinbase_maturity
+                        // (VULN-03) bound to the DAG's block COUNT, which on
+                        // 2026-08-13 exceeded the chain height by 10,769 — so
+                        // `current_height - coinbase_height` was inflated by the
+                        // same amount and EVERY coinbase looked mature on
+                        // admission, whatever the 100-block rule says. The
+                        // comment below this call still asserted the two were
+                        // equal; in a chain they are, in a BlockDAG they are not,
+                        // because parallel blocks are kept rather than orphaned.
+                        let current_height = selected_tip_height(&state);
+                        // P0 (roadmap §1.2 / §2.5 #6): PQ signature verification is
+                        // CPU-bound. Run it on the blocking pool so a flood of
+                        // valid-but-expensive txs on this RPC can't stall the async
+                        // reactor. Verification LOGIC is unchanged — only the thread
+                        // it runs on. Costs one Transaction clone per call.
+                        let store_v = state.store.clone();
+                        let tx_v = tx.clone();
+                        let verified = tokio::task::spawn_blocking(move || {
+                            validate_tx_for_mempool(&tx_v, &store_v, current_height)
+                        }).await;
+                        match verified.unwrap_or_else(|e| Err(format!("verify task failed: {}", e))) {
+                            Err(e)   => json!({ "error": e }),
+                            Ok(fee)  => {
+                                let txid = tx.txid();
+                                match state.mempool.add(tx, fee) {
+                                    // Not L-5: this is MempoolError, a validation
+                                    // outcome (e.g. double-spend, fee too low) the
+                                    // caller needs to see to fix their transaction —
+                                    // not an internal/filesystem detail to withhold.
+                                    Err(e) => json!({ "error": e.to_string() }),
+                                    Ok(_)  => {
+                                        let _ = state.outbound_tx.try_send(NetworkMessage::NewTransaction {
+                                            txid, tx_data: raw,
+                                        });
+                                        json!({ "txid": hex::encode(txid) })
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        // ── Phase 2: validateaddress ─────────────────────────────────
+        "validateaddress" => {
+            let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            let is_mainnet = addr.starts_with(MAINNET_PREFIX);
+            let is_testnet = addr.starts_with(TESTNET_PREFIX);
+            let valid_prefix = is_mainnet || is_testnet;
+            let stripped = addr.trim_start_matches(MAINNET_PREFIX).trim_start_matches(TESTNET_PREFIX);
+            // Expect 40 hex (20-byte hash) + 8 hex (4-byte checksum) = 48 hex chars
+            let valid_len = stripped.len() == 48;
+            let valid_hex = hex::decode(stripped).is_ok();
+
+            // Verify checksum
+            let valid_checksum = if valid_prefix && valid_len && valid_hex {
+                let bytes = hex::decode(stripped).unwrap_or_default();
+                let payload = &bytes[..20];
+                use sha3::{Sha3_256, Digest};
+                let inner = Sha3_256::digest(payload);
+                let outer = Sha3_256::digest(inner);
+                &outer[..4] == &bytes[20..24]
+            } else {
+                false
+            };
+
+            let is_valid = valid_prefix && valid_len && valid_hex && valid_checksum;
+            json!({
+                "address":    addr,
+                "isvalid":    is_valid,
+                "network":    if is_mainnet { "mainnet" } else if is_testnet { "testnet" } else { "unknown" },
+                "checksum":   valid_checksum,
+            })
+        }
+
+        // ── Phase 2: estimatefee ─────────────────────────────────────
+        "estimatefee" => {
+            let median = state.mempool.median_fee();
+            json!({
+                // R3: satoshi amount → decimal string.
+                "feerate_sats":  median.to_string(),
+                "feerate_gnb":  median as f64 / 1e8,
+                "mempool_size":  state.mempool.size(),
+                "note":          "median fee of current mempool entries",
+            })
+        }
+
+        // ── Phase 2: getrawmempool ───────────────────────────────────
+        "getrawmempool" => {
+            let verbose = params.and_then(|p| p.get(0)).and_then(|v| v.as_bool()).unwrap_or(false);
+            if verbose {
+                let entries = state.mempool.entries();
+                let list: Vec<serde_json::Value> = entries.iter().map(|(txid, fee, added)| {
+                    json!({
+                        "txid":     hex::encode(txid),
+                        // R3: satoshi amount → decimal string.
+                        "fee":      fee.to_string(),
+                        "fee_gnb": *fee as f64 / 1e8,
+                        "time":     added,
+                    })
+                }).collect();
+                json!({ "size": list.len(), "transactions": list })
+            } else {
+                let txids: Vec<String> = state.mempool.txids().iter().map(|t| hex::encode(t)).collect();
+                json!({ "size": txids.len(), "txids": txids })
+            }
+        }
+
+        // ── Phase 2: decoderawtransaction ────────────────────────────
+        "decoderawtransaction" => {
+            let hex_tx = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            match hex::decode(hex_tx) {
+                Err(_)  => json!({ "error": "invalid hex" }),
+                // Sprint 1.d: Bitcoin-format tx bytes.
+                Ok(raw) => match Transaction::from_wire_bytes(&raw) {
+                    Err(e)  => json!({ "error": format!("decode failed: {}", e) }),
+                    Ok(tx)  => {
+                        let mut result = format_tx(&tx);
+                        result["size"] = json!(raw.len());
+                        result
+                    }
+                },
+            }
+        }
+
+        // ── Phase 2: getdaginfo ──────────────────────────────────────
+        // ── B5f pool seam: getblocktemplate / submitblock ─────────────────
+        //
+        // Stratum V1/V2 shares cannot carry the Module-SIS solution vector
+        // (main.rs refuses to start them), so pool software mines complete
+        // SIS blocks and talks to the node over these two methods instead:
+        //
+        //   getblocktemplate  — everything needed to assemble a candidate
+        //                       block: parents, height, blue_score, the
+        //                       expected `bits` (computed EXACTLY like
+        //                       accept_block: ASERT-Lattice from the genesis
+        //                       anchor + parent timestamp), subsidy/vesting
+        //                       amounts, and mempool transactions with fees.
+        //   submitblock       — full block (Bitcoin wire format hex, i.e.
+        //                       Block::to_wire_bytes) routed through the
+        //                       same validation pipeline as gossiped blocks.
+        //
+        // The reference pool consuming this lives in pool/.
+        "getblocktemplate" => {
+            // Snapshot DAG state: parents = current tips; height = max
+            // parent height + 1 (accept_block's VULN-02 rule); blue_score =
+            // tip blue score + 1 (mirrors the solo miner loop).
+            let (parents, height, blue_score) = {
+                let d = state.dag.read();
+                // Mine only on BODIED tips: a header-only tip (body never
+                // arrived over headers-first sync) is unmineable — a block
+                // built on it can't be validated by accept_block, so the
+                // template would wedge the miner on a phantom parent.
+                let tips = d.bodied_tips(|h| state.store.get_block(h).ok().flatten().is_some());
+                if tips.is_empty() {
+                    return json!({ "error": "node has no bodied tip yet (still syncing genesis?)" });
+                }
+                // height / blue_score from the bodied parents only — NOT
+                // tip_blue_score(), which follows the bodyless selected_tip.
+                let max_parent_height = tips.iter()
+                    .filter_map(|t| d.get_block_data(t))
+                    .map(|dd| dd.height)
+                    .max()
+                    .unwrap_or(0);
+                let max_parent_blue_score = tips.iter()
+                    .filter_map(|t| d.get_block_data(t))
+                    .map(|dd| dd.blue_score)
+                    .max()
+                    .unwrap_or(0);
+                (tips, max_parent_height + 1, max_parent_blue_score + 1)
+            };
+
+            // Expected bits — exactly what accept_block validates a block with
+            // these parents against: ASERT over the latest parent timestamp.
+            let parent_ts = {
+                let d = state.dag.read();
+                crate::core::difficulty_parent_timestamp(
+                    parents.iter().filter_map(|p| d.get_block_data(p)).map(|dd| dd.timestamp))
+            };
+            let bits = match crate::pow::expected_bits(parent_ts, height) {
+                Ok(b) => b,
+                Err(e) => return json!({ "error": format!("expected bits not derivable: {}", e) }),
+            };
+
+            // Mempool selection + per-tx fees (mirrors stratum's
+            // install_fresh_template).
+            let txs = state.mempool.get_for_block(2000);
+            let mut total_fees: u64 = 0;
+            let tx_entries: Vec<Value> = txs.iter().map(|tx| {
+                let fee = state.mempool.get_entry(&tx.txid()).map(|e| e.fee).unwrap_or(0);
+                total_fees = total_fees.saturating_add(fee);
+                json!({
+                    "txid": hex::encode(tx.txid()),
+                    // R3: satoshi amount → decimal string.
+                    "fee":  fee.to_string(),
+                    "data": hex::encode(tx.to_wire_bytes(true)),
+                })
+            }).collect();
+
+            let subsidy = crate::core::tokenomics::block_subsidy_sat(height);
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs();
+
+            json!({
+                "parents":              parents.iter().map(hex::encode).collect::<Vec<_>>(),
+                "height":               height,
+                "blue_score":           blue_score,
+                "bits":                 bits,
+                "cur_time":             now,
+                "parent_time":          parent_ts,
+                // R3: satoshi amounts → decimal strings.
+                "subsidy_sat":          subsidy.to_string(),
+                "total_fees":           total_fees.to_string(),
+                "transactions":         tx_entries,
+                // The block's timestamp must be >= parent_time and at most
+                // MAX_FUTURE_SECS ahead of the validator's clock.
+                "min_time":             parent_ts,
+                // Proof of work: GnB-SMH v1 over the header preimage
+                // (version u32le | n_parents u32le | parents | merkle_root |
+                // timestamp u64le | bits u32le) and the u64 nonce; valid iff
+                // the 32-byte output, big-endian, is < target(bits).
+                "pow":                  "gnb-smh-v1",
+                "pow_log2_n":           gnb_smh::LOG2_N,
+                "target":               hex::encode(crate::core::bits_to_target(bits)),
+            })
+        }
+
+        "submitblock" => {
+            let block_hex = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            let bytes = match hex::decode(block_hex) {
+                Ok(b)  => b,
+                Err(_) => return json!({ "error": "invalid hex" }),
+            };
+            let block = match crate::core::Block::from_wire_bytes(&bytes) {
+                Ok(b)  => b,
+                Err(e) => return json!({ "error": format!("deserialise failed: {}", e) }),
+            };
+            match &state.submit_block {
+                None => json!({ "error": "submitblock not wired on this node (started without a block-submission hook)" }),
+                Some(hook) => match hook(block) {
+                    Ok(hash_hex) => json!({ "accepted": true, "hash": hash_hex }),
+                    Err(reason)  => json!({ "error": format!("rejected: {}", reason) }),
+                },
+            }
+        }
+
+        "getdaginfo" => {
+            let dag = state.dag.read();
+            let tips = dag.tips();
+            let chain = dag.selected_chain();
+            let tip = dag.selected_tip();
+            let tip_data = tip.and_then(|h| dag.get_block_data(&h).cloned());
+            json!({
+                "tip":            tip.map(|h| hex::encode(h)),
+                "tip_blue_score": tip_data.as_ref().map(|d| d.blue_score).unwrap_or(0),
+                "tip_blue_work":  tip_data.as_ref().map(|d| d.blue_work.to_string()).unwrap_or_default(),
+                "tip_height":     tip_data.as_ref().map(|d| d.height).unwrap_or(0),
+                "block_count":    dag.block_count(),
+                "tip_count":      tips.len(),
+                "tips":           tips.iter().map(|h| hex::encode(h)).collect::<Vec<_>>(),
+                "chain_length":   chain.len(),
+                "k":              crate::core::GHOSTDAG_K,
+            })
+        }
+
+                "listtransactions" => {
+            let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            let limit = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).unwrap_or(20).min(1000) as usize;
+            let start_height = params.and_then(|p| p.get(2)).and_then(|v| v.as_u64()).unwrap_or(0);
+            let end_height = params.and_then(|p| p.get(3)).and_then(|v| v.as_u64())
+                .unwrap_or_else(|| state.node_state.read().block_count);
+            let offset = params.and_then(|p| p.get(4)).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+            let addr_bytes = parse_address(addr);
+            match addr_bytes {
+                Some(ab) => {
+                    let mut addr_hash = [0u8; 20];
+                    if ab.len() >= 20 {
+                        addr_hash.copy_from_slice(&ab[..20]);
+                    } else {
+                        return json!({ "error": "invalid address (too short)" });
+                    }
+                    match state.store.query_address_history(&addr_hash, start_height, end_height, limit, offset) {
+                        Ok(entries) => {
+                            let tip = selected_tip_height(&state);
+                            let total = state.store.count_address_history(&addr_hash, start_height, end_height).unwrap_or(0);
+                            let txs: Vec<serde_json::Value> = entries.iter().map(|e| {
+                                let timestamp = state.store.get_block_timestamp_at_height(e.height).unwrap_or(None).unwrap_or(0);
+                                json!({
+                                    "txid":          hex::encode(&e.txid),
+                                    "block_height":  e.height,
+                                    "timestamp":     timestamp,
+                                    "confirmations": tip.saturating_sub(e.height),
+                                    "direction":     e.direction_str(),
+                                    // R3: satoshi amount → decimal string.
+                                    "amount_sats":   e.amount.to_string(),
+                                    "amount_bloch":   e.amount as f64 / 1e8,
+                                })
+                            }).collect();
+                            json!({
+                                "address":         addr,
+                                "count":           txs.len(),
+                                "total_available": total,
+                                "start_height":    start_height,
+                                "end_height":      end_height,
+                                "limit":           limit,
+                                "offset":          offset,
+                                "transactions":    txs,
+                            })
+                        }
+                        Err(e) => storage_err_response(&e),
+                    }
+                }
+                None => json!({ "error": "invalid address" }),
+            }
+        }
+
+// ── INSERT: gettxsbyblock ──
+
+        // ── Phase 2: getpeerinfo ─────────────────────────────────────
+        "getpeerinfo" => {
+            let s = state.node_state.read();
+            json!({
+                "peer_count": s.peer_count,
+                "syncing":    s.is_syncing,
+            })
+        }
+
+        "getpeers" => {
+            let s = state.node_state.read();
+            let peers: Vec<serde_json::Value> = s.peer_addresses.iter().map(|addr| {
+                // Extract IP from multiaddr like /ip4/1.2.3.4/tcp/17110/p2p/12D3...
+                let ip = addr.split('/').enumerate()
+                    .find(|(i, seg)| *i > 0 && seg.parse::<std::net::Ipv4Addr>().is_ok())
+                    .map(|(_, s)| s.to_string())
+                    .unwrap_or_default();
+                let peer_id = addr.split("/p2p/").last().unwrap_or("").to_string();
+                json!({
+                    "address": addr,
+                    "ip": ip,
+                    "peer_id": peer_id,
+                })
+            }).collect();
+            json!({
+                "peer_count": s.peer_count,
+                "peers": peers,
+            })
+        }
+
+        // ── Treasury (community dev fund) ───────────────────────────────
+        // V2 (ADR-028): replaces V1 "gettreasury" with multi-pool report.
+        // Returns subsidy split for the next block + per-pool address/balance,
+        // gracefully reporting "pending_phase_6" for pools whose address
+        // constants are still None.
+        "getsupplyinfo" => {
+            use crate::core::tokenomics as t;
+            let current_height = selected_tip_height(&state);
+            let next_height    = current_height.saturating_add(1);
+            let subsidy        = t::block_subsidy_sat(next_height);
+            let issued         = t::issued_through_sat(current_height);
+            let next_halving   = (next_height / t::HALVING_INTERVAL + 1) * t::HALVING_INTERVAL;
+            json!({
+                "current_height":          current_height,
+                "next_block_height":       next_height,
+                // Amounts in base units as decimal strings (1 GNB = 10^8).
+                "max_supply_sat":          t::MAX_SUPPLY_SAT.to_string(),
+                "issued_sat":              issued.to_string(),
+                "subsidy_per_block_sat":   subsidy.to_string(),
+                "subsidy_per_block_gnb":   subsidy as f64 / 1e8,
+                "halving_interval":        t::HALVING_INTERVAL,
+                "next_halving_height":     next_halving,
+                "last_subsidy_height":     t::LAST_SUBSIDY_HEIGHT_EXCLUSIVE - 1,
+                "miner_share_bps":         10_000,
+                "min_fee_rate_sat_per_kb": t::MIN_FEE_RATE_SAT_PER_KB.to_string(),
+                "min_tx_fee_sat":          t::MIN_TX_FEE_SAT.to_string(),
+            })
+        }
+
+        // ═════════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
+//
+//      in src/rpc/mod.rs (last arm of the match in dispatch())
+//
+// ═════════════════════════════════════════════════════════════════════════════
+
+        // ── Sprint B: Chain analytics ──────────────────────────────────────
+
+        "getchainstats" => {
+            match crate::analytics::chain_stats(&state.store, &state.mempool) {
+                Ok(s) => json!({
+                    "total_blocks":         s.total_blocks,
+                    "total_txs":            s.total_txs,
+                    "avg_txs_per_block":    s.avg_txs_per_block,
+                    "blocks_last_24h":      s.blocks_last_24h,
+                    "txs_last_24h":         s.txs_last_24h,
+                    "avg_block_time_secs":  s.avg_block_time,
+                    "current_difficulty":   s.current_difficulty,
+                    "hashrate_hs":          s.hashrate_estimate,
+                    "hashrate_human":       format_hashrate(s.hashrate_estimate),
+                }),
+                Err(e) => json!({ "error": e }),
+            }
+        }
+
+        "getsupplydistribution" => {
+            match crate::analytics::supply_distribution(&state.store) {
+                Ok(d) => {
+                    let tiers: Vec<Value> = d.tiers.iter().map(|t| json!({
+                        "label":          t.label,
+                        "address_count":  t.address_count,
+                        // R3: satoshi amount → decimal string.
+                        "total_sats":     t.total_sats.to_string(),
+                        "total_gnb":     t.total_gnb,
+                        "pct_of_supply":  t.pct_of_supply,
+                    })).collect();
+                    json!({
+                        "tiers":            tiers,
+                        "total_addresses":  d.total_addresses,
+                        "total_sats":       d.total_sats.to_string(),
+                        "total_gnb":       d.total_gnb,
+                    })
+                }
+                Err(e) => json!({ "error": e }),
+            }
+        }
+
+        "gethashrate" => {
+            match crate::analytics::chain_stats(&state.store, &state.mempool) {
+                Ok(s) => json!({
+                    "hashrate_hs":          s.hashrate_estimate,
+                    "hashrate_human":       format_hashrate(s.hashrate_estimate),
+                    "avg_block_time_secs":  s.avg_block_time,
+                    "current_difficulty":   s.current_difficulty,
+                }),
+                Err(e) => json!({ "error": e }),
+            }
+        }
+
+        "getdifficultyhistory" => {
+            let limit = params.and_then(|p| p.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20) as usize;
+            let limit = limit.min(100); // cap at 100
+
+            let points = crate::analytics::difficulty_history(&state.store, limit);
+            let items: Vec<Value> = points.iter().map(|p| json!({
+                "height":     p.height,
+                "bits":       p.bits,
+                "bits_hex":   format!("0x{:08x}", p.bits),
+                "timestamp":  p.timestamp,
+                "target_hex": p.target_hex,
+            })).collect();
+            json!({
+                "count": items.len(),
+                "points": items,
+            })
+        }
+
+        "getblocktimepercentiles" => {
+            let window = params.and_then(|p| p.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100) as usize;
+            let window = window.clamp(10, 1000);
+
+            let stats = crate::analytics::block_time_percentiles(&state.store, window);
+            json!({
+                "sample_size":  stats.sample_size,
+                "window":       window,
+                "min_secs":     stats.min,
+                "p50_secs":     stats.p50,
+                "p90_secs":     stats.p90,
+                "p99_secs":     stats.p99,
+                "max_secs":     stats.max,
+                "avg_secs":     stats.avg,
+                "target_secs":  crate::core::TARGET_BLOCK_TIME,
+            })
+        }
+
+        "gettxstatus" => {
+            let txid_hex = params.and_then(|p| p.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let txid_bytes = match hex::decode(txid_hex) {
+                Ok(b) if b.len() == 32 => b,
+                _ => return json!({ "error": "invalid txid" }),
+            };
+            let mut txid_arr = [0u8; 32];
+            txid_arr.copy_from_slice(&txid_bytes);
+
+            // Check mempool first
+            if state.mempool.contains(&txid_arr) {
+                return json!({
+                    "status":        "pending",
+                    "in_mempool":    true,
+                    "confirmations": 0,
+                    "txid":          txid_hex,
+                });
+            }
+
+            // Check storage
+            match state.store.get_tx_location(&txid_arr) {
+                Ok(Some((_block_hash, height))) => {
+                    let tip = selected_tip_height(&state);
+                    let confirmations = tip.saturating_sub(height) + 1;
+                    json!({
+                        "status":        if confirmations >= 100 { "final" } else { "confirmed" },
+                        "in_mempool":    false,
+                        "confirmations": confirmations,
+                        "block_height":  height,
+                        "txid":          txid_hex,
+                    })
+                }
+                _ => json!({
+                    "status":        "unknown",
+                    "in_mempool":    false,
+                    "confirmations": 0,
+                    "txid":          txid_hex,
+                })
+            }
+        }
+
+        "getaddressinfo" => {
+            let addr_str = params.and_then(|p| p.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let addr_bytes = match parse_address(addr_str) {
+                Some(b) if b.len() == 20 => b,
+                _ => return json!({ "error": "invalid address" }),
+            };
+            let mut addr_hash = [0u8; 20];
+            addr_hash.copy_from_slice(&addr_bytes);
+
+            match crate::analytics::address_info(&state.store, &state.mempool, addr_str, &addr_hash) {
+                Ok(info) => json!({
+                    "address":           info.address,
+                    // R3: satoshi amounts → decimal strings.
+                    "balance_sats":      info.balance_sats.to_string(),
+                    "balance_gnb":      info.balance_gnb,
+                    "utxo_count":        info.utxo_count,
+                    "pending_incoming":  info.pending_incoming.to_string(),
+                    "pending_outgoing":  info.pending_outgoing.to_string(),
+                    "pool_role":         info.pool_role,
+                }),
+                Err(e) => json!({ "error": e }),
+            }
+        }
+
+        "estimatefeeadvanced" => {
+            let fee = crate::analytics::estimate_fee_advanced(&state.mempool);
+            json!({
+                // R3: satoshi amounts → decimal strings.
+                "next_block_sats":  fee.next_block_sats.to_string(),
+                "medium_priority":  fee.medium_priority.to_string(),
+                "slow_priority":    fee.slow_priority.to_string(),
+                "mempool_median":   fee.mempool_median.to_string(),
+                "mempool_size":     fee.mempool_size,
+                "recommended_gnb": format!("{:.8}", fee.medium_priority as f64 / 1e8),
+            })
+        }
+
+        "getmempoolstats" => {
+            let stats = crate::analytics::mempool_stats(&state.mempool);
+            let buckets: Vec<Value> = stats.buckets.iter().map(|b| json!({
+                "range":    b.range,
+                "tx_count": b.tx_count,
+            })).collect();
+            json!({
+                "size":        stats.size,
+                // R3: satoshi amounts → decimal strings (`avg_fee` is a
+                // documented-lossy float, so it stays a JSON number).
+                "total_fees":  stats.total_fees.to_string(),
+                "min_fee":     stats.min_fee.to_string(),
+                "max_fee":     stats.max_fee.to_string(),
+                "median_fee":  stats.median_fee.to_string(),
+                "avg_fee":     stats.avg_fee,
+                "buckets":     buckets,
+            })
+        }
+
+        "validateaddressverbose" => {
+            let addr_str = params.and_then(|p| p.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            match crate::address::Address::parse(addr_str) {
+                Ok(a) => json!({
+                    "valid":    true,
+                    "address":  addr_str,
+                    "network":  if a.is_mainnet() { "mainnet" } else { "testnet" },
+                    "hash_hex": hex::encode(a.hash()),
+                    "prefix":   if a.is_mainnet() { crate::core::MAINNET_PREFIX } else { crate::core::TESTNET_PREFIX },
+                }),
+                Err(e) => json!({
+                    "valid":   false,
+                    "address": addr_str,
+                    "reason":  format!("{}", e),
+                }),
+            }
+        }
+
+        // ── End of Sprint B additions ──────────────────────────────────────
+
+"gettxsbyblock" => {
+            // Accept either hash (hex string, 64 chars) or height (number).
+            let p0 = params.and_then(|p| p.get(0));
+            let block_hash = match p0 {
+                Some(v) if v.is_string() => {
+                    let s = v.as_str().unwrap();
+                    if s.len() == 64 {
+                        hex::decode(s).ok().and_then(|b| {
+                            let mut h = [0u8; 32];
+                            if b.len() == 32 { h.copy_from_slice(&b); Some(h) } else { None }
+                        })
+                    } else {
+                        // try parse as height-as-string
+                        s.parse::<u64>().ok().and_then(|h| state.store.get_block_hash_at_height(h).ok().flatten())
+                    }
+                }
+                Some(v) if v.is_u64() => {
+                    let h = v.as_u64().unwrap();
+                    state.store.get_block_hash_at_height(h).ok().flatten()
+                }
+                _ => None,
+            };
+
+            match block_hash {
+                Some(bh) => {
+                    match state.store.get_block(&bh) {
+                        Ok(Some(block)) => {
+                            let txs: Vec<serde_json::Value> = block.transactions.iter().map(|tx| {
+                                let txid = tx.txid();
+                                // Sprint 1.d: size is length of stratum (Bitcoin-format) bytes.
+                                // include_script_sig=true matches what lives on the wire and on disk.
+                                let size_bytes = tx.to_wire_bytes(true).len() as u32;
+                                // Fee: sum(inputs_value) - sum(outputs_value). For coinbase, fee = 0 by convention.
+                                let outputs_total: u64 = tx.outputs.iter().map(|o| o.value).sum();
+                                let fee_sats: u64 = if tx.is_coinbase() {
+                                    0
+                                } else {
+                                    let inputs_total: u64 = tx.inputs.iter().map(|inp| {
+                                        state.store.get_utxo_including_spent(&inp.prev_txid, inp.prev_index)
+                                            .ok().flatten().map(|o| o.value).unwrap_or(0)
+                                    }).sum();
+                                    inputs_total.saturating_sub(outputs_total)
+                                };
+                                json!({
+                                    "txid":           hex::encode(&txid),
+                                    "size_bytes":     size_bytes,
+                                    "inputs_count":   tx.inputs.len(),
+                                    "outputs_count":  tx.outputs.len(),
+                                    // R3: satoshi amount → decimal string.
+                                    "fee_sats":       fee_sats.to_string(),
+                                    "is_coinbase":    tx.is_coinbase(),
+                                })
+                            }).collect();
+                            json!({
+                                "block_hash":      hex::encode(&bh),
+                                "block_height":    block.height,
+                                "block_timestamp": block.header.timestamp,
+                                "count":           txs.len(),
+                                "txs":             txs,
+                            })
+                        }
+                        Ok(None) => json!({ "error": "block not found" }),
+                        Err(e) => storage_err_response(&e),
+                    }
+                }
+                None => json!({ "error": "invalid block identifier (expected hex hash or height)" }),
+            }
+        }
+
+// ── INSERT: getaddressbalance_at_height ──
+
+"getaddressbalance_at_height" => {
+            let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            let height = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).unwrap_or(0);
+
+            let addr_bytes = parse_address(addr);
+            match addr_bytes {
+                Some(ab) => {
+                    let mut addr_hash = [0u8; 20];
+                    if ab.len() >= 20 {
+                        addr_hash.copy_from_slice(&ab[..20]);
+                    } else {
+                        return json!({ "error": "invalid address" });
+                    }
+                    match state.store.balance_at_height(&addr_hash, height) {
+                        Ok(balance) => {
+                            let tx_count = state.store.count_address_history(&addr_hash, 0, height).unwrap_or(0);
+                            json!({
+                                "address":               addr,
+                                "height":                height,
+                                // R3: satoshi amount → decimal string.
+                                "balance_sats":          balance.to_string(),
+                                "balance_gnb":          balance as f64 / 1e8,
+                                "tx_count_up_to_height": tx_count,
+                            })
+                        }
+                        Err(e) => storage_err_response(&e),
+                    }
+                }
+                None => json!({ "error": "invalid address" }),
+            }
+        }
+
+        // Bloch-SIS-Linux L3: attestation status (pluggable provider; reports
+        // attested=false when no TEE is active).
+        "getattestation" => {
+            // Optional freshness nonce (params[0]) echoed into the report and,
+            // for a real TEE, bound into the quote's report-data.
+            let nonce = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).map(String::from);
+            serde_json::to_value(crate::attestation::current_report(nonce))
+                .unwrap_or_else(|e| json!({ "error": format!("attestation serialize: {}", e) }))
+        }
+
+        _ => json!({ "error": format!("unknown method: {}", method) }),
+    }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Parse a gnb1q/gnb1t address to 20-byte pubkey hash
+/// Sprint K: Checksum-validated address parsing.
+/// Delegates to `Address::parse()` from Sprint A — enforces full 54-char
+/// checksummed format (gnb1q + 20-byte hash + 4-byte checksum, hex-encoded).
+/// Rejects the legacy 46-char checksum-less form that the previous implementation
+/// silently accepted.
+fn parse_address(addr: &str) -> Option<Vec<u8>> {
+    crate::address::Address::parse(addr)
+        .ok()
+        .map(|a| a.hash().to_vec())
+}
+
+/// Format a transaction for JSON output
+fn format_tx(tx: &Transaction) -> Value {
+    json!({
+        "txid":     hex::encode(tx.txid()),
+        "version":  tx.version,
+        "coinbase": tx.is_coinbase(),
+        "inputs":   tx.inputs.iter().map(|inp| json!({
+            "prev_txid":  hex::encode(inp.prev_txid),
+            "prev_index": inp.prev_index,
+            "sequence":   inp.sequence,
+        })).collect::<Vec<_>>(),
+        "outputs":  tx.outputs.iter().enumerate().map(|(i, out)| json!({
+            "index":         i,
+            // R3 (docs/specs/BLOCH-RPC-V4.md): satoshi amount → decimal string.
+            "value":         out.value.to_string(),
+            "gnb":          out.value as f64 / 1e8,
+            "script_pubkey": hex::encode(&out.script_pubkey),
+        })).collect::<Vec<_>>(),
+        "locktime": tx.locktime,
+    })
+}
+
+/// Validate a transaction for mempool/broadcast acceptance.
+/// Returns the fee (total_in - total_out) on success.
+///
+/// Sprint N-min: Now checks coinbase maturity (previously only gossip path did).
+/// Callers must pass current chain height for the maturity check. Height of 0
+/// (genesis only) skips the check since there is no matured coinbase to spend.
+fn validate_tx_for_mempool(tx: &Transaction, store: &Arc<Storage>, current_height: u64) -> Result<u64, String> {
+    use sha3::{Sha3_256, Digest};
+
+    // Coinbase maturity check (VULN-03). Single source of truth in
+    // core::check_coinbase_maturity; this call site is one of two.
+    crate::core::check_coinbase_maturity(tx, current_height, |txid| {
+        store.get_coinbase_height(txid).ok().flatten()
+    })?;
+
+
+    // Dust policy (pool-DoS fix): refuse a tx carrying any sub-dust output
+    // (0 < value < DUST_THRESHOLD) at ADMISSION. Block consensus already
+    // rejects such a tx once mined (Block::validate_dust, which exempts the
+    // coinbase and scans every other tx), so a dust tx that slips into the
+    // mempool poisons every block template that includes it — a cheap way to
+    // make an honest pool produce nothing but rejected blocks. Reject it here,
+    // before the expensive signature checks, so it never reaches a template.
+    const DUST_THRESHOLD_SATS: u64 = 546;
+    for (i, o) in tx.outputs.iter().enumerate() {
+        if o.value > 0 && o.value < DUST_THRESHOLD_SATS {
+            return Err(format!(
+                "output {} below dust threshold ({} < {} sats)",
+                i, o.value, DUST_THRESHOLD_SATS
+            ));
+        }
+    }
+
+    let mut total_in = 0u64;
+    // C-R3-2: intra-tx duplicate-outpoint check (insert-as-check, the same
+    // pattern as `euvm_admit_tx_standalone` step (e)). Without it a tx
+    // listing the SAME outpoint N times had its value counted N times below
+    // and was admitted with an N×-inflated fee — an intra-tx double-spend.
+    let mut spent_in_tx = std::collections::HashSet::<([u8; 32], u32)>::new();
+    for (i, inp) in tx.inputs.iter().enumerate() {
+        if !spent_in_tx.insert((inp.prev_txid, inp.prev_index)) {
+            return Err(format!("double-spend: {}:{} already consumed",
+                hex::encode(&inp.prev_txid[..8]), inp.prev_index));
+        }
+        let utxo = store.get_utxo(&inp.prev_txid, inp.prev_index)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("UTXO {}:{} not found", hex::encode(&inp.prev_txid[..8]), inp.prev_index))?;
+        total_in = total_in.checked_add(utxo.value).ok_or("overflow")?;
+        let (sig, pk) = Transaction::parse_script_sig(&inp.script_sig)
+            .ok_or_else(|| format!("malformed script_sig at input {}", i))?;
+        let pk_hash = Sha3_256::digest(&pk)[..20].to_vec();
+        if pk_hash != utxo.script_pubkey { return Err(format!("pubkey mismatch at input {}", i)); }
+        if !crate::crypto::verify(&pk, &tx.sighash(i, crate::core::node_chain_id()), &sig) {
+            return Err(format!("invalid signature at input {}", i));
+        }
+    }
+    let total_out: u64 = tx.outputs.iter()
+        .try_fold(0u64, |acc, o| acc.checked_add(o.value))
+        .ok_or_else(|| "output sum overflow".to_string())?;
+    if total_in < total_out { return Err("inputs < outputs".into()); }
+    let fee = total_in - total_out;
+    crate::core::check_min_fee(tx, fee)?;
+    Ok(fee)
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
+//
+//      look for the "parse_address" helper (around line 560+)
+//
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V4 rule R3 (docs/specs/BLOCH-RPC-V4.md): every satoshi-denominated field is a
+// decimal STRING on the JSON-RPC wire. The V4 supply exceeds i64::MAX and is
+// ~1000× JavaScript's Number.MAX_SAFE_INTEGER, so a JSON number silently
+// corrupts large amounts in every browser client. Internally values stay u64.
+// `format_tx` is the shared output formatter behind getblock / gettransaction /
+// decoderawtransaction, so pinning it pins those three response shapes.
+// ─────────────────────────────────────────────────────────────────────────────
+// ── L-10 / L-11 regressions ─────────────────────────────────────────────────
+
+#[cfg(test)]
+mod l10_l11_id_and_batch_tests {
+    use super::*;
+
+    /// L-10 core regression: an oversized `id` string must be truncated,
+    /// never echoed at full length.
+    #[test]
+    fn oversized_string_id_is_truncated() {
+        let huge = "x".repeat(MAX_ECHOED_ID_LEN * 10);
+        let capped = cap_echoed_id(Value::String(huge));
+        match capped {
+            Value::String(s) => assert!(
+                s.len() <= MAX_ECHOED_ID_LEN,
+                "capped id is {} bytes, expected <= {}", s.len(), MAX_ECHOED_ID_LEN
+            ),
+            other => panic!("expected a String, got {:?}", other),
+        }
+    }
+
+    /// A short, legitimate id passes through unchanged.
+    #[test]
+    fn short_string_id_is_unchanged() {
+        assert_eq!(cap_echoed_id(json!("req-42")), json!("req-42"));
+    }
+
+    /// Numbers and null are the spec-legitimate id shapes and pass through.
+    #[test]
+    fn number_and_null_ids_pass_through() {
+        assert_eq!(cap_echoed_id(json!(42)), json!(42));
+        assert_eq!(cap_echoed_id(json!(null)), json!(null));
+    }
+
+    /// A non-spec id shape (bool/array/object) is replaced with null rather
+    /// than echoed — nothing legitimate sends these, and echoing an
+    /// attacker-shaped structure back verbatim is unnecessary surface.
+    #[test]
+    fn non_scalar_ids_become_null() {
+        assert_eq!(cap_echoed_id(json!(true)), json!(null));
+        assert_eq!(cap_echoed_id(json!([1, 2, 3])), json!(null));
+        assert_eq!(cap_echoed_id(json!({"a": 1})), json!(null));
+    }
+
+    /// Truncation must never split a multi-byte UTF-8 character — reusing
+    /// `network::truncate_utf8` is what guarantees this; pin it here too so a
+    /// future change to this call site cannot silently regress to a raw
+    /// byte-index slice.
+    #[test]
+    fn truncation_is_utf8_safe() {
+        // 300 copies of a 3-byte character comfortably straddles a naive
+        // byte-256 cut point.
+        let s: String = "€".repeat(300);
+        let capped = cap_echoed_id(Value::String(s));
+        match capped {
+            Value::String(s) => {
+                assert!(s.len() <= MAX_ECHOED_ID_LEN);
+                assert!(std::str::from_utf8(s.as_bytes()).is_ok(), "must remain valid UTF-8");
+            }
+            other => panic!("expected a String, got {:?}", other),
+        }
+    }
+
+    /// L-11 core regression: the batch-request response must be the
+    /// JSON-RPC 2.0 Invalid Request code, not a 200 with a garbled method name.
+    #[test]
+    fn batch_response_is_invalid_request_code() {
+        let v = batch_not_supported_response();
+        assert_eq!(v["error"]["code"], json!(-32600));
+        assert_eq!(v["jsonrpc"], json!("2.0"));
+    }
+}
+
+// ── L-5 regression: storage errors never reach the caller verbatim ─────────
+
+#[cfg(test)]
+mod l5_storage_error_sanitization_tests {
+    use super::*;
+
+    /// The core L-5 property: whatever detail `StorageError` carries (here, a
+    /// fabricated RocksDB-shaped message with a filesystem path, mirroring
+    /// what `storage/mod.rs`'s real `.map_err(|e| StorageError::ReadFailed(e.to_string()))`
+    /// sites would actually produce) must NOT appear anywhere in the JSON
+    /// handed back to the RPC caller.
+    #[test]
+    fn caller_response_never_contains_the_storage_detail() {
+        let sensitive = StorageError::ReadFailed(
+            "IO error: /var/lib/bloch-data/CF_BLOCKS/000123.sst: No such file or directory".into(),
+        );
+        let resp = storage_err_response(&sensitive);
+        let rendered = resp.to_string();
+        assert!(
+            !rendered.contains("/var/lib/bloch-data"),
+            "filesystem path from the underlying storage error leaked into the RPC response: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("CF_BLOCKS"),
+            "column-family internal name leaked into the RPC response: {}",
+            rendered
+        );
+    }
+
+    /// Every `StorageError` variant must produce the SAME stable response —
+    /// nothing about which failure mode occurred (open/read/write/serialize)
+    /// should be distinguishable from the response shape either.
+    #[test]
+    fn every_storage_error_variant_yields_the_identical_stable_response() {
+        let variants = [
+            StorageError::OpenFailed("detail a".into()),
+            StorageError::CfNotFound("detail b".into()),
+            StorageError::SerializeFailed("detail c".into()),
+            StorageError::DeserializeFailed("detail d".into()),
+            StorageError::WriteFailed("detail e".into()),
+            StorageError::ReadFailed("detail f".into()),
+        ];
+        let responses: Vec<Value> = variants.iter().map(storage_err_response).collect();
+        for r in &responses {
+            assert_eq!(*r, responses[0], "every StorageError variant must map to the identical sanitized response");
+        }
+        assert_eq!(responses[0], json!({ "error": "internal storage error", "code": "STORAGE_ERROR" }));
+    }
+}
+
+#[cfg(test)]
+mod r3_amount_encoding_tests {
+    use super::*;
+    use crate::core::{TxInput, TxOutput};
+
+    fn tx_with_output(value: u64) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [9u8; 32], prev_index: 0, script_sig: vec![], sequence: u32::MAX,
+            }],
+            outputs: vec![TxOutput { value, script_pubkey: vec![5u8; 20] }],
+            locktime: 0,
+        }
+    }
+
+    #[test]
+    fn tx_output_value_serializes_as_a_decimal_string() {
+        let v = format_tx(&tx_with_output(354_617_540_000_000_000));
+        let out = &v["outputs"][0];
+        assert!(out["value"].is_string(), "R3: `value` must be a JSON string, got {}", out["value"]);
+        assert_eq!(out["value"].as_str().unwrap(), "354617540000000000");
+        // The display-only float companion stays a JSON number (lossy by design).
+        assert!(out["gnb"].is_number(), "`gnb` stays a float");
+    }
+
+    #[test]
+    fn amounts_past_the_javascript_safe_integer_survive_the_wire() {
+        // A value above 2^53 round-trips exactly through the string form; the
+        // same value as a JSON number is what R3 exists to prevent.
+        let big = u64::MAX;
+        let v = format_tx(&tx_with_output(big));
+        let s = v["outputs"][0]["value"].as_str().expect("string amount");
+        assert_eq!(s.parse::<u64>().unwrap(), big);
+        assert!(big > 9_007_199_254_740_991, "test value must exceed MAX_SAFE_INTEGER");
+    }
+}
+
+/// Format a hashrate in H/s into human-readable units (H/s, KH/s, MH/s, GH/s, TH/s, PH/s, EH/s).
+fn format_hashrate(hs: f64) -> String {
+    const UNITS: &[(&str, f64)] = &[
+        ("EH/s", 1e18),
+        ("PH/s", 1e15),
+        ("TH/s", 1e12),
+        ("GH/s", 1e9),
+        ("MH/s", 1e6),
+        ("KH/s", 1e3),
+    ];
+    for (label, threshold) in UNITS {
+        if hs >= *threshold {
+            return format!("{:.2} {}", hs / threshold, label);
+        }
+    }
+    format!("{:.2} H/s", hs)
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C-R3-2 (Round-2 audit, LEG2-intra-dup) — intra-transaction double-spend on
+// the RPC admission path. `validate_tx_for_mempool` (sendrawtransaction) had
+// NO duplicate-outpoint check at all: a tx listing the SAME outpoint N times
+// had its value counted N times and was admitted with an N×-inflated fee.
+// The gossip-path twins live in main.rs `intra_tx_dup_tests`; the euvm path
+// was already covered (`euvm_admission_tests::intra_tx_double_spend_rejected`).
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod c_r3_2_intra_dup_tests {
+    use super::*;
+    use crate::core::{TxInput, TxOutput};
+    use tempfile::TempDir;
+
+    fn mk_store() -> (TempDir, Arc<Storage>) {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(Storage::open(&tmp.path().join("db")).expect("storage"));
+        (tmp, store)
+    }
+
+    /// A tx spending the SAME confirmed 100_000-sat outpoint `n` times, every
+    /// input carrying a VALID hybrid signature over its own sighash — without
+    /// the duplicate check nothing else rejects it.
+    fn dup_input_tx(store: &Arc<Storage>, n: usize, out_value: u64) -> Transaction {
+        use sha3::{Digest as _, Sha3_256};
+        let (pk, sk) = crate::crypto::generate_keypair();
+        let pk_hash = Sha3_256::digest(&pk)[..20].to_vec();
+        let prev_txid = [0x42u8; 32];
+        store.put_utxo(&prev_txid, 0,
+            &TxOutput { value: 100_000, script_pubkey: pk_hash })
+            .expect("put_utxo");
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: (0..n).map(|_| TxInput {
+                prev_txid, prev_index: 0, script_sig: vec![], sequence: u32::MAX,
+            }).collect(),
+            outputs: vec![TxOutput { value: out_value, script_pubkey: vec![7u8; 20] }],
+            locktime: 0,
+        };
+        for i in 0..n {
+            let sighash = tx.sighash(i, crate::core::node_chain_id());
+            let sig = crate::crypto::sign(&sk, &sighash).expect("sign");
+            tx.inputs[i].script_sig = Transaction::build_script_sig(&sig, &pk);
+        }
+        tx
+    }
+
+    /// sendrawtransaction admission: a 2-duplicate-input tx spending a 100k
+    /// outpoint but emitting 150k must be refused. Without the fix it was
+    /// ADMITTED with fee = 50_000 (the outpoint's value counted twice).
+    #[test]
+    fn rpc_path_refuses_intra_tx_duplicate_outpoint() {
+        let (_tmp, store) = mk_store();
+        let tx = dup_input_tx(&store, 2, 150_000);
+        let err = validate_tx_for_mempool(&tx, &store, 0)
+            .expect_err("intra-tx duplicate outpoint must be refused");
+        assert!(err.contains("double-spend"), "got: {err}");
+    }
+
+    /// N=3 duplication is refused too (the check is set-based, not pairwise).
+    #[test]
+    fn rpc_path_refuses_triple_duplicate() {
+        let (_tmp, store) = mk_store();
+        let tx = dup_input_tx(&store, 3, 290_000);
+        let err = validate_tx_for_mempool(&tx, &store, 0)
+            .expect_err("intra-tx duplicate outpoint must be refused");
+        assert!(err.contains("double-spend"), "got: {err}");
+    }
+
+    /// Control: the SAME signed shape with a single input and honest amounts
+    /// is still admitted with the right fee.
+    #[test]
+    fn rpc_single_input_control_still_admitted() {
+        let (_tmp, store) = mk_store();
+        let tx = dup_input_tx(&store, 1, 70_000);
+        let fee = validate_tx_for_mempool(&tx, &store, 0)
+            .expect("valid single-input spend must be admitted");
+        assert_eq!(fee, 30_000);
+    }
+}
+
+// ── R3-audit H-R3-5 tests: CORS layer + heavy-read gate ─────────────────────
+//
+// The auth-layer refusal logic (Host/Origin/loopback/WRITE_METHODS) is
+// unit-tested in `auth.rs`; these tests pin the two pieces that live here:
+// the mounted CORS layer is NOT permissive, and the heavy-read gate bounds
+// the O(chain) analytics methods.
+#[cfg(test)]
+mod h_r3_5_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, HeaderValue, Method, Request, StatusCode};
+    use tower::util::ServiceExt; // oneshot
+
+    fn router_with(origins: &[&str]) -> Router {
+        let origins: Vec<String> = origins.iter().map(|s| s.to_string()).collect();
+        Router::new()
+            .route("/", axum::routing::post(|| async { "ok" }))
+            .layer(build_cors_layer(&origins))
+    }
+
+    async fn preflight(router: Router, origin: &str) -> axum::http::Response<Body> {
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/")
+            .header(header::ORIGIN, origin)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+            .body(Body::empty())
+            .unwrap();
+        router.oneshot(req).await.unwrap()
+    }
+
+    /// The core regression: with the default (empty) origin allowlist, a
+    /// hostile page's preflight gets NO Access-Control-Allow-Origin grant.
+    /// `CorsLayer::permissive()` echoed the origin back — this test FAILS on
+    /// the pre-fix wiring.
+    #[tokio::test]
+    async fn default_config_grants_no_cors_to_any_origin() {
+        let resp = preflight(router_with(&[]), "https://evil.example").await;
+        assert!(
+            resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+            "no origin allowlisted, yet a CORS grant was emitted: {:?}",
+            resp.headers()
+        );
+    }
+
+    #[tokio::test]
+    async fn allowlisted_origin_gets_cors_unlisted_does_not() {
+        let router = router_with(&["https://wallet.posternlabs.com"]);
+        let ok = preflight(router.clone(), "https://wallet.posternlabs.com").await;
+        assert_eq!(
+            ok.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("https://wallet.posternlabs.com")),
+        );
+        let bad = preflight(router, "https://evil.example").await;
+        assert!(bad.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+            "unlisted origin must not receive a CORS grant");
+    }
+
+    /// Simple (non-preflighted) POST: the response must carry no grant for an
+    /// unlisted origin, so a browser page cannot read it.
+    #[tokio::test]
+    async fn simple_post_response_carries_no_grant_for_unlisted_origin() {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .header(header::ORIGIN, "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router_with(&[]).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK); // handler ran (gate lives in handle_rpc)
+        assert!(resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+    }
+
+    // ── HeavyGate ───────────────────────────────────────────────────
+
+    #[test]
+    fn heavy_methods_are_exactly_the_five_scanners() {
+        for m in ["getsupplydistribution", "getchainstats", "gethashrate",
+                  "getaddresscount", "getaddressbalance_at_height"] {
+            assert!(HeavyGate::is_heavy(m), "{m} must be gated");
+        }
+        assert!(!HeavyGate::is_heavy("getblockcount"));
+        assert!(!HeavyGate::is_heavy("sendrawtransaction"));
+    }
+
+    #[test]
+    fn heavy_gate_serves_cache_instead_of_rescanning() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let gate = HeavyGate::new(std::time::Duration::from_secs(60));
+        let scans = AtomicU32::new(0);
+        for _ in 0..10 {
+            let v = gate.run("getsupplydistribution|".into(), || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                json!({"tiers": []})
+            });
+            assert_eq!(v, json!({"tiers": []}));
+        }
+        assert_eq!(scans.load(Ordering::SeqCst), 1,
+            "10 identical heavy calls inside the TTL must run exactly 1 scan");
+    }
+
+    #[test]
+    fn heavy_gate_refuses_concurrent_second_scan() {
+        use std::sync::Arc as StdArc;
+        let gate = StdArc::new(HeavyGate::new(std::time::Duration::from_secs(60)));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let g2 = gate.clone();
+        let t = std::thread::spawn(move || {
+            g2.run("getchainstats|".into(), || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap(); // hold the scan permit
+                json!({"total_blocks": 1})
+            })
+        });
+        started_rx.recv().unwrap(); // first scan is in flight
+        // A different heavy key cannot start a second concurrent scan.
+        let v = gate.run("getsupplydistribution|".into(), || json!({"should": "not run"}));
+        assert!(v.get("error").is_some(),
+            "second concurrent heavy scan must be refused, got {v}");
+        release_tx.send(()).unwrap();
+        assert_eq!(t.join().unwrap(), json!({"total_blocks": 1}));
+    }
+
+    #[test]
+    fn heavy_gate_cache_is_bounded() {
+        let gate = HeavyGate::new(std::time::Duration::from_secs(3600));
+        // Parameterised heavy method: attacker varies params to grow the map.
+        for i in 0..(HEAVY_READ_CACHE_MAX_KEYS * 4) {
+            gate.run(format!("getaddressbalance_at_height|[\"addr{i}\",1]"), || json!(i));
+        }
+        assert!(gate.cache.lock().len() <= HEAVY_READ_CACHE_MAX_KEYS,
+            "cache must stay bounded under key churn");
+    }
+}

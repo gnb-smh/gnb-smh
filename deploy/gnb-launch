@@ -1,0 +1,10 @@
+#!/bin/sh
+# Launcher for gnb-node.service: expands GNB_PEERS into repeated --peer flags.
+set -eu
+set -- --data-dir /var/lib/gnb --carryover-snapshot "$GNB_CARRYOVER" \
+       --listen /ip4/0.0.0.0/tcp/17110 --archive
+if [ -n "${GNB_MINER_ADDRESS:-}" ]; then
+  set -- "$@" --mine --miner-address "$GNB_MINER_ADDRESS" --mine-threads "${GNB_MINE_THREADS:-4}"
+fi
+for p in ${GNB_PEERS:-}; do set -- "$@" --peer "$p"; done
+exec /opt/gnb/bin/gnb "$@"

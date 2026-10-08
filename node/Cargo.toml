@@ -1,0 +1,191 @@
+[package]
+name = "gnb"
+version = "0.1.0"
+edition = "2021"
+authors = ["GnB developers"]
+description = "GnB (Gödel and Bell): post-quantum proof-of-work BlockDAG node — GnB-SMH sequential memory-hard PoW, hybrid Falcon-1024 + ML-DSA-65 signatures, GhostDAG"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[[bin]]
+name = "gnb"
+path = "src/main.rs"
+
+[[bin]]
+name = "gnb-wallet"
+path = "src/bin/gnb-wallet.rs"
+# Needs gnb-crypto's optional `wallet-cli` feature (clap + rpassword):
+#   cargo build --bin gnb-wallet --features gnb-crypto/wallet-cli
+required-features = ["gnb-crypto/wallet-cli"]
+
+[[bin]]
+name = "gnb-cli"
+path = "src/bin/gnb-cli.rs"
+
+[[bin]]
+name = "gnb-mine-genesis"
+path = "src/bin/gnb-mine-genesis.rs"
+
+[lib]
+name = "gnb"
+path = "src/lib.rs"
+
+[features]
+# Bloch-SIS-Linux L3 attestation backends (off by default). Enabling requires
+# the matching platform/hardware; the default build stays clean + unattested.
+#   sev-snp — AMD SEV-SNP confidential VM (Linux). Wires the virtee/sev crate.
+#   mobile  — device-TEE verification (Android Key Attestation / iOS App Attest).
+default = ["node"]
+# `node` gates the heavy full-node modules (storage/consensus/mining/network/
+# rpc/…) and their exclusive deps (rocksdb, libp2p, axum, …) so the pure
+# wallet/crypto subset cross-compiles for mobile with `default-features = false`.
+node = [
+    "dep:rocksdb",
+    "dep:libp2p",
+    "dep:axum",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:prometheus",
+    "dep:governor",
+    "dep:reqwest",
+    "gnb-crypto/node",
+]
+sev-snp = ["dep:sev"]
+mobile  = ["dep:x509-parser", "dep:ciborium"]
+
+[dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1"
+blst = "0.3"
+serde-big-array = "0.5"
+tokio        = { version = "1",    features = ["full"] }
+futures      = "0.3"
+pin-project-lite = "0.2"
+serde        = { version = "1",    features = ["derive"] }
+serde_json   = "1"
+
+# FIX: bincode 1.x unmaintained → 2.x (breaking API, pinned compat feature)
+bincode      = { version = "2",    features = ["serde"] }
+
+sha2         = "0.10"
+sha2_v9      = { package = "sha2", version = "0.9", default-features = false }
+sha3         = "0.10"
+
+# FIX: pqcrypto-dilithium deprecated → pqcrypto-mldsa (official NIST name)
+pqcrypto-mldsa   = "0.1"
+# Sprint B6b: Falcon-1024 for hybrid PQ signatures (Falcon ‖ ML-DSA). Two
+# distinct lattice families (NTRU + Module-LWE/SIS) for defence in depth.
+#
+# PoS finding F1 (BLOCH-FALCON-ONLINE-SIGNING.md §3.2): the crate's DEFAULT
+# features ("avx2", "neon") compile and runtime-dispatch Falcon signing to
+# PQClean's native floating-point variants (AVX2 doubles on x86_64,
+# `typedef double fpr` on aarch64). Under PoS the validator signs on a PUBLIC
+# schedule, so signing must use PQClean's `clean` variant only: integer-emulated
+# IEEE-754, constant-time by construction, bit-exact across platforms.
+# `default-features = false` forces `clean` on every target (the FP variants are
+# not even compiled). Cost: ~11.6 ms/signature vs ~0.46 ms native — irrelevant
+# in a 30 s slot. Cargo features are ADDITIVE across the workspace: re-enabling
+# defaults in ANY member silently restores native-FP dispatch everywhere, which
+# is why gnb-crypto carries a symbol-level tripwire test
+# (`falcon_native_fp_variants_are_not_linked`) and CI runs
+# scripts/falcon-clean-guard.sh. Do not re-enable avx2/neon here.
+pqcrypto-falcon  = { version = "0.4", default-features = false, features = ["std"] }
+pqcrypto-traits  = "0.3"
+pqcrypto-kyber   = "0.8"
+# Sprint T.1: direct dep on pqcrypto-internals so KATs can call `with_seeded_rng_scope`
+# from the pqcrypto-internals fork (see [patch.crates-io] at bottom). Upstream also
+# exposes this as `pub extern "C" fn PQCRYPTO_RUST_randombytes` — we depend on
+# the forked Rust API `with_seeded_rng_scope` which the upstream
+# crate does NOT provide. The fork is a strict superset of upstream 0.2.11.
+pqcrypto-internals = "0.2"
+hkdf             = "0.12"
+
+aes-gcm      = "0.10"
+chacha20poly1305 = "0.10"
+subtle       = "2.5"
+governor     = { version = "0.8", optional = true }
+prometheus   = { version = "0.14", optional = true }
+argon2       = "0.5"
+zeroize      = { version = "1",    features = ["derive"] }
+bip39        = "2"
+
+# FIX: rand 0.8.5 unsound → 0.9
+rand         = "0.9"
+
+rocksdb      = { version = "0.22", optional = true }
+
+# FIX: libp2p 0.53 → 0.56 (pulls ring 0.17+, fixes AES panic vulnerability)
+libp2p       = { version = "0.56", features = ["tcp", "noise", "yamux", "gossipsub", "mdns", "tokio", "dns", "websocket", "identify", "ping", "macros", "ed25519", "request-response"], optional = true }
+
+# FIX: jsonrpc-http-server uses net2+instant (unmaintained) → replace with axum
+axum         = { version = "0.8", optional = true }
+tower        = { version = "0.5", features = ["limit", "util"], optional = true }
+tower-http   = { version = "0.6", features = ["cors", "trace", "timeout"], optional = true }
+
+clap         = { version = "4",    features = ["derive"] }
+rpassword    = "7"
+log          = "0.4"
+env_logger   = "0.11"
+hex          = "0.4"
+chrono       = { version = "0.4",  features = ["serde"] }
+thiserror    = "2"
+base64       = "0.22"
+async-trait  = "0.1"
+reqwest      = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
+pbkdf2       = "0.12"
+hmac         = "0.12"
+parking_lot  = "0.12"
+bytes        = "1"
+
+# Sprint L — 256-bit arithmetic for retarget_bits consensus math.
+# Chose primitive-types (widely used in Substrate/Ethereum Rust ecosystem,
+# audited) over rolling our own [u64; 4] limb arithmetic.
+primitive-types = "0.13"
+
+
+secp256k1                 = { version = "0.29", features = ["rand-std"] }
+
+gnb-smh                   = { path = "../crates/gnb-smh" }
+
+# Lean crypto/wallet/tx surface extracted from this node (crates/gnb-crypto).
+# The node re-exports its modules (types/crypto/core/address/wallet/hd_wallet/
+# util) so every `crate::core::…` path keeps working; downstream products depend
+# on gnb-crypto directly WITHOUT pulling the full node.
+gnb-crypto              = { path = "../crates/gnb-crypto" }
+
+# Coherence C2: lean shielded-pool primitives (notes, commitments, nullifiers,
+# Merkle accumulator, spend statement). Shared source of truth for the node, the
+# SP1 guest prover (crates/coherence-prover), and the mobile wallet.
+coherence-core            = { path = "../crates/coherence-core" }
+
+
+# Sprint B2 (no-BFT): DKG/BLS dependencies (gennaro-dkg, bls12_381, ff, group,
+# rand_chacha, rand_core) removed — FFG finality and the validator committee
+# were deleted. Bloch-SIS is pure PoW; no threshold/BLS crypto on the consensus
+# path. (Re-add only if a post-quantum finality gadget is ever introduced.)
+
+# ── L3 attestation backends (optional, feature-gated; see [features]) ──
+# `mobile` — verifier-side checks of Android Key Attestation / iOS App Attest.
+# Pure Rust; compiles on every host (end-to-end exercise needs real devices).
+x509-parser = { version = "0.18", features = ["verify"], optional = true }
+ciborium    = { version = "0.2", optional = true }
+
+# `sev-snp` — virtee/sev guest interface to /dev/sev-guest. The crate is
+# Linux-only, hence the target gate; on other hosts the provider honestly
+# reports "hardware not present" without pulling the dep at all.
+[target.'cfg(target_os = "linux")'.dependencies]
+sev = { version = "8", default-features = false, features = ["snp"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+# test-util enables tokio::test(start_paused) for the stratum session
+# lifetime tests (virtual clock through the 600s read-poll windows).
+tokio = { version = "1", features = ["full", "test-util"] }
+# Property-based invariant tests for GhostDAG consensus ordering
+# (determinism, parent-order independence, blue-score monotonicity).
+proptest = "1"
+
+[lints.rust]
+# `sp1-verify` gates an optional SP1 shielded-proof verifier whose dependency
+# is not part of this workspace yet.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("sp1-verify"))'] }

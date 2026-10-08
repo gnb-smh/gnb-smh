@@ -1,0 +1,116 @@
+[package]
+name = "gnb-crypto"
+version = "0.1.0-genesis"
+edition = "2021"
+authors = ["Bloch-SIS Protocol"]
+description = "Bloch-SIS Protocol: lean crypto / wallet / transaction surface (post-quantum signatures, HD wallet, tx construction) — the node's non-node island extracted so downstream products can depend on it without the full node"
+license = "AGPL-3.0-or-later"
+repository = "https://gitlab.com/bloch-protocol/bloch"
+
+[lib]
+name = "gnb_crypto"
+path = "src/lib.rs"
+
+# Standalone offline wallet binary (postmarketOS `postern-wallet` package).
+# Thin shim over `wallet::cli::main`; gated behind `wallet-cli` so plain
+# `cargo build -p gnb-crypto` / the workspace build never compiles it.
+# Build: cargo build -p gnb-crypto --no-default-features --features wallet-cli
+[[bin]]
+name = "gnb-light-wallet"
+path = "src/bin/postern-wallet.rs"
+required-features = ["wallet-cli"]
+
+[features]
+# `node` enables the networked `WalletClient` (wallet::client) which talks to a
+# Bloch-SIS node over RPC. Off by default so the pure wallet/crypto subset
+# cross-compiles for mobile. Mirrors the node's `node` feature gate.
+node = ["dep:reqwest", "dep:async-trait"]
+# `wallet-cli` gates the `postern-wallet` [[bin]] above AND the `wallet::cli`
+# module. It pulls the terminal-only deps (clap, rpassword) that do NOT
+# cross-compile to wasm32-unknown-unknown; keeping them behind this feature lets
+# the pure wallet/crypto subset (used by the WASM mobile wallet) build for wasm.
+# hex/serde_json + this crate's lib are unconditional; no blst / secp256k1 /
+# tokio / rocksdb / libp2p anywhere in its tree. Off by default; combine with
+# `node` only if WalletClient is wanted.
+wallet-cli = ["dep:clap", "dep:rpassword"]
+# `mainnet` is an EMPTY marker feature (like `wallet-cli`) with NO deps. It exists
+# only so the release CI guard `mainnet_release_guard::canonical_k_activation_height_is_set_for_mainnet`
+# (core/mod.rs) compiles and runs. Ordinary `--features node` builds do NOT enable
+# it, so they keep the CANONICAL_K_ACTIVATION_HEIGHT placeholder and stay green;
+# the guard bites only when a mainnet artifact is cut:
+#   cargo test -p gnb-crypto --features mainnet canonical_k_activation_height_is_set_for_mainnet
+mainnet = []
+# `auxpow-rehearsal` is an EMPTY marker feature (no deps). It ONLY lowers
+# AUXPOW_ACTIVATION_HEIGHT to 0 (core/mod.rs) so a LOCAL, off-mainnet build
+# accepts merged-mined (AuxPoW) blocks — for exercising the end-to-end BTC↔Bloch
+# dual-mining loop against `bitcoind -regtest`. A mainnet artifact NEVER enables
+# it (default keeps AUXPOW_ACTIVATION_HEIGHT = u64::MAX, merged mining INERT).
+
+[dependencies]
+# Post-quantum signatures (hybrid ML-DSA-65 ‖ Falcon-1024) + seeded keygen.
+# I-4: pinned to an EXACT version (not a caret range) — this crate's keygen
+# determinism (`generate_keypair_from_seed`, the seeded-RNG override in
+# `pqcrypto-internals`) and the KATs pinned against it are only guaranteed
+# stable within one exact upstream release; a transparent minor-version bump
+# could silently change keygen's internal byte consumption and rotate every
+# derived key. Bumping this pin is a deliberate, reviewed action, not
+# something `cargo update` should ever do on its own.
+pqcrypto-mldsa     = "=0.1.2"
+# F1 (BLOCH-FALCON-ONLINE-SIGNING.md §3.2): default features ("avx2","neon")
+# dispatch Falcon SIGNING to PQClean's native floating-point variants — forbidden
+# for a PoS validator that signs on a public schedule. `default-features = false`
+# forces the `clean` variant: integer-only emulated IEEE-754, constant-time,
+# bit-exact on every platform. Guarded by the
+# `falcon_native_fp_variants_are_not_linked` tripwire test in crypto/mod.rs and
+# by scripts/falcon-clean-guard.sh in CI. Do not re-enable avx2/neon.
+# I-4: pinned exact for the same reason as pqcrypto-mldsa above.
+pqcrypto-falcon    = { version = "=0.4.1", default-features = false, features = ["std"] }
+pqcrypto-traits    = "0.3"
+pqcrypto-internals = "0.2"
+
+# Hashing / KDF / AEAD.
+sha2   = "0.10"
+sha3   = "0.10"
+hmac   = "0.12"
+pbkdf2 = "0.12"
+argon2 = "0.5"
+aes-gcm = "0.10"
+
+# Secrets / encoding.
+zeroize = { version = "1", features = ["derive"] }
+bip39   = "2"
+rand    = "0.9"
+hex     = "0.4"
+base64  = "0.22"
+
+# Serialization.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode    = { version = "2", features = ["serde"] }
+
+# 256-bit arithmetic for consensus math in `core`.
+primitive-types = "0.13"
+
+thiserror = "2"
+chrono    = { version = "0.4", features = ["serde"] }
+log       = "0.4"
+
+# CLI wallet (wallet::cli) — terminal-only, optional so the wasm build skips them.
+# Enabled by the `wallet-cli` feature.
+clap      = { version = "4", features = ["derive"], optional = true }
+rpassword = { version = "7", optional = true }
+
+# Protocol crates shared with the node (path deps, inherited from the workspace).
+gnb-smh        = { path = "../gnb-smh" }
+coherence-core = { path = "../coherence-core" }
+
+# Optional — only with the `node` feature (networked WalletClient).
+reqwest     = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
+async-trait = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio    = { version = "1", features = ["full"] }
+# Property-based invariant tests for the Genesis-locked emission / halving /
+# founder-vesting math in src/core/tokenomics_v2.rs (consensus-critical).
+proptest = "1"

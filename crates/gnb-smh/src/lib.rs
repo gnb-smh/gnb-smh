@@ -1,0 +1,276 @@
+//! GnB-SMH v1 (Gödel and Bell Sequential Memory-Hard) — proof-of-work over SHAKE-256.
+//!
+//! Normative definition: `reference/gnb_smh.py`. This crate must reproduce
+//! `reference/test_vectors.json` byte for byte (see `tests/vectors.rs`).
+//!
+//! ```text
+//! X_0   = SHAKE256(enc(DS_SEED) || u8(log2_n) || enc(header) || u64le(nonce), 128)
+//! fill:  for i in 0..N:  V[i] = X;  X = SHAKE256(X || u32le(i) || 0x01, 128)
+//! mix:   for i in 0..N:  j = u64le(X[0..8]) mod N;  X = SHAKE256((X ^ V[j]) || u32le(i) || 0x02, 128)
+//! out   = SHAKE256(enc(DS_FINAL) || X, 32)
+//! valid <=> out (big-endian u256) < target,  1 <= target <= 2^256 - 1
+//! ```
+//!
+//! Every inner call has a 133-byte input, so it costs exactly one
+//! Keccak-f[1600] permutation; this crate computes it directly on lanes.
+
+#![forbid(unsafe_code)]
+
+pub mod difficulty;
+
+use sha3::digest::{ExtendableOutput, Update, XofReader};
+use sha3::Shake256;
+
+/// Scratchpad block size in bytes.
+pub const BLOCK: usize = 128;
+/// Lanes (u64) per block.
+pub const LANES: usize = BLOCK / 8;
+/// Canonical v1 memory parameter (consensus): N = 2^19 blocks = 64 MiB.
+pub const LOG2_N: u32 = 19;
+/// Range accepted for tests and experiments. Consensus uses `LOG2_N` only.
+pub const MIN_LOG2_N: u32 = 1;
+pub const MAX_LOG2_N: u32 = 30;
+
+const DS_SEED: &[u8] = b"GNB-SMH-v1/seed";
+const DS_FINAL: &[u8] = b"GNB-SMH-v1/final";
+const TAG_FILL: u64 = 0x01;
+const TAG_MIX: u64 = 0x02;
+
+fn check_log2_n(log2_n: u32) -> usize {
+    assert!(
+        (MIN_LOG2_N..=MAX_LOG2_N).contains(&log2_n),
+        "log2_n must be in [{MIN_LOG2_N}, {MAX_LOG2_N}]"
+    );
+    1usize.checked_shl(log2_n).expect("2^log2_n does not fit in usize")
+}
+
+/// SHAKE-256 padding for a 133-byte message in a 136-byte rate:
+/// byte 132 = tag, byte 133 = 0x1F (SHAKE suffix + first pad bit),
+/// byte 135 = 0x80 (last pad bit). Lane 16 = i | tag<<32 | 0x1F<<40 | 0x80<<56.
+#[inline(always)]
+fn lane16(i: u32, tag: u64) -> u64 {
+    (i as u64) | (tag << 32) | (0x1F_u64 << 40) | (0x80_u64 << 56)
+}
+
+/// One inner step: X <- SHAKE256(X || u32le(i) || tag, 128), in place on lanes.
+#[inline(always)]
+fn step(x: &mut [u64; LANES], i: u32, tag: u64) {
+    let mut st = [0u64; 25];
+    st[..LANES].copy_from_slice(x);
+    st[LANES] = lane16(i, tag);
+    keccak::f1600(&mut st);
+    x.copy_from_slice(&st[..LANES]);
+}
+
+fn enc(h: &mut Shake256, b: &[u8]) {
+    let len = u32::try_from(b.len()).expect("field longer than u32::MAX");
+    h.update(&len.to_le_bytes());
+    h.update(b);
+}
+
+fn bytes_to_lanes(b: &[u8; BLOCK]) -> [u64; LANES] {
+    let mut x = [0u64; LANES];
+    for (k, lane) in x.iter_mut().enumerate() {
+        *lane = u64::from_le_bytes(b[8 * k..8 * k + 8].try_into().unwrap());
+    }
+    x
+}
+
+fn lanes_to_bytes(x: &[u64; LANES]) -> [u8; BLOCK] {
+    let mut b = [0u8; BLOCK];
+    for (k, lane) in x.iter().enumerate() {
+        b[8 * k..8 * k + 8].copy_from_slice(&lane.to_le_bytes());
+    }
+    b
+}
+
+/// X_0 for (header, nonce).
+pub fn seed(header: &[u8], nonce: u64, log2_n: u32) -> [u8; BLOCK] {
+    check_log2_n(log2_n);
+    let mut h = Shake256::default();
+    enc(&mut h, DS_SEED);
+    h.update(&[log2_n as u8]);
+    enc(&mut h, header);
+    h.update(&nonce.to_le_bytes());
+    let mut out = [0u8; BLOCK];
+    h.finalize_xof().read(&mut out);
+    out
+}
+
+/// Reusable 2^log2_n-block scratchpad (allocate once per mining thread).
+pub struct Scratchpad {
+    v: Vec<[u64; LANES]>,
+    log2_n: u32,
+}
+
+impl Scratchpad {
+    pub fn new(log2_n: u32) -> Self {
+        let n = check_log2_n(log2_n);
+        Self { v: vec![[0u64; LANES]; n], log2_n }
+    }
+
+    pub fn log2_n(&self) -> u32 {
+        self.log2_n
+    }
+
+    /// Bytes of memory the scratchpad occupies.
+    pub fn bytes(&self) -> usize {
+        self.v.len() * BLOCK
+    }
+}
+
+/// Intermediate values, exposed for test vectors and debugging.
+pub struct Trace {
+    pub seed: [u8; BLOCK],
+    pub x_after_fill: [u8; BLOCK],
+    pub x_after_mix: [u8; BLOCK],
+    pub out: [u8; 32],
+}
+
+/// Full evaluation with intermediates.
+pub fn trace_with(sp: &mut Scratchpad, header: &[u8], nonce: u64) -> Trace {
+    let n = sp.v.len();
+    let mask = (n - 1) as u64;
+    let s = seed(header, nonce, sp.log2_n);
+    let mut x = bytes_to_lanes(&s);
+
+    // Phase 1 — fill: hash chain of length N. (i < 2^30 always fits in u32.)
+    for (i, slot) in sp.v.iter_mut().enumerate() {
+        *slot = x;
+        step(&mut x, i as u32, TAG_FILL);
+    }
+    let x_after_fill = lanes_to_bytes(&x);
+
+    // Phase 2 — mix: N data-dependent reads, each step depends on the previous.
+    for i in 0..n {
+        let j = (x[0] & mask) as usize;
+        let vj = &sp.v[j];
+        for k in 0..LANES {
+            x[k] ^= vj[k];
+        }
+        step(&mut x, i as u32, TAG_MIX);
+    }
+    let x_after_mix = lanes_to_bytes(&x);
+
+    let mut h = Shake256::default();
+    enc(&mut h, DS_FINAL);
+    h.update(&x_after_mix);
+    let mut out = [0u8; 32];
+    h.finalize_xof().read(&mut out);
+
+    Trace { seed: s, x_after_fill, x_after_mix, out }
+}
+
+/// GnB-SMH output for (header, nonce), reusing `sp` at whatever size it has.
+pub fn hash_with(sp: &mut Scratchpad, header: &[u8], nonce: u64) -> [u8; 32] {
+    trace_with(sp, header, nonce).out
+}
+
+/// GnB-SMH output at the canonical parameter (allocates 64 MiB).
+pub fn hash(header: &[u8], nonce: u64) -> [u8; 32] {
+    hash_with(&mut Scratchpad::new(LOG2_N), header, nonce)
+}
+
+/// out < target, both big-endian 256-bit integers. Consensus requires target != 0.
+pub fn meets_target(out: &[u8; 32], target: &[u8; 32]) -> bool {
+    out < target
+}
+
+/// Consensus check for one header. Panics if `sp` is not the canonical size.
+pub fn verify_with(sp: &mut Scratchpad, header: &[u8], nonce: u64, target: &[u8; 32]) -> bool {
+    assert_eq!(sp.log2_n, LOG2_N, "consensus verification requires the canonical scratchpad");
+    if target.iter().all(|&b| b == 0) {
+        return false; // target 0 is invalid: no output can be below it
+    }
+    meets_target(&hash_with(sp, header, nonce), target)
+}
+
+std::thread_local! {
+    static THREAD_SCRATCHPAD: std::cell::RefCell<Option<Scratchpad>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Canonical GnB-SMH output using a per-thread canonical scratchpad that is
+/// allocated on first use and kept for the life of the thread, so repeated
+/// verification does not reallocate 64 MiB per call.
+pub fn hash_thread_local(header: &[u8], nonce: u64) -> [u8; 32] {
+    THREAD_SCRATCHPAD.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let sp = slot.get_or_insert_with(|| Scratchpad::new(LOG2_N));
+        hash_with(sp, header, nonce)
+    })
+}
+
+/// Consensus check at the canonical parameter using the per-thread scratchpad.
+pub fn verify(header: &[u8], nonce: u64, target: &difficulty::Target) -> bool {
+    if target.is_zero() {
+        return false;
+    }
+    difficulty::meets_target(&hash_thread_local(header, nonce), target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lane-level step must equal FIPS 202 SHAKE256(x || u32le(i) || tag, 128).
+    #[test]
+    fn step_matches_shake256() {
+        let mut x = [0u64; LANES];
+        for trial in 0u64..200 {
+            for (k, lane) in x.iter_mut().enumerate() {
+                *lane = trial
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .rotate_left(k as u32 * 7)
+                    ^ (k as u64);
+            }
+            let i = (trial as u32).wrapping_mul(2_654_435_761);
+            for tag in [TAG_FILL, TAG_MIX] {
+                let xb = lanes_to_bytes(&x);
+                let mut h = Shake256::default();
+                h.update(&xb);
+                h.update(&i.to_le_bytes());
+                h.update(&[tag as u8]);
+                let mut want = [0u8; BLOCK];
+                h.finalize_xof().read(&mut want);
+
+                let mut got = x;
+                step(&mut got, i, tag);
+                assert_eq!(lanes_to_bytes(&got), want);
+            }
+        }
+    }
+
+    #[test]
+    fn target_compare_is_big_endian() {
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        a[31] = 0xFF;
+        b[0] = 0x01;
+        assert!(meets_target(&a, &b));
+        assert!(!meets_target(&b, &a));
+        assert!(!meets_target(&a, &a));
+    }
+
+    #[test]
+    fn nonce_and_header_change_output() {
+        let mut sp = Scratchpad::new(8);
+        let a = hash_with(&mut sp, b"gnb", 0);
+        assert_ne!(a, hash_with(&mut sp, b"gnb", 1));
+        assert_ne!(a, hash_with(&mut sp, b"gnc", 0));
+        assert_eq!(a, hash_with(&mut sp, b"gnb", 0));
+    }
+
+    #[test]
+    #[should_panic]
+    fn rejects_log2_n_out_of_range() {
+        let _ = Scratchpad::new(MAX_LOG2_N + 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn verify_rejects_non_canonical_scratchpad() {
+        let mut sp = Scratchpad::new(8);
+        let _ = verify_with(&mut sp, b"gnb", 0, &[0xFF; 32]);
+    }
+}
