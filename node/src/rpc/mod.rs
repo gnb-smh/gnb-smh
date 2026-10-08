@@ -9,6 +9,7 @@
 //!   decoderawtransaction, getdaginfo, listtransactions, getpeerinfo
 
 pub mod auth;
+mod explorer;
 
 
 use std::sync::Arc;
@@ -187,6 +188,7 @@ struct AppState {
 // an immediate "busy" error instead of stacking another full computation.
 const HEAVY_READ_METHODS: &[&str] = &[
     "getsupplydistribution",
+    "getrichlist",
     "getchainstats",
     "gethashrate",
     "getaddresscount",
@@ -709,7 +711,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // tolerance or gave up", not "provably at the network tip".
                 "best_announced":  s.best_announced_blue_score,
                 "behind_by":       s.best_announced_blue_score.saturating_sub(s.tip_blue_score),
-                "chain":           "bloch-sis",
+                "chain":           "gnb",
                 "pruned_height":   pruned_h,
             })
         }
@@ -1356,28 +1358,13 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             }
         }
 
-        "getsupplydistribution" => {
-            match crate::analytics::supply_distribution(&state.store) {
-                Ok(d) => {
-                    let tiers: Vec<Value> = d.tiers.iter().map(|t| json!({
-                        "label":          t.label,
-                        "address_count":  t.address_count,
-                        // R3: satoshi amount → decimal string.
-                        "total_sats":     t.total_sats.to_string(),
-                        "total_gnb":     t.total_gnb,
-                        "pct_of_supply":  t.pct_of_supply,
-                    })).collect();
-                    json!({
-                        "tiers":            tiers,
-                        "total_addresses":  d.total_addresses,
-                        "total_sats":       d.total_sats.to_string(),
-                        "total_gnb":       d.total_gnb,
-                    })
-                }
-                Err(e) => json!({ "error": e }),
-            }
-        }
-
+        "getsupplydistribution" => explorer::get_supply_distribution(state),
+        "getselectedchain"      => explorer::get_selected_chain(params, state),
+        "getblockdag"           => explorer::get_block_dag(params, state),
+        "gettransactionfull"    => explorer::get_transaction_full(params, state),
+        "getdagwindow"          => explorer::get_dag_window(params, state),
+        "getaddresshistory"     => explorer::get_address_history(params, state),
+        "getrichlist"           => explorer::get_rich_list(params, state),
         "gethashrate" => {
             match crate::analytics::chain_stats(&state.store, &state.mempool) {
                 Ok(s) => json!({
