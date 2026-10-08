@@ -1,8 +1,8 @@
 """GnB-SMH v1 (Gödel and Bell Sequential Memory-Hard) -- executable reference specification.
 
-Proof-of-work for the GnB chain (a fork of Bloch). Structure: scrypt ROMix
-(Percival 2009; RFC 7914) instantiated with single-permutation SHAKE-256
-calls (FIPS 202).
+Proof-of-work of GnB, a hard fork of Bloch: from the fork height it replaces
+Bloch-SIS-PoW. Structure: scrypt ROMix (Percival 2009; RFC 7914) instantiated
+with single-permutation SHAKE-256 calls (FIPS 202).
 
 This file is the normative definition. Any other implementation must
 reproduce test_vectors.json byte for byte.
@@ -67,10 +67,11 @@ def step(tag: int, i: int, x: bytes) -> bytes:
     without a second permutation. x comes first so it fills Keccak lanes
     0..15; lane 16 carries i, the tag and the SHAKE padding.
 
-    Domain separation: x is always a SHAKE-256 output, while the seed and
-    final inputs start with a fixed 19- or 20-byte label encoding. An inner
-    input can equal another call's input only if some output starts with
-    that label, probability about 2^-152 per call.
+    Domain separation: x is always a SHAKE-256 output, while the seed input
+    starts with the fixed 19-byte encoding of DS_SEED (the final input is
+    148 bytes, so it never has the inner length). An inner input can equal
+    a seed input only if some output starts with those 19 bytes,
+    probability about 2^-152 per call.
     """
     assert len(x) == BLOCK
     return shake256(x + struct.pack("<I", i) + bytes([tag]), BLOCK)

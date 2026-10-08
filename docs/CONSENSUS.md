@@ -14,7 +14,7 @@ block_hash   = SHA3-256("GNB-BLOCK-ID-v1" | pow_preimage | nonce u64le)
 GnB-SMH v1 is specified in `crates/gnb-smh/README.md`; the Python file in
 `crates/gnb-smh/reference/` is normative and the Rust crate reproduces its
 vectors byte for byte. One evaluation costs 64 MiB and about 0.5 s on one core
-of a current x86-64 or Apple CPU (`gnb-bench verify 19`). Verified block ids are
+of a current x86-64 or Apple CPU (`smh-bench verify 19`). Verified block ids are
 cached, so a block's proof is evaluated once per node.
 
 `bits` is the Bitcoin compact encoding. Malformed encodings never validate.

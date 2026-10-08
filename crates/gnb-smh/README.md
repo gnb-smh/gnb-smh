@@ -1,6 +1,6 @@
 # GnB-SMH v1 — Gödel and Bell Sequential Memory-Hard
 
-Proof of work of the GnB chain (a hard fork of Bloch). scrypt's ROMix structure
+The proof-of-work of GnB, a hard fork of Bloch: it replaces Bloch-SIS-PoW. scrypt's ROMix structure
 instantiated with single-permutation SHAKE-256 (FIPS 202): a 64 MiB
 scratchpad and 2^20 SHAKE-256 calls in one dependent chain per nonce.
 
@@ -16,7 +16,7 @@ The full specification and security analysis live in the GnB-SMH spec doc.
 | `reference/test_vectors.json` | 7 vectors: log2_n = 10 (5) and 19 (2) |
 | `src/lib.rs` | The crate (`#![forbid(unsafe_code)]`): evaluation, scratchpad, verification |
 | `src/difficulty.rs` | Compact targets, chain work, ASERT |
-| `src/bin/gnb-bench.rs` | Benchmark and toy miner |
+| `src/bin/smh-bench.rs` | Benchmark and toy miner |
 | `tests/vectors.rs` | Cross-check against the Python vectors |
 | `analysis/stats.py` | Geometric-fit and bit-balance sanity tests (small N only) |
 
@@ -27,8 +27,8 @@ From the repository root:
 ```sh
 python3 crates/gnb-smh/reference/gnb_smh.py 19     # one evaluation in Python (~2-5 s)
 cargo test --release -p gnb-smh                    # unit tests + Python vector cross-check
-./target/release/gnb-bench verify 19 21            # median verification time
-./target/release/gnb-bench mine 8 6 4000 1 > crates/gnb-smh/analysis/mine_log2n8_bits6.csv
+./target/release/smh-bench verify 19 21            # median verification time
+./target/release/smh-bench mine 8 6 4000 1 > crates/gnb-smh/analysis/mine_log2n8_bits6.csv
 python3 crates/gnb-smh/analysis/stats.py
 ```
 

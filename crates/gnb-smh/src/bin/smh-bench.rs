@@ -1,8 +1,8 @@
 //! Benchmark and toy miner for GnB-SMH.
 //!
-//! gnb-bench verify [log2_n] [iters]        time per evaluation (single thread)
-//! gnb-bench perm [count]                   raw Keccak-f[1600] permutations per second
-//! gnb-bench mine <log2_n> <zero_bits> <blocks> [threads]
+//! smh-bench verify [log2_n] [iters]        time per evaluation (single thread)
+//! smh-bench perm [count]                   raw Keccak-f[1600] permutations per second
+//! smh-bench mine <log2_n> <zero_bits> <blocks> [threads]
 //!                                          find blocks at a fixed target; prints attempts per block
 
 use gnb_smh::{hash_with, meets_target, Scratchpad, LOG2_N};
