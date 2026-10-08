@@ -259,6 +259,14 @@ impl Wallet {
     /// Explicit bounded recovery override; byte budget does not bound KDF or parsed memory.
     pub fn load_encrypted_with_file_limit(path: &std::path::Path, password: &str, max_bytes: usize) -> Result<Self, WalletError> {
         let bytes = crate::util::read_wallet_file(path, max_bytes).map_err(|e| WalletError::Io(e.to_string()))?;
+        Self::from_encrypted_bytes(&bytes, password)
+    }
+
+    /// Open v1 keyfile JSON bytes (no filesystem).
+    pub fn from_encrypted_bytes(bytes: &[u8], password: &str) -> Result<Self, WalletError> {
+        if bytes.len() > crate::util::DEFAULT_WALLET_FILE_LIMIT {
+            return Err(WalletError::Io("keyfile exceeds the wallet file size limit".into()));
+        }
         let ef: encryption::EncryptedKeyfile = serde_json::from_slice(&bytes)
             .map_err(|e| WalletError::Parse(e.to_string()))?;
 
@@ -869,6 +877,14 @@ impl Keypair {
     // ── Keystore ──────────────────────────────────────────────────────────────
 
     pub fn save_encrypted(&self, path: &Path, password: &str) -> Result<(), String> {
+        let json = self.to_encrypted_json(password)?;
+        // Sprint T.5 — Audit L-4: atomic write (temp + fsync + rename).
+        crate::util::atomic_write(path, json.as_bytes()).map_err(|e| e.to_string())
+    }
+
+    /// The encrypted keystore v2 JSON for this keypair (what `save_encrypted`
+    /// writes). Used directly where there is no filesystem (the web wallet).
+    pub fn to_encrypted_json(&self, password: &str) -> Result<String, String> {
         // SECURITY (A4 lows): enforce the SAME blocking password policy as
         // the new-style `EncryptedKeyfile` (length + breach denylist) here
         // too — this legacy path is reachable directly (e.g. the CLI's `New`
@@ -905,11 +921,9 @@ impl Keypair {
                     salt: b64::STANDARD.encode(&salt), output_len: 32 },
             },
             created_at:  chrono::Utc::now().to_rfc3339(),
-            description: "Bloch-SIS Protocol ML-DSA-65 Keystore v2".into(),
+            description: "GnB hybrid ML-DSA-65 + Falcon-1024 keystore v2".into(),
         };
-        let json = serde_json::to_string_pretty(&ks).map_err(|e| e.to_string())?;
-        // Sprint T.5 — Audit L-4: atomic write (temp + fsync + rename).
-        crate::util::atomic_write(path, json.as_bytes()).map_err(|e| e.to_string())
+        serde_json::to_string_pretty(&ks).map_err(|e| e.to_string())
     }
 
     pub fn load_encrypted(path: &Path, password: &str) -> Result<Self, String> {
@@ -919,6 +933,15 @@ impl Keypair {
     /// Explicit bounded recovery override for authentic large keystores (maximum 512 MiB).
     pub fn load_encrypted_with_file_limit(path: &Path, password: &str, max_bytes: usize) -> Result<Self, String> {
         let bytes = crate::util::read_wallet_file(path, max_bytes).map_err(|e| e.to_string())?;
+        Self::from_encrypted_bytes(&bytes, password)
+    }
+
+    /// Open keystore v2 JSON bytes (no filesystem). Same checks as
+    /// `load_encrypted`; inputs above the default wallet file limit are refused.
+    pub fn from_encrypted_bytes(bytes: &[u8], password: &str) -> Result<Self, String> {
+        if bytes.len() > crate::util::DEFAULT_WALLET_FILE_LIMIT {
+            return Err("keystore exceeds the wallet file size limit".into());
+        }
         let ks: EncryptedKeystore = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         if ks.version != 2 { return Err("unsupported keystore version".into()); }
 

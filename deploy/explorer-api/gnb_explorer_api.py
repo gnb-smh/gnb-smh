@@ -4,6 +4,7 @@
     GET /v1/<method>?p=<JSON array of params>     -> {"result": ...} | {"error": ...}
     GET /v1/carryover/<address>                    -> carryover share of one address
     GET /v1/health                                 -> {"ok": true, "height": ...}
+    POST /v1/sendrawtransaction  body {"hex": ...}  -> broadcast a signed transaction
 
 Only methods in ALLOWED are forwarded, with validated parameters, to the
 node's localhost JSON-RPC. Responses are cached briefly. Every request must
@@ -81,6 +82,7 @@ ALLOWED = {
     "getdagwindow":            ([_int(1, 300)], 3),
     "getaddresshistory":       ([ADDRESS, PAGE, OFFSET], 5),
     "getbalance":              ([ADDRESS], 5),
+    "getutxos":                ([ADDRESS, _int(1, 50)], 2),
     "getrichlist":             ([PAGE, OFFSET], 60),
     "getsupplydistribution":   ([], 60),
     "validateaddress":         ([_re(re.compile(r"^.{1,80}$"), "string")], 60),
@@ -211,9 +213,36 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(502, {"error": "node unavailable"})
 
 
+HEXTX = re.compile(r"^[0-9a-f]+$")
+MAX_TX_HEX = 2 * 400 * 1024
+
+
+class PostHandler(Handler):
+    def do_POST(self):
+        key = self.headers.get("x-gnb-key", "").encode()
+        if not hmac.compare_digest(key, API_KEY):
+            return self.send(403, {"error": "forbidden"})
+        if urllib.parse.urlsplit(self.path).path != "/v1/sendrawtransaction":
+            return self.send(404, {"error": "not found"})
+        try:
+            n = int(self.headers.get("content-length", "0"))
+            if not 0 < n <= MAX_TX_HEX + 64:
+                raise ValueError("body size out of range")
+            doc = json.loads(self.rfile.read(n))
+            raw = doc.get("hex") if isinstance(doc, dict) else None
+            if not isinstance(raw, str) or not raw or len(raw) > MAX_TX_HEX or len(raw) % 2 or not HEXTX.match(raw):
+                raise ValueError("hex-encoded transaction expected")
+            r = rpc("sendrawtransaction", [raw])
+            return self.send(200 if "result" in r else 400, r)
+        except (ValueError, json.JSONDecodeError) as e:
+            return self.send(400, {"error": str(e)})
+        except Exception:
+            return self.send(502, {"error": "node unavailable"})
+
+
 def main():
     threading.Thread(target=load_carryover, args=(os.environ.get("GNB_CARRYOVER"),), daemon=True).start()
-    httpd = ThreadingHTTPServer((BIND, PORT), Handler)
+    httpd = ThreadingHTTPServer((BIND, PORT), PostHandler)
     httpd.daemon_threads = True
     httpd.serve_forever()
 

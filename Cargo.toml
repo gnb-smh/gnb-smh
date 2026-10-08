@@ -8,6 +8,7 @@ members = [
     "crates/gnb-smh",         # the proof of work: GnB-SMH v1 + difficulty (ASERT)
     "crates/gnb-crypto",      # consensus types, transactions, wallet, signatures
     "crates/coherence-core",  # shielded-pool primitives used by the block format
+    "crates/gnb-wallet-wasm", # browser wallet core (WebAssembly), served at /wallet
     "node",                   # the `gnb` full node, `gnb-cli`, `gnb-wallet`
 ]
 

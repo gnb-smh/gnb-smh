@@ -24,6 +24,9 @@ Status: pre-release. Not audited.
 | `crates/gnb-crypto` | Consensus types (blocks, transactions, genesis, carryover, monetary policy), signatures, wallet |
 | `crates/coherence-core` | Shielded-pool primitives carried in the block format |
 | `node` | The `gnb` full node, `gnb-cli`, `gnb-wallet`, `gnb-mine-genesis` |
+| `crates/gnb-wallet-wasm` | Browser wallet core (keystores, coin selection, hybrid signing) for `wasm32-wasip1` |
+| `site/`, `worker/` | gnb-smh.com: site, explorer (`/explorer`) and web wallet (`/wallet`), served by a Cloudflare Worker that also proxies the read-only explorer API |
+| `deploy/` | Node and explorer-API systemd units and install scripts |
 | `genesis/` | The Bloch Genesis-3 terminal snapshot the genesis ledger is built from |
 | `docs/` | Protocol notes: [consensus](docs/CONSENSUS.md), [monetary policy and carryover](docs/MONETARY-POLICY.md), [running a node](docs/RUNNING.md) |
 
@@ -46,6 +49,16 @@ gunzip -k genesis/bloch-g3-carryover.tsv.gz
 
 The first boot verifies the snapshot against the consensus constants and
 writes the converted ledger before block 0. See [docs/RUNNING.md](docs/RUNNING.md).
+
+## Web wallet
+
+[gnb-smh.com/wallet](https://gnb-smh.com/wallet) opens GnB and Bloch
+keystores (a `bloch1q…` keystore opens as the same `gnb1q…` address), creates
+new wallets, and sends and receives GNB. Decryption (Argon2id, AES-256-GCM)
+and signing run in WebAssembly inside the page; the private key never leaves
+the WebAssembly memory and nothing secret is uploaded. The page is served with
+a strict Content-Security-Policy (same-origin scripts only, no framing).
+Rebuild the core with `scripts/build-wallet-wasm.sh` (needs a wasi-sdk).
 
 ## Relationship to Bloch
 

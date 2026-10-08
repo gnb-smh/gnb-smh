@@ -1519,6 +1519,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gnb-wallet-wasm"
+version = "0.1.0"
+dependencies = [
+ "gnb-crypto",
+ "hex",
+ "serde_json",
+ "zeroize",
+]
+
+[[package]]
 name = "governor"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
