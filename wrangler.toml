@@ -1,0 +1,11 @@
+# Cloudflare Workers static-assets deployment of the gnb-smh.com site.
+# Deploy: wrangler deploy   (from the repository root)
+name = "gnb-smh"
+compatibility_date = "2026-09-01"
+routes = [
+  { pattern = "gnb-smh.com", custom_domain = true },
+  { pattern = "www.gnb-smh.com", custom_domain = true },
+]
+
+[assets]
+directory = "./site"
