@@ -2,6 +2,7 @@
 //!
 //! smh-bench verify [log2_n] [iters]        time per evaluation (single thread)
 //! smh-bench perm [count]                   raw Keccak-f[1600] permutations per second
+//! smh-bench witness [count]                time to check one ledger witness
 //! smh-bench mine <log2_n> <zero_bits> <blocks> [threads]
 //!                                          find blocks at a fixed target; prints attempts per block
 
@@ -35,6 +36,28 @@ fn main() {
                 dt * 1e9 / count as f64,
                 st[0]
             );
+        }
+        Some("witness") => {
+            // Cost of checking one ledger witness: decode + one root recomputation (256 node hashes).
+            use gnb_smh::ledger;
+            let count: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20_000);
+            let mut tree = ledger::SparseMerkleTree::new();
+            let keys: Vec<ledger::Hash> = (0u64..64).map(|i| ledger::test_owner(&i.to_le_bytes())).collect();
+            for k in &keys {
+                tree.set(k, &ledger::leaf_hash(k, k));
+            }
+            let proofs: Vec<Vec<u8>> = keys.iter().map(|k| tree.proof(k)).collect();
+            let root = tree.root();
+            let t0 = Instant::now();
+            let mut ok = 0u32;
+            for i in 0..count as usize {
+                let k = &keys[i % keys.len()];
+                let (sibs, _) = ledger::decode_proof(&proofs[i % keys.len()], 0).unwrap();
+                ok += (ledger::root_from(k, &ledger::leaf_hash(k, k), &sibs) == root) as u32;
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            assert_eq!(ok, count);
+            println!("ledger witness check: {count} in {dt:.3}s = {:.1} us each", dt * 1e6 / count as f64);
         }
         Some("mine") => {
             let log2_n: u32 = args[2].parse().unwrap();
