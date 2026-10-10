@@ -28,7 +28,8 @@ Status: pre-release. Not audited.
 | `site/`, `worker/` | gnb-smh.com: site, explorer (`/explorer`) and web wallet (`/wallet`), served by a Cloudflare Worker that also proxies the read-only explorer API |
 | `deploy/` | Node and explorer-API systemd units and install scripts |
 | `genesis/` | The Bloch Genesis-3 terminal snapshot the genesis ledger is built from |
-| `docs/` | Protocol notes: [consensus](docs/CONSENSUS.md), [monetary policy and carryover](docs/MONETARY-POLICY.md), [running a node](docs/RUNNING.md) |
+| `docs/` | Protocol notes: [consensus](docs/CONSENSUS.md), [monetary policy and carryover](docs/MONETARY-POLICY.md), [running a node](docs/RUNNING.md), [ledger v1](docs/LEDGER.md) |
+| `reference/`, `rust/`, `analysis/` | Standalone GnB-SMH v1 reference implementation and GnB ledger v1 (see below) |
 
 ## Build and test
 
@@ -76,7 +77,33 @@ wallet key derivation and network stack, and changes:
   to 1,000,000 GNB. Owners keep their keys; `bloch1q<hash><checksum>` becomes
   `gnb1q<hash><checksum>`.
 
+## Reference implementation and ledger v1
+
+`reference/`, `rust/` and `analysis/` hold a standalone GnB-SMH v1 reference and the
+**GnB ledger v1**: stateless validation without a committee. Every node checks every
+block holding only two 32-byte state roots; each block travels with O(log n)
+sparse-Merkle witnesses (about 1 KB per touched key at 2^30 outputs), and every
+transaction outcome must be proven. Specification: [`docs/LEDGER.md`](docs/LEDGER.md).
+Research prototype, not yet wired into the node.
+
+| Path | What it is |
+| --- | --- |
+| `reference/gnb_smh.py` | GnB-SMH normative definition (Python standard library only) |
+| `reference/check_vectors.py`, `test_vectors.json` | 7 PoW vectors and their checker |
+| `reference/gnb_ledger.py` | Ledger normative definition: sparse Merkle tree, transactions, witness bundle, validation |
+| `reference/gen_ledger_vectors.py`, `ledger_vectors.json` | 5 valid and 23 single-fault invalid blocks, tree vectors |
+| `reference/test_ledger.py` | Ledger tests, including a producer-versus-validator differential test |
+| `rust/` | Standalone crate (`#![forbid(unsafe_code)]`, outside the workspace): PoW, `ledger` module, `smh-bench` |
+| `analysis/` | PoW statistics and measured witness size versus live outputs |
+
+```sh
+python3 reference/check_vectors.py      # Python 3.10 or newer
+python3 reference/test_ledger.py
+cd rust && cargo test --release --locked
+```
+
 ## License
 
 The node and `gnb-crypto` are AGPL-3.0-or-later, as inherited from Bloch
-(see `LICENSE`). `crates/gnb-smh` is MIT OR Apache-2.0.
+(see `LICENSE`). `crates/gnb-smh`, `reference/`, `rust/` and `analysis/` are MIT OR Apache-2.0
+(see `LICENSE-APACHE` and `LICENSE-MIT`).
