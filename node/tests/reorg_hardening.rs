@@ -688,4 +688,8 @@ fn branch_deeper_than_finality_is_rejected() {
     // Beyond finality is a statement about the local tip: never recordable.
     assert!(matches!(validate_block_on_branch(&store, &path, &b1),
                      Err(BlockTxError::BeyondFinality(m)) if m.contains("forks")));
+    // With finality inactive (tip below MIN_CHAIN_WORK) there is no depth
+    // refusal; the fixture's fake ancestors are simply unavailable.
+    assert!(matches!(gnb::reorg::validate_block_on_branch_with(&store, &path, &b1, false),
+                     Err(BlockTxError::Storage(_))));
 }

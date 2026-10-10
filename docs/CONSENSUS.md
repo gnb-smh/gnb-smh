@@ -120,6 +120,21 @@ parents are requested, it must pass:
 The orphan pool holds at most 10,000 blocks and 128 MiB, evicting the lowest
 height first.
 
+## Finality and minimum chain work
+
+A synced node does not reorg more than `CHECKPOINT_DEPTH` (1,000) blocks,
+records `finalized_height = tip − 1,000`, and prunes block bodies older than
+10,000 blocks.
+
+All three apply only once the selected tip's `blue_work` reaches
+`MIN_CHAIN_WORK` (`crates/gnb-crypto/src/core/mod.rs`). ASERT eases the
+difficulty for a chain behind schedule, so a long low-work chain from genesis
+is cheap to build. A new node fed such a chain during initial sync would,
+without this rule, finalize it and never reach the honest chain. Below the
+minimum it keeps every reorg open. The value names no block (unlike a
+checkpoint); it is set at each release somewhat below the live chain's work,
+and is `0` before a chain exists.
+
 ## GhostDAG
 
 k = 10. The exact interval-index ("Fast") coloring applies from genesis.

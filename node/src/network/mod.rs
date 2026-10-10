@@ -6,18 +6,19 @@
 //! Sprint P: PEX hardening (rate limit, address validation, known_peers cap).
 
 pub mod pex_validator;
+pub mod pow_gate;
 pub mod sync_rr;
 
 use libp2p::{
     identity, identify, mdns, PeerId, Multiaddr,
     swarm::SwarmEvent,
     gossipsub::{self, IdentTopic, MessageAuthenticity, ValidationMode}, tcp, yamux,
-    SwarmBuilder,
+    SwarmBuilder, Swarm,
 };
 use serde::{Serialize, Deserialize};
 use tokio::sync::mpsc;
 use log::{info, warn, debug};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use sha2::{Sha256, Digest};
@@ -28,7 +29,9 @@ use pex_validator::{
     PEX_BATCH_LIMIT, KNOWN_PEERS_CAP,
 };
 
-use crate::transport::upgrade::KyberConfig;
+use std::sync::Arc;
+use crate::transport::identity::{PeerPins, PqIdentity};
+use crate::transport::upgrade::PqConfig;
 
 pub const TOPIC_BLOCKS: &str = "gnb/blocks/1";
 pub const TOPIC_TXS:    &str = "gnb/txs/1";
@@ -52,6 +55,81 @@ pub fn ingest_drops_total() -> u64 {
 /// Forward an inbound frame to the processor, counting + logging drops instead
 /// of discarding them silently. WARNs on the first drop and every 100th after
 /// (a storm that overflows a 1000-slot channel would otherwise flood the log).
+/// Result of an off-loop proof-of-work evaluation (network::pow_gate).
+struct PowVerdict {
+    peer: PeerId,
+    message_id: Option<gossipsub::MessageId>,
+    msg: NetworkMessage,
+    source: &'static str,
+    valid: bool,
+}
+
+/// Route a received block through the proof-of-work gate. Every exit path
+/// reports a gossip verdict (when the block came by gossip), so nothing is
+/// relayed unverified and nothing is held forever.
+#[allow(clippy::too_many_arguments)]
+fn gate_block(
+    gate: &mut pow_gate::PowGate,
+    workers: &Arc<tokio::sync::Semaphore>,
+    verdict_tx: &mpsc::UnboundedSender<PowVerdict>,
+    block_tx: &mpsc::Sender<NetworkMessage>,
+    swarm: &mut Swarm<BlochBehaviour>,
+    peer: PeerId,
+    message_id: Option<gossipsub::MessageId>,
+    msg: NetworkMessage,
+    budgeted: bool,
+    source: &'static str,
+) {
+    use gossipsub::MessageAcceptance::{Accept, Ignore, Reject};
+    let mut report = |swarm: &mut Swarm<BlochBehaviour>, a: gossipsub::MessageAcceptance| {
+        if let Some(id) = &message_id {
+            let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(id, &peer, a);
+        }
+    };
+    let now = Instant::now();
+    if gate.is_banned(&peer, now) {
+        report(swarm, Ignore);
+        return;
+    }
+    let NetworkMessage::NewBlock { block_data, .. } = &msg else {
+        report(swarm, Accept);
+        forward_to_processor(block_tx, msg, source);
+        return;
+    };
+    let block = match crate::core::Block::from_wire_bytes(block_data) {
+        Ok(b) => b,
+        Err(_) => {
+            report(swarm, Reject);
+            return;
+        }
+    };
+    if block.pow_is_cached() {
+        report(swarm, Accept);
+        forward_to_processor(block_tx, msg, source);
+        return;
+    }
+    if let Err(reason) = pow_gate::pow_precheck(&block) {
+        // Cannot come from an honest node: penalize, do not relay.
+        debug!("P2P: block from {} failed precheck: {}", peer, reason);
+        swarm.behaviour_mut().gossipsub.set_application_score(&peer, -100.0);
+        report(swarm, Reject);
+        return;
+    }
+    if budgeted && !gate.take(&peer, now) {
+        debug!("P2P: {} exceeded its proof-of-work budget; block ignored", peer);
+        report(swarm, Ignore);
+        return;
+    }
+    let (workers, tx) = (workers.clone(), verdict_tx.clone());
+    tokio::spawn(async move {
+        let Ok(_permit) = workers.acquire_owned().await else { return };
+        let valid = tokio::task::spawn_blocking(move || block.validate_pow())
+            .await
+            .unwrap_or(false);
+        let _ = tx.send(PowVerdict { peer, message_id, msg, source, valid });
+    });
+}
+
 fn forward_to_processor(block_tx: &mpsc::Sender<NetworkMessage>, msg: NetworkMessage, source: &str) {
     use tokio::sync::mpsc::error::TrySendError;
     match block_tx.try_send(msg) {
@@ -601,6 +679,10 @@ pub struct NetworkNode {
     pub peer_id: PeerId,
     pub config:  NetworkConfig,
     local_key:   identity::Keypair,
+    /// Hybrid ML-DSA-65 ‖ Falcon-1024 transport identity.
+    pq_identity: Arc<PqIdentity>,
+    /// Per-peer PQ key pins (trust on first use).
+    pq_pins:     Arc<PeerPins>,
 }
 
 impl NetworkNode {
@@ -610,7 +692,13 @@ impl NetworkNode {
         let local_key = load_or_create_identity(&key_path)?;
         let peer_id   = PeerId::from(local_key.public());
         info!("P2P identity: {} ({})", peer_id, key_path.display());
-        Ok(Self { peer_id, config, local_key })
+        let pq_path = config.data_dir.join("p2p_pq_identity.bin");
+        let pq_identity = Arc::new(PqIdentity::load_or_create(&pq_path)
+            .map_err(NetworkError::StartFailed)?);
+        info!("P2P PQ identity fingerprint: {}", hex::encode(pq_identity.fingerprint()));
+        let pq_pins = Arc::new(PeerPins::load(&config.data_dir.join("p2p_pq_pins.json"))
+            .map_err(NetworkError::StartFailed)?);
+        Ok(Self { peer_id, config, local_key, pq_identity, pq_pins })
     }
 
     /// Run the network event loop.
@@ -670,6 +758,12 @@ impl NetworkNode {
         let gs_cfg = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(Duration::from_secs(1))
             .validation_mode(ValidationMode::Strict)
+            // Relay only what this node has validated: every message is held
+            // until `report_message_validation_result`. A block is reported
+            // only after its proof of work verified, so an honest peer never
+            // relays an invalid proof and the peer that delivers one is the
+            // one held accountable (network::pow_gate).
+            .validate_messages()
             .message_id_fn(msg_id_fn)
             .max_transmit_size(4 * 1024 * 1024)
             // Mesh fix (fresh-joiner IBD): gossipsub's duplicate_cache_time
@@ -790,19 +884,21 @@ impl NetworkNode {
         let enable_mdns = self.config.enable_mdns;
         let archive = self.config.archive;
 
+        let (pq_tcp, pins_tcp) = (self.pq_identity.clone(), self.pq_pins.clone());
+        let (pq_ws, pins_ws) = (self.pq_identity.clone(), self.pq_pins.clone());
         let mut swarm = SwarmBuilder::with_existing_identity(self.local_key.clone())
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),
-                |keys: &identity::Keypair| -> Result<KyberConfig, std::convert::Infallible> {
-                    Ok(KyberConfig::new(keys))
+                move |keys: &identity::Keypair| -> Result<PqConfig, std::convert::Infallible> {
+                    Ok(PqConfig::new(keys, pq_tcp, pins_tcp))
                 },
                 yamux_config,
             )
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?
             .with_websocket(
-                |keys: &identity::Keypair| -> Result<KyberConfig, std::convert::Infallible> {
-                    Ok(KyberConfig::new(keys))
+                move |keys: &identity::Keypair| -> Result<PqConfig, std::convert::Infallible> {
+                    Ok(PqConfig::new(keys, pq_ws, pins_ws))
                 },
                 yamux_config,
             )
@@ -1034,11 +1130,39 @@ impl NetworkNode {
         // permanently behind.
         let mut tip_announce = tokio::time::interval(Duration::from_secs(60));
 
+        // Proof-of-work admission (network::pow_gate): per-peer budgets and
+        // bans, proofs evaluated on a bounded worker pool, verdicts returned
+        // to this loop.
+        let mut pow_gate = pow_gate::PowGate::new();
+        let pow_workers = Arc::new(tokio::sync::Semaphore::new(
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2)));
+        let (pow_verdict_tx, mut pow_verdict_rx) = mpsc::unbounded_channel::<PowVerdict>();
+
         loop {
             tokio::select! {
+                Some(v) = pow_verdict_rx.recv() => {
+                    let acceptance = if v.valid {
+                        gossipsub::MessageAcceptance::Accept
+                    } else {
+                        gossipsub::MessageAcceptance::Reject
+                    };
+                    if let Some(id) = &v.message_id {
+                        let _ = swarm.behaviour_mut().gossipsub
+                            .report_message_validation_result(id, &v.peer, acceptance);
+                    }
+                    if v.valid {
+                        forward_to_processor(&block_tx, v.msg, v.source);
+                    } else {
+                        warn!("P2P: banning {} for {:?}: invalid GnB-SMH proof of work",
+                            v.peer, pow_gate::BAN_DURATION);
+                        pow_gate.ban(&v.peer, Instant::now());
+                        swarm.behaviour_mut().gossipsub.blacklist_peer(&v.peer);
+                        let _ = swarm.disconnect_peer_id(v.peer);
+                    }
+                }
                 event = poll_swarm(&mut swarm) => {
                     match event {
-                        SwarmEvent::Behaviour(BlochBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
+                        SwarmEvent::Behaviour(BlochBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message_id, message })) => {
                             // C1: bounded decode. `decode_wire_message` (inside
                             // `classify`) enforces the 4 MiB frame/read limit and
                             // per-field length bounds; the unlimited
@@ -1067,6 +1191,25 @@ impl NetworkNode {
                                         propagation_source, message.data.len());
                                 }
                                 WireReaction::Accept(_) => {}
+                            }
+                            // Validation verdict for relaying (validate_messages):
+                            // blocks are decided by the proof-of-work gate below;
+                            // every other decoded message is relayed; anything
+                            // that failed the wire decoder is not.
+                            match &reaction {
+                                WireReaction::Penalize { .. } => {
+                                    let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                        &message_id, &propagation_source, gossipsub::MessageAcceptance::Reject);
+                                }
+                                WireReaction::IgnoreMalformed(_) => {
+                                    let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                        &message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
+                                }
+                                WireReaction::Accept(NetworkMessage::NewBlock { .. }) => {}
+                                WireReaction::Accept(_) => {
+                                    let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                        &message_id, &propagation_source, gossipsub::MessageAcceptance::Accept);
+                                }
                             }
                             if let WireReaction::Accept(msg) = reaction {
                                 match &msg {
@@ -1248,10 +1391,23 @@ impl NetworkNode {
                                     }
                                     _ => {}
                                 }
-                                forward_to_processor(&block_tx, msg, "gossip");
+                                if matches!(msg, NetworkMessage::NewBlock { .. }) {
+                                    gate_block(
+                                        &mut pow_gate, &pow_workers, &pow_verdict_tx, &block_tx,
+                                        &mut swarm, propagation_source, Some(message_id), msg,
+                                        true, "gossip",
+                                    );
+                                } else {
+                                    forward_to_processor(&block_tx, msg, "gossip");
+                                }
                             }
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                            if pow_gate.is_banned(&peer_id, Instant::now()) {
+                                debug!("P2P: dropping connection from banned peer {}", peer_id);
+                                let _ = swarm.disconnect_peer_id(peer_id);
+                                continue;
+                            }
                             info!("✓ connected: {}", peer_id);
                             // DO NOT call gossipsub.add_explicit_peer() here.
                             //
@@ -1566,7 +1722,17 @@ impl NetworkNode {
                                 // processes fetched blocks/headers unchanged.
                                 libp2p::request_response::Message::Response { request_id, response } => {
                                     inflight_pull.remove(&request_id);
-                                    forward_to_processor(&block_tx, sync_rr::response_to_message(response), "directed-pull");
+                                    let msg = sync_rr::response_to_message(response);
+                                    if matches!(msg, NetworkMessage::NewBlock { .. }) {
+                                        // Requested by us: not budgeted, still
+                                        // verified, still accountable.
+                                        gate_block(
+                                            &mut pow_gate, &pow_workers, &pow_verdict_tx, &block_tx,
+                                            &mut swarm, peer, None, msg, false, "directed-pull",
+                                        );
+                                    } else {
+                                        forward_to_processor(&block_tx, msg, "directed-pull");
+                                    }
                                 }
                             },
                             // Directed pull failed: peer doesn't speak
@@ -1686,6 +1852,10 @@ impl NetworkNode {
                 }
 
                 _ = heartbeat.tick() => {
+                    for peer in pow_gate.expire_bans(Instant::now()) {
+                        info!("P2P: ban on {} expired", peer);
+                        swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer);
+                    }
                     // Sprint CC: height displayed in the heartbeat log also
                     // needs to come from the DAG, not a startup-captured
                     // value. Without this fix the seed's heartbeat kept
@@ -1803,9 +1973,10 @@ fn load_or_create_identity(path: &Path) -> Result<identity::Keypair, NetworkErro
     }
     let kp = identity::Keypair::generate_ed25519();
     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).ok(); }
-    let bytes = kp.to_protobuf_encoding()
-        .map_err(|e| NetworkError::StartFailed(format!("encode identity: {}", e)))?;
-    std::fs::write(path, &bytes)
+    let bytes = zeroize::Zeroizing::new(kp.to_protobuf_encoding()
+        .map_err(|e| NetworkError::StartFailed(format!("encode identity: {}", e)))?);
+    // Owner-only permissions, atomic write (the file is a private key).
+    crate::transport::identity::write_private(path, &bytes)
         .map_err(|e| NetworkError::StartFailed(format!("write identity: {}", e)))?;
     info!("created P2P identity: {}", path.display());
     Ok(kp)

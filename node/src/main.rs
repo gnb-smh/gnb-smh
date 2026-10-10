@@ -2159,6 +2159,14 @@ fn accept_block(
     // discarded (`reorg::validate_block_on_branch`). Judging a branch block
     // against the TIP's state — the previous behaviour — rejected valid
     // competing branches and could keep a node off the heaviest chain.
+    // Finality (depth cap, finalized_height, pruning) applies only once the
+    // selected tip carries MIN_CHAIN_WORK; below it the node may be on a cheap
+    // chain fed during initial sync and must stay able to reach the heaviest.
+    let finality_on = {
+        let d = dag.read();
+        core::finality_active(
+            old_tip.and_then(|t| d.get_block_data(&t)).map(|bd| bd.blue_work).unwrap_or(0))
+    };
     {
         let selected_parent = dag.read().preview_selected_parent(&block.header.parents);
         let verdict = match (old_tip, selected_parent) {
@@ -2166,7 +2174,7 @@ fn accept_block(
                 // Path under the DAG read lock; the lock is released before
                 // the storage-heavy in-memory validation runs.
                 let path = { let d = dag.read(); reorg::branch_path(&d, &tip, &sp) };
-                path.and_then(|p| reorg::validate_block_on_branch(store, &p, block))
+                path.and_then(|p| reorg::validate_block_on_branch_with(store, &p, block, finality_on))
             }
             _ => {
                 let utxo = |t: &[u8; 32], i: u32| store.get_utxo(t, i).map_err(|e| e.to_string());
@@ -2379,7 +2387,7 @@ fn accept_block(
                 hex::encode(&plan.lca[..8]),
             );
 
-            let outcome = match reorg::execute_reorg(store, mempool, &plan) {
+            let outcome = match reorg::execute_reorg_with(store, mempool, &plan, finality_on) {
                 Ok(o) => o,
                 Err(e) => {
                     // CONSENSUS-HALT FIX: a refused reorg (e.g. deeper than
@@ -2485,8 +2493,13 @@ fn accept_block(
     };
     // [no-fork] Do not advance finality while mining through a stalled latch —
     // freezing finalized_height keeps a heavier chain able to reorg us back.
+    let tip_work = {
+        let d = dag.read();
+        d.selected_tip().and_then(|h| d.get_block_data(&h)).map(|bd| bd.blue_work).unwrap_or(0)
+    };
     if tip_height > core::CHECKPOINT_DEPTH
         && !FINALITY_FROZEN.load(std::sync::atomic::Ordering::Relaxed)
+        && core::finality_active(tip_work)
     {
         let new_finalized = tip_height - core::CHECKPOINT_DEPTH;
         let current_finalized = store.get_meta("finalized_height").ok().flatten()
@@ -2505,7 +2518,9 @@ fn accept_block(
         if tip_height % 10_000 == 0 {
             info!("archival mode: retaining ALL block bodies (h={}); pruning disabled", tip_height);
         }
-    } else if tip_height > core::PRUNING_DEPTH {
+    } else if tip_height > core::PRUNING_DEPTH && core::finality_active(tip_work) {
+        // Below MIN_CHAIN_WORK nothing is pruned: a deep reorg to the heaviest
+        // chain needs the old bodies.
         let prune_below = tip_height - core::PRUNING_DEPTH;
         let last_pruned = store.pruned_height();
         if prune_below > last_pruned + 1000 { // batch: prune every 1000 blocks

@@ -667,8 +667,19 @@ pub fn validate_block_on_branch(
     branch: &BranchPath,
     block: &Block,
 ) -> Result<u64, BlockTxError> {
+    validate_block_on_branch_with(store, branch, block, true)
+}
+
+/// [`validate_block_on_branch`] with the finality depth cap switched by
+/// `enforce_depth_cap` (off while the tip is below `MIN_CHAIN_WORK`).
+pub fn validate_block_on_branch_with(
+    store: &Storage,
+    branch: &BranchPath,
+    block: &Block,
+    enforce_depth_cap: bool,
+) -> Result<u64, BlockTxError> {
     let BranchPath { to_rollback, to_apply } = branch;
-    if to_rollback.len() as u64 > MAX_REORG_DEPTH {
+    if enforce_depth_cap && to_rollback.len() as u64 > MAX_REORG_DEPTH {
         return Err(BlockTxError::BeyondFinality(format!(
             "branch forks {} blocks below the tip (max {})", to_rollback.len(), MAX_REORG_DEPTH)));
     }
@@ -877,6 +888,18 @@ pub fn execute_reorg(
     mempool: &Mempool,
     plan: &ReorgPlan,
 ) -> Result<ReorgOutcome, String> {
+    execute_reorg_with(store, mempool, plan, true)
+}
+
+/// [`execute_reorg`] with the finality depth cap switched by
+/// `enforce_depth_cap` (off while the tip is below `MIN_CHAIN_WORK`, so a
+/// node fed a cheap chain during initial sync can still reach the heaviest).
+pub fn execute_reorg_with(
+    store: &Storage,
+    mempool: &Mempool,
+    plan: &ReorgPlan,
+    enforce_depth_cap: bool,
+) -> Result<ReorgOutcome, String> {
     // Sprint FF observability: record every attempt and surface the fork
     // depth before doing any work. Failures (including refused-by-depth-cap
     // plans) increment the failures counter — that is the one to alert on.
@@ -886,7 +909,7 @@ pub fn execute_reorg(
     crate::metrics::inc_reorg_attempt();
     crate::metrics::set_fork_depth(plan.to_rollback.len() as i64);
     crate::metrics::observe_reorg_depth(plan.to_rollback.len() as f64);
-    let result = execute_reorg_inner(store, mempool, plan);
+    let result = execute_reorg_inner(store, mempool, plan, enforce_depth_cap);
     match &result {
         Ok(_)  => crate::metrics::inc_reorg_success(),
         Err(_) => crate::metrics::inc_reorg_failure(),
@@ -898,13 +921,14 @@ fn execute_reorg_inner(
     store: &Storage,
     mempool: &Mempool,
     plan: &ReorgPlan,
+    enforce_depth_cap: bool,
 ) -> Result<ReorgOutcome, String> {
     // ── Depth cap (security hardening) ────────────────────────────────────
     // Refuse over-deep plans BEFORE any storage access. Reorg depth = number
     // of established selected-chain blocks the plan unwinds. Distinct error
     // marker so callers can tell policy refusal from execution failure.
     let depth = plan.to_rollback.len() as u64;
-    if depth > MAX_REORG_DEPTH {
+    if enforce_depth_cap && depth > MAX_REORG_DEPTH {
         return Err(format!(
             "{}: plan rolls back {} blocks > cap {} (finality window); refused with no storage mutation",
             ERR_REORG_DEPTH, depth, MAX_REORG_DEPTH,
@@ -1175,6 +1199,24 @@ mod reorg_hardening_unit_tests {
             err.contains(ERR_REORG_DEPTH),
             "too-deep reorg must be refused with the distinct cap error, got: {}", err,
         );
+    }
+
+    /// Below MIN_CHAIN_WORK (finality off) the same over-deep plan is NOT
+    /// refused by the cap: a node fed a cheap chain during initial sync must
+    /// still be able to reorg to the heaviest one. It proceeds and fails only
+    /// on the missing fixture blocks.
+    #[test]
+    fn depth_cap_is_off_while_finality_is_inactive() {
+        let (_tmp, store) = mk_storage();
+        let mempool = Mempool::new();
+        let plan = ReorgPlan {
+            lca:         [0u8; 32],
+            to_rollback: (0..=MAX_REORG_DEPTH).map(hash_of).collect(),
+            to_apply:    vec![[0xEE; 32]],
+        };
+        let err = execute_reorg_with(&store, &mempool, &plan, false).unwrap_err();
+        assert!(!err.contains(ERR_REORG_DEPTH), "no depth refusal without finality: {}", err);
+        assert!(err.contains("block body missing"), "{}", err);
     }
 
     /// Boundary: a plan at EXACTLY the cap passes the gate (it then fails for

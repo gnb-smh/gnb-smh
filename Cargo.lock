@@ -1441,8 +1441,8 @@ dependencies = [
  "pin-project-lite",
  "pqcrypto-falcon",
  "pqcrypto-internals",
- "pqcrypto-kyber",
  "pqcrypto-mldsa",
+ "pqcrypto-mlkem",
  "pqcrypto-traits",
  "primitive-types",
  "prometheus",
@@ -1467,6 +1467,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "x25519-dalek",
  "x509-parser 0.18.1",
  "zeroize",
 ]
@@ -3256,19 +3257,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pqcrypto-kyber"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15c00293cf898859d0c771455388054fd69ab712263c73fdc7f287a39b1ba000"
-dependencies = [
- "cc",
- "glob",
- "libc",
- "pqcrypto-internals",
- "pqcrypto-traits",
-]
-
-[[package]]
 name = "pqcrypto-mldsa"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3278,6 +3266,19 @@ dependencies = [
  "glob",
  "libc",
  "paste",
+ "pqcrypto-internals",
+ "pqcrypto-traits",
+]
+
+[[package]]
+name = "pqcrypto-mlkem"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb14d207f3749e8a59a026c22ceaa72d70fff931cfbf4c8d9b08f3fc56dc6e60"
+dependencies = [
+ "cc",
+ "glob",
+ "libc",
  "pqcrypto-internals",
  "pqcrypto-traits",
 ]

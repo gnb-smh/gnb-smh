@@ -82,6 +82,32 @@ pub const HALVING_INTERVAL:      u64   = tokenomics::HALVING_INTERVAL;
 pub const MAX_BLOCK_SIZE:        usize = 1_000_000;
 pub const TARGET_BLOCK_TIME:     u64   = tokenomics::TARGET_BLOCK_TIME_SECS;
 pub const PROTOCOL_VERSION:      u32   = 1;
+/// Minimum accumulated work (`blue_work` of the selected tip) a node must
+/// reach before it treats its chain as final.
+///
+/// Below it, a node may be on a cheap chain an attacker fed it during initial
+/// sync (ASERT eases the difficulty for a chain behind schedule, so a long
+/// low-work chain from genesis is cheap to build). Until its tip reaches this
+/// work the node keeps finality, the reorg depth cap and pruning OFF, so it can
+/// still switch to the heaviest chain at any depth. Unlike a checkpoint it
+/// names no block and gives no one authority over which chain wins.
+///
+/// Set at each release to a value somewhat below the live selected chain's
+/// `blue_work` at release time (as Bitcoin Core sets `nMinimumChainWork`).
+/// `0` before a chain exists, which leaves behaviour unchanged.
+pub const MIN_CHAIN_WORK: u128 = 0;
+
+/// Whether a node whose selected tip has `tip_blue_work` applies finality
+/// (the reorg depth cap, `finalized_height`, pruning). See [`MIN_CHAIN_WORK`].
+pub fn finality_active(tip_blue_work: u128) -> bool {
+    finality_active_with(tip_blue_work, MIN_CHAIN_WORK)
+}
+
+/// [`finality_active`] against an explicit minimum (testable).
+pub fn finality_active_with(tip_blue_work: u128, min_chain_work: u128) -> bool {
+    tip_blue_work >= min_chain_work
+}
+
 pub const COINBASE_MATURITY:     u64   = 100;        // blocks before coinbase is spendable
 
 /// Verify that none of `tx.inputs` references an immature coinbase output
@@ -929,6 +955,13 @@ impl Block {
             }
         }
         ok
+    }
+
+    /// Whether this block's proof of work was already verified (valid) by
+    /// this process. Never evaluates GnB-SMH.
+    pub fn pow_is_cached(&self) -> bool {
+        let id = self.block_hash();
+        pow_cache().lock().map(|c| c.set.contains(&id)).unwrap_or(false)
     }
 
     /// Basic coinbase format check (value is checked with fees in accept_block).

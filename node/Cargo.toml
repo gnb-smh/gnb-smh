@@ -91,7 +91,10 @@ pqcrypto-mldsa   = "0.1"
 # scripts/falcon-clean-guard.sh. Do not re-enable avx2/neon here.
 pqcrypto-falcon  = { version = "0.4", default-features = false, features = ["std"] }
 pqcrypto-traits  = "0.3"
-pqcrypto-kyber   = "0.8"
+# P2P key exchange: ML-KEM-768 (FIPS 203), hybrid with X25519. Pinned exact,
+# like the other PQClean crates.
+pqcrypto-mlkem   = "=0.1.1"
+x25519-dalek     = { version = "2", features = ["static_secrets", "zeroize"] }
 # Sprint T.1: direct dep on pqcrypto-internals so KATs can call `with_seeded_rng_scope`
 # from the pqcrypto-internals fork (see [patch.crates-io] at bottom). Upstream also
 # exposes this as `pub extern "C" fn PQCRYPTO_RUST_randombytes` — we depend on

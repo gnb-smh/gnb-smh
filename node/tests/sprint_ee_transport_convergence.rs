@@ -45,6 +45,8 @@
 //! The reaction to invalid/oversized frames is asserted deterministically (no
 //! swarm) against the extracted `WirePenaltyTracker` unit in src/network/mod.rs.
 
+mod common;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,9 +169,8 @@ async fn spawn_node(bootstrap_peers: Vec<String>, max_peers: usize) -> Harness {
                     seen.fetch_add(1, Ordering::Relaxed);
                 }
                 if let NetworkMessage::NewBlock { block_data, .. } = msg {
-                    if let Ok((p, _)) = bincode::serde::decode_from_slice::<SimPayload, _>(
-                        &block_data,
-                        bincode::config::standard(),
+                    if let Some(Ok((p, _))) = common::sim_block::unwrap(&block_data).map(|raw|
+                        bincode::serde::decode_from_slice::<SimPayload, _>(&raw, bincode::config::standard())
                     ) {
                         orphans.push(p);
                         // Fixpoint: apply every buffered block whose parents
@@ -264,7 +265,8 @@ async fn propagate_block(producer: &Harness, receivers: &[&Harness], p: &SimPayl
                 .expect("producer add_block");
         }
     }
-    let data = bincode::serde::encode_to_vec(p, bincode::config::standard()).expect("encode payload");
+    let data = common::sim_block::wrap(
+        &bincode::serde::encode_to_vec(p, bincode::config::standard()).expect("encode payload"));
     let (blue_score, height) = {
         let d = producer.dag.read();
         (d.tip_blue_score(), d.block_count() as u64)
@@ -444,4 +446,31 @@ async fn eclipse_inbound_slots_bounded_by_connection_limits() {
         attackers_connected_to_victim <= VICTIM_MAX_PEERS,
         "{attackers_connected_to_victim} attackers connected; cap is {VICTIM_MAX_PEERS}"
     );
+}
+
+/// Peer accountability (network::pow_gate): a peer that delivers a block
+/// whose GnB-SMH proof does not verify is banned and disconnected, and stays
+/// out. Gossip is validated before relay, so only the true sender can be the
+/// source of an invalid proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_proof_of_work_bans_and_disconnects_the_sender() {
+    let a = spawn_node(vec![], 8).await;
+    let b = spawn_node(vec![full_addr(&a)], 8).await;
+    wait_for_mesh(&a, &b).await;
+
+    let bad = common::sim_block::wrap_with_invalid_pow(b"forged proof");
+    a.outbound_tx
+        .send(NetworkMessage::NewBlock { block_hash: [0xBA; 32], blue_score: 1, height: 1, block_data: bad })
+        .await
+        .expect("outbound");
+
+    wait_for(
+        || b.peer_state.connected_count() == 0,
+        Duration::from_secs(60),
+        "B disconnects A after an invalid proof of work",
+    )
+    .await;
+    // B dials A as a bootstrap peer; the ban must keep refusing it.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    assert_eq!(b.peer_state.connected_count(), 0, "banned peer must stay disconnected");
 }
