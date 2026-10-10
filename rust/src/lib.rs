@@ -16,6 +16,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ledger;
+
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::Shake256;
 

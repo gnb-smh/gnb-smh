@@ -15,8 +15,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Reference against test vectors
+      - name: PoW reference against test vectors
         run: python3 reference/check_vectors.py
+      - name: Ledger reference tests
+        run: python3 reference/test_ledger.py
+      - name: Ledger vectors are reproducible
+        run: |
+          python3 reference/gen_ledger_vectors.py
+          git diff --exit-code reference/ledger_vectors.json
 
   rust:
     runs-on: ubuntu-latest
@@ -25,5 +31,5 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
-      - name: Tests (release, includes the Python cross-check)
+      - name: Tests (release, includes both Python cross-checks)
         run: cargo test --release --locked
