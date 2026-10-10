@@ -43,6 +43,7 @@ pub mod encryption;
 #[cfg(feature = "node")]
 pub mod client;
 pub mod errors;
+pub mod policy_spend;   // multi-party spends from policy (multisig/timelock) addresses
 pub mod http_rpc;
 pub mod disclosure;
 
@@ -1102,8 +1103,9 @@ impl TxBuilder {
 
         let to_bytes = hex::decode(to_address_hex)
             .map_err(|_| "invalid destination address hex")?;
-        if to_bytes.len() != 20 {
-            return Err("destination address hash must contain exactly 20 bytes".into());
+        // A 20-byte key hash or a 33-byte policy script (core::policy).
+        if crate::core::policy::output_kind(&to_bytes).is_none() {
+            return Err("destination must be a 20-byte key hash or a 33-byte policy script".into());
         }
         let mut outpoints = std::collections::BTreeSet::new();
         for (txid, index, _) in available_utxos {

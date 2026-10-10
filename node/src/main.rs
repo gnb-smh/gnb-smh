@@ -1269,7 +1269,17 @@ async fn main() {
                     // Sprint 1.d: Bitcoin-format tx wire.
                     if let Ok(tx) = core::Transaction::from_wire_bytes(&tx_data) {
                         if !tx.is_coinbase() {
-                            let height = dag2.read().block_count() as u64;
+                            // The selected tip's HEIGHT, never the DAG block
+                            // count: in a BlockDAG the count exceeds the height
+                            // (parallel blocks are kept), which made every
+                            // coinbase look mature here — the bug the RPC path
+                            // already fixed.
+                            let height = {
+                                let d = dag2.read();
+                                d.selected_tip()
+                                    .and_then(|t| d.get_block_data(&t).map(|bd| bd.height))
+                                    .unwrap_or(0)
+                            };
                             // P0 (roadmap §1.2 / §2.5 #6): move CPU-bound PQ
                             // signature verification off the async reactor so a
                             // gossiped valid-tx flood can't stall this task's
@@ -1648,14 +1658,29 @@ async fn main() {
                     }
                 }
                 mining_round += 1;
-                let txs = mem_m.get_for_block(2000);
-
-                // FIX VULN-05: Compute fees and include in coinbase. See
-                // `miner_template_total_fees`'s doc comment for N-7 (the
-                // duplicate-outpoint fee-inflation fix).
-                let total_fees: u64 = miner_template_total_fees(&txs, &store_m);
-
                 let block_height = current_height + 1;
+                // Template = the mempool candidates that are valid TOGETHER in
+                // this block under the full rule set (blockval). One bad
+                // mempool entry (non-final, conflicting, invalid after a reorg)
+                // can no longer make every mined block invalid; rejected
+                // entries are evicted. The fee total comes from the same
+                // validation (it also covers the N-7 duplicate-outpoint case).
+                let (txs, total_fees) = {
+                    let utxo = |t: &[u8; 32], i: u32| store_m.get_utxo(t, i).map_err(|e| e.to_string());
+                    let coinbase = |t: &[u8; 32]| store_m.get_coinbase_height(t).map_err(|e| e.to_string());
+                    let confirm = |t: &[u8; 32]| store_m.get_tx_location(t)
+                        .map(|o| o.map(|(_, h)| h))
+                        .map_err(|e| e.to_string());
+                    let (txs, fees, rejected) = blockval::select_valid_for_block(
+                        block_height, mem_m.get_for_block(2000), &utxo, &coinbase, &confirm);
+                    for txid in &rejected {
+                        mem_m.remove(txid);
+                    }
+                    if !rejected.is_empty() {
+                        debug!("template: evicted {} invalid mempool tx(s)", rejected.len());
+                    }
+                    (txs, fees)
+                };
                 // Fair launch: 100% of subsidy + fees to the miner, one output.
                 let subsidy = core::tokenomics::block_subsidy_sat(block_height);
                 let cb_outputs = vec![core::TxOutput {
@@ -2179,7 +2204,10 @@ fn accept_block(
             _ => {
                 let utxo = |t: &[u8; 32], i: u32| store.get_utxo(t, i).map_err(|e| e.to_string());
                 let coinbase = |t: &[u8; 32]| store.get_coinbase_height(t).map_err(|e| e.to_string());
-                blockval::validate_block_transactions(block, &utxo, &coinbase)
+                let confirm = |t: &[u8; 32]| store.get_tx_location(t)
+                    .map(|o| o.map(|(_, h)| h))
+                    .map_err(|e| e.to_string());
+                blockval::validate_block_transactions(block, &utxo, &coinbase, &confirm)
             }
         };
         match verdict {
@@ -2803,52 +2831,6 @@ fn drop_orphan_subtree(
 // Unified TX validation lives in `blockval` (shared with the reorg path).
 use blockval::validate_tx_inputs;
 
-/// Compute the total fee the miner's OWN block template may claim across
-/// `txs` (the candidate set selected from the mempool), reading prevout
-/// values from the persistent UTXO set.
-///
-/// SECURITY (Legacy N-7): counts each of a transaction's outpoints ONCE —
-/// insert-as-check, mirroring the C-R3-2 duplicate-outpoint rejection real
-/// admission applies (`validate_tx_inputs`'s `local_spent`). This used to
-/// `filter_map`+`sum` over `tx.inputs` unconditionally, so a transaction
-/// listing the SAME outpoint N times had that outpoint's value summed N
-/// times, inflating the fee the coinbase this template builds is allowed to
-/// claim. Such a transaction is rejected outright by real consensus
-/// validation (the identical insert-as-check, re-run when this self-mined
-/// block is committed through the normal `accept_block` path) — it can never
-/// legitimately contribute ANY fee, so this estimate must not act as if it
-/// could either. Concretely: without this fix, a template that included such
-/// a transaction would build a coinbase `validate_coinbase_value` then
-/// rejects when the self-mined block is committed — wasting the mined block
-/// (a liveness bug) rather than minting anything (accept_block's real,
-/// non-inflating fee computation is still the actual consensus gate) — but
-/// the template must not rely on that backstop to compute a correct number.
-fn miner_template_total_fees(
-    txs:   &[core::Transaction],
-    store: &storage::Storage,
-) -> u64 {
-    txs.iter().map(|tx| {
-        let mut seen_outpoints: HashSet<([u8; 32], u32)> = HashSet::new();
-        let mut has_duplicate_outpoint = false;
-        let mut total_in: u64 = 0;
-        for inp in &tx.inputs {
-            if !seen_outpoints.insert((inp.prev_txid, inp.prev_index)) {
-                has_duplicate_outpoint = true;
-                continue;
-            }
-            if let Ok(Some(out)) = store.get_utxo(&inp.prev_txid, inp.prev_index) {
-                total_in = total_in.saturating_add(out.value);
-            }
-        }
-        if has_duplicate_outpoint {
-            return 0;
-        }
-        let total_out: u64 = tx.outputs.iter()
-            .try_fold(0u64, |acc, o| acc.checked_add(o.value))
-            .unwrap_or(u64::MAX); // overflow → caller (validate_coinbase_value) will reject
-        total_in.saturating_sub(total_out)
-    }).sum()
-}
 
 /// Standalone tx validation (for mempool / sendrawtransaction).
 /// Returns the fee (total_in - total_out).
@@ -2875,8 +2857,12 @@ fn validate_tx_standalone(
     let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
         store.get_utxo(txid, idx).map_err(|e| e.to_string())
     };
-
-    validate_tx_inputs(tx, &lookup, None)
+    let confirm = |t: &[u8; 32]| store.get_tx_location(t)
+        .map(|o| o.map(|(_, h)| h))
+        .map_err(|e| e.to_string());
+    // Evaluated for the next block: locktime and relative timelocks.
+    let ctx = blockval::SpendContext { height: current_height + 1, confirm_height: &confirm };
+    validate_tx_inputs(tx, &lookup, None, &ctx)
 }
 // v0.2.0 PoI
 // v0.2.1 reconnect
@@ -3589,7 +3575,9 @@ mod intra_tx_dup_tests {
         let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
             store.get_utxo(txid, idx).map_err(|e| e.to_string())
         };
-        let err = validate_tx_inputs(&tx, &lookup, None)
+        let confirm = |_: &[u8; 32]| -> Result<Option<u64>, String> { Ok(None) };
+        let ctx = blockval::SpendContext { height: 1, confirm_height: &confirm };
+        let err = validate_tx_inputs(&tx, &lookup, None, &ctx)
             .expect_err("intra-tx duplicate outpoint must be refused");
         assert!(err.contains("double-spend"), "got: {err}");
     }
@@ -3616,43 +3604,59 @@ mod intra_tx_dup_tests {
         assert!(err.contains("below consensus minimum"), "{err}");
     }
 
-    /// Legacy N-7 regression: the MINER's OWN block-template fee estimate
-    /// (`miner_template_total_fees`) must not inflate a duplicate-outpoint
-    /// transaction's fee contribution. A 2-duplicate-input tx spending a
-    /// 100k outpoint and emitting 150k has NO legitimate fee at all (such a
-    /// tx is rejected outright by real admission) — but before the fix,
-    /// summing every input's resolved value unconditionally would have
-    /// counted the 100k outpoint TWICE (200k in, 150k out => 50k "fee").
-    /// Reverting the fix (dropping the insert-as-check) makes this test
-    /// fail (asserting 0 would fail; it would instead read 50_000).
+    fn select(txs: Vec<core::Transaction>, store: &storage::Storage)
+        -> (Vec<core::Transaction>, u64, Vec<[u8; 32]>)
+    {
+        let utxo = |t: &[u8; 32], i: u32| store.get_utxo(t, i).map_err(|e| e.to_string());
+        let coinbase = |t: &[u8; 32]| store.get_coinbase_height(t).map_err(|e| e.to_string());
+        let confirm = |t: &[u8; 32]| store.get_tx_location(t)
+            .map(|o| o.map(|(_, h)| h)).map_err(|e| e.to_string());
+        blockval::select_valid_for_block(1, txs, &utxo, &coinbase, &confirm)
+    }
+
+    /// Legacy N-7 regression: the miner's block template must not count a
+    /// duplicate-outpoint transaction's inflated "fee" (100k spent twice,
+    /// 150k out). The validated template selection rejects the transaction
+    /// outright, so it contributes nothing and is evicted.
     #[test]
     fn miner_template_does_not_inflate_duplicate_outpoint_fee() {
         let (_tmp, store) = mk_store();
         let dup_tx = dup_input_tx(&store, 2, 150_000);
-        let total = miner_template_total_fees(std::slice::from_ref(&dup_tx), &store);
-        assert_eq!(total, 0, "a duplicate-outpoint tx must contribute zero fee to the template");
+        let (selected, fees, rejected) = select(vec![dup_tx.clone()], &store);
+        assert!(selected.is_empty());
+        assert_eq!(fees, 0, "a duplicate-outpoint tx must contribute zero fee to the template");
+        assert_eq!(rejected, vec![dup_tx.txid()]);
     }
 
-    /// Control: an honest, non-duplicated single-input tx still contributes
-    /// its real fee to the template estimate, and a mixed set (one honest,
-    /// one duplicate-outpoint) counts only the honest one.
+    /// Control: an honest single-input tx paying the minimum fee is selected
+    /// with its real fee; in a mixed batch only the honest one is selected.
     #[test]
     fn miner_template_counts_honest_fees_normally() {
         let (_tmp, store) = mk_store();
-        let honest_tx = dup_input_tx(&store, 1, 90_000);
-        assert_eq!(
-            miner_template_total_fees(std::slice::from_ref(&honest_tx), &store),
-            10_000,
-        );
+        let honest_tx = dup_input_tx(&store, 1, 80_000); // fee 20_000 ≥ minimum
+        let (selected, fees, _) = select(vec![honest_tx], &store);
+        assert_eq!((selected.len(), fees), (1, 20_000));
 
         let (_tmp2, store2) = mk_store();
-        let honest_tx2 = dup_input_tx(&store2, 1, 90_000);
+        // Both fixtures fund the same outpoint; the one built LAST owns it.
         let dup_tx2 = dup_input_tx(&store2, 2, 150_000);
-        assert_eq!(
-            miner_template_total_fees(&[honest_tx2, dup_tx2], &store2),
-            10_000,
-            "the mixed batch's total must equal the honest tx's fee alone",
-        );
+        let honest_tx2 = dup_input_tx(&store2, 1, 80_000);
+        let (selected, fees, rejected) = select(vec![honest_tx2.clone(), dup_tx2.clone()], &store2);
+        assert_eq!(selected.iter().map(|t| t.txid()).collect::<Vec<_>>(), vec![honest_tx2.txid()]);
+        assert_eq!(fees, 20_000, "the mixed batch's total must equal the honest tx's fee alone");
+        assert_eq!(rejected, vec![dup_tx2.txid()]);
+    }
+
+    /// A transaction that is not final at the template height is skipped,
+    /// not included (it would make the whole block invalid).
+    #[test]
+    fn miner_template_skips_non_final_transactions() {
+        let (_tmp, store) = mk_store();
+        let mut tx = dup_input_tx(&store, 1, 80_000);
+        tx.locktime = 50; // template height is 1
+        let (selected, _, rejected) = select(vec![tx.clone()], &store);
+        assert!(selected.is_empty());
+        assert_eq!(rejected, vec![tx.txid()]);
     }
 }
 
@@ -3752,7 +3756,8 @@ mod out_of_order_spend_tests {
 
         let utxo = |t: &[u8; 32], i: u32| store.get_utxo(t, i).map_err(|e| e.to_string());
         let cb = |t: &[u8; 32]| store.get_coinbase_height(t).map_err(|e| e.to_string());
-        let err = blockval::validate_block_transactions(&block, &utxo, &cb)
+        let confirm = |_: &[u8; 32]| -> Result<Option<u64>, String> { Ok(None) };
+        let err = blockval::validate_block_transactions(&block, &utxo, &cb, &confirm)
             .expect_err("a transaction must never validate against a LATER transaction's output");
         assert!(matches!(&err, blockval::BlockTxError::Invalid(m) if m.contains("not found")), "expected a prevout-not-found rule violation, got: {err}");
     }
@@ -3813,7 +3818,8 @@ mod out_of_order_spend_tests {
 
         let utxo = |t: &[u8; 32], i: u32| store.get_utxo(t, i).map_err(|e| e.to_string());
         let cb = |t: &[u8; 32]| store.get_coinbase_height(t).map_err(|e| e.to_string());
-        let fees = blockval::validate_block_transactions(&block, &utxo, &cb)
+        let confirm = |_: &[u8; 32]| -> Result<Option<u64>, String> { Ok(None) };
+        let fees = blockval::validate_block_transactions(&block, &utxo, &cb, &confirm)
             .expect("a transaction MAY spend an earlier same-block transaction's output");
         assert_eq!(fees, 100_000);
     }

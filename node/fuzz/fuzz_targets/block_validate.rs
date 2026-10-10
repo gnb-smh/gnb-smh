@@ -9,7 +9,8 @@ fuzz_target!(|data: &[u8]| {
         if block.validate_structure_cheap().is_ok() {
             let utxo = |_: &[u8; 32], _: u32| Ok(None);
             let coinbase = |_: &[u8; 32]| Ok(None);
-            let _ = gnb::blockval::validate_block_transactions(&block, &utxo, &coinbase);
+            let confirm = |_: &[u8; 32]| Ok(None);
+            let _ = gnb::blockval::validate_block_transactions(&block, &utxo, &coinbase, &confirm);
         }
     }
 });

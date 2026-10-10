@@ -9,6 +9,7 @@ use serde::{Serialize, Deserialize};
 
 /// Monetary policy: 10,000,000 GNB hard cap, fair launch, consensus minimum fee.
 pub mod tokenomics;
+pub mod policy;      // m-of-n multisig + absolute/relative timelocks
 
 /// Bloch Genesis-3 carryover: verified, converted opening ledger.
 pub mod carryover;

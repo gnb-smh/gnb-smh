@@ -908,10 +908,17 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // a multi-MB response that overflows clients; a spender only needs enough
             // UTXOs to cover the amount, so it can pass a small limit.
             let limit = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).map(|n| n as usize);
-            let addr_bytes = parse_address(addr);
-            match addr_bytes {
-                Some(ab) => match state.store.get_utxos_for_address(&ab) {
+            // Single-key (gnb1q…) or policy (gnb1m…) address. The address
+            // index is keyed by the script's first 20 bytes; results are
+            // filtered on the FULL script so a prefix match never mixes in
+            // another script's outputs.
+            let script = crate::address::destination_script(addr).ok().map(|(_, spk)| spk);
+            match script {
+                Some(spk) => match state.store.get_utxos_for_address(&spk[..20]) {
                     Ok(utxos) => {
+                        let utxos: Vec<_> = utxos.into_iter()
+                            .filter(|(_, _, o)| o.script_pubkey == spk)
+                            .collect();
                         let total: u64 = utxos.iter().map(|(_, _, o)| o.value).sum();
                         let full_count = utxos.len();
                         let iter = utxos.iter();
@@ -1138,7 +1145,23 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
             // Mempool selection + per-tx fees (mirrors stratum's
             // install_fresh_template).
-            let txs = state.mempool.get_for_block(2000);
+            // Only candidates valid TOGETHER at this height under the full
+            // rule set (blockval); invalid ones are evicted, so an external
+            // miner is never handed a template that cannot be accepted.
+            let txs = {
+                let store = &state.store;
+                let utxo = |t: &[u8; 32], i: u32| store.get_utxo(t, i).map_err(|e| e.to_string());
+                let coinbase = |t: &[u8; 32]| store.get_coinbase_height(t).map_err(|e| e.to_string());
+                let confirm = |t: &[u8; 32]| store.get_tx_location(t)
+                    .map(|o| o.map(|(_, h)| h))
+                    .map_err(|e| e.to_string());
+                let (txs, _fees, rejected) = crate::blockval::select_valid_for_block(
+                    height, state.mempool.get_for_block(2000), &utxo, &coinbase, &confirm);
+                for txid in &rejected {
+                    state.mempool.remove(txid);
+                }
+                txs
+            };
             let mut total_fees: u64 = 0;
             let tx_entries: Vec<Value> = txs.iter().map(|tx| {
                 let fee = state.mempool.get_entry(&tx.txid()).map(|e| e.fee).unwrap_or(0);
@@ -1706,8 +1729,6 @@ fn format_tx(tx: &Transaction) -> Value {
 /// Callers must pass current chain height for the maturity check. Height of 0
 /// (genesis only) skips the check since there is no matured coinbase to spend.
 fn validate_tx_for_mempool(tx: &Transaction, store: &Arc<Storage>, current_height: u64) -> Result<u64, String> {
-    use sha3::{Sha3_256, Digest};
-
     // Coinbase maturity check (VULN-03). Single source of truth in
     // core::check_coinbase_maturity; this call site is one of two.
     crate::core::check_coinbase_maturity(tx, current_height, |txid| {
@@ -1732,36 +1753,16 @@ fn validate_tx_for_mempool(tx: &Transaction, store: &Arc<Storage>, current_heigh
         }
     }
 
-    let mut total_in = 0u64;
-    // C-R3-2: intra-tx duplicate-outpoint check (insert-as-check, the same
-    // pattern as `euvm_admit_tx_standalone` step (e)). Without it a tx
-    // listing the SAME outpoint N times had its value counted N times below
-    // and was admitted with an N×-inflated fee — an intra-tx double-spend.
-    let mut spent_in_tx = std::collections::HashSet::<([u8; 32], u32)>::new();
-    for (i, inp) in tx.inputs.iter().enumerate() {
-        if !spent_in_tx.insert((inp.prev_txid, inp.prev_index)) {
-            return Err(format!("double-spend: {}:{} already consumed",
-                hex::encode(&inp.prev_txid[..8]), inp.prev_index));
-        }
-        let utxo = store.get_utxo(&inp.prev_txid, inp.prev_index)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("UTXO {}:{} not found", hex::encode(&inp.prev_txid[..8]), inp.prev_index))?;
-        total_in = total_in.checked_add(utxo.value).ok_or("overflow")?;
-        let (sig, pk) = Transaction::parse_script_sig(&inp.script_sig)
-            .ok_or_else(|| format!("malformed script_sig at input {}", i))?;
-        let pk_hash = Sha3_256::digest(&pk)[..20].to_vec();
-        if pk_hash != utxo.script_pubkey { return Err(format!("pubkey mismatch at input {}", i)); }
-        if !crate::crypto::verify(&pk, &tx.sighash(i, crate::core::node_chain_id()), &sig) {
-            return Err(format!("invalid signature at input {}", i));
-        }
-    }
-    let total_out: u64 = tx.outputs.iter()
-        .try_fold(0u64, |acc, o| acc.checked_add(o.value))
-        .ok_or_else(|| "output sum overflow".to_string())?;
-    if total_in < total_out { return Err("inputs < outputs".into()); }
-    let fee = total_in - total_out;
-    crate::core::check_min_fee(tx, fee)?;
-    Ok(fee)
+    // Every input/signature/policy/timelock/fee rule: the ONE implementation
+    // block validation uses (crate::blockval), evaluated for the next block
+    // (current_height + 1). This handler used to carry its own copy of the
+    // input rules, which could drift from consensus.
+    let utxo = |t: &[u8; 32], i: u32| store.get_utxo(t, i).map_err(|e| e.to_string());
+    let confirm = |t: &[u8; 32]| store.get_tx_location(t)
+        .map(|o| o.map(|(_, h)| h))
+        .map_err(|e| e.to_string());
+    let ctx = crate::blockval::SpendContext { height: current_height + 1, confirm_height: &confirm };
+    crate::blockval::validate_tx_inputs(tx, &utxo, None, &ctx)
 }
 
 

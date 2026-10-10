@@ -645,7 +645,9 @@ fn branch_block_is_valid_against_its_own_parent_state() {
     // missing output.
     let tip_utxo = |t: &[u8; 32], i: u32| store.get_utxo(t, i).map_err(|e| e.to_string());
     let tip_cb = |t: &[u8; 32]| store.get_coinbase_height(t).map_err(|e| e.to_string());
-    assert!(matches!(validate_block_transactions(&b1, &tip_utxo, &tip_cb),
+    let tip_confirm = |t: &[u8; 32]| store.get_tx_location(t)
+        .map(|o| o.map(|(_, h)| h)).map_err(|e| e.to_string());
+    assert!(matches!(validate_block_transactions(&b1, &tip_utxo, &tip_cb, &tip_confirm),
                      Err(BlockTxError::Invalid(_))));
 
     // The fix: against its parent's (genesis) state, B1 is valid.

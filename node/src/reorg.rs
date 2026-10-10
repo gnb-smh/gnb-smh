@@ -372,6 +372,8 @@ struct ReorgBatch<'a> {
     utxo_overlay: HashMap<Vec<u8>, Option<TxOutput>>,
     /// coinbase txid → Some(height) if staged-put, None if staged-deleted.
     coinbase_overlay: HashMap<[u8; 32], Option<u64>>,
+    /// txid → Some(confirmation height) if staged-indexed, None if staged-removed.
+    tx_overlay: HashMap<[u8; 32], Option<u64>>,
 }
 
 impl<'a> ReorgBatch<'a> {
@@ -381,6 +383,7 @@ impl<'a> ReorgBatch<'a> {
             batch: rocksdb::WriteBatch::default(),
             utxo_overlay: HashMap::new(),
             coinbase_overlay: HashMap::new(),
+            tx_overlay: HashMap::new(),
         }
     }
 
@@ -405,6 +408,16 @@ impl<'a> ReorgBatch<'a> {
         }
         self.store.get_coinbase_height(txid)
             .map_err(|e| format!("reorg batch: get_coinbase_height failed: {}", e))
+    }
+
+    /// Overlay-aware confirmation height of a txid (the tx index).
+    fn get_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String> {
+        if let Some(staged) = self.tx_overlay.get(txid) {
+            return Ok(*staged);
+        }
+        self.store.get_tx_location(txid)
+            .map(|o| o.map(|(_, h)| h))
+            .map_err(|e| format!("reorg batch: get_tx_location failed: {}", e))
     }
 
     /// Mirrors `Storage::put_utxo` (CF_UTXO row + CF_ADDR_UTXO index row).
@@ -459,12 +472,14 @@ impl<'a> ReorgBatch<'a> {
         val.extend_from_slice(block_hash);
         val.extend_from_slice(&height.to_le_bytes());
         self.batch.put_cf(cf, txid, &val);
+        self.tx_overlay.insert(*txid, Some(height));
         Ok(())
     }
 
     fn delete_tx_index(&mut self, txid: &[u8; 32]) -> Result<(), String> {
         let cf = self.cf(CF_TX_INDEX)?;
         self.batch.delete_cf(cf, txid);
+        self.tx_overlay.insert(*txid, None);
         Ok(())
     }
 
@@ -645,7 +660,8 @@ fn apply_block_utxo_mutations_batched(
 fn validate_fork_block_state(batch: &ReorgBatch, block: &Block) -> Result<(), BlockTxError> {
     let utxo = |t: &[u8; 32], i: u32| batch.get_utxo(t, i);
     let coinbase = |t: &[u8; 32]| batch.get_coinbase_height(t);
-    crate::blockval::validate_block_transactions(block, &utxo, &coinbase).map(|_| ())
+    let confirm = |t: &[u8; 32]| batch.get_tx_height(t);
+    crate::blockval::validate_block_transactions(block, &utxo, &coinbase, &confirm).map(|_| ())
 }
 
 /// Validate `block`'s transactions against the UTXO state of its selected
@@ -754,7 +770,8 @@ fn validate_on_branch_inner(
 
     let utxo = |t: &[u8; 32], i: u32| batch.get_utxo(t, i);
     let coinbase = |t: &[u8; 32]| batch.get_coinbase_height(t);
-    let fees = crate::blockval::validate_block_transactions(block, &utxo, &coinbase);
+    let confirm = |t: &[u8; 32]| batch.get_tx_height(t);
+    let fees = crate::blockval::validate_block_transactions(block, &utxo, &coinbase, &confirm);
     drop(batch); // never committed
     fees
 }

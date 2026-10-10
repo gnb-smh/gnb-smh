@@ -81,7 +81,7 @@ fn gate_block(
     source: &'static str,
 ) {
     use gossipsub::MessageAcceptance::{Accept, Ignore, Reject};
-    let mut report = |swarm: &mut Swarm<BlochBehaviour>, a: gossipsub::MessageAcceptance| {
+    let report = |swarm: &mut Swarm<BlochBehaviour>, a: gossipsub::MessageAcceptance| {
         if let Some(id) = &message_id {
             let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(id, &peer, a);
         }

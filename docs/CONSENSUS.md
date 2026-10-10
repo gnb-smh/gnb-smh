@@ -66,6 +66,11 @@ acceptance, reorgs, and in-memory branch validation. In block order:
   ML-DSA-65 ‖ Falcon-1024 signature verifies;
 - inputs ≥ outputs (checked arithmetic) and the fee meets the consensus
   minimum;
+- `locktime` is a block height: the transaction is valid only in a block at
+  height ≥ `locktime`;
+- outputs are a 20-byte key hash or a 33-byte spend policy
+  ([multisig and timelocks](MULTISIG.md)); a policy input must reveal the
+  committed policy, satisfy its timelocks and carry `m` valid signatures;
 - a transaction may spend outputs of earlier transactions in the same block,
   never its own or a later one's;
 - no input may reference a coinbase with fewer than 100 confirmations,
