@@ -1,0 +1,60 @@
+# Coverage-guided fuzzing (cargo-fuzz / libFuzzer). Not part of the workspace.
+#   cargo install cargo-fuzz
+#   cd node && cargo +nightly fuzz run <target> fuzz/corpus/<target>
+# Every target asserts the same invariant: attacker-controlled bytes produce
+# Ok/Err, never a panic (a panic on a crafted buffer is a remote DoS).
+[package]
+name = "gnb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+gnb = { path = "..", features = ["node"] }
+
+[workspace]
+
+[[bin]]
+name = "tx_parse"
+path = "fuzz_targets/tx_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_parse"
+path = "fuzz_targets/block_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "netmsg_decode"
+path = "fuzz_targets/netmsg_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_decode"
+path = "fuzz_targets/sync_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_validate"
+path = "fuzz_targets/block_validate.rs"
+test = false
+doc = false
+bench = false
+
+# Same patched crates as the root workspace, so the fuzzed code is the code
+# that ships (vendored pqcrypto-internals; libp2p-yamux without yamux 0.12).
+[patch.crates-io]
+pqcrypto-internals = { path = "../../crates/pqcrypto-internals" }
+libp2p-yamux = { path = "../../crates/libp2p-yamux" }

@@ -12,7 +12,7 @@ members = [
     "node",                   # the `gnb` full node, `gnb-cli`, `gnb-wallet`
 ]
 # Standalone reference crate (GnB-SMH v1 + ledger v1) with its own Cargo.lock.
-exclude = ["rust"]
+exclude = ["rust", "node/fuzz"]
 
 # GnB-SMH is 2^20 Keccak permutations per evaluation; unoptimized it makes
 # every test that touches a block take seconds. Optimize the hashing crates in

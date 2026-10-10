@@ -27,6 +27,7 @@ use crate::consensus::{BlockHash, GhostDAG};
 use crate::core::{Block, Transaction, TxOutput, UndoData, UndoEntry};
 use crate::mempool::Mempool;
 use crate::storage::Storage;
+use crate::blockval::BlockTxError;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Reorg depth cap (security hardening)
@@ -336,6 +337,7 @@ const CF_COINBASE:        &str = "coinbase";
 const CF_TX_INDEX:        &str = "tx_index";
 const CF_UNDO:            &str = "undo";
 const CF_ADDR_TX_HISTORY: &str = "addr_tx_history";
+const CF_META:            &str = "meta";
 
 /// UTXO key: `[txid][4B index LE]` — mirrors `storage::utxo_key`.
 fn utxo_key(txid: &[u8; 32], index: u32) -> Vec<u8> {
@@ -488,6 +490,13 @@ impl<'a> ReorgBatch<'a> {
         Ok(())
     }
 
+    /// Mirrors `Storage::put_meta` (ascii key → raw value).
+    fn put_meta(&mut self, key: &str, value: &[u8]) -> Result<(), String> {
+        let cf = self.cf(CF_META)?;
+        self.batch.put_cf(cf, key.as_bytes(), value);
+        Ok(())
+    }
+
     /// Commit every staged mutation atomically. Consumes the batch; RocksDB
     /// applies a WriteBatch all-or-nothing.
     fn commit(self) -> Result<(), String> {
@@ -623,64 +632,153 @@ fn apply_block_utxo_mutations_batched(
 /// SECURITY (audit H1): re-validate a fork block's transactions against the
 /// *incrementally-reorged* UTXO state before applying it during a reorg.
 ///
-/// Signatures are state-independent and were already verified at accept time,
-/// so we re-check only the rules that differ between the accept-time
-/// (main-chain) view and the fork's own context: input existence, no
-/// double-spend, value conservation, and coinbase maturity. Without this, a
-/// fork-loser block that spends an output which only ever existed on the main
-/// chain — or that double-spends — would be applied unvalidated and mint coins
-/// from nothing when the fork wins.
+/// Runs the FULL consensus rule set (`blockval::validate_block_transactions`:
+/// input existence, no double-spend, pubkey binding, hybrid signature, value
+/// conservation, minimum fee, coinbase maturity and coinbase value) — the same
+/// code the main-chain extension path runs. A block on a competing branch is
+/// not state-validated when it arrives (its parents' state is not the tip's),
+/// so this is the point where it is fully validated, exactly as Bitcoin Core
+/// connects side-chain blocks only when their branch becomes the best one.
 ///
 /// Reads go through the [`ReorgBatch`] overlay so the "incrementally-reorged"
 /// state is visible even though nothing has been committed to disk yet.
-fn validate_fork_block_state(batch: &ReorgBatch, block: &Block) -> Result<(), String> {
-    // Outputs created earlier in THIS block (outpoint -> value) so a later tx
-    // can spend an earlier one; coinbase outputs are tracked separately because
-    // they are immature to spend within the same block.
-    let mut created: HashMap<([u8; 32], u32), u64> = HashMap::new();
-    let mut created_coinbase: HashSet<([u8; 32], u32)> = HashSet::new();
-    let mut spent: HashSet<([u8; 32], u32)> = HashSet::new();
+fn validate_fork_block_state(batch: &ReorgBatch, block: &Block) -> Result<(), BlockTxError> {
+    let utxo = |t: &[u8; 32], i: u32| batch.get_utxo(t, i);
+    let coinbase = |t: &[u8; 32]| batch.get_coinbase_height(t);
+    crate::blockval::validate_block_transactions(block, &utxo, &coinbase).map(|_| ())
+}
 
-    for tx in &block.transactions {
-        let txid = tx.txid();
-        if !tx.is_coinbase() {
-            let mut in_sum: u64 = 0;
-            for inp in &tx.inputs {
-                let op = (inp.prev_txid, inp.prev_index);
-                if !spent.insert(op) {
-                    return Err(format!("double-spend of {}:{} within fork block",
-                        hex::encode(&op.0[..4]), op.1));
-                }
-                let val = if let Some(v) = created.get(&op) {
-                    if created_coinbase.contains(&op) {
-                        return Err(format!("spends immature same-block coinbase {}:{}",
-                            hex::encode(&op.0[..4]), op.1));
-                    }
-                    *v
-                } else {
-                    match batch.get_utxo(&inp.prev_txid, inp.prev_index) {
-                        Ok(Some(out)) => out.value,
-                        _ => return Err(format!("input {}:{} absent from reorged UTXO set",
-                            hex::encode(&op.0[..4]), op.1)),
-                    }
-                };
-                in_sum = in_sum.saturating_add(val);
-            }
-            let out_sum: u64 = tx.outputs.iter().map(|o| o.value).sum();
-            if in_sum < out_sum {
-                return Err(format!("value violation: inputs {} < outputs {}", in_sum, out_sum));
-            }
-            crate::core::check_coinbase_maturity(tx, block.height, |t| {
-                batch.get_coinbase_height(t).ok().flatten()
-            })?;
-        }
-        for (j, out) in tx.outputs.iter().enumerate() {
-            let op = (txid, j as u32);
-            created.insert(op, out.value);
-            if tx.is_coinbase() { created_coinbase.insert(op); }
-        }
+/// Validate `block`'s transactions against the UTXO state of its selected
+/// parent `selected_parent`, which is NOT the current selected tip.
+///
+/// SECURITY: a block on a competing branch must be judged against its own
+/// branch's state, not the tip's. This builds that state in memory — the
+/// same staged rollback (tip → common ancestor) and re-apply (ancestor →
+/// `selected_parent`) a real reorg would perform, every re-applied block
+/// re-validated under the full rule set — validates `block` on top of it,
+/// and then DROPS the batch: nothing is ever committed, the UTXO set and
+/// indexes are untouched. Only blocks that pass are stored, indexed or
+/// inserted into the DAG, so an invalid block never reaches storage.
+///
+/// Bounded by `MAX_REORG_DEPTH` (the finality window): a branch forking
+/// deeper than that can never become the selected chain anyway.
+pub fn validate_block_on_branch(
+    store: &Storage,
+    branch: &BranchPath,
+    block: &Block,
+) -> Result<u64, BlockTxError> {
+    let BranchPath { to_rollback, to_apply } = branch;
+    if to_rollback.len() as u64 > MAX_REORG_DEPTH {
+        return Err(BlockTxError::BeyondFinality(format!(
+            "branch forks {} blocks below the tip (max {})", to_rollback.len(), MAX_REORG_DEPTH)));
     }
-    Ok(())
+    validate_on_branch_inner(store, to_rollback, to_apply, block)
+}
+
+/// The staged rollback / re-apply path from the selected tip to a branch
+/// block's selected parent. Computed under the DAG read lock by
+/// [`branch_path`]; the (storage-heavy) validation then runs without it.
+pub struct BranchPath {
+    /// Tip-first blocks to roll back down to the common ancestor.
+    pub to_rollback: Vec<BlockHash>,
+    /// Ancestor-first blocks to re-apply up to the selected parent.
+    pub to_apply: Vec<BlockHash>,
+}
+
+/// Path from `old_tip` to `selected_parent` through their common ancestor.
+pub fn branch_path(
+    dag: &GhostDAG,
+    old_tip: &BlockHash,
+    selected_parent: &BlockHash,
+) -> Result<BranchPath, BlockTxError> {
+    let (to_rollback, to_apply) = {
+        let lca = find_lca(dag, old_tip, selected_parent).ok_or_else(|| BlockTxError::Invalid(
+            "branch has no common ancestor with the selected chain".into()))?;
+        let to_rollback = if lca == *old_tip {
+            Vec::new()
+        } else {
+            selected_path_to(dag, old_tip, &lca).ok_or_else(|| BlockTxError::Storage(
+                "selected path from tip to common ancestor unavailable".into()))?
+        };
+        let mut to_apply = if lca == *selected_parent {
+            Vec::new()
+        } else {
+            selected_path_to(dag, selected_parent, &lca).ok_or_else(|| BlockTxError::Storage(
+                "selected path from parent to common ancestor unavailable".into()))?
+        };
+        to_apply.reverse();
+        (to_rollback, to_apply)
+    };
+    Ok(BranchPath { to_rollback, to_apply })
+}
+
+fn validate_on_branch_inner(
+    store: &Storage,
+    to_rollback: &[BlockHash],
+    to_apply: &[BlockHash],
+    block: &Block,
+) -> Result<u64, BlockTxError> {
+
+    let load = |hash: &BlockHash| -> Result<Block, BlockTxError> {
+        store.get_block(hash)
+            .map_err(|e| BlockTxError::Storage(format!("get_block: {}", e)))?
+            .ok_or_else(|| BlockTxError::Storage(format!(
+                "block body {} unavailable", hex::encode(&hash[..8]))))
+    };
+
+    let mut batch = ReorgBatch::new(store);
+    for hash in to_rollback {
+        let b = load(hash)?;
+        rollback_block_batched(&mut batch, &b, hash).map_err(BlockTxError::Storage)?;
+    }
+    for hash in to_apply {
+        let b = load(hash)?;
+        validate_fork_block_state(&batch, &b).map_err(|e| match e {
+            BlockTxError::Invalid(r) => BlockTxError::Invalid(format!(
+                "ancestor {} invalid: {}", hex::encode(&hash[..8]), r)),
+            other => other,
+        })?;
+        apply_block_utxo_mutations_batched(&mut batch, &b).map_err(BlockTxError::Storage)?;
+    }
+
+    let utxo = |t: &[u8; 32], i: u32| batch.get_utxo(t, i);
+    let coinbase = |t: &[u8; 32]| batch.get_coinbase_height(t);
+    let fees = crate::blockval::validate_block_transactions(block, &utxo, &coinbase);
+    drop(batch); // never committed
+    fees
+}
+
+/// Meta key recording that a block failed full validation.
+fn invalid_block_key(hash: &[u8; 32]) -> String {
+    format!("invalid_block:{}", hex::encode(hash))
+}
+
+/// Durably mark `hash` as consensus-invalid. Any block that has it as a
+/// parent is rejected on arrival (`is_block_invalid`), so an invalid branch
+/// is evaluated once, never re-tried on every descendant.
+pub fn mark_block_invalid(store: &Storage, hash: &[u8; 32]) {
+    if let Err(e) = store.put_meta(&invalid_block_key(hash), &[1]) {
+        log::error!("mark_block_invalid({}): {}", hex::encode(&hash[..8]), e);
+    }
+}
+
+/// Whether `hash` was marked consensus-invalid.
+pub fn is_block_invalid(store: &Storage, hash: &[u8; 32]) -> bool {
+    matches!(store.get_meta(&invalid_block_key(hash)), Ok(Some(_)))
+}
+
+/// SECURITY (Legacy M-7): apply a main-chain extension block ATOMICALLY.
+///
+/// Every UTXO / coinbase / tx-index / undo mutation of the block and the
+/// `tip_hash` update are staged into one RocksDB `WriteBatch` and committed
+/// with a single `db.write()`. A failure at any point before the commit
+/// leaves storage byte-identical to the pre-block state; there is no
+/// half-applied block.
+pub fn apply_block_atomic(store: &Storage, block: &Block) -> Result<(), String> {
+    let mut batch = ReorgBatch::new(store);
+    apply_block_utxo_mutations_batched(&mut batch, block)?;
+    batch.put_meta("tip_hash", &block.block_hash())?;
+    batch.commit()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -877,6 +975,11 @@ fn execute_reorg_inner(
             .ok_or_else(|| format!("execute_reorg: block body missing for apply target"))?;
 
         if let Err(reason) = validate_fork_block_state(&batch, &block) {
+            // Only a rule violation is a permanent verdict; a storage read
+            // failure says nothing about the block.
+            if matches!(reason, BlockTxError::Invalid(_)) {
+                mark_block_invalid(store, hash);
+            }
             log::error!(
                 "execute_reorg: fork block h={} failed re-validation ({}); aborting reorg (atomic batch dropped, storage untouched)",
                 block.height, reason
@@ -926,6 +1029,30 @@ mod reorg_hardening_unit_tests {
     use super::*;
     use crate::core::{BlockHeader, TxInput};
     use tempfile::TempDir;
+
+    /// Test signer: a real hybrid keypair, so fork blocks pass the FULL rule set
+    /// (`blockval::validate_block_transactions`) that reorgs now enforce.
+    fn test_key() -> &'static (Vec<u8>, Vec<u8>) {
+        static KEY: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+        KEY.get_or_init(crate::crypto::generate_keypair)
+    }
+
+    /// `script_pubkey` paying `test_key()`.
+    fn owner_script() -> Vec<u8> {
+        use sha3::{Digest as _, Sha3_256};
+        Sha3_256::digest(&test_key().0)[..20].to_vec()
+    }
+
+    /// Sign every input of `tx` with `test_key()`.
+    fn signed(mut tx: Transaction) -> Transaction {
+        let (pk, sk) = test_key();
+        for i in 0..tx.inputs.len() {
+            let sighash = tx.sighash(i, crate::core::node_chain_id());
+            let sig = crate::crypto::sign(sk, &sighash).expect("sign");
+            tx.inputs[i].script_sig = Transaction::build_script_sig(&sig, pk);
+        }
+        tx
+    }
 
     fn mk_storage() -> (TempDir, Storage) {
         let tmp = TempDir::new().unwrap();
@@ -994,7 +1121,7 @@ mod reorg_hardening_unit_tests {
     #[test]
     fn reorg_batch_column_families_exist() {
         let (_tmp, store) = mk_storage();
-        for name in [CF_UTXO, CF_ADDR_UTXO, CF_COINBASE, CF_TX_INDEX, CF_UNDO, CF_ADDR_TX_HISTORY] {
+        for name in [CF_UTXO, CF_ADDR_UTXO, CF_COINBASE, CF_TX_INDEX, CF_UNDO, CF_ADDR_TX_HISTORY, CF_META] {
             assert!(
                 store.db().cf_handle(name).is_some(),
                 "column family '{}' missing — reorg batch constants must mirror src/storage/mod.rs",
@@ -1134,6 +1261,39 @@ mod reorg_hardening_unit_tests {
         assert!(store.get_utxo(&b1.transactions[0].txid(), 0).unwrap().is_none());
     }
 
+    /// Legacy M-7: an extension block is applied in ONE atomic batch together
+    /// with the tip pointer — UTXOs, coinbase index, tx index, undo record and
+    /// `tip_hash` all land, or none do.
+    #[test]
+    fn apply_block_atomic_lands_every_key_and_the_tip_together() {
+        let (_tmp, store) = mk_storage();
+        let b = mk_block_at(1, 0x0C01, vec![mk_coinbase(0xC1, 100, 1, 9)]);
+        let h = b.block_hash();
+        let cb = b.transactions[0].txid();
+        apply_block_atomic(&store, &b).expect("atomic apply");
+        assert!(store.get_utxo(&cb, 0).unwrap().is_some());
+        assert_eq!(store.get_coinbase_height(&cb).unwrap(), Some(1));
+        assert!(store.get_undo_data(&h).unwrap().is_some());
+        assert_eq!(store.get_tx_location(&cb).unwrap().map(|(bh, _)| bh), Some(h));
+        assert_eq!(store.get_meta("tip_hash").unwrap().as_deref(), Some(&h[..]));
+    }
+
+    /// Recorded invalid blocks survive reopening the database.
+    #[test]
+    fn invalid_block_mark_is_durable() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("db");
+        let h = [0x42u8; 32];
+        {
+            let store = Storage::open(&path).unwrap();
+            assert!(!is_block_invalid(&store, &h));
+            mark_block_invalid(&store, &h);
+        }
+        let store = Storage::open(&path).unwrap();
+        assert!(is_block_invalid(&store, &h));
+        assert!(!is_block_invalid(&store, &[0x43u8; 32]));
+    }
+
     /// Atomic-batch success path: after a committed reorg, ALL reorg keys are
     /// applied — old chain fully rolled back, every fork block fully applied
     /// (UTXOs, coinbase index, tx index, fresh undo records) — including a
@@ -1146,7 +1306,8 @@ mod reorg_hardening_unit_tests {
 
         // Seed a spendable outpoint U that exists independently of both forks.
         let u_txid = [0x55u8; 32];
-        store.put_utxo(&u_txid, 0, &mk_output(0x99, 100)).unwrap();
+        store.put_utxo(&u_txid, 0,
+            &TxOutput { value: 1_000_000, script_pubkey: owner_script() }).unwrap();
 
         // Established chain: A1 applied.
         let a1 = mk_block_at(1, 0x0A01, vec![mk_coinbase(0xA1, 100, 1, 1)]);
@@ -1154,14 +1315,17 @@ mod reorg_hardening_unit_tests {
         store.put_block(&a1).unwrap();
         apply_block_utxo_mutations(&store, &a1).unwrap();
 
-        // Fork: B1 = [cb_b1, tx1: U(100) → X(90)], B2 = [cb_b2, tx2: X(90) → Y(80)].
+        // Fork: B1 = [cb_b1, tx1: U → X], B2 = [cb_b2, tx2: X → Y] (signed, min-fee paying).
         let cb_b1 = mk_coinbase(0xB1, 100, 1, 2);
-        let tx1   = mk_spend_tx(u_txid, 0, 0xB2, 90, 1);
+        // Values leave each tx at least the consensus minimum fee.
+        let mut tx1 = mk_spend_tx(u_txid, 0, 0xB2, 900_000, 1);
+        tx1.outputs[0].script_pubkey = owner_script(); // spent by tx2 below
+        let tx1   = signed(tx1);
         let x_txid = tx1.txid();
         let b1 = mk_block_at(1, 0x0B01, vec![cb_b1.clone(), tx1]);
 
         let cb_b2 = mk_coinbase(0xB3, 100, 2, 3);
-        let tx2   = mk_spend_tx(x_txid, 0, 0xB4, 80, 2);
+        let tx2   = signed(mk_spend_tx(x_txid, 0, 0xB4, 800_000, 2));
         let y_txid = tx2.txid();
         let b2 = mk_block_at(2, 0x0B02, vec![cb_b2.clone(), tx2.clone()]);
 

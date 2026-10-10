@@ -40,18 +40,85 @@ obtain from a future timestamp to about 6%.
 
 ## Acceptance order
 
-`accept_block` runs the cheap checks first and the proof of work last:
+No ingress path (P2P, `submitblock`, the built-in miner) evaluates the proof of
+work before the contextual checks. `accept_block` runs the cheap checks first
+and the proof of work last:
 
-1. not already known; parents present in the DAG;
+1. not already known; not recorded invalid, and no parent recorded invalid;
+   parents present in the DAG;
 2. height = max parent height + 1;
 3. `bits == expected_bits(parents, height)`;
 4. timestamp bounds;
 5. GnB-SMH proof (64 MiB, cached by block id);
-6. transactions (signatures, double spends, coinbase maturity at the block's
-   consensus height, consensus minimum fee), coinbase value.
+6. transactions and coinbase value, against the UTXO state of the block's
+   **selected parent** (below).
 
 Structural checks (size, merkle root, coinbase shape, duplicates, dust) run
-before `accept_block` on every ingress path.
+before `accept_block` on every ingress path, without the proof of work.
+
+### Transaction rules
+
+One implementation (`node/src/blockval.rs`) is used on every path: block
+acceptance, reorgs, and in-memory branch validation. In block order:
+
+- each input exists in the state, is not spent twice in the transaction or the
+  block, its pubkey hashes to the output's `script_pubkey`, and its hybrid
+  ML-DSA-65 ‖ Falcon-1024 signature verifies;
+- inputs ≥ outputs (checked arithmetic) and the fee meets the consensus
+  minimum;
+- a transaction may spend outputs of earlier transactions in the same block,
+  never its own or a later one's;
+- no input may reference a coinbase with fewer than 100 confirmations,
+  including the block's own coinbase;
+- the coinbase pays at most subsidy + fees.
+
+### Which state a block is validated against
+
+- **Selected parent = current tip:** the committed UTXO set.
+- **Selected parent on another branch:** the branch state is rebuilt in
+  memory (roll back the tip to the common ancestor, re-apply the branch, every
+  re-applied block re-validated) and discarded after the check. Nothing is
+  written. Branches forking more than `CHECKPOINT_DEPTH` (1,000) blocks below
+  the tip are rejected.
+- **Reorg:** every block of the new chain is re-validated against the
+  incrementally reorged state before the single atomic commit.
+
+A block is stored, indexed and inserted into the DAG only after it passes.
+
+### Atomic state changes
+
+Extending the chain writes every UTXO, coinbase-index, tx-index and undo
+mutation and the `tip_hash` in one RocksDB `WriteBatch`. A reorg commits its
+whole rollback and re-apply in one batch. A failure leaves storage unchanged.
+
+### Recorded invalid blocks
+
+A block that breaks a rule over data its hash commits to (missing or
+double-spent input, value, maturity, coinbase value) is recorded invalid in
+`meta` and rejected on sight afterwards, together with every descendant.
+
+The txid, and so the merkle root and the block hash, does not commit to
+`script_sig`. A copy of a valid block with a corrupted signature has the same
+hash. Failures that depend on `script_sig` (signature, pubkey binding, the
+size-based minimum fee) and storage read errors therefore reject the copy
+received but are **never** recorded, so the honest copy is still accepted.
+
+### Orphans
+
+A block whose parents are unknown cannot have its difficulty checked exactly.
+Before its proof of work is evaluated, before it is buffered and before its
+parents are requested, it must pass:
+
+1. timestamp at most 600 s ahead;
+2. `target(bits) ≤ target(expected_bits(block.timestamp, height))`. ASERT
+   eases monotonically with the parent timestamp, and a parent is never later
+   than its child, so this is the easiest difficulty any valid block at that
+   height can have;
+3. at most 2^8 times easier than the current tip's next block (policy);
+4. the proof of work.
+
+The orphan pool holds at most 10,000 blocks and 128 MiB, evicting the lowest
+height first.
 
 ## GhostDAG
 

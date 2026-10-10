@@ -30,6 +30,7 @@ mod transport;
 mod mempool;
 mod analytics;
 mod reorg;
+mod blockval;    // single block-transaction rule set (accept + reorg)
 mod attestation;  // L3 attestation (referenced by rpc)
 mod coherence;    // Coherence C2 shielded pool
 mod dandelion;    // Coherence P3 Dandelion++ tx-relay privacy
@@ -769,6 +770,9 @@ async fn main() {
           let processor = async {
             // Orphan pool: blocks received before their parents
             const MAX_ORPHANS: usize = 10_000;
+            // Memory bound for the orphan pool (raw wire bytes; the parsed
+            // copy is of the same order). 10,000 × 1 MB used to allow ~20 GB.
+            const MAX_ORPHAN_BYTES: usize = 128 * 1024 * 1024;
             let mut orphans: std::collections::HashMap<[u8; 32], (core::Block, Vec<u8>, u64)> =
                 std::collections::HashMap::new();
             // Reverse index: parent_hash → set of orphan hashes waiting for it
@@ -1129,8 +1133,12 @@ async fn main() {
                                 }
                             }
 
-                            // Structural validation (PoW, merkle, coinbase) — always do first
-                            if let Err(reason) = block.validate_structure() {
+                            // Structural validation WITHOUT the proof of work. The
+                            // 0.5 s / 64 MiB GnB-SMH evaluation runs only after the
+                            // contextual checks: inside accept_block (parents, height,
+                            // bits == expected_bits, timestamp) or, for an orphan,
+                            // after `orphan_admission_check` bounds its difficulty.
+                            if let Err(reason) = block.validate_structure_cheap() {
                                 warn!("block {} rejected ({})", hex::encode(&block_hash[..8]), reason);
                                 continue;
                             }
@@ -1142,19 +1150,44 @@ async fn main() {
                                 .collect();
 
                             if !missing_parents.is_empty() {
-                                // Orphan: parents not yet available — buffer for later
-                                if orphans.len() >= MAX_ORPHANS {
-                                    // Evict oldest orphan (by height, lowest first)
-                                    if let Some((&evict_hash, _)) = orphans.iter()
+                                // Orphan: parents not yet available. Its difficulty
+                                // cannot be checked exactly yet, so bound it (and
+                                // verify its PoW) BEFORE spending memory on it or
+                                // asking peers for its parents.
+                                let tip_child_bits = {
+                                    let d = dag2.read();
+                                    d.selected_tip()
+                                        .and_then(|t| d.get_block_data(&t))
+                                        .and_then(|bd| pow::expected_bits(bd.timestamp, bd.height + 1).ok())
+                                };
+                                if reorg::is_block_invalid(&store2, &block_hash)
+                                    || missing_parents.iter().any(|p| reorg::is_block_invalid(&store2, p))
+                                {
+                                    warn!("orphan block {} rejected (it or a parent was found invalid)",
+                                        hex::encode(&block_hash[..8]));
+                                    continue;
+                                }
+                                if let Err(reason) = orphan_admission_check(&block, tip_child_bits) {
+                                    warn!("orphan block {} rejected ({})", hex::encode(&block_hash[..8]), reason);
+                                    continue;
+                                }
+                                // Memory bound: count AND bytes. Evict lowest height first.
+                                let mut orphan_bytes: usize = orphans.values().map(|(_, d, _)| d.len()).sum();
+                                while !orphans.is_empty()
+                                    && (orphans.len() >= MAX_ORPHANS
+                                        || orphan_bytes + block_data.len() > MAX_ORPHAN_BYTES)
+                                {
+                                    let Some((&evict_hash, _)) = orphans.iter()
                                         .min_by_key(|(_, (b, _, _))| b.height)
-                                    {
-                                        let evict_parents: Vec<[u8;32]> = orphans[&evict_hash].0.header.parents.clone();
-                                        orphans.remove(&evict_hash);
-                                        for p in &evict_parents {
-                                            if let Some(set) = waiting_for.get_mut(p) {
-                                                set.remove(&evict_hash);
-                                                if set.is_empty() { waiting_for.remove(p); }
-                                            }
+                                    else { break };
+                                    let evict_parents: Vec<[u8;32]> = orphans[&evict_hash].0.header.parents.clone();
+                                    if let Some((_, d, _)) = orphans.remove(&evict_hash) {
+                                        orphan_bytes -= d.len();
+                                    }
+                                    for p in &evict_parents {
+                                        if let Some(set) = waiting_for.get_mut(p) {
+                                            set.remove(&evict_hash);
+                                            if set.is_empty() { waiting_for.remove(p); }
                                         }
                                     }
                                 }
@@ -1849,7 +1882,7 @@ fn commit_self_mined_block(
 ) -> Result<[u8; 32], String> {
     // Same structural gate as external submissions (audit H2): the producer
     // grants itself no bypass.
-    block.validate_structure()
+    block.validate_structure_cheap()
         .map_err(|e| format!("structural validation: {}", e))?;
 
     let block_hash = block.block_hash();
@@ -1887,7 +1920,7 @@ fn make_rpc_submit_block_cb(
         if dag.read().has_block(&block_hash) {
             return Err("duplicate block".to_string());
         }
-        block.validate_structure()
+        block.validate_structure_cheap()
             .map_err(|e| format!("structural validation: {}", e))?;
 
         accept_block(
@@ -1953,6 +1986,59 @@ static FINALITY_FROZEN: std::sync::atomic::AtomicBool =
 static ARCHIVE_MODE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// How much easier than the current tip's next block an orphan may be.
+/// Honest blocks near the tip differ from it by ASERT drift only; easing by
+/// 2^8 takes 16 hours of drift at the 2-hour half-life.
+const ORPHAN_MAX_EASIER_SHIFT: u32 = 8;
+
+/// Admission gate for an orphan (a block whose parents are unknown), run
+/// BEFORE its proof of work is evaluated and before it costs memory or
+/// parent requests. Its exact consensus difficulty needs the parents, so this
+/// bounds it instead:
+///
+/// 1. timestamp at most `MAX_FUTURE_SECS` ahead (consensus rule);
+/// 2. exact floor: ASERT eases monotonically with the parent timestamp, and a
+///    parent's timestamp is never after the block's own, so
+///    `expected_bits(block.timestamp, height)` is the EASIEST difficulty any
+///    valid block at this height can carry — never rejects a valid block;
+/// 3. policy: no more than 2^`ORPHAN_MAX_EASIER_SHIFT` times easier than the
+///    current tip's next block, so a fabricated low height cannot buy a
+///    near-free proof of work;
+/// 4. the proof of work itself.
+fn orphan_admission_check(block: &core::Block, tip_child_bits: Option<u32>) -> Result<(), String> {
+    use gnb_smh::difficulty::try_bits_to_target;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if block.header.timestamp > now.saturating_add(core::MAX_FUTURE_SECS) {
+        return Err("timestamp too far in the future".into());
+    }
+    let target = try_bits_to_target(block.header.bits)
+        .map_err(|e| format!("malformed bits: {:?}", e))?;
+    let floor_bits = pow::expected_bits(block.header.timestamp, block.height)
+        .map_err(|e| format!("difficulty floor: {}", e))?;
+    let floor = try_bits_to_target(floor_bits)
+        .map_err(|e| format!("difficulty floor: {:?}", e))?;
+    if target > floor {
+        return Err(format!(
+            "difficulty 0x{:08x} easier than the consensus floor 0x{:08x} for h={}",
+            block.header.bits, floor_bits, block.height));
+    }
+    if let Some(tip_bits) = tip_child_bits {
+        let need = pow::work_from_bits(tip_bits) >> ORPHAN_MAX_EASIER_SHIFT;
+        if pow::work_from_bits(block.header.bits) < need {
+            return Err(format!(
+                "difficulty 0x{:08x} more than 2^{} times easier than the tip's 0x{:08x}",
+                block.header.bits, ORPHAN_MAX_EASIER_SHIFT, tip_bits));
+        }
+    }
+    if !block.validate_pow() {
+        return Err("invalid PoW".into());
+    }
+    Ok(())
+}
+
 /// Validate TX contents, add block to DAG + storage, update UTXO set.
 /// Returns Ok(block_hash) on success.
 fn accept_block(
@@ -1987,6 +2073,20 @@ fn accept_block(
             "consensus rejection: block already in DAG: {}",
             hex::encode(block_hash)
         ));
+    }
+
+    // ── Recorded-invalid blocks and their descendants (cheap, pre-PoW) ─
+    // A block that broke a consensus rule over committed data is recorded
+    // durably (`reorg::mark_block_invalid`). It and every descendant are
+    // rejected here without re-validation, so an invalid branch costs one
+    // full validation, not one per block or per re-send.
+    if reorg::is_block_invalid(store, &block_hash) {
+        return Err("consensus rejection: block previously found invalid".into());
+    }
+    if let Some(bad) = block.header.parents.iter().find(|p| reorg::is_block_invalid(store, p)) {
+        reorg::mark_block_invalid(store, &block_hash);
+        return Err(format!(
+            "consensus rejection: parent {} is invalid", hex::encode(&bad[..8])));
     }
 
     // ── Parents must be known (cheap, before anything else) ──────────
@@ -2051,23 +2151,40 @@ fn accept_block(
         return Err("consensus rejection: invalid GnB-SMH proof of work".into());
     }
 
-    // ── Validate non-coinbase TXs + compute fees ─────────────────────
-    // Coinbase maturity uses the block's consensus-checked height, identical
-    // on every honest node.
-    let current_height = block.height;
-    let mut spent_in_block: HashSet<([u8; 32], u32)> = HashSet::new();
-    let mut total_fees: u64 = 0;
-
-    for tx in block.transactions.iter().skip(1) {
-        let fee = validate_tx_in_block_with_maturity(
-            block, tx, store, &mut spent_in_block, current_height
-        )?;
-        total_fees = total_fees.checked_add(fee).ok_or("block fee sum overflow")?;
+    // ── Transactions are validated against the SELECTED PARENT's state ──
+    // Full rule set (`blockval::validate_block_transactions`) BEFORE the
+    // block touches the DAG or storage. When the selected parent is the
+    // current tip, its state is the committed UTXO set. Otherwise (a block on
+    // a competing branch) the parent's state is rebuilt in memory and
+    // discarded (`reorg::validate_block_on_branch`). Judging a branch block
+    // against the TIP's state — the previous behaviour — rejected valid
+    // competing branches and could keep a node off the heaviest chain.
+    {
+        let selected_parent = dag.read().preview_selected_parent(&block.header.parents);
+        let verdict = match (old_tip, selected_parent) {
+            (Some(tip), Some(sp)) if sp != tip => {
+                // Path under the DAG read lock; the lock is released before
+                // the storage-heavy in-memory validation runs.
+                let path = { let d = dag.read(); reorg::branch_path(&d, &tip, &sp) };
+                path.and_then(|p| reorg::validate_block_on_branch(store, &p, block))
+            }
+            _ => {
+                let utxo = |t: &[u8; 32], i: u32| store.get_utxo(t, i).map_err(|e| e.to_string());
+                let coinbase = |t: &[u8; 32]| store.get_coinbase_height(t).map_err(|e| e.to_string());
+                blockval::validate_block_transactions(block, &utxo, &coinbase)
+            }
+        };
+        match verdict {
+            Ok(_fees) => {}
+            Err(blockval::BlockTxError::Invalid(e)) => {
+                reorg::mark_block_invalid(store, &block_hash);
+                return Err(format!("consensus rejection: {}", e));
+            }
+            // Witness failures and storage errors reject THIS copy only;
+            // neither is recorded (see BlockTxError::InvalidWitness).
+            Err(e) => return Err(format!("consensus rejection: {}", e)),
+        }
     }
-
-    // ── FIX VULN-05: Validate coinbase value includes fees ───────────
-    block.validate_coinbase_value(total_fees)
-        .map_err(|e| format!("coinbase rejected: {}", e))?;
 
     // ── Add to DAG ───────────────────────────────────────────────────
     //
@@ -2211,35 +2328,22 @@ fn accept_block(
         }
 
         Disposition::Extension => {
-            // Apply this block's mutations forward. Uses the shared helper
-            // (src/reorg.rs) so extension and reorg re-apply go through
-            // identical code — they must produce byte-identical UndoData.
-            // Legacy L-1: `apply_block_utxo_mutations` now propagates every
-            // write error instead of silently discarding it (previously
-            // only `put_undo_data` failures were even visible here). This
-            // call site does NOT yet roll back or abort on failure — doing
-            // so safely requires the atomic single-WriteBatch commit and
-            // startup reconciliation check tracked as Legacy M-7 (not yet
-            // implemented: mid-block failure here can already leave the
-            // UTXO set, block body, and tip in different states, and
-            // returning early now — without a rollback path — would not
-            // fix that, only change WHICH state is inconsistent). Until
-            // M-7 lands, a failure here is a fleet-visible, actionable
-            // signal (error!, not warn!) that this node's UTXO set may have
-            // diverged and needs `--verify-carryover`-style reconciliation.
-            if let Err(e) = reorg::apply_block_utxo_mutations(store, block) {
-                error!(
-                    "U.4/L-1: apply_block_utxo_mutations FAILED for h={}: {} — this node's \
-                     UTXO set may now be inconsistent with its block/DAG state (Legacy M-7: \
-                     atomic commit + startup reconciliation not yet implemented). Investigate \
-                     storage health immediately.",
-                    block.height, e
-                );
+            // Transactions were validated before insertion against this
+            // block's selected parent, which for an extension is the old tip.
+
+            // SECURITY (Legacy M-7): one atomic WriteBatch for every UTXO /
+            // coinbase / tx-index / undo mutation plus `tip_hash`. On failure
+            // nothing was written; roll the in-memory DAG insertion back so
+            // DAG, UTXO set and tip stay consistent.
+            if let Err(e) = reorg::apply_block_atomic(store, block) {
+                dag.write().remove_block(&block_hash);
+                error!("apply_block_atomic failed for h={}: {} — block rejected, storage unchanged",
+                    block.height, e);
+                return Err(format!("storage: {}", e));
             }
 
             let confirmed: Vec<[u8; 32]> = block.transactions.iter().map(|t| t.txid()).collect();
             mempool.remove_confirmed(&confirmed);
-            store.put_meta("tip_hash", &block_hash).ok();
         }
 
         Disposition::Reorg => {
@@ -2681,84 +2785,8 @@ fn drop_orphan_subtree(
     dropped
 }
 
-// ── Unified TX validation ────────────────────────────────────────────────────
-// FIX #10: Single validation core used by all code paths.
-
-/// Core input validation logic shared by all TX validation paths.
-/// Resolves each input's UTXO, checks pubkey hash match, verifies ML-DSA-65
-/// signature, and accumulates total input value.
-fn validate_tx_inputs(
-    tx:           &core::Transaction,
-    utxo_lookup:  &dyn Fn(&[u8; 32], u32) -> Result<Option<core::TxOutput>, String>,
-    mut spent_set: Option<&mut HashSet<([u8; 32], u32)>>,
-) -> Result<u64, String> {
-    let mut total_in = 0u64;
-
-    // C-R3-2: the intra-tx duplicate-outpoint check is UNCONDITIONAL. The
-    // standalone (gossip-relay) path passes `spent_set = None`, and the old
-    // Some-gated check let a tx list the SAME outpoint N times — its value
-    // was counted N times below, so a doubled-fee double-spend was admitted
-    // to the mempool. `local_spent` catches duplicates within THIS tx on
-    // every path; the caller's `spent_set` (when provided) still tracks
-    // cross-tx conflicts inside a block.
-    let mut local_spent: HashSet<([u8; 32], u32)> = HashSet::new();
-
-    for (i, inp) in tx.inputs.iter().enumerate() {
-        let outpoint = (inp.prev_txid, inp.prev_index);
-
-        // FIX #9 + C-R3-2: double-spend within the same validation context —
-        // cross-tx via the caller's set (when present), intra-tx ALWAYS via
-        // the local insert-as-check.
-        let cross_tx_dup = spent_set.as_ref().is_some_and(|s| s.contains(&outpoint));
-        if cross_tx_dup || !local_spent.insert(outpoint) {
-            return Err(format!("double-spend: {}:{} already consumed",
-                hex::encode(&inp.prev_txid[..8]), inp.prev_index));
-        }
-
-        // Resolve UTXO
-        let utxo = utxo_lookup(&inp.prev_txid, inp.prev_index)?
-            .ok_or_else(|| format!("UTXO {}:{} not found",
-                hex::encode(&inp.prev_txid[..8]), inp.prev_index))?;
-
-        total_in = total_in.checked_add(utxo.value).ok_or("input overflow")?;
-
-        // Parse and verify script_sig
-        let (sig, pk) = core::Transaction::parse_script_sig(&inp.script_sig)
-            .ok_or_else(|| format!("malformed script_sig at input {}", i))?;
-
-        // Verify pubkey hash matches UTXO script_pubkey
-        let pk_hash = {
-            use sha3::{Sha3_256, Digest};
-            Sha3_256::digest(&pk)[..20].to_vec()
-        };
-        if pk_hash != utxo.script_pubkey {
-            return Err(format!("pubkey mismatch at input {}", i));
-        }
-
-        // Verify hybrid ML-DSA-65 ‖ Falcon-1024 signature. Chain-id (Roadmap #8)
-        // is the node-level single source of truth — miner and validator share it
-        // (see core::node_chain_id / set_node_chain_id).
-        let sighash = tx.sighash(i, core::node_chain_id());
-        if !crypto::verify(&pk, &sighash, &sig) {
-            return Err(format!("invalid signature at input {}", i));
-        }
-
-        // Mark outpoint as spent
-        if let Some(spent) = spent_set.as_mut() {
-            spent.insert(outpoint);
-        }
-    }
-
-    let total_out: u64 = tx.outputs.iter()
-        .try_fold(0u64, |acc, o| acc.checked_add(o.value))
-        .ok_or("output sum overflow")?;
-    if total_in < total_out {
-        return Err(format!("inputs {} < outputs {}", total_in, total_out));
-    }
-    let fee = total_in - total_out;
-    core::check_min_fee(tx, fee)?;
-    Ok(fee)
-}
+// Unified TX validation lives in `blockval` (shared with the reorg path).
+use blockval::validate_tx_inputs;
 
 /// Compute the total fee the miner's OWN block template may claim across
 /// `txs` (the candidate set selected from the mempool), reading prevout
@@ -2806,84 +2834,6 @@ fn miner_template_total_fees(
         total_in.saturating_sub(total_out)
     }).sum()
 }
-
-/// Validate a transaction within a block context.
-/// Uses both in-block outputs and persistent UTXO set, with double-spend tracking.
-fn validate_tx_in_block(
-    block:          &core::Block,
-    tx:             &core::Transaction,
-    store:          &Arc<storage::Storage>,
-    spent_in_block: &mut HashSet<([u8; 32], u32)>,
-) -> Result<(), String> {
-    validate_tx_in_block_with_maturity(block, tx, store, spent_in_block, 0)?;
-    Ok(())
-}
-
-/// FIX VULN-03: Validate TX within a block, including coinbase maturity check.
-/// Returns the fee (total_in - total_out) for coinbase value validation.
-fn validate_tx_in_block_with_maturity(
-    block:          &core::Block,
-    tx:             &core::Transaction,
-    store:          &Arc<storage::Storage>,
-    spent_in_block: &mut HashSet<([u8; 32], u32)>,
-    current_height: u64,
-) -> Result<u64, String> {
-    // SECURITY (Legacy C-2): build the in-block prevout map from ONLY the
-    // transactions STRICTLY BEFORE `tx` in `block.transactions` — never from
-    // the whole block. This used to `flat_map` over ALL of
-    // `block.transactions` unconditionally, so a transaction could spend the
-    // output of a LATER transaction in the same block: `tx[i]` validates
-    // (and is fee-accounted, and its own outputs get created) as if it had
-    // genuinely spent `tx[j]`'s (j > i) output, while the actual UTXO
-    // application (`reorg::apply_block_utxo_mutations`) writes each
-    // transaction's outputs THEN deletes its inputs, walking the block IN
-    // ORDER — so `tx[j]`'s output is written to storage only AFTER `tx[i]`'s
-    // (no-op, not-yet-existent-key) delete already ran, leaving it
-    // permanently unspent. The value tx[i] was credited for spending is
-    // never actually removed from the UTXO set: a supply-inflating mint,
-    // out-of-order-block-only, requiring no signature forgery.
-    //
-    // A transaction MAY legitimately spend an EARLIER same-block
-    // transaction's output (ordinary same-block chaining, e.g. a miner
-    // including a child of a transaction it also included) — that is
-    // exactly what the apply-order above expects and this preserves. It may
-    // never spend its own or a later transaction's not-yet-created output.
-    //
-    // `tx` is identified by TXID (content hash) rather than by reference
-    // identity so this is correct whether the caller passes a reference
-    // borrowed from `block.transactions` (the real consensus path) or an
-    // owned clone with identical content (as some call sites do); if `tx`'s
-    // txid is not found in `block.transactions` at all (a misuse this
-    // function's real callers never trigger), this falls back to the full
-    // block — permissive only for that out-of-invariant case.
-    let tx_txid = tx.txid();
-    let cutoff = block.transactions.iter()
-        .position(|t| t.txid() == tx_txid)
-        .unwrap_or(block.transactions.len());
-    let block_utxos: std::collections::HashMap<([u8; 32], u32), core::TxOutput> = block.transactions[..cutoff]
-        .iter()
-        .flat_map(|t| {
-            let txid = t.txid();
-            t.outputs.iter().enumerate().map(move |(i, o)| ((txid, i as u32), o.clone()))
-        })
-        .collect();
-
-    // Coinbase maturity check (VULN-03). Single source of truth in
-    // core::check_coinbase_maturity; this call site is one of two.
-    core::check_coinbase_maturity(tx, current_height, |txid| {
-        store.get_coinbase_height(txid).ok().flatten()
-    })?;
-
-    let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
-        if let Some(out) = block_utxos.get(&(*txid, idx)) {
-            return Ok(Some(out.clone()));
-        }
-        store.get_utxo(txid, idx).map_err(|e| e.to_string())
-    };
-
-    validate_tx_inputs(tx, &lookup, Some(spent_in_block))
-}
-
 
 /// Standalone tx validation (for mempool / sendrawtransaction).
 /// Returns the fee (total_in - total_out).
@@ -3209,6 +3159,10 @@ mod external_submission_tests {
             node.dag.read().get_block_data(&hash).is_none(),
             "rejected self-mined block must NOT enter the DAG",
         );
+        assert!(
+            reorg::is_block_invalid(&node.store, &hash),
+            "a block breaking a committed-data rule (coinbase value) is recorded invalid",
+        );
         assert_eq!(node.dag.read().block_count(), 1, "DAG must contain only genesis");
     }
 
@@ -3347,8 +3301,9 @@ mod external_submission_tests {
         // The fork block at height D+1 TIES R's tip on blue_work; grind its
         // nonce so its hash LOSES the deterministic tie-break (blue_work,
         // then blue_score, then lexicographic hash — larger wins) and stays
-        // a fork-loser. The flip then happens deterministically at f_{D+2},
-        // which strictly out-weighs R and forces to_rollback.len() == D+1 > D.
+        // a fork-loser. Without the branch-depth gate the flip would happen at
+        // f_{D+2}, forcing to_rollback.len() == D+1 > D; with it, the branch
+        // is refused from f1 on (see below), which is the stronger outcome.
         let mut fparent = gh;
         let mut flip_res: Result<[u8; 32], String> = Err("unreached".into());
         for i in 1..=(d + 2) {
@@ -3361,29 +3316,30 @@ mod external_submission_tests {
                 }
             }
             let res = accept(&node, &fb);
-            if i <= d + 1 {
-                assert!(
-                    res.is_ok(),
-                    "non-flipping fork block f{} must be accepted as a \
-                     fork-loser, got: {:?}", i, res,
-                );
-                assert_eq!(
-                    node.dag.read().selected_tip(), Some(real_tip),
-                    "fork-loser f{} must not move the selected tip", i,
-                );
+            // f1 already forks D+1 > D blocks below the tip, so its branch can
+            // never become the selected chain: it is refused at the
+            // branch-depth gate, BEFORE it touches the DAG or storage. Every
+            // later fork block then has a parent the node never accepted.
+            // The refusal is NOT recorded as invalid (it depends on the local
+            // tip, not on the block).
+            let err = res.clone().expect_err("over-deep fork block must be refused");
+            if i == 1 {
+                assert!(err.contains("forks"), "f1 must hit the branch-depth gate, got: {}", err);
+                assert!(!reorg::is_block_invalid(&node.store, &fb.block_hash()),
+                    "a beyond-finality refusal must never be recorded as invalid");
+            } else {
+                assert!(err.contains("unknown parent"), "f{} builds on a refused block, got: {}", i, err);
             }
+            assert_eq!(
+                node.dag.read().selected_tip(), Some(real_tip),
+                "refused fork block f{} must not move the selected tip", i,
+            );
             fparent = fb.block_hash();
             flip_res = res;
         }
 
-        // (1) The flipping fork block is REFUSED by the reorg depth cap.
-        let err = flip_res.expect_err(
-            "over-deep flipping fork block must be rejected by accept_block",
-        );
-        assert!(
-            err.contains(reorg::ERR_REORG_DEPTH),
-            "rejection must be the depth-cap refusal, got: {}", err,
-        );
+        // (1) The would-be flipping fork block is refused too.
+        assert!(flip_res.is_err(), "over-deep flipping fork block must be rejected");
 
         // (2) HALT GUARD: the refusal must leave the DAG selected tip on the
         // real chain. Baseline fails HERE: add_block already adopted (and
@@ -3779,11 +3735,11 @@ mod out_of_order_spend_tests {
             shielded_transactions: Vec::new(),
         };
 
-        let mut spent = HashSet::new();
-        let err = validate_tx_in_block_with_maturity(
-            &block, &block.transactions[1], &store, &mut spent, 0,
-        ).expect_err("a transaction must never validate against a LATER transaction's output");
-        assert!(err.contains("not found"), "expected a prevout-not-found error, got: {err}");
+        let utxo = |t: &[u8; 32], i: u32| store.get_utxo(t, i).map_err(|e| e.to_string());
+        let cb = |t: &[u8; 32]| store.get_coinbase_height(t).map_err(|e| e.to_string());
+        let err = blockval::validate_block_transactions(&block, &utxo, &cb)
+            .expect_err("a transaction must never validate against a LATER transaction's output");
+        assert!(matches!(&err, blockval::BlockTxError::Invalid(m) if m.contains("not found")), "expected a prevout-not-found rule violation, got: {err}");
     }
 
     /// Control: the SAME shape, but tx_early spends tx_late's output when
@@ -3799,18 +3755,20 @@ mod out_of_order_spend_tests {
 
         let early_prev_txid = [0x88u8; 32];
         store.put_utxo(&early_prev_txid, 0,
-            &core::TxOutput { value: 100_000, script_pubkey: vec![9u8; 20] })
+            &core::TxOutput { value: 200_000, script_pubkey: pk_hash.clone() })
             .expect("put_utxo");
         // This transaction now sits EARLIER in the block (index 1).
-        let tx_funding = core::Transaction {
+        let mut tx_funding = core::Transaction {
             version: 1,
             inputs: vec![core::TxInput {
                 prev_txid: early_prev_txid, prev_index: 0,
                 script_sig: vec![], sequence: u32::MAX,
             }],
-            outputs: vec![core::TxOutput { value: 90_000, script_pubkey: pk_hash }],
+            outputs: vec![core::TxOutput { value: 150_000, script_pubkey: pk_hash }],
             locktime: 0,
         };
+        let fsig = crypto::sign(&sk, &tx_funding.sighash(0, core::node_chain_id())).expect("sign");
+        tx_funding.inputs[0].script_sig = core::Transaction::build_script_sig(&fsig, &pk);
         let funding_txid = tx_funding.txid();
 
         // This transaction sits LATER (index 2) and spends the funding tx's
@@ -3821,7 +3779,7 @@ mod out_of_order_spend_tests {
                 prev_txid: funding_txid, prev_index: 0,
                 script_sig: vec![], sequence: u32::MAX,
             }],
-            outputs: vec![core::TxOutput { value: 60_000, script_pubkey: vec![1u8; 20] }],
+            outputs: vec![core::TxOutput { value: 100_000, script_pubkey: vec![1u8; 20] }],
             locktime: 0,
         };
         let sighash = tx_spend.sighash(0, core::node_chain_id());
@@ -3838,10 +3796,63 @@ mod out_of_order_spend_tests {
             shielded_transactions: Vec::new(),
         };
 
-        let mut spent = HashSet::new();
-        let fee = validate_tx_in_block_with_maturity(
-            &block, &block.transactions[2], &store, &mut spent, 0,
-        ).expect("a transaction MAY spend an earlier same-block transaction's output");
-        assert_eq!(fee, 30_000);
+        let utxo = |t: &[u8; 32], i: u32| store.get_utxo(t, i).map_err(|e| e.to_string());
+        let cb = |t: &[u8; 32]| store.get_coinbase_height(t).map_err(|e| e.to_string());
+        let fees = blockval::validate_block_transactions(&block, &utxo, &cb)
+            .expect("a transaction MAY spend an earlier same-block transaction's output");
+        assert_eq!(fees, 100_000);
+    }
+}
+
+#[cfg(test)]
+mod orphan_admission_tests {
+    use super::*;
+
+    fn block(bits: u32, timestamp: u64) -> core::Block {
+        let mut b = core::Block {
+            header: core::BlockHeader {
+                version: 1, parents: vec![[7u8; 32]], merkle_root: core::MerkleRoot::ZERO,
+                timestamp, bits, nonce: 0,
+            },
+            transactions: vec![], blue_score: 0, height: 5,
+            shielded_transactions: Vec::new(),
+        };
+        // Easiest target: almost any nonce meets it.
+        let pre = b.header.pow_preimage();
+        b.header.nonce = pow::mine(&pre, bits, 0, 64).expect("solve at the pow limit");
+        b
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    fn limit() -> u32 { pow::expected_bits(now(), 5).unwrap() }
+
+    #[test]
+    fn orphan_with_valid_pow_and_no_tip_bound_is_admitted() {
+        assert_eq!(orphan_admission_check(&block(limit(), now()), None), Ok(()));
+    }
+
+    #[test]
+    fn orphan_far_easier_than_the_tip_is_rejected_before_its_pow() {
+        let err = orphan_admission_check(&block(limit(), now()), Some(core::GENESIS_BITS))
+            .expect_err("2^8+ times easier than the tip");
+        assert!(err.contains("easier than the tip"), "{err}");
+    }
+
+    #[test]
+    fn orphan_from_the_future_is_rejected() {
+        let ts = now() + core::MAX_FUTURE_SECS + 120;
+        let err = orphan_admission_check(&block(limit(), ts), None).expect_err("future");
+        assert!(err.contains("future"), "{err}");
+    }
+
+    #[test]
+    fn orphan_with_invalid_pow_is_rejected() {
+        let mut b = block(limit(), now());
+        // A nonce that does not meet a slightly harder copy of the target.
+        b.header.bits = core::GENESIS_BITS;
+        assert!(orphan_admission_check(&b, None).is_err());
     }
 }

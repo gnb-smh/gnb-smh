@@ -273,21 +273,21 @@ fn multi_block_extension_sequence() {
     dag.store.insert(g, mk_dag_data(None, 0));
 
     // Block 1 — first post-genesis.
-    let b1 = mk_block_at(1, 1001, vec![mk_coinbase(0xA1, 500_000_000, 1, 0x01)]);
+    let b1 = mk_block_at(1, 1001, vec![mk_coinbase(0xA1, 100_000_000, 1, 0x01)]);
     let b1h = b1.block_hash();
     dag.store.insert(b1h, mk_dag_data(Some(g), 1));
     let tip = simulate_accept(&store, &mempool, &dag, Some(g), Some(b1h), &b1).unwrap();
     assert_eq!(tip, Some(b1h), "after B1 tip must be B1");
 
     // Block 2.
-    let b2 = mk_block_at(2, 1002, vec![mk_coinbase(0xA2, 500_000_000, 2, 0x02)]);
+    let b2 = mk_block_at(2, 1002, vec![mk_coinbase(0xA2, 100_000_000, 2, 0x02)]);
     let b2h = b2.block_hash();
     dag.store.insert(b2h, mk_dag_data(Some(b1h), 2));
     let tip = simulate_accept(&store, &mempool, &dag, tip, Some(b2h), &b2).unwrap();
     assert_eq!(tip, Some(b2h));
 
     // Block 3.
-    let b3 = mk_block_at(3, 1003, vec![mk_coinbase(0xA3, 500_000_000, 3, 0x03)]);
+    let b3 = mk_block_at(3, 1003, vec![mk_coinbase(0xA3, 100_000_000, 3, 0x03)]);
     let b3h = b3.block_hash();
     dag.store.insert(b3h, mk_dag_data(Some(b2h), 3));
     let tip = simulate_accept(&store, &mempool, &dag, tip, Some(b3h), &b3).unwrap();
@@ -296,7 +296,7 @@ fn multi_block_extension_sequence() {
     // Every block's coinbase must be a spendable UTXO.
     for (cb_idx, tag) in [(0xA1u8, 0x01u8), (0xA2, 0x02), (0xA3, 0x03)].iter().enumerate() {
         let h = (cb_idx + 1) as u64;
-        let cb_txid = mk_coinbase(tag.0, 500_000_000, h, tag.1).txid();
+        let cb_txid = mk_coinbase(tag.0, 100_000_000, h, tag.1).txid();
         assert!(store.get_utxo(&cb_txid, 0).unwrap().is_some(),
             "coinbase for block h={} must be in UTXO set", h);
     }
@@ -322,7 +322,7 @@ fn fork_loser_preserves_main_chain_state() {
     let g = [0u8; 32];
     dag.store.insert(g, mk_dag_data(None, 0));
 
-    let a1 = mk_block_at(1, 1001, vec![mk_coinbase(0xA1, 500_000_000, 1, 0x01)]);
+    let a1 = mk_block_at(1, 1001, vec![mk_coinbase(0xA1, 100_000_000, 1, 0x01)]);
     let a1h = a1.block_hash();
     dag.store.insert(a1h, mk_dag_data(Some(g), 1));
     let tip = simulate_accept(&store, &mempool, &dag, Some(g), Some(a1h), &a1).unwrap();
@@ -330,7 +330,7 @@ fn fork_loser_preserves_main_chain_state() {
 
     // B1 — same height, different address, different nonce → different hash.
     // GhostDAG doesn't actually select it (simulate by leaving new_tip == a1h).
-    let b1 = mk_block_at(1, 9999, vec![mk_coinbase(0xB1, 500_000_000, 1, 0x01)]);
+    let b1 = mk_block_at(1, 9999, vec![mk_coinbase(0xB1, 100_000_000, 1, 0x01)]);
     let b1h = b1.block_hash();
     dag.store.insert(b1h, mk_dag_data(Some(g), 1));
     assert_ne!(a1h, b1h, "test fixture must produce distinct hashes");
@@ -339,12 +339,12 @@ fn fork_loser_preserves_main_chain_state() {
     assert_eq!(tip_after, Some(a1h), "ForkLoser must leave tip unchanged");
 
     // A1 coinbase still exists.
-    let a1_cb = mk_coinbase(0xA1, 500_000_000, 1, 0x01).txid();
+    let a1_cb = mk_coinbase(0xA1, 100_000_000, 1, 0x01).txid();
     assert!(store.get_utxo(&a1_cb, 0).unwrap().is_some(),
         "A1 coinbase UTXO must survive fork-loser accept");
 
     // B1 coinbase must NOT exist — ForkLoser skipped apply_block_utxo_mutations.
-    let b1_cb = mk_coinbase(0xB1, 500_000_000, 1, 0x01).txid();
+    let b1_cb = mk_coinbase(0xB1, 100_000_000, 1, 0x01).txid();
     assert!(store.get_utxo(&b1_cb, 0).unwrap().is_none(),
         "B1 coinbase UTXO must NOT exist — fork loser is not applied");
 
@@ -376,47 +376,47 @@ fn fork_then_reorg_flips_tip_and_converges_utxo() {
     dag.store.insert(g, mk_dag_data(None, 0));
 
     // ── Chain A (applied) ─────────────────────────────────────────────
-    let a1 = mk_block_at(1, 1001, vec![mk_coinbase(0xA1, 500_000_000, 1, 0x01)]);
+    let a1 = mk_block_at(1, 1001, vec![mk_coinbase(0xA1, 100_000_000, 1, 0x01)]);
     let a1h = a1.block_hash();
     dag.store.insert(a1h, mk_dag_data(Some(g), 1));
     let tip = simulate_accept(&store, &mempool, &dag, Some(g), Some(a1h), &a1).unwrap();
 
-    let a2 = mk_block_at(2, 1002, vec![mk_coinbase(0xA2, 500_000_000, 2, 0x02)]);
+    let a2 = mk_block_at(2, 1002, vec![mk_coinbase(0xA2, 100_000_000, 2, 0x02)]);
     let a2h = a2.block_hash();
     dag.store.insert(a2h, mk_dag_data(Some(a1h), 2));
     let tip = simulate_accept(&store, &mempool, &dag, tip, Some(a2h), &a2).unwrap();
     assert_eq!(tip, Some(a2h));
 
     // ── Chain B arrives: B1, B2 as fork-losers (tip stays at A2) ─────
-    let b1 = mk_block_at(1, 2001, vec![mk_coinbase(0xB1, 500_000_000, 1, 0x11)]);
+    let b1 = mk_block_at(1, 2001, vec![mk_coinbase(0xB1, 100_000_000, 1, 0x11)]);
     let b1h = b1.block_hash();
     dag.store.insert(b1h, mk_dag_data(Some(g), 1));
     let tip = simulate_accept(&store, &mempool, &dag, tip, Some(a2h), &b1).unwrap();
     assert_eq!(tip, Some(a2h), "B1 arriving does not dislodge A2");
 
-    let b2 = mk_block_at(2, 2002, vec![mk_coinbase(0xB2, 500_000_000, 2, 0x12)]);
+    let b2 = mk_block_at(2, 2002, vec![mk_coinbase(0xB2, 100_000_000, 2, 0x12)]);
     let b2h = b2.block_hash();
     dag.store.insert(b2h, mk_dag_data(Some(b1h), 2));
     let tip = simulate_accept(&store, &mempool, &dag, tip, Some(a2h), &b2).unwrap();
     assert_eq!(tip, Some(a2h), "B2 arriving does not dislodge A2 — still losing");
 
     // Sanity check: A-chain UTXOs still here, B-chain UTXOs absent.
-    let a1_cb = mk_coinbase(0xA1, 500_000_000, 1, 0x01).txid();
-    let b1_cb = mk_coinbase(0xB1, 500_000_000, 1, 0x11).txid();
+    let a1_cb = mk_coinbase(0xA1, 100_000_000, 1, 0x01).txid();
+    let b1_cb = mk_coinbase(0xB1, 100_000_000, 1, 0x11).txid();
     assert!(store.get_utxo(&a1_cb, 0).unwrap().is_some());
     assert!(store.get_utxo(&b1_cb, 0).unwrap().is_none());
 
     // ── B3 arrives — chain B now has more blue_work, tip flips ───────
-    let b3 = mk_block_at(3, 2003, vec![mk_coinbase(0xB3, 500_000_000, 3, 0x13)]);
+    let b3 = mk_block_at(3, 2003, vec![mk_coinbase(0xB3, 100_000_000, 3, 0x13)]);
     let b3h = b3.block_hash();
     dag.store.insert(b3h, mk_dag_data(Some(b2h), 3));
     let tip = simulate_accept(&store, &mempool, &dag, tip, Some(b3h), &b3).unwrap();
     assert_eq!(tip, Some(b3h), "B3 wins — tip flipped");
 
     // After reorg: A-chain coinbases gone, B-chain coinbases present.
-    let a2_cb = mk_coinbase(0xA2, 500_000_000, 2, 0x02).txid();
-    let b2_cb = mk_coinbase(0xB2, 500_000_000, 2, 0x12).txid();
-    let b3_cb = mk_coinbase(0xB3, 500_000_000, 3, 0x13).txid();
+    let a2_cb = mk_coinbase(0xA2, 100_000_000, 2, 0x02).txid();
+    let b2_cb = mk_coinbase(0xB2, 100_000_000, 2, 0x12).txid();
+    let b3_cb = mk_coinbase(0xB3, 100_000_000, 3, 0x13).txid();
 
     assert!(store.get_utxo(&a1_cb, 0).unwrap().is_none(), "A1 coinbase must be rolled back");
     assert!(store.get_utxo(&a2_cb, 0).unwrap().is_none(), "A2 coinbase must be rolled back");
@@ -451,28 +451,28 @@ fn double_reorg_back_and_forth_is_stable() {
     dag.store.insert(g, mk_dag_data(None, 0));
 
     // Build & apply A1, A2.
-    let a1 = mk_block_at(1, 1001, vec![mk_coinbase(0xA1, 500_000_000, 1, 0x01)]);
+    let a1 = mk_block_at(1, 1001, vec![mk_coinbase(0xA1, 100_000_000, 1, 0x01)]);
     let a1h = a1.block_hash();
     dag.store.insert(a1h, mk_dag_data(Some(g), 1));
     let tip = simulate_accept(&store, &mempool, &dag, Some(g), Some(a1h), &a1).unwrap();
 
-    let a2 = mk_block_at(2, 1002, vec![mk_coinbase(0xA2, 500_000_000, 2, 0x02)]);
+    let a2 = mk_block_at(2, 1002, vec![mk_coinbase(0xA2, 100_000_000, 2, 0x02)]);
     let a2h = a2.block_hash();
     dag.store.insert(a2h, mk_dag_data(Some(a1h), 2));
     let tip = simulate_accept(&store, &mempool, &dag, tip, Some(a2h), &a2).unwrap();
 
     // Phase 2: B1..B3 arrive; B3 triggers first reorg A→B.
-    let b1 = mk_block_at(1, 2001, vec![mk_coinbase(0xB1, 500_000_000, 1, 0x11)]);
+    let b1 = mk_block_at(1, 2001, vec![mk_coinbase(0xB1, 100_000_000, 1, 0x11)]);
     let b1h = b1.block_hash();
     dag.store.insert(b1h, mk_dag_data(Some(g), 1));
     let tip = simulate_accept(&store, &mempool, &dag, tip, Some(a2h), &b1).unwrap();
 
-    let b2 = mk_block_at(2, 2002, vec![mk_coinbase(0xB2, 500_000_000, 2, 0x12)]);
+    let b2 = mk_block_at(2, 2002, vec![mk_coinbase(0xB2, 100_000_000, 2, 0x12)]);
     let b2h = b2.block_hash();
     dag.store.insert(b2h, mk_dag_data(Some(b1h), 2));
     let tip = simulate_accept(&store, &mempool, &dag, tip, Some(a2h), &b2).unwrap();
 
-    let b3 = mk_block_at(3, 2003, vec![mk_coinbase(0xB3, 500_000_000, 3, 0x13)]);
+    let b3 = mk_block_at(3, 2003, vec![mk_coinbase(0xB3, 100_000_000, 3, 0x13)]);
     let b3h = b3.block_hash();
     dag.store.insert(b3h, mk_dag_data(Some(b2h), 3));
     let tip = simulate_accept(&store, &mempool, &dag, tip, Some(b3h), &b3).unwrap();
@@ -480,18 +480,18 @@ fn double_reorg_back_and_forth_is_stable() {
 
     // Phase 3: A3, A4 arrive (extending A2, still losing vs B3). Then A5
     // extends A4 and makes the A-chain's blue_work beat B3 → second reorg.
-    let a3 = mk_block_at(3, 1003, vec![mk_coinbase(0xA3, 500_000_000, 3, 0x03)]);
+    let a3 = mk_block_at(3, 1003, vec![mk_coinbase(0xA3, 100_000_000, 3, 0x03)]);
     let a3h = a3.block_hash();
     dag.store.insert(a3h, mk_dag_data(Some(a2h), 3));
     let tip = simulate_accept(&store, &mempool, &dag, tip, Some(b3h), &a3).unwrap();
 
-    let a4 = mk_block_at(4, 1004, vec![mk_coinbase(0xA4, 500_000_000, 4, 0x04)]);
+    let a4 = mk_block_at(4, 1004, vec![mk_coinbase(0xA4, 100_000_000, 4, 0x04)]);
     let a4h = a4.block_hash();
     dag.store.insert(a4h, mk_dag_data(Some(a3h), 4));
     let tip = simulate_accept(&store, &mempool, &dag, tip, Some(b3h), &a4).unwrap();
     assert_eq!(tip, Some(b3h), "A3/A4 still losing while B3 is tip");
 
-    let a5 = mk_block_at(5, 1005, vec![mk_coinbase(0xA5, 500_000_000, 5, 0x05)]);
+    let a5 = mk_block_at(5, 1005, vec![mk_coinbase(0xA5, 100_000_000, 5, 0x05)]);
     let a5h = a5.block_hash();
     dag.store.insert(a5h, mk_dag_data(Some(a4h), 5));
     let tip = simulate_accept(&store, &mempool, &dag, tip, Some(a5h), &a5).unwrap();
@@ -499,12 +499,12 @@ fn double_reorg_back_and_forth_is_stable() {
 
     // Final state check — A-chain UTXOs present, B-chain UTXOs absent.
     for (addr, h, tag) in [(0xA1u8, 1u64, 0x01u8), (0xA2, 2, 0x02), (0xA3, 3, 0x03), (0xA4, 4, 0x04), (0xA5, 5, 0x05)] {
-        let txid = mk_coinbase(addr, 500_000_000, h, tag).txid();
+        let txid = mk_coinbase(addr, 100_000_000, h, tag).txid();
         assert!(store.get_utxo(&txid, 0).unwrap().is_some(),
             "A{} coinbase UTXO must be present after double reorg", h);
     }
     for (addr, h, tag) in [(0xB1u8, 1u64, 0x11u8), (0xB2, 2, 0x12), (0xB3, 3, 0x13)] {
-        let txid = mk_coinbase(addr, 500_000_000, h, tag).txid();
+        let txid = mk_coinbase(addr, 100_000_000, h, tag).txid();
         assert!(store.get_utxo(&txid, 0).unwrap().is_none(),
             "B{} coinbase UTXO must be absent after flip back to A", h);
     }

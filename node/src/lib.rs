@@ -43,6 +43,7 @@ pub mod tip;
 // Sprint U.3 — Reorg detection & execution primitives (towards audit C-1).
 #[cfg(feature = "node")]
 pub mod reorg;
+pub mod blockval;   // single block-transaction rule set (accept + reorg)
 #[cfg(feature = "node")]
 pub mod attestation;  // Bloch-SIS-Linux L3 — pluggable remote attestation
 #[cfg(feature = "node")]

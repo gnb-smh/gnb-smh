@@ -676,14 +676,16 @@ impl GhostDAG {
     /// - `self.coloring == Fast` (test/replay constructor): always `Fast`.
     /// - `self.coloring == Legacy` (every live constructor): the
     ///   [`CORRECTED_COLORING_ACTIVATION_HEIGHT`] soft-fork gate decides — `Fast`
-    ///   at/above the activation height, `Legacy` below it. With the activation
-    ///   height at its default `u64::MAX` this is `Legacy` for every reachable
-    ///   height, so live behavior is unchanged and all history stays
-    ///   Legacy-colored.
+    ///   at/above the activation height, `Legacy` below it. GnB activates it
+    ///   at genesis (`0`), so every block is `Fast`-colored.
     fn effective_coloring(&self, height: u64) -> ColoringMode {
         match self.coloring {
             ColoringMode::Fast => ColoringMode::Fast,
             ColoringMode::Legacy => {
+                // Always true while the activation height is 0 (GnB: exact
+                // coloring from genesis). Kept as a comparison so the gate
+                // stays a single constant.
+                #[allow(clippy::absurd_extreme_comparisons)]
                 if height >= CORRECTED_COLORING_ACTIVATION_HEIGHT {
                     ColoringMode::Fast
                 } else {
@@ -1148,6 +1150,15 @@ impl GhostDAG {
             }
         }
         true
+    }
+
+    /// The selected parent a block with `parents` WILL get when inserted —
+    /// the same rule `add_block` applies. Used to validate a block's
+    /// transactions against the right state before it is inserted.
+    /// `None` when `parents` is empty.
+    pub fn preview_selected_parent(&self, parents: &[BlockHash]) -> Option<BlockHash> {
+        if parents.is_empty() { return None; }
+        Some(self.select_parent(parents))
     }
 
     /// Select parent with highest blue_work (heaviest chain).

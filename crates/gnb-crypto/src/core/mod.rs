@@ -1004,16 +1004,28 @@ impl Block {
         Ok(())
     }
 
-    /// Structural validation. Cheap checks run first; the proof of work runs
-    /// last. Does NOT check coinbase value, fees, bits or height (those need
-    /// consensus context).
-    pub fn validate_structure(&self) -> Result<(), &'static str> {
+    /// Structural validation WITHOUT the proof of work: every context-free
+    /// check that costs microseconds. Network and RPC ingress run this first
+    /// and evaluate the 64 MiB / ~0.5 s proof of work only after the
+    /// contextual checks (parents, height, `bits == expected_bits`), so a
+    /// peer cannot make a node evaluate GnB-SMH for a header whose difficulty
+    /// is not the consensus difficulty.
+    pub fn validate_structure_cheap(&self) -> Result<(), &'static str> {
         if self.header.parents.len() > MAX_PARENTS   { return Err("too many parents"); }
         if self.size_bytes() > MAX_BLOCK_SIZE        { return Err("block too large"); }
         if !self.validate_merkle()                    { return Err("invalid merkle root"); }
         if !self.validate_coinbase_format()           { return Err("invalid coinbase format"); }
         self.validate_no_duplicate_txs()?;
         self.validate_dust()?;
+        Ok(())
+    }
+
+    /// Structural validation including the proof of work against the
+    /// header's own `bits`. Does NOT check coinbase value, fees, bits or
+    /// height (those need consensus context). Prefer
+    /// `validate_structure_cheap` on untrusted ingress paths.
+    pub fn validate_structure(&self) -> Result<(), &'static str> {
+        self.validate_structure_cheap()?;
         if !self.validate_pow()                       { return Err("invalid PoW"); }
         Ok(())
     }
