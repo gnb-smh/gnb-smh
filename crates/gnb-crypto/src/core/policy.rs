@@ -47,6 +47,15 @@ const MAX_SIG_LEN: usize = 8 * 1024;
 /// Upper bound on one encoded public key.
 const MAX_PK_LEN: usize = 8 * 1024;
 
+/// Largest witness [`PolicyWitness::decode`] can accept: tag, policy length
+/// and the largest policy (`version ‖ m ‖ n`, `MAX_POLICY_KEYS` keys, `after`,
+/// `older`), signature count, then `MAX_POLICY_KEYS` × (index, length,
+/// signature). The transaction decoder must carry any `script_sig` up to this
+/// size, or valid policy spends (a 2-of-3 is about 20 KB) cannot be relayed.
+pub const MAX_POLICY_WITNESS_LEN: usize = 1 + 4
+    + (3 + MAX_POLICY_KEYS * (4 + MAX_PK_LEN) + 8)
+    + 1 + MAX_POLICY_KEYS * (1 + 4 + MAX_SIG_LEN);
+
 /// The two output types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputKind {

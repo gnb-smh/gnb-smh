@@ -537,6 +537,13 @@ fn read_shielded_tx(cur: &mut Cursor<&[u8]>) -> Result<coherence_core::ShieldedT
 
 // ────────────────────────────────────────────────────────────────────────────
 
+/// Largest `script_sig` the wire decoder accepts: the largest policy witness
+/// (`policy::MAX_POLICY_WITNESS_LEN`, about 112 KiB). It used to be 10,000
+/// bytes, which silently made every policy with more than one key (1-of-2:
+/// 12,113 B; 2-of-3: 20,453 B) impossible to relay, mine or store although
+/// consensus accepted it. A single-key witness (~8.4 KB) is far below it.
+pub const MAX_SCRIPT_SIG_LEN: usize = policy::MAX_POLICY_WITNESS_LEN;
+
 impl Transaction {
     /// Canonical stratum/Bitcoin-format serialization.
     ///
@@ -614,7 +621,7 @@ impl Transaction {
             let prev_txid = read_32(&mut cur)?;
             let prev_index = read_u32_le(&mut cur)?;
             let sig_len = read_varint(&mut cur)?;
-            if sig_len > 10_000 { return Err(format!("implausible script_sig length {}", sig_len)); }
+            if sig_len > MAX_SCRIPT_SIG_LEN as u64 { return Err(format!("implausible script_sig length {}", sig_len)); }
             let script_sig = read_bytes(&mut cur, sig_len as usize)?;
             let sequence = read_u32_le(&mut cur)?;
             inputs.push(TxInput { prev_txid, prev_index, script_sig, sequence });

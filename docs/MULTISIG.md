@@ -46,6 +46,27 @@ signatures) therefore reject the copy received but never mark the block
 invalid. Timelock failures are checked after the policy matches the
 committed output, so they are failures over committed data.
 
+## Witness sizes
+
+A policy witness carries the whole policy (every key) plus `m` signatures, so
+it grows with both `n` and `m`. Measured (`node/tests/policy_spend_transport.rs`):
+
+| Policy | Witness (`script_sig`) |
+| --- | --- |
+| 1-of-1 | 8,361 B |
+| 1-of-2 | 12,112 B |
+| 2-of-3 | 20,455 B |
+| 3-of-5 | 32,547 B |
+| 7-of-7 | 58,402 B |
+
+The transaction decoder accepts a `script_sig` up to
+`MAX_SCRIPT_SIG_LEN` = `policy::MAX_POLICY_WITNESS_LEN` (114,768 B), the
+largest witness the policy parser can accept. Before this limit was tied to
+the parser it was 10,000 B, so every policy with more than one key was valid
+by consensus but could not be relayed, mined or stored. That test round-trips
+each shape through the transaction and block wire formats, storage, the
+mempool and block validation.
+
 ## Using it (`gnb-cli`)
 
 ```sh
