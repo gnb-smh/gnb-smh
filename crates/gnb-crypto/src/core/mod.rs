@@ -1210,21 +1210,21 @@ Carryover Bloch G3 terminal snapshot sha3 3d67246e94881a17d302b464f79fee55886d80
 3810744000 BLCH -> 1000000 GNB. \
 Team 1250000 + founder 1250000 GNB locked, 1y cliff + 36 monthly, keys sha3 \
 e24828c3cc6d56fe635581b8214af8733f4b060784d13bd92f2d558940d90d20.";
-/// Unix time of the genesis block (2026-10-11 00:42:26 UTC, provisional: re-mined at relaunch), the launch moment. Also the
+/// Unix time of the genesis block (2026-10-11 02:27:28 UTC), the relaunch moment. Also the
 /// ASERT anchor timestamp.
-pub const GENESIS_TIMESTAMP: u64 = 1791679346;
+pub const GENESIS_TIMESTAMP: u64 = 1791685648;
 /// Genesis difficulty and ASERT anchor bits: ≈ 4,500 evaluations per block,
 /// i.e. 30 s at the launch hashrate (7 hosts × 11 threads ≈ 150 evaluations/s).
 pub const GENESIS_BITS:      u32 = 0x1F0E_9036;
 /// GnB-SMH nonce of the genesis block.
-pub const GENESIS_NONCE:     u64 = 91;
+pub const GENESIS_NONCE:     u64 = 6499;
 /// `block_hash()` of the genesis block:
-/// f51b71acf17b202b1036a76abe38a30df6ee184e91951bead51016fa091ff02f.
+/// a63fd2c124cf34312d2730609204dc3071b8924e24d54f938cf738968fb8f810.
 pub const GENESIS_EXPECTED_HASH: [u8; 32] = [
-    0xf5, 0x1b, 0x71, 0xac, 0xf1, 0x7b, 0x20, 0x2b,
-    0x10, 0x36, 0xa7, 0x6a, 0xbe, 0x38, 0xa3, 0x0d,
-    0xf6, 0xee, 0x18, 0x4e, 0x91, 0x95, 0x1b, 0xea,
-    0xd5, 0x10, 0x16, 0xfa, 0x09, 0x1f, 0xf0, 0x2f,
+    0xa6, 0x3f, 0xd2, 0xc1, 0x24, 0xcf, 0x34, 0x31,
+    0x2d, 0x27, 0x30, 0x60, 0x92, 0x04, 0xdc, 0x30,
+    0x71, 0xb8, 0x92, 0x4e, 0x24, 0xd5, 0x4f, 0x93,
+    0x8c, 0xf7, 0x38, 0x96, 0x8f, 0xb8, 0xf8, 0x10,
 ];
 
 /// Genesis block with explicit header parameters (used by the mining tool).
