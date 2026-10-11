@@ -512,6 +512,13 @@ impl<'a> ReorgBatch<'a> {
         Ok(())
     }
 
+    /// Stage a block's DAG entry (CF_DAG, integrity link, reachability delta).
+    fn stage_dag(&mut self, e: &DagEntry<'_>) -> Result<(), String> {
+        self.store.stage_dag_entry(&mut self.batch, &e.hash, e.data, e.reach_upserts, e.reach_removals)
+            .map(|_| ())
+            .map_err(|err| format!("stage DAG entry: {}", err))
+    }
+
     /// Commit every staged mutation atomically. Consumes the batch; RocksDB
     /// applies a WriteBatch all-or-nothing.
     fn commit(self) -> Result<(), String> {
@@ -803,9 +810,27 @@ pub fn is_block_invalid(store: &Storage, hash: &[u8; 32]) -> bool {
 /// leaves storage byte-identical to the pre-block state; there is no
 /// half-applied block.
 pub fn apply_block_atomic(store: &Storage, block: &Block) -> Result<(), String> {
+    apply_block_atomic_with(store, block, None)
+}
+
+/// A block's CF_DAG entry and the reachability delta of its insertion, to be
+/// committed in the same batch as the chain-state change it causes.
+pub struct DagEntry<'a> {
+    pub hash: BlockHash,
+    pub data: &'a crate::consensus::GhostdagData,
+    pub reach_upserts: &'a [(BlockHash, Vec<u8>)],
+    pub reach_removals: &'a [BlockHash],
+}
+
+/// [`apply_block_atomic`] that also commits the block's DAG entry in the same
+/// write: UTXO set, tip and DAG land together or not at all.
+pub fn apply_block_atomic_with(store: &Storage, block: &Block, dag: Option<&DagEntry<'_>>) -> Result<(), String> {
     let mut batch = ReorgBatch::new(store);
     apply_block_utxo_mutations_batched(&mut batch, block)?;
     batch.put_meta("tip_hash", &block.block_hash())?;
+    if let Some(e) = dag {
+        batch.stage_dag(e)?;
+    }
     batch.commit()
 }
 
@@ -917,6 +942,19 @@ pub fn execute_reorg_with(
     plan: &ReorgPlan,
     enforce_depth_cap: bool,
 ) -> Result<ReorgOutcome, String> {
+    execute_reorg_full(store, mempool, plan, enforce_depth_cap, None)
+}
+
+/// [`execute_reorg_with`] that also commits, in the reorg's single batch, the
+/// new tip (`tip_hash`) and the DAG entry of the block that caused the reorg:
+/// the chain switch, the tip and the DAG land together or not at all.
+pub fn execute_reorg_full(
+    store: &Storage,
+    mempool: &Mempool,
+    plan: &ReorgPlan,
+    enforce_depth_cap: bool,
+    tip: Option<(&BlockHash, &DagEntry<'_>)>,
+) -> Result<ReorgOutcome, String> {
     // Sprint FF observability: record every attempt and surface the fork
     // depth before doing any work. Failures (including refused-by-depth-cap
     // plans) increment the failures counter — that is the one to alert on.
@@ -926,7 +964,7 @@ pub fn execute_reorg_with(
     crate::metrics::inc_reorg_attempt();
     crate::metrics::set_fork_depth(plan.to_rollback.len() as i64);
     crate::metrics::observe_reorg_depth(plan.to_rollback.len() as f64);
-    let result = execute_reorg_inner(store, mempool, plan, enforce_depth_cap);
+    let result = execute_reorg_inner(store, mempool, plan, enforce_depth_cap, tip);
     match &result {
         Ok(_)  => crate::metrics::inc_reorg_success(),
         Err(_) => crate::metrics::inc_reorg_failure(),
@@ -939,6 +977,7 @@ fn execute_reorg_inner(
     mempool: &Mempool,
     plan: &ReorgPlan,
     enforce_depth_cap: bool,
+    tip: Option<(&BlockHash, &DagEntry<'_>)>,
 ) -> Result<ReorgOutcome, String> {
     // ── Depth cap (security hardening) ────────────────────────────────────
     // Refuse over-deep plans BEFORE any storage access. Reorg depth = number
@@ -1030,6 +1069,11 @@ fn execute_reorg_inner(
 
         apply_block_utxo_mutations_batched(&mut batch, &block)
             .map_err(|e| format!("execute_reorg: batched apply failed at h={}: {}", block.height, e))?;
+    }
+
+    if let Some((new_tip, entry)) = tip {
+        batch.put_meta("tip_hash", new_tip)?;
+        batch.stage_dag(entry)?;
     }
 
     // ── Atomic commit: the entire chain switch lands in one db.write() ────
@@ -1318,6 +1362,56 @@ mod reorg_hardening_unit_tests {
         );
         // And nothing of the fork leaked in.
         assert!(store.get_utxo(&b1.transactions[0].txid(), 0).unwrap().is_none());
+    }
+
+    /// F2: an extension commits its DAG entry (CF_DAG, integrity link,
+    /// reachability delta) in the same batch as its UTXO mutations and the
+    /// tip, so no crash point leaves the UTXO set applied for a block CF_DAG
+    /// does not know.
+    #[test]
+    fn extension_commits_its_dag_entry_in_the_same_batch() {
+        let (_tmp, store) = mk_storage();
+        let mut dag = GhostDAG::with_default_k();
+        let genesis = [0x9Au8; 32];
+        dag.add_genesis(genesis, 1_000);
+        store.put_dag_with_integrity(&genesis, dag.get_block_data(&genesis).unwrap()).unwrap();
+        let _ = dag.reach_take_delta();
+
+        let b = mk_block_at(1, 0x0D01, vec![mk_coinbase(0xD1, 100, 1, 4)]);
+        let h = b.block_hash();
+        dag.add_block(h, vec![genesis], 1_030, 1).unwrap();
+        let data = dag.get_block_data(&h).unwrap().clone();
+        let (ups, rem) = dag.reach_take_delta();
+        assert!(store.get_dag_data(&h).unwrap().is_none());
+        let entry = DagEntry { hash: h, data: &data, reach_upserts: &ups, reach_removals: &rem };
+        apply_block_atomic_with(&store, &b, Some(&entry)).expect("atomic apply");
+
+        assert!(store.get_dag_data(&h).unwrap().is_some(), "DAG entry landed");
+        assert!(store.get_integrity_hash(&h).unwrap().is_some(), "integrity link landed");
+        assert_eq!(store.get_meta("tip_hash").unwrap().as_deref(), Some(&h[..]), "tip landed");
+        assert!(store.get_utxo(&b.transactions[0].txid(), 0).unwrap().is_some(), "UTXO landed");
+    }
+
+    /// A drained reachability delta whose write failed is re-queued from the
+    /// current in-memory state: a block rolled back becomes a tombstone.
+    #[test]
+    fn failed_write_requeues_the_reachability_delta() {
+        let mut dag = GhostDAG::with_default_k();
+        let genesis = [0x9Bu8; 32];
+        dag.add_genesis(genesis, 1_000);
+        let _ = dag.reach_take_delta();
+        let h = [0x9Cu8; 32];
+        dag.add_block(h, vec![genesis], 1_030, 1).unwrap();
+        let (ups, rem) = dag.reach_take_delta();
+        if !dag.maintains_reachability_index() {
+            return; // nothing is tracked without the index
+        }
+        assert!(ups.iter().any(|(x, _)| *x == h));
+        assert!(dag.remove_block(&h));
+        dag.reach_restore_delta(&ups, &rem);
+        let (ups2, rem2) = dag.reach_take_delta();
+        assert!(rem2.contains(&h), "the rolled-back block is deleted on the next write");
+        assert!(!ups2.iter().any(|(x, _)| *x == h));
     }
 
     /// Legacy M-7: an extension block is applied in ONE atomic batch together

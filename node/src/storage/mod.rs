@@ -645,6 +645,26 @@ impl Storage {
         reach_upserts: &[(BlockHash, Vec<u8>)],
         reach_removals: &[BlockHash],
     ) -> Result<[u8; 32], StorageError> {
+        let mut batch = rocksdb::WriteBatch::default();
+        let integrity = self.stage_dag_entry(&mut batch, hash, data, reach_upserts, reach_removals)?;
+        self.db.write(batch)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        Ok(integrity)
+    }
+
+    /// Stage a block's CF_DAG entry, its integrity link and a reachability
+    /// delta into `batch`, so a caller can commit them together with the
+    /// chain-state change of the same block (one atomic write: a crash can
+    /// never leave the UTXO set applied for a block CF_DAG does not know).
+    /// The selected parent's integrity hash must already be committed.
+    pub fn stage_dag_entry(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        hash: &BlockHash,
+        data: &GhostdagData,
+        reach_upserts: &[(BlockHash, Vec<u8>)],
+        reach_removals: &[BlockHash],
+    ) -> Result<[u8; 32], StorageError> {
         let parent_integrity: [u8; 32] = match &data.selected_parent {
             Some(sp) => self.get_integrity_hash(sp)?.unwrap_or([0u8; 32]),
             None     => [0u8; 32],
@@ -658,7 +678,6 @@ impl Storage {
         let cf_reach = self.db.cf_handle(CF_REACHABILITY)
             .ok_or(StorageError::CfNotFound(CF_REACHABILITY.into()))?;
 
-        let mut batch = rocksdb::WriteBatch::default();
         batch.put_cf(&cf_dag, hash, &encode(data)?);
         batch.put_cf(&cf_int, hash, &integrity);
         for (h, rec) in reach_upserts {
@@ -667,8 +686,6 @@ impl Storage {
         for h in reach_removals {
             batch.delete_cf(&cf_reach, h);
         }
-        self.db.write(batch)
-            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         Ok(integrity)
     }
 

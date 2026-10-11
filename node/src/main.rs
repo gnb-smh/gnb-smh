@@ -563,6 +563,20 @@ async fn main() {
                 }
             }
         }
+        // The applied chain state (`tip_hash`, written in the same batch as
+        // the UTXO set and the DAG entry) must be the loaded DAG's selected
+        // tip. A mismatch means storage written outside that discipline
+        // (an older binary, a partial restore): surface it loudly.
+        let committed_tip = store.get_meta("tip_hash").ok().flatten();
+        let dag_tip = dag.read().selected_tip();
+        match (committed_tip, dag_tip) {
+            (Some(t), Some(d)) if t.as_slice() != d.as_slice() => error!(
+                "storage: committed tip {} != DAG selected tip {}; the UTXO set may not match the DAG. \
+                 Resync from peers (fresh --data-dir) if balances look wrong.",
+                hex::encode(&t[..t.len().min(8)]), hex::encode(&d[..8])),
+            (Some(_), Some(_)) => info!("storage: committed tip matches the DAG selected tip"),
+            _ => {}
+        }
     }
 
     // ── Phase 2: durable reachability index — load-or-rebuild on boot ─────────
@@ -2100,6 +2114,38 @@ fn orphan_admission_check(block: &core::Block, tip_child_bits: Option<u32>) -> R
     Ok(())
 }
 
+/// The CF_DAG entry of a block just inserted in memory, plus the pending
+/// reachability delta: what must be committed in the same batch as the
+/// block's chain-state change.
+type PendingDag = (consensus::GhostdagData, Vec<([u8; 32], Vec<u8>)>, Vec<[u8; 32]>);
+
+fn take_pending_dag(dag: &Arc<RwLock<consensus::GhostDAG>>, hash: &[u8; 32]) -> Result<PendingDag, String> {
+    let data = dag.read().get_block_data(hash).cloned()
+        .ok_or_else(|| format!("block {} missing from the DAG after insertion", hex::encode(&hash[..8])))?;
+    let (upserts, removals) = if dag.read().maintains_reachability_index() {
+        dag.write().reach_take_delta()
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    Ok((data, upserts, removals))
+}
+
+/// Roll back an in-memory insertion whose write failed or was refused, and
+/// re-queue the reachability delta so the next write persists memory as it
+/// now is. Returns whether the block was removed.
+fn undo_insertion(dag: &Arc<RwLock<consensus::GhostDAG>>, hash: &[u8; 32], pending: Option<&PendingDag>) -> bool {
+    let removed = dag.write().remove_block(hash);
+    if let Some((_, upserts, removals)) = pending {
+        dag.write().reach_restore_delta(upserts, removals);
+    }
+    removed
+}
+
+fn dag_entry<'a>(hash: [u8; 32], p: &'a PendingDag) -> reorg::DagEntry<'a> {
+    reorg::DagEntry { hash, data: &p.0, reach_upserts: &p.1, reach_removals: &p.2 }
+}
+
+
 /// Validate TX contents, add block to DAG + storage, update UTXO set.
 /// Returns Ok(block_hash) on success.
 fn accept_block(
@@ -2390,6 +2436,15 @@ fn accept_block(
 
     match disposition {
         Disposition::ForkLoser => {
+            // Only the DAG entry changes (one atomic write).
+            let pending = match take_pending_dag(dag, &block_hash) {
+                Ok(p) => p,
+                Err(e) => { undo_insertion(dag, &block_hash, None); return Err(e); }
+            };
+            if let Err(e) = store.put_dag_with_integrity_and_reach(&block_hash, &pending.0, &pending.1, &pending.2) {
+                undo_insertion(dag, &block_hash, Some(&pending));
+                return Err(format!("storage: {}", e));
+            }
             info!(
                 "block h={} {} accepted into fork (not selected tip)",
                 block.height, hex::encode(&block_hash[..8])
@@ -2407,8 +2462,14 @@ fn accept_block(
             // coinbase / tx-index / undo mutation plus `tip_hash`. On failure
             // nothing was written; roll the in-memory DAG insertion back so
             // DAG, UTXO set and tip stay consistent.
-            if let Err(e) = reorg::apply_block_atomic(store, block) {
-                dag.write().remove_block(&block_hash);
+            // The block's DAG entry rides in the same batch (F2): UTXO set,
+            // tip and DAG land together or not at all.
+            let pending = match take_pending_dag(dag, &block_hash) {
+                Ok(p) => p,
+                Err(e) => { undo_insertion(dag, &block_hash, None); return Err(e); }
+            };
+            if let Err(e) = reorg::apply_block_atomic_with(store, block, Some(&dag_entry(block_hash, &pending))) {
+                undo_insertion(dag, &block_hash, Some(&pending));
                 error!("apply_block_atomic failed for h={}: {} — block rejected, storage unchanged",
                     block.height, e);
                 return Err(format!("storage: {}", e));
@@ -2451,7 +2512,13 @@ fn accept_block(
                 hex::encode(&plan.lca[..8]),
             );
 
-            let outcome = match reorg::execute_reorg_with(store, mempool, &plan, finality_on) {
+            let pending = match take_pending_dag(dag, &block_hash) {
+                Ok(p) => p,
+                Err(e) => { undo_insertion(dag, &block_hash, None); return Err(e); }
+            };
+            // Chain switch, new tip and this block's DAG entry: one batch (F2).
+            let entry = dag_entry(block_hash, &pending);
+            let outcome = match reorg::execute_reorg_full(store, mempool, &plan, finality_on, Some((&new_tip, &entry))) {
                 Ok(o) => o,
                 Err(e) => {
                     // CONSENSUS-HALT FIX: a refused reorg (e.g. deeper than
@@ -2463,7 +2530,7 @@ fn accept_block(
                     // chain is misclassified as ForkLoser: a durable halt.
                     // Nothing was persisted to CF_DAG (deferred until after
                     // this match), so the undo is purely in-memory.
-                    if !dag.write().remove_block(&block_hash) {
+                    if !undo_insertion(dag, &block_hash, Some(&pending)) {
                         warn!(
                             "U.4: failed to roll back DAG insertion of {} after refused reorg \
                              (block gained children concurrently?) — tip may be inconsistent",
@@ -2485,7 +2552,6 @@ fn accept_block(
             // in case any had slipped in between rollback and apply.
             let confirmed: Vec<[u8; 32]> = block.transactions.iter().map(|t| t.txid()).collect();
             mempool.remove_confirmed(&confirmed);
-            store.put_meta("tip_hash", &new_tip).ok();
         }
 
         Disposition::Unexpected => {
@@ -2508,29 +2574,9 @@ fn accept_block(
         }
     }
 
-    // CONSENSUS-HALT FIX: the DAG entry is persisted only NOW, after the
-    // disposition above has been applied successfully. Every refusal path
-    // above rolled the in-memory insertion back and returned Err, so CF_DAG
-    // can never adopt a fork tip whose chain state was refused.
-    // NOTE: bind the cloned data in its own `let` so the `dag.read()` guard is
-    // released at the `;` — parking_lot's RwLock is NOT reentrant, so keeping a
-    // read guard alive across `dag.write()` below deadlocks (write parks waiting
-    // for the reader that this same thread holds). Harmless while Legacy left the
-    // index untouched; a hard hang once the reachability gate arms `dag.write()`.
-    let ddata_opt = dag.read().get_block_data(&block_hash).cloned();
-    if let Some(ddata) = ddata_opt {
-        // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
-        // Phase 1: when the reachability index is maintained, fold its delta
-        // (which may span several blocks if this insert triggered a reindex)
-        // into the SAME WriteBatch, so a crash here leaves CF_DAG and
-        // CF_REACHABILITY consistent all-or-nothing. Live Legacy: unchanged.
-        if dag.read().maintains_reachability_index() {
-            let (upserts, removals) = dag.write().reach_take_delta();
-            store.put_dag_with_integrity_and_reach(&block_hash, &ddata, &upserts, &removals).ok();
-        } else {
-            store.put_dag_with_integrity(&block_hash, &ddata).ok();
-        }
-    }
+    // The DAG entry was committed above, in the same batch as the chain-state
+    // change of its disposition (F2): no crash point leaves CF_DAG and the
+    // UTXO set disagreeing about this block.
 
     // ── Update node state ────────────────────────────────────────────
     {

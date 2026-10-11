@@ -717,6 +717,12 @@ impl GhostDAG {
         self.reach.take_persist_delta()
     }
 
+    /// Undo [`Self::reach_take_delta`] when its write failed (see
+    /// `ReachabilityIndex::restore_persist_delta`).
+    pub fn reach_restore_delta(&mut self, upserts: &[(BlockHash, Vec<u8>)], removals: &[BlockHash]) {
+        self.reach.restore_persist_delta(upserts, removals)
+    }
+
     /// The current reachability root (genesis), for persisting the meta tag.
     pub fn reach_root(&self) -> Option<BlockHash> {
         self.reach.root()

@@ -120,6 +120,7 @@ impl TxRateLimiter {
 #[allow(clippy::too_many_arguments)]
 fn gate_block(
     gate: &mut pow_gate::PowGate,
+    dag: &parking_lot::RwLock<crate::consensus::GhostDAG>,
     workers: &Arc<tokio::sync::Semaphore>,
     verdict_tx: &mpsc::UnboundedSender<PowVerdict>,
     block_tx: &mpsc::Sender<NetworkMessage>,
@@ -165,17 +166,45 @@ fn gate_block(
         report(swarm, Reject);
         return;
     }
-    if budgeted && !gate.take(&peer, now) {
+    // With every parent known, height and bits must be exactly what block
+    // acceptance requires: a block refused there never costs a proof
+    // evaluation. Not penalized: an honest relay without the parents passes
+    // such a block on after checking only its proof of work.
+    let parents: Option<Vec<(u64, u64)>> = {
+        let d = dag.read();
+        if d.get_block_data(&block.block_hash()).is_some() {
+            drop(d);
+            report(swarm, Ignore);
+            return;
+        }
+        block.header.parents.iter()
+            .map(|p| d.get_block_data(p).map(|x| (x.height, x.timestamp)))
+            .collect()
+    };
+    if let Some(ps) = &parents {
+        if let Err(reason) = pow_gate::contextual_precheck(&block, ps) {
+            debug!("P2P: block from {} fails in context: {}", peer, reason);
+            report(swarm, Ignore);
+            return;
+        }
+    }
+    let cost = if parents.is_some() { 1.0 } else { pow_gate::ORPHAN_COST };
+    if budgeted && !gate.take(&peer, cost, now) {
         debug!("P2P: {} exceeded its proof-of-work budget; block ignored", peer);
         report(swarm, Ignore);
         return;
     }
-    let (workers, tx) = (workers.clone(), verdict_tx.clone());
+    let (workers, tx, banned) = (workers.clone(), verdict_tx.clone(), gate.banned_handle());
     tokio::spawn(async move {
         let Ok(_permit) = workers.acquire_owned().await else { return };
-        let valid = tokio::task::spawn_blocking(move || block.validate_pow())
-            .await
-            .unwrap_or(false);
+        // Banned while queued: drop it unevaluated (reported invalid).
+        let valid = if banned.read().contains(&peer) {
+            false
+        } else {
+            tokio::task::spawn_blocking(move || block.validate_pow())
+                .await
+                .unwrap_or(false)
+        };
         let _ = tx.send(PowVerdict { peer, message_id, msg, source, valid });
     });
 }
@@ -1479,7 +1508,7 @@ impl NetworkNode {
                                 }
                                 if matches!(msg, NetworkMessage::NewBlock { .. }) {
                                     gate_block(
-                                        &mut pow_gate, &pow_workers, &pow_verdict_tx, &block_tx,
+                                        &mut pow_gate, &dag, &pow_workers, &pow_verdict_tx, &block_tx,
                                         &mut swarm, propagation_source, Some(message_id), msg,
                                         true, "gossip",
                                     );
@@ -1513,6 +1542,10 @@ impl NetworkNode {
                             }
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                            // Budgets and bans follow the address, not only the identity.
+                            if let Some(ip) = pow_gate::multiaddr_ip(endpoint.get_remote_address()) {
+                                pow_gate.note_peer_ip(peer_id, ip);
+                            }
                             if pow_gate.is_banned(&peer_id, Instant::now()) {
                                 debug!("P2P: dropping connection from banned peer {}", peer_id);
                                 let _ = swarm.disconnect_peer_id(peer_id);
@@ -1837,7 +1870,7 @@ impl NetworkNode {
                                         // Requested by us: not budgeted, still
                                         // verified, still accountable.
                                         gate_block(
-                                            &mut pow_gate, &pow_workers, &pow_verdict_tx, &block_tx,
+                                            &mut pow_gate, &dag, &pow_workers, &pow_verdict_tx, &block_tx,
                                             &mut swarm, peer, None, msg, false, "directed-pull",
                                         );
                                     } else {

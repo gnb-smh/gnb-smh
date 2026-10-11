@@ -40,15 +40,25 @@ GnB-SMH costs as much to verify as one mining attempt (~0.5 s, 64 MiB), so
 every block received from a peer passes `node/src/network/pow_gate.rs` before
 its proof is evaluated:
 
-1. Banned peers are ignored.
+1. Banned peers, and peers connecting from a banned address, are ignored.
 2. Context-free precheck (microseconds): structure, timestamp at most 600 s
    ahead, and `bits` no easier than `expected_bits(timestamp, height)`, the
    easiest difficulty any valid block at that height can carry.
-3. Unsolicited blocks spend a per-peer budget (burst 32, then 30 per minute).
-   Blocks this node requested are not budgeted.
-4. The proof is evaluated on a worker pool sized to the CPU count, off the
-   event loop and in parallel (which also speeds up sync).
-5. **Invalid proof: the peer is disconnected and banned for 24 hours.**
+3. Contextual precheck when every parent is in the DAG: height and `bits`
+   must be exactly what block acceptance requires (max parent height + 1,
+   the ASERT schedule). Blocks already known are dropped.
+4. Unsolicited blocks spend a budget keyed by the peer's IP address (burst 8,
+   then 30 per minute), so new identities from one address share it. A block
+   with an unknown parent skips step 3 and costs 4. Blocks this node
+   requested are not budgeted.
+5. The proof is evaluated on a worker pool sized to the CPU count, off the
+   event loop and in parallel (which also speeds up sync). Evaluations still
+   queued for a peer that has been banned meanwhile are dropped.
+6. **Invalid proof: the peer is disconnected, and the peer and its IP address
+   are banned for 24 hours.**
+
+Gossiped transactions are relayed only after this node's mempool accepted
+them, and each peer has a transaction budget (burst 100, then 20 per second).
 
 Gossip is validated before it is relayed (`validate_messages`): a block is
 relayed only after its proof verified. An honest peer therefore never
