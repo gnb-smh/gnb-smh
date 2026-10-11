@@ -383,9 +383,11 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     // Every input carries a ~8.5 kB hybrid signature + public key, so the
     // consensus minimum fee depends on how many inputs coin selection picks.
     // Build, measure, and rebuild with max(requested, minimum) until stable.
+    // Falcon signatures vary in length between builds, so the fee only ever
+    // rises (to the largest minimum seen) and this always settles.
     let mut fee_sats = fee_sats;
     let mut tx = None;
-    for _ in 0..4 {
+    for _ in 0..16 {
         let built = match gnb::wallet::TxBuilder::build(
             &keypair, &available_utxos, &to_addr_hex, amount_sats, fee_sats,
         ) {
@@ -398,8 +400,8 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
             tx = Some(built);
             break;
         }
-        println!("Fee raised to the consensus minimum for {} bytes: {} GNB", size, min as f64 / 1e8);
-        fee_sats = min;
+        fee_sats = fee_sats.max(min);
+        println!("Fee raised to the consensus minimum for {} bytes: {} GNB", size, fee_sats as f64 / 1e8);
     }
     let tx = tx.unwrap_or_else(|| die("could not settle the fee for this transaction"));
     let size = tx.to_wire_bytes(true).len();

@@ -699,10 +699,12 @@ async fn main() {
         enable_mdns:     cli.enable_mdns,
         archive:         cli.archive,
     };
-    let node = match network::NetworkNode::new(net_cfg) {
+    let mut node = match network::NetworkNode::new(net_cfg) {
         Ok(n)  => { info!("P2P: {}", n.peer_id); n }
         Err(e) => { error!("network: {}", e); std::process::exit(1); }
     };
+    // Gossiped transactions are relayed only after the mempool verdict below.
+    let tx_verdict = node.tx_verdict_channel();
 
     let (our_score, our_count) = {
         let d = dag.read();
@@ -741,6 +743,7 @@ async fn main() {
     let dag2    = dag.clone();
     let state2  = node_state.clone();
     let mem2    = mempool.clone();
+    let tx_verdict2 = tx_verdict.clone();
     let otx2    = outbound_tx.clone();
     let tip_tx2 = tip_tx.clone();
 
@@ -1284,10 +1287,15 @@ async fn main() {
                 }
 
                 // Add validated tx to mempool
-                network::NetworkMessage::NewTransaction { tx_data, .. } => {
+                network::NetworkMessage::NewTransaction { txid: claimed, tx_data } => {
+                    // Every gossiped transaction gets a verdict, so the network
+                    // loop relays exactly the ones this mempool accepted.
+                    let verdict = |valid: bool| {
+                        let _ = tx_verdict2.send(network::TxVerdict { txid: claimed, valid });
+                    };
                     // Sprint 1.d: Bitcoin-format tx wire.
-                    if let Ok(tx) = core::Transaction::from_wire_bytes(&tx_data) {
-                        if !tx.is_coinbase() {
+                    match core::Transaction::from_wire_bytes(&tx_data) {
+                        Ok(tx) if !tx.is_coinbase() && tx.txid() == claimed => {
                             // The selected tip's HEIGHT, never the DAG block
                             // count: in a BlockDAG the count exceeds the height
                             // (parallel blocks are kept), which made every
@@ -1309,12 +1317,21 @@ async fn main() {
                                 validate_tx_standalone(&tx_v, &store_v, height)
                             }).await;
                             match verified {
-                                Ok(Ok(fee)) => { let _ = mem2.add(tx, fee); }
-                                Ok(Err(e))  => debug!("mempool reject: {}", e),
-                                Err(e)      => warn!("tx verify task failed: {}", e),
+                                Ok(Ok(fee)) => {
+                                    // Already pooled is still valid; a full or
+                                    // conflicting pool is not relayed.
+                                    let added = match mem2.add(tx, fee) {
+                                        Ok(_) | Err(mempool::MempoolError::Duplicate) => true,
+                                        Err(e) => { debug!("mempool reject: {}", e); false }
+                                    };
+                                    verdict(added);
+                                }
+                                Ok(Err(e))  => { debug!("mempool reject: {}", e); verdict(false); }
+                                Err(e)      => { warn!("tx verify task failed: {}", e); verdict(false); }
                             }
+                            state2.write().mempool_size = mem2.size();
                         }
-                        state2.write().mempool_size = mem2.size();
+                        _ => verdict(false),
                     }
                 }
 
@@ -1691,7 +1708,7 @@ async fn main() {
                         .map(|o| o.map(|(_, h)| h))
                         .map_err(|e| e.to_string());
                     let (txs, fees, rejected) = blockval::select_valid_for_block(
-                        block_height, mem_m.get_for_block(2000), &utxo, &coinbase, &confirm);
+                        block_height, core::MAX_TEMPLATE_TX_BYTES, mem_m.get_for_block(2000), &utxo, &coinbase, &confirm);
                     for txid in &rejected {
                         mem_m.remove(txid);
                     }
@@ -3630,7 +3647,7 @@ mod intra_tx_dup_tests {
         let coinbase = |t: &[u8; 32]| store.get_coinbase_height(t).map_err(|e| e.to_string());
         let confirm = |t: &[u8; 32]| store.get_tx_location(t)
             .map(|o| o.map(|(_, h)| h)).map_err(|e| e.to_string());
-        blockval::select_valid_for_block(1, txs, &utxo, &coinbase, &confirm)
+        blockval::select_valid_for_block(1, core::MAX_TEMPLATE_TX_BYTES, txs, &utxo, &coinbase, &confirm)
     }
 
     /// Legacy N-7 regression: the miner's block template must not count a

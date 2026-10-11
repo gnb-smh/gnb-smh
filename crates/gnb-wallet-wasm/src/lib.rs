@@ -108,15 +108,18 @@ fn pay(kp: &Keypair, utxos: &[(Vec<u8>, u32, TxOutput)], to: &str, amount: u64, 
         return Err("destination is on another network".into());
     }
     let to_hex = hex::encode(dest.hash());
+    // Falcon signatures vary in length, so each rebuild can come out a few
+    // bytes larger or smaller. The fee only ever rises (to the largest minimum
+    // seen), so this settles as soon as one build is not the largest yet.
     let mut tx: Option<Transaction> = None;
-    for _ in 0..4 {
+    for _ in 0..16 {
         let built = TxBuilder::build(kp, utxos, &to_hex, amount, fee)?;
         let min = tokenomics::min_tx_fee_sat(built.to_wire_bytes(true).len());
         if fee >= min {
             tx = Some(built);
             break;
         }
-        fee = min;
+        fee = fee.max(min);
     }
     let tx = tx.ok_or("could not settle the fee")?;
     let raw = tx.to_wire_bytes(true);

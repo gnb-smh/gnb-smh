@@ -82,6 +82,11 @@ pub fn node_chain_id() -> ChainId {
 pub const GHOSTDAG_K:            usize = 10;
 pub const HALVING_INTERVAL:      u64   = tokenomics::HALVING_INTERVAL;
 pub const MAX_BLOCK_SIZE:        usize = 1_000_000;
+/// Bytes of non-coinbase transactions a block template may hold: the block
+/// limit minus room for the header (up to `MAX_PARENTS` parent hashes), the
+/// coinbase and encoding overhead. Templates filled past this would produce
+/// blocks `validate_structure_cheap` rejects as too large.
+pub const MAX_TEMPLATE_TX_BYTES:  usize = MAX_BLOCK_SIZE - 32 * 1024;
 pub const TARGET_BLOCK_TIME:     u64   = tokenomics::TARGET_BLOCK_TIME_SECS;
 pub const PROTOCOL_VERSION:      u32   = 1;
 /// Minimum accumulated work (`blue_work` of the selected tip) a node must
@@ -776,6 +781,16 @@ impl Transaction {
         Self::calc_fee(size, fee_rate_per_kb, 1000)
     }
 
+    /// Consensus dust rule for a non-coinbase transaction: no output with
+    /// `0 < value < DUST_THRESHOLD`. Block validation applies it to every
+    /// non-coinbase transaction, so the mempool and templates must too.
+    pub fn validate_dust(&self) -> Result<(), &'static str> {
+        if self.outputs.iter().any(|o| o.value > 0 && o.value < DUST_THRESHOLD) {
+            return Err("output below dust threshold");
+        }
+        Ok(())
+    }
+
     /// Sprint A: Actual serialized size of this transaction (after signing).
     pub fn actual_size(&self) -> usize {
         bincode::serde::encode_to_vec(self, bincode::config::standard())
@@ -1020,16 +1035,10 @@ impl Block {
         Ok(())
     }
 
-    /// Check all non-coinbase outputs meet the dust threshold.
+    /// Check all non-coinbase outputs meet the dust threshold
+    /// ([`Transaction::validate_dust`]).
     pub fn validate_dust(&self) -> Result<(), &'static str> {
-        for tx in self.transactions.iter().skip(1) {
-            for out in &tx.outputs {
-                if out.value > 0 && out.value < DUST_THRESHOLD {
-                    return Err("output below dust threshold");
-                }
-            }
-        }
-        Ok(())
+        self.transactions.iter().skip(1).try_for_each(Transaction::validate_dust)
     }
 
     /// Reject blocks with duplicate transactions (CVE-2012-2459: the merkle

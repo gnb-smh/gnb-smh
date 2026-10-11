@@ -64,6 +64,56 @@ struct PowVerdict {
     valid: bool,
 }
 
+/// Mempool verdict on a gossiped transaction, sent back by the message
+/// processor after full validation (`blockval`), so the network loop reports
+/// the gossip validation result only then: nothing is relayed unvalidated.
+#[derive(Debug, Clone, Copy)]
+pub struct TxVerdict {
+    pub txid:  [u8; 32],
+    pub valid: bool,
+}
+
+/// Gossiped transactions awaiting a [`TxVerdict`] older than this are
+/// dropped (gossipsub then never relays them).
+const TX_VERDICT_TTL: Duration = Duration::from_secs(60);
+/// Bound on distinct txids awaiting a verdict.
+const TX_PENDING_CAP: usize = 20_000;
+/// Per-peer gossiped-transaction budget: burst and refill per second. Each
+/// transaction costs hybrid post-quantum signature checks per input.
+const TX_BURST: f64 = 100.0;
+const TX_PER_SEC: f64 = 20.0;
+/// Bound on peers tracked by the transaction limiter.
+const TX_LIMITER_PEERS: usize = 4_096;
+
+/// Token bucket per peer for gossiped transactions, with a bounded map.
+#[derive(Default)]
+struct TxRateLimiter {
+    buckets: std::collections::HashMap<PeerId, (f64, Instant)>,
+}
+
+impl TxRateLimiter {
+    fn take(&mut self, peer: &PeerId, now: Instant) -> bool {
+        if self.buckets.len() >= TX_LIMITER_PEERS && !self.buckets.contains_key(peer) {
+            // A full bucket is equivalent to an absent one: drop those first.
+            self.buckets.retain(|_, (tokens, last)| {
+                *tokens + now.duration_since(*last).as_secs_f64() * TX_PER_SEC < TX_BURST
+            });
+            if self.buckets.len() >= TX_LIMITER_PEERS {
+                return false;
+            }
+        }
+        let (tokens, last) = self.buckets.entry(*peer).or_insert((TX_BURST, now));
+        *tokens = (*tokens + now.duration_since(*last).as_secs_f64() * TX_PER_SEC).min(TX_BURST);
+        *last = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Route a received block through the proof-of-work gate. Every exit path
 /// reports a gossip verdict (when the block came by gossip), so nothing is
 /// relayed unverified and nothing is held forever.
@@ -683,6 +733,9 @@ pub struct NetworkNode {
     pq_identity: Arc<PqIdentity>,
     /// Per-peer PQ key pins (trust on first use).
     pq_pins:     Arc<PeerPins>,
+    /// Mempool verdicts on gossiped transactions ([`Self::tx_verdict_channel`]).
+    /// `None` (in-process harnesses): transactions are relayed on decode.
+    tx_verdicts: Option<mpsc::UnboundedReceiver<TxVerdict>>,
 }
 
 impl NetworkNode {
@@ -698,7 +751,17 @@ impl NetworkNode {
         info!("P2P PQ identity fingerprint: {}", hex::encode(pq_identity.fingerprint()));
         let pq_pins = Arc::new(PeerPins::load(&config.data_dir.join("p2p_pq_pins.json"))
             .map_err(NetworkError::StartFailed)?);
-        Ok(Self { peer_id, config, local_key, pq_identity, pq_pins })
+        Ok(Self { peer_id, config, local_key, pq_identity, pq_pins, tx_verdicts: None })
+    }
+
+    /// Defer the gossip verdict of every received transaction until the
+    /// message processor sends its mempool verdict on the returned sender:
+    /// valid ones are relayed, invalid ones are not (and the peer is not
+    /// penalized, since a transaction can also fail for a benign race).
+    pub fn tx_verdict_channel(&mut self) -> mpsc::UnboundedSender<TxVerdict> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.tx_verdicts = Some(rx);
+        tx
     }
 
     /// Run the network event loop.
@@ -1137,9 +1200,29 @@ impl NetworkNode {
         let pow_workers = Arc::new(tokio::sync::Semaphore::new(
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2)));
         let (pow_verdict_tx, mut pow_verdict_rx) = mpsc::unbounded_channel::<PowVerdict>();
+        let mut tx_verdict_rx = self.tx_verdicts;
+        let mut tx_pending: std::collections::HashMap<[u8; 32], Vec<(gossipsub::MessageId, PeerId, Instant)>> =
+            std::collections::HashMap::new();
+        let mut tx_limiter = TxRateLimiter::default();
 
         loop {
             tokio::select! {
+                Some(v) = async {
+                    match tx_verdict_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    for (id, peer, _) in tx_pending.remove(&v.txid).unwrap_or_default() {
+                        let acceptance = if v.valid {
+                            gossipsub::MessageAcceptance::Accept
+                        } else {
+                            gossipsub::MessageAcceptance::Ignore
+                        };
+                        let _ = swarm.behaviour_mut().gossipsub
+                            .report_message_validation_result(&id, &peer, acceptance);
+                    }
+                }
                 Some(v) = pow_verdict_rx.recv() => {
                     let acceptance = if v.valid {
                         gossipsub::MessageAcceptance::Accept
@@ -1206,6 +1289,9 @@ impl NetworkNode {
                                         &message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
                                 }
                                 WireReaction::Accept(NetworkMessage::NewBlock { .. }) => {}
+                                // Decided below: rate limit, then the mempool verdict.
+                                WireReaction::Accept(NetworkMessage::NewTransaction { .. })
+                                    if tx_verdict_rx.is_some() => {}
                                 WireReaction::Accept(_) => {
                                     let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
                                         &message_id, &propagation_source, gossipsub::MessageAcceptance::Accept);
@@ -1397,6 +1483,30 @@ impl NetworkNode {
                                         &mut swarm, propagation_source, Some(message_id), msg,
                                         true, "gossip",
                                     );
+                                } else if let (NetworkMessage::NewTransaction { txid, .. }, true) =
+                                    (&msg, tx_verdict_rx.is_some())
+                                {
+                                    let now = Instant::now();
+                                    if !tx_limiter.take(&propagation_source, now) {
+                                        debug!("P2P: {} exceeded its transaction budget; tx ignored", propagation_source);
+                                        let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                            &message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
+                                    } else {
+                                        if tx_pending.len() >= TX_PENDING_CAP {
+                                            tx_pending.retain(|_, v| {
+                                                v.retain(|(_, _, t)| now.duration_since(*t) < TX_VERDICT_TTL);
+                                                !v.is_empty()
+                                            });
+                                        }
+                                        if tx_pending.len() < TX_PENDING_CAP || tx_pending.contains_key(txid) {
+                                            tx_pending.entry(*txid).or_default()
+                                                .push((message_id, propagation_source, now));
+                                            forward_to_processor(&block_tx, msg, "gossip");
+                                        } else {
+                                            let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                                &message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
+                                        }
+                                    }
                                 } else {
                                     forward_to_processor(&block_tx, msg, "gossip");
                                 }
@@ -2337,6 +2447,24 @@ fn serve_sync_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gossiped transactions: a burst of TX_BURST per peer, then TX_PER_SEC;
+    /// peers are independent and the tracked-peer map stays bounded.
+    #[test]
+    fn tx_rate_limiter_bounds_each_peer() {
+        let mut l = TxRateLimiter::default();
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let t0 = Instant::now();
+        let burst = TX_BURST as usize;
+        assert_eq!((0..burst + 10).filter(|_| l.take(&a, t0)).count(), burst);
+        assert!(l.take(&b, t0), "another peer has its own budget");
+        assert!(!l.take(&a, t0));
+        assert!(l.take(&a, t0 + Duration::from_millis(100)), "refills at TX_PER_SEC");
+        for _ in 0..TX_LIMITER_PEERS * 2 {
+            l.take(&PeerId::random(), t0);
+        }
+        assert!(l.buckets.len() <= TX_LIMITER_PEERS);
+    }
 
     // ── M-10 regressions: bounded random-sample PEX answer ──────────────────
 

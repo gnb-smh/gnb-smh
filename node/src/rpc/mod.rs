@@ -1156,7 +1156,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     .map(|o| o.map(|(_, h)| h))
                     .map_err(|e| e.to_string());
                 let (txs, _fees, rejected) = crate::blockval::select_valid_for_block(
-                    height, state.mempool.get_for_block(2000), &utxo, &coinbase, &confirm);
+                    height, crate::core::MAX_TEMPLATE_TX_BYTES, state.mempool.get_for_block(2000), &utxo, &coinbase, &confirm);
                 for txid in &rejected {
                     state.mempool.remove(txid);
                 }
@@ -1743,15 +1743,7 @@ fn validate_tx_for_mempool(tx: &Transaction, store: &Arc<Storage>, current_heigh
     // mempool poisons every block template that includes it — a cheap way to
     // make an honest pool produce nothing but rejected blocks. Reject it here,
     // before the expensive signature checks, so it never reaches a template.
-    const DUST_THRESHOLD_SATS: u64 = 546;
-    for (i, o) in tx.outputs.iter().enumerate() {
-        if o.value > 0 && o.value < DUST_THRESHOLD_SATS {
-            return Err(format!(
-                "output {} below dust threshold ({} < {} sats)",
-                i, o.value, DUST_THRESHOLD_SATS
-            ));
-        }
-    }
+    tx.validate_dust().map_err(|e| e.to_string())?;
 
     // Every input/signature/policy/timelock/fee rule: the ONE implementation
     // block validation uses (crate::blockval), evaluated for the next block

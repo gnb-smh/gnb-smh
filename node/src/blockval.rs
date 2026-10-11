@@ -104,6 +104,11 @@ pub fn validate_tx_inputs(
             return Err(format!("output {}: unsupported script_pubkey ({} bytes)", j, out.script_pubkey.len()));
         }
     }
+    // Dust is a block rule (Block::validate_dust). Checking it here makes the
+    // mempool (gossip and RPC) and block templates refuse what a block would:
+    // a sub-dust tx admitted over P2P otherwise entered every template and the
+    // self-mined block failed its structure check after the proof of work.
+    tx.validate_dust().map_err(|e| e.to_string())?;
 
     // C-R3-2: the intra-tx duplicate-outpoint check is UNCONDITIONAL. The
     // standalone (gossip-relay) path passes `spent_set = None`, and the old
@@ -343,12 +348,16 @@ fn validate_block_transactions_inner(
 /// Choose, in order, the candidates that are valid TOGETHER in a block at
 /// `height` on top of the given state, under the full rule set. Invalid ones
 /// (non-final, immature, double-spending, unsigned, timelocked, conflicting
-/// with an earlier pick, …) are skipped and returned so the caller can evict
-/// them. A block template built from the result never fails transaction
-/// validation, so one bad mempool entry cannot make every mined block
-/// invalid. Returns `(selected, total fees, rejected txids)`.
+/// with an earlier pick, dust, …) are skipped and returned so the caller can
+/// evict them. Valid ones that do not fit in `max_bytes` (serialized size,
+/// as `Block::size_bytes` counts it) are skipped but NOT returned: they stay
+/// in the mempool for a later block. A block template built from the result
+/// never fails transaction validation or the block size limit, so neither one
+/// bad mempool entry nor a full mempool can make every mined block invalid.
+/// Returns `(selected, total fees, rejected txids)`.
 pub fn select_valid_for_block(
     height: u64,
+    max_bytes: usize,
     candidates: Vec<Transaction>,
     utxo_lookup: &UtxoLookup<'_>,
     coinbase_height: &CoinbaseHeightLookup<'_>,
@@ -360,11 +369,16 @@ pub fn select_valid_for_block(
     let mut selected = Vec::new();
     let mut rejected = Vec::new();
     let mut fees: u64 = 0;
+    let mut bytes: usize = 0;
     for tx in candidates {
         let txid = tx.txid();
         if tx.is_coinbase() || created_txids.contains(&txid) {
             rejected.push(txid);
             continue;
+        }
+        let size = tx.actual_size();
+        if size == 0 || bytes.saturating_add(size) > max_bytes {
+            continue; // does not fit (or cannot be measured): leave it for a later block
         }
         let maturity = core::check_coinbase_maturity(&tx, height, |t| {
             coinbase_height(t).unwrap_or(Some(height)) // unreadable index ⇒ treat as immature
@@ -384,6 +398,7 @@ pub fn select_valid_for_block(
         match verdict.ok().and_then(|fee| fees.checked_add(fee)) {
             Some(total) => {
                 fees = total;
+                bytes += size;
                 spent = trial;
                 for (j, out) in tx.outputs.iter().enumerate() {
                     created.insert((txid, j as u32), out.clone());
@@ -448,6 +463,51 @@ mod tests {
     }
     fn no_coinbase(_: &[u8; 32]) -> Result<Option<u64>, String> { Ok(None) }
     fn no_confirm(_: &[u8; 32]) -> Result<Option<u64>, String> { Ok(None) }
+
+    /// Any outpoint `([b; 32], 0)` holds 1,000,000 to `owner()`.
+    fn utxo_any(_: &[u8; 32], i: u32) -> Result<Option<TxOutput>, String> {
+        Ok((i == 0).then(|| TxOutput { value: 1_000_000, script_pubkey: owner() }))
+    }
+
+    /// A sub-dust output is refused by the per-transaction rules, so neither
+    /// the mempool (gossip or RPC) nor a template can carry one into a block
+    /// that `validate_structure_cheap` would reject after the proof of work.
+    #[test]
+    fn dust_is_refused_before_templates() {
+        let dust = spend(([0x11u8; 32], 0), core::DUST_THRESHOLD - 1);
+        let ctx = SpendContext { height: 200, confirm_height: &no_confirm };
+        assert!(validate_tx_inputs(&dust, &utxo_any, None, &ctx).unwrap_err().contains("dust"));
+        let ok = spend(([0x12u8; 32], 0), core::DUST_THRESHOLD);
+        let (sel, _, rej) = select_valid_for_block(200, core::MAX_TEMPLATE_TX_BYTES,
+                                                   vec![dust.clone(), ok], &utxo_any, &no_coinbase, &no_confirm);
+        assert_eq!(sel.len(), 1);
+        assert_eq!(rej, vec![dust.txid()], "dust is evicted");
+        let b = block(std::iter::once(coinbase(1_000)).chain(sel).collect());
+        assert!(b.validate_dust().is_ok());
+    }
+
+    /// A full mempool must not produce an oversized block: valid candidates
+    /// past the byte budget are left out (and NOT evicted).
+    #[test]
+    fn templates_respect_the_block_size_budget() {
+        let txs: Vec<Transaction> = (0..10u8).map(|b| spend(([0x20 + b; 32], 0), 900_000)).collect();
+        let one = txs[0].actual_size();
+        let budget = 3 * one + one / 2;
+        let (sel, _, rej) = select_valid_for_block(200, budget, txs.clone(), &utxo_any, &no_coinbase, &no_confirm);
+        assert_eq!(sel.len(), 3, "only three fit");
+        assert!(rej.is_empty(), "valid transactions that do not fit stay in the mempool");
+        assert!(sel.iter().map(|t| t.actual_size()).sum::<usize>() <= budget);
+
+        // With the real budget, a template of as many ~8.5 kB transactions as
+        // fit always passes the block size rule.
+        let many: Vec<Transaction> = (0..200u8).map(|b| spend(([b; 32], 0), 900_000)).collect();
+        let (sel, _, _) = select_valid_for_block(200, core::MAX_TEMPLATE_TX_BYTES, many, &utxo_any,
+                                                 &no_coinbase, &no_confirm);
+        assert!(sel.len() > 100 && sel.len() < 200, "{} selected", sel.len());
+        let mut b = block(std::iter::once(coinbase(1_000)).chain(sel).collect());
+        b.header.parents = vec![[0xEE; 32]; core::MAX_PARENTS];
+        assert!(b.size_bytes() <= core::MAX_BLOCK_SIZE, "template block is {} bytes", b.size_bytes());
+    }
 
     #[test]
     fn valid_block_passes_and_returns_fees() {
