@@ -432,6 +432,9 @@ impl Storage {
     }
 
     /// O(k) UTXO lookup via address index (was O(n) full UTXO scan)
+    /// UTXOs paying exactly `address_bytes`, the FULL script_pubkey (20-byte
+    /// key hash or 33-byte policy script): the index key is
+    /// `script ‖ txid ‖ index`, so a shorter prefix finds nothing.
     pub fn get_utxos_for_address(&self, address_bytes: &[u8]) -> Result<Vec<(Vec<u8>, u32, TxOutput)>, StorageError> {
         if address_bytes.len() < 20 {
             return Ok(vec![]);
@@ -1097,6 +1100,24 @@ mod sprint_f_tests {
             outputs: vec![mk_output(addr_byte, value)],
             locktime: 0,
         }
+    }
+
+    /// Policy outputs (33-byte scripts) are found by their full script, and
+    /// a key-hash script that shares their first 20 bytes never mixes in.
+    #[test]
+    fn utxos_for_address_finds_policy_scripts() {
+        let (_tmp, s) = mk_storage();
+        let mut policy = vec![0x02u8];
+        policy.extend_from_slice(&[0x55u8; 32]);
+        let key_hash = policy[..20].to_vec();
+        s.put_utxo(&[1u8; 32], 0, &TxOutput { value: 7, script_pubkey: policy.clone() }).unwrap();
+        s.put_utxo(&[2u8; 32], 1, &TxOutput { value: 9, script_pubkey: key_hash.clone() }).unwrap();
+        let p = s.get_utxos_for_address(&policy).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].1, p[0].2.value), (0, 7));
+        let k = s.get_utxos_for_address(&key_hash).unwrap();
+        assert_eq!(k.len(), 1);
+        assert_eq!((k[0].1, k[0].2.value), (1, 9));
     }
 
     #[test]

@@ -908,13 +908,13 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // a multi-MB response that overflows clients; a spender only needs enough
             // UTXOs to cover the amount, so it can pass a small limit.
             let limit = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).map(|n| n as usize);
-            // Single-key (gnb1q…) or policy (gnb1m…) address. The address
-            // index is keyed by the script's first 20 bytes; results are
-            // filtered on the FULL script so a prefix match never mixes in
-            // another script's outputs.
+            // Single-key (gnb1q…, 20-byte script) or policy (gnb1m…, 33-byte
+            // script) address. The address index is keyed by the FULL script,
+            // so the lookup must use all of it (a 20-byte prefix never matches
+            // a policy entry); results are still filtered on the full script.
             let script = crate::address::destination_script(addr).ok().map(|(_, spk)| spk);
             match script {
-                Some(spk) => match state.store.get_utxos_for_address(&spk[..20]) {
+                Some(spk) => match state.store.get_utxos_for_address(&spk) {
                     Ok(utxos) => {
                         let utxos: Vec<_> = utxos.into_iter()
                             .filter(|(_, _, o)| o.script_pubkey == spk)
