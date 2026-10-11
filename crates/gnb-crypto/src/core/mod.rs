@@ -1195,33 +1195,36 @@ impl UndoData {
 // ── Genesis ───────────────────────────────────────────────────────────────────
 //
 // The GnB genesis state is the converted Bloch Genesis-3 carryover (see
-// `carryover`), written into the UTXO set when the genesis is initialised; the
-// genesis coinbase text commits to the snapshot's SHA3-256 and the conversion.
-// No premine: the coinbase pays 0 to an unspendable all-zero script, so the
+// `carryover`) plus the locked team and founder tranches (see `vesting`),
+// written into the UTXO set when the genesis is initialised; the genesis
+// coinbase text commits to the snapshot's SHA3-256, the conversion and the
+// vesting keys. The coinbase pays 0 to an unspendable all-zero script, so the
 // first mined subsidy is at height 1. Its proof of work is a real GnB-SMH
 // solution at GENESIS_BITS, found once by `gnb-mine-genesis` and baked below;
 // the node refuses to start if the genesis does not validate.
 
 /// Coinbase text of the genesis block.
 pub const GENESIS_COINBASE_TEXT: &str =
-    "GnB genesis 2026-10-08: Godel and Bell, GnB-SMH memory-hard PoW, 10M GNB cap. \
+    "GnB genesis: Godel and Bell, GnB-SMH memory-hard PoW, 12.5M GNB cap. \
 Carryover Bloch G3 terminal snapshot sha3 3d67246e94881a17d302b464f79fee55886d8068794e76fed43081117fbe308d \
-3810744000 BLCH -> 1000000 GNB.";
-/// Unix time of the genesis block (2026-10-08 03:11:32 UTC), the launch moment. Also the
+3810744000 BLCH -> 1000000 GNB. \
+Team 1250000 + founder 1250000 GNB locked, 1y cliff + 36 monthly, keys sha3 \
+e24828c3cc6d56fe635581b8214af8733f4b060784d13bd92f2d558940d90d20.";
+/// Unix time of the genesis block (2026-10-11 00:42:26 UTC, provisional: re-mined at relaunch), the launch moment. Also the
 /// ASERT anchor timestamp.
-pub const GENESIS_TIMESTAMP: u64 = 1791429092;
+pub const GENESIS_TIMESTAMP: u64 = 1791679346;
 /// Genesis difficulty and ASERT anchor bits: ≈ 4,500 evaluations per block,
 /// i.e. 30 s at the launch hashrate (7 hosts × 11 threads ≈ 150 evaluations/s).
 pub const GENESIS_BITS:      u32 = 0x1F0E_9036;
 /// GnB-SMH nonce of the genesis block.
-pub const GENESIS_NONCE:     u64 = 482;
+pub const GENESIS_NONCE:     u64 = 91;
 /// `block_hash()` of the genesis block:
-/// 837f7d5c832ae28370cd52baa969528753f619be2a4dd07d814a1a986c4201cd.
+/// f51b71acf17b202b1036a76abe38a30df6ee184e91951bead51016fa091ff02f.
 pub const GENESIS_EXPECTED_HASH: [u8; 32] = [
-    0x83, 0x7f, 0x7d, 0x5c, 0x83, 0x2a, 0xe2, 0x83,
-    0x70, 0xcd, 0x52, 0xba, 0xa9, 0x69, 0x52, 0x87,
-    0x53, 0xf6, 0x19, 0xbe, 0x2a, 0x4d, 0xd0, 0x7d,
-    0x81, 0x4a, 0x1a, 0x98, 0x6c, 0x42, 0x01, 0xcd,
+    0xf5, 0x1b, 0x71, 0xac, 0xf1, 0x7b, 0x20, 0x2b,
+    0x10, 0x36, 0xa7, 0x6a, 0xbe, 0x38, 0xa3, 0x0d,
+    0xf6, 0xee, 0x18, 0x4e, 0x91, 0x95, 0x1b, 0xea,
+    0xd5, 0x10, 0x16, 0xfa, 0x09, 0x1f, 0xf0, 0x2f,
 ];
 
 /// Genesis block with explicit header parameters (used by the mining tool).
