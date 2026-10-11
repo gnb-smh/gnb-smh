@@ -1,0 +1,4 @@
+{
+  "status": "pending",
+  "note": "Founder and team public keys not configured yet. Nodes refuse to create a genesis ledger until this file holds them."
+}

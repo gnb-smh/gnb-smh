@@ -7,9 +7,10 @@ use sha2::Sha256;
 use sha3::{Digest, Sha3_256};
 use serde::{Serialize, Deserialize};
 
-/// Monetary policy: 10,000,000 GNB hard cap, fair launch, consensus minimum fee.
+/// Monetary policy: 12,500,000 GNB hard cap (carryover, locked team and founder, mining), consensus minimum fee.
 pub mod tokenomics;
 pub mod policy;      // m-of-n multisig + absolute/relative timelocks
+pub mod vesting;     // locked team and founder allocations (genesis ledger)
 
 /// Bloch Genesis-3 carryover: verified, converted opening ledger.
 pub mod carryover;

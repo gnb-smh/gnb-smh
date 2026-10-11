@@ -11,7 +11,7 @@ genesis that carries the Bloch Genesis-3 ledger over at a fixed conversion.
 | Consensus | GhostDAG (k = 10), 30-second target spacing |
 | Difficulty | ASERT anchored at genesis, 2-hour half-life, computed per block from its parents |
 | Signatures | Hybrid ML-DSA-65 ‖ Falcon-1024 |
-| Supply | Hard cap 10,000,000 GNB: 10% Bloch carryover, 90% mining |
+| Supply | Hard cap 12,500,000 GNB: 8% Bloch carryover, 10% team and 10% founder (locked: 1-year cliff, then 36 monthly tranches), 72% mining |
 | Unit | 1 GNB = 10^8 base units; addresses `gnb1q…` (mainnet), `gnb1t…` (testnet) |
 
 Status: pre-release. Not audited.

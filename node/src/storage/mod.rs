@@ -1273,6 +1273,7 @@ impl Storage {
     pub fn ingest_carryover(
         &self,
         snap: &crate::core::carryover::VerifiedCarryover,
+        locked: &[crate::core::vesting::Tranche],
     ) -> Result<u64, StorageError> {
         let cf_utxo = self.db.cf_handle(CF_UTXO)
             .ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
@@ -1285,8 +1286,15 @@ impl Storage {
             batch.put_cf(&cf_utxo, utxo_key(&u.txid, u.vout), encode(&u.output)?);
             batch.put_cf(&cf_ai, addr_utxo_key(&u.output.script_pubkey, &u.txid, u.vout), [0u8; 0]);
         }
+        // Locked team and founder tranches (core::vesting), same batch: the
+        // genesis ledger lands complete or not at all.
+        for t in locked {
+            batch.put_cf(&cf_utxo, utxo_key(&t.txid, t.vout), encode(&t.output)?);
+            batch.put_cf(&cf_ai, addr_utxo_key(&t.output.script_pubkey, &t.txid, t.vout), [0u8; 0]);
+        }
         batch.put_cf(&cf_meta, b"carryover_sha3", snap.sha3);
+        batch.put_cf(&cf_meta, b"vesting_sha3", crate::core::vesting::VESTING_SPEC_SHA3);
         self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
-        Ok(snap.utxos.len() as u64)
+        Ok((snap.utxos.len() + locked.len()) as u64)
     }
 }

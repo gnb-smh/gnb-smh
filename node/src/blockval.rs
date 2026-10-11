@@ -717,4 +717,42 @@ mod tests {
         let b = block(vec![coinbase(1_000), tx]);
         assert_eq!(validate_block_transactions(&b, &policy_utxo(&p), &no_coinbase, &no_confirm), Ok(fee));
     }
+
+    /// Locked genesis tranches (core::vesting): unspendable by anyone, the
+    /// beneficiary included, until the unlock height; then spendable with
+    /// the beneficiary's keys (founder 1-of-1, team m-of-n).
+    #[test]
+    fn locked_tranches_unlock_only_at_their_height() {
+        use gnb_crypto::address::Network;
+        use gnb_crypto::core::vesting::{parse_spec, tranches, Role};
+        use gnb_crypto::wallet::policy_spend::PolicySpend;
+
+        let founder = crypto::generate_keypair();
+        let team = signers(3);
+        let spec = serde_json::json!({
+            "founder": hex::encode(&founder.0),
+            "team": { "threshold": 2, "pubkeys": team.keys.iter().map(|k| hex::encode(&k.0)).collect::<Vec<_>>() },
+        }).to_string();
+        let all = tranches(&parse_spec(&spec).unwrap()).unwrap();
+
+        for (role, k) in [(Role::Founder, 1u32), (Role::Team, 36)] {
+            let t = all.iter().find(|t| t.role == role && t.k == k).unwrap();
+            let utxo = |id: &[u8; 32], i: u32| Ok((*id == t.txid && i == t.vout).then(|| t.output.clone()));
+            let unlock = t.unlock_height as u32;
+            let mut spend = PolicySpend::new(Network::Mainnet, t.policy.clone(), &[(t.txid, t.vout, t.output.value)],
+                                             owner(), 1_000_000, 0, unlock).unwrap();
+            match role {
+                Role::Founder => { spend.sign(&founder.0, |m| crypto::sign(&founder.1, m).map_err(|e| format!("{e:?}"))).unwrap(); }
+                Role::Team => for i in [0usize, 2] {
+                    spend.sign(&team.keys[i].0, |m| crypto::sign(&team.keys[i].1, m).map_err(|e| format!("{e:?}"))).unwrap();
+                },
+            }
+            let tx = spend.finalize().unwrap();
+            let early = at_height(t.unlock_height - 1, vec![coinbase(1_000), tx.clone()]);
+            assert!(matches!(validate_block_transactions(&early, &utxo, &no_coinbase, &no_confirm),
+                             Err(BlockTxError::Invalid(m)) if m.contains("non-final")), "{:?} {}", role, k);
+            let on_time = at_height(t.unlock_height, vec![coinbase(1_000), tx]);
+            assert!(validate_block_transactions(&on_time, &utxo, &no_coinbase, &no_confirm).is_ok(), "{:?} {}", role, k);
+        }
+    }
 }

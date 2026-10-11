@@ -382,14 +382,24 @@ async fn main() {
             error!("cannot read {}: {e}", snap_path.display());
             std::process::exit(1);
         });
+        // Locked team and founder allocations (core::vesting): the keys must
+        // be configured and match the consensus hash before any ledger exists.
+        let locked = core::vesting::genesis_tranches().unwrap_or_else(|e| {
+            error!("locked allocations unavailable: {e}. Refusing to start.");
+            std::process::exit(1);
+        });
+        info!("locked allocations: {} tranches (team {} + founder {} sat), first unlock h={}, last h={}",
+              locked.len(), core::tokenomics::TEAM_ALLOCATION_SAT, core::tokenomics::FOUNDER_ALLOCATION_SAT,
+              core::tokenomics::vesting_unlock_height(1),
+              core::tokenomics::vesting_unlock_height(core::tokenomics::VESTING_TRANCHES));
         match core::carryover::verify_and_convert(&bytes) {
             Ok(snap) => {
                 info!("carryover VERIFIED: {} Bloch outputs ({} BLCH sat) -> {} UTXOs, {} GNB sat \
                        ({} zero-value dropped, {} vouts fixed)",
                       snap.source_rows, snap.source_total_sat, snap.utxos.len(),
                       snap.converted_total_sat, snap.dropped_zero, snap.fixed_vouts);
-                match store.ingest_carryover(&snap) {
-                    Ok(n) => info!("carryover ingested: {n} UTXOs written atomically"),
+                match store.ingest_carryover(&snap, &locked) {
+                    Ok(n) => info!("genesis ledger ingested: {n} UTXOs (carryover + locked) written atomically"),
                     Err(e) => {
                         error!("carryover ingestion failed: {e}. Nothing was written. Refusing to start.");
                         std::process::exit(1);
@@ -453,9 +463,10 @@ async fn main() {
             store.put_tx_index(&tx.txid(), &hash, 0).expect("tx_index");
         }
         info!("Genesis: {}", hex::encode(hash));
-        info!("Supply: hard cap {} GNB (carryover {} sat), initial subsidy {} sat/block, halving every {} blocks",
+        info!("Supply: hard cap {} GNB (carryover {} sat, locked team+founder {} sat), initial subsidy {} sat/block, halving every {} blocks",
               core::tokenomics::MAX_SUPPLY_SAT / core::tokenomics::SAT_PER_GNB,
               core::carryover::CARRYOVER_CONVERTED_TOTAL_SAT,
+              core::tokenomics::TEAM_ALLOCATION_SAT + core::tokenomics::FOUNDER_ALLOCATION_SAT,
               core::tokenomics::INITIAL_SUBSIDY_SAT,
               core::tokenomics::HALVING_INTERVAL);
     } else {
@@ -476,6 +487,14 @@ async fn main() {
             _ => {
                 error!("data-dir has no (or a different) carryover marker. Refusing to start; \
                         use a fresh --data-dir with --carryover-snapshot.");
+                std::process::exit(1);
+            }
+        }
+        match store.get_meta("vesting_sha3").ok().flatten() {
+            Some(r) if r.as_slice() == core::vesting::VESTING_SPEC_SHA3 => {}
+            _ => {
+                error!("data-dir has no (or a different) locked-allocation marker. Refusing to start; \
+                        use a fresh --data-dir.");
                 std::process::exit(1);
             }
         }

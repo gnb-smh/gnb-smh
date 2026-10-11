@@ -3,15 +3,40 @@
 Consensus rules, defined in `crates/gnb-crypto/src/core/tokenomics.rs` and
 `crates/gnb-crypto/src/core/carryover.rs`.
 
-## Hard cap: 10,000,000 GNB
+## Hard cap: 12,500,000 GNB
 
 | Allocation | Share | Amount |
 | --- | --- | --- |
-| Bloch Genesis-3 carryover | 10% | 1,000,000 GNB (999,999.99789793 issued after rounding) |
-| Mining | 90% | 9,000,000 GNB (8,999,998.51392253 issued after rounding) |
-| **Total issued** | | **9,999,998.51182046 GNB** |
+| Bloch Genesis-3 carryover | 8% | 1,000,000 GNB (999,999.99789793 issued after rounding) |
+| Team, locked | 10% | 1,250,000 GNB |
+| Founder, locked | 10% | 1,250,000 GNB |
+| Mining | 72% | 9,000,000 GNB (8,999,998.51392253 issued after rounding) |
+| **Total issued** | | **12,499,998.51182046 GNB** |
 
-No premine, no founder allocation, no pools.
+No pools. 100% of every subsidy and fee goes to the miner.
+
+## Team and founder allocations (locked)
+
+Defined in `crates/gnb-crypto/src/core/vesting.rs`. Both allocations are
+written into the genesis ledger as 36 outputs each. Every output pays to a
+spend policy (see [MULTISIG.md](MULTISIG.md)) with an absolute timelock, so
+the lock is a consensus rule: before its height a tranche cannot be spent by
+anyone, the beneficiary included.
+
+| | |
+| --- | --- |
+| Cliff | 1,051,200 blocks (1 year): nothing unlocks |
+| Tranches | 36, one every 87,600 blocks (1 month) |
+| Tranche k unlocks at | 1,051,200 + k × 87,600 (first 1,138,800; last 4,204,800, 4 years) |
+| Tranche value | 1,250,000 GNB / 36 = 34,722.22222222 GNB, remainder in the last |
+| Founder | one key (1-of-1) |
+| Team | m-of-n multisig |
+
+The public keys live in `crates/gnb-crypto/genesis/vesting.json`; its
+SHA3-256 is the consensus constant `VESTING_SPEC_SHA3`, and the relaunch genesis
+coinbase text must commit to it (re-mined once the keys are set). Outpoints are synthetic, like the carryover:
+`txid = SHA3-256("GNB-VESTING-v1" ‖ role ‖ k ‖ policy hash)`, `vout = 0`.
+Until the file holds the keys, nodes refuse to create a genesis ledger.
 
 ## Mining subsidy
 
