@@ -1781,6 +1781,9 @@ async fn main() {
                     height:       block_height,
                     shielded_transactions: Vec::new(),
                 };
+                // From WITNESS_COMMITMENT_HEIGHT the coinbase commits to every
+                // witness (refreshes the merkle root).
+                block.commit_witnesses();
 
                 // GnB-SMH search. Short rounds (MINE_ROUND_ATTEMPTS nonces per
                 // thread, ~10-20 s on a typical core) so the template — tips,
@@ -2311,8 +2314,17 @@ fn accept_block(
                 reorg::mark_block_invalid(store, &block_hash);
                 return Err(format!("consensus rejection: {}", e));
             }
-            // Witness failures and storage errors reject THIS copy only;
-            // neither is recorded (see BlockTxError::InvalidWitness).
+            // From WITNESS_COMMITMENT_HEIGHT the hash commits to every witness
+            // (the structure check verified the commitment), so a witness
+            // failure is a verdict on the block itself, not on this copy.
+            Err(blockval::BlockTxError::InvalidWitness(e))
+                if block.height >= core::WITNESS_COMMITMENT_HEIGHT =>
+            {
+                reorg::mark_block_invalid(store, &block_hash);
+                return Err(format!("consensus rejection: {}", e));
+            }
+            // Below it, witness failures and storage errors reject THIS copy
+            // only; neither is recorded (see BlockTxError::InvalidWitness).
             Err(e) => return Err(format!("consensus rejection: {}", e)),
         }
     }

@@ -1050,6 +1050,13 @@ impl GhostDAG {
 
         // 3. Compute mergeset (topologically sorted, ancestors first)
         let mergeset = compute_mergeset(&self.store, &parents, &selected_parent);
+        // Consensus bound (Kaspa's mergeset size limit): coloring and
+        // validation cost grow with the mergeset, and an honest one stays
+        // near k. Checked before any mutation, so a refused block leaves
+        // the DAG untouched.
+        if mergeset.len() > MERGESET_SIZE_LIMIT {
+            return Err(ConsensusError::MergesetTooLarge { size: mergeset.len(), limit: MERGESET_SIZE_LIMIT });
+        }
 
         // 4. Classify mergeset blocks as blue or red using PHANTOM constraint.
         //    In Fast mode the reachability index must contain every existing
@@ -1672,7 +1679,17 @@ pub enum ConsensusError {
     /// parent, reject it cleanly instead of panicking the node.
     #[error("selected parent not in DAG: {}", hex::encode(.0))]
     MissingSelectedParent(BlockHash),
+
+    /// The block's mergeset exceeds [`MERGESET_SIZE_LIMIT`].
+    #[error("mergeset of {size} blocks exceeds the limit of {limit}")]
+    MergesetTooLarge { size: usize, limit: usize },
 }
+
+/// Largest mergeset a block may have (blocks merged besides its selected
+/// chain). With k = 10 and 30-second blocks an honest mergeset stays near k;
+/// the live chain's has never exceeded 2. Bounds coloring and validation work
+/// per block (Kaspa enforces the same kind of limit).
+pub const MERGESET_SIZE_LIMIT: usize = 64;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -1684,6 +1701,35 @@ mod tests {
         let mut h = [0u8; 32];
         h[0] = n;
         h
+    }
+
+    /// A block may not merge more than MERGESET_SIZE_LIMIT blocks; refusing
+    /// it leaves the DAG unchanged.
+    #[test]
+    fn oversized_mergeset_is_refused_without_mutation() {
+        for coloring in [ColoringMode::Legacy, ColoringMode::Fast] {
+            let mut dag = GhostDAG::with_default_k();
+            dag.coloring = coloring;
+            let g = [0xEEu8; 32];
+            dag.add_genesis(g, 1_000);
+            // The mergeset excludes the selected parent: LIMIT + 2 parents
+            // merge LIMIT + 1 blocks.
+            let side: Vec<BlockHash> = (0..MERGESET_SIZE_LIMIT as u16 + 2)
+                .map(|i| { let mut h = [0u8; 32]; h[..2].copy_from_slice(&i.to_le_bytes()); h[2] = 0x5A; h })
+                .collect();
+            for h in &side {
+                dag.add_block(*h, vec![g], 1_030, 1).unwrap();
+            }
+            let count = dag.block_count();
+            let big = [0xB1u8; 32];
+            let res = dag.add_block(big, side.clone(), 1_060, 1);
+            assert!(matches!(res, Err(ConsensusError::MergesetTooLarge { .. })), "{:?}", res.map(|d| d.height));
+            assert_eq!(dag.block_count(), count, "nothing inserted");
+            assert!(dag.get_block_data(&big).is_none());
+            let ok = [0xB2u8; 32];
+            assert!(dag.add_block(ok, side[..MERGESET_SIZE_LIMIT + 1].to_vec(), 1_060, 1).is_ok(),
+                    "a mergeset at the limit is accepted");
+        }
     }
 
     /// WS-A: the corrected-coloring gate is armed to a FUTURE height. A Legacy

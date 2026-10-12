@@ -77,3 +77,14 @@ punishes an innocent relay.
 
 Not yet: a full new/tried address manager with feeler connections, anchors
 across restarts, and inbound eviction by peer quality.
+
+## Mempool policy
+
+- Transactions spend confirmed outputs only (no unconfirmed chains).
+- Replace-by-fee: a transaction conflicting with pool entries replaces all of
+  them only if it pays their total fee plus 1 sat/byte of its own size, has a
+  strictly higher fee rate than each, replaces at most 100, and fits without
+  further eviction. Otherwise the first-seen transaction stays.
+- A full pool evicts its lowest fee-rate entry only for a newcomer paying at
+  least 1 sat/byte more (incremental relay fee).
+- Entries expire after 72 hours.

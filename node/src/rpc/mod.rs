@@ -1175,6 +1175,16 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             }).collect();
 
             let subsidy = crate::core::tokenomics::block_subsidy_sat(height);
+            // Witness commitment over these transactions (the coinbase slot
+            // counts as zero, so any coinbase the miner builds matches it).
+            let witness_commitment = hex::encode(crate::core::Block {
+                header: crate::core::BlockHeader { version: 1, parents: vec![],
+                    merkle_root: crate::core::MerkleRoot::ZERO, timestamp: 0, bits, nonce: 0 },
+                transactions: std::iter::once(crate::core::Transaction {
+                    version: 1, inputs: vec![], outputs: vec![], locktime: 0 })
+                    .chain(txs.iter().cloned()).collect(),
+                blue_score, height, shielded_transactions: Vec::new(),
+            }.witness_commitment());
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1198,6 +1208,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // (version u32le | n_parents u32le | parents | merkle_root |
                 // timestamp u64le | bits u32le) and the u64 nonce; valid iff
                 // the 32-byte output, big-endian, is < target(bits).
+                // From witness_commitment_height the coinbase script_sig must
+                // END with these bytes (tag ‖ Merkle root of the wtxids, the
+                // coinbase counted as zero); see Block::commit_witnesses.
+                "witness_commitment_height": crate::core::WITNESS_COMMITMENT_HEIGHT,
+                "witness_commitment":   witness_commitment,
                 "pow":                  "gnb-smh-v1",
                 "pow_log2_n":           gnb_smh::LOG2_N,
                 "target":               hex::encode(crate::core::bits_to_target(bits)),

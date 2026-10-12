@@ -432,6 +432,36 @@ fn verify_hybrid_mldsa_falcon(pk_body: &[u8], message: &[u8], sig_body: &[u8]) -
     verify_hybrid_mldsa_falcon_with(pk_body, message, sig_body, falcon::verify)
 }
 
+/// FIPS 204 bound on an ML-DSA-65 signature's response vector `z`: every
+/// coefficient must satisfy |z| < γ1 − β (γ1 = 2^19, β = τ·η = 49·4 = 196).
+///
+/// Checked here, before the library: the linked PQClean-based verifier
+/// (pqcrypto-mldsa 0.1.2) accepts 41 Wycheproof vectors that violate this
+/// bound (tests/wycheproof_mldsa65.rs), including the exact boundary
+/// −(γ1 − β). Such signatures can only be made with the private key, but
+/// accepting them would let a key holder produce signatures a conforming
+/// implementation refuses: a consensus divergence between clients.
+///
+/// Layout (FIPS 204, ML-DSA-65): c̃ (48 bytes) ‖ z (5 polynomials × 256
+/// coefficients × 20 bits, packed little-endian as γ1 − z) ‖ h (61 bytes).
+fn mldsa65_z_within_bound(sig: &[u8]) -> bool {
+    const CTILDE_LEN: usize = 48;
+    const Z_COEFFS: usize = 5 * 256;
+    const GAMMA1: i32 = 1 << 19;
+    const BETA: i32 = 49 * 4;
+    if sig.len() != MLDSA_SIG_LEN {
+        return false;
+    }
+    let z = &sig[CTILDE_LEN..CTILDE_LEN + Z_COEFFS * 20 / 8];
+    (0..Z_COEFFS).all(|j| {
+        let bit = j * 20;
+        let (byte, shift) = (bit / 8, bit % 8); // shift is 0 or 4: 3 bytes suffice
+        let word = u32::from(z[byte]) | u32::from(z[byte + 1]) << 8 | u32::from(z[byte + 2]) << 16;
+        let packed = ((word >> shift) & 0xF_FFFF) as i32;
+        (GAMMA1 - packed).abs() < GAMMA1 - BETA
+    })
+}
+
 fn verify_hybrid_mldsa_falcon_with(
     pk_body: &[u8],
     message: &[u8],
@@ -445,6 +475,10 @@ fn verify_hybrid_mldsa_falcon_with(
     }
     let (mpk, fpk) = pk_body.split_at(MLDSA_PUBKEY_LEN);
     let (msig, fsig) = sig_body.split_at(MLDSA_SIG_LEN);
+    if !mldsa65_z_within_bound(msig) {
+        debug!("crypto::verify: ML-DSA z outside the FIPS 204 norm bound");
+        return false;
+    }
 
     let pk = match mldsa65::PublicKey::from_bytes(mpk) {
         Ok(k) => k,
@@ -469,6 +503,9 @@ fn verify_mldsa65_only(pk_body: &[u8], message: &[u8], sig_body: &[u8]) -> bool 
     if pk_body.len() != MLDSA_PUBKEY_LEN || sig_body.len() != MLDSA_SIG_LEN {
         debug!("crypto::verify: mldsa-only pk/sig body wrong length (pk={}, sig={})",
                pk_body.len(), sig_body.len());
+        return false;
+    }
+    if !mldsa65_z_within_bound(sig_body) {
         return false;
     }
     let pk = match mldsa65::PublicKey::from_bytes(pk_body) {
@@ -1220,6 +1257,38 @@ mod kat {
         let mldsa_sk = wrap_envelope(SUITE_MLDSA65_ONLY, msk.as_bytes());
         let mldsa_sig = sign(&mldsa_sk, msg).unwrap();
         assert!(verify_enveloped_canonical(&mldsa_pk, msg, &mldsa_sig));
+    }
+
+    /// Honest signatures always satisfy the FIPS 204 z bound; a coefficient
+    /// at exactly ±(γ1 − β) does not.
+    #[test]
+    fn mldsa_z_norm_bound() {
+        for i in 0..20u8 {
+            let (pk, sk) = generate_keypair_from_seed(&[i; 32]).unwrap();
+            let msg = [i; 32];
+            let sig = sign(&sk, &msg).unwrap();
+            let body = &sig[SUITE_HEADER_LEN..SUITE_HEADER_LEN + MLDSA_SIG_LEN];
+            assert!(mldsa65_z_within_bound(body), "honest signature {i}");
+            assert!(verify(&pk, &msg, &sig));
+        }
+        let (_, sk) = generate_keypair_from_seed(&[0x77; 32]).unwrap();
+        let sig = sign(&sk, b"bound").unwrap();
+        let body = sig[SUITE_HEADER_LEN..SUITE_HEADER_LEN + MLDSA_SIG_LEN].to_vec();
+        let gamma1: u32 = 1 << 19;
+        let beta: u32 = 196;
+        // Coefficient 0 (bits 0..20 of z, which starts after the 48-byte c̃).
+        let set = |b: &mut Vec<u8>, packed: u32| {
+            let w = u32::from(b[48]) | u32::from(b[49]) << 8 | u32::from(b[50]) << 16;
+            let w = (w & !0xF_FFFF) | (packed & 0xF_FFFF);
+            b[48] = w as u8; b[49] = (w >> 8) as u8; b[50] = (w >> 16) as u8;
+        };
+        for (z, ok) in [(gamma1 - beta - 1, true), (gamma1 - beta, false)] {
+            for (packed, sign) in [(gamma1 - z, "+"), (gamma1 + z, "-")] {
+                let mut b = body.clone();
+                set(&mut b, packed);
+                assert_eq!(mldsa65_z_within_bound(&b), ok, "z = {sign}{z}");
+            }
+        }
     }
 
     /// The single-key consensus verifier: enveloped AND legacy raw keys and

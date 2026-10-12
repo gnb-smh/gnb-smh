@@ -557,6 +557,38 @@ fn read_shielded_tx(cur: &mut Cursor<&[u8]>) -> Result<coherence_core::ShieldedT
 /// consensus accepted it. A single-key witness (~8.4 KB) is far below it.
 pub const MAX_SCRIPT_SIG_LEN: usize = policy::MAX_POLICY_WITNESS_LEN;
 
+/// Bitcoin-style Merkle root (SHA-256d, last hash duplicated on odd levels).
+/// Duplicate-leaf ambiguity (CVE-2012-2459) is excluded by
+/// `Block::validate_no_duplicate_txs`.
+fn merkle_of(mut hashes: Vec<[u8; 32]>) -> [u8; 32] {
+    if hashes.is_empty() { return [0u8; 32]; }
+    while hashes.len() > 1 {
+        if hashes.len() % 2 != 0 {
+            if let Some(last) = hashes.last().copied() {
+                hashes.push(last);
+            }
+        }
+        hashes = hashes.chunks(2).map(|p| {
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&p[0]);
+            buf[32..].copy_from_slice(&p[1]);
+            Sha256::digest(Sha256::digest(buf)).into()
+        }).collect();
+    }
+    hashes[0]
+}
+
+/// From this height every block commits to its witnesses (the full
+/// `script_sig` of each transaction): the coinbase `script_sig` must end with
+/// [`WITNESS_COMMITMENT_TAG`] followed by [`Block::witness_root`]. The txid
+/// excludes witnesses (no third-party malleability), so before this a block
+/// hash did not cover them: a relay could alter witnesses of a valid block.
+/// Activated ahead of the live tip (2,888 on 2026-10-12) so every miner can
+/// upgrade first.
+pub const WITNESS_COMMITMENT_HEIGHT: u64 = 5_000;
+/// Marker before the 32-byte witness root at the end of the coinbase script_sig.
+pub const WITNESS_COMMITMENT_TAG: &[u8; 4] = b"|wc:";
+
 impl Transaction {
     /// Canonical stratum/Bitcoin-format serialization.
     ///
@@ -728,22 +760,13 @@ impl Transaction {
 
     pub fn merkle_root(txs: &[Transaction]) -> MerkleRoot {
         if txs.is_empty() { return MerkleRoot::ZERO; }
-        let mut hashes: Vec<[u8; 32]> = txs.iter().map(|t| t.txid()).collect();
-        while hashes.len() > 1 {
-            // `len() > 1` in the loop guard: `last()` is `Some` (hardened ratchet).
-            if hashes.len() % 2 != 0 {
-                if let Some(last) = hashes.last().copied() {
-                    hashes.push(last);
-                }
-            }
-            hashes = hashes.chunks(2).map(|p| {
-                let mut buf = [0u8; 64];
-                buf[..32].copy_from_slice(&p[0]);
-                buf[32..].copy_from_slice(&p[1]);
-                Sha256::digest(Sha256::digest(buf)).into()
-            }).collect();
-        }
-        MerkleRoot(hashes[0])
+        MerkleRoot(merkle_of(txs.iter().map(|t| t.txid()).collect()))
+    }
+
+    /// Witness transaction id: SHA-256d over the wire encoding WITH the
+    /// witness (`script_sig`), unlike [`Transaction::txid`].
+    pub fn wtxid(&self) -> [u8; 32] {
+        Sha256::digest(Sha256::digest(self.to_wire_bytes(true))).into()
     }
 
     /// Parse sig + pubkey out of script_sig
@@ -1047,6 +1070,48 @@ impl Block {
         Ok(())
     }
 
+    /// Merkle root of the block's wtxids, the coinbase counted as all-zero
+    /// (it carries the commitment, so it cannot commit to itself).
+    pub fn witness_root(&self) -> [u8; 32] {
+        merkle_of(self.transactions.iter().enumerate()
+            .map(|(i, t)| if i == 0 { [0u8; 32] } else { t.wtxid() })
+            .collect())
+    }
+
+    /// The bytes the coinbase script_sig must end with from
+    /// [`WITNESS_COMMITMENT_HEIGHT`]: tag ‖ witness root.
+    pub fn witness_commitment(&self) -> Vec<u8> {
+        [&WITNESS_COMMITMENT_TAG[..], &self.witness_root()[..]].concat()
+    }
+
+    /// For block producers: at or above [`WITNESS_COMMITMENT_HEIGHT`], append
+    /// the witness commitment to the coinbase script_sig and refresh the
+    /// header's merkle root. Call after the transaction list is final.
+    pub fn commit_witnesses(&mut self) {
+        if self.height < WITNESS_COMMITMENT_HEIGHT || self.transactions.is_empty() {
+            return;
+        }
+        let commitment = self.witness_commitment();
+        if let Some(input) = self.transactions[0].inputs.first_mut() {
+            input.script_sig.extend_from_slice(&commitment);
+        }
+        self.header.merkle_root = Transaction::merkle_root(&self.transactions);
+    }
+
+    /// From [`WITNESS_COMMITMENT_HEIGHT`], the coinbase commits to every
+    /// witness in the block, so the block hash covers them.
+    pub fn validate_witness_commitment(&self) -> Result<(), &'static str> {
+        if self.height < WITNESS_COMMITMENT_HEIGHT {
+            return Ok(());
+        }
+        let cb = self.transactions.first().and_then(|t| t.inputs.first())
+            .ok_or("no coinbase input")?;
+        if !cb.script_sig.ends_with(&self.witness_commitment()) {
+            return Err("coinbase does not commit to the block's witnesses");
+        }
+        Ok(())
+    }
+
     /// Check all non-coinbase outputs meet the dust threshold
     /// ([`Transaction::validate_dust`]).
     pub fn validate_dust(&self) -> Result<(), &'static str> {
@@ -1080,6 +1145,7 @@ impl Block {
         if !self.validate_coinbase_format()           { return Err("invalid coinbase format"); }
         self.validate_no_duplicate_txs()?;
         self.validate_dust()?;
+        self.validate_witness_commitment()?;
         Ok(())
     }
 
@@ -1532,6 +1598,46 @@ mod canonical_encoding_tests {
         let mut witness_only = tx.clone();
         witness_only.inputs[0].script_sig = vec![1; 3];
         assert_eq!(h, witness_only.sighash(0, ChainId::Mainnet), "witnesses are not signed");
+    }
+
+    /// From WITNESS_COMMITMENT_HEIGHT the coinbase must commit to every
+    /// witness: a block without it, or with any witness changed afterwards,
+    /// fails the structure check; below the height nothing is required.
+    #[test]
+    fn witness_commitment_binds_every_witness() {
+        let spend = |w: u8| Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [w; 32], prev_index: 0, script_sig: vec![w; 40], sequence: u32::MAX }],
+            outputs: vec![TxOutput { value: 10_000, script_pubkey: vec![3; 20] }],
+            locktime: 0,
+        };
+        let mut b = genesis_block();
+        b.transactions.push(spend(1));
+        b.transactions.push(spend(2));
+        b.height = WITNESS_COMMITMENT_HEIGHT - 1;
+        b.header.merkle_root = Transaction::merkle_root(&b.transactions);
+        assert!(b.validate_witness_commitment().is_ok(), "not required below the height");
+        b.commit_witnesses();
+        assert!(!b.transactions[0].inputs[0].script_sig.ends_with(WITNESS_COMMITMENT_TAG.as_slice())
+                || b.height < WITNESS_COMMITMENT_HEIGHT);
+
+        b.height = WITNESS_COMMITMENT_HEIGHT;
+        assert!(b.validate_witness_commitment().is_err(), "required from the height");
+        b.commit_witnesses();
+        assert!(b.validate_witness_commitment().is_ok());
+        assert!(b.validate_merkle(), "merkle root refreshed");
+
+        // Same txids, different witness: the commitment no longer matches.
+        let mut tampered = b.clone();
+        tampered.transactions[2].inputs[0].script_sig[0] ^= 1;
+        assert_eq!(Transaction::merkle_root(&tampered.transactions), b.header.merkle_root,
+                   "the txid ignores witnesses");
+        assert!(tampered.validate_witness_commitment().is_err(), "but the commitment covers them");
+
+        // The commitment must be at the very end.
+        let mut trailing = b.clone();
+        trailing.transactions[0].inputs[0].script_sig.push(0);
+        assert!(trailing.validate_witness_commitment().is_err());
     }
 
     /// The block size rule counts the wire bytes that are relayed and stored.

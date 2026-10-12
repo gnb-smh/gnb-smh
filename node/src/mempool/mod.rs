@@ -31,6 +31,8 @@ pub const INCREMENTAL_RELAY_FEE_RATE: u64 = 1;
 /// Entries older than this are dropped (Bitcoin Core: 336 h). Their inputs
 /// become spendable again by other transactions.
 pub const MEMPOOL_EXPIRY_SECS: u64 = 72 * 60 * 60;
+/// Most pool transactions one replacement may evict (BIP125: 100).
+pub const MAX_REPLACEMENTS: usize = 100;
 
 /// Sprint N-min: max serialized bytes per tx accepted into mempool.
 /// 400 KB accommodates legitimate consolidation (~120 ML-DSA-65 inputs)
@@ -205,20 +207,67 @@ impl Mempool {
             return Err(MempoolError::Duplicate);
         }
 
-        // Sprint N-min: intra-mempool double-spend detection.
-        // If any input of the new tx is already claimed by a mempool tx,
-        // reject the new tx (no RBF in v0.5.7 — first-seen wins).
+        // Replace-by-fee. A tx spending an input already claimed in the pool
+        // replaces every such conflicting tx only if (BIP125-style) it pays
+        // their total fee plus INCREMENTAL_RELAY_FEE_RATE for its own bytes,
+        // has a strictly higher fee rate than each of them, and replaces at
+        // most MAX_REPLACEMENTS. Otherwise first-seen wins. Pool txs only
+        // spend confirmed outputs, so there are no descendants to evict.
+        let mut conflicts: Vec<[u8; 32]> = Vec::new();
+        let mut first_conflict = None;
         for inp in &tx.inputs {
             let op = (inp.prev_txid, inp.prev_index);
             if let Some(existing_txid) = spent.get(&op) {
+                first_conflict.get_or_insert((inp.prev_txid, inp.prev_index, *existing_txid));
+                if !conflicts.contains(existing_txid) {
+                    conflicts.push(*existing_txid);
+                }
+            }
+        }
+        let new_key = fee_rate_key(fee, size);
+        let mut cur_bytes = self.total_bytes.load(Ordering::Relaxed);
+        if let Some((outpoint_txid, outpoint_idx, existing_spender)) = first_conflict {
+            let refuse = || {
                 crate::metrics::inc_tx_rejected("conflict");
                 tracing::debug!(reason = "conflict", "mempool tx rejected");
-                return Err(MempoolError::Conflict {
-                    outpoint_txid: inp.prev_txid,
-                    outpoint_idx:  inp.prev_index,
-                    existing_spender: *existing_txid,
-                });
+                Err(MempoolError::Conflict { outpoint_txid, outpoint_idx, existing_spender })
+            };
+            if conflicts.len() > MAX_REPLACEMENTS {
+                return refuse();
             }
+            let mut replaced_fees: u64 = 0;
+            for c in &conflicts {
+                let e = &pool[c];
+                replaced_fees = replaced_fees.saturating_add(e.fee);
+                if new_key <= fee_rate_key(e.fee, e.tx.actual_size()) {
+                    return refuse();
+                }
+            }
+            let required = replaced_fees
+                .saturating_add((size as u64).saturating_mul(INCREMENTAL_RELAY_FEE_RATE));
+            if fee < required {
+                return refuse();
+            }
+            // A replacement never also evicts: it must fit in the room its
+            // conflicts free, so no failure can follow their removal.
+            let freed: usize = conflicts.iter().map(|c| pool[c].tx.actual_size()).sum();
+            if pool.len() - conflicts.len() >= MAX_MEMPOOL_SIZE
+                || cur_bytes.saturating_sub(freed).saturating_add(size) > MAX_MEMPOOL_BYTES
+            {
+                crate::metrics::inc_tx_rejected("full");
+                return Err(MempoolError::Full);
+            }
+            for c in &conflicts {
+                if let Some(old) = pool.remove(c) {
+                    let old_size = old.tx.actual_size();
+                    Self::index_remove(&mut rate_index, fee_rate_key(old.fee, old_size), c);
+                    for inp in &old.tx.inputs {
+                        spent.remove(&(inp.prev_txid, inp.prev_index));
+                    }
+                    cur_bytes = cur_bytes.saturating_sub(old_size);
+                }
+            }
+            tracing::debug!(replaced = conflicts.len(), "mempool replace-by-fee");
         }
 
         // Evict the lowest fee-RATE tx(s) until BOTH bounds admit the new tx
@@ -232,8 +281,6 @@ impl Mempool {
         // removal). The comparison semantics are unchanged: the SAME fixed-point
         // `FeeRateKey` the old scan computed, so a small-high-rate-tx flood no
         // longer scans up to 50k entries per accepted tx.
-        let mut cur_bytes = self.total_bytes.load(Ordering::Relaxed);
-        let new_key = fee_rate_key(fee, size);
         let mut evictions: u32 = 0;
         while pool.len() >= MAX_MEMPOOL_SIZE
             || cur_bytes.saturating_add(size) > MAX_MEMPOOL_BYTES
@@ -618,6 +665,48 @@ mod expiry_and_eviction_tests {
         assert_eq!(m.size(), 1);
         // The expired tx's input is free again.
         assert!(m.add(a, fee).is_ok());
+        assert!(m.debug_check_invariants().is_ok());
+    }
+
+    fn spend(prev: u32, extra_input: Option<u32>) -> Transaction {
+        let mut t = tx(prev);
+        if let Some(e) = extra_input {
+            t.inputs.push(tx(e).inputs[0].clone());
+        }
+        t
+    }
+
+    /// Replace-by-fee: a conflicting tx replaces only by paying the total
+    /// fee it evicts plus the incremental rate for its own size, at a
+    /// strictly higher fee rate; the pool stays consistent either way.
+    #[test]
+    fn replace_by_fee_rules() {
+        let m = Mempool::new();
+        let a = spend(1, None);
+        let size = a.actual_size() as u64;
+        m.add(a.clone(), size * 3).unwrap();
+
+        // Same input, a different tx (different output value).
+        let mut b = spend(1, None);
+        b.outputs[0].value = 900;
+        let bsize = b.actual_size() as u64;
+        assert!(matches!(m.add(b.clone(), size * 3 + bsize - 1), Err(MempoolError::Conflict { .. })),
+                "must pay the replaced fee plus 1 sat/byte");
+        assert!(m.contains(&a.txid()), "a refused replacement changes nothing");
+        m.add(b.clone(), size * 3 + bsize).unwrap();
+        assert!(!m.contains(&a.txid()) && m.contains(&b.txid()));
+        assert!(m.debug_check_invariants().is_ok());
+
+        // One replacement may evict several conflicts at once.
+        let c = spend(2, None);
+        m.add(c.clone(), size * 3).unwrap();
+        let mut d = spend(1, Some(2));
+        d.outputs[0].value = 800;
+        let dsize = d.actual_size() as u64;
+        let total = m.get_entry(&b.txid()).unwrap().fee + m.get_entry(&c.txid()).unwrap().fee;
+        m.add(d.clone(), total + dsize).unwrap();
+        assert!(!m.contains(&b.txid()) && !m.contains(&c.txid()) && m.contains(&d.txid()));
+        assert_eq!(m.size(), 1);
         assert!(m.debug_check_invariants().is_ok());
     }
 

@@ -92,10 +92,31 @@ Every consensus byte string has exactly one accepted form:
   (`crypto::verify_canonical`), never PQClean's zero-padded alternate;
   enveloped and legacy raw (carried-over Bloch) keys both remain valid;
 - policy witnesses are strictly parsed and canonical (see MULTISIG.md);
+- ML-DSA-65 signatures must satisfy the FIPS 204 bound |z| < γ1 − β on every
+  coefficient, checked by GnB before the library (the linked PQClean-based
+  verifier accepts 41 Wycheproof vectors that violate it; see
+  `crates/gnb-crypto/tests/wycheproof_mldsa65.rs`);
 - the sighash (version 2) is SHA3-256 over the domain, the version, the
   chain id and the stripped transaction in the hand-written wire format, and
   the block size limit (1,000,000 bytes) counts the wire encoding. No
   consensus value depends on serde or bincode.
+
+### Witness commitment
+
+From height 5,000 (`WITNESS_COMMITMENT_HEIGHT`) the coinbase `script_sig`
+must end with `|wc:` followed by the Merkle root of the block's wtxids
+(SHA-256d of each transaction's wire encoding including `script_sig`; the
+coinbase counts as 32 zero bytes). The txid still excludes witnesses (no
+third-party malleability), but the block hash now covers them: a copy of a
+block with any witness altered fails the structure check (hashing only,
+before any signature check), and a committed witness that fails verification
+marks the block invalid. `getblocktemplate` returns the bytes as
+`witness_commitment`.
+
+### Mergeset size
+
+A block may merge at most 64 blocks besides its selected chain
+(`MERGESET_SIZE_LIMIT`; with k = 10 an honest mergeset stays near k).
 
 ### Which state a block is validated against
 

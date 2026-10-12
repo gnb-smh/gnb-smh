@@ -1065,7 +1065,11 @@ fn execute_reorg_inner(
         if let Err(reason) = validate_fork_block_state(&batch, &block) {
             // Only a rule violation is a permanent verdict; a storage read
             // failure says nothing about the block.
-            if matches!(reason, BlockTxError::Invalid(_)) {
+            // From WITNESS_COMMITMENT_HEIGHT the hash also commits to the
+            // witnesses, so a witness failure is permanent too.
+            let committed_witness = matches!(reason, BlockTxError::InvalidWitness(_))
+                && block.height >= crate::core::WITNESS_COMMITMENT_HEIGHT;
+            if matches!(reason, BlockTxError::Invalid(_)) || committed_witness {
                 mark_block_invalid(store, hash);
             }
             log::error!(
