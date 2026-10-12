@@ -337,6 +337,17 @@ pub fn verify_enveloped_canonical(
     )
 }
 
+/// [`verify`] (enveloped or legacy raw keys and signatures, as carried over
+/// from Bloch) that also requires Falcon-1024's compact canonical encoding,
+/// so one signature has exactly one byte string: PQClean's alternate
+/// zero-padded 1280-byte form of the same signature is refused. This is the
+/// consensus rule for single-key (20-byte hash) spends.
+pub fn verify_canonical(public_key_bytes: &[u8], message: &[u8], signature_bytes: &[u8]) -> bool {
+    let (pk_suite, pk_body) = parse_pubkey_envelope_or_legacy(public_key_bytes);
+    let (sig_suite, sig_body) = parse_envelope_or_legacy(signature_bytes);
+    verify_parsed_with_falcon(pk_suite, pk_body, message, sig_suite, sig_body, falcon::verify_canonical)
+}
+
 fn verify_parsed(
     pk_suite: u16,
     pk_body: &[u8],
@@ -1209,6 +1220,25 @@ mod kat {
         let mldsa_sk = wrap_envelope(SUITE_MLDSA65_ONLY, msk.as_bytes());
         let mldsa_sig = sign(&mldsa_sk, msg).unwrap();
         assert!(verify_enveloped_canonical(&mldsa_pk, msg, &mldsa_sig));
+    }
+
+    /// The single-key consensus verifier: enveloped AND legacy raw keys and
+    /// signatures (the carryover) still verify, but only with the compact
+    /// Falcon encoding.
+    #[test]
+    fn consensus_canonical_verifier_keeps_legacy_but_refuses_padded_falcon() {
+        let msg = b"single-key-consensus";
+        let (pk, sk) = generate_keypair_from_seed(&[0x58; 32]).unwrap();
+        let sig = pqcrypto_internals::with_seeded_rng_scope(&[0xA5; 32], || sign(&sk, msg).unwrap());
+        assert!(verify_canonical(&pk, msg, &sig), "enveloped compact");
+        assert!(verify_canonical(&pk[SUITE_HEADER_LEN..], msg, &sig[SUITE_HEADER_LEN..]), "legacy raw compact");
+
+        let falcon_offset = SUITE_HEADER_LEN + MLDSA_SIG_LEN;
+        let mut padded = sig.clone();
+        padded.resize(falcon_offset + pqcrypto_falcon::falconpadded1024::signature_bytes(), 0);
+        assert!(verify(&pk, msg, &padded), "the historical verifier accepts the padded form");
+        assert!(!verify_canonical(&pk, msg, &padded), "consensus refuses it");
+        assert!(!verify_canonical(&pk[SUITE_HEADER_LEN..], msg, &padded[SUITE_HEADER_LEN..]));
     }
 
     #[test]

@@ -64,6 +64,10 @@ struct PowVerdict {
     valid: bool,
 }
 
+/// Outbound connections a node keeps trying to have (Bitcoin Core keeps 8
+/// full-relay outbound peers).
+const MIN_OUTBOUND: usize = 8;
+
 /// Mempool verdict on a gossiped transaction, sent back by the message
 /// processor after full validation (`blockval`), so the network loop reports
 /// the gossip validation result only then: nothing is relayed unvalidated.
@@ -1172,6 +1176,10 @@ impl NetworkNode {
         let peer_id_str = self.peer_id.to_string();
 
         let mut peer_count = 0usize;
+        // Connections this node dialed. Inbound peers can fill `max_peers`,
+        // so outbound discovery continues until MIN_OUTBOUND of these exist:
+        // an attacker who only connects TO a node cannot surround it.
+        let mut outbound_count = 0usize;
 
         // AUDIT (external-address poisoning): a peer-reported identify
         // `observed_addr` is only a CANDIDATE, never trusted from one peer. We
@@ -1463,8 +1471,8 @@ impl NetworkNode {
 
                                         let mut valid_accepted = 0usize;
                                         for addr_str in peers.iter().take(admitted) {
-                                            if peer_count >= self.config.max_peers {
-                                                break; // ceiling reached
+                                            if peer_count >= self.config.max_peers && outbound_count >= MIN_OUTBOUND {
+                                                break; // ceiling reached, and enough peers of our own choosing
                                             }
                                             if !is_valid_public_multiaddr(addr_str, allow_private) {
                                                 // Is it private specifically? Check without the flag
@@ -1550,6 +1558,9 @@ impl NetworkNode {
                                 debug!("P2P: dropping connection from banned peer {}", peer_id);
                                 let _ = swarm.disconnect_peer_id(peer_id);
                                 continue;
+                            }
+                            if endpoint.is_dialer() {
+                                outbound_count += 1;
                             }
                             info!("✓ connected: {}", peer_id);
                             // DO NOT call gossipsub.add_explicit_peer() here.
@@ -1723,7 +1734,10 @@ impl NetworkNode {
                                 }
                             }
                         }
-                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        SwarmEvent::ConnectionClosed { peer_id, endpoint, .. } => {
+                            if endpoint.is_dialer() {
+                                outbound_count = outbound_count.saturating_sub(1);
+                            }
                             info!("✗ disconnected: {}", peer_id);
                             peer_count = peer_count.saturating_sub(1);
                             crate::metrics::set_peer_count(peer_count as i64);
@@ -2039,6 +2053,22 @@ impl NetworkNode {
                             let resolved = resolve_multiaddr(p).await;
                             if let Ok(addr) = resolved.parse::<libp2p::Multiaddr>() {
                                 info!("reconnecting: {}", resolved);
+                                let _ = swarm.dial(addr);
+                            }
+                        }
+                    }
+                    // Keep MIN_OUTBOUND connections of our own choosing, even
+                    // when inbound peers fill every slot: dial a few known
+                    // addresses (netgroup-diverse by construction, see
+                    // pex_validator::enforce_cap) at random.
+                    if peer_count > 0 && outbound_count < MIN_OUTBOUND {
+                        use rand::seq::IteratorRandom;
+                        let want = MIN_OUTBOUND - outbound_count;
+                        let picks: Vec<String> = known_peers.iter().cloned()
+                            .choose_multiple(&mut rand::thread_rng(), want);
+                        for a in picks {
+                            if let Ok(addr) = a.parse::<libp2p::Multiaddr>() {
+                                debug!("outbound top-up: dialing {}", truncate_utf8(&a, 80));
                                 let _ = swarm.dial(addr);
                             }
                         }

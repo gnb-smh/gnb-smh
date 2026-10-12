@@ -79,7 +79,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [tx_parse, block_parse, netmsg_decode, sync_decode, pq_handshake_decode, block_validate]
+        target: [tx_parse, block_parse, netmsg_decode, sync_decode, pq_handshake_decode, block_validate, tx_validate, policy_witness_decode, script_sig_verify]
     steps:
       - uses: actions/checkout@v4
         with:

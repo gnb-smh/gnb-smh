@@ -1295,9 +1295,16 @@ async fn main() {
                 }
 
                 network::NetworkMessage::PeerCount { count, addresses } => {
+                    // Heartbeat (every 30 s): also expire stale mempool entries.
+                    let expired = mem2.expire(mempool::MEMPOOL_EXPIRY_SECS);
+                    if expired > 0 {
+                        info!("mempool: expired {} transaction(s) older than {} h",
+                              expired, mempool::MEMPOOL_EXPIRY_SECS / 3600);
+                    }
                     let mut s = state2.write();
                     s.peer_count = count as u32;
                     s.peer_addresses = addresses;
+                    s.mempool_size = mem2.size();
                 }
 
                 // Add validated tx to mempool
@@ -2163,6 +2170,12 @@ fn accept_block(
     // validated + applied here before the block is committed.
     shielded:   &Arc<RwLock<crate::coherence::ShieldedPool>>,
 ) -> Result<[u8; 32], String> {
+    // One block at a time (Bitcoin Core's cs_main): the network processor,
+    // the miner and RPC submitblock all call this, and every step from the
+    // tip snapshot through the state commit must see one consistent DAG and
+    // UTXO set — no check-then-act gap between concurrent acceptances.
+    static ACCEPT: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+    let _accepting = ACCEPT.lock();
 
     // Sprint 2.c: snapshot selected tip BEFORE any DAG mutation so we
     // can detect whether this block changed the chain's head. Nested

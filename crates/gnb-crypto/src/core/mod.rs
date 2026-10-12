@@ -25,13 +25,13 @@ pub const NETWORK_MAGIC:         u32   = 0x474E_4231;
 // ── Sighash domain (replay separation) ──────────────────────────────────────
 //
 //   preimage = SIGHASH_DOMAIN(16) ‖ [SIGHASH_VERSION](1) ‖ chain_id.to_le_bytes()(4)
-//              ‖ bincode(stripped_tx)
+//              ‖ wire(stripped_tx)   (Transaction::to_wire_bytes(true))
 //   sighash  = SHA3-256(preimage)
 //
 // The domain and the chain ids differ from Bloch's, so no signature made for a
 // Bloch chain verifies on GnB and vice versa, even over coinciding outpoints.
 pub const SIGHASH_DOMAIN:  [u8; 16] = *b"GNB-SIGHASH-v1\0\0";
-pub const SIGHASH_VERSION: u8       = 0x01;
+pub const SIGHASH_VERSION: u8       = 0x02;
 
 /// Chain-ID registry (u32, serialized little-endian). 0x474E = "GN".
 /// An explicit consensus input derived from the node's network, never from a
@@ -474,9 +474,17 @@ fn read_varint(cur: &mut Cursor<&[u8]>) -> Result<u64, String> {
     let mut tag = [0u8; 1];
     cur.read_exact(&mut tag).map_err(|_| "varint: unexpected EOF on tag".to_string())?;
     match tag[0] {
-        0xFF => { let mut b = [0u8; 8]; cur.read_exact(&mut b).map_err(|_| "varint u64 EOF")?; Ok(u64::from_le_bytes(b)) }
-        0xFE => { let mut b = [0u8; 4]; cur.read_exact(&mut b).map_err(|_| "varint u32 EOF")?; Ok(u32::from_le_bytes(b) as u64) }
-        0xFD => { let mut b = [0u8; 2]; cur.read_exact(&mut b).map_err(|_| "varint u16 EOF")?; Ok(u16::from_le_bytes(b) as u64) }
+        // Canonical only (as Bitcoin's CompactSize): each value has exactly one
+        // encoding, so the parsed bytes are the bytes that were hashed.
+        0xFF => { let mut b = [0u8; 8]; cur.read_exact(&mut b).map_err(|_| "varint u64 EOF")?;
+                  let v = u64::from_le_bytes(b);
+                  if v <= u32::MAX as u64 { return Err("varint: non-canonical u64".into()); } Ok(v) }
+        0xFE => { let mut b = [0u8; 4]; cur.read_exact(&mut b).map_err(|_| "varint u32 EOF")?;
+                  let v = u32::from_le_bytes(b) as u64;
+                  if v <= u16::MAX as u64 { return Err("varint: non-canonical u32".into()); } Ok(v) }
+        0xFD => { let mut b = [0u8; 2]; cur.read_exact(&mut b).map_err(|_| "varint u16 EOF")?;
+                  let v = u16::from_le_bytes(b) as u64;
+                  if v < 0xFD { return Err("varint: non-canonical u16".into()); } Ok(v) }
         n    => Ok(n as u64),
     }
 }
@@ -705,13 +713,16 @@ impl Transaction {
         // is unchanged; v2 only prepends the fixed 21-byte domain+version+chain-id
         // prefix. All prefix fields are fixed-length and only the trailing bincode
         // blob is variable, so simple concatenation is unambiguous.
-        let body = bincode::serde::encode_to_vec(&stripped, bincode::config::standard())
-            .expect("Transaction is always serializable into an in-memory buffer");
+        //
+        // v2 body: the stripped transaction in the hand-written wire format
+        // (`to_wire_bytes(true)`), not a serde/bincode encoding, so no
+        // dependency upgrade or attribute change can alter what is signed.
+        let body = stripped.to_wire_bytes(true);
         let mut h = Sha3_256::new();
         h.update(SIGHASH_DOMAIN);           // 16 bytes (fixed)
         h.update([SIGHASH_VERSION]);        //  1 byte  (fixed)
         h.update(chain_id.to_le_bytes());   //  4 bytes (fixed)
-        h.update(&body);                    //  variable (v1 body, unchanged)
+        h.update(&body);                    //  variable (wire body)
         h.finalize().into()
     }
 
@@ -739,12 +750,13 @@ impl Transaction {
     pub fn parse_script_sig(script_sig: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         if script_sig.len() < 8 { return None; }
         let sig_len = u32::from_le_bytes(script_sig[..4].try_into().ok()?) as usize;
-        if script_sig.len() < 4 + sig_len + 4 { return None; }
+        if script_sig.len() < sig_len.checked_add(8)? { return None; }
         let sig = script_sig[4..4 + sig_len].to_vec();
         let pk_len = u32::from_le_bytes(
             script_sig[4 + sig_len..8 + sig_len].try_into().ok()?
         ) as usize;
-        if script_sig.len() < 8 + sig_len + pk_len { return None; }
+        // Exact length: no trailing bytes, so a relay cannot pad a witness.
+        if script_sig.len() != 8usize.checked_add(sig_len)?.checked_add(pk_len)? { return None; }
         let pk = script_sig[8 + sig_len..8 + sig_len + pk_len].to_vec();
         Some((sig, pk))
     }
@@ -1081,8 +1093,10 @@ impl Block {
         Ok(())
     }
 
+    /// Consensus size: the hand-written wire encoding (`to_wire_bytes`), the
+    /// bytes that are relayed and stored, never a serde/bincode encoding.
     pub fn size_bytes(&self) -> usize {
-        bincode::serde::encode_to_vec(self, bincode::config::standard()).map(|v| v.len()).unwrap_or(usize::MAX)
+        self.to_wire_bytes().len()
     }
 }
 
@@ -1448,3 +1462,82 @@ mod chain_id_tests {
     }
 }
 
+
+#[cfg(test)]
+mod canonical_encoding_tests {
+    use super::*;
+
+    fn varint(bytes: &[u8]) -> Result<u64, String> {
+        read_varint(&mut Cursor::new(bytes))
+    }
+
+    /// Each value has exactly one varint encoding (CompactSize rules).
+    #[test]
+    fn non_canonical_varints_are_refused() {
+        assert_eq!(varint(&[0xFC]), Ok(0xFC));
+        assert_eq!(varint(&[0xFD, 0xFD, 0x00]), Ok(0xFD));
+        assert!(varint(&[0xFD, 0x05, 0x00]).is_err(), "5 must be one byte");
+        assert_eq!(varint(&[0xFE, 0x00, 0x00, 0x01, 0x00]), Ok(0x1_0000));
+        assert!(varint(&[0xFE, 0xFF, 0xFF, 0x00, 0x00]).is_err());
+        assert!(varint(&[0xFF, 1, 0, 0, 0, 0, 0, 0, 0]).is_err());
+        for v in [0u64, 0xFC, 0xFD, 0xFFFF, 0x1_0000, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX] {
+            let mut out = Vec::new();
+            write_varint(&mut out, v);
+            assert_eq!(varint(&out), Ok(v), "round trip {v}");
+        }
+    }
+
+    /// A single-key witness is exactly `len‖sig‖len‖pk`: trailing bytes
+    /// (a relay padding a block) make it malformed.
+    #[test]
+    fn script_sig_must_have_exact_length() {
+        let ss = Transaction::build_script_sig(&[1u8; 10], &[2u8; 12]);
+        assert_eq!(Transaction::parse_script_sig(&ss), Some((vec![1u8; 10], vec![2u8; 12])));
+        let mut padded = ss.clone();
+        padded.push(0);
+        assert_eq!(Transaction::parse_script_sig(&padded), None);
+        assert_eq!(Transaction::parse_script_sig(&ss[..ss.len() - 1]), None);
+        let mut huge = ss.clone();
+        huge[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(Transaction::parse_script_sig(&huge), None, "length overflow is refused, not a panic");
+    }
+
+    /// The sighash commits to the wire encoding: it changes with every field
+    /// it covers, and differs per input and per chain.
+    #[test]
+    fn sighash_is_over_the_wire_encoding() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxInput { prev_txid: [1; 32], prev_index: 0, script_sig: vec![9; 50], sequence: u32::MAX },
+                TxInput { prev_txid: [2; 32], prev_index: 1, script_sig: vec![], sequence: u32::MAX },
+            ],
+            outputs: vec![TxOutput { value: 5_000, script_pubkey: vec![3; 20] }],
+            locktime: 7,
+        };
+        let h = tx.sighash(0, ChainId::Mainnet);
+        let mut stripped = tx.clone();
+        stripped.inputs[0].script_sig = b"GNB_SIGHASH".to_vec();
+        stripped.inputs[1].script_sig = vec![];
+        let mut pre = SIGHASH_DOMAIN.to_vec();
+        pre.push(SIGHASH_VERSION);
+        pre.extend_from_slice(&ChainId::Mainnet.to_le_bytes());
+        pre.extend_from_slice(&stripped.to_wire_bytes(true));
+        assert_eq!(h, <[u8; 32]>::from(Sha3_256::digest(&pre)));
+        assert_ne!(h, tx.sighash(1, ChainId::Mainnet));
+        assert_ne!(h, tx.sighash(0, ChainId::Testnet));
+        let mut other = tx.clone();
+        other.outputs[0].value += 1;
+        assert_ne!(h, other.sighash(0, ChainId::Mainnet));
+        let mut witness_only = tx.clone();
+        witness_only.inputs[0].script_sig = vec![1; 3];
+        assert_eq!(h, witness_only.sighash(0, ChainId::Mainnet), "witnesses are not signed");
+    }
+
+    /// The block size rule counts the wire bytes that are relayed and stored.
+    #[test]
+    fn block_size_is_the_wire_size() {
+        let b = genesis_block();
+        assert_eq!(b.size_bytes(), b.to_wire_bytes().len());
+    }
+}

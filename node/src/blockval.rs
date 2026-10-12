@@ -152,8 +152,9 @@ pub fn validate_tx_inputs(
                 if pk_hash != utxo.script_pubkey {
                     return Err(format!("{}pubkey mismatch at input {}", WITNESS_ERR, i));
                 }
-                // Hybrid ML-DSA-65 ‖ Falcon-1024 signature.
-                if !crypto::verify(&pk, &sighash, &sig) {
+                // Hybrid ML-DSA-65 ‖ Falcon-1024 signature, Falcon in its
+                // canonical compact encoding (one byte string per signature).
+                if !crypto::verify_canonical(&pk, &sighash, &sig) {
                     return Err(format!("{}invalid signature at input {}", WITNESS_ERR, i));
                 }
             }
@@ -335,6 +336,15 @@ fn validate_block_transactions_inner(
                 .map_err(|e| format!("tx {} ({}): {}", i, hex::encode(&txid[..8]), e))?;
             total_fees = total_fees.checked_add(fee).ok_or("block fee sum overflow")?;
         }
+        // BIP30: a transaction may not create an outpoint that is still
+        // unspent. A copy of someone's coinbase (same txid) would otherwise
+        // overwrite their output, and rolling the copy back would delete it.
+        for j in 0..tx.outputs.len() as u32 {
+            if created.contains_key(&(txid, j)) || utxo_lookup(&txid, j)?.is_some() {
+                return Err(format!("tx {} ({}): output {} already exists unspent (BIP30)",
+                                   i, hex::encode(&txid[..8]), j));
+            }
+        }
         for (j, out) in tx.outputs.iter().enumerate() {
             created.insert((txid, j as u32), out.clone());
         }
@@ -376,8 +386,8 @@ pub fn select_valid_for_block(
             rejected.push(txid);
             continue;
         }
-        let size = tx.actual_size();
-        if size == 0 || bytes.saturating_add(size) > max_bytes {
+        let size = tx.to_wire_bytes(true).len(); // as Block::size_bytes counts it
+        if bytes.saturating_add(size) > max_bytes {
             continue; // does not fit (or cannot be measured): leave it for a later block
         }
         let maturity = core::check_coinbase_maturity(&tx, height, |t| {
@@ -469,6 +479,22 @@ mod tests {
         Ok((i == 0).then(|| TxOutput { value: 1_000_000, script_pubkey: owner() }))
     }
 
+    /// BIP30: a block may not create an outpoint that is still unspent, so a
+    /// copy of someone else's coinbase (same txid) cannot overwrite it.
+    #[test]
+    fn duplicate_unspent_outpoints_are_invalid() {
+        let victim = coinbase(1_000);
+        let vtxid = victim.txid();
+        let utxo = move |t: &[u8; 32], i: u32| -> Result<Option<TxOutput>, String> {
+            Ok((*t == vtxid && i == 0).then(|| TxOutput { value: 1_000, script_pubkey: owner() }))
+        };
+        let b = block(vec![victim]);
+        assert!(matches!(validate_block_transactions(&b, &utxo, &no_coinbase, &no_confirm),
+                         Err(BlockTxError::Invalid(m)) if m.contains("BIP30")));
+        let fresh = |_: &[u8; 32], _: u32| -> Result<Option<TxOutput>, String> { Ok(None) };
+        assert!(validate_block_transactions(&b, &fresh, &no_coinbase, &no_confirm).is_ok());
+    }
+
     /// A sub-dust output is refused by the per-transaction rules, so neither
     /// the mempool (gossip or RPC) nor a template can carry one into a block
     /// that `validate_structure_cheap` would reject after the proof of work.
@@ -491,12 +517,12 @@ mod tests {
     #[test]
     fn templates_respect_the_block_size_budget() {
         let txs: Vec<Transaction> = (0..10u8).map(|b| spend(([0x20 + b; 32], 0), 900_000)).collect();
-        let one = txs[0].actual_size();
+        let one = txs[0].to_wire_bytes(true).len();
         let budget = 3 * one + one / 2;
         let (sel, _, rej) = select_valid_for_block(200, budget, txs.clone(), &utxo_any, &no_coinbase, &no_confirm);
         assert_eq!(sel.len(), 3, "only three fit");
         assert!(rej.is_empty(), "valid transactions that do not fit stay in the mempool");
-        assert!(sel.iter().map(|t| t.actual_size()).sum::<usize>() <= budget);
+        assert!(sel.iter().map(|t| t.to_wire_bytes(true).len()).sum::<usize>() <= budget);
 
         // With the real budget, a template of as many ~8.5 kB transactions as
         // fit always passes the block size rule.

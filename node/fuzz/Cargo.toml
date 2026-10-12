@@ -16,6 +16,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 bincode = { version = "2", features = ["serde"] }
 gnb = { path = "..", features = ["node"] }
+sha3 = "0.10"
 
 [workspace]
 
@@ -66,3 +67,24 @@ bench = false
 [patch.crates-io]
 pqcrypto-internals = { path = "../../crates/pqcrypto-internals" }
 libp2p-yamux = { path = "../../crates/libp2p-yamux" }
+
+[[bin]]
+name = "tx_validate"
+path = "fuzz_targets/tx_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_witness_decode"
+path = "fuzz_targets/policy_witness_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "script_sig_verify"
+path = "fuzz_targets/script_sig_verify.rs"
+test = false
+doc = false
+bench = false

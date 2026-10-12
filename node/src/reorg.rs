@@ -284,14 +284,19 @@ pub fn apply_block_utxo_mutations(
             undo.coinbase_txids.push(txid);
         } else {
             for inp in &tx.inputs {
-                // Capture BEFORE delete so rollback can restore the pre-spend output.
-                if let Ok(Some(output)) = store.get_utxo(&inp.prev_txid, inp.prev_index) {
-                    undo.spent_utxos.push(UndoEntry {
-                        prev_txid:  inp.prev_txid,
-                        prev_index: inp.prev_index,
-                        output,
-                    });
-                }
+                // Capture BEFORE delete so rollback can restore the pre-spend
+                // output. A read error or a missing input must fail the apply:
+                // an incomplete undo record would lose coins on rollback.
+                let output = store.get_utxo(&inp.prev_txid, inp.prev_index)
+                    .map_err(|e| format!("apply_block_utxo_mutations: read of input {}:{} failed: {}",
+                        hex::encode(inp.prev_txid), inp.prev_index, e))?
+                    .ok_or_else(|| format!("apply_block_utxo_mutations: input {}:{} missing",
+                        hex::encode(inp.prev_txid), inp.prev_index))?;
+                undo.spent_utxos.push(UndoEntry {
+                    prev_txid:  inp.prev_txid,
+                    prev_index: inp.prev_index,
+                    output,
+                });
                 store.delete_utxo(&inp.prev_txid, inp.prev_index)
                     .map_err(|e| format!("apply_block_utxo_mutations: delete_utxo failed for {}:{}: {}",
                         hex::encode(inp.prev_txid), inp.prev_index, e))?;
@@ -636,13 +641,16 @@ fn apply_block_utxo_mutations_batched(
             for inp in &tx.inputs {
                 // Capture BEFORE delete (through the overlay — the pre-spend
                 // output may have been staged by an earlier fork block).
-                if let Ok(Some(output)) = batch.get_utxo(&inp.prev_txid, inp.prev_index) {
-                    undo.spent_utxos.push(UndoEntry {
-                        prev_txid:  inp.prev_txid,
-                        prev_index: inp.prev_index,
-                        output,
-                    });
-                }
+                let output = batch.get_utxo(&inp.prev_txid, inp.prev_index)
+                    .map_err(|e| format!("batched apply: read of input {}:{} failed: {}",
+                        hex::encode(inp.prev_txid), inp.prev_index, e))?
+                    .ok_or_else(|| format!("batched apply: input {}:{} missing",
+                        hex::encode(inp.prev_txid), inp.prev_index))?;
+                undo.spent_utxos.push(UndoEntry {
+                    prev_txid:  inp.prev_txid,
+                    prev_index: inp.prev_index,
+                    output,
+                });
                 batch.delete_utxo(&inp.prev_txid, inp.prev_index)?;
             }
         }

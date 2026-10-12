@@ -73,9 +73,29 @@ acceptance, reorgs, and in-memory branch validation. In block order:
   committed policy, satisfy its timelocks and carry `m` valid signatures;
 - a transaction may spend outputs of earlier transactions in the same block,
   never its own or a later one's;
+- no transaction may create an outpoint that is still unspent (BIP30), so a
+  copy of another block's coinbase cannot overwrite its output;
+- no output below the dust threshold (546 base units), checked per
+  transaction on every path (mempool, templates, blocks);
 - no input may reference a coinbase with fewer than 100 confirmations,
   including the block's own coinbase;
 - the coinbase pays at most subsidy + fees.
+
+### Canonical encodings
+
+Every consensus byte string has exactly one accepted form:
+
+- varints (counts and lengths) are canonical CompactSize; a value encoded
+  in more bytes than needed is refused;
+- a single-key witness is exactly `len ‖ signature ‖ len ‖ pubkey`, no
+  trailing bytes; its Falcon-1024 half must use the compact encoding
+  (`crypto::verify_canonical`), never PQClean's zero-padded alternate;
+  enveloped and legacy raw (carried-over Bloch) keys both remain valid;
+- policy witnesses are strictly parsed and canonical (see MULTISIG.md);
+- the sighash (version 2) is SHA3-256 over the domain, the version, the
+  chain id and the stripped transaction in the hand-written wire format, and
+  the block size limit (1,000,000 bytes) counts the wire encoding. No
+  consensus value depends on serde or bincode.
 
 ### Which state a block is validated against
 
@@ -126,6 +146,11 @@ The orphan pool holds at most 10,000 blocks and 128 MiB, evicting the lowest
 height first.
 
 ## Finality and minimum chain work
+
+Block acceptance runs one block at a time (a global lock, like Bitcoin
+Core's `cs_main`). Each block's DAG entry is written in the same atomic batch
+as the chain-state change it causes, and at startup the node checks that the
+committed tip is the DAG's selected tip.
 
 A synced node does not reorg more than `CHECKPOINT_DEPTH` (1,000) blocks,
 records `finalized_height = tip − 1,000`, and prunes block bodies older than

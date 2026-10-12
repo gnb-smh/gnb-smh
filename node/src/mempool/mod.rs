@@ -24,6 +24,13 @@ const MAX_MEMPOOL_BYTES: usize = 300 * 1024 * 1024;
 pub const MIN_RELAY_FEE_RATE: u64 = 1;
 /// Fixed-point scale so fee-rate (fee/size) comparisons don't truncate to 0.
 const FEE_RATE_SCALE: u128 = 1_000_000;
+/// To evict a resident from a full pool, a newcomer must pay at least this
+/// much more per byte (Bitcoin's incremental relay fee): otherwise a stream of
+/// transactions each one unit better churns the pool at almost no cost.
+pub const INCREMENTAL_RELAY_FEE_RATE: u64 = 1;
+/// Entries older than this are dropped (Bitcoin Core: 336 h). Their inputs
+/// become spendable again by other transactions.
+pub const MEMPOOL_EXPIRY_SECS: u64 = 72 * 60 * 60;
 
 /// Sprint N-min: max serialized bytes per tx accepted into mempool.
 /// 400 KB accommodates legitimate consolidation (~120 ML-DSA-65 inputs)
@@ -235,7 +242,8 @@ impl Mempool {
             let lowest = rate_index.iter().next()
                 .and_then(|(k, set)| set.iter().next().map(|txid| (*k, *txid)));
             match lowest {
-                Some((low_key, victim)) if new_key > low_key => {
+                Some((low_key, victim))
+                    if new_key.0 >= low_key.0.saturating_add(INCREMENTAL_RELAY_FEE_RATE as u128 * FEE_RATE_SCALE) => {
                     // Drop the victim from txs, spent, total_bytes, and the index
                     // in one step so the three-way invariant never drifts.
                     Self::index_remove(&mut rate_index, low_key, &victim);
@@ -287,6 +295,16 @@ impl Mempool {
         } else {
             false
         }
+    }
+
+    /// Drop entries older than `max_age_secs`; returns how many.
+    pub fn expire(&self, max_age_secs: u64) -> usize {
+        let cutoff = self.clock.now_secs().saturating_sub(max_age_secs);
+        let old: Vec<[u8; 32]> = self.txs.read().iter()
+            .filter(|(_, e)| e.added_at < cutoff)
+            .map(|(t, _)| *t)
+            .collect();
+        old.iter().filter(|t| self.remove(t)).count()
     }
 
     pub fn contains(&self, txid: &[u8; 32]) -> bool {
@@ -558,4 +576,64 @@ pub enum MempoolError {
     /// Sprint N-min: transaction serialized size exceeds MAX_TX_SIZE.
     #[error("transaction too large: {size} bytes (max {max})")]
     Oversized { size: usize, max: usize },
+}
+
+#[cfg(test)]
+mod expiry_and_eviction_tests {
+    use super::*;
+    use crate::core::{TxInput, TxOutput};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    struct TestClock(Arc<AtomicU64>);
+    impl Clock for TestClock {
+        fn now_secs(&self) -> u64 { self.0.load(Ordering::Relaxed) }
+    }
+
+    fn tx(n: u32) -> Transaction {
+        Transaction {
+            version: 1,
+            // Vary the txid, not the index: bincode encodes integers with
+            // variable length, and every test tx must have the same size.
+            inputs: vec![TxInput { prev_txid: { let mut t = [7u8; 32]; t[..4].copy_from_slice(&n.to_le_bytes()); t },
+                                   prev_index: 0, script_sig: vec![1; 8], sequence: u32::MAX }],
+            outputs: vec![TxOutput { value: 1_000, script_pubkey: vec![2u8; 20] }],
+            locktime: 0,
+        }
+    }
+
+    #[test]
+    fn entries_expire_after_the_max_age() {
+        let now = Arc::new(AtomicU64::new(1_000_000));
+        let m = Mempool::with_clock(Box::new(TestClock(now.clone())));
+        let a = tx(1);
+        let fee = a.actual_size() as u64 * 10;
+        m.add(a.clone(), fee).unwrap();
+        now.store(1_000_000 + MEMPOOL_EXPIRY_SECS - 1, Ordering::Relaxed);
+        m.add(tx(2), fee).unwrap();
+        assert_eq!(m.expire(MEMPOOL_EXPIRY_SECS), 0, "nothing is old enough yet");
+        now.store(1_000_000 + MEMPOOL_EXPIRY_SECS + 1, Ordering::Relaxed);
+        assert_eq!(m.expire(MEMPOOL_EXPIRY_SECS), 1);
+        assert!(!m.contains(&a.txid()));
+        assert_eq!(m.size(), 1);
+        // The expired tx's input is free again.
+        assert!(m.add(a, fee).is_ok());
+        assert!(m.debug_check_invariants().is_ok());
+    }
+
+    #[test]
+    fn eviction_needs_the_incremental_fee_rate() {
+        let m = Mempool::new();
+        let size = tx(0).actual_size() as u64;
+        for n in 0..MAX_MEMPOOL_SIZE as u32 {
+            m.add(tx(n), size * 2).unwrap();
+        }
+        let barely = tx(MAX_MEMPOOL_SIZE as u32);
+        let barely_fee = size * 2 + INCREMENTAL_RELAY_FEE_RATE * size - 1;
+        assert!(matches!(m.add(barely, barely_fee), Err(MempoolError::Full)),
+                "one unit better is not enough to evict");
+        let enough = tx(MAX_MEMPOOL_SIZE as u32 + 1);
+        assert!(m.add(enough, size * 2 + INCREMENTAL_RELAY_FEE_RATE * size).is_ok());
+        assert_eq!(m.size(), MAX_MEMPOOL_SIZE);
+    }
 }

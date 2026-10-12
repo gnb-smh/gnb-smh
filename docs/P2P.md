@@ -64,3 +64,16 @@ Gossip is validated before it is relayed (`validate_messages`): a block is
 relayed only after its proof verified. An honest peer therefore never
 forwards an invalid proof, so banning the peer that delivered one never
 punishes an innocent relay.
+
+## Peers and addresses
+
+- The node keeps trying to hold 8 connections it dialed itself; inbound
+  connections can fill the peer limit, but discovery and dialing continue
+  until those 8 outbound peers exist.
+- The known-address table holds at most 8 addresses per IPv4 /16 (IPv6 /32)
+  and 1,000 in total, so one address range cannot fill it.
+- Sync requests are rate limited per peer; peers whose budget has refilled
+  are forgotten, so the limiter never locks new peers out.
+
+Not yet: a full new/tried address manager with feeler connections, anchors
+across restarts, and inbound eviction by peer quality.

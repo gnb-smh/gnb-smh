@@ -295,15 +295,43 @@ impl Default for PexStats {
 /// are removed until within bounds.
 pub fn enforce_cap(peers: &mut std::collections::HashSet<String>) -> usize {
     let initial = peers.len();
-    if initial <= KNOWN_PEERS_CAP {
-        return 0;
+    // Netgroup diversity first (Bitcoin's addrman buckets by /16): at most
+    // MAX_PER_NETGROUP addresses per IPv4 /16 or IPv6 /32, so one operator's
+    // address range cannot fill the table an eclipse attack would need.
+    let mut per_group: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    let mut sorted: Vec<String> = peers.iter().cloned().collect();
+    sorted.sort(); // deterministic choice of which addresses a group keeps
+    for addr in sorted {
+        if let Some(g) = netgroup(&addr) {
+            let n = per_group.entry(g).or_insert(0);
+            *n += 1;
+            if *n > MAX_PER_NETGROUP {
+                peers.remove(&addr);
+            }
+        }
     }
-    let to_remove = initial - KNOWN_PEERS_CAP;
-    let victims: Vec<String> = peers.iter().take(to_remove).cloned().collect();
-    for v in &victims {
-        peers.remove(v);
+    if peers.len() > KNOWN_PEERS_CAP {
+        let to_remove = peers.len() - KNOWN_PEERS_CAP;
+        let victims: Vec<String> = peers.iter().take(to_remove).cloned().collect();
+        for v in &victims {
+            peers.remove(v);
+        }
     }
-    to_remove
+    initial - peers.len()
+}
+
+/// Addresses kept per network group (IPv4 /16, IPv6 /32).
+pub const MAX_PER_NETGROUP: usize = 8;
+
+/// The network group of a multiaddr string: IPv4 /16 or IPv6 /32 prefix.
+/// `None` for DNS names and unparseable strings (not grouped).
+pub fn netgroup(addr: &str) -> Option<Vec<u8>> {
+    let ma: libp2p::Multiaddr = addr.parse().ok()?;
+    ma.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => Some(vec![4, ip.octets()[0], ip.octets()[1]]),
+        libp2p::multiaddr::Protocol::Ip6(ip) => Some([&[6u8][..], &ip.octets()[..4]].concat()),
+        _ => None,
+    })
 }
 
 /// One-time cleanup at startup: drop entries that fail the new validator.
@@ -336,5 +364,25 @@ mod tests {
         assert!(!lan("/ip4/8.8.8.8/tcp/17110"));
         assert!(!lan("/ip4/1.1.1.1/tcp/443"));
         assert!(!lan("/ip6/2606:4700:4700::1111/tcp/443"));
+    }
+}
+
+#[cfg(test)]
+mod netgroup_tests {
+    use super::*;
+
+    #[test]
+    fn one_netgroup_cannot_fill_the_table() {
+        let mut peers: std::collections::HashSet<String> = (0..50u8)
+            .map(|i| format!("/ip4/203.0.{}.{}/tcp/17110", i, i + 1))
+            .collect();
+        peers.insert("/ip4/198.51.100.7/tcp/17110".into());
+        peers.insert("/ip6/2001:db8::1/tcp/17110".into());
+        let removed = enforce_cap(&mut peers);
+        assert_eq!(removed, 50 - MAX_PER_NETGROUP);
+        assert!(peers.contains("/ip4/198.51.100.7/tcp/17110"));
+        assert!(peers.contains("/ip6/2001:db8::1/tcp/17110"));
+        assert_eq!(netgroup("/ip4/203.0.9.10/tcp/1"), netgroup("/ip4/203.0.200.1/tcp/1"));
+        assert_ne!(netgroup("/ip4/203.0.9.10/tcp/1"), netgroup("/ip4/203.1.9.10/tcp/1"));
     }
 }

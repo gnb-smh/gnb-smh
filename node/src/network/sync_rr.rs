@@ -185,7 +185,7 @@ impl RrCodec for BlochSyncCodec {
         T: AsyncRead + Unpin + Send,
     {
         let buf = read_raw_frame(io).await?;
-        decode_response(&buf)
+        response_from_frame(&buf)
     }
 
     async fn write_request<T>(
@@ -279,6 +279,19 @@ pub fn decode_request(buf: &[u8]) -> io::Result<SyncRequest> {
     let req: SyncRequest = decode_frame(buf)?;
     validate_sync_request_bounds(&req)?;
     Ok(req)
+}
+
+/// A response frame as read off a substream. An empty one is a request the
+/// peer did not serve (its sync rate limiter dropped it, or it shut down):
+/// not a protocol violation. It is reported as a plain I/O failure, which is
+/// never penalized, so an honest peer is not graylisted for pacing us; the
+/// pull is retried. Anything else must decode and pass the bounds.
+pub fn response_from_frame(buf: &[u8]) -> io::Result<SyncResponse> {
+    if buf.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::ConnectionAborted,
+                                  "empty sync response (request not served)"));
+    }
+    decode_response(buf)
 }
 
 /// Decode + bounds-validate an inbound [`SyncResponse`]. Without this, a
@@ -407,13 +420,13 @@ const MAX_CONCURRENT_SYNC_STREAMS: usize = 256;
 // independent of it.
 
 /// Bucket capacity (burst allowance) per peer.
-const SYNC_BUCKET_CAPACITY: u32 = 64;
-/// Refill rate per peer, tokens/second. At capacity 64 this allows a burst of
-/// 64 immediately, then a sustained 8 req/s — comfortably above what one
-/// honest IBD follower needs (it directs pulls to ONE selected peer at a
-/// time, see `select_pull_peer`) while bounding what a single hostile
-/// identity can sustain against us.
-const SYNC_BUCKET_REFILL_PER_SEC: u32 = 8;
+const SYNC_BUCKET_CAPACITY: u32 = 128;
+/// Refill rate per peer, tokens/second. At capacity 128 this allows a burst
+/// of 128 immediately, then a sustained 24 req/s. Measured: at 8 req/s a
+/// fresh node pulling one block per request synced ~2 blocks/s, and every
+/// dropped request looked like a protocol violation to it (fixed in
+/// `read_response`). Each request is one bounded store read.
+const SYNC_BUCKET_REFILL_PER_SEC: u32 = 24;
 /// Cap on the number of peers tracked, mirroring
 /// `network::WIRE_PENALTY_TRACK_CAP` — bounds memory against an attacker
 /// cycling libp2p identities (free to generate).
@@ -445,7 +458,18 @@ impl SyncRequestLimiter {
         use std::time::Instant;
         let now = Instant::now();
         if self.buckets.len() >= SYNC_LIMITER_TRACK_CAP && !self.buckets.contains_key(&peer) {
-            // Tracking map full and this is an UNKNOWN peer: fail CLOSED.
+            // Forget peers whose bucket has refilled: a full bucket is
+            // equivalent to an absent one, so this never grants anyone extra
+            // budget. Without it the map filled once (1,024 identities) and
+            // then refused every new peer until restart.
+            self.buckets.retain(|_, (last, tokens)| {
+                let refill = now.saturating_duration_since(*last).as_secs_f64()
+                    * SYNC_BUCKET_REFILL_PER_SEC as f64;
+                (*tokens as f64 + refill) < SYNC_BUCKET_CAPACITY as f64
+            });
+        }
+        if self.buckets.len() >= SYNC_LIMITER_TRACK_CAP && !self.buckets.contains_key(&peer) {
+            // Still full of ACTIVE peers and this is an UNKNOWN one: fail CLOSED.
             // Unlike WirePenaltyTracker (where failing open under a full map
             // just under-penalizes an already-misbehaving peer), failing
             // open here would mean an identity-cycling attacker gets an
@@ -1006,5 +1030,27 @@ mod tests {
             !lim.allow(overflow_peer),
             "a brand-new peer arriving after the tracking cap is full must be refused, not granted an unlimited bucket"
         );
+    }
+
+    /// A peer that did not serve a request (empty frame) is not a protocol
+    /// violator; a truncated or garbage frame still is.
+    #[test]
+    fn unserved_request_is_not_a_wire_violation() {
+        assert_eq!(response_from_frame(&[]).unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(response_from_frame(&[0xFF; 3]).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Once tracked peers' buckets have refilled they are forgotten, so the
+    /// map filling up does not lock new peers out until a restart.
+    #[test]
+    fn sync_request_limiter_admits_new_peers_after_buckets_refill() {
+        let mut lim = SyncRequestLimiter::new();
+        for _ in 0..SYNC_LIMITER_TRACK_CAP {
+            assert!(lim.allow(PeerId::random()));
+        }
+        assert!(!lim.allow(PeerId::random()));
+        std::thread::sleep(Duration::from_millis(1_000 / SYNC_BUCKET_REFILL_PER_SEC as u64 + 100));
+        assert!(lim.allow(PeerId::random()), "refilled (idle) peers make room");
+        assert!(lim.tracked_peers() <= SYNC_LIMITER_TRACK_CAP);
     }
 }
