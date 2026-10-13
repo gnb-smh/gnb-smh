@@ -17,6 +17,8 @@
 #![forbid(unsafe_code)]
 
 pub mod difficulty;
+/// GnB-SMH v2 draft (SHA-256). Not consensus.
+pub mod v2;
 
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::Shake256;

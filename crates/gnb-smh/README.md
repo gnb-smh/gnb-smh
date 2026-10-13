@@ -18,6 +18,7 @@ The full specification and security analysis live in the GnB-SMH spec doc.
 | `src/difficulty.rs` | Compact targets, chain work, ASERT |
 | `src/bin/smh-bench.rs` | Benchmark and toy miner |
 | `tests/vectors.rs` | Cross-check against the Python vectors |
+| `src/v2.rs`, `reference/gnb_smh_v2.py`, `DESIGN-v2.md` | GnB-SMH v2 **draft** (SHA-256, 256 KiB): not consensus |
 | `analysis/stats.py` | Geometric-fit and bit-balance sanity tests (small N only) |
 
 ## Run
