@@ -2,6 +2,7 @@
 //!
 //! smh-bench verify [log2_n] [iters]        time per evaluation (single thread)
 //! smh-bench v2 [log2_n] [iters]           time per v2-draft (SHA-256) evaluation
+//! smh-bench v3 [log2_n] [passes] [iters]  time per v3-draft evaluation
 //! smh-bench perm [count]                   raw Keccak-f[1600] permutations per second
 //! smh-bench mine <log2_n> <zero_bits> <blocks> [threads]
 //!                                          find blocks at a fixed target; prints attempts per block
@@ -46,6 +47,23 @@ fn main() {
                 median * 1e9 / calls,
                 1.0 / median
             );
+        }
+        Some("v3") => {
+            use gnb_smh::v3;
+            let log2_n: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(v3::LOG2_N);
+            let passes: u8 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(v3::PASSES);
+            let iters: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(30);
+            let mut sp = v3::Scratchpad::new(log2_n);
+            let _ = v3::trace_with(&mut sp, passes, b"warmup", 0);
+            let mut samples = Vec::new();
+            for k in 0..iters {
+                let t0 = Instant::now();
+                std::hint::black_box(v3::trace_with(&mut sp, passes, b"bench-header", k as u64).out);
+                samples.push(t0.elapsed().as_secs_f64());
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("v3 log2_n={log2_n} passes={passes} memory={} MiB median={:.1}ms min={:.1}ms",
+                     sp.bytes() >> 20, samples[samples.len() / 2] * 1e3, samples[0] * 1e3);
         }
         Some("perm") => {
             let count: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10_000_000);

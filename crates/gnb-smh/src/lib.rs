@@ -19,6 +19,8 @@
 pub mod difficulty;
 /// GnB-SMH v2 draft (SHA-256). Not consensus.
 pub mod v2;
+/// GnB-SMH v3 draft (Argon2d-style fill, 4 MiB). Not consensus.
+pub mod v3;
 
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::Shake256;
