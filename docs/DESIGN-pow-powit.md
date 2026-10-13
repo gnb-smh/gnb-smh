@@ -9,7 +9,7 @@ signatures. Built from three pieces:
 | --- | --- |
 | Block PoW: GnB-SMH v3 (4 MiB, Argon2d-style fill) | draft, `crates/gnb-smh/src/v3.rs` |
 | Witness shares (custody proof + reward) | draft, `crates/gnb-crypto/src/core/witness_share.rs` |
-| Witness set + checkpoint attestations + finality rule | this document (not implemented) |
+| Witness set + checkpoint attestations + finality rule (rev. 2: ebb-and-flow, accountable safety, inactivity decay) | this document (not implemented) |
 
 ## 1. Block PoW: GnB-SMH v3
 
@@ -66,6 +66,92 @@ excluded from W for K epochs.
 If no checkpoint finalizes for 1,000 blocks, the chain keeps running as pure
 PoW under the depth-finality rule (`CHECKPOINT_DEPTH`) until attestations
 resume. Finality can stall; block production cannot.
+
+## 7. Hardening (revision 2)
+
+### 7.1 Two ledgers: available and final ("ebb-and-flow")
+
+Impossibility results bound every design: no permissionless protocol is
+both always available and always consistent under network partitions (CAP),
+and deterministic agreement needs fewer than 1/3 faulty weight under partial
+synchrony (Dwork–Lynch–Stockmeyer). PoW + PoWit therefore keeps **two
+ledgers** (Neu–Tas–Tse, 2021):
+
+- **LOG_avail**: the GHOSTDAG order of the PoW DAG. Always grows while
+  honest miners hold a hashrate majority, even with most witnesses offline
+  or the network partitioned.
+- **LOG_fin**: the prefix of LOG_avail up to the last finalized checkpoint.
+  Never reverted while < 1/3 of the witness weight is Byzantine, whatever the
+  network delays.
+
+LOG_fin is always a prefix of LOG_avail. Users pick their guarantee:
+fast/probabilistic (LOG_avail) or deterministic (LOG_fin).
+
+### 7.2 Byzantine generals mapping
+
+| Generals problem | PoW + PoWit |
+| --- | --- |
+| Generals | Members of the witness set W_e (earned by custody work, not chosen) |
+| Messages | Attestations signed with ML-DSA-65 ‖ Falcon-1024 (unforgeable, also against quantum adversaries) |
+| Traitors | Any member; tolerated while their weight is < 1/3 of W_e |
+| Agreement | Two checkpoints at the same height can never both finalize unless ≥ 1/3 of the weight signed both, and that is provable on chain |
+| Sybil generals | Weight is work, so splitting a key into many keys gains nothing |
+
+### 7.3 Vote rule with accountable safety
+
+Each attestation is a link `source → target` between two checkpoints
+(source = the latest justified checkpoint the signer knows):
+
+- a checkpoint is **justified** when links from a justified source carry
+  ≥ 2/3 of W_e; it is **final** when its direct child checkpoint is justified
+  from it;
+- **slashable** (escrow burned, key barred for K epochs): two different
+  targets at the same height (double vote), or a link that surrounds another
+  link by the same key (surround vote).
+
+Theorem (as in Casper's accountable safety): two conflicting final
+checkpoints imply that keys holding ≥ 1/3 of W_e broke one of the two rules,
+and the evidence is publishable in any block. The voters here are earned by
+PoW custody work; there is no stake and no appointed validator.
+
+### 7.4 Agreeing on who the generals are
+
+W_e is computed only from **LOG_fin as of the end of epoch e-2**. Every honest
+node therefore derives the same set, even while LOG_avail tips disagree. If
+nothing has finalized for two epochs, W_e = W_{e-1}.
+
+### 7.5 Finality liveness: inactivity decay
+
+If no checkpoint finalizes for 4 epochs, the weight of every member whose
+attestations are not being included decays by 1/16 per epoch (deterministic,
+from included attestations only). Online members regain 2/3 and finality
+resumes, so > 1/3 offline or withholding can only delay finality, not stop it.
+
+### 7.6 Fork choice
+
+Heaviest blue-work DAG **among the branches that contain the latest final
+checkpoint**. A partitioned side may keep producing blocks (LOG_avail), but
+at most one side can finalize, and the other side rejoins it on heal.
+
+### 7.7 Other attacks
+
+- **Selfish mining / withholding**: witness shares pay every 16× easier
+  proof, so small miners earn without pools and withheld blocks forfeit
+  their share slots.
+- **Long-range rewrite**: impossible past LOG_fin for online nodes; new
+  nodes start from `MIN_CHAIN_WORK` + the release checkpoint (weak
+  subjectivity, as every finality protocol).
+- **Bribing witnesses**: the bribe must exceed the 7-day escrow of ≥ 1/3 of
+  the weight, and the attack is attributable.
+- **Data withholding**: a block whose data no one can sample earns no shares
+  and no attestations.
+
+### 7.8 What remains impossible (honest limits)
+
+- A sustained > 2/3 majority of the 7-day witness weight controls LOG_fin.
+- A hashrate majority still controls LOG_avail after the last final checkpoint.
+- Finality needs partial synchrony: during long partitions, LOG_fin stalls
+  (by design it never forks).
 
 ## What it buys against a 51% attacker
 
