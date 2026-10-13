@@ -11,6 +11,7 @@ use serde::{Serialize, Deserialize};
 pub mod tokenomics;
 pub mod policy;      // m-of-n multisig + absolute/relative timelocks
 pub mod vesting;     // locked team and founder allocations (genesis ledger)
+pub mod witness_share; // DRAFT, not consensus: reward for proven witness custody
 
 /// Bloch Genesis-3 carryover: verified, converted opening ledger.
 pub mod carryover;
