@@ -51,30 +51,61 @@ Because every honest node validates before forwarding, an invalid frame is
 only ever delivered by its author, so the penalty lands on the author and
 never on an honest relay.
 
-**Signature budget.** Step 10 is charged to the gossip *author* (the signed
-gossipsub source) as one token per input signature, all-or-nothing, from a
-token bucket per author: burst 400, refill 20 per second, at most 4,096
-authors tracked (least-recently-used eviction). A cache hit costs nothing. An
-author without enough tokens gets `Ignore` and no signature is checked.
+**Signature budget.** Step 10 is charged to the **connection that delivered
+the frame** (the gossipsub `propagation_source`), never to the signed gossip
+author: one connection can sign every frame with a fresh keypair, so an
+author key bounds nothing. One token per input signature, all-or-nothing,
+from a token bucket per connection: burst 400, refill 20 per second, at most
+4,096 connections tracked (far above the connection limit). A cache hit costs
+nothing. The tokens are **refunded when the transaction enters the pool**, so
+a connection pays only for verification that did not lead to admission (an
+invalid signature, a full pool, a failed orphan re-try) and an honest relay
+forwarding valid traffic is never throttled. A connection without enough
+tokens gets `Ignore` and no signature is checked. A connection's bucket is
+dropped when it disconnects.
 
 ## 3. Orphan transactions
 
 A gossiped transaction with missing inputs that passed the context-free checks
 is kept in the orphan pool instead of being dropped:
 
-* at most 100 orphans and 10 MiB in total, 25 orphans and 2 MiB per delivering
-  peer;
-* a peer over its quota loses its own oldest orphan; when the global bound is
-  reached, the oldest orphan of the peer holding the most is evicted;
+* orphans are keyed by **wtxid** (the hash of the full encoding, script_sigs
+  included), as in Bitcoin Core: a copy of a transaction with garbage
+  script_sigs has the same txid but cannot occupy the genuine copy's slot —
+  both are buffered, the one that fails its signatures on re-try is dropped;
+* at most 100 orphans and 10 MiB in total, 25 orphans and 2 MiB per
+  delivering connection; an orphan spends at most 100 inputs (no valid
+  transaction within 400 KiB has more: every input carries at least an
+  ML-DSA-65 key and signature);
+* a connection over its quota loses its own oldest orphan; when the global
+  bound is reached, the oldest orphan of the connection holding the most is
+  evicted; the orphans of a connection that closes are dropped;
 * an orphan expires after 20 minutes;
-* when a transaction enters the pool, the orphans waiting on it are re-tried
-  (at most 25 per event, breadth-first through their own children); after a
-  connected block and on a 30 s sweep every orphan whose inputs are now all
-  available is re-tried; orphans confirmed by a block or spending an outpoint
-  the block spent are erased;
-* a re-tried orphan's signatures are charged to the peer that delivered it;
-  an orphan admitted this way is announced by the node itself (its original
-  frame was answered `Ignore`).
+* when a transaction enters the pool or a connected block confirms it, the
+  orphans waiting on it are re-tried (breadth-first through their own
+  children, at most 25 orphans and 400 inputs per event); there is no scan of
+  the whole orphan pool per block. A 30 s sweep finds orphans whose parents
+  arrived by another path (RPC, the miner, a reorg): one lookup per recorded
+  missing parent, stopping at the first one still missing, at most 1,000
+  lookups per sweep, round-robin. Orphans confirmed by a block (in any
+  encoding) or spending an outpoint the block spent are erased;
+* a re-tried orphan's signatures are charged to the connection that
+  delivered it.
+
+**Verdicts of orphan frames.** The verdict of an orphan's gossip frame is
+withheld, keyed by the frame's wtxid and timed from the frame's arrival at
+the network loop (gossipsub keeps an unvalidated frame for 12 heartbeats of
+1 s; the window is 10 s). It is settled when the orphan's fate is known:
+
+| outcome | verdict of the withheld frame |
+|---|---|
+| exactly these bytes entered the pool, within the window | Accept (gossipsub forwards the original frame) |
+| the re-try proved these bytes consensus-invalid | Reject within the window (the delivering connection takes the P4 penalty); after it, an application-score penalty on that connection |
+| evicted, expired, erased, another encoding admitted, refused by policy | Ignore |
+
+Every admitted orphan is also re-announced by the node 35 s later (after
+gossipsub's 30 s duplicate window), so one admitted after its frame left the
+cache still propagates.
 
 ## 4. Chains of unconfirmed transactions
 

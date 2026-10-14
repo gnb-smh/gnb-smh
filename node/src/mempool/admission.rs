@@ -37,7 +37,7 @@
 //! 10. scripts: pubkey hash then the hybrid signatures, LAST, with a bounded
 //!     verified-signature cache shared with block validation. A caller may
 //!     put a gate in front of this step (`admit_gated`): the gossip relay
-//!     charges the delivering author's signature budget there (MEM-5).
+//!     charges the delivering connection's signature budget there (MEM-5).
 //!
 //! Every error says whether the transaction is consensus-INVALID
 //! ([`AdmissionError::Rejected`]: no honest node relays it, so the gossip
@@ -108,7 +108,7 @@ pub enum AdmissionError {
     LowFee(String),
     /// Already pooled / already confirmed / recently rejected.
     Duplicate(String),
-    /// MEM-5: the delivering author's signature-verification budget is
+    /// MEM-5: the delivering connection's signature-verification budget is
     /// spent. Not cached: the transaction may be perfectly valid.
     RateLimited(String),
     /// The pool refused it (full, or another mempool-level rule).
@@ -438,7 +438,7 @@ pub fn check_transaction_gated(
     }
 
     // Signatures last (the only step whose cost grows with size²), behind
-    // the caller's gate (MEM-5: the relay's per-author budget).
+    // the caller's gate (MEM-5: the relay's per-connection budget).
     if policy.check_signatures {
         if !signatures_cached(tx) {
             gate(tx)?;
@@ -504,4 +504,21 @@ pub fn missing_parents(store: &Storage, mempool: &Mempool, tx: &Transaction) -> 
         })
         .map(|i| i.prev_txid)
         .collect()
+}
+
+/// True iff some input of `tx` is neither confirmed nor pooled. Stops at the
+/// first missing input — use it wherever only emptiness of
+/// [`missing_parents`] matters (the orphan re-try path, review finding).
+pub fn has_missing_input(store: &Storage, mempool: &Mempool, tx: &Transaction) -> bool {
+    tx.inputs.iter().any(|i| {
+        !matches!(store.get_utxo(&i.prev_txid, i.prev_index), Ok(Some(_)))
+            && mempool.pool_output(&i.prev_txid, i.prev_index).is_none()
+    })
+}
+
+/// True iff the transaction `txid` is pooled or confirmed: one lookup per
+/// recorded missing parent is the cheap pre-filter of the periodic orphan
+/// sweep (a parent that is neither cannot have made its child admissible).
+pub fn parent_available(store: &Storage, mempool: &Mempool, txid: &[u8; 32]) -> bool {
+    mempool.contains(txid) || matches!(store.get_tx_location(txid), Ok(Some(_)))
 }

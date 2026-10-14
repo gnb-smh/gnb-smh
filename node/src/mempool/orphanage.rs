@@ -6,17 +6,29 @@
 //! child that overtook its parent on the wire was lost for good. It is now
 //! kept here — bounded — and re-tried when a parent arrives:
 //!
+//! * keyed by WTXID (the witness-inclusive id, `admission::wtxid`), as Core
+//!   keys its orphanage: the txid leaves the script_sigs out, so a copy of a
+//!   transaction with garbage script_sigs shares its txid. Keyed by txid, such
+//!   a copy that arrived first occupied the genuine transaction's slot and
+//!   made the genuine one look "already buffered" (review finding). Both
+//!   copies are now buffered side by side; the one that fails its signatures
+//!   on re-try is dropped, the genuine one is admitted;
 //! * bounded by entry count and bytes globally ([`MAX_ORPHAN_TXS`],
-//!   [`MAX_ORPHAN_BYTES`]) and per delivering peer
-//!   ([`MAX_ORPHANS_PER_PEER`], [`MAX_ORPHAN_BYTES_PER_PEER`]); a peer over
-//!   its quota pays with its OWN oldest orphans, and the global bound evicts
-//!   the oldest orphan of the peer holding the most, so one flooding peer
-//!   cannot flush everyone else's orphans;
+//!   [`MAX_ORPHAN_BYTES`]) and per DELIVERING CONNECTION
+//!   ([`MAX_ORPHANS_PER_PEER`], [`MAX_ORPHAN_BYTES_PER_PEER`]) — the relay
+//!   passes the gossip `propagation_source`, never the self-chosen gossip
+//!   author (one connection can sign every frame with a fresh key); a
+//!   connection over its quota pays with its OWN oldest orphans, and the
+//!   global bound evicts the oldest orphan of the connection holding the
+//!   most, so one flooding connection cannot flush everyone else's orphans;
+//! * an orphan may spend at most [`MAX_ORPHAN_INPUTS`] inputs: no valid
+//!   transaction within `MAX_TX_SIZE` has more, and the per-input lookups of
+//!   the re-try path stay bounded;
 //! * expired after [`ORPHAN_EXPIRY_SECS`] (Core: 20 minutes);
 //! * indexed by missing parent txid, so the arrival of a parent finds its
 //!   waiting children in O(children) ([`TxOrphanage::waiting_on`]);
-//! * indexed by spent outpoint, so a connected block erases the orphans it
-//!   conflicts with ([`TxOrphanage::erase_conflicts`]).
+//! * indexed by spent outpoint and by txid, so a connected block erases the
+//!   orphans it confirmed or conflicts with ([`TxOrphanage::erase_for_block`]).
 //!
 //! Only transactions that passed every context-free check (structure, size,
 //! standardness — see `admission::check_transaction`) reach the orphanage;
@@ -27,17 +39,25 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
 
 use crate::core::Transaction;
+use crate::mempool::admission::wtxid as compute_wtxid;
 
 /// Global entry cap (Bitcoin Core `DEFAULT_MAX_ORPHAN_TRANSACTIONS`).
 pub const MAX_ORPHAN_TXS: usize = 100;
 /// Global byte cap (wire bytes).
 pub const MAX_ORPHAN_BYTES: usize = 10 * 1024 * 1024;
-/// Per delivering peer entry quota.
+/// Per delivering connection entry quota.
 pub const MAX_ORPHANS_PER_PEER: usize = 25;
-/// Per delivering peer byte quota.
+/// Per delivering connection byte quota.
 pub const MAX_ORPHAN_BYTES_PER_PEER: usize = 2 * 1024 * 1024;
 /// Orphans older than this are dropped (Bitcoin Core `ORPHAN_TX_EXPIRE_TIME`).
 pub const ORPHAN_EXPIRY_SECS: u64 = 20 * 60;
+/// Largest number of inputs an orphan may spend. Every valid input carries
+/// at least an ML-DSA-65 public key (1,952 B) and signature (3,309 B), so a
+/// transaction within `MAX_TX_SIZE` (400 KiB) has fewer than 80 inputs; an
+/// orphan with more can never be admitted, and refusing it bounds the
+/// per-orphan storage lookups of the re-try path (review finding: a 400 KiB
+/// orphan of minimal 41-byte inputs used to carry ~10,000 of them).
+pub const MAX_ORPHAN_INPUTS: usize = 100;
 
 /// Bounds of a [`TxOrphanage`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,25 +86,29 @@ impl Default for OrphanLimits {
 pub struct OrphanTx<P> {
     pub tx:              Transaction,
     pub txid:            [u8; 32],
+    /// Witness-inclusive id: the orphan's key.
+    pub wtxid:           [u8; 32],
     /// Wire bytes of the transaction.
     pub bytes:           usize,
-    /// The peer that delivered it (`None` = unknown / local).
+    /// The connection that delivered it (`None` = unknown / local).
     pub peer:            Option<P>,
     /// Unix seconds after which it is dropped.
     pub expires_at:      u64,
     /// Parent txids that were missing when it was buffered.
     pub missing_parents: BTreeSet<[u8; 32]>,
-    seq:                 u64,
+    /// Arrival sequence number (unique, increasing).
+    pub seq:             u64,
 }
 
 /// Result of [`TxOrphanage::add`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OrphanAdd {
-    /// Buffered; `evicted` lists orphans dropped to make room.
+    /// Buffered; `evicted` lists the wtxids of orphans dropped to make room.
     Inserted { evicted: Vec<[u8; 32]> },
-    /// Already buffered (the first copy is kept).
+    /// These exact bytes (same wtxid) are already buffered.
     Duplicate,
-    /// Larger than a quota could ever hold.
+    /// Larger than a quota could ever hold, or more than
+    /// [`MAX_ORPHAN_INPUTS`] inputs.
     TooLarge,
 }
 
@@ -94,7 +118,9 @@ struct PeerUsage {
     seqs:  BTreeSet<u64>,
 }
 
-/// The orphan pool. See the module documentation.
+/// The orphan pool. See the module documentation. Every map is keyed or
+/// valued by wtxid, except `by_parent` / `by_txid`, whose KEYS are txids
+/// (outputs are referenced by txid).
 #[derive(Debug)]
 pub struct TxOrphanage<P: Hash + Eq + Copy> {
     limits:      OrphanLimits,
@@ -102,6 +128,7 @@ pub struct TxOrphanage<P: Hash + Eq + Copy> {
     order:       BTreeMap<u64, [u8; 32]>,
     by_parent:   HashMap<[u8; 32], BTreeSet<[u8; 32]>>,
     by_outpoint: HashMap<([u8; 32], u32), BTreeSet<[u8; 32]>>,
+    by_txid:     HashMap<[u8; 32], BTreeSet<[u8; 32]>>,
     per_peer:    HashMap<Option<P>, PeerUsage>,
     total_bytes: usize,
     next_seq:    u64,
@@ -121,6 +148,7 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
             order: BTreeMap::new(),
             by_parent: HashMap::new(),
             by_outpoint: HashMap::new(),
+            by_txid: HashMap::new(),
             per_peer: HashMap::new(),
             total_bytes: 0,
             next_seq: 0,
@@ -143,12 +171,25 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
         self.total_bytes
     }
 
-    pub fn contains(&self, txid: &[u8; 32]) -> bool {
-        self.entries.contains_key(txid)
+    /// Whether these exact bytes (`wtxid`) are buffered.
+    pub fn contains(&self, wtxid: &[u8; 32]) -> bool {
+        self.entries.contains_key(wtxid)
     }
 
-    pub fn get(&self, txid: &[u8; 32]) -> Option<&OrphanTx<P>> {
-        self.entries.get(txid)
+    /// Whether ANY encoding of `txid` is buffered.
+    pub fn contains_txid(&self, txid: &[u8; 32]) -> bool {
+        self.by_txid.contains_key(txid)
+    }
+
+    /// The buffered encodings (wtxids) of `txid`, oldest first.
+    pub fn wtxids_for_txid(&self, txid: &[u8; 32]) -> Vec<[u8; 32]> {
+        let mut v: Vec<[u8; 32]> = self.by_txid.get(txid).map(|s| s.iter().copied().collect()).unwrap_or_default();
+        v.sort_by_key(|w| self.entries.get(w).map(|e| e.seq).unwrap_or(u64::MAX));
+        v
+    }
+
+    pub fn get(&self, wtxid: &[u8; 32]) -> Option<&OrphanTx<P>> {
+        self.entries.get(wtxid)
     }
 
     /// `(entries, bytes)` buffered on behalf of `peer`.
@@ -156,9 +197,15 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
         self.per_peer.get(&peer).map(|u| (u.seqs.len(), u.bytes)).unwrap_or((0, 0))
     }
 
-    /// Every buffered txid, oldest first.
-    pub fn txids_by_age(&self) -> Vec<[u8; 32]> {
+    /// Every buffered wtxid, oldest first.
+    pub fn wtxids_by_age(&self) -> Vec<[u8; 32]> {
         self.order.values().copied().collect()
+    }
+
+    /// `(seq, wtxid)` of every orphan, starting at sequence number `from`
+    /// and wrapping around (round-robin scans resume where they stopped).
+    pub fn round_robin_from(&self, from: u64) -> impl Iterator<Item = (u64, [u8; 32])> + '_ {
+        self.order.range(from..).chain(self.order.range(..from)).map(|(s, w)| (*s, *w))
     }
 
     /// Buffer `tx` (whose wire size is `bytes`, delivered by `peer`) waiting
@@ -185,8 +232,11 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
         missing_parents: BTreeSet<[u8; 32]>,
         expires_at: u64,
     ) -> OrphanAdd {
-        let txid = tx.txid();
-        if self.entries.contains_key(&txid) {
+        if tx.inputs.len() > MAX_ORPHAN_INPUTS {
+            return OrphanAdd::TooLarge;
+        }
+        let wtxid = compute_wtxid(&tx);
+        if self.entries.contains_key(&wtxid) {
             return OrphanAdd::Duplicate;
         }
         if bytes > self.limits.max_bytes_per_peer || bytes > self.limits.max_bytes
@@ -194,8 +244,10 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
         {
             return OrphanAdd::TooLarge;
         }
+        let txid = tx.txid();
         let mut evicted = Vec::new();
-        // Per-peer quota: the delivering peer pays with its own oldest.
+        // Per-connection quota: the delivering connection pays with its own
+        // oldest.
         loop {
             let (count, used) = self.peer_usage(peer);
             if count < self.limits.max_entries_per_peer
@@ -211,7 +263,7 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
                 None => break,
             }
         }
-        // Global bounds: the oldest orphan of the peer holding the most.
+        // Global bounds: the oldest orphan of the connection holding the most.
         while self.entries.len() >= self.limits.max_entries
             || self.total_bytes.saturating_add(bytes) > self.limits.max_bytes
         {
@@ -233,17 +285,18 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         for p in &missing_parents {
-            self.by_parent.entry(*p).or_default().insert(txid);
+            self.by_parent.entry(*p).or_default().insert(wtxid);
         }
         for inp in &tx.inputs {
-            self.by_outpoint.entry((inp.prev_txid, inp.prev_index)).or_default().insert(txid);
+            self.by_outpoint.entry((inp.prev_txid, inp.prev_index)).or_default().insert(wtxid);
         }
+        self.by_txid.entry(txid).or_default().insert(wtxid);
         let usage = self.per_peer.entry(peer).or_insert_with(|| PeerUsage { bytes: 0, seqs: BTreeSet::new() });
         usage.bytes = usage.bytes.saturating_add(bytes);
         usage.seqs.insert(seq);
         self.total_bytes = self.total_bytes.saturating_add(bytes);
-        self.order.insert(seq, txid);
-        self.entries.insert(txid, OrphanTx { tx, txid, bytes, peer, expires_at, missing_parents, seq });
+        self.order.insert(seq, wtxid);
+        self.entries.insert(wtxid, OrphanTx { tx, txid, wtxid, bytes, peer, expires_at, missing_parents, seq });
         OrphanAdd::Inserted { evicted }
     }
 
@@ -253,9 +306,9 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
             .and_then(|s| self.order.get(&s).copied())
     }
 
-    /// Remove one orphan and every index entry pointing at it.
-    pub fn remove(&mut self, txid: &[u8; 32]) -> Option<OrphanTx<P>> {
-        let e = self.entries.remove(txid)?;
+    /// Remove one orphan (by wtxid) and every index entry pointing at it.
+    pub fn remove(&mut self, wtxid: &[u8; 32]) -> Option<OrphanTx<P>> {
+        let e = self.entries.remove(wtxid)?;
         self.order.remove(&e.seq);
         if let Some(u) = self.per_peer.get_mut(&e.peer) {
             u.seqs.remove(&e.seq);
@@ -267,7 +320,7 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
         self.total_bytes = self.total_bytes.saturating_sub(e.bytes);
         for p in &e.missing_parents {
             if let Some(s) = self.by_parent.get_mut(p) {
-                s.remove(txid);
+                s.remove(wtxid);
                 if s.is_empty() {
                     self.by_parent.remove(p);
                 }
@@ -276,27 +329,34 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
         for inp in &e.tx.inputs {
             let op = (inp.prev_txid, inp.prev_index);
             if let Some(s) = self.by_outpoint.get_mut(&op) {
-                s.remove(txid);
+                s.remove(wtxid);
                 if s.is_empty() {
                     self.by_outpoint.remove(&op);
                 }
             }
         }
+        if let Some(s) = self.by_txid.get_mut(&e.txid) {
+            s.remove(wtxid);
+            if s.is_empty() {
+                self.by_txid.remove(&e.txid);
+            }
+        }
         Some(e)
     }
 
-    /// Orphans that were waiting on `parent`, oldest first (not removed).
+    /// Wtxids of the orphans that were waiting on parent txid `parent`,
+    /// oldest first (not removed).
     pub fn waiting_on(&self, parent: &[u8; 32]) -> Vec<[u8; 32]> {
         let mut v: Vec<[u8; 32]> = self.by_parent.get(parent).map(|s| s.iter().copied().collect()).unwrap_or_default();
         v.sort_by_key(|t| self.entries.get(t).map(|e| e.seq).unwrap_or(u64::MAX));
         v
     }
 
-    /// Drop every orphan whose deadline passed. Returns the dropped txids.
+    /// Drop every orphan whose deadline passed. Returns the dropped wtxids.
     pub fn expire(&mut self, now_unix: u64) -> Vec<[u8; 32]> {
         let doomed: Vec<[u8; 32]> = self.entries.values()
             .filter(|e| e.expires_at <= now_unix)
-            .map(|e| e.txid)
+            .map(|e| e.wtxid)
             .collect();
         for t in &doomed {
             self.remove(t);
@@ -305,10 +365,16 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
     }
 
     /// Drop every orphan spending one of `outpoints` (just consumed by a
-    /// connected block — the orphan can never be mined) or listed in
-    /// `confirmed` (it was mined itself). Returns the dropped txids.
+    /// connected block — the orphan can never be mined) or whose TXID is
+    /// listed in `confirmed` (it was mined itself, in any encoding). Returns
+    /// the dropped wtxids.
     pub fn erase_for_block(&mut self, outpoints: &[([u8; 32], u32)], confirmed: &[[u8; 32]]) -> Vec<[u8; 32]> {
-        let mut doomed: BTreeSet<[u8; 32]> = confirmed.iter().filter(|t| self.entries.contains_key(*t)).copied().collect();
+        let mut doomed: BTreeSet<[u8; 32]> = BTreeSet::new();
+        for t in confirmed {
+            if let Some(s) = self.by_txid.get(t) {
+                doomed.extend(s.iter().copied());
+            }
+        }
         for op in outpoints {
             if let Some(s) = self.by_outpoint.get(op) {
                 doomed.extend(s.iter().copied());
@@ -320,15 +386,26 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
         doomed.into_iter().collect()
     }
 
-    /// Drop every orphan delivered by `peer`. Returns how many.
-    pub fn erase_peer(&mut self, peer: Option<P>) -> usize {
+    /// Drop every encoding of `txid` (another copy of it entered the pool or
+    /// a block). Returns the dropped wtxids.
+    pub fn erase_txid(&mut self, txid: &[u8; 32]) -> Vec<[u8; 32]> {
+        let doomed = self.wtxids_for_txid(txid);
+        for w in &doomed {
+            self.remove(w);
+        }
+        doomed
+    }
+
+    /// Drop every orphan delivered by `peer` (its connection closed, as
+    /// Core's `EraseForPeer`). Returns the dropped wtxids.
+    pub fn erase_peer(&mut self, peer: Option<P>) -> Vec<[u8; 32]> {
         let doomed: Vec<[u8; 32]> = self.per_peer.get(&peer)
             .map(|u| u.seqs.iter().filter_map(|s| self.order.get(s).copied()).collect())
             .unwrap_or_default();
         for t in &doomed {
             self.remove(t);
         }
-        doomed.len()
+        doomed
     }
 
     /// Internal consistency (tests / fuzzing).
@@ -345,6 +422,25 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
         }
         if self.order.len() != self.entries.len() {
             return Err("order index drifted".into());
+        }
+        for (w, e) in &self.entries {
+            if e.wtxid != *w || compute_wtxid(&e.tx) != *w || e.tx.txid() != e.txid {
+                return Err("entry key is not the orphan's wtxid".into());
+            }
+            if e.tx.inputs.len() > MAX_ORPHAN_INPUTS {
+                return Err("orphan above the input cap".into());
+            }
+            if self.order.get(&e.seq) != Some(w) {
+                return Err("order index drifted".into());
+            }
+            if !self.by_txid.get(&e.txid).is_some_and(|s| s.contains(w)) {
+                return Err("by_txid misses an entry".into());
+            }
+            for inp in &e.tx.inputs {
+                if !self.by_outpoint.get(&(inp.prev_txid, inp.prev_index)).is_some_and(|s| s.contains(w)) {
+                    return Err("by_outpoint misses an entry".into());
+                }
+            }
         }
         let mut per_peer_count = 0usize;
         for (p, u) in &self.per_peer {
@@ -372,6 +468,18 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
                 }
             }
         }
+        for (txid, ws) in &self.by_txid {
+            if ws.is_empty() || ws.iter().any(|w| !self.entries.get(w).is_some_and(|e| e.txid == *txid)) {
+                return Err("by_txid drifted".into());
+            }
+        }
+        for (op, ws) in &self.by_outpoint {
+            if ws.is_empty() || ws.iter().any(|w| !self.entries.get(w)
+                .is_some_and(|e| e.tx.inputs.iter().any(|i| (i.prev_txid, i.prev_index) == *op)))
+            {
+                return Err("by_outpoint drifted".into());
+            }
+        }
         Ok(())
     }
 }
@@ -394,6 +502,10 @@ mod tests {
         std::iter::once([p; 32]).collect()
     }
 
+    fn w(tx: &Transaction) -> [u8; 32] {
+        compute_wtxid(tx)
+    }
+
     #[test]
     fn per_peer_quota_charges_the_flooder_only() {
         let limits = OrphanLimits { max_entries: 10, max_bytes: 1 << 20, max_entries_per_peer: 3, max_bytes_per_peer: 1 << 20, expiry_secs: 60 };
@@ -405,7 +517,7 @@ mod tests {
             o.debug_check_invariants().unwrap();
         }
         assert_eq!(o.peer_usage(Some(2)).0, 3, "the flooder keeps only its quota");
-        assert!(o.contains(&honest.txid()), "the honest peer's orphan survives");
+        assert!(o.contains(&w(&honest)), "the honest peer's orphan survives");
     }
 
     #[test]
@@ -419,7 +531,7 @@ mod tests {
         }
         // Global cap reached: a newcomer evicts peer 2's oldest, not peer 1's.
         o.add(orphan(3, 30, 10), 10, Some(3), parents(3), 0);
-        assert!(o.contains(&a.txid()));
+        assert!(o.contains(&w(&a)));
         assert_eq!(o.len(), 4);
         assert_eq!(o.peer_usage(Some(2)).0, 2);
         o.debug_check_invariants().unwrap();
@@ -448,12 +560,75 @@ mod tests {
         o.add(a.clone(), 10, Some(1), parents(7), 100);
         o.add(b.clone(), 10, Some(1), parents(7), 200);
         o.add(c.clone(), 10, None, parents(8), 300);
-        assert_eq!(o.waiting_on(&[7; 32]), vec![a.txid(), b.txid()], "arrival order");
+        assert_eq!(o.waiting_on(&[7; 32]), vec![w(&a), w(&b)], "arrival order");
         let gone = o.expire(100 + ORPHAN_EXPIRY_SECS);
-        assert_eq!(gone, vec![a.txid()]);
-        assert_eq!(o.erase_for_block(&[([8; 32], 0)], &[]), vec![c.txid()], "conflicts with a confirmed spend");
-        assert_eq!(o.erase_for_block(&[], &[b.txid()]), vec![b.txid()], "itself confirmed");
+        assert_eq!(gone, vec![w(&a)]);
+        assert_eq!(o.erase_for_block(&[([8; 32], 0)], &[]), vec![w(&c)], "conflicts with a confirmed spend");
+        assert_eq!(o.erase_for_block(&[], &[b.txid()]), vec![w(&b)], "itself confirmed");
         assert!(o.is_empty());
         o.debug_check_invariants().unwrap();
+    }
+
+    /// Review finding: two encodings of one txid (same spends and outputs,
+    /// different script_sigs) are separate orphans — a junk copy that arrived
+    /// first no longer occupies the genuine one's slot. A block confirming
+    /// the txid, or `erase_txid`, drops every encoding.
+    #[test]
+    fn orphans_are_keyed_by_wtxid() {
+        let mut o: TxOrphanage<u8> = TxOrphanage::default();
+        let junk = orphan(9, 0xAA, 40);
+        let mut genuine = junk.clone();
+        genuine.inputs[0].script_sig = vec![0xBB; 40];
+        assert_eq!(junk.txid(), genuine.txid(), "script_sigs are outside the txid");
+        assert_ne!(w(&junk), w(&genuine));
+        assert!(matches!(o.add(junk.clone(), 100, Some(1), parents(9), 0), OrphanAdd::Inserted { .. }));
+        assert!(matches!(o.add(genuine.clone(), 100, Some(2), parents(9), 0), OrphanAdd::Inserted { .. }),
+            "the genuine copy is buffered next to the junk one");
+        assert_eq!(o.add(genuine.clone(), 100, Some(3), parents(9), 0), OrphanAdd::Duplicate, "same bytes");
+        assert!(o.contains_txid(&junk.txid()));
+        assert_eq!(o.wtxids_for_txid(&junk.txid()), vec![w(&junk), w(&genuine)]);
+        assert_eq!(o.waiting_on(&[9; 32]), vec![w(&junk), w(&genuine)]);
+        o.debug_check_invariants().unwrap();
+        assert_eq!(o.erase_txid(&junk.txid()).len(), 2);
+        assert!(o.is_empty());
+        o.add(junk.clone(), 100, Some(1), parents(9), 0);
+        o.add(genuine.clone(), 100, Some(2), parents(9), 0);
+        assert_eq!(o.erase_for_block(&[], &[junk.txid()]).len(), 2, "a confirmed txid drops every encoding");
+        assert!(o.is_empty());
+        o.debug_check_invariants().unwrap();
+    }
+
+    /// Review finding: an orphan carries at most `MAX_ORPHAN_INPUTS` inputs,
+    /// and no valid transaction within `MAX_TX_SIZE` can have more (every
+    /// valid input holds at least an ML-DSA-65 public key and signature).
+    #[test]
+    fn orphan_input_count_is_capped() {
+        use crate::crypto::{MLDSA_PUBKEY_LEN, MLDSA_SIG_LEN};
+        assert!(MAX_ORPHAN_INPUTS * (MLDSA_PUBKEY_LEN + MLDSA_SIG_LEN) > crate::mempool::MAX_TX_SIZE,
+            "the cap never refuses a transaction that could be valid");
+        let wide = |n: usize| Transaction {
+            version: 1,
+            inputs: (0..n).map(|i| TxInput { prev_txid: [0x42; 32], prev_index: i as u32, script_sig: vec![1], sequence: u32::MAX }).collect(),
+            outputs: vec![TxOutput { value: 10_000, script_pubkey: vec![1; 20] }],
+            locktime: 0,
+        };
+        let mut o: TxOrphanage<u8> = TxOrphanage::default();
+        assert_eq!(o.add(wide(MAX_ORPHAN_INPUTS + 1), 100, Some(1), parents(0x42), 0), OrphanAdd::TooLarge);
+        assert!(matches!(o.add(wide(MAX_ORPHAN_INPUTS), 100, Some(1), parents(0x42), 0), OrphanAdd::Inserted { .. }));
+        o.debug_check_invariants().unwrap();
+    }
+
+    #[test]
+    fn round_robin_resumes_and_wraps() {
+        let mut o: TxOrphanage<u8> = TxOrphanage::default();
+        let txs: Vec<Transaction> = (0..4u8).map(|i| orphan(i, i, 4)).collect();
+        for t in &txs {
+            o.add(t.clone(), 10, Some(1), parents(t.inputs[0].prev_txid[0]), 0);
+        }
+        let seqs: Vec<u64> = o.round_robin_from(2).map(|(s, _)| s).collect();
+        assert_eq!(seqs, vec![2, 3, 0, 1]);
+        assert_eq!(o.round_robin_from(2).next().map(|(_, wt)| wt), Some(w(&txs[2])));
+        assert_eq!(o.erase_peer(Some(1)).len(), 4);
+        assert!(o.is_empty());
     }
 }

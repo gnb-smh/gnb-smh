@@ -10,9 +10,14 @@
 //! deterministic in tests.
 //!
 //! Evicting a key can only ever GRANT that key a fresh full bucket; it never
-//! refuses a key it has not seen. Identity cycling therefore buys an attacker
-//! nothing it could not get by opening a new connection, which libp2p's
-//! connection limits already bound.
+//! refuses a key it has not seen. This bounds an attacker only when the keys
+//! are bound to connections (the peer id of a connected neighbour, the
+//! `propagation_source` of a gossip frame, the responder of a directed
+//! pull): cycling such keys costs a new connection, which libp2p's connection
+//! limits bound. A key the sender chooses freely — the signed gossip AUTHOR
+//! of a frame, which any connection can mint per frame — is NOT a bound: a
+//! fresh key is a fresh full bucket (review finding on the transaction
+//! signature budget, now keyed by the delivering connection).
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -97,6 +102,22 @@ impl<K: Hash + Eq + Copy> TokenBuckets<K> {
         } else {
             false
         }
+    }
+
+    /// Give back up to `n` tokens to `key` (capped at the burst). No-op for
+    /// an untracked key. MEM-5: the transaction relay refunds the signature
+    /// budget of a transaction that entered the pool, so a connection is
+    /// charged only for verification that did not lead to admission.
+    pub fn refund_n(&mut self, key: K, n: usize) {
+        let cap = self.capacity;
+        if let Some(b) = self.buckets.get_mut(&key) {
+            b.tokens = (b.tokens + n as f64).min(cap);
+        }
+    }
+
+    /// Forget `key` (its connection closed).
+    pub fn remove(&mut self, key: &K) {
+        self.buckets.remove(key);
     }
 
     /// Drop keys whose bucket has refilled completely (they carry no state a
@@ -186,6 +207,21 @@ mod tests {
         assert!(!tb.try_take_n_at(1, 1, t0));
         assert!(tb.try_take_n_at(1, 2, t0 + Duration::from_secs(2)));
         assert!(!tb.try_take_n_at(2, 11, t0), "more than the burst never passes");
+    }
+
+    #[test]
+    fn refund_is_capped_and_remove_forgets() {
+        let t0 = Instant::now();
+        let mut tb: TokenBuckets<u32> = TokenBuckets::new(10, 0.0, 16);
+        assert!(tb.try_take_n_at(1, 8, t0));
+        tb.refund_n(1, 5);
+        assert!(tb.try_take_n_at(1, 7, t0), "2 + 5 refunded");
+        tb.refund_n(1, 1_000);
+        assert!(tb.try_take_n_at(1, 10, t0) && !tb.try_take_n_at(1, 1, t0), "refund capped at the burst");
+        tb.refund_n(2, 5); // untracked: no-op
+        assert_eq!(tb.tracked(), 1);
+        tb.remove(&1);
+        assert_eq!(tb.tracked(), 0);
     }
 
     #[test]

@@ -115,6 +115,33 @@ pub struct GossipValidation {
     pub verdict:            GossipVerdict,
 }
 
+/// Gossipsub `history_length`: heartbeats (1 s each) an unvalidated frame
+/// stays in the message cache, i.e. how long a withheld verdict can still
+/// forward it.
+pub const GOSSIP_HISTORY_LENGTH: usize = 12;
+
+/// Out-of-band requests from the message processor to the network loop
+/// (see [`NetworkNode::attach_control`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NetworkControl {
+    /// MEM-5 / MEM-6: `peer` delivered a consensus-invalid transaction whose
+    /// gossip frame can no longer be answered `Reject` (it was buffered as an
+    /// orphan and left gossipsub's cache before its re-try proved it
+    /// invalid). The network loop applies one application-score penalty, as
+    /// for a wire violation (decaying, shared with the wire tracker).
+    PenalizePeer(PeerId),
+}
+
+/// Peer lifecycle notices from the network loop to the message processor
+/// (see [`NetworkNode::attach_peer_events`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerEvent {
+    /// The last connection to this peer closed. The transaction relay drops
+    /// its per-connection signature budget and the orphans it delivered
+    /// (Bitcoin Core's `EraseForPeer`).
+    Disconnected(PeerId),
+}
+
 /// Where an inbound frame handed to the processor came from.
 #[derive(Clone, Debug)]
 pub enum InboundOrigin {
@@ -126,6 +153,12 @@ pub enum InboundOrigin {
         propagation_source: PeerId,
         author:             Option<PeerId>,
         pending:            Option<gossipsub::MessageId>,
+        /// When the network loop received the frame — gossipsub put it in
+        /// its message cache at that moment, and it is shifted out
+        /// [`GOSSIP_HISTORY_LENGTH`] heartbeats later. A withheld verdict
+        /// must be reported before then (review finding: the deferred-orphan
+        /// TTL used to start at processor time).
+        received_at:        std::time::Instant,
     },
     /// The answer to one of OUR directed `/gnb/sync/1` pulls, from `peer`.
     Directed { peer: PeerId },
@@ -146,6 +179,15 @@ impl InboundOrigin {
             InboundOrigin::Gossip { propagation_source, .. } => Some(*propagation_source),
             InboundOrigin::Directed { peer } => Some(*peer),
             InboundOrigin::Local => None,
+        }
+    }
+
+    /// When the network loop received this gossip frame (`None` for
+    /// directed and local frames).
+    pub fn received_at(&self) -> Option<std::time::Instant> {
+        match self {
+            InboundOrigin::Gossip { received_at, .. } => Some(*received_at),
+            _ => None,
         }
     }
 
@@ -194,7 +236,7 @@ pub fn gossip_disposition(msg: &NetworkMessage, validator_attached: bool, claim_
     use GossipDisposition::*;
     match msg {
         // MEM-5 / NET-2 / NET-4 (audit): transactions are judged by the
-        // processor (shared admission, signatures last, per-author budget —
+        // processor (shared admission, signatures last, per-connection budget —
         // `mempool::relay`) BEFORE gossipsub relays them, exactly like blocks.
         NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. } => {
             if validator_attached { DeliverDeferred } else { Deliver(GossipVerdict::Accept) }
@@ -844,6 +886,8 @@ pub struct NetworkNode {
     pub peer_id: PeerId,
     pub config:  NetworkConfig,
     local_key:   identity::Keypair,
+    control_rx:  Option<mpsc::Receiver<NetworkControl>>,
+    peer_events: Option<mpsc::Sender<PeerEvent>>,
 }
 
 impl NetworkNode {
@@ -853,7 +897,18 @@ impl NetworkNode {
         let local_key = load_or_create_identity(&key_path)?;
         let peer_id   = PeerId::from(local_key.public());
         info!("P2P identity: {} ({})", peer_id, key_path.display());
-        Ok(Self { peer_id, config, local_key })
+        Ok(Self { peer_id, config, local_key, control_rx: None, peer_events: None })
+    }
+
+    /// Accept [`NetworkControl`] requests from the processor on `rx`.
+    pub fn attach_control(&mut self, rx: mpsc::Receiver<NetworkControl>) {
+        self.control_rx = Some(rx);
+    }
+
+    /// Report [`PeerEvent`]s to the processor on `tx` (never blocks: a full
+    /// channel drops the notice).
+    pub fn attach_peer_events(&mut self, tx: mpsc::Sender<PeerEvent>) {
+        self.peer_events = Some(tx);
     }
 
     /// Run the network event loop for a consumer that does NOT report gossip
@@ -908,7 +963,7 @@ impl NetworkNode {
 
     #[allow(clippy::too_many_arguments)]
     async fn run_inner(
-        self,
+        mut self,
         sink:            IngestSink,
         mut verdict_rx:  Option<mpsc::Receiver<GossipValidation>>,
         mut outbound_rx: mpsc::Receiver<NetworkMessage>,
@@ -942,7 +997,7 @@ impl NetworkNode {
             .validate_messages()
             // Keep unvalidated frames long enough for the processor to judge
             // them (a block verdict waits behind its 64 MiB PoW check).
-            .history_length(12)
+            .history_length(GOSSIP_HISTORY_LENGTH)
             // Mesh fix (fresh-joiner IBD): gossipsub's duplicate_cache_time
             // defaults to 60s — the SAME period as tip_announce below, which
             // made byte-identical periodic PeerTips Duplicate-dropped locally.
@@ -1163,6 +1218,8 @@ impl NetworkNode {
         // C1 / NET-4 / NET-8: cumulative, decaying, bounded app-score
         // penalties for wire-violating peers.
         let mut wire_tracker = WirePenaltyTracker::new();
+        // MEM-5 / MEM-6: processor → network penalties (optional).
+        let mut control_rx = self.control_rx.take();
 
         // H-R3-1 fix #4 / NET-8: bounded per-peer + global rate of served
         // inbound directed-sync requests. Refusals are answered `Busy` (NET-5).
@@ -1327,11 +1384,11 @@ impl NetworkNode {
                                 // from answers to our own directed GetPeers.
                                 _ => {}
                             }
-                            let source = InboundOrigin::Gossip { propagation_source, author, pending: None };
+                            let source = InboundOrigin::Gossip { propagation_source, author, pending: None, received_at: now };
                             match gossip_disposition(&msg, sink.validator_attached(), claim_ok) {
                                 GossipDisposition::DeliverDeferred => {
                                     let origin = InboundOrigin::Gossip {
-                                        propagation_source, author, pending: Some(message_id.clone()),
+                                        propagation_source, author, pending: Some(message_id.clone()), received_at: now,
                                     };
                                     if !sink.deliver(msg, origin, "gossip") {
                                         // Never queued: nobody will judge it. Do not relay.
@@ -1458,6 +1515,9 @@ impl NetworkNode {
                             if num_established == 0 {
                                 peer_state.on_disconnect(&peer_id);
                                 selector.on_disconnect(&peer_id);
+                                if let Some(tx) = &self.peer_events {
+                                    let _ = tx.try_send(PeerEvent::Disconnected(peer_id));
+                                }
                             }
                         }
                         SwarmEvent::NewListenAddr { address, .. } => {
@@ -1641,10 +1701,27 @@ impl NetworkNode {
                 v = recv_verdict(&mut verdict_rx) => {
                     match v {
                         Some(v) => {
-                            swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                            let relayed = swarm.behaviour_mut().gossipsub.report_message_validation_result(
                                 &v.message_id, &v.propagation_source, v.verdict.into());
+                            if !relayed && v.verdict == GossipVerdict::Accept {
+                                // The frame already left gossipsub's cache: it is not
+                                // forwarded (a late orphan release is re-announced).
+                                debug!("late Accept: frame from {} no longer in the gossip cache", v.propagation_source);
+                            }
                         }
                         None => verdict_rx = None,
+                    }
+                }
+
+                // MEM-5 / MEM-6: out-of-band penalties from the processor.
+                c = recv_control(&mut control_rx) => {
+                    match c {
+                        Some(NetworkControl::PenalizePeer(peer)) => {
+                            let score = wire_tracker.record_violation(peer);
+                            swarm.behaviour_mut().gossipsub.set_application_score(&peer, score);
+                            warn!("invalid orphan transaction from {} (app score → {})", peer, score);
+                        }
+                        None => control_rx = None,
                     }
                 }
 
@@ -1859,6 +1936,15 @@ fn drain_pulls(
         debug!("→ directed pull [{}] to {}", p.msg.kind_name(), peer);
         selector.on_sent(peer, now);
         inflight.insert(id, (p, peer));
+    }
+}
+
+/// Receive the next processor control request; pending forever when none
+/// is attached.
+async fn recv_control(rx: &mut Option<mpsc::Receiver<NetworkControl>>) -> Option<NetworkControl> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
     }
 }
 

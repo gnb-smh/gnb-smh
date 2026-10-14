@@ -3,7 +3,7 @@
 //! * MEM-5 residual (+ NET-2 / NET-4, transaction side): gossiped
 //!   transactions are judged by the shared admission function before relay;
 //!   Reject only for consensus-invalid ones, Ignore for policy / duplicates /
-//!   recent rejects; signatures last and budgeted per author.
+//!   recent rejects; signatures last and budgeted per delivering connection.
 //! * MEM-6 residual: bounded orphan pool; chains of unconfirmed transactions
 //!   with ancestor/descendant limits, CPFP templates, descendant-consistent
 //!   removal; full-RBF with BIP125 rules 2-6.
@@ -27,7 +27,7 @@ use gnb::mempool::admission::{self, AdmissionError, AdmissionPolicy};
 use gnb::mempool::orphanage::OrphanLimits;
 use gnb::mempool::relay::{self, TxRelay};
 use gnb::mempool::{self as mp, Clock, Mempool, MempoolError, PackageCandidate};
-use gnb::network::GossipVerdict;
+use gnb::network::{GossipVerdict, InboundOrigin};
 use gnb::reorg::{self, ConnectHooks, ReorgPlan, UtxoView};
 use gnb::storage::aggregates::{self, AggregateSnapshot, HolderEntry};
 use gnb::storage::Storage;
@@ -154,58 +154,75 @@ fn mem5_verdict_mapping_rejects_only_consensus_invalid() {
     assert!(!RateLimited("x".into()).is_cacheable(), "a rate-limited tx may be valid");
 }
 
-/// Signatures are verified LAST and charged to the gossip author's budget
-/// (one token per input, all-or-nothing): cheap failures cost nothing; an
-/// author out of budget is ignored without any signature work and the
-/// transaction stays admissible from another author.
+/// Signatures are verified LAST and charged to the delivering connection's
+/// budget (one token per input, all-or-nothing): cheap failures cost
+/// nothing; a connection out of budget is ignored without any signature
+/// work and the transaction stays admissible from another connection.
+/// Review finding: the tokens are REFUNDED when the transaction enters the
+/// pool, so only verification that did not lead to admission is charged
+/// (pre-fix an honest relay forwarding valid traffic spent its budget).
 #[test]
-fn mem5_signature_work_is_last_and_budgeted_per_author() {
+fn mem5_signature_work_is_last_and_budgeted_per_connection() {
     let genesis = mk_genesis(unix_now() - 10_000);
     let k = key();
-    let funds: Vec<_> = (0..6u8).map(|i| ([0x70 + i; 32], 0u32, out(1_000_000, &k.spk))).collect();
+    let funds: Vec<_> = (0..10u8).map(|i| ([0x70 + i; 32], 0u32, out(1_000_000, &k.spk))).collect();
     let n = node_with(&genesis, &funds);
     let next = admission::next_block_height(&n.dag.read());
     let mut relay = TxRelay::with_limits(3, 0.0, OrphanLimits::default());
     let (a, b) = (Some(PeerId::random()), Some(PeerId::random()));
     let t0 = Instant::now();
+    let mut go = |relay: &mut TxRelay, tx: &Transaction, p: Option<PeerId>| {
+        relay.on_gossip_tx(&n.store, &n.mempool, next, &tx.txid(), &wire(tx), p, t0, unix_now())
+    };
+    let bad_last = |inputs: &[([u8; 32], u32)], v: u64, tag: u8| {
+        let mut t = signed_spend(&k, inputs, vec![out(v, &[tag; 20])]);
+        let last = t.inputs.len() - 1;
+        t.inputs[last].script_sig[10] ^= 0xFF;
+        t
+    };
 
     // Three transactions below the consensus minimum fee (fee 1 sat), each
     // also badly signed: refused at the fee step, signatures never touched.
     for i in 0..3u8 {
         let mut cheap = signed_spend(&k, &[(funds[0].0, 0)], vec![out(999_999 - i as u64, &[0x10 + i; 20])]);
         cheap.inputs[0].script_sig[10] ^= 0xFF;
-        let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &cheap.txid(), &wire(&cheap), a, t0, unix_now());
+        let o = go(&mut relay, &cheap, a);
         assert_eq!(o.verdict, GossipVerdict::Reject);
         assert!(o.detail.contains("below consensus minimum"), "the fee error, not the signature: {}", o.detail);
     }
-    // A still has its full budget of 3: a 3-input transaction passes.
+    // A still has its full budget of 3: a 3-input transaction passes...
     let three = signed_spend(&k, &[(funds[1].0, 0), (funds[2].0, 0), (funds[3].0, 0)], vec![out(2_900_000, &[0x20; 20])]);
-    let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &three.txid(), &wire(&three), a, t0, unix_now());
-    assert_eq!(o.verdict, GossipVerdict::Accept, "{}", o.detail);
-    // A's budget is now spent: the next transaction is ignored unverified.
+    assert_eq!(go(&mut relay, &three, a).verdict, GossipVerdict::Accept);
+    // ... and, admitted, it was refunded: A still verifies another one.
     let one = signed_spend(&k, &[(funds[4].0, 0)], vec![out(900_000, &[0x21; 20])]);
-    let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &one.txid(), &wire(&one), a, t0, unix_now());
+    let o = go(&mut relay, &one, a);
+    assert_eq!(o.verdict, GossipVerdict::Accept, "refunded on admission: {}", o.detail);
+    // A consensus-invalid 3-input transaction is charged in full.
+    let bad = bad_last(&[(funds[5].0, 0), (funds[6].0, 0), (funds[7].0, 0)], 2_900_000, 0x22);
+    assert_eq!(go(&mut relay, &bad, a).verdict, GossipVerdict::Reject);
+    // A's budget is now spent: the next transaction is ignored unverified.
+    let next_one = signed_spend(&k, &[(funds[8].0, 0)], vec![out(900_000, &[0x23; 20])]);
+    let o = go(&mut relay, &next_one, a);
     assert_eq!(o.verdict, GossipVerdict::Ignore);
     assert!(o.detail.contains("budget"), "{}", o.detail);
-    assert!(!admission::signatures_cached(&one), "no signature was verified");
-    assert!(!n.mempool.contains(&one.txid()));
-    assert!(!n.mempool.is_recently_rejected(&admission::wtxid(&one)), "not cached: it may be valid");
-    // Another author is unaffected.
-    let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &one.txid(), &wire(&one), b, t0, unix_now());
-    assert_eq!(o.verdict, GossipVerdict::Accept, "{}", o.detail);
-    // Invalid signatures are charged too (the attacker pays for the work).
-    let mut bad = signed_spend(&k, &[(funds[5].0, 0)], vec![out(900_000, &[0x22; 20])]);
-    bad.inputs[0].script_sig[10] ^= 0xFF;
-    assert_eq!(relay.on_gossip_tx(&n.store, &n.mempool, next, &bad.txid(), &wire(&bad), b, t0, unix_now()).verdict,
-        GossipVerdict::Reject);
-    let mut bad2 = signed_spend(&k, &[(funds[5].0, 0)], vec![out(890_000, &[0x23; 20])]);
-    bad2.inputs[0].script_sig[10] ^= 0xFF;
-    assert_eq!(relay.on_gossip_tx(&n.store, &n.mempool, next, &bad2.txid(), &wire(&bad2), b, t0, unix_now()).verdict,
-        GossipVerdict::Reject);
-    let mut bad3 = signed_spend(&k, &[(funds[5].0, 0)], vec![out(880_000, &[0x24; 20])]);
-    bad3.inputs[0].script_sig[10] ^= 0xFF;
-    let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &bad3.txid(), &wire(&bad3), b, t0, unix_now());
+    assert!(!admission::signatures_cached(&next_one), "no signature was verified");
+    assert!(!n.mempool.contains(&next_one.txid()));
+    assert!(!n.mempool.is_recently_rejected(&admission::wtxid(&next_one)), "not cached: it may be valid");
+    // Another connection is unaffected.
+    assert_eq!(go(&mut relay, &next_one, b).verdict, GossipVerdict::Accept);
+    // B pays for invalid signatures only: 1 + 2 tokens, then out of budget.
+    let b1 = bad_last(&[(funds[9].0, 0)], 900_000, 0x24);
+    assert_eq!(go(&mut relay, &b1, b).verdict, GossipVerdict::Reject);
+    let b2 = bad_last(&[(funds[5].0, 0), (funds[6].0, 0)], 1_900_000, 0x25);
+    assert_eq!(go(&mut relay, &b2, b).verdict, GossipVerdict::Reject);
+    let b3 = bad_last(&[(funds[7].0, 0)], 880_000, 0x26);
+    let o = go(&mut relay, &b3, b);
     assert_eq!(o.verdict, GossipVerdict::Ignore, "B spent 1 + 2 tokens: {}", o.detail);
+    // A closed connection forgets its bucket (and its orphans).
+    let tracked = relay.budgets_tracked();
+    let ev = relay.on_peer_disconnected(a.unwrap());
+    assert!(ev.is_empty());
+    assert_eq!(relay.budgets_tracked(), tracked - 1);
 }
 
 // ── MEM-6 (a): orphan transactions ───────────────────────────────────────────
@@ -234,30 +251,65 @@ fn mem6_orphan_is_admitted_when_its_parent_arrives() {
 
     let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &parent.txid(), &wire(&parent), peer, t0, unix_now());
     assert_eq!(o.verdict, GossipVerdict::Accept, "{}", o.detail);
-    assert_eq!(o.newly_admitted.iter().map(|t| t.txid()).collect::<Vec<_>>(), vec![child.txid()]);
+    assert_eq!(o.orphans.admitted.iter().map(|t| t.txid()).collect::<Vec<_>>(), vec![child.txid()]);
     assert!(relay.orphans().is_empty());
     let e = n.mempool.get_entry(&child.txid()).expect("child pooled");
     assert_eq!(e.parents.iter().copied().collect::<Vec<_>>(), vec![parent.txid()]);
     n.mempool.debug_check_invariants().unwrap();
 }
 
-/// An orphan's gossip verdict is withheld and released as Accept when it is
-/// admitted within gossipsub's cache window (the original frame is then
-/// relayed); later admissions are re-announced after the duplicate window.
+/// An orphan's gossip verdict is withheld (keyed by the frame's wtxid) and
+/// released as Accept when exactly those bytes are admitted within
+/// gossipsub's cache window, timed from the frame's ARRIVAL; every admitted
+/// orphan is re-announced after the duplicate window.
 #[test]
 fn mem6_orphan_verdicts_are_deferred_and_released() {
     use gnb::mempool::relay::{DeferredVerdicts, DEFERRED_VERDICT_TTL, REANNOUNCE_DELAY};
     let t0 = Instant::now();
     let mut d: DeferredVerdicts<&'static str> = DeferredVerdicts::new();
-    d.defer([1; 32], "frame-1", t0);
-    d.defer([2; 32], "frame-2", t0);
-    assert_eq!(d.on_admitted(&[[1; 32]], t0 + DEFERRED_VERDICT_TTL / 2), vec!["frame-1"], "released in time");
-    assert!(d.on_admitted(&[[2; 32]], t0 + DEFERRED_VERDICT_TTL).is_empty(), "frame expired: not released");
+    assert!(d.defer([1; 32], "frame-1", t0, t0).is_none());
+    assert!(d.defer([2; 32], "frame-2", t0, t0).is_none());
+    assert_eq!(d.defer([2; 32], "frame-2b", t0, t0), Some("frame-2b"), "the same bytes are pending already");
+    assert_eq!(d.on_admitted(&[([0x11; 32], [1; 32])], t0 + DEFERRED_VERDICT_TTL / 2), vec!["frame-1"], "released in time");
+    assert!(d.on_admitted(&[([0x22; 32], [2; 32])], t0 + DEFERRED_VERDICT_TTL).is_empty(), "frame expired: not released");
     assert!(d.due_reannouncements(t0 + DEFERRED_VERDICT_TTL).is_empty());
-    assert_eq!(d.due_reannouncements(t0 + DEFERRED_VERDICT_TTL + REANNOUNCE_DELAY), vec![[2; 32]], "re-announced later");
-    d.defer([3; 32], "frame-3", t0);
-    d.prune(|_| false, t0);
-    assert!(d.is_empty(), "an orphan that left the orphanage forgets its frame");
+    assert_eq!(d.due_reannouncements(t0 + DEFERRED_VERDICT_TTL + REANNOUNCE_DELAY), vec![[0x11; 32], [0x22; 32]],
+        "every admitted orphan is re-announced later");
+    assert!(d.defer([3; 32], "frame-3", t0, t0).is_none());
+    assert_eq!(d.prune(|_| false, t0), vec!["frame-3"], "an orphan that left the orphanage: Ignore its frame");
+    assert!(d.is_empty());
+}
+
+/// Review finding (deferred TTL): the window is measured from the frame's
+/// arrival at the network loop — gossipsub cached it then and shifts it out
+/// `GOSSIP_HISTORY_LENGTH` heartbeats later — with two heartbeats of margin.
+/// Pre-fix the stamp was taken when the (possibly backlogged) processor got
+/// to the frame and the window equalled the cache lifetime, so an orphan
+/// released 11-12 s after receipt was "released" into a cache that no longer
+/// held it and was never relayed nor re-announced.
+#[test]
+fn mem6_deferred_ttl_is_measured_from_frame_arrival() {
+    use gnb::mempool::relay::{DeferredVerdicts, DEFERRED_VERDICT_TTL, REANNOUNCE_DELAY};
+    use gnb::network::GOSSIP_HISTORY_LENGTH;
+    use std::time::Duration;
+    assert!(DEFERRED_VERDICT_TTL + Duration::from_secs(2) <= Duration::from_secs(GOSSIP_HISTORY_LENGTH as u64));
+    let t0 = Instant::now();
+    let mut d: DeferredVerdicts<&'static str> = DeferredVerdicts::new();
+    // The processor gets to the frame 5 s after it arrived.
+    assert!(d.defer([1; 32], "late-frame", t0, t0 + Duration::from_secs(5)).is_none());
+    // Its parent arrives 11 s after receipt: past the window, not released...
+    let at = t0 + Duration::from_secs(11);
+    assert!(d.on_admitted(&[([0xA1; 32], [1; 32])], at).is_empty());
+    // ... but re-announced after the duplicate window.
+    assert!(d.due_reannouncements(at + REANNOUNCE_DELAY - Duration::from_millis(1)).is_empty());
+    assert_eq!(d.due_reannouncements(at + REANNOUNCE_DELAY), vec![[0xA1; 32]]);
+    // Within the window (from arrival) it is released.
+    assert!(d.defer([2; 32], "frame", t0, t0 + Duration::from_secs(5)).is_none());
+    assert_eq!(d.on_admitted(&[([0xA2; 32], [2; 32])], t0 + Duration::from_secs(9)), vec!["frame"]);
+    // A frame that is already too old when the processor reaches it is not
+    // withheld at all: the caller answers Ignore.
+    assert_eq!(d.defer([3; 32], "stale", t0, t0 + DEFERRED_VERDICT_TTL), Some("stale"));
+    assert!(d.is_empty());
 }
 
 /// The orphan pool is bounded per peer and globally, expires entries, and
@@ -289,17 +341,320 @@ fn mem6_orphan_pool_is_bounded_expires_and_follows_blocks() {
     let zo = syn(&[(ext(300), 0)], &[50_000], 0x50, 16);
     gossip(&mut relay, &zo, z, now);
     assert_eq!(relay.orphans().len(), 4, "global cap");
-    assert!(relay.orphans().contains(&zo.txid()));
+    assert!(relay.orphans().contains(&admission::wtxid(&zo)));
     relay.orphans().debug_check_invariants().unwrap();
 
     // A block spending the outpoint an orphan spends erases it.
     let blocked = relay.on_block_connected(&n.store, &n.mempool, next,
         &[coinbase("cb", 0, vec![1; 20]), syn(&[(ext(300), 0)], &[40_000], 0x51, 16)], t0, now);
-    assert!(blocked.is_empty());
-    assert!(!relay.orphans().contains(&zo.txid()), "conflicts with a confirmed spend");
+    assert!(blocked.admitted.is_empty());
+    assert_eq!(blocked.dropped, vec![admission::wtxid(&zo)], "reported for its deferred frame");
+    assert!(!relay.orphans().contains(&admission::wtxid(&zo)), "conflicts with a confirmed spend");
     // Everything else expires.
     relay.retry_orphans(&n.store, &n.mempool, next, t0, now + 61);
     assert!(relay.orphans().is_empty(), "expired after 60 s");
+}
+
+/// A gossip origin delivered by connection `conn` whose frame is signed by a
+/// FRESH author key — what one connection can do for every frame.
+fn fresh_author_origin(conn: PeerId) -> InboundOrigin {
+    InboundOrigin::Gossip { propagation_source: conn, author: Some(PeerId::random()), pending: None, received_at: Instant::now() }
+}
+
+/// Review finding (author keying): the orphan quotas and the signature
+/// budget are keyed by the DELIVERING CONNECTION (`InboundOrigin::peer`, the
+/// gossip propagation_source — what main.rs passes), never by the signed
+/// gossip author, which a sender can mint per frame. One connection sending
+/// 100 orphans under 100 fresh author keys keeps only its own 25-orphan
+/// quota and cannot evict another connection's (heavier) orphan; the
+/// re-try signature work of its orphans is bounded by ONE bucket. Pre-fix
+/// every fresh key got its own quota (the global tie-break then evicted the
+/// honest ~8 KB orphan first) and a fresh 400-token bucket.
+#[test]
+fn mem5_orphan_quotas_and_budget_follow_the_connection_not_the_author() {
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let k = key();
+    let fund = ([0x5Au8; 32], 0u32, out(10_000_000, &k.spk));
+    let fund2 = ([0x5Bu8; 32], 0u32, out(10_000_000, &k.spk));
+    let n = node_with(&genesis, &[fund.clone(), fund2.clone()]);
+    let next = admission::next_block_height(&n.dag.read());
+    let t0 = Instant::now();
+    let (honest, attacker) = (PeerId::random(), PeerId::random());
+
+    // (a) The orphan flush.
+    let mut relay = TxRelay::new();
+    let parent = signed_spend(&k, &[(fund2.0, 0)], vec![out(9_000_000, &k.spk)]);
+    let honest_child = signed_spend(&k, &[(parent.txid(), 0)], vec![out(8_900_000, &[0x01; 20])]);
+    let origin = fresh_author_origin(honest);
+    let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &honest_child.txid(), &wire(&honest_child), origin.peer(), t0, unix_now());
+    assert!(o.orphaned, "{}", o.detail);
+    for i in 0..100u64 {
+        let origin = fresh_author_origin(attacker);
+        assert_eq!(origin.peer(), Some(attacker), "the relay key is the connection, never the author");
+        let t = syn(&[(ext(5_000 + i), 0)], &[50_000], i as u8, 8);
+        relay.on_gossip_tx(&n.store, &n.mempool, next, &t.txid(), &wire(&t), origin.peer(), t0, unix_now());
+    }
+    assert_eq!(relay.orphans().peer_usage(Some(attacker)).0, gnb::mempool::orphanage::MAX_ORPHANS_PER_PEER);
+    assert!(relay.orphans().contains(&admission::wtxid(&honest_child)), "another connection's orphan survives");
+    assert_eq!(relay.orphans().len(), 1 + gnb::mempool::orphanage::MAX_ORPHANS_PER_PEER);
+    relay.orphans().debug_check_invariants().unwrap();
+
+    // (b) The re-try signature work: five 3-input orphans with bad scripts,
+    // under five fresh authors, all waiting on one cheap parent. A bucket
+    // of 10 verifies three of them (9 tokens); the other two wait.
+    let mut relay = TxRelay::with_limits(10, 0.0, OrphanLimits::default());
+    let p = signed_spend(&k, &[(fund.0, 0)], (0..15).map(|_| out(600_000, &k.spk)).collect());
+    for j in 0..5u32 {
+        let t = syn(&[(p.txid(), 3 * j), (p.txid(), 3 * j + 1), (p.txid(), 3 * j + 2)], &[1_700_000], 0x60 + j as u8, 64);
+        let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &t.txid(), &wire(&t), fresh_author_origin(attacker).peer(), t0, unix_now());
+        assert!(o.orphaned, "{}", o.detail);
+    }
+    let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &p.txid(), &wire(&p), fresh_author_origin(honest).peer(), t0, unix_now());
+    assert_eq!(o.verdict, GossipVerdict::Accept, "{}", o.detail);
+    assert_eq!(o.orphans.rejected.len(), 3, "one bucket: 3 × 3 input signatures, then out of budget");
+    assert!(o.orphans.rejected.iter().all(|r| r.peer == Some(attacker)));
+    assert_eq!(relay.orphans().peer_usage(Some(attacker)).0, 2, "the rest wait for the connection's budget");
+    // The honest connection paid nothing for its admitted parent.
+    let more = signed_spend(&k, &[(p.txid(), 14)], vec![out(580_000, &[0x02; 20])]);
+    let honest_after = relay.on_gossip_tx(&n.store, &n.mempool, next, &more.txid(), &wire(&more), Some(honest), t0, unix_now());
+    assert_eq!(honest_after.verdict, GossipVerdict::Accept, "{}", honest_after.detail);
+    // When the attacker disconnects, its orphans go (Core's EraseForPeer).
+    let ev = relay.on_peer_disconnected(attacker);
+    assert_eq!(ev.dropped.len(), 2);
+    assert!(relay.orphans().is_empty());
+}
+
+/// Review finding (orphan re-try verdict): an orphan whose re-try proves it
+/// consensus-invalid is reported, so its withheld frame gets `Reject` (the
+/// delivering connection takes gossipsub's P4 penalty) — or, once the frame
+/// left gossipsub's cache, the connection is penalised through the
+/// application score. A valid sibling is still released as `Accept`.
+/// Pre-fix the failure was only logged and the deferred verdict silently
+/// pruned: invalid transactions routed through the orphan pool were free.
+#[test]
+fn mem6_invalid_orphan_on_retry_is_rejected_or_penalised() {
+    use gnb::mempool::relay::{DeferredVerdicts, DEFERRED_VERDICT_TTL};
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let k = key();
+    let fund = ([0x6Au8; 32], 0u32, out(10_000_000, &k.spk));
+    let n = node_with(&genesis, std::slice::from_ref(&fund));
+    let next = admission::next_block_height(&n.dag.read());
+    let mut relay = TxRelay::new();
+    let (x, y) = (PeerId::random(), PeerId::random());
+    let t0 = Instant::now();
+    let parent = signed_spend(&k, &[(fund.0, 0)], vec![out(4_000_000, &k.spk), out(4_000_000, &k.spk)]);
+    let mut bad = signed_spend(&k, &[(parent.txid(), 0)], vec![out(3_900_000, &[0x0B; 20])]);
+    bad.inputs[0].script_sig[10] ^= 0xFF;
+    let good = signed_spend(&k, &[(parent.txid(), 1)], vec![out(3_900_000, &[0x0C; 20])]);
+    let mut on_time: DeferredVerdicts<&'static str> = DeferredVerdicts::new();
+    let mut late: DeferredVerdicts<&'static str> = DeferredVerdicts::new();
+    for (tx, peer, frame) in [(&bad, x, "frame-bad"), (&good, y, "frame-good")] {
+        let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &tx.txid(), &wire(tx), Some(peer), t0, unix_now());
+        assert!(o.orphaned, "{}", o.detail);
+        assert!(on_time.defer(o.wtxid, frame, t0, t0).is_none());
+        assert!(late.defer(o.wtxid, frame, t0, t0).is_none());
+    }
+    let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &parent.txid(), &wire(&parent), Some(y), t0, unix_now());
+    assert_eq!(o.verdict, GossipVerdict::Accept);
+    assert_eq!(o.orphans.admitted.iter().map(|t| t.txid()).collect::<Vec<_>>(), vec![good.txid()]);
+    assert_eq!(o.orphans.rejected.len(), 1);
+    assert_eq!((o.orphans.rejected[0].wtxid, o.orphans.rejected[0].peer), (admission::wtxid(&bad), Some(x)));
+
+    let s = on_time.settle(&o.orphans, t0 + std::time::Duration::from_secs(1));
+    let mut v = s.verdicts.clone();
+    v.sort_by_key(|(f, _)| *f);
+    assert_eq!(v, vec![("frame-bad", GossipVerdict::Reject), ("frame-good", GossipVerdict::Accept)]);
+    assert!(s.penalize.is_empty(), "the Reject verdict carries the penalty");
+    // The parent arrived after the bad frame left gossipsub's cache: no
+    // verdict can reach it any more, the connection is penalised instead.
+    let s = late.settle(&o.orphans, t0 + DEFERRED_VERDICT_TTL);
+    assert!(s.verdicts.is_empty(), "{:?}", s.verdicts);
+    assert_eq!(s.penalize, vec![x]);
+    assert!(late.is_empty() && on_time.is_empty());
+}
+
+/// Review findings (txid keying of the orphanage and of the deferred
+/// verdicts). C1 is the child C with a junk signature: same txid, other
+/// bytes. (1) A C1 that arrives first no longer shadows C: both are
+/// buffered. (2) The exact attack: the attacker's C1 frame is deferred, C1
+/// is evicted by the attacker's own quota, the valid C is deferred, then
+/// the parent arrives — only C's frame is released as Accept; C1's frame
+/// was answered Ignore when C1 left the orphanage. Pre-fix the verdict was
+/// keyed by txid: C1's frame was released as Accept, the honest node
+/// forwarded an invalid transaction and its neighbours penalised it.
+/// (3) With both copies buffered, the junk one is Rejected and the genuine
+/// one Accepted.
+#[test]
+fn mem6_junk_signature_copy_neither_shadows_nor_releases_the_genuine_child() {
+    use gnb::mempool::relay::DeferredVerdicts;
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let k = key();
+    let funds: Vec<_> = (0..2u8).map(|i| ([0x7Au8 + i; 32], 0u32, out(10_000_000, &k.spk))).collect();
+    let n = node_with(&genesis, &funds);
+    let next = admission::next_block_height(&n.dag.read());
+    let limits = OrphanLimits { max_entries_per_peer: 3, ..OrphanLimits::default() };
+    let mut relay = TxRelay::with_limits(400, 20.0, limits);
+    let (attacker, honest) = (PeerId::random(), PeerId::random());
+    let t0 = Instant::now();
+    let pair = |fund: &([u8; 32], u32, gnb::core::TxOutput), tag: u8| {
+        let p = signed_spend(&k, &[(fund.0, 0)], vec![out(9_000_000, &k.spk)]);
+        let c = signed_spend(&k, &[(p.txid(), 0)], vec![out(8_900_000, &[tag; 20])]);
+        let mut c1 = c.clone();
+        let sig = &mut c1.inputs[0].script_sig;
+        let mid = sig.len() / 2;
+        sig[mid] ^= 0xFF;
+        (p, c, c1)
+    };
+    let mut d: DeferredVerdicts<&'static str> = DeferredVerdicts::new();
+    let verdicts: std::cell::RefCell<Vec<(&'static str, GossipVerdict)>> = Default::default();
+    let gossip = |relay: &mut TxRelay, d: &mut DeferredVerdicts<&'static str>, tx: &Transaction, peer: PeerId, frame: &'static str| {
+        let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &tx.txid(), &wire(tx), Some(peer), t0, unix_now());
+        if o.orphaned {
+            assert!(d.defer(o.wtxid, frame, t0, t0).is_none());
+        } else {
+            verdicts.borrow_mut().push((frame, o.verdict));
+        }
+        verdicts.borrow_mut().extend(d.settle(&o.orphans, t0).verdicts);
+        o
+    };
+
+    // (1) + (2): the attack.
+    let (p, c, c1) = pair(&funds[0], 0x91);
+    assert_eq!(c.txid(), c1.txid());
+    assert_ne!(admission::wtxid(&c), admission::wtxid(&c1));
+    assert!(gossip(&mut relay, &mut d, &c1, attacker, "F1-junk").orphaned);
+    let o = gossip(&mut relay, &mut d, &c, honest, "F2-valid");
+    assert!(o.orphaned, "the genuine copy is not 'already buffered': {}", o.detail);
+    assert_eq!(relay.orphans().wtxids_for_txid(&c.txid()).len(), 2);
+    for i in 0..3u64 {
+        gossip(&mut relay, &mut d, &syn(&[(ext(7_000 + i), 0)], &[50_000], 0xE0 + i as u8, 8), attacker, "tiny");
+    }
+    assert!(!relay.orphans().contains(&admission::wtxid(&c1)), "evicted by its own sender's quota");
+    assert_eq!(*verdicts.borrow(), vec![("F1-junk", GossipVerdict::Ignore)], "answered Ignore the moment it left");
+    verdicts.borrow_mut().clear();
+    gossip(&mut relay, &mut d, &p, honest, "P");
+    assert!(n.mempool.contains(&c.txid()), "the genuine child entered the pool");
+    assert_eq!(*verdicts.borrow(), vec![("P", GossipVerdict::Accept), ("F2-valid", GossipVerdict::Accept)],
+        "only the frame carrying the admitted bytes is released");
+    verdicts.borrow_mut().clear();
+
+    // (3) Both copies buffered when the parent arrives.
+    let (p, c, c1) = pair(&funds[1], 0x92);
+    assert!(gossip(&mut relay, &mut d, &c1, attacker, "G1-junk").orphaned);
+    assert!(gossip(&mut relay, &mut d, &c, honest, "G2-valid").orphaned);
+    gossip(&mut relay, &mut d, &p, honest, "Q");
+    assert!(n.mempool.contains(&c.txid()));
+    assert_eq!(n.mempool.get_tx(&c.txid()).map(|t| admission::wtxid(&t)), Some(admission::wtxid(&c)));
+    verdicts.borrow_mut().sort_by_key(|(f, _)| *f);
+    // ("tiny": the junk copy G1 made the attacker pay with its own oldest
+    // tiny orphan, whose frame is answered Ignore.)
+    assert_eq!(*verdicts.borrow(), vec![("G1-junk", GossipVerdict::Reject), ("G2-valid", GossipVerdict::Accept),
+        ("Q", GossipVerdict::Accept), ("tiny", GossipVerdict::Ignore)]);
+    assert_eq!(relay.orphans().len(), 2, "only the attacker's two tiny orphans are left");
+    relay.orphans().debug_check_invariants().unwrap();
+}
+
+/// Review finding (orphan work on the block path): a connected block
+/// re-tries only the orphans waiting on one of its transactions (Core's
+/// work set) — no storage read at all for 100 unrelated orphans of 100
+/// inputs each (pre-fix: one UTXO read per orphan input, 10,000) — and the
+/// periodic sweep spends one lookup per orphan whose first recorded parent
+/// is still missing, at most `MAX_SWEEP_LOOKUPS`. An orphan above
+/// `MAX_ORPHAN_INPUTS` inputs is not buffered at all.
+#[test]
+fn mem6_orphan_work_per_block_and_sweep_is_bounded() {
+    use gnb::mempool::orphanage::MAX_ORPHAN_INPUTS;
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let n = node_with(&genesis, &[]);
+    let next = admission::next_block_height(&n.dag.read());
+    let mut relay = TxRelay::new();
+    let t0 = Instant::now();
+    let now = unix_now();
+    let wide = |base: u64, n_in: usize, tag: u8| {
+        syn(&(0..n_in as u64).map(|i| (ext(base + i), 0)).collect::<Vec<_>>(), &[50_000], tag, 8)
+    };
+    let too_wide = wide(10_000_000, MAX_ORPHAN_INPUTS + 1, 0x01);
+    let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &too_wide.txid(), &wire(&too_wide), Some(PeerId::random()), t0, now);
+    assert!(!o.orphaned && o.detail.contains("not buffered"), "{}", o.detail);
+    for c in 0..4u64 {
+        let conn = Some(PeerId::random());
+        for j in 0..25u64 {
+            let t = wide(1_000_000 * (c + 1) + 1_000 * j, MAX_ORPHAN_INPUTS, (c * 25 + j) as u8);
+            assert!(relay.on_gossip_tx(&n.store, &n.mempool, next, &t.txid(), &wire(&t), conn, t0, now).orphaned);
+        }
+    }
+    assert_eq!(relay.orphans().len(), 100);
+
+    let unrelated = [coinbase("cb", 0, vec![1; 20]), syn(&[(ext(99_999_999), 0)], &[40_000], 0x77, 8)];
+    let r0 = n.store.storage_reads();
+    let ev = relay.on_block_connected(&n.store, &n.mempool, next, &unrelated, t0, now);
+    assert_eq!(n.store.storage_reads() - r0, 0, "no orphan waits on the block: nothing is read");
+    assert!(ev.is_empty());
+    assert_eq!(relay.orphans().len(), 100);
+
+    let r0 = n.store.storage_reads();
+    let ev = relay.retry_orphans(&n.store, &n.mempool, next, t0, now);
+    let reads = n.store.storage_reads() - r0;
+    assert!(ev.is_empty());
+    assert!(reads <= 100 && reads <= relay::MAX_SWEEP_LOOKUPS as u64, "{reads} reads for 100 orphans");
+}
+
+/// Review finding (work set): an orphan whose parent is confirmed by a
+/// connected block is admitted by `on_block_connected` (the block's txids
+/// are the work set); an unrelated orphan is left alone.
+#[test]
+fn mem6_block_confirming_a_parent_admits_its_waiting_orphan() {
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0x8Eu8; 32], 0u32, out(5_000_000, &k.spk));
+    let n = node_with(&genesis, std::slice::from_ref(&fund));
+    let mut relay = TxRelay::new();
+    let t0 = Instant::now();
+    let tx1 = signed_spend(&k, &[(fund.0, 0)], vec![out(4_900_000, &k.spk)]);
+    let child = signed_spend(&k, &[(tx1.txid(), 0)], vec![out(4_800_000, &[0x41; 20])]);
+    let stranger = syn(&[(ext(4_242), 0)], &[50_000], 0x42, 8);
+    let next = admission::next_block_height(&n.dag.read());
+    for t in [&child, &stranger] {
+        assert!(relay.on_gossip_tx(&n.store, &n.mempool, next, &t.txid(), &wire(t), Some(PeerId::random()), t0, unix_now()).orphaned);
+    }
+    let m1 = mk_block(&n, vec![gh], vec![coinbase("m1", core::tokenomics::block_subsidy_sat(1) + 100_000, vec![0xA1; 20]), tx1.clone()]);
+    accept(&n, &m1).unwrap();
+    let next = admission::next_block_height(&n.dag.read());
+    let ev = relay.on_block_connected(&n.store, &n.mempool, next, &m1.transactions, t0, unix_now());
+    assert_eq!(ev.admitted.iter().map(|t| t.txid()).collect::<Vec<_>>(), vec![child.txid()]);
+    assert!(n.mempool.contains(&child.txid()));
+    assert!(relay.orphans().contains(&admission::wtxid(&stranger)));
+    assert_eq!(relay.orphans().len(), 1);
+}
+
+/// Review finding (per-event work): orphan re-tries triggered by ONE event
+/// stop after `MAX_ORPHAN_RETRY_INPUTS_PER_EVENT` inputs (here six 60-input
+/// orphans, from six connections so no per-connection budget interferes);
+/// the periodic sweep picks up the rest.
+#[test]
+fn mem6_orphan_retry_work_per_event_is_bounded_by_inputs() {
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let k = key();
+    let fund = ([0x9Eu8; 32], 0u32, out(10_000_000, &k.spk));
+    let n = node_with(&genesis, std::slice::from_ref(&fund));
+    let next = admission::next_block_height(&n.dag.read());
+    let mut relay = TxRelay::new();
+    let t0 = Instant::now();
+    let p = signed_spend(&k, &[(fund.0, 0)], (0..600).map(|_| out(10_000, &k.spk)).collect());
+    for j in 0..10u32 {
+        let ins: Vec<_> = (0..60u32).map(|i| (p.txid(), 60 * j + i)).collect();
+        let t = syn(&ins, &[570_000], 0xC0 + j as u8, 8);
+        assert!(relay.on_gossip_tx(&n.store, &n.mempool, next, &t.txid(), &wire(&t), Some(PeerId::random()), t0, unix_now()).orphaned);
+    }
+    let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &p.txid(), &wire(&p), Some(PeerId::random()), t0, unix_now());
+    assert_eq!(o.verdict, GossipVerdict::Accept, "{}", o.detail);
+    assert_eq!(relay::MAX_ORPHAN_RETRY_INPUTS_PER_EVENT, 400);
+    assert_eq!(o.orphans.rejected.len(), 6, "6 × 60 inputs fit the per-event budget, a 7th does not");
+    assert_eq!(relay.orphans().len(), 4);
+    let ev = relay.retry_orphans(&n.store, &n.mempool, next, t0, unix_now());
+    assert_eq!(ev.rejected.len(), 4, "the sweep re-tries the rest");
+    assert!(relay.orphans().is_empty());
 }
 
 // ── MEM-6 (b): chains of unconfirmed transactions ────────────────────────────

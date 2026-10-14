@@ -6,7 +6,10 @@
 //! processor that calls the SAME library function as `main.rs`
 //! (`mempool::relay::TxRelay::on_gossip_tx`, i.e. the shared admission with
 //! real hybrid signatures, real UTXO stores) and reports its verdicts, and
-//! defers orphan verdicts with `DeferredVerdicts` exactly like `main.rs`.
+//! defers orphan verdicts with `DeferredVerdicts` exactly like `main.rs`
+//! (relay key = the delivering connection, deferral keyed by the frame's
+//! wtxid and timed from its arrival, settlement from the relay's
+//! `OrphanEvents`, penalties through `NetworkControl`).
 //! Before the fix, `gossip_disposition` relayed every decodable
 //! `NewTransaction` frame (`Deliver(Accept)`).
 
@@ -21,7 +24,7 @@ use gnb::mempool::admission;
 use gnb::mempool::relay::{DeferredVerdicts, TxRelay};
 use gnb::mempool::Mempool;
 use gnb::network::{
-    GossipValidation, GossipVerdict, Inbound, InboundOrigin, NetworkConfig, NetworkMessage, NetworkNode,
+    GossipValidation, GossipVerdict, Inbound, InboundOrigin, NetworkConfig, NetworkControl, NetworkMessage, NetworkNode,
 };
 use libp2p::PeerId;
 use parking_lot::Mutex;
@@ -105,8 +108,10 @@ async fn spawn_publisher(bootstrap_peers: Vec<String>) -> Peer {
 /// `genesis` + `funds`, the library transaction relay as processor.
 async fn spawn_validator(bootstrap_peers: Vec<String>, genesis: &Block, funds: &[([u8; 32], u32, gnb::core::TxOutput)]) -> Peer {
     let dir = tempfile::tempdir().expect("tempdir");
-    let node = NetworkNode::new(config(&dir, bootstrap_peers)).expect("NetworkNode::new");
+    let mut node = NetworkNode::new(config(&dir, bootstrap_peers)).expect("NetworkNode::new");
     let peer_id = node.peer_id;
+    let (ctl_tx, ctl_rx) = mpsc::channel::<NetworkControl>(64);
+    node.attach_control(ctl_rx);
     let n = node_with(genesis, funds);
     let peer_state = Arc::new(gnb::sync::peer_state::PeerStateTable::new());
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<Inbound>(1024);
@@ -136,22 +141,25 @@ async fn spawn_validator(bootstrap_peers: Vec<String>, genesis: &Block, funds: &
                     continue;
                 };
                 seen.lock().push(txid);
-                let author = match &origin {
-                    InboundOrigin::Gossip { author, propagation_source, .. } => Some(author.unwrap_or(*propagation_source)),
-                    other => other.peer(),
-                };
+                let peer = origin.peer();
+                let received_at = origin.received_at().unwrap_or_else(Instant::now);
                 let next = admission::next_block_height(&dag.read());
                 let o = tokio::task::block_in_place(|| {
-                    relay.on_gossip_tx(&store, &mempool, next, &txid, &tx_data, author, Instant::now(), unix_now())
+                    relay.on_gossip_tx(&store, &mempool, next, &txid, &tx_data, peer, Instant::now(), unix_now())
                 });
                 if o.orphaned {
-                    deferred.defer(txid, origin, Instant::now());
+                    if let Some(back) = deferred.defer(o.wtxid, origin, received_at, Instant::now()) {
+                        report(&back, GossipVerdict::Ignore);
+                    }
                 } else {
                     report(&origin, o.verdict);
                 }
-                let ids: Vec<[u8; 32]> = o.newly_admitted.iter().map(|t| t.txid()).collect();
-                for released in deferred.on_admitted(&ids, Instant::now()) {
-                    report(&released, GossipVerdict::Accept);
+                let settled = deferred.settle(&o.orphans, Instant::now());
+                for (released, verdict) in settled.verdicts {
+                    report(&released, verdict);
+                }
+                for p in settled.penalize {
+                    let _ = ctl_tx.try_send(NetworkControl::PenalizePeer(p));
                 }
             }
         });
