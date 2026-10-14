@@ -111,6 +111,8 @@ table.compact td, table.compact th { padding: 2pt 3pt; }
 .sev { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 7.6pt; font-weight: 700; color: #fff; white-space: nowrap; }
 .sev-critical { background: #7a0019; } .sev-high { background: #c0392b; } .sev-medium { background: #d68910; }
 .sev-low { background: #2e86c1; } .sev-info { background: #7f8c8d; }
+.st { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 7.6pt; font-weight: 700; white-space: nowrap; border: 1px solid; }
+.st-ok { color: #1e7b34; border-color: #1e7b34; background: #e8f5ec; } .st-sched { color: #7a5200; border-color: #b07a00; background: #fff6e0; } .st-open { color: #a00; border-color: #a00; background: #fdeaea; }
 .cover { height: 250mm; display: flex; flex-direction: column; justify-content: space-between; break-after: page; }
 .cover .title { margin-top: 30mm; }
 .cover .title h1 { font-size: 26pt; line-height: 1.15; }
@@ -160,23 +162,45 @@ def toc(sections):
     return f'<h2 id="toc">Contents</h2><div class="toc"><ul>{items}</ul></div>'
 
 
+STATUS_CLS = {"Solved": "ok", "Solved (scheduled activation)": "sched"}
+
+
+def status_badge(s):
+    cls = STATUS_CLS.get(s, "open")
+    return f'<span class="st st-{cls}">{esc(s)}</span>'
+
+
 def render_findings(findings):
     out = []
     for f in findings:
         refs = f.get("refs", [])
         loc = "; ".join(refs)
+        head = f'{sev_badge(f["severity"])} '
+        if f.get("status"):
+            head += status_badge(f["status"]) + " "
         parts = [
-            f'<div class="finding"><div class="fh">{sev_badge(f["severity"])} '
+            f'<div class="finding"><div class="fh">{head}'
             f'{esc(f["id"])} &mdash; {rich(f["title"])}</div><div class="fb">',
-            f'<div class="loc">Location: {rich(loc)} &middot; Area: {esc(f["area"])} '
-            f'&middot; Evidence: {esc(f["evidence"])}</div>',
-            f'<p>{rich(f["description"])}</p>',
+            f'<div class="loc">Original location: {rich(loc)} &middot; Area: {esc(f["area"])}</div>',
+            f'<p><b>Issue.</b> {rich(f["description"])}</p>',
         ]
-        if f.get("scenario"):
+        if f.get("scenario") and not f.get("status"):
             parts.append(f'<p><b>Failure scenario.</b> {rich(f["scenario"])}</p>')
+        if f.get("fix"):
+            parts.append(f'<p><b>Fix.</b> {rich(f["fix"])}</p>')
+        if f.get("activation"):
+            parts.append(f'<p><b>Activation.</b> {rich(f["activation"])}</p>')
+        if f.get("fix_refs"):
+            parts.append(f'<p class="loc"><b>Changed:</b> {rich("; ".join(f["fix_refs"]))}</p>')
+        if f.get("tests"):
+            parts.append(f'<p class="loc"><b>Regression tests:</b> {rich("; ".join(f["tests"]))}</p>')
+        if f.get("verification"):
+            parts.append(f'<p class="loc"><b>Independent verification:</b> {rich(f["verification"])}</p>')
         if f.get("btc"):
             parts.append(f'<p><b>Bitcoin Core.</b> {rich(f["btc"])}</p>')
-        parts.append(f'<p><b>Recommendation.</b> {rich(f["recommendation"])}</p></div></div>')
+        if f.get("recommendation") and not f.get("status"):
+            parts.append(f'<p><b>Recommendation.</b> {rich(f["recommendation"])}</p>')
+        parts.append("</div></div>")
         out.append("".join(parts))
     return "".join(out)
 
@@ -222,12 +246,21 @@ def main():
                 counts = {s: sum(1 for f in findings if f["severity"] == s) for s in SEV_ORDER}
                 rows = [[s, str(counts[s])] for s in SEV_ORDER] + [["Total", str(len(findings))]]
                 body.append(table(["Severity", "Count"], rows, cls="compact", widths=["70%", "30%"]))
-                rows = [
-                    [sev_badge(f["severity"]), esc(f["id"]), rich(f["title"]), esc(f["area"])]
-                    for f in findings
-                ]
-                body.append(table(["Sev.", "ID", "Title", "Area"], rows, cls="compact",
-                                  widths=["9%", "11%", "62%", "18%"], raw_cols=(0, 1, 2, 3)))
+                if any(f.get("status") for f in findings):
+                    rows = [
+                        [sev_badge(f["severity"]), esc(f["id"]), rich(f["title"]),
+                         status_badge(f.get("status", "Open"))]
+                        for f in findings
+                    ]
+                    body.append(table(["Sev.", "ID", "Finding", "Status"], rows, cls="compact",
+                                      widths=["9%", "10%", "61%", "20%"], raw_cols=(0, 1, 2, 3)))
+                else:
+                    rows = [
+                        [sev_badge(f["severity"]), esc(f["id"]), rich(f["title"]), esc(f["area"])]
+                        for f in findings
+                    ]
+                    body.append(table(["Sev.", "ID", "Title", "Area"], rows, cls="compact",
+                                      widths=["9%", "11%", "62%", "18%"], raw_cols=(0, 1, 2, 3)))
             elif t == "scorebig":
                 body.append(
                     f'<div class="scorebig"><div><div class="v">{score["gnb_total"]:.1f} / 10</div>'
