@@ -1009,11 +1009,21 @@ impl Keypair {
     /// so compatibility tests can produce the files older releases (and
     /// Bloch) wrote.
     fn to_encrypted_json_version(&self, password: &str, version: u32) -> Result<String, String> {
+        self.to_encrypted_json_with_policy(password, version, true)
+    }
+
+    /// `enforce_policy = false` only for the CRY-7 v2 -> v3 migration, which
+    /// re-encrypts under the password the user already has.
+    fn to_encrypted_json_with_policy(&self, password: &str, version: u32, enforce_policy: bool)
+        -> Result<String, String>
+    {
         // SECURITY (A4 lows): enforce the SAME blocking password policy as
         // the new-style `EncryptedKeyfile` (length + breach denylist) here
         // too — this legacy path is reachable directly (e.g. the CLI's `New`
         // command), and Argon2 hardening is moot behind a weak password.
-        encryption::validate_password_strength(password).map_err(|e| e.to_string())?;
+        if enforce_policy {
+            encryption::validate_password_strength(password).map_err(|e| e.to_string())?;
+        }
 
         let address = Address::parse(&self.address)
             .map_err(|e| format!("keypair address is invalid: {e}"))?;
@@ -1083,8 +1093,10 @@ impl Keypair {
     /// Residual risk (CRY-7, documented): a v2 file authenticates neither its
     /// `network` field nor its address prefix, and the address checksum does
     /// not cover the prefix, so editing `gnb1q…` to `gnb1t…` in a v2 file still
-    /// loads the key for the other network. Re-save such files (any front end
-    /// now writes v3) to authenticate the network.
+    /// loads the key for the other network here. Spending paths therefore use
+    /// [`Self::load_for_spending`], which makes the caller state the network
+    /// for a v2 file, verifies the stored address against it and rewrites the
+    /// file as v3.
     pub fn from_encrypted_bytes(bytes: &[u8], password: &str) -> Result<Self, String> {
         if bytes.len() > crate::util::DEFAULT_WALLET_FILE_LIMIT {
             return Err("keystore exceeds the wallet file size limit".into());
@@ -1165,6 +1177,99 @@ impl Keypair {
         if derived != address { return Err("address mismatch — keystore may be tampered".into()); }
         Ok(Keypair { private_key: std::mem::take(&mut *private_key), public_key, address })
     }
+
+    /// Open a keystore file for SPENDING or signing (CRY-7 migration).
+    ///
+    /// * **v3** authenticates its network and address (AEAD associated
+    ///   data). If the caller states `network`, it must be the keystore's.
+    /// * **v2** authenticates neither, so the caller MUST state the network
+    ///   (`None` is refused). The stored address must be a valid address of
+    ///   that network (prefix and checksum) and match the decrypted public
+    ///   key, and the file's `network` field must not name the other network.
+    ///   After the unlock succeeds the file is rewritten as keystore **v3**
+    ///   under the same password — atomically (temp file, fsync, rename) and
+    ///   with mode 0600 — once the new bytes have been decrypted and checked
+    ///   to hold the same key. From then on the network is authenticated.
+    ///
+    /// The migration keeps the user's existing password even if it predates
+    /// the current password policy (re-encrypting does not weaken it, and
+    /// refusing would leave the file unauthenticated). Returns the keypair and
+    /// what was done to the file.
+    pub fn load_for_spending(path: &Path, password: &str, network: Option<Network>)
+        -> Result<(Self, KeystoreMigration), String>
+    {
+        let bytes = crate::util::read_wallet_file(path, crate::util::DEFAULT_WALLET_FILE_LIMIT)
+            .map_err(|e| e.to_string())?;
+        let (kp, v3_json) = Self::unlock_for_spending_bytes(&bytes, password, network)?;
+        match v3_json {
+            None => Ok((kp, KeystoreMigration::AlreadyV3)),
+            Some(json) => {
+                crate::util::atomic_write(path, json.as_bytes()).map_err(|e| format!(
+                    "keystore v2 -> v3 migration: cannot rewrite {}: {e}", path.display()))?;
+                Ok((kp, KeystoreMigration::MigratedV2ToV3))
+            }
+        }
+    }
+
+    /// The filesystem-free part of [`Self::load_for_spending`] (for front ends
+    /// that hold the keystore in memory, e.g. the web wallet): unlock `bytes`,
+    /// apply the network checks, and for a v2 keystore also return the v3
+    /// JSON that replaces it (already verified to decrypt, under `password`,
+    /// to the same key and address).
+    pub fn unlock_for_spending_bytes(bytes: &[u8], password: &str, network: Option<Network>)
+        -> Result<(Self, Option<String>), String>
+    {
+        let header: EncryptedKeystore = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        let kp = Self::from_encrypted_bytes(bytes, password)?;
+        let actual = kp.network()?;
+        let name = |n: Network| if n == Network::Testnet { "testnet" } else { "mainnet" };
+        match header.version {
+            KEYSTORE_VERSION_V3 => {
+                if let Some(stated) = network {
+                    if stated != actual {
+                        return Err(format!(
+                            "keystore is a {} key (authenticated) but {} was requested",
+                            name(actual), name(stated)));
+                    }
+                }
+                Ok((kp, None))
+            }
+            LEGACY_KEYSTORE_VERSION_V2 => {
+                let stated = network.ok_or_else(|| {
+                    "keystore v2 does not authenticate its network: state the network (mainnet or \
+                     testnet) to unlock it for spending; it is then rewritten as keystore v3"
+                        .to_string()
+                })?;
+                Address::parse_for_network(&kp.address, stated).map_err(|e| format!(
+                    "keystore v2 address {} is not a {} address: {e}", kp.address, name(stated)))?;
+                let other = name(if stated == Network::Testnet { Network::Mainnet } else { Network::Testnet });
+                if header.network == other {
+                    return Err(format!(
+                        "keystore v2 records network {:?} but {} was requested; refusing to migrate",
+                        header.network, name(stated)));
+                }
+                let json = kp.to_encrypted_json_with_policy(password, KEYSTORE_VERSION_V3, false)?;
+                let check = Self::from_encrypted_bytes(json.as_bytes(), password)?;
+                if check.private_key != kp.private_key || check.public_key != kp.public_key
+                    || check.address != kp.address || check.network()? != stated
+                {
+                    return Err("keystore v2 -> v3 migration produced a different key; file left unchanged".into());
+                }
+                Ok((kp, Some(json)))
+            }
+            other => Err(format!("unsupported keystore version {other}")),
+        }
+    }
+}
+
+/// What [`Keypair::load_for_spending`] did with the keystore file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeystoreMigration {
+    /// Already keystore v3 (network and address authenticated); unchanged.
+    AlreadyV3,
+    /// A v2 keystore was verified against the stated network and rewritten
+    /// as v3 (atomic write, mode 0600).
+    MigratedV2ToV3,
 }
 
 /// Parse the authenticated legacy plaintext while keeping its complete
@@ -2296,6 +2401,106 @@ mod audit_2026_10_wallet_fixes {
         let loaded = Keypair::from_encrypted_bytes(json.as_bytes(), PW).unwrap();
         assert_eq!(loaded.address, kp.address);
         assert_eq!(loaded.network().unwrap(), Network::Testnet);
+    }
+
+    fn temp_keystore(tag: &str, contents: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "gnb-cry7-{tag}-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet.json");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// CRY-7 residual: a v2 keystore opened for spending must have its
+    /// network stated; it is checked against the stored address and the file
+    /// is rewritten as v3 (0600), after which the network is authenticated.
+    #[test]
+    fn v2_keystore_is_migrated_to_v3_when_unlocked_for_spending() {
+        let kp = generate_keypair(true);
+        let v2 = kp.to_encrypted_json_version(PW, LEGACY_KEYSTORE_VERSION_V2).unwrap();
+        let path = temp_keystore("migrate", &v2);
+
+        // No network stated: refused, file untouched.
+        let err = Keypair::load_for_spending(&path, PW, None).unwrap_err();
+        assert!(err.contains("state the network"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), v2);
+        // The wrong network: refused, file untouched.
+        let err = Keypair::load_for_spending(&path, PW, Some(Network::Mainnet)).unwrap_err();
+        assert!(err.contains("not a mainnet address"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), v2);
+        // Wrong password: refused, file untouched.
+        assert!(Keypair::load_for_spending(&path, "Wrong-password-123!", Some(Network::Testnet)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), v2);
+
+        // The right network: unlocked and migrated.
+        let (loaded, what) = Keypair::load_for_spending(&path, PW, Some(Network::Testnet)).unwrap();
+        assert_eq!(what, KeystoreMigration::MigratedV2ToV3);
+        assert_eq!(loaded.address, kp.address);
+        assert_eq!(loaded.private_key, kp.private_key);
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(rewritten.contains("\"version\": 3"), "{rewritten}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // The rewritten file authenticates its network: the prefix edit that
+        // a v2 file accepted now fails, and a second unlock is a no-op.
+        let flipped = rewritten
+            .replace(&kp.address, &format!("gnb1q{}", &kp.address[5..]))
+            .replace("\"network\": \"testnet\"", "\"network\": \"mainnet\"");
+        assert!(Keypair::from_encrypted_bytes(flipped.as_bytes(), PW).is_err());
+        let (_, again) = Keypair::load_for_spending(&path, PW, Some(Network::Testnet)).unwrap();
+        assert_eq!(again, KeystoreMigration::AlreadyV3);
+        let (_, unstated) = Keypair::load_for_spending(&path, PW, None).unwrap();
+        assert_eq!(unstated, KeystoreMigration::AlreadyV3, "v3 needs no stated network");
+        assert!(Keypair::load_for_spending(&path, PW, Some(Network::Mainnet)).unwrap_err()
+            .contains("testnet key (authenticated)"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The audit's attack on v2: the address prefix edited to the other
+    /// network. With the owner's network stated the forged address is
+    /// refused; stating the forged network is refused because the network
+    /// field contradicts it. (If both fields were edited, the key is unlocked
+    /// for exactly the network the caller stated, never silently for another.)
+    #[test]
+    fn v2_network_edits_are_caught_by_the_stated_network() {
+        let kp = generate_keypair(false); // mainnet
+        let v2 = kp.to_encrypted_json_version(PW, LEGACY_KEYSTORE_VERSION_V2).unwrap();
+        let flipped_addr = format!("gnb1t{}", &kp.address[5..]);
+        // Only the prefix edited: the stored address names testnet, the
+        // network field still says mainnet.
+        let edited = v2.replace(&kp.address, &flipped_addr);
+        let path = temp_keystore("edit", &edited);
+        // The owner states mainnet: the forged testnet address is refused.
+        assert!(Keypair::load_for_spending(&path, PW, Some(Network::Mainnet)).unwrap_err()
+            .contains("not a mainnet address"));
+        // Stating testnet: the network field contradicts it.
+        assert!(Keypair::load_for_spending(&path, PW, Some(Network::Testnet)).unwrap_err()
+            .contains("records network"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited, "nothing rewritten");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Bloch v2 keystores (bloch1q… addresses) migrate under their GnB
+    /// address; a v2 password below today's policy is kept (not refused).
+    #[test]
+    fn bloch_v2_keystore_with_a_legacy_password_migrates() {
+        let kp = generate_keypair(false);
+        let weak = "short";
+        assert!(kp.to_encrypted_json_version(weak, LEGACY_KEYSTORE_VERSION_V2).is_err(), "policy applies to new files");
+        let v2 = kp.to_encrypted_json_with_policy(weak, LEGACY_KEYSTORE_VERSION_V2, false).unwrap();
+        let body = kp.address.strip_prefix(crate::core::MAINNET_PREFIX).unwrap();
+        let bloch = v2.replace(&kp.address, &format!("bloch1q{body}"));
+        let (loaded, json) = Keypair::unlock_for_spending_bytes(bloch.as_bytes(), weak, Some(Network::Mainnet)).unwrap();
+        assert_eq!(loaded.address, kp.address);
+        let json = json.expect("v2 is migrated");
+        let reopened = Keypair::from_encrypted_bytes(json.as_bytes(), weak).unwrap();
+        assert_eq!(reopened.address, kp.address);
+        assert!(json.contains(&kp.address) && json.contains("\"version\": 3"));
     }
 
     /// WAL-1 regression: `Wallet::build_tx` refuses a fee equal to almost

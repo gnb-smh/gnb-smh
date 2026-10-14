@@ -23,6 +23,9 @@ fn main() {
     // WAL-7: the network of a new wallet is an explicit choice recorded in
     // the file (keystore v3 authenticates it), never inferred from its name.
     let mut testnet = false;
+    // CRY-7: `send` unlocks a v2 keystore only for an explicitly stated
+    // network (--mainnet / --testnet), then rewrites it as v3.
+    let mut mainnet = false;
     let mut cmd_args: Vec<&str> = Vec::new();
 
     let mut i = 1;
@@ -32,10 +35,19 @@ fn main() {
             "--rpc-port" => { i += 1; if i < args.len() { rpc_port = args[i].parse().unwrap_or(17210); } }
             "--allow-large-hd-wallet" => { allow_large_hd_wallet = true; }
             "--testnet" => { testnet = true; }
+            "--mainnet" => { mainnet = true; }
             _ => { cmd_args.push(&args[i]); }
         }
         i += 1;
     }
+    if testnet && mainnet {
+        die("--mainnet and --testnet are mutually exclusive");
+    }
+    let stated_network = match (testnet, mainnet) {
+        (true, _) => Some(gnb::address::Network::Testnet),
+        (false, true) => Some(gnb::address::Network::Mainnet),
+        (false, false) => None,
+    };
 
     if cmd_args.is_empty() {
         print_usage();
@@ -136,7 +148,7 @@ fn main() {
         // ── Wallet: send (builds + signs + broadcasts) ─────────────
         "send" => {
             require_params(params, 3, "send <wallet.json> <to_address> <amount_gnb> [--fee auto|GNB] [--max-fee GNB] [--yes] [--allow-unverified-inputs]");
-            do_send(params, &rpc_host, rpc_port);
+            do_send(params, &rpc_host, rpc_port, stated_network);
             return;
         }
 
@@ -296,7 +308,7 @@ fn rpc_call(host: &str, port: u16, method: &str, params: &serde_json::Value) -> 
 
 // ── Send command ────────────────────────────────────────────────────────────
 
-fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
+fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16, stated_network: Option<gnb::address::Network>) {
     let wallet_path = params[0];
     let to_address = params[1];
     let amount_str = params[2];
@@ -328,10 +340,24 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     let path = std::path::Path::new(wallet_path);
     // Keystore v3/v2 first (address field; bloch1q… accepted for v2), then
     // the v1 keyfile format (address derived from the public key).
-    let keypair = match gnb::wallet::Keypair::load_encrypted(path, &password) {
-        Ok(kp) => kp,
+    // CRY-7: a v2 keystore needs the network stated (--mainnet/--testnet);
+    // it is checked against the stored address and rewritten as v3.
+    let keypair = match gnb::wallet::Keypair::load_for_spending(path, &password, stated_network) {
+        Ok((kp, migration)) => {
+            if migration == gnb::wallet::KeystoreMigration::MigratedV2ToV3 {
+                eprintln!("Keystore {} rewritten as v3 (its network and address are now authenticated).",
+                    path.display());
+            }
+            kp
+        }
+        Err(e2) if is_keystore_v2_or_v3(path) => die(&format!("Failed to load wallet: {e2}")),
         Err(e2) => match gnb::wallet::Wallet::load_encrypted(path, &password) {
-            Ok(w) => w.into_keypair(),
+            Ok(w) => {
+                if stated_network.is_some_and(|n| n != w.network()) {
+                    die("the wallet's network does not match --mainnet/--testnet");
+                }
+                w.into_keypair()
+            }
             Err(e1) => {
                 eprintln!("Failed to load wallet: {} (keystore v2/v3) / {} (keyfile v1)", e2, e1);
                 process::exit(1);
@@ -711,6 +737,20 @@ fn die(msg: &str) -> ! {
     process::exit(1);
 }
 
+/// True when `path` holds a keystore v2/v3 JSON (a top-level `"version"` of 2
+/// or 3), so a failure to unlock it is reported as is instead of falling back
+/// to the v1 keyfile parser.
+fn is_keystore_v2_or_v3(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if meta.len() > gnb::util::DEFAULT_WALLET_FILE_LIMIT as u64 {
+        return false;
+    }
+    std::fs::read(path).ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("version").and_then(serde_json::Value::as_u64))
+        .is_some_and(|v| v == 2 || v == 3)
+}
+
 fn print_usage() {
     println!(r#"
   gnb-cli — Bloch-SIS Protocol RPC client
@@ -774,7 +814,11 @@ fn print_usage() {
     --rpc-port <port>                      RPC port (default: 17210)
     --allow-large-hd-wallet                Trusted-backup recovery (up to 512 MiB)
     --testnet                              New wallets are testnet (newwallet,
-                                           restorewallet, newseed)
+                                           restorewallet, newseed); for send: the
+                                           keystore must be a testnet key
+    --mainnet                              For send: the keystore must be a mainnet
+                                           key. A v2 keystore needs --mainnet or
+                                           --testnet and is rewritten as v3 (CRY-7)
     GNB_RPC_API_KEY=<key>                  Sent only to loopback hosts (use an
                                            SSH tunnel for remote nodes)
     --help                                 This message

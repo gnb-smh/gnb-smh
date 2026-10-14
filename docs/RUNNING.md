@@ -42,3 +42,20 @@ new chain.
 JSON-RPC on 127.0.0.1:17210. Useful methods: `getblockcount`, `getdaginfo`,
 `getblocktemplate`, `submitblock`, `getsupplyinfo`, `getbalance`,
 `sendrawtransaction`. See `node/src/rpc/mod.rs`.
+
+## Wallet keystores (audit CRY-7)
+
+Every front end writes keystore **v3**, which authenticates the network and
+the address in the AES-GCM associated data. Older **v2** files, from Bloch
+or from GnB before the fix, authenticate neither: editing `gnb1q…` to
+`gnb1t…` in a v2 file still loads the key for the other network. The CLIs
+therefore unlock a v2 keystore for spending (`gnb-cli send`) or signing
+(`gnb-wallet send` / `sign`) only when the network is stated with `--mainnet`
+or `--testnet`. The stored address must be a valid address of that network
+and match the decrypted key, and the file's `network` field must not name the
+other network. After a successful unlock the file is rewritten as v3 under
+the same password. The rewrite is atomic (temp file, fsync, rename), mode
+0600, and the new bytes are decrypted and checked before they replace the
+old file. A v3 keystore needs no flag, but a stated network must match it.
+The library calls are `Keypair::load_for_spending` and, for front ends without
+a filesystem, `Keypair::unlock_for_spending_bytes`.

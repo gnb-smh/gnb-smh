@@ -66,8 +66,14 @@ fn label(k: &str, v: &str) {
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
-    #[arg(long, global = true)]
+    /// New wallets are testnet; for `send` and `sign`, the network the
+    /// keystore must belong to (a v2 keystore needs it stated, CRY-7).
+    #[arg(long, global = true, conflicts_with = "mainnet")]
     testnet: bool,
+    /// For `send` and `sign`: the keystore must be a mainnet key (required
+    /// to unlock, and migrate to v3, a v2 keystore; CRY-7).
+    #[arg(long, global = true)]
+    mainnet: bool,
     #[arg(long, global = true, default_value = "http://127.0.0.1:17210")]
     rpc: String,
 }
@@ -266,7 +272,7 @@ pub fn main() {
         }
 
         Cmd::Send { keystore, to, amount, fee, max_fee, yes, allow_unverified_inputs } => {
-            let kp          = load_kp(&keystore);
+            let kp          = load_kp_for_spending(&keystore, stated_network(cli.testnet, cli.mainnet));
             let amount_sats = checked_cli_satoshis(&amount, false).unwrap_or_else(|message| err(message));
             let fee_choice  = crate::wallet::send::parse_fee_arg(&fee).unwrap_or_else(|message| err(message));
             let fee_policy  = crate::wallet::send::parse_max_fee_arg(max_fee.as_deref())
@@ -417,7 +423,7 @@ pub fn main() {
         }
 
         Cmd::Sign { keystore, message } => {
-            let kp = load_kp(&keystore);
+            let kp = load_kp_for_spending(&keystore, stated_network(cli.testnet, cli.mainnet));
             // A4-M-4 FIX: sign a DOMAIN-SEPARATED digest of the message's raw
             // bytes — NEVER hex-decode user-supplied text first. The old
             // code's `hex::decode(&message).unwrap_or_else(|_| message.into_bytes())`
@@ -553,6 +559,33 @@ fn read_disclosure_bundle_with_limit(
         }
     })?;
     serde_json::from_slice(&bytes).map_err(|error| format!("Bundle parse failed: {}", error))
+}
+
+/// The network the caller stated with `--mainnet` / `--testnet` (CRY-7).
+fn stated_network(testnet: bool, mainnet: bool) -> Option<crate::address::Network> {
+    match (testnet, mainnet) {
+        (true, _) => Some(crate::address::Network::Testnet),
+        (false, true) => Some(crate::address::Network::Mainnet),
+        (false, false) => None,
+    }
+}
+
+/// Unlock a keystore for spending or signing (CRY-7): a v2 keystore needs
+/// the network stated and is rewritten as v3 once unlocked.
+fn load_kp_for_spending(path: &std::path::Path, network: Option<crate::address::Network>) -> crate::wallet::Keypair {
+    let pw = prompt_password(&format!("  {}password:{} ", MUTED, RESET));
+    let loaded = crate::wallet::Keypair::load_for_spending(path, &pw, network);
+    drop(pw);
+    match loaded {
+        Ok((kp, crate::wallet::KeystoreMigration::MigratedV2ToV3)) => {
+            ok("keystore decrypted");
+            ok("keystore v2 rewritten as v3: its network and address are now authenticated");
+            println!();
+            kp
+        }
+        Ok((kp, crate::wallet::KeystoreMigration::AlreadyV3)) => { ok("keystore decrypted"); println!(); kp }
+        Err(e) => err(&format!("Load failed: {e} (pass --mainnet or --testnet for a v2 keystore)")),
+    }
 }
 
 fn load_kp(path: &PathBuf) -> crate::wallet::Keypair {
@@ -1017,6 +1050,19 @@ mod audit_2026_10_cli_tests {
         let cli = Cli::try_parse_from(["gnb-wallet", "send", "w.json", "to", "1", "--max-fee", "0.5",
             "--yes", "--allow-unverified-inputs"]).unwrap();
         assert!(matches!(cli.cmd, Cmd::Send { yes: true, allow_unverified_inputs: true, .. }));
+    }
+
+    /// CRY-7: `send` / `sign` take the stated network from --mainnet /
+    /// --testnet (none stated: only a v3 keystore unlocks); both is an error.
+    #[test]
+    fn spending_network_is_stated_explicitly() {
+        let cli = Cli::try_parse_from(["gnb-wallet", "--mainnet", "send", "w.json", "to", "1"]).unwrap();
+        assert_eq!(stated_network(cli.testnet, cli.mainnet), Some(crate::address::Network::Mainnet));
+        let cli = Cli::try_parse_from(["gnb-wallet", "sign", "w.json", "msg", "--testnet"]).unwrap();
+        assert_eq!(stated_network(cli.testnet, cli.mainnet), Some(crate::address::Network::Testnet));
+        let cli = Cli::try_parse_from(["gnb-wallet", "sign", "w.json", "msg"]).unwrap();
+        assert_eq!(stated_network(cli.testnet, cli.mainnet), None);
+        assert!(Cli::try_parse_from(["gnb-wallet", "--mainnet", "--testnet", "sign", "w.json", "m"]).is_err());
     }
 
     /// WAL-7: `new` is phrase-backed unless --random-key is given.
