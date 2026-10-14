@@ -58,6 +58,15 @@ pub const SYNC_PROTOCOL: StreamProtocol = StreamProtocol::new("/gnb/sync/1");
 /// Kept as `u64` because `AsyncReadExt::take` wants that type; `MAX_FRAME_LIMIT`
 /// below is the same value as `usize` for bincode's `with_limit`.
 const MAX_FRAME: u64 = 4 * 1024 * 1024;
+/// Most bytes read from an inbound REQUEST stream before decoding. The largest
+/// valid `SyncRequest` is `GetBlock` (1 tag byte + 32 bytes = 33);
+/// `GetHeaders` with bincode varints is at most 1 + 9 + 5 = 15. A request
+/// stream used to be read up to `MAX_FRAME` (4 MiB, sized for block
+/// responses) before anything looked at it, and a connection may hold 256
+/// inbound streams for the 30 s request timeout: about 1 GiB buffered per
+/// peer connection. 64 bytes leaves headroom and bounds that to 16 KiB.
+pub const MAX_REQUEST_FRAME: u64 = 64;
+
 /// H-R3-4: `MAX_FRAME` as a `usize`, for `bincode::config::with_limit`. Frame
 /// bytes are already capped at the transport by `.take(MAX_FRAME)`, but that
 /// bounds only the RAW READ — see the `decode_*` functions below for why the
@@ -191,7 +200,14 @@ impl RrCodec for BlochSyncCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let buf = read_raw_frame(io).await?;
+        let buf = read_raw_frame(io, MAX_REQUEST_FRAME).await?;
+        if buf.len() as u64 >= MAX_REQUEST_FRAME {
+            // No valid request is this long: a violation, not a transport error.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("sync request frame reached {MAX_REQUEST_FRAME} bytes (no valid request is that long)"),
+            ));
+        }
         decode_request(&buf)
     }
 
@@ -199,7 +215,7 @@ impl RrCodec for BlochSyncCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let buf = read_raw_frame(io).await?;
+        let buf = read_raw_frame(io, MAX_FRAME).await?;
         decode_response(&buf)
     }
 
@@ -230,16 +246,17 @@ impl RrCodec for BlochSyncCodec {
     }
 }
 
-/// Read the raw frame bytes off the wire, capped at [`MAX_FRAME`]. This bounds
-/// the READ; it does not by itself bound what bincode does with the bytes
-/// (see [`decode_frame`]'s doc comment) — it only stops a peer from streaming
+/// Read the raw frame bytes off the wire, capped at `cap` ([`MAX_REQUEST_FRAME`]
+/// for requests, [`MAX_FRAME`] for responses). This bounds the READ; it does
+/// not by itself bound what bincode does with the bytes (see
+/// [`decode_frame`]'s doc comment) — it only stops a peer from streaming
 /// unbounded data down an open substream.
-async fn read_raw_frame<T>(io: &mut T) -> io::Result<Vec<u8>>
+async fn read_raw_frame<T>(io: &mut T, cap: u64) -> io::Result<Vec<u8>>
 where
     T: AsyncRead + Unpin + Send,
 {
     let mut buf = Vec::new();
-    io.take(MAX_FRAME).read_to_end(&mut buf).await?;
+    io.take(cap).read_to_end(&mut buf).await?;
     check_nonempty_frame(buf)
 }
 
@@ -1172,6 +1189,90 @@ mod tests {
             "a brand-new honest peer must be served after the map filled (NET-8)"
         );
         assert_eq!(lim.tracked_peers(), SYNC_LIMITER_TRACK_CAP, "map stays bounded");
+    }
+
+    // ── Inbound request read cap ────────────────────────────────────────────
+
+    /// An endless request stream: counts the bytes handed out, never EOFs.
+    struct EndlessJunk {
+        served: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl futures::io::AsyncRead for EndlessJunk {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            buf.fill(0xFF);
+            self.served.fetch_add(buf.len(), std::sync::atomic::Ordering::Relaxed);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+    }
+
+    /// Review follow-up (pre-existing): a request stream is read only up to
+    /// MAX_REQUEST_FRAME bytes before it is judged, not up to the 4 MiB block
+    /// frame cap — so 256 open streams per connection can no longer pin about
+    /// 1 GiB of junk for the request timeout. The oversized request is a
+    /// protocol violation (penalized like any malformed frame).
+    #[test]
+    fn oversized_request_is_cut_at_the_request_cap_and_is_a_violation() {
+        use futures::executor::block_on;
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut io = EndlessJunk { served: served.clone() };
+        let e = block_on(BlochSyncCodec.read_request(&SYNC_PROTOCOL, &mut io)).expect_err("junk request");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(is_sync_protocol_violation(&e));
+        assert!(
+            served.load(std::sync::atomic::Ordering::Relaxed) as u64 <= MAX_REQUEST_FRAME,
+            "read {} bytes from a request stream",
+            served.load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        // A valid request followed by padding up to the cap is refused too.
+        let mut padded = encode_frame(&SyncRequest::GetTips).unwrap();
+        padded.resize(MAX_REQUEST_FRAME as usize + 10, 0);
+        let e = block_on(BlochSyncCodec.read_request(&SYNC_PROTOCOL, &mut futures::io::Cursor::new(padded)))
+            .expect_err("padded request");
+        assert!(is_sync_protocol_violation(&e));
+    }
+
+    /// Every valid request fits well under the request cap, including the
+    /// longest encodings bincode varints can produce.
+    #[test]
+    fn every_valid_request_fits_the_request_cap() {
+        let mut reqs = sample_requests();
+        reqs.push(SyncRequest::GetBlock { block_hash: [0xFF; 32] });
+        reqs.push(SyncRequest::GetHeaders { from_blue_score: u64::MAX, limit: u32::MAX });
+        for req in reqs {
+            let bytes = encode_frame(&req).unwrap();
+            assert!((bytes.len() as u64) < MAX_REQUEST_FRAME, "{req:?} encodes to {} bytes", bytes.len());
+            if let SyncRequest::GetBlock { .. } = req {
+                assert_eq!(bytes.len(), 33);
+            }
+            // And it still round-trips through the capped reader.
+            let back = futures::executor::block_on(
+                BlochSyncCodec.read_request(&SYNC_PROTOCOL, &mut futures::io::Cursor::new(bytes)),
+            );
+            match req {
+                SyncRequest::GetHeaders { limit, .. } if limit > MAX_WIRE_GETHEADERS_LIMIT => {
+                    assert!(back.is_err(), "bounds still apply")
+                }
+                _ => assert_eq!(back.unwrap(), req),
+            }
+        }
+    }
+
+    /// Responses keep the block-sized cap.
+    #[test]
+    fn responses_are_not_held_to_the_request_cap() {
+        let big = SyncResponse::Block { block_hash: [1; 32], blue_score: 2, height: 3, block_data: vec![7u8; 64 * 1024] };
+        let bytes = encode_frame(&big).unwrap();
+        let back = futures::executor::block_on(
+            BlochSyncCodec.read_response(&SYNC_PROTOCOL, &mut futures::io::Cursor::new(bytes)),
+        )
+        .unwrap();
+        assert_eq!(back, big);
     }
 
     // ── NET-5 / NET-9 regressions ───────────────────────────────────────────
