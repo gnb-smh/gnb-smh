@@ -22,9 +22,9 @@
 //!     (`core::sighash::SighashV3Precomputed`): a server that lies about a
 //!     UTXO makes the wallet sign a transaction every node rejects, so
 //!     nothing can be lost and the previous transactions need not be fetched.
-//!     [`PaymentOptions::next_block_height`] (one above the node's selected
-//!     tip height, from `getdaginfo`) selects the version; the builder
-//!     refuses to sign without it.
+//!     [`PaymentOptions::next_block_height`] (the node's `getdaginfo`
+//!     `next_block_height`) selects the version; the builder refuses to sign
+//!     without it.
 //!   - [`FeePolicy`]: an absolute and a per-kB ceiling on the fee, enforced on
 //!     the ACTUAL fee and size of the signed transaction. The consensus
 //!     minimum is always allowed; anything above the ceilings needs an
@@ -243,9 +243,11 @@ pub struct PaymentOptions<'a> {
     /// transactions; a version-3 signature commits to every spent value).
     pub require_verified_inputs: bool,
     pub max_tx_bytes: usize,
-    /// Header height of the block the payment targets: the node's selected
-    /// tip height + 1 (`getdaginfo` `tip_height` + 1, the height mempool
-    /// admission checks against). With the hardening activation height of the
+    /// Header height of the block the payment targets: the node's `getdaginfo`
+    /// `next_block_height` (the height its mempool admission and block
+    /// template check against; `tip_height` + 1 from a node that predates
+    /// that field, see `send::next_block_height_from_daginfo`). With the
+    /// hardening activation height of the
     /// wallet's chain it selects the transaction version
     /// (`core::sighash::tx_version_for_height`): 3 and sighash v3 at/after the
     /// activation, 1 and sighash v2 below it. `None` (the default) refuses to
@@ -270,7 +272,7 @@ impl PaymentOptions<'_> {
     /// Transaction version these options produce for `chain_id`.
     pub fn tx_version(&self, chain_id: ChainId) -> Result<u32, String> {
         let next = self.next_block_height.ok_or_else(|| {
-            "the height of the next block is unknown; ask the node (getdaginfo: tip_height + 1) \
+            "the height of the next block is unknown; ask the node (getdaginfo: next_block_height) \
              before signing".to_string()
         })?;
         Ok(sighash::tx_version_for_height(next, activation::hardening_activation_height_for_signer(chain_id)))

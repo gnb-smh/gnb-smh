@@ -126,9 +126,11 @@ impl WalletClient {
         })
     }
 
-    /// Height of the next block: the node's selected tip height + 1
-    /// (`getdaginfo`). Selects the version of the transactions this wallet
-    /// signs (3 at/after the hardening activation, 1 below it).
+    /// Height of the next block: the node's `getdaginfo` `next_block_height`
+    /// (the height its mempool admission and template check against;
+    /// `tip_height` + 1 from a node that predates the field). Selects the
+    /// version of the transactions this wallet signs (3 at/after the
+    /// hardening activation, 1 below it).
     pub async fn next_block_height(&self) -> Result<u64, WalletError> {
         let response = self.call("getdaginfo", json!([])).await?;
         super::send::next_block_height_from_daginfo(&response).map_err(WalletError::BadResponse)

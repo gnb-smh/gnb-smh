@@ -65,7 +65,7 @@ export async function loadCore(url, sha256Hex) {
     create: () => call({ op: "create", mnemonic: true }),
     restore: (words) => call({ op: "restore", words }),
     exportKeystore: (password) => call({ op: "export", password }).keystore,
-    // WAL-1: `nextHeight` is the node's getdaginfo tip_height + 1; it selects
+    // WAL-1: `nextHeight` is the node's getdaginfo next_block_height; it selects
     // the transaction version (3 / sighash v3 from the hardening activation
     // height, 1 below it). Version 1 only: the outpoints whose previous
     // transactions should be fetched...

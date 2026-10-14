@@ -3,8 +3,9 @@
 //! closure, so the flow is unit-tested without a node.
 //!
 //! 1. `getutxos` (bounded by a limit) and `getdaginfo` (the next block's
-//!    height = `tip_height` + 1, which selects the transaction version:
-//!    3 with sighash v3 at/after the hardening activation, 1 below it);
+//!    height = `next_block_height`, or `tip_height` + 1 from an older node;
+//!    it selects the transaction version: 3 with sighash v3 at/after the
+//!    hardening activation, 1 below it);
 //! 2. coin selection on the claimed values;
 //! 3. version 1 only: `getrawtransaction` for every selected outpoint, hashed
 //!    against its txid, so a lying server is detected before anything is
@@ -110,16 +111,22 @@ pub fn parse_utxo_rows(result: &Value) -> Result<Vec<Utxo>, String> {
     }).collect()
 }
 
-/// The height of the next block from a `getdaginfo` result: the selected
-/// tip's height + 1 (the height mempool admission checks a transaction
-/// against).
+/// The height of the next block from a `getdaginfo` result: its
+/// `next_block_height` (the height the node's mempool admission and block
+/// template check a transaction against; it can exceed `tip_height` + 1 when
+/// the template merges a tip with a greater DAG height), or, from a node that
+/// predates that field, the selected tip's height + 1.
 pub fn next_block_height_from_daginfo(result: &Value) -> Result<u64, String> {
     if let Some(e) = result_error(result) {
         return Err(format!("getdaginfo: {e}"));
     }
-    result.get("tip_height").and_then(Value::as_u64)
-        .and_then(|h| h.checked_add(1))
-        .ok_or_else(|| "getdaginfo: missing or invalid tip_height".to_string())
+    match result.get("next_block_height") {
+        None | Some(Value::Null) => result.get("tip_height").and_then(Value::as_u64)
+            .and_then(|h| h.checked_add(1))
+            .ok_or_else(|| "getdaginfo: missing or invalid tip_height".to_string()),
+        Some(v) => v.as_u64().filter(|&h| h >= 1)
+            .ok_or_else(|| "getdaginfo: invalid next_block_height".to_string()),
+    }
 }
 
 /// Steps 1–4: fetch, select, verify, build and sign. Nothing is broadcast.
@@ -345,6 +352,12 @@ mod tests {
     #[test]
     fn daginfo_height_parsing() {
         assert_eq!(next_block_height_from_daginfo(&json!({"tip_height": 41})), Ok(42));
+        // The node's own next height wins (a template merging a tip with a
+        // greater DAG height sits above tip_height + 1).
+        assert_eq!(next_block_height_from_daginfo(&json!({"tip_height": 41, "next_block_height": 43})), Ok(43));
+        assert_eq!(next_block_height_from_daginfo(&json!({"tip_height": 41, "next_block_height": null})), Ok(42));
+        assert!(next_block_height_from_daginfo(&json!({"tip_height": 41, "next_block_height": 0})).is_err());
+        assert!(next_block_height_from_daginfo(&json!({"tip_height": 41, "next_block_height": "43"})).is_err());
         assert!(next_block_height_from_daginfo(&json!({})).is_err());
         assert!(next_block_height_from_daginfo(&json!({"error": "x"})).is_err());
         assert!(next_block_height_from_daginfo(&json!({"tip_height": u64::MAX})).is_err());

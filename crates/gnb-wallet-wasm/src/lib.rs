@@ -20,7 +20,7 @@
 //! export {password}           encrypted keystore v3 JSON of the unlocked key
 //! plan {utxos, to, amount, fee, next_height}
 //!                             the transaction `version` a payment targeting block
-//!                             `next_height` (the node's getdaginfo tip_height + 1)
+//!                             `next_height` (the node's getdaginfo next_block_height)
 //!                             gets, and, for version 1 only, the txids whose creating
 //!                             transactions the page should fetch (WAL-1). A version-3
 //!                             signature commits to every spent value and script, so
@@ -217,7 +217,7 @@ fn parse_height(req: &Value) -> Result<u64, String> {
     match req.get("next_height") {
         Some(Value::String(v)) => v.trim().parse().map_err(|_| "invalid next_height".to_string()),
         Some(Value::Number(n)) => n.as_u64().ok_or_else(|| "invalid next_height".to_string()),
-        _ => Err("missing `next_height` (the node's getdaginfo tip_height + 1)".into()),
+        _ => Err("missing `next_height` (the node's getdaginfo next_block_height)".into()),
     }
 }
 

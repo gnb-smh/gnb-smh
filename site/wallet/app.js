@@ -4,7 +4,7 @@
 // Audit fixes: all markup is built with the escaping `html` template and API
 // values are type-checked (WAL-3); the wasm core is checked against the
 // SHA-256 pinned below before it runs (WAL-5); from the hardening activation
-// height (read from the node: getdaginfo tip_height + 1) payments are
+// height (read from the node: getdaginfo next_block_height) payments are
 // version-3 transactions whose signatures commit to every spent value, below
 // it the claimed values of the UTXOs a payment spends are verified against
 // their previous transactions inside the core; the review shows the ACTUAL
@@ -15,7 +15,7 @@ import { html, raw, isAddress, isHex64, num, sats } from "/assets/safe.js";
 
 // SHA-256 of /wallet/gnb_wallet.wasm. Written by scripts/build-wallet-wasm.sh
 // and checked by `node --test site/tests/`; loadCore refuses any other binary.
-const WASM_SHA256 = "469dd390836d1998894b970c6c77eb2706f4b40158f383078c771f3eb8ffd82b";
+const WASM_SHA256 = "36db178089339f42f00eb4f17cca8f1c8f0b160f3269d0dba7ffd54f313a5943";
 
 const SAT = 100000000n;
 const IDLE_LOCK_MS = 10 * 60 * 1000;
@@ -248,11 +248,18 @@ function paintPane() {
   ({ send: paintSend, receive: paintReceive, activity: paintActivity, backup: paintBackup }[state.tab] || paintReceive)(pane);
 }
 
-/** Height of the next block (the node's selected tip height + 1). The core
- *  signs version 3 (sighash v3, which commits to every spent value) from the
- *  hardening activation height and version 1 below it. */
+/** Height of the next block: the node's getdaginfo next_block_height (the
+ *  height its mempool and block template check a payment against; it can
+ *  exceed tip_height + 1), or tip_height + 1 from a node without the field.
+ *  The core signs version 3 (sighash v3, which commits to every spent value)
+ *  from the hardening activation height and version 1 below it. */
 async function nextBlockHeight() {
   const dag = await api("getdaginfo");
+  if (dag.next_block_height !== undefined && dag.next_block_height !== null) {
+    const next = num(dag.next_block_height);
+    if (!Number.isSafeInteger(next) || next < 1) throw new Error("The node reported an invalid next block height.");
+    return next;
+  }
   const tip = num(dag.tip_height);
   if (!Number.isSafeInteger(tip) || tip < 0) throw new Error("The node did not report its chain height.");
   return tip + 1;

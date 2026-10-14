@@ -1075,13 +1075,16 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     Ok(tx)  => {
                         if tx.is_coinbase() { return json!({ "error": "coinbase not accepted" }); }
                         // MEM-1/4/5: the SAME admission function as gossip and
-                        // reorg re-injection. Maturity is evaluated at the next
-                        // block's height (selected-tip DAG height + 1) — never
-                        // the DAG block COUNT, which on 2026-08-13 exceeded the
-                        // chain height by 10,769 and made every coinbase look
-                        // mature. P0: PQ signature verification is CPU-bound, so
-                        // it runs on the blocking pool.
-                        let next_height = crate::mempool::admission::next_block_height(&state.dag.read());
+                        // reorg re-injection. Version and maturity are evaluated
+                        // at the next block's height (the node's next template
+                        // height, `pool_next_height`, also reported by
+                        // getdaginfo) — never the DAG block COUNT, which on
+                        // 2026-08-13 exceeded the chain height by 10,769 and
+                        // made every coinbase look mature. P0: PQ signature
+                        // verification is CPU-bound, so it runs on the blocking
+                        // pool.
+                        let next_height = crate::mempool::admission::pool_next_height(
+                            &state.dag.read(), &state.store, &state.mempool);
                         let store_v = state.store.clone();
                         let mempool_v = state.mempool.clone();
                         let txid = tx.txid();
@@ -1307,11 +1310,18 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let chain = dag.selected_chain();
             let tip = dag.selected_tip();
             let tip_data = tip.and_then(|h| dag.get_block_data(&h).cloned());
+            // The header height of the next block mempool admission targets
+            // (the node's next template height): wallets sign for it (version
+            // 3 / sighash v3 from the hardening activation). Not always
+            // tip_height + 1: a template that merges a tip with a greater DAG
+            // height sits higher (DAG-8).
+            let next_block_height = crate::mempool::admission::pool_next_height(&dag, &state.store, &state.mempool);
             json!({
                 "tip":            tip.map(|h| hex::encode(h)),
                 "tip_blue_score": tip_data.as_ref().map(|d| d.blue_score).unwrap_or(0),
                 "tip_blue_work":  tip_data.as_ref().map(|d| d.blue_work.to_string()).unwrap_or_default(),
                 "tip_height":     tip_data.as_ref().map(|d| d.height).unwrap_or(0),
+                "next_block_height": next_block_height,
                 "block_count":    dag.block_count(),
                 "tip_count":      tips.len(),
                 "tips":           tips.iter().map(|h| hex::encode(h)).collect::<Vec<_>>(),
@@ -2387,5 +2397,23 @@ mod audit_2026_10_rpc_tests {
         assert_eq!(r["error"], "block not found");
         // A writer can take the lock right after a read returns.
         drop(state.dag.try_write().expect("DAG lock must be free after an explorer read"));
+    }
+
+    /// CRY-3 / WAL-1: `getdaginfo` reports the height of the next block the
+    /// mempool targets (`next_block_height`: the node's next template height,
+    /// cached in the pool), which wallets sign for. It is not tip_height + 1
+    /// when a template merges a tip with a greater DAG height (DAG-8). With no
+    /// cached value it is computed (here: no bodied tip, so the selected tip's
+    /// DAG height + 1).
+    #[tokio::test]
+    async fn getdaginfo_reports_the_pools_next_block_height() {
+        let (_tmp, state) = state_with_chain(5);
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["tip_height"], 5);
+        assert_eq!(r["next_block_height"], 6);
+        state.mempool.set_next_height(9);
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["tip_height"], 5);
+        assert_eq!(r["next_block_height"], 9, "the pool's next height, not tip_height + 1");
     }
 }

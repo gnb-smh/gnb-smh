@@ -388,7 +388,7 @@ impl Wallet {
 
     /// Build an unsigned transaction paying `amount` to `recipient` from the
     /// given UTXOs with an exact `fee`, for the block at `next_block_height`
-    /// (the node's selected tip height + 1).
+    /// (the node's `getdaginfo` `next_block_height`).
     ///
     /// This is pure — no network call required. Caller must provide UTXOs
     /// (typically from `WalletClient::utxos()`).
@@ -1350,8 +1350,9 @@ impl TxBuilder {
     /// fee. New callers should use [`Self::build_payment`], which also
     /// verifies claimed UTXO values and reports the actual fee.
     ///
-    /// `next_block_height` (the node's selected tip height + 1) selects the
-    /// transaction version (3 at/after the hardening activation, 1 below).
+    /// `next_block_height` (the node's `getdaginfo` `next_block_height`)
+    /// selects the transaction version (3 at/after the hardening activation,
+    /// 1 below).
     pub fn build(
         keypair:         &Keypair,
         available_utxos: &[(Vec<u8>, u32, TxOutput)],  // (txid, index, output)

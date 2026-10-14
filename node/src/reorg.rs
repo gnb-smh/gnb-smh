@@ -776,7 +776,8 @@ pub fn validate_fork_block_state(batch: &dyn UtxoView, block: &Block) -> Result<
 /// uses sighash v2 at every height. At/after the activation the input scripts
 /// ARE verified again (normally a verified-signature cache hit): a version-3
 /// transaction mined below the activation was checked against the v2 digest
-/// only.
+/// only. `next_block_height` is the node's next template height after the
+/// move (`Mempool::next_height`), never the new tip's header height + 1.
 pub fn reinject_disconnected(
     store: &Storage,
     mempool: &Mempool,
@@ -1001,7 +1002,20 @@ fn execute_reorg_inner(
     let candidates: Vec<Transaction> = outcome.disconnected.iter()
         .flat_map(|b| b.transactions.iter().filter(|t| !t.is_coinbase()).cloned())
         .collect();
-    let next_height = outcome.connected.last().map(|b| b.height.saturating_add(1)).unwrap_or(0);
+    // The next block's height: this storage-only entry point has no DAG, so
+    // it uses the new tip's DAG height + 1 (its CF_DAG record) — the template
+    // height when the new tip is the only tip — never the tip's HEADER height
+    // + 1, which exceeds it when the tip merged a parent with a greater DAG
+    // height (DAG-8). The acceptance pipeline passes the template height.
+    let next_height = outcome.connected.last()
+        .map(|b| match store.get_dag_data(&b.block_hash()) {
+            Ok(Some(d)) => d.height.saturating_add(1),
+            _ => b.height.saturating_add(1),
+        })
+        .unwrap_or(0);
+    if next_height != 0 {
+        mempool.set_next_height(next_height);
+    }
     let (txs_reinjected, txs_discarded) =
         reinject_disconnected(store, mempool, candidates, next_height);
 

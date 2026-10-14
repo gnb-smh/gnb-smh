@@ -14,12 +14,22 @@
 //! * Self-check: every selected transaction is re-validated against the
 //!   current UTXO set (standardness, inputs present and not already used by
 //!   the template, coinbase maturity at the template height, the
-//!   transaction-version rule at the template height (CRY-3 activation),
-//!   MoneyRange, consensus minimum fee, input scripts — normally
+//!   transaction-version rule and policy at the template height (CRY-3
+//!   activation), MoneyRange, consensus minimum fee, input scripts — normally
 //!   verified-signature cache hits). A transaction that fails is EVICTED from
-//!   the mempool instead of making every template invalid (MEM-1, MEM-3). The
-//!   fees the coinbase may claim are recomputed from the UTXO set, never taken
-//!   from the pool.
+//!   the mempool instead of making every template invalid (MEM-1, MEM-3) —
+//!   except a transaction that fails ONLY the version rule at the template
+//!   height while it is valid at the pool's own next height
+//!   (`Mempool::next_height`), which is skipped, never evicted. The fees the
+//!   coinbase may claim are recomputed from the UTXO set, never taken from
+//!   the pool.
+//! * Height: [`template_parents_and_height`] — the ONE "next block height"
+//!   of the node. Mempool admission, post-connect eviction, re-injection and
+//!   wallets (`getdaginfo.next_block_height`) use the same value
+//!   ([`next_template_height`], cached in `Mempool::next_height`), so they
+//!   can never sit on opposite sides of the hardening activation (the header
+//!   height of a block that merges a tip with a greater DAG height than its
+//!   selected parent exceeds the selected tip's DAG height + 1, DAG-8).
 //!
 //! The template is built under the store's acceptance lock, so the DAG and
 //! UTXO snapshot it reads are consistent with each other.
@@ -102,6 +112,35 @@ pub fn miner_coinbase(height: u64, value: u64, script_pubkey: Vec<u8>) -> Transa
     }
 }
 
+/// The parents a template on the current DAG would use (at most
+/// `core::MAX_PARENTS` bodied, non-disqualified tips, `GhostDAG::template_parents`)
+/// and the template's header height: the largest parent DAG height + 1 (the
+/// `accept_block` rule). With no bodied tip, no parents and the selected
+/// tip's DAG height + 1 (`admission::next_block_height`).
+pub fn template_parents_and_height(d: &GhostDAG, store: &Storage) -> (Vec<BlockHash>, u64) {
+    let parents = d.template_parents(core::MAX_PARENTS, |h| {
+        store.get_block(h).ok().flatten().is_some()
+    });
+    if parents.is_empty() {
+        return (parents, admission::next_block_height(d));
+    }
+    let height = parents.iter()
+        .filter_map(|t| d.get_block_data(t))
+        .map(|x| x.height)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    (parents, height)
+}
+
+/// Header height of the node's next template (see
+/// [`template_parents_and_height`]): the height the mempool, the template
+/// self-check and the wallets evaluate the height-dependent transaction rules
+/// (version / sighash, coinbase maturity) at. Never smaller than 1.
+pub fn next_template_height(d: &GhostDAG, store: &Storage) -> u64 {
+    template_parents_and_height(d, store).1.max(1)
+}
+
 /// Build a template on the current DAG / UTXO / mempool state.
 ///
 /// `coinbase_reserve` is the number of bytes kept free for the coinbase
@@ -139,18 +178,10 @@ pub fn build_block_template_with(
 
     let (parents, height, blue_score, parent_ts) = {
         let d = dag.read();
-        let parents = d.template_parents(core::MAX_PARENTS, |h| {
-            store.get_block(h).ok().flatten().is_some()
-        });
+        let (parents, height) = template_parents_and_height(&d, store);
         if parents.is_empty() {
             return Err("node has no bodied tip yet (still syncing genesis?)".into());
         }
-        let height = parents.iter()
-            .filter_map(|t| d.get_block_data(t))
-            .map(|x| x.height)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
         let blue_score = parents.iter()
             .filter_map(|t| d.get_block_data(t))
             .map(|x| x.blue_score)
@@ -174,11 +205,18 @@ pub fn build_block_template_with(
     let mut selected: Vec<(Transaction, u64)> = Vec::new();
     let mut total_fees: u64 = 0;
     let mut evict: HashSet<[u8; 32]> = HashSet::new();
+    // The pool's own next height. Equal to `height` whenever the cache is
+    // current (both come from `template_parents_and_height` on the same DAG
+    // under the acceptance lock); 0 (unknown) means "the template height".
+    let pool_height = match mempool.next_height() {
+        0 => height,
+        h => h,
+    };
     for (tx, _pool_fee, size) in mempool.entries_by_fee_rate() {
         if used.saturating_add(size) > budget {
             continue; // a smaller, lower-rate tx may still fit
         }
-        match self_check(store, &tx, height, &spent_by_template, options.verify_scripts) {
+        match self_check(store, &tx, height, pool_height, &spent_by_template, options.verify_scripts) {
             Ok(fee) => {
                 let new_total = match core::limits::money_add(total_fees, fee) {
                     Ok(t) => t,
@@ -222,23 +260,34 @@ enum TemplateReject {
     /// The transaction can never be mined on this chain: drop it from the pool.
     Evict(String),
     /// Not includable in THIS template (its input is used by an earlier
-    /// template transaction); keep it pooled.
+    /// template transaction, or its version is valid at the pool's next
+    /// height but not at this template's height); keep it pooled.
     Skip,
 }
 
-/// Signature-free in-context check of one candidate (see the module docs).
+/// In-context check of one candidate (see the module docs). `pool_height` is
+/// the mempool's next height (normally equal to `height`).
 fn self_check(
     store: &Storage,
     tx: &Transaction,
     height: u64,
+    pool_height: u64,
     spent_by_template: &HashSet<([u8; 32], u32)>,
     verify_scripts: bool,
 ) -> Result<u64, TemplateReject> {
     admission::check_standard(tx).map_err(|e| TemplateReject::Evict(e.to_string()))?;
-    // CRY-3 activation: the version must be valid at the TEMPLATE height
-    // (version 3 from the hardening activation, never below it); checked even
-    // when scripts are not verified.
-    admission::check_version_for_next_block(tx, height).map_err(TemplateReject::Evict)?;
+    // CRY-3 activation: the version must be valid (and standard) at the
+    // TEMPLATE height (version 3 from the hardening activation, version < 3
+    // below it); checked even when scripts are not verified. A transaction
+    // that fails only because this template's height differs from the pool's
+    // next height is still minable in the block the pool targets: skip it,
+    // never evict it.
+    if let Err(e) = admission::check_version_for_next_block(tx, height) {
+        if pool_height != height && admission::check_version_for_next_block(tx, pool_height).is_ok() {
+            return Err(TemplateReject::Skip);
+        }
+        return Err(TemplateReject::Evict(e));
+    }
     let mut seen: HashSet<([u8; 32], u32)> = HashSet::new();
     let mut total_in: u64 = 0;
     let mut prevouts: Vec<TxOutput> = Vec::with_capacity(tx.inputs.len());

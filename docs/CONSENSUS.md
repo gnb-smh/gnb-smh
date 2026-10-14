@@ -271,9 +271,34 @@ self-check and mempool admission all call.
 
 A transaction rule compares the HEADER height `h` of the block that contains
 the transaction (`Block::height`, which `accept_block` requires to equal the
-largest parent height + 1). Mempool admission uses the height of the next
-block on the selected tip (selected tip height + 1); templates use their own
-height; wallets use the node's `getdaginfo` `tip_height` + 1.
+largest parent DAG height + 1).
+
+Everything that decides for a block not yet built — mempool admission,
+post-connect eviction, reorg re-injection, the template self-check and the
+wallets — uses ONE next-block height: the header height of the node's own
+next template, i.e. the largest DAG height (`GhostdagData::height`) among the
+template parents (`GhostDAG::template_parents`) + 1
+(`template::next_template_height`). The node keeps it in
+`Mempool::next_height`, recomputed under the acceptance lock after every DAG
+change (a connect, a stored fork-loser or merge candidate, a
+disqualification), and reports it as `getdaginfo` `next_block_height`, which
+wallets sign for (`tip_height` + 1 only from a node without that field).
+
+- It is never the new tip's header height + 1. The header height of a tip
+  that merged a parent with a greater DAG height than its selected parent
+  exceeds its DAG height (DAG-8), while a child of that tip alone sits at its
+  DAG height + 1.
+- It can exceed the selected tip's DAG height + 1: a tip with less blue work
+  but a greater DAG height is a template parent too (below the activation
+  every bodied valid tip is; from it, every one within the mergeset and
+  merge-depth bounds).
+- A template skips, and never evicts, a transaction that fails only the
+  version rule at the template's height while it is valid at the pool's next
+  height (only possible while the cached height is stale).
+- Mempool admission re-checks the version rule and policy and coinbase
+  maturity against the current next height when it inserts, under the
+  acceptance lock, so a block connected while a transaction was being checked
+  cannot let in a transaction that is invalid for the new next block.
 
 ### Version rule (consensus, non-coinbase transactions)
 
@@ -435,18 +460,21 @@ to include the spend directly.
 Mempool admission (gossip, RPC; not reorg re-injection of already-mined
 transactions) additionally requires, at every height, the canonical witness of
 every input and a hybrid public key. Transactions are admitted only if valid
-and standard for the next block's height: below the activation version ≥ 3 is
-non-standard, at/after it only version 3 is valid. After every connect,
-pooled transactions whose version is invalid or non-standard at the new next
-height are evicted (a version-1 transaction admitted for block H-1 is mined in
-H-1 or evicted when the next block is H); the template self-check applies the
-version rule and policy at the template height.
+and standard for the next block's height (see "Which height"): below the
+activation version ≥ 3 is non-standard, at/after it only version 3 is valid.
+Whenever the next height moves (after every connect, and after a DAG change
+that moves the template height without connecting), pooled transactions whose
+version is invalid or non-standard at the new next height are evicted (a
+version-1 transaction admitted for block H-1 is mined in H-1 or evicted when
+the next block is H); the template self-check applies the version rule and
+policy at the template height.
 
 ### Signers
 
 Every signer (the `gnb-crypto` wallet API, `gnb-cli send`, `gnb-wallet send`,
 `WalletClient::send`, the browser wallet core) learns the next block's height
-from the node (`getdaginfo`: `tip_height` + 1) and produces version 3 with
+from the node (`getdaginfo`: `next_block_height`, or `tip_height` + 1 from a
+node without that field) and produces version 3 with
 sighash v3 and bound signatures at/after the activation of its chain, and
 version 1 with sighash v2 below it. Without the height they refuse to sign.
 Below the activation, wallets still fetch the previous transactions to verify

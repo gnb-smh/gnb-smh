@@ -15,7 +15,10 @@
 //! Review follow-ups: below the activation every transaction (version 3
 //! included) keeps the pre-upgrade verdict and version >= 3 is refused only by
 //! relay policy; the verified-signature cache is keyed by regime and prevouts;
-//! re-injection across the activation re-verifies the scripts.
+//! mempool admission, post-connect eviction, re-injection, templates and
+//! wallets share ONE next-block height (the node's template height), also in
+//! DAG shapes where a block's header height exceeds its DAG height (DAG-8);
+//! `admit` re-checks that height under the acceptance lock.
 
 mod fix_common;
 use fix_common::*;
@@ -169,8 +172,17 @@ fn tip_height(n: &Node) -> u64 {
     d.get_block_data(&d.selected_tip().unwrap()).unwrap().height
 }
 
+/// The node's ONE next-block height (`admission::pool_next_height`: the
+/// template height, cached in the pool), checked against a fresh computation.
 fn next_height(n: &Node) -> u64 {
-    admission::next_block_height(&n.dag.read())
+    let d = n.dag.read();
+    let h = admission::pool_next_height(&d, &n.store, &n.mempool);
+    assert_eq!(h, template::next_template_height(&d, &n.store), "the pool's next height is current");
+    h
+}
+
+fn dag_height(n: &Node, b: &BlockHash) -> u64 {
+    n.dag.read().get_block_data(b).unwrap().height
 }
 
 fn fee_of(n: &Node, t: &Transaction) -> u64 {
@@ -182,14 +194,20 @@ fn fee_of(n: &Node, t: &Transaction) -> u64 {
 
 static TAG: AtomicU64 = AtomicU64::new(0);
 
-/// A child of `parent` carrying `txs`, its coinbase claiming subsidy + fees.
-fn child_where(n: &Node, parent: BlockHash, txs: Vec<Transaction>, pred: impl Fn(&BlockHash) -> bool) -> Block {
-    let h = n.dag.read().get_block_data(&parent).unwrap().height + 1;
+/// A block on `parents` (header height = largest parent DAG height + 1)
+/// carrying `txs`, its coinbase claiming subsidy + fees.
+fn block_on_where(n: &Node, parents: Vec<BlockHash>, txs: Vec<Transaction>, pred: impl Fn(&BlockHash) -> bool) -> Block {
+    let h = parents.iter().map(|p| dag_height(n, p)).max().unwrap() + 1;
     let fees: u64 = txs.iter().map(|t| fee_of(n, t)).sum();
     let tag = format!("fix-sig-{}-{}", h, TAG.fetch_add(1, Ordering::Relaxed));
     let mut all = vec![coinbase(&tag, core::tokenomics::block_subsidy_sat(h) + fees, vec![0xC0; 20])];
     all.extend(txs);
-    mk_block_where(n, vec![parent], all, pred)
+    mk_block_where(n, parents, all, pred)
+}
+
+/// A child of `parent` carrying `txs`, its coinbase claiming subsidy + fees.
+fn child_where(n: &Node, parent: BlockHash, txs: Vec<Transaction>, pred: impl Fn(&BlockHash) -> bool) -> Block {
+    block_on_where(n, vec![parent], txs, pred)
 }
 
 /// Extend the selected tip with a block carrying `txs`.
@@ -519,6 +537,39 @@ fn raw_pubkey_carryover_outputs_stay_spendable() {
 
 // ── WAL-1: the wallet send flow at H-1 and H, end to end ─────────────────────
 
+/// The JSON-RPC methods the wallet send flow uses, served from the node's
+/// state. `getdaginfo` reports `next_block_height` exactly as the RPC
+/// computes it (`admission::pool_next_height`); `sendrawtransaction` runs the
+/// real admission at that height.
+fn wallet_rpc<'a>(
+    n: &'a Node,
+    funds: &'a [([u8; 32], u32, TxOutput)],
+    calls: &'a std::cell::RefCell<Vec<String>>,
+) -> impl Fn(&str, &Value) -> Result<Value, String> + 'a {
+    move |method: &str, params: &Value| -> Result<Value, String> {
+        calls.borrow_mut().push(method.to_string());
+        Ok(match method {
+            "getdaginfo" => json!({
+                "tip_height": tip_height(n),
+                "next_block_height": admission::pool_next_height(&n.dag.read(), &n.store, &n.mempool),
+            }),
+            "getutxos" => json!({ "utxos": funds.iter().filter(|f| !spent(n, f)).map(|f| json!({
+                "txid": hex::encode(f.0), "index": f.1, "value": f.2.value.to_string(),
+                "script_pubkey": hex::encode(&f.2.script_pubkey) })).collect::<Vec<_>>() }),
+            "getrawtransaction" => json!({ "error": "transaction body not available" }),
+            "sendrawtransaction" => {
+                let raw = hex::decode(params[0].as_str().unwrap()).unwrap();
+                let tx = admission::decode_tx_strict(&raw)?;
+                match admit(n, &tx) {
+                    Ok(txid) => json!({ "txid": hex::encode(txid) }),
+                    Err(e) => json!({ "error": e.to_string() }),
+                }
+            }
+            _ => json!({ "error": "unknown method" }),
+        })
+    }
+}
+
 /// `gnb-cli send` / `gnb-wallet send` (`wallet::send::prepare_send`) against
 /// an RPC backed by the node: it learns the next height from `getdaginfo`,
 /// signs version 1 for H-1 and version 3 for H (fetching no previous
@@ -536,25 +587,7 @@ fn wallet_send_flow_round_trips_at_both_sides_of_the_activation() {
     let to = gnb::address::Address::from_hash([0xB2; 20], gnb::address::Network::Mainnet);
     let calls = std::cell::RefCell::new(Vec::<String>::new());
     let funds = [f1.clone(), f2.clone()];
-    let rpc = |method: &str, params: &Value| -> Result<Value, String> {
-        calls.borrow_mut().push(method.to_string());
-        Ok(match method {
-            "getdaginfo" => json!({ "tip_height": tip_height(&n) }),
-            "getutxos" => json!({ "utxos": funds.iter().filter(|f| !spent(&n, f)).map(|f| json!({
-                "txid": hex::encode(f.0), "index": f.1, "value": f.2.value.to_string(),
-                "script_pubkey": hex::encode(&f.2.script_pubkey) })).collect::<Vec<_>>() }),
-            "getrawtransaction" => json!({ "error": "transaction body not available" }),
-            "sendrawtransaction" => {
-                let raw = hex::decode(params[0].as_str().unwrap()).unwrap();
-                let tx = admission::decode_tx_strict(&raw)?;
-                match admit(&n, &tx) {
-                    Ok(txid) => json!({ "txid": hex::encode(txid) }),
-                    Err(e) => json!({ "error": e.to_string() }),
-                }
-            }
-            _ => json!({ "error": "unknown method" }),
-        })
-    };
+    let rpc = wallet_rpc(&n, &funds, &calls);
     let request = send::SendRequest {
         keypair: &kp, to: &to, amount: SAT, fee: FeeChoice::AUTO, fee_policy: FeePolicy::DEFAULT,
         require_verified_inputs: false, utxo_limit: 50,
@@ -819,4 +852,238 @@ fn reinjection_across_the_activation_reverifies_the_scripts() {
     let e2 = accept(&n, &child_where(&n, e1, vec![], |_| true)).unwrap();
     assert_eq!(applied_tip(&n), Some(e2), "reorg");
     assert!(n.mempool.contains(&new.txid()), "re-admitted");
+}
+
+// ── Review: ONE next-block height (DAG-8 shapes) ─────────────────────────────
+
+/// A node whose GhostDAG instance runs the hardened rules from genesis (Kaspa
+/// blue work: the work of the merged blues counts), while the transaction
+/// rules follow the calling thread's activation override (`GhostDAG`
+/// captures its activation height when it is constructed).
+///
+/// Why: under `test-pow-limit` every block carries the same work, so with the
+/// legacy blue work (selected-chain work only) the heaviest tip always has
+/// the greatest DAG height and a block's header height always equals its DAG
+/// height. On a real chain the ASERT difficulty differs between blocks and a
+/// lighter tip can have a greater DAG height below the activation too; the
+/// Kaspa blue work produces the same DAG-8 shape (a merging tip heavier than
+/// a longer chain) with equal-work blocks.
+fn node_with_dag8_shapes(funds: &[([u8; 32], u32, TxOutput)]) -> Node {
+    let _dag_rules = activation::scoped_override(0);
+    node_with(&mk_genesis(unix_now() - 10_000), funds)
+}
+
+/// From the selected tip A: three siblings B1..B3 merged by S (the most blue
+/// work, DAG height a+2) and a lighter linear side chain X1 -> X2 -> X (DAG
+/// height a+3). Returns (S, X). Every block goes through `accept_block`.
+/// Needs [`node_with_dag8_shapes`].
+fn heavy_merge_and_light_long_tip(n: &Node) -> (BlockHash, BlockHash) {
+    let a = sel_tip(n).unwrap();
+    let ha = dag_height(n, &a);
+    let bs: Vec<BlockHash> = (0..3).map(|_| accept(n, &child_where(n, a, vec![], |_| true)).unwrap()).collect();
+    let s = accept(n, &block_on_where(n, bs, vec![], |_| true)).unwrap();
+    let mut x = a;
+    for _ in 0..3 {
+        x = accept(n, &child_where(n, x, vec![], |_| true)).unwrap();
+    }
+    assert_eq!(sel_tip(n), Some(s), "S carries the most blue work");
+    assert_eq!(applied_tip(n), Some(s));
+    assert_eq!((dag_height(n, &s), dag_height(n, &x)), (ha + 2, ha + 3));
+    let mut tips = n.dag.read().valid_tips();
+    tips.sort();
+    let mut want = vec![s, x];
+    want.sort();
+    assert_eq!(tips, want);
+    (s, x)
+}
+
+/// Finding: admission and wallets used the selected tip's DAG height + 1
+/// while templates (and the consensus header height) used the largest
+/// template-parent DAG height + 1, so a lighter tip with a greater DAG height
+/// put them on opposite sides of the activation (admission refused version 3,
+/// the template evicted every version 1 — no user transaction could be
+/// mined). Now one height: admission, the template, getdaginfo / the wallet
+/// and post-connect maintenance all target the template height.
+#[test]
+fn light_tip_with_a_greater_dag_height_moves_every_next_height_together() {
+    const ACT: u64 = 8;
+    let _g = activation::scoped_override(ACT);
+    let k = key();
+    let kp = gnb::wallet::generate_keypair(false);
+    let wallet_fund = fund(0xF3, 3 * SAT, &kp.address_bytes());
+    let f: Vec<_> = (0..2u8).map(|i| fund(0xF0 + i, 2 * SAT, &k.spk)).collect();
+    let n = node_with_dag8_shapes(&[f.clone(), vec![wallet_fund.clone()]].concat());
+    advance_to(&n, ACT - 4);
+    let pay = |i: usize| vec![out(2 * SAT - FEE, &[0xF8 + i as u8; 20])];
+
+    // A version-1 payment pooled while the next block is ACT-3.
+    let early = v2_spend(&k, &[(f[0].0, 0)], pay(0));
+    assert_eq!(next_height(&n), ACT - 3);
+    admit(&n, &early).expect("version 1 for ACT-3");
+
+    let (s, x) = heavy_merge_and_light_long_tip(&n);
+    assert_eq!(tip_height(&n), ACT - 2, "selected tip S");
+    assert_eq!(admission::next_block_height(&n.dag.read()), ACT - 1, "selected tip DAG height + 1");
+    // The ONE next height is the template height: the template merges X.
+    assert_eq!(next_height(&n), ACT);
+    assert_eq!(n.mempool.next_height(), ACT, "cached in the pool when X was stored");
+    // The pooled version-1 payment cannot be in the node's next block: the
+    // DAG change that moved the height evicted it.
+    assert!(!n.mempool.contains(&early.txid()));
+
+    // Admission at ACT: version 1 refused, version 3 admitted.
+    let late_v1 = v2_spend(&k, &[(f[1].0, 0)], pay(1));
+    let err = admit(&n, &late_v1).unwrap_err();
+    assert!(err.to_string().contains("bad-txns-version"), "{err}");
+
+    // The wallet learns ACT from getdaginfo (tip_height + 1 is only ACT-1)
+    // and signs version 3; the node admits it.
+    let calls = std::cell::RefCell::new(Vec::<String>::new());
+    let funds = [wallet_fund.clone()];
+    let rpc = wallet_rpc(&n, &funds, &calls);
+    let daginfo = rpc("getdaginfo", &json!([])).unwrap();
+    assert_eq!(daginfo["tip_height"], ACT - 2);
+    assert_eq!(send::next_block_height_from_daginfo(&daginfo), Ok(ACT));
+    let to = gnb::address::Address::from_hash([0xF9; 20], gnb::address::Network::Mainnet);
+    let request = send::SendRequest {
+        keypair: &kp, to: &to, amount: SAT, fee: FeeChoice::AUTO, fee_policy: FeePolicy::DEFAULT,
+        require_verified_inputs: false, utxo_limit: 50,
+    };
+    let prepared = send::prepare_send(&rpc, &request).unwrap();
+    assert_eq!(prepared.payment.tx.version, 3);
+    send::broadcast(&rpc, &prepared).expect("admitted for ACT");
+    let paid = prepared.payment.tx.txid();
+
+    // The template on {S, X} sits at ACT, carries the payment, evicts nothing.
+    let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
+    assert_eq!(tmpl.height, ACT);
+    assert_eq!(tmpl.parents.len(), 2);
+    assert_eq!(tmpl.evicted, 0);
+    assert_eq!(tmpl.transactions.iter().map(|(t, _)| t.txid()).collect::<Vec<_>>(), vec![paid]);
+    let mined = mine_template(&n);
+    assert_eq!(mined.iter().map(|t| t.txid()).collect::<Vec<_>>(), vec![paid]);
+    assert!(spent(&n, &wallet_fund));
+
+    // The mined block M on {S, X}: header ACT, DAG height ACT-1. A child of
+    // M alone sits at ACT, so that is the next height (not header + 1).
+    let m = sel_tip(&n).unwrap();
+    assert_eq!(n.store.get_block(&m).unwrap().unwrap().height, ACT);
+    assert_eq!(dag_height(&n, &m), ACT - 1);
+    assert_eq!(next_height(&n), ACT);
+    let _ = (s, x);
+}
+
+/// Finding: post-connect eviction (and re-injection) used the new tip's
+/// HEADER height + 1. A tip T that merged a parent with a greater DAG height
+/// than its selected parent has header(T) = DAG(T) + 1, while a child of T
+/// alone sits at DAG(T) + 1 = header(T). With the activation at header(T) + 1
+/// the old code evicted every pooled version-1 payment although the next
+/// block could still mine it. Now it stays pooled, is still admitted, and the
+/// next template (a child of T, at header(T) = ACT-1) mines it.
+#[test]
+fn post_connect_maintenance_uses_the_template_height_not_the_header_height() {
+    const ACT: u64 = 9;
+    let _g = activation::scoped_override(ACT);
+    let k = key();
+    let f: Vec<_> = (0..3u8).map(|i| fund(0xF4 + i, 2 * SAT, &k.spk)).collect();
+    let n = node_with_dag8_shapes(&f);
+    advance_to(&n, ACT - 5);
+    let pay = |i: usize| vec![out(2 * SAT - FEE, &[0xFC + i as u8; 20])];
+
+    let (s, x) = heavy_merge_and_light_long_tip(&n);
+    assert_eq!(next_height(&n), ACT - 1, "template on {{S, X}}");
+    let p = v2_spend(&k, &[(f[0].0, 0)], pay(0));
+    admit(&n, &p).expect("version 1 for ACT-1");
+
+    // T on {S, X}, no transactions: header ACT-1, DAG height ACT-2.
+    let t = accept(&n, &block_on_where(&n, vec![s, x], vec![], |_| true)).unwrap();
+    assert_eq!(applied_tip(&n), Some(t));
+    assert_eq!(n.store.get_block(&t).unwrap().unwrap().height, ACT - 1);
+    assert_eq!(dag_height(&n, &t), ACT - 2);
+    assert_eq!(next_height(&n), ACT - 1, "a child of T alone: DAG(T) + 1, not header(T) + 1");
+    assert!(n.mempool.contains(&p.txid()), "the version-1 payment is still valid for the next block");
+    let q = v2_spend(&k, &[(f[1].0, 0)], pay(1));
+    admit(&n, &q).expect("version 1 is still admitted for ACT-1");
+
+    // The next template is a child of T at ACT-1 and mines both.
+    let mined = mine_template(&n);
+    let mut got: Vec<_> = mined.iter().map(|t| t.txid()).collect();
+    got.sort();
+    let mut want = vec![p.txid(), q.txid()];
+    want.sort();
+    assert_eq!(got, want);
+    assert_eq!(tip_height(&n), ACT - 1);
+    assert!(spent(&n, &f[0]) && spent(&n, &f[1]));
+    // Now the next block is ACT: version 3 from here on.
+    assert_eq!(next_height(&n), ACT);
+    let r = v3_spend(&k, &[(f[2].0, 0)], std::slice::from_ref(&f[2].2), pay(2));
+    admit(&n, &r).expect("version 3 for ACT");
+}
+
+/// A template whose height differs from the pool's next height (only while
+/// the cached height is stale) skips — never evicts — a transaction that
+/// fails only the version rule at the template height but is valid at the
+/// pool's height. With the heights equal the same transaction is evicted.
+#[test]
+fn template_skips_a_version_only_failure_at_another_height() {
+    const ACT: u64 = 8;
+    let _g = activation::scoped_override(ACT);
+    let k = key();
+    let f = fund(0xF7, 2 * SAT, &k.spk);
+    let n = node_with_dag8_shapes(std::slice::from_ref(&f));
+    advance_to(&n, ACT - 4);
+    heavy_merge_and_light_long_tip(&n);
+    assert_eq!(next_height(&n), ACT);
+
+    let p = v2_spend(&k, &[(f.0, 0)], vec![out(2 * SAT - FEE, &[0xFB; 20])]);
+    n.mempool.set_next_height(ACT - 1); // a stale pool height (simulated)
+    n.mempool.add(p.clone(), FEE).unwrap();
+    let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
+    assert_eq!(tmpl.height, ACT);
+    assert!(tmpl.transactions.is_empty());
+    assert_eq!(tmpl.evicted, 0, "skipped, not evicted");
+    assert!(n.mempool.contains(&p.txid()));
+
+    n.mempool.set_next_height(ACT);
+    let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
+    assert_eq!(tmpl.evicted, 1, "invalid for the block the pool targets: evicted");
+    assert!(!n.mempool.contains(&p.txid()));
+}
+
+// ── Review: admission re-checks the next height under the acceptance lock ───
+
+/// A transaction checked for H-1 (outside the lock: the signature work takes
+/// milliseconds) while block H-1 connects must not be inserted after the
+/// post-connect eviction: `admit` re-checks the version rule and policy (and
+/// coinbase maturity) against the pool's current next height under the
+/// acceptance lock. Same in reverse for version 3 after a move back below H.
+#[test]
+fn admission_rechecks_the_next_height_under_the_acceptance_lock() {
+    let _g = activation::scoped_override(H);
+    let k = key();
+    let f: Vec<_> = (0..2u8).map(|i| fund(0xEA + i, 2 * SAT, &k.spk)).collect();
+    let n = node_with(&mk_genesis(unix_now() - 10_000), &f);
+    advance_to(&n, H - 2);
+    let checked_for = next_height(&n);
+    assert_eq!(checked_for, H - 1);
+
+    // Block H-1 connects between the check and the insert.
+    extend(&n, vec![]).unwrap();
+    assert_eq!(n.mempool.next_height(), H);
+    let v1 = v2_spend(&k, &[(f[0].0, 0)], vec![out(2 * SAT - FEE, &[0xEC; 20])]);
+    admission::check_transaction(&n.store, Some(&n.mempool), &v1, &AdmissionPolicy::relay(checked_for))
+        .expect("valid at the height it was checked for");
+    let err = admission::admit(&n.store, &n.mempool, v1.clone(), &AdmissionPolicy::relay(checked_for)).unwrap_err();
+    assert!(matches!(&err, AdmissionError::Rejected(m) if m.contains("bad-txns-version") && m.contains("moved")), "{err}");
+    assert!(!n.mempool.contains(&v1.txid()));
+
+    // Reverse: a version-3 spend checked for H, inserted after the next
+    // height moved back to H-1 (simulated), is refused by the policy.
+    let v3 = v3_spend(&k, &[(f[1].0, 0)], std::slice::from_ref(&f[1].2), vec![out(2 * SAT - FEE, &[0xED; 20])]);
+    n.mempool.set_next_height(H - 1);
+    let err = admission::admit(&n.store, &n.mempool, v3.clone(), &AdmissionPolicy::relay(H)).unwrap_err();
+    assert!(matches!(&err, AdmissionError::Rejected(m) if m.contains("non-standard-version")), "{err}");
+    n.mempool.set_next_height(H);
+    admission::admit(&n.store, &n.mempool, v3.clone(), &AdmissionPolicy::relay(H)).expect("current height");
+    assert!(n.mempool.contains(&v3.txid()));
 }

@@ -33,8 +33,9 @@
 //!     the explicit replacement rule is "no replacement", MEM-6);
 //!  7. duplicate inputs within the tx (C-R3-2);
 //!  8. UTXO presence (no unconfirmed parents: package relay is not supported);
-//!  9. coinbase maturity at the height of the NEXT block (selected-tip DAG
-//!     height + 1, never `dag.block_count()`, MEM-4);
+//!  9. coinbase maturity at the height of the NEXT block (the node's next
+//!     template height, `Mempool::next_height`; never `dag.block_count()`,
+//!     MEM-4);
 //! 10. value: inputs ≥ outputs, MoneyRange of the input sum, consensus
 //!     minimum fee, relay fee rate, rolling minimum fee (MEM-6);
 //! 11. scripts: the consensus input-script rule at the next block's height
@@ -45,6 +46,22 @@
 //! Rejections other than "missing inputs" are remembered in the mempool's
 //! bounded recent-rejects filter until the selected tip changes, so a peer
 //! replaying the same invalid transaction costs a hash lookup (MEM-5).
+//!
+//! # Which height
+//!
+//! Every height-dependent decision (version / sighash regime, coinbase
+//! maturity) uses ONE next-block height: the header height of the node's own
+//! next template (`template::next_template_height` = the largest DAG height
+//! among the template parents + 1), cached in `Mempool::next_height` under the
+//! acceptance lock after every DAG change ([`pool_next_height`]). Admission,
+//! post-connect eviction, reorg re-injection, the template self-check and
+//! `getdaginfo.next_block_height` (wallets) therefore agree at the activation
+//! boundary, also when a tip with a greater DAG height but less blue work
+//! makes the template height exceed the selected tip's DAG height + 1
+//! (DAG-8). [`admit`] re-checks the height-dependent rules against the cached
+//! height under the acceptance lock, so a block connected while a transaction
+//! was being verified cannot let a transaction that is invalid for the new
+//! next height into the pool.
 
 use std::collections::HashSet;
 
@@ -155,18 +172,34 @@ pub fn decode_tx_strict(bytes: &[u8]) -> Result<Transaction, String> {
     Ok(tx)
 }
 
-/// Header height of the next block on top of the selected tip: the tip's DAG
-/// height + 1. This is the smallest height any child of the tip can declare
-/// (`max(parent DAG heights) + 1`), so a transaction admitted at this height
-/// is mature in every possible next block. Never `dag.block_count()` (MEM-4:
-/// the DAG block count includes merged/red blocks and exceeded the chain
-/// height by >10k on the Bloch chain, making every immature coinbase look
-/// mature).
+/// The selected tip's DAG height + 1: the smallest header height a child of
+/// the selected tip alone can declare (`max(parent DAG heights) + 1`). Never
+/// `dag.block_count()` (MEM-4: the DAG block count includes merged/red blocks
+/// and exceeded the chain height by >10k on the Bloch chain, making every
+/// immature coinbase look mature).
+///
+/// NOT the height admission uses: a template that merges a tip with a
+/// greater DAG height sits higher (DAG-8). Admission, eviction, templates and
+/// wallets use [`pool_next_height`]; this is its fallback when the node has
+/// no bodied tip.
 pub fn next_block_height(dag: &crate::consensus::GhostDAG) -> u64 {
     dag.selected_tip()
         .and_then(|t| dag.get_block_data(&t).map(|d| d.height))
         .unwrap_or(0)
         .saturating_add(1)
+}
+
+/// The height of the next block for every mempool / wallet decision (see
+/// "Which height" in the module docs): `Mempool::next_height` (kept current
+/// under the acceptance lock by `accept.rs`), or, before the first DAG
+/// change of the process, the node's next template height computed from
+/// `dag` (`template::next_template_height`). The caller holds the DAG read
+/// lock (lock order: acceptance → DAG).
+pub fn pool_next_height(dag: &crate::consensus::GhostDAG, store: &Storage, mempool: &Mempool) -> u64 {
+    match mempool.next_height() {
+        0 => crate::template::next_template_height(dag, store),
+        h => h,
+    }
 }
 
 // ── Verified-signature cache (shared with block validation) ─────────────────
@@ -471,7 +504,13 @@ pub fn check_transaction(
 /// The final insert runs under the store's acceptance lock with a re-check
 /// that every input is still unspent, so it cannot race a block connect that
 /// spends an input and sweeps conflicts (MEM-3) between the check and the
-/// insert.
+/// insert. Under the same lock the height-dependent rules (version rule and
+/// policy, coinbase maturity) are re-checked against the pool's CURRENT next
+/// height (`Mempool::next_height`) when it differs from the height the checks
+/// ran at: a block connected meanwhile (whose post-connect eviction ran
+/// before this insert) cannot let in a transaction invalid for the new next
+/// block. Signatures need no re-check: a version that passes the policy at
+/// both heights selects the same digest at both.
 pub fn admit(
     store: &Storage,
     mempool: &Mempool,
@@ -494,6 +533,13 @@ pub fn admit(
             _ => return Err(AdmissionError::MissingInputs(format!(
                 "UTXO {}:{} spent while admitting", hex::encode(&inp.prev_txid[..8]), inp.prev_index))),
         }
+    }
+    let current = mempool.next_height();
+    if current != 0 && current != policy.next_block_height {
+        check_version_for_next_block(&tx, current).map_err(|e| AdmissionError::Rejected(format!(
+            "{e} (the next block moved to height {current} while the transaction was being checked)")))?;
+        core::check_coinbase_maturity(&tx, current, |t| store.get_coinbase_height(t).ok().flatten())
+            .map_err(AdmissionError::Immature)?;
     }
     mempool.add(tx, fee).map_err(|e| match e {
         MempoolError::Duplicate => AdmissionError::Duplicate(e.to_string()),
