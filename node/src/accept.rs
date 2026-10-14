@@ -1218,10 +1218,10 @@ pub struct RecheckReport {
     pub unchecked: usize,
 }
 
-/// Recheck the blocks a PRE-UPGRADE binary may have stored at header height
-/// >= the hardening activation against the context-free hardening rules
-/// (wire size, tagged Merkle root, 64-byte transactions, coinbase
-/// commitment). An upgraded node never stores such a block, so one left in
+/// Recheck the blocks a PRE-UPGRADE binary may have stored at a header
+/// height at or above the hardening activation against the context-free
+/// hardening rules (wire size, tagged Merkle root, 64-byte transactions,
+/// coinbase commitment). An upgraded node never stores such a block, so one left in
 /// the DAG (a legacy-format fork-loser, or a legacy chain the node applied
 /// while it still ran the old binary) would stay a valid template parent and
 /// make this node's blocks unacceptable to every upgraded peer.
@@ -1425,6 +1425,9 @@ pub fn validate_tx_inputs(
     validate_tx_inputs_classified(tx, utxo_lookup, spent_set).map_err(|f| f.reason)
 }
 
+/// Prevout lookup used by the input validation: `Ok(None)` = not found.
+type UtxoLookup<'a> = dyn Fn(&[u8; 32], u32) -> Result<Option<core::TxOutput>, String> + 'a;
+
 /// [`validate_tx_inputs`] with the failure classified: script failures (the
 /// `script_sig` must parse, its public key must hash to the prevout's
 /// script_pubkey, its signature must verify) and the minimum fee (measured on
@@ -1432,7 +1435,7 @@ pub fn validate_tx_inputs(
 /// check depends only on data the txid commits to.
 fn validate_tx_inputs_classified(
     tx:           &core::Transaction,
-    utxo_lookup:  &dyn Fn(&[u8; 32], u32) -> Result<Option<core::TxOutput>, String>,
+    utxo_lookup:  &UtxoLookup<'_>,
     mut spent_set: Option<&mut HashSet<([u8; 32], u32)>>,
 ) -> Result<u64, TxFailure> {
     let witness = |reason: String| TxFailure { reason, witness: true };
