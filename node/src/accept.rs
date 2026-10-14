@@ -248,7 +248,9 @@ fn shielded_after_plan(
     }
     for h in &plan.to_apply {
         let b = store.get_block(h).map_err(|e| ConnectError::Failed(e.to_string()))?
-            .ok_or_else(|| ConnectError::Failed("block body missing for shielded apply".into()))?;
+            .ok_or_else(|| ConnectError::Failed(format!(
+                "{}: block {} to connect has no body (pruned, DAG-6)",
+                reorg::ERR_MISSING_BODIES, hex::encode(&h[..8]))))?;
         if let Err(e) = next.apply_block_self(*h, &b.shielded_transactions) {
             return Err(ConnectError::Invalid {
                 block: *h,
@@ -1065,6 +1067,43 @@ pub fn rebuild_chain_state(
     warn!("chain state rebuilt from block bodies: {} row(s) cleared, {} consensus mark(s) re-derived, \
            {} block(s) connected", cleared_rows, drop.len(), connected_blocks);
     Ok(RebuildReport { cleared_rows, cleared_marks: drop.len(), connected_blocks })
+}
+
+// ── Pruned nodes: re-fetching bodies a reorg needs again (DAG-6) ────────────
+
+/// The blocks a connect of a block with these `parents` would APPLY that
+/// have no stored body: its selected-chain ancestors that are not applied
+/// (no undo record), walking down from the parent of greatest
+/// `(blue_work, blue_score, hash)`, nearest first, at most `limit`.
+///
+/// A pruned node that reorganized away from blocks whose bodies it had pruned
+/// cannot connect them again (`reorg::ERR_MISSING_BODIES`) until it has
+/// re-fetched them; the ingress requests exactly these. Since there is no
+/// reorg-depth limit, this is what keeps such a node able to follow the best
+/// chain in that case too.
+pub fn missing_bodies_below(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    parents: &[BlockHash],
+    limit: usize,
+) -> Vec<BlockHash> {
+    let d = dag.read();
+    let genesis = d.store.genesis;
+    let mut cur = parents.iter()
+        .filter_map(|p| d.get_block_data(p).map(|x| (x.blue_work, x.blue_score, *p)))
+        .max()
+        .map(|(_, _, p)| p);
+    let mut out = Vec::new();
+    while let Some(h) = cur {
+        if out.len() >= limit || Some(h) == genesis || store.has_undo_data(&h).unwrap_or(true) {
+            break;
+        }
+        if !store.has_block_body(&h).unwrap_or(true) {
+            out.push(h);
+        }
+        cur = d.get_block_data(&h).and_then(|x| x.selected_parent);
+    }
+    out
 }
 
 // ── Operator recovery: invalidateblock / reconsiderblock (DAG-6) ─────────────

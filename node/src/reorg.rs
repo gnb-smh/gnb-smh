@@ -58,6 +58,13 @@ use crate::storage::Storage;
 /// node follows.
 pub const DEEP_REORG_ALERT_DEPTH: u64 = crate::core::CHECKPOINT_DEPTH;
 
+/// Marker of a connect that cannot run because blocks it must APPLY have no
+/// stored body: a pruned node that reorganized away from blocks whose bodies
+/// it had pruned, and now needs them again. The ingress re-fetches them
+/// (`accept::missing_bodies_below`, `ingress::BlockIngress`); nothing is
+/// written in the meantime.
+pub const ERR_MISSING_BODIES: &str = "missing block bodies";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -889,6 +896,24 @@ pub fn connect_plan(
     plan: &ReorgPlan,
     hooks: &ConnectHooks,
 ) -> Result<ConnectOutcome, ConnectError> {
+    // A block to APPLY needs its body. A pruned node that reorganized away
+    // from blocks it had pruned lacks theirs: report that up front, before
+    // staging anything (the ingress re-fetches the bodies, DAG-6).
+    let mut missing = 0usize;
+    let mut first_missing = None;
+    for h in &plan.to_apply {
+        if !store.has_block_body(h).map_err(|e| ConnectError::Failed(e.to_string()))? {
+            missing += 1;
+            first_missing.get_or_insert(*h);
+        }
+    }
+    if let Some(first) = first_missing {
+        return Err(ConnectError::Failed(format!(
+            "{}: {} block(s) to connect have no body (first {})",
+            ERR_MISSING_BODIES, missing, hex::encode(&first[..8]),
+        )));
+    }
+
     let mut batch = ReorgBatch::new(store);
     let mut outcome = ConnectOutcome::default();
 

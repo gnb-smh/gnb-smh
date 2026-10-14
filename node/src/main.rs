@@ -1042,7 +1042,11 @@ async fn main() {
                 network::NetworkMessage::NewBlock { block_data, block_hash, height, .. } => {
                     let now = std::time::Instant::now();
                     let verdict: network::GossipVerdict = 'blk: {
-                        if dag2.read().has_block(&block_hash) || ingress_core.orphans.contains(&block_hash) {
+                        // Known = in the DAG WITH its body (a pruned body that a
+                        // reorg needs again is re-fetched, DAG-6), or buffered.
+                        let in_dag_with_body = dag2.read().has_block(&block_hash)
+                            && store2.has_block_body(&block_hash).unwrap_or(true);
+                        if in_dag_with_body || ingress_core.orphans.contains(&block_hash) {
                             break 'blk network::GossipVerdict::Ignore;
                         }
                         let tip_h = selected_tip_height(&dag2);
@@ -1100,6 +1104,11 @@ async fn main() {
                             ingress::BlockOutcome::Known | ingress::BlockOutcome::PoolRefused => {
                                 network::GossipVerdict::Ignore
                             }
+                            ingress::BlockOutcome::BodyRestored => {
+                                info!("re-fetched body of pruned block {} h={} restored (DAG-6)",
+                                    hex::encode(&block_hash[..8]), height);
+                                network::GossipVerdict::Ignore
+                            }
                             ingress::BlockOutcome::Dropped(reason) => {
                                 debug!("block {} h={} dropped before PoW: {:?} (tip h={})",
                                     hex::encode(&block_hash[..8]), height, reason, tip_h);
@@ -1139,12 +1148,25 @@ async fn main() {
                                 maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                                 network::GossipVerdict::Accept
                             }
-                            ingress::BlockOutcome::Processed { admission, result, drained } => {
+                            ingress::BlockOutcome::Processed { admission, result, drained, missing_bodies } => {
                                 crate::metrics::observe_block_validation(t_validate.elapsed().as_secs_f64());
                                 match result {
                                     Err(e) => {
                                         crate::metrics::inc_block_rejected();
                                         warn!("block {} h={} REJECTED: {}", hex::encode(&block_hash[..8]), height, e);
+                                        // DAG-6, pruned nodes: the chain through this
+                                        // block needs bodies we pruned; fetch them (the
+                                        // block itself comes back with the next tip
+                                        // announcement).
+                                        if !missing_bodies.is_empty() {
+                                            warn!("re-fetching {} pruned block bod(ies) needed to follow the chain through {}",
+                                                missing_bodies.len(), hex::encode(&block_hash[..8]));
+                                            for h in missing_bodies {
+                                                let _ = otx2.send(network::NetworkMessage::GetBlock {
+                                                    block_hash: h, nonce: getblock_nonce(),
+                                                }).await;
+                                            }
+                                        }
                                         ingress::verdict_for_accept_error(&e)
                                     }
                                     Ok(_) => {

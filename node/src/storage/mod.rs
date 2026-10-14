@@ -311,6 +311,15 @@ impl Storage {
         self.db.delete_cf(&cf_b, hash).map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
+    /// True iff the body of `hash` is stored (not pruned / never received),
+    /// without decoding it.
+    pub fn has_block_body(&self, hash: &[u8; 32]) -> Result<bool, StorageError> {
+        let cf_b = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
+        Ok(self.db.get_pinned_cf(&cf_b, hash)
+            .map_err(|e| StorageError::ReadFailed(e.to_string()))?
+            .is_some())
+    }
+
     pub fn get_block(&self, hash: &[u8; 32]) -> Result<Option<Block>, StorageError> {
         let cf = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
         match self.db.get_cf(&cf, hash).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
@@ -1150,6 +1159,15 @@ impl Storage {
             Some(d) => Ok(Some(decode(&d)?)),
             None    => Ok(None),
         }
+    }
+
+    /// True iff `block_hash` has an undo record (its effects are applied),
+    /// without decoding it.
+    pub fn has_undo_data(&self, block_hash: &[u8; 32]) -> Result<bool, StorageError> {
+        let cf = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
+        Ok(self.db.get_pinned_cf(&cf, block_hash)
+            .map_err(|e| StorageError::ReadFailed(e.to_string()))?
+            .is_some())
     }
 
     /// Every block hash that has an undo record (i.e. whose UTXO effects are

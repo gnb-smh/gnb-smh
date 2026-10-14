@@ -456,6 +456,38 @@ fn dag6_reorg_through_pruned_bodies_is_exact() {
     for (i, blk) in fork.iter().enumerate() {
         assert_eq!(x.store.get_block_hash_at_height(i as u64 + 1).unwrap(), Some(blk.block_hash()));
     }
+
+    // The honest chain grows past the fork again: X must re-apply honest
+    // blocks whose bodies it pruned. The connect reports them missing
+    // (nothing is written); the ingress core names exactly the bodies to
+    // re-fetch, stores them after the usual structure and proof checks, and
+    // the chain is followed — with the UTXO set of a node that never left it.
+    let more = b.chain(honest.last().unwrap().block_hash(), 4, "ph-more"); // 64 > 62
+    let mut core = BlockIngress::new();
+    let mut refetched = 0;
+    for blk in &more {
+        loop {
+            match feed(&mut core, &x, blk) {
+                BlockOutcome::Processed { result: Ok(_), .. } => break,
+                BlockOutcome::Processed { result: Err(e), missing_bodies, .. } => {
+                    assert!(e.contains(gnb::reorg::ERR_MISSING_BODIES), "{e}");
+                    assert!(!missing_bodies.is_empty());
+                    for h in missing_bodies {
+                        let body = honest.iter().find(|x| x.block_hash() == h).expect("a pruned honest block");
+                        assert!(matches!(feed(&mut core, &x, body), BlockOutcome::BodyRestored));
+                        refetched += 1;
+                    }
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    assert_eq!(refetched, 39, "the 39 pruned honest bodies (genesis is never re-applied)");
+    assert_eq!(tip_meta(&x), more.last().unwrap().block_hash());
+    let v = node_with(&genesis, &[fund.clone()]);
+    deliver(&v, &honest);
+    deliver(&v, &more);
+    assert_eq!(digest(&x), digest(&v), "back on the honest chain with its exact UTXO set");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -845,7 +877,7 @@ fn sync_tip_first(
                 admissions.push((h, admission));
             }
             BlockOutcome::Dropped(r) => drops.push((h, r)),
-            BlockOutcome::Known | BlockOutcome::PoolRefused => {}
+            BlockOutcome::Known | BlockOutcome::PoolRefused | BlockOutcome::BodyRestored => {}
             BlockOutcome::Invalid(e) => panic!("invalid: {e}"),
         }
     }
@@ -923,7 +955,7 @@ fn pow3_merge_backed_deep_blocks_are_rationed() {
         let merger = b.empty(vec![tip, deep.block_hash()], &format!("merger{i}"));
         assert!(matches!(feed(&mut core, &x, &merger), BlockOutcome::Buffered { .. }));
         match feed(&mut core, &x, &deep) {
-            BlockOutcome::Processed { admission, result, drained } => {
+            BlockOutcome::Processed { admission, result, drained, .. } => {
                 assert_eq!(admission, WorkAdmission::MergeBacked);
                 result.expect("deep block stored as a fork-loser");
                 assert_eq!(drained, vec![merger.block_hash()]);

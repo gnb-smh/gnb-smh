@@ -901,11 +901,19 @@ pub enum DropReason {
     DeepBudgetExhausted,
 }
 
+/// At most this many missing bodies are requested per failed connect
+/// (`accept::missing_bodies_below`); a later attempt asks for the next ones.
+pub const MAX_BODY_REFETCH: usize = 4_096;
+
 /// What [`BlockIngress::handle_block`] did with one block.
 #[derive(Debug)]
 pub enum BlockOutcome {
-    /// Already in the DAG or buffered.
+    /// Already in the DAG (with its body) or buffered.
     Known,
+    /// DAG-6, pruned nodes: the block was in the DAG without a body (pruned,
+    /// then reorganized away from); the re-fetched body was verified and
+    /// stored, so a chain through it can be connected again.
+    BodyRestored,
     /// Dropped before any proof-of-work evaluation.
     Dropped(DropReason),
     /// Context-free invalid (structure, or an orphan's proof of work).
@@ -916,11 +924,14 @@ pub enum BlockOutcome {
     PoolRefused,
     /// Its parents are known and it passed the POW-3 work rule (`admission`):
     /// `accept_block` ran (`result`) and, on success, the orphans waiting on
-    /// it were drained (`drained`).
+    /// it were drained (`drained`). If the connect failed because blocks it
+    /// had to apply have no body (`reorg::ERR_MISSING_BODIES`),
+    /// `missing_bodies` lists those to re-fetch (then the block again).
     Processed {
-        admission: WorkAdmission,
-        result:    Result<[u8; 32], String>,
-        drained:   Vec<[u8; 32]>,
+        admission:      WorkAdmission,
+        result:         Result<[u8; 32], String>,
+        drained:        Vec<[u8; 32]>,
+        missing_bodies: Vec<[u8; 32]>,
     },
 }
 
@@ -1016,7 +1027,25 @@ impl BlockIngress {
         now_unix: u64,
         ctx: &AcceptCtx,
     ) -> BlockOutcome {
-        if ctx.dag.read().has_block(&hash) || self.orphans.contains(&hash) {
+        if ctx.dag.read().has_block(&hash) {
+            // DAG-6, pruned nodes: a DAG block whose body is missing (pruned,
+            // then reorganized away from) gets its re-fetched body back,
+            // after the same structure and proof checks as any block.
+            if ctx.store.has_block_body(&hash).unwrap_or(true) {
+                return BlockOutcome::Known;
+            }
+            if let Err(reason) = block.validate_structure_without_pow() {
+                return BlockOutcome::Invalid(reason.to_string());
+            }
+            if !block.validate_pow() {
+                return BlockOutcome::Invalid("invalid PoW".into());
+            }
+            return match ctx.store.put_block_body(&block) {
+                Ok(()) => BlockOutcome::BodyRestored,
+                Err(e) => BlockOutcome::Invalid(format!("body not stored: {e}")),
+            };
+        }
+        if self.orphans.contains(&hash) {
             return BlockOutcome::Known;
         }
         let tip_h = {
@@ -1088,14 +1117,18 @@ impl BlockIngress {
                 &block, hash, height, ctx.dag, ctx.store, ctx.mempool, ctx.node_state,
                 ctx.tip_tx, ctx.shielded,
             );
-            let drained = match &result {
+            let (drained, missing_bodies) = match &result {
                 Ok(h) => {
                     self.orphans.forget(h);
-                    self.drain_orphans(*h, ctx)
+                    (self.drain_orphans(*h, ctx), Vec::new())
                 }
-                Err(_) => Vec::new(),
+                Err(e) if e.contains(crate::reorg::ERR_MISSING_BODIES) => (
+                    Vec::new(),
+                    crate::accept::missing_bodies_below(ctx.dag, ctx.store, &block.header.parents, MAX_BODY_REFETCH),
+                ),
+                Err(_) => (Vec::new(), Vec::new()),
             };
-            BlockOutcome::Processed { admission, result, drained }
+            BlockOutcome::Processed { admission, result, drained, missing_bodies }
         }
     }
 
