@@ -105,6 +105,7 @@ Research prototype, not yet wired into the node.
 | `reference/check_vectors.py`, `test_vectors.json` | 7 PoW vectors and the checker of both vector files |
 | `reference/gnb_difficulty.py` | Difficulty normative definition: compact bits, chain work, ASERT, GnB's difficulty input |
 | `reference/gen_difficulty_vectors.py`, `difficulty_vectors.json` | Compact, chain-work, ASERT and multi-parent expected-bits vectors, checked by `crates/gnb-smh` and `crates/gnb-crypto` |
+| `reference/gnb_sighash.py`, `sighash_vectors.json` | Transaction signature digests (sighash v2 byte by byte, sighash v3, v3 component messages) and their vectors (`python3 reference/gnb_sighash.py` regenerates them), checked by `crates/gnb-crypto/tests/sighash_vectors.rs` |
 | `reference/gnb_ledger.py` | Ledger normative definition: sparse Merkle tree, transactions, witness bundle, validation |
 | `reference/gen_ledger_vectors.py`, `ledger_vectors.json` | 5 valid and 25 single-fault invalid blocks, tree vectors |
 | `reference/test_ledger.py` | Ledger tests, including a producer-versus-validator differential test |
