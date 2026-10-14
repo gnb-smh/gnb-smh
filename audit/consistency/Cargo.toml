@@ -1,0 +1,39 @@
+# Independent consistency harness for the 2026-10-14 code audit.
+#
+# Applies Bitcoin Core's own test vectors, line-for-line ports of Bitcoin Core
+# and BCHN consensus routines, and rust-bitcoin (the `bitcoin` crate) as
+# reference oracles to GnB's consensus arithmetic: compact targets, ASERT,
+# the transaction Merkle tree, amount sums, and GnB-SMH against its normative
+# Python definition. Property-based cases use proptest.
+#
+# Its own workspace, so the project's manifests and lockfile stay untouched:
+#   cd audit/consistency && cargo test --release
+[package]
+name = "gnb-audit-consistency"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[workspace]
+
+[dependencies]
+primitive-types = "0.13"
+sha2 = "0.10"
+
+[dev-dependencies]
+gnb-smh = { path = "../../crates/gnb-smh" }
+gnb-crypto = { path = "../../crates/gnb-crypto" }
+bitcoin = "0.32"
+proptest = "1"
+
+[profile.release]
+overflow-checks = true
+
+[profile.test]
+opt-level = 3
+overflow-checks = true
+
+[patch.crates-io]
+# Same patch as the root workspace: gnb-crypto needs the forked seeded-RNG API.
+pqcrypto-internals = { path = "../../crates/pqcrypto-internals" }
