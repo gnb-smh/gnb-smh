@@ -2337,6 +2337,35 @@ mod audit_2026_10_rpc_tests {
         )).await.expect("a failed bind must end the RPC task");
     }
 
+    /// Audit DAG-6: `invalidateblock` / `reconsiderblock` parse one block
+    /// hash and reach the chain-admin hook with the right operation; a bad
+    /// parameter never reaches it; an unwired node says so.
+    #[tokio::test]
+    async fn chain_admin_methods_reach_the_hook() {
+        let (_tmp, mut state) = state_with_chain(1);
+        let r = dispatch("invalidateblock", Some(&json!([hex::encode([7u8; 32])])), &state).await;
+        assert!(r["error"].as_str().unwrap().contains("not wired"), "{r}");
+
+        let calls: Arc<parking_lot::Mutex<Vec<(ChainAdminOp, [u8; 32])>>> = Arc::default();
+        let seen = calls.clone();
+        state.chain_admin = Some(Arc::new(move |op, h| {
+            seen.lock().push((op, h));
+            Ok(json!({ "tip": hex::encode(h) }))
+        }));
+        let r = dispatch("invalidateblock", Some(&json!([hex::encode([7u8; 32])])), &state).await;
+        assert_eq!(r["tip"], json!(hex::encode([7u8; 32])));
+        let r = dispatch("reconsiderblock", Some(&json!([hex::encode([8u8; 32])])), &state).await;
+        assert_eq!(r["tip"], json!(hex::encode([8u8; 32])));
+        for bad in [json!([]), json!(["zz"]), json!([hex::encode([1u8; 31])])] {
+            let r = dispatch("invalidateblock", Some(&bad), &state).await;
+            assert!(r["error"].as_str().unwrap().contains("block hash"), "{r}");
+        }
+        assert_eq!(*calls.lock(), vec![
+            (ChainAdminOp::Invalidate, [7u8; 32]),
+            (ChainAdminOp::Reconsider, [8u8; 32]),
+        ]);
+    }
+
     /// WAL-1: `getrawtransaction` returns bytes that hash to the txid.
     #[tokio::test]
     async fn getrawtransaction_returns_bytes_that_hash_to_the_txid() {

@@ -421,7 +421,9 @@ fn dag6_reorg_through_pruned_bodies_is_exact() {
         accept(&x, blk).unwrap();
     }
     let addr = [0xD1u8; 20];
-    assert_eq!(x.store.query_address_history(&addr, 0, u64::MAX, 10, 0).unwrap().len(), 1);
+    let spender: [u8; 20] = k.spk[..20].try_into().unwrap();
+    assert_eq!(x.store.query_address_history(&addr, 0, u64::MAX, 10, 0).unwrap().len(), 1, "output row");
+    assert_eq!(x.store.query_address_history(&spender, 0, u64::MAX, 10, 0).unwrap().len(), 1, "input row");
     let pruned = x.store.prune_blocks_below(40).unwrap();
     assert_eq!(pruned, 40, "genesis + 39 honest bodies pruned");
     assert!(x.store.get_block(&h1.block_hash()).unwrap().is_none());
@@ -448,7 +450,9 @@ fn dag6_reorg_through_pruned_bodies_is_exact() {
     assert!(x.store.get_undo_data(&h1.block_hash()).unwrap().is_none(), "undo consumed");
     assert!(x.store.get_pruned_body_record(&h1.block_hash()).unwrap().is_none(), "record consumed");
     assert!(x.store.query_address_history(&addr, 0, u64::MAX, 10, 0).unwrap().is_empty(),
-        "address history of the pruned, disconnected block is un-indexed");
+        "address history (output row) of the pruned, disconnected block is un-indexed");
+    assert!(x.store.query_address_history(&spender, 0, u64::MAX, 10, 0).unwrap().is_empty(),
+        "address history (input row) of the pruned, disconnected block is un-indexed");
     for (i, blk) in fork.iter().enumerate() {
         assert_eq!(x.store.get_block_hash_at_height(i as u64 + 1).unwrap(), Some(blk.block_hash()));
     }
