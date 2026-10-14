@@ -1861,8 +1861,10 @@ async fn main() {
     ));
     // Sprint EE (S3): `None` = no listen-addr report; production behavior
     // is byte-identical to before the harness affordance was added.
-    node.run(block_tx, outbound_rx, dag.clone(), peer_state.clone(), store.clone(), None).await;
-    error!("Network exited");
+    match node.run(block_tx, outbound_rx, dag.clone(), peer_state.clone(), store.clone(), None).await {
+        Ok(_) => error!("Network exited"),
+        Err(e) => error!("Network exited: {:?}", e),
+    }
 }
 
 // ── External block submission callbacks (RPC submitblock) ──────────────────
