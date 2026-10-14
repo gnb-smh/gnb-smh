@@ -45,8 +45,14 @@ pub mod client;
 pub mod errors;
 pub mod http_rpc;
 pub mod disclosure;
+pub mod payment;
+pub mod send;
 
 pub use seed::{SeedPhrase, SeedVersion};
+pub use payment::{
+    BuiltPayment, FeeChoice, FeePolicy, PaymentOptions, PrevTxs, DUST_THRESHOLD_SATS,
+    MAX_STANDARD_TX_BYTES,
+};
 pub use errors::WalletError;
 pub use disclosure::{DisclosureBundle, DisclosureEntry, VerifiedDisclosure, DisclosureError};
 
@@ -329,56 +335,118 @@ impl Wallet {
         &self.keypair.public
     }
 
-    /// Sign a transaction in-place.
+    /// Sign a version-1/2 (sighash v2) transaction in-place.
     ///
     /// Each input gets a signature derived from the tx sighash. The wallet
     /// MUST own the UTXOs referenced by the inputs (i.e., their script_pubkey
     /// equals this wallet's address hash) — otherwise signing produces an
     /// invalid tx that the network will reject.
-    pub fn sign_tx(&self, mut tx: Transaction) -> Result<Transaction, WalletError> {
-        // Each input gets its own sighash. script_sig = signature || pubkey.
-        let pubkey = &self.keypair.public;
-        let mut signatures = Vec::with_capacity(tx.inputs.len());
+    ///
+    /// A version-3 transaction commits to the outputs it spends, which this
+    /// entry point does not have: it is refused; use
+    /// [`Self::sign_tx_with_prevouts`].
+    pub fn sign_tx(&self, tx: Transaction) -> Result<Transaction, WalletError> {
+        if tx.version == crate::core::sighash::TX_VERSION_V3 {
+            return Err(WalletError::Payment(
+                "a version-3 transaction commits to the outputs it spends; \
+                 sign it with sign_tx_with_prevouts".into(),
+            ));
+        }
+        // Sighash v2 does not read the spent outputs; any placeholders do.
+        let placeholders = vec![TxOutput { value: 0, script_pubkey: Vec::new() }; tx.inputs.len()];
+        self.sign_tx_with_prevouts(tx, &placeholders)
+    }
 
+    /// Sign every input of `tx`, which spends `prevouts` (one output per
+    /// input, in order: the value and `script_pubkey` each input spends), under
+    /// the digest the transaction's version selects (sighash v3 for version
+    /// 3, which commits to `prevouts`; v2 otherwise). Witnesses are canonical
+    /// and every signature is verified under this wallet's key before use.
+    pub fn sign_tx_with_prevouts(&self, mut tx: Transaction, prevouts: &[TxOutput]) -> Result<Transaction, WalletError> {
+        if !crypto::is_hybrid_public_key(&self.keypair.public) {
+            return Err(WalletError::Crypto("wallets sign only with the hybrid suite (0x0001)".into()));
+        }
         // Chain-id (Roadmap #8) derived from the wallet's own network — the
         // signer and the node validator must fold the SAME domain into the sighash.
         let chain_id = crate::core::ChainId::for_network(self.network);
-        for i in 0..tx.inputs.len() {
-            let sighash = tx.sighash(i, chain_id);
-            let sig = crypto::sign(&self.keypair.secret, &sighash)
-                .map_err(|e| WalletError::Crypto(e.to_string()))?;
-            // FIX: consensus verification parses script_sig with
-            // `parse_script_sig` (length-prefixed [4B sig_len][sig][4B pk_len]
-            // [pk]). This previously wrote a RAW `sig||pubkey`, which
-            // parse_script_sig mis-parses → the signature fails to verify and the
-            // tx is rejected. Use the canonical builder (matches build_tx +
-            // the RPC/consensus verifiers).
-            signatures.push(Transaction::build_script_sig(&sig, pubkey));
-        }
-
-        for (input, script_sig) in tx.inputs.iter_mut().zip(signatures) {
-            input.script_sig = script_sig;
-        }
-
+        payment::sign_inputs(&mut tx, prevouts, &self.keypair.public, chain_id,
+            &|digest, version| self.sign_digest(digest, version))
+            .map_err(WalletError::Crypto)?;
         Ok(tx)
     }
 
-    /// Build an unsigned transaction spending the given UTXOs to `recipient`.
+    /// Verified signature of a transaction digest under the binding of
+    /// `version` (CRY-5 / CRY-2).
+    fn sign_digest(&self, digest: &[u8; 32], version: crate::core::sighash::SighashVersion) -> Result<Vec<u8>, String> {
+        let (secret, public) = (&self.keypair.secret, &self.keypair.public);
+        match version {
+            crate::core::sighash::SighashVersion::V2 => crypto::sign_checked(secret, public, digest),
+            crate::core::sighash::SighashVersion::V3 => crypto::sign_bound_checked(secret, public, digest),
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    /// Build an unsigned transaction paying `amount` to `recipient` from the
+    /// given UTXOs with an exact `fee`, for the block at `next_block_height`
+    /// (the node's `getdaginfo` `next_block_height`).
     ///
     /// This is pure — no network call required. Caller must provide UTXOs
     /// (typically from `WalletClient::utxos()`).
     ///
     /// Logic:
-    ///   - Sum UTXO values, verify >= `amount + fee`
+    ///   - Verify the UTXOs can cover `amount + fee`
+    ///   - Select inputs (WAL-6: the smallest single UTXO that covers the
+    ///     payment, else largest first) instead of spending every UTXO
     ///   - Create output to `recipient` with `amount`
-    ///   - Create change output to self with `(total - amount - fee)` if > dust
-    ///   - Return unsigned tx ready for `sign_tx()`
+    ///   - Create a change output to self if the change is at least the dust
+    ///     threshold; sub-dust change becomes fee
+    ///   - Enforce the default maximum-fee guard (WAL-1) on the resulting
+    ///     fee; [`Self::build_tx_with_policy`] overrides it explicitly
+    ///   - Version 3 at/after the hardening activation of the wallet's chain,
+    ///     1 below it (`core::sighash::tx_version_for_height`)
+    ///   - Return the unsigned tx: version 1 is ready for `sign_tx()`,
+    ///     version 3 for `sign_tx_with_prevouts()` with the selected UTXOs'
+    ///     outputs
     pub fn build_tx(
         &self,
         utxos: Vec<Utxo>,
         recipient: &Address,
         amount: u64,
         fee: u64,
+        next_block_height: u64,
+    ) -> Result<Transaction, WalletError> {
+        self.build_tx_with_policy(utxos, recipient, amount, fee, &FeePolicy::DEFAULT, next_block_height)
+    }
+
+    /// Build and sign a payment with coin selection, size-aware fees, the
+    /// maximum-fee guard and (when `opts.prev_txs` is set) verification of
+    /// the claimed UTXO values (WAL-1, WAL-6). Reports the actual fee.
+    pub fn build_payment(
+        &self,
+        utxos: &[Utxo],
+        recipient: &Address,
+        amount: u64,
+        opts: &PaymentOptions<'_>,
+    ) -> Result<BuiltPayment, WalletError> {
+        if recipient.network() != self.network {
+            return Err(WalletError::NetworkMismatch);
+        }
+        let chain_id = crate::core::ChainId::for_network(self.network);
+        payment::build_payment(
+            utxos, recipient.hash(), amount, self.address.hash(), &self.keypair.public, chain_id, opts,
+            &|digest, version| self.sign_digest(digest, version),
+        ).map_err(WalletError::Payment)
+    }
+
+    /// [`Self::build_tx`] with an explicit fee guard.
+    pub fn build_tx_with_policy(
+        &self,
+        utxos: Vec<Utxo>,
+        recipient: &Address,
+        amount: u64,
+        fee: u64,
+        fee_policy: &FeePolicy,
+        next_block_height: u64,
     ) -> Result<Transaction, WalletError> {
         if recipient.network() != self.network {
             return Err(WalletError::NetworkMismatch);
@@ -401,11 +469,14 @@ impl Wallet {
             return Err(WalletError::InsufficientFunds { needed, have: total_in });
         }
 
-        let change = total_in - needed;
+        let (selected, change) =
+            payment::select_exact_fee(&utxos, amount, fee, self.keypair.public.len())
+                .ok_or(WalletError::InsufficientFunds { needed, have: total_in })?;
+        let selected_total = selected.iter().map(|&i| utxos[i].output.value).sum::<u64>();
 
-        let inputs: Vec<TxInput> = utxos.iter().map(|u| TxInput {
-            prev_txid: u.txid,
-            prev_index: u.index,
+        let inputs: Vec<TxInput> = selected.iter().map(|&i| TxInput {
+            prev_txid: utxos[i].txid,
+            prev_index: utxos[i].index,
             script_sig: Vec::new(), // filled by sign_tx
             sequence: 0xffffffff,
         }).collect();
@@ -417,22 +488,28 @@ impl Wallet {
             },
         ];
 
-        // Add change output if above dust threshold
-        const DUST_THRESHOLD_SATS: u64 = 546;
-        if change >= DUST_THRESHOLD_SATS {
+        // Change output when it is at least the dust threshold (the single
+        // comparison of every builder, `payment::keeps_change`); a sub-dust
+        // remainder is fee and is counted by the guard below.
+        if change > 0 {
             outputs.push(TxOutput {
                 value: change,
                 script_pubkey: self.address.hash().to_vec(),
             });
         }
-        // If change < dust, it becomes additional fee (implicit)
 
-        Ok(Transaction {
-            version: 1,
+        let chain_id = crate::core::ChainId::for_network(self.network);
+        let opts = PaymentOptions { next_block_height: Some(next_block_height), ..PaymentOptions::default() };
+        let tx = Transaction {
+            version: opts.tx_version(chain_id).map_err(WalletError::Payment)?,
             inputs,
             outputs,
             locktime: 0,
-        })
+        };
+        let actual_fee = selected_total - amount - change;
+        payment::check_unsigned_fee(&tx, actual_fee, self.keypair.public.len(), fee_policy)
+            .map_err(WalletError::FeeTooHigh)?;
+        Ok(tx)
     }
 }
 
@@ -665,7 +742,7 @@ mod tests {
         }];
 
         // Try to send 2000 with 1000 UTXO
-        let result = wallet.build_tx(utxos, other_wallet.address(), 2000, 100);
+        let result = wallet.build_tx(utxos, other_wallet.address(), 2000, 100, 1);
         assert!(matches!(result, Err(WalletError::InsufficientFunds { .. })));
     }
 
@@ -680,7 +757,7 @@ mod tests {
             output: TxOutput { value: 100_000, script_pubkey: wallet.address().hash().to_vec() },
         }];
 
-        let tx = wallet.build_tx(utxos, other_wallet.address(), 50_000, 1000).unwrap();
+        let tx = wallet.build_tx(utxos, other_wallet.address(), 50_000, 1000, 1).unwrap();
 
         // 2 outputs: recipient + change
         assert_eq!(tx.outputs.len(), 2);
@@ -700,7 +777,7 @@ mod tests {
         }];
 
         // Send exactly (utxo - fee) — no change
-        let tx = wallet.build_tx(utxos, other.address(), 50_000, 1_000).unwrap();
+        let tx = wallet.build_tx(utxos, other.address(), 50_000, 1_000, 1).unwrap();
         assert_eq!(tx.outputs.len(), 1);
         assert_eq!(tx.outputs[0].value, 50_000);
     }
@@ -815,15 +892,50 @@ impl Keypair {
         // declares, so the signature matches the address's suite. Never mutates
         // the stored key. The temporary owned wrapper contains the entire secret,
         // so keep it in zeroizing storage instead of a plain `Cow::Owned` buffer.
+        //
+        // CRY-5: `sign_checked` verifies both hybrid halves of the produced
+        // signature under `self.public_key` (and its canonical encoding)
+        // before returning it, so a corrupted or mismatched secret key is an
+        // error here, never a transaction the network rejects later.
+        self.with_enveloped_secret(|sk| crypto::sign_checked(sk, &self.public_key, msg))
+    }
+
+    /// Verified sighash-v3 signature (component-bound, CRY-2) of `digest`,
+    /// with the same legacy-key handling as [`Self::sign`].
+    pub fn sign_bound(&self, digest: &[u8; 32]) -> Result<Vec<u8>, String> {
+        self.with_enveloped_secret(|sk| crypto::sign_bound_checked(sk, &self.public_key, digest))
+    }
+
+    /// Verified signature of a transaction digest under the binding of
+    /// `version`: [`Self::sign`] for sighash v2, [`Self::sign_bound`] for v3.
+    pub fn sign_tx_digest(&self, digest: &[u8; 32], version: crate::core::sighash::SighashVersion) -> Result<Vec<u8>, String> {
+        match version {
+            crate::core::sighash::SighashVersion::V2 => self.sign(digest),
+            crate::core::sighash::SighashVersion::V3 => self.sign_bound(digest),
+        }
+    }
+
+    /// Run `f` with the secret key in its enveloped form (wrapping a legacy
+    /// raw key under the public key's suite in zeroizing storage).
+    fn with_enveloped_secret(
+        &self,
+        f: impl FnOnce(&[u8]) -> Result<Vec<u8>, crypto::CryptoError>,
+    ) -> Result<Vec<u8>, String> {
         if crypto::parse_envelope(&self.private_key).is_some() {
-            crypto::sign(&self.private_key, msg).map_err(|e| e.to_string())
+            f(&self.private_key).map_err(|e| e.to_string())
         } else {
             let suite = crypto::parse_envelope(&self.public_key)
                 .map(|(s, _)| s)
                 .unwrap_or(crypto::SUITE_MLDSA65_FALCON1024);
             let sk = Zeroizing::new(crypto::wrap_envelope(suite, &self.private_key));
-            crypto::sign(&sk, msg).map_err(|e| e.to_string())
+            f(&sk).map_err(|e| e.to_string())
         }
+    }
+
+    /// Network of this keypair, from its (authenticated, for keystore v3)
+    /// address prefix.
+    pub fn network(&self) -> Result<Network, String> {
+        Address::parse(&self.address).map(|a| a.network()).map_err(|e| format!("invalid wallet address: {e}"))
     }
 
     /// Verify arbitrary wallet data while preserving legacy format compatibility.
@@ -838,35 +950,81 @@ impl Keypair {
     }
 
     /// A4-M-4: sign an arbitrary user-supplied MESSAGE (never a raw digest).
-    /// Signs `crypto::signed_message_digest(message)`, not `message` itself —
+    /// Signs a domain-separated digest of `message`, not `message` itself —
     /// the caller must pass the message's raw bytes, never hex-decoded text,
     /// so a 64-hex-character message can never be reinterpreted as a raw
     /// 32-byte tx sighash / disclosure digest / PoS signing root. Pair with
-    /// [`Self::verify_message`].
+    /// [`Self::verify_message_on`] (or [`Self::verify_message`]).
+    ///
+    /// CRY-8: new signatures use the chain-bound v2 domain
+    /// ([`crypto::signed_message_digest_v2`]) with the chain of this
+    /// keypair's network, so they do not carry over between GnB mainnet,
+    /// GnB testnet and Bloch (which share keys). Verifiers still accept v1.
     pub fn sign_message(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+        let chain = crate::core::ChainId::for_network(self.network()?);
+        let digest = crypto::signed_message_digest_v2(chain, message);
+        self.sign(&digest)
+    }
+
+    /// Sign under the legacy v1 message domain (no chain id). Only for
+    /// interoperability with verifiers that predate v2.
+    pub fn sign_message_v1(&self, message: &[u8]) -> Result<Vec<u8>, String> {
         let digest = crypto::signed_message_digest(message);
         self.sign(&digest)
+    }
+
+    /// Compatibility verification of one digest: explicit enveloped and
+    /// raw-hybrid pairs first, the generic verifier last (older mixed
+    /// envelope/raw records whose storage metadata was not retained).
+    fn verify_digest_compat(pk: &[u8], digest: &[u8; 32], sig: &[u8]) -> bool {
+        crypto::verify_enveloped(pk, digest, sig)
+            || crypto::verify_legacy_hybrid_raw(pk, digest, sig)
+            || crypto::verify(pk, digest, sig)
+    }
+
+    /// Message digests a verifier for `network` accepts: v2 for that chain,
+    /// then the legacy v1 domain.
+    fn message_digests(network: Option<Network>, message: &[u8]) -> Vec<[u8; 32]> {
+        use crate::core::ChainId;
+        let mut digests = match network {
+            Some(n) => vec![crypto::signed_message_digest_v2(ChainId::for_network(n), message)],
+            None => vec![
+                crypto::signed_message_digest_v2(ChainId::Mainnet, message),
+                crypto::signed_message_digest_v2(ChainId::Testnet, message),
+            ],
+        };
+        digests.push(crypto::signed_message_digest(message));
+        digests
     }
 
     /// Verify a signature produced by [`Self::sign_message`] over `message`
     /// under public key `pk` while preserving historical wallet compatibility.
     ///
-    /// Known enveloped and raw-hybrid pairs are tried through their explicit
-    /// format APIs first. The generic verifier remains a final fallback for
-    /// older mixed envelope/raw records whose storage metadata was not retained.
+    /// Accepts a v2 signature for EITHER GnB chain and a legacy v1 signature;
+    /// callers that know the chain should use [`Self::verify_message_on`].
     pub fn verify_message(pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
-        let digest = crypto::signed_message_digest(message);
-        crypto::verify_enveloped(pk, &digest, sig)
-            || crypto::verify_legacy_hybrid_raw(pk, &digest, sig)
-            || crypto::verify(pk, &digest, sig)
+        Self::message_digests(None, message).iter().any(|d| Self::verify_digest_compat(pk, d, sig))
+    }
+
+    /// Verify a message signature for a specific network: a v2 signature
+    /// must name that network's chain id; legacy v1 signatures (no chain id)
+    /// are still accepted.
+    pub fn verify_message_on(network: Network, pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
+        Self::message_digests(Some(network), message).iter().any(|d| Self::verify_digest_compat(pk, d, sig))
     }
 
     /// Verify a newly-issued wallet message using the strict modern policy.
     /// Both objects must carry suite envelopes and the signature encoding must
     /// be canonical; legacy raw and mixed-format records are rejected.
     pub fn verify_message_canonical(pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
-        let digest = crypto::signed_message_digest(message);
-        crypto::verify_enveloped_canonical(pk, &digest, sig)
+        Self::message_digests(None, message).iter()
+            .any(|d| crypto::verify_enveloped_canonical(pk, d, sig))
+    }
+
+    /// [`Self::verify_message_canonical`] for a specific network.
+    pub fn verify_message_canonical_on(network: Network, pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
+        Self::message_digests(Some(network), message).iter()
+            .any(|d| crypto::verify_enveloped_canonical(pk, d, sig))
     }
 
     pub fn address_bytes(&self) -> Vec<u8> {
@@ -882,14 +1040,36 @@ impl Keypair {
         crate::util::atomic_write(path, json.as_bytes()).map_err(|e| e.to_string())
     }
 
-    /// The encrypted keystore v2 JSON for this keypair (what `save_encrypted`
+    /// The encrypted keystore JSON for this keypair (what `save_encrypted`
     /// writes). Used directly where there is no filesystem (the web wallet).
+    ///
+    /// CRY-7 / WAL-7: writes keystore **v3**, whose AES-GCM associated data
+    /// binds the format version, the network and the address (which commits
+    /// to SHA3-256 of the public key, re-derived from the decrypted key on
+    /// load). Editing the `network` or `address` field of a v3 file makes it
+    /// fail to decrypt. v2 files (empty associated data) still load.
     pub fn to_encrypted_json(&self, password: &str) -> Result<String, String> {
+        self.to_encrypted_json_version(password, KEYSTORE_VERSION_V3)
+    }
+
+    /// Writer for both formats. Production writes only v3; v2 output exists
+    /// so compatibility tests can produce the files older releases (and
+    /// Bloch) wrote.
+    fn to_encrypted_json_version(&self, password: &str, version: u32) -> Result<String, String> {
         // SECURITY (A4 lows): enforce the SAME blocking password policy as
         // the new-style `EncryptedKeyfile` (length + breach denylist) here
         // too — this legacy path is reachable directly (e.g. the CLI's `New`
         // command), and Argon2 hardening is moot behind a weak password.
         encryption::validate_password_strength(password).map_err(|e| e.to_string())?;
+
+        let address = Address::parse(&self.address)
+            .map_err(|e| format!("keypair address is invalid: {e}"))?;
+        if address.to_string() != self.address
+            || crypto::address_from_pubkey(&self.public_key, address.is_testnet()) != self.address
+        {
+            return Err("keypair address does not match its public key".into());
+        }
+        let network = if address.is_testnet() { "testnet" } else { "mainnet" };
 
         let mut salt = vec![0u8; 32];
         rand::rng().fill_bytes(&mut salt);
@@ -897,11 +1077,16 @@ impl Keypair {
         let mut nonce_b = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce_b);
 
-        let ct = encrypt_legacy_keystore_payload(
+        let ct = encrypt_keystore_payload_with_aad(
             &enc_key,
             &nonce_b,
             &self.private_key,
             &self.public_key,
+            &match version {
+                KEYSTORE_VERSION_V3 => keystore_v3_aad(network, &self.address),
+                LEGACY_KEYSTORE_VERSION_V2 => Vec::new(),
+                other => return Err(format!("cannot write keystore version {other}")),
+            },
         )?;
         // The derived key is no longer needed once the private helper has
         // returned the ciphertext. Wipe it before public metadata assembly,
@@ -909,9 +1094,9 @@ impl Keypair {
         drop(enc_key);
 
         let ks = EncryptedKeystore {
-            version: 2,
+            version,
             address: self.address.clone(),
-            network: if self.address.starts_with(TESTNET_PREFIX) { "testnet" } else { "mainnet" }.into(),
+            network: network.into(),
             crypto: KeystoreCrypto {
                 cipher:     "aes-256-gcm".into(),
                 ciphertext: b64::STANDARD.encode(&ct),
@@ -921,7 +1106,10 @@ impl Keypair {
                     salt: b64::STANDARD.encode(&salt), output_len: 32 },
             },
             created_at:  chrono::Utc::now().to_rfc3339(),
-            description: "GnB hybrid ML-DSA-65 + Falcon-1024 keystore v2".into(),
+            description: format!(
+                "GnB hybrid ML-DSA-65 + Falcon-1024 keystore v{version}{}",
+                if version == KEYSTORE_VERSION_V3 { " (network and address authenticated)" } else { "" }
+            ),
         };
         serde_json::to_string_pretty(&ks).map_err(|e| e.to_string())
     }
@@ -936,14 +1124,39 @@ impl Keypair {
         Self::from_encrypted_bytes(&bytes, password)
     }
 
-    /// Open keystore v2 JSON bytes (no filesystem). Same checks as
+    /// Open keystore v2 or v3 JSON bytes (no filesystem). Same checks as
     /// `load_encrypted`; inputs above the default wallet file limit are refused.
+    ///
+    /// Residual risk (CRY-7, documented): a v2 file authenticates neither its
+    /// `network` field nor its address prefix, and the address checksum does
+    /// not cover the prefix, so editing `gnb1q…` to `gnb1t…` in a v2 file still
+    /// loads the key for the other network. Re-save such files (any front end
+    /// now writes v3) to authenticate the network.
     pub fn from_encrypted_bytes(bytes: &[u8], password: &str) -> Result<Self, String> {
         if bytes.len() > crate::util::DEFAULT_WALLET_FILE_LIMIT {
             return Err("keystore exceeds the wallet file size limit".into());
         }
         let ks: EncryptedKeystore = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        if ks.version != 2 { return Err("unsupported keystore version".into()); }
+        if ks.version != LEGACY_KEYSTORE_VERSION_V2 && ks.version != KEYSTORE_VERSION_V3 {
+            return Err("unsupported keystore version".into());
+        }
+        // v3: the AAD binds version, network and address. Both cleartext
+        // fields must be canonical and agree before they are authenticated.
+        let aad = if ks.version == KEYSTORE_VERSION_V3 {
+            let network = match ks.network.as_str() {
+                "mainnet" => Network::Mainnet,
+                "testnet" => Network::Testnet,
+                _ => return Err("keystore v3 network must be \"mainnet\" or \"testnet\"".into()),
+            };
+            let address = Address::parse_for_network(&ks.address, network)
+                .map_err(|e| format!("keystore v3 address invalid for its network: {e}"))?;
+            if address.to_string() != ks.address {
+                return Err("keystore v3 address is not in canonical GnB form".into());
+            }
+            keystore_v3_aad(&ks.network, &ks.address)
+        } else {
+            Vec::new()
+        };
 
         // Reject attacker-controlled Argon2 work before any Base64 decoder can
         // allocate output for the remaining untrusted fields.
@@ -986,7 +1199,7 @@ impl Keypair {
         // and `output_len != 32` would panic the AES-256 key conversion below.
         let enc_k = derive_key_with_params(password, &salt, &ks.crypto.kdf_params)?;
 
-        decrypt_legacy_keystore_in_place(&enc_k, &nonce_b, &mut plain)?;
+        decrypt_keystore_in_place_with_aad(&enc_k, &nonce_b, &aad, &mut plain)?;
         drop(enc_k);
 
         let (mut private_key, public_key) = decode_legacy_keystore_payload(plain)?;
@@ -1025,12 +1238,43 @@ fn decode_legacy_keystore_payload(
 /// is wiped as soon as serialization succeeds; the zeroizing JSON plaintext
 /// is wiped when this helper returns, before public metadata is assembled or
 /// the final keystore is written.
+#[cfg(test)]
 fn encrypt_legacy_keystore_payload(
     key: &[u8],
     nonce: &[u8; 12],
     private_key: &[u8],
     public_key: &[u8],
 ) -> Result<Vec<u8>, String> {
+    encrypt_keystore_payload_with_aad(key, nonce, private_key, public_key, b"")
+}
+
+/// Keystore format versions handled by [`Keypair`]. v2 encrypts with empty
+/// associated data; v3 (written since the CRY-7 fix) authenticates the
+/// version, network and address.
+pub const LEGACY_KEYSTORE_VERSION_V2: u32 = 2;
+pub const KEYSTORE_VERSION_V3: u32 = 3;
+
+/// v3 associated data: domain tag ‖ version u32 LE ‖ network byte ‖
+/// address length u32 LE ‖ address. Fixed-width fields before the single
+/// variable one, so the encoding is unambiguous.
+fn keystore_v3_aad(network: &str, address: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(16 + 4 + 1 + 4 + address.len());
+    aad.extend_from_slice(b"GNB-KEYSTORE-v3\0");
+    aad.extend_from_slice(&KEYSTORE_VERSION_V3.to_le_bytes());
+    aad.push(if network == "testnet" { 1 } else { 0 });
+    aad.extend_from_slice(&(address.len() as u32).to_le_bytes());
+    aad.extend_from_slice(address.as_bytes());
+    aad
+}
+
+fn encrypt_keystore_payload_with_aad(
+    key: &[u8],
+    nonce: &[u8; 12],
+    private_key: &[u8],
+    public_key: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, String> {
+    use aes_gcm::aead::Payload;
     let payload = KeystorePayload {
         private_key_hex: hex::encode(private_key),
         public_key_hex: hex::encode(public_key),
@@ -1041,13 +1285,23 @@ fn encrypt_legacy_keystore_payload(
     drop(payload);
 
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    cipher.encrypt(Nonce::from_slice(nonce), plain.as_ref())
+    cipher.encrypt(Nonce::from_slice(nonce), Payload { msg: plain.as_ref(), aad })
         .map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
 fn decrypt_legacy_keystore_in_place(
     key: &[u8],
     nonce_b: &[u8],
+    ciphertext: &mut Vec<u8>,
+) -> Result<(), String> {
+    decrypt_keystore_in_place_with_aad(key, nonce_b, b"", ciphertext)
+}
+
+fn decrypt_keystore_in_place_with_aad(
+    key: &[u8],
+    nonce_b: &[u8],
+    aad: &[u8],
     ciphertext: &mut Vec<u8>,
 ) -> Result<(), String> {
     const NONCE_LEN: usize = 12;
@@ -1068,7 +1322,7 @@ fn decrypt_legacy_keystore_in_place(
         ));
     }
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    cipher.decrypt_in_place(Nonce::from_slice(nonce_b), b"", ciphertext)
+    cipher.decrypt_in_place(Nonce::from_slice(nonce_b), aad, ciphertext)
         .map_err(|_| "decryption failed — wrong password or corrupted file".to_string())
 }
 
@@ -1087,104 +1341,124 @@ impl std::fmt::Debug for Keypair {
 pub struct TxBuilder;
 
 impl TxBuilder {
-    /// Build and sign a transaction.
-    /// Selects UTXOs from `available_utxos`, signs each input with `keypair`.
-    /// Returns the fully signed Transaction ready to broadcast.
+    /// Build and sign a transaction with an exact fee (legacy entry point).
+    ///
+    /// Selects UTXOs from `available_utxos` (WAL-6: smallest single covering
+    /// UTXO, else largest first), signs each input with `keypair` through the
+    /// verifying signer, and enforces the default maximum-fee guard (WAL-1)
+    /// on the actual fee. A change below the dust threshold is added to the
+    /// fee. New callers should use [`Self::build_payment`], which also
+    /// verifies claimed UTXO values and reports the actual fee.
+    ///
+    /// `next_block_height` (the node's `getdaginfo` `next_block_height`)
+    /// selects the transaction version (3 at/after the hardening activation,
+    /// 1 below).
     pub fn build(
         keypair:         &Keypair,
         available_utxos: &[(Vec<u8>, u32, TxOutput)],  // (txid, index, output)
         to_address_hex:  &str,                           // 20-byte hex address
         amount_sats:     u64,
         fee_sats:        u64,
+        next_block_height: u64,
     ) -> Result<Transaction, String> {
-        let total_needed = amount_sats.checked_add(fee_sats)
-            .ok_or("amount + fee overflow")?;
-
+        amount_sats.checked_add(fee_sats).ok_or("amount + fee overflow")?;
         let to_bytes = hex::decode(to_address_hex)
             .map_err(|_| "invalid destination address hex")?;
         if to_bytes.len() != 20 {
             return Err("destination address hash must contain exactly 20 bytes".into());
         }
-        let mut outpoints = std::collections::BTreeSet::new();
-        for (txid, index, _) in available_utxos {
-            if txid.len() != 32 {
-                return Err("UTXO transaction ID must contain exactly 32 bytes".into());
-            }
-            if !outpoints.insert((txid.as_slice(), *index)) {
-                return Err("duplicate UTXO outpoint".into());
-            }
-        }
-
-        // Coin selection: greedy, smallest-first
-        let mut selected: Vec<&(Vec<u8>, u32, TxOutput)> = vec![];
-        let mut selected_total = 0u64;
-        let mut sorted = available_utxos.iter().collect::<Vec<_>>();
-        sorted.sort_by_key(|(_, _, o)| o.value);
-
-        for utxo in &sorted {
-            selected.push(utxo);
-            selected_total = selected_total.checked_add(utxo.2.value)
-                .ok_or("selected UTXO value overflow")?;
-            if selected_total >= total_needed { break; }
-        }
-
-        if selected_total < total_needed {
-            return Err(format!(
-                "insufficient funds: have {} sats, need {} sats",
-                selected_total, total_needed
-            ));
-        }
-
-        // Build inputs (script_sig empty for now — filled after sighash)
-        let inputs: Vec<TxInput> = selected.iter().map(|(txid, idx, _)| {
-            let mut prev_txid = [0u8; 32];
-            prev_txid.copy_from_slice(txid);
-            TxInput { prev_txid, prev_index: *idx, script_sig: vec![], sequence: u32::MAX }
-        }).collect();
-
-        // Build outputs (destination was validated before coin selection/signing).
-        let mut outputs = vec![TxOutput { value: amount_sats, script_pubkey: to_bytes }];
-
-        // Change output
-        let change = selected_total - total_needed;
-        if change > 546 { // dust threshold
-            outputs.push(TxOutput {
-                value:         change,
-                script_pubkey: keypair.address_bytes(),
-            });
-        }
-
-        let mut tx = Transaction { version: 1, inputs, outputs, locktime: 0 };
-
-        // Chain-id: folded into every input's sighash, so it must match the
-        // validator's node_chain_id(). Derived from the address prefix.
-        let chain_id = if keypair.address.starts_with(TESTNET_PREFIX) {
-            crate::core::ChainId::Testnet
-        } else {
-            crate::core::ChainId::Mainnet
+        let utxos = Self::utxos_from_rows(available_utxos)?;
+        let opts = PaymentOptions {
+            fee: FeeChoice::Exact(fee_sats),
+            next_block_height: Some(next_block_height),
+            ..PaymentOptions::default()
         };
-        // Sign each input
-        for i in 0..tx.inputs.len() {
-            let sighash = tx.sighash(i, chain_id);
-            let sig     = keypair.sign(&sighash)?;
-            tx.inputs[i].script_sig = Transaction::build_script_sig(&sig, &keypair.public_key);
-        }
+        Self::build_payment_to_spk(keypair, &utxos, &to_bytes, amount_sats, &opts).map(|p| p.tx)
+    }
 
-        Ok(tx)
+    /// Convert `(txid, index, output)` rows, refusing malformed txids.
+    pub fn utxos_from_rows(rows: &[(Vec<u8>, u32, TxOutput)]) -> Result<Vec<Utxo>, String> {
+        rows.iter().map(|(txid, index, output)| {
+            let txid: [u8; 32] = txid.as_slice().try_into()
+                .map_err(|_| "UTXO transaction ID must contain exactly 32 bytes".to_string())?;
+            Ok(Utxo { txid, index: *index, output: output.clone() })
+        }).collect()
+    }
+
+    /// Build and sign a payment to `to` (WAL-1, WAL-6): coin selection,
+    /// size-aware fee, maximum-fee guard on the actual fee, verification of
+    /// the claimed UTXO values against `opts.prev_txs`, and a report of the
+    /// actual fee, change and verified/unverified inputs.
+    pub fn build_payment(
+        keypair: &Keypair,
+        utxos:   &[Utxo],
+        to:      &Address,
+        amount:  u64,
+        opts:    &PaymentOptions<'_>,
+    ) -> Result<BuiltPayment, String> {
+        if to.network() != keypair.network()? {
+            return Err("destination address network differs from wallet".into());
+        }
+        Self::build_payment_to_spk(keypair, utxos, to.hash(), amount, opts)
+    }
+
+    /// Outpoints [`Self::build_payment`] would spend, chosen on the claimed
+    /// values: fetch their creating transactions into a [`PrevTxs`] first.
+    pub fn plan_inputs(
+        keypair: &Keypair,
+        utxos:   &[Utxo],
+        amount:  u64,
+        fee:     FeeChoice,
+    ) -> Result<Vec<([u8; 32], u32)>, String> {
+        payment::plan_payment_inputs(utxos, amount, keypair.public_key.len(), fee)
+    }
+
+    fn build_payment_to_spk(
+        keypair: &Keypair,
+        utxos:   &[Utxo],
+        to_spk:  &[u8],
+        amount:  u64,
+        opts:    &PaymentOptions<'_>,
+    ) -> Result<BuiltPayment, String> {
+        // Chain-id: folded into every input's sighash, so it must match the
+        // validator's node_chain_id(). Derived from the address prefix, which
+        // keystore v3 authenticates.
+        let chain_id = crate::core::ChainId::for_network(keypair.network()?);
+        payment::build_payment(
+            utxos, to_spk, amount, &keypair.address_bytes(), &keypair.public_key,
+            chain_id, opts, &|digest, version| keypair.sign_tx_digest(digest, version),
+        )
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 pub fn generate_keypair(testnet: bool) -> Keypair {
-    let (public_key, private_key) = crypto::generate_keypair();
-    let mut private_key = wallet_secret_owner(private_key);
+    // CRY-4: the secret is produced under wiping ownership and moved (not
+    // copied) into the `Keypair`, whose `Drop` wipes it.
+    let (public_key, mut private_key) = crypto::generate_keypair_zeroizing();
     let address = crypto::address_from_pubkey(&public_key, testnet);
     Keypair {
         private_key: std::mem::take(&mut *private_key),
         public_key,
         address,
     }
+}
+
+/// WAL-7: create a keypair backed by a fresh 24-word BIP39 mnemonic (the
+/// same derivation as [`Wallet::generate`]: seed version V2, no passphrase),
+/// so the words are a complete backup of the key. Show the phrase to the
+/// user once; it is wiped when dropped.
+pub fn generate_mnemonic_keypair(network: Network) -> Result<(Keypair, SeedPhrase), WalletError> {
+    let (wallet, phrase) = Wallet::generate(network)?;
+    Ok((wallet.into_keypair(), phrase))
+}
+
+/// WAL-7: restore the keypair of [`generate_mnemonic_keypair`] (or of a
+/// [`Wallet`] created from a seed phrase) from its words.
+pub fn keypair_from_mnemonic(phrase: &str, network: Network) -> Result<Keypair, WalletError> {
+    let phrase = SeedPhrase::parse(phrase)?;
+    Ok(Wallet::from_seed(&phrase, network)?.into_keypair())
 }
 
 pub fn validate_password(pw: &str) -> Result<(), String> {
@@ -1914,18 +2188,18 @@ mod audit_transaction_boundaries {
             let right = Address::from_hash([42;20], network);
             let utxos = || vec![Utxo { txid:[1;32], index:0,
                 output: TxOutput { value:1000, script_pubkey:wallet.address().hash().to_vec() } }];
-            assert!(matches!(wallet.build_tx(utxos(), &wrong, 900, 100), Err(WalletError::NetworkMismatch)));
-            assert!(wallet.build_tx(utxos(), &right, 900, 100).is_ok());
+            assert!(matches!(wallet.build_tx(utxos(), &wrong, 900, 100, 1), Err(WalletError::NetworkMismatch)));
+            assert!(wallet.build_tx(utxos(), &right, 900, 100, 1).is_ok());
         }
     }
     #[test]
     fn empty_and_aggregate_input_overflows_return_errors() {
         let (wallet, _) = Wallet::generate(Network::Testnet).unwrap();
-        assert!(matches!(wallet.build_tx(vec![], wallet.address(), u64::MAX, 1), Err(WalletError::Overflow)));
+        assert!(matches!(wallet.build_tx(vec![], wallet.address(), u64::MAX, 1, 1), Err(WalletError::Overflow)));
         let inputs = [u64::MAX, 1].into_iter().enumerate().map(|(index, value)| Utxo {
             txid:[1;32], index:index as u32, output:TxOutput { value, script_pubkey:wallet.address().hash().to_vec() }
         }).collect();
-        assert!(matches!(wallet.build_tx(inputs, wallet.address(), 1, 0), Err(WalletError::Overflow)));
+        assert!(matches!(wallet.build_tx(inputs, wallet.address(), 1, 0, 1), Err(WalletError::Overflow)));
     }
 }
 
@@ -1940,22 +2214,22 @@ mod audit_coin_selection_inputs {
         let destination = "ab".repeat(20);
         for length in [0, 1, 31, 33, 64] {
             let inputs = vec![(vec![1; length], 0, output(1000))];
-            assert!(TxBuilder::build(&keypair, &inputs, &destination, 900, 100)
+            assert!(TxBuilder::build(&keypair, &inputs, &destination, 900, 100, 1)
                 .err().unwrap().contains("exactly 32 bytes"));
         }
         let valid = vec![(vec![1; 32], 0, output(1000))];
         for destination in [String::new(), "ab".repeat(19), "ab".repeat(21), "zz".repeat(20)] {
-            assert!(TxBuilder::build(&keypair, &valid, &destination, 900, 100).is_err());
+            assert!(TxBuilder::build(&keypair, &valid, &destination, 900, 100, 1).is_err());
         }
         let repeated = vec![(vec![1; 32], 0, output(500)), (vec![1; 32], 0, output(500))];
-        assert!(TxBuilder::build(&keypair, &repeated, &destination, 900, 100)
+        assert!(TxBuilder::build(&keypair, &repeated, &destination, 900, 100, 1)
             .err().unwrap().contains("duplicate"));
         let overflow = vec![(vec![1; 32], 0, output(1)), (vec![2; 32], 0, output(u64::MAX))];
-        assert!(TxBuilder::build(&keypair, &overflow, &destination, u64::MAX, 0)
+        assert!(TxBuilder::build(&keypair, &overflow, &destination, u64::MAX, 0, 1)
             .err().unwrap().contains("overflow"));
         // Distinct output indices from the same transaction are legitimate.
         let distinct = vec![(vec![1; 32], 0, output(500)), (vec![1; 32], 1, output(500))];
-        let tx = TxBuilder::build(&keypair, &distinct, &destination, 900, 100).unwrap();
+        let tx = TxBuilder::build(&keypair, &distinct, &destination, 900, 100, 1).unwrap();
         assert_eq!(tx.inputs.len(), 2);
         assert_eq!(tx.outputs[0].value, 900);
         assert_eq!(tx.outputs[0].script_pubkey, vec![0xab; 20]);
@@ -1966,9 +2240,9 @@ mod audit_coin_selection_inputs {
         let (wallet, _) = Wallet::generate(Network::Testnet).unwrap();
         let utxo = |index| Utxo { txid: [3; 32], index,
             output: TxOutput { value: 500, script_pubkey: wallet.address().hash().to_vec() } };
-        assert!(matches!(wallet.build_tx(vec![utxo(0), utxo(0)], wallet.address(), 900, 100),
+        assert!(matches!(wallet.build_tx(vec![utxo(0), utxo(0)], wallet.address(), 900, 100, 1),
             Err(WalletError::Parse(message)) if message.contains("duplicate")));
-        let tx = wallet.build_tx(vec![utxo(0), utxo(1)], wallet.address(), 900, 100).unwrap();
+        let tx = wallet.build_tx(vec![utxo(0), utxo(1)], wallet.address(), 900, 100, 1).unwrap();
         assert_eq!(tx.inputs.len(), 2);
     }
 }
@@ -2002,10 +2276,10 @@ mod bloch_keystore_compat_tests {
     fn bloch_keystore_loads_under_its_gnb_address() {
         let dir = tempfile_dir();
         let kp = generate_keypair(false);
-        let gnb_path = dir.join("gnb.json");
-        kp.save_encrypted(&gnb_path, "correct horse battery 9!").unwrap();
-
-        let json = std::fs::read_to_string(&gnb_path).unwrap();
+        // Bloch (and GnB before the CRY-7 fix) wrote keystore v2; build one
+        // explicitly, since `save_encrypted` now writes v3.
+        let json = kp.to_encrypted_json_version("correct horse battery 9!", LEGACY_KEYSTORE_VERSION_V2).unwrap();
+        assert!(json.contains("\"version\": 2"));
         let body = kp.address.strip_prefix(crate::core::MAINNET_PREFIX).unwrap();
         let bloch_path = dir.join("bloch.json");
         std::fs::write(&bloch_path, json.replace(&kp.address, &format!("bloch1q{body}"))).unwrap();
@@ -2034,5 +2308,199 @@ mod bloch_keystore_compat_tests {
         let d = std::env::temp_dir().join(format!("gnb-bloch-ks-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+}
+
+#[cfg(test)]
+mod audit_2026_10_wallet_fixes {
+    use super::*;
+
+    const SAT: u64 = 100_000_000;
+    const PW: &str = "Audit-PoC-password-17!";
+
+    /// CRY-7 regression: keystore v3 authenticates network and address, so
+    /// the gnb1q -> gnb1t edit that a v2 file accepts makes v3 fail to open.
+    #[test]
+    fn keystore_v3_rejects_network_and_address_edits() {
+        let kp = generate_keypair(false);
+        let json = kp.to_encrypted_json(PW).unwrap();
+        assert!(json.contains("\"version\": 3"));
+        let loaded = Keypair::from_encrypted_bytes(json.as_bytes(), PW).unwrap();
+        assert_eq!(loaded.address, kp.address);
+        assert_eq!(loaded.private_key, kp.private_key);
+
+        let flipped = format!("gnb1t{}", &kp.address[5..]);
+        // Address prefix edited, network field left alone: refused up front.
+        let tampered = json.replace(&kp.address, &flipped);
+        assert!(Keypair::from_encrypted_bytes(tampered.as_bytes(), PW).is_err());
+        // Both fields edited consistently: the AEAD tag no longer verifies.
+        let tampered = tampered.replace("\"network\": \"mainnet\"", "\"network\": \"testnet\"");
+        assert_eq!(
+            Keypair::from_encrypted_bytes(tampered.as_bytes(), PW).unwrap_err(),
+            "decryption failed — wrong password or corrupted file"
+        );
+        // Downgrading the version to v2 (empty AAD) fails the same way.
+        let downgraded = json.replace("\"version\": 3", "\"version\": 2");
+        assert!(Keypair::from_encrypted_bytes(downgraded.as_bytes(), PW).is_err());
+    }
+
+    /// v2 keystores keep loading (documented residual risk: unauthenticated).
+    #[test]
+    fn keystore_v2_still_loads() {
+        let kp = generate_keypair(true);
+        let json = kp.to_encrypted_json_version(PW, LEGACY_KEYSTORE_VERSION_V2).unwrap();
+        let loaded = Keypair::from_encrypted_bytes(json.as_bytes(), PW).unwrap();
+        assert_eq!(loaded.address, kp.address);
+        assert_eq!(loaded.network().unwrap(), Network::Testnet);
+    }
+
+    /// WAL-1 regression: `Wallet::build_tx` refuses a fee equal to almost
+    /// all inputs, and no longer spends every UTXO it is handed (WAL-6).
+    #[test]
+    fn build_tx_enforces_the_fee_guard_and_selects_inputs() {
+        let (wallet, _) = Wallet::generate(Network::Testnet).unwrap();
+        let dest = Address::from_hash([9u8; 20], Network::Testnet);
+        let spk = wallet.address().hash().to_vec();
+        let utxos = vec![
+            Utxo { txid: [1; 32], index: 0, output: TxOutput { value: 50 * SAT, script_pubkey: spk.clone() } },
+            Utxo { txid: [2; 32], index: 0, output: TxOutput { value: 50 * SAT, script_pubkey: spk.clone() } },
+        ];
+        assert!(matches!(wallet.build_tx(utxos.clone(), &dest, 1, 100 * SAT - 1, 1),
+            Err(WalletError::FeeTooHigh(_))));
+        // An explicit override is honoured.
+        assert!(wallet.build_tx_with_policy(utxos.clone(), &dest, 1, 100 * SAT - 1, &FeePolicy::UNLIMITED, 1).is_ok());
+        // A normal payment spends one coin, not both.
+        let tx = wallet.build_tx(utxos.clone(), &dest, SAT, 50_000, 1).unwrap();
+        assert_eq!(tx.inputs.len(), 1);
+        assert_eq!(tx.outputs[1].value, 50 * SAT - SAT - 50_000);
+
+        // Signed payments report the actual fee.
+        let paid = wallet.build_payment(&utxos, &dest, SAT, &PaymentOptions { next_block_height: Some(1), ..PaymentOptions::default() }).unwrap();
+        assert_eq!(paid.tx.inputs.len(), 1);
+        assert_eq!(paid.inputs_total - paid.amount - paid.change, paid.fee);
+        assert!(paid.fee >= crate::core::tokenomics::min_tx_fee_sat(paid.size));
+    }
+
+    /// WAL-1 regression on the legacy builder: an explicit fee above the
+    /// guard is refused.
+    #[test]
+    fn tx_builder_build_enforces_the_fee_guard() {
+        let kp = generate_keypair(false);
+        let rows = vec![(vec![0xAB; 32], 0u32, TxOutput { value: 100 * SAT, script_pubkey: kp.address_bytes() })];
+        let err = TxBuilder::build(&kp, &rows, &"05".repeat(20), SAT, 99 * SAT, 1).unwrap_err();
+        assert!(err.contains("guard"), "{err}");
+    }
+
+    /// CRY-8: message signatures are chain-bound (v2) and v1 still verifies.
+    #[test]
+    fn message_signatures_are_chain_bound_and_v1_still_verifies() {
+        let kp = generate_keypair(false);
+        let sig = kp.sign_message(b"hello").unwrap();
+        assert!(Keypair::verify_message_on(Network::Mainnet, &kp.public_key, b"hello", &sig));
+        assert!(!Keypair::verify_message_on(Network::Testnet, &kp.public_key, b"hello", &sig));
+        assert!(Keypair::verify_message_canonical_on(Network::Mainnet, &kp.public_key, b"hello", &sig));
+        assert!(!crypto::verify(&kp.public_key, &crypto::signed_message_digest(b"hello"), &sig));
+        let v1 = kp.sign_message_v1(b"hello").unwrap();
+        assert!(Keypair::verify_message_on(Network::Testnet, &kp.public_key, b"hello", &v1));
+        assert!(Keypair::verify_message(&kp.public_key, b"hello", &v1));
+    }
+
+    /// CRY-5 through the wallet: a corrupted Falcon secret never signs.
+    #[test]
+    fn keypair_sign_fails_on_corrupted_falcon_secret() {
+        let mut kp = generate_keypair(false);
+        kp.private_key[crypto::SUITE_HEADER_LEN + crypto::MLDSA_SECRET_LEN] ^= 0xFF;
+        assert!(kp.sign(b"m").is_err());
+        let rows = vec![(vec![1; 32], 0u32, TxOutput { value: SAT, script_pubkey: kp.address_bytes() })];
+        assert!(TxBuilder::build(&kp, &rows, &"05".repeat(20), SAT / 2, 50_000, 1).is_err());
+    }
+
+    /// WAL-7: mnemonic-backed keypairs restore from their words.
+    #[test]
+    fn mnemonic_keypair_restores_from_its_words() {
+        let (kp, phrase) = generate_mnemonic_keypair(Network::Mainnet).unwrap();
+        let words = Zeroizing::new(phrase.words().join(" "));
+        assert_eq!(words.split_whitespace().count(), 24);
+        let restored = keypair_from_mnemonic(&words, Network::Mainnet).unwrap();
+        assert_eq!(restored.address, kp.address);
+        assert_eq!(restored.public_key, kp.public_key);
+        assert!(keypair_from_mnemonic("not a mnemonic", Network::Mainnet).is_err());
+    }
+
+    /// CRY-4: the bip39 mnemonic type now wipes itself on drop.
+    #[test]
+    fn bip39_mnemonic_has_a_wiping_destructor() {
+        assert!(std::mem::needs_drop::<bip39::Mnemonic>());
+    }
+}
+
+#[cfg(test)]
+mod sighash_v3_signers {
+    //! WAL-1 full fix / CRY-1 / CRY-2 on the detached signers: `Wallet`
+    //! and `Keypair` produce sighash-v3 transactions that pass the shared
+    //! consensus input-script rule (`core::sighash::verify_tx_scripts`).
+    use super::*;
+    use crate::core::sighash::{self, SighashVersion};
+    use crate::core::{activation, ChainId};
+
+    const SAT: u64 = 100_000_000;
+
+    #[test]
+    fn wallet_signs_v3_with_prevouts_and_refuses_v3_without() {
+        let (wallet, _) = Wallet::generate(Network::Testnet).unwrap();
+        let spk = wallet.address().hash().to_vec();
+        let utxos = vec![
+            Utxo { txid: [1; 32], index: 0, output: TxOutput { value: 2 * SAT, script_pubkey: spk.clone() } },
+            Utxo { txid: [2; 32], index: 3, output: TxOutput { value: 3 * SAT, script_pubkey: spk.clone() } },
+        ];
+        let dest = Address::from_hash([9u8; 20], Network::Testnet);
+        // Testnet activates at 0: version 3.
+        let tx = wallet.build_tx(utxos.clone(), &dest, 4 * SAT, 100_000, 7).unwrap();
+        assert_eq!(tx.version, 3);
+        assert!(matches!(wallet.sign_tx(tx.clone()), Err(WalletError::Payment(m)) if m.contains("sign_tx_with_prevouts")));
+        let spent: Vec<TxOutput> = tx.inputs.iter()
+            .map(|i| utxos.iter().find(|u| u.txid == i.prev_txid).unwrap().output.clone())
+            .collect();
+        let signed = wallet.sign_tx_with_prevouts(tx, &spent).unwrap();
+        assert_eq!(sighash::verify_tx_scripts(&signed, &spent, ChainId::Testnet, 7, 0), Ok(SighashVersion::V3));
+        for input in &signed.inputs {
+            assert!(sighash::canonical_witness(&input.script_sig).is_ok());
+        }
+        // Mainnet below its activation: version 1, the historical signer.
+        let (main, _) = Wallet::generate(Network::Mainnet).unwrap();
+        let mspk = main.address().hash().to_vec();
+        let mutxo = vec![Utxo { txid: [5; 32], index: 0, output: TxOutput { value: 2 * SAT, script_pubkey: mspk } }];
+        let tx = main.build_tx(mutxo.clone(), &Address::from_hash([9u8; 20], Network::Mainnet), SAT, 100_000, 7).unwrap();
+        assert_eq!(tx.version, 1);
+        let signed = main.sign_tx(tx).unwrap();
+        assert_eq!(sighash::verify_tx_scripts(&signed, &[mutxo[0].output.clone()], ChainId::Mainnet, 7,
+            activation::MAINNET_HARDENING_ACTIVATION_HEIGHT), Ok(SighashVersion::V2));
+    }
+
+    /// A genesis carry-over key (raw, pre-envelope public AND secret key; the
+    /// address commits to the raw key) still spends under sighash v3: the
+    /// public key is not forced into an envelope, the signature is enveloped.
+    #[test]
+    fn raw_carryover_key_spends_under_v3() {
+        use sha3::{Digest, Sha3_256};
+        let (pk_env, sk_env) = crypto::generate_keypair();
+        let raw_pk = pk_env[4..].to_vec();
+        let kp = Keypair {
+            private_key: sk_env[4..].to_vec(),
+            public_key: raw_pk.clone(),
+            address: crypto::address_from_pubkey(&raw_pk, true),
+        };
+        let spk = Sha3_256::digest(&raw_pk)[..20].to_vec();
+        assert_eq!(spk, kp.address_bytes());
+        let utxo = Utxo { txid: [0xCA; 32], index: 0, output: TxOutput { value: 5 * SAT, script_pubkey: spk } };
+        let opts = PaymentOptions { next_block_height: Some(1), ..PaymentOptions::default() };
+        let paid = TxBuilder::build_payment(&kp, std::slice::from_ref(&utxo),
+            &Address::from_hash([3; 20], Network::Testnet), SAT, &opts).unwrap();
+        assert_eq!(paid.tx.version, 3);
+        let (sig, pk) = Transaction::parse_script_sig_exact(&paid.tx.inputs[0].script_sig).unwrap();
+        assert_eq!(pk, &raw_pk[..], "the raw key goes into the witness unchanged");
+        assert!(crypto::split_envelope(sig).is_some(), "the signature carries its suite envelope");
+        assert_eq!(sighash::verify_tx_scripts(&paid.tx, &[utxo.output], ChainId::Testnet, 1, 0),
+            Ok(SighashVersion::V3));
     }
 }

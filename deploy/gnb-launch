@@ -1,10 +1,39 @@
 #!/bin/sh
 # Launcher for gnb-node.service: expands GNB_PEERS into repeated --peer flags.
-set -eu
+#
+# GNB_PEERS is a whitespace-separated list of multiaddrs. It is split on
+# whitespace only, with pathname expansion disabled (`set -f`), and each word
+# must look like a multiaddr, so a value can never expand into file names or
+# smuggle extra options into the node's argument list.
+set -euf
+die() { echo "gnb-launch: $*" >&2; exit 64; }
+
+[ -n "${GNB_CARRYOVER:-}" ] || die "GNB_CARRYOVER is not set"
 set -- --data-dir /var/lib/gnb --carryover-snapshot "$GNB_CARRYOVER" \
        --listen /ip4/0.0.0.0/tcp/17110 --archive
 if [ -n "${GNB_MINER_ADDRESS:-}" ]; then
-  set -- "$@" --mine --miner-address "$GNB_MINER_ADDRESS" --mine-threads "${GNB_MINE_THREADS:-4}"
+  threads=${GNB_MINE_THREADS:-4}
+  case $threads in
+    ''|*[!0-9]*) die "GNB_MINE_THREADS must be a decimal number, got '$threads'" ;;
+  esac
+  case $GNB_MINER_ADDRESS in
+    *[!A-Za-z0-9]*) die "GNB_MINER_ADDRESS must be alphanumeric" ;;
+  esac
+  set -- "$@" --mine --miner-address "$GNB_MINER_ADDRESS" --mine-threads "$threads"
 fi
-for p in ${GNB_PEERS:-}; do set -- "$@" --peer "$p"; done
+
+old_ifs=$IFS
+IFS=$(printf ' \t\nx'); IFS=${IFS%x}   # space, tab, newline
+for p in ${GNB_PEERS:-}; do
+  case $p in
+    /*) ;;
+    *) die "GNB_PEERS entry '$p' is not a multiaddr (must start with /)" ;;
+  esac
+  case $p in
+    *[!A-Za-z0-9./:_-]*) die "GNB_PEERS entry '$p' contains characters outside a multiaddr" ;;
+  esac
+  set -- "$@" --peer "$p"
+done
+IFS=$old_ifs
+
 exec /opt/gnb/bin/gnb "$@"

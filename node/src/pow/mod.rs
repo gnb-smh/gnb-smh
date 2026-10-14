@@ -4,23 +4,27 @@
 //! - Validation goes through `Block::validate_pow` (gnb-crypto), which runs
 //!   GnB-SMH v1 at the canonical 64 MiB parameter and caches verified block ids.
 //! - Difficulty goes through [`expected_bits`], ASERT anchored at genesis, a
-//!   pure function of the selected parent's (height, timestamp). The validator,
-//!   the internal miner and `getblocktemplate` all call it.
+//!   pure function of the parent set: the latest timestamp over ALL parents
+//!   and the height max(parent heights) + 1 (not the GhostDAG selected
+//!   parent's; see docs/CONSENSUS.md). The validator, the internal miner and
+//!   `getblocktemplate` all call it.
 //! - Mining here is a plain CPU search: one 64 MiB scratchpad per thread,
 //!   disjoint nonce ranges, cooperative stop flag.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 
-/// Chain-work contribution of a block at compact `bits` (≈ 2^256 / target).
+/// Chain-work contribution of a block at compact `bits` (≈ 2^256 / target;
+/// exact definition: `gnb_smh::difficulty::work`).
 #[inline]
 pub fn work_from_bits(bits: u32) -> u128 {
     gnb_crypto::core::bits_to_work(bits)
 }
 
-/// Expected `bits` for the block at `height` whose selected parent has
-/// timestamp `parent_timestamp`. CONSENSUS-CRITICAL: miner and validator must
-/// call exactly this.
+/// Expected `bits` for the block at `height` (= max parent height + 1) whose
+/// parents' LATEST timestamp is `parent_timestamp` (see
+/// `core::difficulty_parent_timestamp`). CONSENSUS-CRITICAL: miner and
+/// validator must call exactly this.
 #[inline]
 pub fn expected_bits(parent_timestamp: u64, height: u64) -> Result<u32, String> {
     gnb_crypto::core::expected_bits(parent_timestamp, height)

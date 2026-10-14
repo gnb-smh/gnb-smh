@@ -32,5 +32,8 @@ wasm32-unknown-unknown-openbsd-libc = "0.2"
 # G3: `tests/vendor_pin.rs` recomputes and checks the VENDOR.toml hash pin
 # over the vendored PQClean C sources (cfiles/, include/).
 sha2 = "0.10"
-toml = "0.8"
+# toml 1.x (not 0.8): shares toml_datetime/toml_parser/winnow 1.x with the
+# rest of the workspace graph, so deny.toml's `multiple-versions = "deny"`
+# needs no new skip now that this crate is a workspace member.
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
 serde = { version = "1", features = ["derive"] }

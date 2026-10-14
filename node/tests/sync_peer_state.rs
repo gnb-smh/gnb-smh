@@ -101,16 +101,20 @@ fn observe_with_empty_tips_preserves_prior_tips_but_bumps_hints() {
     assert_eq!(snap[0].1.announced_height, 9);
 }
 
+/// NET-6 (audit): this test used to pin MONOTONIC hints ("a lower announced
+/// score must not lower the stored hint") — the property that let one
+/// inflated claim latch `best_announced` for the connection's lifetime. It now
+/// pins the fixed behaviour: the stored hint is the peer's LATEST claim.
 #[test]
-fn observe_hints_are_monotonic_never_regress() {
+fn observe_hints_track_latest_claim_not_monotonic_max() {
     let t = PeerStateTable::new();
     let p = PeerId::random();
     t.observe(p, 100, 50, &[], Instant::now());
-    // A lower announced score must not lower the stored hint.
+    // A later, lower claim replaces the earlier one (no monotonic max).
     t.observe(p, 10, 5, &[], Instant::now());
     let snap = t.snapshot();
-    assert_eq!(snap[0].1.announced_blue_score, 100);
-    assert_eq!(snap[0].1.announced_height, 50);
+    assert_eq!(snap[0].1.announced_blue_score, 10);
+    assert_eq!(snap[0].1.announced_height, 5);
 }
 
 // ── connected_advertised_tips ─────────────────────────────────────────────────

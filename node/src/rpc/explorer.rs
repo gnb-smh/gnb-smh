@@ -26,6 +26,11 @@ fn chain_cache() -> &'static parking_lot::Mutex<Option<ChainCache>> {
 }
 
 /// Run `f` with an up-to-date selected-chain cache.
+///
+/// NET-15: `f` runs while the DAG read lock is held, so it must only read
+/// DAG data (copying what it needs). Every storage (RocksDB) access happens
+/// after `with_chain` returns, so a slow disk read can no longer hold the
+/// lock that `accept_block` needs to write.
 fn with_chain<R>(state: &AppState, f: impl FnOnce(&ChainCache, &GhostDAG) -> R) -> Option<R> {
     let dag = state.dag.read();
     let tip = dag.selected_tip()?;
@@ -141,8 +146,23 @@ fn colour_of(c: &ChainCache, dag: &GhostDAG, hash: &[u8; 32], data: &GhostdagDat
     ("pending", None)
 }
 
-fn block_summary(state: &AppState, dag: &GhostDAG, hash: &[u8; 32]) -> Value {
-    let d = dag.get_block_data(hash);
+/// The DAG facts a block summary shows, copied out under the DAG lock.
+#[derive(Clone, Copy)]
+struct DagFacts { height: u64, blue_score: u64, timestamp: u64, parents: usize, merged: usize, reds: usize }
+
+fn dag_facts(dag: &GhostDAG, hash: &[u8; 32]) -> Option<DagFacts> {
+    dag.get_block_data(hash).map(|d| DagFacts {
+        height: d.height,
+        blue_score: d.blue_score,
+        timestamp: d.timestamp,
+        parents: d.parents.len(),
+        merged: d.mergeset_blues.len() + d.mergeset_reds.len(),
+        reds: d.mergeset_reds.len(),
+    })
+}
+
+/// Storage half of a block summary; call without the DAG lock (NET-15).
+fn block_summary(state: &AppState, hash: &[u8; 32], d: Option<DagFacts>) -> Value {
     let b = state.store.get_block(hash).ok().flatten();
     let cb = b.as_ref().and_then(|b| b.transactions.first());
     json!({
@@ -150,9 +170,9 @@ fn block_summary(state: &AppState, dag: &GhostDAG, hash: &[u8; 32]) -> Value {
         "height":     d.map(|d| d.height),
         "blue_score": d.map(|d| d.blue_score),
         "timestamp":  d.map(|d| d.timestamp),
-        "parents":    d.map(|d| d.parents.len()),
-        "merged":     d.map(|d| d.mergeset_blues.len() + d.mergeset_reds.len()),
-        "reds":       d.map(|d| d.mergeset_reds.len()),
+        "parents":    d.map(|d| d.parents),
+        "merged":     d.map(|d| d.merged),
+        "reds":       d.map(|d| d.reds),
         "tx_count":   b.as_ref().map(|b| b.transactions.len()),
         "size":       b.as_ref().map(|b| b.size_bytes()),
         "bits":       b.as_ref().map(|b| format!("0x{:08x}", b.header.bits)),
@@ -166,12 +186,16 @@ fn block_summary(state: &AppState, dag: &GhostDAG, hash: &[u8; 32]) -> Value {
 pub(super) fn get_selected_chain(params: Option<&Value>, state: &AppState) -> Value {
     let offset = params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let count = (params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).unwrap_or(25) as usize).clamp(1, MAX_PAGE);
-    with_chain(state, |c, dag| {
-        let len = c.chain.len();
-        let blocks: Vec<Value> = c.chain.iter().rev().skip(offset).take(count)
-            .map(|h| block_summary(state, dag, h)).collect();
-        json!({ "chain_length": len, "offset": offset, "blocks": blocks })
-    }).unwrap_or_else(|| json!({ "error": "no selected tip yet" }))
+    // NET-15: copy the page's DAG facts under the lock, read storage after.
+    let Some((len, page)) = with_chain(state, |c, dag| {
+        let page: Vec<([u8; 32], Option<DagFacts>)> = c.chain.iter().rev().skip(offset).take(count)
+            .map(|h| (*h, dag_facts(dag, h))).collect();
+        (c.chain.len(), page)
+    }) else {
+        return json!({ "error": "no selected tip yet" });
+    };
+    let blocks: Vec<Value> = page.iter().map(|(h, d)| block_summary(state, h, *d)).collect();
+    json!({ "chain_length": len, "offset": offset, "blocks": blocks })
 }
 
 /// `getblockdag [hash]` — header, GhostDAG data, colour and full transactions.
@@ -179,14 +203,22 @@ pub(super) fn get_block_dag(params: Option<&Value>, state: &AppState) -> Value {
     let Some(hash) = parse_hash(params.and_then(|p| p.get(0))) else {
         return json!({ "error": "invalid block hash" });
     };
-    with_chain(state, |c, dag| {
-        let Some(d) = dag.get_block_data(&hash) else {
-            return json!({ "error": "block not found" });
-        };
+    // NET-15: DAG facts are copied under the lock; the block body and every
+    // per-input storage lookup in `tx_json` run after it is released.
+    let facts = with_chain(state, |c, dag| {
+        let d = dag.get_block_data(&hash)?;
         let (colour, merged_by) = colour_of(c, dag, &hash, d);
         let tip_score = c.chain.last().and_then(|t| dag.get_block_data(t)).map(|t| t.blue_score).unwrap_or(0);
-        let block = state.store.get_block(&hash).ok().flatten();
         let next_chain = c.pos.get(&hash).and_then(|&p| c.chain.get(p + 1)).map(hex32);
+        Some((d.clone(), colour, merged_by, tip_score, next_chain))
+    });
+    let (d, colour, merged_by, tip_score, next_chain) = match facts {
+        None => return json!({ "error": "no selected tip yet" }),
+        Some(None) => return json!({ "error": "block not found" }),
+        Some(Some(f)) => f,
+    };
+    let block = state.store.get_block(&hash).ok().flatten();
+    {
         json!({
             "hash":            hex32(&hash),
             "height":          d.height,
@@ -210,7 +242,85 @@ pub(super) fn get_block_dag(params: Option<&Value>, state: &AppState) -> Value {
             "size":            block.as_ref().map(|b| b.size_bytes()),
             "transactions":    block.as_ref().map(|b| b.transactions.iter().map(|t| tx_json(state, t)).collect::<Vec<_>>()),
         })
-    }).unwrap_or_else(|| json!({ "error": "no selected tip yet" }))
+    }
+}
+
+/// Selected-chain blocks from the tip backwards, at most `n`, as
+/// `(hash, height, timestamp)`. An O(n) walk of selected parents under a
+/// short DAG read lock; no storage access (NET-12/NET-15).
+fn chain_tail(state: &AppState, n: usize) -> Vec<([u8; 32], u64, u64)> {
+    let dag = state.dag.read();
+    let mut out = Vec::with_capacity(n.min(4096));
+    let mut cur = dag.selected_tip();
+    while let Some(h) = cur {
+        if out.len() >= n { break; }
+        let Some(d) = dag.get_block_data(&h) else { break };
+        out.push((h, d.height, d.timestamp));
+        cur = d.selected_parent;
+    }
+    out
+}
+
+/// Upper bound on blocks read by `getdifficultyhistory`, per point asked.
+const DIFFICULTY_SCAN_PER_POINT: usize = 4;
+
+/// `getdifficultyhistory [limit=20]` — the last `limit` (≤ 100) changes of
+/// `bits` along the selected chain, newest first.
+///
+/// NET-12: reads at most `4 × limit` chain blocks (was: every stored block
+/// body, decoded and sorted on every call).
+pub(super) fn get_difficulty_history(params: Option<&Value>, state: &AppState) -> Value {
+    let limit = (params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(20) as usize).clamp(1, 100);
+    let tail = chain_tail(state, limit * DIFFICULTY_SCAN_PER_POINT);
+    let mut items: Vec<Value> = Vec::new();
+    let mut last_bits: Option<u32> = None;
+    for (hash, height, timestamp) in tail {
+        let Ok(Some(block)) = state.store.get_block(&hash) else { continue };
+        let bits = block.header.bits;
+        if last_bits != Some(bits) {
+            items.push(json!({
+                "height":     height,
+                "bits":       bits,
+                "bits_hex":   format!("0x{:08x}", bits),
+                "timestamp":  timestamp,
+                "target_hex": hex::encode(crate::core::bits_to_target(bits)),
+            }));
+            last_bits = Some(bits);
+            if items.len() >= limit { break; }
+        }
+    }
+    json!({ "count": items.len(), "points": items })
+}
+
+/// `getblocktimepercentiles [window=100]` — block-interval statistics over
+/// the last `window` (10..=1000) selected-chain blocks.
+///
+/// NET-12: an O(window) walk of in-memory DAG data (was: every stored block
+/// body, decoded and sorted on every call).
+pub(super) fn get_block_time_percentiles(params: Option<&Value>, state: &AppState) -> Value {
+    let window = (params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(100) as usize).clamp(10, 1000);
+    let tail = chain_tail(state, window + 1);
+    let mut deltas: Vec<u64> = tail.windows(2).map(|w| w[0].2.saturating_sub(w[1].2)).collect();
+    deltas.sort_unstable();
+    let n = deltas.len();
+    let (min, p50, p90, p99, max, avg) = if n == 0 {
+        (0, 0, 0, 0, 0, 0.0)
+    } else {
+        let p = |pct: f64| deltas[(((n - 1) as f64 * pct).round() as usize).min(n - 1)];
+        let sum: u64 = deltas.iter().fold(0u64, |a, d| a.saturating_add(*d));
+        (deltas[0], p(0.50), p(0.90), p(0.99), deltas[n - 1], sum as f64 / n as f64)
+    };
+    json!({
+        "sample_size":  n,
+        "window":       window,
+        "min_secs":     min,
+        "p50_secs":     p50,
+        "p90_secs":     p90,
+        "p99_secs":     p99,
+        "max_secs":     max,
+        "avg_secs":     avg,
+        "target_secs":  crate::core::TARGET_BLOCK_TIME,
+    })
 }
 
 /// `gettransactionfull [txid]` — transaction with resolved inputs and its block.

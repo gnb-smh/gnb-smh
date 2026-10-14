@@ -193,6 +193,12 @@ const HEAVY_READ_METHODS: &[&str] = &[
     "gethashrate",
     "getaddresscount",
     "getaddressbalance_at_height",
+    // NET-12: chain-walking explorer reads. Both are now bounded walks of
+    // the selected chain (see `explorer::get_difficulty_history` /
+    // `explorer::get_block_time_percentiles`) instead of decoding every
+    // block body, and additionally share the single-flight TTL cache.
+    "getdifficultyhistory",
+    "getblocktimepercentiles",
     // L-8 (audit): `getblocktemplate` is expensive and stateful: it is
     // privileged (see
     // `auth::WRITE_METHODS`) and now shares the same short-TTL/single-flight
@@ -200,6 +206,59 @@ const HEAVY_READ_METHODS: &[&str] = &[
     // loop and force a fresh mempool drain + ancestry walk every time" cost.
     "getblocktemplate",
 ];
+
+/// NET-13: every method name `dispatch` implements. Metrics label anything
+/// else as `"unknown"`, so a caller cannot mint unbounded Prometheus label
+/// values, and logs show at most [`MAX_LOGGED_METHOD_LEN`] bytes of it.
+/// `known_methods_list_matches_dispatch` keeps this list in sync.
+const KNOWN_RPC_METHODS: &[&str] = &[
+    "getnetworkinfo", "getblockcount", "getmempoolinfo", "getblockhash", "getblock",
+    "getblockbyheight", "getrecentblocks", "gettransaction", "getrawtransaction", "getbalance",
+    "getaddresscount", "getutxos", "sendrawtransaction", "validateaddress", "estimatefee",
+    "getrawmempool", "decoderawtransaction", "getblocktemplate", "submitblock", "getdaginfo",
+    "listtransactions", "getpeerinfo", "getpeers", "getsupplyinfo", "getchainstats",
+    "getsupplydistribution", "getselectedchain", "getblockdag", "gettransactionfull",
+    "getdagwindow", "getaddresshistory", "getrichlist", "gethashrate", "getdifficultyhistory",
+    "getblocktimepercentiles", "gettxstatus", "getaddressinfo", "estimatefeeadvanced",
+    "getmempoolstats", "validateaddressverbose", "gettxsbyblock", "getaddressbalance_at_height",
+    "getattestation",
+];
+
+/// Longest method-name prefix written to a log line (NET-13).
+const MAX_LOGGED_METHOD_LEN: usize = 48;
+
+/// NET-16: pause before answering a request that failed authentication, so
+/// key guessing is slow even from loopback (which skips the rate limiter).
+const FAILED_AUTH_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Bounded metrics label for a method name (NET-13).
+pub fn method_label(method: &str) -> &'static str {
+    KNOWN_RPC_METHODS.iter().copied().find(|m| *m == method).unwrap_or("unknown")
+}
+
+/// Log-safe form of a caller-supplied method name: known names verbatim,
+/// anything else truncated and debug-escaped (no control characters).
+fn method_for_log(method: &str) -> String {
+    match KNOWN_RPC_METHODS.iter().find(|m| **m == method) {
+        Some(m) => (*m).to_string(),
+        None => format!("{:?}", crate::network::truncate_utf8(method, MAX_LOGGED_METHOD_LEN)),
+    }
+}
+
+/// NET-14: resolve a configured bind address (`127.0.0.1`, `0.0.0.0`,
+/// `::1`, `[::1]`, `localhost`) and port into a socket address, with a
+/// clear error instead of a failure deep inside the server task.
+pub fn resolve_bind_address(host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    let bare = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, port));
+    }
+    use std::net::ToSocketAddrs;
+    (bare, port).to_socket_addrs()
+        .map_err(|e| format!("cannot resolve bind address {host:?}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("bind address {host:?} resolves to nothing"))
+}
 
 /// TTL for cached heavy-read results. Analytics freshness of ~1 block is fine.
 const HEAVY_READ_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -304,7 +363,16 @@ pub async fn start_rpc_server(
     // B5f pool seam — see `SubmitBlockFn`.
     submit_block: Option<Arc<SubmitBlockFn>>,
 ) {
-    let addr = format!("{}:{}", config.bind_address, config.port);
+    // NET-14: `format!("{host}:{port}")` could not express IPv6 hosts such as
+    // `::1`; resolve explicitly and report a bad address clearly. main.rs
+    // validates the same way at start-up, before the node starts.
+    let addr = match resolve_bind_address(&config.bind_address, config.port) {
+        Ok(a) => a,
+        Err(e) => {
+            error!("RPC: {}; the RPC service is not running (the node keeps running)", e);
+            return;
+        }
+    };
 
     // L-6 (audit): validate the configured key BEFORE it is ever compared
     // against anything, regardless of how the caller sourced it
@@ -388,9 +456,12 @@ pub async fn start_rpc_server(
         config.rate_limit_reads_per_min,
         config.rate_limit_writes_per_min,
     );
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
+    let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l)  => l,
-        Err(e) => { error!("RPC bind: {}", e); return; }
+        Err(e) => {
+            error!("RPC bind {} failed: {}; the RPC service is not running (the node keeps running)", addr, e);
+            return;
+        }
     };
     // Sprint M: connect_info makes the client IP available to handlers.
     if let Err(e) = axum::serve(
@@ -500,6 +571,9 @@ async fn handle_rpc(
     }
 
     let method = req["method"].as_str().unwrap_or("");
+    // NET-13: bounded label for metrics/spans, truncated form for logs.
+    let label = method_label(method);
+    let method_log = method_for_log(method);
     // L-10 (audit): the `id` used to be echoed back completely unbounded —
     // a ~1 MiB `id` string in the request produced a ~1 MiB response, at
     // zero cost to the attacker and real memory pressure for the node.
@@ -523,9 +597,11 @@ async fn handle_rpc(
         &state.allowed_hosts,
         &state.allowed_origins,
     ) {
-        crate::metrics::inc_rpc_request(method, "forbidden");
+        crate::metrics::inc_rpc_request(label, "forbidden");
         log::info!("rpc denied ip={} method={} reason={:?} host={:?} origin={:?}",
-            client_ip, method, refusal, host_hdr, origin_hdr);
+            client_ip, method_log, refusal,
+            host_hdr.map(|h| crate::network::truncate_utf8(h, 128)),
+            origin_hdr.map(|o| crate::network::truncate_utf8(o, 128)));
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -630,7 +706,7 @@ async fn handle_rpc(
             let result = tokio::select! {
                 r = join_handle.instrument(tracing::info_span!(
                     "rpc_request",
-                    method,
+                    method = label,
                     client_ip = %client_ip,
                     id = %id,
                 )) => {
@@ -645,24 +721,26 @@ async fn handle_rpc(
                         "rpc dispatch timed out for method={} ip={} after {:?}; aborted \
                          (queued work is cancelled; already-running work finishes in the \
                          background but this response does not wait for it)",
-                        method, client_ip, DISPATCH_INNER_TIMEOUT
+                        method_log, client_ip, DISPATCH_INNER_TIMEOUT
                     );
                     json!({ "error": "internal dispatch timeout" })
                 }
             };
             let elapsed = start.elapsed();
             let elapsed_ms = elapsed.as_millis();
-            crate::metrics::observe_rpc_latency(method, elapsed.as_secs_f64());
-            crate::metrics::inc_rpc_request(method, "ok");
-            log::debug!("rpc ok ip={} method={} took={}ms", client_ip, method, elapsed_ms);
+            crate::metrics::observe_rpc_latency(label, elapsed.as_secs_f64());
+            crate::metrics::inc_rpc_request(label, "ok");
+            log::debug!("rpc ok ip={} method={} took={}ms", client_ip, method_log, elapsed_ms);
             (
                 StatusCode::OK,
                 Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
             )
         }
         auth::AuthDecision::Unauthorized => {
-            crate::metrics::inc_rpc_request(method, "unauthorized");
-            log::info!("rpc denied ip={} method={} reason=unauthorized", client_ip, method);
+            crate::metrics::inc_rpc_request(label, "unauthorized");
+            log::info!("rpc denied ip={} method={} reason=unauthorized", client_ip, method_log);
+            // NET-16: slow down key guessing (async sleep: no worker blocked).
+            tokio::time::sleep(FAILED_AUTH_DELAY).await;
             (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({
@@ -673,8 +751,8 @@ async fn handle_rpc(
             )
         }
         auth::AuthDecision::RateLimited => {
-            crate::metrics::inc_rpc_request(method, "rate_limited");
-            log::info!("rpc denied ip={} method={} reason=rate_limited", client_ip, method);
+            crate::metrics::inc_rpc_request(label, "rate_limited");
+            log::info!("rpc denied ip={} method={} reason=rate_limited", client_ip, method_log);
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(json!({
@@ -866,6 +944,47 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             }
         }
 
+        // ── Wallet: raw transaction bytes (WAL-1) ────────────────────
+        //
+        // Read-only. Returns the wire bytes (`to_wire_bytes(true)`) of a
+        // transaction so a wallet can hash them, compare the result with
+        // the txid of a UTXO it is about to spend, and read the output's
+        // value from a source it does not have to trust. Outputs of the
+        // genesis carryover have no creating transaction, and pruned nodes
+        // lose old bodies: both answer with an error and the wallet treats
+        // the input as unverified.
+        "getrawtransaction" => {
+            let txid_hex = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            let Some(txid) = hex::decode(txid_hex).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) else {
+                return json!({ "error": "invalid txid" });
+            };
+            if let Some(entry) = state.mempool.get_entry(&txid) {
+                return json!({
+                    "txid":       hex::encode(txid),
+                    "hex":        hex::encode(entry.tx.to_wire_bytes(true)),
+                    "in_mempool": true,
+                });
+            }
+            match state.store.get_tx_location(&txid) {
+                Ok(Some((block_hash, height))) => match state.store.get_block(&block_hash) {
+                    Ok(Some(block)) => match block.transactions.iter().find(|t| t.txid() == txid) {
+                        Some(tx) => json!({
+                            "txid":         hex::encode(txid),
+                            "hex":          hex::encode(tx.to_wire_bytes(true)),
+                            "block_hash":   hex::encode(block_hash),
+                            "block_height": height,
+                            "in_mempool":   false,
+                        }),
+                        None => json!({ "error": "tx index stale" }),
+                    },
+                    Ok(None) => json!({ "error": "transaction body not available (block pruned)" }),
+                    Err(e)   => storage_err_response(&e),
+                },
+                Ok(None) => json!({ "error": "transaction not found" }),
+                Err(e)   => storage_err_response(&e),
+            }
+        }
+
         // ── Wallet: balance query ────────────────────────────────────
         "getbalance" => {
             let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
@@ -907,29 +1026,32 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // thousands of UTXOs (e.g. the carry-over founder set) otherwise serializes
             // a multi-MB response that overflows clients; a spender only needs enough
             // UTXOs to cover the amount, so it can pass a small limit.
-            let limit = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).map(|n| n as usize);
+            //
+            // NET-12: the limit is applied WHILE walking the address index
+            // (the old code loaded every UTXO of the address first), and a
+            // request without a limit is capped at GETUTXOS_MAX. When the
+            // walk stops early `truncated` is true and `utxo_count` /
+            // `satoshis` cover the returned UTXOs only; `getbalance` gives
+            // the address totals.
+            const GETUTXOS_MAX: usize = 10_000;
+            let limit = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64())
+                .map(|n| usize::try_from(n).unwrap_or(usize::MAX).min(GETUTXOS_MAX))
+                .unwrap_or(GETUTXOS_MAX);
             let addr_bytes = parse_address(addr);
             match addr_bytes {
-                Some(ab) => match state.store.get_utxos_for_address(&ab) {
-                    Ok(utxos) => {
-                        let total: u64 = utxos.iter().map(|(_, _, o)| o.value).sum();
-                        let full_count = utxos.len();
-                        let iter = utxos.iter();
-                        let list: Vec<Value> = match limit {
-                            // R3: `value` is a satoshi amount → decimal string.
-                            Some(n) => iter.take(n).map(|(txid, idx, out)| json!({
-                                "txid": hex::encode(txid), "index": idx,
-                                "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
-                            })).collect(),
-                            None => iter.map(|(txid, idx, out)| json!({
-                                "txid": hex::encode(txid), "index": idx,
-                                "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
-                            })).collect(),
-                        };
+                Some(ab) => match state.store.get_utxos_for_address_limited(&ab, limit) {
+                    Ok((utxos, truncated)) => {
+                        let total: u64 = utxos.iter().map(|(_, _, o)| o.value).fold(0u64, u64::saturating_add);
+                        // R3: `value` is a satoshi amount → decimal string.
+                        let list: Vec<Value> = utxos.iter().map(|(txid, idx, out)| json!({
+                            "txid": hex::encode(txid), "index": idx,
+                            "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
+                        })).collect();
                         json!({
                             "address":    addr,
-                            "utxo_count": full_count,
+                            "utxo_count": list.len(),
                             "returned":   list.len(),
+                            "truncated":  truncated,
                             "satoshis":   total.to_string(),
                             "gnb":       total as f64 / 1e8,
                             "utxos":      list,
@@ -946,48 +1068,41 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             match hex::decode(hex_tx) {
                 Err(_)   => json!({ "error": "invalid hex" }),
                 // Sprint 1.d: Bitcoin-format tx bytes (replaces bincode).
-                // Wallet clients now send stratum_bytes(include_script_sig=true).
-                Ok(raw)  => match Transaction::from_wire_bytes(&raw) {
+                // Wallet clients send stratum_bytes(include_script_sig=true).
+                // MEM-5: strict decode — trailing bytes are refused.
+                Ok(raw)  => match crate::mempool::admission::decode_tx_strict(&raw) {
                     Err(_)  => json!({ "error": "deserialise failed" }),
                     Ok(tx)  => {
                         if tx.is_coinbase() { return json!({ "error": "coinbase not accepted" }); }
-                        // MUST be a height. This fed check_coinbase_maturity
-                        // (VULN-03) bound to the DAG's block COUNT, which on
-                        // 2026-08-13 exceeded the chain height by 10,769 — so
-                        // `current_height - coinbase_height` was inflated by the
-                        // same amount and EVERY coinbase looked mature on
-                        // admission, whatever the 100-block rule says. The
-                        // comment below this call still asserted the two were
-                        // equal; in a chain they are, in a BlockDAG they are not,
-                        // because parallel blocks are kept rather than orphaned.
-                        let current_height = selected_tip_height(&state);
-                        // P0 (roadmap §1.2 / §2.5 #6): PQ signature verification is
-                        // CPU-bound. Run it on the blocking pool so a flood of
-                        // valid-but-expensive txs on this RPC can't stall the async
-                        // reactor. Verification LOGIC is unchanged — only the thread
-                        // it runs on. Costs one Transaction clone per call.
+                        // MEM-1/4/5: the SAME admission function as gossip and
+                        // reorg re-injection. Version and maturity are evaluated
+                        // at the next block's height (the node's next template
+                        // height, `pool_next_height`, also reported by
+                        // getdaginfo) — never the DAG block COUNT, which on
+                        // 2026-08-13 exceeded the chain height by 10,769 and
+                        // made every coinbase look mature. P0: PQ signature
+                        // verification is CPU-bound, so it runs on the blocking
+                        // pool.
+                        let next_height = crate::mempool::admission::pool_next_height(
+                            &state.dag.read(), &state.store, &state.mempool);
                         let store_v = state.store.clone();
-                        let tx_v = tx.clone();
-                        let verified = tokio::task::spawn_blocking(move || {
-                            validate_tx_for_mempool(&tx_v, &store_v, current_height)
+                        let mempool_v = state.mempool.clone();
+                        let txid = tx.txid();
+                        let admitted = tokio::task::spawn_blocking(move || {
+                            let policy = crate::mempool::admission::AdmissionPolicy::relay(next_height);
+                            crate::mempool::admission::admit(&store_v, &mempool_v, tx, &policy)
                         }).await;
-                        match verified.unwrap_or_else(|e| Err(format!("verify task failed: {}", e))) {
-                            Err(e)   => json!({ "error": e }),
-                            Ok(fee)  => {
-                                let txid = tx.txid();
-                                match state.mempool.add(tx, fee) {
-                                    // Not L-5: this is MempoolError, a validation
-                                    // outcome (e.g. double-spend, fee too low) the
-                                    // caller needs to see to fix their transaction —
-                                    // not an internal/filesystem detail to withhold.
-                                    Err(e) => json!({ "error": e.to_string() }),
-                                    Ok(_)  => {
-                                        let _ = state.outbound_tx.try_send(NetworkMessage::NewTransaction {
-                                            txid, tx_data: raw,
-                                        });
-                                        json!({ "txid": hex::encode(txid) })
-                                    }
-                                }
+                        match admitted {
+                            // Not L-5: an admission verdict (double-spend, fee too
+                            // low, dust, ...) the caller needs to fix their tx —
+                            // not an internal/filesystem detail to withhold.
+                            Err(e)      => json!({ "error": format!("verify task failed: {}", e) }),
+                            Ok(Err(e))  => json!({ "error": e.to_string() }),
+                            Ok(Ok(_))   => {
+                                let _ = state.outbound_tx.try_send(NetworkMessage::NewTransaction {
+                                    txid, tx_data: raw,
+                                });
+                                json!({ "txid": hex::encode(txid) })
                             }
                         }
                     }
@@ -1029,13 +1144,28 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
         // ── Phase 2: estimatefee ─────────────────────────────────────
         "estimatefee" => {
-            let median = state.mempool.median_fee();
+            // MEM-6: a fee RATE (sat per 1,000 wire bytes, the unit of the
+            // consensus minimum), never below the consensus minimum rate or the
+            // mempool's rolling minimum, plus the resulting fee of a typical
+            // one-input / two-output transaction, never below the consensus
+            // minimum fee. (Previously: the median ABSOLUTE fee, defaulting to
+            // 1,000 sat while the consensus minimum is 10,000 sat.)
+            let rate = state.mempool.estimate_fee_rate_per_kb();
+            let typical_size = Transaction::estimate_size(1, 2);
+            let typical_fee = crate::core::tokenomics::min_tx_fee_sat(typical_size)
+                .max((typical_size as u64).saturating_mul(rate).div_ceil(1000));
             json!({
-                // R3: satoshi amount → decimal string.
-                "feerate_sats":  median.to_string(),
-                "feerate_gnb":  median as f64 / 1e8,
-                "mempool_size":  state.mempool.size(),
-                "note":          "median fee of current mempool entries",
+                // R3: satoshi amounts → decimal strings.
+                "feerate_sat_per_kb": rate.to_string(),
+                "min_fee_sat":        crate::core::tokenomics::MIN_TX_FEE_SAT.to_string(),
+                "typical_tx_bytes":   typical_size,
+                "typical_tx_fee_sat": typical_fee.to_string(),
+                // Legacy key: now the recommended ABSOLUTE fee for a typical
+                // transaction (>= the consensus minimum).
+                "feerate_sats":       typical_fee.to_string(),
+                "feerate_gnb":        typical_fee as f64 / 1e8,
+                "mempool_size":       state.mempool.size(),
+                "note":               "fee rate in sat/kB of wire bytes (>= consensus minimum); typical_tx_fee_sat for a 1-in/2-out tx",
             })
         }
 
@@ -1096,53 +1226,22 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         //
         // The reference pool consuming this lives in pool/.
         "getblocktemplate" => {
-            // Snapshot DAG state: parents = current tips; height = max
-            // parent height + 1 (accept_block's VULN-02 rule); blue_score =
-            // tip blue score + 1 (mirrors the solo miner loop).
-            let (parents, height, blue_score) = {
-                let d = state.dag.read();
-                // Mine only on BODIED tips: a header-only tip (body never
-                // arrived over headers-first sync) is unmineable — a block
-                // built on it can't be validated by accept_block, so the
-                // template would wedge the miner on a phantom parent.
-                let tips = d.bodied_tips(|h| state.store.get_block(h).ok().flatten().is_some());
-                if tips.is_empty() {
-                    return json!({ "error": "node has no bodied tip yet (still syncing genesis?)" });
-                }
-                // height / blue_score from the bodied parents only — NOT
-                // tip_blue_score(), which follows the bodyless selected_tip.
-                let max_parent_height = tips.iter()
-                    .filter_map(|t| d.get_block_data(t))
-                    .map(|dd| dd.height)
-                    .max()
-                    .unwrap_or(0);
-                let max_parent_blue_score = tips.iter()
-                    .filter_map(|t| d.get_block_data(t))
-                    .map(|dd| dd.blue_score)
-                    .max()
-                    .unwrap_or(0);
-                (tips, max_parent_height + 1, max_parent_blue_score + 1)
+            // Shared template builder (audit MEM-2 / DAG-2): parents = at most
+            // MAX_PARENTS bodied, non-disqualified tips by blue work; height =
+            // max parent height + 1 (accept_block's VULN-02 rule); expected
+            // bits exactly as accept_block validates them; transactions by fee
+            // rate under a byte budget measured like the consensus size rule,
+            // reserving EXTERNAL_COINBASE_RESERVE bytes for the caller's
+            // coinbase; every tx re-validated against the UTXO set (offenders
+            // evicted). Fees are recomputed from the UTXO set.
+            let tmpl = match crate::template::build_block_template(
+                &state.dag, &state.store, &state.mempool,
+                crate::template::EXTERNAL_COINBASE_RESERVE,
+            ) {
+                Ok(t) => t,
+                Err(e) => return json!({ "error": e }),
             };
-
-            // Expected bits — exactly what accept_block validates a block with
-            // these parents against: ASERT over the latest parent timestamp.
-            let parent_ts = {
-                let d = state.dag.read();
-                crate::core::difficulty_parent_timestamp(
-                    parents.iter().filter_map(|p| d.get_block_data(p)).map(|dd| dd.timestamp))
-            };
-            let bits = match crate::pow::expected_bits(parent_ts, height) {
-                Ok(b) => b,
-                Err(e) => return json!({ "error": format!("expected bits not derivable: {}", e) }),
-            };
-
-            // Mempool selection + per-tx fees (mirrors stratum's
-            // install_fresh_template).
-            let txs = state.mempool.get_for_block(2000);
-            let mut total_fees: u64 = 0;
-            let tx_entries: Vec<Value> = txs.iter().map(|tx| {
-                let fee = state.mempool.get_entry(&tx.txid()).map(|e| e.fee).unwrap_or(0);
-                total_fees = total_fees.saturating_add(fee);
+            let tx_entries: Vec<Value> = tmpl.transactions.iter().map(|(tx, fee)| {
                 json!({
                     "txid": hex::encode(tx.txid()),
                     // R3: satoshi amount → decimal string.
@@ -1151,33 +1250,38 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 })
             }).collect();
 
-            let subsidy = crate::core::tokenomics::block_subsidy_sat(height);
-
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_secs();
 
             json!({
-                "parents":              parents.iter().map(hex::encode).collect::<Vec<_>>(),
-                "height":               height,
-                "blue_score":           blue_score,
-                "bits":                 bits,
+                "parents":              tmpl.parents.iter().map(hex::encode).collect::<Vec<_>>(),
+                "height":               tmpl.height,
+                "blue_score":           tmpl.blue_score,
+                "bits":                 tmpl.bits,
                 "cur_time":             now,
-                "parent_time":          parent_ts,
+                "parent_time":          tmpl.parent_timestamp,
                 // R3: satoshi amounts → decimal strings.
-                "subsidy_sat":          subsidy.to_string(),
-                "total_fees":           total_fees.to_string(),
+                "subsidy_sat":          tmpl.subsidy.to_string(),
+                "total_fees":           tmpl.total_fees.to_string(),
                 "transactions":         tx_entries,
                 // The block's timestamp must be >= parent_time and at most
                 // MAX_FUTURE_SECS ahead of the validator's clock.
-                "min_time":             parent_ts,
+                "min_time":             tmpl.parent_timestamp,
+                // Size accounting: the whole block, measured as the consensus
+                // rule measures it (bincode `Block::size_bytes`), must stay
+                // <= max_block_size; the listed transactions leave
+                // coinbase_reserve bytes for the coinbase.
+                "max_block_size":       crate::core::MAX_BLOCK_SIZE,
+                "coinbase_reserve":     crate::template::EXTERNAL_COINBASE_RESERVE,
+                "max_parents":          crate::core::MAX_PARENTS,
                 // Proof of work: GnB-SMH v1 over the header preimage
                 // (version u32le | n_parents u32le | parents | merkle_root |
                 // timestamp u64le | bits u32le) and the u64 nonce; valid iff
                 // the 32-byte output, big-endian, is < target(bits).
                 "pow":                  "gnb-smh-v1",
                 "pow_log2_n":           gnb_smh::LOG2_N,
-                "target":               hex::encode(crate::core::bits_to_target(bits)),
+                "target":               hex::encode(crate::core::bits_to_target(tmpl.bits)),
             })
         }
 
@@ -1206,11 +1310,18 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let chain = dag.selected_chain();
             let tip = dag.selected_tip();
             let tip_data = tip.and_then(|h| dag.get_block_data(&h).cloned());
+            // The header height of the next block mempool admission targets
+            // (the node's next template height): wallets sign for it (version
+            // 3 / sighash v3 from the hardening activation). Not always
+            // tip_height + 1: a template that merges a tip with a greater DAG
+            // height sits higher (DAG-8).
+            let next_block_height = crate::mempool::admission::pool_next_height(&dag, &state.store, &state.mempool);
             json!({
                 "tip":            tip.map(|h| hex::encode(h)),
                 "tip_blue_score": tip_data.as_ref().map(|d| d.blue_score).unwrap_or(0),
                 "tip_blue_work":  tip_data.as_ref().map(|d| d.blue_work.to_string()).unwrap_or_default(),
                 "tip_height":     tip_data.as_ref().map(|d| d.height).unwrap_or(0),
+                "next_block_height": next_block_height,
                 "block_count":    dag.block_count(),
                 "tip_count":      tips.len(),
                 "tips":           tips.iter().map(|h| hex::encode(h)).collect::<Vec<_>>(),
@@ -1377,47 +1488,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             }
         }
 
-        "getdifficultyhistory" => {
-            let limit = params.and_then(|p| p.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_u64())
-                .unwrap_or(20) as usize;
-            let limit = limit.min(100); // cap at 100
-
-            let points = crate::analytics::difficulty_history(&state.store, limit);
-            let items: Vec<Value> = points.iter().map(|p| json!({
-                "height":     p.height,
-                "bits":       p.bits,
-                "bits_hex":   format!("0x{:08x}", p.bits),
-                "timestamp":  p.timestamp,
-                "target_hex": p.target_hex,
-            })).collect();
-            json!({
-                "count": items.len(),
-                "points": items,
-            })
-        }
-
-        "getblocktimepercentiles" => {
-            let window = params.and_then(|p| p.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_u64())
-                .unwrap_or(100) as usize;
-            let window = window.clamp(10, 1000);
-
-            let stats = crate::analytics::block_time_percentiles(&state.store, window);
-            json!({
-                "sample_size":  stats.sample_size,
-                "window":       window,
-                "min_secs":     stats.min,
-                "p50_secs":     stats.p50,
-                "p90_secs":     stats.p90,
-                "p99_secs":     stats.p99,
-                "max_secs":     stats.max,
-                "avg_secs":     stats.avg,
-                "target_secs":  crate::core::TARGET_BLOCK_TIME,
-            })
-        }
+        // NET-12: bounded walks of the selected chain (were full scans that
+        // decoded every stored block body), also behind the HeavyGate.
+        "getdifficultyhistory"    => explorer::get_difficulty_history(params, state),
+        "getblocktimepercentiles" => explorer::get_block_time_percentiles(params, state),
 
         "gettxstatus" => {
             let txid_hex = params.and_then(|p| p.as_array())
@@ -1659,7 +1733,8 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 .unwrap_or_else(|e| json!({ "error": format!("attestation serialize: {}", e) }))
         }
 
-        _ => json!({ "error": format!("unknown method: {}", method) }),
+        // NET-13: never echo an unbounded caller-supplied string.
+        _ => json!({ "error": format!("unknown method: {}", method_for_log(method)) }),
     }
 }
 
@@ -1699,69 +1774,23 @@ fn format_tx(tx: &Transaction) -> Value {
     })
 }
 
-/// Validate a transaction for mempool/broadcast acceptance.
+/// Validate a transaction for mempool/broadcast acceptance (no pool context).
 /// Returns the fee (total_in - total_out) on success.
 ///
-/// Sprint N-min: Now checks coinbase maturity (previously only gossip path did).
-/// Callers must pass current chain height for the maturity check. Height of 0
-/// (genesis only) skips the check since there is no matured coinbase to spend.
-fn validate_tx_for_mempool(tx: &Transaction, store: &Arc<Storage>, current_height: u64) -> Result<u64, String> {
-    use sha3::{Sha3_256, Digest};
-
-    // Coinbase maturity check (VULN-03). Single source of truth in
-    // core::check_coinbase_maturity; this call site is one of two.
-    crate::core::check_coinbase_maturity(tx, current_height, |txid| {
-        store.get_coinbase_height(txid).ok().flatten()
-    })?;
-
-
-    // Dust policy (pool-DoS fix): refuse a tx carrying any sub-dust output
-    // (0 < value < DUST_THRESHOLD) at ADMISSION. Block consensus already
-    // rejects such a tx once mined (Block::validate_dust, which exempts the
-    // coinbase and scans every other tx), so a dust tx that slips into the
-    // mempool poisons every block template that includes it — a cheap way to
-    // make an honest pool produce nothing but rejected blocks. Reject it here,
-    // before the expensive signature checks, so it never reaches a template.
-    const DUST_THRESHOLD_SATS: u64 = 546;
-    for (i, o) in tx.outputs.iter().enumerate() {
-        if o.value > 0 && o.value < DUST_THRESHOLD_SATS {
-            return Err(format!(
-                "output {} below dust threshold ({} < {} sats)",
-                i, o.value, DUST_THRESHOLD_SATS
-            ));
-        }
-    }
-
-    let mut total_in = 0u64;
-    // C-R3-2: intra-tx duplicate-outpoint check (insert-as-check, the same
-    // pattern as `euvm_admit_tx_standalone` step (e)). Without it a tx
-    // listing the SAME outpoint N times had its value counted N times below
-    // and was admitted with an N×-inflated fee — an intra-tx double-spend.
-    let mut spent_in_tx = std::collections::HashSet::<([u8; 32], u32)>::new();
-    for (i, inp) in tx.inputs.iter().enumerate() {
-        if !spent_in_tx.insert((inp.prev_txid, inp.prev_index)) {
-            return Err(format!("double-spend: {}:{} already consumed",
-                hex::encode(&inp.prev_txid[..8]), inp.prev_index));
-        }
-        let utxo = store.get_utxo(&inp.prev_txid, inp.prev_index)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("UTXO {}:{} not found", hex::encode(&inp.prev_txid[..8]), inp.prev_index))?;
-        total_in = total_in.checked_add(utxo.value).ok_or("overflow")?;
-        let (sig, pk) = Transaction::parse_script_sig(&inp.script_sig)
-            .ok_or_else(|| format!("malformed script_sig at input {}", i))?;
-        let pk_hash = Sha3_256::digest(&pk)[..20].to_vec();
-        if pk_hash != utxo.script_pubkey { return Err(format!("pubkey mismatch at input {}", i)); }
-        if !crate::crypto::verify(&pk, &tx.sighash(i, crate::core::node_chain_id()), &sig) {
-            return Err(format!("invalid signature at input {}", i));
-        }
-    }
-    let total_out: u64 = tx.outputs.iter()
-        .try_fold(0u64, |acc, o| acc.checked_add(o.value))
-        .ok_or_else(|| "output sum overflow".to_string())?;
-    if total_in < total_out { return Err("inputs < outputs".into()); }
-    let fee = total_in - total_out;
-    crate::core::check_min_fee(tx, fee)?;
-    Ok(fee)
+/// Delegates to the shared admission rules (`mempool::admission`, audit
+/// MEM-1/4/5): size, standardness (dust, zero-value, canonical limits,
+/// MoneyRange), duplicate inputs, UTXO presence, coinbase maturity at
+/// `next_block_height` (`0` skips it), consensus minimum fee and relay fee,
+/// then the hybrid signatures. `sendrawtransaction` itself calls
+/// `admission::admit`, which also runs the pool-relative checks.
+#[allow(dead_code)]
+fn validate_tx_for_mempool(tx: &Transaction, store: &Arc<Storage>, next_block_height: u64) -> Result<u64, String> {
+    let policy = crate::mempool::admission::AdmissionPolicy {
+        next_block_height,
+        check_signatures: true,
+        use_reject_filter: false,
+    };
+    crate::mempool::admission::check_transaction(store, None, tx, &policy).map_err(|e| e.to_string())
 }
 
 
@@ -2177,5 +2206,214 @@ mod h_r3_5_tests {
         }
         assert!(gate.cache.lock().len() <= HEAVY_READ_CACHE_MAX_KEYS,
             "cache must stay bounded under key churn");
+    }
+}
+
+// ── 2026-10 audit regressions: NET-12, NET-13, NET-14, NET-15, WAL-1 ───────
+#[cfg(test)]
+mod audit_2026_10_rpc_tests {
+    use super::*;
+    use crate::core::{Block, BlockHeader, MerkleRoot, TxInput, TxOutput};
+    use tempfile::TempDir;
+
+    /// An AppState over a fresh store and a linear DAG of `n` chain blocks
+    /// spaced 30 s apart (the last 10 gaps are 60 s).
+    fn state_with_chain(n: u8) -> (TempDir, AppState) {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(Storage::open(&tmp.path().join("db")).expect("storage"));
+        let mut dag = GhostDAG::with_default_k();
+        dag.add_genesis([0u8; 32], 1_000);
+        let mut ts = 1_000u64;
+        for i in 1..=n {
+            ts += if i > n.saturating_sub(10) { 60 } else { 30 };
+            dag.add_block([i; 32], vec![[i - 1; 32]], ts, 1).unwrap();
+        }
+        let (outbound_tx, _rx) = mpsc::channel(1);
+        let state = AppState {
+            node_state: Arc::new(RwLock::new(NodeState::default())),
+            store,
+            mempool: Arc::new(Mempool::new()),
+            dag: Arc::new(RwLock::new(dag)),
+            outbound_tx,
+            api_key: None,
+            require_auth_for_writes: false,
+            require_auth_for_reads: false,
+            rate_limiter: Arc::new(auth::RateLimiterSet::new(60, 5)),
+            trust_private_ranges: false,
+            allowed_origins: Arc::new(Vec::new()),
+            allowed_hosts: Arc::new(Vec::new()),
+            trust_loopback: false,
+            heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
+            submit_block: None,
+        };
+        (tmp, state)
+    }
+
+    #[test]
+    fn method_labels_are_bounded_and_logs_truncated() {
+        assert_eq!(method_label("getblockcount"), "getblockcount");
+        assert_eq!(method_label(&"x".repeat(1 << 20)), "unknown");
+        assert_eq!(method_label("getBlockCount"), "unknown");
+        let logged = method_for_log(&"\u{1b}[31m".repeat(10_000));
+        assert!(logged.len() < 4 * MAX_LOGGED_METHOD_LEN, "{}", logged.len());
+        assert!(!logged.contains('\u{1b}'), "control characters are escaped");
+    }
+
+    /// Every arm of `dispatch` is a known method (so it gets its own metrics
+    /// label) and every known method has an arm.
+    #[test]
+    fn known_methods_list_matches_dispatch() {
+        let src = include_str!("mod.rs");
+        let start = src.find("async fn dispatch(").unwrap();
+        let end = src[start..].find("// ── Helpers").unwrap() + start;
+        let mut arms = std::collections::BTreeSet::new();
+        for line in src[start..end].lines() {
+            let t = line.trim_start();
+            if let Some(rest) = t.strip_prefix('"') {
+                if let Some(q) = rest.find('"') {
+                    if rest[q + 1..].trim_start().starts_with("=>") {
+                        arms.insert(rest[..q].to_string());
+                    }
+                }
+            }
+        }
+        let known: std::collections::BTreeSet<String> = KNOWN_RPC_METHODS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(arms, known);
+    }
+
+    #[test]
+    fn bind_addresses_resolve_ipv4_ipv6_and_names() {
+        assert!(resolve_bind_address("127.0.0.1", 17210).unwrap().is_ipv4());
+        assert!(resolve_bind_address("::1", 17210).unwrap().is_ipv6());
+        assert!(resolve_bind_address("[::1]", 17210).unwrap().is_ipv6());
+        assert!(resolve_bind_address("localhost", 17210).is_ok());
+        assert!(resolve_bind_address("not a host name", 17210).is_err());
+    }
+
+    /// NET-14: an RPC server whose port is taken returns instead of taking
+    /// the node down with it.
+    #[tokio::test]
+    async fn rpc_server_bind_failure_returns() {
+        let (_tmp, state) = state_with_chain(1);
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = RpcConfig { port: busy.local_addr().unwrap().port(), ..RpcConfig::default() };
+        tokio::time::timeout(std::time::Duration::from_secs(10), start_rpc_server(
+            config, state.node_state.clone(), state.store.clone(), state.mempool.clone(),
+            state.dag.clone(), state.outbound_tx.clone(), None,
+        )).await.expect("a failed bind must end the RPC task");
+    }
+
+    /// WAL-1: `getrawtransaction` returns bytes that hash to the txid.
+    #[tokio::test]
+    async fn getrawtransaction_returns_bytes_that_hash_to_the_txid() {
+        let (_tmp, state) = state_with_chain(1);
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [0; 32], prev_index: u32::MAX, script_sig: b"height:1".to_vec(), sequence: u32::MAX }],
+            outputs: vec![TxOutput { value: 5, script_pubkey: vec![1; 20] }],
+            locktime: 0,
+        };
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [7; 32], prev_index: 1, script_sig: vec![9; 40], sequence: u32::MAX }],
+            outputs: vec![TxOutput { value: 123_456, script_pubkey: vec![2; 20] }],
+            locktime: 0,
+        };
+        let mut block = Block {
+            header: BlockHeader { version: 1, parents: vec![[0; 32]], merkle_root: MerkleRoot::ZERO, timestamp: 1_030, bits: 0x2100_FFFF, nonce: 0 },
+            transactions: vec![coinbase.clone(), spend.clone()],
+            blue_score: 1, height: 1, shielded_transactions: vec![],
+        };
+        block.header.merkle_root = block.body_merkle_root();
+        state.store.put_block(&block).unwrap();
+        for tx in [&coinbase, &spend] {
+            state.store.put_tx_index(&tx.txid(), &block.block_hash(), 1).unwrap();
+        }
+        for tx in [&coinbase, &spend] {
+            let r = dispatch("getrawtransaction", Some(&json!([hex::encode(tx.txid())])), &state).await;
+            let raw = hex::decode(r["hex"].as_str().expect("hex")).unwrap();
+            assert_eq!(Transaction::from_wire_bytes(&raw).unwrap().txid(), tx.txid());
+            assert_eq!(r["block_height"], 1);
+        }
+        let r = dispatch("getrawtransaction", Some(&json!([hex::encode([3u8; 32])])), &state).await;
+        assert!(r["error"].is_string());
+        let r = dispatch("getrawtransaction", Some(&json!(["zz"])), &state).await;
+        assert_eq!(r["error"], "invalid txid");
+    }
+
+    /// NET-12: `getutxos` stops at its limit while walking the index.
+    #[tokio::test]
+    async fn getutxos_applies_its_limit_while_iterating() {
+        let (_tmp, state) = state_with_chain(1);
+        let address = crate::address::Address::from_hash([4; 20], crate::address::Network::Mainnet);
+        for i in 0..5u8 {
+            state.store.put_utxo(&[i; 32], 0, &TxOutput { value: 1_000, script_pubkey: vec![4; 20] }).unwrap();
+        }
+        let (rows, more) = state.store.get_utxos_for_address_limited(&[4; 20], 2).unwrap();
+        assert_eq!((rows.len(), more), (2, true));
+        let (rows, more) = state.store.get_utxos_for_address_limited(&[4; 20], 5).unwrap();
+        assert_eq!((rows.len(), more), (5, false));
+
+        let r = dispatch("getutxos", Some(&json!([address.to_string(), 2])), &state).await;
+        assert_eq!(r["returned"], 2);
+        assert_eq!(r["truncated"], true);
+        assert_eq!(r["satoshis"], "2000");
+        let r = dispatch("getutxos", Some(&json!([address.to_string()])), &state).await;
+        assert_eq!(r["returned"], 5);
+        assert_eq!(r["truncated"], false);
+    }
+
+    /// NET-12: the chain-walking statistics read only the requested window.
+    #[tokio::test]
+    async fn block_time_percentiles_walk_only_the_window() {
+        let (_tmp, state) = state_with_chain(60);
+        assert!(HeavyGate::is_heavy("getblocktimepercentiles"));
+        assert!(HeavyGate::is_heavy("getdifficultyhistory"));
+        let r = dispatch("getblocktimepercentiles", Some(&json!([10])), &state).await;
+        assert_eq!(r["sample_size"], 10);
+        assert_eq!(r["p50_secs"], 60);
+        let r = dispatch("getblocktimepercentiles", Some(&json!([1000])), &state).await;
+        assert_eq!(r["sample_size"], 60);
+        assert_eq!(r["min_secs"], 30);
+        // No stored bodies: the difficulty walk is bounded and empty.
+        let r = dispatch("getdifficultyhistory", Some(&json!([500])), &state).await;
+        assert_eq!(r["count"], 0);
+    }
+
+    /// NET-15: explorer reads still work with storage access moved out of
+    /// the DAG lock (and do not deadlock against a concurrent writer).
+    #[tokio::test]
+    async fn explorer_reads_release_the_dag_lock_before_storage() {
+        let (_tmp, state) = state_with_chain(5);
+        let r = dispatch("getselectedchain", Some(&json!([0, 3])), &state).await;
+        assert_eq!(r["chain_length"], 6);
+        assert_eq!(r["blocks"].as_array().unwrap().len(), 3);
+        assert_eq!(r["blocks"][0]["height"], 5);
+        let r = dispatch("getblockdag", Some(&json!([hex::encode([3u8; 32])])), &state).await;
+        assert_eq!(r["colour"], "chain");
+        assert_eq!(r["body"], false);
+        assert_eq!(r["next_chain_block"], hex::encode([4u8; 32]));
+        let r = dispatch("getblockdag", Some(&json!([hex::encode([0xEEu8; 32])])), &state).await;
+        assert_eq!(r["error"], "block not found");
+        // A writer can take the lock right after a read returns.
+        drop(state.dag.try_write().expect("DAG lock must be free after an explorer read"));
+    }
+
+    /// CRY-3 / WAL-1: `getdaginfo` reports the height of the next block the
+    /// mempool targets (`next_block_height`: the node's next template height,
+    /// cached in the pool), which wallets sign for. It is not tip_height + 1
+    /// when a template merges a tip with a greater DAG height (DAG-8). With no
+    /// cached value it is computed (here: no bodied tip, so the selected tip's
+    /// DAG height + 1).
+    #[tokio::test]
+    async fn getdaginfo_reports_the_pools_next_block_height() {
+        let (_tmp, state) = state_with_chain(5);
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["tip_height"], 5);
+        assert_eq!(r["next_block_height"], 6);
+        state.mempool.set_next_height(9);
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["tip_height"], 5);
+        assert_eq!(r["next_block_height"], 9, "the pool's next height, not tip_height + 1");
     }
 }

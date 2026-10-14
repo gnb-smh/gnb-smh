@@ -14,6 +14,11 @@ sha3 = "0.10"
 serde_json = "1"
 hex = "0.4"
 
+# Its own workspace (the root workspace excludes it). Explicit, so cargo never
+# walks up into an enclosing checkout's workspace (e.g. a worktree nested
+# inside another clone).
+[workspace]
+
 [profile.release]
 opt-level = 3
 lto = true

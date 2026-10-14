@@ -9,10 +9,13 @@ How a node validates without the UTXO set:
 * The state is a SHAKE-256 sparse Merkle tree (depth 256) of unspent outputs,
   plus a second tree reserved for shielded-pool nullifiers. The node keeps only
   their roots; the header commits to both.
-* A block travels with a witness bundle (not committed by the header): for each
-  transaction, the spent output records and an O(log n) Merkle witness per touched
-  key, each against the root left by the previous operation. About 1 KB per key
-  at 2^30 outputs.
+* A block travels with a witness bundle: for each transaction, the spent output
+  records and an O(log n) Merkle witness per touched key, each against the root
+  left by the previous operation. About 1 KB per key at 2^30 outputs. The header
+  commits to the bundle's hash (witness_root), so a damaged bundle is detected by
+  one hash before any proof is checked, and a bad committed bundle makes the block
+  permanently invalid: a peer cannot make a node redo the proof checks of one
+  block id with a different bad bundle.
 * The header commits to every transaction byte, authorization included (the
   transaction root is built over wtxids), and every transaction gets exactly one
   outcome that the witness must prove: ACCEPT, or REJECT with a proof (an input
@@ -24,8 +27,8 @@ How a node validates without the UTXO set:
 
 Faults come in two classes (InvalidBlock.permanent). Permanent ones prove the block
 itself is invalid: mark its id invalid. Transient ones only show that the body or
-the witness received does not fit the header: penalize the peer and fetch again,
-because the witness is not committed and anyone relaying the block can damage it.
+the witness received does not hash to the header's commitments: penalize the peer
+and fetch again.
 
 Encodings are little-endian, enc(b) = u32le(len(b)) || b, and every hash is
 H(label, data) = SHAKE256(enc("GNB-LEDGER-v1/" + label) || data, 32).
@@ -40,6 +43,7 @@ ledger_vectors.json exactly, including which error code each invalid case raises
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import struct
 from dataclasses import dataclass, field
@@ -49,7 +53,7 @@ VERSION = 1
 DEPTH = 256
 HASH_LEN = 32
 RECORD_LEN = 49
-HEADER_LEN = 140
+HEADER_LEN = 172
 
 # Placeholder limits until GnB's monetary and block-size parameters are fixed.
 MAX_MONEY = (1 << 63) - 1
@@ -91,6 +95,7 @@ _P_TXNODE = _prefix(b"txnode")
 _P_TXROOT = _prefix(b"txroot")
 _P_STATE = _prefix(b"state")
 _P_BLOCK = _prefix(b"block")
+_P_WITNESS = _prefix(b"witness")
 _P_TEST_OWNER = _prefix(b"test-owner")
 
 
@@ -101,16 +106,20 @@ def _h(prefix: bytes, *parts: bytes) -> bytes:
 class InvalidBlock(Exception):
     """Raised with one of the shared error codes below; vectors pin the code.
 
-    Permanent codes prove the committed block is invalid. Transient codes mean the
-    body or witness received does not match the header (wrong transactions for this
-    tx_root, or a malformed, forged or stale witness): the block may still be valid."""
+    Permanent codes prove the committed block is invalid; the witness bundle is
+    committed too, so a malformed, forged or stale committed bundle is permanent.
+    Transient codes mean the body or witness received does not hash to the header's
+    commitments (tx_root, witness_root): the block may still be valid."""
 
     CODES = (
-        "header", "target", "pow", "tx-root", "isolation", "witness-format",
-        "noncanonical-proof", "witness-mismatch", "accept-invalid", "reject-invalid",
-        "coinbase", "state-commitment",
+        "header", "target", "pow", "tx-root", "witness-commitment", "isolation",
+        "witness-format", "noncanonical-proof", "witness-mismatch", "accept-invalid",
+        "reject-invalid", "coinbase", "state-commitment",
     )
-    PERMANENT = frozenset({"header", "target", "pow", "isolation", "coinbase", "state-commitment"})
+    PERMANENT = frozenset({
+        "header", "target", "pow", "isolation", "witness-format", "noncanonical-proof",
+        "witness-mismatch", "accept-invalid", "reject-invalid", "coinbase", "state-commitment",
+    })
 
     def __init__(self, code: str, detail: str = ""):
         assert code in self.CODES, code
@@ -270,6 +279,7 @@ class Tx:
     height: int = 0          # coinbase only: must equal the block height
     extra: bytes = b""       # coinbase only
     auth: tuple[bytes, ...] = ()   # one entry per input; not covered by the txid
+    parents_root: bytes = EMPTY    # coinbase only: must equal the header's parents_root
 
 
 @dataclass(frozen=True)
@@ -297,7 +307,7 @@ def tx_bytes(tx: Tx) -> bytes:
     """Canonical encoding covered by the txid (no authorization data)."""
     out = [struct.pack("<I", VERSION), bytes([tx.kind])]
     if tx.kind == TX_COINBASE:
-        out += [struct.pack("<Q", tx.height), enc(tx.extra)]
+        out += [struct.pack("<Q", tx.height), tx.parents_root, enc(tx.extra)]
     out.append(struct.pack("<I", len(tx.inputs)))
     for op in tx.inputs:
         out += [op.txid, struct.pack("<I", op.vout)]
@@ -349,9 +359,10 @@ def decode_tx_wire(buf: bytes) -> Tx:
     kind = r.u8()
     if kind not in (TX_REGULAR, TX_COINBASE):
         raise InvalidBlock("isolation", "tx kind")
-    height, extra = 0, b""
+    height, extra, parents_root = 0, b"", EMPTY
     if kind == TX_COINBASE:
         height = r.u64()
+        parents_root = r.take(32)
         extra = r.take(r.u32())
     n_in = r.u32()
     if n_in > MAX_INPUTS:
@@ -372,7 +383,7 @@ def decode_tx_wire(buf: bytes) -> Tx:
         auth.append(r.take(n))
     if not r.done():
         raise InvalidBlock("isolation", "trailing bytes")
-    return Tx(kind, inputs, outputs, height, extra, tuple(auth))
+    return Tx(kind, inputs, outputs, height, extra, tuple(auth), parents_root)
 
 
 def txid(tx: Tx) -> bytes:
@@ -419,7 +430,7 @@ def check_tx_isolation(tx: Tx) -> None:
             raise InvalidBlock("isolation", "auth count")
         if any(len(a) > MAX_AUTH_LEN for a in tx.auth):
             raise InvalidBlock("isolation", "auth entry too long")
-        if tx.height != 0 or tx.extra:
+        if tx.height != 0 or tx.extra or tx.parents_root != EMPTY:
             raise InvalidBlock("isolation", "coinbase fields on a regular tx")
         for op in tx.inputs:
             if len(op.txid) != 32 or not 0 <= op.vout < 1 << 32:
@@ -429,6 +440,8 @@ def check_tx_isolation(tx: Tx) -> None:
             raise InvalidBlock("isolation", "coinbase with inputs")
         if len(tx.extra) > MAX_COINBASE_EXTRA:
             raise InvalidBlock("isolation", "coinbase extra")
+        if len(tx.parents_root) != 32:
+            raise InvalidBlock("isolation", "coinbase parents root")
 
 
 # --------------------------------------------------------------------------- authorization
@@ -465,6 +478,9 @@ class Context:
     subsidy: int
     auth: AuthFn = field(compare=False)      # required: there is deliberately no default
     coinbase_maturity: int = COINBASE_MATURITY
+    # The block's parents_root. validate_body sets it from the header; callers of
+    # apply_block_txs / FullNode.build pass the parents_root the block will carry.
+    parents_root: bytes = EMPTY
 
 
 def context_fee(tx: Tx, records: Sequence[UtxoRecord], ctx: Context) -> int | None:
@@ -492,6 +508,13 @@ def check_block_txs(txs: Sequence[Tx], ctx: Context) -> None:
         raise InvalidBlock("isolation", "too many inputs and outputs in the block")
     if txs[0].height != ctx.height:
         raise InvalidBlock("isolation", "coinbase height")
+    # Coinbase uniqueness: the coinbase commits to the block's height AND its parent
+    # set, so two blocks can share a coinbase (and its output keys) only if they are
+    # built on the very same parents at the same height by the same payee with the
+    # same extra: a choice of their own producer, not something another miner can
+    # force on them without mining a sibling block that pays them.
+    if txs[0].parents_root != ctx.parents_root:
+        raise InvalidBlock("isolation", "coinbase parents root")
 
 
 def apply_block_txs(state: State, txs: Sequence[Tx], witness: bytes, ctx: Context
@@ -600,6 +623,7 @@ def _create(root: bytes, tid: bytes, vout: int, record: UtxoRecord, sibs: list[b
 class Header:
     parents_root: bytes      # commitment to the GhostDAG parents (consensus layer)
     tx_root: bytes
+    witness_root: bytes      # witness_commitment(bundle)
     state_commitment: bytes
     timestamp: int
     target: int
@@ -607,15 +631,20 @@ class Header:
 
     def encode(self) -> bytes:
         return (struct.pack("<I", self.version) + self.parents_root + self.tx_root
-                + self.state_commitment + struct.pack("<Q", self.timestamp)
+                + self.witness_root + self.state_commitment + struct.pack("<Q", self.timestamp)
                 + self.target.to_bytes(32, "big"))
 
     @staticmethod
     def decode(b: bytes) -> "Header":
         if len(b) != HEADER_LEN:
             raise InvalidBlock("header", "length")
-        return Header(b[4:36], b[36:68], b[68:100], struct.unpack_from("<Q", b, 100)[0],
-                      int.from_bytes(b[108:140], "big"), struct.unpack_from("<I", b, 0)[0])
+        return Header(b[4:36], b[36:68], b[68:100], b[100:132], struct.unpack_from("<Q", b, 132)[0],
+                      int.from_bytes(b[140:172], "big"), struct.unpack_from("<I", b, 0)[0])
+
+
+def witness_commitment(witness: bytes) -> bytes:
+    """What the header's witness_root commits to: the exact bundle bytes."""
+    return _h(_P_WITNESS, witness)
 
 
 def tx_root(wtxids: Sequence[bytes]) -> bytes:
@@ -654,15 +683,20 @@ def validate_header(header_bytes: bytes, nonce: int, *, log2_n: int | None = Non
 
 def validate_body(parent: State, hdr: Header, tx_wires: Sequence[bytes], witness: bytes,
                   ctx: Context) -> tuple[State, list[bool]]:
-    """Body stage. The transactions must hash to the header's tx_root before anything in
-    them is judged: a mismatch is transient (wrong body for this header), while a
-    committed body that breaks a rule is permanent. Peers' oversized bodies should be
+    """Body stage. The transactions must hash to the header's tx_root and the bundle to
+    its witness_root before anything in them is judged: a mismatch is transient (wrong
+    body or bundle for this header), while a committed body or bundle that breaks a
+    rule is permanent. So a bad bundle costs one hash per attempt, and the proof checks
+    of a block id run to completion at most once. Peers' oversized bodies should be
     cut at the network layer; hashing here is linear in what was received."""
     if tx_root([wtxid(w) for w in tx_wires]) != hdr.tx_root:
         raise InvalidBlock("tx-root")
+    if witness_commitment(witness) != hdr.witness_root:
+        raise InvalidBlock("witness-commitment")
     if sum(len(w) for w in tx_wires) > MAX_BLOCK_TX_BYTES:
         raise InvalidBlock("isolation", "block size")
     txs = [decode_tx_wire(w) for w in tx_wires]
+    ctx = dataclasses.replace(ctx, parents_root=hdr.parents_root)
     new_state, accepted = apply_block_txs(parent, txs, witness, ctx)
     if new_state.commitment() != hdr.state_commitment:
         raise InvalidBlock("state-commitment")

@@ -1,16 +1,60 @@
 #!/bin/sh
-# Build the browser wallet core (crates/gnb-wallet-wasm) for wasm32-wasip1 and
-# copy it to site/wallet/gnb_wallet.wasm.
+# Build the browser wallet core (crates/gnb-wallet-wasm) for wasm32-wasip1,
+# copy it to site/wallet/gnb_wallet.wasm, pin its SHA-256 in
+# site/wallet/app.js (WASM_SHA256, checked by loadCore before instantiation)
+# and refresh the Subresource Integrity hashes of the site's scripts.
 #
 # Needs: the rustup target wasm32-wasip1 and a wasi-sdk (clang with the wasm32
 # backend and the WASI sysroot), e.g. https://github.com/WebAssembly/wasi-sdk
 #   WASI_SDK=~/.local/wasi-sdk scripts/build-wallet-wasm.sh
+#
+#   scripts/build-wallet-wasm.sh --pin-only   re-pin the committed binary and
+#                                             refresh SRI without rebuilding
+#
+# The pin and the SRI attributes are verified by `node --test site/tests/`;
+# a stale pin fails those tests. Deploy only a binary whose hash is pinned.
 set -eu
-W=${WASI_SDK:-$HOME/.local/wasi-sdk}
-export WASI_SDK_DIR="$W/share/wasi-sysroot"
-export CC_wasm32_wasip1="$W/bin/clang" AR_wasm32_wasip1="$W/bin/llvm-ar"
-export CFLAGS_wasm32_wasip1="--target=wasm32-wasip1 --sysroot=$W/share/wasi-sysroot"
 cd "$(dirname "$0")/.."
-cargo build --release -p gnb-wallet-wasm --target wasm32-wasip1
-cp target/wasm32-wasip1/release/gnb_wallet_wasm.wasm site/wallet/gnb_wallet.wasm
-shasum -a 256 site/wallet/gnb_wallet.wasm
+
+if [ "${1:-}" != "--pin-only" ]; then
+  W=${WASI_SDK:-$HOME/.local/wasi-sdk}
+  export WASI_SDK_DIR="$W/share/wasi-sysroot"
+  export CC_wasm32_wasip1="$W/bin/clang" AR_wasm32_wasip1="$W/bin/llvm-ar"
+  # Reproducibility: keep build-machine paths out of the binary, so the same
+  # source, toolchain (rust-toolchain.toml) and wasi-sdk give the same hash.
+  ROOT=$(pwd) CARGO_DIR=${CARGO_HOME:-$HOME/.cargo}
+  export CFLAGS_wasm32_wasip1="--target=wasm32-wasip1 --sysroot=$W/share/wasi-sysroot -ffile-prefix-map=$ROOT=/gnb-smh -ffile-prefix-map=$CARGO_DIR=/cargo -ffile-prefix-map=$W=/wasi-sdk"
+  export CARGO_TARGET_WASM32_WASIP1_RUSTFLAGS="--remap-path-prefix=$ROOT=/gnb-smh --remap-path-prefix=$CARGO_DIR=/cargo"
+  cargo build --release --locked -p gnb-wallet-wasm --target wasm32-wasip1
+  cp "${CARGO_TARGET_DIR:-target}/wasm32-wasip1/release/gnb_wallet_wasm.wasm" site/wallet/gnb_wallet.wasm
+fi
+
+sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
+sri() { printf 'sha384-%s' "$(openssl dgst -sha384 -binary "$1" | openssl base64 -A)"; }
+
+# 1. Pin the wasm hash in app.js.
+WASM_HASH=$(sha256 site/wallet/gnb_wallet.wasm)
+sed "s/^const WASM_SHA256 = \"[0-9a-f]*\";/const WASM_SHA256 = \"$WASM_HASH\";/" \
+  site/wallet/app.js > site/wallet/app.js.tmp
+mv site/wallet/app.js.tmp site/wallet/app.js
+grep -q "^const WASM_SHA256 = \"$WASM_HASH\";" site/wallet/app.js \
+  || { echo "could not pin WASM_SHA256 in site/wallet/app.js" >&2; exit 1; }
+
+# 2. Refresh integrity="..." on every <script src> / <link rel=modulepreload>
+#    that names one of these files (after step 1: app.js changed).
+set_sri() { # <html file> <url path> <local file>
+  H=$(sri "$3")
+  sed "s#\\(\"$2\" integrity=\"\\)sha384-[A-Za-z0-9+/=]*\"#\\1$H\"#g" "$1" > "$1.tmp"
+  mv "$1.tmp" "$1"
+}
+for page in site/wallet.html site/explorer.html site/index.html site/brand.html; do
+  set_sri "$page" /wallet/app.js     site/wallet/app.js
+  set_sri "$page" /wallet/core.js    site/wallet/core.js
+  set_sri "$page" /wallet/qrcode.js  site/wallet/qrcode.js
+  set_sri "$page" /assets/safe.js    site/assets/safe.js
+  set_sri "$page" /assets/site.js    site/assets/site.js
+  set_sri "$page" /explorer.js       site/explorer.js
+  set_sri "$page" /assets/explorer-views.js site/assets/explorer-views.js
+done
+
+echo "gnb_wallet.wasm sha256 $WASM_HASH (pinned in site/wallet/app.js)"

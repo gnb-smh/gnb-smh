@@ -6,7 +6,12 @@
 //! DAG (see [`PeerStateTable::servable_blue_work`]).
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// NET-6 (audit): an announced tip claim stops counting this long after the
+/// peer last made it. Claims used to be a monotonic max that lived as long as
+/// the connection, so one inflated frame pinned `best_announced` forever.
+pub const CLAIM_TTL: Duration = Duration::from_secs(600);
 
 use libp2p::PeerId;
 use parking_lot::RwLock;
@@ -21,6 +26,9 @@ pub struct PeerChainState {
     pub advertised_tips:      Vec<[u8; 32]>,
     pub last_seen:            Instant,
     pub connected:            bool,
+    /// When the peer last made a tip claim (`None` = never). Claims older
+    /// than [`CLAIM_TTL`] are ignored by [`PeerStateTable::best_announced_blue_score`].
+    pub claimed_at:           Option<Instant>,
 }
 
 /// Thread-safe `PeerId -> PeerChainState` table + servable-frontier query.
@@ -43,6 +51,7 @@ impl PeerStateTable {
             advertised_tips: Vec::new(),
             last_seen: now,
             connected: true,
+            claimed_at: None,
         });
         e.connected = true;
         e.last_seen = now;
@@ -78,6 +87,12 @@ impl PeerStateTable {
     /// P4: on decode of `Tips` / `PeerTip` / `Version`. For `PeerTip`/`Version`
     /// pass `tips = &[]` (they carry no tip hashes); for `Tips` pass the entry
     /// hashes. Updates hints + `last_seen` and (re)marks the peer connected.
+    ///
+    /// NET-6 (audit): the hints are the peer's LATEST claim, not a monotonic
+    /// max — a peer that once announced an inflated score no longer keeps it
+    /// forever; it is replaced by the next claim and expires after
+    /// [`CLAIM_TTL`]. Callers must pass the claim's AUTHOR (the peer that made
+    /// it), never the relay it arrived through.
     pub fn observe(
         &self,
         peer: PeerId,
@@ -93,18 +108,42 @@ impl PeerStateTable {
             advertised_tips: Vec::new(),
             last_seen: now,
             connected: true,
+            claimed_at: None,
         });
         e.connected = true;
         e.last_seen = now;
-        if announced_blue_score > e.announced_blue_score {
-            e.announced_blue_score = announced_blue_score;
-        }
-        if announced_height > e.announced_height {
-            e.announced_height = announced_height;
-        }
+        e.announced_blue_score = announced_blue_score;
+        e.announced_height = announced_height;
+        e.claimed_at = Some(now);
         if !tips.is_empty() {
             e.advertised_tips = tips.to_vec();
             e.advertised_tips.truncate(crate::sync::MAX_ADVERTISED_TIPS);
+        }
+    }
+
+    /// NET-6 (audit): record a gossip tip claim (`PeerTip` / `Version`) made
+    /// by `author` — ONLY if `author` is a currently connected peer (it has a
+    /// row from [`Self::on_connect`]). Claims by authors we are not connected
+    /// to (relayed through someone else) are never stored: the table cannot be
+    /// grown by minted identities, and a relay is never charged for a claim it
+    /// merely forwarded. Returns `true` if the claim was recorded.
+    pub fn observe_claim(
+        &self,
+        author: PeerId,
+        announced_blue_score: u64,
+        announced_height: u64,
+        now: Instant,
+    ) -> bool {
+        let mut g = self.inner.write();
+        match g.get_mut(&author) {
+            Some(e) if e.connected => {
+                e.last_seen = now;
+                e.announced_blue_score = announced_blue_score;
+                e.announced_height = announced_height;
+                e.claimed_at = Some(now);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -141,12 +180,20 @@ impl PeerStateTable {
         best
     }
 
-    /// Highest announced blue_score among connected peers — RPC hint ONLY.
+    /// Highest FRESH announced blue_score among connected peers (claims made
+    /// within [`CLAIM_TTL`]) — a hint used only to RELEASE the IBD latch
+    /// early (never to set it), and for RPC.
     pub fn best_announced_blue_score(&self) -> u64 {
+        self.best_announced_blue_score_at(Instant::now())
+    }
+
+    /// [`Self::best_announced_blue_score`] with an explicit clock.
+    pub fn best_announced_blue_score_at(&self, now: Instant) -> u64 {
         self.inner
             .read()
             .values()
             .filter(|s| s.connected)
+            .filter(|s| s.claimed_at.is_some_and(|t| now.saturating_duration_since(t) < CLAIM_TTL))
             .map(|s| s.announced_blue_score)
             .max()
             .unwrap_or(0)

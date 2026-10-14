@@ -1,9 +1,14 @@
 //! Bloch-SIS Protocol — Reorg detection & execution (Sprint U.3).
 //!
-//! Pure functions that compute *what* a reorg looks like (`compute_reorg_plan`)
-//! and *perform* one against storage + mempool (`execute_reorg`). This module
-//! is deliberately disconnected from `accept_block` in main.rs — Sprint U.4 is
-//! responsible for wiring these primitives into the node event loop.
+//! Pure functions that compute *what* a chain move looks like
+//! (`compute_reorg_plan`, `compute_connect_plan`) and *perform* one atomically
+//! against storage (`connect_plan`, used by the acceptance pipeline in
+//! `accept.rs` for extensions AND reorgs, audit DAG-1/DAG-11) or against
+//! storage + mempool (`execute_reorg`, the standalone U.3 entry point).
+//!
+//! (Historical note below: U.4 has since wired these primitives into the
+//! node; `accept::accept_block` now drives every chain move through
+//! `connect_plan`.)
 //!
 //! # Rationale for splitting U.3 / U.4
 //!
@@ -223,6 +228,29 @@ pub fn compute_reorg_plan(
     Some(ReorgPlan { lca, to_rollback, to_apply })
 }
 
+/// Compute the plan that moves the APPLIED selected chain from `from` (the
+/// currently applied tip) to `to` (the new best valid block). Unlike
+/// [`compute_reorg_plan`] this also covers pure forward moves: `to_rollback`
+/// is empty when `from` is an ancestor of `to` on the selected-parent chain
+/// (an ordinary extension, possibly of several blocks). Returns `None` when
+/// `from == to`, when `to` is a selected-chain ancestor of `from` (moving
+/// backwards is never a valid transition), or when the chains share no
+/// ancestor.
+pub fn compute_connect_plan(
+    dag: &GhostDAG,
+    from: &BlockHash,
+    to: &BlockHash,
+) -> Option<ReorgPlan> {
+    if from == to { return None; }
+    let lca = find_lca(dag, from, to)?;
+    if lca == *to { return None; }
+    let to_rollback = selected_path_to(dag, from, &lca)?;
+    let mut to_apply = selected_path_to(dag, to, &lca)?;
+    to_apply.reverse();
+    if to_apply.is_empty() { return None; }
+    Some(ReorgPlan { lca, to_rollback, to_apply })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Block UTXO mutation (forward apply)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -359,6 +387,33 @@ fn addr_utxo_key(script_pubkey: &[u8], txid: &[u8; 32], index: u32) -> Vec<u8> {
 fn bc_encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, String> {
     bincode::serde::encode_to_vec(v, bincode::config::standard())
         .map_err(|e| format!("reorg batch: encode failed: {}", e))
+}
+
+/// Read-only view of a UTXO set plus its coinbase-height index. Implemented by
+/// the committed [`Storage`] and by the staging overlay of an in-progress
+/// connect, so the SAME validation code checks a block against the live tip
+/// state (extension) or against the incrementally re-organised state (reorg).
+pub trait UtxoView {
+    fn view_utxo(&self, txid: &[u8; 32], index: u32) -> Result<Option<TxOutput>, String>;
+    fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String>;
+}
+
+impl UtxoView for Storage {
+    fn view_utxo(&self, txid: &[u8; 32], index: u32) -> Result<Option<TxOutput>, String> {
+        self.get_utxo(txid, index).map_err(|e| e.to_string())
+    }
+    fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String> {
+        self.get_coinbase_height(txid).map_err(|e| e.to_string())
+    }
+}
+
+impl<'a> UtxoView for ReorgBatch<'a> {
+    fn view_utxo(&self, txid: &[u8; 32], index: u32) -> Result<Option<TxOutput>, String> {
+        self.get_utxo(txid, index)
+    }
+    fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String> {
+        self.get_coinbase_height(txid)
+    }
 }
 
 /// All chain-switch mutations staged for one atomic commit, with an overlay
@@ -574,6 +629,10 @@ fn rollback_block_batched(
     // 6. Delete the undo record itself.
     batch.delete_undo_data(block_hash)?;
 
+    // 7. Selected-chain height/timestamp index rows (DAG-12).
+    batch.store.stage_chain_unindex(&mut batch.batch, block)
+        .map_err(|e| format!("rollback: chain unindex failed: {}", e))?;
+
     Ok(())
 }
 
@@ -586,6 +645,17 @@ fn apply_block_utxo_mutations_batched(
 ) -> Result<(), String> {
     let block_hash = block.block_hash();
     let mut undo = UndoData::new(block_hash, block.height);
+    // DAG-12: the selected-chain indexes (height → hash, height → timestamp,
+    // address history) are written when the block JOINS the selected chain,
+    // in this same batch. Input rows resolve through the undo capture so they
+    // match what `rollback_block_batched` later deletes.
+    let stage_index = |batch: &mut ReorgBatch, undo: &UndoData| -> Result<(), String> {
+        let spent: HashMap<([u8; 32], u32), TxOutput> = undo.spent_utxos.iter()
+            .map(|e| ((e.prev_txid, e.prev_index), e.output.clone()))
+            .collect();
+        batch.store.stage_chain_index(&mut batch.batch, block, &spent)
+            .map_err(|e| format!("apply: chain index failed: {}", e))
+    };
 
     for tx in &block.transactions {
         let txid = tx.txid();
@@ -617,6 +687,7 @@ fn apply_block_utxo_mutations_batched(
         }
     }
 
+    stage_index(batch, &undo)?;
     batch.put_undo_data(&block_hash, &undo)
 }
 
@@ -633,7 +704,7 @@ fn apply_block_utxo_mutations_batched(
 ///
 /// Reads go through the [`ReorgBatch`] overlay so the "incrementally-reorged"
 /// state is visible even though nothing has been committed to disk yet.
-fn validate_fork_block_state(batch: &ReorgBatch, block: &Block) -> Result<(), String> {
+pub fn validate_fork_block_state(batch: &dyn UtxoView, block: &Block) -> Result<(), String> {
     // Outputs created earlier in THIS block (outpoint -> value) so a later tx
     // can spend an earlier one; coinbase outputs are tracked separately because
     // they are immature to spend within the same block.
@@ -658,7 +729,7 @@ fn validate_fork_block_state(batch: &ReorgBatch, block: &Block) -> Result<(), St
                     }
                     *v
                 } else {
-                    match batch.get_utxo(&inp.prev_txid, inp.prev_index) {
+                    match batch.view_utxo(&inp.prev_txid, inp.prev_index) {
                         Ok(Some(out)) => out.value,
                         _ => return Err(format!("input {}:{} absent from reorged UTXO set",
                             hex::encode(&op.0[..4]), op.1)),
@@ -671,7 +742,7 @@ fn validate_fork_block_state(batch: &ReorgBatch, block: &Block) -> Result<(), St
                 return Err(format!("value violation: inputs {} < outputs {}", in_sum, out_sum));
             }
             crate::core::check_coinbase_maturity(tx, block.height, |t| {
-                batch.get_coinbase_height(t).ok().flatten()
+                batch.view_coinbase_height(t).ok().flatten()
             })?;
         }
         for (j, out) in tx.outputs.iter().enumerate() {
@@ -687,50 +758,153 @@ fn validate_fork_block_state(batch: &ReorgBatch, block: &Block) -> Result<(), St
 // Mempool reinject (with validation)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Compute a transaction's fee by looking up each input's prev output in
-/// the CURRENT UTXO set. Also returns whether every input resolved —
-/// a tx with missing inputs is invalid in the post-reorg state and must
-/// not be reinjected.
+/// Re-admit the non-coinbase transactions of disconnected blocks to the
+/// mempool after a committed chain switch. Returns (reinjected, discarded).
 ///
-/// Returns `(fee, all_inputs_present)`.
-fn compute_fee_and_validate(
-    store: &Storage,
-    tx: &Transaction,
-) -> (u64, bool) {
-    let mut input_sum: u64 = 0;
-    for inp in &tx.inputs {
-        match store.get_utxo(&inp.prev_txid, inp.prev_index) {
-            Ok(Some(out)) => input_sum = input_sum.saturating_add(out.value),
-            _             => return (0, false),
-        }
-    }
-    let output_sum: u64 = tx.outputs.iter().map(|o| o.value).sum();
-    let fee = input_sum.saturating_sub(output_sum);
-    (fee, true)
-}
-
-/// Attempt to reinject one tx into the mempool, validating against the
-/// current UTXO set. Returns true if reinjected, false if discarded.
-///
-/// Reasons for discarding:
-///   * Any input UTXO missing from the current set (the new chain spent it
-///     elsewhere, or it was created by a rolled-back block that the new
-///     chain doesn't include).
-///   * Tx already present in mempool (shouldn't happen but defensive —
-///     without this we'd double-count a reinject).
-///   * mempool.add rejects (e.g. oversized, malformed, output overflow —
-///     these are checks `accept_block` didn't make at acceptance time).
-fn try_reinject(
+/// Audit MEM-7 fix: re-injected transactions used to skip the maturity and
+/// minimum-fee checks applied at normal admission, so a reorg to a lower
+/// height could re-admit immature coinbase spends (or fee-less txs) that then
+/// poisoned every block template. They now go through the SAME admission
+/// function as gossip and RPC (`mempool::admission::admit`), evaluated at the
+/// new tip: size, standardness (dust, MoneyRange, script limits), duplicate,
+/// conflicts, UTXO presence, coinbase maturity at `next_block_height`, the
+/// version rule and policy at `next_block_height`, consensus minimum fee and
+/// relay fee. The witness standardness step is skipped, and so is the
+/// signature step below the hardening activation (`check_signatures =
+/// false`): every one of these transactions was signature-checked when the
+/// disconnected block was connected, and below the activation every version
+/// uses sighash v2 at every height. At/after the activation the input scripts
+/// ARE verified again (normally a verified-signature cache hit): a version-3
+/// transaction mined below the activation was checked against the v2 digest
+/// only. `next_block_height` is the node's next template height after the
+/// move (`Mempool::next_height`), never the new tip's header height + 1.
+pub fn reinject_disconnected(
     store: &Storage,
     mempool: &Mempool,
-    tx: &Transaction,
-) -> bool {
-    if mempool.contains(&tx.txid()) { return false; }
+    txs: Vec<Transaction>,
+    next_block_height: u64,
+) -> (usize, usize) {
+    let policy = crate::mempool::admission::AdmissionPolicy::reinjection(next_block_height);
+    let mut reinjected: usize = 0;
+    let mut discarded: usize = 0;
+    for tx in txs {
+        match crate::mempool::admission::admit(store, mempool, tx, &policy) {
+            Ok(_)  => reinjected = reinjected.saturating_add(1),
+            Err(_) => discarded = discarded.saturating_add(1),
+        }
+    }
+    (reinjected, discarded)
+}
 
-    let (fee, valid) = compute_fee_and_validate(store, tx);
-    if !valid { return false; }
+// ─────────────────────────────────────────────────────────────────────────────
+// Atomic connect (extension or reorg) — audit DAG-1 / DAG-11
+// ─────────────────────────────────────────────────────────────────────────────
 
-    mempool.add(tx.clone(), fee).is_ok()
+/// Why a [`connect_plan`] did not commit. In every case NOTHING was written:
+/// the staged batch is dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectError {
+    /// Refused by policy (reorg depth cap). Says nothing about validity.
+    Refused(String),
+    /// `block` (at header height `height`) is invalid in its own selected-
+    /// chain context. Deterministic and permanent: every node evaluating the
+    /// same block in the same context reaches the same verdict.
+    Invalid { block: BlockHash, height: u64, reason: String },
+    /// Storage / missing-data failure. Transient from the caller's view.
+    Failed(String),
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectError::Refused(m) => write!(f, "{}", m),
+            ConnectError::Invalid { height, reason, .. } =>
+                write!(f, "reorg aborted: fork block h={} invalid: {}", height, reason),
+            ConnectError::Failed(m) => write!(f, "{}", m),
+        }
+    }
+}
+
+/// What a committed [`connect_plan`] changed.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectOutcome {
+    /// Blocks removed from the selected chain, tip-first.
+    pub disconnected: Vec<Block>,
+    /// Blocks added to the selected chain, LCA-first (last = new tip).
+    pub connected: Vec<Block>,
+}
+
+/// Hooks the caller plugs into [`connect_plan`].
+pub struct ConnectHooks<'h> {
+    /// Validate one block against the staged view of ITS OWN selected-chain
+    /// context (every earlier block of the plan already staged). `Err` marks
+    /// the block invalid (see [`ConnectError::Invalid`]).
+    pub validate: &'h dyn Fn(&dyn UtxoView, &Block) -> Result<(), String>,
+    /// Extra writes folded into the SAME batch right before the commit (DAG
+    /// record of the arriving block, tip pointer, invalid marks, ...).
+    pub stage_extra: &'h dyn Fn(&Storage, &mut rocksdb::WriteBatch) -> Result<(), String>,
+}
+
+/// Move the applied selected chain along `plan` in ONE atomic RocksDB batch.
+///
+/// `plan.to_rollback` may be empty (a forward extension). Every block of
+/// `plan.to_apply` is validated by `hooks.validate` against the
+/// incrementally-staged state before it is staged, so a block is only ever
+/// applied in its own context. All UTXO effects, undo records, chain indexes
+/// and the caller's extra writes land together or not at all (DAG-11): a crash
+/// leaves either the complete old state or the complete new state.
+pub fn connect_plan(
+    store: &Storage,
+    plan: &ReorgPlan,
+    hooks: &ConnectHooks,
+) -> Result<ConnectOutcome, ConnectError> {
+    let depth = plan.to_rollback.len() as u64;
+    if depth > MAX_REORG_DEPTH {
+        return Err(ConnectError::Refused(format!(
+            "{}: plan rolls back {} blocks > cap {} (finality window); refused with no storage mutation",
+            ERR_REORG_DEPTH, depth, MAX_REORG_DEPTH,
+        )));
+    }
+
+    let mut batch = ReorgBatch::new(store);
+    let mut outcome = ConnectOutcome::default();
+
+    for hash in &plan.to_rollback {
+        let block = store.get_block(hash)
+            .map_err(|e| ConnectError::Failed(format!(
+                "execute_reorg: get_block on rollback target failed: {}", e)))?
+            .ok_or_else(|| ConnectError::Failed(
+                "execute_reorg: block body missing for rollback target".to_string()))?;
+        rollback_block_batched(&mut batch, &block, hash)
+            .map_err(|e| ConnectError::Failed(format!(
+                "execute_reorg: rollback failed at h={} (reorg aborted, no storage mutation committed): {}",
+                block.height, e
+            )))?;
+        outcome.disconnected.push(block);
+    }
+
+    for hash in &plan.to_apply {
+        let block = store.get_block(hash)
+            .map_err(|e| ConnectError::Failed(format!(
+                "execute_reorg: get_block on apply target failed: {}", e)))?
+            .ok_or_else(|| ConnectError::Failed(
+                "execute_reorg: block body missing for apply target".to_string()))?;
+        if let Err(reason) = (hooks.validate)(&batch, &block) {
+            log::warn!(
+                "connect: block h={} {} failed in-context validation ({}); batch dropped, storage untouched",
+                block.height, hex::encode(&hash[..8]), reason
+            );
+            return Err(ConnectError::Invalid { block: *hash, height: block.height, reason });
+        }
+        apply_block_utxo_mutations_batched(&mut batch, &block)
+            .map_err(|e| ConnectError::Failed(format!(
+                "execute_reorg: batched apply failed at h={}: {}", block.height, e)))?;
+        outcome.connected.push(block);
+    }
+
+    (hooks.stage_extra)(store, &mut batch.batch).map_err(ConnectError::Failed)?;
+    batch.commit().map_err(ConnectError::Failed)?;
+    Ok(outcome)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -745,8 +919,15 @@ fn try_reinject(
 ///    rolled-back block, collect non-coinbase txs as reinject candidates.
 /// 2. **Apply** each block in `plan.to_apply` (LCA-first). Each apply
 ///    captures fresh UndoData so the new chain is also reorg-capable.
-/// 3. **Reinject** candidate txs into the mempool, validating each against
-///    the now-current UTXO set. Invalid ones are counted as discarded.
+/// 3. **Reinject** candidate txs into the mempool through the shared
+///    admission function (`reinject_disconnected`, audit MEM-7): UTXO
+///    presence, maturity and minimum fees at the new tip. Rejected ones are
+///    counted as discarded.
+///
+/// Fork blocks are re-validated with the audit-H1 UTXO-state rules
+/// (`validate_fork_block_state`). The acceptance pipeline does not call this
+/// function: it calls [`connect_plan`] directly with the FULL in-context
+/// block validator.
 ///
 /// # Preconditions
 ///
@@ -801,110 +982,42 @@ fn execute_reorg_inner(
     mempool: &Mempool,
     plan: &ReorgPlan,
 ) -> Result<ReorgOutcome, String> {
-    // ── Depth cap (security hardening) ────────────────────────────────────
-    // Refuse over-deep plans BEFORE any storage access. Reorg depth = number
-    // of established selected-chain blocks the plan unwinds. Distinct error
-    // marker so callers can tell policy refusal from execution failure.
-    let depth = plan.to_rollback.len() as u64;
-    if depth > MAX_REORG_DEPTH {
-        return Err(format!(
-            "{}: plan rolls back {} blocks > cap {} (finality window); refused with no storage mutation",
-            ERR_REORG_DEPTH, depth, MAX_REORG_DEPTH,
-        ));
+    // Same depth-cap gate, staging and atomic commit as the acceptance
+    // pipeline (`connect_plan`); this standalone entry point re-validates
+    // fork blocks with the audit-H1 UTXO-state rules only. The acceptance
+    // pipeline plugs the FULL in-context validator (signatures, fees,
+    // coinbase value) into `connect_plan` instead.
+    //
+    // Shielded state: the acceptance pipeline (`accept::accept_block`)
+    // disconnects/connects the shielded pool for exactly the blocks of the
+    // committed plan (audit COH-2); this storage-only entry point does not
+    // touch it.
+    let validate = |view: &dyn UtxoView, block: &Block| validate_fork_block_state(view, block);
+    let no_extra = |_: &Storage, _: &mut rocksdb::WriteBatch| -> Result<(), String> { Ok(()) };
+    let hooks = ConnectHooks { validate: &validate, stage_extra: &no_extra };
+    let outcome = connect_plan(store, plan, &hooks).map_err(|e| e.to_string())?;
+
+    // Phase 3: re-admit the disconnected blocks' transactions through the
+    // shared admission function, evaluated at the new tip (MEM-7).
+    let candidates: Vec<Transaction> = outcome.disconnected.iter()
+        .flat_map(|b| b.transactions.iter().filter(|t| !t.is_coinbase()).cloned())
+        .collect();
+    // The next block's height: this storage-only entry point has no DAG, so
+    // it uses the new tip's DAG height + 1 (its CF_DAG record) — the template
+    // height when the new tip is the only tip — never the tip's HEADER height
+    // + 1, which exceeds it when the tip merged a parent with a greater DAG
+    // height (DAG-8). The acceptance pipeline passes the template height.
+    let next_height = outcome.connected.last()
+        .map(|b| match store.get_dag_data(&b.block_hash()) {
+            Ok(Some(d)) => d.height.saturating_add(1),
+            _ => b.height.saturating_add(1),
+        })
+        .unwrap_or(0);
+    if next_height != 0 {
+        mempool.set_next_height(next_height);
     }
-
-    let mut candidate_txs: Vec<Transaction> = Vec::new();
-
-    // All phase-1/phase-2 mutations are STAGED here and committed atomically
-    // after the whole plan has validated. Any early return drops the batch —
-    // storage untouched.
-    let mut batch = ReorgBatch::new(store);
-
-    // Phase 1: Stage rollback of the old chain (tip-toward-LCA).
-    for hash in &plan.to_rollback {
-        // Capture the block's non-coinbase txs BEFORE rollback mutates state
-        // (though get_block reads CF_BLOCKS, which rollback never touches —
-        // order is correct either way, we read first for clarity).
-        let block = store.get_block(hash)
-            .map_err(|e| format!("execute_reorg: get_block on rollback target failed: {}", e))?
-            .ok_or_else(|| format!("execute_reorg: block body missing for rollback target"))?;
-
-        for tx in &block.transactions {
-            if !tx.is_coinbase() {
-                candidate_txs.push(tx.clone());
-            }
-        }
-
-        rollback_block_batched(&mut batch, &block, hash)
-            .map_err(|e| format!(
-                "execute_reorg: rollback failed at h={} (reorg aborted, no storage mutation committed): {}",
-                block.height, e
-            ))?;
-        // Shielded-state undo (Sprint U.4 live-wiring). AUDIT CORRECTION: a bare
-        // LIFO pop is NOT safe here. `apply_block_self` currently runs for EVERY
-        // accepted block (incl. side/losing forks, at main.rs), so the undo stack
-        // is in ARRIVAL order, not selected-chain order. Correct U.4 wiring:
-        //  (a) shielded state must mutate ONLY on selected-chain connect/disconnect
-        //      — move the accept-path `apply_block_self` into the connect
-        //      transition so the undo stack IS the selected chain;
-        //  (b) here, call `shielded.write().disconnect_block_self(hash)` per
-        //      rolled-back block (tip-first). It is now identity-keyed and returns
-        //      `ReorgOrderMismatch` rather than undo the wrong block;
-        //  (c) Phase 2 calls `apply_block_self(fork_hash, &b.shielded_transactions)`
-        //      per applied fork block, and RE-ADMITS dropped shielded txs to the
-        //      shielded mempool (currently lost — liveness).
-        // Mechanism + exact-reversal/order-guard tests: `coherence::ShieldedEngine`.
-        // Whole path is LATENT today (RejectAll makes shielded txs never apply).
-        //
-        // DECISION (U.4 close-out): this shielded selected-chain-order wiring is
-        // DEFERRED to the SP1-verifier track, on purpose. It is only end-to-end
-        // exercisable once `RejectAll` is lifted (real shielded txs applying), so
-        // landing it now would merge consensus-path code that cannot be tested for
-        // zero present effect. It lands WITH the SP1 verifier, as one coherent,
-        // reviewable, fully-testable change. The UTXO half of U.4 (above) is
-        // complete and hardened — see tests/reorg_hardening.rs (audit-H1 restore,
-        // byte-exact A→B→A symmetry, shielded order-guard) + tests/sprint_u4_reorg_e2e.rs.
-    }
-
-    // Phase 2: Validate THEN stage the new chain (LCA-toward-tip). Each fork
-    // block is re-validated against the incrementally-reorged UTXO state via
-    // the batch overlay (audit H1). If any block is invalid, drop the batch —
-    // no explicit restore pass is needed because nothing was committed, so a
-    // rejected reorg can never leave a corrupted / coins-from-nothing UTXO set.
-    for hash in &plan.to_apply {
-        let block = store.get_block(hash)
-            .map_err(|e| format!("execute_reorg: get_block on apply target failed: {}", e))?
-            .ok_or_else(|| format!("execute_reorg: block body missing for apply target"))?;
-
-        if let Err(reason) = validate_fork_block_state(&batch, &block) {
-            log::error!(
-                "execute_reorg: fork block h={} failed re-validation ({}); aborting reorg (atomic batch dropped, storage untouched)",
-                block.height, reason
-            );
-            return Err(format!("reorg aborted: fork block h={} invalid: {}", block.height, reason));
-        }
-
-        apply_block_utxo_mutations_batched(&mut batch, &block)
-            .map_err(|e| format!("execute_reorg: batched apply failed at h={}: {}", block.height, e))?;
-    }
-
-    // ── Atomic commit: the entire chain switch lands in one db.write() ────
-    batch.commit()?;
-
-    // Phase 3: Reinject valid, validate-rejected txs into mempool.
-    // UTXO set now reflects the new chain (the batch above is committed);
-    // any tx whose inputs survive is still spendable.
-    let mut txs_reinjected: usize = 0;
-    let mut txs_discarded: usize = 0;
-    for tx in candidate_txs {
-        // Report counters (bounded by the candidate count); saturating so the
-        // reorg path carries no unchecked arithmetic (hardened ratchet).
-        if try_reinject(store, mempool, &tx) {
-            txs_reinjected = txs_reinjected.saturating_add(1);
-        } else {
-            txs_discarded = txs_discarded.saturating_add(1);
-        }
-    }
+    let (txs_reinjected, txs_discarded) =
+        reinject_disconnected(store, mempool, candidates, next_height);
 
     Ok(ReorgOutcome {
         rolled_back:    plan.to_rollback.len(),

@@ -11,12 +11,31 @@ node's localhost JSON-RPC. Responses are cached briefly. Every request must
 carry the shared secret in X-GnB-Key (set by the Cloudflare Worker), so the
 origin is not an open public API. Standard library only.
 
+Hardening (audit WAL-2, WAL-4, NET-12):
+  * binds 127.0.0.1 by default: expose it through a Cloudflare Tunnel, or
+    terminate TLS here (GNB_API_TLS_CERT/KEY) behind the Cloudflare-only
+    firewall of firewall-cloudflare.sh; see README.md;
+  * every connection has a socket timeout AND an absolute deadline, so idle
+    or slow-drip (slowloris) clients cannot hold a worker;
+  * at most GNB_API_MAX_CONNECTIONS connections are served at once; further
+    connections are refused immediately instead of spawning threads;
+  * requests are rate-limited per ORIGINAL client: the X-GnB-Client-IP header
+    the Worker sets from CF-Connecting-IP (trusted only on requests that carry
+    the shared key), else the peer address.
+
 Environment:
-    GNB_RPC_URL        node JSON-RPC (default http://127.0.0.1:17210/)
-    GNB_API_BIND       bind address   (default 0.0.0.0)
-    GNB_API_PORT       bind port      (default 2086)
-    GNB_API_KEY_FILE   file holding the shared secret (required)
-    GNB_CARRYOVER      uncompressed Bloch Genesis-3 carryover TSV (optional)
+    GNB_RPC_URL              node JSON-RPC (default http://127.0.0.1:17210/)
+    GNB_API_BIND             bind address   (default 127.0.0.1)
+    GNB_API_PORT             bind port      (default 2086)
+    GNB_API_KEY_FILE         file holding the shared secret (required, mode 0600/0640)
+    GNB_API_TLS_CERT         PEM certificate chain: serve HTTPS (optional)
+    GNB_API_TLS_KEY          PEM private key for GNB_API_TLS_CERT
+    GNB_API_TIMEOUT          per-read socket timeout, seconds (default 10)
+    GNB_API_DEADLINE         absolute per-connection deadline, seconds (default 30)
+    GNB_API_MAX_CONNECTIONS  concurrent connections (default 64)
+    GNB_API_RATE_PER_MIN     GET requests per client per minute (default 240)
+    GNB_API_POST_PER_MIN     broadcasts per client per minute (default 6)
+    GNB_CARRYOVER            uncompressed Bloch Genesis-3 carryover TSV (optional)
 """
 
 import hashlib
@@ -24,6 +43,10 @@ import hmac
 import json
 import os
 import re
+import socket
+import ssl
+import stat
+import sys
 import threading
 import time
 import urllib.parse
@@ -31,15 +54,23 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 RPC_URL = os.environ.get("GNB_RPC_URL", "http://127.0.0.1:17210/")
-BIND = os.environ.get("GNB_API_BIND", "0.0.0.0")
-PORT = int(os.environ.get("GNB_API_PORT", "2086"))
-with open(os.environ["GNB_API_KEY_FILE"], "r", encoding="utf-8") as fh:
-    API_KEY = fh.readline().strip().encode()
-if len(API_KEY) < 32:
-    raise SystemExit("GNB_API_KEY_FILE must hold a secret of at least 32 characters")
+API_KEY = b""
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 ADDR = re.compile(r"^gnb1[qt][0-9a-f]{48}$")
+IP_TEXT = re.compile(r"^[0-9a-fA-F:.]{2,45}$")
+
+
+def load_api_key(path):
+    """Read the shared secret; refuse group/world-writable or world-readable files."""
+    st = os.stat(path)
+    if st.st_mode & (stat.S_IWGRP | stat.S_IRWXO):
+        raise SystemExit(f"{path}: the API key file must be mode 0600 or 0640")
+    with open(path, "r", encoding="utf-8") as fh:
+        key = fh.readline().strip().encode()
+    if len(key) < 32:
+        raise SystemExit("GNB_API_KEY_FILE must hold a secret of at least 32 characters")
+    return key
 
 
 def _int(lo, hi):
@@ -72,13 +103,16 @@ ALLOWED = {
     "getsupplyinfo":           ([], 10),
     "getchainstats":           ([], 30),
     "gethashrate":             ([], 30),
-    "getdifficultyhistory":    ([_int(1, 500)], 30),
+    # NET-12: the node caps this at 100 points; bounded walk, single-flight.
+    "getdifficultyhistory":    ([_int(1, 100)], 30),
     "getblocktimepercentiles": ([], 30),
     "getmempoolstats":         ([], 5),
     "getrawmempool":           ([], 5),
     "getselectedchain":        ([OFFSET, PAGE], 3),
     "getblockdag":             ([HASH], 5),
     "gettransactionfull":      ([HASH], 5),
+    # WAL-1: raw bytes of a previous transaction, hashed by the wallet.
+    "getrawtransaction":       ([HASH], 60),
     "getdagwindow":            ([_int(1, 300)], 3),
     "getaddresshistory":       ([ADDRESS, PAGE, OFFSET], 5),
     "getbalance":              ([ADDRESS], 5),
@@ -118,6 +152,37 @@ def cached(key, ttl, fn):
             _cache.clear()
         _cache[key] = (now + ttl, value)
     return value
+
+
+# ── per-client rate limiting (WAL-4) ────────────────────────────────────────
+
+class RateLimiter:
+    """Fixed-window counter per client and bucket, bounded in size."""
+
+    def __init__(self, per_min, max_clients=50_000):
+        self.per_min = per_min
+        self.max_clients = max_clients
+        self.windows = {}
+        self.lock = threading.Lock()
+
+    def allow(self, client):
+        now = int(time.monotonic() // 60)
+        with self.lock:
+            window, n = self.windows.get(client, (now, 0))
+            if window != now:
+                window, n = now, 0
+            if n >= self.per_min:
+                return False
+            if client not in self.windows and len(self.windows) >= self.max_clients:
+                self.windows = {k: v for k, v in self.windows.items() if v[0] == now}
+                if len(self.windows) >= self.max_clients:
+                    return False
+            self.windows[client] = (window, n + 1)
+            return True
+
+
+GET_LIMIT = RateLimiter(int(os.environ.get("GNB_API_RATE_PER_MIN", "240")))
+POST_LIMIT = RateLimiter(int(os.environ.get("GNB_API_POST_PER_MIN", "6")))
 
 
 # ── carryover share per address ─────────────────────────────────────────────
@@ -165,6 +230,29 @@ def carryover_of(address):
 class Handler(BaseHTTPRequestHandler):
     server_version = "gnb-explorer-api"
     sys_version = ""
+    # Per-read socket timeout (BaseHTTPRequestHandler applies it in setup()).
+    timeout = float(os.environ.get("GNB_API_TIMEOUT", "10"))
+    # Absolute deadline for a whole connection, whatever the client sends.
+    deadline = float(os.environ.get("GNB_API_DEADLINE", "30"))
+
+    def setup(self):
+        super().setup()
+        self._timer = threading.Timer(self.deadline, self._expire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _expire(self):
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def finish(self):
+        self._timer.cancel()
+        try:
+            super().finish()
+        except OSError:
+            pass
 
     def log_message(self, fmt, *args):  # quiet; systemd keeps errors only
         pass
@@ -178,10 +266,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_GET(self):
+    def authorized(self):
         key = self.headers.get("x-gnb-key", "").encode()
-        if not hmac.compare_digest(key, API_KEY):
+        return bool(API_KEY) and hmac.compare_digest(
+            hashlib.sha256(key).digest(), hashlib.sha256(API_KEY).digest())
+
+    def client(self):
+        """The original client: the Worker's X-GnB-Client-IP (only trusted on
+        authorized requests), else CF-Connecting-IP, else the peer address."""
+        for header in ("x-gnb-client-ip", "cf-connecting-ip"):
+            v = self.headers.get(header, "").strip()
+            if v and IP_TEXT.match(v):
+                return v
+        return self.client_address[0]
+
+    def do_GET(self):
+        if not self.authorized():
             return self.send(403, {"error": "forbidden"})
+        if not GET_LIMIT.allow(self.client()):
+            return self.send(429, {"error": "rate limit exceeded; retry in a minute"})
         url = urllib.parse.urlsplit(self.path)
         parts = [p for p in url.path.split("/") if p]
         if len(parts) < 2 or parts[0] != "v1":
@@ -219,11 +322,12 @@ MAX_TX_HEX = 2 * 400 * 1024
 
 class PostHandler(Handler):
     def do_POST(self):
-        key = self.headers.get("x-gnb-key", "").encode()
-        if not hmac.compare_digest(key, API_KEY):
+        if not self.authorized():
             return self.send(403, {"error": "forbidden"})
         if urllib.parse.urlsplit(self.path).path != "/v1/sendrawtransaction":
             return self.send(404, {"error": "not found"})
+        if not POST_LIMIT.allow(self.client()):
+            return self.send(429, {"error": "rate limit exceeded; retry in a minute"})
         try:
             n = int(self.headers.get("content-length", "0"))
             if not 0 < n <= MAX_TX_HEX + 64:
@@ -240,10 +344,70 @@ class PostHandler(Handler):
             return self.send(502, {"error": "node unavailable"})
 
 
+class BoundedServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a hard cap on concurrent connections: a
+    connection beyond the cap is closed at once instead of getting a thread."""
+
+    daemon_threads = True
+    request_queue_size = 128
+
+    def __init__(self, addr, handler, max_connections=64, ssl_context=None):
+        self.slots = threading.BoundedSemaphore(max_connections)
+        self.ssl_context = ssl_context
+        super().__init__(addr, handler)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def handle_error(self, request, client_address):
+        # Connections cut at the deadline or dropped by the client are routine.
+        if isinstance(sys.exc_info()[1], (OSError, ssl.SSLError)):
+            return
+        super().handle_error(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            if self.ssl_context is not None:
+                request.settimeout(Handler.timeout)
+                request = self.ssl_context.wrap_socket(request, server_side=True)
+            super().process_request_thread(request, client_address)
+        except (OSError, ssl.SSLError):
+            self.shutdown_request(request)
+        finally:
+            self.slots.release()
+
+
+def make_server(bind, port, max_connections, cert=None, key=None):
+    ctx = None
+    if cert or key:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(cert, key)
+    return BoundedServer((bind, port), PostHandler, max_connections, ctx)
+
+
 def main():
+    global API_KEY
+    API_KEY = load_api_key(os.environ["GNB_API_KEY_FILE"])
+    bind = os.environ.get("GNB_API_BIND", "127.0.0.1")
+    port = int(os.environ.get("GNB_API_PORT", "2086"))
+    cert, key = os.environ.get("GNB_API_TLS_CERT"), os.environ.get("GNB_API_TLS_KEY")
+    if bind not in ("127.0.0.1", "::1", "localhost") and not cert:
+        raise SystemExit("refusing to serve plain HTTP on a non-loopback address; set "
+                         "GNB_API_TLS_CERT/GNB_API_TLS_KEY or use a Cloudflare Tunnel (README.md)")
     threading.Thread(target=load_carryover, args=(os.environ.get("GNB_CARRYOVER"),), daemon=True).start()
-    httpd = ThreadingHTTPServer((BIND, PORT), PostHandler)
-    httpd.daemon_threads = True
+    httpd = make_server(bind, port, int(os.environ.get("GNB_API_MAX_CONNECTIONS", "64")), cert, key)
     httpd.serve_forever()
 
 

@@ -10,9 +10,16 @@ members = [
     "crates/coherence-core",  # shielded-pool primitives used by the block format
     "crates/gnb-wallet-wasm", # browser wallet core (WebAssembly), served at /wallet
     "node",                   # the `gnb` full node, `gnb-cli`, `gnb-wallet`
+    # Vendored forks, patched in through [patch.crates-io] below. Members so
+    # their own guard tests run in place (`cargo test -p pqcrypto-internals`,
+    # `cargo test -p libp2p-yamux`: tests/vendor_pin.rs, tests/lockfile_guard.rs)
+    # and in `cargo test --workspace` (audit finding AUD-2).
+    "crates/pqcrypto-internals",
+    "crates/libp2p-yamux",
 ]
-# Standalone reference crate (GnB-SMH v1 + ledger v1) with its own Cargo.lock.
-exclude = ["rust"]
+# Standalone reference crate (GnB-SMH v1 + ledger v1) with its own Cargo.lock,
+# and the cargo-fuzz crate (nightly + sanitizer flags, its own workspace).
+exclude = ["rust", "node/fuzz"]
 
 # GnB-SMH is 2^20 Keccak permutations per evaluation; unoptimized it makes
 # every test that touches a block take seconds. Optimize the hashing crates in

@@ -1,0 +1,11 @@
+# cargo-audit configuration (read from .cargo/audit.toml in the repository
+# root). Mirrors the vulnerability exceptions of deny.toml, whose comments give
+# the full reachability argument; keep the two lists in sync. Unmaintained
+# notices are reported as warnings and do not fail `cargo audit`.
+[advisories]
+ignore = [
+    # hickory-proto 0.25.2 via libp2p-dns 0.44 / libp2p-mdns 0.48 (libp2p
+    # 0.56). Fixed only in hickory 0.26.x, which needs libp2p >= 0.57.
+    "RUSTSEC-2026-0118", # DNSSEC NSEC3 loop: dnssec features not compiled
+    "RUSTSEC-2026-0119", # O(n^2) encoding: hickory encodes only our own queries
+]

@@ -1,0 +1,119 @@
+# cargo-fuzz targets for the node's untrusted-input surfaces (audit OPS-1).
+#
+# Its own workspace (excluded from the root one): libFuzzer needs nightly and
+# sanitizer flags, which must never leak into the consensus build.
+#
+#   cp Cargo.lock node/fuzz/Cargo.lock      # start from the audited lockfile
+#   cd node/fuzz
+#   cargo +nightly fuzz build               # all targets (cargo install cargo-fuzz)
+#   cargo +nightly fuzz run tx_parse        # seeds: corpus/tx_parse/
+#
+# Targets and the seed corpus each starts from (corpus/<target>/; the seeds are
+# generated and replayed on stable by node/tests/parser_corpus_floor.rs):
+#
+#   tx_parse          Transaction::from_wire_bytes (+ decode/encode idempotence)
+#   block_parse       Block::from_wire_bytes (+ idempotence)
+#   header_parse      BlockHeader::from_wire_bytes (+ idempotence)
+#   netmsg_decode     gnb::network::decode_wire_message (gossip frames)
+#   handshake_decode  transport handshake messages (HandshakeInit / HandshakeResp)
+#   pow_decode        compact bits <-> target, chain work, ASERT (vs a U512 oracle)
+#   pow_verify        GnB-SMH output vs target (small scratchpad), hybrid signature verify
+#   merkle_path       coherence_core::verify_path
+#   mempool_ops       Mempool op stream with the txs/spent/rate-index invariant
+#
+# `cargo check` on stable type-checks the targets (libfuzzer-sys builds there
+# too); actually fuzzing needs nightly + cargo-fuzz.
+
+[package]
+name = "gnb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+gnb = { path = ".." }
+gnb-crypto = { path = "../../crates/gnb-crypto" }
+gnb-smh = { path = "../../crates/gnb-smh" }
+coherence-core = { path = "../../crates/coherence-core" }
+bincode = { version = "2", features = ["serde"] }
+primitive-types = "0.13"
+
+[workspace]
+members = ["."]
+
+[patch.crates-io]
+# Same patches as the root workspace.
+pqcrypto-internals = { path = "../../crates/pqcrypto-internals" }
+libp2p-yamux = { path = "../../crates/libp2p-yamux" }
+
+[profile.release]
+debug = 1
+overflow-checks = true
+
+[[bin]]
+name = "tx_parse"
+path = "fuzz_targets/tx_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_parse"
+path = "fuzz_targets/block_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "header_parse"
+path = "fuzz_targets/header_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "netmsg_decode"
+path = "fuzz_targets/netmsg_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_decode"
+path = "fuzz_targets/handshake_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pow_decode"
+path = "fuzz_targets/pow_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pow_verify"
+path = "fuzz_targets/pow_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "merkle_path"
+path = "fuzz_targets/merkle_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mempool_ops"
+path = "fuzz_targets/mempool_ops.rs"
+test = false
+doc = false
+bench = false

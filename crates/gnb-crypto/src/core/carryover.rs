@@ -235,11 +235,17 @@ mod tests {
         assert_eq!(reparsed.hash(), &hash);
     }
 
+    /// The snapshot shipped in the repository (genesis/bloch-g3-carryover.tsv.gz),
+    /// decompressed in memory, verifies against this chain's constants. Runs by
+    /// default; the consensus hash is over the uncompressed bytes, so the gzip
+    /// framing itself is not pinned.
     #[test]
-    #[ignore = "needs genesis/bloch-g3-carryover.tsv (gunzip the shipped .gz)"]
     fn shipped_snapshot_verifies() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../genesis/bloch-g3-carryover.tsv");
-        let bytes = std::fs::read(path).expect("gunzip -k genesis/bloch-g3-carryover.tsv.gz first");
+        use std::io::Read;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../genesis/bloch-g3-carryover.tsv.gz");
+        let gz = std::fs::File::open(path).expect("genesis/bloch-g3-carryover.tsv.gz is shipped in the repository");
+        let mut bytes = Vec::new();
+        flate2::read::GzDecoder::new(gz).read_to_end(&mut bytes).expect("snapshot gzip decodes");
         let c = verify_and_convert(&bytes).unwrap_or_else(|f| panic!("{f:?}"));
         assert_eq!(c.fixed_vouts, 38);
         assert_eq!(c.dropped_zero, 1);
