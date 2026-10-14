@@ -43,6 +43,17 @@ JSON-RPC on 127.0.0.1:17210. Useful methods: `getblockcount`, `getdaginfo`,
 `getblocktemplate`, `submitblock`, `getsupplyinfo`, `getbalance`,
 `sendrawtransaction`. See `node/src/rpc/mod.rs`.
 
+The node serves plain HTTP. To reach a remote node, put a TLS reverse proxy in
+front of its RPC port or use an SSH tunnel
+(`ssh -L 17210:127.0.0.1:17210 host`). Both CLI wallets speak HTTPS (audit
+WAL-7): `gnb-cli --rpc-url https://node.example …` or
+`gnb-wallet --rpc https://node.example …`. They verify the certificate chain
+against the Mozilla roots (`webpki-roots`) and check the host name. For a
+private CA or a self-signed certificate, pass the trust anchor with
+`gnb-cli --rpc-ca ca.pem` or set `GNB_RPC_CA=ca.pem` for `gnb-wallet`.
+`GNB_RPC_API_KEY` is sent over HTTPS to any host, but over plain HTTP only
+to loopback addresses.
+
 ## Wallet keystores (audit CRY-7)
 
 Every front end writes keystore **v3**, which authenticates the network and

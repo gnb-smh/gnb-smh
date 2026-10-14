@@ -49,6 +49,8 @@ node = [
     "dep:governor",
     "dep:reqwest",
     "gnb-crypto/node",
+    # WAL-7: HTTPS (certificate-verified) for gnb-cli's RPC client.
+    "gnb-crypto/https-rpc",
 ]
 sev-snp = ["dep:sev"]
 mobile  = ["dep:x509-parser", "dep:ciborium"]
@@ -186,6 +188,10 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # Property-based invariant tests for GhostDAG consensus ordering
 # (determinism, parent-order independence, blue-score monotonicity).
 proptest = "1"
+# WAL-7: a local TLS server with a throw-away CA for the HTTPS RPC client
+# tests (versions already in Cargo.lock through libp2p / reqwest).
+rcgen  = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [lints.rust]
 # `sp1-verify` gates an optional SP1 shielded-proof verifier whose dependency

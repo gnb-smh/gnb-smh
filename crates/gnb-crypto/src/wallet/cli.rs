@@ -74,6 +74,8 @@ struct Cli {
     /// to unlock, and migrate to v3, a v2 keystore; CRY-7).
     #[arg(long, global = true)]
     mainnet: bool,
+    /// Node RPC endpoint: http://host:port, or https://host[:port] (TLS,
+    /// certificate verified; GNB_RPC_CA=<PEM/DER file> for a private CA).
     #[arg(long, global = true, default_value = "http://127.0.0.1:17210")]
     rpc: String,
 }
@@ -647,20 +649,24 @@ fn rpc_call(endpoint: &str, method: &str, params: serde_json::Value) -> serde_js
     rpc_result(endpoint, method, params).unwrap_or_else(|error| serde_json::json!({"error":error}))
 }
 
-/// The plaintext client cannot speak TLS: refuse `https://` instead of
-/// silently downgrading it (WAL-7). Remote nodes are reached through an
-/// SSH tunnel to a loopback port.
-fn rpc_authority(endpoint: &str) -> Result<&str, String> {
-    if endpoint.starts_with("https://") {
-        return Err("https:// RPC endpoints are not supported by this client; use an SSH tunnel \
-                    (ssh -L 17210:127.0.0.1:17210 host) and --rpc http://127.0.0.1:17210".into());
+/// WAL-7: `http://host:port` (plain) or `https://host[:port]` (rustls,
+/// certificate and host name verified against the webpki roots, or against
+/// the `GNB_RPC_CA` PEM/DER file for a private CA). An https endpoint is never
+/// downgraded to plain HTTP.
+fn rpc_endpoint(endpoint: &str) -> Result<crate::wallet::http_rpc::Endpoint, String> {
+    crate::wallet::http_rpc::Endpoint::parse(endpoint)
+}
+
+fn rpc_trust() -> Result<crate::wallet::http_rpc::TlsTrust, String> {
+    match std::env::var_os("GNB_RPC_CA") {
+        Some(path) => crate::wallet::http_rpc::TlsTrust::from_cert_file(std::path::Path::new(&path)),
+        None => Ok(crate::wallet::http_rpc::TlsTrust::WebPkiRoots),
     }
-    Ok(endpoint.strip_prefix("http://").unwrap_or(endpoint).trim_end_matches('/'))
 }
 
 fn rpc_result(endpoint: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
-    let authority = rpc_authority(endpoint)?;
-    crate::wallet::http_rpc::call(authority, method, &params, None)
+    rpc_endpoint(endpoint)?;
+    crate::wallet::http_rpc::call_with_trust(endpoint, method, &params, None, &rpc_trust()?)
 }
 
 // Parse once from the original CLI token: no float may choose the spend amount.
@@ -1027,12 +1033,19 @@ mod audit_cli_input_tests {
 mod audit_2026_10_cli_tests {
     use super::*;
 
-    /// WAL-7: an https endpoint is refused instead of silently downgraded.
+    /// WAL-7 (residual): https endpoints are spoken over TLS, never
+    /// downgraded to plain HTTP; plain endpoints keep working. (Before
+    /// HTTPS support this test asserted that https was refused.)
     #[test]
-    fn https_endpoints_are_refused_not_downgraded() {
-        assert!(rpc_authority("https://node.example:17210").is_err());
-        assert_eq!(rpc_authority("http://127.0.0.1:17210/").unwrap(), "127.0.0.1:17210");
-        assert!(rpc_call("https://node.example", "getblockcount", serde_json::json!([]))["error"].is_string());
+    fn https_endpoints_use_tls_and_plain_endpoints_stay_plain() {
+        let e = rpc_endpoint("https://node.example:17210").unwrap();
+        assert!(e.tls && e.host == "node.example" && e.port == 17210);
+        assert_eq!(rpc_endpoint("https://node.example/").unwrap().port, 443);
+        let e = rpc_endpoint("http://127.0.0.1:17210/").unwrap();
+        assert!(!e.tls && e.authority() == "127.0.0.1:17210");
+        assert!(rpc_endpoint("https://user@node.example").is_err());
+        // Nothing listens on port 1: an error, not a plain-HTTP fallback.
+        assert!(rpc_call("https://127.0.0.1:1", "getblockcount", serde_json::json!([]))["error"].is_string());
     }
 
     /// WAL-1/WAL-6/WAL-7: send defaults to the size-aware fee and asks for
