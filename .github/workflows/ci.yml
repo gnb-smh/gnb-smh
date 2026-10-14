@@ -3,9 +3,19 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 3 * * *"   # nightly: fuzz-target build and smoke run
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Test binaries without debug info: the workspace has ~60 of them and the
+  # runner's disk is small. Incremental builds are useless on a fresh runner.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   python-reference:
@@ -15,8 +25,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: PoW reference against test vectors
+      - name: PoW and difficulty references against their vectors
         run: python3 reference/check_vectors.py
+      - name: Difficulty vectors are reproducible
+        run: |
+          python3 reference/gen_difficulty_vectors.py
+          git diff --exit-code reference/difficulty_vectors.json
       - name: Ledger reference tests
         run: python3 reference/test_ledger.py
       - name: Ledger vectors are reproducible
@@ -33,3 +47,131 @@ jobs:
       - uses: actions/checkout@v4
       - name: Tests (release, includes both Python cross-checks)
         run: cargo test --release --locked
+
+  # The consensus workspace: node, gnb-crypto, gnb-smh, coherence-core, the
+  # wallet and the vendored forks. Dev profile with the per-package
+  # opt-levels configured in the root Cargo.toml.
+  workspace-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies (librocksdb-sys needs clang/libclang)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: workspace-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Build
+        run: cargo build --workspace --locked
+      - name: Test
+        run: cargo test --workspace --locked
+
+  # POW-5: in a workspace-wide invocation the node's dev-dependency feature
+  # `test-pow-limit` is unified into gnb-crypto and pins every expected target
+  # to the pow limit. Test the consensus crates in their OWN invocations so
+  # the real ASERT path is exercised.
+  consensus-crates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: consensus-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: gnb-smh (PoW, compact bits, chain work, ASERT, Python vectors)
+        run: cargo test -p gnb-smh --locked
+      - name: gnb-crypto (real ASERT; test-pow-limit must be off)
+        run: cargo test -p gnb-crypto --locked
+      - name: The real-ASERT test ran and was not ignored
+        run: |
+          cargo test -p gnb-crypto --locked --lib expected_bits_at_schedule_is_genesis_bits 2>&1 \
+            | tee /dev/stderr | grep -q "test result: ok. 1 passed; 0 failed; 0 ignored"
+
+  # Vendored forks: PQClean source pin (VENDOR.toml), the yamux lockfile guard
+  # (GHSA-vxx9-2994-q338), and the Falcon clean-variant guard.
+  vendored-guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: pqcrypto-internals (tests/vendor_pin.rs + unit tests)
+        run: cargo test -p pqcrypto-internals --locked
+      - name: libp2p-yamux (tests/lockfile_guard.rs + unit tests)
+        run: cargo test -p libp2p-yamux --locked
+      - name: Falcon clean-variant guard
+        run: sh scripts/falcon-clean-guard.sh
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies (librocksdb-sys needs clang/libclang)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: clippy-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      # Fails on every deny-level lint (clippy's correctness group and any
+      # `#![deny]` in the code); warnings are reported, not fatal.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+      - name: cargo deny (advisories, bans, licenses, sources; deny.toml)
+        run: cargo deny check
+      - name: cargo audit (exceptions in .cargo/audit.toml)
+        run: cargo audit
+
+  # Independent consistency harness from the 2026-10 code audit: Bitcoin Core,
+  # BCHN aserti3-2d and rust-bitcoin oracles, and the normative Python
+  # GnB-SMH. Its own workspace and lockfile.
+  audit-harness:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: audit/consistency
+    steps:
+      - uses: actions/checkout@v4
+      - name: Consistency harness (release)
+        run: cargo test --release --locked
+
+  # Builds every cargo-fuzz target (node/fuzz, nightly + libFuzzer) and runs
+  # each briefly over its committed seed corpus.
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies (librocksdb-sys needs clang/libclang)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: Nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Start from the audited lockfile
+        run: cp Cargo.lock node/fuzz/Cargo.lock
+      - name: Build all fuzz targets
+        working-directory: node/fuzz
+        run: cargo +nightly fuzz build
+      - name: Smoke-run each target over its seed corpus
+        working-directory: node/fuzz
+        run: |
+          for t in $(cargo +nightly fuzz list); do
+            mkdir -p "corpus/$t"
+            cargo +nightly fuzz run "$t" "corpus/$t" -- -max_total_time=30 -rss_limit_mb=4096
+          done
