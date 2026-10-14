@@ -138,8 +138,11 @@ pub const SIG_SIZE:     usize = 4 + 3309 + 1462; // 4775
 // a big-endian 256-bit integer, is strictly below the target encoded by `bits`.
 //
 // Difficulty: ASERT anchored at the genesis block. The expected `bits` of a
-// block is a pure function of its selected parent's height and timestamp, so
-// miner and validator agree regardless of arrival order.
+// block is a pure function of its parent set: the LATEST timestamp over all
+// parents (`difficulty_parent_timestamp`) and the block height
+// max(parent heights) + 1 -- not the GhostDAG selected parent's timestamp or
+// height (docs/CONSENSUS.md, "Difficulty input"). Miner and validator agree
+// regardless of arrival order or parent order.
 
 /// True when built with the `test-pow-limit` feature, which pins every
 /// expected target to the pow limit so tests do not depend on the wall clock.
@@ -963,7 +966,8 @@ impl Block {
     }
 
     /// Validate the timestamp is within acceptable bounds.
-    /// `parent_timestamp`: timestamp of the selected parent (or 0 for genesis).
+    /// `parent_timestamp`: the latest timestamp over all of the block's
+    /// parents (the node passes the max; 0 for genesis).
     pub fn validate_timestamp(&self, parent_timestamp: u64) -> Result<(), &'static str> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1233,7 +1237,8 @@ pub fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
     hash < target
 }
 
-/// Chain-work contribution of a block at `bits`: ≈ 2^256 / target, 0 for
+/// Chain-work contribution of a block at `bits`: ≈ 2^256 / target (exact
+/// definition: `gnb_smh::difficulty::work`), 0 for
 /// malformed bits.
 pub fn bits_to_work(bits: u32) -> u128 {
     gnb_smh::difficulty::work_from_bits(bits)
