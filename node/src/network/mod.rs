@@ -877,6 +877,12 @@ pub const GOSSIP_PEER_DEFAULT_CONTROL_BYTES: usize = 16 * 1024;
 /// Bytes one message id costs inside an IHAVE / IWANT (tag, length, id).
 pub const GOSSIP_ID_WIRE_COST: usize = 2 + GOSSIP_MESSAGE_ID_LEN;
 
+// Build-time check of both directions (64 bytes: RPC / ControlIHave framing
+// and the topic id): our largest IHAVE fits a default 0.50 receiver, and we
+// decode a default sender's 5000-id IHAVE.
+const _: () = assert!(GOSSIP_MAX_CONTROL_IDS * GOSSIP_ID_WIRE_COST + 64 <= GOSSIP_PEER_DEFAULT_CONTROL_BYTES);
+const _: () = assert!(GOSSIP_MAX_CONTROL_BYTES >= 5000 * GOSSIP_ID_WIRE_COST + 64);
+
 /// Audit M-10 fix: SHA-256 (truncated to 16 bytes) message ids are
 /// deterministic across toolchains, unlike std's DefaultHasher.
 pub fn gossip_message_id(m: &gossipsub::Message) -> gossipsub::MessageId {
