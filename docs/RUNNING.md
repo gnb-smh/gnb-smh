@@ -52,7 +52,10 @@ against the Mozilla roots (`webpki-roots`) and check the host name. For a
 private CA or a self-signed certificate, pass the trust anchor with
 `gnb-cli --rpc-ca ca.pem` or set `GNB_RPC_CA=ca.pem` for `gnb-wallet`.
 `GNB_RPC_API_KEY` is sent over HTTPS to any host, but over plain HTTP only
-to loopback addresses.
+to loopback addresses. Each call has one 30-second deadline covering name
+resolution, connect, the TLS handshake, the request and the response; every
+socket read and write gets only the time left, so a server that stalls or
+drips its answer cannot hold the wallet longer than that.
 
 ## Wallet keystores (audit CRY-7)
 

@@ -127,7 +127,16 @@ pub fn call(endpoint: &str, method: &str, params: &Value, api_key: Option<&str>)
 pub fn call_with_trust(endpoint: &str, method: &str, params: &Value, api_key: Option<&str>, trust: &TlsTrust)
     -> Result<Value, String>
 {
-    call_with_limits_trust(endpoint, method, params, api_key, MAX_RESPONSE, Duration::from_secs(30), trust)
+    call_with_trust_timeout(endpoint, method, params, api_key, trust, Duration::from_secs(30))
+}
+
+/// [`call_with_trust`] with an explicit overall deadline: name resolution,
+/// connect, TLS handshake, request and response together must finish within
+/// `timeout` (the default is 30 s).
+pub fn call_with_trust_timeout(endpoint: &str, method: &str, params: &Value, api_key: Option<&str>,
+    trust: &TlsTrust, timeout: Duration) -> Result<Value, String>
+{
+    call_with_limits_trust(endpoint, method, params, api_key, MAX_RESPONSE, timeout, trust)
 }
 
 #[cfg(test)]
@@ -135,21 +144,59 @@ fn call_with_limits(authority: &str, method: &str, params: &Value, api_key: Opti
     call_with_limits_trust(authority, method, params, api_key, cap, timeout, &TlsTrust::WebPkiRoots)
 }
 
-/// The connection: plain TCP or TLS over TCP, with per-operation timeouts.
+/// The TCP socket under the call's absolute deadline. Every read and write
+/// on it — including each one rustls makes while it completes the handshake
+/// or assembles one TLS record — first sets the time left as the socket
+/// timeout, and none starts once the deadline has passed. Setting the timeout
+/// once per `read()` of the TLS stream was not enough: rustls loops over
+/// several socket reads inside one call (the handshake had no read timeout at
+/// all), so a server that never answered, or dripped one byte per timeout,
+/// held the wallet indefinitely.
+struct DeadlineStream {
+    tcp: TcpStream,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    fn time_left(&self) -> std::io::Result<Duration> {
+        remaining(self.deadline).map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))
+    }
+}
+
+/// A socket timeout surfaces as `WouldBlock` on Unix; report it as `TimedOut`.
+fn deadline_error(e: std::io::Error) -> std::io::Error {
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "RPC deadline exceeded")
+    } else {
+        e
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.tcp.set_read_timeout(Some(self.time_left()?))?;
+        self.tcp.read(buf).map_err(deadline_error)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tcp.set_write_timeout(Some(self.time_left()?))?;
+        self.tcp.write(buf).map_err(deadline_error)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
+/// The connection: plain TCP or TLS over TCP, both under the deadline.
 enum Conn {
-    Plain(TcpStream),
+    Plain(DeadlineStream),
     #[cfg(feature = "https-rpc")]
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, DeadlineStream>>),
 }
 
 impl Conn {
-    fn socket(&self) -> &TcpStream {
-        match self {
-            Conn::Plain(s) => s,
-            #[cfg(feature = "https-rpc")]
-            Conn::Tls(s) => &s.sock,
-        }
-    }
     fn is_tls(&self) -> bool {
         !matches!(self, Conn::Plain(_))
     }
@@ -235,7 +282,7 @@ fn call_with_limits_trust(endpoint: &str, method: &str, params: &Value, api_key:
     for address in addresses {
         if let Ok(stream) = TcpStream::connect_timeout(&address, remaining(deadline)?) { connected = Some(stream); break; }
     }
-    let tcp = connected.ok_or("RPC connection failed")?;
+    let tcp = DeadlineStream { tcp: connected.ok_or("RPC connection failed")?, deadline };
     let mut stream = if endpoint.tls {
         #[cfg(feature = "https-rpc")]
         {
@@ -243,7 +290,19 @@ fn call_with_limits_trust(endpoint: &str, method: &str, params: &Value, api_key:
                 .map_err(|_| "invalid TLS server name")?;
             let conn = rustls::ClientConnection::new(tls_config(trust)?, name)
                 .map_err(|e| format!("TLS setup failed: {e}"))?;
-            Conn::Tls(Box::new(rustls::StreamOwned::new(conn, tcp)))
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            // Complete the handshake (certificate and host-name checks) before
+            // anything is written, under the deadline.
+            while tls.conn.is_handshaking() {
+                tls.conn.complete_io(&mut tls.sock).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::InvalidData {
+                        format!("TLS handshake failed: {e}")
+                    } else {
+                        "RPC TLS handshake failed or deadline exceeded".to_string()
+                    }
+                })?;
+            }
+            Conn::Tls(Box::new(tls))
         }
         #[cfg(not(feature = "https-rpc"))]
         unreachable!("refused above")
@@ -257,12 +316,10 @@ fn call_with_limits_trust(endpoint: &str, method: &str, params: &Value, api_key:
         auth.as_ref().map(|a| a.as_str()).unwrap_or(""), body.len()));
     let mut pending = request.as_bytes();
     while !pending.is_empty() {
-        stream.socket().set_write_timeout(Some(remaining(deadline)?)).map_err(|_| "RPC socket configuration failed")?;
         let count = stream.write(pending).map_err(|e| transport_error("write", &e, stream.is_tls()))?;
         if count == 0 { return Err("RPC connection closed during write".into()); }
         pending = &pending[count..];
     }
-    stream.socket().set_write_timeout(Some(remaining(deadline)?)).map_err(|_| "RPC socket configuration failed")?;
     stream.flush().map_err(|e| transport_error("write", &e, stream.is_tls()))?;
     let response = read_response(&mut stream, deadline, cap)?;
     let body = decode_response(&response, cap)?;
@@ -306,7 +363,7 @@ fn read_response(stream: &mut Conn, deadline: Instant, cap: usize) -> Result<Vec
     let mut response = Vec::new();
     let mut headers_complete = false;
     loop {
-        stream.socket().set_read_timeout(Some(remaining(deadline)?)).map_err(|_| "RPC socket configuration failed")?;
+        remaining(deadline)?;
         let mut chunk = [0u8; 8192];
         let count = match stream.read(&mut chunk) {
             Ok(n) => n,
