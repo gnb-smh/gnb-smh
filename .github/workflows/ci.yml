@@ -107,6 +107,47 @@ jobs:
       - name: Falcon clean-variant guard
         run: sh scripts/falcon-clean-guard.sh
 
+  # WAL-5: the committed browser wallet core must be reproducible from source.
+  # Rebuild it with the pinned toolchain (rust-toolchain.toml, 1.94.1) and the
+  # pinned wasi-sdk 25 (download checked against its SHA-256) through
+  # scripts/build-wallet-wasm.sh, and fail if the binary's SHA-256 differs from
+  # the pin in site/wallet/app.js (which loadCore enforces in the browser) or
+  # from the committed site/wallet/gnb_wallet.wasm. Any source change that
+  # reaches the WASM (panic locations included) requires re-running the
+  # script and committing the new binary and pin.
+  wasm-reproducible:
+    runs-on: ubuntu-latest
+    env:
+      WASI_SDK_VERSION: "25"
+      WASI_SDK_SHA256: "52640dde13599bf127a95499e61d6d640256119456d1af8897ab6725bcf3d89c"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust 1.94.1 with the wasm32-wasip1 target
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal --target wasm32-wasip1
+          test "$(rustc --version | cut -d' ' -f2)" = "1.94.1"
+      - name: wasi-sdk 25 (pinned download and checksum)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/wasi-sdk.tar.gz" \
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz"
+          echo "${WASI_SDK_SHA256}  $RUNNER_TEMP/wasi-sdk.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wasi-sdk"
+          tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP/wasi-sdk" --strip-components=1
+      - name: Rebuild the wallet core and compare with the pin
+        run: |
+          pinned=$(sed -n 's/^const WASM_SHA256 = "\([0-9a-f]*\)";/\1/p' site/wallet/app.js)
+          committed=$(sha256sum site/wallet/gnb_wallet.wasm | cut -d' ' -f1)
+          WASI_SDK="$RUNNER_TEMP/wasi-sdk" sh scripts/build-wallet-wasm.sh
+          rebuilt=$(sha256sum site/wallet/gnb_wallet.wasm | cut -d' ' -f1)
+          echo "pinned    $pinned"
+          echo "committed $committed"
+          echo "rebuilt   $rebuilt"
+          test -n "$pinned"
+          test "$committed" = "$pinned"
+          test "$rebuilt" = "$pinned"
+          # The script re-pins and refreshes the SRI hashes: nothing may change.
+          git diff --exit-code -- site/
+
   clippy:
     runs-on: ubuntu-latest
     steps:
