@@ -64,9 +64,10 @@ pub const MAX_MERGESET_SIZE: usize = 180;
 /// a blue that deep would have more than k blues in its anticone.
 ///
 /// Why 360: 3 hours at the 30 s target, comparable to Kaspa's one hour and far
-/// above any propagation delay, yet well inside the 1,000-block reorg and
-/// finality depth (`CHECKPOINT_DEPTH`), as Kaspa keeps merge depth below its
-/// finality depth.
+/// above any propagation delay. It bounds MERGING objectively (a pure
+/// function of each block's past); it does not bound reorgs: GnB has no
+/// reorg-depth limit and no finality checkpoint (audit DAG-6), so the
+/// heaviest valid chain is followed at any depth.
 pub const MERGE_DEPTH: u64 = 360;
 
 pub mod reachability;
@@ -2320,6 +2321,41 @@ impl GhostDAG {
         self.invalid_loaded
     }
 
+    /// Replace the chain-disqualified set by the closure of `roots` (the
+    /// persisted marks that remain after an operator `reconsiderblock`, or
+    /// the operator marks kept by a chain-state rebuild). Returns how many
+    /// blocks are marked afterwards.
+    pub fn reset_invalid<I: IntoIterator<Item = BlockHash>>(&mut self, roots: I) -> usize {
+        self.invalid.clear();
+        self.load_invalid(roots)
+    }
+
+    /// True iff `ancestor` is `block` itself or lies on `block`'s
+    /// selected-parent chain. Walks selected parents from `block` while the
+    /// DAG height is above `ancestor`'s (the DAG height strictly decreases
+    /// along selected-parent edges), so it costs O(height difference).
+    pub fn is_on_selected_chain_of(&self, ancestor: &BlockHash, block: &BlockHash) -> bool {
+        let target_h = match self.store.get(ancestor) {
+            Some(d) => d.height,
+            None => return false,
+        };
+        let mut cur = Some(*block);
+        while let Some(h) = cur {
+            if h == *ancestor {
+                return true;
+            }
+            let d = match self.store.get(&h) {
+                Some(d) => d,
+                None => return false,
+            };
+            if d.height <= target_h {
+                return false;
+            }
+            cur = d.selected_parent;
+        }
+        false
+    }
+
     /// True iff `hash` is chain-disqualified.
     pub fn is_invalid(&self, hash: &BlockHash) -> bool {
         self.invalid.contains(hash)
@@ -2546,14 +2582,13 @@ impl GhostDAG {
         false
     }
 
-    /// Finality: a block is final if its blue_score is more than
-    /// CHECKPOINT_DEPTH below the current tip.
+    /// Informational confirmation depth: true when `hash`'s blue_score is more
+    /// than `CHECKPOINT_DEPTH` below the current tip.
     ///
-    /// Audit H-6 fix: previously used a local `FINALITY_DEPTH = 86_400` (~10 days
-    /// at 10s block time) which disagreed with `core::CHECKPOINT_DEPTH = 1_000`
-    /// used by the finalization checkpoint in main.rs. RPC clients saw is_final
-    /// return false for 10 days on blocks the node already treated as final.
-    /// Now both sides use `core::CHECKPOINT_DEPTH` as single source of truth.
+    /// Audit DAG-6: this is NOT finality. The node has no finality checkpoint
+    /// and no reorg-depth limit; a heavier valid chain is followed at any
+    /// depth, so a "final" block can still be reorganized out by a chain with
+    /// more work (as in Bitcoin). Kept for diagnostics only.
     pub fn is_final(&self, hash: &BlockHash) -> bool {
         let tip_score = self.tip_blue_score();
         if let Some(data) = self.store.get(hash) {

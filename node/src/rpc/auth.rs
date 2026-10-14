@@ -87,6 +87,22 @@ pub const WRITE_METHODS: &[&str] = &[
     "sendrawtransaction",
     "submitblock",
     "getblocktemplate",
+    "invalidateblock",
+    "reconsiderblock",
+];
+
+/// Operator chain-override methods (audit DAG-6): `invalidateblock` /
+/// `reconsiderblock` make this node leave or rejoin a chain regardless of its
+/// work, so they are write-class (Host/Origin gate, never a wildcard origin,
+/// write rate bucket — see [`WRITE_METHODS`]) AND they are never served to an
+/// anonymous caller: they need either a fully trusted caller (loopback with
+/// `--rpc-trust-loopback`, or a trusted private range) or the configured API
+/// key, whatever `--rpc-require-auth-for-writes` says. With no key configured
+/// and no trusted caller they are refused (fail-safe), like Bitcoin Core, where
+/// every RPC requires credentials.
+pub const ADMIN_METHODS: &[&str] = &[
+    "invalidateblock",
+    "reconsiderblock",
 ];
 
 /// Type alias for a direct (non-keyed) in-memory rate limiter.
@@ -310,7 +326,7 @@ pub fn authorize_with_policy(
         return AuthDecision::RateLimited;
     }
 
-    if is_write && require_auth_for_writes {
+    if (is_write && require_auth_for_writes) || ADMIN_METHODS.contains(&method) {
         match (presented_key, configured_key) {
             (Some(p), Some(c)) => {
                 if keys_match(p, c) {
@@ -360,7 +376,7 @@ pub fn authorize_with_trust(
         return AuthDecision::RateLimited;
     }
 
-    if is_write && require_auth_for_writes {
+    if (is_write && require_auth_for_writes) || ADMIN_METHODS.contains(&method) {
         match (presented_key, configured_key) {
             (Some(p), Some(c)) => {
                 if keys_match(p, c) {
@@ -432,8 +448,9 @@ pub fn authorize_with_read_policy(
         return AuthDecision::RateLimited;
     }
 
-    let requires_key =
-        (is_write && require_auth_for_writes) || (!is_write && require_auth_for_reads);
+    let requires_key = (is_write && require_auth_for_writes)
+        || (!is_write && require_auth_for_reads)
+        || ADMIN_METHODS.contains(&method);
 
     if requires_key {
         match (presented_key, configured_key) {
@@ -1212,6 +1229,48 @@ mod tests {
             true, false, &r,
         );
         assert_eq!(d, AuthDecision::Unauthorized);
+    }
+
+    // ── Audit DAG-6: operator chain overrides are never anonymous ──
+    #[test]
+    fn admin_methods_need_a_key_or_a_trusted_caller() {
+        let rl = RateLimiterSet::new(1000, 1000);
+        let remote: IpAddr = "203.0.113.7".parse().unwrap();
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let key = "k".repeat(32);
+        for m in ADMIN_METHODS {
+            assert!(WRITE_METHODS.contains(m), "{m} must be write-class");
+            // Even with --rpc-require-auth-for-writes OFF, no key = refused.
+            for ip in [remote, lo] {
+                assert_eq!(
+                    authorize_with_read_policy(ip, m, None, None, false, false, false, false, &rl),
+                    AuthDecision::Unauthorized, "{m} anonymous from {ip}",
+                );
+                assert_eq!(
+                    authorize_with_read_policy(ip, m, None, Some(&key), false, false, false, false, &rl),
+                    AuthDecision::Unauthorized, "{m} without the key from {ip}",
+                );
+                assert_eq!(
+                    authorize_with_read_policy(ip, m, Some(&key), Some(&key), false, false, false, false, &rl),
+                    AuthDecision::Allow, "{m} with the key from {ip}",
+                );
+                assert_eq!(
+                    authorize_with_policy(ip, m, None, None, false, false, false, &rl),
+                    AuthDecision::Unauthorized,
+                );
+            }
+            // A fully trusted caller (--rpc-trust-loopback) needs no key.
+            assert_eq!(
+                authorize_with_read_policy(lo, m, None, None, false, false, false, true, &rl),
+                AuthDecision::Allow,
+            );
+        }
+        // Ordinary writes keep their policy (anonymous allowed when writes
+        // do not require auth).
+        assert_eq!(
+            authorize_with_read_policy(remote, "submitblock", None, None, false, false, false, false, &rl),
+            AuthDecision::Allow,
+        );
     }
 
     // ── WRITE_METHODS must cover external block submission ──

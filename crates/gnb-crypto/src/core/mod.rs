@@ -125,8 +125,15 @@ pub const DNS_SEED_DOMAIN: &str = "";
 /// No public seed infrastructure yet; peers are supplied with --peer.
 pub const DEFAULT_SEEDS: &[&str] = &[];
 
-pub const CHECKPOINT_DEPTH:      u64   = 1_000;      // finality: reorgs deeper than this rejected
-pub const PRUNING_DEPTH:         u64   = 10_000;     // block bodies pruned below tip - this
+/// Node-local ingress window and deep-reorg alert depth (blocks). NOT a
+/// consensus or fork-choice limit: there is no reorg-depth cap and no
+/// finality checkpoint (audit DAG-6); a node always follows the best valid
+/// chain of the blocks it holds.
+pub const CHECKPOINT_DEPTH:      u64   = 1_000;
+/// Block bodies of the selected chain are pruned below tip − this (non-archive
+/// nodes). Undo records are kept for every connected block, so a reorg of any
+/// depth can still disconnect pruned blocks (`reorg::connect_plan`).
+pub const PRUNING_DEPTH:         u64   = 10_000;
 
 // Hybrid ML-DSA-65 ‖ Falcon-1024 sizes, including the 4-byte crypto-agility
 // suite header. SIG_SIZE is an upper bound (Falcon is variable length) used
@@ -950,6 +957,29 @@ impl Block {
             }
         }
         ok
+    }
+
+    /// TEST FIXTURES ONLY — compiled only with the `test-pow-limit` feature,
+    /// which the node binary refuses to run with. Records this block's id in
+    /// the proof-of-work cache WITHOUT evaluating GnB-SMH, so integration
+    /// tests can build thousand-block chains (one evaluation takes most of a
+    /// second in a dev build). `validate_pow` still decodes `bits` and
+    /// enforces the pow limit before it consults the cache, and every check
+    /// after the proof (height, expected bits, timestamp, transactions,
+    /// GhostDAG, connect) runs unchanged.
+    #[cfg(feature = "test-pow-limit")]
+    pub fn test_only_assume_pow_valid(&self) {
+        let id = self.block_hash();
+        if let Ok(mut cache) = pow_cache().lock() {
+            if cache.set.insert(id) {
+                cache.order.push_back(id);
+                if cache.order.len() > POW_CACHE_CAPACITY {
+                    if let Some(old) = cache.order.pop_front() {
+                        cache.set.remove(&old);
+                    }
+                }
+            }
+        }
     }
 
     /// POW-9: `target <= pow_limit` (both big-endian). Every target a valid

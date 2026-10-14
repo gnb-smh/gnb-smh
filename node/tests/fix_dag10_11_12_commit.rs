@@ -8,7 +8,7 @@ use fix_common::*;
 use std::sync::Arc;
 
 use gnb::core::{self, Block};
-use gnb::{accept, reorg};
+use gnb::reorg;
 
 /// DAG-10: many threads accept conflicting sibling blocks (all spending the
 /// same outpoint) and their children concurrently into ONE node. With the
@@ -211,5 +211,4 @@ fn height_index_tracks_the_selected_chain_only() {
     for (h, b) in [(1u64, &m1), (2, &m2), (3, &m3)] {
         assert_eq!(n.store.get_block_hash_at_height(h).unwrap(), Some(b.block_hash()), "height {h}");
     }
-    let _ = accept::FINALITY_FROZEN.load(std::sync::atomic::Ordering::Relaxed);
 }

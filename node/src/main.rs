@@ -45,7 +45,7 @@ mod template;     // Block templates for the miner + getblocktemplate (MEM-2, DA
 #[allow(unused_imports)]
 use accept::{
     accept_block, validate_tx_standalone, validate_tx_inputs, miner_template_total_fees,
-    validate_tx_in_block, validate_tx_in_block_with_maturity, FINALITY_FROZEN, ARCHIVE_MODE,
+    validate_tx_in_block, validate_tx_in_block_with_maturity, ARCHIVE_MODE,
 };
 
 use clap::Parser;
@@ -687,30 +687,9 @@ async fn main() {
         }
     }
 
-    // ── Heal poisoned finality checkpoint (blue-score/height unit bug) ─────────
-    // Older builds persisted finalized_height = tip_blue_score − CHECKPOINT_DEPTH,
-    // which runs ahead of the selected tip's *height* by the DAG width and can
-    // exceed it once the skew passes CHECKPOINT_DEPTH — bricking block ingestion
-    // (every chain-extending block is <= finalized_height and gets rejected). The
-    // monotonic guard in accept_block cannot lower the value, so clamp it down to
-    // a height-based ceiling here, once, at startup.
-    {
-        let tip_h = {
-            let d = dag.read();
-            d.selected_tip()
-                .and_then(|h| d.get_block_data(&h).map(|x| x.height))
-                .unwrap_or(0)
-        };
-        let cap = tip_h.saturating_sub(core::CHECKPOINT_DEPTH);
-        let cur = store.get_meta("finalized_height").ok().flatten()
-            .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
-            .unwrap_or(0);
-        if cur > cap {
-            warn!("finalized_height {} exceeds height-based cap {} \
-                   (blue-score/height unit bug) — clamping to heal ingestion", cur, cap);
-            store.put_meta("finalized_height", &cap.to_le_bytes()).ok();
-        }
-    }
+    // (The start-up clamp of `finalized_height` is gone with the finality
+    // checkpoint itself — audit DAG-6. The meta key, if present in an old
+    // data dir, is no longer read.)
 
     // ── Mempool + Network ─────────────────────────────────────────────────────
     let mempool  = Arc::new(mempool::Mempool::new());
@@ -763,6 +742,58 @@ async fn main() {
 
     // Coherence C2: the node's shielded-pool engine (in-memory).
     let shielded = Arc::new(RwLock::new(crate::coherence::ShieldedPool::new()));
+
+    // DAG-11 residual: detect the footprint of the pre-fix NON-atomic
+    // extension commit (UTXO effects without an undo record) that the
+    // reconciliation below cannot repair, and rebuild the chain state from the
+    // block bodies. A node must not run on an inconsistent UTXO set: it would
+    // disqualify valid blocks and leave the network, so without the means to
+    // rebuild it refuses to start.
+    match accept::check_chain_state(&dag, &store) {
+        Ok(faults) if faults.is_empty() => {}
+        Ok(faults) => {
+            for f in &faults {
+                error!("chain-state check: {}", f);
+            }
+            let Some(snap_path) = cli.carryover_snapshot.as_ref() else {
+                error!("the chain state is inconsistent (interrupted pre-fix commit). Restart with \
+                        --carryover-snapshot <bloch-g3-carryover.tsv> to rebuild it from the block \
+                        bodies. Refusing to start.");
+                std::process::exit(1);
+            };
+            let snap = match std::fs::read(snap_path).map_err(|e| vec![e.to_string()])
+                .and_then(|b| core::carryover::verify_and_convert(&b))
+            {
+                Ok(s) => s,
+                Err(failures) => {
+                    for f in &failures { error!("carryover for the rebuild: {f}"); }
+                    error!("cannot rebuild the chain state without a valid carryover snapshot. Refusing to start.");
+                    std::process::exit(1);
+                }
+            };
+            let genesis = core::genesis_block();
+            let gh = genesis.block_hash();
+            let seed = |st: &storage::Storage, batch: &mut rocksdb::WriteBatch| -> Result<(), String> {
+                st.stage_carryover(batch, &snap).map_err(|e| e.to_string())?;
+                // Exactly what first boot writes for the genesis block.
+                for tx in &genesis.transactions {
+                    st.stage_tx_index(batch, &tx.txid(), &gh, 0).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            };
+            match accept::rebuild_chain_state(&dag, &store, &shielded, &seed) {
+                Ok(r) => info!("chain state rebuilt: {} block(s) re-applied from genesis", r.connected_blocks),
+                Err(e) => {
+                    error!("chain-state rebuild failed: {e}. Refusing to start.");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            error!("chain-state check failed: {e}. Refusing to start.");
+            std::process::exit(1);
+        }
+    }
 
     // DAG-1 / DAG-11: load the persisted invalid-block set and reconcile any
     // state a pre-fix non-atomic commit left behind, before any block is accepted.
@@ -1472,8 +1503,8 @@ async fn main() {
                 // During IBD the DAG tip reflects the local view, which
                 // lags the network by up to thousands of blocks. Mining
                 // against a stale tip produces blocks at low height
-                // which the rest of the network rejects via the finality
-                // rule (block at or below finalized_height). Pre-fix,
+                // which lose to the network chain on blue work (and were,
+                // before audit DAG-6, refused by its finality rule). Pre-fix,
                 // fresh miners would burn CPU for hours producing
                 // orphan blocks that never paid out — an awful new-user
                 // experience that looked like a protocol fault.
@@ -1494,14 +1525,11 @@ async fn main() {
                 }
                 let sync_stalled = last_tip_advance.elapsed()
                     >= std::time::Duration::from_secs(SYNC_STALL_SECS);
-                // [no-fork] Freeze finality while mining through a stall (the
-                // announced heaviest tip is unreachable and we mine our local
-                // tip to stay live): a strictly-heavier chain must still be able
-                // to deep-reorg us back once its holder becomes reachable, so
-                // mine-through can never self-finalize a solo fork. Unfrozen
-                // whenever we are synced or catching up normally.
-                FINALITY_FROZEN.store(syncing_now && sync_stalled,
-                    std::sync::atomic::Ordering::Relaxed);
+                // (Mining through a stall can no longer self-finalize a solo
+                // fork: there is no finality checkpoint and no reorg-depth
+                // limit, audit DAG-6 — a strictly heavier chain reorgs us at
+                // any depth once its blocks arrive. The old FINALITY_FROZEN
+                // flag is gone.)
                 if syncing_now && !sync_stalled {
                     if !was_syncing_last_tick {
                         info!("⛏  IBD in progress — miner paused, will resume when sync completes");
@@ -1679,6 +1707,11 @@ async fn main() {
         dag.clone(), store.clone(), mempool.clone(), node_state.clone(),
         shielded.clone(), outbound_tx.clone(), tip_tx.clone(),
     );
+    // Audit DAG-6: operator recovery (invalidateblock / reconsiderblock).
+    let rpc_chain_admin: Arc<rpc::ChainAdminFn> = make_chain_admin_cb(
+        dag.clone(), store.clone(), mempool.clone(), node_state.clone(),
+        shielded.clone(), tip_tx.clone(),
+    );
 
     let metrics_state = std::sync::Arc::new(
         crate::metrics::MetricsState::new(
@@ -1751,6 +1784,8 @@ async fn main() {
         node_state.clone(), store.clone(), mempool.clone(), dag.clone(), outbound_tx.clone(),
         // B5f pool seam: submitblock hook (see rpc::SubmitBlockFn).
         Some(rpc_submit_block.clone()),
+        // Audit DAG-6: invalidateblock / reconsiderblock (see rpc::ChainAdminFn).
+        Some(rpc_chain_admin.clone()),
     ));
     // Sprint EE (S3): `None` = no listen-addr report; production behavior
     // is byte-identical to before the harness affordance was added.
@@ -1868,14 +1903,40 @@ fn make_rpc_submit_block_cb(
     })
 }
 
+/// Build the `invalidateblock` / `reconsiderblock` hook (audit DAG-6): both
+/// run through the acceptance pipeline (`accept::invalidate_block` /
+/// `accept::reconsider_block`) under the acceptance lock, persist their marks
+/// atomically with the chain move, and refresh mempool, RPC state and the
+/// stratum tip notification. Authorization is the RPC layer's
+/// (`rpc::auth::ADMIN_METHODS`: never anonymous).
+fn make_chain_admin_cb(
+    dag:        Arc<RwLock<consensus::GhostDAG>>,
+    store:      Arc<storage::Storage>,
+    mempool:    Arc<mempool::Mempool>,
+    node_state: Arc<RwLock<rpc::NodeState>>,
+    shielded:   Arc<RwLock<crate::coherence::ShieldedPool>>,
+    tip_tx:     broadcast::Sender<tip::TipChanged>,
+) -> Arc<rpc::ChainAdminFn> {
+    Arc::new(move |op: rpc::ChainAdminOp, hash: [u8; 32]| -> Result<serde_json::Value, String> {
+        let r = match op {
+            rpc::ChainAdminOp::Invalidate => accept::invalidate_block(
+                hash, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
+            rpc::ChainAdminOp::Reconsider => accept::reconsider_block(
+                hash, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
+        }?;
+        Ok(serde_json::json!({
+            "block":       hex::encode(hash),
+            "affected":    r.affected,
+            "rolled_back": r.rolled_back,
+            "connected":   r.connected,
+            "tip":         hex::encode(r.tip),
+            "tip_height":  r.tip_height,
+        }))
+    })
+}
+
 // ── Block acceptance + Orphan processing ─────────────────────────────────────
 
-/// [no-fork] Set true while the miner is mining through a stalled IBD latch
-/// (the announced heaviest tip is unreachable and we mine our locally-heaviest
-/// validated tip to keep the chain live). While frozen we do NOT advance
-/// `finalized_height`, so a strictly-heavier chain can still deep-reorg us back
-/// once its holder becomes reachable — mine-through can never self-finalize a
-/// solo fork. Driven by the miner loop; cleared when synced / catching up.
 /// A per-request nonce whose ONLY job is to make each GetBlock unique on the
 /// wire, so gossipsub's duplicate cache cannot swallow a retry. Monotonic rather
 /// than random: retries must differ from each other, and a counter guarantees
@@ -1892,8 +1953,9 @@ fn getblock_nonce() -> u64 {
 /// never starve itself; a SYNCED node stops reacting to overheard streams.
 const HEADERS_SOLICITED_WINDOW_MS: u64 = 60_000;
 
-// `FINALITY_FROZEN`, `ARCHIVE_MODE` and `accept_block` moved to `accept.rs`
-// (audit DAG-1/DAG-10/DAG-11); imported at the top of this file.
+// `ARCHIVE_MODE` and `accept_block` moved to `accept.rs` (audit
+// DAG-1/DAG-10/DAG-11); imported at the top of this file. `FINALITY_FROZEN`
+// was removed with the finality checkpoint (audit DAG-6).
 
 /// Blue_work-VERIFIED / evidence-based IBD release — the ONLY path that clears
 /// `is_syncing`.
@@ -2640,15 +2702,15 @@ mod external_submission_tests {
         assert_eq!(node.node_state.read().block_count, 2, "RPC state must be refreshed");
     }
 
-    // ── CONSENSUS-HALT regression (DAG-vs-UTXO ordering) ────────────────────
+    // ── Audit DAG-6: no reorg-depth limit ───────────────────────────────────
     //
-    // Drive the REAL `accept_block` pipeline (add_block → disposition →
-    // execute_reorg) — NOT a synthetic ReorgPlan — with an attacker fork
-    // whose accumulated blue_work beats the live chain but whose reorg depth
-    // exceeds reorg::MAX_REORG_DEPTH. On the unfixed baseline the flipping
-    // fork block is inserted + persisted into the DAG BEFORE the depth cap
-    // runs; the refusal then leaves selected_tip() pinned to the fork
-    // forever, freezing the real chain (durable halt).
+    // Drive the REAL `accept_block` pipeline (add_block → resolve → atomic
+    // connect) with a fork that out-weighs the live chain only once it is
+    // deeper than the live chain itself. The old pipeline refused such a
+    // reorg once it exceeded `MAX_REORG_DEPTH` (a node-local cap, so nodes
+    // that saw the blocks in different orders split); it is now followed at
+    // any depth. The >1,000-block audit scenario, with two nodes and UTXO
+    // digests, is `node/tests/fix_chain_selection.rs`.
 
     /// Submit a block through the real `accept_block` pipeline. This is the
     /// exact function the stratum/RPC callbacks delegate to; those wrappers
@@ -2695,20 +2757,14 @@ mod external_submission_tests {
         }
     }
 
-    /// Acceptance regression for the DAG-vs-UTXO ordering halt.
-    ///
-    /// FAILS on baseline cad723c (tip poisoned by the refused fork; real
-    /// chain frozen as ForkLoser), PASSES with the fix (GhostDAG undo +
-    /// deferred CF_DAG persist).
+    /// Audit DAG-6 (replaces `refused_deep_reorg_must_not_poison_dag_selected_tip`,
+    /// which pinned the removed depth cap): a heavier fork that branches at
+    /// genesis, deeper than the whole live chain, is adopted — selected AND
+    /// applied — and a later extension of the old chain is an ordinary
+    /// fork-loser. The DAG and the applied state never disagree.
     #[tokio::test(flavor = "multi_thread")]
-    async fn refused_deep_reorg_must_not_poison_dag_selected_tip() {
-        let d = reorg::MAX_REORG_DEPTH;
-        assert!(
-            d <= 16,
-            "this regression builds chains of length MAX_REORG_DEPTH+2 through \
-             the real accept path; keep the cfg(test) cap small (got {})", d,
-        );
-
+    async fn heavier_fork_is_followed_at_any_depth() {
+        const D: u64 = 6;
         let g_ts    = unix_now();
         let genesis = mk_genesis(g_ts);
         let node    = node_with_genesis(&genesis);
@@ -2716,94 +2772,56 @@ mod external_submission_tests {
 
         // (a) Real chain R: genesis → r1 … r_{D+1}, all through accept_block.
         let mut parent = gh;
-        for i in 1..=(d + 1) {
+        for i in 1..=(D + 1) {
             let b = mk_block_at(&node, parent, i, g_ts + 30 * i, i);
             accept(&node, &b).expect("real-chain block must be accepted");
             parent = b.block_hash();
         }
         let real_tip = parent;
-        assert_eq!(
-            node.dag.read().selected_tip(), Some(real_tip),
-            "sanity: R's head is the selected tip before the attack",
-        );
+        assert_eq!(node.dag.read().selected_tip(), Some(real_tip));
 
-        // (b) Attacker fork F branching at genesis: f1 … f_{D+2}, same
-        // per-height timestamps as R (so expected bits — hence per-block
-        // work — match per height) but distinct nonces (distinct hashes).
-        // The fork block at height D+1 TIES R's tip on blue_work; grind its
-        // nonce so its hash LOSES the deterministic tie-break (blue_work,
-        // then blue_score, then lexicographic hash — larger wins) and stays
-        // a fork-loser. The flip then happens deterministically at f_{D+2},
-        // which strictly out-weighs R and forces to_rollback.len() == D+1 > D.
+        // (b) Fork F from genesis: f1 … f_{D+2}. f_{D+1} ties R's tip on
+        // blue_work and is ground to lose the hash tie-break; f_{D+2}
+        // strictly out-weighs R and needs a reorg of all D+1 blocks of R.
         let mut fparent = gh;
-        let mut flip_res: Result<[u8; 32], String> = Err("unreached".into());
-        for i in 1..=(d + 2) {
+        let mut fork_tip = gh;
+        for i in 1..=(D + 2) {
             let mut nonce = 1_000_000 + i;
             let mut fb = mk_block_at(&node, fparent, i, g_ts + 30 * i, nonce);
-            if i == d + 1 {
+            if i == D + 1 {
                 while fb.block_hash() >= real_tip {
                     nonce += 1;
                     fb = mk_block_at(&node, fparent, i, g_ts + 30 * i, nonce);
                 }
             }
             let res = accept(&node, &fb);
-            if i <= d + 1 {
-                assert!(
-                    res.is_ok(),
-                    "non-flipping fork block f{} must be accepted as a \
-                     fork-loser, got: {:?}", i, res,
-                );
-                assert_eq!(
-                    node.dag.read().selected_tip(), Some(real_tip),
-                    "fork-loser f{} must not move the selected tip", i,
-                );
+            assert!(res.is_ok(), "fork block f{} must be accepted, got: {:?}", i, res);
+            if i <= D + 1 {
+                assert_eq!(node.dag.read().selected_tip(), Some(real_tip),
+                    "fork-loser f{} must not move the selected tip", i);
             }
             fparent = fb.block_hash();
-            flip_res = res;
+            fork_tip = fparent;
         }
 
-        // (1) The flipping fork block is REFUSED by the reorg depth cap.
-        let err = flip_res.expect_err(
-            "over-deep flipping fork block must be rejected by accept_block",
-        );
-        assert!(
-            err.contains(reorg::ERR_REORG_DEPTH),
-            "rejection must be the depth-cap refusal, got: {}", err,
-        );
+        // (1) The heavier fork is followed: selected tip and applied tip.
+        assert_eq!(node.dag.read().selected_tip(), Some(fork_tip));
+        let tip_meta = node.store.get_meta("tip_hash").expect("meta read").expect("tip_hash");
+        assert_eq!(tip_meta.as_slice(), &fork_tip[..], "the applied state follows the fork");
 
-        // (2) HALT GUARD: the refusal must leave the DAG selected tip on the
-        // real chain. Baseline fails HERE: add_block already adopted (and
-        // persisted) the fork tip before execute_reorg refused.
-        assert_eq!(
-            node.dag.read().selected_tip(), Some(real_tip),
-            "refused deep reorg must NOT poison the DAG selected tip",
-        );
-
-        // (3) LIVENESS GUARD: a further legitimate extension of the real
-        // chain is still accepted AND applied. Baseline fails here too: with
-        // the tip pinned to the poison fork, R_next is misclassified and the
-        // applied chain state never advances.
-        let r_next = mk_block_at(
-            &node, real_tip, d + 2, g_ts + 30 * (d + 2), 424_242,
-        );
-        let r_next_hash = r_next.block_hash();
-        let res = accept(&node, &r_next);
-        assert!(
-            res.is_ok(),
-            "legitimate extension of the real chain must still be accepted \
-             after the refused fork, got: {:?}", res,
-        );
-        assert_eq!(
-            node.dag.read().selected_tip(), Some(r_next_hash),
-            "real chain must re-take / keep the selected tip",
-        );
-        let tip_meta = node.store.get_meta("tip_hash")
-            .expect("meta read").expect("tip_hash meta present");
-        assert_eq!(
-            tip_meta.as_slice(), &r_next_hash[..],
-            "applied chain state (tip_hash meta / UTXO apply) must advance \
-             with the real chain",
-        );
+        // (2) An extension of the old chain that only TIES the fork (and is
+        // ground to lose the hash tie-break) is a fork-loser: accepted into
+        // the DAG, applied tip unchanged.
+        let mut nonce = 424_242;
+        let mut r_next = mk_block_at(&node, real_tip, D + 2, g_ts + 30 * (D + 2), nonce);
+        while r_next.block_hash() >= fork_tip {
+            nonce += 1;
+            r_next = mk_block_at(&node, real_tip, D + 2, g_ts + 30 * (D + 2), nonce);
+        }
+        assert!(accept(&node, &r_next).is_ok());
+        assert_eq!(node.dag.read().selected_tip(), Some(fork_tip));
+        let tip_meta = node.store.get_meta("tip_hash").expect("meta read").expect("tip_hash");
+        assert_eq!(tip_meta.as_slice(), &fork_tip[..]);
     }
 
     /// Root-cause regression for the red/side-block body-retention starvation
@@ -2834,8 +2852,8 @@ mod external_submission_tests {
         }
         let real_tip = parent;
 
-        // Simulate a finalized checkpoint at height 3 (as a live node sets once
-        // its tip is CHECKPOINT_DEPTH ahead).
+        // An old data dir may still carry a `finalized_height` meta key (here
+        // 3). Since audit DAG-6 it is ignored: nothing below must change.
         node.store.put_meta("finalized_height", &3u64.to_le_bytes())
             .expect("set finalized_height");
 
@@ -2903,7 +2921,7 @@ mod external_submission_tests {
         }
         let real_tip = parent;
 
-        // Finalize at height 3.
+        // A stale `finalized_height` meta key (ignored since audit DAG-6).
         node.store.put_meta("finalized_height", &3u64.to_le_bytes())
             .expect("set finalized_height");
 

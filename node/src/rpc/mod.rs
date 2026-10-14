@@ -6,7 +6,8 @@
 //!   gettransaction, getbalance, getutxos,
 //!   sendrawtransaction,
 //!   validateaddress, estimatefee, getrawmempool,
-//!   decoderawtransaction, getdaginfo, listtransactions, getpeerinfo
+//!   decoderawtransaction, getdaginfo, listtransactions, getpeerinfo,
+//!   invalidateblock, reconsiderblock (admin: audit DAG-6)
 
 pub mod auth;
 mod explorer;
@@ -90,6 +91,22 @@ pub struct NodeState {
 /// a "not wired" error instead of silently accepting.
 pub type SubmitBlockFn = dyn Fn(crate::core::Block) -> Result<String, String> + Send + Sync;
 
+/// Operator chain overrides (audit DAG-6), Bitcoin Core's `invalidateblock`
+/// and `reconsiderblock`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainAdminOp {
+    /// Disqualify a block and its selected-chain descendants, persistently.
+    Invalidate,
+    /// Remove such disqualifications (the block, its selected-chain ancestors
+    /// and descendants) and let the node re-evaluate them.
+    Reconsider,
+}
+
+/// Hook that performs a [`ChainAdminOp`] on a block through the acceptance
+/// pipeline (`accept::invalidate_block` / `accept::reconsider_block`), wired by
+/// main.rs. Returns a JSON summary. `None` makes the methods report "not wired".
+pub type ChainAdminFn = dyn Fn(ChainAdminOp, [u8; 32]) -> Result<Value, String> + Send + Sync;
+
 #[derive(Clone, Debug)]
 pub struct RpcConfig {
     pub bind_address:              String,
@@ -172,6 +189,8 @@ struct AppState {
     heavy_gate:              Arc<HeavyGate>,
     // B5f pool seam: submitblock hook (None = method returns "not wired").
     submit_block:            Option<Arc<SubmitBlockFn>>,
+    // Audit DAG-6: invalidateblock / reconsiderblock hook.
+    chain_admin:             Option<Arc<ChainAdminFn>>,
 }
 
 // ─── R3-audit H-R3-5 / L-8: bound the expensive analytics + template RPCs ───
@@ -221,7 +240,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getdagwindow", "getaddresshistory", "getrichlist", "gethashrate", "getdifficultyhistory",
     "getblocktimepercentiles", "gettxstatus", "getaddressinfo", "estimatefeeadvanced",
     "getmempoolstats", "validateaddressverbose", "gettxsbyblock", "getaddressbalance_at_height",
-    "getattestation",
+    "getattestation", "invalidateblock", "reconsiderblock",
 ];
 
 /// Longest method-name prefix written to a log line (NET-13).
@@ -362,6 +381,8 @@ pub async fn start_rpc_server(
     outbound_tx: mpsc::Sender<NetworkMessage>,
     // B5f pool seam — see `SubmitBlockFn`.
     submit_block: Option<Arc<SubmitBlockFn>>,
+    // Audit DAG-6 — see `ChainAdminFn`.
+    chain_admin: Option<Arc<ChainAdminFn>>,
 ) {
     // NET-14: `format!("{host}:{port}")` could not express IPv6 hosts such as
     // `::1`; resolve explicitly and report a bad address clearly. main.rs
@@ -430,6 +451,7 @@ pub async fn start_rpc_server(
         trust_loopback:          config.trust_loopback,
         heavy_gate:              Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
         submit_block,
+        chain_admin,
     };
 
     // P0 RPC hardening (roadmap §1.6 / §4.3): body-size cap, global
@@ -762,6 +784,22 @@ async fn handle_rpc(
                 })),
             )
         }
+    }
+}
+
+/// `invalidateblock` / `reconsiderblock`: params `[block_hash_hex]`.
+fn chain_admin_call(op: ChainAdminOp, params: Option<&Value>, state: &AppState) -> Value {
+    let hex_str = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+    let hash: [u8; 32] = match hex::decode(hex_str).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) {
+        Some(h) => h,
+        None => return json!({ "error": "expected one parameter: a 64-hex-character block hash" }),
+    };
+    match &state.chain_admin {
+        None => json!({ "error": "invalidateblock/reconsiderblock not wired on this node" }),
+        Some(hook) => match hook(op, hash) {
+            Ok(v) => v,
+            Err(e) => json!({ "error": e }),
+        },
     }
 }
 
@@ -1300,6 +1338,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 },
             }
         }
+
+        // Audit DAG-6: operator recovery (Bitcoin Core's invalidateblock /
+        // reconsiderblock). Admin methods: never anonymous (auth::ADMIN_METHODS).
+        "invalidateblock" => chain_admin_call(ChainAdminOp::Invalidate, params, state),
+        "reconsiderblock" => chain_admin_call(ChainAdminOp::Reconsider, params, state),
 
         "getdaginfo" => {
             let dag = state.dag.read();
@@ -2235,6 +2278,7 @@ mod audit_2026_10_rpc_tests {
             trust_loopback: false,
             heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
             submit_block: None,
+            chain_admin: None,
         };
         (tmp, state)
     }
@@ -2289,7 +2333,7 @@ mod audit_2026_10_rpc_tests {
         let config = RpcConfig { port: busy.local_addr().unwrap().port(), ..RpcConfig::default() };
         tokio::time::timeout(std::time::Duration::from_secs(10), start_rpc_server(
             config, state.node_state.clone(), state.store.clone(), state.mempool.clone(),
-            state.dag.clone(), state.outbound_tx.clone(), None,
+            state.dag.clone(), state.outbound_tx.clone(), None, None,
         )).await.expect("a failed bind must end the RPC task");
     }
 

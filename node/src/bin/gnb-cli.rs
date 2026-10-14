@@ -123,6 +123,16 @@ fn main() {
             ("getdaginfo", serde_json::Value::Null)
         }
 
+        // ── Operator recovery (audit DAG-6) ────────────────────────
+        "invalidateblock" => {
+            require_params(params, 1, "invalidateblock <block_hash>");
+            ("invalidateblock", serde_json::json!([params[0]]))
+        }
+        "reconsiderblock" => {
+            require_params(params, 1, "reconsiderblock <block_hash>");
+            ("reconsiderblock", serde_json::json!([params[0]]))
+        }
+
         "listtransactions" | "txlist" => {
             require_params(params, 1, "listtransactions <address> [count]");
             let count: u64 = params.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
@@ -727,6 +737,11 @@ fn print_usage() {
     gnb-cli getblock <hash> [verbose]     Get block by hash
     gnb-cli getblockhash <height>         Get block hash at height
     gnb-cli recent [count]                Recent blocks (default: 10)
+
+  OPERATOR RECOVERY (need GNB_RPC_API_KEY or --rpc-trust-loopback on the node)
+    gnb-cli invalidateblock <hash>        Leave the chain through <hash>: mark it and its
+                                          selected-chain descendants invalid (persisted)
+    gnb-cli reconsiderblock <hash>        Undo invalidateblock (and re-check the chain)
 
   TRANSACTIONS
     gnb-cli tx <txid>                     Get transaction

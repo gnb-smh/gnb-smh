@@ -34,34 +34,29 @@ use crate::mempool::Mempool;
 use crate::storage::Storage;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Reorg depth cap (security hardening)
+// Deep reorgs: alert, never refuse (audit DAG-6)
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// There is NO reorg-depth limit. The old `MAX_REORG_DEPTH` (1,000 blocks) and
+// the `finalized_height` gate compared a fork against THIS node's history, so
+// two nodes holding the same blocks could end on different chains depending on
+// the order the blocks arrived in (the audit's node X refused a 1,101-block
+// reorg that node Z, fed the same blocks interleaved, followed). Like Bitcoin
+// Core (no depth limit, no checkpoints), a node now always ends on the best
+// valid chain of the blocks it holds. Bounded MERGING is enforced objectively
+// by GhostDAG's merge depth after the hardening activation; operators recover
+// from an unwanted chain with `invalidateblock` / `reconsiderblock`.
+//
+// Undo records are kept for every connected block (pruning removes bodies,
+// never undo records), and a pruned body's rollback needs are recorded when it
+// is pruned (`storage::PrunedBodyRecord`), so a reorg of any depth can be
+// executed on a pruned node.
 
-/// Maximum reorg depth — the number of selected-chain blocks `execute_reorg`
-/// may roll back in one plan. Anchored to the finality window
-/// (`core::CHECKPOINT_DEPTH`): `accept_block` already refuses blocks at or
-/// below the finalized height, so any plan deeper than this window indicates
-/// either a bug in plan computation or an attack attempt to unwind history.
-/// Such plans are refused with [`ERR_REORG_DEPTH`] before ANY storage access.
-#[cfg(not(test))]
-pub const MAX_REORG_DEPTH: u64 = crate::core::CHECKPOINT_DEPTH;
-
-/// Test builds use a tiny cap so the accept-path depth-cap regression
-/// (`refused_deep_reorg_must_not_poison_dag_selected_tip` in src/main.rs)
-/// can drive whole real chains through `accept_block` in milliseconds
-/// instead of building 1000-block fixtures. All depth-cap unit tests in
-/// this file are written against the symbolic constant, so they hold at
-/// any value. Production (non-test) builds are unchanged: the cap stays
-/// anchored to the finality window, and integration tests in tests/ link
-/// the library crate compiled WITHOUT `cfg(test)`, so they too see the
-/// production value.
-#[cfg(test)]
-pub const MAX_REORG_DEPTH: u64 = 4;
-
-/// Distinct, machine-matchable error marker for a refused too-deep reorg.
-/// Callers (and tests) can distinguish "refused by policy" from "failed
-/// mid-execution" by matching on this substring.
-pub const ERR_REORG_DEPTH: &str = "reorg depth exceeds maximum";
+/// A committed chain move that rolled back more than this many selected-chain
+/// blocks is logged at error level and counted
+/// (`gnb_deep_reorgs_total`). Alert only: it never changes which chain the
+/// node follows.
+pub const DEEP_REORG_ALERT_DEPTH: u64 = crate::core::CHECKPOINT_DEPTH;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -132,8 +127,8 @@ fn collect_selected_ancestors(
 /// either a corrupted DAG or blocks from incompatible genesis, and the
 /// caller should refuse to reorg.
 ///
-/// Runtime: O(depth_a + depth_b). For within-finality-window reorgs
-/// (depth ≤ CHECKPOINT_DEPTH = 1000) this is trivially fast.
+/// Runtime: O(depth_a + depth_b) hash-map lookups; a deep reorg pays one
+/// walk proportional to its depth.
 pub fn find_lca(
     dag: &GhostDAG,
     a: &BlockHash,
@@ -232,10 +227,12 @@ pub fn compute_reorg_plan(
 /// currently applied tip) to `to` (the new best valid block). Unlike
 /// [`compute_reorg_plan`] this also covers pure forward moves: `to_rollback`
 /// is empty when `from` is an ancestor of `to` on the selected-parent chain
-/// (an ordinary extension, possibly of several blocks). Returns `None` when
-/// `from == to`, when `to` is a selected-chain ancestor of `from` (moving
-/// backwards is never a valid transition), or when the chains share no
-/// ancestor.
+/// (an ordinary extension, possibly of several blocks), and pure backward
+/// moves: `to_apply` is empty when `to` is a selected-chain ancestor of
+/// `from`. A backward move only happens after an operator `invalidateblock`
+/// disqualified the applied tip (the applied tip is otherwise valid and
+/// heavier than its ancestors). Returns `None` when `from == to` or when the
+/// chains share no ancestor.
 pub fn compute_connect_plan(
     dag: &GhostDAG,
     from: &BlockHash,
@@ -243,11 +240,10 @@ pub fn compute_connect_plan(
 ) -> Option<ReorgPlan> {
     if from == to { return None; }
     let lca = find_lca(dag, from, to)?;
-    if lca == *to { return None; }
     let to_rollback = selected_path_to(dag, from, &lca)?;
     let mut to_apply = selected_path_to(dag, to, &lca)?;
     to_apply.reverse();
-    if to_apply.is_empty() { return None; }
+    if to_apply.is_empty() && to_rollback.is_empty() { return None; }
     Some(ReorgPlan { lca, to_rollback, to_apply })
 }
 
@@ -535,6 +531,12 @@ impl<'a> ReorgBatch<'a> {
         Ok(())
     }
 
+    /// Mirrors `Storage::stage_delete_pruned_body_record`.
+    fn delete_pruned_record(&mut self, block_hash: &[u8; 32]) -> Result<(), String> {
+        self.store.stage_delete_pruned_body_record(&mut self.batch, block_hash)
+            .map_err(|e| format!("reorg batch: {}", e))
+    }
+
     /// Stage deletion of one addr_tx_history row (key precomputed by the
     /// caller via `storage::indexer::make_key`).
     fn delete_addr_history_key(&mut self, key: &[u8]) -> Result<(), String> {
@@ -551,61 +553,24 @@ impl<'a> ReorgBatch<'a> {
     }
 }
 
-/// Stage the full rollback of one block into the batch — the batched twin of
-/// `Storage::rollback_block` (U.2), preserving its exact mutation set and
-/// ordering: addr_tx_history unindex, restore spent UTXOs, delete created
-/// UTXOs, delete coinbase infos, delete tx_index rows, delete the undo record.
-fn rollback_block_batched(
-    batch: &mut ReorgBatch,
-    block: &Block,
-    block_hash: &BlockHash,
-) -> Result<(), String> {
-    let undo = batch.store.get_undo_data(block_hash)
+/// Load the undo record a rollback of `block_hash` needs.
+fn undo_for_rollback(store: &Storage, block_hash: &BlockHash) -> Result<UndoData, String> {
+    store.get_undo_data(block_hash)
         .map_err(|e| format!("rollback: get_undo_data failed: {}", e))?
         .ok_or_else(|| format!(
             "rollback: no undo data for block {}..",
             hex::encode(&block_hash[..4]),
-        ))?;
+        ))
+}
 
-    // Spent-output lookup from UndoData — same rationale as
-    // `Storage::unindex_tx_addresses` (deterministic accept-time capture).
-    let mut spent_lookup: HashMap<([u8; 32], u32), TxOutput> =
-        HashMap::with_capacity(undo.spent_utxos.len());
-    for entry in &undo.spent_utxos {
-        spent_lookup.insert((entry.prev_txid, entry.prev_index), entry.output.clone());
-    }
-
-    // 1. Un-index addr_tx_history. Key computation mirrors
-    //    `Storage::unindex_tx_addresses` byte-for-byte (20-byte script prefix
-    //    as address hash; bit-31 marker for input entries). Best-effort
-    //    semantics preserved: unresolvable addresses are skipped.
-    for (tx_idx, tx) in block.transactions.iter().enumerate() {
-        for (vout_idx, output) in tx.outputs.iter().enumerate() {
-            if output.script_pubkey.len() >= 20 {
-                let mut addr = [0u8; 20];
-                addr.copy_from_slice(&output.script_pubkey[..20]);
-                let key = crate::storage::indexer::make_key(
-                    &addr, block.height, tx_idx as u32, vout_idx as u32,
-                );
-                batch.delete_addr_history_key(&key)?;
-            }
-        }
-        if !tx.is_coinbase() {
-            for (vin_idx, input) in tx.inputs.iter().enumerate() {
-                if let Some(prev_output) = spent_lookup.get(&(input.prev_txid, input.prev_index)) {
-                    if prev_output.script_pubkey.len() >= 20 {
-                        let mut addr = [0u8; 20];
-                        addr.copy_from_slice(&prev_output.script_pubkey[..20]);
-                        let key = crate::storage::indexer::make_key(
-                            &addr, block.height, tx_idx as u32, 0x8000_0000 | vin_idx as u32,
-                        );
-                        batch.delete_addr_history_key(&key)?;
-                    }
-                }
-            }
-        }
-    }
-
+/// Steps 2-6 of a rollback, shared by the bodied and the pruned path: they
+/// need only the undo record. Restore spent UTXOs, delete created UTXOs,
+/// coinbase-info and tx_index rows, then the undo record itself.
+fn rollback_undo_effects(
+    batch: &mut ReorgBatch,
+    undo: &UndoData,
+    block_hash: &BlockHash,
+) -> Result<(), String> {
     // 2. Restore spent UTXOs (also restages the CF_ADDR_UTXO row).
     for entry in &undo.spent_utxos {
         batch.put_utxo(&entry.prev_txid, entry.prev_index, &entry.output)?;
@@ -627,12 +592,72 @@ fn rollback_block_batched(
     }
 
     // 6. Delete the undo record itself.
-    batch.delete_undo_data(block_hash)?;
+    batch.delete_undo_data(block_hash)
+}
+
+/// Stage the full rollback of one block into the batch — the batched twin of
+/// `Storage::rollback_block` (U.2), preserving its exact mutation set and
+/// ordering: addr_tx_history unindex, restore spent UTXOs, delete created
+/// UTXOs, delete coinbase infos, delete tx_index rows, delete the undo record.
+fn rollback_block_batched(
+    batch: &mut ReorgBatch,
+    block: &Block,
+    block_hash: &BlockHash,
+) -> Result<(), String> {
+    let undo = undo_for_rollback(batch.store, block_hash)?;
+
+    // Spent-output lookup from UndoData — same rationale as
+    // `Storage::unindex_tx_addresses` (deterministic accept-time capture).
+    let spent_lookup: HashMap<([u8; 32], u32), TxOutput> = undo.spent_utxos.iter()
+        .map(|e| ((e.prev_txid, e.prev_index), e.output.clone()))
+        .collect();
+
+    // 1. Un-index addr_tx_history: exactly the keys `stage_chain_index`
+    //    wrote (`indexer::addr_history_keys`, the single definition).
+    for key in crate::storage::indexer::addr_history_keys(block, &spent_lookup) {
+        batch.delete_addr_history_key(&key)?;
+    }
+
+    rollback_undo_effects(batch, &undo, block_hash)?;
 
     // 7. Selected-chain height/timestamp index rows (DAG-12).
     batch.store.stage_chain_unindex(&mut batch.batch, block)
         .map_err(|e| format!("rollback: chain unindex failed: {}", e))?;
 
+    Ok(())
+}
+
+/// Stage the rollback of a selected-chain block whose BODY HAS BEEN PRUNED
+/// (audit DAG-6: no reorg-depth limit, so a deep reorg on a pruned node
+/// disconnects pruned blocks). The UTXO effects, coinbase, tx-index and
+/// chain-index rows come from the undo record alone; the address-history keys
+/// from the `PrunedBodyRecord` written when the body was pruned. Bodies pruned
+/// by an older release have no such record: their address-history rows (a
+/// non-consensus explorer index) are left in place and a warning is logged;
+/// the UTXO set is still restored exactly.
+fn rollback_pruned_block_batched(
+    batch: &mut ReorgBatch,
+    block_hash: &BlockHash,
+) -> Result<(), String> {
+    let undo = undo_for_rollback(batch.store, block_hash)?;
+    match batch.store.get_pruned_body_record(block_hash)
+        .map_err(|e| format!("rollback: pruned-body record unreadable: {}", e))?
+    {
+        Some(rec) => {
+            for key in &rec.addr_history_keys {
+                batch.delete_addr_history_key(key)?;
+            }
+            batch.delete_pruned_record(block_hash)?;
+        }
+        None => log::warn!(
+            "rollback: block {}.. (h={}) was pruned without a rollback record; its \
+             address-history rows stay (UTXO state is restored exactly from the undo record)",
+            hex::encode(&block_hash[..4]), undo.block_height
+        ),
+    }
+    rollback_undo_effects(batch, &undo, block_hash)?;
+    batch.store.stage_chain_unindex_at(&mut batch.batch, undo.block_height, block_hash)
+        .map_err(|e| format!("rollback: chain unindex failed: {}", e))?;
     Ok(())
 }
 
@@ -795,11 +820,10 @@ pub fn reinject_disconnected(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Why a [`connect_plan`] did not commit. In every case NOTHING was written:
-/// the staged batch is dropped.
+/// the staged batch is dropped. (There is no policy refusal: no reorg-depth
+/// limit, audit DAG-6.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectError {
-    /// Refused by policy (reorg depth cap). Says nothing about validity.
-    Refused(String),
     /// `block` (at header height `height`) is invalid in its own selected-
     /// chain context. Deterministic and permanent: every node evaluating the
     /// same block in the same context reaches the same verdict.
@@ -811,7 +835,6 @@ pub enum ConnectError {
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConnectError::Refused(m) => write!(f, "{}", m),
             ConnectError::Invalid { height, reason, .. } =>
                 write!(f, "reorg aborted: fork block h={} invalid: {}", height, reason),
             ConnectError::Failed(m) => write!(f, "{}", m),
@@ -822,10 +845,21 @@ impl std::fmt::Display for ConnectError {
 /// What a committed [`connect_plan`] changed.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectOutcome {
-    /// Blocks removed from the selected chain, tip-first.
+    /// Blocks removed from the selected chain, tip-first, whose bodies were
+    /// available (their transactions can be re-admitted to the mempool).
     pub disconnected: Vec<Block>,
+    /// Blocks removed from the selected chain whose bodies had been pruned
+    /// (rolled back from their undo records; nothing to re-admit), tip-first.
+    pub disconnected_pruned: Vec<BlockHash>,
     /// Blocks added to the selected chain, LCA-first (last = new tip).
     pub connected: Vec<Block>,
+}
+
+impl ConnectOutcome {
+    /// Number of selected-chain blocks the move rolled back.
+    pub fn rolled_back(&self) -> usize {
+        self.disconnected.len() + self.disconnected_pruned.len()
+    }
 }
 
 /// Hooks the caller plugs into [`connect_plan`].
@@ -841,7 +875,10 @@ pub struct ConnectHooks<'h> {
 
 /// Move the applied selected chain along `plan` in ONE atomic RocksDB batch.
 ///
-/// `plan.to_rollback` may be empty (a forward extension). Every block of
+/// `plan.to_rollback` may be empty (a forward extension) and so may
+/// `plan.to_apply` (a pure rollback after an operator `invalidateblock`).
+/// There is no depth limit (audit DAG-6): a rolled-back block whose body was
+/// pruned is disconnected from its undo record. Every block of
 /// `plan.to_apply` is validated by `hooks.validate` against the
 /// incrementally-staged state before it is staged, so a block is only ever
 /// applied in its own context. All UTXO effects, undo records, chain indexes
@@ -852,29 +889,32 @@ pub fn connect_plan(
     plan: &ReorgPlan,
     hooks: &ConnectHooks,
 ) -> Result<ConnectOutcome, ConnectError> {
-    let depth = plan.to_rollback.len() as u64;
-    if depth > MAX_REORG_DEPTH {
-        return Err(ConnectError::Refused(format!(
-            "{}: plan rolls back {} blocks > cap {} (finality window); refused with no storage mutation",
-            ERR_REORG_DEPTH, depth, MAX_REORG_DEPTH,
-        )));
-    }
-
     let mut batch = ReorgBatch::new(store);
     let mut outcome = ConnectOutcome::default();
 
     for hash in &plan.to_rollback {
-        let block = store.get_block(hash)
+        let body = store.get_block(hash)
             .map_err(|e| ConnectError::Failed(format!(
-                "execute_reorg: get_block on rollback target failed: {}", e)))?
-            .ok_or_else(|| ConnectError::Failed(
-                "execute_reorg: block body missing for rollback target".to_string()))?;
-        rollback_block_batched(&mut batch, &block, hash)
-            .map_err(|e| ConnectError::Failed(format!(
-                "execute_reorg: rollback failed at h={} (reorg aborted, no storage mutation committed): {}",
-                block.height, e
-            )))?;
-        outcome.disconnected.push(block);
+                "execute_reorg: get_block on rollback target failed: {}", e)))?;
+        match body {
+            Some(block) => {
+                rollback_block_batched(&mut batch, &block, hash)
+                    .map_err(|e| ConnectError::Failed(format!(
+                        "execute_reorg: rollback failed at h={} (reorg aborted, no storage mutation committed): {}",
+                        block.height, e
+                    )))?;
+                outcome.disconnected.push(block);
+            }
+            None => {
+                rollback_pruned_block_batched(&mut batch, hash)
+                    .map_err(|e| ConnectError::Failed(format!(
+                        "execute_reorg: rollback of pruned block {}.. failed (reorg aborted, no storage \
+                         mutation committed): {}",
+                        hex::encode(&hash[..4]), e
+                    )))?;
+                outcome.disconnected_pruned.push(*hash);
+            }
+        }
     }
 
     for hash in &plan.to_apply {
@@ -898,6 +938,19 @@ pub fn connect_plan(
 
     (hooks.stage_extra)(store, &mut batch.batch).map_err(ConnectError::Failed)?;
     batch.commit().map_err(ConnectError::Failed)?;
+
+    // Deep-reorg alerting (policy that never changes the outcome).
+    let depth = outcome.rolled_back() as u64;
+    if depth > DEEP_REORG_ALERT_DEPTH {
+        crate::metrics::inc_deep_reorg();
+        log::error!(
+            "DEEP REORG committed: rolled back {} selected-chain block(s) (alert depth {}; {} with \
+             pruned bodies), applied {} (lca={}). The node follows the best valid chain at any depth; \
+             if this chain is unwanted, inspect it and use `invalidateblock`.",
+            depth, DEEP_REORG_ALERT_DEPTH, outcome.disconnected_pruned.len(),
+            outcome.connected.len(), hex::encode(&plan.lca[..8]),
+        );
+    }
     Ok(outcome)
 }
 
@@ -936,8 +989,8 @@ pub fn connect_plan(
 ///
 /// All chain-switch storage mutations (phases 1 + 2) are staged into a single
 /// RocksDB `WriteBatch` and committed atomically. Any error before the commit
-/// — a plan deeper than [`MAX_REORG_DEPTH`], a missing block body or undo
-/// record, or a fork block failing H1 re-validation — drops the batch, so
+/// — a missing undo record, a missing body of a block to APPLY, or a fork
+/// block failing H1 re-validation — drops the batch, so
 /// storage stays byte-identical to the pre-reorg state. A crash mid-reorg
 /// likewise leaves either the complete old state (commit not reached) or the
 /// complete new state (commit durable); half-applied chain state is no
@@ -955,8 +1008,8 @@ pub fn execute_reorg(
     plan: &ReorgPlan,
 ) -> Result<ReorgOutcome, String> {
     // Sprint FF observability: record every attempt and surface the fork
-    // depth before doing any work. Failures (including refused-by-depth-cap
-    // plans) increment the failures counter — that is the one to alert on.
+    // depth before doing any work. Failures increment the failures counter —
+    // that is the one to alert on.
     // S5: the depth histogram keeps the per-attempt distribution (the gauge
     // is last-value-only), and the explicit success counter makes the success
     // rate a direct series (invariant: attempts == success + failures).
@@ -976,7 +1029,7 @@ fn execute_reorg_inner(
     mempool: &Mempool,
     plan: &ReorgPlan,
 ) -> Result<ReorgOutcome, String> {
-    // Same depth-cap gate, staging and atomic commit as the acceptance
+    // Same staging and atomic commit as the acceptance
     // pipeline (`connect_plan`); this standalone entry point re-validates
     // fork blocks with the audit-H1 UTXO-state rules only. The acceptance
     // pipeline plugs the FULL in-context validator (signatures, fees,
@@ -996,7 +1049,11 @@ fn execute_reorg_inner(
     let candidates: Vec<Transaction> = outcome.disconnected.iter()
         .flat_map(|b| b.transactions.iter().filter(|t| !t.is_coinbase()).cloned())
         .collect();
-    let next_height = outcome.connected.last().map(|b| b.height.saturating_add(1)).unwrap_or(0);
+    // Next block height: one above the new tip; for a pure rollback the new
+    // tip is the LCA, the parent of the last disconnected block.
+    let next_height = outcome.connected.last().map(|b| b.height.saturating_add(1))
+        .or_else(|| outcome.disconnected.last().map(|b| b.height))
+        .unwrap_or(0);
     let (txs_reinjected, txs_discarded) =
         reinject_disconnected(store, mempool, candidates, next_height);
 
@@ -1123,49 +1180,61 @@ mod reorg_hardening_unit_tests {
             "expected the FIRST failing write (put_tx_index) to be named in the error, got: {err}");
     }
 
-    /// Depth cap regression: a plan rolling back MAX_REORG_DEPTH + 1 blocks
-    /// must be refused with the DISTINCT cap error before any storage access.
-    /// Without the cap, execute_reorg instead walks the plan and fails with a
-    /// generic "block body missing" error — so this assertion fails.
+    /// Audit DAG-6: there is no reorg-depth limit. A plan rolling back more
+    /// than the old 1,000-block cap (now only the alert depth) is executed:
+    /// here it proceeds to the rollback staging and fails only because the
+    /// fixture blocks have no undo records — never with a depth refusal.
+    /// (Replaces `reorg_depth_cap_refuses_plan_beyond_max_depth` and
+    /// `reorg_depth_cap_allows_plan_at_exact_cap`, which pinned the cap.)
     #[test]
-    fn reorg_depth_cap_refuses_plan_beyond_max_depth() {
+    fn plan_deeper_than_the_old_cap_is_not_refused() {
         let (_tmp, store) = mk_storage();
         let mempool = Mempool::new();
 
         let plan = ReorgPlan {
             lca:         [0u8; 32],
-            to_rollback: (0..=MAX_REORG_DEPTH).map(hash_of).collect(), // cap + 1 entries
+            to_rollback: (0..=DEEP_REORG_ALERT_DEPTH).map(hash_of).collect(), // old cap + 1
             to_apply:    vec![[0xEE; 32]],
         };
         let err = execute_reorg(&store, &mempool, &plan).unwrap_err();
+        assert!(!err.contains("depth"), "no depth refusal any more: {}", err);
         assert!(
-            err.contains(ERR_REORG_DEPTH),
-            "too-deep reorg must be refused with the distinct cap error, got: {}", err,
+            err.contains("no undo data"),
+            "the deep plan must reach the rollback staging and fail on the missing fixtures: {}", err,
         );
     }
 
-    /// Boundary: a plan at EXACTLY the cap passes the gate (it then fails for
-    /// a different reason — the fixture blocks don't exist — proving the cap
-    /// does not over-refuse at the boundary).
+    /// A pure backward move (the new best block is a selected-chain ancestor
+    /// of the applied tip — only reachable after an operator
+    /// `invalidateblock`) is a rollback-only plan, executed atomically.
     #[test]
-    fn reorg_depth_cap_allows_plan_at_exact_cap() {
+    fn rollback_only_plan_is_planned_and_executed() {
         let (_tmp, store) = mk_storage();
         let mempool = Mempool::new();
 
-        let plan = ReorgPlan {
-            lca:         [0u8; 32],
-            to_rollback: (0..MAX_REORG_DEPTH).map(hash_of).collect(), // exactly cap
-            to_apply:    vec![[0xEE; 32]],
-        };
-        let err = execute_reorg(&store, &mempool, &plan).unwrap_err();
-        assert!(
-            !err.contains(ERR_REORG_DEPTH),
-            "plan at exactly the cap must not be refused by the depth cap: {}", err,
-        );
-        assert!(
-            err.contains("block body missing"),
-            "at-cap plan must proceed past the gate and fail on the missing fixture blocks: {}", err,
-        );
+        let g = [0x10u8; 32];
+        let a1 = mk_block_at(1, 0x0A01, vec![mk_coinbase(0xA1, 100, 1, 1)]);
+        let a2 = mk_block_at(2, 0x0A02, vec![mk_coinbase(0xA2, 100, 2, 2)]);
+        let (a1h, a2h) = (a1.block_hash(), a2.block_hash());
+        let mut dag = GhostDAG::with_default_k();
+        dag.add_genesis(g, 0);
+        dag.add_block(a1h, vec![g], 1, 1).unwrap();
+        dag.add_block(a2h, vec![a1h], 2, 1).unwrap();
+        for b in [&a1, &a2] {
+            store.put_block(b).unwrap();
+            apply_block_utxo_mutations(&store, b).unwrap();
+        }
+
+        let plan = compute_connect_plan(&dag, &a2h, &a1h).expect("backward plan");
+        assert_eq!(plan, ReorgPlan { lca: a1h, to_rollback: vec![a2h], to_apply: vec![] });
+        assert_eq!(compute_connect_plan(&dag, &a2h, &g).unwrap().to_rollback, vec![a2h, a1h]);
+
+        let out = execute_reorg(&store, &mempool, &plan).expect("rollback-only plan commits");
+        assert_eq!((out.rolled_back, out.applied), (1, 0));
+        let cb_a2 = a2.transactions[0].txid();
+        assert!(store.get_utxo(&cb_a2, 0).unwrap().is_none(), "A2's output rolled back");
+        assert!(store.get_undo_data(&a2h).unwrap().is_none());
+        assert!(store.get_utxo(&a1.transactions[0].txid(), 0).unwrap().is_some(), "A1 stays applied");
     }
 
     /// Atomic-batch regression (crash-consistency): a reorg that fails MIDWAY
