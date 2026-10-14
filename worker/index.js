@@ -16,7 +16,7 @@ export default {
     if (url.pathname === "/api/sendrawtransaction") return broadcast(request, env);
     if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
     const rest = url.pathname.slice(5).split("/").filter(Boolean);
-    if (!rest.length || !rest.every((s) => NAME.test(s) || /^gnb1[qt][0-9a-f]{48}$/.test(s))) {
+    if (!rest.length || !rest.every((s) => NAME.test(s) || /^(gnb1[qt][0-9a-f]{48}|gnb1[mn][0-9a-f]{72})$/.test(s))) {
       return json({ error: "not found" }, 404);
     }
     const p = url.searchParams.get("p") || "[]";

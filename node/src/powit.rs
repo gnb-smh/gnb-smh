@@ -553,7 +553,11 @@ pub fn info_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value {
     let p = powit::params();
     let tip = dag.selected_tip();
     let tip_h = tip.and_then(|t| dag.get_block_data(&t)).map(|d| d.height).unwrap_or(0);
-    let st = tip.and_then(|t| load_state(store, &t));
+    // The tip's state is written just after the tip is accepted; until then,
+    // report the latest selected-chain block that has one instead of nothing.
+    let st = selected_chain_since(dag, tip, tip_h.saturating_sub(16))
+        .into_iter()
+        .find_map(|(h, _)| load_state(store, &h));
     let (ps, pa, pe) = pool().counts();
     let cp = |c: &Checkpoint| serde_json::json!({
         "slot": c.height,

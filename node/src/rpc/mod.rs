@@ -749,7 +749,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             "parents":     b.header.parents.iter().map(|p| hex::encode(p)).collect::<Vec<_>>(),
                             "merkle_root": hex::encode(b.header.merkle_root),
                             "size":        b.size_bytes(),
+                            "pow":         crate::core::pow_algo(b.height).name(),
                         });
+                        if crate::core::powit_active(b.height) {
+                            result["powit"] = format_powit(&b.powit);
+                        }
                         if verbose {
                             result["transactions"] = json!(b.transactions.iter().map(|tx| {
                                 format_tx(tx)
@@ -786,7 +790,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             "parents":     b.header.parents.iter().map(|p| hex::encode(p)).collect::<Vec<_>>(),
                             "merkle_root": hex::encode(b.header.merkle_root),
                             "size":        b.size_bytes(),
+                            "pow":         crate::core::pow_algo(b.height).name(),
                         });
+                        if crate::core::powit_active(b.height) {
+                            result["powit"] = format_powit(&b.powit);
+                        }
                         if verbose {
                             result["transactions"] = json!(b.transactions.iter().map(|tx| {
                                 format_tx(tx)
@@ -1767,6 +1775,33 @@ fn parse_address(addr: &str) -> Option<Vec<u8>> {
 }
 
 /// Format a transaction for JSON output
+/// A block's PoWit section for explorers: witness shares, KES-signed
+/// attestations (with the epoch leaf each one used) and equivocation proofs.
+fn format_powit(p: &crate::core::powit::PowitBody) -> Value {
+    let cp = |c: &crate::core::powit::Checkpoint| json!({ "slot": c.height, "hash": hex::encode(c.hash) });
+    let att = |a: &crate::core::powit::Attestation| json!({
+        "witness":    hex::encode(a.key_id()),
+        "source":     cp(&a.source),
+        "target":     cp(&a.target),
+        "kes_epoch":  a.sig.index,
+        "kes_depth":  a.witness.depth,
+        "kes_root":   hex::encode(a.witness.root),
+        "sig_bytes":  a.sig.sig.len(),
+    });
+    json!({
+        "shares": p.shares.iter().map(|s| json!({
+            "id":       hex::encode(crate::core::witness_share::share_id(s)),
+            "attested": hex::encode(s.attested),
+            "witness":  hex::encode(s.witness),
+            "payout":   hex::encode(&s.payout),
+        })).collect::<Vec<_>>(),
+        "attestations": p.attestations.iter().map(att).collect::<Vec<_>>(),
+        "evidence": p.evidence.iter().map(|e| json!({
+            "witness": hex::encode(e.a.key_id()), "a": att(&e.a), "b": att(&e.b),
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn format_tx(tx: &Transaction) -> Value {
     json!({
         "txid":     hex::encode(tx.txid()),

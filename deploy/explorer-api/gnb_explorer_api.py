@@ -39,7 +39,7 @@ if len(API_KEY) < 32:
     raise SystemExit("GNB_API_KEY_FILE must hold a secret of at least 32 characters")
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-ADDR = re.compile(r"^gnb1[qt][0-9a-f]{48}$")
+ADDR = re.compile(r"^(gnb1[qt][0-9a-f]{48}|gnb1[mn][0-9a-f]{72})$")
 
 
 def _int(lo, hi):
@@ -59,10 +59,16 @@ def _re(rx, what):
 
 
 HASH = _re(HEX64, "64-char lowercase hex")
-ADDRESS = _re(ADDR, "gnb1q/gnb1t address")
+ADDRESS = _re(ADDR, "gnb1q/gnb1t/gnb1m/gnb1n address")
 U32 = _int(0, 2**32 - 1)
 PAGE = _int(1, 100)
 OFFSET = _int(0, 10**9)
+
+
+def BOOL(v):
+    if not isinstance(v, bool):
+        raise ValueError("true or false expected")
+    return v
 
 # method -> (list of parameter checkers, cache seconds)
 ALLOWED = {
@@ -82,7 +88,12 @@ ALLOWED = {
     "getdagwindow":            ([_int(1, 300)], 3),
     "getaddresshistory":       ([ADDRESS, PAGE, OFFSET], 5),
     "getbalance":              ([ADDRESS], 5),
-    "getutxos":                ([ADDRESS, _int(1, 50)], 2),
+    "getutxos":                ([ADDRESS, _int(1, 500)], 2),
+    "getpowitinfo":            ([], 3),
+    "getblock":                ([HASH, BOOL], 10),
+    "getblockhash":            ([U32], 5),
+    "gettransaction":          ([HASH], 5),
+    "gettxstatus":             ([HASH], 3),
     "getrichlist":             ([PAGE, OFFSET], 60),
     "getsupplydistribution":   ([], 60),
     "validateaddress":         ([_re(re.compile(r"^.{1,80}$"), "string")], 60),

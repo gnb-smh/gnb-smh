@@ -58,9 +58,11 @@ export async function loadCore(url = "/wallet/gnb_wallet.wasm", sha256Hex = null
   }
   return {
     open: (json, password) => call({ op: "open", json, password }),
-    create: () => call({ op: "create" }),
+    create: (testnet = false) => call({ op: "create", testnet: !!testnet }),
     exportKeystore: (password) => call({ op: "export", password }).keystore,
     pay: (utxos, to, amount, fee) => call({ op: "pay", utxos, to, amount: String(amount), fee: String(fee) }),
+    bridgeLock: (utxos, vaultScript, amount, l2, fee = "0") =>
+      call({ op: "bridgelock", utxos, vault_script: vaultScript, amount: String(amount), l2, fee: String(fee) }),
     address: () => call({ op: "address" }).address,
     normalize: (address) => call({ op: "normalize", address }).address,
     minFee: (size) => call({ op: "minfee", size }).fee,
