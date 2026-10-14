@@ -13,7 +13,7 @@ use sha3::{Digest, Sha3_256};
 pub fn wrap(payload: &[u8]) -> Vec<u8> {
     let mut b = block_for(payload, core::POW_LIMIT_BITS);
     let pre = b.header.pow_preimage();
-    b.header.nonce = gnb::pow::mine(&pre, b.header.bits, 0, 256).expect("solve at the pow limit");
+    b.header.nonce = gnb::pow::mine(&pre, b.header.bits, b.height, 0, 256).expect("solve at the pow limit");
     b.to_wire_bytes()
 }
 
@@ -55,7 +55,7 @@ fn block_for(payload: &[u8], bits: u32) -> Block {
         transactions: vec![coinbase],
         blue_score: 1,
         height: 1,
-        shielded_transactions: Vec::new(),
+        shielded_transactions: Vec::new(), powit: Default::default(),
     };
     b.header.merkle_root = b.body_merkle_root();
     b

@@ -123,7 +123,7 @@ fn rand_block(r: &mut Rng) -> Vec<u8> {
         transactions: vec![cb],
         blue_score: r.next(),
         height: r.next(),
-        shielded_transactions: shielded,
+        shielded_transactions: shielded, powit: Default::default(),
     };
     block.to_wire_bytes()
 }

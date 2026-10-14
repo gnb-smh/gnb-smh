@@ -462,7 +462,7 @@ mod tests {
             header: BlockHeader { version: 1, parents: vec![], merkle_root: MerkleRoot::ZERO,
                                   timestamp: 0, bits: core::GENESIS_BITS, nonce: 0 },
             transactions: txs, blue_score: 1, height: 200,
-            shielded_transactions: Vec::new(),
+            shielded_transactions: Vec::new(), powit: Default::default(),
         }
     }
 

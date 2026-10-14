@@ -11,7 +11,8 @@ use serde::{Serialize, Deserialize};
 pub mod tokenomics;
 pub mod policy;      // m-of-n multisig + absolute/relative timelocks
 pub mod vesting;     // locked team and founder allocations (genesis ledger)
-pub mod witness_share; // DRAFT, not consensus: reward for proven witness custody
+pub mod witness_share; // reward for proven witness custody (from powit_height)
+pub mod powit;         // Proof of Witnesses: witness-set finality (from powit_height)
 
 /// Bloch Genesis-3 carryover: verified, converted opening ledger.
 pub mod carryover;
@@ -77,6 +78,59 @@ pub fn set_node_chain_id(id: ChainId) -> Result<(), ChainId> {
 pub fn node_chain_id() -> ChainId {
     *NODE_CHAIN_ID.get().unwrap_or(&ChainId::Mainnet)
 }
+
+// ── PoW + PoWit activation ───────────────────────────────────────────────────
+//
+// From `powit_height()` the chain switches its proof of work to GnB-SMH v3 and
+// enables witness shares and witness-set finality (`core::powit`). Mainnet keeps
+// it OFF (u64::MAX) until a release fixes the height; a testnet node may set it
+// at startup (`--powit-height`). Changing the mainnet value is a hard fork.
+
+/// Mainnet activation height: off until decided.
+pub const POWIT_HEIGHT_MAINNET: u64 = u64::MAX;
+
+static POWIT_HEIGHT_OVERRIDE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Set the activation height for this process (testnet nodes and tests only;
+/// the mainnet node never calls it). Idempotent for the same value.
+pub fn set_powit_height_override(height: u64) -> Result<(), u64> {
+    match POWIT_HEIGHT_OVERRIDE.set(height) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let cur = *POWIT_HEIGHT_OVERRIDE.get().expect("OnceLock set");
+            if cur == height { Ok(()) } else { Err(cur) }
+        }
+    }
+}
+
+/// First height at which PoW + PoWit rules apply.
+pub fn powit_height() -> u64 {
+    POWIT_HEIGHT_OVERRIDE.get().copied().unwrap_or(match node_chain_id() {
+        ChainId::Mainnet => POWIT_HEIGHT_MAINNET,
+        ChainId::Testnet => POWIT_HEIGHT_MAINNET,
+    })
+}
+
+/// Whether PoW + PoWit rules apply at `height`.
+pub fn powit_active(height: u64) -> bool {
+    height >= powit_height()
+}
+
+/// The proof-of-work function for a block at `height`.
+pub fn pow_algo(height: u64) -> gnb_smh::Algo {
+    pow_algo_with(height, powit_height())
+}
+
+/// [`pow_algo`] against an explicit activation height (testable).
+pub fn pow_algo_with(height: u64, activation: u64) -> gnb_smh::Algo {
+    if height >= activation { gnb_smh::Algo::V3 } else { gnb_smh::Algo::V1 }
+}
+
+/// GnB-SMH v3 attempts are ~6x cheaper than v1 (90 ms vs 527 ms on one core),
+/// so from activation the target is 2^POW_V3_DIFFICULTY_SHIFT times harder
+/// than the ASERT schedule, and each block's chain work is divided by the same
+/// factor so that cumulative work stays comparable across the switch.
+pub const POW_V3_DIFFICULTY_SHIFT: u32 = 2;
 
 // ── Consensus constants ─────────────────────────────────────────────────────
 
@@ -232,8 +286,22 @@ pub fn expected_bits(parent_timestamp: u64, height: u64) -> Result<u32, String> 
     #[allow(unreachable_code)]
     let parent_time = i64::try_from(parent_timestamp)
         .map_err(|_| format!("parent timestamp {parent_timestamp} out of range"))?;
-    gnb_smh::difficulty::asert_next_bits(&asert_params(), &asert_anchor(), parent_time, height)
-        .map_err(|e| e.to_string())
+    let bits = gnb_smh::difficulty::asert_next_bits(&asert_params(), &asert_anchor(), parent_time, height)
+        .map_err(|e| e.to_string())?;
+    Ok(adjust_bits_for_algo(bits, pow_algo(height)))
+}
+
+/// ASERT bits for `algo`: v3 targets are `POW_V3_DIFFICULTY_SHIFT` bits lower.
+pub fn adjust_bits_for_algo(bits: u32, algo: gnb_smh::Algo) -> u32 {
+    match algo {
+        gnb_smh::Algo::V1 => bits,
+        gnb_smh::Algo::V3 => {
+            let t = bits_to_target(bits);
+            let v = primitive_types::U256::from_big_endian(&t) >> POW_V3_DIFFICULTY_SHIFT;
+            let v = v.max(primitive_types::U256::one());
+            target_to_bits(&v.to_big_endian())
+        }
+    }
 }
 
 // ── BlockHeader ───────────────────────────────────────────────────────────────
@@ -355,8 +423,8 @@ impl BlockHeader {
 
     /// GnB-SMH output for this header (64 MiB, ~1M Keccak permutations).
     /// Expensive: use `Block::validate_pow`, which caches verified blocks.
-    pub fn pow_hash(&self) -> [u8; 32] {
-        gnb_smh::hash_thread_local(&self.pow_preimage(), self.nonce)
+    pub fn pow_hash(&self, height: u64) -> [u8; 32] {
+        gnb_smh::hash_algo(pow_algo(height), &self.pow_preimage(), self.nonce)
     }
 
     /// Cheap header digest used for DAG indexing: SHA3-256 over every header
@@ -456,7 +524,7 @@ use std::io::{Cursor, Read};
 // Used by Transaction::to_wire_bytes / from_wire_bytes so that external
 // miners and the node agree on txid wire format.
 
-fn write_varint(out: &mut Vec<u8>, n: u64) {
+pub(crate) fn write_varint(out: &mut Vec<u8>, n: u64) {
     if n < 0xFD {
         out.push(n as u8);
     } else if n <= 0xFFFF {
@@ -862,6 +930,11 @@ pub struct Block {
     /// `body_merkle_root` and serialized after the transparent transactions.
     #[serde(default)]
     pub shielded_transactions: Vec<coherence_core::ShieldedTx>,
+    /// PoWit section (witness shares, attestations, equivocation proofs).
+    /// Present on the wire and committed in the body root only from
+    /// `powit_height()`; must be empty below it.
+    #[serde(default)]
+    pub powit: powit::PowitBody,
 }
 
 /// Bounded cache of block ids whose GnB-SMH proof has been verified. A block
@@ -904,6 +977,7 @@ impl Block {
     ///   transactions Transaction::to_wire_bytes(true) × tx_count
     ///   sh_count     varint
     ///   shielded     shielded tx × sh_count
+    ///   powit        PowitBody (only when height >= powit_height())
     /// ```
     pub fn to_wire_bytes(&self) -> Vec<u8> {
         let mut out = self.header.to_wire_bytes(self.blue_score, self.height);
@@ -914,6 +988,9 @@ impl Block {
         write_varint(&mut out, self.shielded_transactions.len() as u64);
         for stx in &self.shielded_transactions {
             write_shielded_tx(&mut out, stx);
+        }
+        if powit_active(self.height) {
+            self.powit.write_wire(&mut out);
         }
         out
     }
@@ -951,16 +1028,34 @@ impl Block {
         }
         offset += sh_cur.position() as usize;
 
+        let powit = if powit_active(height) {
+            let mut pc = Cursor::new(&body[offset..]);
+            let pb = powit::PowitBody::read_wire(&mut pc).map_err(|e| format!("powit section: {e}"))?;
+            offset += pc.position() as usize;
+            pb
+        } else {
+            powit::PowitBody::default()
+        };
+
         if offset != body.len() {
             return Err(format!("trailing bytes in block body: parsed {} of {}", offset, body.len()));
         }
-        Ok(Block { header, transactions, blue_score, height, shielded_transactions })
+        Ok(Block { header, transactions, blue_score, height, shielded_transactions, powit })
     }
 
     /// Merkle commitment over the block body — transparent and shielded txs.
     /// With no shielded txs it equals `Transaction::merkle_root(transparent)`.
     pub fn body_merkle_root(&self) -> MerkleRoot {
         let tx_root = Transaction::merkle_root(&self.transactions);
+        if powit_active(self.height) {
+            // v2 body root: transparent, shielded and PoWit sections, always.
+            let mut c = Sha3_256::new();
+            c.update(b"gnb:block:body:v2");
+            c.update(tx_root.0);
+            c.update(self.shielded_root());
+            c.update(self.powit.root());
+            return MerkleRoot(c.finalize().into());
+        }
         if self.shielded_transactions.is_empty() {
             return tx_root;
         }
@@ -978,6 +1073,19 @@ impl Block {
         c.update(tx_root.0);
         c.update(sh_root);
         MerkleRoot(c.finalize().into())
+    }
+
+    /// Root of the shielded section (also over an empty list).
+    fn shielded_root(&self) -> [u8; 32] {
+        let mut sh = Sha3_256::new();
+        sh.update(b"gnb:block:shielded:v1");
+        for stx in &self.shielded_transactions {
+            let mut buf = Vec::new();
+            write_shielded_tx(&mut buf, stx);
+            let h: [u8; 32] = Sha3_256::digest(&buf).into();
+            sh.update(h);
+        }
+        sh.finalize().into()
     }
 
     pub fn validate_merkle(&self) -> bool {
@@ -1001,7 +1109,8 @@ impl Block {
                 return true;
             }
         }
-        let ok = gnb_smh::verify(&self.header.pow_preimage(), self.header.nonce, &target);
+        let ok = gnb_smh::verify_algo(pow_algo(self.height), &self.header.pow_preimage(),
+                                      self.header.nonce, &target);
         if ok {
             if let Ok(mut cache) = pow_cache().lock() {
                 if cache.set.insert(id) {
@@ -1040,6 +1149,9 @@ impl Block {
     /// Paying less burns the difference.
     pub fn validate_coinbase_value(&self, total_fees: u64) -> Result<(), &'static str> {
         if self.transactions.is_empty() { return Err("no transactions"); }
+        if powit_active(self.height) {
+            return self.validate_coinbase_value_powit(total_fees);
+        }
         let cb = &self.transactions[0];
         if cb.outputs.len() != 1 {
             return Err("coinbase must have 1 output (miner)");
@@ -1053,6 +1165,47 @@ impl Block {
             return Err("miner coinbase output exceeds allowed amount");
         }
         Ok(())
+    }
+
+    /// From `powit_height()`: output 0 pays the miner at most its share of
+    /// the subsidy (`witness_share::split_subsidy`) plus fees; output `1 + k`
+    /// pays exactly `per_attester` to share `k`'s payout script. Nothing else.
+    fn validate_coinbase_value_powit(&self, total_fees: u64) -> Result<(), &'static str> {
+        let cb = &self.transactions[0];
+        let shares = &self.powit.shares;
+        if shares.len() > witness_share::MAX_SHARES_PER_BLOCK {
+            return Err("too many witness shares");
+        }
+        if cb.outputs.len() != 1 + shares.len() {
+            return Err("coinbase must have 1 miner output plus 1 output per witness share");
+        }
+        let split = witness_share::split_subsidy(self.height, shares.len());
+        let max_miner = split.miner.checked_add(total_fees)
+            .ok_or("coinbase reward computation overflowed (subsidy + fees)")?;
+        if cb.outputs[0].value > max_miner {
+            return Err("miner coinbase output exceeds allowed amount");
+        }
+        for (out, share) in cb.outputs[1..].iter().zip(shares) {
+            if out.value != split.per_attester || out.script_pubkey != share.payout {
+                return Err("coinbase witness-share output does not match its share");
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the coinbase outputs for a block template from `powit_height()`:
+    /// the miner output followed by one output per share. Below activation
+    /// it is just the miner output.
+    pub fn coinbase_outputs(height: u64, miner_script: Vec<u8>, total_fees: u64,
+                            shares: &[witness_share::WitnessShare]) -> Vec<TxOutput> {
+        if !powit_active(height) {
+            let v = tokenomics::block_subsidy_sat(height).saturating_add(total_fees);
+            return vec![TxOutput { value: v, script_pubkey: miner_script }];
+        }
+        let split = witness_share::split_subsidy(height, shares.len());
+        let mut outs = vec![TxOutput { value: split.miner.saturating_add(total_fees), script_pubkey: miner_script }];
+        outs.extend(shares.iter().map(|s| TxOutput { value: split.per_attester, script_pubkey: s.payout.clone() }));
+        outs
     }
 
     /// Validate the timestamp is within acceptable bounds.
@@ -1147,6 +1300,26 @@ impl Block {
         self.validate_no_duplicate_txs()?;
         self.validate_dust()?;
         self.validate_witness_commitment()?;
+        self.validate_powit_structure()?;
+        Ok(())
+    }
+
+    /// Context-free PoWit checks: empty below activation; bounded counts;
+    /// every share pays a pay-to-pubkey-hash script and attests with the
+    /// block's own difficulty; no duplicate share ids.
+    pub fn validate_powit_structure(&self) -> Result<(), &'static str> {
+        if !powit_active(self.height) {
+            return if self.powit.is_empty() { Ok(()) } else { Err("PoWit section before activation") };
+        }
+        let p = powit::params();
+        if self.powit.shares.len() > witness_share::MAX_SHARES_PER_BLOCK { return Err("too many witness shares"); }
+        if self.powit.attestations.len() > p.max_attestations_per_block { return Err("too many attestations"); }
+        if self.powit.evidence.len() > p.max_evidence_per_block { return Err("too many equivocation proofs"); }
+        let mut ids = std::collections::HashSet::with_capacity(self.powit.shares.len());
+        for sh in &self.powit.shares {
+            if sh.key_id().is_none() { return Err("witness share must pay a pay-to-pubkey-hash script"); }
+            if !ids.insert(witness_share::share_id(sh)) { return Err("duplicate witness share"); }
+        }
         Ok(())
     }
 
@@ -1194,7 +1367,7 @@ mod validate_coinbase_value_tests {
             }],
             blue_score: 0,
             height,
-            shielded_transactions: vec![],
+            shielded_transactions: vec![], powit: Default::default(),
         }
     }
 
@@ -1350,7 +1523,7 @@ pub fn create_genesis_block_with(timestamp: u64, bits: u32, nonce: u64) -> Block
         transactions: vec![coinbase],
         blue_score: 0,
         height: 0,
-        shielded_transactions: Vec::new(),
+        shielded_transactions: Vec::new(), powit: Default::default(),
     }
 }
 
@@ -1386,6 +1559,16 @@ pub fn bits_to_work(bits: u32) -> u128 {
     gnb_smh::difficulty::work_from_bits(bits)
 }
 
+/// Chain-work contribution of a block at `height` with `bits`: v3 blocks are
+/// normalised by `POW_V3_DIFFICULTY_SHIFT` so cumulative work is continuous
+/// across the switch. Every place that adds a block's work must call this.
+pub fn block_work(bits: u32, height: u64) -> u128 {
+    match pow_algo(height) {
+        gnb_smh::Algo::V1 => bits_to_work(bits),
+        gnb_smh::Algo::V3 => bits_to_work(bits) >> POW_V3_DIFFICULTY_SHIFT,
+    }
+}
+
 fn u256_to_f64(v: primitive_types::U256) -> f64 {
     v.0.iter().rev().fold(0.0, |acc, &limb| acc * 18_446_744_073_709_551_616.0 + limb as f64)
 }
@@ -1414,6 +1597,92 @@ pub fn difficulty_to_target(diff: f64) -> [u8; 32] {
     let scaled = (diff * 4_294_967_296.0).min(3.4e38) as u128;
     let t = (limit / U256::from(scaled.max(1))) << 32;
     t.min(limit).to_big_endian()
+}
+
+#[cfg(test)]
+mod powit_pow_tests {
+    use super::*;
+    use primitive_types::U256;
+
+    /// Activation used by the tests in this binary. Far above any height the
+    /// other tests touch, so it cannot change their outcome.
+    const TEST_ACTIVATION: u64 = 1 << 40;
+
+    fn activate() {
+        set_powit_height_override(TEST_ACTIVATION).expect("one activation height per test binary");
+    }
+
+    #[test]
+    fn algorithm_switches_exactly_at_activation() {
+        assert_eq!(pow_algo_with(99, 100), gnb_smh::Algo::V1);
+        assert_eq!(pow_algo_with(100, 100), gnb_smh::Algo::V3);
+        assert_eq!(pow_algo_with(u64::MAX - 1, POWIT_HEIGHT_MAINNET), gnb_smh::Algo::V1);
+        activate();
+        assert_eq!(pow_algo(TEST_ACTIVATION - 1), gnb_smh::Algo::V1);
+        assert_eq!(pow_algo(TEST_ACTIVATION), gnb_smh::Algo::V3);
+        assert!(!powit_active(TEST_ACTIVATION - 1) && powit_active(TEST_ACTIVATION));
+    }
+
+    #[test]
+    fn v3_target_is_four_times_harder() {
+        for bits in [GENESIS_BITS, POW_LIMIT_BITS, 0x1E0F_FFFF, 0x1D00_FFFF] {
+            let t1 = U256::from_big_endian(&bits_to_target(bits));
+            let t3 = U256::from_big_endian(&bits_to_target(adjust_bits_for_algo(bits, gnb_smh::Algo::V3)));
+            // Compact encoding keeps 3 mantissa bytes, so allow its rounding.
+            let want = t1 >> POW_V3_DIFFICULTY_SHIFT;
+            assert!(t3 <= want && t3 >= want - (want >> 15), "bits 0x{bits:08x}");
+            assert_eq!(adjust_bits_for_algo(bits, gnb_smh::Algo::V1), bits);
+        }
+    }
+
+    #[test]
+    fn chain_work_is_continuous_across_the_switch() {
+        activate();
+        let v1_bits = GENESIS_BITS;
+        let v3_bits = adjust_bits_for_algo(v1_bits, gnb_smh::Algo::V3);
+        let before = block_work(v1_bits, TEST_ACTIVATION - 1);
+        let after = block_work(v3_bits, TEST_ACTIVATION);
+        let diff = before.abs_diff(after);
+        assert!(diff <= before >> 12, "work jumps across activation: {before} vs {after}");
+    }
+
+    #[test]
+    fn v3_block_validates_only_with_v3() {
+        activate();
+        // Target 2^252: 1 in 16 evaluations pass, so v1 and v3 disagree often.
+        let bits = target_to_bits(&(U256::MAX >> 4).to_big_endian());
+        let mut b = genesis_block();
+        b.height = TEST_ACTIVATION;
+        b.header.bits = bits;
+        let pre = b.header.pow_preimage();
+        let target = gnb_smh::difficulty::bits_to_target(bits);
+        let mut nonce = 0u64;
+        loop {
+            let v3_ok = gnb_smh::verify_algo(gnb_smh::Algo::V3, &pre, nonce, &target);
+            let v1_ok = gnb_smh::verify_algo(gnb_smh::Algo::V1, &pre, nonce, &target);
+            if v3_ok && !v1_ok { break; }
+            nonce += 1;
+            assert!(nonce < 4_000, "no separating nonce found");
+        }
+        b.header.nonce = nonce;
+        assert!(b.validate_pow(), "v3 proof must validate at the activation height");
+        assert_eq!(b.header.pow_hash(TEST_ACTIVATION), gnb_smh::v3::hash_thread_local(&pre, nonce));
+
+        let mut early = b.clone();
+        early.height = TEST_ACTIVATION - 1;
+        early.header.timestamp += 1; // different block id, so no pow-cache hit
+        let pre_e = early.header.pow_preimage();
+        let mut n = 0u64;
+        loop {
+            let v3_ok = gnb_smh::verify_algo(gnb_smh::Algo::V3, &pre_e, n, &target);
+            let v1_ok = gnb_smh::verify_algo(gnb_smh::Algo::V1, &pre_e, n, &target);
+            if v3_ok && !v1_ok { break; }
+            n += 1;
+            assert!(n < 4_000);
+        }
+        early.header.nonce = n;
+        assert!(!early.validate_pow(), "a v3-only proof must fail below the activation height");
+    }
 }
 
 #[cfg(test)]

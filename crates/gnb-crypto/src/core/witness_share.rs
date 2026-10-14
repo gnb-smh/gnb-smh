@@ -1,7 +1,9 @@
-//! Witness shares (DRAFT, not consensus): extra reward for proven witness custody.
+//! Witness shares: extra reward for proven witness custody.
 //!
-//! Nothing here is wired into block validation. Rationale and parameters:
-//! `docs/DESIGN-witness-shares.md`.
+//! Consensus from `core::powit_height()`: blocks carry up to
+//! `MAX_SHARES_PER_BLOCK` shares in their PoWit section and pay them from the
+//! coinbase (`Block::validate_coinbase_value`). The share proof is GnB-SMH v3.
+//! Rationale and parameters: `docs/DESIGN-witness-shares.md`.
 //!
 //! A witness share is a small GnB-SMH proof (`SHARE_TARGET_FACTOR` times
 //! easier than a block) that attests to a recent block `B` and can only be
@@ -50,7 +52,7 @@ pub const INCLUSION_BONUS_BPS: u64 = 1_000;
 /// Largest payout script accepted.
 pub const MAX_PAYOUT_SCRIPT: usize = 128;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WitnessShare {
     /// DAG hash of the attested block.
     pub attested: [u8; 32],
@@ -161,6 +163,42 @@ pub fn share_target(block_target: &Target) -> Target {
     Target(out)
 }
 
+impl WitnessShare {
+    /// Wire: attested 32 ‖ varint len ‖ payout ‖ bits u32le ‖ nonce u64le.
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 9 + self.payout.len() + 12);
+        out.extend_from_slice(&self.attested);
+        super::write_varint(&mut out, self.payout.len() as u64);
+        out.extend_from_slice(&self.payout);
+        out.extend_from_slice(&self.bits.to_le_bytes());
+        out.extend_from_slice(&self.nonce.to_le_bytes());
+        out
+    }
+
+    pub fn read_wire(cur: &mut std::io::Cursor<&[u8]>) -> Result<Self, String> {
+        let attested = super::powit::read_array32(cur)?;
+        let payout = super::powit::read_bytes(cur, MAX_PAYOUT_SCRIPT, "share payout")?;
+        let bits = super::powit::read_u32(cur)?;
+        let nonce = super::powit::read_u64(cur)?;
+        Ok(WitnessShare { attested, payout, bits, nonce })
+    }
+
+    /// The witness key this share credits: the payout must be a
+    /// pay-to-pubkey-hash script, whose 20 bytes are the key id.
+    pub fn key_id(&self) -> Option<super::powit::KeyId> {
+        (self.payout.len() == super::policy::PKH_SPK_LEN).then(|| {
+            let mut k = [0u8; 20];
+            k.copy_from_slice(&self.payout);
+            k
+        })
+    }
+}
+
+/// Production share proof: GnB-SMH v3.
+pub fn smh_v3(pre: &[u8], nonce: u64) -> [u8; 32] {
+    gnb_smh::hash_algo(gnb_smh::Algo::V3, pre, nonce)
+}
+
 /// Unique id of a share (duplicates are refused across a block).
 pub fn share_id(share: &WitnessShare) -> [u8; 32] {
     sha3(&[DS_ID, &share.attested, &sha3(&[&share.payout]), &share.bits.to_le_bytes(),
@@ -260,7 +298,7 @@ mod tests {
             version: 1, parents: vec![[7; 32]], merkle_root: MerkleRoot([0; 32]),
             timestamp: 1, bits: 0x2000_FFFF, nonce: height,
         };
-        Block { header, transactions: vec![cb], height, blue_score: height, shielded_transactions: vec![] }
+        Block { header, transactions: vec![cb], height, blue_score: height, shielded_transactions: vec![], powit: Default::default() }
     }
 
     /// Stub PoW: SHA3 of the input; deterministic and cheap.

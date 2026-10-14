@@ -73,6 +73,10 @@ struct Cli {
     /// totals) before anything is written; any mismatch refuses to start.
     #[arg(long)]                                         carryover_snapshot: Option<PathBuf>,
     #[arg(long)]                                         testnet: bool,
+    /// PoW + PoWit activation height (GnB-SMH v3, witness shares, witness-set
+    /// finality). TESTNET ONLY: refused without --testnet. Mainnet activation
+    /// is a consensus constant (core::POWIT_HEIGHT_MAINNET).
+    #[arg(long)]                                         powit_height: Option<u64>,
     #[arg(long, default_value = "./gnb-data")]            data_dir: String,
     /// RPC bind address. SECURITY: defaults to 127.0.0.1 (local only).
     /// Use --rpc-public to bind 0.0.0.0, which exposes RPC to the internet.
@@ -262,6 +266,16 @@ async fn main() {
     core::set_node_chain_id(
         if cli.testnet { core::ChainId::Testnet } else { core::ChainId::Mainnet }
     ).expect("node chain-id must be settable exactly once at startup");
+    if let Some(h) = cli.powit_height {
+        if !cli.testnet {
+            eprintln!("--powit-height is testnet-only; mainnet activation is a consensus constant");
+            std::process::exit(2);
+        }
+        core::set_powit_height_override(h).expect("PoWit height must be settable once at startup");
+    }
+    info!("proof of work: {} (PoWit activation height {})",
+          core::pow_algo(0).name(),
+          match core::powit_height() { u64::MAX => "off".to_string(), h => h.to_string() });
 
     // FIX v0.5.1 BLK-3: apply --rpc-public escape hatch.
     let rpc_bind = if cli.rpc_public { "0.0.0.0".to_string() } else { cli.rpc_bind.clone() };
@@ -1779,7 +1793,7 @@ async fn main() {
                     transactions: all_txs,
                     blue_score:   current_blue_score + 1,
                     height:       block_height,
-                    shielded_transactions: Vec::new(),
+                    shielded_transactions: Vec::new(), powit: Default::default(),
                 };
                 // From WITNESS_COMMITMENT_HEIGHT the coinbase commits to every
                 // witness (refreshes the merkle root).
@@ -1803,7 +1817,7 @@ async fn main() {
                 });
                 let stop_m = stop.clone();
                 let mined = tokio::task::spawn_blocking(move || {
-                    pow::mine_parallel(&preimage, bits, start_nonce, MINE_ROUND_ATTEMPTS,
+                    pow::mine_parallel(&preimage, bits, block_height, start_nonce, MINE_ROUND_ATTEMPTS,
                                        mine_threads, Some(&stop_m))
                 }).await;
                 tip_watch.abort();
@@ -2111,8 +2125,8 @@ fn orphan_admission_check(block: &core::Block, tip_child_bits: Option<u32>) -> R
             block.header.bits, floor_bits, block.height));
     }
     if let Some(tip_bits) = tip_child_bits {
-        let need = pow::work_from_bits(tip_bits) >> ORPHAN_MAX_EASIER_SHIFT;
-        if pow::work_from_bits(block.header.bits) < need {
+        let need = pow::block_work(tip_bits, block.height) >> ORPHAN_MAX_EASIER_SHIFT;
+        if pow::block_work(block.header.bits, block.height) < need {
             return Err(format!(
                 "difficulty 0x{:08x} more than 2^{} times easier than the tip's 0x{:08x}",
                 block.header.bits, ORPHAN_MAX_EASIER_SHIFT, tip_bits));
@@ -2338,7 +2352,7 @@ fn accept_block(
 
     let ts      = block.header.timestamp;
     let parents = block.header.parents.clone();
-    let work    = pow::work_from_bits(block.header.bits);
+    let work    = pow::block_work(block.header.bits, block.height);
     // M-9: propagate consensus rejection upward instead of panicking.
     // NoParents / DuplicateBlock here mean the caller (the sync path or
     // gossipsub) handed us a structurally-broken block; we reject with
@@ -3070,7 +3084,7 @@ mod external_submission_tests {
             transactions: vec![mk_coinbase(0, 0)],
             blue_score: 0,
             height: 0,
-            shielded_transactions: Vec::new(),
+            shielded_transactions: Vec::new(), powit: Default::default(),
         }
     }
 
@@ -3128,12 +3142,12 @@ mod external_submission_tests {
             transactions: all_txs,
             blue_score: 1,
             height: 1,
-            shielded_transactions: Vec::new(),
+            shielded_transactions: Vec::new(), powit: Default::default(),
                 };
 
         if mine {
             let preimage = block.header.pow_preimage();
-            let nonce = pow::mine_parallel(&preimage, bits, 0, 1 << 16, 4, None)
+            let nonce = pow::mine_parallel(&preimage, bits, 1, 0, 1 << 16, 4, None)
                 .expect("GnB-SMH solve within attempt budget");
             block.header.nonce = nonce;
             assert!(
@@ -3211,10 +3225,10 @@ mod external_submission_tests {
             transactions: all_txs,
             blue_score: 1,
             height: 1,
-            shielded_transactions: Vec::new(),
+            shielded_transactions: Vec::new(), powit: Default::default(),
         };
         let preimage = block.header.pow_preimage();
-        let nonce = pow::mine_parallel(&preimage, bits, 0, 1 << 16, 4, None)
+        let nonce = pow::mine_parallel(&preimage, bits, 1, 0, 1 << 16, 4, None)
                 .expect("GnB-SMH solve within attempt budget");
             block.header.nonce = nonce;
         assert!(
@@ -3367,7 +3381,7 @@ mod external_submission_tests {
             transactions: vec![mk_coinbase(height, subsidy)],
             blue_score: height,
             height,
-            shielded_transactions: Vec::new(),
+            shielded_transactions: Vec::new(), powit: Default::default(),
         }
     }
 
@@ -3858,7 +3872,7 @@ mod out_of_order_spend_tests {
             },
             transactions: vec![coinbase(), tx_early, tx_late],
             blue_score: 0, height: 1,
-            shielded_transactions: Vec::new(),
+            shielded_transactions: Vec::new(), powit: Default::default(),
         };
 
         let utxo = |t: &[u8; 32], i: u32| store.get_utxo(t, i).map_err(|e| e.to_string());
@@ -3920,7 +3934,7 @@ mod out_of_order_spend_tests {
             },
             transactions: vec![coinbase(), tx_funding, tx_spend],
             blue_score: 0, height: 1,
-            shielded_transactions: Vec::new(),
+            shielded_transactions: Vec::new(), powit: Default::default(),
         };
 
         let utxo = |t: &[u8; 32], i: u32| store.get_utxo(t, i).map_err(|e| e.to_string());
@@ -3943,11 +3957,11 @@ mod orphan_admission_tests {
                 timestamp, bits, nonce: 0,
             },
             transactions: vec![], blue_score: 0, height: 5,
-            shielded_transactions: Vec::new(),
+            shielded_transactions: Vec::new(), powit: Default::default(),
         };
         // Easiest target: almost any nonce meets it.
         let pre = b.header.pow_preimage();
-        b.header.nonce = pow::mine(&pre, bits, 0, 64).expect("solve at the pow limit");
+        b.header.nonce = pow::mine(&pre, bits, b.height, 0, 64).expect("solve at the pow limit");
         b
     }
 

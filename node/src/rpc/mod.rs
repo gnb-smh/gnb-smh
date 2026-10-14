@@ -1183,7 +1183,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 transactions: std::iter::once(crate::core::Transaction {
                     version: 1, inputs: vec![], outputs: vec![], locktime: 0 })
                     .chain(txs.iter().cloned()).collect(),
-                blue_score, height, shielded_transactions: Vec::new(),
+                blue_score, height, shielded_transactions: Vec::new(), powit: Default::default(),
             }.witness_commitment());
 
             let now = std::time::SystemTime::now()
@@ -1204,7 +1204,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // The block's timestamp must be >= parent_time and at most
                 // MAX_FUTURE_SECS ahead of the validator's clock.
                 "min_time":             parent_ts,
-                // Proof of work: GnB-SMH v1 over the header preimage
+                // Proof of work: GnB-SMH (v1, or v3 from powit_height) over the header preimage
                 // (version u32le | n_parents u32le | parents | merkle_root |
                 // timestamp u64le | bits u32le) and the u64 nonce; valid iff
                 // the 32-byte output, big-endian, is < target(bits).
@@ -1213,8 +1213,14 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // coinbase counted as zero); see Block::commit_witnesses.
                 "witness_commitment_height": crate::core::WITNESS_COMMITMENT_HEIGHT,
                 "witness_commitment":   witness_commitment,
-                "pow":                  "gnb-smh-v1",
-                "pow_log2_n":           gnb_smh::LOG2_N,
+                // From powit_height the proof of work is GnB-SMH v3 (4 MiB);
+                // "pow" names the function for THIS height.
+                "pow":                  crate::core::pow_algo(height).name(),
+                "pow_log2_n":           match crate::core::pow_algo(height) {
+                    gnb_smh::Algo::V1 => gnb_smh::LOG2_N,
+                    gnb_smh::Algo::V3 => gnb_smh::v3::LOG2_N,
+                },
+                "powit_height":         crate::core::powit_height().to_string(),
                 "target":               hex::encode(crate::core::bits_to_target(bits)),
             })
         }

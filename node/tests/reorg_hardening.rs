@@ -108,7 +108,7 @@ fn mk_block_at(height: u64, nonce_tag: u64, txs: Vec<Transaction>) -> Block {
         transactions: txs,
         blue_score: height,
         height,
-        shielded_transactions: Vec::new(),
+        shielded_transactions: Vec::new(), powit: Default::default(),
     }
 }
 

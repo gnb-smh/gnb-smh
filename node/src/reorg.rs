@@ -1174,7 +1174,7 @@ mod reorg_hardening_unit_tests {
             transactions: txs,
             blue_score: height,
             height,
-            shielded_transactions: Vec::new(),
+            shielded_transactions: Vec::new(), powit: Default::default(),
         }
     }
 

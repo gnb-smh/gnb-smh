@@ -1,6 +1,7 @@
 //! GnB-SMH v3 draft — data-dependent multi-pass fill (Argon2d-style), SHAKE-256.
 //!
-//! DRAFT, NOT CONSENSUS. Normative definition: `reference/gnb_smh_v3.py`;
+//! Consensus proof of work from the PoWit activation height (`gnb_crypto::core::powit_height`).
+//! Normative definition: `reference/gnb_smh_v3.py`;
 //! must reproduce `reference/test_vectors_v3.json` (see `tests/vectors_v3.rs`).
 //!
 //! ```text
@@ -109,6 +110,21 @@ pub fn trace_with(sp: &mut Scratchpad, passes: u8, header: &[u8], nonce: u64) ->
 
 pub fn hash_with(sp: &mut Scratchpad, header: &[u8], nonce: u64) -> [u8; 32] {
     trace_with(sp, PASSES, header, nonce).out
+}
+
+std::thread_local! {
+    static THREAD_SCRATCHPAD: std::cell::RefCell<Option<Scratchpad>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Canonical v3 output using a per-thread 4 MiB scratchpad kept for the life
+/// of the thread.
+pub fn hash_thread_local(header: &[u8], nonce: u64) -> [u8; 32] {
+    THREAD_SCRATCHPAD.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let sp = slot.get_or_insert_with(|| Scratchpad::new(LOG2_N));
+        hash_with(sp, header, nonce)
+    })
 }
 
 #[cfg(test)]
