@@ -83,12 +83,16 @@ pub fn node_chain_id() -> ChainId {
 // ── PoW + PoWit activation ───────────────────────────────────────────────────
 //
 // From `powit_height()` the chain switches its proof of work to GnB-SMH v3 and
-// enables witness shares and witness-set finality (`core::powit`). Mainnet keeps
-// it OFF (u64::MAX) until a release fixes the height; a testnet node may set it
-// at startup (`--powit-height`). Changing the mainnet value is a hard fork.
+// enables witness shares and witness-set finality (`core::powit`). A testnet
+// node may set it at startup (`--powit-height`). Changing the mainnet value is
+// a hard fork.
 
-/// Mainnet activation height: off until decided.
-pub const POWIT_HEIGHT_MAINNET: u64 = u64::MAX;
+/// Mainnet activation height (fixed 2026-10-14 for the chain relaunched from
+/// genesis that day).
+pub const POWIT_HEIGHT_MAINNET: u64 = 10_000;
+
+/// Testnet default when no `--powit-height` is given: off.
+pub const POWIT_HEIGHT_TESTNET: u64 = u64::MAX;
 
 static POWIT_HEIGHT_OVERRIDE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -108,7 +112,7 @@ pub fn set_powit_height_override(height: u64) -> Result<(), u64> {
 pub fn powit_height() -> u64 {
     POWIT_HEIGHT_OVERRIDE.get().copied().unwrap_or(match node_chain_id() {
         ChainId::Mainnet => POWIT_HEIGHT_MAINNET,
-        ChainId::Testnet => POWIT_HEIGHT_MAINNET,
+        ChainId::Testnet => POWIT_HEIGHT_TESTNET,
     })
 }
 
@@ -1616,7 +1620,7 @@ mod powit_pow_tests {
     fn algorithm_switches_exactly_at_activation() {
         assert_eq!(pow_algo_with(99, 100), gnb_smh::Algo::V1);
         assert_eq!(pow_algo_with(100, 100), gnb_smh::Algo::V3);
-        assert_eq!(pow_algo_with(u64::MAX - 1, POWIT_HEIGHT_MAINNET), gnb_smh::Algo::V1);
+        assert_eq!(pow_algo_with(POWIT_HEIGHT_MAINNET - 1, POWIT_HEIGHT_MAINNET), gnb_smh::Algo::V1);
         activate();
         assert_eq!(pow_algo(TEST_ACTIVATION - 1), gnb_smh::Algo::V1);
         assert_eq!(pow_algo(TEST_ACTIVATION), gnb_smh::Algo::V3);
