@@ -67,6 +67,11 @@ struct Cli {
     /// recovered. Run at least one archival node, or new nodes cannot join.
     /// Costs disk: the full chain instead of the last 10,000 blocks.
     #[arg(long)]                                         archive: bool,
+    /// Rebuild the address history index (what getaddresshistory serves) from
+    /// the selected chain, then continue normally. Needs --carryover-snapshot:
+    /// spends of genesis-ledger outputs are resolved from it. Fixes histories
+    /// that lost their spends to reorgs on older releases.
+    #[arg(long)]                                         reindex_addresses: bool,
     /// Path to the uncompressed Bloch Genesis-3 carryover snapshot
     /// (`gunzip -k genesis/bloch-g3-carryover.tsv.gz`). Required on first
     /// boot: the genesis ledger is that snapshot converted to 1,000,000 GNB.
@@ -588,6 +593,31 @@ async fn main() {
                     dag.write().add_genesis(blk.block_hash(), blk.header.timestamp);
                     info!("Genesis loaded (fallback): {}", hex::encode(&gh));
                 }
+            }
+        }
+        if cli.reindex_addresses {
+            let Some(snap_path) = cli.carryover_snapshot.as_ref() else {
+                error!("--reindex-addresses needs --carryover-snapshot"); std::process::exit(2);
+            };
+            let bytes = std::fs::read(snap_path).unwrap_or_else(|e| {
+                error!("cannot read {}: {e}", snap_path.display()); std::process::exit(1);
+            });
+            let snap = core::carryover::verify_and_convert(&bytes).unwrap_or_else(|f| {
+                error!("carryover verification failed: {:?}", f); std::process::exit(1);
+            });
+            let locked = core::vesting::genesis_tranches().unwrap_or_else(|e| {
+                error!("locked allocations unavailable: {e}"); std::process::exit(1);
+            });
+            let mut genesis_outputs = std::collections::HashMap::with_capacity(snap.utxos.len() + locked.len());
+            for u in snap.utxos { genesis_outputs.insert((u.txid, u.vout), u.output); }
+            for t in locked { genesis_outputs.insert((t.txid, t.vout), t.output); }
+            let mut chain = dag.read().selected_chain();
+            chain.reverse();
+            info!("reindexing address history over {} selected-chain blocks…", chain.len());
+            match store.reindex_addresses(&chain, genesis_outputs) {
+                Ok((blocks, rows, unresolved)) => info!(
+                    "address history rebuilt: {blocks} blocks, {rows} rows, {unresolved} unresolved inputs"),
+                Err(e) => { error!("address reindex failed: {e}"); std::process::exit(1); }
             }
         }
         // The applied chain state (`tip_hash`, written in the same batch as

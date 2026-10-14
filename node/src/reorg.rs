@@ -502,6 +502,14 @@ impl<'a> ReorgBatch<'a> {
         Ok(())
     }
 
+    /// Stage one addr_tx_history row (`storage::indexer::make_key` /
+    /// `make_value`). Idempotent: the same block always yields the same rows.
+    fn put_addr_history(&mut self, key: &[u8], value: &[u8]) -> Result<(), String> {
+        let cf = self.cf(CF_ADDR_TX_HISTORY)?;
+        self.batch.put_cf(cf, key, value);
+        Ok(())
+    }
+
     /// Stage deletion of one addr_tx_history row (key precomputed by the
     /// caller via `storage::indexer::make_key`).
     fn delete_addr_history_key(&mut self, key: &[u8]) -> Result<(), String> {
@@ -620,10 +628,16 @@ fn apply_block_utxo_mutations_batched(
     batch: &mut ReorgBatch,
     block: &Block,
 ) -> Result<(), String> {
+    use crate::storage::indexer::{make_key, make_value, DIR_IN, DIR_OUT};
     let block_hash = block.block_hash();
     let mut undo = UndoData::new(block_hash, block.height);
+    // Address history rows, written at apply time too: `put_block` indexes a
+    // block once when it arrives, but a reorg's rollback deletes those rows,
+    // and a block re-applied later (or whose sibling spent the inputs first)
+    // would otherwise lose its spends from the history for good.
+    let addr = |spk: &[u8]| -> Option<[u8; 20]> { spk.get(..20).and_then(|b| b.try_into().ok()) };
 
-    for tx in &block.transactions {
+    for (tx_idx, tx) in block.transactions.iter().enumerate() {
         let txid = tx.txid();
 
         batch.put_tx_index(&txid, &block_hash, block.height)?;
@@ -632,13 +646,17 @@ fn apply_block_utxo_mutations_batched(
         for (j, out) in tx.outputs.iter().enumerate() {
             batch.put_utxo(&txid, j as u32, out)?;
             undo.created_utxo_keys.push((txid, j as u32));
+            if let Some(a) = addr(&out.script_pubkey) {
+                batch.put_addr_history(&make_key(&a, block.height, tx_idx as u32, j as u32),
+                                       &make_value(&txid, DIR_OUT, out.value))?;
+            }
         }
 
         if tx.is_coinbase() {
             batch.put_coinbase_info(&txid, block.height)?;
             undo.coinbase_txids.push(txid);
         } else {
-            for inp in &tx.inputs {
+            for (vin_idx, inp) in tx.inputs.iter().enumerate() {
                 // Capture BEFORE delete (through the overlay — the pre-spend
                 // output may have been staged by an earlier fork block).
                 let output = batch.get_utxo(&inp.prev_txid, inp.prev_index)
@@ -646,6 +664,11 @@ fn apply_block_utxo_mutations_batched(
                         hex::encode(inp.prev_txid), inp.prev_index, e))?
                     .ok_or_else(|| format!("batched apply: input {}:{} missing",
                         hex::encode(inp.prev_txid), inp.prev_index))?;
+                if let Some(a) = addr(&output.script_pubkey) {
+                    batch.put_addr_history(
+                        &make_key(&a, block.height, tx_idx as u32, 0x8000_0000 | vin_idx as u32),
+                        &make_value(&txid, DIR_IN, output.value))?;
+                }
                 undo.spent_utxos.push(UndoEntry {
                     prev_txid:  inp.prev_txid,
                     prev_index: inp.prev_index,
