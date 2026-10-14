@@ -73,6 +73,32 @@ impl<K: Hash + Eq + Copy> TokenBuckets<K> {
         granted as usize
     }
 
+    /// Consume exactly `n` tokens for `key` at `now`, or none at all.
+    /// Returns `true` iff all `n` were available (MEM-5: a transaction's
+    /// signature checks are charged as one unit — a partial grant would let
+    /// the work run while charging less than its cost).
+    pub fn try_take_n_at(&mut self, key: K, n: usize, now: Instant) -> bool {
+        if !self.buckets.contains_key(&key) && self.buckets.len() >= self.max_tracked {
+            self.evict_one(now);
+        }
+        let cap = self.capacity;
+        let rate = self.refill_per_sec;
+        let b = self.buckets.entry(key).or_insert(Bucket { tokens: cap, last_refill: now, last_used: now });
+        let elapsed = now.saturating_duration_since(b.last_refill).as_secs_f64();
+        if elapsed > 0.0 {
+            b.tokens = (b.tokens + elapsed * rate).min(cap);
+            b.last_refill = now;
+        }
+        b.last_used = now;
+        let need = n as f64;
+        if b.tokens.floor() >= need {
+            b.tokens -= need;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Drop keys whose bucket has refilled completely (they carry no state a
     /// fresh bucket would not) or that have been idle for `idle_ttl`.
     pub fn gc_at(&mut self, now: Instant, idle_ttl: Duration) {
@@ -148,6 +174,18 @@ mod tests {
         // At t0+5s key 1 is full again (idle): it is evicted, key 2 keeps its empty bucket.
         assert!(tb.allow_at(3, t0 + Duration::from_secs(5)));
         assert!(!tb.allow_at(2, t0 + Duration::from_secs(5)), "key 2 state survived eviction");
+    }
+
+    #[test]
+    fn try_take_n_is_all_or_nothing() {
+        let t0 = Instant::now();
+        let mut tb: TokenBuckets<u32> = TokenBuckets::new(10, 1.0, 16);
+        assert!(tb.try_take_n_at(1, 7, t0));
+        assert!(!tb.try_take_n_at(1, 4, t0), "only 3 left: nothing is taken");
+        assert!(tb.try_take_n_at(1, 3, t0), "the refused request consumed nothing");
+        assert!(!tb.try_take_n_at(1, 1, t0));
+        assert!(tb.try_take_n_at(1, 2, t0 + Duration::from_secs(2)));
+        assert!(!tb.try_take_n_at(2, 11, t0), "more than the burst never passes");
     }
 
     #[test]

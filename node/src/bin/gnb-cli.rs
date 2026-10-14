@@ -718,7 +718,7 @@ fn print_usage() {
   NETWORK
     gnb-cli info                          Network info
     gnb-cli height                        Current block count
-    gnb-cli mempool                       Mempool info
+    gnb-cli mempool                       Mempool info and relay policy (getmempoolinfo)
     gnb-cli peers                         Peer info
     gnb-cli dag                           DAG info (tips, chain, scores)
 
@@ -730,7 +730,14 @@ fn print_usage() {
 
   TRANSACTIONS
     gnb-cli tx <txid>                     Get transaction
-    gnb-cli sendraw <hex>                 Broadcast raw transaction
+    gnb-cli sendraw <hex>                 Broadcast raw transaction. Mempool policy
+                                          (docs/MEMPOOL.md): it may spend outputs of
+                                          unconfirmed txs (max 25 ancestors/descendants);
+                                          full-RBF — a tx double-spending pooled ones
+                                          REPLACES them iff it adds no new unconfirmed
+                                          input, pays a higher fee rate than each, and
+                                          an absolute fee >= all evicted fees + 1 sat/B
+                                          of its own size, evicting <= 100 txs
     gnb-cli decode <hex>                  Decode raw TX (without broadcast)
     gnb-cli rawmempool [verbose]          List mempool transactions
     gnb-cli fee                           Estimate fee

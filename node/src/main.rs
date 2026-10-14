@@ -27,6 +27,9 @@ mod rpc;
 mod metrics;
 mod pow;         // GnB-SMH PoW adapter
 mod transport;
+// The binary uses part of the mempool's library API (the rest serves RPC
+// consumers, tools and tests through the `gnb` library crate).
+#[allow(dead_code)]
 mod mempool;
 mod analytics;
 mod reorg;
@@ -843,6 +846,14 @@ async fn main() {
             // DAG-7 / POW-3: ration deep (below-finality) insertions that the
             // "awaited orphan parent" exemption may grant.
             let mut deep_budget = ingress::DeepBackfillBudget::new();
+            // MEM-5 / MEM-6: validated transaction relay — per-author
+            // signature budgets and the bounded orphan-transaction pool.
+            // Shared with the blocking pool, where admission runs.
+            let tx_relay = Arc::new(parking_lot::Mutex::new(mempool::relay::TxRelay::new()));
+            // MEM-6: verdicts withheld for orphan frames (released as Accept
+            // when the orphan enters the pool) and late re-announcements.
+            let mut deferred: mempool::relay::DeferredVerdicts<network::InboundOrigin> =
+                mempool::relay::DeferredVerdicts::new();
 
             loop {
             // Orphan-deadlock fix: select between the inbound channel and the
@@ -865,6 +876,23 @@ async fn main() {
                     }
                     frontier2.lock().set_orphan_evidence(orphans.max_evidence_height());
                     maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
+                    // MEM-6: expire orphan transactions and re-try those
+                    // whose parents arrived through any path (miner, RPC).
+                    let next_height = mempool::admission::next_block_height(&dag2.read());
+                    let (store_v, mem_v, relay_v) = (store2.clone(), mem2.clone(), tx_relay.clone());
+                    if let Ok(admitted) = tokio::task::spawn_blocking(move || {
+                        relay_v.lock().retry_orphans(&store_v, &mem_v, next_height, std::time::Instant::now(), unix_now_secs())
+                    }).await {
+                        release_admitted_orphans(&mut deferred, &vtx2, &admitted);
+                    }
+                    let now = std::time::Instant::now();
+                    {
+                        let relay = tx_relay.lock();
+                        deferred.prune(|t| relay.orphans().contains(t), now);
+                    }
+                    let due: Vec<core::Transaction> = deferred.due_reannouncements(now).iter()
+                        .filter_map(|t| mem2.get_tx(t)).collect();
+                    announce_txs(&otx2, &due);
                     continue;
                 }
             };
@@ -1187,6 +1215,21 @@ async fn main() {
                                     &dag2, &store2, &mem2, &state2,
                                     Some(&tip_tx2), &shielded2,
                                 );
+                                // MEM-6: orphan transactions the block confirmed or
+                                // conflicts with are dropped; those whose parents it
+                                // confirmed are re-tried (and announced).
+                                {
+                                    let next_height = mempool::admission::next_block_height(&dag2.read());
+                                    let (store_v, mem_v, relay_v) = (store2.clone(), mem2.clone(), tx_relay.clone());
+                                    let block_txs = block.transactions.clone();
+                                    if let Ok(admitted) = tokio::task::spawn_blocking(move || {
+                                        relay_v.lock().on_block_connected(
+                                            &store_v, &mem_v, next_height, &block_txs,
+                                            std::time::Instant::now(), unix_now_secs())
+                                    }).await {
+                                        release_admitted_orphans(&mut deferred, &vtx2, &admitted);
+                                    }
+                                }
                                 {
                                     let mut fr = frontier2.lock();
                                     fr.note_received(&block_hash);
@@ -1210,36 +1253,59 @@ async fn main() {
                     }
                 }
 
-                // Add validated tx to mempool
-                network::NetworkMessage::NewTransaction { tx_data, .. } => {
-                    // Sprint 1.d: Bitcoin-format tx wire. MEM-5: strict decode —
-                    // trailing bytes are refused, so one tx has exactly one
-                    // encoding (no gossipsub-dedup bypass by byte mutation).
-                    match mempool::admission::decode_tx_strict(&tx_data) {
-                        Ok(tx) => {
-                            // MEM-1/4/5: the shared admission function (same rules
-                            // as sendrawtransaction and reorg re-injection): size,
-                            // standardness incl. dust, known/recent-reject, UTXO,
-                            // maturity at the NEXT block height (selected-tip DAG
-                            // height + 1 — never dag.block_count()), fees, and
-                            // signatures last. P0: it runs on the blocking pool so
-                            // PQ signature work cannot stall this task's reactor.
-                            let next_height = mempool::admission::next_block_height(&dag2.read());
-                            let store_v = store2.clone();
-                            let mem_v = mem2.clone();
-                            let admitted = tokio::task::spawn_blocking(move || {
-                                let policy = mempool::admission::AdmissionPolicy::relay(next_height);
-                                mempool::admission::admit(&store_v, &mem_v, tx, &policy)
-                            }).await;
-                            match admitted {
-                                Ok(Ok(_))  => {}
-                                Ok(Err(e)) => debug!("mempool reject: {}", e),
-                                Err(e)     => warn!("tx verify task failed: {}", e),
-                            }
-                            state2.write().mempool_size = mem2.size();
+                // Validated transaction relay (MEM-5 / NET-2 / NET-4).
+                //
+                // The network loop no longer relays a gossiped transaction on
+                // decode: it waits for the verdict computed here. The shared
+                // admission function (same rules as sendrawtransaction and
+                // reorg re-injection — strict decode, size, standardness incl.
+                // dust, known/recent-reject, inputs from the UTXO set or the
+                // pool, maturity at the NEXT block height, fees, replacement
+                // and chain limits) runs cheapest first; the signature step
+                // runs LAST and is charged to the gossip AUTHOR's budget.
+                // Accept → relayed; Reject (malformed or consensus-invalid)
+                // → not relayed and the delivering peer — its author, as no
+                // honest node forwards it any more — takes gossipsub's
+                // invalid-message penalty; Ignore → dropped without penalty
+                // (policy, duplicates, recent rejects, rate limit). MEM-6: an
+                // orphan's verdict is WITHHELD and released as Accept when the
+                // orphan enters the pool, so its original frame is relayed.
+                // P0: it runs on the blocking pool so PQ signature work
+                // cannot stall this task's reactor.
+                network::NetworkMessage::NewTransaction { txid, tx_data } => {
+                    let author = match &origin {
+                        network::InboundOrigin::Gossip { author, propagation_source, .. } => {
+                            Some(author.unwrap_or(*propagation_source))
                         }
-                        Err(e) => debug!("tx decode rejected: {}", e),
+                        other => other.peer(),
+                    };
+                    let next_height = mempool::admission::next_block_height(&dag2.read());
+                    let (store_v, mem_v, relay_v) = (store2.clone(), mem2.clone(), tx_relay.clone());
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        relay_v.lock().on_gossip_tx(
+                            &store_v, &mem_v, next_height, &txid, &tx_data, author,
+                            std::time::Instant::now(), unix_now_secs())
+                    }).await;
+                    match outcome {
+                        Ok(o) => {
+                            if o.verdict == network::GossipVerdict::Reject {
+                                warn!("tx {} from {:?} REJECTED: {}", hex::encode(&txid[..8]), author, o.detail);
+                            } else {
+                                debug!("tx {} verdict {:?}: {}", hex::encode(&txid[..8]), o.verdict, o.detail);
+                            }
+                            if o.orphaned {
+                                deferred.defer(txid, origin, std::time::Instant::now());
+                            } else {
+                                report_verdict(&vtx2, &origin, o.verdict);
+                            }
+                            release_admitted_orphans(&mut deferred, &vtx2, &o.newly_admitted);
+                        }
+                        Err(e) => {
+                            warn!("tx verify task failed: {}", e);
+                            report_verdict(&vtx2, &origin, network::GossipVerdict::Ignore);
+                        }
                     }
+                    state2.write().mempool_size = mem2.size();
                 }
 
                 // NET-6: same claim handling as PeerTip (rate-limited directed
@@ -1961,6 +2027,42 @@ fn maybe_release_ibd(
             info!("IBD complete (verified={} caught_up={}; score {} height {} best_announced {}; work {} servable {}; abandoned_gap={}; orphan_evidence={:?})",
                 verified, caught_up, our_score, our_height, best_announced, our_work, servable, abandoned_gap, evidence);
         }
+    }
+}
+
+/// Current Unix time in seconds.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// MEM-6: orphans that just entered the pool: release their withheld gossip
+/// verdicts as Accept (gossipsub relays the original frames); the others are
+/// scheduled for re-announcement (`DeferredVerdicts::due_reannouncements`).
+fn release_admitted_orphans(
+    deferred: &mut mempool::relay::DeferredVerdicts<network::InboundOrigin>,
+    vtx: &mpsc::Sender<network::GossipValidation>,
+    admitted: &[core::Transaction],
+) {
+    if admitted.is_empty() {
+        return;
+    }
+    let ids: Vec<[u8; 32]> = admitted.iter().map(|t| t.txid()).collect();
+    for origin in deferred.on_admitted(&ids, std::time::Instant::now()) {
+        report_verdict(vtx, &origin, network::GossipVerdict::Accept);
+    }
+}
+
+/// MEM-6: announce transactions that entered the pool without their own
+/// gossip frame being relayed (orphans admitted after that frame expired).
+fn announce_txs(otx: &mpsc::Sender<network::NetworkMessage>, txs: &[core::Transaction]) {
+    for tx in txs {
+        let _ = otx.try_send(network::NetworkMessage::NewTransaction {
+            txid: tx.txid(),
+            tx_data: tx.to_wire_bytes(true),
+        });
     }
 }
 

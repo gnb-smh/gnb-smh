@@ -193,12 +193,12 @@ pub enum GossipDisposition {
 pub fn gossip_disposition(msg: &NetworkMessage, validator_attached: bool, claim_ok: bool) -> GossipDisposition {
     use GossipDisposition::*;
     match msg {
-        NetworkMessage::NewBlock { .. } => {
+        // MEM-5 / NET-2 / NET-4 (audit): transactions are judged by the
+        // processor (shared admission, signatures last, per-author budget —
+        // `mempool::relay`) BEFORE gossipsub relays them, exactly like blocks.
+        NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. } => {
             if validator_attached { DeliverDeferred } else { Deliver(GossipVerdict::Accept) }
         }
-        // Transaction relay semantics are unchanged (validated by the mempool
-        // owner); relayed on decode as before.
-        NetworkMessage::NewTransaction { .. } => Deliver(GossipVerdict::Accept),
         // Tip claims: consumed locally (author-attributed), never relayed —
         // every node floods its own claims to all of its direct peers.
         NetworkMessage::PeerTip { .. } | NetworkMessage::Version { .. } => {
@@ -886,7 +886,8 @@ impl NetworkNode {
     /// Gossipsub is configured with `validate_messages()`: a received frame is
     /// relayed only after a verdict is reported. Frames are delivered on
     /// `inbound_tx` with their [`InboundOrigin`]; for every frame whose
-    /// origin carries a pending message id (gossip `NewBlock`), the consumer
+    /// origin carries a pending message id (gossip `NewBlock` and, since
+    /// audit MEM-5, gossip `NewTransaction`), the consumer
     /// MUST send exactly one [`GossipValidation`] on the channel whose
     /// receiver is `verdict_rx`. Frames it never answers are simply not
     /// relayed (they expire from gossipsub's message cache).
@@ -2976,6 +2977,10 @@ mod tests {
         let blk = NetworkMessage::NewBlock { block_hash: [0u8; 32], blue_score: 0, height: 0, block_data: vec![] };
         assert_eq!(gossip_disposition(&blk, true, false), GossipDisposition::DeliverDeferred);
         assert_eq!(gossip_disposition(&blk, false, false), GossipDisposition::Deliver(GossipVerdict::Accept));
+        // MEM-5: transactions are validated before relay too.
+        let tx = NetworkMessage::NewTransaction { txid: [0u8; 32], tx_data: vec![] };
+        assert_eq!(gossip_disposition(&tx, true, false), GossipDisposition::DeliverDeferred);
+        assert_eq!(gossip_disposition(&tx, false, false), GossipDisposition::Deliver(GossipVerdict::Accept));
         let v = NetworkMessage::Version { version: 1, user_agent: "x".into(), blue_score: 1, height: 1, timestamp: 0 };
         assert_eq!(gossip_disposition(&v, true, true), GossipDisposition::Deliver(GossipVerdict::Ignore),
             "claims are consumed locally, never relayed");

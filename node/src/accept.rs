@@ -285,18 +285,25 @@ pub fn update_mempool_after_connect(
 
 /// MEM-3: drop every pooled tx that is no longer minable on the current
 /// UTXO set (an input missing, an immature coinbase input at `next_height`,
-/// or a fee below the consensus minimum). Signature-free and cheap. Returns
-/// how many were removed.
+/// or a fee below the consensus minimum). An input may also be an output of
+/// another pooled tx (MEM-6 chains); a tx that fails is removed together
+/// with its in-pool descendants. Signature-free and cheap. Returns how many
+/// were removed.
 pub fn revalidate_mempool(store: &storage::Storage, mempool: &mempool::Mempool, next_height: u64) -> usize {
-    mempool.retain_valid(|e| {
+    mempool.retain_valid_with(|e, pool_output| {
         let mut total_in: u64 = 0;
         for inp in &e.tx.inputs {
-            match store.get_utxo(&inp.prev_txid, inp.prev_index) {
-                Ok(Some(o)) => match core::limits::money_add(total_in, o.value) {
+            let prev = match store.get_utxo(&inp.prev_txid, inp.prev_index) {
+                Ok(Some(o)) => Some(o),
+                Ok(None) => pool_output(&inp.prev_txid, inp.prev_index),
+                Err(_) => None,
+            };
+            match prev {
+                Some(o) => match core::limits::money_add(total_in, o.value) {
                     Ok(t) => total_in = t,
                     Err(_) => return false,
                 },
-                _ => return false,
+                None => return false,
             }
         }
         if core::check_coinbase_maturity(&e.tx, next_height, |t| store.get_coinbase_height(t).ok().flatten()).is_err() {
