@@ -309,9 +309,13 @@ pub fn asert_next_target(
     // (Before the 2026-10 audit fix AUD-1 the product was shifted right by 16
     // and saturated at 2^256 - 1 first, then shifted bit by bit. That
     // saturation made anchors at or above ~2^255 up to 2x too hard after a
-    // negative shift. For anchors below 2^255, including GnB's genesis anchor
-    // (~2^244), the two orders give the same compact `bits`: they differ only
-    // in bits below position `shifts`, which the compact form never keeps.)
+    // negative shift. Below 2^255 nothing saturates: for `shifts <= 0` the two
+    // orders give the same target (floors compose), and for `shifts > 0` they
+    // differ only in bits below position `shifts`. The compact form keeps the
+    // top 24 bits, which lie above that position whenever the anchor target is
+    // at least 2^24, so for anchors in [2^24, 2^255) -- GnB's genesis anchor is
+    // ~2^244 -- every compact `bits` value is unchanged. A tiny anchor (below
+    // 2^24) now keeps fraction bits the old order discarded.)
     let product = mul_wide(&anchor_target.0, factor);
     let net = shifts - 16;
     let mut out = match shift_to_u256(&product, net) {
@@ -436,8 +440,8 @@ mod tests {
 
     /// The ASERT step as written before audit fix AUD-1: `(t * factor) >> 16`
     /// saturated at 2^256 - 1, then shifted one bit at a time. Kept only to
-    /// prove that the fix leaves every compact result for anchors below
-    /// 2^255 (GnB's genesis anchor among them) unchanged.
+    /// prove that the fix leaves every compact result for anchors in
+    /// [2^24, 2^255) (GnB's genesis anchor among them) unchanged.
     fn legacy_asert_bits(p: &AsertParams, a: &AsertAnchor, parent_time: i64, height: u64) -> u32 {
         let anchor_target = try_bits_to_target(a.bits).unwrap();
         let ahead = parent_time as i128
@@ -619,9 +623,9 @@ mod tests {
         assert_eq!(t, Target(expect));
     }
 
-    /// The fix changes no compact result for anchors below 2^255: sweep the
-    /// genesis anchor and others over heights and skews on both sides of the
-    /// schedule, including both clamps.
+    /// The fix changes no compact result for anchors in [2^24, 2^255): sweep
+    /// the genesis anchor and others over heights and skews on both sides of
+    /// the schedule, including both clamps.
     #[test]
     fn low_anchor_bits_match_legacy_order() {
         let p = params();
