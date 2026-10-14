@@ -469,7 +469,7 @@ impl<P: Hash + Eq + Copy> TxOrphanage<P> {
             }
         }
         for (txid, ws) in &self.by_txid {
-            if ws.is_empty() || ws.iter().any(|w| !self.entries.get(w).is_some_and(|e| e.txid == *txid)) {
+            if ws.is_empty() || ws.iter().any(|w| self.entries.get(w).is_none_or(|e| e.txid != *txid)) {
                 return Err("by_txid drifted".into());
             }
         }
@@ -604,8 +604,8 @@ mod tests {
     #[test]
     fn orphan_input_count_is_capped() {
         use crate::crypto::{MLDSA_PUBKEY_LEN, MLDSA_SIG_LEN};
-        assert!(MAX_ORPHAN_INPUTS * (MLDSA_PUBKEY_LEN + MLDSA_SIG_LEN) > crate::mempool::MAX_TX_SIZE,
-            "the cap never refuses a transaction that could be valid");
+        // The cap never refuses a transaction that could be valid.
+        const { assert!(MAX_ORPHAN_INPUTS * (MLDSA_PUBKEY_LEN + MLDSA_SIG_LEN) > crate::mempool::MAX_TX_SIZE) };
         let wide = |n: usize| Transaction {
             version: 1,
             inputs: (0..n).map(|i| TxInput { prev_txid: [0x42; 32], prev_index: i as u32, script_sig: vec![1], sequence: u32::MAX }).collect(),

@@ -171,7 +171,7 @@ fn mem5_signature_work_is_last_and_budgeted_per_connection() {
     let mut relay = TxRelay::with_limits(3, 0.0, OrphanLimits::default());
     let (a, b) = (Some(PeerId::random()), Some(PeerId::random()));
     let t0 = Instant::now();
-    let mut go = |relay: &mut TxRelay, tx: &Transaction, p: Option<PeerId>| {
+    let go = |relay: &mut TxRelay, tx: &Transaction, p: Option<PeerId>| {
         relay.on_gossip_tx(&n.store, &n.mempool, next, &tx.txid(), &wire(tx), p, t0, unix_now())
     };
     let bad_last = |inputs: &[([u8; 32], u32)], v: u64, tag: u8| {

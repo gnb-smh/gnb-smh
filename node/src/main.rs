@@ -1312,6 +1312,11 @@ async fn main() {
                     // and the orphan quotas. The signed gossip author is
                     // chosen by the sender and bounds nothing.
                     let peer = origin.peer();
+                    // The signed gossip author: for logs only.
+                    let author = match &origin {
+                        network::InboundOrigin::Gossip { author, .. } => *author,
+                        _ => None,
+                    };
                     let received_at = origin.received_at().unwrap_or_else(std::time::Instant::now);
                     let next_height = mempool::admission::next_block_height(&dag2.read());
                     let (store_v, mem_v, relay_v) = (store2.clone(), mem2.clone(), tx_relay.clone());
@@ -1323,7 +1328,7 @@ async fn main() {
                     match outcome {
                         Ok(o) => {
                             if o.verdict == network::GossipVerdict::Reject {
-                                warn!("tx {} from {:?} REJECTED: {}", hex::encode(&txid[..8]), peer, o.detail);
+                                warn!("tx {} from {:?} (author {:?}) REJECTED: {}", hex::encode(&txid[..8]), peer, author, o.detail);
                             } else {
                                 debug!("tx {} verdict {:?}: {}", hex::encode(&txid[..8]), o.verdict, o.detail);
                             }
