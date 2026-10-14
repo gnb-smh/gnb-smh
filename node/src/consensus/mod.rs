@@ -15,12 +15,59 @@
 //! Performance:
 //!   - is_ancestor: O(height_diff) with blue_score/height shortcuts (vs O(DAG) naive)
 //!   - past_blue_set: bounded to K*100 depth on selected chain (audit H-5)
-//!   - blue_work: cumulative chain work (Kaspa-aligned)
+//!   - blue_work: cumulative work; see the hardening activation note below
+//!
+//! Hardening activation (audit 2026-10-14, DAG-3 / DAG-4 / DAG-7):
+//!   Blocks whose `GhostdagData::height` is at or above
+//!   [`GhostDAG::hardening_activation_height`] (mainnet 110,000; testnet and
+//!   regtest 0, see `crate::core::activation`) are processed under corrected
+//!   rules. Blocks below it are processed exactly as before.
+//!   - blue_work = sp.blue_work + work of the mergeset blues + own work, i.e.
+//!     the work of blue(B) ∪ {B} (DAG-3). Below activation: sp.blue_work + own.
+//!   - coloring: exact GHOSTDAG k-cluster rule over the full blue anticone,
+//!     selected chain included (DAG-4). Below activation: the old coloring.
+//!   - mergeset at most [`MAX_MERGESET_SIZE`] blocks (selected parent
+//!     included) and no red merged from below the merge-depth root
+//!     ([`MERGE_DEPTH`]) unless a merged blue covers it (DAG-7).
+//!
+//!   The ledger stays selected-chain-only at every height: transactions of
+//!   merged blocks are never applied (docs/CONSENSUS.md).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use serde::{Serialize, Deserialize};
 use log::warn;
 use crate::core::GHOSTDAG_K;
+use crate::core::activation;
+
+/// Maximum mergeset size of a block at or above the hardening activation,
+/// counting the selected parent (Kaspa's convention: `mergeset_blues` there
+/// includes the selected parent; GnB stores it separately, so the check is
+/// `1 + |mergeset_blues| + |mergeset_reds| <= MAX_MERGESET_SIZE`).
+///
+/// Why 180: it is Kaspa's mainnet `mergeset_size_limit`, in production since
+/// 2021. With k = 10 at most k + 1 = 11 entries are blue, so the limit leaves
+/// 169 slots for reds: at the 30 s target an honest block merges a few blocks,
+/// and a partition that produced up to ~170 blocks on the losing side can still
+/// be merged in one block (larger ones are merged over several blocks, or not
+/// at all once they fall below the merge-depth root). The limit bounds the
+/// coloring cost of one block to 179 candidates, each checked with the k + 1
+/// early-exit walk below (measured in `node/tests/fix_ghostdag_dag7_perf.rs`).
+/// It is below `MAX_PARENTS` (256), so templates must pick their parents with
+/// [`GhostDAG::select_parents_for_template`].
+pub const MAX_MERGESET_SIZE: usize = 180;
+
+/// Merge depth, in blue score, for blocks at or above the hardening
+/// activation. The merge-depth root of a block B is the highest block of B's
+/// selected chain whose blue_score is at most `B.blue_score - MERGE_DEPTH`. A
+/// red block in B's mergeset must be in the future of that root, or in the past
+/// of a mergeset blue that is (Kaspa's "kosherizing" rule). Blues need no check:
+/// a blue that deep would have more than k blues in its anticone.
+///
+/// Why 360: 3 hours at the 30 s target, comparable to Kaspa's one hour and far
+/// above any propagation delay, yet well inside the 1,000-block reorg and
+/// finality depth (`CHECKPOINT_DEPTH`), as Kaspa keeps merge depth below its
+/// finality depth.
+pub const MERGE_DEPTH: u64 = 360;
 
 pub mod reachability;
 use reachability::ReachabilityStore;
@@ -409,6 +456,10 @@ fn compute_blue_set(store: &DagStore, b: &BlockHash) -> HashSet<BlockHash> {
 /// Compute mergeset(B, selected_parent):
 /// All blocks in past(B) that are NOT in past(selected_parent) and not selected_parent itself.
 /// These are blocks B "merges" by referencing parents other than selected_parent.
+///
+/// O(|past(selected_parent)|): kept as the fallback for a DAG whose
+/// reachability index is not populated. `GhostDAG::compute_mergeset_bounded`
+/// returns the identical list in O(|mergeset|) when the index is ready.
 fn compute_mergeset(
     store: &DagStore,
     b_parents: &[BlockHash],
@@ -615,36 +666,89 @@ pub struct GhostDAG {
     /// `maintains_reachability_index()` is true (always on GnB, gate = 0).
     /// Never consensus state.
     reach: ReachabilityStore,
+    /// Hardening activation height (DAG-3/4/7): blocks with
+    /// `GhostdagData::height >= hardening_activation` use the corrected rules.
+    /// Fixed for the lifetime of the DAG (stored data is interpreted with it).
+    hardening_activation: u64,
+    /// Cache, never consensus state: PoW work of blocks at or above the
+    /// activation (their own work is not recoverable from `GhostdagData` in
+    /// O(1)). Missing entries are derived from the stored data; see `work_of`.
+    block_work: HashMap<BlockHash, u128>,
+    /// Cache, never consensus state, for blocks below the activation: the
+    /// nearest block at or below the key on its selected chain whose
+    /// `mergeset_blues` is non-empty (`None` = none down to genesis). Lets the
+    /// pre-activation chain walk skip blocks that contribute nothing; a missing
+    /// entry falls back to a plain one-step walk.
+    merge_skip: HashMap<BlockHash, Option<BlockHash>>,
+}
+
+/// Result of [`GhostDAG::compute_block`]: everything `add_block` needs,
+/// computed without mutating the DAG.
+struct ComputedBlock {
+    data: GhostdagData,
+    selected_parent: BlockHash,
+    /// Blues ∪ reds, i.e. the mergeset, for the reachability index.
+    mergeset: Vec<BlockHash>,
+    /// Work values derived while computing blue_work, worth caching.
+    derived_work: HashMap<BlockHash, u128>,
 }
 
 impl GhostDAG {
-    pub fn with_default_k() -> Self {
-        Self {
-            k: GHOSTDAG_K,
-            store: DagStore::new(),
-            coloring: ColoringMode::Legacy,
-            reach: ReachabilityStore::new(),
-        }
-    }
-
-    pub fn with_k(k: usize) -> Self {
+    fn new_with(k: usize, coloring: ColoringMode, hardening_activation: u64) -> Self {
         Self {
             k,
             store: DagStore::new(),
-            coloring: ColoringMode::Legacy,
+            coloring,
             reach: ReachabilityStore::new(),
+            hardening_activation,
+            block_work: HashMap::new(),
+            merge_skip: HashMap::new(),
         }
+    }
+
+    pub fn with_default_k() -> Self {
+        Self::new_with(GHOSTDAG_K, ColoringMode::Legacy, activation::hardening_activation_height())
+    }
+
+    pub fn with_k(k: usize) -> Self {
+        Self::new_with(k, ColoringMode::Legacy, activation::hardening_activation_height())
     }
 
     /// Test/benchmark constructor: same as `with_k` but selects the `Fast`
     /// (interval-index) coloring mode. NOT for live use — see [`ColoringMode`].
     pub fn with_k_fast(k: usize) -> Self {
-        Self {
-            k,
-            store: DagStore::new(),
-            coloring: ColoringMode::Fast,
-            reach: ReachabilityStore::new(),
-        }
+        Self::new_with(k, ColoringMode::Fast, activation::hardening_activation_height())
+    }
+
+    /// Same as [`with_k`](Self::with_k) with an explicit hardening activation
+    /// height: `0` applies the corrected rules from genesis,
+    /// `activation::NEVER` (`u64::MAX`) keeps the old rules forever. The other
+    /// constructors take the height from the node's chain id
+    /// (`activation::hardening_activation_height`).
+    pub fn with_k_and_activation(k: usize, activation_height: u64) -> Self {
+        Self::new_with(k, ColoringMode::Legacy, activation_height)
+    }
+
+    /// Builder form: replace the hardening activation height. Must be called
+    /// before any block is added, because stored data is interpreted with it.
+    pub fn with_hardening_activation(mut self, activation_height: u64) -> Self {
+        assert!(
+            self.store.data.is_empty(),
+            "the hardening activation height must be set before blocks are added"
+        );
+        self.hardening_activation = activation_height;
+        self
+    }
+
+    /// The hardening activation height this DAG applies.
+    pub fn hardening_activation_height(&self) -> u64 {
+        self.hardening_activation
+    }
+
+    /// Whether a block at `height` (its `GhostdagData::height`) is processed
+    /// under the corrected rules.
+    pub fn is_hardened_at(&self, height: u64) -> bool {
+        activation::is_active_at(height, self.hardening_activation)
     }
 
     /// Construct with the default K, honoring the **dev/test** coloring override.
@@ -1037,6 +1141,14 @@ impl GhostDAG {
     /// upstream validation (gossipsub, accept_block, etc). Now returns
     /// a `ConsensusError` variant so callers can reject the block
     /// cleanly without tearing down the process.
+    ///
+    /// Hardening (DAG-3/4/7): a block whose height (`selected_parent.height +
+    /// 1`) is at or above [`hardening_activation_height`](Self::hardening_activation_height)
+    /// is colored with the exact GHOSTDAG rule, gets Kaspa blue work, and is
+    /// rejected with [`ConsensusError::MergesetTooLarge`] or
+    /// [`ConsensusError::MergeDepthViolation`] when it breaks the new limits.
+    /// Below that height the result is bit-identical to the old code. Nothing
+    /// is mutated when an error is returned.
     pub fn add_block(
         &mut self,
         hash: BlockHash,
@@ -1051,57 +1163,17 @@ impl GhostDAG {
             return Err(ConsensusError::DuplicateBlock(hash));
         }
 
-        // 1. Select parent: argmax blue_score, tie-break by hash (lexicographic)
+        // Warm the pre-activation skip cache for the selected chain (pure
+        // performance; `compute_block` gives the same answer without it).
         let selected_parent = self.select_parent(&parents);
+        let sp_height = self.store.get(&selected_parent).map(|d| d.height);
+        let hardened = matches!(sp_height, Some(h) if self.is_hardened_at(h + 1));
+        if sp_height.is_some() && !hardened {
+            self.ensure_merge_skip(&selected_parent);
+        }
 
-        // The selected parent must be present in the store. A block whose
-        // selected parent is absent is an orphan the sync layer should have
-        // buffered; reaching here means it slipped past upstream validation.
-        // Reject cleanly rather than panic (completes Audit M-9 — previously a
-        // `.expect()` here, inconsistent with the tolerant lookups elsewhere).
-        let sp_data = self.store.get(&selected_parent).cloned()
-            .ok_or(ConsensusError::MissingSelectedParent(selected_parent))?;
-
-        // 2. Compute height from the (now validated) selected parent. This is
-        //    the DAG height (selected parent + 1). The difficulty and
-        //    `block.height` rule uses max(parent heights) + 1 over these stored
-        //    heights instead (docs/CONSENSUS.md, "Difficulty input").
-        let height = sp_data.height + 1;
-
-        // 3. Compute mergeset (topologically sorted, ancestors first)
-        let mergeset = compute_mergeset(&self.store, &parents, &selected_parent);
-
-        // 4. Classify mergeset blocks as blue or red using PHANTOM constraint.
-        //    In Fast mode the reachability index must contain every existing
-        //    block before classification queries it; the index is maintained
-        //    incrementally, so it already does. `hash` itself is not queried
-        //    during its own classification, so we register it afterwards.
-        //    The coloring is chosen by the height-gated `effective_coloring`:
-        //    Legacy below CORRECTED_COLORING_ACTIVATION_HEIGHT, Fast at/above
-        //    it. On GnB the gate is 0, so every block is Fast-colored.
-        let (mergeset_blues, mergeset_reds, blues_anticone_sizes) =
-            match self.effective_coloring(height) {
-                ColoringMode::Legacy => self.classify_mergeset(&mergeset, &selected_parent),
-                ColoringMode::Fast => self.classify_mergeset_fast(&mergeset, &selected_parent),
-            };
-
-        // 5. Compute blue_score and blue_work
-        let blue_score = sp_data.blue_score + mergeset_blues.len() as u64 + 1;
-        // blue_work = cumulative PoW along selected chain + this block's work
-        // (Kaspa-aligned: only this block's work is added, not mergeset blues)
-        let blue_work = sp_data.blue_work + work;
-
-        let data = GhostdagData {
-            blue_score,
-            blue_work,
-            selected_parent: Some(selected_parent),
-            mergeset_blues,
-            mergeset_reds,
-            blues_anticone_sizes,
-            parents,
-            height,
-            timestamp,
-        };
+        let ComputedBlock { data, selected_parent, mergeset, derived_work } =
+            self.compute_block(&parents, timestamp, work)?;
 
         // Maintain the reachability index (Fast mode only). Register `hash`
         // now, after classification, before it is inserted into the store — so
@@ -1110,9 +1182,123 @@ impl GhostDAG {
             self.reach.add_block(hash, &selected_parent, &mergeset);
         }
 
+        // Non-consensus caches.
+        self.block_work.extend(derived_work);
+        if hardened {
+            self.block_work.insert(hash, work);
+        } else if !data.mergeset_blues.is_empty() {
+            self.merge_skip.insert(hash, Some(hash));
+        } else if let Some(below) = self.merge_skip.get(&selected_parent).copied() {
+            self.merge_skip.insert(hash, below);
+        }
+
         let result = data.clone();
         self.store.insert(hash, data);
         Ok(result)
+    }
+
+    /// Compute a block's `GhostdagData` from its parents without touching the
+    /// DAG. Shared by [`add_block`](Self::add_block) and
+    /// [`select_parents_for_template`](Self::select_parents_for_template), so a
+    /// template is checked with exactly the consensus code.
+    fn compute_block(
+        &self,
+        parents: &[BlockHash],
+        timestamp: u64,
+        work: u128,
+    ) -> Result<ComputedBlock, ConsensusError> {
+        if parents.is_empty() {
+            return Err(ConsensusError::NoParents);
+        }
+
+        // 1. Select parent: argmax blue_score, tie-break by hash (lexicographic)
+        let selected_parent = self.select_parent(parents);
+
+        // The selected parent must be present in the store. A block whose
+        // selected parent is absent is an orphan the sync layer should have
+        // buffered; reaching here means it slipped past upstream validation.
+        // Reject cleanly rather than panic (completes Audit M-9 — previously a
+        // `.expect()` here, inconsistent with the tolerant lookups elsewhere).
+        let sp_data = self.store.get(&selected_parent)
+            .ok_or(ConsensusError::MissingSelectedParent(selected_parent))?;
+
+        // 2. Compute height from the (now validated) selected parent. This is
+        //    the DAG height (selected parent + 1). The difficulty and
+        //    `block.height` rule uses max(parent heights) + 1 over these stored
+        //    heights instead (docs/CONSENSUS.md, "Difficulty input").
+        let height = sp_data.height + 1;
+        let hardened = self.is_hardened_at(height);
+        let use_index = self.ancestry_index_ready(parents, &selected_parent);
+
+        // 3. Compute mergeset (topologically sorted, ancestors first). The
+        //    index-based walk returns the same list as the O(past) one; the
+        //    size limit applies only at or above the activation.
+        let limit = if hardened { Some(MAX_MERGESET_SIZE - 1) } else { None };
+        let mergeset = if use_index {
+            self.compute_mergeset_bounded(parents, &selected_parent, limit)?
+        } else {
+            let m = compute_mergeset(&self.store, parents, &selected_parent);
+            if let Some(limit) = limit {
+                if m.len() > limit {
+                    return Err(ConsensusError::MergesetTooLarge { limit: MAX_MERGESET_SIZE });
+                }
+            }
+            m
+        };
+
+        // 4. Classify mergeset blocks as blue or red using PHANTOM constraint.
+        //    In Fast mode the reachability index must contain every existing
+        //    block before classification queries it; the index is maintained
+        //    incrementally, so it already does. `hash` itself is not queried
+        //    during its own classification, so we register it afterwards.
+        //    Below the hardening activation the coloring is chosen by the
+        //    height-gated `effective_coloring`, exactly as before (Legacy below
+        //    CORRECTED_COLORING_ACTIVATION_HEIGHT, Fast at/above it). At or
+        //    above the hardening activation the exact GHOSTDAG coloring applies.
+        let (mergeset_blues, mergeset_reds, blues_anticone_sizes) = if hardened {
+            self.classify_mergeset_exact(&mergeset, &selected_parent, use_index)
+        } else {
+            match self.effective_coloring(height) {
+                ColoringMode::Legacy => self.classify_mergeset(&mergeset, &selected_parent),
+                ColoringMode::Fast => self.classify_mergeset_fast(&mergeset, &selected_parent),
+            }
+        };
+
+        // 5. Compute blue_score and blue_work
+        let blue_score = sp_data.blue_score + mergeset_blues.len() as u64 + 1;
+        let mut derived_work = HashMap::new();
+        let blue_work = if hardened {
+            // DAG-3: Kaspa blue work. sp.blue_work already counts the selected
+            // parent's own work, so adding every mergeset blue and this block's
+            // work makes blue_work(B) the total work of blue(B) ∪ {B}.
+            let merged: u128 = mergeset_blues
+                .iter()
+                .map(|m| self.work_of(m, &mut derived_work))
+                .sum();
+            sp_data.blue_work + merged + work
+        } else {
+            // Pre-activation rule: cumulative PoW along the selected chain plus
+            // this block's work; merged blues add nothing.
+            sp_data.blue_work + work
+        };
+
+        // 6. Merge depth (DAG-7), at or above the activation only.
+        if hardened && !mergeset_reds.is_empty() {
+            self.check_merge_depth(&selected_parent, blue_score, &mergeset_blues, &mergeset_reds, use_index)?;
+        }
+
+        let data = GhostdagData {
+            blue_score,
+            blue_work,
+            selected_parent: Some(selected_parent),
+            mergeset_blues,
+            mergeset_reds,
+            blues_anticone_sizes,
+            parents: parents.to_vec(),
+            height,
+            timestamp,
+        };
+        Ok(ComputedBlock { data, selected_parent, mergeset, derived_work })
     }
 
     /// Remove a just-added LEAF block, exactly inverting `DagStore::insert`.
@@ -1155,6 +1341,11 @@ impl GhostDAG {
             mergeset.extend_from_slice(&data.mergeset_reds);
             self.reach.remove_leaf(hash, &mergeset);
         }
+        // Drop the non-consensus caches for this block. A leaf is nobody's
+        // selected parent and nobody's merged blue, so no other entry refers
+        // to it.
+        self.block_work.remove(hash);
+        self.merge_skip.remove(hash);
         self.store.tips.remove(hash);
         self.store.children.remove(hash);
         // Exact inverse of `DagStore::insert`: drop the child edge from each
@@ -1285,6 +1476,14 @@ impl GhostDAG {
     /// The `blues_anticone_sizes` map SHAPE differs (compact vs whole-history);
     /// that difference is exactly the gated-consensus metadata change activated
     /// with the reachability index at [`CORRECTED_COLORING_ACTIVATION_HEIGHT`].
+    ///
+    /// Audit DAG-4: this coloring is NOT exact GHOSTDAG. The selected parent is
+    /// not part of GnB's `mergeset_blues`, so the chain walk never counts the
+    /// selected-chain blocks below the immediate selected parent, and the
+    /// anticone sizes of historical blues restart at 0 per block. It is kept
+    /// bit-for-bit as the rule for blocks below the hardening activation;
+    /// [`classify_mergeset_exact`](Self::classify_mergeset_exact) applies at or
+    /// above it.
     fn classify_mergeset_fast(
         &self,
         mergeset: &[BlockHash],
@@ -1349,6 +1548,18 @@ impl GhostDAG {
     /// never its anticone. Each block belongs to exactly one mergeset, so there
     /// are no duplicates. This replaces the old O(depth) `past_blue_set_unbounded`
     /// seed + full-set scan while producing the identical anticone set.
+    ///
+    /// Audit DAG-7, two output-preserving shortcuts (pre-activation rule):
+    /// - k + 1 early exit: the caller colours the candidate red as soon as the
+    ///   list holds more than k blues, so the walk stops there. The returned list
+    ///   is then a (k + 1)-prefix of the full one, which leads to the same red
+    ///   decision and to no anticone-size update (only blues update sizes).
+    /// - skip pointers (`merge_skip`): chain blocks with an empty
+    ///   `mergeset_blues` add nothing to the list, so the walk jumps from one
+    ///   merging chain block to the next. The stop condition is unaffected: if
+    ///   a skipped block is an ancestor of the candidate, the next merging block
+    ///   below it is one too (ancestry is transitive), so the walk still stops
+    ///   before processing anything the original walk would not have processed.
     fn candidate_anticone_blues(
         &self,
         selected_parent: &BlockHash,
@@ -1363,11 +1574,14 @@ impl GhostDAG {
                 && !self.reach.is_dag_ancestor(candidate, &blue)
             {
                 out.push(blue);
+                if out.len() > self.k {
+                    return out;
+                }
             }
         }
 
         // Phase 1 — selected_parent and up, until an ancestor of the candidate.
-        let mut chain = Some(*selected_parent);
+        let mut chain = self.next_merging_chain_block(selected_parent);
         while let Some(h) = chain {
             if self.reach.is_dag_ancestor(&h, candidate) {
                 break;
@@ -1381,12 +1595,521 @@ impl GhostDAG {
                     && !self.reach.is_dag_ancestor(candidate, &blue)
                 {
                     out.push(blue);
+                    if out.len() > self.k {
+                        return out;
+                    }
                 }
             }
-            chain = d.selected_parent;
+            chain = d.selected_parent.and_then(|p| self.next_merging_chain_block(&p));
         }
 
         out
+    }
+
+    /// First block at or below `from` on its selected chain whose
+    /// `mergeset_blues` is non-empty, from the `merge_skip` cache. Without a
+    /// cache entry this is `Some(from)`: the walk then visits `from` itself,
+    /// exactly like the original one-step walk.
+    fn next_merging_chain_block(&self, from: &BlockHash) -> Option<BlockHash> {
+        match self.merge_skip.get(from) {
+            Some(v) => *v,
+            None => Some(*from),
+        }
+    }
+
+    /// Fill the `merge_skip` cache for `from` and every block below it on its
+    /// selected chain (amortised O(1) per block; a DAG loaded from disk pays
+    /// one walk the first time). If the store lacks a chain block the cache
+    /// ends above it, which the original walk would also stop at.
+    fn ensure_merge_skip(&mut self, from: &BlockHash) {
+        let mut path: Vec<(BlockHash, bool)> = Vec::new();
+        let mut below: Option<BlockHash> = None;
+        let mut cur = Some(*from);
+        while let Some(h) = cur {
+            if let Some(v) = self.merge_skip.get(&h) {
+                below = *v;
+                break;
+            }
+            let d = match self.store.get(&h) {
+                Some(d) => d,
+                None => break,
+            };
+            path.push((h, !d.mergeset_blues.is_empty()));
+            cur = d.selected_parent;
+        }
+        let mut acc = below;
+        for (h, merging) in path.into_iter().rev() {
+            if merging {
+                acc = Some(h);
+            }
+            self.merge_skip.insert(h, acc);
+        }
+    }
+
+    // ── Hardening (audit DAG-3 / DAG-4 / DAG-7) ─────────────────────────────
+
+    /// Whether ancestry queries for a block with these parents can use the
+    /// reachability index. The index is filled in topological order (or loaded
+    /// whole and self-checked at boot), so indexed parents imply an indexed
+    /// past. Otherwise the callers fall back to unbounded graph walks, which
+    /// give the same answers more slowly.
+    fn ancestry_index_ready(&self, parents: &[BlockHash], selected_parent: &BlockHash) -> bool {
+        self.maintains_reachability_index()
+            && self.reach.has(selected_parent)
+            && parents.iter().all(|p| self.reach.has(p))
+    }
+
+    /// Exact, unbounded `a ∈ past(b)` (strict). Never the bounded legacy
+    /// `is_ancestor`.
+    fn dag_ancestor(&self, a: &BlockHash, b: &BlockHash, use_index: bool) -> bool {
+        if use_index {
+            self.reach.is_dag_ancestor(a, b)
+        } else {
+            reachability::brute_force_is_ancestor(&self.store, a, b)
+        }
+    }
+
+    /// The mergeset of a block with these parents, from the reachability index
+    /// in O(|mergeset| · parents · log): a backward walk from the non-selected
+    /// parents that stops at `past(selected_parent) ∪ {selected_parent}`.
+    ///
+    /// Same output as [`compute_mergeset`]: both collect exactly the blocks
+    /// reachable from a non-selected parent without passing through
+    /// `past(selected_parent) ∪ {selected_parent}` (any path to a mergeset
+    /// block avoids that set, since it is closed under taking ancestors), and
+    /// both order the set with the same deterministic `topological_sort`. The
+    /// index answers `h ∈ past(selected_parent)` exactly where the old code
+    /// looked `h` up in the materialised `compute_past(selected_parent)`.
+    ///
+    /// `limit` (blocks, selected parent excluded) aborts the walk with
+    /// [`ConsensusError::MergesetTooLarge`] as soon as it is exceeded, so an
+    /// oversized mergeset costs O(limit), not O(|mergeset|).
+    fn compute_mergeset_bounded(
+        &self,
+        parents: &[BlockHash],
+        selected_parent: &BlockHash,
+        limit: Option<usize>,
+    ) -> Result<Vec<BlockHash>, ConsensusError> {
+        let mut set: HashSet<BlockHash> = HashSet::new();
+        let mut queue: VecDeque<BlockHash> = parents
+            .iter()
+            .filter(|p| *p != selected_parent)
+            .copied()
+            .collect();
+        while let Some(h) = queue.pop_front() {
+            if h == *selected_parent || set.contains(&h) || self.reach.is_dag_ancestor(&h, selected_parent) {
+                continue;
+            }
+            set.insert(h);
+            if let Some(limit) = limit {
+                if set.len() > limit {
+                    return Err(ConsensusError::MergesetTooLarge { limit: MAX_MERGESET_SIZE });
+                }
+            }
+            if let Some(d) = self.store.get(&h) {
+                for p in &d.parents {
+                    if !set.contains(p) {
+                        queue.push_back(*p);
+                    }
+                }
+            }
+        }
+        Ok(topological_sort(&self.store, set.into_iter().collect()))
+    }
+
+    /// Exact GHOSTDAG coloring (PHANTOM paper, Kaspa's algorithm) for blocks at
+    /// or above the hardening activation (audit DAG-4).
+    ///
+    /// Candidates are taken in the deterministic mergeset order (ancestors
+    /// first, hash tie-break). With `blue` = blue(selected_parent) ∪
+    /// {selected_parent} ∪ the candidates already coloured blue, a candidate
+    /// `c` is blue iff
+    ///   (a) |anticone(c) ∩ blue| ≤ k, and
+    ///   (b) every `x ∈ anticone(c) ∩ blue` has |anticone(x) ∩ blue| + 1 ≤ k.
+    /// Both counts run over the FULL blue anticone, selected-chain blocks
+    /// included: every chain block's selected parent is walked as a blue, which
+    /// is what Kaspa gets from storing the selected parent as
+    /// `mergeset_blues[0]` and what the pre-activation walk misses.
+    ///
+    /// Anticone sizes are computed from the DAG, never read from stored
+    /// `blues_anticone_sizes` (those of pre-activation blocks are not exact),
+    /// then kept current as blues are added. Every walk exits after k + 1
+    /// blues, so a candidate costs O(k) chain blocks: each chain block visited
+    /// that is not in the past of the walked block is itself in its blue
+    /// anticone. Returns (blues without the selected parent, reds, the sizes of
+    /// the selected parent, the new blues and every older blue whose size grew,
+    /// each exact with respect to blue(B)).
+    fn classify_mergeset_exact(
+        &self,
+        mergeset: &[BlockHash],
+        selected_parent: &BlockHash,
+        use_index: bool,
+    ) -> (Vec<BlockHash>, Vec<BlockHash>, HashMap<BlockHash, usize>) {
+        let k = self.k;
+        let mut blues: Vec<BlockHash> = Vec::new();
+        let mut reds: Vec<BlockHash> = Vec::new();
+        // |anticone(x) ∩ blue| for every blue looked at so far, exact while < k
+        // and stored as k once it reaches k (such an x turns every candidate in
+        // its anticone red, so it never grows further).
+        let mut sizes: HashMap<BlockHash, usize> = HashMap::new();
+        let mut changed: HashSet<BlockHash> = HashSet::new();
+        // blue(sp) ⊂ past(sp): the selected parent starts with an empty blue anticone.
+        sizes.insert(*selected_parent, 0);
+        changed.insert(*selected_parent);
+
+        for &candidate in mergeset {
+            let anticone = match self.exact_candidate_blue_anticone(selected_parent, &blues, &candidate, use_index) {
+                Some(a) => a,
+                None => {
+                    reds.push(candidate); // (a): more than k blues in its anticone
+                    continue;
+                }
+            };
+            let mut fits = true;
+            for x in &anticone {
+                let s = match sizes.get(x) {
+                    Some(s) => *s,
+                    None => {
+                        let s = self.exact_blue_anticone_size(x, selected_parent, &blues, use_index);
+                        sizes.insert(*x, s);
+                        s
+                    }
+                };
+                if s + 1 > k {
+                    fits = false; // (b): x would exceed k
+                    break;
+                }
+            }
+            if !fits {
+                reds.push(candidate);
+                continue;
+            }
+            for x in &anticone {
+                if let Some(s) = sizes.get_mut(x) {
+                    *s += 1;
+                }
+                changed.insert(*x);
+            }
+            sizes.insert(candidate, anticone.len());
+            changed.insert(candidate);
+            blues.push(candidate);
+        }
+
+        let anticone_sizes = changed
+            .into_iter()
+            .map(|h| {
+                let s = sizes.get(&h).copied().unwrap_or(0);
+                (h, s)
+            })
+            .collect();
+        (blues, reds, anticone_sizes)
+    }
+
+    /// The blues in `candidate`'s anticone, or `None` as soon as there are more
+    /// than k. The blue set is blue(sp) ∪ {sp} ∪ `blues`; it is enumerated as
+    /// sp and `blues` (the block under construction), then, for each chain
+    /// block d from sp down, sp(d) and d's mergeset blues. The walk stops after
+    /// d once sp(d) is in the candidate's past: all remaining blues are below.
+    ///
+    /// A candidate is never in the past of a listed blue: candidates come in
+    /// topological order and are not in past(sp), so only `y ∈ past(c)` needs a
+    /// test.
+    fn exact_candidate_blue_anticone(
+        &self,
+        selected_parent: &BlockHash,
+        blues: &[BlockHash],
+        candidate: &BlockHash,
+        use_index: bool,
+    ) -> Option<Vec<BlockHash>> {
+        let k = self.k;
+        let mut out: Vec<BlockHash> = Vec::with_capacity(k + 1);
+        for y in std::iter::once(selected_parent).chain(blues.iter()) {
+            if !self.dag_ancestor(y, candidate, use_index) {
+                out.push(*y);
+                if out.len() > k {
+                    return None;
+                }
+            }
+        }
+        let mut d = *selected_parent;
+        while let Some(dd) = self.store.get(&d) {
+            let dsp = match dd.selected_parent {
+                Some(p) => p,
+                None => break, // genesis: blue(genesis) is empty
+            };
+            let dsp_in_past = self.dag_ancestor(&dsp, candidate, use_index);
+            if !dsp_in_past {
+                out.push(dsp);
+                if out.len() > k {
+                    return None;
+                }
+            }
+            for y in &dd.mergeset_blues {
+                if !self.dag_ancestor(y, candidate, use_index) {
+                    out.push(*y);
+                    if out.len() > k {
+                        return None;
+                    }
+                }
+            }
+            if dsp_in_past {
+                break;
+            }
+            d = dsp;
+        }
+        Some(out)
+    }
+
+    /// |anticone(x) ∩ blue| for a blue `x`, where blue = blue(sp) ∪ {sp} ∪
+    /// `blues`, capped at k (the caller only needs to know whether it reached
+    /// k). Same enumeration as [`exact_candidate_blue_anticone`], testing both
+    /// directions of ancestry, and stopping once the chain reaches `x` or its
+    /// past.
+    fn exact_blue_anticone_size(
+        &self,
+        x: &BlockHash,
+        selected_parent: &BlockHash,
+        blues: &[BlockHash],
+        use_index: bool,
+    ) -> usize {
+        let cap = self.k;
+        let in_anticone = |y: &BlockHash| {
+            y != x && !self.dag_ancestor(y, x, use_index) && !self.dag_ancestor(x, y, use_index)
+        };
+        let mut n = 0usize;
+        for y in std::iter::once(selected_parent).chain(blues.iter()) {
+            if in_anticone(y) {
+                n += 1;
+                if n >= cap {
+                    return cap;
+                }
+            }
+        }
+        let mut d = *selected_parent;
+        loop {
+            if d == *x {
+                break; // blue(x) ⊂ past(x)
+            }
+            let dd = match self.store.get(&d) {
+                Some(dd) => dd,
+                None => break,
+            };
+            let dsp = match dd.selected_parent {
+                Some(p) => p,
+                None => break,
+            };
+            for y in std::iter::once(&dsp).chain(dd.mergeset_blues.iter()) {
+                if in_anticone(y) {
+                    n += 1;
+                    if n >= cap {
+                        return cap;
+                    }
+                }
+            }
+            if dsp == *x || self.dag_ancestor(&dsp, x, use_index) {
+                break;
+            }
+            d = dsp;
+        }
+        n
+    }
+
+    /// PoW work of a block (the `work` it was added with), for Kaspa blue work.
+    ///
+    /// Taken from the cache, or derived from stored `GhostdagData`: below the
+    /// activation `blue_work = sp.blue_work + work`, at or above it
+    /// `blue_work = sp.blue_work + Σ work(mergeset blues) + work`. Both invert
+    /// exactly; the recursion only descends into mergeset blues (ancestors), so
+    /// it terminates. Iterative, with results recorded in `memo`.
+    fn work_of(&self, block: &BlockHash, memo: &mut HashMap<BlockHash, u128>) -> u128 {
+        let known = |h: &BlockHash, memo: &HashMap<BlockHash, u128>| {
+            self.block_work.get(h).or_else(|| memo.get(h)).copied()
+        };
+        if let Some(w) = known(block, memo) {
+            return w;
+        }
+        let mut stack = vec![*block];
+        while let Some(&h) = stack.last() {
+            if known(&h, memo).is_some() {
+                stack.pop();
+                continue;
+            }
+            let d = match self.store.get(&h) {
+                Some(d) => d,
+                None => {
+                    memo.insert(h, 0);
+                    stack.pop();
+                    continue;
+                }
+            };
+            let sp_work = d
+                .selected_parent
+                .and_then(|p| self.store.get(&p))
+                .map(|p| p.blue_work)
+                .unwrap_or(0);
+            let own_and_merged = d.blue_work.saturating_sub(sp_work);
+            if d.selected_parent.is_none() || !self.is_hardened_at(d.height) {
+                memo.insert(h, own_and_merged);
+                stack.pop();
+                continue;
+            }
+            let missing: Vec<BlockHash> = d
+                .mergeset_blues
+                .iter()
+                .filter(|m| known(m, memo).is_none())
+                .copied()
+                .collect();
+            if missing.is_empty() {
+                let merged: u128 = d.mergeset_blues.iter().filter_map(|m| known(m, memo)).sum();
+                memo.insert(h, own_and_merged.saturating_sub(merged));
+                stack.pop();
+            } else {
+                stack.extend(missing);
+            }
+        }
+        known(block, memo).unwrap_or(0)
+    }
+
+    /// The merge-depth root of a block with this selected parent and blue
+    /// score: the highest block of the selected chain (from the selected parent
+    /// down) whose blue_score is at most `blue_score - MERGE_DEPTH`; `None` while
+    /// the chain is shallower than `MERGE_DEPTH`. At most `MERGE_DEPTH` steps,
+    /// since blue_score strictly decreases down the chain.
+    fn merge_depth_root(&self, selected_parent: &BlockHash, blue_score: u64) -> Option<BlockHash> {
+        let required = blue_score.checked_sub(MERGE_DEPTH)?;
+        let mut d = *selected_parent;
+        loop {
+            let dd = self.store.get(&d)?;
+            if dd.blue_score <= required {
+                return Some(d);
+            }
+            d = dd.selected_parent?;
+        }
+    }
+
+    /// Bounded merge depth (audit DAG-7), as in Kaspa: every red of the
+    /// mergeset must be in the future of the merge-depth root, or in the past
+    /// of a mergeset blue that is ("kosherized").
+    fn check_merge_depth(
+        &self,
+        selected_parent: &BlockHash,
+        blue_score: u64,
+        blues: &[BlockHash],
+        reds: &[BlockHash],
+        use_index: bool,
+    ) -> Result<(), ConsensusError> {
+        let root = match self.merge_depth_root(selected_parent, blue_score) {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        let above_root = |h: &BlockHash| *h == root || self.dag_ancestor(&root, h, use_index);
+        let kosherizing: Vec<&BlockHash> = blues.iter().filter(|b| above_root(b)).collect();
+        for red in reds {
+            if above_root(red) {
+                continue;
+            }
+            if kosherizing.iter().any(|b| self.dag_ancestor(red, b, use_index)) {
+                continue;
+            }
+            return Err(ConsensusError::MergeDepthViolation { red: *red });
+        }
+        Ok(())
+    }
+
+    /// Parents for a block template (audit DAG-2 / DAG-7).
+    ///
+    /// Returns at most `max_parents` of `candidates` (normally the bodied tips)
+    /// such that a block with exactly these parents, in this order, is accepted
+    /// by [`add_block`](Self::add_block): the first entry is the block's
+    /// selected parent (the heaviest candidate by blue work, blue score, hash —
+    /// the same rule `add_block` applies), and the others follow by decreasing
+    /// blue work.
+    ///
+    /// Below the hardening activation (judged at the template's height,
+    /// `selected_parent.height + 1`) this is the heaviest `max_parents`
+    /// candidates. At or above it, a candidate is added only while the
+    /// mergeset stays within [`MAX_MERGESET_SIZE`], and parents that would make
+    /// the block merge a red below the merge-depth root are then dropped, as
+    /// Kaspa's virtual-parent selection does.
+    ///
+    /// Template code should call it as
+    /// `dag.select_parents_for_template(&dag.bodied_tips(has_body), core::MAX_PARENTS)`
+    /// and use the result as `header.parents` unchanged. Unknown candidates
+    /// are ignored. With a single candidate the result is that candidate.
+    pub fn select_parents_for_template(&self, candidates: &[BlockHash], max_parents: usize) -> Vec<BlockHash> {
+        let key = |h: &BlockHash| {
+            let d = self.store.get(h);
+            (d.map(|d| d.blue_work).unwrap_or(0), d.map(|d| d.blue_score).unwrap_or(0), *h)
+        };
+        let mut cands: Vec<BlockHash> = candidates.iter().copied().filter(|h| self.store.has(h)).collect();
+        cands.sort_by_key(|h| std::cmp::Reverse(key(h)));
+        cands.dedup();
+        if cands.is_empty() || max_parents == 0 {
+            return Vec::new();
+        }
+        let sp = cands[0];
+        let height = self.store.get(&sp).map(|d| d.height + 1).unwrap_or(1);
+        if !self.is_hardened_at(height) {
+            cands.truncate(max_parents);
+            return cands;
+        }
+
+        let use_index = self.ancestry_index_ready(&cands, &sp);
+        let budget = MAX_MERGESET_SIZE - 1;
+        let mut chosen = vec![sp];
+        let mut merged: HashSet<BlockHash> = HashSet::new();
+        for c in cands.iter().skip(1) {
+            if chosen.len() >= max_parents {
+                break;
+            }
+            if merged.contains(c) || self.dag_ancestor(c, &sp, use_index) {
+                continue; // adds nothing to the mergeset
+            }
+            // The blocks `c` would add to the mergeset, bounded by the budget.
+            let mut added: Vec<BlockHash> = Vec::new();
+            let mut seen: HashSet<BlockHash> = HashSet::new();
+            let mut queue: VecDeque<BlockHash> = VecDeque::from([*c]);
+            let mut over = false;
+            while let Some(h) = queue.pop_front() {
+                if h == sp || merged.contains(&h) || !seen.insert(h) || self.dag_ancestor(&h, &sp, use_index) {
+                    continue;
+                }
+                added.push(h);
+                if merged.len() + added.len() > budget {
+                    over = true;
+                    break;
+                }
+                if let Some(d) = self.store.get(&h) {
+                    queue.extend(d.parents.iter().copied());
+                }
+            }
+            if over {
+                continue;
+            }
+            merged.extend(added);
+            chosen.push(*c);
+        }
+
+        // Drop parents responsible for merge-depth violations, re-checking
+        // with the consensus code until the template is valid. Each round
+        // removes at least one parent; the selected parent alone always is.
+        loop {
+            match self.compute_block(&chosen, 0, 0) {
+                Ok(_) => break,
+                Err(ConsensusError::MergeDepthViolation { red }) => {
+                    let before = chosen.len();
+                    chosen.retain(|p| *p == sp || !(*p == red || self.dag_ancestor(&red, p, use_index)));
+                    if chosen.len() == before {
+                        chosen.truncate(1);
+                    }
+                }
+                Err(_) => {
+                    chosen.truncate(1);
+                    break;
+                }
+            }
+        }
+        chosen
     }
 
     /// Compute |anticone(candidate) ∩ blue_set|
@@ -1681,6 +2404,17 @@ pub enum ConsensusError {
     /// parent, reject it cleanly instead of panicking the node.
     #[error("selected parent not in DAG: {}", hex::encode(.0))]
     MissingSelectedParent(BlockHash),
+
+    /// Audit DAG-7 (at or above the hardening activation): the block's
+    /// mergeset, selected parent included, has more than `limit` blocks.
+    #[error("mergeset exceeds {limit} blocks (selected parent included)")]
+    MergesetTooLarge { limit: usize },
+
+    /// Audit DAG-7 (at or above the hardening activation): the block merges a
+    /// red block that is neither in the future of its merge-depth root nor in
+    /// the past of a merged blue block that is.
+    #[error("merges red block {} below the merge-depth root", hex::encode(.red))]
+    MergeDepthViolation { red: BlockHash },
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2115,6 +2849,30 @@ mod ghostdag_proptest {
         dag
     }
 
+    /// Same as `build` with an explicit hardening activation height (0 = the
+    /// corrected rules from genesis; a mid-DAG height mixes both regimes).
+    fn build_at(shape: &[Vec<usize>], k: usize, reverse: bool, activation: u64) -> GhostDAG {
+        let mut dag = GhostDAG::with_k_and_activation(k, activation);
+        dag.add_genesis(idx_hash(0), 0);
+        for (i, parents) in shape.iter().enumerate().skip(1) {
+            let mut ph: Vec<BlockHash> = parents.iter().map(|&j| idx_hash(j)).collect();
+            if reverse {
+                ph.reverse();
+            }
+            // Vary the work so blue work (DAG-3) is exercised, deterministically.
+            let work = 1 + (i as u128 * 7919) % 1000;
+            dag.add_block(idx_hash(i), ph, i as u64, work)
+                .expect("well-formed block must be accepted");
+        }
+        dag
+    }
+
+    /// Activation heights for the hardened proptests: from genesis, or inside
+    /// the DAG so both regimes and the boundary are exercised.
+    fn activation_height() -> impl Strategy<Value = u64> {
+        prop_oneof![Just(0u64), 1u64..12]
+    }
+
     /// A structurally valid DAG shape: block `i` (>0) has a non-empty parent set
     /// drawn from `{0..i}`, so parents always exist when added in index order.
     fn dag_shape() -> impl Strategy<Value = (Vec<Vec<usize>>, usize)> {
@@ -2223,6 +2981,240 @@ mod ghostdag_proptest {
             // Determinism: recomputing on an independently-built DAG matches.
             let dag2 = build(&shape, k, false);
             prop_assert_eq!(ord, dag2.topological_order().unwrap());
+        }
+
+        // ── Hardened (post-activation and mixed) regimes ──────────────────
+
+        // Determinism of the full canonical data, every field included.
+        #[test]
+        fn hardened_colouring_is_deterministic((shape, k) in dag_shape(), act in activation_height()) {
+            let a = build_at(&shape, k, false, act);
+            let b = build_at(&shape, k, false, act);
+            for i in 0..shape.len() {
+                let h = idx_hash(i);
+                prop_assert_eq!(
+                    canonical_encode(a.get_block_data(&h).unwrap()),
+                    canonical_encode(b.get_block_data(&h).unwrap())
+                );
+            }
+        }
+
+        // Parent-order independence of the full canonical data (canonical
+        // encoding sorts the parent list, everything else must match).
+        #[test]
+        fn hardened_colouring_ignores_parent_order((shape, k) in dag_shape(), act in activation_height()) {
+            let fwd = build_at(&shape, k, false, act);
+            let rev = build_at(&shape, k, true, act);
+            for i in 0..shape.len() {
+                let h = idx_hash(i);
+                prop_assert_eq!(
+                    canonical_encode(fwd.get_block_data(&h).unwrap()),
+                    canonical_encode(rev.get_block_data(&h).unwrap()),
+                    "block {} depends on parent order", i
+                );
+            }
+            prop_assert_eq!(fwd.selected_tip(), rev.selected_tip());
+        }
+
+        // Monotonicity and DAG-3 blue work: a hardened block's blue work is its
+        // selected parent's plus the work of its merged blues plus its own, so
+        // it strictly exceeds the selected parent's; blue_score counts blues.
+        #[test]
+        fn hardened_blue_work_and_score((shape, k) in dag_shape(), act in activation_height()) {
+            let dag = build_at(&shape, k, false, act);
+            for i in 1..shape.len() {
+                let d = dag.get_block_data(&idx_hash(i)).unwrap();
+                let sp = d.selected_parent.expect("non-genesis has a selected parent");
+                let sd = dag.get_block_data(&sp).unwrap();
+                let own = 1 + (i as u128 * 7919) % 1000;
+                let merged: u128 = d.mergeset_blues.iter()
+                    .map(|m| {
+                        let j = u64::from_le_bytes(m[..8].try_into().unwrap()) as u128;
+                        1 + (j * 7919) % 1000
+                    })
+                    .sum();
+                if dag.is_hardened_at(d.height) {
+                    prop_assert_eq!(d.blue_work, sd.blue_work + merged + own);
+                    // Exact coloring: at most k blues besides the selected parent.
+                    prop_assert!(d.mergeset_blues.len() <= k);
+                } else {
+                    prop_assert_eq!(d.blue_work, sd.blue_work + own);
+                }
+                prop_assert_eq!(d.blue_score, sd.blue_score + d.mergeset_blues.len() as u64 + 1);
+                prop_assert!(d.height == sd.height + 1);
+            }
+        }
+
+        // Below the activation, the hardened DAG and a never-activating DAG
+        // agree on every block whose whole past is below the activation.
+        #[test]
+        fn hardened_keeps_old_data_below_activation((shape, k) in dag_shape(), act in 1u64..12) {
+            let mixed = build_at(&shape, k, false, act);
+            let never = build_at(&shape, k, false, u64::MAX);
+            let mut below = vec![false; shape.len()];
+            below[0] = true;
+            for i in 1..shape.len() {
+                let d = never.get_block_data(&idx_hash(i)).unwrap();
+                below[i] = d.height < act && shape[i].iter().all(|&j| below[j]);
+                if below[i] {
+                    prop_assert_eq!(
+                        canonical_encode(mixed.get_block_data(&idx_hash(i)).unwrap()),
+                        canonical_encode(d)
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ── Hardening unit tests (audit DAG-3 / DAG-4 / DAG-7) ───────────────────────
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    fn h(tag: u8, i: u64) -> BlockHash {
+        let mut out = [0u8; 32];
+        out[0] = tag;
+        out[1..9].copy_from_slice(&i.to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn default_constructors_follow_the_process_activation_height() {
+        // Unit tests never set the chain id: mainnet schedule.
+        assert_eq!(
+            GhostDAG::with_default_k().hardening_activation_height(),
+            activation::hardening_activation_height()
+        );
+        {
+            let _g = activation::scoped_override(0);
+            assert_eq!(GhostDAG::with_k(3).hardening_activation_height(), 0);
+            assert_eq!(GhostDAG::with_k_fast(3).hardening_activation_height(), 0);
+        }
+        let dag = GhostDAG::with_k(3).with_hardening_activation(7);
+        assert!(!dag.is_hardened_at(6));
+        assert!(dag.is_hardened_at(7));
+    }
+
+    #[test]
+    #[should_panic(expected = "before blocks are added")]
+    fn activation_height_cannot_change_after_blocks_exist() {
+        let mut dag = GhostDAG::with_k_and_activation(3, 0);
+        dag.add_genesis(h(0, 0), 0);
+        let _ = dag.with_hardening_activation(5);
+    }
+
+    /// `work_of` recovers the exact work of every block from stored data
+    /// alone (as after a restart), in both regimes and across the boundary.
+    #[test]
+    fn work_is_recovered_from_stored_data() {
+        let mut dag = GhostDAG::with_k_and_activation(3, 4);
+        let g = h(0, 0);
+        dag.add_genesis(g, 0);
+        let mut works = HashMap::new();
+        let mut tips = vec![g];
+        for i in 1..=40u64 {
+            let w = 1 + (i as u128 * 37) % 50;
+            let mut parents = vec![tips[tips.len() - 1]];
+            if i % 3 == 0 && tips.len() > 2 {
+                parents.push(tips[tips.len() - 3]);
+            }
+            let b = h(1, i);
+            dag.add_block(b, parents, i, w).unwrap();
+            works.insert(b, w);
+            tips.push(b);
+        }
+        let mut fresh = GhostDAG::with_k_and_activation(3, 4);
+        fresh.load_persisted(dag.store.data.iter().map(|(k, v)| (*k, v.clone())).collect());
+        let mut memo = HashMap::new();
+        for (b, w) in &works {
+            assert_eq!(fresh.work_of(b, &mut memo), *w, "work of {}", hex::encode(&b[..9]));
+        }
+        assert_eq!(fresh.work_of(&g, &mut memo), 0);
+    }
+
+    /// Removing a just-added block clears its cache entries; re-adding it
+    /// gives the same data.
+    #[test]
+    fn remove_and_re_add_is_identical() {
+        for act in [0u64, u64::MAX] {
+            let mut dag = GhostDAG::with_k_and_activation(3, act);
+            let g = h(0, 0);
+            dag.add_genesis(g, 0);
+            let a = h(1, 1);
+            let b = h(1, 2);
+            dag.add_block(a, vec![g], 1, 10).unwrap();
+            dag.add_block(b, vec![g], 1, 20).unwrap();
+            let m = h(1, 3);
+            let first = dag.add_block(m, vec![a, b], 2, 30).unwrap();
+            assert!(dag.remove_block(&m));
+            assert!(!dag.block_work.contains_key(&m) && !dag.merge_skip.contains_key(&m));
+            let again = dag.add_block(m, vec![a, b], 2, 30).unwrap();
+            assert_eq!(canonical_encode(&first), canonical_encode(&again));
+        }
+    }
+
+    /// The pre-activation skip pointers name the nearest merging block on the
+    /// selected chain, and a DAG without them (fallback walk) agrees.
+    #[test]
+    fn merge_skip_pointers_are_correct() {
+        let mut dag = GhostDAG::with_k_and_activation(5, u64::MAX);
+        let g = h(0, 0);
+        dag.add_genesis(g, 0);
+        let mut prev = g;
+        let mut merging = None;
+        for i in 1..=30u64 {
+            let b = h(1, i);
+            let mut parents = vec![prev];
+            if i % 7 == 0 {
+                let s = h(2, i);
+                dag.add_block(s, vec![prev], i, 1).unwrap();
+                parents.push(s);
+            }
+            dag.add_block(b, parents, i, 1000).unwrap();
+            if !dag.get_block_data(&b).unwrap().mergeset_blues.is_empty() {
+                merging = Some(b);
+            }
+            assert_eq!(dag.merge_skip.get(&b).copied(), Some(merging), "block {i}");
+            prev = b;
+        }
+        // Rebuilding the cache from scratch gives the same pointers.
+        let cached = dag.merge_skip.clone();
+        dag.merge_skip.clear();
+        dag.ensure_merge_skip(&prev);
+        for (k, v) in &dag.merge_skip {
+            assert_eq!(cached.get(k), Some(v));
+        }
+    }
+
+    /// The index-based mergeset equals the O(past) one, in content and order.
+    #[test]
+    fn bounded_mergeset_equals_compute_past_mergeset() {
+        let mut dag = GhostDAG::with_k_and_activation(4, u64::MAX);
+        let g = h(0, 0);
+        dag.add_genesis(g, 0);
+        let mut all = vec![g];
+        let mut state = 0x1234_5678_9ABC_DEF1u64;
+        for i in 1..=150u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let n = all.len();
+            let mut parents = vec![all[n - 1 - (state as usize % n.min(5))]];
+            for j in 0..(state % 4) as usize {
+                let p = all[(state as usize >> (8 + j * 8)) % n];
+                if !parents.contains(&p) {
+                    parents.push(p);
+                }
+            }
+            let sp = dag.select_parent(&parents);
+            let a = compute_mergeset(&dag.store, &parents, &sp);
+            let b = dag.compute_mergeset_bounded(&parents, &sp, None).unwrap();
+            assert_eq!(a, b, "block {i}");
+            let blk = h(1, i);
+            dag.add_block(blk, parents, i, 1 + state as u128 % 100).unwrap();
+            all.push(blk);
         }
     }
 }

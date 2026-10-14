@@ -12,6 +12,7 @@ pub mod tokenomics;
 
 /// Bloch Genesis-3 carryover: verified, converted opening ledger.
 pub mod carryover;
+pub mod activation;
 
 // ── Network identity ─────────────────────────────────────────────────────────
 

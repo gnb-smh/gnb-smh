@@ -230,10 +230,19 @@ impl ReachabilityStore {
     /// do when the reachability soft-fork activates. A chain this deep is nearly
     /// linear, so "one level up" is not a shallow hop: it is a walk of the whole
     /// chain.
+    ///
+    /// Audit DAG-7: subtree sizes are computed once per reindex, in one
+    /// post-order pass, and stored in a map shared by the walk up and by
+    /// [`assign_subtree`](Self::assign_subtree). The old code recounted the
+    /// subtree of every node it visited, O(subtree × depth) on a chain-shaped
+    /// tree (seconds per deep side block or genesis sibling at 12k blocks); this
+    /// is O(subtree). The sizes are the same numbers, so the resulting
+    /// intervals are identical.
     fn reindex(&mut self, node: BlockHash) {
+        let mut sizes: HashMap<BlockHash, u64> = HashMap::new();
         let mut cur = node;
         loop {
-            let size = self.subtree_size(&cur);
+            let size = self.subtree_size_memo(&cur, &mut sizes);
             let cap = self.interval.get(&cur).map(|iv| iv.capacity()).unwrap_or(0);
             if cap >= size { break; }
             match self.tree_parent.get(&cur).copied() {
@@ -248,13 +257,15 @@ impl ReachabilityStore {
             }
         }
         let iv = *self.interval.get(&cur).expect("node has interval");
-        self.assign_subtree(cur, iv);
+        self.assign_subtree(cur, iv, &sizes);
     }
 
     /// Lay out `node` and all its tree-descendants within `iv` using a
     /// count-based proportional split, distributing slack in proportion to
-    /// subtree sizes. `node`'s own identity point is `iv.end`.
-    fn assign_subtree(&mut self, node: BlockHash, iv: Interval) {
+    /// subtree sizes. `node`'s own identity point is `iv.end`. `sizes` holds the
+    /// subtree size of every node below `node` (filled by `reindex`); a missing
+    /// entry is counted directly.
+    fn assign_subtree(&mut self, node: BlockHash, iv: Interval, sizes: &HashMap<BlockHash, u64>) {
         // EXPLICIT STACK, not recursion. The recursive form descended once per
         // block in the subtree, and this chain is nearly linear — rebuilding the
         // index over 408,482 blocks overflowed the 8 MB main stack and aborted
@@ -276,12 +287,15 @@ impl ReachabilityStore {
             // Children occupy [iv.start, iv.end-1]; iv.end reserved for `node`.
             let region_start = iv.start;
             let region_len = iv.end - iv.start; // slots available to children
-            let sizes: Vec<u64> = children.iter().map(|c| self.subtree_size(c)).collect();
-            let total: u64 = sizes.iter().sum::<u64>().max(1);
+            let child_sizes: Vec<u64> = children
+                .iter()
+                .map(|c| sizes.get(c).copied().unwrap_or_else(|| self.subtree_size(c)))
+                .collect();
+            let total: u64 = child_sizes.iter().sum::<u64>().max(1);
             let slack = region_len.saturating_sub(total);
 
             let mut cursor = region_start;
-            for (c, &sz) in children.iter().zip(sizes.iter()) {
+            for (c, &sz) in children.iter().zip(child_sizes.iter()) {
                 // proportional share of slack, plus the child's own subtree size
                 let extra = if total > 0 { slack.saturating_mul(sz) / total } else { 0 };
                 let child_len = (sz + extra).max(1);
@@ -294,6 +308,38 @@ impl ReachabilityStore {
             // Any trailing slots stay free on `node` for future children.
             self.remaining.insert(node, (cursor, iv.end.saturating_sub(1)));
         }
+    }
+
+    /// Subtree size of `node`, computing and recording in `memo` the size of
+    /// every node of its subtree not already there (iterative post-order, each
+    /// node visited once). Used by `reindex`; same numbers as `subtree_size`.
+    fn subtree_size_memo(&self, node: &BlockHash, memo: &mut HashMap<BlockHash, u64>) -> u64 {
+        if let Some(s) = memo.get(node) {
+            return *s;
+        }
+        let mut stack: Vec<(BlockHash, bool)> = vec![(*node, false)];
+        while let Some((n, children_done)) = stack.pop() {
+            if memo.contains_key(&n) {
+                continue;
+            }
+            let children = self.children.get(&n);
+            if children_done {
+                let below: u64 = children
+                    .map(|ch| ch.iter().map(|c| memo.get(c).copied().unwrap_or(0)).sum())
+                    .unwrap_or(0);
+                memo.insert(n, 1 + below);
+            } else {
+                stack.push((n, true));
+                if let Some(ch) = children {
+                    for c in ch {
+                        if !memo.contains_key(c) {
+                            stack.push((*c, false));
+                        }
+                    }
+                }
+            }
+        }
+        memo.get(node).copied().unwrap_or(1)
     }
 
     fn subtree_size(&self, node: &BlockHash) -> u64 {
@@ -695,6 +741,52 @@ mod tests {
                     restored.is_dag_ancestor(a, b),
                     "roundtrip mismatch for pair"
                 );
+            }
+        }
+    }
+
+    /// DAG-7: the memoized subtree sizes used by `reindex` are the numbers the
+    /// old per-node recount produced, for every node, whatever order the memo
+    /// is filled in. `assign_subtree` only changed where it reads sizes from,
+    /// so equal sizes mean an identical interval layout.
+    #[test]
+    fn memoized_subtree_sizes_match_direct_count() {
+        let mut r = ReachabilityStore::new();
+        let g = h(0);
+        r.add_genesis(g);
+        let mut all = vec![g];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for i in 1..=600u16 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Mostly extend a recent block (deep chains, many reindexes), with
+            // occasional deep side blocks and genesis siblings.
+            let parent = match state % 10 {
+                0 => g,
+                1 => all[(state as usize / 10) % all.len()],
+                _ => all[all.len() - 1 - (state as usize / 10) % all.len().min(3)],
+            };
+            let b = h(i);
+            r.add_block(b, &parent, &[]);
+            all.push(b);
+        }
+        let mut shared = HashMap::new();
+        for n in all.iter().rev() {
+            let direct = r.subtree_size(n);
+            assert_eq!(r.subtree_size_memo(n, &mut HashMap::new()), direct);
+            assert_eq!(r.subtree_size_memo(n, &mut shared), direct);
+        }
+        // The index built through all those reindexes still answers exactly.
+        for a in all.iter().step_by(7) {
+            for b in all.iter().step_by(5) {
+                let mut x = *b;
+                let mut expect = false;
+                while let Some(p) = r.tree_parent.get(&x) {
+                    if p == a { expect = true; break; }
+                    x = *p;
+                }
+                assert_eq!(r.is_dag_ancestor(a, b), expect);
             }
         }
     }
