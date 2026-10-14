@@ -9,6 +9,21 @@
 //! This module is the pure routing core (decision + epoch stem-successor + the
 //! anti-blackhole embargo timer), unit-tested without the network. Wiring it into
 //! the gossip/relay path is the integration step.
+//!
+//! **Status (audit NET-17): NOT WIRED IN — dead code.** Nothing in the node
+//! constructs [`Dandelion`] or [`DandelionRelay`]; transactions are published
+//! directly on the gossip `txs` topic from their origin node, so the origin
+//! IP is NOT hidden today. The module also deviates from Dandelion++ as
+//! specified and must not be described as providing its guarantees:
+//!
+//! * the fluff coin is a deterministic function of the tx id and epoch seed
+//!   (per-transaction), not a per-node, per-epoch stem/fluff role;
+//! * there is a single stem successor per epoch instead of the protocol's two
+//!   outbound successors with per-inbound-peer routing;
+//! * the embargo is a fixed timeout, not randomized (exponential) per hop;
+//! * the embargo map has no size bound.
+//!
+//! Treat it as a design sketch; do not claim transaction-origin privacy.
 
 use std::collections::HashMap;
 
