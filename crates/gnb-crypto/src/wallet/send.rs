@@ -2,19 +2,25 @@
 //! (WAL-1, WAL-6, WAL-7). Transport-agnostic: the caller passes a JSON-RPC
 //! closure, so the flow is unit-tested without a node.
 //!
-//! 1. `getutxos` (bounded by a limit);
+//! 1. `getutxos` (bounded by a limit) and `getdaginfo` (the next block's
+//!    height = `next_block_height`, or `tip_height` + 1 from an older node;
+//!    it selects the transaction version: 3 with sighash v3 at/after the
+//!    hardening activation, 1 below it);
 //! 2. coin selection on the claimed values;
-//! 3. `getrawtransaction` for every selected outpoint, hashed against its
-//!    txid: a lying server is detected before anything is signed;
+//! 3. version 1 only: `getrawtransaction` for every selected outpoint, hashed
+//!    against its txid, so a lying server is detected before anything is
+//!    signed. A version-3 signature commits to every spent value and script,
+//!    so a lie only produces a transaction the network rejects; nothing is
+//!    fetched;
 //! 4. build and sign with the size-aware fee and the maximum-fee guard;
 //! 5. the caller shows [`PreparedSend::summary`] (actual fee, change,
 //!    verified/unverified inputs) and asks for confirmation;
 //! 6. [`broadcast`].
 
-use super::payment::{BuiltPayment, FeeChoice, FeePolicy, PaymentOptions, PrevTxs};
+use super::payment::{self, BuiltPayment, FeeChoice, FeePolicy, PaymentOptions, PrevTxs};
 use super::{Keypair, TxBuilder, Utxo};
 use crate::address::Address;
-use crate::core::TxOutput;
+use crate::core::{ChainId, TxOutput};
 use serde_json::{json, Value};
 
 /// JSON-RPC call: `(method, params) -> result`.
@@ -58,8 +64,12 @@ impl PreparedSend {
                 if p.dust_to_fee > 0 { format!(", incl. {} sat dust change", p.dust_to_fee) } else { String::new() })),
             ("change".into(), gnb(p.change)),
             ("total leaving".into(), gnb(p.amount.saturating_add(p.fee))),
-            ("inputs".into(), format!("{} ({} verified, {} unverified) · {} bytes",
-                p.tx.inputs.len(), p.verified_inputs, p.unverified_inputs, p.size)),
+            ("inputs".into(), if p.amounts_committed {
+                format!("{} (values committed by the version-3 signature) · {} bytes", p.tx.inputs.len(), p.size)
+            } else {
+                format!("{} ({} verified, {} unverified) · {} bytes",
+                    p.tx.inputs.len(), p.verified_inputs, p.unverified_inputs, p.size)
+            }),
             ("txid".into(), hex::encode(p.tx.txid())),
         ];
         if p.unverified_inputs > 0 {
@@ -101,6 +111,24 @@ pub fn parse_utxo_rows(result: &Value) -> Result<Vec<Utxo>, String> {
     }).collect()
 }
 
+/// The height of the next block from a `getdaginfo` result: its
+/// `next_block_height` (the height the node's mempool admission and block
+/// template check a transaction against; it can exceed `tip_height` + 1 when
+/// the template merges a tip with a greater DAG height), or, from a node that
+/// predates that field, the selected tip's height + 1.
+pub fn next_block_height_from_daginfo(result: &Value) -> Result<u64, String> {
+    if let Some(e) = result_error(result) {
+        return Err(format!("getdaginfo: {e}"));
+    }
+    match result.get("next_block_height") {
+        None | Some(Value::Null) => result.get("tip_height").and_then(Value::as_u64)
+            .and_then(|h| h.checked_add(1))
+            .ok_or_else(|| "getdaginfo: missing or invalid tip_height".to_string()),
+        Some(v) => v.as_u64().filter(|&h| h >= 1)
+            .ok_or_else(|| "getdaginfo: invalid next_block_height".to_string()),
+    }
+}
+
 /// Steps 1–4: fetch, select, verify, build and sign. Nothing is broadcast.
 pub fn prepare_send(rpc: &RpcFn<'_>, req: &SendRequest<'_>) -> Result<PreparedSend, String> {
     let result = rpc("getutxos", &json!([req.keypair.address, req.utxo_limit]))?;
@@ -113,18 +141,22 @@ pub fn prepare_send(rpc: &RpcFn<'_>, req: &SendRequest<'_>) -> Result<PreparedSe
     }
     let value_seen = utxos.iter().try_fold(0u64, |t, u| t.checked_add(u.output.value))
         .ok_or("UTXO value total exceeds u64")?;
+    let next_block_height = next_block_height_from_daginfo(&rpc("getdaginfo", &json!([]))?)?;
+    let chain_id = ChainId::for_network(req.keypair.network()?);
 
-    let planned = TxBuilder::plan_inputs(req.keypair, &utxos, req.amount, req.fee)?;
     let mut prevs = PrevTxs::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for (txid, _) in &planned {
-        if !seen.insert(*txid) { continue; }
-        let txid_hex = hex::encode(txid);
-        // A node without the method, or without the body (carryover,
-        // pruned), leaves the input unverified; a forged body is an error.
-        if let Ok(v) = rpc("getrawtransaction", &json!([txid_hex])) {
-            if let Some(raw) = v.get("hex").and_then(Value::as_str) {
-                prevs.insert_hex(&txid_hex, raw)?;
+    if !payment::amounts_committed_at(next_block_height, chain_id) {
+        let planned = TxBuilder::plan_inputs(req.keypair, &utxos, req.amount, req.fee)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for (txid, _) in &planned {
+            if !seen.insert(*txid) { continue; }
+            let txid_hex = hex::encode(txid);
+            // A node without the method, or without the body (carryover,
+            // pruned), leaves the input unverified; a forged body is an error.
+            if let Ok(v) = rpc("getrawtransaction", &json!([txid_hex])) {
+                if let Some(raw) = v.get("hex").and_then(Value::as_str) {
+                    prevs.insert_hex(&txid_hex, raw)?;
+                }
             }
         }
     }
@@ -134,6 +166,7 @@ pub fn prepare_send(rpc: &RpcFn<'_>, req: &SendRequest<'_>) -> Result<PreparedSe
         fee_policy: req.fee_policy,
         prev_txs: Some(&prevs),
         require_verified_inputs: req.require_verified_inputs,
+        next_block_height: Some(next_block_height),
         ..PaymentOptions::default()
     };
     let payment = TxBuilder::build_payment(req.keypair, &utxos, req.to, req.amount, &opts)?;
@@ -209,10 +242,22 @@ mod tests {
         serve_prev: bool,
         calls: &'a RefCell<Vec<String>>,
     ) -> impl Fn(&str, &Value) -> Result<Value, String> + 'a {
+        // Mainnet tip far below the activation: version-1 payments.
+        mock_at(claimed, prev, serve_prev, calls, 10)
+    }
+
+    fn mock_at<'a>(
+        claimed: u64,
+        prev: &'a Transaction,
+        serve_prev: bool,
+        calls: &'a RefCell<Vec<String>>,
+        tip_height: u64,
+    ) -> impl Fn(&str, &Value) -> Result<Value, String> + 'a {
         move |method, _params| {
             calls.borrow_mut().push(method.to_string());
             let txid = hex::encode(prev.txid());
             Ok(match method {
+                "getdaginfo" => json!({"tip_height": tip_height, "tip_blue_score": tip_height}),
                 "getutxos" => json!({"utxos": [{"txid": txid, "index": 0, "value": claimed.to_string(),
                     "script_pubkey": hex::encode(&prev.outputs[0].script_pubkey)}]}),
                 "getrawtransaction" if serve_prev => json!({"txid": txid, "hex": hex::encode(prev.to_wire_bytes(true))}),
@@ -265,6 +310,57 @@ mod tests {
         assert!(prepared.summary(&kp.address, &to.to_string()).iter().any(|(k, _)| k == "warning"));
         let strict = SendRequest { require_verified_inputs: true, ..request(&kp, &to) };
         assert!(prepare_send(&rpc, &strict).is_err());
+    }
+
+    /// WAL-1 full fix through the CLI flow: at the activation height the
+    /// payment is version 3, no previous transaction is fetched, and a lied
+    /// value yields a signature that is invalid for the real UTXO.
+    #[test]
+    fn cli_send_signs_version_3_from_the_activation_height() {
+        use crate::core::{activation, sighash};
+        let kp = super::super::generate_keypair(false);
+        let to = Address::from_hash([7; 20], Network::Mainnet);
+        let prev = prev_paying(&kp, 100 * SAT);
+        let act = activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
+
+        // Next block = act - 1: version 1, previous transaction fetched.
+        let calls = RefCell::new(Vec::new());
+        let rpc = mock_at(100 * SAT, &prev, true, &calls, act - 2);
+        let v1 = prepare_send(&rpc, &request(&kp, &to)).unwrap();
+        assert_eq!(v1.payment.tx.version, 1);
+        assert!(calls.borrow().iter().any(|m| m == "getrawtransaction"));
+
+        // Next block = act: version 3, nothing fetched, values committed.
+        let calls = RefCell::new(Vec::new());
+        let rpc = mock_at(SAT + 50_000, &prev, true, &calls, act - 1);
+        let strict = SendRequest { require_verified_inputs: true, ..request(&kp, &to) };
+        let v3 = prepare_send(&rpc, &strict).unwrap();
+        assert_eq!(v3.payment.tx.version, 3);
+        assert!(v3.payment.amounts_committed);
+        assert!(!calls.borrow().iter().any(|m| m == "getrawtransaction"));
+        assert!(!v3.summary(&kp.address, &to.to_string()).iter().any(|(k, _)| k == "warning"));
+        // The lie (claimed 1.0005 GNB for a 100 GNB coin) makes the signature
+        // invalid against the real coin: the network rejects it, nothing is lost.
+        let real = prev.outputs[0].clone();
+        let claimed = TxOutput { value: SAT + 50_000, ..real.clone() };
+        let verify = |spent: &TxOutput| sighash::verify_tx_scripts(&v3.payment.tx, std::slice::from_ref(spent),
+            crate::core::ChainId::Mainnet, act, act);
+        assert!(verify(&claimed).is_ok());
+        assert!(verify(&real).unwrap_err().contains("invalid signature"));
+    }
+
+    #[test]
+    fn daginfo_height_parsing() {
+        assert_eq!(next_block_height_from_daginfo(&json!({"tip_height": 41})), Ok(42));
+        // The node's own next height wins (a template merging a tip with a
+        // greater DAG height sits above tip_height + 1).
+        assert_eq!(next_block_height_from_daginfo(&json!({"tip_height": 41, "next_block_height": 43})), Ok(43));
+        assert_eq!(next_block_height_from_daginfo(&json!({"tip_height": 41, "next_block_height": null})), Ok(42));
+        assert!(next_block_height_from_daginfo(&json!({"tip_height": 41, "next_block_height": 0})).is_err());
+        assert!(next_block_height_from_daginfo(&json!({"tip_height": 41, "next_block_height": "43"})).is_err());
+        assert!(next_block_height_from_daginfo(&json!({})).is_err());
+        assert!(next_block_height_from_daginfo(&json!({"error": "x"})).is_err());
+        assert!(next_block_height_from_daginfo(&json!({"tip_height": u64::MAX})).is_err());
     }
 
     #[test]

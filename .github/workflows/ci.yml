@@ -37,6 +37,10 @@ jobs:
         run: |
           python3 reference/gen_ledger_vectors.py
           git diff --exit-code reference/ledger_vectors.json
+      - name: Sighash v2/v3 vectors are reproducible
+        run: |
+          python3 reference/gnb_sighash.py
+          git diff --exit-code reference/sighash_vectors.json
 
   rust:
     runs-on: ubuntu-latest

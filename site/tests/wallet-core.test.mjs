@@ -32,16 +32,43 @@ test("phrase-backed wallet, plan, verified pay and the actual fee", async () => 
     { txid: "22".repeat(32), index: 0, value: "20000000", script_pubkey: spk },
   ];
   const dest = core.normalize(created.address); // own address is a valid destination
-  const plan = core.plan(utxos, dest, "100000000", "0");
+  // Mainnet, next block far below the hardening activation (110,000): version 1.
+  const next = 12;
+  const plan = core.plan(utxos, dest, "100000000", "0", next);
+  assert.equal(plan.version, 1);
   assert.deepEqual(plan.prev_txids, ["11".repeat(32)], "one covering input, not the small one");
   // A transaction that does not hash to its claimed id is refused.
-  assert.throws(() => core.pay(utxos, dest, "100000000", "0", { ["11".repeat(32)]: "00" }));
-  const tx = core.pay(utxos, dest, "100000000", "0", {});
+  assert.throws(() => core.pay(utxos, dest, "100000000", "0", next, { ["11".repeat(32)]: "00" }));
+  const tx = core.pay(utxos, dest, "100000000", "0", next, {});
+  assert.equal(tx.version, 1);
   assert.equal(tx.inputs, 1);
   assert.equal(tx.unverified_inputs, 1);
   assert.equal(BigInt(tx.fee), 500000000n - 100000000n - BigInt(tx.change));
   assert.ok(BigInt(tx.fee) < 100000n);
   // The fee guard holds even if a caller asks for a huge fee.
-  assert.throws(() => core.pay(utxos, dest, "1", "490000000", {}), /guard/);
+  assert.throws(() => core.pay(utxos, dest, "1", "490000000", next, {}), /guard/);
+  // Without the next block's height the core refuses to sign.
+  assert.throws(() => core.pay(utxos, dest, "100000000", "0", undefined, {}), /next_height/);
+  core.wipe();
+});
+
+test("from the activation height the core signs version 3 and fetches nothing", async () => {
+  const core = await loadCore("/wallet/gnb_wallet.wasm", pin);
+  const created = core.create();
+  const spk = created.address.slice(5, 45);
+  const utxos = [{ txid: "33".repeat(32), index: 1, value: "500000000", script_pubkey: spk }];
+  const dest = core.normalize(created.address);
+  const activation = 110000;
+  const plan = core.plan(utxos, dest, "100000000", "0", activation);
+  assert.equal(plan.version, 3);
+  assert.deepEqual(plan.prev_txids, [], "a version-3 signature commits every spent value");
+  const tx = core.pay(utxos, dest, "100000000", "0", activation, {});
+  assert.equal(tx.version, 3);
+  assert.equal(tx.amounts_committed, true);
+  assert.equal(tx.unverified_inputs, 0);
+  // The raw transaction starts with version 3 (u32 little-endian).
+  assert.equal(tx.raw.slice(0, 8), "03000000");
+  // One block earlier: version 1.
+  assert.equal(core.plan(utxos, dest, "100000000", "0", activation - 1).version, 1);
   core.wipe();
 });

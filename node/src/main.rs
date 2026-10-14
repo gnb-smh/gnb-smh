@@ -769,6 +769,13 @@ async fn main() {
     if let Err(e) = accept::reconcile_on_startup(&dag, &store, &shielded) {
         error!("start-up chain-state reconciliation failed: {}", e);
     }
+    // The ONE next-block height of mempool admission, eviction, templates
+    // and getdaginfo (wallets): the node's next template height. Kept
+    // current by accept_block from here on (nothing else runs yet).
+    {
+        let next = accept::sync_mempool_next_height(&dag, &store, &mempool);
+        info!("next block height (template height): {}", next);
+    }
 
     // ── Message processor ─────────────────────────────────────────────────────
     let store2    = store.clone();
@@ -1220,11 +1227,12 @@ async fn main() {
                             // MEM-1/4/5: the shared admission function (same rules
                             // as sendrawtransaction and reorg re-injection): size,
                             // standardness incl. dust, known/recent-reject, UTXO,
-                            // maturity at the NEXT block height (selected-tip DAG
-                            // height + 1 — never dag.block_count()), fees, and
-                            // signatures last. P0: it runs on the blocking pool so
-                            // PQ signature work cannot stall this task's reactor.
-                            let next_height = mempool::admission::next_block_height(&dag2.read());
+                            // version and maturity at the NEXT block height (the
+                            // node's next template height, `pool_next_height` —
+                            // never dag.block_count()), fees, and signatures
+                            // last. P0: it runs on the blocking pool so PQ
+                            // signature work cannot stall this task's reactor.
+                            let next_height = mempool::admission::pool_next_height(&dag2.read(), &store2, &mem2);
                             let store_v = store2.clone();
                             let mem_v = mem2.clone();
                             let admitted = tokio::task::spawn_blocking(move || {
@@ -1648,7 +1656,7 @@ async fn main() {
                             );
                             // MEM-1/MEM-3: never retry with the same poisoned
                             // template — drop every pooled tx no longer minable.
-                            let next_height = mempool::admission::next_block_height(&dag_m.read());
+                            let next_height = mempool::admission::pool_next_height(&dag_m.read(), &store_m, &mem_m);
                             let dropped = accept::revalidate_mempool(&store_m, &mem_m, next_height);
                             if dropped > 0 {
                                 warn!("mining: evicted {} stale tx(s) after the rejected block", dropped);
@@ -3004,7 +3012,7 @@ mod intra_tx_dup_tests {
         let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
             store.get_utxo(txid, idx).map_err(|e| e.to_string())
         };
-        let err = validate_tx_inputs(&tx, &lookup, None)
+        let err = validate_tx_inputs(&tx, &lookup, None, 1)
             .expect_err("intra-tx duplicate outpoint must be refused");
         assert!(err.contains("double-spend"), "got: {err}");
     }

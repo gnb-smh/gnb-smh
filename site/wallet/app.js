@@ -3,17 +3,19 @@
 //
 // Audit fixes: all markup is built with the escaping `html` template and API
 // values are type-checked (WAL-3); the wasm core is checked against the
-// SHA-256 pinned below before it runs (WAL-5); the claimed values of the
-// UTXOs a payment spends are verified against their previous transactions
-// inside the core, the review shows the ACTUAL fee and any input that could
-// not be verified (WAL-1, WAL-6); new wallets are backed by a 24-word
-// recovery phrase (WAL-7).
+// SHA-256 pinned below before it runs (WAL-5); from the hardening activation
+// height (read from the node: getdaginfo next_block_height) payments are
+// version-3 transactions whose signatures commit to every spent value, below
+// it the claimed values of the UTXOs a payment spends are verified against
+// their previous transactions inside the core; the review shows the ACTUAL
+// fee and any input that could not be verified (WAL-1, WAL-6); new wallets
+// are backed by a 24-word recovery phrase (WAL-7).
 import { loadCore } from "/wallet/core.js";
 import { html, raw, isAddress, isHex64, num, sats } from "/assets/safe.js";
 
 // SHA-256 of /wallet/gnb_wallet.wasm. Written by scripts/build-wallet-wasm.sh
 // and checked by `node --test site/tests/`; loadCore refuses any other binary.
-const WASM_SHA256 = "7d38e3b9e9968865b5858d88c9b51a96daa7404316447e4998a5e5fc992f1c92";
+const WASM_SHA256 = "36db178089339f42f00eb4f17cca8f1c8f0b160f3269d0dba7ffd54f313a5943";
 
 const SAT = 100000000n;
 const IDLE_LOCK_MS = 10 * 60 * 1000;
@@ -246,10 +248,28 @@ function paintPane() {
   ({ send: paintSend, receive: paintReceive, activity: paintActivity, backup: paintBackup }[state.tab] || paintReceive)(pane);
 }
 
-/** WAL-1: fetch the creating transactions of the inputs the core plans to
- *  spend. A transaction the server cannot provide (carryover, pruned) is
- *  simply absent: that input stays unverified and is flagged. The core hashes
- *  every provided transaction against its txid, so a forged one is refused. */
+/** Height of the next block: the node's getdaginfo next_block_height (the
+ *  height its mempool and block template check a payment against; it can
+ *  exceed tip_height + 1), or tip_height + 1 from a node without the field.
+ *  The core signs version 3 (sighash v3, which commits to every spent value)
+ *  from the hardening activation height and version 1 below it. */
+async function nextBlockHeight() {
+  const dag = await api("getdaginfo");
+  if (dag.next_block_height !== undefined && dag.next_block_height !== null) {
+    const next = num(dag.next_block_height);
+    if (!Number.isSafeInteger(next) || next < 1) throw new Error("The node reported an invalid next block height.");
+    return next;
+  }
+  const tip = num(dag.tip_height);
+  if (!Number.isSafeInteger(tip) || tip < 0) throw new Error("The node did not report its chain height.");
+  return tip + 1;
+}
+
+/** WAL-1 (version-1 payments): fetch the creating transactions of the inputs
+ *  the core plans to spend. A transaction the server cannot provide
+ *  (carryover, pruned) is simply absent: that input stays unverified and is
+ *  flagged. The core hashes every provided transaction against its txid, so
+ *  a forged one is refused. Version 3 needs none (plan returns no txids). */
 async function fetchPrevTxs(txids) {
   const out = {};
   await Promise.all(txids.filter(isHex64).map(async (txid) => {
@@ -277,9 +297,10 @@ function paintSend(pane = document.getElementById("pane")) {
       if (amount <= 0n) throw new Error("Enter an amount above zero.");
       if (!state.utxos.length) throw new Error("No spendable outputs found for this address yet.");
       busy(btn, "Verifying inputs and signing…"); await nextFrame();
-      const plan = core.plan(state.utxos, to, amount.toString(), "0");
+      const next = await nextBlockHeight();
+      const plan = core.plan(state.utxos, to, amount.toString(), "0", next);
       const prevtxs = await fetchPrevTxs(plan.prev_txids || []);
-      const tx = core.pay(state.utxos, to, amount.toString(), "0", prevtxs);
+      const tx = core.pay(state.utxos, to, amount.toString(), "0", next, prevtxs);
       state.pending = { ...tx, to };
       unbusy(btn);
       const unverified = num(tx.unverified_inputs) || 0;
@@ -289,7 +310,9 @@ function paintSend(pane = document.getElementById("pane")) {
         <div><span>Amount</span><b>${fmt(tx.amount)} GNB</b></div>
         <div><span>Network fee (actual)</span><b>${fmt(tx.fee)} GNB${dust > 0n ? html` <small>incl. ${fmt(dust)} GNB change too small to return</small>` : ""}</b></div>
         <div><span>Inputs · size</span><b>${count(tx.inputs)} · ${(num(tx.size) / 1024).toFixed(1)} kB</b></div>
-        <div><span>Inputs verified against the chain</span><b>${count(tx.verified_inputs)} of ${count(tx.inputs)}</b></div>
+        ${tx.amounts_committed === true
+          ? html`<div><span>Input values</span><b>committed by the signature (version 3)</b></div>`
+          : html`<div><span>Inputs verified against the chain</span><b>${count(tx.verified_inputs)} of ${count(tx.inputs)}</b></div>`}
         <div><span>Change back to you</span><b>${fmt(tx.change)} GNB</b></div>
         <div><span>Total leaving this address</span><b>${fmt((sats(tx.amount) ?? 0n) + (sats(tx.fee) ?? 0n))} GNB</b></div></div>
         ${unverified ? html`<div class="alert bad" style="margin-top:12px">${unverified} input value(s) come only from the server (genesis carryover or pruned history) and could not be checked against their transaction. If the server lied, the difference would be paid as fee.

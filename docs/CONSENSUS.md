@@ -102,8 +102,9 @@ obtain from a future timestamp to about 6%.
 3. `bits == expected_bits(parents, height)`;
 4. timestamp bounds;
 5. GnB-SMH proof (64 MiB, cached by block id);
-6. transactions (signatures, double spends, coinbase maturity at the block's
-   consensus height, consensus minimum fee), coinbase value.
+6. transactions (version rule, witnesses and signatures as specified in
+   "Transaction signatures" below, double spends, coinbase maturity at the
+   block's consensus height, consensus minimum fee), coinbase value.
 
 Structural checks (size, merkle root, coinbase shape, duplicates, dust) run
 before `accept_block` on every ingress path.
@@ -251,6 +252,245 @@ At the audit's 12,000-block scenario (dev profile), these changes reduced a
 deep side block from 10–26 s to 50–84 ms, a genesis sibling that forces a
 reindex from 46 s to 0.1 s, and the 1,000-block side-chain merge from 35 s to
 29 ms. After activation, that merge is rejected in under 1 ms.
+
+## Transaction signatures (sighash v2 and v3, hardening activation)
+
+The audit found that the signature digest was whatever a serialization
+library emitted and did not commit to the spent amounts or scripts (CRY-3,
+WAL-1), that its cost was quadratic in the transaction size (MEM-5), that a
+hybrid signature could be split into a valid ML-DSA-only signature (CRY-2),
+and that witnesses were malleable (CRY-1). The fixes below change validity, so
+the consensus parts take effect at the hardening activation height (mainnet
+110,000; testnet and regtest 0). The rules live in
+`crates/gnb-crypto/src/core/sighash.rs`; the node applies them through one
+function, `mempool::admission::verify_input_scripts`, which block acceptance
+and connect (`accept::validate_tx_inputs`), reorg connect, the template
+self-check and mempool admission all call.
+
+### Which height
+
+A transaction rule compares the HEADER height `h` of the block that contains
+the transaction (`Block::height`, which `accept_block` requires to equal the
+largest parent DAG height + 1).
+
+Everything that decides for a block not yet built — mempool admission,
+post-connect eviction, reorg re-injection, the template self-check and the
+wallets — uses ONE next-block height: the header height of the node's own
+next template, i.e. the largest DAG height (`GhostdagData::height`) among the
+template parents (`GhostDAG::template_parents`) + 1
+(`template::next_template_height`). The node keeps it in
+`Mempool::next_height`, recomputed under the acceptance lock after every DAG
+change (a connect, a stored fork-loser or merge candidate, a
+disqualification), and reports it as `getdaginfo` `next_block_height`, which
+wallets sign for (`tip_height` + 1 only from a node without that field).
+
+- It is never the new tip's header height + 1. The header height of a tip
+  that merged a parent with a greater DAG height than its selected parent
+  exceeds its DAG height (DAG-8), while a child of that tip alone sits at its
+  DAG height + 1.
+- It can exceed the selected tip's DAG height + 1: a tip with less blue work
+  but a greater DAG height is a template parent too (below the activation
+  every bodied valid tip is; from it, every one within the mergeset and
+  merge-depth bounds).
+- A template skips, and never evicts, a transaction that fails only the
+  version rule at the template's height while it is valid at the pool's next
+  height (only possible while the cached height is stale).
+- Mempool admission re-checks the version rule and policy and coinbase
+  maturity against the current next height when it inserts, under the
+  acceptance lock, so a block connected while a transaction was being checked
+  cannot let in a transaction that is invalid for the new next block.
+
+### Version rule (consensus, non-coinbase transactions)
+
+| | version 0, 1, 2 | version 3 | version ≥ 4 |
+| --- | --- | --- | --- |
+| `h` < activation | valid: sighash v2, lenient witness | valid: sighash v2, lenient witness (non-standard) | valid: sighash v2, lenient witness (non-standard) |
+| `h` ≥ activation | invalid | valid: sighash v3, canonical witness | invalid |
+
+(`core::sighash::check_tx_version`.) Below the activation the version is
+ignored: every transaction, version 3 included, is verified exactly as before
+the upgrade, with sighash v2 and the historical lenient witness rules. From
+the activation only version 3 is valid, and it uses sighash v3, the canonical
+witness and component-bound signatures. Coinbase transactions are not signed
+and keep no version rule.
+
+Rationale. Nodes that predate the upgrade ignore the version and accept a
+non-coinbase version-3 transaction signed over the v2 digest. If upgraded
+nodes refused it below the activation, anyone could split the network before
+the flag day: submit such a transaction to a non-upgraded node, wait for a
+non-upgraded miner to mine it, and upgraded nodes would disqualify that block
+and its selected-chain descendants while old nodes extended it. So consensus
+below the activation stays exactly the old rule, and version ≥ 3 below the
+activation is refused only by relay POLICY
+(`core::sighash::check_tx_version_standard`, error strings starting with
+`non-standard-version`): upgraded nodes never admit, relay or mine one, and
+wallets write version 1 there. Consequences:
+
+- A version-3 transaction signed over the v3 digest is invalid below the
+  activation (its signatures are checked against the v2 digest), and one
+  signed over the v2 digest is invalid from the activation. No transaction
+  is valid under both regimes.
+- A pooled transaction always passed the policy at the pool's next height,
+  so the pool never holds a version-3 transaction verified under v2.
+  Re-injection of a disconnected block's transactions at/after the
+  activation re-verifies their input scripts (a version-3 transaction mined
+  below it was checked under v2 only).
+- The node's verified-signature cache is keyed by the chain id, the regime
+  (sighash v2 or v3) and whether the activation is in force at the height,
+  the wtxid and every spent output (value and script), so a cached "valid"
+  never answers for another digest version, prevout set or height regime.
+
+`node/tests/fix_signatures.rs`
+(`never_activated_regime_reproduces_the_old_verdicts`,
+`pre_activation_version_3_with_the_v2_digest_is_valid_but_non_standard`)
+proves the pre-activation verdicts unchanged.
+
+Consensus error strings for this rule start with `bad-txns-version`.
+
+### Sighash v2 (historical; unchanged)
+
+```text
+preimage = "GNB-SIGHASH-v1\0\0" (16 bytes) ‖ 0x01 ‖ chain_id u32 LE ‖ body
+body     = bincode-2 "standard" encoding of the transaction in which the
+           signed input's script_sig is "GNB_SIGHASH" (11 bytes) and every
+           other input's script_sig is empty
+sighash  = SHA3-256(preimage)
+```
+
+The bincode-2 standard encoding, spelled out so the digest no longer depends
+on the library:
+
+```text
+Transaction = varint(version) ‖ varint(n_inputs) ‖ TxInput* ‖ varint(n_outputs) ‖ TxOutput* ‖ varint(locktime)
+TxInput     = prev_txid (32 raw bytes) ‖ varint(prev_index) ‖ varint(len) ‖ script_sig ‖ varint(sequence)
+TxOutput    = varint(value) ‖ varint(len) ‖ script_pubkey
+varint(v)   = v                     if v ≤ 250
+            = 0xFB ‖ u16 LE(v)      if v ≤ 0xFFFF
+            = 0xFC ‖ u32 LE(v)      if v ≤ 0xFFFF_FFFF
+            = 0xFD ‖ u64 LE(v)      otherwise
+```
+
+An out-of-range input index puts the marker nowhere (historical; no signature
+is ever made for one). The cost is O(size) per input, O(size²) per
+transaction, bounded by the size limits; v2 is invalid from the activation.
+Chain ids: mainnet `0x474E0001`, testnet `0x474E0002`.
+
+### Sighash v3
+
+```text
+list_hash(tag, count, items) = SHA3-256( u8 len(tag) ‖ tag ‖ u32 LE count ‖ items )
+
+hash_prevouts  = list_hash("GNB-SIGHASH-v3/prevouts",  n_in,  for each input:  prev_txid (32) ‖ prev_index u32 LE)
+hash_sequences = list_hash("GNB-SIGHASH-v3/sequences", n_in,  for each input:  sequence u32 LE)
+hash_amounts   = list_hash("GNB-SIGHASH-v3/amounts",   n_in,  for each input:  spent value u64 LE)
+hash_scripts   = list_hash("GNB-SIGHASH-v3/scripts",   n_in,  for each input:  u32 LE len ‖ spent script_pubkey)
+hash_outputs   = list_hash("GNB-SIGHASH-v3/outputs",   n_out, for each output: value u64 LE ‖ u32 LE len ‖ script_pubkey)
+
+preimage (195 bytes) =
+      "GNB-SIGHASH-v3\0\0" (16) ‖ 0x03 (1) ‖ chain_id u32 LE (4)
+    ‖ version u32 LE (4) ‖ locktime u32 LE (4)
+    ‖ hash_prevouts ‖ hash_sequences ‖ hash_amounts ‖ hash_scripts ‖ hash_outputs  (5 × 32)
+    ‖ input_index u32 LE (4) ‖ suite_id u16 LE (2)
+sighash_v3 = SHA3-256(preimage)
+```
+
+- The "spent" value and script of input i are those of the output it spends
+  (from the UTXO set, or from an earlier transaction of the same block).
+- `input_index` must be below `n_in`; otherwise there is no digest and the
+  input is invalid. A wrong number of spent outputs is likewise an error.
+- `suite_id` is the suite in the signature's envelope.
+- The five list hashes are computed once per transaction, so signing or
+  verifying all inputs hashes O(size) bytes.
+- The digest commits to every spent amount and script: a wallet told a wrong
+  value or script signs a transaction every node rejects (WAL-1).
+- The witness (`script_sig`) is not committed, as before.
+
+### Signature binding
+
+Sighash v2 signatures (legacy binding): every component signs the 32-byte
+digest verbatim (`crypto::verify`, unchanged).
+
+Sighash v3 signatures (bound): component `c` of a suite-`s` signature signs
+
+```text
+"GNB-TXSIG-v3" (12) ‖ s u16 LE ‖ c (1) ‖ sighash_v3 (32)          (47 bytes)
+c = 0x01 for ML-DSA-65, 0x02 for Falcon-1024
+```
+
+Suite 0x0001 (hybrid) signature body: `mldsa_sig (3,309) ‖ falcon_sig`; both
+components must verify, each over its own message. Suite 0x0002 body: the
+3,309-byte ML-DSA-65 signature over its message. A key of one suite never
+verifies a signature of another. Because the suite is in every component
+message (and in the digest), stripping the Falcon half of a hybrid signature
+and relabelling it 0x0002 never verifies (`crypto::verify_bound`).
+
+### Witnesses
+
+`script_sig` = `[u32 LE sig_len][sig][u32 LE pk_len][pk]`, and the public key
+must hash to the spent output: `SHA3-256(pk)[0..20] == script_pubkey`.
+
+- Below the activation (sighash v2, every version; unchanged): bytes after
+  `pk` are ignored; `sig` may lack the envelope (it is then read as hybrid)
+  and its Falcon half may use the 1,280-byte zero-padded form.
+- From the activation (version 3, sighash v3): the canonical witness is
+  required. `script_sig` is exactly the framing above with no trailing bytes,
+  and `sig` has its single canonical encoding
+  (`crypto::is_canonical_signature_encoding`): the 4-byte envelope
+  `B1 0C ‖ suite u16 LE` is present and names suite 0x0001 or 0x0002; for
+  0x0001 the Falcon half is the COMPACT encoding (header byte 0x3A, 40-byte
+  nonce, exactly framed coefficients, zero padding bits, nothing after it, at
+  most 1,462 bytes); for 0x0002 the body is exactly 3,309 bytes.
+- The PUBLIC key is never required to carry an envelope: genesis carry-over
+  addresses commit to the raw 3,745-byte hybrid key, which keeps verifying as
+  suite 0x0001 (exact length decides; an enveloped key is 4 bytes longer).
+
+The block-level witness commitment is specified separately.
+
+### Suite 0x0002 (ML-DSA-65 only)
+
+Consensus-valid at every height: outputs may already be locked to 0x0002 keys
+(anyone could lock funds to such a key before this change), and making the
+suite invalid would freeze them. It is non-standard: mempool admission refuses
+every input whose key is not hybrid (`crypto::is_hybrid_public_key`), and
+wallets never sign with such a key. A holder of a 0x0002 output needs a miner
+to include the spend directly.
+
+### Relay policy (all heights)
+
+Mempool admission (gossip, RPC; not reorg re-injection of already-mined
+transactions) additionally requires, at every height, the canonical witness of
+every input and a hybrid public key. Transactions are admitted only if valid
+and standard for the next block's height (see "Which height"): below the
+activation version ≥ 3 is non-standard, at/after it only version 3 is valid.
+Whenever the next height moves (after every connect, and after a DAG change
+that moves the template height without connecting), pooled transactions whose
+version is invalid or non-standard at the new next height are evicted (a
+version-1 transaction admitted for block H-1 is mined in H-1 or evicted when
+the next block is H); the template self-check applies the version rule and
+policy at the template height.
+
+### Signers
+
+Every signer (the `gnb-crypto` wallet API, `gnb-cli send`, `gnb-wallet send`,
+`WalletClient::send`, the browser wallet core) learns the next block's height
+from the node (`getdaginfo`: `next_block_height`, or `tip_height` + 1 from a
+node without that field) and produces version 3 with
+sighash v3 and bound signatures at/after the activation of its chain, and
+version 1 with sighash v2 below it. Without the height they refuse to sign.
+Below the activation, wallets still fetch the previous transactions to verify
+claimed values; under v3 that is unnecessary.
+
+### Vectors
+
+`reference/gnb_sighash.py` is the normative reference for both digests and the
+component messages. `reference/sighash_vectors.json` holds its golden vectors:
+many inputs, empty scripts, maximum field values, long scripts, every suite
+id, both chain ids, the out-of-range and spent-count errors, and random
+transactions, plus `version_rule` vectors: the consensus verdict
+(`v2` / `v3` / `invalid`) and the relay-policy verdict (adding
+`non-standard`) for versions 0, 1, 2, 3, 4 and 2³²−1 at heights around
+activations 0, 100 and `NEVER`. `crates/gnb-crypto/tests/sighash_vectors.rs`
+pins them, and CI regenerates the file and diffs it.
 
 ## Mining
 

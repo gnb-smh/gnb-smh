@@ -14,6 +14,10 @@ pub mod tokenomics;
 pub mod carryover;
 pub mod activation;
 
+/// Sighash v2/v3, the transaction-version activation rule and the shared
+/// input-script (witness + signature) rules (audit CRY-1/2/3, MEM-5).
+pub mod sighash;
+
 /// MoneyRange and canonical-encoding size helpers (audit VAL-11 / VAL-12).
 pub mod limits;
 
@@ -26,9 +30,14 @@ pub const NETWORK_MAGIC:         u32   = 0x474E_4231;
 
 // ── Sighash domain (replay separation) ──────────────────────────────────────
 //
+// Sighash v2 (every transaction below the hardening activation, whatever its
+// version):
 //   preimage = SIGHASH_DOMAIN(16) ‖ [SIGHASH_VERSION](1) ‖ chain_id.to_le_bytes()(4)
 //              ‖ bincode(stripped_tx)
 //   sighash  = SHA3-256(preimage)
+// Sighash v3 (version-3 transactions, the only valid version at/after the
+// hardening activation): see `sighash` (module) — commits the spent amounts
+// and scripts and the signature suite, linear cost.
 //
 // The domain and the chain ids differ from Bloch's, so no signature made for a
 // Bloch chain verifies on GnB and vice versa, even over coinciding outpoints.
@@ -643,6 +652,17 @@ impl Transaction {
 
     /// Sighash (v2) for input at `index`, bound to `chain_id`.
     ///
+    /// The digest of every transaction below the hardening activation,
+    /// whatever its version (see the `core::sighash` module for the selection
+    /// and the activation rule). Specified
+    /// byte for byte in `docs/CONSENSUS.md` (the bincode body is re-derived
+    /// by an independent encoder in `reference/gnb_sighash.py`) and pinned by
+    /// golden vectors; it must never change. Costs O(size) per input, so
+    /// O(size²) per transaction (bounded by the size limits, and invalid
+    /// at/after the activation). An out-of-range `input_index` silently
+    /// omits the marker (historical behaviour, kept for digest stability);
+    /// [`Transaction::sighash_v2_checked`] reports it as an error instead.
+    ///
     /// `chain_id` is an EXPLICIT consensus input threaded from the node's network
     /// (`ChainId::for_network` / `node_chain_id()`), never a compile-time flag and
     /// never taken from the transaction. Folding it into the preimage prevents
@@ -702,8 +722,34 @@ impl Transaction {
         MerkleRoot(hashes[0])
     }
 
-    /// Parse sig + pubkey out of script_sig
+    /// Parse sig + pubkey out of script_sig (historical, lenient framing:
+    /// bytes after the public key are ignored). Owned copy of
+    /// [`Self::parse_script_sig_borrowed`].
     pub fn parse_script_sig(script_sig: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        Self::parse_script_sig_borrowed(script_sig).map(|(s, p)| (s.to_vec(), p.to_vec()))
+    }
+
+    /// The historical (sighash v2) witness framing
+    /// `[u32 LE sig_len][sig][u32 LE pk_len][pk]`, borrowed. Bytes after the
+    /// public key are IGNORED; this acceptance is consensus below the
+    /// hardening activation and must not change.
+    pub fn parse_script_sig_borrowed(script_sig: &[u8]) -> Option<(&[u8], &[u8])> {
+        Self::parse_script_sig_prefix(script_sig).map(|(s, p, _)| (s, p))
+    }
+
+    /// The canonical witness framing: exactly
+    /// `[u32 LE sig_len][sig][u32 LE pk_len][pk]` with no trailing bytes
+    /// (CRY-1; consensus at/after the hardening activation, relay policy at
+    /// every height).
+    pub fn parse_script_sig_exact(script_sig: &[u8]) -> Option<(&[u8], &[u8])> {
+        match Self::parse_script_sig_prefix(script_sig) {
+            Some((s, p, end)) if end == script_sig.len() => Some((s, p)),
+            _ => None,
+        }
+    }
+
+    /// (sig, pk, bytes consumed).
+    fn parse_script_sig_prefix(script_sig: &[u8]) -> Option<(&[u8], &[u8], usize)> {
         // CRY-8: checked arithmetic. On 64-bit targets no sum below can
         // overflow (lengths are u32), so acceptance is unchanged; on 32-bit
         // targets a huge declared length now returns None instead of panicking.
@@ -712,14 +758,14 @@ impl Transaction {
         let sig_end = sig_len.checked_add(4)?;
         let pk_len_end = sig_end.checked_add(4)?;
         if script_sig.len() < pk_len_end { return None; }
-        let sig = script_sig[4..sig_end].to_vec();
+        let sig = &script_sig[4..sig_end];
         let pk_len = usize::try_from(u32::from_le_bytes(
             script_sig[sig_end..pk_len_end].try_into().ok()?
         )).ok()?;
         let pk_end = pk_len_end.checked_add(pk_len)?;
         if script_sig.len() < pk_end { return None; }
-        let pk = script_sig[pk_len_end..pk_end].to_vec();
-        Some((sig, pk))
+        let pk = &script_sig[pk_len_end..pk_end];
+        Some((sig, pk, pk_end))
     }
 
     /// Build script_sig from sig + pubkey

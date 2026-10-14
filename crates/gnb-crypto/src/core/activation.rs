@@ -167,6 +167,19 @@ pub fn hardening_activation_height() -> u64 {
     }
 }
 
+/// Activation height for code that knows the chain it signs for but is not a
+/// node (wallets and other transaction signers never call
+/// `set_node_chain_id`, so [`hardening_activation_height`] would answer with
+/// the mainnet schedule for a testnet wallet). Order of precedence: a
+/// [`scoped_override`] on the calling thread (tests that move the boundary
+/// for node and wallet together), otherwise the schedule of `id`.
+pub fn hardening_activation_height_for_signer(id: ChainId) -> u64 {
+    if let Some(h) = THREAD_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    hardening_activation_height_for_chain(id)
+}
+
 /// `true` iff the hardening rules apply at `height` under the process-wide
 /// activation height. Prefer [`is_active_at`] with a stored height in code
 /// that must be testable in both regimes.

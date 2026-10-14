@@ -126,6 +126,16 @@ impl WalletClient {
         })
     }
 
+    /// Height of the next block: the node's `getdaginfo` `next_block_height`
+    /// (the height its mempool admission and template check against;
+    /// `tip_height` + 1 from a node that predates the field). Selects the
+    /// version of the transactions this wallet signs (3 at/after the
+    /// hardening activation, 1 below it).
+    pub async fn next_block_height(&self) -> Result<u64, WalletError> {
+        let response = self.call("getdaginfo", json!([])).await?;
+        super::send::next_block_height_from_daginfo(&response).map_err(WalletError::BadResponse)
+    }
+
     /// Fetch the creating transactions of `outpoints` through
     /// `getrawtransaction` so their claimed values can be verified (WAL-1).
     ///
@@ -198,9 +208,11 @@ impl WalletClient {
     ///
     /// WAL-1/WAL-6: the fee is size-aware from the consensus formula at the
     /// rate `fee_rate_preference` selects (never a node-chosen absolute fee),
-    /// the claimed values of the selected UTXOs are verified against their
-    /// creating transactions where the node can serve them, and `fee_policy`
-    /// caps the actual fee.
+    /// and `fee_policy` caps the actual fee. The next block's height
+    /// (`getdaginfo`) selects the version: a version-3 signature commits to
+    /// every spent value, so nothing else is fetched; for version 1 the
+    /// claimed values of the selected UTXOs are verified against their
+    /// creating transactions where the node can serve them.
     pub async fn send_payment(
         &self,
         wallet: &super::Wallet,
@@ -211,10 +223,22 @@ impl WalletClient {
     ) -> Result<([u8; 32], BuiltPayment), WalletError> {
         let fee = fee_rate_preference.fee_choice();
         let utxos = self.utxos(wallet.address()).await?;
-        let planned = payment::plan_payment_inputs(&utxos, amount, wallet.public_key().len(), fee)
-            .map_err(WalletError::Payment)?;
-        let prevs = self.fetch_prev_txs(&planned).await?;
-        let opts = PaymentOptions { fee, fee_policy: *fee_policy, prev_txs: Some(&prevs), ..PaymentOptions::default() };
+        let next_block_height = self.next_block_height().await?;
+        let chain_id = crate::core::ChainId::for_network(wallet.network());
+        let prevs = if payment::amounts_committed_at(next_block_height, chain_id) {
+            PrevTxs::new()
+        } else {
+            let planned = payment::plan_payment_inputs(&utxos, amount, wallet.public_key().len(), fee)
+                .map_err(WalletError::Payment)?;
+            self.fetch_prev_txs(&planned).await?
+        };
+        let opts = PaymentOptions {
+            fee,
+            fee_policy: *fee_policy,
+            prev_txs: Some(&prevs),
+            next_block_height: Some(next_block_height),
+            ..PaymentOptions::default()
+        };
         let built = wallet.build_payment(&utxos, to, amount, &opts)?;
         let txid = self.broadcast(&built.tx).await?;
         if txid != built.tx.txid() {
@@ -627,11 +651,13 @@ mod audit_2026_10_send_tests {
         (format!("http://{address}"), seen)
     }
 
-    /// WAL-1 regression: a node that under-reports a UTXO value while
-    /// serving the real previous transaction is caught; nothing is broadcast.
+    /// WAL-1 regression (version-1 payments, below the activation): a node
+    /// that under-reports a UTXO value while serving the real previous
+    /// transaction is caught; nothing is broadcast. (Mainnet wallet, tip far
+    /// below the mainnet activation height.)
     #[tokio::test]
     async fn send_detects_a_lied_utxo_value_and_does_not_broadcast() {
-        let (wallet, _) = crate::wallet::Wallet::generate(Network::Testnet).unwrap();
+        let (wallet, _) = crate::wallet::Wallet::generate(Network::Mainnet).unwrap();
         let prev = Transaction {
             version: 1,
             inputs: vec![TxInput { prev_txid: [3; 32], prev_index: 0, script_sig: vec![], sequence: u32::MAX }],
@@ -640,16 +666,42 @@ mod audit_2026_10_send_tests {
         };
         let txid = hex::encode(prev.txid());
         let responses = std::collections::HashMap::from([
+            ("getdaginfo", json!({"tip_height": 10})),
             ("getutxos", json!({"utxos": [{"txid": txid, "index": 0, "value": "100050000"}]})),
             ("getrawtransaction", json!({"txid": txid, "hex": hex::encode(prev.to_wire_bytes(true))})),
             ("sendrawtransaction", json!({"txid": "00"})),
         ]);
         let (url, seen) = serve(responses);
         let client = WalletClient::new(url);
-        let to = Address::from_hash([7; 20], Network::Testnet);
+        let to = Address::from_hash([7; 20], Network::Mainnet);
         let err = client.send(&wallet, &to, 100_000_000, FeePreference::Slow).await.unwrap_err();
         assert!(matches!(&err, WalletError::Payment(m) if m.contains("refusing to sign")), "{err}");
         assert!(!seen.lock().unwrap().iter().any(|m| m == "sendrawtransaction"));
+    }
+
+    /// WAL-1 full fix: at/after the activation (testnet: from genesis) the
+    /// client signs version 3 and fetches no previous transaction; a lied
+    /// value only yields a transaction every node rejects.
+    #[tokio::test]
+    async fn send_signs_version_3_without_fetching_previous_transactions() {
+        let (wallet, _) = crate::wallet::Wallet::generate(Network::Testnet).unwrap();
+        let utxo_txid = hex::encode([9u8; 32]);
+        let responses = std::collections::HashMap::from([
+            ("getdaginfo", json!({"tip_height": 41})),
+            ("getutxos", json!({"utxos": [{"txid": utxo_txid, "index": 0, "value": "300000000"}]})),
+            ("sendrawtransaction", json!({"txid": "00"})),
+        ]);
+        let (url, seen) = serve(responses);
+        let client = WalletClient::new(url);
+        assert_eq!(client.next_block_height().await.unwrap(), 42);
+        let to = Address::from_hash([7; 20], Network::Testnet);
+        // The mock echoes a wrong txid, so `send` reports an error AFTER
+        // building and broadcasting the version-3 transaction.
+        let err = client.send(&wallet, &to, 100_000_000, FeePreference::Slow).await.unwrap_err();
+        assert!(matches!(err, WalletError::BadResponse(_)), "{err}");
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|m| m == "sendrawtransaction"));
+        assert!(!seen.iter().any(|m| m == "getrawtransaction"), "{seen:?}");
     }
 
     #[test]

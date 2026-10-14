@@ -180,7 +180,7 @@ fn validate_tx_in_view(
         }
         view.view_utxo(txid, idx)
     };
-    validate_tx_inputs(tx, &lookup, Some(spent_in_block))
+    validate_tx_inputs(tx, &lookup, Some(spent_in_block), current_height)
 }
 
 /// Full in-context validation of a block's transactions against `view` (the
@@ -248,14 +248,24 @@ fn shielded_after_plan(
 /// after a reorg re-admit the disconnected txs through the shared admission
 /// function and re-validate the whole pool against the new UTXO set; clear
 /// the recent-rejects filter (the tip changed) and expire stale entries.
+///
+/// `next_height` is the node's next template height on the DAG AFTER the
+/// move (`template::next_template_height`, the value `accept_block` passes):
+/// the ONE height admission, eviction, re-injection, templates and wallets
+/// use. It is NOT the new tip's header height + 1: a tip that merged a
+/// parent with a greater DAG height than its selected parent has a header
+/// height above its DAG height (DAG-8), while a child of that tip alone sits
+/// at its DAG height + 1, so the header height would evict transactions that
+/// are still valid for the next block. It is recorded in
+/// `Mempool::next_height` first, so concurrent admissions re-check against it.
+/// Call under the acceptance lock.
 pub fn update_mempool_after_connect(
     store: &storage::Storage,
     mempool: &mempool::Mempool,
     outcome: &ConnectOutcome,
+    next_height: u64,
 ) {
-    let next_height = outcome.connected.last()
-        .map(|b| b.height.saturating_add(1))
-        .unwrap_or(0);
+    let previous = mempool.set_next_height(next_height);
     let confirmed: Vec<[u8; 32]> = outcome.connected.iter()
         .flat_map(|b| b.transactions.iter().map(|t| t.txid()))
         .collect();
@@ -267,6 +277,26 @@ pub fn update_mempool_after_connect(
     let swept = mempool.remove_conflicts(&spent);
     if !swept.is_empty() {
         info!("mempool: removed {} tx(s) conflicting with the connected block(s)", swept.len());
+    }
+    // CRY-3 activation: after EVERY connect (extension or reorg) drop pooled
+    // transactions whose version is invalid or non-standard for the next
+    // block (version 1/2 once the next block is at/after the hardening
+    // activation; version >= 3 after a reorg back below it). Cheap: no I/O,
+    // no signatures.
+    // When the next height went DOWN on an extension (the new tip merged the
+    // tip that set the old, higher template height), maturity can also be
+    // lost: run the full signature-free revalidation instead (a reorg runs it
+    // below anyway).
+    if !outcome.connected.is_empty() {
+        let lower = previous != 0 && next_height < previous && outcome.disconnected.is_empty();
+        let stale = if lower {
+            revalidate_mempool(store, mempool, next_height)
+        } else {
+            evict_version_invalid(mempool, next_height)
+        };
+        if stale > 0 {
+            info!("mempool: evicted {} tx(s) no longer valid for the next block at height {}", stale, next_height);
+        }
     }
     if !outcome.disconnected.is_empty() {
         let candidates: Vec<core::Transaction> = outcome.disconnected.iter()
@@ -283,12 +313,22 @@ pub fn update_mempool_after_connect(
     }
 }
 
+/// Drop every pooled tx whose version the consensus rule or the version policy
+/// rejects for a block at `next_height`
+/// (`admission::check_version_for_next_block`). Returns how many were removed.
+pub fn evict_version_invalid(mempool: &mempool::Mempool, next_height: u64) -> usize {
+    mempool.retain_valid(|e| admission::check_version_for_next_block(&e.tx, next_height).is_ok())
+}
+
 /// MEM-3: drop every pooled tx that is no longer minable on the current
 /// UTXO set (an input missing, an immature coinbase input at `next_height`,
-/// or a fee below the consensus minimum). Signature-free and cheap. Returns
-/// how many were removed.
+/// a fee below the consensus minimum, or a version invalid or non-standard at
+/// `next_height`). Signature-free and cheap. Returns how many were removed.
 pub fn revalidate_mempool(store: &storage::Storage, mempool: &mempool::Mempool, next_height: u64) -> usize {
     mempool.retain_valid(|e| {
+        if admission::check_version_for_next_block(&e.tx, next_height).is_err() {
+            return false;
+        }
         let mut total_in: u64 = 0;
         for inp in &e.tx.inputs {
             match store.get_utxo(&inp.prev_txid, inp.prev_index) {
@@ -307,6 +347,35 @@ pub fn revalidate_mempool(store: &storage::Storage, mempool: &mempool::Mempool, 
             _ => false,
         }
     })
+}
+
+/// Keep `Mempool::next_height` equal to the node's next template height after
+/// a DAG change that connected nothing (a fork-loser or merge candidate
+/// stored, a block disqualified): a new tip with a greater DAG height, or a
+/// disqualified one, moves the template height without moving the applied
+/// tip. When the height moved, drop the transactions whose version is invalid
+/// or non-standard at the new height and, when it went down, the ones no
+/// longer mature (`revalidate_mempool`). Call under the acceptance lock (or
+/// at start-up before any concurrent acceptance). Returns the height.
+pub fn sync_mempool_next_height(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    mempool: &mempool::Mempool,
+) -> u64 {
+    let next = crate::template::next_template_height(&dag.read(), store);
+    let previous = mempool.set_next_height(next);
+    if previous != 0 && previous != next {
+        let dropped = if next < previous {
+            revalidate_mempool(store, mempool, next)
+        } else {
+            evict_version_invalid(mempool, next)
+        };
+        if dropped > 0 {
+            info!("mempool: next block height {} -> {}: evicted {} tx(s) no longer valid for it",
+                previous, next, dropped);
+        }
+    }
+    next
 }
 
 // ── The pipeline ─────────────────────────────────────────────────────────────
@@ -639,6 +708,8 @@ pub fn accept_block(
                     error!("failed to persist invalid-block marks: {}", e);
                 }
             }
+            // Disqualifications found on the way change the valid tips.
+            sync_mempool_next_height(dag, store, mempool);
             return Err(match stop {
                 ResolveStop::Refused(m) if m.starts_with("finality:") => m,
                 ResolveStop::Refused(m) => format!("U.4: execute_reorg failed: {}", m),
@@ -655,8 +726,12 @@ pub fn accept_block(
                 error!("failed to persist DAG record of {}: {}", hex::encode(&block_hash[..8]), e);
                 dag.write().remove_block(&block_hash);
                 let _ = store.delete_block_body(&block_hash);
+                sync_mempool_next_height(dag, store, mempool);
                 return Err(format!("block {} not committed: {}", hex::encode(&block_hash[..8]), e));
             }
+            // A stored fork-loser / merge candidate (or a disqualification)
+            // can move the template height without moving the applied tip.
+            sync_mempool_next_height(dag, store, mempool);
             false
         }
         Resolution::Connected { plan, outcome } => {
@@ -668,7 +743,10 @@ pub fn accept_block(
                     block.height, plan.to_rollback.len(), plan.to_apply.len(),
                     hex::encode(&plan.lca[..8]));
             }
-            update_mempool_after_connect(store, mempool, outcome);
+            // The next height on the DAG after the move: the template
+            // height (never the new tip's header height + 1, DAG-8).
+            let next_height = crate::template::next_template_height(&dag.read(), store);
+            update_mempool_after_connect(store, mempool, outcome, next_height);
             true
         }
     };
@@ -863,13 +941,16 @@ pub fn reconcile_on_startup(
 
 /// Core input validation logic shared by all TX validation paths.
 /// Resolves each input's UTXO (rejecting duplicate outpoints), then checks
-/// every input script (pubkey hash vs prevout, hybrid signature — cached, see
+/// every input script under the rules of a block at header height
+/// `block_height` (version rule, witness, pubkey hash vs prevout, hybrid
+/// signature under the digest the version selects — cached, see
 /// `admission::verify_input_scripts`), value conservation and the consensus
 /// minimum fee. All amounts are MoneyRange-checked (VAL-11).
 pub fn validate_tx_inputs(
     tx:           &core::Transaction,
     utxo_lookup:  &dyn Fn(&[u8; 32], u32) -> Result<Option<core::TxOutput>, String>,
     mut spent_set: Option<&mut HashSet<([u8; 32], u32)>>,
+    block_height: u64,
 ) -> Result<u64, String> {
     let mut total_in = 0u64;
 
@@ -892,7 +973,7 @@ pub fn validate_tx_inputs(
         prevouts.push(utxo);
     }
 
-    admission::verify_input_scripts(tx, &prevouts)?;
+    admission::verify_input_scripts(tx, &prevouts, block_height)?;
 
     if let Some(spent) = spent_set.as_mut() {
         for inp in &tx.inputs {

@@ -5,7 +5,7 @@
 //! Sprint N-min: per-tx size cap, intra-mempool double-spend detection.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use parking_lot::{Mutex, RwLock};
 use crate::core::Transaction;
 
@@ -129,6 +129,14 @@ pub struct Mempool {
     rolling_min: Mutex<(u128, u64)>,
     /// MEM-5: recent-rejects filter (wtxid set + FIFO order).
     recent_rejects: Mutex<(HashSet<[u8; 32]>, VecDeque<[u8; 32]>)>,
+    /// Header height of the next block the pool targets: the height of the
+    /// node's own next template (`template::next_template_height`), the ONE
+    /// height admission, post-connect eviction, re-injection, templates and
+    /// `getdaginfo.next_block_height` (wallets) use. Written only under the
+    /// store's acceptance lock, after every DAG change (`accept.rs`); `0` =
+    /// not known yet (callers then compute it). `admission::admit` re-checks
+    /// the height-dependent rules against it under the same lock.
+    next_height: AtomicU64,
 }
 
 impl Mempool {
@@ -147,7 +155,21 @@ impl Mempool {
             clock,
             rolling_min: Mutex::new((0, 0)),
             recent_rejects: Mutex::new((HashSet::new(), VecDeque::new())),
+            next_height: AtomicU64::new(0),
         }
+    }
+
+    /// Header height of the next block the pool targets (`0` = unknown; see
+    /// the field documentation).
+    pub fn next_height(&self) -> u64 {
+        self.next_height.load(Ordering::SeqCst)
+    }
+
+    /// Record the next block's height. Call under the store's acceptance lock
+    /// (or before any concurrent acceptance, at start-up). Returns the
+    /// previous value.
+    pub fn set_next_height(&self, height: u64) -> u64 {
+        self.next_height.swap(height, Ordering::SeqCst)
     }
 
     /// Current time from the injected clock (Unix seconds).
