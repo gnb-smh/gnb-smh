@@ -602,7 +602,11 @@ def apply_block_txs(state: State, txs: Sequence[Tx], witness: bytes, ctx: Contex
     if tag not in (ACCEPT, REJECT_OUTPUT_EXISTS):
         raise InvalidBlock("witness-format", "coinbase entry must be ACCEPT or a collision proof")
     # Every regular outcome above is proven, so `fees` is forced: an overclaim is the block's fault.
-    if sum(o.amount for o in cb.outputs) > ctx.subsidy + fees:
+    # The one exception is a merged twin forfeiting its coinbase (checked below): it mints nothing,
+    # and its identical coinbase claimed the twin's fees when the twin was applied -- the same fees
+    # that make this block's own transactions fail now, so its `fees` here can be 0.
+    if (sum(o.amount for o in cb.outputs) > ctx.subsidy + fees
+            and not (merged and tag == REJECT_OUTPUT_EXISTS)):
         raise InvalidBlock("coinbase", "claims more than subsidy plus fees")
     cid = txid(cb)
     if tag == REJECT_OUTPUT_EXISTS:
@@ -618,7 +622,9 @@ def apply_block_txs(state: State, txs: Sequence[Tx], witness: bytes, ctx: Contex
         if not merged:
             raise InvalidBlock("coinbase", "coinbase output already exists")
         # Mergeset rule: the twin of an applied block forfeits its coinbase. The
-        # existing output must be exactly what this coinbase would create.
+        # existing output must be exactly what this coinbase would create. A
+        # forfeit is exempt from the claim check above: nothing is minted, and
+        # the identical coinbase holding the output passed it when applied.
         out = cb.outputs[o]
         if value != utxo_value(UtxoRecord(out.amount, out.owner, ctx.height, True)):
             raise InvalidBlock("coinbase", "colliding output is not an identical coinbase output")
@@ -801,11 +807,14 @@ class FullNode:
             fees += fee
             accepted[idx] = True
         cb = txs[0]
-        if sum(o.amount for o in cb.outputs) > ctx.subsidy + fees:
-            raise InvalidBlock("coinbase", "claims more than subsidy plus fees")
+        overclaim = sum(o.amount for o in cb.outputs) > ctx.subsidy + fees
         cid = txid(cb)
         out_keys = [outpoint_key(cid, o) for o in range(len(cb.outputs))]
         taken = next((o for o, k in enumerate(out_keys) if k in self.utxos), None)
+        # A merged twin forfeiting its coinbase is exempt from the claim check
+        # (see apply_block_txs); every other coinbase is held to it.
+        if overclaim and not (merged and taken is not None):
+            raise InvalidBlock("coinbase", "claims more than subsidy plus fees")
         if taken is not None:
             if not merged:
                 raise InvalidBlock("coinbase", "coinbase output already exists")

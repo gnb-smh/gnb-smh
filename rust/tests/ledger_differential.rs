@@ -3,11 +3,13 @@
 //! `reference/ledger_oracle.py gen` builds random valid blocks with the Python
 //! `FullNode` (spends, missing inputs, wrong authorization, overspends, taken
 //! output keys, duplicate transactions, immature coinbases, merged twins whose
-//! coinbase is forfeited). This test mutates every case at random (witness bytes,
-//! transaction bytes, transaction order, height, subsidy, maturity, parents root,
-//! the merged flag), sends all cases to `ledger_oracle.py eval`, and requires the
-//! Rust port to reach exactly the Python verdict: the same post-state and accepted
-//! flags, or the same error code and fault class.
+//! coinbase is forfeited, including twins built from the same template whose
+//! transactions the first twin already spent). This test mutates every case at
+//! random (witness bytes, transaction bytes, transaction order, height, subsidy,
+//! maturity, parents root, the merged flag), sends all cases to
+//! `ledger_oracle.py eval`, and requires the Rust port to reach exactly the
+//! Python verdict: the same post-state and accepted flags, or the same error
+//! code and fault class.
 //!
 //! Seeds: a fixed set, plus `GNB_LEDGER_DIFF_SEED` if set, else one derived from
 //! the clock (printed, so a failure can be replayed). Needs `python3` (>= 3.10).
@@ -211,4 +213,27 @@ fn rust_and_python_agree_on_random_blocks() {
         // The mutations must exercise both outcomes.
         assert!(rejected > n / 4 && rejected < n, "seed {seed}: {rejected} of {n} rejected");
     }
+}
+
+/// Fee-paying twins (same template, transactions already spent by the first
+/// twin) reach the differential: some generated case is merged, its regular
+/// transactions all fail, and its coinbase claims more than the subsidy.
+#[test]
+fn generated_cases_include_fee_paying_twins() {
+    let base = python(&["gen", "7", "60"], None);
+    let found = base.as_array().unwrap().iter().any(|c| {
+        let accepted = c["verdict"]["accepted"].as_array().unwrap();
+        let txs: Vec<_> = c["txs_hex"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| ledger::decode_tx_wire(&hex::decode(t.as_str().unwrap()).unwrap()).unwrap())
+            .collect();
+        let claimed: u64 = txs[0].outputs.iter().map(|o| o.amount).sum();
+        c["merged"].as_bool().unwrap()
+            && txs.len() > 1
+            && accepted.iter().all(|a| !a.as_bool().unwrap())
+            && claimed > c["subsidy"].as_u64().unwrap()
+    });
+    assert!(found, "no fee-paying merged twin among 60 generated cases");
 }

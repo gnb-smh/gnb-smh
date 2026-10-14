@@ -403,8 +403,23 @@ def main() -> None:
     w_odd = (struct.pack("<I", 1) + bytes([L.REJECT_OUTPUT_EXISTS]) + struct.pack("<I", 0)
              + L.utxo_value(odd.utxos[odd_key]) + odd.tree.proof(odd_key))
     mergeset.append(merged_case("collision-not-identical-coinbase", odd.state(), [twin_cb], w_odd, True))
-    assert [("expected_error" in v) for v in mergeset] == [False, True, True, True]
-    assert [v.get("expected_error") for v in mergeset[1:]] == ["coinbase", "witness-mismatch", "coinbase"]
+    # Review follow-up: twins share their template, so the merged twin carries the transactions
+    # the first one already spent. Its fees are 0 while its identical coinbase claims SUBSIDY plus
+    # the first one's fees; the forfeit is exempt from the claim check.
+    f_node = copy.deepcopy(node)
+    fee_cb = coinbase(5, [("dave", SUBSIDY + 1_000)], b"fee-twin", parents_root=m_parents)
+    txs_f = [fee_cb, t8]                         # t8 pays a fee of 1_000
+    _, accepted_fa, fees_fa = f_node.build(txs_f, m_ctx)
+    assert accepted_fa == [True, True] and fees_fa == 1_000
+    pre_f = f_node.state()
+    wf, accepted_f, fees_f = f_node.build(txs_f, m_ctx, merged=True)
+    assert accepted_f == [False, False] and fees_f == 0 and f_node.state() == pre_f
+    mergeset.append(merged_case("fee-paying-twin-forfeited", pre_f, txs_f, wf, True))
+    mergeset.append(merged_case("fee-paying-twin-outside-mergeset", pre_f, txs_f, wf, False))
+    assert [("expected_error" in v) for v in mergeset] == [False, True, True, True, False, True]
+    assert [v.get("expected_error") for v in mergeset[1:]] == ["coinbase", "witness-mismatch", "coinbase",
+                                                               None, "coinbase"]
+    assert mergeset[4]["post"] == state_json(pre_f) and mergeset[4]["accepted"] == [False, False]
     _ = wa
 
     # ------------------------------------------------------------- sparse Merkle tree vectors

@@ -102,11 +102,17 @@ def random_case(rng: random.Random) -> dict:
         outs.append(L.TxOut(0, OWNERS[rng.randrange(len(OWNERS))]))
     cb = L.Tx(L.TX_COINBASE, (), tuple(outs), height, rng.choice([b"", b"cb", b"twin"]), parents_root=parents_root)
     merged = rng.random() < 0.35
-    if merged and rng.random() < 0.6:
+    txs = [cb] + regular
+    roll = rng.random()
+    if merged and roll < 0.3:
         # The twin of this block was applied first: its coinbase outputs exist.
         for o, out in enumerate(cb.outputs):
             node.insert(L.outpoint_key(L.txid(cb), o), L.UtxoRecord(out.amount, out.owner, height, True))
-    txs = [cb] + regular
+    elif merged and roll < 0.6:
+        # The twin came from the same template (same coinbase AND transactions) and was applied
+        # first: this block's fee-paying transactions now fail, so its fees are 0 while its
+        # identical coinbase claims subsidy + the twin's fees (the forfeit is exempt).
+        node.build(txs, ctx)
     pre = node.state()
     witness, _, _ = node.build(txs, ctx, merged=merged)
     case = {"pre": state_json(pre), "height": height, "subsidy": ctx.subsidy, "coinbase_maturity": maturity,

@@ -121,7 +121,7 @@ class LedgerVectorTest(unittest.TestCase):
 
     def test_mergeset(self):
         """LED-1 mergeset coinbase-collision vectors (applied without a header)."""
-        self.assertEqual(len(VECTORS["mergeset"]), 4)
+        self.assertEqual(len(VECTORS["mergeset"]), 6)
         for v in VECTORS["mergeset"]:
             with self.subTest(v["name"]):
                 ctx = L.Context(height=v["height"], subsidy=v["subsidy"], auth=L.test_preimage_auth,
@@ -318,6 +318,64 @@ class MergesetCoinbaseTest(unittest.TestCase):
         with self.assertRaises(L.InvalidBlock) as cm:
             copy.deepcopy(self.node).build([greedy], self.ctx, merged=True)
         self.assertEqual(cm.exception.code, "coinbase")
+
+    def test_fee_claiming_twin_forfeits_when_merged(self):
+        """Review follow-up: twins come from one template, so the second carries
+        the first one's transactions. Merged, those are rejected (inputs already
+        spent) and its fees are 0, while its identical coinbase still claims
+        subsidy + the first one's fees. The forfeit is exempt from the claim
+        check; before, the merged twin -- and every block merging it -- was
+        permanently invalid (coinbase)."""
+        node = L.FullNode()
+        funding = L.Tx(L.TX_COINBASE, (), (L.TxOut(500, self.bob),), 1, b"fund")
+        node.insert(L.outpoint_key(L.txid(funding), 0), L.UtxoRecord(500, self.bob, 1, False))
+        T = L.Tx(L.TX_REGULAR, (L.Outpoint(L.txid(funding), 0),), (L.TxOut(400, self.alice),), auth=(b"bob",))
+        cb = L.Tx(L.TX_COINBASE, (), (L.TxOut(1_100, self.alice),), 5, b"fee-twin", parents_root=self.PR)
+        txs = [cb, T]
+        s0 = node.state()
+        # B on its own parent is valid (fee 100 covers the claim).
+        wb, acc_b, fees_b = copy.deepcopy(node).build(txs, self.ctx)
+        self.assertEqual((L.apply_block_txs(s0, txs, wb, self.ctx)[1], fees_b), ([True, True], 100))
+        # A (same template) is applied first.
+        wa, acc_a, _ = node.build(txs, self.ctx)
+        s1, flags_a = L.apply_block_txs(s0, txs, wa, self.ctx)
+        self.assertEqual((s1, flags_a, acc_a), (node.state(), [True, True], [True, True]))
+        # Merging B: T is rejected (input spent), the coinbase is forfeited, nothing changes.
+        w, accepted, fees = node.build(txs, self.ctx, merged=True)
+        self.assertEqual((accepted, fees), ([False, False], 0))
+        post, flags = L.apply_block_txs(s1, txs, w, self.ctx, merged=True)
+        self.assertEqual((post, flags), (node.state(), [False, False]))
+        self.assertEqual(post, s1, "the forfeited twin mints nothing")
+        # Outside a mergeset the same block is still invalid (claim check first).
+        with self.assertRaises(L.InvalidBlock) as cm:
+            L.apply_block_txs(s1, txs, w, self.ctx)
+        self.assertEqual((cm.exception.code, cm.exception.permanent), ("coinbase", True))
+        self.assertIn("claims more", str(cm.exception))
+        with self.assertRaises(L.InvalidBlock) as cm:
+            copy.deepcopy(node).build(txs, self.ctx)
+        self.assertEqual(cm.exception.code, "coinbase")
+
+    def test_forfeit_exemption_needs_a_valid_forfeit(self):
+        """The exemption covers only a proven identical twin: an overclaiming
+        coinbase colliding with a different record is still invalid, and a
+        forfeit entry whose proof does not verify is a witness fault."""
+        node = L.FullNode()
+        greedy = L.Tx(L.TX_COINBASE, (), (L.TxOut(1_100, self.alice),), 5, b"greedy", parents_root=self.PR)
+        key = L.outpoint_key(L.txid(greedy), 0)
+        node.insert(key, L.UtxoRecord(1_100, self.alice, 4, True))      # another height: not a twin
+        w, _, _ = copy.deepcopy(node).build([greedy], self.ctx, merged=True)
+        with self.assertRaises(L.InvalidBlock) as cm:
+            L.apply_block_txs(node.state(), [greedy], w, self.ctx, merged=True)
+        self.assertEqual((cm.exception.code, str(cm.exception)),
+                         ("coinbase", "coinbase: colliding output is not an identical coinbase output"))
+        twin = L.FullNode()
+        twin.insert(key, L.UtxoRecord(1_100, self.alice, 5, True))
+        w, _, _ = copy.deepcopy(twin).build([greedy], self.ctx, merged=True)
+        bad = bytearray(w)
+        bad[4 + 1 + 4] ^= 1         # count, tag, output index, then the claimed value: proof fails
+        with self.assertRaises(L.InvalidBlock) as cm:
+            L.apply_block_txs(twin.state(), [greedy], bytes(bad), self.ctx, merged=True)
+        self.assertEqual(cm.exception.code, "witness-mismatch")
 
     def test_a_non_identical_sibling_is_paid(self):
         sibling = L.Tx(L.TX_COINBASE, (), (L.TxOut(1_000, self.bob),), 5, b"other", parents_root=self.PR)

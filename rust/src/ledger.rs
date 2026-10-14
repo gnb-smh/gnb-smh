@@ -825,8 +825,11 @@ fn apply_txs(state: &State, txs: &[Tx], witness: &[u8], ctx: &Context, merged: b
         return err(ErrorCode::WitnessFormat, "coinbase entry must be ACCEPT or a collision proof");
     }
     // Every regular outcome above is proven, so `fees` is forced: an overclaim is the block's fault.
+    // The one exception is a merged twin forfeiting its coinbase (checked below): it mints nothing,
+    // and its identical coinbase claimed the twin's fees when the twin was applied -- the same fees
+    // that make this block's own transactions fail now, so its `fees` here can be 0.
     let claimed: u128 = cb.outputs.iter().map(|o| o.amount as u128).sum();
-    if claimed > ctx.subsidy as u128 + fees {
+    if claimed > ctx.subsidy as u128 + fees && !(merged && tag == REJECT_OUTPUT_EXISTS) {
         return err(ErrorCode::Coinbase, "claims more than subsidy plus fees");
     }
     let cid = txid(cb);
@@ -847,7 +850,9 @@ fn apply_txs(state: &State, txs: &[Tx], witness: &[u8], ctx: &Context, merged: b
             return err(ErrorCode::Coinbase, "coinbase output already exists");
         }
         // Mergeset rule: the twin of an applied block forfeits its coinbase. The existing
-        // output must be exactly what this coinbase would create.
+        // output must be exactly what this coinbase would create. A forfeit is exempt from
+        // the claim check above: nothing is minted, and the identical coinbase that holds the
+        // output passed that check when it was applied.
         let out = &cb.outputs[o];
         let twin = UtxoRecord { amount: out.amount, owner: out.owner, height: ctx.height, coinbase: true };
         if value != utxo_value(&twin) {

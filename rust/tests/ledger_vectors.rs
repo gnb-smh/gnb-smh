@@ -117,12 +117,14 @@ fn invalid_blocks_raise_the_same_error_codes() {
 }
 
 /// LED-1: the mergeset coinbase-collision rule (`merged` cases are applied with
-/// `apply_merged_block_txs`, the others with `apply_block_txs`; no header).
+/// `apply_merged_block_txs`, the others with `apply_block_txs`; no header),
+/// including a fee-paying twin whose forfeited coinbase claims the first
+/// twin's fees (exempt from the claim check).
 #[test]
 fn mergeset_vectors() {
     let d = doc();
     let cases = d["mergeset"].as_array().unwrap();
-    assert_eq!(cases.len(), 4);
+    assert_eq!(cases.len(), 6);
     for v in cases {
         let name = v["name"].as_str().unwrap();
         let c = Context { parents_root: h32(&v["parents_root"]), ..ctx(v) };

@@ -207,8 +207,15 @@ No coinbase output is created, its other outcomes stand, and the merging block s
 payee was paid once by the twin, and no value is minted twice. The same entry in a block applied on
 its own selected parent still makes that block invalid (`coinbase`), as before. Invalidating the
 merging block instead would let anyone who mines a twin that pays its payee make every honest
-merger of both invalid. The coinbase claim check (subsidy plus fees) still applies to a forfeited
-coinbase. Vectors: the `mergeset` section of `ledger_vectors.json`.
+merger of both invalid. The coinbase claim check (subsidy plus fees) does **not** apply to a
+forfeited coinbase: it mints nothing, and the identical coinbase holding the output passed that
+check when its block was applied. It must not apply: a twin built from the same template carries
+the same transactions, which the first block already spent, so the merged twin's own fees are 0
+while its coinbase claims subsidy plus the first block's fees. The check still applies to every
+coinbase that is created (the `ACCEPT` entry, merged or not) and to a non-merged block whose entry
+is `REJECT_OUTPUT_EXISTS`. A non-twin merged block whose fee-paying transactions conflict with
+already-applied ones can still fail it; that is part of open item 1 (fee attribution). Vectors: the
+`mergeset` section of `ledger_vectors.json`.
 
 ## 8. Proofs stay off the accept path
 
@@ -247,8 +254,10 @@ store must compress single-leaf chains.
 ## 10. Open items
 
 1. **GhostDAG mergeset rules:** acceptance order, one coinbase per merged block, the context
-   (height, maturity) of a merged block's transactions, and fee attribution. The coinbase collision
-   is settled: the merged twin forfeits its coinbase (section 7).
+   (height, maturity) of a merged block's transactions, and fee attribution (a merged block whose
+   fee-paying transactions lost to conflicts can overclaim; only the identical twin is settled). The
+   coinbase collision is settled: the merged twin forfeits its coinbase and is exempt from the claim
+   check (section 7).
 2. **Authorization:** the hybrid ML-DSA-65 ‖ Falcon-1024 rule, its sighash, and its per-input
    encoding. Wallets and mempools must track outcomes by wtxid. A producer can include a copy of a
    user's transaction with garbage authorization; that copy is rejected without effect, and the
