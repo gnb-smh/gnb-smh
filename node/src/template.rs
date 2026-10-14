@@ -13,11 +13,13 @@
 //!   `MAX_BLOCK_SIZE` (MEM-2).
 //! * Self-check: every selected transaction is re-validated against the
 //!   current UTXO set (standardness, inputs present and not already used by
-//!   the template, coinbase maturity at the template height, MoneyRange,
-//!   consensus minimum fee, input scripts — normally verified-signature cache
-//!   hits). A transaction that fails is EVICTED from the mempool instead of
-//!   making every template invalid (MEM-1, MEM-3). The fees the coinbase may
-//!   claim are recomputed from the UTXO set, never taken from the pool.
+//!   the template, coinbase maturity at the template height, the
+//!   transaction-version rule at the template height (CRY-3 activation),
+//!   MoneyRange, consensus minimum fee, input scripts — normally
+//!   verified-signature cache hits). A transaction that fails is EVICTED from
+//!   the mempool instead of making every template invalid (MEM-1, MEM-3). The
+//!   fees the coinbase may claim are recomputed from the UTXO set, never taken
+//!   from the pool.
 //!
 //! The template is built under the store's acceptance lock, so the DAG and
 //! UTXO snapshot it reads are consistent with each other.
@@ -233,6 +235,10 @@ fn self_check(
     verify_scripts: bool,
 ) -> Result<u64, TemplateReject> {
     admission::check_standard(tx).map_err(|e| TemplateReject::Evict(e.to_string()))?;
+    // CRY-3 activation: the version must be valid at the TEMPLATE height
+    // (version 3 from the hardening activation, never below it); checked even
+    // when scripts are not verified.
+    admission::check_version_for_next_block(tx, height).map_err(TemplateReject::Evict)?;
     let mut seen: HashSet<([u8; 32], u32)> = HashSet::new();
     let mut total_in: u64 = 0;
     let mut prevouts: Vec<TxOutput> = Vec::with_capacity(tx.inputs.len());
@@ -265,7 +271,7 @@ fn self_check(
     if verify_scripts {
         // Normally a verified-signature cache hit: pooled transactions were
         // verified at admission, re-injected ones when their block connected.
-        admission::verify_input_scripts(tx, &prevouts).map_err(TemplateReject::Evict)?;
+        admission::verify_input_scripts(tx, &prevouts, height).map_err(TemplateReject::Evict)?;
     }
     Ok(fee)
 }

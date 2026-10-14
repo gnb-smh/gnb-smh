@@ -15,22 +15,30 @@
 //!
 //!  1. structure: not a coinbase, has inputs and outputs;
 //!  2. size: canonical wire size and bincode size within `MAX_TX_SIZE` — this
-//!     bounds the quadratic `Transaction::sighash` cost before any signature
-//!     is checked (the sighash itself is consensus and is NOT changed);
+//!     bounds the quadratic sighash-v2 cost before any signature is checked
+//!     (sighash v3, the only digest valid at/after the hardening activation,
+//!     is linear: MEM-5 residual closed by CRY-3);
 //!  3. known: already pooled, already confirmed, or recently rejected (a
 //!     replay costs one size-bounded hash);
 //!  4. standardness: canonical-encoding limits (VAL-12), MoneyRange (VAL-11),
 //!     no dust output (the consensus `Block::validate_dust` rule), no
-//!     zero-value output (policy: UTXO-set bloat, VAL-11 note);
-//!  5. conflicts: an input already spent by a pooled tx (first-seen wins —
+//!     zero-value output (policy: UTXO-set bloat, VAL-11 note), canonical
+//!     witnesses at EVERY height and the hybrid signature suite only
+//!     ([`check_standard_witnesses`], CRY-1/CRY-2 policy);
+//!  5. version: valid for the next block's height (the consensus
+//!     `core::sighash::check_tx_version` rule: version 3 from the hardening
+//!     activation height, never below it);
+//!  6. conflicts: an input already spent by a pooled tx (first-seen wins —
 //!     the explicit replacement rule is "no replacement", MEM-6);
-//!  6. duplicate inputs within the tx (C-R3-2);
-//!  7. UTXO presence (no unconfirmed parents: package relay is not supported);
-//!  8. coinbase maturity at the height of the NEXT block (selected-tip DAG
+//!  7. duplicate inputs within the tx (C-R3-2);
+//!  8. UTXO presence (no unconfirmed parents: package relay is not supported);
+//!  9. coinbase maturity at the height of the NEXT block (selected-tip DAG
 //!     height + 1, never `dag.block_count()`, MEM-4);
-//!  9. value: inputs ≥ outputs, MoneyRange of the input sum, consensus
+//! 10. value: inputs ≥ outputs, MoneyRange of the input sum, consensus
 //!     minimum fee, relay fee rate, rolling minimum fee (MEM-6);
-//! 10. scripts: pubkey hash then the hybrid signatures, LAST, with a bounded
+//! 11. scripts: the consensus input-script rule at the next block's height
+//!     ([`verify_input_scripts`]: witnesses, pubkey hash, signatures under
+//!     the digest the version selects), LAST, with a bounded
 //!     verified-signature cache shared with block validation.
 //!
 //! Rejections other than "missing inputs" are remembered in the mempool's
@@ -39,6 +47,7 @@
 
 use std::collections::HashSet;
 
+use crate::core::sighash::SighashVersion;
 use crate::core::{self, Transaction, TxOutput};
 use crate::mempool::{Mempool, MempoolError, MAX_TX_SIZE, MIN_RELAY_FEE_RATE};
 use crate::storage::Storage;
@@ -49,9 +58,11 @@ pub struct AdmissionPolicy {
     /// Header height of the block the transaction would be mined in (for
     /// coinbase maturity). `0` skips the maturity check (genesis-only node).
     pub next_block_height: u64,
-    /// Verify the hybrid signatures. `false` ONLY for re-injection of
-    /// transactions from disconnected blocks, whose signatures were verified
-    /// when the block was connected (signatures do not depend on chain state).
+    /// Verify the witnesses (standardness: canonical witness, hybrid suite)
+    /// and the signatures. `false` ONLY for re-injection of transactions from
+    /// disconnected blocks, whose witnesses and signatures were accepted when
+    /// the block was connected. The consensus version rule at
+    /// `next_block_height` applies either way.
     pub check_signatures: bool,
     /// Consult and update the recent-rejects filter.
     pub use_reject_filter: bool,
@@ -165,50 +176,65 @@ fn sig_cache() -> &'static parking_lot::Mutex<(HashSet<[u8; 32]>, std::collectio
     CACHE.get_or_init(|| parking_lot::Mutex::new((HashSet::new(), std::collections::VecDeque::new())))
 }
 
-fn sig_cache_key(tx: &Transaction) -> [u8; 32] {
+/// Cache key of a verified transaction. Version 1/2 (sighash v2): the wtxid
+/// fixes every sighash, signature and public key. Version 3 (sighash v3):
+/// the digests also commit to the spent outputs, so they are part of the key.
+fn sig_cache_key(tx: &Transaction, version: SighashVersion, prevouts: &[TxOutput]) -> [u8; 32] {
     use sha3::{Digest, Sha3_256};
     let mut h = Sha3_256::new();
-    h.update(b"gnb-sigcache-v1");
-    h.update(core::node_chain_id().to_le_bytes());
-    h.update(wtxid(tx));
+    match version {
+        SighashVersion::V2 => {
+            h.update(b"gnb-sigcache-v1");
+            h.update(core::node_chain_id().to_le_bytes());
+            h.update(wtxid(tx));
+        }
+        SighashVersion::V3 => {
+            h.update(b"gnb-sigcache-v3");
+            h.update(core::node_chain_id().to_le_bytes());
+            h.update(wtxid(tx));
+            for p in prevouts {
+                h.update(p.value.to_le_bytes());
+                h.update((p.script_pubkey.len() as u64).to_le_bytes());
+                h.update(&p.script_pubkey);
+            }
+        }
+    }
     h.finalize().into()
 }
 
-/// Verify every input's script against its prevout: the script_sig must parse
-/// as (sig, pubkey), the pubkey hash must equal the prevout's script_pubkey,
-/// and the hybrid signature must verify over the input's sighash.
+/// The hardening activation height the transaction rules are evaluated
+/// under (process-wide; a `scoped_override` on the calling thread in tests).
+fn activation_height() -> u64 {
+    core::activation::hardening_activation_height()
+}
+
+/// The consensus input-script rule of a non-coinbase transaction in a block
+/// at header height `block_height` — the ONE function block acceptance and
+/// connect (`accept::validate_tx_inputs`), reorg connect, template self-check
+/// and mempool admission (at the next block's height) all call:
 ///
-/// The (expensive) signature results are cached per (chain id, wtxid): the
-/// wtxid commits to the whole transaction including every script_sig, so the
-/// sighash, the signature and the public key of every input are fixed by it —
-/// a cache hit is exactly as good as re-verifying. The pubkey-hash binding to
-/// the prevout is re-checked on every call (it depends on the prevout, i.e. on
-/// the chain context). Only successes are cached.
-pub fn verify_input_scripts(tx: &Transaction, prevouts: &[TxOutput]) -> Result<(), String> {
-    use sha3::{Digest, Sha3_256};
-    if prevouts.len() != tx.inputs.len() {
-        return Err(format!("{} prevouts for {} inputs", prevouts.len(), tx.inputs.len()));
-    }
-    let mut parsed: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(tx.inputs.len());
-    for (i, (inp, prev)) in tx.inputs.iter().zip(prevouts).enumerate() {
-        let (sig, pk) = Transaction::parse_script_sig(&inp.script_sig)
-            .ok_or_else(|| format!("malformed script_sig at input {}", i))?;
-        let pk_hash = Sha3_256::digest(&pk)[..20].to_vec();
-        if pk_hash != prev.script_pubkey {
-            return Err(format!("pubkey mismatch at input {}", i));
-        }
-        parsed.push((sig, pk));
-    }
-    let key = sig_cache_key(tx);
+/// 1. version: `core::sighash::check_tx_version` (version 3 is invalid below
+///    the hardening activation; only version 3 is valid at/after it);
+/// 2. witnesses (`core::sighash::check_input_witnesses`): version 1/2 keep the
+///    historical lenient `script_sig` framing; version 3 requires the
+///    canonical witness (exact framing, enveloped canonical signature, CRY-1);
+///    the public key must hash to the spent `script_pubkey` (`prevouts[i]`);
+/// 3. signatures (`core::sighash::verify_input_signatures`): sighash v2 with
+///    the historical verifier, or sighash v3 (spent amounts and scripts, the
+///    suite and the input index committed; linear cost) with component-bound
+///    signatures (CRY-2, CRY-3).
+///
+/// Steps 1–2 run on every call (they depend on the height and the prevouts).
+/// The expensive signature results are cached (see [`sig_cache_key`]); only
+/// successes are cached.
+pub fn verify_input_scripts(tx: &Transaction, prevouts: &[TxOutput], block_height: u64) -> Result<(), String> {
+    let version = core::sighash::check_tx_version(tx.version, block_height, activation_height())?;
+    let witnesses = core::sighash::check_input_witnesses(tx, prevouts, version)?;
+    let key = sig_cache_key(tx, version, prevouts);
     if sig_cache().lock().0.contains(&key) {
         return Ok(());
     }
-    for (i, (sig, pk)) in parsed.iter().enumerate() {
-        let sighash = tx.sighash(i, core::node_chain_id());
-        if !crate::crypto::verify(pk, &sighash, sig) {
-            return Err(format!("invalid signature at input {}", i));
-        }
-    }
+    core::sighash::verify_input_signatures(tx, prevouts, &witnesses, version, core::node_chain_id())?;
     let mut g = sig_cache().lock();
     let (set, order) = &mut *g;
     if set.insert(key) {
@@ -253,7 +279,9 @@ fn check_structure_and_size(tx: &Transaction) -> Result<(), AdmissionError> {
     Ok(())
 }
 
-/// Step 3: canonical limits, MoneyRange, dust, zero-value outputs.
+/// Step 3: canonical limits, MoneyRange, dust, zero-value outputs. (The
+/// witness standardness of step 4 runs in [`check_transaction`] together with
+/// the signature policy.)
 fn check_policy(tx: &Transaction) -> Result<(), AdmissionError> {
     core::limits::check_tx_canonical_limits(tx).map_err(AdmissionError::Rejected)?;
     core::limits::check_tx_money_range(tx).map_err(AdmissionError::Rejected)?;
@@ -270,7 +298,44 @@ fn check_policy(tx: &Transaction) -> Result<(), AdmissionError> {
     Ok(())
 }
 
-/// Run every admission check (steps 1–10) WITHOUT inserting. Returns the fee.
+/// Witness standardness (relay policy at EVERY height; no signature math):
+///
+/// * CRY-1: every `script_sig` must be the canonical witness
+///   (`core::sighash::canonical_witness`: exactly
+///   `[u32 sig_len][sig][u32 pk_len][pk]`, enveloped canonical signature —
+///   compact Falcon half, exact ML-DSA length). Consensus requires it only
+///   for version 3 (at/after the activation); below it a non-canonical
+///   witness is still consensus-valid but is not relayed or mined from the
+///   pool, so third parties cannot malleate pooled transactions. Wallets
+///   always emit canonical witnesses.
+/// * CRY-2: the public key must name the hybrid suite
+///   (`crypto::is_hybrid_public_key`: suite 0x0001, or the raw legacy hybrid
+///   key of a carry-over address). Single-algorithm suite 0x0002 stays
+///   consensus-valid (outputs that may already be locked to such keys are not
+///   frozen) but is non-standard: no new 0x0002 spend enters the pool.
+pub fn check_standard_witnesses(tx: &Transaction) -> Result<(), String> {
+    for (i, inp) in tx.inputs.iter().enumerate() {
+        let (_sig, pk) = core::sighash::canonical_witness(&inp.script_sig)
+            .map_err(|e| format!("input {i}: {e} (non-standard)"))?;
+        if !crate::crypto::is_hybrid_public_key(pk) {
+            return Err(format!(
+                "input {i}: single-algorithm signature suite (non-standard; only the hybrid \
+                 ML-DSA-65 + Falcon-1024 suite 0x0001 is relayed)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Step 5: the consensus version rule at the next block's height (cheap; runs
+/// even when signatures are not checked, e.g. reorg re-injection, so a
+/// version-1 transaction is never re-admitted at/after the activation and a
+/// version-3 one never below it).
+pub fn check_version_for_next_block(tx: &Transaction, next_block_height: u64) -> Result<(), String> {
+    core::sighash::check_tx_version(tx.version, next_block_height, activation_height()).map(|_| ())
+}
+
+/// Run every admission check (steps 1–11) WITHOUT inserting. Returns the fee.
 /// `mempool = None` skips the pool-relative checks (known/conflict/rolling
 /// fee), which is what block-independent callers such as
 /// `validate_tx_standalone` want.
@@ -298,6 +363,13 @@ pub fn check_transaction(
     }
 
     check_policy(tx)?;
+    if policy.check_signatures {
+        // Witness standardness travels with the signature policy: a
+        // re-injected transaction was already mined (its witness accepted by
+        // consensus), relayed ones must be standard.
+        check_standard_witnesses(tx).map_err(AdmissionError::Rejected)?;
+    }
+    check_version_for_next_block(tx, policy.next_block_height).map_err(AdmissionError::Rejected)?;
 
     // Conflicts with the pool and duplicate inputs (cheap, no I/O).
     let mut seen: HashSet<([u8; 32], u32)> = HashSet::with_capacity(tx.inputs.len());
@@ -353,9 +425,9 @@ pub fn check_transaction(
         }
     }
 
-    // Signatures last (the only step whose cost grows with size²).
+    // Signatures last (the most expensive step).
     if policy.check_signatures {
-        verify_input_scripts(tx, &prevouts).map_err(AdmissionError::Rejected)?;
+        verify_input_scripts(tx, &prevouts, policy.next_block_height).map_err(AdmissionError::Rejected)?;
     }
     Ok(fee)
 }

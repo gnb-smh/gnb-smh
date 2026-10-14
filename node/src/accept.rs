@@ -180,7 +180,7 @@ fn validate_tx_in_view(
         }
         view.view_utxo(txid, idx)
     };
-    validate_tx_inputs(tx, &lookup, Some(spent_in_block))
+    validate_tx_inputs(tx, &lookup, Some(spent_in_block), current_height)
 }
 
 /// Full in-context validation of a block's transactions against `view` (the
@@ -268,6 +268,16 @@ pub fn update_mempool_after_connect(
     if !swept.is_empty() {
         info!("mempool: removed {} tx(s) conflicting with the connected block(s)", swept.len());
     }
+    // CRY-3 activation: after EVERY connect (extension or reorg) drop pooled
+    // transactions whose version is invalid for the next block (version 1/2
+    // once the next block is at/after the hardening activation; version 3
+    // after a reorg back below it). Cheap: no I/O, no signatures.
+    if !outcome.connected.is_empty() {
+        let stale = evict_version_invalid(mempool, next_height);
+        if stale > 0 {
+            info!("mempool: evicted {} tx(s) whose version is invalid at height {}", stale, next_height);
+        }
+    }
     if !outcome.disconnected.is_empty() {
         let candidates: Vec<core::Transaction> = outcome.disconnected.iter()
             .flat_map(|b| b.transactions.iter().filter(|t| !t.is_coinbase()).cloned())
@@ -283,12 +293,22 @@ pub fn update_mempool_after_connect(
     }
 }
 
+/// Drop every pooled tx whose version the consensus rule rejects in a block
+/// at `next_height` (`admission::check_version_for_next_block`). Returns how
+/// many were removed.
+pub fn evict_version_invalid(mempool: &mempool::Mempool, next_height: u64) -> usize {
+    mempool.retain_valid(|e| admission::check_version_for_next_block(&e.tx, next_height).is_ok())
+}
+
 /// MEM-3: drop every pooled tx that is no longer minable on the current
 /// UTXO set (an input missing, an immature coinbase input at `next_height`,
-/// or a fee below the consensus minimum). Signature-free and cheap. Returns
-/// how many were removed.
+/// a fee below the consensus minimum, or a version invalid at
+/// `next_height`). Signature-free and cheap. Returns how many were removed.
 pub fn revalidate_mempool(store: &storage::Storage, mempool: &mempool::Mempool, next_height: u64) -> usize {
     mempool.retain_valid(|e| {
+        if admission::check_version_for_next_block(&e.tx, next_height).is_err() {
+            return false;
+        }
         let mut total_in: u64 = 0;
         for inp in &e.tx.inputs {
             match store.get_utxo(&inp.prev_txid, inp.prev_index) {
@@ -863,13 +883,16 @@ pub fn reconcile_on_startup(
 
 /// Core input validation logic shared by all TX validation paths.
 /// Resolves each input's UTXO (rejecting duplicate outpoints), then checks
-/// every input script (pubkey hash vs prevout, hybrid signature — cached, see
+/// every input script under the rules of a block at header height
+/// `block_height` (version rule, witness, pubkey hash vs prevout, hybrid
+/// signature under the digest the version selects — cached, see
 /// `admission::verify_input_scripts`), value conservation and the consensus
 /// minimum fee. All amounts are MoneyRange-checked (VAL-11).
 pub fn validate_tx_inputs(
     tx:           &core::Transaction,
     utxo_lookup:  &dyn Fn(&[u8; 32], u32) -> Result<Option<core::TxOutput>, String>,
     mut spent_set: Option<&mut HashSet<([u8; 32], u32)>>,
+    block_height: u64,
 ) -> Result<u64, String> {
     let mut total_in = 0u64;
 
@@ -892,7 +915,7 @@ pub fn validate_tx_inputs(
         prevouts.push(utxo);
     }
 
-    admission::verify_input_scripts(tx, &prevouts)?;
+    admission::verify_input_scripts(tx, &prevouts, block_height)?;
 
     if let Some(spent) = spent_set.as_mut() {
         for inp in &tx.inputs {

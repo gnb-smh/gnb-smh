@@ -3004,7 +3004,7 @@ mod intra_tx_dup_tests {
         let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
             store.get_utxo(txid, idx).map_err(|e| e.to_string())
         };
-        let err = validate_tx_inputs(&tx, &lookup, None)
+        let err = validate_tx_inputs(&tx, &lookup, None, 1)
             .expect_err("intra-tx duplicate outpoint must be refused");
         assert!(err.contains("double-spend"), "got: {err}");
     }

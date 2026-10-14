@@ -102,8 +102,9 @@ obtain from a future timestamp to about 6%.
 3. `bits == expected_bits(parents, height)`;
 4. timestamp bounds;
 5. GnB-SMH proof (64 MiB, cached by block id);
-6. transactions (signatures, double spends, coinbase maturity at the block's
-   consensus height, consensus minimum fee), coinbase value.
+6. transactions (version rule, witnesses and signatures as specified in
+   "Transaction signatures" below, double spends, coinbase maturity at the
+   block's consensus height, consensus minimum fee), coinbase value.
 
 Structural checks (size, merkle root, coinbase shape, duplicates, dust) run
 before `accept_block` on every ingress path.
@@ -251,6 +252,190 @@ At the audit's 12,000-block scenario (dev profile), these changes reduced a
 deep side block from 10–26 s to 50–84 ms, a genesis sibling that forces a
 reindex from 46 s to 0.1 s, and the 1,000-block side-chain merge from 35 s to
 29 ms. After activation, that merge is rejected in under 1 ms.
+
+## Transaction signatures (sighash v2 and v3, hardening activation)
+
+The audit found that the signature digest was whatever a serialization
+library emitted and did not commit to the spent amounts or scripts (CRY-3,
+WAL-1), that its cost was quadratic in the transaction size (MEM-5), that a
+hybrid signature could be split into a valid ML-DSA-only signature (CRY-2),
+and that witnesses were malleable (CRY-1). The fixes below change validity, so
+the consensus parts take effect at the hardening activation height (mainnet
+110,000; testnet and regtest 0). The rules live in
+`crates/gnb-crypto/src/core/sighash.rs`; the node applies them through one
+function, `mempool::admission::verify_input_scripts`, which block acceptance
+and connect (`accept::validate_tx_inputs`), reorg connect, the template
+self-check and mempool admission all call.
+
+### Which height
+
+A transaction rule compares the HEADER height `h` of the block that contains
+the transaction (`Block::height`, which `accept_block` requires to equal the
+largest parent height + 1). Mempool admission uses the height of the next
+block on the selected tip (selected tip height + 1); templates use their own
+height; wallets use the node's `getdaginfo` `tip_height` + 1.
+
+### Version rule (consensus, non-coinbase transactions)
+
+| | version 3 | any other version |
+| --- | --- | --- |
+| `h` < activation | invalid | valid, sighash v2 |
+| `h` ≥ activation | valid, sighash v3 | invalid |
+
+The transaction's own `version` field selects the digest: 3 selects sighash
+v3, anything else sighash v2. Coinbase transactions are not signed and keep
+no version rule.
+
+Below the activation every rule of this section reproduces the previous code
+bit for bit, with one deliberate exception: a non-coinbase version-3
+transaction, which the previous code accepted with the v2 digest, is invalid.
+Nodes that predate the upgrade cannot verify a v3 digest, and with this rule a
+valid version-3 transaction always means sighash v3. No released signer ever
+produced version 3 (every wallet wrote version 1), so the exception only
+affects deliberately crafted transactions. It is a soft-fork tightening that
+upgraded nodes enforce from release. `node/tests/fix_signatures.rs`
+(`never_activated_regime_reproduces_the_old_verdicts`) proves the other
+pre-activation verdicts unchanged.
+
+Error strings for this rule start with `bad-txns-version`.
+
+### Sighash v2 (historical; unchanged)
+
+```text
+preimage = "GNB-SIGHASH-v1\0\0" (16 bytes) ‖ 0x01 ‖ chain_id u32 LE ‖ body
+body     = bincode-2 "standard" encoding of the transaction in which the
+           signed input's script_sig is "GNB_SIGHASH" (11 bytes) and every
+           other input's script_sig is empty
+sighash  = SHA3-256(preimage)
+```
+
+The bincode-2 standard encoding, spelled out so the digest no longer depends
+on the library:
+
+```text
+Transaction = varint(version) ‖ varint(n_inputs) ‖ TxInput* ‖ varint(n_outputs) ‖ TxOutput* ‖ varint(locktime)
+TxInput     = prev_txid (32 raw bytes) ‖ varint(prev_index) ‖ varint(len) ‖ script_sig ‖ varint(sequence)
+TxOutput    = varint(value) ‖ varint(len) ‖ script_pubkey
+varint(v)   = v                     if v ≤ 250
+            = 0xFB ‖ u16 LE(v)      if v ≤ 0xFFFF
+            = 0xFC ‖ u32 LE(v)      if v ≤ 0xFFFF_FFFF
+            = 0xFD ‖ u64 LE(v)      otherwise
+```
+
+An out-of-range input index puts the marker nowhere (historical; no signature
+is ever made for one). The cost is O(size) per input, O(size²) per
+transaction, bounded by the size limits; v2 is invalid from the activation.
+Chain ids: mainnet `0x474E0001`, testnet `0x474E0002`.
+
+### Sighash v3
+
+```text
+list_hash(tag, count, items) = SHA3-256( u8 len(tag) ‖ tag ‖ u32 LE count ‖ items )
+
+hash_prevouts  = list_hash("GNB-SIGHASH-v3/prevouts",  n_in,  for each input:  prev_txid (32) ‖ prev_index u32 LE)
+hash_sequences = list_hash("GNB-SIGHASH-v3/sequences", n_in,  for each input:  sequence u32 LE)
+hash_amounts   = list_hash("GNB-SIGHASH-v3/amounts",   n_in,  for each input:  spent value u64 LE)
+hash_scripts   = list_hash("GNB-SIGHASH-v3/scripts",   n_in,  for each input:  u32 LE len ‖ spent script_pubkey)
+hash_outputs   = list_hash("GNB-SIGHASH-v3/outputs",   n_out, for each output: value u64 LE ‖ u32 LE len ‖ script_pubkey)
+
+preimage (195 bytes) =
+      "GNB-SIGHASH-v3\0\0" (16) ‖ 0x03 (1) ‖ chain_id u32 LE (4)
+    ‖ version u32 LE (4) ‖ locktime u32 LE (4)
+    ‖ hash_prevouts ‖ hash_sequences ‖ hash_amounts ‖ hash_scripts ‖ hash_outputs  (5 × 32)
+    ‖ input_index u32 LE (4) ‖ suite_id u16 LE (2)
+sighash_v3 = SHA3-256(preimage)
+```
+
+- The "spent" value and script of input i are those of the output it spends
+  (from the UTXO set, or from an earlier transaction of the same block).
+- `input_index` must be below `n_in`; otherwise there is no digest and the
+  input is invalid. A wrong number of spent outputs is likewise an error.
+- `suite_id` is the suite in the signature's envelope.
+- The five list hashes are computed once per transaction, so signing or
+  verifying all inputs hashes O(size) bytes.
+- The digest commits to every spent amount and script: a wallet told a wrong
+  value or script signs a transaction every node rejects (WAL-1).
+- The witness (`script_sig`) is not committed, as before.
+
+### Signature binding
+
+Sighash v2 signatures (legacy binding): every component signs the 32-byte
+digest verbatim (`crypto::verify`, unchanged).
+
+Sighash v3 signatures (bound): component `c` of a suite-`s` signature signs
+
+```text
+"GNB-TXSIG-v3" (12) ‖ s u16 LE ‖ c (1) ‖ sighash_v3 (32)          (47 bytes)
+c = 0x01 for ML-DSA-65, 0x02 for Falcon-1024
+```
+
+Suite 0x0001 (hybrid) signature body: `mldsa_sig (3,309) ‖ falcon_sig`; both
+components must verify, each over its own message. Suite 0x0002 body: the
+3,309-byte ML-DSA-65 signature over its message. A key of one suite never
+verifies a signature of another. Because the suite is in every component
+message (and in the digest), stripping the Falcon half of a hybrid signature
+and relabelling it 0x0002 never verifies (`crypto::verify_bound`).
+
+### Witnesses
+
+`script_sig` = `[u32 LE sig_len][sig][u32 LE pk_len][pk]`, and the public key
+must hash to the spent output: `SHA3-256(pk)[0..20] == script_pubkey`.
+
+- Version 1/2 (sighash v2, below the activation; unchanged): bytes after
+  `pk` are ignored; `sig` may lack the envelope (it is then read as hybrid)
+  and its Falcon half may use the 1,280-byte zero-padded form.
+- Version 3 (sighash v3, so every non-coinbase transaction from the
+  activation): the canonical witness is required. `script_sig` is exactly the
+  framing above with no trailing bytes, and `sig` has its single canonical
+  encoding (`crypto::is_canonical_signature_encoding`): the 4-byte envelope
+  `B1 0C ‖ suite u16 LE` is present and names suite 0x0001 or 0x0002; for
+  0x0001 the Falcon half is the COMPACT encoding (header byte 0x3A, 40-byte
+  nonce, exactly framed coefficients, zero padding bits, nothing after it, at
+  most 1,462 bytes); for 0x0002 the body is exactly 3,309 bytes.
+- The PUBLIC key is never required to carry an envelope: genesis carry-over
+  addresses commit to the raw 3,745-byte hybrid key, which keeps verifying as
+  suite 0x0001 (exact length decides; an enveloped key is 4 bytes longer).
+
+The block-level witness commitment is specified separately.
+
+### Suite 0x0002 (ML-DSA-65 only)
+
+Consensus-valid at every height: outputs may already be locked to 0x0002 keys
+(anyone could lock funds to such a key before this change), and making the
+suite invalid would freeze them. It is non-standard: mempool admission refuses
+every input whose key is not hybrid (`crypto::is_hybrid_public_key`), and
+wallets never sign with such a key. A holder of a 0x0002 output needs a miner
+to include the spend directly.
+
+### Relay policy (all heights)
+
+Mempool admission (gossip, RPC; not reorg re-injection of already-mined
+transactions) additionally requires, at every height, the canonical witness of
+every input and a hybrid public key. Transactions are admitted only if valid
+for the next block's height. After every connect, pooled transactions whose
+version is invalid at the new next height are evicted (a version-1
+transaction admitted for block H-1 is mined in H-1 or evicted when the next
+block is H); the template self-check applies the version rule at the template
+height.
+
+### Signers
+
+Every signer (the `gnb-crypto` wallet API, `gnb-cli send`, `gnb-wallet send`,
+`WalletClient::send`, the browser wallet core) learns the next block's height
+from the node (`getdaginfo`: `tip_height` + 1) and produces version 3 with
+sighash v3 and bound signatures at/after the activation of its chain, and
+version 1 with sighash v2 below it. Without the height they refuse to sign.
+Below the activation, wallets still fetch the previous transactions to verify
+claimed values; under v3 that is unnecessary.
+
+### Vectors
+
+`reference/gnb_sighash.py` is the normative reference for both digests and the
+component messages. `reference/sighash_vectors.json` holds its golden vectors:
+many inputs, empty scripts, maximum field values, long scripts, every suite
+id, both chain ids, the out-of-range and spent-count errors, and random
+transactions. `crates/gnb-crypto/tests/sighash_vectors.rs` pins them, and
+CI regenerates the file and diffs it.
 
 ## Mining
 
