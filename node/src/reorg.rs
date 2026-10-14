@@ -292,12 +292,19 @@ pub fn apply_block_utxo_mutations(
     for tx in &block.transactions {
         let txid = tx.txid();
 
+        // VAL-2: capture every row this block replaces (restored on rollback).
+        if let Ok(Some((prev_block, prev_height))) = store.get_tx_location(&txid) {
+            undo.overwritten.tx_index.push((txid, prev_block, prev_height));
+        }
         store.put_tx_index(&txid, &block_hash, block.height)
             .map_err(|e| format!("apply_block_utxo_mutations: put_tx_index failed for {}: {}",
                 hex::encode(txid), e))?;
         undo.tx_index_keys.push(txid);
 
         for (j, out) in tx.outputs.iter().enumerate() {
+            if let Ok(Some(prev)) = store.get_utxo(&txid, j as u32) {
+                undo.overwritten.utxos.push(UndoEntry { prev_txid: txid, prev_index: j as u32, output: prev });
+            }
             store.put_utxo(&txid, j as u32, out)
                 .map_err(|e| format!("apply_block_utxo_mutations: put_utxo failed for {}:{}: {}",
                     hex::encode(txid), j, e))?;
@@ -305,6 +312,9 @@ pub fn apply_block_utxo_mutations(
         }
 
         if tx.is_coinbase() {
+            if let Ok(Some(prev_height)) = store.get_coinbase_height(&txid) {
+                undo.overwritten.coinbase_heights.push((txid, prev_height));
+            }
             store.put_coinbase_info(&txid, block.height)
                 .map_err(|e| format!("apply_block_utxo_mutations: put_coinbase_info failed for {}: {}",
                     hex::encode(txid), e))?;
@@ -425,6 +435,9 @@ struct ReorgBatch<'a> {
     utxo_overlay: HashMap<Vec<u8>, Option<TxOutput>>,
     /// coinbase txid → Some(height) if staged-put, None if staged-deleted.
     coinbase_overlay: HashMap<[u8; 32], Option<u64>>,
+    /// txid → Some((block, height)) if staged-put, None if staged-deleted
+    /// (read back when a block replaces a tx-index row, audit VAL-2).
+    tx_index_overlay: HashMap<[u8; 32], Option<([u8; 32], u64)>>,
 }
 
 impl<'a> ReorgBatch<'a> {
@@ -434,6 +447,7 @@ impl<'a> ReorgBatch<'a> {
             batch: rocksdb::WriteBatch::default(),
             utxo_overlay: HashMap::new(),
             coinbase_overlay: HashMap::new(),
+            tx_index_overlay: HashMap::new(),
         }
     }
 
@@ -458,6 +472,15 @@ impl<'a> ReorgBatch<'a> {
         }
         self.store.get_coinbase_height(txid)
             .map_err(|e| format!("reorg batch: get_coinbase_height failed: {}", e))
+    }
+
+    /// Overlay-aware tx-index read.
+    fn get_tx_location(&self, txid: &[u8; 32]) -> Result<Option<([u8; 32], u64)>, String> {
+        if let Some(staged) = self.tx_index_overlay.get(txid) {
+            return Ok(*staged);
+        }
+        self.store.get_tx_location(txid)
+            .map_err(|e| format!("reorg batch: get_tx_location failed: {}", e))
     }
 
     /// Mirrors `Storage::put_utxo` (CF_UTXO row + CF_ADDR_UTXO index row).
@@ -512,18 +535,21 @@ impl<'a> ReorgBatch<'a> {
         val.extend_from_slice(block_hash);
         val.extend_from_slice(&height.to_le_bytes());
         self.batch.put_cf(cf, txid, &val);
+        self.tx_index_overlay.insert(*txid, Some((*block_hash, height)));
         Ok(())
     }
 
     fn delete_tx_index(&mut self, txid: &[u8; 32]) -> Result<(), String> {
         let cf = self.cf(CF_TX_INDEX)?;
         self.batch.delete_cf(cf, txid);
+        self.tx_index_overlay.insert(*txid, None);
         Ok(())
     }
 
-    /// Mirrors `Storage::put_undo_data`.
+    /// Mirrors `Storage::put_undo_data` (`UndoData::to_bytes`: the legacy
+    /// encoding plus the VAL-2 extension when the block replaced a row).
     fn put_undo_data(&mut self, block_hash: &[u8; 32], data: &UndoData) -> Result<(), String> {
-        let encoded = bc_encode(data)?;
+        let encoded = data.to_bytes().map_err(|e| format!("reorg batch: {}", e))?;
         let cf = self.cf(CF_UNDO)?;
         self.batch.put_cf(cf, block_hash, &encoded);
         Ok(())
@@ -611,19 +637,31 @@ fn rollback_block_batched(
         batch.put_utxo(&entry.prev_txid, entry.prev_index, &entry.output)?;
     }
 
-    // 3. Delete created UTXOs (also cleans the CF_ADDR_UTXO row).
+    // 3. Delete created UTXOs (also cleans the CF_ADDR_UTXO row), then
+    //    restore the coins those outputs overwrote (audit VAL-2: a node that
+    //    applied and disconnected the block must end with the UTXO set of a
+    //    node that never applied it).
     for (txid, idx) in &undo.created_utxo_keys {
         batch.delete_utxo(txid, *idx)?;
     }
+    for entry in &undo.overwritten.utxos {
+        batch.put_utxo(&entry.prev_txid, entry.prev_index, &entry.output)?;
+    }
 
-    // 4. Delete coinbase-info rows.
+    // 4. Delete coinbase-info rows, restore the ones they replaced.
     for txid in &undo.coinbase_txids {
         batch.delete_coinbase_info(txid)?;
     }
+    for (txid, height) in &undo.overwritten.coinbase_heights {
+        batch.put_coinbase_info(txid, *height)?;
+    }
 
-    // 5. Delete tx_index rows.
+    // 5. Delete tx_index rows, restore the ones they replaced.
     for txid in &undo.tx_index_keys {
         batch.delete_tx_index(txid)?;
+    }
+    for (txid, prev_block, prev_height) in &undo.overwritten.tx_index {
+        batch.put_tx_index(txid, prev_block, *prev_height)?;
     }
 
     // 6. Delete the undo record itself.
@@ -660,15 +698,27 @@ fn apply_block_utxo_mutations_batched(
     for tx in &block.transactions {
         let txid = tx.txid();
 
+        // VAL-2: capture every row this block replaces, through the overlay
+        // (an earlier block of the same plan may have staged it). Restored by
+        // `rollback_block_batched` after the block's own rows are deleted.
+        if let Some((prev_block, prev_height)) = batch.get_tx_location(&txid)? {
+            undo.overwritten.tx_index.push((txid, prev_block, prev_height));
+        }
         batch.put_tx_index(&txid, &block_hash, block.height)?;
         undo.tx_index_keys.push(txid);
 
         for (j, out) in tx.outputs.iter().enumerate() {
+            if let Some(prev) = batch.get_utxo(&txid, j as u32)? {
+                undo.overwritten.utxos.push(UndoEntry { prev_txid: txid, prev_index: j as u32, output: prev });
+            }
             batch.put_utxo(&txid, j as u32, out)?;
             undo.created_utxo_keys.push((txid, j as u32));
         }
 
         if tx.is_coinbase() {
+            if let Some(prev_height) = batch.get_coinbase_height(&txid)? {
+                undo.overwritten.coinbase_heights.push((txid, prev_height));
+            }
             batch.put_coinbase_info(&txid, block.height)?;
             undo.coinbase_txids.push(txid);
         } else {

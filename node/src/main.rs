@@ -1555,9 +1555,12 @@ async fn main() {
                 // consensus size rule, each re-validated against the UTXO set
                 // (offenders are evicted from the mempool); coinbase fees
                 // recomputed from the UTXO set (N-7 duplicate-outpoint safe).
-                // Coinbase reserve: our own coinbase at its widest encoding.
-                let cb_reserve = template::miner_coinbase(u64::MAX, u64::MAX, miner_spk.clone())
-                    .actual_size();
+                // Coinbase reserve: our own coinbase at its widest encoding,
+                // including the 80-byte hardening commitment, in the larger
+                // of the two size measures (valid on both sides of the
+                // activation). `assemble_block` writes the commitment and the
+                // tagged Merkle root when the template's height requires them.
+                let cb_reserve = template::miner_coinbase_reserve(&miner_spk);
                 let tmpl = match template::build_block_template(&dag_m, &store_m, &mem_m, cb_reserve) {
                     Ok(t) => t,
                     Err(e) => {

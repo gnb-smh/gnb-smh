@@ -10,11 +10,14 @@
 //! "disqualified from chain" status:
 //!
 //! **Acceptance** (every block, any arrival order): parents known, header
-//! height = max parent DAG height + 1, expected ASERT bits, timestamp, proof of
-//! work, and the context-free consensus checks (canonical-encoding limits,
-//! MoneyRange; the structural checks run in `validate_structure` before this
-//! function). A failure here is context-free, so every node rejects the block
-//! and it is never stored. A block that passes is inserted into GhostDAG and
+//! height = max parent DAG height + 1, expected ASERT bits, timestamp, at/after
+//! the hardening activation the context-free block rules of
+//! `core::block_rules` (wire size, tagged Merkle root, 64-byte transactions,
+//! coinbase height / parents / witness commitment), proof of work, and the
+//! context-free consensus checks (canonical-encoding limits, MoneyRange; the
+//! structural checks run in `validate_structure` before this function). A
+//! failure here is context-free, so every node rejects the block and it is
+//! never stored. A block that passes is inserted into GhostDAG and
 //! its body is stored — fork-losers included — WITHOUT validating its
 //! transactions against the current tip's UTXO set.
 //!
@@ -162,15 +165,25 @@ fn stage_dag_record_for(
 
 /// Validate `tx` (the transaction at index `idx` of `block`) against `view`
 /// plus the outputs of the transactions STRICTLY BEFORE it in the block
-/// (`earlier`). Coinbase maturity uses the block's header height. Returns the
-/// fee.
+/// (`earlier`). Coinbase maturity uses the block's header height. When
+/// `same_block_coinbase` is `Some` (hardening rules, audit VAL-3) an input
+/// spending that coinbase's outputs is rejected. Returns the fee.
 fn validate_tx_in_view(
     tx: &core::Transaction,
     view: &dyn UtxoView,
     earlier: &HashMap<([u8; 32], u32), core::TxOutput>,
     spent_in_block: &mut HashSet<([u8; 32], u32)>,
     current_height: u64,
+    same_block_coinbase: Option<&[u8; 32]>,
 ) -> Result<u64, String> {
+    if let Some(cb) = same_block_coinbase {
+        if let Some(i) = tx.inputs.iter().position(|inp| &inp.prev_txid == cb) {
+            return Err(format!(
+                "coinbase maturity: input {} spends the coinbase of its own block (0 confirmations, need {})",
+                i, core::COINBASE_MATURITY
+            ));
+        }
+    }
     core::check_coinbase_maturity(tx, current_height, |txid| {
         view.view_coinbase_height(txid).ok().flatten()
     })?;
@@ -189,16 +202,64 @@ fn validate_tx_in_view(
 /// coinbase value against subsidy + fees. The rules are exactly the ones the
 /// pre-fix `accept_block` applied to an extension block; the difference is
 /// only WHICH state a block is checked against (its own, never the tip's).
+///
+/// THE shared connect-time rule: the acceptance pipeline calls it for an
+/// extension and for every block of a reorg (`reorg::connect_plan`), under
+/// the process-wide hardening activation height (see
+/// [`validate_block_in_view_at`] for the rules that change there).
 pub fn validate_block_in_view(view: &dyn UtxoView, block: &core::Block) -> Result<(), String> {
+    validate_block_in_view_at(view, block, core::activation::hardening_activation_height())
+}
+
+/// [`validate_block_in_view`] for an explicit activation height. At/after
+/// the activation (`core::block_rules::rules_active_at(block.height, ..)`):
+///
+/// * **BIP30 (audit VAL-2)**: no output of the block may have the outpoint of
+///   a coin that is unspent in `view` (the parent's state), checked for every
+///   transaction, the coinbase included, before any transaction is validated;
+/// * **no same-block coinbase spend (audit VAL-3)**: the coinbase's outputs
+///   are not in the in-block prevout map, and an input spending them is
+///   rejected as a coinbase-maturity violation.
+///
+/// Below the activation both rules are absent, exactly as before.
+pub fn validate_block_in_view_at(
+    view: &dyn UtxoView,
+    block: &core::Block,
+    activation_height: u64,
+) -> Result<(), String> {
     let height = block.height;
+    let hardened = core::block_rules::rules_active_at(height, activation_height);
+    if hardened {
+        for tx in &block.transactions {
+            let txid = tx.txid();
+            for j in 0..tx.outputs.len() as u32 {
+                if view.view_utxo(&txid, j)?.is_some() {
+                    return Err(format!(
+                        "BIP30: output {}:{} would overwrite an unspent coin",
+                        hex::encode(&txid[..8]), j
+                    ));
+                }
+            }
+        }
+    }
+    let same_block_coinbase = if hardened {
+        block.transactions.first().map(|cb| cb.txid())
+    } else {
+        None
+    };
     let mut spent_in_block: HashSet<([u8; 32], u32)> = HashSet::new();
     let mut earlier: HashMap<([u8; 32], u32), core::TxOutput> = HashMap::new();
     let mut total_fees: u64 = 0;
     for (i, tx) in block.transactions.iter().enumerate() {
         if i > 0 {
-            let fee = validate_tx_in_view(tx, view, &earlier, &mut spent_in_block, height)?;
+            let fee = validate_tx_in_view(
+                tx, view, &earlier, &mut spent_in_block, height, same_block_coinbase.as_ref(),
+            )?;
             total_fees = core::limits::money_add(total_fees, fee)
                 .map_err(|e| format!("block fee sum: {}", e))?;
+        }
+        if hardened && i == 0 {
+            continue; // VAL-3: the coinbase's outputs are not spendable in its own block
         }
         let txid = tx.txid();
         for (j, o) in tx.outputs.iter().enumerate() {
@@ -300,6 +361,11 @@ pub fn revalidate_mempool(store: &storage::Storage, mempool: &mempool::Mempool, 
             }
         }
         if core::check_coinbase_maturity(&e.tx, next_height, |t| store.get_coinbase_height(t).ok().flatten()).is_err() {
+            return false;
+        }
+        if core::block_rules::rules_active(next_height)
+            && core::block_rules::check_tx_not_64_bytes(&e.tx).is_err()
+        {
             return false;
         }
         match core::limits::check_tx_money_range(&e.tx) {
@@ -567,6 +633,17 @@ pub fn accept_block(
         block.validate_timestamp(parent_ts)
             .map_err(|e| format!("timestamp rejected: {}", e))?;
     }
+
+    // ── Hardening block rules (context-free; the header height is now
+    //    verified). At/after the activation: wire-size limit, tagged Merkle
+    //    root, no 64-byte transaction, coinbase height / parents / witness
+    //    commitment (audit VAL-2, VAL-10, VAL-12, CRY-1). Checked BEFORE the
+    //    block is stored and before any signature work, so a block whose
+    //    witnesses were altered in transit (same block id) is refused without
+    //    a trace, and the honest copy of that id is still accepted later. A
+    //    no-op below the activation.
+    core::block_rules::check_block_hardened_at(block, core::activation::hardening_activation_height())
+        .map_err(|e| format!("consensus rejection: {}", e))?;
 
     // ── Proof of work (expensive: 64 MiB GnB-SMH, cached by block id) ─
     if !block.validate_pow() {
@@ -976,15 +1053,19 @@ pub fn validate_tx_in_block_with_maturity(
     let cutoff = block.transactions.iter()
         .position(|t| t.txid() == tx_txid)
         .unwrap_or(block.transactions.len());
+    // Same gate as `validate_block_in_view` (audit VAL-3).
+    let hardened = core::block_rules::rules_active(block.height);
+    let same_block_coinbase = if hardened { block.transactions.first().map(|cb| cb.txid()) } else { None };
     let earlier: HashMap<([u8; 32], u32), core::TxOutput> = block.transactions[..cutoff]
         .iter()
+        .filter(|t| !(hardened && t.is_coinbase()))
         .flat_map(|t| {
             let txid = t.txid();
             t.outputs.iter().enumerate().map(move |(i, o)| ((txid, i as u32), o.clone()))
         })
         .collect();
     let view: &storage::Storage = store;
-    validate_tx_in_view(tx, view, &earlier, spent_in_block, current_height)
+    validate_tx_in_view(tx, view, &earlier, spent_in_block, current_height, same_block_coinbase.as_ref())
 }
 
 /// Standalone tx validation (no mempool context): the shared admission rules

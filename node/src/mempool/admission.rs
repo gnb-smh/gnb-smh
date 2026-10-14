@@ -21,7 +21,9 @@
 //!     replay costs one size-bounded hash);
 //!  4. standardness: canonical-encoding limits (VAL-12), MoneyRange (VAL-11),
 //!     no dust output (the consensus `Block::validate_dust` rule), no
-//!     zero-value output (policy: UTXO-set bloat, VAL-11 note);
+//!     zero-value output (policy: UTXO-set bloat, VAL-11 note); at/after the
+//!     hardening activation (judged at the next block's height) no 64-byte
+//!     txid preimage (VAL-10);
 //!  5. conflicts: an input already spent by a pooled tx (first-seen wins —
 //!     the explicit replacement rule is "no replacement", MEM-6);
 //!  6. duplicate inputs within the tx (C-R3-2);
@@ -298,6 +300,14 @@ pub fn check_transaction(
     }
 
     check_policy(tx)?;
+
+    // Hardening rule (audit VAL-10), judged at the height of the block the
+    // transaction would be mined in: a 64-byte txid preimage can never be
+    // mined at/after the activation, so it is never pooled there.
+    if core::block_rules::rules_active(policy.next_block_height) {
+        core::block_rules::check_tx_not_64_bytes(tx)
+            .map_err(|e| AdmissionError::Rejected(e.to_string()))?;
+    }
 
     // Conflicts with the pool and duplicate inputs (cheap, no I/O).
     let mut seen: HashSet<([u8; 32], u32)> = HashSet::with_capacity(tx.inputs.len());

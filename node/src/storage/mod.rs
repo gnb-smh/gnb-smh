@@ -1060,7 +1060,10 @@ impl Storage {
         -> Result<(), StorageError>
     {
         let cf = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
-        self.db.put_cf(&cf, block_hash, &encode(data)?)
+        // `UndoData::to_bytes`: the legacy encoding, plus the overwritten-rows
+        // extension only when the block replaced something (audit VAL-2).
+        let bytes = data.to_bytes().map_err(StorageError::SerializeFailed)?;
+        self.db.put_cf(&cf, block_hash, &bytes)
             .map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
@@ -1071,7 +1074,8 @@ impl Storage {
     {
         let cf = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
         match self.db.get_cf(&cf, block_hash).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
-            Some(d) => Ok(Some(decode(&d)?)),
+            // Records written before the VAL-2 extension decode unchanged.
+            Some(d) => Ok(Some(crate::core::UndoData::from_bytes(&d).map_err(StorageError::DeserializeFailed)?)),
             None    => Ok(None),
         }
     }
@@ -1203,12 +1207,20 @@ impl Storage {
         for (txid, idx) in &undo.created_utxo_keys {
             let _ = self.delete_utxo(txid, *idx);
         }
+        //    VAL-2: restore the coins those outputs overwrote (same outpoint),
+        //    so the UTXO set equals that of a node that never applied the block.
+        for entry in &undo.overwritten.utxos {
+            let _ = self.put_utxo(&entry.prev_txid, entry.prev_index, &entry.output);
+        }
 
         // 7. Delete coinbase-info entries for any coinbase txs this block
         //    introduced. A reverted coinbase must not be treated as mature
         //    by downstream validation.
         for txid in &undo.coinbase_txids {
             let _ = self.delete_coinbase_info(txid);
+        }
+        for (txid, height) in &undo.overwritten.coinbase_heights {
+            let _ = self.put_coinbase_info(txid, *height);
         }
 
         // 8. Delete tx_index entries. After rollback the txid is no longer
@@ -1217,6 +1229,9 @@ impl Storage {
         //    to the mempool.
         for txid in &undo.tx_index_keys {
             let _ = self.delete_tx_index(txid);
+        }
+        for (txid, block, height) in &undo.overwritten.tx_index {
+            let _ = self.put_tx_index(txid, block, *height);
         }
 
         // 9. Finally, delete the undo record itself. Must be last: if any

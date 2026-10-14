@@ -6,11 +6,20 @@
 //!   used EVERY tip, so more than 256 tips made every template invalid
 //!   (`too many parents`) with nobody able to merge them (DAG-2).
 //! * Transactions: highest fee rate first under a BYTE budget measured exactly
-//!   as the consensus rule measures (`Block::size_bytes`, bincode): the
-//!   budget is `MAX_BLOCK_SIZE` minus an upper bound of the header and block
-//!   framing (every varint at its maximum width) minus a coinbase reserve. A
+//!   as the consensus rule measures AT THE TEMPLATE'S HEIGHT (bincode
+//!   `Block::size_bytes` below the hardening activation, the canonical wire
+//!   encoding `Block::wire_size` at/after it, audit VAL-12): the budget is
+//!   `MAX_BLOCK_SIZE` minus an upper bound of the header and block framing
+//!   (every varint at its maximum width) minus a coinbase reserve. A
 //!   count-only cap let ~116 ordinary transactions push every template past
 //!   `MAX_BLOCK_SIZE` (MEM-2).
+//! * Hardening rules (docs/CONSENSUS.md, "Block rules at the hardening
+//!   activation"): a template at/after the activation height gets the
+//!   tagged Merkle root and a coinbase whose `script_sig` starts with the
+//!   80-byte commitment (height, parents, witness root) —
+//!   [`assemble_block`] writes it — and never contains a 64-byte
+//!   transaction or a spend of its own coinbase (inputs must be in the UTXO
+//!   set). A template below the height is built exactly as before.
 //! * Self-check: every selected transaction is re-validated against the
 //!   current UTXO set (standardness, inputs present and not already used by
 //!   the template, coinbase maturity at the template height, MoneyRange,
@@ -60,11 +69,48 @@ pub struct BlockTemplate {
     pub evicted: usize,
     /// The byte budget the transactions were selected under.
     pub tx_byte_budget: usize,
+    /// The hardening activation height the template was built under.
+    pub activation_height: u64,
+    /// Whether the hardening block rules apply at `height`.
+    pub hardened: bool,
 }
 
-/// Upper bound of the bincode size of a block with these parents and NO
-/// transactions: every variable-width integer at its widest encoding.
-fn framing_upper_bound(parents: &[BlockHash]) -> usize {
+impl BlockTemplate {
+    /// The 80-byte coinbase commitment a block built from this template must
+    /// carry at the start of its coinbase `script_sig` (`None` below the
+    /// activation, where the `script_sig` is free-form).
+    pub fn coinbase_commitment(&self) -> Option<[u8; core::block_rules::COINBASE_COMMITMENT_LEN]> {
+        if !self.hardened {
+            return None;
+        }
+        // The witness root ignores position 0 (the coinbase).
+        let placeholder = Transaction { version: 0, inputs: vec![], outputs: vec![], locktime: 0 };
+        let txs: Vec<Transaction> = std::iter::once(placeholder)
+            .chain(self.transactions.iter().map(|(t, _)| t.clone()))
+            .collect();
+        Some(core::block_rules::coinbase_commitment(
+            self.height, &self.parents, &core::block_rules::witness_root(&txs)))
+    }
+
+    /// The sibling hashes from the coinbase leaf to the header Merkle root,
+    /// under the rule of the template's height.
+    pub fn coinbase_merkle_branch(&self) -> Vec<[u8; 32]> {
+        let ids: Vec<[u8; 32]> = std::iter::once([0u8; 32])
+            .chain(self.transactions.iter().map(|(t, _)| t.txid()))
+            .collect();
+        core::block_rules::coinbase_merkle_branch(&ids, self.hardened)
+    }
+}
+
+/// Upper bound of the size of a block with these parents and NO
+/// transactions, in the measure of the regime (wire when `hardened`,
+/// bincode otherwise): every variable-width integer at its widest encoding.
+fn framing_upper_bound(parents: &[BlockHash], hardened: bool) -> usize {
+    if hardened {
+        // header (fixed fields + parents varint + parents) + tx-count varint
+        // (at most 9) + shielded-count varint (1: templates carry none).
+        return 4 + 9 + 32 * parents.len() + 32 + 8 + 4 + 8 + 8 + 8 + 9 + 1;
+    }
     let empty = Block {
         header: BlockHeader {
             version: u32::MAX,
@@ -85,7 +131,9 @@ fn framing_upper_bound(parents: &[BlockHash]) -> usize {
 
 /// The node's own coinbase for `height` paying `value` to `script_pubkey`.
 /// Height plus a random tag: two blocks at the same height (common in a DAG)
-/// must never share a coinbase txid.
+/// must never share a coinbase txid. At/after the hardening activation
+/// [`assemble_block`] prefixes this `script_sig` with the 80-byte commitment
+/// (the tag stays as the miner's extra bytes).
 pub fn miner_coinbase(height: u64, value: u64, script_pubkey: Vec<u8>) -> Transaction {
     Transaction {
         version: 1,
@@ -98,6 +146,18 @@ pub fn miner_coinbase(height: u64, value: u64, script_pubkey: Vec<u8>) -> Transa
         outputs: vec![TxOutput { value, script_pubkey }],
         locktime: 0,
     }
+}
+
+/// Bytes the miner reserves for its own coinbase: the widest coinbase it can
+/// build (maximal value and tag, plus the 80-byte hardening commitment) in
+/// the larger of the two size measures, so the reserve holds on both sides of
+/// the activation.
+pub fn miner_coinbase_reserve(script_pubkey: &[u8]) -> usize {
+    let mut cb = miner_coinbase(u64::MAX, u64::MAX, script_pubkey.to_vec());
+    let mut ss = vec![0xFF; core::block_rules::COINBASE_COMMITMENT_LEN];
+    ss.extend_from_slice(&cb.inputs[0].script_sig);
+    cb.inputs[0].script_sig = ss;
+    cb.actual_size().max(cb.wire_size(true))
 }
 
 /// Build a template on the current DAG / UTXO / mempool state.
@@ -161,9 +221,13 @@ pub fn build_block_template_with(
     };
     let bits = crate::pow::expected_bits(parent_ts, height)
         .map_err(|e| format!("expected bits not derivable: {}", e))?;
+    // The rules of the template's height (header height, as accept_block
+    // will judge the block).
+    let activation_height = core::activation::hardening_activation_height();
+    let hardened = core::block_rules::rules_active_at(height, activation_height);
 
     let budget = core::MAX_BLOCK_SIZE
-        .saturating_sub(framing_upper_bound(&parents))
+        .saturating_sub(framing_upper_bound(&parents, hardened))
         .saturating_sub(coinbase_reserve);
 
     // Fee-rate order, byte budget, self-check, eviction.
@@ -172,11 +236,14 @@ pub fn build_block_template_with(
     let mut selected: Vec<(Transaction, u64)> = Vec::new();
     let mut total_fees: u64 = 0;
     let mut evict: HashSet<[u8; 32]> = HashSet::new();
-    for (tx, _pool_fee, size) in mempool.entries_by_fee_rate() {
+    for (tx, _pool_fee, pool_size) in mempool.entries_by_fee_rate() {
+        // The pool records bincode sizes; the consensus measure at/after the
+        // activation is the wire encoding (VAL-12).
+        let size = if hardened { tx.wire_size(true) } else { pool_size };
         if used.saturating_add(size) > budget {
             continue; // a smaller, lower-rate tx may still fit
         }
-        match self_check(store, &tx, height, &spent_by_template, options.verify_scripts) {
+        match self_check(store, &tx, height, &spent_by_template, options.verify_scripts, hardened) {
             Ok(fee) => {
                 let new_total = match core::limits::money_add(total_fees, fee) {
                     Ok(t) => t,
@@ -213,6 +280,8 @@ pub fn build_block_template_with(
         subsidy: core::tokenomics::block_subsidy_sat(height),
         evicted,
         tx_byte_budget: budget,
+        activation_height,
+        hardened,
     })
 }
 
@@ -231,8 +300,14 @@ fn self_check(
     height: u64,
     spent_by_template: &HashSet<([u8; 32], u32)>,
     verify_scripts: bool,
+    hardened: bool,
 ) -> Result<u64, TemplateReject> {
     admission::check_standard(tx).map_err(|e| TemplateReject::Evict(e.to_string()))?;
+    if hardened {
+        // Pooled before the activation, unminable from it (VAL-10).
+        core::block_rules::check_tx_not_64_bytes(tx)
+            .map_err(|e| TemplateReject::Evict(e.to_string()))?;
+    }
     let mut seen: HashSet<([u8; 32], u32)> = HashSet::new();
     let mut total_in: u64 = 0;
     let mut prevouts: Vec<TxOutput> = Vec::with_capacity(tx.inputs.len());
@@ -272,18 +347,25 @@ fn self_check(
 
 /// Assemble the candidate block for `template` with the given coinbase, and
 /// run the context-free consensus checks a mined block must pass (size,
-/// parents, dust, duplicates, canonical limits, MoneyRange, coinbase value).
-/// The returned block still needs a nonce.
+/// parents, dust, duplicates, canonical limits, MoneyRange, coinbase value,
+/// and at/after the activation the hardening rules). The returned block
+/// still needs a nonce.
+///
+/// At/after the hardening activation the coinbase's `script_sig` is
+/// rewritten to `commitment || extra`, where `extra` is the caller's
+/// `script_sig` (with a leading commitment, if the caller already wrote one,
+/// removed): every in-process producer that goes through this function emits
+/// a valid coinbase on both sides of the boundary. The header Merkle root
+/// follows the rule of the template's height.
 pub fn assemble_block(template: &BlockTemplate, coinbase: Transaction, timestamp: u64) -> Result<Block, String> {
     let all: Vec<Transaction> = std::iter::once(coinbase)
         .chain(template.transactions.iter().map(|(t, _)| t.clone()))
         .collect();
-    let merkle = Transaction::merkle_root(&all);
-    let block = Block {
+    let mut block = Block {
         header: BlockHeader {
             version: 1,
             parents: template.parents.clone(),
-            merkle_root: merkle,
+            merkle_root: MerkleRoot::ZERO,
             timestamp: timestamp.max(template.parent_timestamp),
             bits: template.bits,
             nonce: 0,
@@ -293,29 +375,43 @@ pub fn assemble_block(template: &BlockTemplate, coinbase: Transaction, timestamp
         height: template.height,
         shielded_transactions: Vec::new(),
     };
-    check_template_block(&block, template.total_fees)?;
+    if template.hardened {
+        let commitment = core::block_rules::expected_coinbase_commitment(&block);
+        if let Some(input) = block.transactions[0].inputs.first_mut() {
+            let tag = &core::block_rules::COINBASE_COMMITMENT_TAG;
+            let extra = if input.script_sig.len() >= core::block_rules::COINBASE_COMMITMENT_LEN
+                && input.script_sig.starts_with(tag)
+            {
+                input.script_sig[core::block_rules::COINBASE_COMMITMENT_LEN..].to_vec()
+            } else {
+                std::mem::take(&mut input.script_sig)
+            };
+            input.script_sig = core::block_rules::coinbase_script_sig(&commitment, &extra);
+        }
+    }
+    block.header.merkle_root = block.body_merkle_root_at(template.activation_height);
+    check_template_block_at(&block, template.total_fees, template.activation_height)?;
     Ok(block)
 }
 
 /// The template self-check on an assembled (not yet mined) block: every
 /// structural rule of `validate_structure` except the proof of work, plus
-/// the coinbase value.
+/// the coinbase value, under the process-wide activation height.
 pub fn check_template_block(block: &Block, total_fees: u64) -> Result<(), String> {
-    if block.header.parents.len() > core::MAX_PARENTS {
-        return Err("too many parents".into());
-    }
-    let size = block.size_bytes();
+    check_template_block_at(block, total_fees, core::activation::hardening_activation_height())
+}
+
+/// [`check_template_block`] for an explicit activation height.
+pub fn check_template_block_at(block: &Block, total_fees: u64, activation_height: u64) -> Result<(), String> {
+    let hardened = core::block_rules::rules_active_at(block.height, activation_height);
+    let size = core::block_rules::block_size_for_rules(block, hardened);
     if size > core::MAX_BLOCK_SIZE {
-        return Err(format!("block too large: {} > {}", size, core::MAX_BLOCK_SIZE));
+        return Err(format!(
+            "block too large: {} > {} ({} encoding)",
+            size, core::MAX_BLOCK_SIZE, if hardened { "wire" } else { "bincode" }
+        ));
     }
-    if !block.validate_merkle() {
-        return Err("invalid merkle root".into());
-    }
-    if !block.validate_coinbase_format() {
-        return Err("invalid coinbase format".into());
-    }
-    block.validate_no_duplicate_txs().map_err(|e| e.to_string())?;
-    block.validate_dust().map_err(|e| e.to_string())?;
+    block.validate_structure_without_pow_at(activation_height).map_err(|e| e.to_string())?;
     core::limits::check_block_context_free(block)?;
     block.validate_coinbase_value(total_fees).map_err(|e| e.to_string())?;
     Ok(())
