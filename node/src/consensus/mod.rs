@@ -503,17 +503,36 @@ fn topological_sort(store: &DagStore, blocks: Vec<BlockHash>) -> Vec<BlockHash> 
 /// bit**, and is exercised by `tests/ghostdag_differential.rs`. Where the two
 /// diverge, the legacy (bug-compatible) answer is the consensus-correct one to
 /// keep; adopting `Fast`'s answer there would be a FORK and requires an
-/// activation-height gate. `Fast` is therefore an opt-in mode, never selected
-/// on the live path in this change.
+/// activation-height gate.
+///
+/// (The two paragraphs above describe Bloch. On GnB the activation gate
+/// [`CORRECTED_COLORING_ACTIVATION_HEIGHT`] is `0`, so a DAG built with the
+/// `Legacy` constructor mode colors every block with `Fast`; the `Legacy`
+/// coloring is never applied on the live path and stays in the code for the
+/// replay/differential tests inherited from Bloch.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColoringMode {
-    /// Deployed behavior — bounded BFS. Default everywhere.
+    /// Bounded-BFS coloring (Bloch's deployed behavior). As a constructor
+    /// mode it defers to the activation gate, which selects `Fast` for every
+    /// height on GnB.
     Legacy,
-    /// Interval-index-backed unbounded coloring. Opt-in / test-only.
+    /// Interval-index-backed unbounded coloring: what GnB applies to every
+    /// block. As a constructor mode, it bypasses the gate.
     Fast,
 }
 
 /// Activation height for the corrected (`Fast`) GhostDAG coloring.
+///
+/// # Current value on GnB: `0` — `Fast` from genesis
+///
+/// GnB is a new chain with no Legacy-colored history, so the gate is `0`: every
+/// block, genesis included, is colored with the exact index-based `Fast`
+/// coloring, and the reachability index is maintained from genesis. With the
+/// value at `0` the gate comparison is always true; it is kept (written with
+/// `Ord::cmp`, not `>=`, so that it is not an always-true comparison) so that
+/// a future re-arming is a one-constant change. The passages below that
+/// describe a `u64::MAX` ("disabled") gate or the `21_430` flag day are
+/// history inherited from Bloch, not GnB's current state.
 ///
 /// # TOKEN / HISTORY PRESERVATION — READ BEFORE CHANGING
 ///
@@ -529,8 +548,8 @@ pub enum ColoringMode {
 /// and "changes ZERO live behavior". That was true only until WS-A
 /// (2026-08-05) armed it — see the "Coordinated-release sentinel" and
 /// "FLAG-DAY LOWERED" notes below, which were added at that time but never
-/// reconciled against this paragraph. The constant has been `21_430`, not
-/// `u64::MAX`, since the flag day, and roughly 46% of the Genesis-3 chain's
+/// reconciled against this paragraph. On Bloch the constant was `21_430`, not
+/// `u64::MAX`, from the flag day, and roughly 46% of the Genesis-3 chain's
 /// eventual terminal height (39,918, reached 2026-08-24) was mined AT OR
 /// ABOVE this gate, i.e. under `Fast` coloring, not `Legacy`. Historical
 /// blocks are never *recolored* after the fact regardless of where the gate
@@ -589,10 +608,12 @@ pub const CORRECTED_COLORING_ACTIVATION_HEIGHT: u64 = 0;
 pub struct GhostDAG {
     pub k: usize,
     pub store: DagStore,
-    /// Coloring strategy. Defaults to `Legacy` (unchanged mainnet behavior).
+    /// Constructor coloring mode. Defaults to `Legacy`, which defers to the
+    /// activation gate (`Fast` for every block on GnB, gate = 0).
     pub coloring: ColoringMode,
-    /// Interval reachability index. Maintained only while `coloring == Fast`;
-    /// left empty (zero overhead) in `Legacy` mode. Never consensus state.
+    /// Interval reachability index. Maintained whenever
+    /// `maintains_reachability_index()` is true (always on GnB, gate = 0).
+    /// Never consensus state.
     reach: ReachabilityStore,
 }
 
@@ -628,12 +649,14 @@ impl GhostDAG {
 
     /// Construct with the default K, honoring the **dev/test** coloring override.
     ///
-    /// # Activation shape (Phase 3) — SAFE BY DEFAULT
+    /// # Activation shape
     ///
-    /// The shipped default is ALWAYS `Legacy`: with no override set this is
-    /// exactly [`with_default_k`], and the live gate
-    /// [`CORRECTED_COLORING_ACTIVATION_HEIGHT`] stays at `u64::MAX`. Nothing on
-    /// the live chain changes from this branch.
+    /// With no override set this is exactly [`with_default_k`]: the constructor
+    /// mode is `Legacy`, and the live gate
+    /// [`CORRECTED_COLORING_ACTIVATION_HEIGHT`] (`0` on GnB) then colors every
+    /// block with `Fast` from genesis. The override below does not change
+    /// which coloring a live node applies to any block; it only selects the
+    /// `Fast` constructor mode directly.
     ///
     /// For local testing / replay ONLY, setting the env var
     /// `GNB_GHOSTDAG_COLORING=fast` selects the `Fast` interval-index coloring
@@ -676,31 +699,33 @@ impl GhostDAG {
     /// - `self.coloring == Fast` (test/replay constructor): always `Fast`.
     /// - `self.coloring == Legacy` (every live constructor): the
     ///   [`CORRECTED_COLORING_ACTIVATION_HEIGHT`] soft-fork gate decides — `Fast`
-    ///   at/above the activation height, `Legacy` below it. With the activation
-    ///   height at its default `u64::MAX` this is `Legacy` for every reachable
-    ///   height, so live behavior is unchanged and all history stays
-    ///   Legacy-colored.
+    ///   at/above the activation height, `Legacy` below it. On GnB the
+    ///   activation height is `0`, so this is `Fast` for every height, genesis
+    ///   included.
     fn effective_coloring(&self, height: u64) -> ColoringMode {
         match self.coloring {
             ColoringMode::Fast => ColoringMode::Fast,
-            ColoringMode::Legacy => {
-                if height >= CORRECTED_COLORING_ACTIVATION_HEIGHT {
-                    ColoringMode::Fast
-                } else {
-                    ColoringMode::Legacy
-                }
-            }
+            // `height >= CORRECTED_COLORING_ACTIVATION_HEIGHT`, spelled with
+            // `cmp` because the constant is 0 and `>= 0` on a u64 is the
+            // deny-level `clippy::absurd_extreme_comparisons`. Same result for
+            // every height: only `Less` (impossible while the gate is 0)
+            // selects Legacy.
+            ColoringMode::Legacy => match height.cmp(&CORRECTED_COLORING_ACTIVATION_HEIGHT) {
+                std::cmp::Ordering::Less => ColoringMode::Legacy,
+                std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => ColoringMode::Fast,
+            },
         }
     }
 
     /// Whether the reachability index must be maintained for this DAG.
     ///
     /// True when the DAG is a `Fast` constructor OR when the corrected-coloring
-    /// activation gate is armed (a real future height is configured) — in the
+    /// activation gate is armed (any value other than `u64::MAX`) — in the
     /// armed case the index must be built from genesis so `Fast` classification
-    /// is ready by the time the activation height is reached. When the gate is
-    /// disabled (`u64::MAX`, the default) and the DAG is `Legacy`, this is
-    /// `false` and the index is never touched — zero overhead, zero change.
+    /// is ready by the time the activation height is reached. On GnB the gate
+    /// is `0`, so this is always `true`. Only a gate set to `u64::MAX`
+    /// ("disabled", Bloch's pre-flag-day value, never used on GnB) with a
+    /// `Legacy` DAG would leave the index untouched.
     pub fn maintains_reachability_index(&self) -> bool {
         self.coloring == ColoringMode::Fast
             || CORRECTED_COLORING_ACTIVATION_HEIGHT != u64::MAX
@@ -1037,7 +1062,10 @@ impl GhostDAG {
         let sp_data = self.store.get(&selected_parent).cloned()
             .ok_or(ConsensusError::MissingSelectedParent(selected_parent))?;
 
-        // 2. Compute height from the (now validated) selected parent.
+        // 2. Compute height from the (now validated) selected parent. This is
+        //    the DAG height (selected parent + 1). The difficulty and
+        //    `block.height` rule uses max(parent heights) + 1 over these stored
+        //    heights instead (docs/CONSENSUS.md, "Difficulty input").
         let height = sp_data.height + 1;
 
         // 3. Compute mergeset (topologically sorted, ancestors first)
@@ -1050,9 +1078,7 @@ impl GhostDAG {
         //    during its own classification, so we register it afterwards.
         //    The coloring is chosen by the height-gated `effective_coloring`:
         //    Legacy below CORRECTED_COLORING_ACTIVATION_HEIGHT, Fast at/above
-        //    it. With the gate disabled (default u64::MAX) this is always Legacy
-        //    on the live path — historical and new blocks alike stay
-        //    Legacy-colored, preserving all mined tokens.
+        //    it. On GnB the gate is 0, so every block is Fast-colored.
         let (mergeset_blues, mergeset_reds, blues_anticone_sizes) =
             match self.effective_coloring(height) {
                 ColoringMode::Legacy => self.classify_mergeset(&mergeset, &selected_parent),
