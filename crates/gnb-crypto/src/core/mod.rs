@@ -14,6 +14,9 @@ pub mod tokenomics;
 pub mod carryover;
 pub mod activation;
 
+/// MoneyRange and canonical-encoding size helpers (audit VAL-11 / VAL-12).
+pub mod limits;
+
 // ── Network identity ─────────────────────────────────────────────────────────
 
 pub const MAINNET_PREFIX:        &str  = "gnb1q";

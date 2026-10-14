@@ -53,6 +53,14 @@ pub mod dandelion;    // Coherence P3 — Dandelion++ tx-relay metadata privacy
 pub mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer (frontier reconciliation)
 #[cfg(feature = "node")]
 pub mod ingress;      // audit fixes: block-ingress / orphan / IBD-latch policy
+// Block acceptance pipeline (accept / connect split, audit DAG-1/10/11),
+// moved out of main.rs so integration tests drive the real path.
+#[cfg(feature = "node")]
+pub mod accept;
+// Block-template construction shared by the miner and getblocktemplate
+// (audit MEM-2, DAG-2).
+#[cfg(feature = "node")]
+pub mod template;
 
 /// Convenience re-exports for consumers of the library (wallet UIs,
 /// block explorers, etc.). Import with `use gnb::prelude::*`.

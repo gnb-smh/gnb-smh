@@ -4,12 +4,33 @@
 //! Accepts transactions, deduplicates, evicts by fee rate.
 //! Sprint N-min: per-tx size cap, intra-mempool double-spend detection.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use crate::core::Transaction;
 
+/// Shared standardness-and-admission function (audit MEM-1/4/5/7) used by
+/// gossip, RPC `sendrawtransaction` and reorg re-injection.
+pub mod admission;
+
 const MAX_MEMPOOL_SIZE: usize = 50_000;
+
+/// Audit MEM-3: a transaction that has not been mined within this many
+/// seconds is dropped (Bitcoin Core's default `-mempoolexpiry` is 336 h; GnB
+/// blocks are 20× faster, 72 h is ample).
+pub const MEMPOOL_EXPIRY_SECS: u64 = 72 * 3600;
+
+/// Audit MEM-6: half-life of the rolling minimum fee rate raised by
+/// evictions (Bitcoin Core uses 12 h).
+pub const ROLLING_FEE_HALFLIFE_SECS: u64 = 12 * 3600;
+
+/// Audit MEM-6: incremental relay fee rate, sat/byte, added on top of an
+/// evicted transaction's rate when it raises the rolling minimum.
+pub const INCREMENTAL_RELAY_FEE_RATE: u64 = 1;
+
+/// Audit MEM-5: bound on the recent-rejects filter (entries are 32-byte
+/// wtxids; FIFO eviction). Cleared whenever the selected tip changes.
+pub const MAX_RECENT_REJECTS: usize = 50_000;
 
 /// P0 memory bound (roadmap §3.4 / §1.4): total serialized bytes the mempool
 /// will hold. The count cap alone allowed 50_000 × 400 KiB ≈ 20 GB worst case;
@@ -102,6 +123,12 @@ pub struct Mempool {
     /// P1 time seam (behavior-neutral): stamps `added_at`. Defaults to
     /// `SystemClock`.
     clock: Box<dyn Clock>,
+    /// MEM-6: rolling minimum fee rate (fixed-point `FeeRateKey` units) and
+    /// the time it was last raised. Raised on eviction, halves every
+    /// `ROLLING_FEE_HALFLIFE_SECS`.
+    rolling_min: Mutex<(u128, u64)>,
+    /// MEM-5: recent-rejects filter (wtxid set + FIFO order).
+    recent_rejects: Mutex<(HashSet<[u8; 32]>, VecDeque<[u8; 32]>)>,
 }
 
 impl Mempool {
@@ -118,7 +145,14 @@ impl Mempool {
             rate_index: RwLock::new(BTreeMap::new()),
             total_bytes: AtomicUsize::new(0),
             clock,
+            rolling_min: Mutex::new((0, 0)),
+            recent_rejects: Mutex::new((HashSet::new(), VecDeque::new())),
         }
+    }
+
+    /// Current time from the injected clock (Unix seconds).
+    pub fn now_secs(&self) -> u64 {
+        self.clock.now_secs()
     }
 
     /// Insert a txid into the fee-rate index. Caller MUST hold the `txs` write
@@ -236,6 +270,11 @@ impl Mempool {
                 .and_then(|(k, set)| set.iter().next().map(|txid| (*k, *txid)));
             match lowest {
                 Some((low_key, victim)) if new_key > low_key => {
+                    // MEM-6: an eviction raises the rolling minimum fee rate
+                    // to the evicted rate plus the incremental relay rate, so
+                    // a flood of barely-better txs cannot churn the pool for
+                    // free.
+                    self.raise_rolling_min(low_key.0);
                     // Drop the victim from txs, spent, total_bytes, and the index
                     // in one step so the three-way invariant never drifts.
                     Self::index_remove(&mut rate_index, low_key, &victim);
@@ -334,7 +373,9 @@ impl Mempool {
         self.txs.read().iter().map(|(k, e)| (*k, e.fee, e.added_at)).collect()
     }
 
-    /// Median fee across all mempool entries (for fee estimation)
+    /// Median ABSOLUTE fee across all mempool entries. Diagnostics only:
+    /// the `estimatefee` RPC uses `estimate_fee_rate_per_kb` (MEM-6), which is
+    /// bounded below by the consensus minimum.
     pub fn median_fee(&self) -> u64 {
         let pool = self.txs.read();
         if pool.is_empty() { return 1000; } // default 1000 sats
@@ -345,24 +386,194 @@ impl Mempool {
 
     /// Remove all txs whose inputs are now spent (after block confirmation)
     pub fn remove_confirmed(&self, txids: &[[u8; 32]]) {
+        // Sprint N-min / P1: drops each tx's spent-outpoint and fee-rate index
+        // entries together with the tx (see `remove_many`).
         let set: HashSet<[u8; 32]> = txids.iter().cloned().collect();
+        self.remove_many(&set);
+    }
+
+    /// Remove `txids` (and their spent-outpoint and fee-index entries).
+    /// Returns how many were present. Shared by every removal path so the
+    /// three-way invariant never drifts.
+    fn remove_many(&self, txids: &HashSet<[u8; 32]>) -> usize {
         let mut pool  = self.txs.write();
         let mut spent = self.spent.write();
         let mut rate_index = self.rate_index.write();
-        // Sprint N-min: collect outpoints to drop from spent before removing
-        // the tx entries themselves. P1: also drop the fee-rate index entry so
-        // the index never drifts from `txs`.
-        for txid in &set {
-            if let Some(entry) = pool.get(txid) {
+        let mut removed = 0usize;
+        for txid in txids {
+            if let Some(entry) = pool.remove(txid) {
                 self.total_bytes.fetch_sub(entry.tx.actual_size(), Ordering::Relaxed);
                 let key = fee_rate_key(entry.fee, entry.tx.actual_size());
                 Self::index_remove(&mut rate_index, key, txid);
                 for inp in &entry.tx.inputs {
                     spent.remove(&(inp.prev_txid, inp.prev_index));
                 }
+                removed += 1;
             }
         }
-        pool.retain(|k, _| !set.contains(k));
+        removed
+    }
+
+    /// Audit MEM-3: remove every pooled transaction that spends one of
+    /// `outpoints` (outpoints just consumed by a connected block). A pooled
+    /// tx whose input was spent by a DIFFERENT confirmed tx can never be mined
+    /// any more; leaving it in the pool made every template invalid. Returns
+    /// the removed txids.
+    pub fn remove_conflicts(&self, outpoints: &[([u8; 32], u32)]) -> Vec<[u8; 32]> {
+        let victims: HashSet<[u8; 32]> = {
+            let spent = self.spent.read();
+            outpoints.iter().filter_map(|op| spent.get(op).copied()).collect()
+        };
+        if victims.is_empty() {
+            return Vec::new();
+        }
+        self.remove_many(&victims);
+        victims.into_iter().collect()
+    }
+
+    /// Audit MEM-3: re-check every pooled transaction with `still_valid`
+    /// (e.g. against the post-reorg UTXO set) and drop the failures. Returns
+    /// how many were removed.
+    pub fn retain_valid<F: Fn(&MempoolEntry) -> bool>(&self, still_valid: F) -> usize {
+        let doomed: HashSet<[u8; 32]> = {
+            let pool = self.txs.read();
+            pool.iter()
+                .filter(|(_, e)| !still_valid(e))
+                .map(|(k, _)| *k)
+                .collect()
+        };
+        if doomed.is_empty() {
+            return 0;
+        }
+        self.remove_many(&doomed)
+    }
+
+    /// Audit MEM-3: drop transactions older than `max_age_secs` (by the
+    /// injected clock). Returns how many were removed.
+    pub fn expire_older_than(&self, max_age_secs: u64) -> usize {
+        let now = self.clock.now_secs();
+        let doomed: HashSet<[u8; 32]> = {
+            let pool = self.txs.read();
+            pool.iter()
+                .filter(|(_, e)| now.saturating_sub(e.added_at) > max_age_secs)
+                .map(|(k, _)| *k)
+                .collect()
+        };
+        if doomed.is_empty() {
+            return 0;
+        }
+        self.remove_many(&doomed)
+    }
+
+    /// Entries in block-template order: highest fee RATE first, with the
+    /// bincode size (`actual_size`, the same measure the consensus block-size
+    /// rule uses) precomputed. Ties broken by txid for determinism.
+    pub fn entries_by_fee_rate(&self) -> Vec<(Transaction, u64, usize)> {
+        let pool = self.txs.read();
+        let rate_index = self.rate_index.read();
+        let mut out = Vec::with_capacity(pool.len());
+        for (_key, set) in rate_index.iter().rev() {
+            let mut ids: Vec<&[u8; 32]> = set.iter().collect();
+            ids.sort();
+            for txid in ids {
+                if let Some(e) = pool.get(txid) {
+                    out.push((e.tx.clone(), e.fee, e.tx.actual_size()));
+                }
+            }
+        }
+        out
+    }
+
+    // ── MEM-6: rolling minimum fee ───────────────────────────────────────
+
+    fn raise_rolling_min(&self, evicted_rate: u128) {
+        let now = self.clock.now_secs();
+        let bumped = evicted_rate
+            .saturating_add(INCREMENTAL_RELAY_FEE_RATE as u128 * FEE_RATE_SCALE);
+        let mut g = self.rolling_min.lock();
+        let current = Self::decayed(*g, now);
+        if bumped > current {
+            *g = (bumped, now);
+        }
+    }
+
+    fn decayed((rate, at): (u128, u64), now: u64) -> u128 {
+        let halvings = now.saturating_sub(at) / ROLLING_FEE_HALFLIFE_SECS;
+        if halvings >= 128 { 0 } else { rate >> halvings }
+    }
+
+    /// The rolling minimum fee rate in sat/byte (rounded up), after decay.
+    /// Zero until the pool has had to evict.
+    pub fn rolling_min_fee_rate(&self) -> u64 {
+        let now = self.clock.now_secs();
+        let r = Self::decayed(*self.rolling_min.lock(), now);
+        u64::try_from(r.div_ceil(FEE_RATE_SCALE)).unwrap_or(u64::MAX)
+    }
+
+    /// True iff `fee` for a tx of bincode `size` meets the rolling minimum.
+    pub fn meets_rolling_min(&self, fee: u64, size: usize) -> bool {
+        let now = self.clock.now_secs();
+        let floor = Self::decayed(*self.rolling_min.lock(), now);
+        fee_rate_key(fee, size).0 >= floor
+    }
+
+    /// Audit MEM-6: fee-rate estimate in sat per 1,000 bytes of the canonical
+    /// wire encoding — the unit of the consensus minimum fee. The median rate
+    /// of the pool, never below the consensus minimum rate
+    /// (`MIN_FEE_RATE_SAT_PER_KB`) nor the rolling minimum.
+    pub fn estimate_fee_rate_per_kb(&self) -> u64 {
+        let floor = crate::core::tokenomics::MIN_FEE_RATE_SAT_PER_KB
+            .max(self.rolling_min_fee_rate().saturating_mul(1000));
+        let pool = self.txs.read();
+        if pool.is_empty() {
+            return floor;
+        }
+        let mut rates: Vec<u64> = pool.values().map(|e| {
+            let wire = e.tx.to_wire_bytes(true).len().max(1) as u64;
+            e.fee.saturating_mul(1000) / wire
+        }).collect();
+        rates.sort_unstable();
+        rates[rates.len() / 2].max(floor)
+    }
+
+    // ── MEM-5: recent-rejects filter ─────────────────────────────────────
+
+    /// True iff a transaction with this wtxid was rejected since the last
+    /// tip change.
+    pub fn is_recently_rejected(&self, wtxid: &[u8; 32]) -> bool {
+        self.recent_rejects.lock().0.contains(wtxid)
+    }
+
+    /// Remember a rejected wtxid (bounded, FIFO).
+    pub fn note_rejected(&self, wtxid: [u8; 32]) {
+        let mut g = self.recent_rejects.lock();
+        let (set, order) = &mut *g;
+        if set.insert(wtxid) {
+            order.push_back(wtxid);
+            while order.len() > MAX_RECENT_REJECTS {
+                if let Some(old) = order.pop_front() {
+                    set.remove(&old);
+                }
+            }
+        }
+    }
+
+    /// Forget every remembered rejection (called when the selected tip
+    /// changes: a tx rejected against the old tip may be valid now).
+    pub fn clear_recent_rejects(&self) {
+        let mut g = self.recent_rejects.lock();
+        g.0.clear();
+        g.1.clear();
+    }
+
+    /// Number of remembered rejections.
+    pub fn recent_rejects_len(&self) -> usize {
+        self.recent_rejects.lock().0.len()
+    }
+
+    /// True iff `outpoint` is spent by a pooled transaction.
+    pub fn spends_outpoint(&self, outpoint: &([u8; 32], u32)) -> bool {
+        self.spent.read().contains_key(outpoint)
     }
 
     /// P0: total serialized bytes currently held (for the byte-cap metric /

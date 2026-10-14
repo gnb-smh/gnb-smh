@@ -88,7 +88,18 @@ pub fn decode_snapshot_row(key: &[u8], value: &[u8], canonical_vout: bool)
     Ok((key[..32].to_vec(), vout, output.value, output.script_pubkey))
 }
 
-pub struct Storage { db: DB }
+pub struct Storage {
+    db: DB,
+    /// Audit DAG-10: the acceptance mutex. Every path that mutates chain
+    /// state (block acceptance from gossip, the miner, RPC `submitblock`,
+    /// orphan resurrection, start-up reconciliation) holds it for the whole
+    /// accept → connect → commit pipeline, so tip snapshot, validation, DAG
+    /// insertion and the atomic commit can never interleave. It lives on the
+    /// store because the store is the one object every ingress path shares
+    /// and every chain-state mutation goes through. Reentrant so a nested
+    /// call on the same thread cannot self-deadlock.
+    accept_lock: parking_lot::ReentrantMutex<()>,
+}
 
 impl Storage {
     /// Build the full column-family descriptor list. Shared by the read-write
@@ -166,7 +177,7 @@ impl Storage {
         opts.set_write_buffer_size(64 * 1024 * 1024);
         let db = DB::open_cf_descriptors(&opts, path, Self::cf_descriptors())
             .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
-        Ok(Self { db })
+        Ok(Self { db, accept_lock: parking_lot::ReentrantMutex::new(()) })
     }
 
     /// Open an existing snapshot **read-only**. RocksDB is opened with
@@ -185,7 +196,12 @@ impl Storage {
         // mutates the primary.
         let db = DB::open_cf_descriptors_read_only(&opts, path, Self::cf_descriptors(), false)
             .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
-        Ok(Self { db })
+        Ok(Self { db, accept_lock: parking_lot::ReentrantMutex::new(()) })
+    }
+
+    /// Take the acceptance mutex (audit DAG-10). See the field documentation.
+    pub fn acceptance_lock(&self) -> parking_lot::ReentrantMutexGuard<'_, ()> {
+        self.accept_lock.lock()
     }
 
     /// Returns a reference to the underlying RocksDB instance. Used by
@@ -241,6 +257,31 @@ impl Storage {
 
         self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         Ok(())
+    }
+
+    /// Persist ONLY the block body (CF_BLOCKS), keyed by block hash.
+    ///
+    /// Audit DAG-12: `put_block` also writes the height→hash and
+    /// height→timestamp indexes and the address-history rows, which are
+    /// SELECTED-CHAIN indexes. The acceptance pipeline stores every DAG block's
+    /// body (fork-losers and disqualified blocks included, so they can be
+    /// served and connected later) through this body-only write, and writes the
+    /// chain indexes in the atomic connect batch (`stage_chain_index`) only for
+    /// blocks that join the selected chain — so a fork-loser or a refused block
+    /// can no longer overwrite `getblockhash`'s answer or the pruning cursor.
+    pub fn put_block_body(&self, block: &Block) -> Result<(), StorageError> {
+        let hash = block.block_hash();
+        let cf_b = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
+        self.db.put_cf(&cf_b, &hash, &block.to_wire_bytes())
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))
+    }
+
+    /// Delete a block body (CF_BLOCKS only). Used to drop the body of a block
+    /// whose DAG insertion was rolled back (refused by policy), so nothing
+    /// unreferenced is left behind.
+    pub fn delete_block_body(&self, hash: &[u8; 32]) -> Result<(), StorageError> {
+        let cf_b = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
+        self.db.delete_cf(&cf_b, hash).map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
     pub fn get_block(&self, hash: &[u8; 32]) -> Result<Option<Block>, StorageError> {
@@ -701,6 +742,185 @@ impl Storage {
         Ok(integrity)
     }
 
+    // ── Batched chain-state staging (audit DAG-11) ─────────────────────
+    //
+    // The acceptance pipeline commits a block's UTXO effects, undo record,
+    // CF_DAG + CF_DAG_INTEGRITY (+ CF_REACHABILITY) record, the selected-chain
+    // indexes, the tip pointer and any invalid-block marks in ONE RocksDB
+    // WriteBatch (see `reorg::connect_plan`). These helpers stage into a
+    // caller-owned batch; nothing is visible until the caller commits it.
+
+    /// Stage a block's CF_DAG + CF_DAG_INTEGRITY record (+ the reachability
+    /// delta) into `batch`. Returns the staged integrity hash.
+    ///
+    /// Unlike `put_dag_with_integrity`, a missing selected-parent integrity
+    /// record is an ERROR here (DAG-11): zero-filling it wrote a link that the
+    /// boot-time chain check then rejected, turning a lost write into a fatal
+    /// start-up error. `parent_integrity_override` lets the caller supply a
+    /// parent integrity it staged in the same batch (lazy genesis record).
+    pub fn stage_dag_record(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        hash: &BlockHash,
+        data: &GhostdagData,
+        reach_upserts: &[(BlockHash, Vec<u8>)],
+        reach_removals: &[BlockHash],
+        parent_integrity_override: Option<[u8; 32]>,
+    ) -> Result<[u8; 32], StorageError> {
+        let parent_integrity: [u8; 32] = match (&data.selected_parent, parent_integrity_override) {
+            (_, Some(p)) => p,
+            (Some(sp), None) => self.get_integrity_hash(sp)?.ok_or_else(|| {
+                StorageError::ReadFailed(format!(
+                    "integrity record of selected parent {} is missing; refusing to \
+                     write a zero-filled chain link",
+                    hex::encode(&sp[..8])
+                ))
+            })?,
+            (None, None) => [0u8; 32],
+        };
+        let integrity = crate::consensus::compute_integrity_hash(hash, data, &parent_integrity);
+        let cf_dag = self.db.cf_handle(CF_DAG).ok_or(StorageError::CfNotFound(CF_DAG.into()))?;
+        let cf_int = self.db.cf_handle(CF_DAG_INTEGRITY)
+            .ok_or(StorageError::CfNotFound(CF_DAG_INTEGRITY.into()))?;
+        let cf_reach = self.db.cf_handle(CF_REACHABILITY)
+            .ok_or(StorageError::CfNotFound(CF_REACHABILITY.into()))?;
+        batch.put_cf(&cf_dag, hash, &encode(data)?);
+        batch.put_cf(&cf_int, hash, &integrity);
+        for (h, rec) in reach_upserts {
+            batch.put_cf(&cf_reach, h, rec);
+        }
+        for h in reach_removals {
+            batch.delete_cf(&cf_reach, h);
+        }
+        Ok(integrity)
+    }
+
+    /// Stage a CF_META write.
+    pub fn stage_meta(&self, batch: &mut rocksdb::WriteBatch, key: &str, value: &[u8])
+        -> Result<(), StorageError>
+    {
+        let cf = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        batch.put_cf(&cf, key.as_bytes(), value);
+        Ok(())
+    }
+
+    /// Commit a caller-built batch atomically.
+    pub fn write_batch(&self, batch: rocksdb::WriteBatch) -> Result<(), StorageError> {
+        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))
+    }
+
+    /// Stage the SELECTED-CHAIN indexes of a block being connected (DAG-12):
+    /// height→hash, height→timestamp and the address-history rows. Input rows
+    /// resolve the spent output through `spent` (the block's undo capture), so
+    /// they are byte-identical to what `rollback_block` later un-indexes.
+    pub fn stage_chain_index(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        block: &Block,
+        spent: &std::collections::HashMap<([u8; 32], u32), TxOutput>,
+    ) -> Result<(), StorageError> {
+        let hash = block.block_hash();
+        let cf_h = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
+        let cf_t = self.db.cf_handle(CF_TIMESTAMPS).ok_or(StorageError::CfNotFound(CF_TIMESTAMPS.into()))?;
+        let cf_ai = self.db.cf_handle(CF_ADDR_TX_HISTORY)
+            .ok_or(StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
+        batch.put_cf(&cf_h, &block.height.to_be_bytes(), &hash);
+        batch.put_cf(&cf_t, &block.height.to_be_bytes(), &block.header.timestamp.to_le_bytes());
+        for (tx_idx, tx) in block.transactions.iter().enumerate() {
+            let txid = tx.txid();
+            for (vout, out) in tx.outputs.iter().enumerate() {
+                if out.script_pubkey.len() >= 20 {
+                    let mut addr = [0u8; 20];
+                    addr.copy_from_slice(&out.script_pubkey[..20]);
+                    batch.put_cf(&cf_ai,
+                        indexer::make_key(&addr, block.height, tx_idx as u32, vout as u32),
+                        indexer::make_value(&txid, indexer::DIR_OUT, out.value));
+                }
+            }
+            if !tx.is_coinbase() {
+                for (vin, inp) in tx.inputs.iter().enumerate() {
+                    if let Some(prev) = spent.get(&(inp.prev_txid, inp.prev_index)) {
+                        if prev.script_pubkey.len() >= 20 {
+                            let mut addr = [0u8; 20];
+                            addr.copy_from_slice(&prev.script_pubkey[..20]);
+                            batch.put_cf(&cf_ai,
+                                indexer::make_key(&addr, block.height, tx_idx as u32, 0x8000_0000 | vin as u32),
+                                indexer::make_value(&txid, indexer::DIR_IN, prev.value));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stage removal of a disconnected block's height→hash / height→timestamp
+    /// rows, but only where they still point at this block (a block connected
+    /// later in the same batch overwrites them in batch order). Address-history
+    /// rows are un-indexed by the rollback staging itself.
+    pub fn stage_chain_unindex(&self, batch: &mut rocksdb::WriteBatch, block: &Block)
+        -> Result<(), StorageError>
+    {
+        let hash = block.block_hash();
+        if self.get_block_hash_at_height(block.height)? == Some(hash) {
+            let cf_h = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
+            let cf_t = self.db.cf_handle(CF_TIMESTAMPS).ok_or(StorageError::CfNotFound(CF_TIMESTAMPS.into()))?;
+            batch.delete_cf(&cf_h, &block.height.to_be_bytes());
+            batch.delete_cf(&cf_t, &block.height.to_be_bytes());
+        }
+        Ok(())
+    }
+
+    // ── Chain-disqualified blocks (audit DAG-1) ─────────────────────────
+
+    const INVALID_PREFIX: &'static [u8] = b"invalid_block/";
+
+    fn invalid_key(hash: &BlockHash) -> Vec<u8> {
+        let mut k = Self::INVALID_PREFIX.to_vec();
+        k.extend_from_slice(hash);
+        k
+    }
+
+    /// Stage a persistent "chain-disqualified" mark for `hash` with a short
+    /// reason (diagnostics only — the mark itself is what is consensus-relevant
+    /// for this node: the block is never selected or applied again).
+    pub fn stage_invalid_block(&self, batch: &mut rocksdb::WriteBatch, hash: &BlockHash, reason: &str)
+        -> Result<(), StorageError>
+    {
+        let cf = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        let mut r = reason.as_bytes().to_vec();
+        r.truncate(256);
+        batch.put_cf(&cf, Self::invalid_key(hash), r);
+        Ok(())
+    }
+
+    /// Every persisted chain-disqualified block hash.
+    pub fn load_invalid_blocks(&self) -> Result<Vec<BlockHash>, StorageError> {
+        let cf = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        let mut out = Vec::new();
+        let iter = self.db.iterator_cf(&cf, IteratorMode::From(Self::INVALID_PREFIX, rocksdb::Direction::Forward));
+        for item in iter {
+            let (k, _) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            if !k.starts_with(Self::INVALID_PREFIX) {
+                break;
+            }
+            if k.len() == Self::INVALID_PREFIX.len() + 32 {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&k[Self::INVALID_PREFIX.len()..]);
+                out.push(h);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The recorded reason a block was disqualified, if it was.
+    pub fn invalid_block_reason(&self, hash: &BlockHash) -> Result<Option<String>, StorageError> {
+        let cf = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        Ok(self.db.get_cf(&cf, Self::invalid_key(hash))
+            .map_err(|e| StorageError::ReadFailed(e.to_string()))?
+            .map(|v| String::from_utf8_lossy(&v).into_owned()))
+    }
+
     /// Persist a full reachability snapshot + its version tag + root in one
     /// batch. Used after a boot-time rebuild to write the freshly-materialized
     /// index. Clears any stale records first so the CF exactly mirrors memory.
@@ -854,6 +1074,24 @@ impl Storage {
             Some(d) => Ok(Some(decode(&d)?)),
             None    => Ok(None),
         }
+    }
+
+    /// Every block hash that has an undo record (i.e. whose UTXO effects are
+    /// currently applied). Used by start-up reconciliation (DAG-11) to find
+    /// blocks a pre-fix, non-atomic commit applied but never recorded in
+    /// CF_DAG. Keys only; O(applied blocks).
+    pub fn undo_block_hashes(&self) -> Result<Vec<[u8; 32]>, StorageError> {
+        let cf = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (k, _) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            if k.len() == 32 {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&k);
+                out.push(h);
+            }
+        }
+        Ok(out)
     }
 
     /// Remove an undo record. Called when the block has passed the finality

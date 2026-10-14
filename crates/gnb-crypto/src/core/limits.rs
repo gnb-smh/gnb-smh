@@ -1,0 +1,272 @@
+//! Consensus value-range and canonical-size helpers (audit VAL-11, VAL-12).
+//!
+//! # VAL-11: MoneyRange
+//!
+//! The 10 M GNB cap follows from the subsidy schedule, the coinbase rule and
+//! value conservation; nothing compared amounts with
+//! [`tokenomics::MAX_SUPPLY_SAT`] at validation time. [`money_range`] and the
+//! `check_*_money_range` helpers below are the Bitcoin-Core-style defence in
+//! depth: every individual amount and every running sum must stay within
+//! `0..=MAX_SUPPLY_SAT`. No block that can reach a node today violates them
+//! (no amount can exceed the issued supply), so adding them changes no
+//! validity outcome; they only turn a hypothetical future arithmetic bug into
+//! a clean rejection instead of an inflation.
+//!
+//! # VAL-12: canonical-encoding size rules
+//!
+//! The wire parser (`Transaction::from_wire_bytes`, `Block::from_wire_bytes`)
+//! enforces count and length caps (10,000-byte scripts, 100,000 inputs /
+//! outputs, ...). A block built in-process (RPC `submitblock` after decode is
+//! fine, but the miner, a test harness or any future in-process producer is
+//! not) never went through the parser, so it could carry a larger field, be
+//! accepted, persisted, and then fail to load from disk. The constants below
+//! mirror the parser's caps exactly and [`check_block_canonical_limits`]
+//! enforces them on the in-memory value, so every accepted block is guaranteed
+//! to round-trip through its canonical wire encoding. Again a no-op for every
+//! block that arrives over the network (it was parsed, so it already obeys
+//! the caps). `limits_match_the_wire_parser` keeps the two in sync.
+//!
+//! Block SIZE (`MAX_BLOCK_SIZE`) is deliberately NOT re-measured here: the
+//! consensus rule is `Block::size_bytes()` (bincode), checked by
+//! `Block::validate_structure`. Switching the measure to the wire encoding
+//! would change which blocks are valid; every producer (miner template,
+//! `getblocktemplate`) instead budgets with the exact same `size_bytes()`
+//! measure the rule uses.
+
+use super::{tokenomics, Block, Transaction, MAX_PARENTS};
+
+/// Maximum `script_sig` length (wire parser cap).
+pub const MAX_SCRIPT_SIG_SIZE: usize = 10_000;
+/// Maximum `script_pubkey` length (wire parser cap).
+pub const MAX_SCRIPT_PUBKEY_SIZE: usize = 10_000;
+/// Maximum inputs per transaction (wire parser cap).
+pub const MAX_TX_INPUTS: usize = 100_000;
+/// Maximum outputs per transaction (wire parser cap).
+pub const MAX_TX_OUTPUTS: usize = 100_000;
+/// Maximum transparent transactions per block (wire parser cap).
+pub const MAX_BLOCK_TXS: usize = 1_000_000;
+/// Maximum shielded transactions per block (wire parser cap).
+pub const MAX_BLOCK_SHIELDED_TXS: usize = 100_000;
+/// Maximum nullifiers / output commitments per shielded tx (wire parser cap).
+pub const MAX_SHIELDED_NULLIFIERS: usize = 100_000;
+/// Maximum output commitments per shielded tx (wire parser cap).
+pub const MAX_SHIELDED_OUTPUTS: usize = 100_000;
+/// Maximum shielded proof length (wire parser cap).
+pub const MAX_SHIELDED_PROOF_SIZE: usize = 8_000_000;
+/// Maximum shielded binding-signature length (wire parser cap).
+pub const MAX_SHIELDED_BINDING_SIG_SIZE: usize = 100_000;
+
+/// `MoneyRange`: an amount is valid iff it does not exceed the hard cap.
+#[inline]
+pub const fn money_range(value: u64) -> bool {
+    value <= tokenomics::MAX_SUPPLY_SAT
+}
+
+/// Add two amounts, failing on overflow OR on leaving the money range.
+pub fn money_add(a: u64, b: u64) -> Result<u64, String> {
+    let s = a.checked_add(b).ok_or_else(|| "amount sum overflows u64".to_string())?;
+    if !money_range(s) {
+        return Err(format!("amount sum {s} exceeds MAX_SUPPLY_SAT"));
+    }
+    Ok(s)
+}
+
+/// Every output of `tx` and their running sum must be within the money
+/// range. Returns the output total.
+pub fn check_tx_money_range(tx: &Transaction) -> Result<u64, String> {
+    let mut total: u64 = 0;
+    for (i, o) in tx.outputs.iter().enumerate() {
+        if !money_range(o.value) {
+            return Err(format!("output {i} value {} exceeds MAX_SUPPLY_SAT", o.value));
+        }
+        total = money_add(total, o.value).map_err(|e| format!("output total: {e}"))?;
+    }
+    Ok(total)
+}
+
+/// MoneyRange over every transaction of a block (coinbase included), plus the
+/// block-wide output total.
+pub fn check_block_money_range(block: &Block) -> Result<(), String> {
+    let mut block_total: u64 = 0;
+    for (i, tx) in block.transactions.iter().enumerate() {
+        let t = check_tx_money_range(tx).map_err(|e| format!("tx[{i}]: {e}"))?;
+        block_total = money_add(block_total, t).map_err(|e| format!("block output total: {e}"))?;
+    }
+    for (i, stx) in block.shielded_transactions.iter().enumerate() {
+        if !money_range(stx.fee) {
+            return Err(format!("shielded[{i}] fee exceeds MAX_SUPPLY_SAT"));
+        }
+    }
+    Ok(())
+}
+
+/// The wire parser's per-transaction caps, enforced on the in-memory value.
+pub fn check_tx_canonical_limits(tx: &Transaction) -> Result<(), String> {
+    if tx.inputs.len() > MAX_TX_INPUTS {
+        return Err(format!("{} inputs exceed the {} cap", tx.inputs.len(), MAX_TX_INPUTS));
+    }
+    if tx.outputs.len() > MAX_TX_OUTPUTS {
+        return Err(format!("{} outputs exceed the {} cap", tx.outputs.len(), MAX_TX_OUTPUTS));
+    }
+    for (i, inp) in tx.inputs.iter().enumerate() {
+        if inp.script_sig.len() > MAX_SCRIPT_SIG_SIZE {
+            return Err(format!(
+                "input {i} script_sig of {} bytes exceeds the {} cap",
+                inp.script_sig.len(), MAX_SCRIPT_SIG_SIZE
+            ));
+        }
+    }
+    for (i, out) in tx.outputs.iter().enumerate() {
+        if out.script_pubkey.len() > MAX_SCRIPT_PUBKEY_SIZE {
+            return Err(format!(
+                "output {i} script_pubkey of {} bytes exceeds the {} cap",
+                out.script_pubkey.len(), MAX_SCRIPT_PUBKEY_SIZE
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The wire parser's block-level caps (parents, tx counts, every tx, every
+/// shielded field), enforced on the in-memory value. A block passing this
+/// check is guaranteed to round-trip through `to_wire_bytes` /
+/// `from_wire_bytes`.
+pub fn check_block_canonical_limits(block: &Block) -> Result<(), String> {
+    if block.header.parents.len() > MAX_PARENTS {
+        return Err(format!("{} parents exceed the {} cap", block.header.parents.len(), MAX_PARENTS));
+    }
+    if block.transactions.len() > MAX_BLOCK_TXS {
+        return Err(format!("{} transactions exceed the {} cap", block.transactions.len(), MAX_BLOCK_TXS));
+    }
+    for (i, tx) in block.transactions.iter().enumerate() {
+        check_tx_canonical_limits(tx).map_err(|e| format!("tx[{i}]: {e}"))?;
+    }
+    if block.shielded_transactions.len() > MAX_BLOCK_SHIELDED_TXS {
+        return Err(format!(
+            "{} shielded transactions exceed the {} cap",
+            block.shielded_transactions.len(), MAX_BLOCK_SHIELDED_TXS
+        ));
+    }
+    for (i, stx) in block.shielded_transactions.iter().enumerate() {
+        if stx.nullifiers.len() > MAX_SHIELDED_NULLIFIERS
+            || stx.outputs.len() > MAX_SHIELDED_OUTPUTS
+            || stx.proof.len() > MAX_SHIELDED_PROOF_SIZE
+            || stx.binding_sig.len() > MAX_SHIELDED_BINDING_SIG_SIZE
+        {
+            return Err(format!("shielded[{i}] exceeds a wire-format cap"));
+        }
+    }
+    Ok(())
+}
+
+/// Context-free consensus checks added by the 2026-10 audit fixes, in one
+/// call: canonical-encoding limits (VAL-12) then MoneyRange (VAL-11).
+pub fn check_block_context_free(block: &Block) -> Result<(), String> {
+    check_block_canonical_limits(block)?;
+    check_block_money_range(block)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{BlockHeader, MerkleRoot, TxInput, TxOutput};
+
+    fn tx(script_sig_len: usize, spk_len: usize, value: u64) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [1u8; 32], prev_index: 0,
+                script_sig: vec![0xAB; script_sig_len], sequence: u32::MAX,
+            }],
+            outputs: vec![TxOutput { value, script_pubkey: vec![0xCD; spk_len] }],
+            locktime: 0,
+        }
+    }
+
+    fn block_with(txs: Vec<Transaction>) -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1, parents: vec![[7u8; 32]], merkle_root: MerkleRoot::ZERO,
+                timestamp: 0, bits: 0, nonce: 0,
+            },
+            transactions: txs,
+            blue_score: 1, height: 1, shielded_transactions: vec![],
+        }
+    }
+
+    /// The constants must equal the parser's caps: a field at the cap parses,
+    /// one byte over is refused by BOTH the parser and the consensus helper.
+    #[test]
+    fn limits_match_the_wire_parser() {
+        let at = tx(MAX_SCRIPT_SIG_SIZE, MAX_SCRIPT_PUBKEY_SIZE, 1);
+        assert!(Transaction::from_wire_bytes(&at.to_wire_bytes(true)).is_ok());
+        assert!(check_tx_canonical_limits(&at).is_ok());
+
+        let big_sig = tx(MAX_SCRIPT_SIG_SIZE + 1, 20, 1);
+        assert!(Transaction::from_wire_bytes(&big_sig.to_wire_bytes(true)).is_err());
+        assert!(check_tx_canonical_limits(&big_sig).is_err());
+
+        let big_spk = tx(10, MAX_SCRIPT_PUBKEY_SIZE + 1, 1);
+        assert!(Transaction::from_wire_bytes(&big_spk.to_wire_bytes(true)).is_err());
+        assert!(check_tx_canonical_limits(&big_spk).is_err());
+    }
+
+    /// VAL-12 regression: an in-process block with a 12.6 kB script_sig (the
+    /// audit PoC shape) is refused by the consensus helper; a block that passes
+    /// the helper always round-trips through its wire encoding.
+    #[test]
+    fn oversized_script_block_is_refused_and_valid_block_round_trips() {
+        let bad = block_with(vec![tx(12_600, 20, 1_000)]);
+        assert!(check_block_context_free(&bad).is_err());
+        assert!(Block::from_wire_bytes(&bad.to_wire_bytes()).is_err(),
+            "the parser refuses it too: such a block could never be read back");
+
+        let good = block_with(vec![tx(8_000, 20, 1_000)]);
+        assert!(check_block_context_free(&good).is_ok());
+        assert!(Block::from_wire_bytes(&good.to_wire_bytes()).is_ok());
+    }
+
+    #[test]
+    fn too_many_parents_is_refused() {
+        let mut b = block_with(vec![tx(1, 20, 1)]);
+        b.header.parents = vec![[1u8; 32]; MAX_PARENTS + 1];
+        assert!(check_block_canonical_limits(&b).is_err());
+        b.header.parents.truncate(MAX_PARENTS);
+        assert!(check_block_canonical_limits(&b).is_ok());
+    }
+
+    /// VAL-11: amounts above the cap, and sums leaving the money range, are
+    /// rejected; the cap itself is in range.
+    #[test]
+    fn money_range_rejects_amounts_and_sums_above_the_cap() {
+        let cap = tokenomics::MAX_SUPPLY_SAT;
+        assert!(money_range(0) && money_range(cap) && !money_range(cap + 1));
+        assert_eq!(money_add(cap - 1, 1), Ok(cap));
+        assert!(money_add(cap, 1).is_err());
+        assert!(money_add(u64::MAX, 1).is_err());
+
+        assert!(check_tx_money_range(&tx(1, 20, cap)).is_ok());
+        assert!(check_tx_money_range(&tx(1, 20, cap + 1)).is_err());
+
+        let mut two = tx(1, 20, cap / 2 + 1);
+        two.outputs.push(two.outputs[0].clone());
+        assert!(check_tx_money_range(&two).is_err(), "sum of two in-range outputs above the cap");
+
+        // Block-wide: two transactions whose combined outputs exceed the cap.
+        let b = block_with(vec![tx(1, 20, cap / 2 + 1), tx(2, 20, cap / 2 + 1)]);
+        assert!(check_block_money_range(&b).is_err());
+        let ok = block_with(vec![tx(1, 20, 1_000), tx(2, 20, 2_000)]);
+        assert!(check_block_money_range(&ok).is_ok());
+    }
+
+    /// Supply invariant: the whole mining schedule plus the carryover is in
+    /// range, so MoneyRange can never reject an honestly issued amount.
+    #[test]
+    fn issued_supply_is_within_money_range() {
+        let mined = tokenomics::issued_through_sat(u64::MAX);
+        let total = money_add(mined, crate::core::carryover::CARRYOVER_CONVERTED_TOTAL_SAT)
+            .expect("issued supply is in range");
+        assert!(money_range(total));
+        assert!(money_range(tokenomics::block_subsidy_sat(1)));
+    }
+}

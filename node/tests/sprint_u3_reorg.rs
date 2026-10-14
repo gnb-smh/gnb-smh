@@ -409,8 +409,14 @@ fn execute_reorg_reinjects_non_coinbase_tx_when_still_valid() {
     store.put_utxo(&u_txid, 0, &u_out).unwrap();
 
     // Fork A: coinbase + spend-of-U.
+    // UPDATED for audit MEM-7: re-injection now runs the shared admission
+    // rules (maturity, consensus minimum fee, ...). The original fixture paid
+    // a 1,000-sat fee — below the 10,000-sat consensus minimum, so that tx
+    // could never have been in a valid block and is now (correctly) discarded.
+    // The fixture pays the consensus minimum instead; the property under test
+    // (a still-spendable tx is re-injected) is unchanged.
     let cb_a    = mk_coinbase(0xA1, 500_000_000, 1);
-    let spend_u = mk_spend_tx(u_txid, 0, 0xBB, 9_999_000, 0x01);
+    let spend_u = mk_spend_tx(u_txid, 0, 0xBB, 9_990_000, 0x01);
     let spend_u_txid = spend_u.txid();
     let block_a = mk_block(1, vec![cb_a, spend_u]);
     let a_hash = block_a.block_hash();

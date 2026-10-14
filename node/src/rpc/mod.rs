@@ -1068,48 +1068,38 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             match hex::decode(hex_tx) {
                 Err(_)   => json!({ "error": "invalid hex" }),
                 // Sprint 1.d: Bitcoin-format tx bytes (replaces bincode).
-                // Wallet clients now send stratum_bytes(include_script_sig=true).
-                Ok(raw)  => match Transaction::from_wire_bytes(&raw) {
+                // Wallet clients send stratum_bytes(include_script_sig=true).
+                // MEM-5: strict decode — trailing bytes are refused.
+                Ok(raw)  => match crate::mempool::admission::decode_tx_strict(&raw) {
                     Err(_)  => json!({ "error": "deserialise failed" }),
                     Ok(tx)  => {
                         if tx.is_coinbase() { return json!({ "error": "coinbase not accepted" }); }
-                        // MUST be a height. This fed check_coinbase_maturity
-                        // (VULN-03) bound to the DAG's block COUNT, which on
-                        // 2026-08-13 exceeded the chain height by 10,769 — so
-                        // `current_height - coinbase_height` was inflated by the
-                        // same amount and EVERY coinbase looked mature on
-                        // admission, whatever the 100-block rule says. The
-                        // comment below this call still asserted the two were
-                        // equal; in a chain they are, in a BlockDAG they are not,
-                        // because parallel blocks are kept rather than orphaned.
-                        let current_height = selected_tip_height(&state);
-                        // P0 (roadmap §1.2 / §2.5 #6): PQ signature verification is
-                        // CPU-bound. Run it on the blocking pool so a flood of
-                        // valid-but-expensive txs on this RPC can't stall the async
-                        // reactor. Verification LOGIC is unchanged — only the thread
-                        // it runs on. Costs one Transaction clone per call.
+                        // MEM-1/4/5: the SAME admission function as gossip and
+                        // reorg re-injection. Maturity is evaluated at the next
+                        // block's height (selected-tip DAG height + 1) — never
+                        // the DAG block COUNT, which on 2026-08-13 exceeded the
+                        // chain height by 10,769 and made every coinbase look
+                        // mature. P0: PQ signature verification is CPU-bound, so
+                        // it runs on the blocking pool.
+                        let next_height = crate::mempool::admission::next_block_height(&state.dag.read());
                         let store_v = state.store.clone();
-                        let tx_v = tx.clone();
-                        let verified = tokio::task::spawn_blocking(move || {
-                            validate_tx_for_mempool(&tx_v, &store_v, current_height)
+                        let mempool_v = state.mempool.clone();
+                        let txid = tx.txid();
+                        let admitted = tokio::task::spawn_blocking(move || {
+                            let policy = crate::mempool::admission::AdmissionPolicy::relay(next_height);
+                            crate::mempool::admission::admit(&store_v, &mempool_v, tx, &policy)
                         }).await;
-                        match verified.unwrap_or_else(|e| Err(format!("verify task failed: {}", e))) {
-                            Err(e)   => json!({ "error": e }),
-                            Ok(fee)  => {
-                                let txid = tx.txid();
-                                match state.mempool.add(tx, fee) {
-                                    // Not L-5: this is MempoolError, a validation
-                                    // outcome (e.g. double-spend, fee too low) the
-                                    // caller needs to see to fix their transaction —
-                                    // not an internal/filesystem detail to withhold.
-                                    Err(e) => json!({ "error": e.to_string() }),
-                                    Ok(_)  => {
-                                        let _ = state.outbound_tx.try_send(NetworkMessage::NewTransaction {
-                                            txid, tx_data: raw,
-                                        });
-                                        json!({ "txid": hex::encode(txid) })
-                                    }
-                                }
+                        match admitted {
+                            // Not L-5: an admission verdict (double-spend, fee too
+                            // low, dust, ...) the caller needs to fix their tx —
+                            // not an internal/filesystem detail to withhold.
+                            Err(e)      => json!({ "error": format!("verify task failed: {}", e) }),
+                            Ok(Err(e))  => json!({ "error": e.to_string() }),
+                            Ok(Ok(_))   => {
+                                let _ = state.outbound_tx.try_send(NetworkMessage::NewTransaction {
+                                    txid, tx_data: raw,
+                                });
+                                json!({ "txid": hex::encode(txid) })
                             }
                         }
                     }
@@ -1151,13 +1141,28 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
         // ── Phase 2: estimatefee ─────────────────────────────────────
         "estimatefee" => {
-            let median = state.mempool.median_fee();
+            // MEM-6: a fee RATE (sat per 1,000 wire bytes, the unit of the
+            // consensus minimum), never below the consensus minimum rate or the
+            // mempool's rolling minimum, plus the resulting fee of a typical
+            // one-input / two-output transaction, never below the consensus
+            // minimum fee. (Previously: the median ABSOLUTE fee, defaulting to
+            // 1,000 sat while the consensus minimum is 10,000 sat.)
+            let rate = state.mempool.estimate_fee_rate_per_kb();
+            let typical_size = Transaction::estimate_size(1, 2);
+            let typical_fee = crate::core::tokenomics::min_tx_fee_sat(typical_size)
+                .max((typical_size as u64).saturating_mul(rate).div_ceil(1000));
             json!({
-                // R3: satoshi amount → decimal string.
-                "feerate_sats":  median.to_string(),
-                "feerate_gnb":  median as f64 / 1e8,
-                "mempool_size":  state.mempool.size(),
-                "note":          "median fee of current mempool entries",
+                // R3: satoshi amounts → decimal strings.
+                "feerate_sat_per_kb": rate.to_string(),
+                "min_fee_sat":        crate::core::tokenomics::MIN_TX_FEE_SAT.to_string(),
+                "typical_tx_bytes":   typical_size,
+                "typical_tx_fee_sat": typical_fee.to_string(),
+                // Legacy key: now the recommended ABSOLUTE fee for a typical
+                // transaction (>= the consensus minimum).
+                "feerate_sats":       typical_fee.to_string(),
+                "feerate_gnb":        typical_fee as f64 / 1e8,
+                "mempool_size":       state.mempool.size(),
+                "note":               "fee rate in sat/kB of wire bytes (>= consensus minimum); typical_tx_fee_sat for a 1-in/2-out tx",
             })
         }
 
@@ -1218,53 +1223,22 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         //
         // The reference pool consuming this lives in pool/.
         "getblocktemplate" => {
-            // Snapshot DAG state: parents = current tips; height = max
-            // parent height + 1 (accept_block's VULN-02 rule); blue_score =
-            // tip blue score + 1 (mirrors the solo miner loop).
-            let (parents, height, blue_score) = {
-                let d = state.dag.read();
-                // Mine only on BODIED tips: a header-only tip (body never
-                // arrived over headers-first sync) is unmineable — a block
-                // built on it can't be validated by accept_block, so the
-                // template would wedge the miner on a phantom parent.
-                let tips = d.bodied_tips(|h| state.store.get_block(h).ok().flatten().is_some());
-                if tips.is_empty() {
-                    return json!({ "error": "node has no bodied tip yet (still syncing genesis?)" });
-                }
-                // height / blue_score from the bodied parents only — NOT
-                // tip_blue_score(), which follows the bodyless selected_tip.
-                let max_parent_height = tips.iter()
-                    .filter_map(|t| d.get_block_data(t))
-                    .map(|dd| dd.height)
-                    .max()
-                    .unwrap_or(0);
-                let max_parent_blue_score = tips.iter()
-                    .filter_map(|t| d.get_block_data(t))
-                    .map(|dd| dd.blue_score)
-                    .max()
-                    .unwrap_or(0);
-                (tips, max_parent_height + 1, max_parent_blue_score + 1)
+            // Shared template builder (audit MEM-2 / DAG-2): parents = at most
+            // MAX_PARENTS bodied, non-disqualified tips by blue work; height =
+            // max parent height + 1 (accept_block's VULN-02 rule); expected
+            // bits exactly as accept_block validates them; transactions by fee
+            // rate under a byte budget measured like the consensus size rule,
+            // reserving EXTERNAL_COINBASE_RESERVE bytes for the caller's
+            // coinbase; every tx re-validated against the UTXO set (offenders
+            // evicted). Fees are recomputed from the UTXO set.
+            let tmpl = match crate::template::build_block_template(
+                &state.dag, &state.store, &state.mempool,
+                crate::template::EXTERNAL_COINBASE_RESERVE,
+            ) {
+                Ok(t) => t,
+                Err(e) => return json!({ "error": e }),
             };
-
-            // Expected bits — exactly what accept_block validates a block with
-            // these parents against: ASERT over the latest parent timestamp.
-            let parent_ts = {
-                let d = state.dag.read();
-                crate::core::difficulty_parent_timestamp(
-                    parents.iter().filter_map(|p| d.get_block_data(p)).map(|dd| dd.timestamp))
-            };
-            let bits = match crate::pow::expected_bits(parent_ts, height) {
-                Ok(b) => b,
-                Err(e) => return json!({ "error": format!("expected bits not derivable: {}", e) }),
-            };
-
-            // Mempool selection + per-tx fees (mirrors stratum's
-            // install_fresh_template).
-            let txs = state.mempool.get_for_block(2000);
-            let mut total_fees: u64 = 0;
-            let tx_entries: Vec<Value> = txs.iter().map(|tx| {
-                let fee = state.mempool.get_entry(&tx.txid()).map(|e| e.fee).unwrap_or(0);
-                total_fees = total_fees.saturating_add(fee);
+            let tx_entries: Vec<Value> = tmpl.transactions.iter().map(|(tx, fee)| {
                 json!({
                     "txid": hex::encode(tx.txid()),
                     // R3: satoshi amount → decimal string.
@@ -1273,33 +1247,38 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 })
             }).collect();
 
-            let subsidy = crate::core::tokenomics::block_subsidy_sat(height);
-
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_secs();
 
             json!({
-                "parents":              parents.iter().map(hex::encode).collect::<Vec<_>>(),
-                "height":               height,
-                "blue_score":           blue_score,
-                "bits":                 bits,
+                "parents":              tmpl.parents.iter().map(hex::encode).collect::<Vec<_>>(),
+                "height":               tmpl.height,
+                "blue_score":           tmpl.blue_score,
+                "bits":                 tmpl.bits,
                 "cur_time":             now,
-                "parent_time":          parent_ts,
+                "parent_time":          tmpl.parent_timestamp,
                 // R3: satoshi amounts → decimal strings.
-                "subsidy_sat":          subsidy.to_string(),
-                "total_fees":           total_fees.to_string(),
+                "subsidy_sat":          tmpl.subsidy.to_string(),
+                "total_fees":           tmpl.total_fees.to_string(),
                 "transactions":         tx_entries,
                 // The block's timestamp must be >= parent_time and at most
                 // MAX_FUTURE_SECS ahead of the validator's clock.
-                "min_time":             parent_ts,
+                "min_time":             tmpl.parent_timestamp,
+                // Size accounting: the whole block, measured as the consensus
+                // rule measures it (bincode `Block::size_bytes`), must stay
+                // <= max_block_size; the listed transactions leave
+                // coinbase_reserve bytes for the coinbase.
+                "max_block_size":       crate::core::MAX_BLOCK_SIZE,
+                "coinbase_reserve":     crate::template::EXTERNAL_COINBASE_RESERVE,
+                "max_parents":          crate::core::MAX_PARENTS,
                 // Proof of work: GnB-SMH v1 over the header preimage
                 // (version u32le | n_parents u32le | parents | merkle_root |
                 // timestamp u64le | bits u32le) and the u64 nonce; valid iff
                 // the 32-byte output, big-endian, is < target(bits).
                 "pow":                  "gnb-smh-v1",
                 "pow_log2_n":           gnb_smh::LOG2_N,
-                "target":               hex::encode(crate::core::bits_to_target(bits)),
+                "target":               hex::encode(crate::core::bits_to_target(tmpl.bits)),
             })
         }
 
@@ -1785,69 +1764,23 @@ fn format_tx(tx: &Transaction) -> Value {
     })
 }
 
-/// Validate a transaction for mempool/broadcast acceptance.
+/// Validate a transaction for mempool/broadcast acceptance (no pool context).
 /// Returns the fee (total_in - total_out) on success.
 ///
-/// Sprint N-min: Now checks coinbase maturity (previously only gossip path did).
-/// Callers must pass current chain height for the maturity check. Height of 0
-/// (genesis only) skips the check since there is no matured coinbase to spend.
-fn validate_tx_for_mempool(tx: &Transaction, store: &Arc<Storage>, current_height: u64) -> Result<u64, String> {
-    use sha3::{Sha3_256, Digest};
-
-    // Coinbase maturity check (VULN-03). Single source of truth in
-    // core::check_coinbase_maturity; this call site is one of two.
-    crate::core::check_coinbase_maturity(tx, current_height, |txid| {
-        store.get_coinbase_height(txid).ok().flatten()
-    })?;
-
-
-    // Dust policy (pool-DoS fix): refuse a tx carrying any sub-dust output
-    // (0 < value < DUST_THRESHOLD) at ADMISSION. Block consensus already
-    // rejects such a tx once mined (Block::validate_dust, which exempts the
-    // coinbase and scans every other tx), so a dust tx that slips into the
-    // mempool poisons every block template that includes it — a cheap way to
-    // make an honest pool produce nothing but rejected blocks. Reject it here,
-    // before the expensive signature checks, so it never reaches a template.
-    const DUST_THRESHOLD_SATS: u64 = 546;
-    for (i, o) in tx.outputs.iter().enumerate() {
-        if o.value > 0 && o.value < DUST_THRESHOLD_SATS {
-            return Err(format!(
-                "output {} below dust threshold ({} < {} sats)",
-                i, o.value, DUST_THRESHOLD_SATS
-            ));
-        }
-    }
-
-    let mut total_in = 0u64;
-    // C-R3-2: intra-tx duplicate-outpoint check (insert-as-check, the same
-    // pattern as `euvm_admit_tx_standalone` step (e)). Without it a tx
-    // listing the SAME outpoint N times had its value counted N times below
-    // and was admitted with an N×-inflated fee — an intra-tx double-spend.
-    let mut spent_in_tx = std::collections::HashSet::<([u8; 32], u32)>::new();
-    for (i, inp) in tx.inputs.iter().enumerate() {
-        if !spent_in_tx.insert((inp.prev_txid, inp.prev_index)) {
-            return Err(format!("double-spend: {}:{} already consumed",
-                hex::encode(&inp.prev_txid[..8]), inp.prev_index));
-        }
-        let utxo = store.get_utxo(&inp.prev_txid, inp.prev_index)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("UTXO {}:{} not found", hex::encode(&inp.prev_txid[..8]), inp.prev_index))?;
-        total_in = total_in.checked_add(utxo.value).ok_or("overflow")?;
-        let (sig, pk) = Transaction::parse_script_sig(&inp.script_sig)
-            .ok_or_else(|| format!("malformed script_sig at input {}", i))?;
-        let pk_hash = Sha3_256::digest(&pk)[..20].to_vec();
-        if pk_hash != utxo.script_pubkey { return Err(format!("pubkey mismatch at input {}", i)); }
-        if !crate::crypto::verify(&pk, &tx.sighash(i, crate::core::node_chain_id()), &sig) {
-            return Err(format!("invalid signature at input {}", i));
-        }
-    }
-    let total_out: u64 = tx.outputs.iter()
-        .try_fold(0u64, |acc, o| acc.checked_add(o.value))
-        .ok_or_else(|| "output sum overflow".to_string())?;
-    if total_in < total_out { return Err("inputs < outputs".into()); }
-    let fee = total_in - total_out;
-    crate::core::check_min_fee(tx, fee)?;
-    Ok(fee)
+/// Delegates to the shared admission rules (`mempool::admission`, audit
+/// MEM-1/4/5): size, standardness (dust, zero-value, canonical limits,
+/// MoneyRange), duplicate inputs, UTXO presence, coinbase maturity at
+/// `next_block_height` (`0` skips it), consensus minimum fee and relay fee,
+/// then the hybrid signatures. `sendrawtransaction` itself calls
+/// `admission::admit`, which also runs the pool-relative checks.
+#[allow(dead_code)]
+fn validate_tx_for_mempool(tx: &Transaction, store: &Arc<Storage>, next_block_height: u64) -> Result<u64, String> {
+    let policy = crate::mempool::admission::AdmissionPolicy {
+        next_block_height,
+        check_signatures: true,
+        use_reject_filter: false,
+    };
+    crate::mempool::admission::check_transaction(store, None, tx, &policy).map_err(|e| e.to_string())
 }
 
 
