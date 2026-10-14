@@ -373,14 +373,16 @@ fn do_send(params: &[&str], target: &RpcTarget, stated_network: Option<gnb::addr
     // Keystore v3/v2 first (address field; bloch1q… accepted for v2), then
     // the v1 keyfile format (address derived from the public key).
     // CRY-7: a v2 keystore needs the network stated (--mainnet/--testnet);
-    // it is checked against the stored address and rewritten as v3.
-    let keypair = match gnb::wallet::Keypair::load_for_spending(path, &password, stated_network) {
-        Ok((kp, migration)) => {
-            if migration == gnb::wallet::KeystoreMigration::MigratedV2ToV3 {
-                eprintln!("Keystore {} rewritten as v3 (its network and address are now authenticated).",
-                    path.display());
+    // it is checked against the stored address and rewritten as v3 — but only
+    // once the send is confirmed, keeping the original as <file>.v2.bak.
+    let (keypair, pending_migration) = match gnb::wallet::Keypair::unlock_for_spending(path, &password, stated_network) {
+        Ok((kp, pending)) => {
+            if pending.is_some() {
+                eprintln!("Keystore {} is v2: it is rewritten as v3 (network and address authenticated) \
+                           once the send is confirmed; the original is kept as a .v2.bak copy for Bloch \
+                           wallets and GnB releases before v3, which read only version 2.", path.display());
             }
-            kp
+            (kp, pending)
         }
         Err(e2) if is_keystore_v2_or_v3(path) => die(&format!("Failed to load wallet: {e2}")),
         Err(e2) => match gnb::wallet::Wallet::load_encrypted(path, &password) {
@@ -388,7 +390,7 @@ fn do_send(params: &[&str], target: &RpcTarget, stated_network: Option<gnb::addr
                 if stated_network.is_some_and(|n| n != w.network()) {
                     die("the wallet's network does not match --mainnet/--testnet");
                 }
-                w.into_keypair()
+                (w.into_keypair(), None)
             }
             Err(e1) => {
                 eprintln!("Failed to load wallet: {} (keystore v2/v3) / {} (keyfile v1)", e2, e1);
@@ -424,6 +426,14 @@ fn do_send(params: &[&str], target: &RpcTarget, stated_network: Option<gnb::addr
     }
     if !yes && !gnb::wallet::send::confirm("Broadcast this transaction?") {
         die("not broadcast");
+    }
+    // CRY-7: the send passed every check and was confirmed.
+    if let Some(pending) = pending_migration {
+        match pending.commit() {
+            Ok(backup) => eprintln!("Keystore {} rewritten as v3; the v2 original is kept at {} \
+                                     (keep it for Bloch or older GnB releases).", path.display(), backup.display()),
+            Err(e) => eprintln!("Keystore not migrated: {e}"),
+        }
     }
 
     match gnb::wallet::send::broadcast(&rpc, &prepared) {

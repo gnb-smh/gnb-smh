@@ -274,7 +274,7 @@ pub fn main() {
         }
 
         Cmd::Send { keystore, to, amount, fee, max_fee, yes, allow_unverified_inputs } => {
-            let kp          = load_kp_for_spending(&keystore, stated_network(cli.testnet, cli.mainnet));
+            let (kp, pending_migration) = load_kp_for_spending(&keystore, stated_network(cli.testnet, cli.mainnet));
             let amount_sats = checked_cli_satoshis(&amount, false).unwrap_or_else(|message| err(message));
             let fee_choice  = crate::wallet::send::parse_fee_arg(&fee).unwrap_or_else(|message| err(message));
             let fee_policy  = crate::wallet::send::parse_max_fee_arg(max_fee.as_deref())
@@ -310,6 +310,8 @@ pub fn main() {
             if !yes && !crate::wallet::send::confirm("  Broadcast this transaction?") {
                 err("Not broadcast.");
             }
+            // CRY-7: the spend passed every check and was confirmed.
+            finish_keystore_migration(pending_migration);
 
             print!("  {}broadcasting via sendrawtransaction...{}\r", MUTED, RESET);
             match crate::wallet::send::broadcast(&rpc, &prepared) {
@@ -425,7 +427,7 @@ pub fn main() {
         }
 
         Cmd::Sign { keystore, message } => {
-            let kp = load_kp_for_spending(&keystore, stated_network(cli.testnet, cli.mainnet));
+            let (kp, pending_migration) = load_kp_for_spending(&keystore, stated_network(cli.testnet, cli.mainnet));
             // A4-M-4 FIX: sign a DOMAIN-SEPARATED digest of the message's raw
             // bytes — NEVER hex-decode user-supplied text first. The old
             // code's `hex::decode(&message).unwrap_or_else(|_| message.into_bytes())`
@@ -442,6 +444,7 @@ pub fn main() {
                     let h = hex::encode(&sig);
                     println!("  {}", muted(&h[..64]));
                     println!("  {}...{}", DIM, RESET);
+                    finish_keystore_migration(pending_migration);
                 }
                 Err(e) => err(&format!("Sign failed: {}", e)),
             }
@@ -573,20 +576,42 @@ fn stated_network(testnet: bool, mainnet: bool) -> Option<crate::address::Networ
 }
 
 /// Unlock a keystore for spending or signing (CRY-7): a v2 keystore needs
-/// the network stated and is rewritten as v3 once unlocked.
-fn load_kp_for_spending(path: &std::path::Path, network: Option<crate::address::Network>) -> crate::wallet::Keypair {
+/// the network stated. Its rewrite as v3 is returned pending: the caller
+/// commits it with [`finish_keystore_migration`] only once the spend or
+/// signature went ahead, so an aborted command leaves the v2 file untouched.
+fn load_kp_for_spending(path: &std::path::Path, network: Option<crate::address::Network>)
+    -> (crate::wallet::Keypair, Option<crate::wallet::PendingKeystoreMigration>)
+{
     let pw = prompt_password(&format!("  {}password:{} ", MUTED, RESET));
-    let loaded = crate::wallet::Keypair::load_for_spending(path, &pw, network);
+    let loaded = crate::wallet::Keypair::unlock_for_spending(path, &pw, network);
     drop(pw);
     match loaded {
-        Ok((kp, crate::wallet::KeystoreMigration::MigratedV2ToV3)) => {
+        Ok((kp, pending)) => {
             ok("keystore decrypted");
-            ok("keystore v2 rewritten as v3: its network and address are now authenticated");
+            if pending.is_some() {
+                println!("  {}keystore v2: it is rewritten as v3 (network and address authenticated) once{}", MUTED, RESET);
+                println!("  {}this command completes; the original is kept as <file>.v2.bak for Bloch{}", MUTED, RESET);
+                println!("  {}wallets and GnB releases before v3, which read only version 2.{}", MUTED, RESET);
+            }
             println!();
-            kp
+            (kp, pending)
         }
-        Ok((kp, crate::wallet::KeystoreMigration::AlreadyV3)) => { ok("keystore decrypted"); println!(); kp }
         Err(e) => err(&format!("Load failed: {e} (pass --mainnet or --testnet for a v2 keystore)")),
+    }
+}
+
+/// Commit a pending v2 -> v3 keystore migration (CRY-7) and report where the
+/// original went. A failure is reported but does not undo the command: the
+/// v2 file is then simply left as it was.
+fn finish_keystore_migration(pending: Option<crate::wallet::PendingKeystoreMigration>) {
+    let Some(pending) = pending else { return };
+    match pending.commit() {
+        Ok(backup) => {
+            ok("keystore v2 rewritten as v3: its network and address are now authenticated");
+            label("v2 original", &backup.display().to_string());
+            println!("  {}keep it if you use this key with Bloch or an older GnB release{}", MUTED, RESET);
+        }
+        Err(e) => println!("  {} keystore not migrated: {e}", red("!")),
     }
 }
 

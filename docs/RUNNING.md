@@ -67,9 +67,20 @@ therefore unlock a v2 keystore for spending (`gnb-cli send`) or signing
 (`gnb-wallet send` / `sign`) only when the network is stated with `--mainnet`
 or `--testnet`. The stored address must be a valid address of that network
 and match the decrypted key, and the file's `network` field must not name the
-other network. After a successful unlock the file is rewritten as v3 under
-the same password. The rewrite is atomic (temp file, fsync, rename), mode
-0600, and the new bytes are decrypted and checked before they replace the
-old file. A v3 keystore needs no flag, but a stated network must match it.
-The library calls are `Keypair::load_for_spending` and, for front ends without
-a filesystem, `Keypair::unlock_for_spending_bytes`.
+other network. The file is then rewritten as v3 under the same password,
+but only once the command went ahead: after the send was checked and
+confirmed (`send`) or the message was signed (`sign`); an aborted command
+leaves the v2 file as it was. Before the rewrite the original v2 file is
+copied byte for byte to a new `<file>.v2.bak` (`<file>.v2.bak.1`, `.2`, …
+if that name is taken; an existing backup is never overwritten), mode 0600
+and fsynced; if the copy cannot be written, nothing is rewritten. Keep that
+copy if you use the key elsewhere: **Bloch wallets and GnB releases before
+keystore v3 read only version-2 keystores** and cannot open the v3 file.
+The rewrite itself is atomic (temp file, fsync, rename), mode 0600, and the
+new bytes are decrypted and checked before they replace the old file. A v3
+keystore needs no flag, but a stated network must match it. The library
+calls are `Keypair::unlock_for_spending` (verify in memory, then
+`PendingKeystoreMigration::commit`), `Keypair::load_for_spending` (both at
+once) and, for front ends without a filesystem,
+`Keypair::unlock_for_spending_bytes` (a front end that stores the v3 JSON
+must also keep, or offer for download, the original v2 bytes).

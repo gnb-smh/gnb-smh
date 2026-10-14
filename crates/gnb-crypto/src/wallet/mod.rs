@@ -1187,35 +1187,57 @@ impl Keypair {
     ///   that network (prefix and checksum) and match the decrypted public
     ///   key, and the file's `network` field must not name the other network.
     ///   After the unlock succeeds the file is rewritten as keystore **v3**
-    ///   under the same password — atomically (temp file, fsync, rename) and
-    ///   with mode 0600 — once the new bytes have been decrypted and checked
-    ///   to hold the same key. From then on the network is authenticated.
+    ///   under the same password (see [`PendingKeystoreMigration::commit`]):
+    ///   the original v2 bytes are first kept in a new `<file>.v2.bak`
+    ///   (Bloch wallets and GnB before v3 read only version 2), then the
+    ///   file is replaced atomically (temp file, fsync, rename), mode 0600,
+    ///   once the new bytes have been decrypted and checked to hold the same
+    ///   key. From then on the network is authenticated.
     ///
     /// The migration keeps the user's existing password even if it predates
     /// the current password policy (re-encrypting does not weaken it, and
     /// refusing would leave the file unauthenticated). Returns the keypair and
-    /// what was done to the file.
+    /// what was done to the file. Front ends that should rewrite the file only
+    /// once the spend went ahead use [`Self::unlock_for_spending`].
     pub fn load_for_spending(path: &Path, password: &str, network: Option<Network>)
         -> Result<(Self, KeystoreMigration), String>
+    {
+        let (kp, pending) = Self::unlock_for_spending(path, password, network)?;
+        match pending {
+            None => Ok((kp, KeystoreMigration::AlreadyV3)),
+            Some(pending) => {
+                let backup = pending.commit()?;
+                Ok((kp, KeystoreMigration::MigratedV2ToV3 { backup }))
+            }
+        }
+    }
+
+    /// [`Self::load_for_spending`] without touching the file: a v2 keystore
+    /// is unlocked and checked in memory, and the verified migration is
+    /// returned for the caller to [`PendingKeystoreMigration::commit`] once
+    /// the spend or signature it was unlocked for has passed its checks and
+    /// been confirmed (an aborted send leaves the v2 file exactly as it was).
+    pub fn unlock_for_spending(path: &Path, password: &str, network: Option<Network>)
+        -> Result<(Self, Option<PendingKeystoreMigration>), String>
     {
         let bytes = crate::util::read_wallet_file(path, crate::util::DEFAULT_WALLET_FILE_LIMIT)
             .map_err(|e| e.to_string())?;
         let (kp, v3_json) = Self::unlock_for_spending_bytes(&bytes, password, network)?;
-        match v3_json {
-            None => Ok((kp, KeystoreMigration::AlreadyV3)),
-            Some(json) => {
-                crate::util::atomic_write(path, json.as_bytes()).map_err(|e| format!(
-                    "keystore v2 -> v3 migration: cannot rewrite {}: {e}", path.display()))?;
-                Ok((kp, KeystoreMigration::MigratedV2ToV3))
-            }
-        }
+        let pending = v3_json.map(|v3_json| PendingKeystoreMigration {
+            path: path.to_path_buf(),
+            original: bytes,
+            v3_json,
+        });
+        Ok((kp, pending))
     }
 
     /// The filesystem-free part of [`Self::load_for_spending`] (for front ends
     /// that hold the keystore in memory, e.g. the web wallet): unlock `bytes`,
     /// apply the network checks, and for a v2 keystore also return the v3
     /// JSON that replaces it (already verified to decrypt, under `password`,
-    /// to the same key and address).
+    /// to the same key and address). A caller that stores the v3 JSON must
+    /// keep (or offer the user) the original v2 bytes as well: Bloch wallets
+    /// and GnB releases before keystore v3 cannot open the v3 file.
     pub fn unlock_for_spending_bytes(bytes: &[u8], password: &str, network: Option<Network>)
         -> Result<(Self, Option<String>), String>
     {
@@ -1263,13 +1285,61 @@ impl Keypair {
 }
 
 /// What [`Keypair::load_for_spending`] did with the keystore file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeystoreMigration {
     /// Already keystore v3 (network and address authenticated); unchanged.
     AlreadyV3,
     /// A v2 keystore was verified against the stated network and rewritten
-    /// as v3 (atomic write, mode 0600).
-    MigratedV2ToV3,
+    /// as v3 (atomic write, mode 0600); `backup` holds the original v2 file,
+    /// byte for byte.
+    MigratedV2ToV3 { backup: std::path::PathBuf },
+}
+
+/// A verified v2 -> v3 keystore migration that has not touched the file yet
+/// (CRY-7). Returned by [`Keypair::unlock_for_spending`]; dropping it leaves
+/// the v2 file as it is.
+pub struct PendingKeystoreMigration {
+    path: std::path::PathBuf,
+    original: Vec<u8>,
+    v3_json: String,
+}
+
+impl std::fmt::Debug for PendingKeystoreMigration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingKeystoreMigration").field("path", &self.path).finish_non_exhaustive()
+    }
+}
+
+impl PendingKeystoreMigration {
+    /// The keystore file this migration rewrites.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Rewrite the keystore as v3, keeping the original. In order:
+    /// 1. the file must still hold exactly the bytes that were unlocked
+    ///    (otherwise nothing is done);
+    /// 2. those bytes are written to a NEW sibling `<file>.v2.bak` (or
+    ///    `<file>.v2.bak.<n>` if that name is taken: an existing backup is
+    ///    never overwritten), mode 0600, fsynced with its directory — if this
+    ///    fails, the migration stops and the file is left untouched;
+    /// 3. the file is replaced by the v3 keystore (atomic write, mode 0600).
+    ///
+    /// Returns the backup's path, for the front end to show the user.
+    pub fn commit(self) -> Result<std::path::PathBuf, String> {
+        let shown = self.path.display();
+        let current = crate::util::read_wallet_file(&self.path, crate::util::DEFAULT_WALLET_FILE_LIMIT)
+            .map_err(|e| format!("keystore v2 -> v3 migration: cannot re-read {shown}: {e}"))?;
+        if current != self.original {
+            return Err(format!("keystore v2 -> v3 migration: {shown} changed since it was unlocked; left as it is"));
+        }
+        let backup = crate::util::write_new_backup(&self.path, ".v2.bak", &self.original).map_err(|e| format!(
+            "keystore v2 -> v3 migration: cannot write a backup of {shown} ({e}); the file is left unchanged"))?;
+        crate::util::atomic_write(&self.path, self.v3_json.as_bytes()).map_err(|e| format!(
+            "keystore v2 -> v3 migration: cannot rewrite {shown}: {e} (the v2 original is unchanged; a copy is at {})",
+            backup.display()))?;
+        Ok(backup)
+    }
 }
 
 /// Parse the authenticated legacy plaintext while keeping its complete
@@ -2436,7 +2506,9 @@ mod audit_2026_10_wallet_fixes {
 
         // The right network: unlocked and migrated.
         let (loaded, what) = Keypair::load_for_spending(&path, PW, Some(Network::Testnet)).unwrap();
-        assert_eq!(what, KeystoreMigration::MigratedV2ToV3);
+        let mut backup_name = path.file_name().unwrap().to_os_string();
+        backup_name.push(".v2.bak");
+        assert_eq!(what, KeystoreMigration::MigratedV2ToV3 { backup: path.with_file_name(backup_name) });
         assert_eq!(loaded.address, kp.address);
         assert_eq!(loaded.private_key, kp.private_key);
         let rewritten = std::fs::read_to_string(&path).unwrap();
@@ -2501,6 +2573,107 @@ mod audit_2026_10_wallet_fixes {
         let reopened = Keypair::from_encrypted_bytes(json.as_bytes(), weak).unwrap();
         assert_eq!(reopened.address, kp.address);
         assert!(json.contains(&kp.address) && json.contains("\"version\": 3"));
+    }
+
+    fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+        let mut name = path.file_name().unwrap().to_os_string();
+        name.push(suffix);
+        path.with_file_name(name)
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Review follow-up (CRY-7): migrating a Bloch v2 keystore keeps the
+    /// original — the only file Bloch wallets and pre-v3 GnB can open —
+    /// byte for byte in a new `<file>.v2.bak` (0600), and a later migration
+    /// never overwrites an existing backup.
+    #[test]
+    fn v2_migration_keeps_a_byte_identical_backup_and_never_overwrites_one() {
+        let kp = generate_keypair(false);
+        let v2 = kp.to_encrypted_json_version(PW, LEGACY_KEYSTORE_VERSION_V2).unwrap();
+        let body = kp.address.strip_prefix(crate::core::MAINNET_PREFIX).unwrap();
+        let bloch = v2.replace(&kp.address, &format!("bloch1q{body}"));
+        let path = temp_keystore("backup", &bloch);
+
+        let (_, what) = Keypair::load_for_spending(&path, PW, Some(Network::Mainnet)).unwrap();
+        let first = with_suffix(&path, ".v2.bak");
+        assert_eq!(what, KeystoreMigration::MigratedV2ToV3 { backup: first.clone() });
+        assert_eq!(std::fs::read(&first).unwrap(), bloch.as_bytes(), "the backup is the original, byte for byte");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"version\": 3"));
+        #[cfg(unix)]
+        assert_eq!(mode_of(&first), 0o600);
+        // The backup still opens as the v2 keystore it was.
+        let reopened = Keypair::from_encrypted_bytes(&std::fs::read(&first).unwrap(), PW).unwrap();
+        assert_eq!(reopened.address, kp.address);
+
+        // The same v2 file migrated again (e.g. restored from the backup):
+        // the first backup is kept and a new name is used.
+        std::fs::write(&path, &bloch).unwrap();
+        let (_, what) = Keypair::load_for_spending(&path, PW, Some(Network::Mainnet)).unwrap();
+        let second = with_suffix(&path, ".v2.bak.1");
+        assert_eq!(what, KeystoreMigration::MigratedV2ToV3 { backup: second.clone() });
+        assert_eq!(std::fs::read(&first).unwrap(), bloch.as_bytes());
+        assert_eq!(std::fs::read(&second).unwrap(), bloch.as_bytes());
+        // An unrelated file squatting on the next name is not touched either.
+        std::fs::write(with_suffix(&path, ".v2.bak.2"), b"not a keystore").unwrap();
+        std::fs::write(&path, &bloch).unwrap();
+        let (_, what) = Keypair::load_for_spending(&path, PW, Some(Network::Mainnet)).unwrap();
+        assert_eq!(what, KeystoreMigration::MigratedV2ToV3 { backup: with_suffix(&path, ".v2.bak.3") });
+        assert_eq!(std::fs::read(with_suffix(&path, ".v2.bak.2")).unwrap(), b"not a keystore");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Review follow-up (CRY-7): `unlock_for_spending` verifies the
+    /// migration in memory and changes nothing until `commit`, so a send that
+    /// is aborted (mistyped address, refused confirmation) leaves the v2 file
+    /// as it was; a file changed in between is not overwritten.
+    #[test]
+    fn unlock_for_spending_rewrites_nothing_until_commit() {
+        let kp = generate_keypair(true);
+        let v2 = kp.to_encrypted_json_version(PW, LEGACY_KEYSTORE_VERSION_V2).unwrap();
+        let path = temp_keystore("pending", &v2);
+        let (loaded, pending) = Keypair::unlock_for_spending(&path, PW, Some(Network::Testnet)).unwrap();
+        assert_eq!(loaded.private_key, kp.private_key);
+        let pending = pending.expect("a v2 file has a pending migration");
+        assert_eq!(pending.path(), path.as_path());
+        drop(pending);                                  // the spend was aborted
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), v2, "nothing written");
+        assert!(!with_suffix(&path, ".v2.bak").exists(), "no backup either");
+
+        let (_, pending) = Keypair::unlock_for_spending(&path, PW, Some(Network::Testnet)).unwrap();
+        let backup = pending.unwrap().commit().unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), v2);
+        let (_, again) = Keypair::unlock_for_spending(&path, PW, None).unwrap();
+        assert!(again.is_none(), "v3 now: nothing left to migrate");
+
+        // Changed between unlock and commit: refused, left alone.
+        std::fs::write(&path, &v2).unwrap();
+        let (_, pending) = Keypair::unlock_for_spending(&path, PW, Some(Network::Testnet)).unwrap();
+        std::fs::write(&path, format!("{v2} ")).unwrap();
+        let err = pending.unwrap().commit().unwrap_err();
+        assert!(err.contains("changed since it was unlocked"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{v2} "));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Review follow-up (CRY-7): if the backup cannot be written the
+    /// migration stops and the v2 file is left untouched (here the backup's
+    /// name would exceed the file-name length limit).
+    #[test]
+    fn migration_stops_when_the_backup_cannot_be_written() {
+        let kp = generate_keypair(true);
+        let v2 = kp.to_encrypted_json_version(PW, LEGACY_KEYSTORE_VERSION_V2).unwrap();
+        let dir = temp_keystore("nobackup", "").parent().unwrap().to_path_buf();
+        let path = dir.join("w".repeat(250));
+        std::fs::write(&path, &v2).unwrap();
+        let err = Keypair::load_for_spending(&path, PW, Some(Network::Testnet)).unwrap_err();
+        assert!(err.contains("cannot write a backup") && err.contains("left unchanged"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), v2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// WAL-1 regression: `Wallet::build_tx` refuses a fee equal to almost
