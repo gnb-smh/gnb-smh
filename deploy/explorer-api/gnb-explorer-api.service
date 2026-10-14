@@ -1,4 +1,9 @@
 # Read-only explorer API for gnb-smh.com, in front of the local GnB node.
+#
+# Default (WAL-2/WAL-4): loopback only, published through a Cloudflare Tunnel
+# (cloudflared-gnb-explorer.service). For direct TLS instead, set
+# GNB_API_BIND=0.0.0.0 plus GNB_API_TLS_CERT/GNB_API_TLS_KEY and apply
+# firewall-cloudflare.sh so only Cloudflare can connect. See README.md.
 [Unit]
 Description=GnB explorer API (read-only)
 After=gnb-node.service
@@ -8,14 +13,23 @@ Wants=gnb-node.service
 User=gnb
 Group=gnb
 Environment=GNB_RPC_URL=http://127.0.0.1:17210/
-Environment=GNB_API_BIND=0.0.0.0
+Environment=GNB_API_BIND=127.0.0.1
 Environment=GNB_API_PORT=2086
 Environment=GNB_API_KEY_FILE=/etc/gnb/explorer-api.key
 Environment=GNB_CARRYOVER=/opt/gnb/carryover.tsv
+Environment=GNB_API_MAX_CONNECTIONS=64
+Environment=GNB_API_TIMEOUT=10
+Environment=GNB_API_DEADLINE=30
+# Direct-TLS mode only (key readable by the gnb user, mode 0640 root:gnb):
+#Environment=GNB_API_BIND=0.0.0.0
+#Environment=GNB_API_PORT=2087
+#Environment=GNB_API_TLS_CERT=/etc/gnb/explorer-api.crt
+#Environment=GNB_API_TLS_KEY=/etc/gnb/explorer-api.tls.key
 ExecStart=/usr/bin/python3 -I /opt/gnb/bin/gnb_explorer_api.py
 Restart=always
 RestartSec=3
 MemoryMax=1G
+TasksMax=128
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
