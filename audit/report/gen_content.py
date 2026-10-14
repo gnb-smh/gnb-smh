@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the narrative, scorecard, component, metrics and test-run data files.
+"""Write the narrative, scorecard, component and metrics data files.
 
     python3 audit/report/gen_content.py
 
@@ -421,7 +421,6 @@ def main():
     dump("scorecard.json", SCORE)
     dump("components.json", COMPONENTS)
     dump("metrics.json", METRICS)
-    dump("test_runs.json", dict(headers=["Suite", "Result"], rows=[]))
     print("scores", SCORE["gnb_total"], SCORE["btc_total"])
 
 
