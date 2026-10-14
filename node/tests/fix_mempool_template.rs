@@ -63,13 +63,32 @@ fn mem1_mem3_unminable_pool_tx_is_evicted_by_the_template() {
     for t in [&dust, &stale, &good] {
         n.mempool.add(t.clone(), 100_000).unwrap(); // bypasses admission (pre-fix state)
     }
-    let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
+    let tmpl = template::build_block_template_with(&n.dag, &n.store, &n.mempool, &template::TemplateOptions {
+        coinbase_reserve: template::EXTERNAL_COINBASE_RESERVE, verify_scripts: false,
+    }).unwrap();
     assert_eq!(tmpl.evicted, 2);
     assert_eq!(tmpl.transactions.len(), 1);
     assert_eq!(tmpl.transactions[0].0.txid(), good.txid());
     assert!(!n.mempool.contains(&dust.txid()) && !n.mempool.contains(&stale.txid()));
     let cb = template::miner_coinbase(tmpl.height, tmpl.subsidy + tmpl.total_fees, vec![0xCB; 20]);
     template::assemble_block(&tmpl, cb, unix_now()).expect("template passes its self-check");
+}
+
+/// The default template verifies input scripts too: a pooled tx with a bad
+/// signature (pre-fix state) is evicted, never mined into an invalid block.
+#[test]
+fn mem1_badly_signed_pool_tx_is_evicted_by_the_default_template() {
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let k = key();
+    let fund = ([0x47u8; 32], 0u32, out(1_000_000, &k.spk));
+    let n = node_with(&genesis, &[fund.clone()]);
+    let mut t = signed_spend(&k, &[(fund.0, 0)], vec![out(900_000, &[0x01; 20])]);
+    t.inputs[0].script_sig[10] ^= 0xFF; // corrupt the signature
+    n.mempool.add(t.clone(), 100_000).unwrap();
+    let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
+    assert_eq!(tmpl.evicted, 1);
+    assert!(tmpl.transactions.is_empty());
+    assert!(!n.mempool.contains(&t.txid()));
 }
 
 // ── MEM-2 ────────────────────────────────────────────────────────────────────
@@ -92,7 +111,10 @@ fn mem2_template_stays_under_max_block_size_with_200_pending_txs() {
         n.mempool.add(fake_spend(prev, 1_000_000 - 20_000 - i as u64, script_sig_len), 20_000 + i as u64).unwrap();
     }
     let reserve = template::miner_coinbase(u64::MAX, u64::MAX, vec![0xCB; 20]).actual_size();
-    let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, reserve).unwrap();
+    // Synthetic signature-sized script_sigs: size accounting only.
+    let tmpl = template::build_block_template_with(&n.dag, &n.store, &n.mempool, &template::TemplateOptions {
+        coinbase_reserve: reserve, verify_scripts: false,
+    }).unwrap();
     assert!(!tmpl.transactions.is_empty() && tmpl.transactions.len() < 200,
         "byte budget bounds the selection: {}", tmpl.transactions.len());
     // Highest fee rate first.

@@ -14,8 +14,8 @@
 //! * Self-check: every selected transaction is re-validated against the
 //!   current UTXO set (standardness, inputs present and not already used by
 //!   the template, coinbase maturity at the template height, MoneyRange,
-//!   consensus minimum fee — signatures were verified at admission and are
-//!   cached). A transaction that fails is EVICTED from the mempool instead of
+//!   consensus minimum fee, input scripts — normally verified-signature cache
+//!   hits). A transaction that fails is EVICTED from the mempool instead of
 //!   making every template invalid (MEM-1, MEM-3). The fees the coinbase may
 //!   claim are recomputed from the UTXO set, never taken from the pool.
 //!
@@ -111,6 +111,28 @@ pub fn build_block_template(
     mempool: &Mempool,
     coinbase_reserve: usize,
 ) -> Result<BlockTemplate, String> {
+    build_block_template_with(dag, store, mempool, &TemplateOptions { coinbase_reserve, verify_scripts: true })
+}
+
+/// Template-building knobs.
+#[derive(Clone, Copy, Debug)]
+pub struct TemplateOptions {
+    /// Bytes kept free for the coinbase.
+    pub coinbase_reserve: usize,
+    /// Verify each selected transaction's input scripts (signatures). On by
+    /// default; normally served from the verified-signature cache. Tests with
+    /// synthetic unsigned transactions turn it off.
+    pub verify_scripts: bool,
+}
+
+/// [`build_block_template`] with explicit options.
+pub fn build_block_template_with(
+    dag: &Arc<RwLock<GhostDAG>>,
+    store: &Storage,
+    mempool: &Mempool,
+    options: &TemplateOptions,
+) -> Result<BlockTemplate, String> {
+    let coinbase_reserve = options.coinbase_reserve;
     let _guard = store.acceptance_lock();
 
     let (parents, height, blue_score, parent_ts) = {
@@ -154,7 +176,7 @@ pub fn build_block_template(
         if used.saturating_add(size) > budget {
             continue; // a smaller, lower-rate tx may still fit
         }
-        match self_check(store, &tx, height, &spent_by_template) {
+        match self_check(store, &tx, height, &spent_by_template, options.verify_scripts) {
             Ok(fee) => {
                 let new_total = match core::limits::money_add(total_fees, fee) {
                     Ok(t) => t,
@@ -208,10 +230,12 @@ fn self_check(
     tx: &Transaction,
     height: u64,
     spent_by_template: &HashSet<([u8; 32], u32)>,
+    verify_scripts: bool,
 ) -> Result<u64, TemplateReject> {
     admission::check_standard(tx).map_err(|e| TemplateReject::Evict(e.to_string()))?;
     let mut seen: HashSet<([u8; 32], u32)> = HashSet::new();
     let mut total_in: u64 = 0;
+    let mut prevouts: Vec<TxOutput> = Vec::with_capacity(tx.inputs.len());
     for inp in &tx.inputs {
         let op = (inp.prev_txid, inp.prev_index);
         if !seen.insert(op) {
@@ -227,7 +251,8 @@ fn self_check(
             Err(_) => return Err(TemplateReject::Skip),
         };
         total_in = core::limits::money_add(total_in, out.value)
-            .map_err(|e| TemplateReject::Evict(e))?;
+            .map_err(TemplateReject::Evict)?;
+        prevouts.push(out);
     }
     core::check_coinbase_maturity(tx, height, |t| store.get_coinbase_height(t).ok().flatten())
         .map_err(TemplateReject::Evict)?;
@@ -237,6 +262,11 @@ fn self_check(
     }
     let fee = total_in - total_out;
     core::check_min_fee(tx, fee).map_err(TemplateReject::Evict)?;
+    if verify_scripts {
+        // Normally a verified-signature cache hit: pooled transactions were
+        // verified at admission, re-injected ones when their block connected.
+        admission::verify_input_scripts(tx, &prevouts).map_err(TemplateReject::Evict)?;
+    }
     Ok(fee)
 }
 

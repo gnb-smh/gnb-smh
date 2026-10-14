@@ -1864,6 +1864,13 @@ fn make_rpc_submit_block_cb(
     Arc::new(move |block: core::Block| -> Result<String, String> {
         let block_hash = block.block_hash();
         if dag.read().has_block(&block_hash) {
+            // DAG-1: a disqualified block stays in the DAG; tell the
+            // submitter it is invalid rather than merely a duplicate.
+            if dag.read().is_invalid(&block_hash) {
+                let reason = store.invalid_block_reason(&block_hash).ok().flatten()
+                    .unwrap_or_else(|| "descends from an invalid block".to_string());
+                return Err(format!("duplicate block (known invalid: {})", reason));
+            }
             return Err("duplicate block".to_string());
         }
         block.validate_structure()
