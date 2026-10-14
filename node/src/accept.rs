@@ -210,36 +210,14 @@ pub fn validate_block_in_view(view: &dyn UtxoView, block: &core::Block) -> Resul
 }
 
 // ── Shielded state (COH-2) ───────────────────────────────────────────────────
-
-/// Compute the shielded pool after moving the applied chain along `plan`
-/// (disconnect `to_rollback` tip-first, connect `to_apply` in order) on a
-/// CLONE. The caller swaps it in only after the RocksDB batch committed.
-fn shielded_after_plan(
-    shielded: &Arc<RwLock<ShieldedPool>>,
-    store: &storage::Storage,
-    plan: &reorg::ReorgPlan,
-) -> Result<ShieldedPool, ConnectError> {
-    let mut next = shielded.read().clone();
-    for h in &plan.to_rollback {
-        let had = store.get_block(h).ok().flatten()
-            .map(|b| !b.shielded_transactions.is_empty())
-            .unwrap_or(true);
-        next.disconnect_for_reorg(*h, had).map_err(|e| ConnectError::Failed(format!(
-            "shielded disconnect of {} failed: {:?}", hex::encode(&h[..8]), e)))?;
-    }
-    for h in &plan.to_apply {
-        let b = store.get_block(h).map_err(|e| ConnectError::Failed(e.to_string()))?
-            .ok_or_else(|| ConnectError::Failed("block body missing for shielded apply".into()))?;
-        if let Err(e) = next.apply_block_self(*h, &b.shielded_transactions) {
-            return Err(ConnectError::Invalid {
-                block: *h,
-                height: b.height,
-                reason: format!("shielded consensus rejection: {:?}", e),
-            });
-        }
-    }
-    Ok(next)
-}
+//
+// The shielded pool moves with the applied chain: `ShieldedPool::stage_plan`
+// moves it in memory along the plan (no clone: in-place apply/undo with an
+// exact revert journal) and returns its writes, which `stage_extra` folds into
+// the plan's WriteBatch; after the commit the staged plan is committed, on
+// any failure it is reverted. The shielded lock is taken only for those short
+// steps (acceptance is serialized by the acceptance lock, and the pipeline is
+// the only user of the pool).
 
 // ── Mempool maintenance after a connect (MEM-3, MEM-7) ──────────────────────
 
@@ -375,7 +353,8 @@ fn resolve_best_chain(
             }
         }
 
-        let next_shielded = match shielded_after_plan(shielded, store, &plan) {
+        let staged_shielded = shielded.write().stage_plan(store, &plan);
+        let staged_shielded = match staged_shielded {
             Ok(s) => s,
             Err(ConnectError::Invalid { block, reason, .. }) => {
                 disqualify(dag, block, reason, invalid_log);
@@ -401,13 +380,19 @@ fn resolve_best_chain(
                 }
             }
             stage_invalid_marks(dag, st, batch, &log_snapshot)?;
+            // COH-2: the shielded state of the plan, in the same batch.
+            staged_shielded.stage_into(st, batch)?;
             st.stage_meta(batch, "tip_hash", &new_tip).map_err(|e| e.to_string())
         };
         let hooks = ConnectHooks { validate: &validate, stage_extra: &stage_extra };
-        match reorg::connect_plan(store, &plan, &hooks) {
+        let result = reorg::connect_plan(store, &plan, &hooks);
+        match &result {
+            Ok(_) => shielded.write().commit_staged(staged_shielded),
+            Err(_) => shielded.write().revert_staged(staged_shielded),
+        }
+        match result {
             Ok(outcome) => {
                 if reorg_depth > 0 { crate::metrics::inc_reorg_success(); }
-                *shielded.write() = next_shielded;
                 // Marks were persisted in the batch.
                 invalid_log.clear();
                 return Ok(Resolution::Connected { plan, outcome });
@@ -821,16 +806,33 @@ pub fn reconcile_on_startup(
              pre-fix commit); rolling them back atomically",
             to_rollback.len()
         );
+        // COH-2: these blocks predate shielded persistence; the shielded tip
+        // follows the UTXO tip in the same batch.
+        let staged_shielded = match back_to {
+            Some(t) => Some(shielded.write().stage_retip(store, &to_rollback, t)
+                .map_err(|e| format!("reconcile rollback: {e}"))?),
+            None => None,
+        };
         let plan = reorg::ReorgPlan { lca: back_to.unwrap_or([0u8; 32]), to_rollback, to_apply: vec![] };
         let validate = |_: &dyn UtxoView, _: &core::Block| -> Result<(), String> { Ok(()) };
         let stage_extra = |st: &storage::Storage, batch: &mut rocksdb::WriteBatch| -> Result<(), String> {
             if let Some(t) = back_to {
                 st.stage_meta(batch, "tip_hash", &t).map_err(|e| e.to_string())?;
             }
+            if let Some(s) = &staged_shielded {
+                s.stage_into(st, batch)?;
+            }
             Ok(())
         };
         let hooks = ConnectHooks { validate: &validate, stage_extra: &stage_extra };
-        reorg::connect_plan(store, &plan, &hooks).map_err(|e| format!("reconcile rollback: {}", e))?;
+        let result = reorg::connect_plan(store, &plan, &hooks);
+        if let Some(s) = staged_shielded {
+            match &result {
+                Ok(_) => shielded.write().commit_staged(s),
+                Err(_) => shielded.write().revert_staged(s),
+            }
+        }
+        result.map_err(|e| format!("reconcile rollback: {}", e))?;
     }
 
     // Step 3: applied tip vs best valid block.

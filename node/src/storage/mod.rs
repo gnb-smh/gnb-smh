@@ -21,6 +21,7 @@ const CF_ADDR_TX_HISTORY: &str = "addr_tx_history";  // addr → chronological t
 const CF_UNDO:       &str = "undo";        // Sprint U.1: per-block undo data for reorg rollback
 const CF_DAG_INTEGRITY: &str = "dag_integrity";  // Sprint Y (M-2): hash-chain over GhostdagData
 const CF_REACHABILITY: &str = "reachability";    // Phase 1: durable interval-reachability index (non-consensus cache)
+const CF_SHIELDED: &str = "shielded";            // audit COH-2: shielded-pool state + undo (layout: coherence::persist)
 
 // ── PoBRS Column Families (Sprint 1.5) ─────────────────────────────────
 // Persistence layer for the Proof-of-Blue-and-Red-Score subsystem.
@@ -131,6 +132,10 @@ impl Storage {
             // value = encode_record() bytes. A rebuildable cache, never part of
             // the integrity chain; see docs/adr/ADR-035-durable-reachability-index.md.
             ColumnFamilyDescriptor::new(CF_REACHABILITY, Options::default()),
+            // Audit COH-2: shielded-pool consensus state (commitment-tree
+            // leaves, spent nullifiers, anchor window, per-block undo, tip),
+            // written in the same WriteBatch as the UTXO changes.
+            ColumnFamilyDescriptor::new(CF_SHIELDED, Options::default()),
             // ── PoBRS CFs (Sprint 1.5) ─────────────────────────────
             ColumnFamilyDescriptor::new(CF_POBRS_META,                Options::default()),
             ColumnFamilyDescriptor::new(CF_POBRS_ORACLES,             Options::default()),
@@ -191,10 +196,21 @@ impl Storage {
     /// The DB must already exist; this never creates column families.
     pub fn open_read_only(path: &Path) -> Result<Self, StorageError> {
         let opts = Options::default();
+        // A read-only open cannot create column families, so open only the
+        // ones the snapshot has: a data-dir written before a CF was added
+        // (e.g. `shielded`, audit COH-2) stays readable.
+        let existing: std::collections::HashSet<String> = DB::list_cf(&opts, path)
+            .map_err(|e| StorageError::OpenFailed(e.to_string()))?
+            .into_iter()
+            .collect();
+        let descriptors: Vec<ColumnFamilyDescriptor> = Self::cf_descriptors()
+            .into_iter()
+            .filter(|d| existing.contains(d.name()))
+            .collect();
         // `error_if_log_file_exist = false`: tolerate a live/unclean WAL so we
         // can inspect a running node's dir. Read-only mode never replays into or
         // mutates the primary.
-        let db = DB::open_cf_descriptors_read_only(&opts, path, Self::cf_descriptors(), false)
+        let db = DB::open_cf_descriptors_read_only(&opts, path, descriptors, false)
             .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
         Ok(Self { db, accept_lock: parking_lot::ReentrantMutex::new(()) })
     }
@@ -869,6 +885,47 @@ impl Storage {
             batch.delete_cf(&cf_t, &block.height.to_be_bytes());
         }
         Ok(())
+    }
+
+    // ── Shielded-pool state (audit COH-2; key layout in coherence::persist) ──
+
+    /// Stage a CF_SHIELDED put.
+    pub fn stage_shielded_put(&self, batch: &mut rocksdb::WriteBatch, key: &[u8], value: &[u8])
+        -> Result<(), StorageError>
+    {
+        let cf = self.db.cf_handle(CF_SHIELDED).ok_or(StorageError::CfNotFound(CF_SHIELDED.into()))?;
+        batch.put_cf(&cf, key, value);
+        Ok(())
+    }
+
+    /// Stage a CF_SHIELDED delete.
+    pub fn stage_shielded_delete(&self, batch: &mut rocksdb::WriteBatch, key: &[u8])
+        -> Result<(), StorageError>
+    {
+        let cf = self.db.cf_handle(CF_SHIELDED).ok_or(StorageError::CfNotFound(CF_SHIELDED.into()))?;
+        batch.delete_cf(&cf, key);
+        Ok(())
+    }
+
+    /// Read one CF_SHIELDED value.
+    pub fn get_shielded(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        let cf = self.db.cf_handle(CF_SHIELDED).ok_or(StorageError::CfNotFound(CF_SHIELDED.into()))?;
+        self.db.get_cf(&cf, key).map_err(|e| StorageError::ReadFailed(e.to_string()))
+    }
+
+    /// Every CF_SHIELDED (key, value) whose key starts with `prefix`, in key
+    /// order.
+    pub fn scan_shielded_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let cf = self.db.cf_handle(CF_SHIELDED).ok_or(StorageError::CfNotFound(CF_SHIELDED.into()))?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(&cf, IteratorMode::From(prefix, rocksdb::Direction::Forward)) {
+            let (k, v) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            if !k.starts_with(prefix) {
+                break;
+            }
+            out.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(out)
     }
 
     // ── Chain-disqualified blocks (audit DAG-1) ─────────────────────────

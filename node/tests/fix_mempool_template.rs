@@ -7,6 +7,7 @@ use fix_common::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use gnb::coherence::ShieldedPool;
 use gnb::consensus::GhostDAG;
 use gnb::core::{self, Block, BlockHeader, MerkleRoot, Transaction, TxInput, TxOutput};
 use gnb::mempool::admission::{self, AdmissionError, AdmissionPolicy};
@@ -438,28 +439,36 @@ fn val11_money_range_is_enforced_on_acceptance() {
 
 // ── COH-2 ────────────────────────────────────────────────────────────────────
 
-/// The shielded engine is driven ONLY by selected-chain connects/disconnects:
+/// The shielded state is driven ONLY by selected-chain connects/disconnects:
 /// a fork-loser leaves it untouched; a reorg disconnects and reconnects.
 /// Pre-fix every accepted block (fork-losers included) pushed an undo record
 /// in arrival order and reorgs never disconnected anything.
+///
+/// (Updated for the COH-2 residual: the pipeline no longer keeps an
+/// in-memory undo journal, so the shielded TIP — in memory and persisted in
+/// the connect batch — is what follows the selected chain.)
 #[test]
 fn coh2_shielded_state_follows_the_selected_chain_only() {
     let genesis = mk_genesis(unix_now() - 10_000);
     let gh = genesis.block_hash();
     let n = node_with(&genesis, &[]);
-    let depth = |n: &Node| n.shielded.read().engine.undo_depth();
+    let tip = |n: &Node| n.shielded.read().tip();
+    let persisted_tip = |n: &Node| ShieldedPool::load(&n.store).unwrap().tip();
 
     let m1 = empty_child(&n, gh, "m1");
     accept(&n, &m1).unwrap();
-    assert_eq!(depth(&n), 1, "connected block recorded");
+    assert_eq!(tip(&n), Some(m1.block_hash()), "connected block recorded");
+    assert_eq!(persisted_tip(&n), Some(m1.block_hash()));
     let sub = core::tokenomics::block_subsidy_sat(1);
     let f1 = mk_block_where(&n, vec![gh], vec![coinbase("f1", sub, vec![0xF1; 20])], |h| *h < m1.block_hash());
     accept(&n, &f1).unwrap();
-    assert_eq!(depth(&n), 1, "fork-loser does not touch the shielded state");
+    assert_eq!(tip(&n), Some(m1.block_hash()), "fork-loser does not touch the shielded state");
+    assert_eq!(persisted_tip(&n), Some(m1.block_hash()));
     let f2 = empty_child(&n, f1.block_hash(), "f2");
     accept(&n, &f2).unwrap();
     assert_eq!(sel_tip(&n), Some(f2.block_hash()));
-    assert_eq!(depth(&n), 2, "reorg: m1 disconnected, f1 + f2 connected");
+    assert_eq!(tip(&n), Some(f2.block_hash()), "reorg: m1 disconnected, f1 + f2 connected");
+    assert_eq!(persisted_tip(&n), applied_tip(&n), "shielded tip committed with the UTXO tip");
 }
 
 #[allow(dead_code)]
