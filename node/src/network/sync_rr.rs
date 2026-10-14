@@ -27,13 +27,16 @@
 //! `request-response` protocol (`/gnb/sync/1`): one request → one chosen
 //! peer, not a broadcast. This removes the O(peers) IBD amplification entirely.
 //!
-//! ## Mixed-fleet compatibility
+//! ## Failure handling (audit NET-5 / NET-7 / NET-9)
 //!
-//! Some fleet nodes still run the old binary and only speak gossip `GetBlock`.
-//! The router therefore degrades gracefully: a directed request that fails with
-//! `OutboundFailure` (peer doesn't speak `/gnb/sync/1`, dial failure, or
-//! timeout) is **re-published on the gossip sync topic**, so an old peer can
-//! still answer. See `mod.rs`'s `SyncRr` event arm.
+//! A directed request that fails (timeout, reset, peer without
+//! `/gnb/sync/1`) or is answered [`SyncResponse::Busy`] is retried on ANOTHER
+//! connected peer chosen by [`PullPeerSelector`] (rotation, per-peer in-flight
+//! cap, stall cooldown). It is NEVER re-published on the gossip sync topic:
+//! gossip pulls are no longer answered by anyone, because answering them made
+//! every node broadcast a reply to the whole mesh (O(N²) amplification). A
+//! request that exhausts its attempts is dropped; the processor's own retry
+//! paths (frontier expiry, orphan sweep, the 30 s nudge) re-issue it.
 
 use async_trait::async_trait;
 use futures::prelude::*;
@@ -109,6 +112,14 @@ pub enum SyncResponse {
     Peers {
         peers: Vec<String>,
     },
+    /// NET-5 (audit): explicit "rate-limited, ask someone else / later". The
+    /// server used to DROP the response channel when its `SyncRequestLimiter`
+    /// refused a request; libp2p then closed the stream cleanly, the requester
+    /// decoded the empty frame as InvalidData and charged the honest server a
+    /// protocol-violation penalty. A refusal is now an answer, and a requester
+    /// treats it as back-pressure (rotate peer, retry later), never as an
+    /// offence. Appended LAST so every existing variant keeps its bincode tag.
+    Busy,
 }
 
 /// Map an outbound `NetworkMessage` to a `SyncRequest` IFF it is a PULL message
@@ -139,8 +150,11 @@ pub fn as_pull_request(msg: &NetworkMessage) -> Option<SyncRequest> {
 /// `main.rs` message-processor already understands, so directed-pull answers
 /// flow through the SAME ingest path as the legacy gossip answers — no change
 /// to the processor's block/header handling.
-pub fn response_to_message(resp: SyncResponse) -> NetworkMessage {
-    match resp {
+///
+/// `Busy` (NET-5) carries no payload for the processor and maps to `None`:
+/// the network loop handles it (peer rotation + retry) before delivery.
+pub fn response_to_message(resp: SyncResponse) -> Option<NetworkMessage> {
+    Some(match resp {
         SyncResponse::Block { block_hash, blue_score, height, block_data } => {
             NetworkMessage::NewBlock { block_hash, blue_score, height, block_data }
         }
@@ -155,7 +169,8 @@ pub fn response_to_message(resp: SyncResponse) -> NetworkMessage {
         // persistence until a dial confirms) — no new client-side logic
         // needed, only the transport (directed vs. broadcast) changed.
         SyncResponse::Peers { peers } => NetworkMessage::PeerExchange { peers },
-    }
+        SyncResponse::Busy => return None,
+    })
 }
 
 // ── Codec ──────────────────────────────────────────────────────────────────
@@ -225,6 +240,23 @@ where
 {
     let mut buf = Vec::new();
     io.take(MAX_FRAME).read_to_end(&mut buf).await?;
+    check_nonempty_frame(buf)
+}
+
+/// NET-5 (audit): a clean EOF with zero bytes is what a peer produces when it
+/// closes the stream without answering (an overloaded or restarting server,
+/// a dropped response channel, a stream reset by the muxer). No well-formed
+/// frame is empty, but no DELIBERATE violation looks like this either, so it
+/// is reported as `UnexpectedEof` — a transport failure that
+/// [`is_sync_protocol_violation`] never penalizes — instead of falling
+/// through to the decoder's `InvalidData`.
+pub fn check_nonempty_frame(buf: Vec<u8>) -> io::Result<Vec<u8>> {
+    if buf.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "sync stream closed without a frame (transport failure, not a violation)",
+        ));
+    }
     Ok(buf)
 }
 
@@ -330,7 +362,7 @@ fn validate_sync_response_bounds(resp: &SyncResponse) -> io::Result<()> {
                 return Err(bounds_violation("block_data larger than MAX_WIRE_BYTES"));
             }
         }
-        SyncResponse::BlockNotFound { .. } => {}
+        SyncResponse::BlockNotFound { .. } | SyncResponse::Busy => {}
         SyncResponse::Headers { entries } => {
             if entries.len() > MAX_WIRE_SYNC_ENTRIES {
                 return Err(bounds_violation("Headers entries longer than MAX_WIRE_SYNC_ENTRIES"));
@@ -418,14 +450,30 @@ const SYNC_BUCKET_REFILL_PER_SEC: u32 = 8;
 /// `network::WIRE_PENALTY_TRACK_CAP` — bounds memory against an attacker
 /// cycling libp2p identities (free to generate).
 const SYNC_LIMITER_TRACK_CAP: usize = 1024;
+/// NET-8: aggregate serving budget across ALL peers (burst / per second).
+/// Bounds the total directed-sync work this node does regardless of how many
+/// identities ask, so per-peer buckets can evict freely without ever turning
+/// identity cycling into extra capacity.
+const SYNC_GLOBAL_CAPACITY: u32 = 1024;
+const SYNC_GLOBAL_REFILL_PER_SEC: f64 = 256.0;
+/// Keys idle this long (or whose bucket refilled) are garbage-collected.
+pub const SYNC_LIMITER_IDLE_TTL: Duration = Duration::from_secs(120);
 
 /// Per-peer token bucket for inbound `/gnb/sync/1` REQUESTS (as opposed to
 /// [`super::WirePenaltyTracker`], which scores DECODE/BOUNDS violations).
 /// `allow` is the only entry point: it refills lazily on each call (no
 /// background task) and consumes one token per call, returning whether the
-/// request should be served.
+/// request should be served. A refused request is answered with
+/// [`SyncResponse::Busy`] (NET-5), never by dropping the channel.
+///
+/// NET-8 (audit): the per-peer map used to fail CLOSED once 1,024 identities
+/// had been seen — every later peer, honest or not, was refused forever. It is
+/// now a bounded LRU ([`super::ratelimit::TokenBuckets`]): a newcomer always
+/// gets a bucket (an idle or least-recently-used key is evicted), and a global
+/// bucket bounds the aggregate rate so eviction cannot be farmed.
 pub struct SyncRequestLimiter {
-    buckets: HashMap<PeerId, (std::time::Instant, u32)>,
+    per_peer: super::ratelimit::TokenBuckets<PeerId>,
+    global: super::ratelimit::TokenBuckets<()>,
 }
 
 impl Default for SyncRequestLimiter {
@@ -436,49 +484,39 @@ impl Default for SyncRequestLimiter {
 
 impl SyncRequestLimiter {
     pub fn new() -> Self {
-        Self { buckets: HashMap::new() }
+        Self {
+            per_peer: super::ratelimit::TokenBuckets::new(
+                SYNC_BUCKET_CAPACITY,
+                f64::from(SYNC_BUCKET_REFILL_PER_SEC),
+                SYNC_LIMITER_TRACK_CAP,
+            ),
+            global: super::ratelimit::TokenBuckets::new(SYNC_GLOBAL_CAPACITY, SYNC_GLOBAL_REFILL_PER_SEC, 1),
+        }
     }
 
     /// Returns `true` iff a token was available (and is now consumed) for
-    /// `peer`. Callers must NOT serve the request when this returns `false`.
+    /// `peer`. Callers must NOT serve the request when this returns `false`
+    /// (they answer [`SyncResponse::Busy`] instead).
     pub fn allow(&mut self, peer: PeerId) -> bool {
-        use std::time::Instant;
-        let now = Instant::now();
-        if self.buckets.len() >= SYNC_LIMITER_TRACK_CAP && !self.buckets.contains_key(&peer) {
-            // Tracking map full and this is an UNKNOWN peer: fail CLOSED.
-            // Unlike WirePenaltyTracker (where failing open under a full map
-            // just under-penalizes an already-misbehaving peer), failing
-            // open here would mean an identity-cycling attacker gets an
-            // unlimited request rate by always looking "new" once the map
-            // fills — exactly the amplification this bucket exists to stop.
+        self.allow_at(peer, std::time::Instant::now())
+    }
+
+    /// [`Self::allow`] with an explicit clock (deterministic tests).
+    pub fn allow_at(&mut self, peer: PeerId, now: std::time::Instant) -> bool {
+        if !self.per_peer.allow_at(peer, now) {
             return false;
         }
-        let entry = self.buckets.entry(peer).or_insert((now, SYNC_BUCKET_CAPACITY));
-        let elapsed = now.saturating_duration_since(entry.0).as_secs_f64();
-        // checked/saturating throughout: `elapsed` is always >= 0.0 (Instant
-        // is monotonic and we saturate the duration), and the refill amount
-        // is clamped to the bucket capacity before it can overflow a u32.
-        let refill = (elapsed * SYNC_BUCKET_REFILL_PER_SEC as f64).floor();
-        if refill >= 1.0 {
-            let refill_tokens = if refill.is_finite() && refill <= u32::MAX as f64 {
-                refill as u32
-            } else {
-                SYNC_BUCKET_CAPACITY
-            };
-            entry.1 = entry.1.saturating_add(refill_tokens).min(SYNC_BUCKET_CAPACITY);
-            entry.0 = now;
-        }
-        if entry.1 > 0 {
-            entry.1 -= 1;
-            true
-        } else {
-            false
-        }
+        self.global.allow_at((), now)
+    }
+
+    /// Drop idle / fully-refilled peers (heartbeat housekeeping).
+    pub fn gc_at(&mut self, now: std::time::Instant) {
+        self.per_peer.gc_at(now, SYNC_LIMITER_IDLE_TTL);
     }
 
     /// Number of peers currently tracked (observability for tests/metrics).
     pub fn tracked_peers(&self) -> usize {
-        self.buckets.len()
+        self.per_peer.tracked()
     }
 }
 
@@ -494,36 +532,29 @@ pub fn new_behaviour() -> Behaviour {
     )
 }
 
-// ── Peer selection (archival-preferred) ──────────────────────────────────────
+// ── Peer selection ───────────────────────────────────────────────────────────
 
-/// Per-peer sync hint tracked in the network loop: highest announced blue_score
-/// and whether the peer advertises itself as archival (learned from the
-/// identify agent-version handshake; `None` = old binary / unknown).
+/// Per-peer sync hint: highest announced blue_score and the peer's
+/// SELF-DECLARED archival bit (identify agent-version; `None` = unknown).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PeerSync {
     pub blue_score: u64,
     pub archival: Option<bool>,
 }
 
-/// Choose the single peer to direct an IBD pull to.
+/// Stateless legacy selector: the explicit `--peer` (highest blue_score among
+/// them), else the highest-blue_score peer. Ties break by PeerId bytes.
 ///
-/// Priority (per design): a known-**archival** peer → the explicit `--peer` →
-/// the highest `blue_score` peer. Ties break deterministically by PeerId bytes.
-/// Returns `None` when no peer is connected (caller then falls back to gossip).
+/// NET-9 (audit): the `archival` bit is IGNORED. It is self-declared in the
+/// identify agent string, so preferring it let any peer that claimed
+/// "archival" (and announced a high score) capture every pull. The live
+/// network loop no longer uses this function at all: it uses
+/// [`PullPeerSelector`], which rotates, caps in-flight requests and puts
+/// stalling peers on cooldown.
 pub fn select_pull_peer(
     peers: &HashMap<PeerId, PeerSync>,
     explicit: &HashSet<PeerId>,
 ) -> Option<PeerId> {
-    // 1. Archival-preferred: highest blue_score among known-archival peers.
-    if let Some(p) = peers
-        .iter()
-        .filter(|(_, s)| s.archival == Some(true))
-        .max_by(|a, b| score_cmp(a, b))
-        .map(|(p, _)| *p)
-    {
-        return Some(p);
-    }
-    // 2. Explicit --peer that is currently connected (highest blue_score).
     if let Some(p) = peers
         .iter()
         .filter(|(p, _)| explicit.contains(p))
@@ -532,7 +563,6 @@ pub fn select_pull_peer(
     {
         return Some(p);
     }
-    // 3. Highest blue_score peer (archival unknown).
     peers.iter().max_by(|a, b| score_cmp(a, b)).map(|(p, _)| *p)
 }
 
@@ -543,6 +573,134 @@ fn score_cmp(
     a.1.blue_score
         .cmp(&b.1.blue_score)
         .then_with(|| a.0.to_bytes().cmp(&b.0.to_bytes()))
+}
+
+/// NET-5: client-side cap on concurrent directed pulls to ONE peer. Kept well
+/// below the server's per-peer burst (`SYNC_BUCKET_CAPACITY`) so an honest
+/// IBD burst is spread across peers instead of tripping one server's limiter.
+pub const MAX_INFLIGHT_PER_PEER: u32 = 16;
+/// NET-9: consecutive failures (timeouts, resets, undecodable answers) after
+/// which a peer is considered stalled and put on cooldown.
+pub const STALL_FAILURES: u32 = 2;
+/// NET-9: cooldown applied to a stalled peer.
+pub const STALL_COOLDOWN: Duration = Duration::from_secs(60);
+/// NET-5: short back-off after a `Busy` answer (honest back-pressure).
+pub const BUSY_COOLDOWN: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Debug, Default)]
+struct PullPeer {
+    in_flight: u32,
+    consecutive_failures: u32,
+    cooldown_until: Option<std::time::Instant>,
+    last_selected: Option<std::time::Instant>,
+}
+
+/// NET-9 (audit): stateful directed-pull peer selection with ROTATION, stall
+/// detection and a per-peer in-flight cap.
+///
+/// Candidates are the currently connected peers. Among those not on cooldown
+/// and below [`MAX_INFLIGHT_PER_PEER`], the least-loaded peer wins, then the
+/// one with fewer recent failures, then the one selected LEAST recently — so
+/// consecutive pulls rotate across peers and no single peer (whatever it
+/// claims about itself) can capture the pull path. Nothing self-declared
+/// (archival bit, announced score) influences the choice.
+#[derive(Debug, Default)]
+pub struct PullPeerSelector {
+    peers: HashMap<PeerId, PullPeer>,
+    explicit: HashSet<PeerId>,
+}
+
+impl PullPeerSelector {
+    pub fn new(explicit: HashSet<PeerId>) -> Self {
+        Self { peers: HashMap::new(), explicit }
+    }
+
+    /// A connection to `peer` was established: it becomes a candidate.
+    pub fn on_connect(&mut self, peer: PeerId) {
+        self.peers.entry(peer).or_default();
+    }
+
+    /// The last connection to `peer` closed: it stops being a candidate.
+    pub fn on_disconnect(&mut self, peer: &PeerId) {
+        self.peers.remove(peer);
+    }
+
+    /// Pick the peer for the next pull, skipping `exclude` (peers that already
+    /// failed this particular request). `None` = no eligible peer right now
+    /// (none connected, all saturated, or all cooling down).
+    pub fn select(&self, now: std::time::Instant, exclude: &[PeerId]) -> Option<PeerId> {
+        self.peers
+            .iter()
+            .filter(|(p, s)| {
+                s.in_flight < MAX_INFLIGHT_PER_PEER
+                    && s.cooldown_until.is_none_or(|t| now >= t)
+                    && !exclude.contains(p)
+            })
+            .min_by(|(pa, a), (pb, b)| {
+                a.in_flight
+                    .cmp(&b.in_flight)
+                    .then(a.consecutive_failures.cmp(&b.consecutive_failures))
+                    .then(a.last_selected.cmp(&b.last_selected))
+                    .then(self.explicit.contains(*pb).cmp(&self.explicit.contains(*pa)))
+                    .then_with(|| pa.to_bytes().cmp(&pb.to_bytes()))
+            })
+            .map(|(p, _)| *p)
+    }
+
+    /// A request was sent to `peer`.
+    pub fn on_sent(&mut self, peer: PeerId, now: std::time::Instant) {
+        let s = self.peers.entry(peer).or_default();
+        s.in_flight = s.in_flight.saturating_add(1);
+        s.last_selected = Some(now);
+    }
+
+    /// `peer` answered (any well-formed, non-Busy answer — NotFound included).
+    pub fn on_success(&mut self, peer: &PeerId) {
+        if let Some(s) = self.peers.get_mut(peer) {
+            s.in_flight = s.in_flight.saturating_sub(1);
+            s.consecutive_failures = 0;
+        }
+    }
+
+    /// `peer` answered `Busy`: back off briefly, no failure recorded.
+    pub fn on_busy(&mut self, peer: &PeerId, now: std::time::Instant) {
+        if let Some(s) = self.peers.get_mut(peer) {
+            s.in_flight = s.in_flight.saturating_sub(1);
+            s.cooldown_until = Some(now + BUSY_COOLDOWN);
+        }
+    }
+
+    /// The request to `peer` failed (timeout, reset, undecodable answer).
+    /// [`STALL_FAILURES`] in a row put the peer on [`STALL_COOLDOWN`].
+    pub fn on_failure(&mut self, peer: &PeerId, now: std::time::Instant) {
+        if let Some(s) = self.peers.get_mut(peer) {
+            s.in_flight = s.in_flight.saturating_sub(1);
+            s.consecutive_failures = s.consecutive_failures.saturating_add(1);
+            if s.consecutive_failures >= STALL_FAILURES {
+                s.cooldown_until = Some(now + STALL_COOLDOWN);
+                s.consecutive_failures = 0;
+            }
+        }
+    }
+
+    /// Requests currently outstanding to `peer`.
+    pub fn in_flight(&self, peer: &PeerId) -> u32 {
+        self.peers.get(peer).map(|s| s.in_flight).unwrap_or(0)
+    }
+
+    /// True while `peer` is on a stall/Busy cooldown.
+    pub fn is_cooling_down(&self, peer: &PeerId, now: std::time::Instant) -> bool {
+        self.peers.get(peer).and_then(|s| s.cooldown_until).is_some_and(|t| now < t)
+    }
+
+    /// Number of candidate (connected) peers.
+    pub fn len(&self) -> usize {
+        self.peers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
 }
 
 // ── Archival advertisement over the identify handshake (wire-safe) ───────────
@@ -627,6 +785,7 @@ mod tests {
             SyncResponse::Peers {
                 peers: vec!["/ip4/1.2.3.4/tcp/17110/p2p/x".to_string()],
             },
+            SyncResponse::Busy,
         ]
     }
 
@@ -705,16 +864,17 @@ mod tests {
         assert!(as_pull_request(&NetworkMessage::PeerExchange { peers: vec![] }).is_none());
     }
 
-    // 4. Peer selection: archival > explicit --peer > highest blue_score.
+    // 4. Peer selection: explicit --peer > highest blue_score. NET-9 (audit):
+    //    this test used to assert that a self-declared ARCHIVAL peer wins over
+    //    everyone — exactly the capture primitive the audit reported. It now
+    //    pins the fixed behaviour: the self-declared bit is ignored.
     #[test]
-    fn peer_selection_prefers_archival() {
+    fn peer_selection_ignores_self_declared_archival() {
         let archival = PeerId::random();
         let explicit_peer = PeerId::random();
         let high_score = PeerId::random();
 
         let mut peers = HashMap::new();
-        // archival peer has a LOWER score than the high-score peer, to prove
-        // archival preference wins over raw score.
         peers.insert(archival, PeerSync { blue_score: 10, archival: Some(true) });
         peers.insert(explicit_peer, PeerSync { blue_score: 20, archival: Some(false) });
         peers.insert(high_score, PeerSync { blue_score: 99, archival: None });
@@ -722,8 +882,10 @@ mod tests {
         let mut explicit = HashSet::new();
         explicit.insert(explicit_peer);
 
-        assert_eq!(select_pull_peer(&peers, &explicit), Some(archival),
-            "an archival peer must win even over a higher-score non-archival peer");
+        assert_eq!(select_pull_peer(&peers, &explicit), Some(explicit_peer),
+            "a self-declared archival peer must NOT win over the explicit --peer");
+        assert_eq!(select_pull_peer(&peers, &HashSet::new()), Some(high_score),
+            "nor over the highest-score peer when no explicit peer is configured");
     }
 
     #[test]
@@ -779,7 +941,7 @@ mod tests {
         // A directed Block answer must ingest exactly like a gossip NewBlock.
         let m = response_to_message(SyncResponse::Block {
             block_hash: [1u8; 32], blue_score: 7, height: 3, block_data: vec![9, 9],
-        });
+        }).expect("Block maps to NewBlock");
         match m {
             NetworkMessage::NewBlock { block_hash, blue_score, height, block_data } => {
                 assert_eq!(block_hash, [1u8; 32]);
@@ -795,7 +957,8 @@ mod tests {
     /// dial-before-persist discipline, just a different transport.
     #[test]
     fn peers_response_maps_to_peer_exchange_ingest_message() {
-        let m = response_to_message(SyncResponse::Peers { peers: vec!["/ip4/9.9.9.9/tcp/1".to_string()] });
+        let m = response_to_message(SyncResponse::Peers { peers: vec!["/ip4/9.9.9.9/tcp/1".to_string()] })
+            .expect("Peers maps to PeerExchange");
         match m {
             NetworkMessage::PeerExchange { peers } => {
                 assert_eq!(peers, vec!["/ip4/9.9.9.9/tcp/1".to_string()]);
@@ -988,23 +1151,125 @@ mod tests {
         assert!(lim.allow(honest), "an unrelated peer's bucket must be untouched");
     }
 
-    /// Once the tracked-peer cap is reached, a genuinely NEW (never-seen)
-    /// peer must be refused rather than silently granted an unbounded bucket
-    /// — the map must fail CLOSED, unlike WirePenaltyTracker's fail-open
-    /// one-shot penalty (a false ALLOW here is a served request, not merely
-    /// an under-counted score).
+    /// NET-8 (audit): this test used to assert that, once the tracked-peer
+    /// cap was reached, every NEW peer was refused — a permanent lockout of
+    /// honest newcomers after 1,024 free identities. It now pins the fixed
+    /// behaviour: the map stays bounded (LRU / idle eviction) and a newcomer
+    /// is served; the global bucket bounds the aggregate instead.
     #[test]
     fn sync_request_limiter_fails_closed_when_tracking_map_is_full() {
         let mut lim = SyncRequestLimiter::new();
-        for _ in 0..SYNC_LIMITER_TRACK_CAP {
+        let t0 = std::time::Instant::now();
+        for i in 0..SYNC_LIMITER_TRACK_CAP {
             let p = PeerId::random();
-            assert!(lim.allow(p), "each distinct peer's first request must be allowed while under cap");
+            assert!(lim.allow_at(p, t0 + Duration::from_micros(i as u64)),
+                "each distinct peer's first request must be allowed");
         }
         assert_eq!(lim.tracked_peers(), SYNC_LIMITER_TRACK_CAP);
-        let overflow_peer = PeerId::random();
+        let newcomer = PeerId::random();
         assert!(
-            !lim.allow(overflow_peer),
-            "a brand-new peer arriving after the tracking cap is full must be refused, not granted an unlimited bucket"
+            lim.allow_at(newcomer, t0 + Duration::from_secs(1)),
+            "a brand-new honest peer must be served after the map filled (NET-8)"
         );
+        assert_eq!(lim.tracked_peers(), SYNC_LIMITER_TRACK_CAP, "map stays bounded");
+    }
+
+    // ── NET-5 / NET-9 regressions ───────────────────────────────────────────
+
+    /// NET-5: an empty frame (server closed the stream without answering) is a
+    /// transport failure, NOT a protocol violation — the requester must never
+    /// penalize a server for it.
+    #[test]
+    fn empty_frame_is_eof_not_protocol_violation() {
+        let e = check_nonempty_frame(Vec::new()).expect_err("empty frame is an error");
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(!is_sync_protocol_violation(&e), "clean EOF must not be penalized");
+        assert_eq!(check_nonempty_frame(vec![1]).unwrap(), vec![1]);
+    }
+
+    /// NET-5: the codec turns a closed-without-answer stream into EOF too.
+    #[test]
+    fn codec_reads_empty_response_as_eof() {
+        use futures::executor::block_on;
+        use futures::io::Cursor;
+        block_on(async {
+            let mut codec = BlochSyncCodec;
+            let mut input = Cursor::new(Vec::<u8>::new());
+            let e = codec.read_response(&SYNC_PROTOCOL, &mut input).await.expect_err("no frame");
+            assert!(!is_sync_protocol_violation(&e));
+        });
+    }
+
+    /// NET-5: `Busy` is a well-formed answer that the processor never sees.
+    #[test]
+    fn busy_roundtrips_and_is_not_delivered() {
+        let bytes = encode_frame(&SyncResponse::Busy).unwrap();
+        assert_eq!(decode_response(&bytes).unwrap(), SyncResponse::Busy);
+        assert!(response_to_message(SyncResponse::Busy).is_none());
+    }
+
+    /// NET-9: consecutive pulls rotate across connected peers.
+    #[test]
+    fn selector_rotates_across_peers() {
+        let (a, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let mut sel = PullPeerSelector::new(HashSet::new());
+        for p in [a, b, c] { sel.on_connect(p); }
+        let t0 = std::time::Instant::now();
+        let mut picked = Vec::new();
+        for i in 0..6u64 {
+            let now = t0 + Duration::from_millis(i);
+            let p = sel.select(now, &[]).expect("a candidate");
+            sel.on_sent(p, now);
+            sel.on_success(&p);
+            picked.push(p);
+        }
+        for p in [a, b, c] {
+            assert_eq!(picked.iter().filter(|x| **x == p).count(), 2, "every peer gets its turn");
+        }
+    }
+
+    /// NET-9: a peer that stalls (repeated timeouts) is put on cooldown and
+    /// the pulls move to another peer.
+    #[test]
+    fn selector_cools_down_stalled_peer() {
+        let (bad, good) = (PeerId::random(), PeerId::random());
+        let mut sel = PullPeerSelector::new(HashSet::new());
+        sel.on_connect(bad);
+        sel.on_connect(good);
+        let t0 = std::time::Instant::now();
+        for _ in 0..STALL_FAILURES {
+            sel.on_sent(bad, t0);
+            sel.on_failure(&bad, t0);
+        }
+        assert!(sel.is_cooling_down(&bad, t0));
+        for i in 0..5u64 {
+            let now = t0 + Duration::from_millis(i);
+            assert_eq!(sel.select(now, &[]), Some(good));
+            sel.on_sent(good, now);
+            sel.on_success(&good);
+        }
+        // After the cooldown the stalled peer is eligible again.
+        assert!(!sel.is_cooling_down(&bad, t0 + STALL_COOLDOWN));
+    }
+
+    /// NET-5: in-flight requests per peer are capped client-side, and `Busy`
+    /// backs off without counting as a failure.
+    #[test]
+    fn selector_caps_in_flight_and_handles_busy() {
+        let p = PeerId::random();
+        let mut sel = PullPeerSelector::new(HashSet::new());
+        sel.on_connect(p);
+        let t0 = std::time::Instant::now();
+        for _ in 0..MAX_INFLIGHT_PER_PEER {
+            assert_eq!(sel.select(t0, &[]), Some(p));
+            sel.on_sent(p, t0);
+        }
+        assert_eq!(sel.select(t0, &[]), None, "per-peer in-flight cap reached");
+        sel.on_busy(&p, t0);
+        assert!(sel.is_cooling_down(&p, t0));
+        assert_eq!(sel.select(t0 + BUSY_COOLDOWN, &[]), Some(p), "Busy is a short back-off");
+        assert_eq!(sel.select(t0 + BUSY_COOLDOWN, &[p]), None, "exclusion is honoured");
+        sel.on_disconnect(&p);
+        assert!(sel.is_empty());
     }
 }

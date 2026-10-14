@@ -913,6 +913,14 @@ impl Block {
             Ok(t) => t,
             Err(_) => return false,
         };
+        // POW-9 (audit): explicit `target <= pow_limit`. Unreachable today —
+        // the largest decodable compact target IS the pow limit — but the
+        // proof must never rely on that coincidence of the encoding: a future
+        // change to the decoder or to POW_LIMIT_BITS must fail closed here,
+        // before any evaluation is spent.
+        if !Self::target_within_pow_limit(&target.0) {
+            return false;
+        }
         let id = self.block_hash();
         if let Ok(cache) = pow_cache().lock() {
             if cache.set.contains(&id) {
@@ -933,6 +941,13 @@ impl Block {
             }
         }
         ok
+    }
+
+    /// POW-9: `target <= pow_limit` (both big-endian). Every target a valid
+    /// block may claim must be at most the chain's pow limit; `validate_pow`
+    /// checks it explicitly instead of relying on the compact encoding's range.
+    pub fn target_within_pow_limit(target: &[u8; 32]) -> bool {
+        *target <= bits_to_target(POW_LIMIT_BITS)
     }
 
     /// Basic coinbase format check (value is checked with fees in accept_block).
@@ -1012,19 +1027,118 @@ impl Block {
     /// Structural validation. Cheap checks run first; the proof of work runs
     /// last. Does NOT check coinbase value, fees, bits or height (those need
     /// consensus context).
+    ///
+    /// Exactly `validate_structure_without_pow()` followed by `validate_pow()`.
+    /// Network ingress (NET-2) calls the two halves separately so the cheap
+    /// contextual checks (expected bits, height, timestamp, or the orphan
+    /// anti-DoS work floor) can run BETWEEN them, before the 64 MiB
+    /// evaluation; the proof itself is still verified on every ingress path.
     pub fn validate_structure(&self) -> Result<(), &'static str> {
+        self.validate_structure_without_pow()?;
+        if !self.validate_pow()                       { return Err("invalid PoW"); }
+        Ok(())
+    }
+
+    /// The cheap, context-free half of [`Block::validate_structure`]: parent
+    /// count, size, merkle commitment, coinbase format, duplicate txs, dust.
+    /// Does NOT verify the proof of work — a caller that uses this MUST call
+    /// [`Block::validate_pow`] (directly or through the node's `accept_block`)
+    /// before treating the block as valid.
+    pub fn validate_structure_without_pow(&self) -> Result<(), &'static str> {
         if self.header.parents.len() > MAX_PARENTS   { return Err("too many parents"); }
         if self.size_bytes() > MAX_BLOCK_SIZE        { return Err("block too large"); }
         if !self.validate_merkle()                    { return Err("invalid merkle root"); }
         if !self.validate_coinbase_format()           { return Err("invalid coinbase format"); }
         self.validate_no_duplicate_txs()?;
         self.validate_dust()?;
-        if !self.validate_pow()                       { return Err("invalid PoW"); }
         Ok(())
     }
 
     pub fn size_bytes(&self) -> usize {
         bincode::serde::encode_to_vec(self, bincode::config::standard()).map(|v| v.len()).unwrap_or(usize::MAX)
+    }
+}
+
+#[cfg(test)]
+mod structure_split_tests {
+    //! NET-2 / POW-9 regressions: the cheap structural half is separable from
+    //! the proof of work, and `validate_pow` checks `target <= pow_limit`.
+    use super::*;
+
+    fn block_with(bits: u32, nonce: u64) -> Block {
+        let txs = vec![Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0u8; 32],
+                prev_index: u32::MAX,
+                script_sig: b"structure-split".to_vec(),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOutput { value: 1, script_pubkey: vec![7u8; 20] }],
+            locktime: 0,
+        }];
+        let mut b = Block {
+            header: BlockHeader {
+                version: 1,
+                parents: vec![[0x11; 32]],
+                merkle_root: MerkleRoot::ZERO,
+                timestamp: GENESIS_TIMESTAMP,
+                bits,
+                nonce,
+            },
+            transactions: txs,
+            blue_score: 1,
+            height: 1,
+            shielded_transactions: vec![],
+        };
+        b.header.merkle_root = b.body_merkle_root();
+        b
+    }
+
+    #[test]
+    fn target_above_pow_limit_is_rejected() {
+        assert!(!Block::target_within_pow_limit(&[0xFF; 32]), "target above the limit must fail");
+        assert!(Block::target_within_pow_limit(&bits_to_target(POW_LIMIT_BITS)), "the limit itself is allowed");
+        assert!(Block::target_within_pow_limit(&bits_to_target(GENESIS_BITS)));
+        // One unit above the limit is already out of range.
+        let mut above = bits_to_target(POW_LIMIT_BITS);
+        let last = above.iter().rposition(|&b| b != 0xFF).expect("limit is not all-ones");
+        above[last] = above[last].wrapping_add(1);
+        for b in above.iter_mut().skip(last + 1) { *b = 0; }
+        assert!(!Block::target_within_pow_limit(&above));
+    }
+
+    #[test]
+    fn malformed_bits_never_validate_and_cost_no_evaluation() {
+        // Negative-flag bits: rejected by the decoder before any evaluation.
+        let b = block_with(0x0480_0001, 0);
+        let t = std::time::Instant::now();
+        assert!(!b.validate_pow());
+        assert!(t.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn cheap_half_accepts_well_formed_block_regardless_of_pow() {
+        // Hard target, arbitrary nonce: the PoW fails, the cheap half passes.
+        let mut b = block_with(GENESIS_BITS, 0);
+        while b.validate_pow() { b.header.nonce += 1; } // find a FAILING nonce
+        assert_eq!(b.validate_structure_without_pow(), Ok(()));
+        assert_eq!(b.validate_structure(), Err("invalid PoW"),
+            "validate_structure must still verify the proof of work");
+    }
+
+    #[test]
+    fn cheap_half_still_rejects_structural_faults() {
+        let mut b = block_with(POW_LIMIT_BITS, 0);
+        b.header.merkle_root = MerkleRoot([9u8; 32]);
+        assert_eq!(b.validate_structure_without_pow(), Err("invalid merkle root"));
+        let mut b = block_with(POW_LIMIT_BITS, 0);
+        b.header.parents = vec![[1u8; 32]; MAX_PARENTS + 1];
+        assert_eq!(b.validate_structure_without_pow(), Err("too many parents"));
+        let mut b = block_with(POW_LIMIT_BITS, 0);
+        b.transactions.clear();
+        b.header.merkle_root = b.body_merkle_root();
+        assert_eq!(b.validate_structure_without_pow(), Err("invalid coinbase format"));
     }
 }
 
