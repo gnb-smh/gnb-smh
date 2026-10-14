@@ -834,7 +834,9 @@ fn checked_destination(destination: &str, source: &str) -> Result<String, &'stat
 }
 
 fn parse_send_utxos(rows: &[serde_json::Value]) -> Result<Vec<(Vec<u8>, u32, gnb::core::TxOutput)>, &'static str> {
-    rows.iter().map(|row| {
+    // Immature coinbase outputs (`spendable: false`) would make the node refuse
+    // the whole transaction; leave them out of coin selection.
+    rows.iter().filter(|row| row["spendable"].as_bool() != Some(false)).map(|row| {
         let txid = hex::decode(row["txid"].as_str().ok_or("UTXO missing transaction ID")?)
             .map_err(|_| "invalid UTXO transaction ID hex")?;
         if txid.len() != 32 { return Err("UTXO transaction ID must contain 32 bytes"); }

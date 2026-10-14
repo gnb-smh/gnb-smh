@@ -925,17 +925,27 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             .collect();
                         let total: u64 = utxos.iter().map(|(_, _, o)| o.value).sum();
                         let full_count = utxos.len();
-                        let iter = utxos.iter();
+                        // Coinbase outputs are spendable only after
+                        // COINBASE_MATURITY blocks; say so per row, so wallets
+                        // never pick an immature one (the node would refuse it).
+                        let next_height = {
+                            let d = state.dag.read();
+                            d.selected_tip().and_then(|t| d.get_block_data(&t).map(|bd| bd.height)).unwrap_or(0) + 1
+                        };
+                        let row = |(txid, idx, out): &(Vec<u8>, u32, crate::core::TxOutput)| {
+                            let cb = <[u8; 32]>::try_from(txid.as_slice()).ok()
+                                .and_then(|t| state.store.get_coinbase_height(&t).ok().flatten());
+                            let spendable = cb.map_or(true, |h| next_height.saturating_sub(h) >= crate::core::COINBASE_MATURITY);
+                            json!({
+                                "txid": hex::encode(txid), "index": idx,
+                                // R3: `value` is a satoshi amount → decimal string.
+                                "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
+                                "coinbase_height": cb, "spendable": spendable,
+                            })
+                        };
                         let list: Vec<Value> = match limit {
-                            // R3: `value` is a satoshi amount → decimal string.
-                            Some(n) => iter.take(n).map(|(txid, idx, out)| json!({
-                                "txid": hex::encode(txid), "index": idx,
-                                "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
-                            })).collect(),
-                            None => iter.map(|(txid, idx, out)| json!({
-                                "txid": hex::encode(txid), "index": idx,
-                                "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
-                            })).collect(),
+                            Some(n) => utxos.iter().take(n).map(row).collect(),
+                            None => utxos.iter().map(row).collect(),
                         };
                         json!({
                             "address":    addr,

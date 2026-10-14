@@ -12,6 +12,9 @@
 //! - `create {}`                  new mainnet keypair from the WASI CSPRNG (browser crypto)
 //! - `export {password}`          encrypted keystore v2 JSON of the unlocked key
 //! - `pay {utxos, to, amount, fee}` build and sign a payment (amounts in base units)
+//! - `bridgelock {utxos, vault_script, amount, l2, fee}` lock GNB in the Bloch bridge
+//!   vault for an L2 (0x…) address: vault in output 0, 20-byte destination marker in output 1
+//! - `create {testnet?}`             new keypair (mainnet unless `testnet: true`)
 //! - `address {}` · `wipe {}` · `normalize {address}` · `minfee {size}`
 //!
 //! The secret key never crosses the boundary: responses carry addresses,
@@ -62,7 +65,8 @@ pub fn handle(req: &Value) -> Result<Value, String> {
             Ok(out)
         }
         "create" => {
-            let kp = generate_keypair(false);
+            let testnet = req.get("testnet").and_then(Value::as_bool).unwrap_or(false);
+            let kp = generate_keypair(testnet);
             let out = json!({ "address": kp.address, "public_key": hex::encode(&kp.public_key) });
             set_session(kp);
             Ok(out)
@@ -78,6 +82,15 @@ pub fn handle(req: &Value) -> Result<Value, String> {
             let fee: u64 = s(req, "fee")?.parse().map_err(|_| "invalid fee")?;
             let to = s(req, "to")?;
             with_session(|kp| pay(kp, &utxos, to, amount, fee))
+        }
+        "bridgelock" => {
+            let utxos = parse_utxos(req.get("utxos").ok_or("missing `utxos`")?)?;
+            let amount: u64 = s(req, "amount")?.parse().map_err(|_| "invalid amount")?;
+            let fee: u64 = s(req, "fee")?.parse().map_err(|_| "invalid fee")?;
+            let vault = hex::decode(s(req, "vault_script")?).map_err(|_| "vault_script must be hex")?;
+            let l2: [u8; 20] = hex::decode(s(req, "l2")?.trim().trim_start_matches("0x")).ok()
+                .and_then(|v| v.try_into().ok()).ok_or("L2 address must be 0x + 40 hex digits")?;
+            with_session(|kp| bridge_lock(kp, &utxos, &vault, amount, l2, fee))
         }
         "wipe" => {
             let mut s = SESSION.lock().unwrap_or_else(|e| e.into_inner());
@@ -136,9 +149,40 @@ fn pay(kp: &Keypair, utxos: &[(Vec<u8>, u32, TxOutput)], to: &str, amount: u64, 
     }))
 }
 
+fn bridge_lock(kp: &Keypair, utxos: &[(Vec<u8>, u32, TxOutput)], vault: &[u8], amount: u64, l2: [u8; 20],
+               mut fee: u64) -> Result<Value, String> {
+    if gnb_crypto::core::policy::output_kind(vault) != Some(gnb_crypto::core::policy::OutputKind::Policy) {
+        return Err("the vault must be a policy address".into());
+    }
+    let outputs = gnb_crypto::bridge::lock_outputs(vault, amount, l2);
+    let mut tx: Option<Transaction> = None;
+    for _ in 0..16 {
+        let built = TxBuilder::build_outputs(kp, utxos, outputs.clone(), fee)?;
+        let min = tokenomics::min_tx_fee_sat(built.to_wire_bytes(true).len());
+        if fee >= min {
+            tx = Some(built);
+            break;
+        }
+        fee = fee.max(min);
+    }
+    let tx = tx.ok_or("could not settle the fee")?;
+    // Never hand back something the signers would not recognise as a lock.
+    let lock = gnb_crypto::bridge::parse_lock(&tx.outputs, vault, 0)?;
+    let raw = tx.to_wire_bytes(true);
+    if raw.len() > MAX_TX_BYTES {
+        return Err("this lock needs too many inputs; lock a smaller amount".into());
+    }
+    Ok(json!({
+        "raw": hex::encode(&raw), "txid": hex::encode(tx.txid()), "size": raw.len(), "fee": fee.to_string(),
+        "inputs": tx.inputs.len(), "amount": lock.amount.to_string(),
+        "l2_recipient": format!("0x{}", hex::encode(lock.l2_recipient)), "lock_vout": 0,
+    }))
+}
+
 fn parse_utxos(rows: &Value) -> Result<Vec<(Vec<u8>, u32, TxOutput)>, String> {
     let rows = rows.as_array().ok_or("`utxos` must be an array")?;
-    rows.iter().map(|row| {
+    // Immature coinbase outputs (`spendable: false` from getutxos) are skipped.
+    rows.iter().filter(|row| row.get("spendable").and_then(Value::as_bool) != Some(false)).map(|row| {
         let txid = hex::decode(s(row, "txid")?).map_err(|e| e.to_string())?;
         if txid.len() != 32 {
             return Err("UTXO txid must be 32 bytes".into());
