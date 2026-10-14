@@ -489,7 +489,7 @@ impl TxRelay {
         let mut events = OrphanEvents { dropped: self.orphans.expire(now_unix), ..Default::default() };
         let policy = AdmissionPolicy::relay(next_block_height);
         let mut lookups = 0usize;
-        let mut ready: Vec<[u8; 32]> = Vec::new();
+        let mut ready: Vec<(u64, [u8; 32])> = Vec::new();
         let mut resume_at = None;
         for (seq, w) in self.orphans.round_robin_from(self.sweep_cursor) {
             if ready.len() >= MAX_ORPHANS_PER_EVENT || lookups >= MAX_SWEEP_LOOKUPS {
@@ -506,7 +506,7 @@ impl TxRelay {
                 }
             }
             if all_there {
-                ready.push(w);
+                ready.push((seq, w));
             }
         }
         if let Some(s) = resume_at {
@@ -514,9 +514,11 @@ impl TxRelay {
         }
         let mut budget = MAX_ORPHAN_RETRY_INPUTS_PER_EVENT;
         let mut admitted_ids = Vec::new();
-        for (i, w) in ready.iter().enumerate() {
+        for (i, (seq, w)) in ready.iter().enumerate() {
             let inputs = self.orphans.get(w).map(|o| o.tx.inputs.len()).unwrap_or(0);
             if i > 0 && inputs > budget {
+                // Out of budget: the next sweep resumes at this ready orphan.
+                self.sweep_cursor = *seq;
                 break;
             }
             budget = budget.saturating_sub(inputs);
