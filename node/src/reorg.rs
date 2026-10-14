@@ -767,11 +767,16 @@ pub fn validate_fork_block_state(batch: &dyn UtxoView, block: &Block) -> Result<
 /// poisoned every block template. They now go through the SAME admission
 /// function as gossip and RPC (`mempool::admission::admit`), evaluated at the
 /// new tip: size, standardness (dust, MoneyRange, script limits), duplicate,
-/// conflicts, UTXO presence, coinbase maturity at `next_block_height`,
-/// consensus minimum fee and relay fee. Only the signature step is skipped
-/// (`check_signatures = false`): every one of these transactions was
-/// signature-checked when the disconnected block was connected, and
-/// signatures do not depend on chain state.
+/// conflicts, UTXO presence, coinbase maturity at `next_block_height`, the
+/// version rule and policy at `next_block_height`, consensus minimum fee and
+/// relay fee. The witness standardness step is skipped, and so is the
+/// signature step below the hardening activation (`check_signatures =
+/// false`): every one of these transactions was signature-checked when the
+/// disconnected block was connected, and below the activation every version
+/// uses sighash v2 at every height. At/after the activation the input scripts
+/// ARE verified again (normally a verified-signature cache hit): a version-3
+/// transaction mined below the activation was checked against the v2 digest
+/// only.
 pub fn reinject_disconnected(
     store: &Storage,
     mempool: &Mempool,

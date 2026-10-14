@@ -13,10 +13,17 @@ specification with no serialization library: every byte is spelled out here.
 The output is deterministic (the random cases come from SHAKE-256 of a fixed
 label), so CI regenerates the file and diffs it.
 
-Selection (consensus): a transaction's own `version` selects the digest.
-Version 3 -> sighash v3; any other version -> sighash v2. Below the hardening
-activation height a non-coinbase version-3 transaction is invalid; at/after
-it only version 3 is valid (`core::sighash::check_tx_version`).
+Selection (consensus, `core::sighash::check_tx_version`; `version_rule`
+below): the header height h of the containing block and the transaction's
+own `version` select the digest of a non-coinbase transaction.
+    h <  activation: every version (3 included) is valid -> sighash v2 with
+                     the historical lenient witness rule (exactly the
+                     pre-upgrade rule: no split before the flag day);
+    h >= activation: version 3 -> sighash v3 with the canonical witness;
+                     any other version is invalid.
+Relay policy (`core::sighash::check_tx_version_standard`; `version_policy`
+below) additionally refuses version >= 3 below the activation as
+non-standard. `version_rule` vectors pin both.
 
 Sighash v2 (historical; must never change):
 
@@ -236,6 +243,24 @@ def sighash_v3(tx: Tx, spent: list, input_index: int, suite: int, chain_id: int)
     return sha3(v3_preimage(tx, spent, input_index, suite, chain_id))
 
 
+def version_rule(version: int, height: int, activation: int) -> str:
+    """Consensus rule for a non-coinbase transaction in a block at header
+    height `height`: "v2", "v3" or "invalid" (`check_tx_version`)."""
+    if height < activation:
+        return "v2"
+    return "v3" if version == 3 else "invalid"
+
+
+def version_policy(version: int, height: int, activation: int) -> str:
+    """Relay policy for the next block at `height`: the consensus verdict, or
+    "non-standard" for version >= 3 below the activation
+    (`check_tx_version_standard`)."""
+    verdict = version_rule(version, height, activation)
+    if verdict == "v2" and version >= 3:
+        return "non-standard"
+    return verdict
+
+
 def component_message(suite: int, component: int, digest: bytes) -> bytes:
     assert len(digest) == 32
     m = TX_SIG_COMPONENT_DOMAIN + u16(suite) + bytes([component]) + digest
@@ -398,6 +423,15 @@ def build() -> dict:
         for comp in (COMPONENT_MLDSA65, COMPONENT_FALCON1024):
             messages.append({"suite": suite, "component": comp, "digest": d.hex(),
                              "message": component_message(suite, comp, d).hex()})
+    # Version rule (consensus) and version policy (relay), on both sides of
+    # the activation; heights are decimal strings (u64).
+    rules = []
+    for act in (0, 100, U64_MAX):
+        for height in (0, 99, 100, 101, U64_MAX - 1, U64_MAX):
+            for version in (0, 1, 2, 3, 4, U32_MAX):
+                rules.append({"version": version, "height": str(height), "activation": str(act),
+                              "consensus": version_rule(version, height, act),
+                              "policy": version_policy(version, height, act)})
     return {
         "description": "GnB sighash v2 and v3 golden vectors (reference/gnb_sighash.py). "
                        "Vectors name a transaction in `transactions` (hex of Transaction::to_wire_bytes(true)) "
@@ -416,6 +450,7 @@ def build() -> dict:
         "v3": v3,
         "v3_errors": errors,
         "component_messages": messages,
+        "version_rule": rules,
     }
 
 
@@ -424,7 +459,8 @@ def main() -> None:
     path = HERE / "sighash_vectors.json"
     path.write_text(json.dumps(doc, indent=1) + "\n")
     print(f"wrote {path.name}: {len(doc['v2'])} v2, {len(doc['v3'])} v3, "
-          f"{len(doc['v3_errors'])} error, {len(doc['component_messages'])} component-message vectors")
+          f"{len(doc['v3_errors'])} error, {len(doc['component_messages'])} component-message, "
+          f"{len(doc['version_rule'])} version-rule vectors")
 
 
 if __name__ == "__main__":

@@ -1,21 +1,25 @@
 //! Transaction signature digests and input-script rules (audit CRY-1, CRY-2,
 //! CRY-3, MEM-5, WAL-1).
 //!
-//! Two digests exist. The transaction's own `version` field selects one:
+//! Two digests exist. The hardening activation (`core::activation`) and the
+//! transaction's own `version` field select one ([`check_tx_version`]); the
+//! height compared is the header height of the block containing the
+//! transaction (`Block::height`, validated by `accept_block`):
 //!
-//! | `tx.version` | digest | component binding |
-//! | --- | --- | --- |
-//! | 3 | sighash v3 ([`SighashV3Precomputed`]) | each component signs `crypto::bound_component_message` |
-//! | anything else | sighash v2 ([`Transaction::sighash`]) | every component signs the digest verbatim |
+//! | height | `tx.version` | consensus | digest | witness | component binding |
+//! | --- | --- | --- | --- | --- | --- |
+//! | below the activation | any (3 included) | valid | sighash v2 ([`Transaction::sighash`]) | lenient (historical) | every component signs the digest verbatim |
+//! | at/after the activation | 3 | valid | sighash v3 ([`SighashV3Precomputed`]) | canonical ([`canonical_witness`]) | each component signs `crypto::bound_component_message` |
+//! | at/after the activation | anything else | invalid | — | — | — |
 //!
-//! and the hardening activation (`core::activation`) decides which versions a
-//! non-coinbase transaction in a block may have ([`check_tx_version`]): below
-//! the activation height version 3 is invalid (nodes that predate it cannot
-//! verify a v3 digest) and every other version keeps the historical v2 rules
-//! bit for bit; at and after it only version 3 is valid. The height compared
-//! is the header height of the block containing the transaction
-//! (`Block::height`, validated by `accept_block`); mempool and wallets use the
-//! height of the next block.
+//! Below the activation every transaction, whatever its version, is verified
+//! exactly as before the upgrade (nodes that predate it accept a version-3
+//! transaction signed over the v2 digest; refusing it would split the network
+//! before the flag day). Relay policy ([`check_tx_version_standard`], mempool
+//! admission and templates) refuses version ≥ 3 below the activation, so
+//! upgraded nodes never relay or mine one there; signers emit version 1 below
+//! the activation and version 3 from it ([`tx_version_for_height`]). Mempool
+//! and wallets evaluate these rules at the height of the next block.
 //!
 //! # Sighash v3 (byte-exact; normative text in `docs/CONSENSUS.md`)
 //!
@@ -52,11 +56,12 @@ use sha3::{Digest, Sha3_256};
 use super::{activation, ChainId, Transaction, TxOutput};
 use crate::crypto;
 
-/// Transaction version that selects sighash v3.
+/// The only non-coinbase transaction version valid at/after the activation
+/// height, where it selects sighash v3.
 pub const TX_VERSION_V3: u32 = 3;
 /// Version signers give non-coinbase transactions below the activation
-/// height (the historical wallet output; any version other than 3 selects
-/// sighash v2).
+/// height (the historical wallet output; below the activation every version
+/// is verified with sighash v2).
 pub const TX_VERSION_LEGACY: u32 = 1;
 
 /// First 16 bytes of every sighash v3 preimage.
@@ -76,14 +81,20 @@ pub const TAG_OUTPUTS: &[u8] = b"GNB-SIGHASH-v3/outputs";
 /// Which digest (and component binding) a transaction's signatures use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SighashVersion {
-    /// Historical digest ([`Transaction::sighash`]); components sign it verbatim.
+    /// Historical digest ([`Transaction::sighash`]); components sign it
+    /// verbatim; lenient witness framing.
     V2,
-    /// [`SighashV3Precomputed::digest`]; components sign bound messages.
+    /// [`SighashV3Precomputed::digest`]; components sign bound messages;
+    /// canonical witnesses.
     V3,
 }
 
 impl SighashVersion {
-    /// The digest a transaction version selects (no height gate).
+    /// The digest a SIGNER uses for a transaction of `version` that targets a
+    /// block at/after the activation height (3 selects v3, anything else v2).
+    /// Not a validity rule: below the activation every version, 3 included,
+    /// is verified with v2 ([`check_tx_version`]), and signers never emit
+    /// version 3 there ([`tx_version_for_height`]).
     pub const fn for_tx_version(version: u32) -> Self {
         if version == TX_VERSION_V3 { SighashVersion::V3 } else { SighashVersion::V2 }
     }
@@ -96,31 +107,48 @@ pub const fn tx_version_for_height(height: u64, activation_height: u64) -> u32 {
 }
 
 /// Consensus rule: the version of a NON-COINBASE transaction in a block at
-/// header height `height`. Returns the digest the version selects.
+/// header height `height`. Returns the digest (and witness rule) that applies.
 ///
-/// * below the activation: version 3 is invalid, every other version is
-///   valid and uses sighash v2 (the historical rule, unchanged);
-/// * at/after the activation: only version 3 is valid.
+/// * below the activation: every version is valid and uses sighash v2 with
+///   the historical lenient witness rule — exactly the pre-upgrade rule
+///   (version 3 included: nodes that predate the upgrade accept it);
+/// * at/after the activation: only version 3 is valid; it uses sighash v3
+///   with the canonical witness rule.
 ///
-/// Error strings start with `bad-txns-version`.
+/// Error strings start with `bad-txns-version`. Relay policy adds
+/// [`check_tx_version_standard`].
 pub fn check_tx_version(version: u32, height: u64, activation_height: u64) -> Result<SighashVersion, String> {
-    if activation::is_active_at(height, activation_height) {
-        if version == TX_VERSION_V3 {
-            Ok(SighashVersion::V3)
-        } else {
-            Err(format!(
-                "bad-txns-version: version {version} is invalid at height {height} \
-                 (only version 3 is valid at/after the hardening activation height {activation_height})"
-            ))
-        }
-    } else if version == TX_VERSION_V3 {
-        Err(format!(
-            "bad-txns-version: version 3 is invalid at height {height}, below the hardening \
-             activation height {activation_height}"
-        ))
-    } else {
-        Ok(SighashVersion::V2)
+    if !activation::is_active_at(height, activation_height) {
+        return Ok(SighashVersion::V2);
     }
+    if version == TX_VERSION_V3 {
+        Ok(SighashVersion::V3)
+    } else {
+        Err(format!(
+            "bad-txns-version: version {version} is invalid at height {height} \
+             (only version 3 is valid at/after the hardening activation height {activation_height})"
+        ))
+    }
+}
+
+/// Relay policy (standardness) for the version of a non-coinbase transaction
+/// targeting a block at `height`: the consensus rule ([`check_tx_version`])
+/// plus, below the activation, version ≥ 3 is NON-STANDARD. Such a
+/// transaction is consensus-valid there (sighash v2) but upgraded nodes never
+/// admit, relay or mine it, so no version-3 transaction verified under the v2
+/// digest ever sits in a pool that crosses the activation.
+///
+/// Policy error strings start with `non-standard-version`.
+pub fn check_tx_version_standard(version: u32, height: u64, activation_height: u64) -> Result<SighashVersion, String> {
+    let digest = check_tx_version(version, height, activation_height)?;
+    if !activation::is_active_at(height, activation_height) && version >= TX_VERSION_V3 {
+        return Err(format!(
+            "non-standard-version: version {version} is not relayed or mined below the hardening \
+             activation height {activation_height} (next block {height}); it is consensus-valid there \
+             with sighash v2, and signers use version {TX_VERSION_LEGACY}"
+        ));
+    }
+    Ok(digest)
 }
 
 /// Why a digest could not be computed.
@@ -326,8 +354,8 @@ impl Transaction {
 /// Falcon half, exact ML-DSA length). The PUBLIC key is not required to be
 /// enveloped: genesis carry-over addresses commit to raw keys.
 ///
-/// Consensus for every version-3 transaction (so for every non-coinbase
-/// transaction at/after the activation); relay policy at every height.
+/// Consensus for every non-coinbase transaction at/after the activation
+/// (sighash v3); relay policy at every height.
 pub fn canonical_witness(script_sig: &[u8]) -> Result<Witness<'_>, String> {
     let (sig, pk) = Transaction::parse_script_sig_exact(script_sig)
         .ok_or_else(|| "non-canonical script_sig framing (expected exactly \
@@ -464,15 +492,49 @@ mod tests {
             assert_eq!(check_tx_version(v, h - 1, h), Ok(SighashVersion::V2), "v{v} below activation");
             assert!(check_tx_version(v, h, h).unwrap_err().starts_with("bad-txns-version"));
         }
-        assert!(check_tx_version(3, h - 1, h).unwrap_err().starts_with("bad-txns-version"));
+        // Below the activation version 3 is consensus-valid with the v2 digest
+        // (exactly the pre-upgrade rule: no split before the flag day).
+        assert_eq!(check_tx_version(3, h - 1, h), Ok(SighashVersion::V2));
+        assert_eq!(check_tx_version(3, 0, h), Ok(SighashVersion::V2));
         assert_eq!(check_tx_version(3, h, h), Ok(SighashVersion::V3));
         assert_eq!(check_tx_version(3, u64::MAX, h), Ok(SighashVersion::V3));
-        // NEVER: the historical rule forever (every version but 3 is v2).
-        assert_eq!(check_tx_version(1, u64::MAX - 1, activation::NEVER), Ok(SighashVersion::V2));
+        // NEVER: the historical rule forever (every version is v2).
+        for v in [0u32, 1, 2, 3, 4, u32::MAX] {
+            assert_eq!(check_tx_version(v, u64::MAX - 1, activation::NEVER), Ok(SighashVersion::V2));
+        }
         assert_eq!(tx_version_for_height(h - 1, h), TX_VERSION_LEGACY);
         assert_eq!(tx_version_for_height(h, h), TX_VERSION_V3);
         assert_eq!(SighashVersion::for_tx_version(3), SighashVersion::V3);
         assert_eq!(SighashVersion::for_tx_version(2), SighashVersion::V2);
+    }
+
+    /// Relay policy: below the activation version >= 3 is non-standard (it is
+    /// consensus-valid there); at/after it the policy is the consensus rule.
+    #[test]
+    fn version_policy_refuses_version_3_and_above_below_the_activation() {
+        let h = 100;
+        for v in [0u32, 1, 2] {
+            assert_eq!(check_tx_version_standard(v, h - 1, h), Ok(SighashVersion::V2));
+            assert!(check_tx_version_standard(v, h, h).unwrap_err().starts_with("bad-txns-version"));
+        }
+        for v in [3u32, 4, u32::MAX] {
+            assert_eq!(check_tx_version(v, h - 1, h), Ok(SighashVersion::V2), "consensus-valid");
+            assert!(check_tx_version_standard(v, h - 1, h).unwrap_err().starts_with("non-standard-version"));
+            assert!(check_tx_version_standard(v, 0, activation::NEVER).unwrap_err().starts_with("non-standard-version"));
+        }
+        assert_eq!(check_tx_version_standard(3, h, h), Ok(SighashVersion::V3));
+        assert!(check_tx_version_standard(4, h, h).unwrap_err().starts_with("bad-txns-version"));
+        // Whatever passes the policy at two heights uses the same digest at
+        // both (so a pooled transaction never needs re-verifying when the
+        // next height moves).
+        for v in [0u32, 1, 2, 3, 4] {
+            let at = |height| check_tx_version_standard(v, height, h).ok();
+            for (a, b) in [(0, h - 1), (h, u64::MAX), (h - 1, h)] {
+                if let (Some(x), Some(y)) = (at(a), at(b)) {
+                    assert_eq!(x, y, "v{v} at {a} and {b}");
+                }
+            }
+        }
     }
 
     #[test]

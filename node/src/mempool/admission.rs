@@ -25,9 +25,10 @@
 //!     zero-value output (policy: UTXO-set bloat, VAL-11 note), canonical
 //!     witnesses at EVERY height and the hybrid signature suite only
 //!     ([`check_standard_witnesses`], CRY-1/CRY-2 policy);
-//!  5. version: valid for the next block's height (the consensus
-//!     `core::sighash::check_tx_version` rule: version 3 from the hardening
-//!     activation height, never below it);
+//!  5. version: valid AND standard for the next block's height
+//!     (`core::sighash::check_tx_version_standard`: version 3 from the
+//!     hardening activation height; below it version >= 3 is non-standard
+//!     although consensus-valid with sighash v2);
 //!  6. conflicts: an input already spent by a pooled tx (first-seen wins —
 //!     the explicit replacement rule is "no replacement", MEM-6);
 //!  7. duplicate inputs within the tx (C-R3-2);
@@ -61,8 +62,11 @@ pub struct AdmissionPolicy {
     /// Verify the witnesses (standardness: canonical witness, hybrid suite)
     /// and the signatures. `false` ONLY for re-injection of transactions from
     /// disconnected blocks, whose witnesses and signatures were accepted when
-    /// the block was connected. The consensus version rule at
-    /// `next_block_height` applies either way.
+    /// the block was connected: standardness is then skipped, and so are the
+    /// signatures below the activation (every version is sighash v2 there, as
+    /// when the block was mined); at/after it the input scripts are verified
+    /// anyway, since the block may have been mined below it under v2. The
+    /// version rule and policy at `next_block_height` apply either way.
     pub check_signatures: bool,
     /// Consult and update the recent-rejects filter.
     pub use_reject_filter: bool,
@@ -176,28 +180,34 @@ fn sig_cache() -> &'static parking_lot::Mutex<(HashSet<[u8; 32]>, std::collectio
     CACHE.get_or_init(|| parking_lot::Mutex::new((HashSet::new(), std::collections::VecDeque::new())))
 }
 
-/// Cache key of a verified transaction. Version 1/2 (sighash v2): the wtxid
-/// fixes every sighash, signature and public key. Version 3 (sighash v3):
-/// the digests also commit to the spent outputs, so they are part of the key.
-fn sig_cache_key(tx: &Transaction, version: SighashVersion, prevouts: &[TxOutput]) -> [u8; 32] {
+/// Cache key of a verified transaction: EVERYTHING the cached verdict
+/// depends on, so a "valid" entry can never answer for another digest
+/// version, prevout set or height regime (mandated with CRY-3):
+///
+/// * the chain id (every digest commits to it);
+/// * the digest / witness regime (`SighashVersion`: v2 + lenient witness, or
+///   v3 + canonical witness + bound signatures) and whether the hardening
+///   activation is in force at the block height (the regime is a function of
+///   both, so a version-3 transaction verified under v2 below the activation
+///   never hits at/after it, and vice versa);
+/// * the wtxid (every input's outpoint, sequence, script_sig, every output,
+///   version and locktime);
+/// * every spent output (value and `script_pubkey`, in input order): sighash
+///   v3 commits to them, and the witness check hashes the public key against
+///   the spent script. Included for v2 too, so the key never depends on the
+///   regime-specific reasoning above.
+fn sig_cache_key(tx: &Transaction, version: SighashVersion, active: bool, prevouts: &[TxOutput]) -> [u8; 32] {
     use sha3::{Digest, Sha3_256};
     let mut h = Sha3_256::new();
-    match version {
-        SighashVersion::V2 => {
-            h.update(b"gnb-sigcache-v1");
-            h.update(core::node_chain_id().to_le_bytes());
-            h.update(wtxid(tx));
-        }
-        SighashVersion::V3 => {
-            h.update(b"gnb-sigcache-v3");
-            h.update(core::node_chain_id().to_le_bytes());
-            h.update(wtxid(tx));
-            for p in prevouts {
-                h.update(p.value.to_le_bytes());
-                h.update((p.script_pubkey.len() as u64).to_le_bytes());
-                h.update(&p.script_pubkey);
-            }
-        }
+    h.update(b"gnb-sigcache-v4");
+    h.update(core::node_chain_id().to_le_bytes());
+    h.update([match version { SighashVersion::V2 => 2u8, SighashVersion::V3 => 3u8 }, u8::from(active)]);
+    h.update(wtxid(tx));
+    h.update((prevouts.len() as u64).to_le_bytes());
+    for p in prevouts {
+        h.update(p.value.to_le_bytes());
+        h.update((p.script_pubkey.len() as u64).to_le_bytes());
+        h.update(&p.script_pubkey);
     }
     h.finalize().into()
 }
@@ -213,24 +223,31 @@ fn activation_height() -> u64 {
 /// connect (`accept::validate_tx_inputs`), reorg connect, template self-check
 /// and mempool admission (at the next block's height) all call:
 ///
-/// 1. version: `core::sighash::check_tx_version` (version 3 is invalid below
-///    the hardening activation; only version 3 is valid at/after it);
-/// 2. witnesses (`core::sighash::check_input_witnesses`): version 1/2 keep the
-///    historical lenient `script_sig` framing; version 3 requires the
-///    canonical witness (exact framing, enveloped canonical signature, CRY-1);
-///    the public key must hash to the spent `script_pubkey` (`prevouts[i]`);
+/// 1. version: `core::sighash::check_tx_version` (below the hardening
+///    activation every version, 3 included, is valid with sighash v2 — the
+///    pre-upgrade rule exactly; at/after it only version 3 is valid, with
+///    sighash v3);
+/// 2. witnesses (`core::sighash::check_input_witnesses`): below the
+///    activation the historical lenient `script_sig` framing; from it the
+///    canonical witness (exact framing, enveloped canonical signature,
+///    CRY-1); the public key must hash to the spent `script_pubkey`
+///    (`prevouts[i]`);
 /// 3. signatures (`core::sighash::verify_input_signatures`): sighash v2 with
 ///    the historical verifier, or sighash v3 (spent amounts and scripts, the
 ///    suite and the input index committed; linear cost) with component-bound
 ///    signatures (CRY-2, CRY-3).
 ///
 /// Steps 1–2 run on every call (they depend on the height and the prevouts).
-/// The expensive signature results are cached (see [`sig_cache_key`]); only
-/// successes are cached.
+/// The expensive signature results are cached under a key that covers the
+/// regime, the activation state at `block_height` and the prevouts (see
+/// [`sig_cache_key`]); only successes are cached. Relay policy (version >= 3
+/// non-standard below the activation) is NOT part of this rule: see
+/// [`check_version_for_next_block`].
 pub fn verify_input_scripts(tx: &Transaction, prevouts: &[TxOutput], block_height: u64) -> Result<(), String> {
-    let version = core::sighash::check_tx_version(tx.version, block_height, activation_height())?;
+    let act = activation_height();
+    let version = core::sighash::check_tx_version(tx.version, block_height, act)?;
     let witnesses = core::sighash::check_input_witnesses(tx, prevouts, version)?;
-    let key = sig_cache_key(tx, version, prevouts);
+    let key = sig_cache_key(tx, version, core::activation::is_active_at(block_height, act), prevouts);
     if sig_cache().lock().0.contains(&key) {
         return Ok(());
     }
@@ -327,12 +344,21 @@ pub fn check_standard_witnesses(tx: &Transaction) -> Result<(), String> {
     Ok(())
 }
 
-/// Step 5: the consensus version rule at the next block's height (cheap; runs
-/// even when signatures are not checked, e.g. reorg re-injection, so a
-/// version-1 transaction is never re-admitted at/after the activation and a
-/// version-3 one never below it).
+/// Step 5: the version rule AND policy at the next block's height
+/// (`core::sighash::check_tx_version_standard`): consensus (only version 3
+/// at/after the hardening activation) plus relay policy (version >= 3 is
+/// non-standard below it, although consensus-valid there with sighash v2).
+/// Cheap; runs even when signatures are not checked (reorg re-injection), in
+/// post-connect eviction, in `accept::revalidate_mempool` and in the
+/// template self-check, so the pool never holds a version-1 transaction for a
+/// block at/after the activation, nor a version >= 3 one for a block below it.
+///
+/// Whatever passes this check at two heights uses the same digest at both, so
+/// a pooled transaction's verified signatures stay valid while the next
+/// height moves (only a move across the activation changes the regime, and
+/// then no version passes on both sides).
 pub fn check_version_for_next_block(tx: &Transaction, next_block_height: u64) -> Result<(), String> {
-    core::sighash::check_tx_version(tx.version, next_block_height, activation_height()).map(|_| ())
+    core::sighash::check_tx_version_standard(tx.version, next_block_height, activation_height()).map(|_| ())
 }
 
 /// Run every admission check (steps 1–11) WITHOUT inserting. Returns the fee.
@@ -425,8 +451,16 @@ pub fn check_transaction(
         }
     }
 
-    // Signatures last (the most expensive step).
-    if policy.check_signatures {
+    // Signatures last (the most expensive step). Re-injection skips them only
+    // where the digest regime cannot have changed since the transaction was
+    // mined: below the activation every version is verified with sighash v2
+    // at every height. From the activation the scripts are verified again (a
+    // verified-signature cache hit when the disconnected block was itself at
+    // or after it): a version-3 transaction mined BELOW the activation was
+    // checked against the v2 digest, which says nothing about v3.
+    let regime_may_have_changed = !policy.check_signatures
+        && core::activation::is_active_at(policy.next_block_height, activation_height());
+    if policy.check_signatures || regime_may_have_changed {
         verify_input_scripts(tx, &prevouts, policy.next_block_height).map_err(AdmissionError::Rejected)?;
     }
     Ok(fee)

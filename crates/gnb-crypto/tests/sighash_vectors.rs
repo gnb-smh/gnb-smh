@@ -157,3 +157,39 @@ fn component_messages_match_reference() {
         assert_eq!(hex::encode(got), m["message"].as_str().unwrap());
     }
 }
+
+/// The version rule (consensus, `check_tx_version`) and the version policy
+/// (relay, `check_tx_version_standard`) on both sides of the activation,
+/// against the reference's `version_rule` / `version_policy`. Below the
+/// activation every version (3 included) is consensus-valid with sighash v2
+/// and version >= 3 is non-standard.
+#[test]
+fn version_rule_and_policy_match_reference() {
+    use gnb_crypto::core::sighash::{check_tx_version, check_tx_version_standard, SighashVersion};
+    let d = doc();
+    let rules = d["version_rule"].as_array().unwrap();
+    assert_eq!(rules.len(), 108);
+    let verdict = |r: Result<SighashVersion, String>, prefix: &str| match r {
+        Ok(SighashVersion::V2) => "v2".to_string(),
+        Ok(SighashVersion::V3) => "v3".to_string(),
+        Err(e) if e.starts_with("bad-txns-version") => "invalid".to_string(),
+        Err(e) if e.starts_with(prefix) => "non-standard".to_string(),
+        Err(e) => panic!("unexpected error {e}"),
+    };
+    let mut pre_v3_valid = 0;
+    for r in rules {
+        let version = u32::try_from(r["version"].as_u64().unwrap()).unwrap();
+        let height: u64 = r["height"].as_str().unwrap().parse().unwrap();
+        let act: u64 = r["activation"].as_str().unwrap().parse().unwrap();
+        let consensus = verdict(check_tx_version(version, height, act), "\u{0}");
+        let policy = verdict(check_tx_version_standard(version, height, act), "non-standard-version");
+        assert_eq!(consensus, r["consensus"].as_str().unwrap(), "consensus {r}");
+        assert_eq!(policy, r["policy"].as_str().unwrap(), "policy {r}");
+        if version == 3 && height < act {
+            assert_eq!(consensus, "v2");
+            assert_eq!(policy, "non-standard");
+            pre_v3_valid += 1;
+        }
+    }
+    assert!(pre_v3_valid >= 6, "the pre-activation version-3 case is covered");
+}

@@ -30,7 +30,8 @@ pub const NETWORK_MAGIC:         u32   = 0x474E_4231;
 
 // ── Sighash domain (replay separation) ──────────────────────────────────────
 //
-// Sighash v2 (transactions whose version is not 3):
+// Sighash v2 (every transaction below the hardening activation, whatever its
+// version):
 //   preimage = SIGHASH_DOMAIN(16) ‖ [SIGHASH_VERSION](1) ‖ chain_id.to_le_bytes()(4)
 //              ‖ bincode(stripped_tx)
 //   sighash  = SHA3-256(preimage)
@@ -651,8 +652,9 @@ impl Transaction {
 
     /// Sighash (v2) for input at `index`, bound to `chain_id`.
     ///
-    /// The digest of transactions whose version is not 3 (see the
-    /// `core::sighash` module for the selection and the activation rule). Specified
+    /// The digest of every transaction below the hardening activation,
+    /// whatever its version (see the `core::sighash` module for the selection
+    /// and the activation rule). Specified
     /// byte for byte in `docs/CONSENSUS.md` (the bincode body is re-derived
     /// by an independent encoder in `reference/gnb_sighash.py`) and pinned by
     /// golden vectors; it must never change. Costs O(size) per input, so
@@ -737,8 +739,8 @@ impl Transaction {
 
     /// The canonical witness framing: exactly
     /// `[u32 LE sig_len][sig][u32 LE pk_len][pk]` with no trailing bytes
-    /// (CRY-1; consensus for version-3 transactions, relay policy at every
-    /// height).
+    /// (CRY-1; consensus at/after the hardening activation, relay policy at
+    /// every height).
     pub fn parse_script_sig_exact(script_sig: &[u8]) -> Option<(&[u8], &[u8])> {
         match Self::parse_script_sig_prefix(script_sig) {
             Some((s, p, end)) if end == script_sig.len() => Some((s, p)),

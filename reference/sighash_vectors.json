@@ -2129,5 +2129,763 @@
    "digest": "e971b34a3c4050019b225144557b8f6803bf2d138ea46d12054b2730f4a91aa5",
    "message": "474e422d54585349472d7633020002e971b34a3c4050019b225144557b8f6803bf2d138ea46d12054b2730f4a91aa5"
   }
+ ],
+ "version_rule": [
+  {
+   "version": 0,
+   "height": "0",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 1,
+   "height": "0",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 2,
+   "height": "0",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 3,
+   "height": "0",
+   "activation": "0",
+   "consensus": "v3",
+   "policy": "v3"
+  },
+  {
+   "version": 4,
+   "height": "0",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 4294967295,
+   "height": "0",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 0,
+   "height": "99",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 1,
+   "height": "99",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 2,
+   "height": "99",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 3,
+   "height": "99",
+   "activation": "0",
+   "consensus": "v3",
+   "policy": "v3"
+  },
+  {
+   "version": 4,
+   "height": "99",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 4294967295,
+   "height": "99",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 0,
+   "height": "100",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 1,
+   "height": "100",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 2,
+   "height": "100",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 3,
+   "height": "100",
+   "activation": "0",
+   "consensus": "v3",
+   "policy": "v3"
+  },
+  {
+   "version": 4,
+   "height": "100",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 4294967295,
+   "height": "100",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 0,
+   "height": "101",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 1,
+   "height": "101",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 2,
+   "height": "101",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 3,
+   "height": "101",
+   "activation": "0",
+   "consensus": "v3",
+   "policy": "v3"
+  },
+  {
+   "version": 4,
+   "height": "101",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 4294967295,
+   "height": "101",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 0,
+   "height": "18446744073709551614",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 1,
+   "height": "18446744073709551614",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 2,
+   "height": "18446744073709551614",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 3,
+   "height": "18446744073709551614",
+   "activation": "0",
+   "consensus": "v3",
+   "policy": "v3"
+  },
+  {
+   "version": 4,
+   "height": "18446744073709551614",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 4294967295,
+   "height": "18446744073709551614",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 0,
+   "height": "18446744073709551615",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 1,
+   "height": "18446744073709551615",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 2,
+   "height": "18446744073709551615",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 3,
+   "height": "18446744073709551615",
+   "activation": "0",
+   "consensus": "v3",
+   "policy": "v3"
+  },
+  {
+   "version": 4,
+   "height": "18446744073709551615",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 4294967295,
+   "height": "18446744073709551615",
+   "activation": "0",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 0,
+   "height": "0",
+   "activation": "100",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 1,
+   "height": "0",
+   "activation": "100",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 2,
+   "height": "0",
+   "activation": "100",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 3,
+   "height": "0",
+   "activation": "100",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 4,
+   "height": "0",
+   "activation": "100",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 4294967295,
+   "height": "0",
+   "activation": "100",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 0,
+   "height": "99",
+   "activation": "100",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 1,
+   "height": "99",
+   "activation": "100",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 2,
+   "height": "99",
+   "activation": "100",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 3,
+   "height": "99",
+   "activation": "100",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 4,
+   "height": "99",
+   "activation": "100",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 4294967295,
+   "height": "99",
+   "activation": "100",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 0,
+   "height": "100",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 1,
+   "height": "100",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 2,
+   "height": "100",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 3,
+   "height": "100",
+   "activation": "100",
+   "consensus": "v3",
+   "policy": "v3"
+  },
+  {
+   "version": 4,
+   "height": "100",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 4294967295,
+   "height": "100",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 0,
+   "height": "101",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 1,
+   "height": "101",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 2,
+   "height": "101",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 3,
+   "height": "101",
+   "activation": "100",
+   "consensus": "v3",
+   "policy": "v3"
+  },
+  {
+   "version": 4,
+   "height": "101",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 4294967295,
+   "height": "101",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 0,
+   "height": "18446744073709551614",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 1,
+   "height": "18446744073709551614",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 2,
+   "height": "18446744073709551614",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 3,
+   "height": "18446744073709551614",
+   "activation": "100",
+   "consensus": "v3",
+   "policy": "v3"
+  },
+  {
+   "version": 4,
+   "height": "18446744073709551614",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 4294967295,
+   "height": "18446744073709551614",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 0,
+   "height": "18446744073709551615",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 1,
+   "height": "18446744073709551615",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 2,
+   "height": "18446744073709551615",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 3,
+   "height": "18446744073709551615",
+   "activation": "100",
+   "consensus": "v3",
+   "policy": "v3"
+  },
+  {
+   "version": 4,
+   "height": "18446744073709551615",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 4294967295,
+   "height": "18446744073709551615",
+   "activation": "100",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 0,
+   "height": "0",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 1,
+   "height": "0",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 2,
+   "height": "0",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 3,
+   "height": "0",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 4,
+   "height": "0",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 4294967295,
+   "height": "0",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 0,
+   "height": "99",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 1,
+   "height": "99",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 2,
+   "height": "99",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 3,
+   "height": "99",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 4,
+   "height": "99",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 4294967295,
+   "height": "99",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 0,
+   "height": "100",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 1,
+   "height": "100",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 2,
+   "height": "100",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 3,
+   "height": "100",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 4,
+   "height": "100",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 4294967295,
+   "height": "100",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 0,
+   "height": "101",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 1,
+   "height": "101",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 2,
+   "height": "101",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 3,
+   "height": "101",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 4,
+   "height": "101",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 4294967295,
+   "height": "101",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 0,
+   "height": "18446744073709551614",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 1,
+   "height": "18446744073709551614",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 2,
+   "height": "18446744073709551614",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "v2"
+  },
+  {
+   "version": 3,
+   "height": "18446744073709551614",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 4,
+   "height": "18446744073709551614",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 4294967295,
+   "height": "18446744073709551614",
+   "activation": "18446744073709551615",
+   "consensus": "v2",
+   "policy": "non-standard"
+  },
+  {
+   "version": 0,
+   "height": "18446744073709551615",
+   "activation": "18446744073709551615",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 1,
+   "height": "18446744073709551615",
+   "activation": "18446744073709551615",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 2,
+   "height": "18446744073709551615",
+   "activation": "18446744073709551615",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 3,
+   "height": "18446744073709551615",
+   "activation": "18446744073709551615",
+   "consensus": "v3",
+   "policy": "v3"
+  },
+  {
+   "version": 4,
+   "height": "18446744073709551615",
+   "activation": "18446744073709551615",
+   "consensus": "invalid",
+   "policy": "invalid"
+  },
+  {
+   "version": 4294967295,
+   "height": "18446744073709551615",
+   "activation": "18446744073709551615",
+   "consensus": "invalid",
+   "policy": "invalid"
+  }
  ]
 }

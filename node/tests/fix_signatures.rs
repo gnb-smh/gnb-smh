@@ -11,6 +11,11 @@
 //! connect, reorg connect, templates, mempool admission) and the wallet
 //! signers all see the same boundary. Blocks go through the REAL pipeline
 //! (`fix_common::accept` -> `accept::accept_block`).
+//!
+//! Review follow-ups: below the activation every transaction (version 3
+//! included) keeps the pre-upgrade verdict and version >= 3 is refused only by
+//! relay policy; the verified-signature cache is keyed by regime and prevouts;
+//! re-injection across the activation re-verifies the scripts.
 
 mod fix_common;
 use fix_common::*;
@@ -223,8 +228,10 @@ fn spent(n: &Node, f: &([u8; 32], u32, TxOutput)) -> bool {
 
 // ── CRY-3: the version rule at the boundary (acceptance pipeline) ────────────
 
-/// Below H a version-3 transaction is invalid; at/after H a version-1
-/// transaction is invalid; the other combinations are valid.
+/// Below H every version is verified with the v2 digest (so a version-3
+/// transaction signed over the v3 digest fails there); at/after H a version-1
+/// transaction is invalid, and a version-3 one signed over the v2 digest
+/// fails; version 1 below H and version 3 (v3 digest) from H are valid.
 #[test]
 fn version_rule_at_the_activation_boundary() {
     let _g = activation::scoped_override(H);
@@ -234,10 +241,10 @@ fn version_rule_at_the_activation_boundary() {
     advance_to(&n, H - 2);
     let pay = |i: usize| vec![out(2 * SAT - FEE, &[0x21 + i as u8; 20])];
 
-    // Block at H-1.
+    // Block at H-1: a v3-digest signature is checked against the v2 digest.
     let v3 = v3_spend(&k, &[(f[0].0, 0)], std::slice::from_ref(&f[0].2), pay(0));
     let err = extend(&n, vec![v3]).unwrap_err();
-    assert!(err.contains("bad-txns-version"), "{err}");
+    assert!(err.contains("invalid signature"), "{err}");
     assert_eq!(tip_height(&n), H - 2);
     extend(&n, vec![v2_spend(&k, &[(f[0].0, 0)], pay(0))]).expect("version 1 below the activation");
     assert!(spent(&n, &f[0]));
@@ -246,6 +253,10 @@ fn version_rule_at_the_activation_boundary() {
     // Block at H.
     let err = extend(&n, vec![v2_spend(&k, &[(f[1].0, 0)], pay(1))]).unwrap_err();
     assert!(err.contains("bad-txns-version"), "{err}");
+    assert_eq!(tip_height(&n), H - 1);
+    let v3_old_digest = sign_v2(&k, unsigned(3, &[(f[1].0, 0)], pay(1)));
+    let err = extend(&n, vec![v3_old_digest]).unwrap_err();
+    assert!(err.contains("invalid signature"), "{err}");
     assert_eq!(tip_height(&n), H - 1);
     extend(&n, vec![v3_spend(&k, &[(f[1].0, 0)], std::slice::from_ref(&f[1].2), pay(1))]).expect("version 3 at H");
     assert!(spent(&n, &f[1]));
@@ -274,7 +285,7 @@ fn mempool_and_templates_follow_the_next_block_height() {
     admit(&n, &a).expect("v2 admitted for H-1");
     admit(&n, &b).expect("v2 admitted for H-1");
     let err = admit(&n, &c).unwrap_err();
-    assert!(matches!(&err, AdmissionError::Rejected(m) if m.contains("bad-txns-version")), "{err}");
+    assert!(matches!(&err, AdmissionError::Rejected(m) if m.contains("non-standard-version")), "{err}");
 
     // The template at H-1 carries both version-1 transactions.
     let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
@@ -611,10 +622,9 @@ fn reorg_connect_applies_the_version_rule() {
 
 /// With the activation never reached, every pre-fix verdict is reproduced:
 /// version 1, an arbitrary version (7) with the v2 digest, the three
-/// non-canonical witness encodings, a 0x0002 spend and a raw carry-over key
-/// are all consensus-valid. The one intended tightening is version 3, which
-/// is invalid below the activation (pre-upgrade nodes cannot verify a v3
-/// digest; no released signer ever produced version 3).
+/// non-canonical witness encodings, a 0x0002 spend, a raw carry-over key and
+/// a version-3 transaction signed over the v2 digest are all
+/// consensus-valid (relay policy refuses version >= 3, consensus does not).
 #[test]
 fn never_activated_regime_reproduces_the_old_verdicts() {
     let _g = activation::scoped_override(activation::NEVER);
@@ -637,11 +647,13 @@ fn never_activated_regime_reproduces_the_old_verdicts() {
     }
     extend(&n, txs).expect("old verdicts: all valid");
     assert!(fk[..5].iter().all(|f| spent(&n, f)) && spent(&n, &f2) && spent(&n, &fr));
-    // Version 3 (even signed with the v2 digest old nodes would check) is the
-    // single intended change below the activation.
+    // Version 3 signed over the v2 digest (what pre-upgrade nodes check):
+    // non-standard, but consensus-valid exactly as before the upgrade.
     let v3_with_v2_digest = sign_v2(&k, unsigned(3, &[(fk[5].0, 0)], o(6)));
-    let err = extend(&n, vec![v3_with_v2_digest]).unwrap_err();
-    assert!(err.contains("bad-txns-version"), "{err}");
+    let err = admit(&n, &v3_with_v2_digest).unwrap_err();
+    assert!(err.to_string().contains("non-standard-version"), "{err}");
+    extend(&n, vec![v3_with_v2_digest]).expect("old verdict: version 3 with the v2 digest is valid");
+    assert!(spent(&n, &fk[5]));
 }
 
 // ── MEM-5 residual: linear sighash ───────────────────────────────────────────
@@ -678,4 +690,133 @@ fn v3_sighash_cost_is_linear_v2_is_quadratic() {
     let tx = v3_spend(&k, &ins, &spent, vec![out(40 * SAT - FEE, &[9; 20])]);
     assert_eq!(gnb::core::sighash::verify_tx_scripts(&tx, &spent, chain(), 1, 0), Ok(SighashVersion::V3));
     admission::verify_input_scripts(&tx, &spent, 1).expect("node rule");
+}
+
+// ── Review: pre-activation version 3 is consensus-valid, non-standard ────────
+
+/// Mandated rule: below the activation a non-coinbase transaction of version
+/// 3 (or higher) signed over the v2 digest — what a non-upgraded node checks
+/// — is consensus-valid exactly as before the upgrade, so a block a
+/// non-upgraded miner builds with it is accepted (no split before the flag
+/// day). Upgraded nodes refuse it as relay policy: admission rejects it as
+/// non-standard and a template never mines it.
+#[test]
+fn pre_activation_version_3_with_the_v2_digest_is_valid_but_non_standard() {
+    let _g = activation::scoped_override(H);
+    let k = key();
+    let f: Vec<_> = (0..3u8).map(|i| fund(0xE0 + i, 2 * SAT, &k.spk)).collect();
+    let n = node_with(&mk_genesis(unix_now() - 10_000), &f);
+    advance_to(&n, H - 2);
+    assert_eq!(next_height(&n), H - 1);
+    let pay = |i: usize| vec![out(2 * SAT - FEE, &[0xE8 + i as u8; 20])];
+    let v3_old = sign_v2(&k, unsigned(3, &[(f[0].0, 0)], pay(0)));
+    let v4_old = sign_v2(&k, unsigned(4, &[(f[1].0, 0)], pay(1)));
+
+    // Policy: refused by admission (gossip / RPC)...
+    for t in [&v3_old, &v4_old] {
+        let err = admit(&n, t).unwrap_err();
+        assert!(matches!(&err, AdmissionError::Rejected(m) if m.contains("non-standard-version")), "{err}");
+        assert!(!n.mempool.contains(&t.txid()));
+    }
+    // ...and never mined from the pool: a template at H-1 evicts one that
+    // got in some other way.
+    n.mempool.add(v3_old.clone(), FEE).unwrap();
+    let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
+    assert_eq!(tmpl.height, H - 1);
+    assert!(tmpl.transactions.is_empty());
+    assert_eq!(tmpl.evicted, 1);
+    assert!(!n.mempool.contains(&v3_old.txid()));
+
+    // Consensus: the block at H-1 a non-upgraded miner builds is valid.
+    extend(&n, vec![v3_old, v4_old]).expect("version >= 3 with the v2 digest is consensus-valid below H");
+    assert!(spent(&n, &f[0]) && spent(&n, &f[1]));
+    assert_eq!(tip_height(&n), H - 1);
+    // A v2-digest version-3 transaction is invalid from the activation.
+    let v3_late = sign_v2(&k, unsigned(3, &[(f[2].0, 0)], pay(2)));
+    assert!(extend(&n, vec![v3_late]).unwrap_err().contains("invalid signature"));
+    assert!(!spent(&n, &f[2]));
+}
+
+// ── Review: the verified-signature cache is keyed by everything it depends on ─
+
+/// The cache never returns a "valid" for another digest version, height
+/// regime or prevout set: the same wtxid is verified again whenever any of
+/// them changes.
+#[test]
+fn signature_cache_is_keyed_by_regime_and_prevouts() {
+    let _g = activation::scoped_override(H);
+    let k = key();
+    let f = fund(0xE4, 2 * SAT, &k.spk);
+    let spent_ok = std::slice::from_ref(&f.2);
+    let pay = vec![out(2 * SAT - FEE, &[0xE5; 20])];
+
+    // Version 3 over the v2 digest: valid below H (and cached), invalid at H.
+    let old = sign_v2(&k, unsigned(3, &[(f.0, 0)], pay.clone()));
+    admission::verify_input_scripts(&old, spent_ok, H - 1).expect("v2 regime below H");
+    admission::verify_input_scripts(&old, spent_ok, H - 1).expect("cache hit, same regime");
+    let err = admission::verify_input_scripts(&old, spent_ok, H).unwrap_err();
+    assert!(err.contains("invalid signature"), "{err}");
+
+    // Version 3 over the v3 digest: valid at H (and cached), invalid below H.
+    let new = v3_spend(&k, &[(f.0, 0)], spent_ok, pay.clone());
+    admission::verify_input_scripts(&new, spent_ok, H).expect("v3 regime at H");
+    let err = admission::verify_input_scripts(&new, spent_ok, H - 1).unwrap_err();
+    assert!(err.contains("invalid signature"), "{err}");
+
+    // Same wtxid, another prevout set (a different spent amount or script).
+    for lie in [TxOutput { value: f.2.value + 1, ..f.2.clone() }, TxOutput { script_pubkey: vec![0x99; 20], ..f.2.clone() }] {
+        assert!(admission::verify_input_scripts(&new, std::slice::from_ref(&lie), H).is_err());
+    }
+
+    // Same height, another activation state (never activated): v2 regime.
+    {
+        let _never = activation::scoped_override(activation::NEVER);
+        let err = admission::verify_input_scripts(&new, spent_ok, H).unwrap_err();
+        assert!(err.contains("invalid signature"), "{err}");
+        admission::verify_input_scripts(&old, spent_ok, H).expect("v2 regime when never activated");
+    }
+    admission::verify_input_scripts(&new, spent_ok, H + 5).expect("still valid in its own regime");
+}
+
+// ── Review: re-injection across the activation re-verifies the scripts ──────
+
+/// A version-3 transaction signed over the v2 digest, mined below H by a
+/// non-upgraded miner, is not re-admitted when a reorg disconnects its block
+/// and the next block is at/after H: re-injection from the activation
+/// verifies the scripts under sighash v3, where that signature is invalid. A
+/// version-3 transaction mined under v3 is re-admitted after a reorg.
+#[test]
+fn reinjection_across_the_activation_reverifies_the_scripts() {
+    let _g = activation::scoped_override(H);
+    let k = key();
+    let f = fund(0xE6, 2 * SAT, &k.spk);
+    let n = node_with(&mk_genesis(unix_now() - 10_000), std::slice::from_ref(&f));
+    advance_to(&n, H - 2);
+    let t = sel_tip(&n).unwrap();
+
+    // Block B at H-1 (a non-upgraded miner): the v2-signed version-3 spend.
+    let old = sign_v2(&k, unsigned(3, &[(f.0, 0)], vec![out(2 * SAT - FEE, &[0xE7; 20])]));
+    let bh = accept(&n, &child_where(&n, t, vec![old.clone()], |_| true)).expect("valid below H");
+    assert_eq!(applied_tip(&n), Some(bh));
+    assert!(spent(&n, &f));
+
+    // A heavier fork without it (C1 at H-1 loses the tie, C2 at H wins).
+    let c1 = accept(&n, &child_where(&n, t, vec![], |h| *h < bh)).unwrap();
+    assert_eq!(applied_tip(&n), Some(bh));
+    let c2 = accept(&n, &child_where(&n, c1, vec![], |_| true)).unwrap();
+    assert_eq!(applied_tip(&n), Some(c2), "reorg");
+    assert_eq!(next_height(&n), H + 1);
+    assert!(!spent(&n, &f), "the coin is unspent again");
+    assert!(!n.mempool.contains(&old.txid()), "not re-admitted: its signature is invalid under v3");
+
+    // A version-3 spend under v3, mined at H+1 and then reorged away, IS
+    // re-admitted (its scripts verify under v3; a cache hit).
+    let new = v3_spend(&k, &[(f.0, 0)], std::slice::from_ref(&f.2), vec![out(2 * SAT - FEE, &[0xE9; 20])]);
+    let dh = extend(&n, vec![new.clone()]).unwrap();
+    assert!(spent(&n, &f));
+    let e1 = accept(&n, &child_where(&n, c2, vec![], |h| *h < dh)).unwrap();
+    assert_eq!(applied_tip(&n), Some(dh));
+    let e2 = accept(&n, &child_where(&n, e1, vec![], |_| true)).unwrap();
+    assert_eq!(applied_tip(&n), Some(e2), "reorg");
+    assert!(n.mempool.contains(&new.txid()), "re-admitted");
 }

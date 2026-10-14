@@ -277,27 +277,50 @@ height; wallets use the node's `getdaginfo` `tip_height` + 1.
 
 ### Version rule (consensus, non-coinbase transactions)
 
-| | version 3 | any other version |
-| --- | --- | --- |
-| `h` < activation | invalid | valid, sighash v2 |
-| `h` ≥ activation | valid, sighash v3 | invalid |
+| | version 0, 1, 2 | version 3 | version ≥ 4 |
+| --- | --- | --- | --- |
+| `h` < activation | valid: sighash v2, lenient witness | valid: sighash v2, lenient witness (non-standard) | valid: sighash v2, lenient witness (non-standard) |
+| `h` ≥ activation | invalid | valid: sighash v3, canonical witness | invalid |
 
-The transaction's own `version` field selects the digest: 3 selects sighash
-v3, anything else sighash v2. Coinbase transactions are not signed and keep
-no version rule.
+(`core::sighash::check_tx_version`.) Below the activation the version is
+ignored: every transaction, version 3 included, is verified exactly as before
+the upgrade, with sighash v2 and the historical lenient witness rules. From
+the activation only version 3 is valid, and it uses sighash v3, the canonical
+witness and component-bound signatures. Coinbase transactions are not signed
+and keep no version rule.
 
-Below the activation every rule of this section reproduces the previous code
-bit for bit, with one deliberate exception: a non-coinbase version-3
-transaction, which the previous code accepted with the v2 digest, is invalid.
-Nodes that predate the upgrade cannot verify a v3 digest, and with this rule a
-valid version-3 transaction always means sighash v3. No released signer ever
-produced version 3 (every wallet wrote version 1), so the exception only
-affects deliberately crafted transactions. It is a soft-fork tightening that
-upgraded nodes enforce from release. `node/tests/fix_signatures.rs`
-(`never_activated_regime_reproduces_the_old_verdicts`) proves the other
-pre-activation verdicts unchanged.
+Rationale. Nodes that predate the upgrade ignore the version and accept a
+non-coinbase version-3 transaction signed over the v2 digest. If upgraded
+nodes refused it below the activation, anyone could split the network before
+the flag day: submit such a transaction to a non-upgraded node, wait for a
+non-upgraded miner to mine it, and upgraded nodes would disqualify that block
+and its selected-chain descendants while old nodes extended it. So consensus
+below the activation stays exactly the old rule, and version ≥ 3 below the
+activation is refused only by relay POLICY
+(`core::sighash::check_tx_version_standard`, error strings starting with
+`non-standard-version`): upgraded nodes never admit, relay or mine one, and
+wallets write version 1 there. Consequences:
 
-Error strings for this rule start with `bad-txns-version`.
+- A version-3 transaction signed over the v3 digest is invalid below the
+  activation (its signatures are checked against the v2 digest), and one
+  signed over the v2 digest is invalid from the activation. No transaction
+  is valid under both regimes.
+- A pooled transaction always passed the policy at the pool's next height,
+  so the pool never holds a version-3 transaction verified under v2.
+  Re-injection of a disconnected block's transactions at/after the
+  activation re-verifies their input scripts (a version-3 transaction mined
+  below it was checked under v2 only).
+- The node's verified-signature cache is keyed by the chain id, the regime
+  (sighash v2 or v3) and whether the activation is in force at the height,
+  the wtxid and every spent output (value and script), so a cached "valid"
+  never answers for another digest version, prevout set or height regime.
+
+`node/tests/fix_signatures.rs`
+(`never_activated_regime_reproduces_the_old_verdicts`,
+`pre_activation_version_3_with_the_v2_digest_is_valid_but_non_standard`)
+proves the pre-activation verdicts unchanged.
+
+Consensus error strings for this rule start with `bad-txns-version`.
 
 ### Sighash v2 (historical; unchanged)
 
@@ -381,13 +404,13 @@ and relabelling it 0x0002 never verifies (`crypto::verify_bound`).
 `script_sig` = `[u32 LE sig_len][sig][u32 LE pk_len][pk]`, and the public key
 must hash to the spent output: `SHA3-256(pk)[0..20] == script_pubkey`.
 
-- Version 1/2 (sighash v2, below the activation; unchanged): bytes after
+- Below the activation (sighash v2, every version; unchanged): bytes after
   `pk` are ignored; `sig` may lack the envelope (it is then read as hybrid)
   and its Falcon half may use the 1,280-byte zero-padded form.
-- Version 3 (sighash v3, so every non-coinbase transaction from the
-  activation): the canonical witness is required. `script_sig` is exactly the
-  framing above with no trailing bytes, and `sig` has its single canonical
-  encoding (`crypto::is_canonical_signature_encoding`): the 4-byte envelope
+- From the activation (version 3, sighash v3): the canonical witness is
+  required. `script_sig` is exactly the framing above with no trailing bytes,
+  and `sig` has its single canonical encoding
+  (`crypto::is_canonical_signature_encoding`): the 4-byte envelope
   `B1 0C ‖ suite u16 LE` is present and names suite 0x0001 or 0x0002; for
   0x0001 the Falcon half is the COMPACT encoding (header byte 0x3A, 40-byte
   nonce, exactly framed coefficients, zero padding bits, nothing after it, at
@@ -412,11 +435,12 @@ to include the spend directly.
 Mempool admission (gossip, RPC; not reorg re-injection of already-mined
 transactions) additionally requires, at every height, the canonical witness of
 every input and a hybrid public key. Transactions are admitted only if valid
-for the next block's height. After every connect, pooled transactions whose
-version is invalid at the new next height are evicted (a version-1
-transaction admitted for block H-1 is mined in H-1 or evicted when the next
-block is H); the template self-check applies the version rule at the template
-height.
+and standard for the next block's height: below the activation version ≥ 3 is
+non-standard, at/after it only version 3 is valid. After every connect,
+pooled transactions whose version is invalid or non-standard at the new next
+height are evicted (a version-1 transaction admitted for block H-1 is mined in
+H-1 or evicted when the next block is H); the template self-check applies the
+version rule and policy at the template height.
 
 ### Signers
 
@@ -434,8 +458,11 @@ claimed values; under v3 that is unnecessary.
 component messages. `reference/sighash_vectors.json` holds its golden vectors:
 many inputs, empty scripts, maximum field values, long scripts, every suite
 id, both chain ids, the out-of-range and spent-count errors, and random
-transactions. `crates/gnb-crypto/tests/sighash_vectors.rs` pins them, and
-CI regenerates the file and diffs it.
+transactions, plus `version_rule` vectors: the consensus verdict
+(`v2` / `v3` / `invalid`) and the relay-policy verdict (adding
+`non-standard`) for versions 0, 1, 2, 3, 4 and 2³²−1 at heights around
+activations 0, 100 and `NEVER`. `crates/gnb-crypto/tests/sighash_vectors.rs`
+pins them, and CI regenerates the file and diffs it.
 
 ## Mining
 
