@@ -10,3 +10,5 @@ sha3 = "0.10"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+# Property tests of the spend statement and the incremental tree (COH-1, COH-2).
+proptest = "1"
