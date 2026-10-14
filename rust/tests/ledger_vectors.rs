@@ -22,6 +22,8 @@ fn ctx(v: &serde_json::Value) -> Context {
         subsidy: v["subsidy"].as_u64().unwrap(),
         coinbase_maturity: v["coinbase_maturity"].as_u64().unwrap(),
         auth: ledger::test_preimage_auth,
+        // validate_block sets it from the header.
+        parents_root: ledger::EMPTY,
     }
 }
 

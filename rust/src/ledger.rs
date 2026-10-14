@@ -1,9 +1,10 @@
 //! GnB ledger v1: stateless validation, port of `reference/gnb_ledger.py` (normative).
 //!
 //! Validity is deterministic and needs no committee: a node holds only the two
-//! 32-byte state roots, and every block travels with a witness bundle (not committed
-//! by the header) carrying the spent records and an O(log n) sparse-Merkle witness
-//! per touched key, each against the root left by the previous operation. Every
+//! 32-byte state roots, and every block travels with a witness bundle (committed by
+//! the header's `witness_root`) carrying the spent records and an O(log n)
+//! sparse-Merkle witness per touched key, each against the root left by the previous
+//! operation. Every
 //! transaction gets exactly one outcome (accept, or reject with proof), so the
 //! post-state root is a deterministic function of the pre-state root and the block.
 //! Ordering is left to GnB-SMH over GhostDAG. No proof system is on this path.
@@ -20,7 +21,7 @@ use sha3::Shake256;
 pub const VERSION: u32 = 1;
 pub const DEPTH: usize = 256;
 pub const RECORD_LEN: usize = 49;
-pub const HEADER_LEN: usize = 140;
+pub const HEADER_LEN: usize = 172;
 // Placeholder limits until GnB's monetary and block-size parameters are fixed.
 pub const MAX_MONEY: u64 = (1 << 63) - 1;
 /// Per transaction.
@@ -60,6 +61,7 @@ pub enum ErrorCode {
     Target,
     Pow,
     TxRoot,
+    WitnessCommitment,
     Isolation,
     WitnessFormat,
     NoncanonicalProof,
@@ -71,18 +73,12 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// Permanent codes prove the committed block is invalid. The others mean the body or
-    /// witness received does not fit the header: penalize the peer and fetch again.
+    /// Permanent codes prove the committed block is invalid; the witness bundle is
+    /// committed by the header, so its faults are permanent too. The others (tx-root,
+    /// witness-commitment) mean the body or bundle received does not hash to the
+    /// header's commitments: penalize the peer and fetch again.
     pub fn is_permanent(self) -> bool {
-        matches!(
-            self,
-            ErrorCode::Header
-                | ErrorCode::Target
-                | ErrorCode::Pow
-                | ErrorCode::Isolation
-                | ErrorCode::Coinbase
-                | ErrorCode::StateCommitment
-        )
+        !matches!(self, ErrorCode::TxRoot | ErrorCode::WitnessCommitment)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -91,6 +87,7 @@ impl ErrorCode {
             ErrorCode::Target => "target",
             ErrorCode::Pow => "pow",
             ErrorCode::TxRoot => "tx-root",
+            ErrorCode::WitnessCommitment => "witness-commitment",
             ErrorCode::Isolation => "isolation",
             ErrorCode::WitnessFormat => "witness-format",
             ErrorCode::NoncanonicalProof => "noncanonical-proof",
@@ -371,6 +368,9 @@ pub struct Tx {
     pub extra: Vec<u8>,
     /// One entry per input; not covered by the txid.
     pub auth: Vec<Vec<u8>>,
+    /// Coinbase only: must equal the header's `parents_root` (EMPTY on a regular tx,
+    /// where it is not encoded).
+    pub parents_root: Hash,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -419,6 +419,7 @@ pub fn tx_bytes(tx: &Tx) -> Vec<u8> {
     out.push(tx.kind);
     if tx.kind == TX_COINBASE {
         out.extend_from_slice(&tx.height.to_le_bytes());
+        out.extend_from_slice(&tx.parents_root);
         put_enc(&mut out, &tx.extra);
     }
     out.extend_from_slice(&(tx.inputs.len() as u32).to_le_bytes());
@@ -501,9 +502,10 @@ pub fn decode_tx_wire(buf: &[u8]) -> Result<Tx, InvalidBlock> {
     if kind != TX_REGULAR && kind != TX_COINBASE {
         return err(ErrorCode::Isolation, "tx kind");
     }
-    let (mut height, mut extra) = (0, Vec::new());
+    let (mut height, mut extra, mut parents_root) = (0, Vec::new(), EMPTY);
     if kind == TX_COINBASE {
         height = r.u64()?;
+        parents_root = r.hash()?;
         let n = r.u32()? as usize;
         extra = r.take(n)?.to_vec();
     }
@@ -542,7 +544,7 @@ pub fn decode_tx_wire(buf: &[u8]) -> Result<Tx, InvalidBlock> {
     if !r.done() {
         return err(ErrorCode::Isolation, "trailing bytes");
     }
-    Ok(Tx { kind, inputs, outputs, height, extra, auth })
+    Ok(Tx { kind, inputs, outputs, height, extra, auth, parents_root })
 }
 
 /// Identity of the transfer (no authorization data): what outpoints refer to.
@@ -600,7 +602,7 @@ pub fn check_tx_isolation(tx: &Tx) -> Result<(), InvalidBlock> {
         if tx.auth.iter().any(|a| a.len() > MAX_AUTH_LEN) {
             return iso("auth entry too long");
         }
-        if tx.height != 0 || !tx.extra.is_empty() {
+        if tx.height != 0 || !tx.extra.is_empty() || tx.parents_root != EMPTY {
             return iso("coinbase fields on a regular tx");
         }
     } else {
@@ -655,6 +657,9 @@ pub struct Context {
     pub subsidy: u64,
     pub coinbase_maturity: u64,
     pub auth: AuthFn,
+    /// The block's parents_root. `validate_body` sets it from the header; callers of
+    /// `apply_block_txs` pass the parents_root the block will carry.
+    pub parents_root: Hash,
 }
 
 /// Fee if the context rules pass (maturity, value, authorization), else None.
@@ -688,6 +693,11 @@ pub fn check_block_txs(txs: &[Tx], ctx: &Context) -> Result<(), InvalidBlock> {
     }
     if txs[0].height != ctx.height {
         return err(ErrorCode::Isolation, "coinbase height");
+    }
+    // Coinbase uniqueness: the coinbase commits to the block's height and parent set
+    // (see the Python reference).
+    if txs[0].parents_root != ctx.parents_root {
+        return err(ErrorCode::Isolation, "coinbase parents root");
     }
     Ok(())
 }
@@ -830,6 +840,8 @@ pub struct Header {
     /// Commitment to the GhostDAG parents (consensus layer).
     pub parents_root: Hash,
     pub tx_root: Hash,
+    /// `witness_commitment(bundle)`.
+    pub witness_root: Hash,
     pub state_commitment: Hash,
     pub timestamp: u64,
     /// Big-endian 256-bit target.
@@ -842,9 +854,10 @@ impl Header {
         b[0..4].copy_from_slice(&self.version.to_le_bytes());
         b[4..36].copy_from_slice(&self.parents_root);
         b[36..68].copy_from_slice(&self.tx_root);
-        b[68..100].copy_from_slice(&self.state_commitment);
-        b[100..108].copy_from_slice(&self.timestamp.to_le_bytes());
-        b[108..140].copy_from_slice(&self.target);
+        b[68..100].copy_from_slice(&self.witness_root);
+        b[100..132].copy_from_slice(&self.state_commitment);
+        b[132..140].copy_from_slice(&self.timestamp.to_le_bytes());
+        b[140..172].copy_from_slice(&self.target);
         b
     }
 
@@ -856,11 +869,17 @@ impl Header {
             version: u32::from_le_bytes(b[0..4].try_into().unwrap()),
             parents_root: b[4..36].try_into().unwrap(),
             tx_root: b[36..68].try_into().unwrap(),
-            state_commitment: b[68..100].try_into().unwrap(),
-            timestamp: u64::from_le_bytes(b[100..108].try_into().unwrap()),
-            target: b[108..140].try_into().unwrap(),
+            witness_root: b[68..100].try_into().unwrap(),
+            state_commitment: b[100..132].try_into().unwrap(),
+            timestamp: u64::from_le_bytes(b[132..140].try_into().unwrap()),
+            target: b[140..172].try_into().unwrap(),
         })
     }
+}
+
+/// What the header's `witness_root` commits to: the exact bundle bytes.
+pub fn witness_commitment(witness: &[u8]) -> Hash {
+    h(b"witness", &[witness])
 }
 
 /// Binary tree over wtxids (so authorization is committed), odd node promoted unchanged,
@@ -907,8 +926,10 @@ pub fn validate_header_any_size(header: &[u8], nonce: u64, sp: &mut crate::Scrat
     Ok(hdr)
 }
 
-/// Body stage. The transactions must hash to the header's tx_root before anything in them
-/// is judged: a mismatch is transient, a committed body that breaks a rule is permanent.
+/// Body stage. The transactions must hash to the header's tx_root and the bundle to its
+/// witness_root before anything in them is judged: a mismatch is transient, a committed
+/// body or bundle that breaks a rule is permanent. A bad bundle therefore costs one hash
+/// per attempt, and the proof checks of a block id run to completion at most once.
 pub fn validate_body<W: AsRef<[u8]>>(
     parent: &State,
     hdr: &Header,
@@ -920,12 +941,16 @@ pub fn validate_body<W: AsRef<[u8]>>(
     if tx_root(&ids) != hdr.tx_root {
         return err(ErrorCode::TxRoot, "mismatch");
     }
+    if witness_commitment(witness) != hdr.witness_root {
+        return err(ErrorCode::WitnessCommitment, "mismatch");
+    }
     let bytes: usize = tx_wires.iter().map(|w| w.as_ref().len()).sum();
     if bytes > MAX_BLOCK_TX_BYTES {
         return err(ErrorCode::Isolation, "block size");
     }
     let txs = tx_wires.iter().map(|w| decode_tx_wire(w.as_ref())).collect::<Result<Vec<_>, _>>()?;
-    let (state, accepted) = apply_block_txs(parent, &txs, witness, ctx)?;
+    let ctx = Context { parents_root: hdr.parents_root, ..*ctx };
+    let (state, accepted) = apply_block_txs(parent, &txs, witness, &ctx)?;
     if state.commitment() != hdr.state_commitment {
         return err(ErrorCode::StateCommitment, "mismatch");
     }
@@ -1057,11 +1082,19 @@ mod tests {
     }
 
     fn ctx() -> Context {
-        Context { height: 1, subsidy: 0, coinbase_maturity: COINBASE_MATURITY, auth: test_preimage_auth }
+        Context { height: 1, subsidy: 0, coinbase_maturity: COINBASE_MATURITY, auth: test_preimage_auth, parents_root: EMPTY }
     }
 
     fn cb() -> Tx {
-        Tx { kind: TX_COINBASE, inputs: vec![], outputs: vec![TxOut { amount: 0, owner: EMPTY }], height: 1, extra: vec![], auth: vec![] }
+        Tx {
+            kind: TX_COINBASE,
+            inputs: vec![],
+            outputs: vec![TxOut { amount: 0, owner: EMPTY }],
+            height: 1,
+            extra: vec![],
+            auth: vec![],
+            parents_root: EMPTY,
+        }
     }
 
     #[test]
@@ -1077,6 +1110,7 @@ mod tests {
                 height: 0,
                 extra: vec![],
                 auth: vec![vec![]],
+                parents_root: EMPTY,
             });
         }
         let e = check_block_txs(&txs, &ctx()).unwrap_err();
@@ -1095,6 +1129,7 @@ mod tests {
             height: 0,
             extra: vec![],
             auth: vec![vec![0; MAX_AUTH_LEN]],
+            parents_root: EMPTY,
         };
         check_tx_isolation(&tx).unwrap();
         assert_eq!(decode_tx_wire(&tx_wire(&tx)).unwrap(), tx);
@@ -1112,16 +1147,62 @@ mod tests {
             height: 0,
             extra: vec![],
             auth: vec![vec![0; MAX_AUTH_LEN]],
+            parents_root: EMPTY,
         };
         let mut wires = vec![tx_wire(&cb())];
         wires.extend(std::iter::repeat(tx_wire(&filler)).take(MAX_BLOCK_TX_BYTES / MAX_AUTH_LEN + 1));
         let ids: Vec<Hash> = wires.iter().map(|w| wtxid(w)).collect();
-        let good = Header { version: 1, parents_root: EMPTY, tx_root: tx_root(&ids), state_commitment: EMPTY, timestamp: 0, target: [0x80; 32] };
+        let good = Header {
+            version: 1,
+            parents_root: EMPTY,
+            tx_root: tx_root(&ids),
+            witness_root: witness_commitment(&[]),
+            state_commitment: EMPTY,
+            timestamp: 0,
+            target: [0x80; 32],
+        };
         let e = validate_body(&State::genesis(), &good, &wires, &[], &ctx()).unwrap_err();
         assert_eq!((e.code, e.code.is_permanent()), (ErrorCode::Isolation, true));
         let wrong = Header { tx_root: EMPTY, ..good };
         let e = validate_body(&State::genesis(), &wrong, &wires, &[], &ctx()).unwrap_err();
         assert_eq!((e.code, e.code.is_permanent()), (ErrorCode::TxRoot, false));
+        // A bundle that does not hash to witness_root is transient and is detected before
+        // any rule is judged (here, before the block byte limit).
+        let e = validate_body(&State::genesis(), &good, &wires, &[0], &ctx()).unwrap_err();
+        assert_eq!((e.code, e.code.is_permanent()), (ErrorCode::WitnessCommitment, false));
+    }
+
+    #[test]
+    fn permanence_classes() {
+        use ErrorCode::*;
+        for code in [Header, Target, Pow, Isolation, WitnessFormat, NoncanonicalProof, WitnessMismatch,
+                     AcceptInvalid, RejectInvalid, Coinbase, StateCommitment] {
+            assert!(code.is_permanent(), "{}", code.as_str());
+        }
+        for code in [TxRoot, WitnessCommitment] {
+            assert!(!code.is_permanent(), "{}", code.as_str());
+        }
+    }
+
+    #[test]
+    fn coinbase_commits_to_the_parents_root() {
+        let mut c = cb();
+        c.parents_root = key(9);
+        let w = tx_wire(&c);
+        assert_eq!(decode_tx_wire(&w).unwrap(), c);
+        assert_eq!(&w[13..45], &key(9)[..], "parents_root follows the height");
+        let e = check_block_txs(std::slice::from_ref(&c), &ctx()).unwrap_err();
+        assert_eq!((e.code, e.detail), (ErrorCode::Isolation, "coinbase parents root"));
+        check_block_txs(&[c], &Context { parents_root: key(9), ..ctx() }).unwrap();
+        // A regular transaction must not carry one.
+        let mut tx = cb();
+        tx.kind = TX_REGULAR;
+        tx.height = 0;
+        tx.inputs = vec![Outpoint { txid: EMPTY, vout: 0 }];
+        tx.auth = vec![vec![]];
+        check_tx_isolation(&tx).unwrap();
+        tx.parents_root = key(1);
+        assert_eq!(check_tx_isolation(&tx).unwrap_err().code, ErrorCode::Isolation);
     }
 
     #[test]
@@ -1140,6 +1221,7 @@ mod tests {
             height: 0,
             extra: vec![],
             auth: vec![b"secret".to_vec()],
+            parents_root: EMPTY,
         };
         let w = tx_wire(&tx);
         assert_eq!(decode_tx_wire(&w).unwrap(), tx);

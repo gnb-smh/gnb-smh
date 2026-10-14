@@ -165,20 +165,57 @@ class LimitsTest(unittest.TestCase):
         wires = [L.tx_wire(self._cb())] + [L.tx_wire(filler)] * (L.MAX_BLOCK_TX_BYTES // L.MAX_AUTH_LEN + 1)
         self.assertGreater(sum(map(len, wires)), L.MAX_BLOCK_TX_BYTES)
         good_root = L.tx_root([L.wtxid(w) for w in wires])
-        hdr = L.Header(bytes(32), good_root, bytes(32), 0, 1 << 255)
+        hdr = L.Header(bytes(32), good_root, L.witness_commitment(b""), bytes(32), 0, 1 << 255)
         with self.assertRaises(L.InvalidBlock) as cm:
             L.validate_body(L.State(), hdr, wires, b"", self.ctx)
         self.assertEqual((cm.exception.code, cm.exception.permanent), ("isolation", True))
-        wrong = L.Header(bytes(32), bytes(32), bytes(32), 0, 1 << 255)
+        wrong = L.Header(bytes(32), bytes(32), L.witness_commitment(b""), bytes(32), 0, 1 << 255)
         with self.assertRaises(L.InvalidBlock) as cm:
             L.validate_body(L.State(), wrong, wires, b"", self.ctx)
         self.assertEqual((cm.exception.code, cm.exception.permanent), ("tx-root", False))
+        # A bundle that does not hash to witness_root: transient, before any rule is judged.
+        with self.assertRaises(L.InvalidBlock) as cm:
+            L.validate_body(L.State(), hdr, wires, b"\x00", self.ctx)
+        self.assertEqual((cm.exception.code, cm.exception.permanent), ("witness-commitment", False))
 
     def test_permanence_classes(self):
-        self.assertEqual(L.InvalidBlock.PERMANENT,
-                         {"header", "target", "pow", "isolation", "coinbase", "state-commitment"})
+        self.assertEqual(set(L.InvalidBlock.CODES) - L.InvalidBlock.PERMANENT,
+                         {"tx-root", "witness-commitment"})
         for code in L.InvalidBlock.CODES:
             self.assertEqual(L.InvalidBlock(code).permanent, code in L.InvalidBlock.PERMANENT)
+
+
+class CoinbaseBindingTest(unittest.TestCase):
+    """The coinbase commits to the block height and the header's parents_root."""
+
+    def test_parents_root_is_encoded_and_checked(self):
+        pr = bytes(range(32))
+        cb = L.Tx(L.TX_COINBASE, (), (L.TxOut(0, bytes(32)),), 1, b"x", parents_root=pr)
+        wire = L.tx_wire(cb)
+        self.assertEqual(wire[13:45], pr)                 # right after the height
+        self.assertEqual(L.decode_tx_wire(wire), cb)
+        ctx = L.Context(height=1, subsidy=0, auth=L.test_preimage_auth)
+        with self.assertRaises(L.InvalidBlock) as cm:
+            L.check_block_txs([cb], ctx)
+        self.assertEqual((cm.exception.code, str(cm.exception)), ("isolation", "isolation: coinbase parents root"))
+        L.check_block_txs([cb], L.Context(height=1, subsidy=0, auth=L.test_preimage_auth, parents_root=pr))
+        # Same height, payee and extra on another parent set: a different coinbase txid.
+        other = L.Tx(L.TX_COINBASE, (), cb.outputs, 1, b"x", parents_root=bytes(32))
+        self.assertNotEqual(L.txid(cb), L.txid(other))
+
+    def test_regular_tx_cannot_carry_one(self):
+        tx = L.Tx(L.TX_REGULAR, (L.Outpoint(bytes(32), 0),), (L.TxOut(1, bytes(32)),), auth=(b"",),
+                  parents_root=bytes(range(32)))
+        with self.assertRaises(L.InvalidBlock) as cm:
+            L.check_tx_isolation(tx)
+        self.assertEqual(cm.exception.code, "isolation")
+
+    def test_header_layout(self):
+        h = L.Header(b"\x01" * 32, b"\x02" * 32, b"\x03" * 32, b"\x04" * 32, 5, 6)
+        b = h.encode()
+        self.assertEqual(len(b), L.HEADER_LEN)
+        self.assertEqual(L.Header.decode(b), h)
+        self.assertEqual(b[68:100], b"\x03" * 32)            # witness_root after tx_root
 
 
 class DifferentialTest(unittest.TestCase):
