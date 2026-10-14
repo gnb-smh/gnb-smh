@@ -193,6 +193,12 @@ const HEAVY_READ_METHODS: &[&str] = &[
     "gethashrate",
     "getaddresscount",
     "getaddressbalance_at_height",
+    // NET-12: chain-walking explorer reads. Both are now bounded walks of
+    // the selected chain (see `explorer::get_difficulty_history` /
+    // `explorer::get_block_time_percentiles`) instead of decoding every
+    // block body, and additionally share the single-flight TTL cache.
+    "getdifficultyhistory",
+    "getblocktimepercentiles",
     // L-8 (audit): `getblocktemplate` is expensive and stateful: it is
     // privileged (see
     // `auth::WRITE_METHODS`) and now shares the same short-TTL/single-flight
@@ -200,6 +206,59 @@ const HEAVY_READ_METHODS: &[&str] = &[
     // loop and force a fresh mempool drain + ancestry walk every time" cost.
     "getblocktemplate",
 ];
+
+/// NET-13: every method name `dispatch` implements. Metrics label anything
+/// else as `"unknown"`, so a caller cannot mint unbounded Prometheus label
+/// values, and logs show at most [`MAX_LOGGED_METHOD_LEN`] bytes of it.
+/// `known_methods_list_matches_dispatch` keeps this list in sync.
+const KNOWN_RPC_METHODS: &[&str] = &[
+    "getnetworkinfo", "getblockcount", "getmempoolinfo", "getblockhash", "getblock",
+    "getblockbyheight", "getrecentblocks", "gettransaction", "getrawtransaction", "getbalance",
+    "getaddresscount", "getutxos", "sendrawtransaction", "validateaddress", "estimatefee",
+    "getrawmempool", "decoderawtransaction", "getblocktemplate", "submitblock", "getdaginfo",
+    "listtransactions", "getpeerinfo", "getpeers", "getsupplyinfo", "getchainstats",
+    "getsupplydistribution", "getselectedchain", "getblockdag", "gettransactionfull",
+    "getdagwindow", "getaddresshistory", "getrichlist", "gethashrate", "getdifficultyhistory",
+    "getblocktimepercentiles", "gettxstatus", "getaddressinfo", "estimatefeeadvanced",
+    "getmempoolstats", "validateaddressverbose", "gettxsbyblock", "getaddressbalance_at_height",
+    "getattestation",
+];
+
+/// Longest method-name prefix written to a log line (NET-13).
+const MAX_LOGGED_METHOD_LEN: usize = 48;
+
+/// NET-16: pause before answering a request that failed authentication, so
+/// key guessing is slow even from loopback (which skips the rate limiter).
+const FAILED_AUTH_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Bounded metrics label for a method name (NET-13).
+pub fn method_label(method: &str) -> &'static str {
+    KNOWN_RPC_METHODS.iter().copied().find(|m| *m == method).unwrap_or("unknown")
+}
+
+/// Log-safe form of a caller-supplied method name: known names verbatim,
+/// anything else truncated and debug-escaped (no control characters).
+fn method_for_log(method: &str) -> String {
+    match KNOWN_RPC_METHODS.iter().find(|m| **m == method) {
+        Some(m) => (*m).to_string(),
+        None => format!("{:?}", crate::network::truncate_utf8(method, MAX_LOGGED_METHOD_LEN)),
+    }
+}
+
+/// NET-14: resolve a configured bind address (`127.0.0.1`, `0.0.0.0`,
+/// `::1`, `[::1]`, `localhost`) and port into a socket address, with a
+/// clear error instead of a failure deep inside the server task.
+pub fn resolve_bind_address(host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    let bare = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, port));
+    }
+    use std::net::ToSocketAddrs;
+    (bare, port).to_socket_addrs()
+        .map_err(|e| format!("cannot resolve bind address {host:?}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("bind address {host:?} resolves to nothing"))
+}
 
 /// TTL for cached heavy-read results. Analytics freshness of ~1 block is fine.
 const HEAVY_READ_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -304,7 +363,16 @@ pub async fn start_rpc_server(
     // B5f pool seam — see `SubmitBlockFn`.
     submit_block: Option<Arc<SubmitBlockFn>>,
 ) {
-    let addr = format!("{}:{}", config.bind_address, config.port);
+    // NET-14: `format!("{host}:{port}")` could not express IPv6 hosts such as
+    // `::1`; resolve explicitly and report a bad address clearly. main.rs
+    // validates the same way at start-up, before the node starts.
+    let addr = match resolve_bind_address(&config.bind_address, config.port) {
+        Ok(a) => a,
+        Err(e) => {
+            error!("RPC: {}; the RPC service is not running (the node keeps running)", e);
+            return;
+        }
+    };
 
     // L-6 (audit): validate the configured key BEFORE it is ever compared
     // against anything, regardless of how the caller sourced it
@@ -388,9 +456,12 @@ pub async fn start_rpc_server(
         config.rate_limit_reads_per_min,
         config.rate_limit_writes_per_min,
     );
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
+    let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l)  => l,
-        Err(e) => { error!("RPC bind: {}", e); return; }
+        Err(e) => {
+            error!("RPC bind {} failed: {}; the RPC service is not running (the node keeps running)", addr, e);
+            return;
+        }
     };
     // Sprint M: connect_info makes the client IP available to handlers.
     if let Err(e) = axum::serve(
@@ -500,6 +571,9 @@ async fn handle_rpc(
     }
 
     let method = req["method"].as_str().unwrap_or("");
+    // NET-13: bounded label for metrics/spans, truncated form for logs.
+    let label = method_label(method);
+    let method_log = method_for_log(method);
     // L-10 (audit): the `id` used to be echoed back completely unbounded —
     // a ~1 MiB `id` string in the request produced a ~1 MiB response, at
     // zero cost to the attacker and real memory pressure for the node.
@@ -523,9 +597,11 @@ async fn handle_rpc(
         &state.allowed_hosts,
         &state.allowed_origins,
     ) {
-        crate::metrics::inc_rpc_request(method, "forbidden");
+        crate::metrics::inc_rpc_request(label, "forbidden");
         log::info!("rpc denied ip={} method={} reason={:?} host={:?} origin={:?}",
-            client_ip, method, refusal, host_hdr, origin_hdr);
+            client_ip, method_log, refusal,
+            host_hdr.map(|h| crate::network::truncate_utf8(h, 128)),
+            origin_hdr.map(|o| crate::network::truncate_utf8(o, 128)));
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -630,7 +706,7 @@ async fn handle_rpc(
             let result = tokio::select! {
                 r = join_handle.instrument(tracing::info_span!(
                     "rpc_request",
-                    method,
+                    method = label,
                     client_ip = %client_ip,
                     id = %id,
                 )) => {
@@ -645,24 +721,26 @@ async fn handle_rpc(
                         "rpc dispatch timed out for method={} ip={} after {:?}; aborted \
                          (queued work is cancelled; already-running work finishes in the \
                          background but this response does not wait for it)",
-                        method, client_ip, DISPATCH_INNER_TIMEOUT
+                        method_log, client_ip, DISPATCH_INNER_TIMEOUT
                     );
                     json!({ "error": "internal dispatch timeout" })
                 }
             };
             let elapsed = start.elapsed();
             let elapsed_ms = elapsed.as_millis();
-            crate::metrics::observe_rpc_latency(method, elapsed.as_secs_f64());
-            crate::metrics::inc_rpc_request(method, "ok");
-            log::debug!("rpc ok ip={} method={} took={}ms", client_ip, method, elapsed_ms);
+            crate::metrics::observe_rpc_latency(label, elapsed.as_secs_f64());
+            crate::metrics::inc_rpc_request(label, "ok");
+            log::debug!("rpc ok ip={} method={} took={}ms", client_ip, method_log, elapsed_ms);
             (
                 StatusCode::OK,
                 Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
             )
         }
         auth::AuthDecision::Unauthorized => {
-            crate::metrics::inc_rpc_request(method, "unauthorized");
-            log::info!("rpc denied ip={} method={} reason=unauthorized", client_ip, method);
+            crate::metrics::inc_rpc_request(label, "unauthorized");
+            log::info!("rpc denied ip={} method={} reason=unauthorized", client_ip, method_log);
+            // NET-16: slow down key guessing (async sleep: no worker blocked).
+            tokio::time::sleep(FAILED_AUTH_DELAY).await;
             (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({
@@ -673,8 +751,8 @@ async fn handle_rpc(
             )
         }
         auth::AuthDecision::RateLimited => {
-            crate::metrics::inc_rpc_request(method, "rate_limited");
-            log::info!("rpc denied ip={} method={} reason=rate_limited", client_ip, method);
+            crate::metrics::inc_rpc_request(label, "rate_limited");
+            log::info!("rpc denied ip={} method={} reason=rate_limited", client_ip, method_log);
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(json!({
@@ -866,6 +944,47 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             }
         }
 
+        // ── Wallet: raw transaction bytes (WAL-1) ────────────────────
+        //
+        // Read-only. Returns the wire bytes (`to_wire_bytes(true)`) of a
+        // transaction so a wallet can hash them, compare the result with
+        // the txid of a UTXO it is about to spend, and read the output's
+        // value from a source it does not have to trust. Outputs of the
+        // genesis carryover have no creating transaction, and pruned nodes
+        // lose old bodies: both answer with an error and the wallet treats
+        // the input as unverified.
+        "getrawtransaction" => {
+            let txid_hex = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            let Some(txid) = hex::decode(txid_hex).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) else {
+                return json!({ "error": "invalid txid" });
+            };
+            if let Some(entry) = state.mempool.get_entry(&txid) {
+                return json!({
+                    "txid":       hex::encode(txid),
+                    "hex":        hex::encode(entry.tx.to_wire_bytes(true)),
+                    "in_mempool": true,
+                });
+            }
+            match state.store.get_tx_location(&txid) {
+                Ok(Some((block_hash, height))) => match state.store.get_block(&block_hash) {
+                    Ok(Some(block)) => match block.transactions.iter().find(|t| t.txid() == txid) {
+                        Some(tx) => json!({
+                            "txid":         hex::encode(txid),
+                            "hex":          hex::encode(tx.to_wire_bytes(true)),
+                            "block_hash":   hex::encode(block_hash),
+                            "block_height": height,
+                            "in_mempool":   false,
+                        }),
+                        None => json!({ "error": "tx index stale" }),
+                    },
+                    Ok(None) => json!({ "error": "transaction body not available (block pruned)" }),
+                    Err(e)   => storage_err_response(&e),
+                },
+                Ok(None) => json!({ "error": "transaction not found" }),
+                Err(e)   => storage_err_response(&e),
+            }
+        }
+
         // ── Wallet: balance query ────────────────────────────────────
         "getbalance" => {
             let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
@@ -907,29 +1026,32 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // thousands of UTXOs (e.g. the carry-over founder set) otherwise serializes
             // a multi-MB response that overflows clients; a spender only needs enough
             // UTXOs to cover the amount, so it can pass a small limit.
-            let limit = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).map(|n| n as usize);
+            //
+            // NET-12: the limit is applied WHILE walking the address index
+            // (the old code loaded every UTXO of the address first), and a
+            // request without a limit is capped at GETUTXOS_MAX. When the
+            // walk stops early `truncated` is true and `utxo_count` /
+            // `satoshis` cover the returned UTXOs only; `getbalance` gives
+            // the address totals.
+            const GETUTXOS_MAX: usize = 10_000;
+            let limit = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64())
+                .map(|n| usize::try_from(n).unwrap_or(usize::MAX).min(GETUTXOS_MAX))
+                .unwrap_or(GETUTXOS_MAX);
             let addr_bytes = parse_address(addr);
             match addr_bytes {
-                Some(ab) => match state.store.get_utxos_for_address(&ab) {
-                    Ok(utxos) => {
-                        let total: u64 = utxos.iter().map(|(_, _, o)| o.value).sum();
-                        let full_count = utxos.len();
-                        let iter = utxos.iter();
-                        let list: Vec<Value> = match limit {
-                            // R3: `value` is a satoshi amount → decimal string.
-                            Some(n) => iter.take(n).map(|(txid, idx, out)| json!({
-                                "txid": hex::encode(txid), "index": idx,
-                                "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
-                            })).collect(),
-                            None => iter.map(|(txid, idx, out)| json!({
-                                "txid": hex::encode(txid), "index": idx,
-                                "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
-                            })).collect(),
-                        };
+                Some(ab) => match state.store.get_utxos_for_address_limited(&ab, limit) {
+                    Ok((utxos, truncated)) => {
+                        let total: u64 = utxos.iter().map(|(_, _, o)| o.value).fold(0u64, u64::saturating_add);
+                        // R3: `value` is a satoshi amount → decimal string.
+                        let list: Vec<Value> = utxos.iter().map(|(txid, idx, out)| json!({
+                            "txid": hex::encode(txid), "index": idx,
+                            "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
+                        })).collect();
                         json!({
                             "address":    addr,
-                            "utxo_count": full_count,
+                            "utxo_count": list.len(),
                             "returned":   list.len(),
+                            "truncated":  truncated,
                             "satoshis":   total.to_string(),
                             "gnb":       total as f64 / 1e8,
                             "utxos":      list,
@@ -1377,47 +1499,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             }
         }
 
-        "getdifficultyhistory" => {
-            let limit = params.and_then(|p| p.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_u64())
-                .unwrap_or(20) as usize;
-            let limit = limit.min(100); // cap at 100
-
-            let points = crate::analytics::difficulty_history(&state.store, limit);
-            let items: Vec<Value> = points.iter().map(|p| json!({
-                "height":     p.height,
-                "bits":       p.bits,
-                "bits_hex":   format!("0x{:08x}", p.bits),
-                "timestamp":  p.timestamp,
-                "target_hex": p.target_hex,
-            })).collect();
-            json!({
-                "count": items.len(),
-                "points": items,
-            })
-        }
-
-        "getblocktimepercentiles" => {
-            let window = params.and_then(|p| p.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_u64())
-                .unwrap_or(100) as usize;
-            let window = window.clamp(10, 1000);
-
-            let stats = crate::analytics::block_time_percentiles(&state.store, window);
-            json!({
-                "sample_size":  stats.sample_size,
-                "window":       window,
-                "min_secs":     stats.min,
-                "p50_secs":     stats.p50,
-                "p90_secs":     stats.p90,
-                "p99_secs":     stats.p99,
-                "max_secs":     stats.max,
-                "avg_secs":     stats.avg,
-                "target_secs":  crate::core::TARGET_BLOCK_TIME,
-            })
-        }
+        // NET-12: bounded walks of the selected chain (were full scans that
+        // decoded every stored block body), also behind the HeavyGate.
+        "getdifficultyhistory"    => explorer::get_difficulty_history(params, state),
+        "getblocktimepercentiles" => explorer::get_block_time_percentiles(params, state),
 
         "gettxstatus" => {
             let txid_hex = params.and_then(|p| p.as_array())
@@ -1659,7 +1744,8 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 .unwrap_or_else(|e| json!({ "error": format!("attestation serialize: {}", e) }))
         }
 
-        _ => json!({ "error": format!("unknown method: {}", method) }),
+        // NET-13: never echo an unbounded caller-supplied string.
+        _ => json!({ "error": format!("unknown method: {}", method_for_log(method)) }),
     }
 }
 
@@ -2177,5 +2263,196 @@ mod h_r3_5_tests {
         }
         assert!(gate.cache.lock().len() <= HEAVY_READ_CACHE_MAX_KEYS,
             "cache must stay bounded under key churn");
+    }
+}
+
+// ── 2026-10 audit regressions: NET-12, NET-13, NET-14, NET-15, WAL-1 ───────
+#[cfg(test)]
+mod audit_2026_10_rpc_tests {
+    use super::*;
+    use crate::core::{Block, BlockHeader, MerkleRoot, TxInput, TxOutput};
+    use tempfile::TempDir;
+
+    /// An AppState over a fresh store and a linear DAG of `n` chain blocks
+    /// spaced 30 s apart (the last 10 gaps are 60 s).
+    fn state_with_chain(n: u8) -> (TempDir, AppState) {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(Storage::open(&tmp.path().join("db")).expect("storage"));
+        let mut dag = GhostDAG::with_default_k();
+        dag.add_genesis([0u8; 32], 1_000);
+        let mut ts = 1_000u64;
+        for i in 1..=n {
+            ts += if i > n.saturating_sub(10) { 60 } else { 30 };
+            dag.add_block([i; 32], vec![[i - 1; 32]], ts, 1).unwrap();
+        }
+        let (outbound_tx, _rx) = mpsc::channel(1);
+        let state = AppState {
+            node_state: Arc::new(RwLock::new(NodeState::default())),
+            store,
+            mempool: Arc::new(Mempool::new()),
+            dag: Arc::new(RwLock::new(dag)),
+            outbound_tx,
+            api_key: None,
+            require_auth_for_writes: false,
+            require_auth_for_reads: false,
+            rate_limiter: Arc::new(auth::RateLimiterSet::new(60, 5)),
+            trust_private_ranges: false,
+            allowed_origins: Arc::new(Vec::new()),
+            allowed_hosts: Arc::new(Vec::new()),
+            trust_loopback: false,
+            heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
+            submit_block: None,
+        };
+        (tmp, state)
+    }
+
+    #[test]
+    fn method_labels_are_bounded_and_logs_truncated() {
+        assert_eq!(method_label("getblockcount"), "getblockcount");
+        assert_eq!(method_label(&"x".repeat(1 << 20)), "unknown");
+        assert_eq!(method_label("getBlockCount"), "unknown");
+        let logged = method_for_log(&"\u{1b}[31m".repeat(10_000));
+        assert!(logged.len() < 4 * MAX_LOGGED_METHOD_LEN, "{}", logged.len());
+        assert!(!logged.contains('\u{1b}'), "control characters are escaped");
+    }
+
+    /// Every arm of `dispatch` is a known method (so it gets its own metrics
+    /// label) and every known method has an arm.
+    #[test]
+    fn known_methods_list_matches_dispatch() {
+        let src = include_str!("mod.rs");
+        let start = src.find("async fn dispatch(").unwrap();
+        let end = src[start..].find("// ── Helpers").unwrap() + start;
+        let mut arms = std::collections::BTreeSet::new();
+        for line in src[start..end].lines() {
+            let t = line.trim_start();
+            if let Some(rest) = t.strip_prefix('"') {
+                if let Some(q) = rest.find('"') {
+                    if rest[q + 1..].trim_start().starts_with("=>") {
+                        arms.insert(rest[..q].to_string());
+                    }
+                }
+            }
+        }
+        let known: std::collections::BTreeSet<String> = KNOWN_RPC_METHODS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(arms, known);
+    }
+
+    #[test]
+    fn bind_addresses_resolve_ipv4_ipv6_and_names() {
+        assert!(resolve_bind_address("127.0.0.1", 17210).unwrap().is_ipv4());
+        assert!(resolve_bind_address("::1", 17210).unwrap().is_ipv6());
+        assert!(resolve_bind_address("[::1]", 17210).unwrap().is_ipv6());
+        assert!(resolve_bind_address("localhost", 17210).is_ok());
+        assert!(resolve_bind_address("not a host name", 17210).is_err());
+    }
+
+    /// NET-14: an RPC server whose port is taken returns instead of taking
+    /// the node down with it.
+    #[tokio::test]
+    async fn rpc_server_bind_failure_returns() {
+        let (_tmp, state) = state_with_chain(1);
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = RpcConfig { port: busy.local_addr().unwrap().port(), ..RpcConfig::default() };
+        tokio::time::timeout(std::time::Duration::from_secs(10), start_rpc_server(
+            config, state.node_state.clone(), state.store.clone(), state.mempool.clone(),
+            state.dag.clone(), state.outbound_tx.clone(), None,
+        )).await.expect("a failed bind must end the RPC task");
+    }
+
+    /// WAL-1: `getrawtransaction` returns bytes that hash to the txid.
+    #[tokio::test]
+    async fn getrawtransaction_returns_bytes_that_hash_to_the_txid() {
+        let (_tmp, state) = state_with_chain(1);
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [0; 32], prev_index: u32::MAX, script_sig: b"height:1".to_vec(), sequence: u32::MAX }],
+            outputs: vec![TxOutput { value: 5, script_pubkey: vec![1; 20] }],
+            locktime: 0,
+        };
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [7; 32], prev_index: 1, script_sig: vec![9; 40], sequence: u32::MAX }],
+            outputs: vec![TxOutput { value: 123_456, script_pubkey: vec![2; 20] }],
+            locktime: 0,
+        };
+        let mut block = Block {
+            header: BlockHeader { version: 1, parents: vec![[0; 32]], merkle_root: MerkleRoot::ZERO, timestamp: 1_030, bits: 0x2100_FFFF, nonce: 0 },
+            transactions: vec![coinbase.clone(), spend.clone()],
+            blue_score: 1, height: 1, shielded_transactions: vec![],
+        };
+        block.header.merkle_root = block.body_merkle_root();
+        state.store.put_block(&block).unwrap();
+        for tx in [&coinbase, &spend] {
+            state.store.put_tx_index(&tx.txid(), &block.block_hash(), 1).unwrap();
+        }
+        for tx in [&coinbase, &spend] {
+            let r = dispatch("getrawtransaction", Some(&json!([hex::encode(tx.txid())])), &state).await;
+            let raw = hex::decode(r["hex"].as_str().expect("hex")).unwrap();
+            assert_eq!(Transaction::from_wire_bytes(&raw).unwrap().txid(), tx.txid());
+            assert_eq!(r["block_height"], 1);
+        }
+        let r = dispatch("getrawtransaction", Some(&json!([hex::encode([3u8; 32])])), &state).await;
+        assert!(r["error"].is_string());
+        let r = dispatch("getrawtransaction", Some(&json!(["zz"])), &state).await;
+        assert_eq!(r["error"], "invalid txid");
+    }
+
+    /// NET-12: `getutxos` stops at its limit while walking the index.
+    #[tokio::test]
+    async fn getutxos_applies_its_limit_while_iterating() {
+        let (_tmp, state) = state_with_chain(1);
+        let address = crate::address::Address::from_hash([4; 20], crate::address::Network::Mainnet);
+        for i in 0..5u8 {
+            state.store.put_utxo(&[i; 32], 0, &TxOutput { value: 1_000, script_pubkey: vec![4; 20] }).unwrap();
+        }
+        let (rows, more) = state.store.get_utxos_for_address_limited(&[4; 20], 2).unwrap();
+        assert_eq!((rows.len(), more), (2, true));
+        let (rows, more) = state.store.get_utxos_for_address_limited(&[4; 20], 5).unwrap();
+        assert_eq!((rows.len(), more), (5, false));
+
+        let r = dispatch("getutxos", Some(&json!([address.to_string(), 2])), &state).await;
+        assert_eq!(r["returned"], 2);
+        assert_eq!(r["truncated"], true);
+        assert_eq!(r["satoshis"], "2000");
+        let r = dispatch("getutxos", Some(&json!([address.to_string()])), &state).await;
+        assert_eq!(r["returned"], 5);
+        assert_eq!(r["truncated"], false);
+    }
+
+    /// NET-12: the chain-walking statistics read only the requested window.
+    #[tokio::test]
+    async fn block_time_percentiles_walk_only_the_window() {
+        let (_tmp, state) = state_with_chain(60);
+        assert!(HeavyGate::is_heavy("getblocktimepercentiles"));
+        assert!(HeavyGate::is_heavy("getdifficultyhistory"));
+        let r = dispatch("getblocktimepercentiles", Some(&json!([10])), &state).await;
+        assert_eq!(r["sample_size"], 10);
+        assert_eq!(r["p50_secs"], 60);
+        let r = dispatch("getblocktimepercentiles", Some(&json!([1000])), &state).await;
+        assert_eq!(r["sample_size"], 60);
+        assert_eq!(r["min_secs"], 30);
+        // No stored bodies: the difficulty walk is bounded and empty.
+        let r = dispatch("getdifficultyhistory", Some(&json!([500])), &state).await;
+        assert_eq!(r["count"], 0);
+    }
+
+    /// NET-15: explorer reads still work with storage access moved out of
+    /// the DAG lock (and do not deadlock against a concurrent writer).
+    #[tokio::test]
+    async fn explorer_reads_release_the_dag_lock_before_storage() {
+        let (_tmp, state) = state_with_chain(5);
+        let r = dispatch("getselectedchain", Some(&json!([0, 3])), &state).await;
+        assert_eq!(r["chain_length"], 6);
+        assert_eq!(r["blocks"].as_array().unwrap().len(), 3);
+        assert_eq!(r["blocks"][0]["height"], 5);
+        let r = dispatch("getblockdag", Some(&json!([hex::encode([3u8; 32])])), &state).await;
+        assert_eq!(r["colour"], "chain");
+        assert_eq!(r["body"], false);
+        assert_eq!(r["next_chain_block"], hex::encode([4u8; 32]));
+        let r = dispatch("getblockdag", Some(&json!([hex::encode([0xEEu8; 32])])), &state).await;
+        assert_eq!(r["error"], "block not found");
+        // A writer can take the lock right after a read returns.
+        drop(state.dag.try_write().expect("DAG lock must be free after an explorer read"));
     }
 }

@@ -464,6 +464,38 @@ impl Storage {
         Ok(result)
     }
 
+    /// NET-12: [`Self::get_utxos_for_address`] that stops after `limit`
+    /// entries while walking the address index, instead of loading every
+    /// UTXO of the address first. Returns the UTXOs and whether more exist.
+    pub fn get_utxos_for_address_limited(
+        &self,
+        address_bytes: &[u8],
+        limit: usize,
+    ) -> Result<(Vec<(Vec<u8>, u32, TxOutput)>, bool), StorageError> {
+        if address_bytes.len() < 20 {
+            return Ok((vec![], false));
+        }
+        let cf_ai = self.db.cf_handle(CF_ADDR_UTXO).ok_or(StorageError::CfNotFound(CF_ADDR_UTXO.into()))?;
+        let cf_utxo = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
+        let alen = address_bytes.len();
+        let expected = alen + 36;
+        let mut result = Vec::new();
+        for (k, _) in self.db.prefix_iterator_cf(&cf_ai, address_bytes).flatten() {
+            if k.len() < alen || &k[..alen] != address_bytes { break; }
+            if k.len() != expected { continue; }
+            let Some(v) = self.db.get_cf(&cf_utxo, &k[alen..expected])
+                .map_err(|e| StorageError::ReadFailed(e.to_string()))? else { continue };
+            let Ok(out) = decode::<TxOutput>(&v) else { continue };
+            if result.len() == limit {
+                return Ok((result, true));
+            }
+            let mut idx = [0u8; 4];
+            idx.copy_from_slice(&k[alen + 32..expected]);
+            result.push((k[alen..alen + 32].to_vec(), u32::from_le_bytes(idx), out));
+        }
+        Ok((result, false))
+    }
+
     // ── DAG persistence ─────────────────────────────────────────────────────
 
     /// Persist GhostDAG data for a single block

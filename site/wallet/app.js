@@ -1,6 +1,19 @@
 // GnB web wallet. Keys are decrypted and used only inside the WebAssembly
 // core (core.js / gnb_wallet.wasm); this file never sees a private key.
+//
+// Audit fixes: all markup is built with the escaping `html` template and API
+// values are type-checked (WAL-3); the wasm core is checked against the
+// SHA-256 pinned below before it runs (WAL-5); the claimed values of the
+// UTXOs a payment spends are verified against their previous transactions
+// inside the core, the review shows the ACTUAL fee and any input that could
+// not be verified (WAL-1, WAL-6); new wallets are backed by a 24-word
+// recovery phrase (WAL-7).
 import { loadCore } from "/wallet/core.js";
+import { html, raw, isAddress, isHex64, num, sats } from "/assets/safe.js";
+
+// SHA-256 of /wallet/gnb_wallet.wasm. Written by scripts/build-wallet-wasm.sh
+// and checked by `node --test site/tests/`; loadCore refuses any other binary.
+const WASM_SHA256 = "7d38e3b9e9968865b5858d88c9b51a96daa7404316447e4998a5e5fc992f1c92";
 
 const SAT = 100000000n;
 const IDLE_LOCK_MS = 10 * 60 * 1000;
@@ -11,13 +24,15 @@ let state = { mode: "locked", address: null, tab: "send", balance: null, utxos: 
 let idleTimer = null, pollTimer = null;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const show = (el, markup) => { el.innerHTML = String(markup); };
 function fmt(sat, dp = 8) {
-  if (sat === null || sat === undefined) return "—";
-  const v = BigInt(sat), whole = (v / SAT).toLocaleString("en-US");
+  const v = typeof sat === "bigint" ? sat : sats(sat);
+  if (v === null || v === undefined) return "—";
+  const whole = (v / SAT).toLocaleString("en-US");
   const frac = (v % SAT).toString().padStart(8, "0").slice(0, dp).replace(/0+$/, "");
   return frac ? `${whole}.${frac}` : whole;
 }
+const count = (v) => { const n = num(v); return Number.isFinite(n) ? n.toLocaleString("en-US") : "—"; };
 function parseGnb(s) {
   s = String(s).trim().replace(/,/g, "");
   if (!/^\d+(\.\d{1,8})?$/.test(s)) throw new Error("Enter an amount like 12.5 (up to 8 decimals).");
@@ -27,14 +42,20 @@ function parseGnb(s) {
 async function api(method, params = []) {
   const r = await fetch(`/api/${method}?p=${encodeURIComponent(JSON.stringify(params))}`, { cache: "no-store" });
   const doc = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
-  if (doc.error) throw new Error(doc.error);
+  if (doc.error) throw new Error(String(doc.error));
+  if (doc.result === null || typeof doc.result !== "object") throw new Error("unexpected response");
   return doc.result;
 }
 async function broadcast(hex) {
   const r = await fetch("/api/sendrawtransaction", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ hex }) });
   const doc = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
-  if (doc.error) throw new Error(doc.error);
+  if (doc.error) throw new Error(String(doc.error));
   return doc.result;
+}
+/** Only well-formed UTXO rows reach the core (WAL-3). */
+function cleanUtxos(rows) {
+  return (Array.isArray(rows) ? rows : []).filter((u) => u && isHex64(u.txid) && Number.isInteger(u.index)
+    && u.index >= 0 && sats(u.value) !== null && typeof u.script_pubkey === "string" && /^[0-9a-f]{40}$/.test(u.script_pubkey));
 }
 function download(name, text) {
   const a = document.createElement("a");
@@ -44,12 +65,13 @@ function download(name, text) {
 }
 const nextFrame = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
 async function getCore() {
-  if (!core) core = await loadCore("/wallet/gnb_wallet.wasm");
+  if (!WASM_SHA256) throw new Error("wallet core hash is not pinned; refusing to load it");
+  if (!core) core = await loadCore("/wallet/gnb_wallet.wasm", WASM_SHA256);
   return core;
 }
-function busy(btn, label) { btn.disabled = true; btn.dataset.label = btn.innerHTML; btn.innerHTML = `<span class="busy"></span>${esc(label)}`; }
+function busy(btn, label) { btn.disabled = true; btn.dataset.label = btn.innerHTML; show(btn, html`<span class="busy"></span>${label}`); }
 function unbusy(btn) { btn.disabled = false; if (btn.dataset.label) btn.innerHTML = btn.dataset.label; }
-function showError(where, e) { where.innerHTML = `<div class="alert bad">${esc(e.message || e)}</div>`; }
+function showError(where, e) { show(where, html`<div class="alert bad">${e?.message || e}</div>`); }
 
 function armIdleLock() {
   clearTimeout(idleTimer);
@@ -69,10 +91,10 @@ window.addEventListener("pagehide", () => { try { core?.wipe(); } catch {} });
 
 // ── the gate (locked) ────────────────────────────────────────────────────────
 function renderGate(message) {
-  app.innerHTML = `<div class="gate">
+  show(app, html`<div class="gate">
   <div class="gate-head"><span class="eyebrow">GnB Wallet</span><h1>Hold GNB with post-quantum keys.</h1>
    <p>Open a GnB or Bloch keystore, create a new one, or watch an address. Your keystore is decrypted in this tab with its password, and signing happens here too. Nothing secret is uploaded.</p></div>
-  ${message ? `<div class="alert ok">${esc(message)}</div>` : ""}
+  ${message ? html`<div class="alert ok">${message}</div>` : ""}
   <div class="doors">
    <section class="door primary"><span class="num">01 · OPEN</span><h2>Open a keystore</h2>
     <p>A <span class="mono">.json</span> keystore from GnB or from Bloch (Genesis-3). A Bloch address becomes the same <span class="mono">gnb1q…</span> address.</p>
@@ -81,25 +103,30 @@ function renderGate(message) {
     <label>Password<input type="password" id="pw" autocomplete="current-password"></label>
     <button class="btn" id="open">Unlock</button><div id="open-msg"></div></section>
    <section class="door"><span class="num">02 · CREATE</span><h2>Create a wallet</h2>
-    <p>A new ML-DSA-65 + Falcon-1024 key, generated here. You download its encrypted keystore before you can use it.</p>
+    <p>A new ML-DSA-65 + Falcon-1024 key, generated here from a 24-word recovery phrase that you write down. You also download its encrypted keystore.</p>
     <label>Password<input type="password" id="npw" autocomplete="new-password"></label>
     <label>Repeat password<input type="password" id="npw2" autocomplete="new-password"></label>
-    <p class="note">At least 12 characters, three of upper, lower, digit, symbol. It cannot be recovered.</p>
-    <button class="btn ghost" id="create">Create and download</button><div id="create-msg"></div></section>
-   <section class="door"><span class="num">03 · WATCH</span><h2>Watch an address</h2>
+    <p class="note">At least 12 characters, three of upper, lower, digit, symbol.</p>
+    <button class="btn ghost" id="create">Create</button><div id="create-msg"></div></section>
+   <section class="door"><span class="num">03 · RESTORE</span><h2>Restore from words</h2>
+    <p>Bring back a wallet created here from its 24-word recovery phrase.</p>
+    <label>Recovery phrase<textarea id="rwords" rows="3" spellcheck="false" autocomplete="off"></textarea></label>
+    <label>New keystore password<input type="password" id="rpw" autocomplete="new-password"></label>
+    <button class="btn ghost" id="restore">Restore and download</button><div id="restore-msg"></div></section>
+   <section class="door"><span class="num">04 · WATCH</span><h2>Watch an address</h2>
     <p>Balance, activity and a receive QR for any <span class="mono">gnb1q…</span> or <span class="mono">bloch1q…</span> address. No keys involved.</p>
     <label>Address<input id="waddr" spellcheck="false" placeholder="gnb1q…"></label>
     <button class="btn ghost" id="watch">Watch</button><div id="watch-msg"></div></section>
   </div>
   <div class="trust">
-   <div><b>Keys stay in the tab</b><span>Decryption (Argon2id, AES-256-GCM) and signing run in WebAssembly in this page. The page loads only code from gnb-smh.com.</span></div>
+   <div><b>Keys stay in the tab</b><span>Decryption (Argon2id, AES-256-GCM) and signing run in WebAssembly in this page. The page loads only code from gnb-smh.com, checked against pinned hashes.</span></div>
    <div><b>Post-quantum signatures</b><span>Every input is signed with ML-DSA-65 and Falcon-1024 together; both must verify.</span></div>
    <div><b>Locks itself</b><span>The key is wiped from memory on Lock, when the tab closes, and after 10 minutes idle.</span></div>
-  </div></div>`;
+  </div></div>`);
   let fileText = null;
   const drop = document.getElementById("drop"), file = document.getElementById("file");
   const take = async (f) => { if (!f) return; if (f.size > 4 * 1024 * 1024) return showError(document.getElementById("open-msg"), "That file is too large to be a keystore.");
-    fileText = await f.text(); drop.innerHTML = `<b>${esc(f.name)}</b><br>${(f.size / 1024).toFixed(1)} kB · ready`; document.getElementById("pw").focus(); };
+    fileText = await f.text(); show(drop, html`<b>${f.name}</b><br>${(f.size / 1024).toFixed(1)} kB · ready`); document.getElementById("pw").focus(); };
   drop.addEventListener("click", () => file.click());
   drop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); file.click(); } });
   file.addEventListener("change", () => take(file.files[0]));
@@ -126,9 +153,21 @@ function renderGate(message) {
       const c = await getCore(); const r = c.create();
       let ks;
       try { ks = c.exportKeystore(p1); } catch (e) { c.wipe(); throw e; }
-      download(`gnb-wallet-${r.address.slice(0, 14)}.json`, ks);
       document.getElementById("npw").value = document.getElementById("npw2").value = "";
-      enter("keys", r.address, "New wallet created. Keep the downloaded keystore and its password: they are the only way back in.");
+      showPhrase(r, ks);
+    } catch (e) { unbusy(btn); showError(msg, e); }
+  });
+  document.getElementById("restore").addEventListener("click", async (ev) => {
+    const btn = ev.currentTarget, msg = document.getElementById("restore-msg"); msg.innerHTML = "";
+    const words = document.getElementById("rwords").value.trim().toLowerCase().split(/\s+/).join(" ");
+    busy(btn, "Restoring…"); await nextFrame();
+    try {
+      const c = await getCore(); const r = c.restore(words);
+      let ks;
+      try { ks = c.exportKeystore(document.getElementById("rpw").value); } catch (e) { c.wipe(); throw e; }
+      document.getElementById("rwords").value = document.getElementById("rpw").value = "";
+      download(`gnb-wallet-${String(r.address).slice(0, 14)}.json`, ks);
+      enter("keys", r.address, "Wallet restored from its recovery phrase. A new encrypted keystore was downloaded.");
     } catch (e) { unbusy(btn); showError(msg, e); }
   });
   document.getElementById("watch").addEventListener("click", async (ev) => {
@@ -139,8 +178,26 @@ function renderGate(message) {
   });
 }
 
+/** WAL-7: show the new recovery phrase once; continue only after the user
+ *  confirms it is written down. */
+function showPhrase(created, keystore) {
+  const words = String(created.words || "").split(" ").filter(Boolean);
+  show(app, html`<div class="gate"><div class="gate-head"><span class="eyebrow">Recovery phrase</span><h1>Write these 24 words down.</h1>
+    <p>They restore this wallet on any device. Anyone who has them controls the funds. They are shown once and never stored or sent.</p></div>
+    <ol class="phrase">${words.map((w) => html`<li><span class="mono">${w}</span></li>`)}</ol>
+    <label class="check"><input type="checkbox" id="wrote"> I have written the 24 words down, in order, offline.</label>
+    <div class="row" style="margin-top:14px"><button class="btn" id="phrase-done" disabled>Download keystore and continue</button></div></div>`);
+  const done = document.getElementById("phrase-done");
+  document.getElementById("wrote").addEventListener("change", (e) => { done.disabled = !e.target.checked; });
+  done.addEventListener("click", () => {
+    download(`gnb-wallet-${String(created.address).slice(0, 14)}.json`, keystore);
+    enter("keys", created.address, "New wallet created. Keep the recovery phrase offline and the keystore with its password.");
+  });
+}
+
 // ── the vault (unlocked or watching) ─────────────────────────────────────────
 function enter(mode, address, notice) {
+  if (!isAddress(address)) throw new Error("invalid address");
   state = { mode, address, tab: mode === "keys" ? "send" : "receive", balance: null, utxos: [], pending: null, notice };
   lockBtn.hidden = false; lockBtn.textContent = mode === "keys" ? "Lock" : "Close";
   armIdleLock(); renderVault(); refresh();
@@ -151,21 +208,21 @@ async function refresh() {
   if (state.mode === "locked") return;
   try {
     const [bal, utxos] = await Promise.all([api("getbalance", [state.address]), api("getutxos", [state.address, 50])]);
-    state.balance = bal.satoshis ?? bal.balance ?? "0";
-    state.utxos = utxos.utxos || [];
-    state.utxoTotal = state.utxos.reduce((s, u) => s + BigInt(u.value), 0n);
-    state.utxoCount = bal.utxo_count ?? state.utxos.length;
+    state.balance = sats(bal.satoshis ?? bal.balance) ?? 0n;
+    state.utxos = cleanUtxos(utxos.utxos);
+    state.utxoTotal = state.utxos.reduce((s, u) => s + sats(u.value), 0n);
+    state.utxoCount = count(bal.utxo_count ?? state.utxos.length);
     paintSlab();
     if (state.tab === "activity") paintActivity();
-  } catch (e) { const el = document.getElementById("slab-err"); if (el) el.innerHTML = `<div class="alert bad">${esc(e.message)}</div>`; }
+  } catch (e) { const el = document.getElementById("slab-err"); if (el) showError(el, e); }
 }
 
 function renderVault() {
   const keys = state.mode === "keys";
   const tabs = keys ? [["send", "Send"], ["receive", "Receive"], ["activity", "Activity"], ["backup", "Backup"]] : [["receive", "Receive"], ["activity", "Activity"]];
-  app.innerHTML = `${state.notice ? `<div class="alert ok" style="margin-bottom:18px">${esc(state.notice)}</div>` : ""}<div class="vault">
+  show(app, html`${state.notice ? html`<div class="alert ok" style="margin-bottom:18px">${state.notice}</div>` : ""}<div class="vault">
    <aside class="slab" id="slab"></aside>
-   <section class="panel"><div class="tabs" role="tablist">${tabs.map(([k, l]) => `<button role="tab" data-tab="${k}" aria-selected="${state.tab === k}">${l}</button>`).join("")}</div><div class="pane" id="pane"></div></section></div>`;
+   <section class="panel"><div class="tabs" role="tablist">${tabs.map(([k, l]) => html`<button role="tab" data-tab="${k}" aria-selected="${state.tab === k}">${l}</button>`)}</div><div class="pane" id="pane"></div></section></div>`);
   app.querySelectorAll("[data-tab]").forEach((b) => b.addEventListener("click", () => { state.tab = b.dataset.tab; renderVault(); }));
   paintSlab(); paintPane();
 }
@@ -173,13 +230,13 @@ function renderVault() {
 function paintSlab() {
   const el = document.getElementById("slab"); if (!el) return;
   const keys = state.mode === "keys";
-  el.innerHTML = `<span class="k">Balance</span>
-   <div class="bal">${state.balance === null ? `<span class="busy"></span>` : esc(fmt(state.balance))}<small>GNB</small></div>
-   <div class="row">${keys ? `<span class="chip on">● Unlocked</span>` : `<span class="chip watch">◌ Watching</span>`}<a class="chip" href="/explorer#/address/${esc(state.address)}" target="_blank" rel="noopener">Explorer ↗</a></div>
-   <span class="k">Address</span><div class="addr" id="addr">${esc(state.address)}</div>
+  show(el, html`<span class="k">Balance</span>
+   <div class="bal">${state.balance === null ? raw(`<span class="busy"></span>`) : fmt(state.balance)}<small>GNB</small></div>
+   <div class="row">${keys ? raw(`<span class="chip on">● Unlocked</span>`) : raw(`<span class="chip watch">◌ Watching</span>`)}<a class="chip" href="/explorer#/address/${state.address}" target="_blank" rel="noopener">Explorer ↗</a></div>
+   <span class="k">Address</span><div class="addr" id="addr">${state.address}</div>
    <div class="row"><button class="chip" id="copy">Copy address</button><button class="chip" id="refresh">Refresh</button></div>
    <div class="facts"><div><b>${state.utxoCount ?? "—"}</b><span>Unspent outputs</span></div><div><b>${state.utxos.length ? fmt(state.utxoTotal, 4) : "—"}</b><span>Spendable now*</span></div></div>
-   <p class="note">* One payment can spend up to 50 outputs (each input carries an ~8.5 kB post-quantum signature).</p><div id="slab-err"></div>`;
+   <p class="note">* One payment can spend up to 50 outputs (each input carries an ~8.5 kB post-quantum signature).</p><div id="slab-err"></div>`);
   document.getElementById("copy").addEventListener("click", (e) => navigator.clipboard?.writeText(state.address).then(() => { e.target.textContent = "Copied"; setTimeout(() => (e.target.textContent = "Copy address"), 1200); }));
   document.getElementById("refresh").addEventListener("click", refresh);
 }
@@ -189,12 +246,24 @@ function paintPane() {
   ({ send: paintSend, receive: paintReceive, activity: paintActivity, backup: paintBackup }[state.tab] || paintReceive)(pane);
 }
 
+/** WAL-1: fetch the creating transactions of the inputs the core plans to
+ *  spend. A transaction the server cannot provide (carryover, pruned) is
+ *  simply absent: that input stays unverified and is flagged. The core hashes
+ *  every provided transaction against its txid, so a forged one is refused. */
+async function fetchPrevTxs(txids) {
+  const out = {};
+  await Promise.all(txids.filter(isHex64).map(async (txid) => {
+    try { const r = await api("getrawtransaction", [txid]); if (typeof r.hex === "string") out[txid] = r.hex; } catch {}
+  }));
+  return out;
+}
+
 function paintSend(pane = document.getElementById("pane")) {
-  pane.innerHTML = `<h3>Send GNB</h3>
+  show(pane, html`<h3>Send GNB</h3>
    <label>To<input id="to" spellcheck="false" placeholder="gnb1q… (a bloch1q… address is accepted)"></label>
    <div class="field-row"><label>Amount (GNB)<input id="amt" inputmode="decimal" placeholder="0.00"></label><button class="btn ghost" id="max">Max</button></div>
-   <p class="note">The network fee is set to the consensus minimum for the transaction's real size (≈ 0.00002 GNB per kB, at least 0.0001 GNB).</p>
-   <button class="btn" id="review">Review payment</button><div id="send-out"></div>`;
+   <p class="note">The network fee is the consensus minimum for the transaction's real size (≈ 0.00002 GNB per kB, at least 0.0001 GNB). Fees above 0.02 GNB are refused.</p>
+   <button class="btn" id="review">Review payment</button><div id="send-out"></div>`);
   document.getElementById("max").addEventListener("click", () => {
     // Leave room for the fee of up to 50 inputs (~430 kB at 2,000 sat/kB).
     const reserve = 900000n, total = state.utxoTotal || 0n;
@@ -207,25 +276,34 @@ function paintSend(pane = document.getElementById("pane")) {
       const amount = parseGnb(document.getElementById("amt").value);
       if (amount <= 0n) throw new Error("Enter an amount above zero.");
       if (!state.utxos.length) throw new Error("No spendable outputs found for this address yet.");
-      busy(btn, "Building and signing…"); await nextFrame();
-      const tx = core.pay(state.utxos, to, amount.toString(), "0");
+      busy(btn, "Verifying inputs and signing…"); await nextFrame();
+      const plan = core.plan(state.utxos, to, amount.toString(), "0");
+      const prevtxs = await fetchPrevTxs(plan.prev_txids || []);
+      const tx = core.pay(state.utxos, to, amount.toString(), "0", prevtxs);
       state.pending = { ...tx, to };
       unbusy(btn);
-      out.innerHTML = `<div class="review">
-        <div><span>To</span><b>${esc(to)}</b></div>
-        <div><span>Amount</span><b>${esc(fmt(tx.amount))} GNB</b></div>
-        <div><span>Network fee</span><b>${esc(fmt(tx.fee))} GNB</b></div>
-        <div><span>Inputs · size</span><b>${tx.inputs} · ${(tx.size / 1024).toFixed(1)} kB</b></div>
-        <div><span>Change back to you</span><b>${esc(fmt(tx.change))} GNB</b></div>
-        <div><span>Total leaving this address</span><b>${esc(fmt(BigInt(tx.amount) + BigInt(tx.fee)))} GNB</b></div></div>
-        <div class="row" style="margin-top:14px"><button class="btn" id="confirm">Confirm and send</button><button class="btn ghost" id="cancel">Cancel</button></div>`;
+      const unverified = num(tx.unverified_inputs) || 0;
+      const dust = sats(tx.dust_to_fee) ?? 0n;
+      show(out, html`<div class="review">
+        <div><span>To</span><b>${to}</b></div>
+        <div><span>Amount</span><b>${fmt(tx.amount)} GNB</b></div>
+        <div><span>Network fee (actual)</span><b>${fmt(tx.fee)} GNB${dust > 0n ? html` <small>incl. ${fmt(dust)} GNB change too small to return</small>` : ""}</b></div>
+        <div><span>Inputs · size</span><b>${count(tx.inputs)} · ${(num(tx.size) / 1024).toFixed(1)} kB</b></div>
+        <div><span>Inputs verified against the chain</span><b>${count(tx.verified_inputs)} of ${count(tx.inputs)}</b></div>
+        <div><span>Change back to you</span><b>${fmt(tx.change)} GNB</b></div>
+        <div><span>Total leaving this address</span><b>${fmt((sats(tx.amount) ?? 0n) + (sats(tx.fee) ?? 0n))} GNB</b></div></div>
+        ${unverified ? html`<div class="alert bad" style="margin-top:12px">${unverified} input value(s) come only from the server (genesis carryover or pruned history) and could not be checked against their transaction. If the server lied, the difference would be paid as fee.
+          <label class="check"><input type="checkbox" id="accept-unverified"> I accept the unverified input value(s) shown above.</label></div>` : ""}
+        <div class="row" style="margin-top:14px"><button class="btn" id="confirm" ${unverified ? raw("disabled") : ""}>Confirm and send</button><button class="btn ghost" id="cancel">Cancel</button></div>`);
+      const confirmBtn = document.getElementById("confirm");
+      document.getElementById("accept-unverified")?.addEventListener("change", (e) => { confirmBtn.disabled = !e.target.checked; });
       document.getElementById("cancel").addEventListener("click", () => { state.pending = null; out.innerHTML = ""; });
-      document.getElementById("confirm").addEventListener("click", async (e2) => {
+      confirmBtn.addEventListener("click", async (e2) => {
         const b2 = e2.currentTarget; busy(b2, "Broadcasting…");
         try {
           await broadcast(state.pending.raw);
-          const id = state.pending.txid; state.pending = null;
-          out.innerHTML = `<div class="alert ok">Sent. Transaction <a class="mono" href="/explorer#/tx/${esc(id)}" target="_blank" rel="noopener">${esc(id.slice(0, 16))}…</a> is in the mempool and will confirm in the next blocks.</div>`;
+          const id = isHex64(state.pending.txid) ? state.pending.txid : ""; state.pending = null;
+          show(out, html`<div class="alert ok">Sent. Transaction <a class="mono" href="/explorer#/tx/${id}" target="_blank" rel="noopener">${id.slice(0, 16)}…</a> is in the mempool and will confirm in the next blocks.</div>`);
           setTimeout(refresh, 3000);
         } catch (err) { unbusy(b2); showError(out, err); }
       });
@@ -234,42 +312,45 @@ function paintSend(pane = document.getElementById("pane")) {
 }
 
 function paintReceive(pane = document.getElementById("pane")) {
-  let qrHtml = "";
-  try { const q = window.qrcode(0, "M"); q.addData(state.address, "Byte"); q.make(); qrHtml = q.createSvgTag({ cellSize: 6, margin: 0, scalable: true }); } catch {}
-  pane.innerHTML = `<h3>Receive GNB</h3><div class="receive"><div class="qr" aria-label="QR code of the address">${qrHtml}</div>
-   <div style="display:grid;gap:12px"><p>Share this address. Anyone can send GNB to it; only the keystore can spend it.</p><div class="addr">${esc(state.address)}</div>
-   <p class="note">Same key as the Bloch address <span class="mono">bloch1q${esc(state.address.slice(5))}</span>: GNB from the Genesis-3 carryover is already here.</p></div></div>`;
+  let qr = "";
+  // The QR library returns SVG markup for the (validated) address only.
+  try { const q = window.qrcode(0, "M"); q.addData(state.address, "Byte"); q.make(); qr = raw(q.createSvgTag({ cellSize: 6, margin: 0, scalable: true })); } catch {}
+  show(pane, html`<h3>Receive GNB</h3><div class="receive"><div class="qr" aria-label="QR code of the address">${qr}</div>
+   <div style="display:grid;gap:12px"><p>Share this address. Anyone can send GNB to it; only the keystore can spend it.</p><div class="addr">${state.address}</div>
+   <p class="note">Same key as the Bloch address <span class="mono">bloch1q${state.address.slice(5)}</span>: GNB from the Genesis-3 carryover is already here.</p></div></div>`);
 }
 
 async function paintActivity(pane = document.getElementById("pane")) {
   if (!pane || state.tab !== "activity") return;
-  if (!pane.dataset.loaded) pane.innerHTML = `<h3>Activity</h3><p class="muted"><span class="busy"></span>Loading…</p>`;
+  if (!pane.dataset.loaded) show(pane, html`<h3>Activity</h3><p class="muted"><span class="busy"></span>Loading…</p>`);
   try {
     const [h, carry] = await Promise.all([api("getaddresshistory", [state.address, 25, 0]), fetch(`/api/carryover/${state.address}`).then((r) => r.json()).catch(() => null)]);
     pane.dataset.loaded = "1";
     const c = carry?.result;
-    pane.innerHTML = `<h3>Activity</h3>
-     ${c?.in_carryover ? `<div class="alert ok">Genesis carryover: ${esc(fmt(c.amount))} GNB from the Bloch Genesis-3 snapshot (${Number(c.utxos).toLocaleString("en-US")} outputs).</div>` : ""}
-     ${h.items.length ? `<table class="activity"><thead><tr><th>Height</th><th>Transaction</th><th></th><th class="num">GNB</th></tr></thead><tbody>
-      ${h.items.map((i) => `<tr><td class="mono">${Number(i.height).toLocaleString("en-US")}</td><td><a class="mono" href="/explorer#/tx/${esc(i.txid)}" target="_blank" rel="noopener">${esc(i.txid.slice(0, 12))}…</a></td><td class="muted">${i.direction === "in" ? "received" : "sent"}</td><td class="num ${i.direction === "in" ? "in" : ""}">${i.direction === "in" ? "+" : "−"}${esc(fmt(i.amount))}</td></tr>`).join("")}
-      </tbody></table>${h.total > 25 ? `<p class="note">Showing the latest 25 of ${h.total}. <a href="/explorer#/address/${esc(state.address)}" target="_blank" rel="noopener">Full history in the explorer ↗</a></p>` : ""}`
-      : `<p class="muted">No on-chain movements yet.</p>`}`;
+    const items = Array.isArray(h.items) ? h.items : [];
+    show(pane, html`<h3>Activity</h3>
+     ${c?.in_carryover === true ? html`<div class="alert ok">Genesis carryover: ${fmt(c.amount)} GNB from the Bloch Genesis-3 snapshot (${count(c.utxos)} outputs).</div>` : ""}
+     ${items.length ? html`<table class="activity"><thead><tr><th>Height</th><th>Transaction</th><th></th><th class="num">GNB</th></tr></thead><tbody>
+      ${items.map((i) => { const txid = isHex64(i.txid) ? i.txid : ""; const incoming = i.direction === "in";
+        return html`<tr><td class="mono">${count(i.height)}</td><td><a class="mono" href="/explorer#/tx/${txid}" target="_blank" rel="noopener">${txid.slice(0, 12)}…</a></td><td class="muted">${incoming ? "received" : "sent"}</td><td class="num ${incoming ? "in" : ""}">${incoming ? "+" : "−"}${fmt(i.amount)}</td></tr>`; })}
+      </tbody></table>${num(h.total) > 25 ? html`<p class="note">Showing the latest 25 of ${count(h.total)}. <a href="/explorer#/address/${state.address}" target="_blank" rel="noopener">Full history in the explorer ↗</a></p>` : ""}`
+      : html`<p class="muted">No on-chain movements yet.</p>`}`);
   } catch (e) { showError(pane, e); }
 }
 
 function paintBackup(pane = document.getElementById("pane")) {
-  pane.innerHTML = `<h3>Back up this wallet</h3>
-   <p>Download the key again as an encrypted GnB keystore (v2). Choose a password; it is the only way to open the file.</p>
+  show(pane, html`<h3>Back up this wallet</h3>
+   <p>Download the key again as an encrypted GnB keystore (v3: its network and address are authenticated). Choose a password; it is the only way to open the file.</p>
    <label>Password<input type="password" id="bpw" autocomplete="new-password"></label>
    <label>Repeat password<input type="password" id="bpw2" autocomplete="new-password"></label>
    <button class="btn ghost" id="bdl">Download encrypted keystore</button><div id="b-out"></div>
-   <p class="note">The file can be opened here, with <span class="mono">gnb-cli send</span>, and with any GnB node tool. Never share it together with its password.</p>`;
+   <p class="note">The file can be opened here, with <span class="mono">gnb-cli send</span>, and with any GnB node tool. Never share it together with its password.</p>`);
   document.getElementById("bdl").addEventListener("click", async (ev) => {
     const btn = ev.currentTarget, out = document.getElementById("b-out"); out.innerHTML = "";
     const p1 = document.getElementById("bpw").value, p2 = document.getElementById("bpw2").value;
     if (p1 !== p2) return showError(out, "The passwords do not match.");
     busy(btn, "Encrypting…"); await nextFrame();
-    try { download(`gnb-wallet-${state.address.slice(0, 14)}.json`, core.exportKeystore(p1)); unbusy(btn); out.innerHTML = `<div class="alert ok">Keystore downloaded.</div>`;
+    try { download(`gnb-wallet-${state.address.slice(0, 14)}.json`, core.exportKeystore(p1)); unbusy(btn); show(out, html`<div class="alert ok">Keystore downloaded.</div>`);
       document.getElementById("bpw").value = document.getElementById("bpw2").value = ""; }
     catch (e) { unbusy(btn); showError(out, e); }
   });

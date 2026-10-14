@@ -43,6 +43,15 @@ pub enum WalletError {
     #[error("address does not match wallet network")]
     NetworkMismatch,
 
+    /// WAL-1: the fee exceeds the maximum-fee guard.
+    #[error("fee too high: {0}")]
+    FeeTooHigh(String),
+
+    /// Payment construction failed (selection, value verification, guard,
+    /// signing); the message says which.
+    #[error("payment refused: {0}")]
+    Payment(String),
+
     // ── I/O and parsing ──────────────────────────────────────────────────────
 
     #[error("I/O error: {0}")]

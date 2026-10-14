@@ -309,7 +309,8 @@ impl DisclosureBundle {
         let is_testnet = matches!(network, Network::Testnet);
         let mut entries = Vec::with_capacity(keyed.len());
         for (index, pk, sk) in &keyed {
-            let sig = crypto::sign(sk, &digest)
+            // CRY-5: verified under the entry's own public key before use.
+            let sig = crypto::sign_checked(sk, pk, &digest)
                 .map_err(|e| DisclosureError::Crypto(e.to_string()))?;
             entries.push(DisclosureEntry {
                 index: *index,

@@ -1,0 +1,2 @@
+# Not published by `wrangler deploy` (Workers static assets).
+tests/

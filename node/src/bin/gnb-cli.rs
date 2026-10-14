@@ -20,6 +20,9 @@ fn main() {
     let mut rpc_host = "127.0.0.1".to_string();
     let mut rpc_port = 17210u16;
     let mut allow_large_hd_wallet = false;
+    // WAL-7: the network of a new wallet is an explicit choice recorded in
+    // the file (keystore v3 authenticates it), never inferred from its name.
+    let mut testnet = false;
     let mut cmd_args: Vec<&str> = Vec::new();
 
     let mut i = 1;
@@ -28,6 +31,7 @@ fn main() {
             "--rpc-host" => { i += 1; if i < args.len() { rpc_host = args[i].clone(); } }
             "--rpc-port" => { i += 1; if i < args.len() { rpc_port = args[i].parse().unwrap_or(17210); } }
             "--allow-large-hd-wallet" => { allow_large_hd_wallet = true; }
+            "--testnet" => { testnet = true; }
             _ => { cmd_args.push(&args[i]); }
         }
         i += 1;
@@ -131,7 +135,7 @@ fn main() {
 
         // ── Wallet: send (builds + signs + broadcasts) ─────────────
         "send" => {
-            require_params(params, 3, "send <wallet.json> <to_address> <amount_gnb> [--fee 0.0005]");
+            require_params(params, 3, "send <wallet.json> <to_address> <amount_gnb> [--fee auto|GNB] [--max-fee GNB] [--yes] [--allow-unverified-inputs]");
             do_send(params, &rpc_host, rpc_port);
             return;
         }
@@ -161,15 +165,22 @@ fn main() {
 
         // ── Wallet: generate ───────────────────────────────────────
         "newwallet" | "createwallet" => {
-            require_params(params, 1, "newwallet <output_path.json>");
-            do_new_wallet(params[0]);
+            require_params(params, 1, "newwallet <output_path.json> [--random-key] [--testnet]");
+            let random_key = params[1..].contains(&"--random-key");
+            do_new_wallet(params[0], testnet, random_key);
+            return;
+        }
+
+        "restorewallet" => {
+            require_params(params, 1, "restorewallet <output_path.json> [--testnet]");
+            do_restore_wallet(params[0], testnet);
             return;
         }
 
         // ── Phase 3: HD Wallet commands ────────────────────────────
         "newseed" => {
-            require_params(params, 1, "newseed <output_path.json>");
-            do_newseed(params[0]);
+            require_params(params, 1, "newseed <output_path.json> [--testnet]");
+            do_newseed(params[0], testnet);
             return;
         }
 
@@ -274,167 +285,141 @@ fn main() {
 
 // ── RPC client ──────────────────────────────────────────────────────────────
 
+/// Plain-HTTP JSON-RPC. WAL-7/NET-16: the transport refuses to send
+/// `GNB_RPC_API_KEY` to anything but a loopback address; reach a remote node
+/// through an SSH tunnel (`ssh -L 17210:127.0.0.1:17210 host`).
 fn rpc_call(host: &str, port: u16, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
     let authority = if host.contains(':') && !host.starts_with('[') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
-    let api_key = std::env::var("GNB_RPC_API_KEY").ok();
-    gnb::wallet::http_rpc::call(&authority, method, params, api_key.as_deref())
+    let api_key = std::env::var("GNB_RPC_API_KEY").ok().map(zeroize::Zeroizing::new);
+    gnb::wallet::http_rpc::call(&authority, method, params, api_key.as_deref().map(String::as_str))
 }
 
 // ── Send command ────────────────────────────────────────────────────────────
-
-/// Mempool admission limit (node/src/mempool MAX_TX_SIZE).
-const MAX_TX_BYTES: usize = 400 * 1024;
 
 fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     let wallet_path = params[0];
     let to_address = params[1];
     let amount_str = params[2];
 
-    // Fee in GNB. Default 0.0005 GNB (50,000 base units) clears the
-    // consensus minimum (max(0.0001 GNB, 0.00002 GNB/kB)) for transactions up
-    // to ~25 kB. The sighash chain id follows the wallet's address prefix.
-    let mut fee_bloch = "0.0005";
+    // Fee: `auto` (default) = the consensus minimum for the signed
+    // transaction's actual size; a GNB value is a floor raised to that
+    // minimum. --max-fee replaces the default guard explicitly (WAL-1).
+    let mut fee_arg = "auto";
+    let mut max_fee_arg: Option<&str> = None;
+    let mut yes = false;
+    let mut allow_unverified = false;
     let mut i = 3;
     while i < params.len() {
-        if params[i] == "--fee" && i + 1 < params.len() {
-            fee_bloch = params[i + 1];
-            i += 2;
-        } else {
-            i += 1;
+        match params[i] {
+            "--fee" if i + 1 < params.len() => { fee_arg = params[i + 1]; i += 2; }
+            "--max-fee" if i + 1 < params.len() => { max_fee_arg = Some(params[i + 1]); i += 2; }
+            "--yes" | "-y" => { yes = true; i += 1; }
+            "--allow-unverified-inputs" => { allow_unverified = true; i += 1; }
+            other => die(&format!("unknown send option {other:?}")),
         }
     }
 
     let amount_sats = bloch_to_sats(amount_str);
-    let fee_sats = gnb::wallet::parse_bloch_satoshis(fee_bloch).unwrap_or_else(|message| die(message));
-    amount_sats.checked_add(fee_sats).unwrap_or_else(|| die("amount plus fee exceeds u64"));
+    let fee = gnb::wallet::send::parse_fee_arg(fee_arg).unwrap_or_else(|message| die(message));
+    let fee_policy = gnb::wallet::send::parse_max_fee_arg(max_fee_arg).unwrap_or_else(|message| die(message));
 
     // Load wallet
     let password = read_password("Wallet password: ");
     let path = std::path::Path::new(wallet_path);
-    // Bloch/GnB keystore v2 first (address field; bloch1q… accepted), then
+    // Keystore v3/v2 first (address field; bloch1q… accepted for v2), then
     // the v1 keyfile format (address derived from the public key).
     let keypair = match gnb::wallet::Keypair::load_encrypted(path, &password) {
         Ok(kp) => kp,
         Err(e2) => match gnb::wallet::Wallet::load_encrypted(path, &password) {
             Ok(w) => w.into_keypair(),
             Err(e1) => {
-                eprintln!("Failed to load wallet: {} (keystore v2) / {} (keyfile v1)", e2, e1);
+                eprintln!("Failed to load wallet: {} (keystore v2/v3) / {} (keyfile v1)", e2, e1);
                 process::exit(1);
             }
         },
     };
+    drop(password);
 
-    println!("From: {}", keypair.address);
-    println!("To:   {}", to_address);
-    println!("Amount: {} GNB", amount_str);
-    println!("Fee:    {} GNB", fee_bloch);
+    checked_destination(to_address, &keypair.address).unwrap_or_else(|message| die(message));
+    let to = gnb::address::Address::parse(to_address).unwrap_or_else(|_| die("invalid destination address"));
 
-    // Get UTXOs via RPC
-    // Pass a UTXO limit: a huge wallet (e.g. the carry-over founder set with
-    // hundreds of thousands of UTXOs) otherwise returns a multi-MB response that
-    // times out the client. A handful of UTXOs is plenty to cover any single spend.
-    let utxos_result = match rpc_call(rpc_host, rpc_port, "getutxos", &serde_json::json!([keypair.address, 50])) {
-        Ok(r) => r,
-        Err(e) => { eprintln!("RPC error: {}", e); process::exit(1); }
+    // Fetch UTXOs (bounded), verify the selected ones against their
+    // transactions (WAL-1), build and sign under the fee guard.
+    let rpc = |method: &str, p: &serde_json::Value| rpc_call(rpc_host, rpc_port, method, p);
+    let request = gnb::wallet::send::SendRequest {
+        keypair: &keypair,
+        to: &to,
+        amount: amount_sats,
+        fee,
+        fee_policy,
+        // Non-interactive sends refuse unprovable inputs unless asked.
+        require_verified_inputs: yes && !allow_unverified,
+        utxo_limit: 50,
     };
+    let prepared = gnb::wallet::send::prepare_send(&rpc, &request)
+        .unwrap_or_else(|e| die(&format!("TX build failed: {e}")));
 
-    let utxos_json = utxos_result.get("utxos").and_then(|u| u.as_array()).cloned().unwrap_or_default();
-    if utxos_json.is_empty() {
-        eprintln!("No UTXOs found for {}", keypair.address);
-        process::exit(1);
+    // Show what will be signed — with the ACTUAL fee — and confirm (WAL-7).
+    println!("UTXOs seen: {} ({} GNB)", prepared.utxos_seen, prepared.value_seen as f64 / 1e8);
+    for (k, v) in prepared.summary(&keypair.address, to_address) {
+        println!("{:<14} {}", format!("{k}:"), v);
+    }
+    if !yes && !gnb::wallet::send::confirm("Broadcast this transaction?") {
+        die("not broadcast");
     }
 
-    // Refuse malformed rows before they lose width or network information.
-    let available_utxos = parse_send_utxos(&utxos_json).unwrap_or_else(|message| die(message));
-    let total_available = available_utxos.iter().try_fold(0u64, |total, (_, _, output)| total.checked_add(output.value))
-        .unwrap_or_else(|| die("UTXO value total exceeds u64"));
-    println!("Available: {} GNB ({} UTXOs)", total_available as f64 / 1e8, available_utxos.len());
-    let to_addr_hex = checked_destination(to_address, &keypair.address).unwrap_or_else(|message| die(message));
-
-    // Build and sign TX
-    // Every input carries a ~8.5 kB hybrid signature + public key, so the
-    // consensus minimum fee depends on how many inputs coin selection picks.
-    // Build, measure, and rebuild with max(requested, minimum) until stable.
-    let mut fee_sats = fee_sats;
-    let mut tx = None;
-    for _ in 0..4 {
-        let built = match gnb::wallet::TxBuilder::build(
-            &keypair, &available_utxos, &to_addr_hex, amount_sats, fee_sats,
-        ) {
-            Ok(tx) => tx,
-            Err(e) => { eprintln!("TX build failed: {}", e); process::exit(1); }
-        };
-        let size = built.to_wire_bytes(true).len();
-        let min = gnb::core::tokenomics::min_tx_fee_sat(size);
-        if fee_sats >= min {
-            tx = Some(built);
-            break;
-        }
-        println!("Fee raised to the consensus minimum for {} bytes: {} GNB", size, min as f64 / 1e8);
-        fee_sats = min;
-    }
-    let tx = tx.unwrap_or_else(|| die("could not settle the fee for this transaction"));
-    let size = tx.to_wire_bytes(true).len();
-    if size > MAX_TX_BYTES {
-        die(&format!(
-            "transaction is {} bytes with {} inputs; the mempool limit is {} bytes. \
-             Send a smaller amount (each input carries ~8.5 kB) and repeat.",
-            size, tx.inputs.len(), MAX_TX_BYTES));
-    }
-    println!("Inputs: {} · Size: {} bytes · Fee: {} GNB", tx.inputs.len(), size, fee_sats as f64 / 1e8);
-
-    let txid = hex::encode(tx.txid());
-    println!("TXID: {}", txid);
-
-    // Serialize and broadcast
-    // Sprint 1.d: Bitcoin-format wire (replaces bincode). Infallible.
-    let raw = tx.to_wire_bytes(true);
-    let raw_hex = hex::encode(&raw);
-
-    match rpc_call(rpc_host, rpc_port, "sendrawtransaction", &serde_json::json!([raw_hex])) {
-        Ok(result) => {
-            if let Some(err) = result.get("error").and_then(|e| e.as_str()) {
-                eprintln!("Broadcast rejected: {}", err);
-                process::exit(1);
-            }
-            println!("Broadcast OK");
-        }
-        Err(e) => { eprintln!("Broadcast failed: {}", e); process::exit(1); }
+    match gnb::wallet::send::broadcast(&rpc, &prepared) {
+        Ok(txid) => println!("Broadcast OK: {txid}"),
+        Err(e) => die(&format!("Broadcast failed: {e}")),
     }
 }
+
 
 // ── New wallet command ──────────────────────────────────────────────────────
 
 // ── Phase 3: HD Wallet functions ────────────────────────────────────────────
 
-fn do_newseed(output_path: &str) {
-    println!("Generating HD wallet with 24-word mnemonic...");
-    println!();
-
-    let password = loop {
+/// Prompt for a new password twice (CRY-4: every copy is zeroizing).
+fn read_new_password() -> zeroize::Zeroizing<String> {
+    loop {
         let p1 = read_password("Set password (min 12 chars, 3 of: upper/lower/digit/special): ");
         if let Err(e) = gnb::wallet::validate_password(&p1) {
             eprintln!("Weak password: {}", e);
             continue;
         }
         let p2 = read_password("Confirm password: ");
-        if p1 != p2 {
+        if *p1 != *p2 {
             eprintln!("Passwords don't match.");
             continue;
         }
         break p1;
-    };
+    }
+}
+
+/// WAL-7: a file name containing "testnet" no longer selects the network.
+fn warn_if_name_suggests_other_network(output_path: &str, testnet: bool) {
+    if output_path.contains("testnet") && !testnet {
+        eprintln!("Note: creating a MAINNET wallet; pass --testnet for a testnet wallet \
+                   (the network is no longer inferred from the file name).");
+    }
+}
+
+fn do_newseed(output_path: &str, testnet: bool) {
+    println!("Generating HD wallet with 24-word mnemonic...");
+    println!();
+    warn_if_name_suggests_other_network(output_path, testnet);
+
+    let password = read_new_password();
 
     let use_passphrase = read_password("Optional passphrase (press Enter to skip): ");
     let passphrase = if use_passphrase.is_empty() { None } else { Some(use_passphrase.as_str()) };
 
-    let testnet = output_path.contains("testnet");
     let wallet = match gnb::hd_wallet::HdWallet::create(&password, passphrase, testnet) {
         Ok(w) => w,
         Err(e) => { eprintln!("Failed to create wallet: {}", e); process::exit(1); }
     };
 
-    let mnemonic_str = wallet.mnemonic.to_string();
+    let mnemonic_str = zeroize::Zeroizing::new(wallet.mnemonic.to_string());
     let first_addr = wallet.addresses[0].1.address.clone();
 
     let path = std::path::Path::new(output_path);
@@ -611,25 +596,38 @@ fn do_import_founder(hd_wallet_path: &str, founder_path: &str, allow_large_hd_wa
 
 // ── Original wallet function ────────────────────────────────────────────────
 
-fn do_new_wallet(output_path: &str) {
-    println!("Generating ML-DSA-65 keypair...");
+fn network_of(testnet: bool) -> gnb::address::Network {
+    if testnet { gnb::address::Network::Testnet } else { gnb::address::Network::Mainnet }
+}
 
-    let password = loop {
-        let p1 = read_password("Set password (min 12 chars, 3 of: upper/lower/digit/special): ");
-        if let Err(e) = gnb::wallet::validate_password(&p1) {
-            eprintln!("Weak password: {}", e);
-            continue;
+/// WAL-7: by default the key is derived from a new 24-word recovery phrase
+/// (shown once), so the encrypted file is not its only backup; the network
+/// is the explicit `--testnet` choice and keystore v3 authenticates it.
+fn do_new_wallet(output_path: &str, testnet: bool, random_key: bool) {
+    println!("Generating hybrid ML-DSA-65 + Falcon-1024 keypair...");
+    warn_if_name_suggests_other_network(output_path, testnet);
+
+    let keypair = if random_key {
+        gnb::wallet::generate_keypair(testnet)
+    } else {
+        let (keypair, phrase) = gnb::wallet::generate_mnemonic_keypair(network_of(testnet))
+            .unwrap_or_else(|e| die(&format!("key generation failed: {e}")));
+        println!();
+        println!("RECOVERY PHRASE (24 words). Write them down offline; anyone with them controls the funds:");
+        println!();
+        for (row, chunk) in phrase.words().chunks(4).enumerate() {
+            let line: Vec<String> = chunk.iter().enumerate()
+                .map(|(j, w)| format!("{:2}. {:<10}", row * 4 + j + 1, w)).collect();
+            println!("  {}", line.join(" "));
         }
-        let p2 = read_password("Confirm password: ");
-        if p1 != p2 {
-            eprintln!("Passwords don't match.");
-            continue;
+        println!();
+        if !gnb::wallet::send::confirm("I have written the 24 words down") {
+            die("aborted: no wallet file was written");
         }
-        break p1;
+        keypair
     };
 
-    let testnet = output_path.contains("testnet");
-    let keypair = gnb::wallet::generate_keypair(testnet);
+    let password = read_new_password();
     let path = std::path::Path::new(output_path);
 
     match keypair.save_encrypted(path, &password) {
@@ -638,7 +636,11 @@ fn do_new_wallet(output_path: &str) {
             println!("Address:      {}", keypair.address);
             println!("Network:      {}", if testnet { "testnet" } else { "mainnet" });
             println!();
-            println!("BACKUP THIS FILE. If lost, your GNB is gone forever.");
+            if random_key {
+                println!("BACKUP THIS FILE. If lost, your GNB is gone forever.");
+            } else {
+                println!("The recovery phrase restores this key: gnb-cli restorewallet <path>.");
+            }
         }
         Err(e) => {
             eprintln!("Failed to save wallet: {}", e);
@@ -647,26 +649,28 @@ fn do_new_wallet(output_path: &str) {
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
-
-fn read_password(prompt: &str) -> String {
-    eprint!("{}", prompt);
-    rpassword::read_password().unwrap_or_else(|e| {
-        eprintln!("Failed to read password: {}", e);
-        process::exit(1);
-    })
+fn do_restore_wallet(output_path: &str, testnet: bool) {
+    let phrase = read_password("Recovery phrase (24 words): ");
+    let keypair = gnb::wallet::keypair_from_mnemonic(&phrase, network_of(testnet))
+        .unwrap_or_else(|e| die(&format!("restore failed: {e}")));
+    drop(phrase);
+    println!("Address: {}", keypair.address);
+    let password = read_new_password();
+    match keypair.save_encrypted(std::path::Path::new(output_path), &password) {
+        Ok(_) => println!("Wallet saved: {}", output_path),
+        Err(e) => die(&format!("failed to save wallet: {e}")),
+    }
 }
 
-/// Read a satoshi-denominated response field that may be a JSON number (V3
-/// nodes, and the live G3 fleet) or a decimal string (V4 rule R3,
-/// docs/specs/BLOCH-RPC-V4.md — amounts exceed both `i64::MAX` and JS
-/// `Number.MAX_SAFE_INTEGER`, so they travel as strings). Dual-tolerant so one
-/// CLI binary talks to both wires.
-fn sat_u64(v: &serde_json::Value) -> Option<u64> {
-    if let Some(n) = v.as_u64() {
-        return Some(n);
-    }
-    v.as_str().and_then(|s| s.trim().parse::<u64>().ok())
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// CRY-4: passwords and mnemonics are read into wiping storage.
+fn read_password(prompt: &str) -> zeroize::Zeroizing<String> {
+    eprint!("{}", prompt);
+    zeroize::Zeroizing::new(rpassword::read_password().unwrap_or_else(|e| {
+        eprintln!("Failed to read password: {}", e);
+        process::exit(1);
+    }))
 }
 
 fn bloch_to_sats(s: &str) -> u64 {
@@ -686,18 +690,13 @@ fn checked_destination(destination: &str, source: &str) -> Result<String, &'stat
     Ok(hex::encode(destination.hash()))
 }
 
-fn parse_send_utxos(rows: &[serde_json::Value]) -> Result<Vec<(Vec<u8>, u32, gnb::core::TxOutput)>, &'static str> {
-    rows.iter().map(|row| {
-        let txid = hex::decode(row["txid"].as_str().ok_or("UTXO missing transaction ID")?)
-            .map_err(|_| "invalid UTXO transaction ID hex")?;
-        if txid.len() != 32 { return Err("UTXO transaction ID must contain 32 bytes"); }
-        let index = row["index"].as_u64().and_then(|value| u32::try_from(value).ok())
-            .ok_or("UTXO index must fit u32")?;
-        let value = sat_u64(&row["value"]).ok_or("invalid UTXO value")?;
-        let script_pubkey = hex::decode(row["script_pubkey"].as_str().ok_or("UTXO missing script")?)
-            .map_err(|_| "invalid UTXO script hex")?;
-        Ok((txid, index, gnb::core::TxOutput { value, script_pubkey }))
-    }).collect()
+/// Test view of the production UTXO-row parser `send` uses
+/// (`gnb::wallet::send::parse_utxo_rows`: number or decimal-string values,
+/// malformed rows refused, never filtered).
+#[cfg(test)]
+fn parse_send_utxos(rows: &[serde_json::Value]) -> Result<Vec<(Vec<u8>, u32, gnb::core::TxOutput)>, String> {
+    Ok(gnb::wallet::send::parse_utxo_rows(&serde_json::json!({ "utxos": rows }))?
+        .into_iter().map(|u| (u.txid.to_vec(), u.index, u.output)).collect())
 }
 
 fn require_params(params: &[&str], min: usize, usage: &str) {
@@ -741,8 +740,14 @@ fn print_usage() {
     gnb-cli utxos <address>               List unspent outputs
     gnb-cli txlist <address> [count]      Transaction history
     gnb-cli validate <address>            Validate address format
-    gnb-cli newwallet <path.json>         Generate simple wallet (1 keypair)
-    gnb-cli send <wallet.json> <to> <amount> [--fee 0.0005]
+    gnb-cli newwallet <path.json> [--random-key]
+                                          New 1-key wallet from a 24-word recovery
+                                          phrase (shown once); keystore v3
+    gnb-cli restorewallet <path.json>     Restore a 1-key wallet from its phrase
+    gnb-cli send <wallet.json> <to> <amount> [--fee auto|GNB] [--max-fee GNB]
+                 [--yes] [--allow-unverified-inputs]
+                                          Shows the actual fee and asks before
+                                          broadcasting; verifies UTXO values
 
   HD WALLET (BIP39, multi-address)
     gnb-cli newseed <wallet-hd.json>      Generate 24-word mnemonic + wallet
@@ -768,6 +773,10 @@ fn print_usage() {
     --rpc-host <host>                      RPC host (default: 127.0.0.1)
     --rpc-port <port>                      RPC port (default: 17210)
     --allow-large-hd-wallet                Trusted-backup recovery (up to 512 MiB)
+    --testnet                              New wallets are testnet (newwallet,
+                                           restorewallet, newseed)
+    GNB_RPC_API_KEY=<key>                  Sent only to loopback hosts (use an
+                                           SSH tunnel for remote nodes)
     --help                                 This message
 "#);
 }

@@ -1,0 +1,32 @@
+# Cloudflare Tunnel publishing the loopback explorer API (WAL-2).
+#
+# The tunnel is an outbound, authenticated, TLS-protected connection from this
+# host to Cloudflare: the API never listens on a public address, and the
+# Worker reaches it at https://<tunnel hostname> (set in GNB_ORIGINS).
+#
+# One-time setup (as root; the credentials file is created by cloudflared and
+# must stay mode 0600, owned by the cloudflared user):
+#   cloudflared tunnel login
+#   cloudflared tunnel create gnb-explorer-<host>
+#   cloudflared tunnel route dns gnb-explorer-<host> <tunnel hostname>
+#   install -m 0644 cloudflared-config.example.yml /etc/cloudflared/gnb-explorer.yml
+#   (edit the tunnel id, credentials path and hostname in that file)
+[Unit]
+Description=Cloudflare Tunnel for the GnB explorer API
+After=network-online.target gnb-explorer-api.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=cloudflared
+Group=cloudflared
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel --config /etc/cloudflared/gnb-explorer.yml run
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -74,8 +74,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Generate a new keypair and encrypted keystore
+    /// Generate a new keypair and encrypted keystore. By default the key is
+    /// derived from a new 24-word recovery phrase, shown once (WAL-7).
     New {
+        #[arg(long, default_value = "./gnb-wallet.json")]
+        output: PathBuf,
+        /// Generate a random key with no recovery phrase: the encrypted
+        /// keystore file is then the ONLY backup.
+        #[arg(long)]
+        random_key: bool,
+    },
+    /// Restore a phrase-backed key into a new encrypted keystore
+    Restore {
         #[arg(long, default_value = "./gnb-wallet.json")]
         output: PathBuf,
     },
@@ -85,15 +95,27 @@ enum Cmd {
     Pubkey { keystore: PathBuf },
     /// Check balance via RPC
     Balance { address: String },
-    /// Build, sign, and broadcast a transaction
+    /// Build, sign, and broadcast a transaction (asks for confirmation)
     Send {
         keystore: PathBuf,
         to:       String,
         amount:   String,
-        /// Fee in GNB. The default clears the consensus minimum fee
-        /// (max(0.0001 GNB, 0.00002 GNB/kB)) for transactions up to ~25 kB.
-        #[arg(long, default_value = "0.0005")]
+        /// Fee in GNB, or `auto`: the consensus minimum for the signed
+        /// transaction's actual size (max(0.0001 GNB, 0.00002 GNB/kB)). A
+        /// lower value is raised to that minimum.
+        #[arg(long, default_value = "auto")]
         fee:      String,
+        /// Explicit maximum fee in GNB, replacing the default guard
+        /// (0.02 GNB and 0.001 GNB/kB).
+        #[arg(long)]
+        max_fee:  Option<String>,
+        /// Broadcast without asking for confirmation.
+        #[arg(long)]
+        yes:      bool,
+        /// With --yes: allow inputs whose value the node could not prove
+        /// (carryover or pruned history).
+        #[arg(long)]
+        allow_unverified_inputs: bool,
     },
     /// Sign a message (domain-separated digest — see `verify-message`)
     Sign { keystore: PathBuf, message: String },
@@ -147,13 +169,23 @@ pub fn main() {
 
     match cli.cmd {
 
-        Cmd::New { output } => {
+        Cmd::New { output, random_key } => {
             println!("  {}Generating hybrid ML-DSA-65 + Falcon-1024 keypair...{}", MUTED, RESET);
             println!("  {}(post-quantum key generation may take a moment){}",
                 DIM, RESET);
             println!();
 
-            let kp = crate::wallet::generate_keypair(cli.testnet);
+            let network = cli_network(cli.testnet);
+            let kp = if random_key {
+                crate::wallet::generate_keypair(cli.testnet)
+            } else {
+                // WAL-7: phrase-backed by default; the words are a complete
+                // backup of the key (shown once, wiped on drop).
+                let (kp, phrase) = crate::wallet::generate_mnemonic_keypair(network)
+                    .unwrap_or_else(|e| err(&format!("Key generation failed: {e}")));
+                show_recovery_phrase(&phrase);
+                kp
+            };
 
             println!("  {} {}", amber("address"), bold(&kp.address));
             println!();
@@ -174,6 +206,24 @@ pub fn main() {
                     println!("  {}Keep your password safe — it cannot be recovered.{}",
                         MUTED, RESET);
                 }
+                Err(e) => err(&format!("Save failed: {}", e)),
+            }
+        }
+
+        Cmd::Restore { output } => {
+            let network = cli_network(cli.testnet);
+            let phrase = prompt_password(&format!("  {}recovery phrase (24 words):{} ", MUTED, RESET));
+            let kp = crate::wallet::keypair_from_mnemonic(&phrase, network)
+                .unwrap_or_else(|e| err(&format!("Restore failed: {e}")));
+            drop(phrase);
+            println!("  {} {}", amber("address"), bold(&kp.address));
+            label("network", if cli.testnet { "testnet" } else { "mainnet" });
+            println!();
+            let pw = prompt_new_password();
+            let saved = kp.save_encrypted(&output, &pw);
+            drop(pw);
+            match saved {
+                Ok(()) => ok(&format!("Keystore saved: {}", amber(&output.display().to_string()))),
                 Err(e) => err(&format!("Save failed: {}", e)),
             }
         }
@@ -215,83 +265,52 @@ pub fn main() {
             }
         }
 
-        Cmd::Send { keystore, to, amount, fee } => {
+        Cmd::Send { keystore, to, amount, fee, max_fee, yes, allow_unverified_inputs } => {
             let kp          = load_kp(&keystore);
             let amount_sats = checked_cli_satoshis(&amount, false).unwrap_or_else(|message| err(message));
-            let fee_sats = checked_cli_satoshis(&fee, true).unwrap_or_else(|message| err(message));
-            let total_needed = amount_sats.checked_add(fee_sats)
-                .unwrap_or_else(|| err("amount plus fee exceeds u64"));
-            let to_hex = checked_destination(&to, &kp.address).unwrap_or_else(|message| err(&message));
+            let fee_choice  = crate::wallet::send::parse_fee_arg(&fee).unwrap_or_else(|message| err(message));
+            let fee_policy  = crate::wallet::send::parse_max_fee_arg(max_fee.as_deref())
+                .unwrap_or_else(|message| err(message));
+            checked_destination(&to, &kp.address).unwrap_or_else(|message| err(&message));
+            let to_addr = crate::address::Address::parse(&to).unwrap_or_else(|_| err("invalid destination address"));
 
+            // 1-4: fetch UTXOs, select, verify claimed values against their
+            // transactions (WAL-1), build and sign under the fee guard.
+            print!("  {}fetching UTXOs and previous transactions...{}\r", MUTED, RESET);
+            let endpoint = cli.rpc.clone();
+            let rpc = move |method: &str, params: &serde_json::Value| rpc_result(&endpoint, method, params.clone());
+            let request = crate::wallet::send::SendRequest {
+                keypair: &kp,
+                to: &to_addr,
+                amount: amount_sats,
+                fee: fee_choice,
+                fee_policy,
+                // Non-interactive sends refuse unprovable inputs unless asked.
+                require_verified_inputs: yes && !allow_unverified_inputs,
+                utxo_limit: 200,
+            };
+            let prepared = crate::wallet::send::prepare_send(&rpc, &request)
+                .unwrap_or_else(|e| err(&format!("Build failed: {e}")));
+
+            // 5. Show what will be signed — the ACTUAL fee — and confirm (WAL-7).
             println!("  {}transaction preview{}", BOLD, RESET);
             println!();
-            label("from",   &kp.address);
-            label("to",     &to);
-            label("amount", &format!("{} BLOCH  {}({} sats){}",
-                amount, MUTED, amount_sats, RESET));
-            label("fee",    &format!("{} GNB", fee));
+            for (k, v) in prepared.summary(&kp.address, &to) {
+                if k == "warning" { label(&k, &red(&v)) } else { label(&k, &v) }
+            }
             println!();
-
-            // 1. Fetch UTXOs via getutxos (returns full UTXO list for coin selection)
-            print!("  {}fetching UTXOs...{}\r", MUTED, RESET);
-            let resp = rpc_call(&cli.rpc, "getutxos",
-                serde_json::json!([kp.address]));
-
-            if let Some(e) = resp.get("error") {
-                if !e.is_null() {
-                    err(&format!("RPC error: {}", e));
-                }
+            if !yes && !crate::wallet::send::confirm("  Broadcast this transaction?") {
+                err("Not broadcast.");
             }
-
-            let avail = crate::wallet::sat_u64(&resp["satoshis"]).unwrap_or(0);
-            let utxo_count = resp["utxo_count"].as_u64().unwrap_or(0);
-            if avail < total_needed {
-                err(&format!("Insufficient funds: have {:.8} GNB ({} UTXOs), need {:.8} GNB",
-                    avail as f64 / 1e8, utxo_count,
-                    total_needed as f64 / 1e8));
-            }
-
-            // 2. Parse UTXOs from getutxos response
-            let available_utxos = parse_send_utxos(&resp)
-                .unwrap_or_else(|message| err(message));
-
-            if available_utxos.is_empty() {
-                err("No UTXOs returned by node — cannot build transaction");
-            }
-
-            ok(&format!("{} UTXOs available ({:.8} GNB)",
-                available_utxos.len(), avail as f64 / 1e8));
-
-
-            let tx = match crate::wallet::TxBuilder::build(&kp, &available_utxos, &to_hex, amount_sats, fee_sats) {
-                Ok(t)  => t,
-                Err(e) => { err(&format!("Build failed: {}", e)) }
-            };
-
-            let txid = tx.txid();
-            ok(&format!("Transaction built — txid: {}", amber(&hex::encode(txid))));
-            label("inputs",  &format!("{}", tx.inputs.len()));
-            label("outputs", &format!("{}", tx.outputs.len()));
-            label("sig size",&format!("{} bytes", tx.inputs[0].script_sig.len()));
-            println!();
-
-            // 5. Serialize and broadcast via sendrawtransaction
-            // Sprint 1.d: Bitcoin-format wire (replaces bincode).
-            // include_script_sig=true — the signature bytes must travel
-            // with the tx so the node can verify.
-            let raw = tx.to_wire_bytes(true);
 
             print!("  {}broadcasting via sendrawtransaction...{}\r", MUTED, RESET);
-            let resp2 = rpc_call(&cli.rpc, "sendrawtransaction",
-                serde_json::json!([hex::encode(&raw)]));
-
-            match resp2.get("error") {
-                Some(e) if !e.is_null() => err(&format!("Broadcast failed: {}", e)),
-                _ => {
+            match crate::wallet::send::broadcast(&rpc, &prepared) {
+                Ok(txid) => {
                     ok("Broadcast accepted by node");
                     println!();
-                    println!("  {} {}", amber("txid"), bold(&hex::encode(txid)));
+                    println!("  {} {}", amber("txid"), bold(&txid));
                 }
+                Err(e) => err(&format!("Broadcast failed: {e}")),
             }
         }
 
@@ -431,7 +450,8 @@ pub fn main() {
             };
             // Same domain-separated digest `sign` uses — never hex-decode
             // `message` either; verification must mirror signing exactly.
-            if verify_message_with_policy(&pk, message.as_bytes(), &sig, canonical) {
+            // CRY-8: a v2 signature must name this network's chain id.
+            if verify_message_on_network(cli_network(cli.testnet), &pk, message.as_bytes(), &sig, canonical) {
                 ok("signature verifies for this message and public key");
             } else {
                 err("signature does NOT verify for this message and public key");
@@ -455,6 +475,9 @@ fn verify_bundle_with_policy(
     }
 }
 
+/// Network-agnostic policy view (any GnB chain or v1); the command itself
+/// uses [`verify_message_on_network`].
+#[cfg(test)]
 fn verify_message_with_policy(
     public_key: &[u8],
     message: &[u8],
@@ -466,6 +489,42 @@ fn verify_message_with_policy(
     } else {
         crate::wallet::Keypair::verify_message(public_key, message, signature)
     }
+}
+
+fn verify_message_on_network(
+    network: crate::address::Network,
+    public_key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+    canonical: bool,
+) -> bool {
+    if canonical {
+        crate::wallet::Keypair::verify_message_canonical_on(network, public_key, message, signature)
+    } else {
+        crate::wallet::Keypair::verify_message_on(network, public_key, message, signature)
+    }
+}
+
+fn cli_network(testnet: bool) -> crate::address::Network {
+    if testnet { crate::address::Network::Testnet } else { crate::address::Network::Mainnet }
+}
+
+/// Show a new recovery phrase once, numbered, and require an explicit
+/// acknowledgement before the key is used.
+fn show_recovery_phrase(phrase: &crate::wallet::SeedPhrase) {
+    println!("  {}RECOVERY PHRASE — write these 24 words down, offline:{}", BOLD, RESET);
+    println!();
+    for (row, chunk) in phrase.words().chunks(4).enumerate() {
+        let line: Vec<String> = chunk.iter().enumerate()
+            .map(|(j, w)| format!("{:2}. {:<10}", row * 4 + j + 1, w)).collect();
+        println!("  {}", line.join(" "));
+    }
+    println!();
+    println!("  {}Anyone with these words controls the funds. They are not stored.{}", MUTED, RESET);
+    if !crate::wallet::send::confirm("  I have written the 24 words down") {
+        err("Aborted: no keystore was written.");
+    }
+    println!();
 }
 
 fn load_and_verify_bundle(
@@ -552,9 +611,23 @@ fn prompt_new_password() -> zeroize::Zeroizing<String> {
 }
 
 fn rpc_call(endpoint: &str, method: &str, params: serde_json::Value) -> serde_json::Value {
-    let authority = endpoint.strip_prefix("http://").unwrap_or(endpoint).trim_end_matches('/');
+    rpc_result(endpoint, method, params).unwrap_or_else(|error| serde_json::json!({"error":error}))
+}
+
+/// The plaintext client cannot speak TLS: refuse `https://` instead of
+/// silently downgrading it (WAL-7). Remote nodes are reached through an
+/// SSH tunnel to a loopback port.
+fn rpc_authority(endpoint: &str) -> Result<&str, String> {
+    if endpoint.starts_with("https://") {
+        return Err("https:// RPC endpoints are not supported by this client; use an SSH tunnel \
+                    (ssh -L 17210:127.0.0.1:17210 host) and --rpc http://127.0.0.1:17210".into());
+    }
+    Ok(endpoint.strip_prefix("http://").unwrap_or(endpoint).trim_end_matches('/'))
+}
+
+fn rpc_result(endpoint: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let authority = rpc_authority(endpoint)?;
     crate::wallet::http_rpc::call(authority, method, &params, None)
-        .unwrap_or_else(|error| serde_json::json!({"error":error}))
 }
 
 // Parse once from the original CLI token: no float may choose the spend amount.
@@ -571,19 +644,12 @@ fn checked_destination(destination: &str, source: &str) -> Result<String, String
     Ok(hex::encode(destination.hash()))
 }
 
-fn parse_send_utxos(response: &serde_json::Value) -> Result<Vec<(Vec<u8>, u32, crate::core::TxOutput)>, &'static str> {
-    let rows = response["utxos"].as_array().ok_or("RPC response missing UTXO array")?;
-    rows.iter().map(|row| {
-        let txid = hex::decode(row["txid"].as_str().ok_or("UTXO missing transaction ID")?)
-            .map_err(|_| "invalid UTXO transaction ID hex")?;
-        if txid.len() != 32 { return Err("UTXO transaction ID must contain 32 bytes"); }
-        let index = row["index"].as_u64().and_then(|value| u32::try_from(value).ok())
-            .ok_or("UTXO index must fit u32")?;
-        let value = crate::wallet::sat_u64(&row["value"]).ok_or("invalid UTXO value")?;
-        let script_pubkey = hex::decode(row["script_pubkey"].as_str().ok_or("UTXO missing script")?)
-            .map_err(|_| "invalid UTXO script hex")?;
-        Ok((txid, index, crate::core::TxOutput { value, script_pubkey }))
-    }).collect()
+/// Test view of the production UTXO-row parser (`send::parse_utxo_rows`,
+/// which `Send` uses): malformed rows are refused, never filtered.
+#[cfg(test)]
+fn parse_send_utxos(response: &serde_json::Value) -> Result<Vec<(Vec<u8>, u32, crate::core::TxOutput)>, String> {
+    Ok(crate::wallet::send::parse_utxo_rows(response)?
+        .into_iter().map(|u| (u.txid.to_vec(), u.index, u.output)).collect())
 }
 
 #[cfg(test)]
@@ -921,5 +987,54 @@ mod audit_cli_input_tests {
             !verify_message_with_policy(raw_pk, message, raw_sig, true),
             "canonical product policy must reject legacy raw records"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_2026_10_cli_tests {
+    use super::*;
+
+    /// WAL-7: an https endpoint is refused instead of silently downgraded.
+    #[test]
+    fn https_endpoints_are_refused_not_downgraded() {
+        assert!(rpc_authority("https://node.example:17210").is_err());
+        assert_eq!(rpc_authority("http://127.0.0.1:17210/").unwrap(), "127.0.0.1:17210");
+        assert!(rpc_call("https://node.example", "getblockcount", serde_json::json!([]))["error"].is_string());
+    }
+
+    /// WAL-1/WAL-6/WAL-7: send defaults to the size-aware fee and asks for
+    /// confirmation; the guard and confirmation are overridable only explicitly.
+    #[test]
+    fn send_flags_default_to_auto_fee_guard_and_confirmation() {
+        let cli = Cli::try_parse_from(["gnb-wallet", "send", "w.json", "to", "1"]).unwrap();
+        match cli.cmd {
+            Cmd::Send { fee, max_fee, yes, allow_unverified_inputs, .. } => {
+                assert_eq!(fee, "auto");
+                assert!(max_fee.is_none() && !yes && !allow_unverified_inputs);
+            }
+            _ => panic!("expected send"),
+        }
+        let cli = Cli::try_parse_from(["gnb-wallet", "send", "w.json", "to", "1", "--max-fee", "0.5",
+            "--yes", "--allow-unverified-inputs"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Send { yes: true, allow_unverified_inputs: true, .. }));
+    }
+
+    /// WAL-7: `new` is phrase-backed unless --random-key is given.
+    #[test]
+    fn new_is_phrase_backed_by_default() {
+        let cli = Cli::try_parse_from(["gnb-wallet", "new"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::New { random_key: false, .. }));
+        let cli = Cli::try_parse_from(["gnb-wallet", "--testnet", "restore"]).unwrap();
+        assert!(cli.testnet && matches!(cli.cmd, Cmd::Restore { .. }));
+    }
+
+    /// CRY-8: the CLI verifier is chain-bound for v2 signatures.
+    #[test]
+    fn verify_message_is_network_bound() {
+        let kp = crate::wallet::generate_keypair(true);
+        let sig = kp.sign_message(b"cli").unwrap();
+        assert!(verify_message_on_network(cli_network(true), &kp.public_key, b"cli", &sig, false));
+        assert!(!verify_message_on_network(cli_network(false), &kp.public_key, b"cli", &sig, false));
+        assert!(verify_message_on_network(cli_network(true), &kp.public_key, b"cli", &sig, true));
     }
 }

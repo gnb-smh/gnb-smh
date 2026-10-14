@@ -184,8 +184,17 @@ struct Cli {
 /// address parser (`Address::parse`: prefix, hex, length, AND checksum, none
 /// of which does any raw indexing) and fails closed — every caller below
 /// exits loudly instead of constructing a block that pays a burned address.
+///
+/// CRY-7: the address checksum does not cover the gnb1q/gnb1t prefix, so the
+/// network is compared explicitly against the node's chain (set from
+/// `--testnet` before any caller runs): a testnet address on a mainnet node
+/// (or the reverse) is refused instead of silently paying the same hash.
 fn address_to_script_pubkey(addr: &str) -> Result<Vec<u8>, address::AddressError> {
-    Ok(address::Address::parse(addr)?.hash().to_vec())
+    let network = match core::node_chain_id() {
+        core::ChainId::Testnet => address::Network::Testnet,
+        core::ChainId::Mainnet => address::Network::Mainnet,
+    };
+    Ok(address::Address::parse_for_network(addr, network)?.hash().to_vec())
 }
 
 #[cfg(test)]
@@ -231,6 +240,20 @@ mod address_to_script_pubkey_tests {
         // return a clean Err instead.
         assert!(address_to_script_pubkey("gnb1q").is_err());
     }
+
+    /// CRY-7 regression: an address of the other network (valid checksum,
+    /// same 20-byte hash) is rejected. Unit tests run with the default
+    /// (mainnet) node chain id.
+    #[test]
+    fn address_of_the_wrong_network_is_rejected() {
+        assert_eq!(core::node_chain_id(), core::ChainId::Mainnet);
+        let testnet = address::Address::from_hash([7u8; 20], address::Network::Testnet).to_string();
+        assert!(matches!(
+            address_to_script_pubkey(&testnet),
+            Err(address::AddressError::WrongNetwork { .. })
+        ));
+        assert_eq!(address_to_script_pubkey(&sample_address()).unwrap(), vec![7u8; 20]);
+    }
 }
 
 // Floor the worker count at 4. The default is the core count, and the
@@ -270,19 +293,30 @@ async fn main() {
     let api_key: Option<String> = match (&cli.rpc_api_key, &cli.rpc_api_key_file) {
         (Some(k), _) => Some(k.trim().to_string()),
         (None, Some(path)) => {
+            // NET-16: an operator who names a key file wants authentication.
+            // A missing, unreadable, empty or over-permissive file is a fatal
+            // configuration error (it used to fall back to NO key, i.e. auth
+            // silently disabled).
+            match rpc::auth::check_key_file_permissions(std::path::Path::new(path)) {
+                Ok(None) => {}
+                Ok(Some(warning)) => eprintln!("⚠  {warning}"),
+                Err(refusal) => {
+                    eprintln!("❌ {refusal}");
+                    std::process::exit(2);
+                }
+            }
             match std::fs::read_to_string(path) {
                 Ok(contents) => {
                     let k = contents.lines().next().unwrap_or("").trim().to_string();
                     if k.is_empty() {
-                        eprintln!("⚠  --rpc-api-key-file {:?} is empty; ignoring.", path);
-                        None
-                    } else {
-                        Some(k)
+                        eprintln!("❌ --rpc-api-key-file {:?} is empty", path);
+                        std::process::exit(2);
                     }
+                    Some(k)
                 }
                 Err(e) => {
-                    eprintln!("⚠  failed to read --rpc-api-key-file {:?}: {}", path, e);
-                    None
+                    eprintln!("❌ failed to read --rpc-api-key-file {:?}: {}", path, e);
+                    std::process::exit(2);
                 }
             }
         }
@@ -1702,33 +1736,48 @@ async fn main() {
         }
     });
 
-    tokio::select! {
-        _ = crate::metrics::start_metrics_server(
-                metrics_config,
-                metrics_state.clone(),
-            ) => { error!("metrics exited"); }
-        _ = rpc::start_rpc_server(
-                rpc::RpcConfig {
-                    bind_address:              rpc_bind,
-                    port:                      cli.rpc_port,
-                    api_key,
-                    require_auth_for_writes:   cli.rpc_require_auth_for_writes,
-                    rate_limit_reads_per_min:  cli.rpc_rate_limit_reads,
-                    rate_limit_writes_per_min: cli.rpc_rate_limit_writes,
-                    trust_private_ranges:      cli.rpc_trust_private_ranges,
-                    allowed_origins:           cli.rpc_allow_origins.clone(),
-                    allowed_hosts:             cli.rpc_allow_hosts.clone(),
-                    trust_loopback:            cli.rpc_trust_loopback,
-                },
-                node_state.clone(), store.clone(), mempool.clone(), dag.clone(), outbound_tx.clone(),
-                // B5f pool seam: submitblock hook (see rpc::SubmitBlockFn).
-                Some(rpc_submit_block.clone()),
-            ) => { error!("RPC exited"); }
-        // Sprint EE (S3): `None` = no listen-addr report; production behavior
-        // is byte-identical to before the harness affordance was added.
-        _ = node.run_validated(block_tx, validation_rx, outbound_rx, dag.clone(), peer_state.clone(), store.clone(), None) => {
-            error!("Network exited");
+    // NET-14: validate the auxiliary servers' addresses before starting
+    // them (a bad address is a configuration error, reported clearly), then
+    // run them as independent tasks. A server that fails later (bind error,
+    // runtime error) logs and stops ITSELF; only the network loop's exit
+    // ends the node. Previously both sat in the top-level `select!`, so any
+    // RPC/metrics failure (e.g. `--metrics-addr ::1`) stopped the node.
+    if let Err(e) = rpc::resolve_bind_address(&rpc_bind, cli.rpc_port) {
+        eprintln!("❌ invalid RPC address (--rpc-bind/--rpc-port): {e}");
+        std::process::exit(2);
+    }
+    if metrics_config.enabled {
+        if let Err(e) = rpc::resolve_bind_address(&metrics_config.bind_address, metrics_config.port) {
+            eprintln!("❌ invalid metrics address (--metrics-addr/--metrics-port): {e}");
+            std::process::exit(2);
         }
+    }
+    tokio::spawn(crate::metrics::start_metrics_server(
+        metrics_config,
+        metrics_state.clone(),
+    ));
+    tokio::spawn(rpc::start_rpc_server(
+        rpc::RpcConfig {
+            bind_address:              rpc_bind,
+            port:                      cli.rpc_port,
+            api_key,
+            require_auth_for_writes:   cli.rpc_require_auth_for_writes,
+            rate_limit_reads_per_min:  cli.rpc_rate_limit_reads,
+            rate_limit_writes_per_min: cli.rpc_rate_limit_writes,
+            trust_private_ranges:      cli.rpc_trust_private_ranges,
+            allowed_origins:           cli.rpc_allow_origins.clone(),
+            allowed_hosts:             cli.rpc_allow_hosts.clone(),
+            trust_loopback:            cli.rpc_trust_loopback,
+        },
+        node_state.clone(), store.clone(), mempool.clone(), dag.clone(), outbound_tx.clone(),
+        // B5f pool seam: submitblock hook (see rpc::SubmitBlockFn).
+        Some(rpc_submit_block.clone()),
+    ));
+    // Sprint EE (S3): `None` = no listen-addr report; production behavior
+    // is byte-identical to before the harness affordance was added.
+    match node.run_validated(block_tx, validation_rx, outbound_rx, dag.clone(), peer_state.clone(), store.clone(), None).await {
+        Ok(_) => error!("Network exited"),
+        Err(e) => error!("Network exited: {:?}", e),
     }
 }
 
