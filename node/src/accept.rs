@@ -269,9 +269,9 @@ pub fn update_mempool_after_connect(
         info!("mempool: removed {} tx(s) conflicting with the connected block(s)", swept.len());
     }
     if !outcome.disconnected.is_empty() {
-        let candidates: Vec<core::Transaction> = outcome.disconnected.iter()
-            .flat_map(|b| b.transactions.iter().filter(|t| !t.is_coinbase()).cloned())
-            .collect();
+        // Oldest disconnected block first: a child confirmed after its parent
+        // is re-admitted after it, as an in-pool chain (MEM-6).
+        let candidates: Vec<core::Transaction> = outcome.disconnected_txs_oldest_first();
         let (re, dropped) = reorg::reinject_disconnected(store, mempool, candidates, next_height);
         let stale = revalidate_mempool(store, mempool, next_height);
         info!("reorg: mempool reinjected={} discarded={} invalidated={}", re, dropped, stale);

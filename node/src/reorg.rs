@@ -881,6 +881,21 @@ pub struct ConnectOutcome {
     pub connected: Vec<Block>,
 }
 
+impl ConnectOutcome {
+    /// The non-coinbase transactions of the disconnected blocks in the order
+    /// they must be re-admitted to the mempool: OLDEST disconnected block
+    /// first, block order inside each block (Bitcoin Core's
+    /// `DisconnectedBlockTransactions`). A child confirmed one block after its
+    /// parent therefore comes back after the parent, as an in-pool chain
+    /// (MEM-6); `disconnected` itself is tip-first, and re-admitting in that
+    /// order refused the child with "missing inputs" and lost it.
+    pub fn disconnected_txs_oldest_first(&self) -> Vec<Transaction> {
+        self.disconnected.iter().rev()
+            .flat_map(|b| b.transactions.iter().filter(|t| !t.is_coinbase()).cloned())
+            .collect()
+    }
+}
+
 /// Hooks the caller plugs into [`connect_plan`].
 pub struct ConnectHooks<'h> {
     /// Validate one block against the staged view of ITS OWN selected-chain
@@ -968,8 +983,11 @@ pub fn connect_plan(
 ///    captures fresh UndoData so the new chain is also reorg-capable.
 /// 3. **Reinject** candidate txs into the mempool through the shared
 ///    admission function (`reinject_disconnected`, audit MEM-7): UTXO
-///    presence, maturity and minimum fees at the new tip. Rejected ones are
-///    counted as discarded.
+///    presence, maturity and minimum fees at the new tip. Candidates are
+///    re-admitted OLDEST disconnected block first, in block order
+///    ([`ConnectOutcome::disconnected_txs_oldest_first`]), so a parent is
+///    back in the pool before a child confirmed in a later block. Rejected
+///    ones are counted as discarded.
 ///
 /// Fork blocks are re-validated with the audit-H1 UTXO-state rules
 /// (`validate_fork_block_state`). The acceptance pipeline does not call this
@@ -1045,10 +1063,9 @@ fn execute_reorg_inner(
     let outcome = connect_plan(store, plan, &hooks).map_err(|e| e.to_string())?;
 
     // Phase 3: re-admit the disconnected blocks' transactions through the
-    // shared admission function, evaluated at the new tip (MEM-7).
-    let candidates: Vec<Transaction> = outcome.disconnected.iter()
-        .flat_map(|b| b.transactions.iter().filter(|t| !t.is_coinbase()).cloned())
-        .collect();
+    // shared admission function, evaluated at the new tip (MEM-7), oldest
+    // disconnected block first so parents precede their children (MEM-6).
+    let candidates: Vec<Transaction> = outcome.disconnected_txs_oldest_first();
     let next_height = outcome.connected.last().map(|b| b.height.saturating_add(1)).unwrap_or(0);
     let (txs_reinjected, txs_discarded) =
         reinject_disconnected(store, mempool, candidates, next_height);

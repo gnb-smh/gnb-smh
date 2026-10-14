@@ -518,6 +518,62 @@ fn mem6_reorg_relinks_child_and_template_mines_parent_first() {
     assert_eq!(n.store.chain_totals().unwrap().blocks, 3, "f1, f2 and the template block");
 }
 
+/// Review finding (reorg re-injection order): a reorg that disconnects TWO
+/// blocks — the parent `tx1` confirmed in m1 and its child `p` confirmed in
+/// m2 — re-admits both, parent first, as an in-pool chain; the next template
+/// mines them in that order. Pre-fix the disconnected blocks were re-admitted
+/// tip-first: `p` came first, failed with "missing inputs" (tx1 was neither
+/// in the UTXO set nor pooled yet) and was lost.
+#[test]
+fn mem6_reorg_reinjects_a_cross_block_chain_parents_first() {
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0x8Du8; 32], 0u32, out(5_000_000, &k.spk));
+    let n = node_with(&genesis, std::slice::from_ref(&fund));
+    let tx1 = signed_spend(&k, &[(fund.0, 0)], vec![out(4_900_000, &k.spk)]);
+    let m1 = mk_block(&n, vec![gh], vec![coinbase("m1", core::tokenomics::block_subsidy_sat(1) + 100_000, vec![0xA1; 20]), tx1.clone()]);
+    accept(&n, &m1).unwrap();
+    let p = signed_spend(&k, &[(tx1.txid(), 0)], vec![out(4_800_000, &[0x32; 20])]);
+    let m2 = mk_block(&n, vec![m1.block_hash()], vec![coinbase("m2", core::tokenomics::block_subsidy_sat(2) + 100_000, vec![0xA2; 20]), p.clone()]);
+    accept(&n, &m2).unwrap();
+    assert_eq!(sel_tip(&n), Some(m2.block_hash()));
+    assert_eq!(n.mempool.size(), 0);
+
+    // A heavier fork from genesis that carries neither transaction.
+    let f1 = empty_child(&n, gh, "f1");
+    accept(&n, &f1).unwrap();
+    let f2 = empty_child(&n, f1.block_hash(), "f2");
+    accept(&n, &f2).unwrap();
+    let f3 = empty_child(&n, f2.block_hash(), "f3");
+    accept(&n, &f3).unwrap();
+    assert_eq!(sel_tip(&n), Some(f3.block_hash()), "the fork won: m2 and m1 were disconnected");
+
+    assert!(n.mempool.contains(&tx1.txid()), "the parent is back in the pool");
+    assert!(n.mempool.contains(&p.txid()), "the child confirmed one block later is back too");
+    assert_eq!(n.mempool.ancestors_of(&p.txid()).into_iter().collect::<Vec<_>>(), vec![tx1.txid()]);
+    n.mempool.debug_check_invariants().unwrap();
+    let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
+    let ids: Vec<_> = tmpl.transactions.iter().map(|(t, _)| t.txid()).collect();
+    assert_eq!(ids, vec![tx1.txid(), p.txid()], "parent before child");
+}
+
+/// The re-injection order itself: oldest disconnected block first, block
+/// order inside each block, coinbases skipped.
+#[test]
+fn mem6_disconnected_txs_are_ordered_oldest_block_first() {
+    let mk = |tag: &str, txs: Vec<Transaction>| Block {
+        header: BlockHeader { version: 1, parents: vec![[0; 32]], merkle_root: MerkleRoot::ZERO, timestamp: 0, bits: 0, nonce: 0 },
+        transactions: std::iter::once(coinbase(tag, 1, vec![1; 20])).chain(txs).collect(),
+        blue_score: 0, height: 0, shielded_transactions: vec![],
+    };
+    let (a, b, c, d) = (syn(&[(ext(1), 0)], &[9], 1, 4), syn(&[(ext(2), 0)], &[9], 2, 4), syn(&[(ext(3), 0)], &[9], 3, 4), syn(&[(ext(4), 0)], &[9], 4, 4));
+    // `disconnected` is tip-first: [B2 (c, d), B1 (a, b)].
+    let outcome = reorg::ConnectOutcome { disconnected: vec![mk("b2", vec![c.clone(), d.clone()]), mk("b1", vec![a.clone(), b.clone()])], connected: vec![] };
+    let ids: Vec<_> = outcome.disconnected_txs_oldest_first().iter().map(|t| t.txid()).collect();
+    assert_eq!(ids, vec![a.txid(), b.txid(), c.txid(), d.txid()]);
+}
+
 /// Eviction by DESCENDANT score: a low-fee parent whose child pays a lot is
 /// protected (CPFP); the cheapest independent transaction is evicted. With
 /// own-rate eviction the parent went first and orphaned its child in the pool.
