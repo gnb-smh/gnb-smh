@@ -8,24 +8,34 @@
 //! ```
 //!
 //! Requests: `{"op": ...}` with
-//! - `open {json, password}`      unlock a keystore (v3/v2, `bloch1q…` accepted for v2; then v1)
-//! - `create {mnemonic?}`         new mainnet key from the WASI CSPRNG (browser crypto).
-//!                                 By default (`mnemonic` absent or true) the key is
-//!                                 derived from a fresh 24-word phrase, returned ONCE as
-//!                                 `words` for the user to write down (WAL-7);
-//!                                 `mnemonic: false` makes a random key with no phrase.
-//! - `restore {words}`            unlock the key of a 24-word phrase
-//! - `export {password}`          encrypted keystore v3 JSON of the unlocked key
-//! - `plan {utxos, to, amount, fee}`  outpoints a payment would spend, so the page can
-//!                                 fetch their creating transactions (WAL-1)
-//! - `pay {utxos, to, amount, fee, prevtxs?, max_fee?, require_verified?}`
-//!                                 build and sign a payment (amounts in base units).
-//!                                 `prevtxs` maps txid → raw transaction hex; each is
-//!                                 hashed against its txid and the claimed UTXO values
-//!                                 are checked against it before anything is signed.
-//!                                 The response reports the ACTUAL fee, dust added to
-//!                                 the fee, change and verified/unverified inputs.
-//! - `address {}` · `wipe {}` · `normalize {address}` · `minfee {size}`
+//!
+//! ```text
+//! open {json, password}       unlock a keystore (v3/v2, `bloch1q…` accepted for v2; then v1)
+//! create {mnemonic?}          new mainnet key from the WASI CSPRNG (browser crypto).
+//!                             By default (`mnemonic` absent or true) the key is
+//!                             derived from a fresh 24-word phrase, returned ONCE as
+//!                             `words` for the user to write down (WAL-7);
+//!                             `mnemonic: false` makes a random key with no phrase.
+//! restore {words}             unlock the key of a 24-word phrase
+//! export {password}           encrypted keystore v3 JSON of the unlocked key
+//! plan {utxos, to, amount, fee, next_height}
+//!                             the transaction `version` a payment targeting block
+//!                             `next_height` (the node's getdaginfo tip_height + 1)
+//!                             gets, and, for version 1 only, the txids whose creating
+//!                             transactions the page should fetch (WAL-1). A version-3
+//!                             signature commits to every spent value and script, so
+//!                             `prev_txids` is empty from the hardening activation on.
+//! pay {utxos, to, amount, fee, next_height, prevtxs?, max_fee?, require_verified?}
+//!                             build and sign a payment (amounts in base units) as
+//!                             version 3 / sighash v3 at/after the activation, version
+//!                             1 / sighash v2 below it. `prevtxs` maps txid -> raw
+//!                             transaction hex; each is hashed against its txid and
+//!                             the claimed UTXO values are checked against it before
+//!                             anything is signed. The response reports the ACTUAL
+//!                             fee, dust added to the fee, change, verified/unverified
+//!                             inputs, `version` and `amounts_committed`.
+//! address {} · wipe {} · normalize {address} · minfee {size}
+//! ```
 //!
 //! The secret key never crosses the boundary: responses carry addresses,
 //! public keys, signed transactions, encrypted keystores and — only from
@@ -33,7 +43,8 @@
 //! loader (`core.js`) and the password copies made here are wiped on drop.
 
 use gnb_crypto::address::{Address, Network};
-use gnb_crypto::core::{tokenomics, TxOutput};
+use gnb_crypto::core::{tokenomics, ChainId, TxOutput};
+use gnb_crypto::wallet::payment::amounts_committed_at;
 use gnb_crypto::wallet::{
     generate_keypair, generate_mnemonic_keypair, keypair_from_mnemonic, FeeChoice, FeePolicy,
     Keypair, PaymentOptions, PrevTxs, TxBuilder, Utxo, Wallet,
@@ -136,17 +147,25 @@ pub fn handle(req: &Value) -> Result<Value, String> {
             let utxos = parse_utxos(req.get("utxos").ok_or("missing `utxos`")?)?;
             let amount = parse_amount(req, "amount")?;
             let fee = FeeChoice::AtLeast(parse_amount(req, "fee")?);
+            let next_height = parse_height(req)?;
             with_session(|kp| {
+                let chain = ChainId::for_network(kp.network()?);
+                let opts = PaymentOptions { next_block_height: Some(next_height), ..PaymentOptions::default() };
+                let version = opts.tx_version(chain)?;
+                if amounts_committed_at(next_height, chain) {
+                    return Ok(json!({ "prev_txids": [], "version": version }));
+                }
                 let outpoints = TxBuilder::plan_inputs(kp, &utxos, amount, fee)?;
                 let mut txids: Vec<String> = outpoints.iter().map(|(t, _)| hex::encode(t)).collect();
                 txids.dedup();
-                Ok(json!({ "prev_txids": txids }))
+                Ok(json!({ "prev_txids": txids, "version": version }))
             })
         }
         "pay" => {
             let utxos = parse_utxos(req.get("utxos").ok_or("missing `utxos`")?)?;
             let amount = parse_amount(req, "amount")?;
             let fee = parse_amount(req, "fee")?;
+            let next_height = parse_height(req)?;
             let to = s(req, "to")?;
             let mut prevs = PrevTxs::new();
             if let Some(map) = req.get("prevtxs").and_then(Value::as_object) {
@@ -163,6 +182,7 @@ pub fn handle(req: &Value) -> Result<Value, String> {
                 fee_policy,
                 prev_txs: Some(&prevs),
                 require_verified_inputs: req.get("require_verified").and_then(Value::as_bool).unwrap_or(false),
+                next_block_height: Some(next_height),
                 ..PaymentOptions::default()
             };
             with_session(|kp| pay(kp, &utxos, to, amount, &opts))
@@ -190,6 +210,17 @@ fn parse_amount(req: &Value, k: &str) -> Result<u64, String> {
     s(req, k)?.parse().map_err(|_| format!("invalid {k}"))
 }
 
+/// `next_height`: height of the block the payment targets (decimal string or
+/// JSON number). Required: it selects the transaction version, and a guess
+/// would sign a transaction the network rejects.
+fn parse_height(req: &Value) -> Result<u64, String> {
+    match req.get("next_height") {
+        Some(Value::String(v)) => v.trim().parse().map_err(|_| "invalid next_height".to_string()),
+        Some(Value::Number(n)) => n.as_u64().ok_or_else(|| "invalid next_height".to_string()),
+        _ => Err("missing `next_height` (the node's getdaginfo tip_height + 1)".into()),
+    }
+}
+
 fn pay(kp: &Keypair, utxos: &[Utxo], to: &str, amount: u64, opts: &PaymentOptions<'_>) -> Result<Value, String> {
     if amount == 0 {
         return Err("amount must be positive".into());
@@ -208,6 +239,8 @@ fn pay(kp: &Keypair, utxos: &[Utxo], to: &str, amount: u64, opts: &PaymentOption
         "inputs": paid.tx.inputs.len(), "amount": amount.to_string(),
         "change": paid.change.to_string(), "inputs_total": paid.inputs_total.to_string(),
         "verified_inputs": paid.verified_inputs, "unverified_inputs": paid.unverified_inputs,
+        // WAL-1 full fix: version 3 (sighash v3) commits every spent value.
+        "version": paid.tx.version, "amounts_committed": paid.amounts_committed,
     }))
 }
 
@@ -296,7 +329,14 @@ mod tests {
             {"txid": "22".repeat(32), "index": 1, "value": "200000000", "script_pubkey": hex::encode(&spk)},
         ]);
         let to = Address::from_hash([7u8; 20], Network::Mainnet).to_string();
-        let r = handle(&json!({"op": "pay", "utxos": utxos, "to": to, "amount": "300000000", "fee": "0"})).unwrap();
+        // Without the next block's height the core refuses to sign.
+        let err = handle(&json!({"op": "pay", "utxos": utxos, "to": to, "amount": "300000000", "fee": "0"})).unwrap_err();
+        assert!(err.contains("next_height"), "{err}");
+        // Mainnet, far below the activation height: version 1 / sighash v2.
+        let r = handle(&json!({"op": "pay", "utxos": utxos, "to": to, "amount": "300000000", "fee": "0",
+            "next_height": "11"})).unwrap();
+        assert_eq!(r["version"], 1);
+        assert_eq!(r["amounts_committed"], false);
         let size = r["size"].as_u64().unwrap() as usize;
         assert_eq!(r["inputs"], 2);
         let fee: u64 = r["fee"].as_str().unwrap().parse().unwrap();
@@ -327,19 +367,41 @@ mod tests {
         };
         let txid = hex::encode(prev.txid());
         let lied = json!([{"txid": txid, "index": 0, "value": "100050000", "script_pubkey": hex::encode(&spk)}]);
-        let plan = handle(&json!({"op": "plan", "utxos": lied, "to": to, "amount": "100000000", "fee": "0"})).unwrap();
+        let plan = handle(&json!({"op": "plan", "utxos": lied, "to": to, "amount": "100000000", "fee": "0",
+            "next_height": 11})).unwrap();
         assert_eq!(plan["prev_txids"], json!([txid]));
+        assert_eq!(plan["version"], 1);
         let prevtxs = json!({ txid.clone(): hex::encode(prev.to_wire_bytes(true)) });
         let err = handle(&json!({"op": "pay", "utxos": lied, "to": to, "amount": "100000000", "fee": "0",
-            "prevtxs": prevtxs})).unwrap_err();
+            "next_height": "11", "prevtxs": prevtxs})).unwrap_err();
         assert!(err.contains("refusing to sign"), "{err}");
         let honest = json!([{"txid": txid, "index": 0, "value": "10000000000", "script_pubkey": hex::encode(&spk)}]);
         let r = handle(&json!({"op": "pay", "utxos": honest, "to": to, "amount": "100000000", "fee": "0",
-            "prevtxs": prevtxs, "require_verified": true})).unwrap();
+            "next_height": "11", "prevtxs": prevtxs, "require_verified": true})).unwrap();
         assert_eq!(r["verified_inputs"], 1);
         // The maximum-fee guard cannot be bypassed through `fee`.
-        let err = handle(&json!({"op": "pay", "utxos": honest, "to": to, "amount": "1", "fee": "9900000000"})).unwrap_err();
+        let err = handle(&json!({"op": "pay", "utxos": honest, "to": to, "amount": "1", "fee": "9900000000",
+            "next_height": "11"})).unwrap_err();
         assert!(err.contains("guard"), "{err}");
+
+        // ── WAL-1 full fix: from the mainnet activation height, version 3 ──
+        let act = gnb_crypto::core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
+        let plan = handle(&json!({"op": "plan", "utxos": lied, "to": to, "amount": "100000000", "fee": "0",
+            "next_height": act.to_string()})).unwrap();
+        assert_eq!(plan["prev_txids"], json!([]), "nothing to fetch: the signature commits the values");
+        assert_eq!(plan["version"], 3);
+        let r = handle(&json!({"op": "pay", "utxos": lied, "to": to, "amount": "100000000", "fee": "0",
+            "next_height": act.to_string(), "require_verified": true})).unwrap();
+        assert_eq!(r["version"], 3);
+        assert_eq!(r["amounts_committed"], true);
+        assert_eq!(r["unverified_inputs"], 0);
+        let tx = Transaction::from_wire_bytes(&hex::decode(r["raw"].as_str().unwrap()).unwrap()).unwrap();
+        let claimed = TxOutput { value: 100_050_000, script_pubkey: spk.clone() };
+        let real = prev.outputs[0].clone();
+        let verify = |spent: &TxOutput| gnb_crypto::core::sighash::verify_tx_scripts(
+            &tx, std::slice::from_ref(spent), gnb_crypto::core::ChainId::Mainnet, act, act);
+        assert!(verify(&claimed).is_ok(), "valid for the value it was signed over");
+        assert!(verify(&real).is_err(), "the lie invalidates it against the real coin");
         handle(&json!({"op": "wipe"})).unwrap();
     }
 

@@ -335,43 +335,60 @@ impl Wallet {
         &self.keypair.public
     }
 
-    /// Sign a transaction in-place.
+    /// Sign a version-1/2 (sighash v2) transaction in-place.
     ///
     /// Each input gets a signature derived from the tx sighash. The wallet
     /// MUST own the UTXOs referenced by the inputs (i.e., their script_pubkey
     /// equals this wallet's address hash) — otherwise signing produces an
     /// invalid tx that the network will reject.
-    pub fn sign_tx(&self, mut tx: Transaction) -> Result<Transaction, WalletError> {
-        // Each input gets its own sighash. script_sig = signature || pubkey.
-        let pubkey = &self.keypair.public;
-        let mut signatures = Vec::with_capacity(tx.inputs.len());
+    ///
+    /// A version-3 transaction commits to the outputs it spends, which this
+    /// entry point does not have: it is refused; use
+    /// [`Self::sign_tx_with_prevouts`].
+    pub fn sign_tx(&self, tx: Transaction) -> Result<Transaction, WalletError> {
+        if tx.version == crate::core::sighash::TX_VERSION_V3 {
+            return Err(WalletError::Payment(
+                "a version-3 transaction commits to the outputs it spends; \
+                 sign it with sign_tx_with_prevouts".into(),
+            ));
+        }
+        // Sighash v2 does not read the spent outputs; any placeholders do.
+        let placeholders = vec![TxOutput { value: 0, script_pubkey: Vec::new() }; tx.inputs.len()];
+        self.sign_tx_with_prevouts(tx, &placeholders)
+    }
 
+    /// Sign every input of `tx`, which spends `prevouts` (one output per
+    /// input, in order: the value and `script_pubkey` each input spends), under
+    /// the digest the transaction's version selects (sighash v3 for version
+    /// 3, which commits to `prevouts`; v2 otherwise). Witnesses are canonical
+    /// and every signature is verified under this wallet's key before use.
+    pub fn sign_tx_with_prevouts(&self, mut tx: Transaction, prevouts: &[TxOutput]) -> Result<Transaction, WalletError> {
+        if !crypto::is_hybrid_public_key(&self.keypair.public) {
+            return Err(WalletError::Crypto("wallets sign only with the hybrid suite (0x0001)".into()));
+        }
         // Chain-id (Roadmap #8) derived from the wallet's own network — the
         // signer and the node validator must fold the SAME domain into the sighash.
         let chain_id = crate::core::ChainId::for_network(self.network);
-        for i in 0..tx.inputs.len() {
-            let sighash = tx.sighash(i, chain_id);
-            // CRY-5: verified under this wallet's public key before use.
-            let sig = crypto::sign_checked(&self.keypair.secret, pubkey, &sighash)
-                .map_err(|e| WalletError::Crypto(e.to_string()))?;
-            // FIX: consensus verification parses script_sig with
-            // `parse_script_sig` (length-prefixed [4B sig_len][sig][4B pk_len]
-            // [pk]). This previously wrote a RAW `sig||pubkey`, which
-            // parse_script_sig mis-parses → the signature fails to verify and the
-            // tx is rejected. Use the canonical builder (matches build_tx +
-            // the RPC/consensus verifiers).
-            signatures.push(Transaction::build_script_sig(&sig, pubkey));
-        }
-
-        for (input, script_sig) in tx.inputs.iter_mut().zip(signatures) {
-            input.script_sig = script_sig;
-        }
-
+        payment::sign_inputs(&mut tx, prevouts, &self.keypair.public, chain_id,
+            &|digest, version| self.sign_digest(digest, version))
+            .map_err(WalletError::Crypto)?;
         Ok(tx)
     }
 
+    /// Verified signature of a transaction digest under the binding of
+    /// `version` (CRY-5 / CRY-2).
+    fn sign_digest(&self, digest: &[u8; 32], version: crate::core::sighash::SighashVersion) -> Result<Vec<u8>, String> {
+        let (secret, public) = (&self.keypair.secret, &self.keypair.public);
+        match version {
+            crate::core::sighash::SighashVersion::V2 => crypto::sign_checked(secret, public, digest),
+            crate::core::sighash::SighashVersion::V3 => crypto::sign_bound_checked(secret, public, digest),
+        }
+        .map_err(|e| e.to_string())
+    }
+
     /// Build an unsigned transaction paying `amount` to `recipient` from the
-    /// given UTXOs with an exact `fee`.
+    /// given UTXOs with an exact `fee`, for the block at `next_block_height`
+    /// (the node's selected tip height + 1).
     ///
     /// This is pure — no network call required. Caller must provide UTXOs
     /// (typically from `WalletClient::utxos()`).
@@ -385,15 +402,20 @@ impl Wallet {
     ///     threshold; sub-dust change becomes fee
     ///   - Enforce the default maximum-fee guard (WAL-1) on the resulting
     ///     fee; [`Self::build_tx_with_policy`] overrides it explicitly
-    ///   - Return unsigned tx ready for `sign_tx()`
+    ///   - Version 3 at/after the hardening activation of the wallet's chain,
+    ///     1 below it (`core::sighash::tx_version_for_height`)
+    ///   - Return the unsigned tx: version 1 is ready for `sign_tx()`,
+    ///     version 3 for `sign_tx_with_prevouts()` with the selected UTXOs'
+    ///     outputs
     pub fn build_tx(
         &self,
         utxos: Vec<Utxo>,
         recipient: &Address,
         amount: u64,
         fee: u64,
+        next_block_height: u64,
     ) -> Result<Transaction, WalletError> {
-        self.build_tx_with_policy(utxos, recipient, amount, fee, &FeePolicy::DEFAULT)
+        self.build_tx_with_policy(utxos, recipient, amount, fee, &FeePolicy::DEFAULT, next_block_height)
     }
 
     /// Build and sign a payment with coin selection, size-aware fees, the
@@ -410,11 +432,9 @@ impl Wallet {
             return Err(WalletError::NetworkMismatch);
         }
         let chain_id = crate::core::ChainId::for_network(self.network);
-        let public = &self.keypair.public;
-        let secret = &self.keypair.secret;
         payment::build_payment(
-            utxos, recipient.hash(), amount, self.address.hash(), public, chain_id, opts,
-            &|sighash| crypto::sign_checked(secret, public, sighash).map_err(|e| e.to_string()),
+            utxos, recipient.hash(), amount, self.address.hash(), &self.keypair.public, chain_id, opts,
+            &|digest, version| self.sign_digest(digest, version),
         ).map_err(WalletError::Payment)
     }
 
@@ -426,6 +446,7 @@ impl Wallet {
         amount: u64,
         fee: u64,
         fee_policy: &FeePolicy,
+        next_block_height: u64,
     ) -> Result<Transaction, WalletError> {
         if recipient.network() != self.network {
             return Err(WalletError::NetworkMismatch);
@@ -477,8 +498,10 @@ impl Wallet {
             });
         }
 
+        let chain_id = crate::core::ChainId::for_network(self.network);
+        let opts = PaymentOptions { next_block_height: Some(next_block_height), ..PaymentOptions::default() };
         let tx = Transaction {
-            version: 1,
+            version: opts.tx_version(chain_id).map_err(WalletError::Payment)?,
             inputs,
             outputs,
             locktime: 0,
@@ -719,7 +742,7 @@ mod tests {
         }];
 
         // Try to send 2000 with 1000 UTXO
-        let result = wallet.build_tx(utxos, other_wallet.address(), 2000, 100);
+        let result = wallet.build_tx(utxos, other_wallet.address(), 2000, 100, 1);
         assert!(matches!(result, Err(WalletError::InsufficientFunds { .. })));
     }
 
@@ -734,7 +757,7 @@ mod tests {
             output: TxOutput { value: 100_000, script_pubkey: wallet.address().hash().to_vec() },
         }];
 
-        let tx = wallet.build_tx(utxos, other_wallet.address(), 50_000, 1000).unwrap();
+        let tx = wallet.build_tx(utxos, other_wallet.address(), 50_000, 1000, 1).unwrap();
 
         // 2 outputs: recipient + change
         assert_eq!(tx.outputs.len(), 2);
@@ -754,7 +777,7 @@ mod tests {
         }];
 
         // Send exactly (utxo - fee) — no change
-        let tx = wallet.build_tx(utxos, other.address(), 50_000, 1_000).unwrap();
+        let tx = wallet.build_tx(utxos, other.address(), 50_000, 1_000, 1).unwrap();
         assert_eq!(tx.outputs.len(), 1);
         assert_eq!(tx.outputs[0].value, 50_000);
     }
@@ -874,14 +897,38 @@ impl Keypair {
         // signature under `self.public_key` (and its canonical encoding)
         // before returning it, so a corrupted or mismatched secret key is an
         // error here, never a transaction the network rejects later.
+        self.with_enveloped_secret(|sk| crypto::sign_checked(sk, &self.public_key, msg))
+    }
+
+    /// Verified sighash-v3 signature (component-bound, CRY-2) of `digest`,
+    /// with the same legacy-key handling as [`Self::sign`].
+    pub fn sign_bound(&self, digest: &[u8; 32]) -> Result<Vec<u8>, String> {
+        self.with_enveloped_secret(|sk| crypto::sign_bound_checked(sk, &self.public_key, digest))
+    }
+
+    /// Verified signature of a transaction digest under the binding of
+    /// `version`: [`Self::sign`] for sighash v2, [`Self::sign_bound`] for v3.
+    pub fn sign_tx_digest(&self, digest: &[u8; 32], version: crate::core::sighash::SighashVersion) -> Result<Vec<u8>, String> {
+        match version {
+            crate::core::sighash::SighashVersion::V2 => self.sign(digest),
+            crate::core::sighash::SighashVersion::V3 => self.sign_bound(digest),
+        }
+    }
+
+    /// Run `f` with the secret key in its enveloped form (wrapping a legacy
+    /// raw key under the public key's suite in zeroizing storage).
+    fn with_enveloped_secret(
+        &self,
+        f: impl FnOnce(&[u8]) -> Result<Vec<u8>, crypto::CryptoError>,
+    ) -> Result<Vec<u8>, String> {
         if crypto::parse_envelope(&self.private_key).is_some() {
-            crypto::sign_checked(&self.private_key, &self.public_key, msg).map_err(|e| e.to_string())
+            f(&self.private_key).map_err(|e| e.to_string())
         } else {
             let suite = crypto::parse_envelope(&self.public_key)
                 .map(|(s, _)| s)
                 .unwrap_or(crypto::SUITE_MLDSA65_FALCON1024);
             let sk = Zeroizing::new(crypto::wrap_envelope(suite, &self.private_key));
-            crypto::sign_checked(&sk, &self.public_key, msg).map_err(|e| e.to_string())
+            f(&sk).map_err(|e| e.to_string())
         }
     }
 
@@ -1302,12 +1349,16 @@ impl TxBuilder {
     /// on the actual fee. A change below the dust threshold is added to the
     /// fee. New callers should use [`Self::build_payment`], which also
     /// verifies claimed UTXO values and reports the actual fee.
+    ///
+    /// `next_block_height` (the node's selected tip height + 1) selects the
+    /// transaction version (3 at/after the hardening activation, 1 below).
     pub fn build(
         keypair:         &Keypair,
         available_utxos: &[(Vec<u8>, u32, TxOutput)],  // (txid, index, output)
         to_address_hex:  &str,                           // 20-byte hex address
         amount_sats:     u64,
         fee_sats:        u64,
+        next_block_height: u64,
     ) -> Result<Transaction, String> {
         amount_sats.checked_add(fee_sats).ok_or("amount + fee overflow")?;
         let to_bytes = hex::decode(to_address_hex)
@@ -1316,7 +1367,11 @@ impl TxBuilder {
             return Err("destination address hash must contain exactly 20 bytes".into());
         }
         let utxos = Self::utxos_from_rows(available_utxos)?;
-        let opts = PaymentOptions { fee: FeeChoice::Exact(fee_sats), ..PaymentOptions::default() };
+        let opts = PaymentOptions {
+            fee: FeeChoice::Exact(fee_sats),
+            next_block_height: Some(next_block_height),
+            ..PaymentOptions::default()
+        };
         Self::build_payment_to_spk(keypair, &utxos, &to_bytes, amount_sats, &opts).map(|p| p.tx)
     }
 
@@ -1370,7 +1425,7 @@ impl TxBuilder {
         let chain_id = crate::core::ChainId::for_network(keypair.network()?);
         payment::build_payment(
             utxos, to_spk, amount, &keypair.address_bytes(), &keypair.public_key,
-            chain_id, opts, &|sighash| keypair.sign(sighash),
+            chain_id, opts, &|digest, version| keypair.sign_tx_digest(digest, version),
         )
     }
 }
@@ -2132,18 +2187,18 @@ mod audit_transaction_boundaries {
             let right = Address::from_hash([42;20], network);
             let utxos = || vec![Utxo { txid:[1;32], index:0,
                 output: TxOutput { value:1000, script_pubkey:wallet.address().hash().to_vec() } }];
-            assert!(matches!(wallet.build_tx(utxos(), &wrong, 900, 100), Err(WalletError::NetworkMismatch)));
-            assert!(wallet.build_tx(utxos(), &right, 900, 100).is_ok());
+            assert!(matches!(wallet.build_tx(utxos(), &wrong, 900, 100, 1), Err(WalletError::NetworkMismatch)));
+            assert!(wallet.build_tx(utxos(), &right, 900, 100, 1).is_ok());
         }
     }
     #[test]
     fn empty_and_aggregate_input_overflows_return_errors() {
         let (wallet, _) = Wallet::generate(Network::Testnet).unwrap();
-        assert!(matches!(wallet.build_tx(vec![], wallet.address(), u64::MAX, 1), Err(WalletError::Overflow)));
+        assert!(matches!(wallet.build_tx(vec![], wallet.address(), u64::MAX, 1, 1), Err(WalletError::Overflow)));
         let inputs = [u64::MAX, 1].into_iter().enumerate().map(|(index, value)| Utxo {
             txid:[1;32], index:index as u32, output:TxOutput { value, script_pubkey:wallet.address().hash().to_vec() }
         }).collect();
-        assert!(matches!(wallet.build_tx(inputs, wallet.address(), 1, 0), Err(WalletError::Overflow)));
+        assert!(matches!(wallet.build_tx(inputs, wallet.address(), 1, 0, 1), Err(WalletError::Overflow)));
     }
 }
 
@@ -2158,22 +2213,22 @@ mod audit_coin_selection_inputs {
         let destination = "ab".repeat(20);
         for length in [0, 1, 31, 33, 64] {
             let inputs = vec![(vec![1; length], 0, output(1000))];
-            assert!(TxBuilder::build(&keypair, &inputs, &destination, 900, 100)
+            assert!(TxBuilder::build(&keypair, &inputs, &destination, 900, 100, 1)
                 .err().unwrap().contains("exactly 32 bytes"));
         }
         let valid = vec![(vec![1; 32], 0, output(1000))];
         for destination in [String::new(), "ab".repeat(19), "ab".repeat(21), "zz".repeat(20)] {
-            assert!(TxBuilder::build(&keypair, &valid, &destination, 900, 100).is_err());
+            assert!(TxBuilder::build(&keypair, &valid, &destination, 900, 100, 1).is_err());
         }
         let repeated = vec![(vec![1; 32], 0, output(500)), (vec![1; 32], 0, output(500))];
-        assert!(TxBuilder::build(&keypair, &repeated, &destination, 900, 100)
+        assert!(TxBuilder::build(&keypair, &repeated, &destination, 900, 100, 1)
             .err().unwrap().contains("duplicate"));
         let overflow = vec![(vec![1; 32], 0, output(1)), (vec![2; 32], 0, output(u64::MAX))];
-        assert!(TxBuilder::build(&keypair, &overflow, &destination, u64::MAX, 0)
+        assert!(TxBuilder::build(&keypair, &overflow, &destination, u64::MAX, 0, 1)
             .err().unwrap().contains("overflow"));
         // Distinct output indices from the same transaction are legitimate.
         let distinct = vec![(vec![1; 32], 0, output(500)), (vec![1; 32], 1, output(500))];
-        let tx = TxBuilder::build(&keypair, &distinct, &destination, 900, 100).unwrap();
+        let tx = TxBuilder::build(&keypair, &distinct, &destination, 900, 100, 1).unwrap();
         assert_eq!(tx.inputs.len(), 2);
         assert_eq!(tx.outputs[0].value, 900);
         assert_eq!(tx.outputs[0].script_pubkey, vec![0xab; 20]);
@@ -2184,9 +2239,9 @@ mod audit_coin_selection_inputs {
         let (wallet, _) = Wallet::generate(Network::Testnet).unwrap();
         let utxo = |index| Utxo { txid: [3; 32], index,
             output: TxOutput { value: 500, script_pubkey: wallet.address().hash().to_vec() } };
-        assert!(matches!(wallet.build_tx(vec![utxo(0), utxo(0)], wallet.address(), 900, 100),
+        assert!(matches!(wallet.build_tx(vec![utxo(0), utxo(0)], wallet.address(), 900, 100, 1),
             Err(WalletError::Parse(message)) if message.contains("duplicate")));
-        let tx = wallet.build_tx(vec![utxo(0), utxo(1)], wallet.address(), 900, 100).unwrap();
+        let tx = wallet.build_tx(vec![utxo(0), utxo(1)], wallet.address(), 900, 100, 1).unwrap();
         assert_eq!(tx.inputs.len(), 2);
     }
 }
@@ -2309,17 +2364,17 @@ mod audit_2026_10_wallet_fixes {
             Utxo { txid: [1; 32], index: 0, output: TxOutput { value: 50 * SAT, script_pubkey: spk.clone() } },
             Utxo { txid: [2; 32], index: 0, output: TxOutput { value: 50 * SAT, script_pubkey: spk.clone() } },
         ];
-        assert!(matches!(wallet.build_tx(utxos.clone(), &dest, 1, 100 * SAT - 1),
+        assert!(matches!(wallet.build_tx(utxos.clone(), &dest, 1, 100 * SAT - 1, 1),
             Err(WalletError::FeeTooHigh(_))));
         // An explicit override is honoured.
-        assert!(wallet.build_tx_with_policy(utxos.clone(), &dest, 1, 100 * SAT - 1, &FeePolicy::UNLIMITED).is_ok());
+        assert!(wallet.build_tx_with_policy(utxos.clone(), &dest, 1, 100 * SAT - 1, &FeePolicy::UNLIMITED, 1).is_ok());
         // A normal payment spends one coin, not both.
-        let tx = wallet.build_tx(utxos.clone(), &dest, SAT, 50_000).unwrap();
+        let tx = wallet.build_tx(utxos.clone(), &dest, SAT, 50_000, 1).unwrap();
         assert_eq!(tx.inputs.len(), 1);
         assert_eq!(tx.outputs[1].value, 50 * SAT - SAT - 50_000);
 
         // Signed payments report the actual fee.
-        let paid = wallet.build_payment(&utxos, &dest, SAT, &PaymentOptions::default()).unwrap();
+        let paid = wallet.build_payment(&utxos, &dest, SAT, &PaymentOptions { next_block_height: Some(1), ..PaymentOptions::default() }).unwrap();
         assert_eq!(paid.tx.inputs.len(), 1);
         assert_eq!(paid.inputs_total - paid.amount - paid.change, paid.fee);
         assert!(paid.fee >= crate::core::tokenomics::min_tx_fee_sat(paid.size));
@@ -2331,7 +2386,7 @@ mod audit_2026_10_wallet_fixes {
     fn tx_builder_build_enforces_the_fee_guard() {
         let kp = generate_keypair(false);
         let rows = vec![(vec![0xAB; 32], 0u32, TxOutput { value: 100 * SAT, script_pubkey: kp.address_bytes() })];
-        let err = TxBuilder::build(&kp, &rows, &"05".repeat(20), SAT, 99 * SAT).unwrap_err();
+        let err = TxBuilder::build(&kp, &rows, &"05".repeat(20), SAT, 99 * SAT, 1).unwrap_err();
         assert!(err.contains("guard"), "{err}");
     }
 
@@ -2356,7 +2411,7 @@ mod audit_2026_10_wallet_fixes {
         kp.private_key[crypto::SUITE_HEADER_LEN + crypto::MLDSA_SECRET_LEN] ^= 0xFF;
         assert!(kp.sign(b"m").is_err());
         let rows = vec![(vec![1; 32], 0u32, TxOutput { value: SAT, script_pubkey: kp.address_bytes() })];
-        assert!(TxBuilder::build(&kp, &rows, &"05".repeat(20), SAT / 2, 50_000).is_err());
+        assert!(TxBuilder::build(&kp, &rows, &"05".repeat(20), SAT / 2, 50_000, 1).is_err());
     }
 
     /// WAL-7: mnemonic-backed keypairs restore from their words.
@@ -2375,5 +2430,76 @@ mod audit_2026_10_wallet_fixes {
     #[test]
     fn bip39_mnemonic_has_a_wiping_destructor() {
         assert!(std::mem::needs_drop::<bip39::Mnemonic>());
+    }
+}
+
+#[cfg(test)]
+mod sighash_v3_signers {
+    //! WAL-1 full fix / CRY-1 / CRY-2 on the detached signers: `Wallet`
+    //! and `Keypair` produce sighash-v3 transactions that pass the shared
+    //! consensus input-script rule (`core::sighash::verify_tx_scripts`).
+    use super::*;
+    use crate::core::sighash::{self, SighashVersion};
+    use crate::core::{activation, ChainId};
+
+    const SAT: u64 = 100_000_000;
+
+    #[test]
+    fn wallet_signs_v3_with_prevouts_and_refuses_v3_without() {
+        let (wallet, _) = Wallet::generate(Network::Testnet).unwrap();
+        let spk = wallet.address().hash().to_vec();
+        let utxos = vec![
+            Utxo { txid: [1; 32], index: 0, output: TxOutput { value: 2 * SAT, script_pubkey: spk.clone() } },
+            Utxo { txid: [2; 32], index: 3, output: TxOutput { value: 3 * SAT, script_pubkey: spk.clone() } },
+        ];
+        let dest = Address::from_hash([9u8; 20], Network::Testnet);
+        // Testnet activates at 0: version 3.
+        let tx = wallet.build_tx(utxos.clone(), &dest, 4 * SAT, 100_000, 7).unwrap();
+        assert_eq!(tx.version, 3);
+        assert!(matches!(wallet.sign_tx(tx.clone()), Err(WalletError::Payment(m)) if m.contains("sign_tx_with_prevouts")));
+        let spent: Vec<TxOutput> = tx.inputs.iter()
+            .map(|i| utxos.iter().find(|u| u.txid == i.prev_txid).unwrap().output.clone())
+            .collect();
+        let signed = wallet.sign_tx_with_prevouts(tx, &spent).unwrap();
+        assert_eq!(sighash::verify_tx_scripts(&signed, &spent, ChainId::Testnet, 7, 0), Ok(SighashVersion::V3));
+        for input in &signed.inputs {
+            assert!(sighash::canonical_witness(&input.script_sig).is_ok());
+        }
+        // Mainnet below its activation: version 1, the historical signer.
+        let (main, _) = Wallet::generate(Network::Mainnet).unwrap();
+        let mspk = main.address().hash().to_vec();
+        let mutxo = vec![Utxo { txid: [5; 32], index: 0, output: TxOutput { value: 2 * SAT, script_pubkey: mspk } }];
+        let tx = main.build_tx(mutxo.clone(), &Address::from_hash([9u8; 20], Network::Mainnet), SAT, 100_000, 7).unwrap();
+        assert_eq!(tx.version, 1);
+        let signed = main.sign_tx(tx).unwrap();
+        assert_eq!(sighash::verify_tx_scripts(&signed, &[mutxo[0].output.clone()], ChainId::Mainnet, 7,
+            activation::MAINNET_HARDENING_ACTIVATION_HEIGHT), Ok(SighashVersion::V2));
+    }
+
+    /// A genesis carry-over key (raw, pre-envelope public AND secret key; the
+    /// address commits to the raw key) still spends under sighash v3: the
+    /// public key is not forced into an envelope, the signature is enveloped.
+    #[test]
+    fn raw_carryover_key_spends_under_v3() {
+        use sha3::{Digest, Sha3_256};
+        let (pk_env, sk_env) = crypto::generate_keypair();
+        let raw_pk = pk_env[4..].to_vec();
+        let kp = Keypair {
+            private_key: sk_env[4..].to_vec(),
+            public_key: raw_pk.clone(),
+            address: crypto::address_from_pubkey(&raw_pk, true),
+        };
+        let spk = Sha3_256::digest(&raw_pk)[..20].to_vec();
+        assert_eq!(spk, kp.address_bytes());
+        let utxo = Utxo { txid: [0xCA; 32], index: 0, output: TxOutput { value: 5 * SAT, script_pubkey: spk } };
+        let opts = PaymentOptions { next_block_height: Some(1), ..PaymentOptions::default() };
+        let paid = TxBuilder::build_payment(&kp, std::slice::from_ref(&utxo),
+            &Address::from_hash([3; 20], Network::Testnet), SAT, &opts).unwrap();
+        assert_eq!(paid.tx.version, 3);
+        let (sig, pk) = Transaction::parse_script_sig_exact(&paid.tx.inputs[0].script_sig).unwrap();
+        assert_eq!(pk, &raw_pk[..], "the raw key goes into the witness unchanged");
+        assert!(crypto::split_envelope(sig).is_some(), "the signature carries its suite envelope");
+        assert_eq!(sighash::verify_tx_scripts(&paid.tx, &[utxo.output], ChainId::Testnet, 1, 0),
+            Ok(SighashVersion::V3));
     }
 }

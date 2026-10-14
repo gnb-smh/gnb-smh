@@ -14,9 +14,17 @@
 //!     Outputs whose creating transaction cannot be fetched (the genesis
 //!     carryover, bodies pruned on non-archival nodes) stay *unverified*; they
 //!     are reported to the user, avoided by coin selection when possible and
-//!     refused when [`PaymentOptions::require_verified_inputs`] is set. The
-//!     complete fix is a sighash version that commits to spent amounts (a
-//!     consensus change, tracked separately).
+//!     refused when [`PaymentOptions::require_verified_inputs`] is set. This
+//!     check is needed only for version-1 (sighash v2) transactions.
+//!   - **Full fix: sighash v3.** From the hardening activation height the
+//!     builder produces version-3 transactions whose signatures commit to
+//!     every spent amount and `script_pubkey`
+//!     (`core::sighash::SighashV3Precomputed`): a server that lies about a
+//!     UTXO makes the wallet sign a transaction every node rejects, so
+//!     nothing can be lost and the previous transactions need not be fetched.
+//!     [`PaymentOptions::next_block_height`] (one above the node's selected
+//!     tip height, from `getdaginfo`) selects the version; the builder
+//!     refuses to sign without it.
 //!   - [`FeePolicy`]: an absolute and a per-kB ceiling on the fee, enforced on
 //!     the ACTUAL fee and size of the signed transaction. The consensus
 //!     minimum is always allowed; anything above the ceilings needs an
@@ -27,13 +35,21 @@
 //!   the consensus formula ([`tokenomics::min_tx_fee_sat`]), sub-dust change
 //!   is reported as part of the fee, and there is one dust comparison
 //!   ([`keeps_change`]).
-//! * **CRY-1/CRY-2 (wallet side)** — every input is signed through
-//!   [`crate::crypto::sign_checked`], so the witness is canonical: enveloped
-//!   signature, compact Falcon encoding, exact-length `script_sig`.
+//! * **CRY-1/CRY-2 (wallet side)** — every input is signed through a
+//!   verifying signer ([`crate::crypto::sign_checked`] for sighash v2,
+//!   [`crate::crypto::sign_bound_checked`] for v3), so the witness is
+//!   canonical: enveloped signature, compact Falcon encoding, exact-length
+//!   `script_sig`. Wallets sign only with the hybrid suite 0x0001
+//!   ([`crate::crypto::is_hybrid_public_key`]); they never produce 0x0002.
 
 use super::Utxo;
-use crate::core::{tokenomics, ChainId, Transaction, TxInput, TxOutput, DUST_THRESHOLD};
+use crate::core::sighash::{self, SighashV3Precomputed, SighashVersion};
+use crate::core::{activation, tokenomics, ChainId, Transaction, TxInput, TxOutput, DUST_THRESHOLD};
 use std::collections::{BTreeSet, HashMap};
+
+/// A verifying signer of transaction digests: `(digest, version)` -> the
+/// enveloped signature under the binding of `version` (see [`build_payment`]).
+pub type DigestSigner<'a> = dyn Fn(&[u8; 32], SighashVersion) -> Result<Vec<u8>, String> + 'a;
 
 /// Largest transaction the node's mempool admits (`mempool::MAX_TX_SIZE`).
 pub const MAX_STANDARD_TX_BYTES: usize = 400 * 1024;
@@ -223,9 +239,18 @@ pub struct PaymentOptions<'a> {
     pub fee: FeeChoice,
     pub fee_policy: FeePolicy,
     pub prev_txs: Option<&'a PrevTxs>,
-    /// Refuse to spend any input whose value could not be verified.
+    /// Refuse to spend any input whose value could not be verified (version-1
+    /// transactions; a version-3 signature commits to every spent value).
     pub require_verified_inputs: bool,
     pub max_tx_bytes: usize,
+    /// Header height of the block the payment targets: the node's selected
+    /// tip height + 1 (`getdaginfo` `tip_height` + 1, the height mempool
+    /// admission checks against). With the hardening activation height of the
+    /// wallet's chain it selects the transaction version
+    /// (`core::sighash::tx_version_for_height`): 3 and sighash v3 at/after the
+    /// activation, 1 and sighash v2 below it. `None` (the default) refuses to
+    /// sign: a wrong guess makes a transaction the network rejects.
+    pub next_block_height: Option<u64>,
 }
 
 impl Default for PaymentOptions<'_> {
@@ -236,8 +261,28 @@ impl Default for PaymentOptions<'_> {
             prev_txs: None,
             require_verified_inputs: false,
             max_tx_bytes: MAX_STANDARD_TX_BYTES,
+            next_block_height: None,
         }
     }
+}
+
+impl PaymentOptions<'_> {
+    /// Transaction version these options produce for `chain_id`.
+    pub fn tx_version(&self, chain_id: ChainId) -> Result<u32, String> {
+        let next = self.next_block_height.ok_or_else(|| {
+            "the height of the next block is unknown; ask the node (getdaginfo: tip_height + 1) \
+             before signing".to_string()
+        })?;
+        Ok(sighash::tx_version_for_height(next, activation::hardening_activation_height_for_signer(chain_id)))
+    }
+}
+
+/// Whether a payment for `chain_id` targeting `next_block_height` is a
+/// version-3 transaction, whose signatures commit to the spent amounts (the
+/// previous transactions need not be fetched, WAL-1).
+pub fn amounts_committed_at(next_block_height: u64, chain_id: ChainId) -> bool {
+    sighash::tx_version_for_height(next_block_height, activation::hardening_activation_height_for_signer(chain_id))
+        == sighash::TX_VERSION_V3
 }
 
 /// A signed payment and what it actually does.
@@ -256,10 +301,16 @@ pub struct BuiltPayment {
     pub inputs_total: u64,
     /// Signed wire size in bytes.
     pub size: usize,
-    /// Inputs whose value was verified against their creating transaction.
+    /// Inputs whose value was verified against their creating transaction,
+    /// or, for a version-3 transaction, every input (its signature commits to
+    /// the spent value, so a wrong claim invalidates the transaction).
     pub verified_inputs: usize,
-    /// Inputs whose value comes only from the server's claim.
+    /// Inputs whose value comes only from the server's claim (always 0 for
+    /// version 3).
     pub unverified_inputs: usize,
+    /// `true` for a version-3 (sighash v3) transaction: the signatures commit
+    /// to every spent amount and script.
+    pub amounts_committed: bool,
 }
 
 // ── Size estimation ──────────────────────────────────────────────────────────
@@ -417,9 +468,12 @@ fn insufficient(have: u64, amount: u64) -> String {
 
 /// Build and sign a payment of `amount` to `to_spk`, change to `own_spk`.
 ///
-/// `sign` returns the enveloped signature of a 32-byte sighash and must
-/// verify it (see [`crate::crypto::sign_checked`]); `public_key` goes into
-/// every `script_sig`.
+/// `sign(digest, version)` returns the enveloped signature of a 32-byte
+/// digest under the binding of `version` and must verify it (see
+/// [`crate::crypto::sign_checked`] for [`SighashVersion::V2`] and
+/// [`crate::crypto::sign_bound_checked`] for [`SighashVersion::V3`]);
+/// `public_key` goes into every `script_sig`. The transaction version follows
+/// [`PaymentOptions::next_block_height`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_payment(
     utxos: &[Utxo],
@@ -429,7 +483,7 @@ pub fn build_payment(
     public_key: &[u8],
     chain_id: ChainId,
     opts: &PaymentOptions<'_>,
-    sign: &dyn Fn(&[u8; 32]) -> Result<Vec<u8>, String>,
+    sign: &DigestSigner<'_>,
 ) -> Result<BuiltPayment, String> {
     if amount == 0 {
         return Err("amount must be positive".into());
@@ -440,17 +494,30 @@ pub fn build_payment(
     if utxos.is_empty() {
         return Err(insufficient(0, amount));
     }
+    // CRY-2: wallets never produce the single-algorithm suite.
+    if !crate::crypto::is_hybrid_public_key(public_key) {
+        return Err("wallets sign only with the hybrid ML-DSA-65 + Falcon-1024 suite (0x0001); \
+                    this key is not a hybrid key".into());
+    }
+    let version = opts.tx_version(chain_id)?;
+    let amounts_committed = SighashVersion::for_tx_version(version) == SighashVersion::V3;
     let (verified, total) = prepare(utxos, own_spk, opts.prev_txs)?;
 
-    // Prefer inputs whose value was verified; fall back to every input.
+    // Version 1: prefer inputs whose value was verified, fall back to every
+    // input. Version 3: every input is equivalent (the signature commits to
+    // its value).
     let verified_only: Vec<usize> = (0..utxos.len()).filter(|&i| verified[i]).collect();
     let all: Vec<usize> = (0..utxos.len()).collect();
     let plan_with = |c: &[usize]| plan(utxos, c, amount, to_spk.len(), own_spk.len(), public_key.len(), opts.fee);
-    let plan = (!verified_only.is_empty()).then(|| plan_with(&verified_only)).flatten()
+    let plan = (!amounts_committed && !verified_only.is_empty()).then(|| plan_with(&verified_only)).flatten()
         .or_else(|| plan_with(&all))
         .ok_or_else(|| insufficient(total, amount))?;
 
-    let verified_inputs = plan.inputs.iter().filter(|&&i| verified[i]).count();
+    let verified_inputs = if amounts_committed {
+        plan.inputs.len()
+    } else {
+        plan.inputs.iter().filter(|&&i| verified[i]).count()
+    };
     let unverified_inputs = plan.inputs.len() - verified_inputs;
     if opts.require_verified_inputs && unverified_inputs > 0 {
         return Err(format!(
@@ -469,7 +536,7 @@ pub fn build_payment(
     if plan.change > 0 {
         outputs.push(TxOutput { value: plan.change, script_pubkey: own_spk.to_vec() });
     }
-    let mut tx = Transaction { version: 1, inputs, outputs, locktime: 0 };
+    let mut tx = Transaction { version, inputs, outputs, locktime: 0 };
 
     // Guard before signing on the upper-bound size, then again on the
     // actual signed size below.
@@ -477,11 +544,8 @@ pub fn build_payment(
     let bound = signed_size_upper_bound(tx.inputs.len(), &spk_lens, public_key.len());
     opts.fee_policy.check(plan.fee, bound)?;
 
-    for i in 0..tx.inputs.len() {
-        let sighash = tx.sighash(i, chain_id);
-        let sig = sign(&sighash)?;
-        tx.inputs[i].script_sig = Transaction::build_script_sig(&sig, public_key);
-    }
+    let spent: Vec<TxOutput> = plan.inputs.iter().map(|&i| utxos[i].output.clone()).collect();
+    sign_inputs(&mut tx, &spent, public_key, chain_id, sign)?;
 
     let size = tx.to_wire_bytes(true).len();
     if size > opts.max_tx_bytes {
@@ -510,7 +574,47 @@ pub fn build_payment(
         size,
         verified_inputs,
         unverified_inputs,
+        amounts_committed,
     })
+}
+
+/// Sign every input of `tx` (spending `spent`, one output per input, in
+/// order) under the digest its version selects, and write canonical
+/// witnesses. Version 3 computes the per-transaction hashes once (linear in
+/// the transaction size) and signs each input's digest, which commits to the
+/// suite of `public_key`.
+pub fn sign_inputs(
+    tx: &mut Transaction,
+    spent: &[TxOutput],
+    public_key: &[u8],
+    chain_id: ChainId,
+    sign: &DigestSigner<'_>,
+) -> Result<(), String> {
+    if spent.len() != tx.inputs.len() {
+        return Err(format!("{} spent outputs for {} inputs", spent.len(), tx.inputs.len()));
+    }
+    let version = SighashVersion::for_tx_version(tx.version);
+    let sigs: Vec<Vec<u8>> = match version {
+        SighashVersion::V2 => (0..tx.inputs.len())
+            .map(|i| sign(&tx.sighash(i, chain_id), version))
+            .collect::<Result<_, _>>()?,
+        SighashVersion::V3 => {
+            let suite = crate::crypto::public_key_suite(public_key)
+                .ok_or("public key has no recognised signature suite")?;
+            let pre = SighashV3Precomputed::new(tx, spent).map_err(|e| e.to_string())?;
+            (0..tx.inputs.len())
+                .map(|i| sign(&pre.digest(i, suite, chain_id).map_err(|e| e.to_string())?, version))
+                .collect::<Result<_, _>>()?
+        }
+    };
+    for (input, sig) in tx.inputs.iter_mut().zip(sigs) {
+        input.script_sig = Transaction::build_script_sig(&sig, public_key);
+        if version == SighashVersion::V3 {
+            // The consensus witness rule of version 3 (format only).
+            sighash::canonical_witness(&input.script_sig)?;
+        }
+    }
+    Ok(())
 }
 
 /// Fee-guard check for an UNSIGNED transaction (e.g. `Wallet::build_tx`),
@@ -544,9 +648,12 @@ mod tests {
         Utxo { txid: [tag; 32], index: 0, output: TxOutput { value, script_pubkey: kp.address_bytes() } }
     }
 
+    /// Mainnet payment; without an explicit next block height the tests below
+    /// target height 1 (far below the mainnet activation: version 1, sighash v2).
     fn build(kp: &Keypair, utxos: &[Utxo], amount: u64, opts: &PaymentOptions<'_>) -> Result<BuiltPayment, String> {
+        let opts = PaymentOptions { next_block_height: opts.next_block_height.or(Some(1)), ..*opts };
         build_payment(utxos, &[5u8; 20], amount, &kp.address_bytes(), &kp.public_key,
-            ChainId::Mainnet, opts, &|h| kp.sign(h))
+            ChainId::Mainnet, &opts, &|h, v| kp.sign_tx_digest(h, v))
     }
 
     /// A previous transaction paying `value` to the keypair, and the UTXO
@@ -693,18 +800,94 @@ mod tests {
         assert_eq!(build(&kp, &[u], 1, &explicit).unwrap().fee, 99 * SAT - 1);
     }
 
-    /// Wallet side of CRY-1/CRY-2: emitted witnesses are canonical.
+    /// Wallet side of CRY-1/CRY-2: emitted witnesses are canonical (v2 below
+    /// the activation; the mainnet schedule is used, height 1).
     #[test]
     fn emitted_witnesses_are_canonical_and_exact_length() {
-        let kp = generate_keypair(true);
-        let paid = build_payment(&[utxo(&kp, 1, 2 * SAT), utxo(&kp, 2, 2 * SAT)], &[5u8; 20], 3 * SAT,
-            &kp.address_bytes(), &kp.public_key, ChainId::Testnet, &PaymentOptions::default(), &|h| kp.sign(h)).unwrap();
+        let kp = generate_keypair(false);
+        let paid = build(&kp, &[utxo(&kp, 1, 2 * SAT), utxo(&kp, 2, 2 * SAT)], 3 * SAT, &PaymentOptions::default()).unwrap();
+        assert_eq!(paid.tx.version, 1);
         for (i, input) in paid.tx.inputs.iter().enumerate() {
             let (sig, pk) = Transaction::parse_script_sig(&input.script_sig).unwrap();
             assert_eq!(input.script_sig.len(), 8 + sig.len() + pk.len(), "no trailing bytes");
-            let sighash = paid.tx.sighash(i, ChainId::Testnet);
+            assert!(sighash::canonical_witness(&input.script_sig).is_ok());
+            let sighash = paid.tx.sighash(i, ChainId::Mainnet);
             assert!(crate::crypto::verify_enveloped_canonical(&pk, &sighash, &sig));
         }
+    }
+
+    // ── WAL-1 full fix: sighash v3 ───────────────────────────────────────
+
+    /// The signer follows the next block height: version 1 below the
+    /// activation, version 3 at it; no height, no signature.
+    #[test]
+    fn version_follows_the_next_block_height() {
+        let kp = generate_keypair(true); // testnet: activation height 0
+        let utxos = [utxo(&kp, 1, 2 * SAT)];
+        let pay = |next: Option<u64>| build_payment(&utxos, &[5u8; 20], SAT, &kp.address_bytes(), &kp.public_key,
+            ChainId::Testnet, &PaymentOptions { next_block_height: next, ..Default::default() },
+            &|h, v| kp.sign_tx_digest(h, v));
+        assert!(pay(None).unwrap_err().contains("next block is unknown"));
+        let v3 = pay(Some(1)).unwrap();
+        assert_eq!(v3.tx.version, 3);
+        assert!(v3.amounts_committed);
+        assert_eq!((v3.verified_inputs, v3.unverified_inputs), (1, 0));
+        // Mainnet just below / at its activation height.
+        let kp = generate_keypair(false);
+        let utxos = [utxo(&kp, 1, 2 * SAT)];
+        let act = activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
+        let below = build(&kp, &utxos, SAT, &PaymentOptions { next_block_height: Some(act - 1), ..Default::default() }).unwrap();
+        assert_eq!((below.tx.version, below.amounts_committed), (1, false));
+        let at = build(&kp, &utxos, SAT, &PaymentOptions { next_block_height: Some(act), ..Default::default() }).unwrap();
+        assert_eq!((at.tx.version, at.amounts_committed), (3, true));
+        // A scoped override moves the boundary for signers too (tests only).
+        let _g = activation::scoped_override(10);
+        assert_eq!(build(&kp, &utxos, SAT, &PaymentOptions { next_block_height: Some(9), ..Default::default() }).unwrap().tx.version, 1);
+        assert_eq!(build(&kp, &utxos, SAT, &PaymentOptions { next_block_height: Some(10), ..Default::default() }).unwrap().tx.version, 3);
+    }
+
+    /// WAL-1 full fix: under v3 a lied UTXO value (or script) produces a
+    /// signature over the claimed value, which the consensus verifier, fed
+    /// the TRUE spent output, rejects. No previous transaction is needed.
+    #[test]
+    fn v3_signature_commits_to_the_spent_amount_and_script() {
+        let kp = generate_keypair(true);
+        let honest = utxo(&kp, 1, 100 * SAT);
+        let mut lied = honest.clone();
+        lied.output.value = SAT + 50_000;
+        let opts = PaymentOptions { next_block_height: Some(5), require_verified_inputs: true, ..Default::default() };
+        let paid = build_payment(std::slice::from_ref(&lied), &[5u8; 20], SAT, &kp.address_bytes(), &kp.public_key,
+            ChainId::Testnet, &opts, &|h, v| kp.sign_tx_digest(h, v)).unwrap();
+        assert_eq!(paid.tx.version, 3);
+        let verify = |spent: &TxOutput| sighash::verify_tx_scripts(&paid.tx, std::slice::from_ref(spent),
+            ChainId::Testnet, 5, 0);
+        assert_eq!(verify(&lied.output), Ok(SighashVersion::V3), "valid for the value it was signed for");
+        assert!(verify(&honest.output).unwrap_err().contains("invalid signature"), "the real UTXO value invalidates it");
+        // The digest also commits to the spent script: the same signature
+        // checked against another script (here re-encoded with a trailing
+        // byte, so the key hash check fails first) is rejected too.
+        let mut other_script = lied.output.clone();
+        other_script.script_pubkey.push(0);
+        assert!(verify(&other_script).is_err());
+        let pre_lied = SighashV3Precomputed::new(&paid.tx, std::slice::from_ref(&lied.output)).unwrap();
+        let pre_other = SighashV3Precomputed::new(&paid.tx, std::slice::from_ref(&other_script)).unwrap();
+        assert_ne!(pre_lied.hash_scripts, pre_other.hash_scripts);
+        assert_ne!(pre_lied.digest(0, 1, ChainId::Testnet), pre_other.digest(0, 1, ChainId::Testnet));
+    }
+
+    /// CRY-2: wallets refuse to sign with a single-algorithm (0x0002) key.
+    #[test]
+    fn single_algorithm_keys_are_refused() {
+        use pqcrypto_traits::sign::PublicKey as _;
+        use sha3::Digest as _;
+        let (mpk, _msk) = pqcrypto_mldsa::mldsa65::keypair();
+        let pk = crate::crypto::wrap_envelope(crate::crypto::SUITE_MLDSA65_ONLY, mpk.as_bytes());
+        let spk = sha3::Sha3_256::digest(&pk)[..20].to_vec();
+        let u = Utxo { txid: [1; 32], index: 0, output: TxOutput { value: 2 * SAT, script_pubkey: spk.clone() } };
+        let err = build_payment(&[u], &[5u8; 20], SAT, &spk, &pk, ChainId::Mainnet,
+            &PaymentOptions { next_block_height: Some(1), ..Default::default() },
+            &|_, _| Err("must not be asked to sign".into())).unwrap_err();
+        assert!(err.contains("hybrid"), "{err}");
     }
 
     #[test]

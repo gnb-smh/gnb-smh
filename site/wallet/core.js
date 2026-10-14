@@ -65,11 +65,15 @@ export async function loadCore(url, sha256Hex) {
     create: () => call({ op: "create", mnemonic: true }),
     restore: (words) => call({ op: "restore", words }),
     exportKeystore: (password) => call({ op: "export", password }).keystore,
-    // WAL-1: outpoints whose previous transactions should be fetched...
-    plan: (utxos, to, amount, fee) => call({ op: "plan", utxos, to, amount: String(amount), fee: String(fee) }),
+    // WAL-1: `nextHeight` is the node's getdaginfo tip_height + 1; it selects
+    // the transaction version (3 / sighash v3 from the hardening activation
+    // height, 1 below it). Version 1 only: the outpoints whose previous
+    // transactions should be fetched...
+    plan: (utxos, to, amount, fee, nextHeight) => call({ op: "plan", utxos, to, amount: String(amount), fee: String(fee), next_height: String(nextHeight) }),
     // ...and the payment, with those transactions (txid -> raw hex) so the
-    // core can check the claimed UTXO values before it signs.
-    pay: (utxos, to, amount, fee, prevtxs = {}) => call({ op: "pay", utxos, to, amount: String(amount), fee: String(fee), prevtxs }),
+    // core can check the claimed UTXO values before it signs. A version-3
+    // signature commits to every spent value, so nothing needs fetching.
+    pay: (utxos, to, amount, fee, nextHeight, prevtxs = {}) => call({ op: "pay", utxos, to, amount: String(amount), fee: String(fee), next_height: String(nextHeight), prevtxs }),
     address: () => call({ op: "address" }).address,
     normalize: (address) => call({ op: "normalize", address }).address,
     minFee: (size) => call({ op: "minfee", size }).fee,
