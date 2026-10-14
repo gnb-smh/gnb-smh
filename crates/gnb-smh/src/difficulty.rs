@@ -11,12 +11,18 @@
 //! and no accumulated rounding drift.
 //!
 //! ```text
-//! exponent = (parent_time - anchor_time - T * (height - anchor_height - 1)) / halflife
-//! target   = anchor_target * 2^exponent,  clamped to [1, pow_limit]
+//! ahead    = parent_time - anchor_time - T * (height - anchor_height - 1)
+//! exponent = floor(ahead * 65536 / halflife)           // 16.16 fixed point, rounds toward -inf
+//! shifts   = floor(exponent / 65536),  frac = exponent mod 65536
+//! factor   = 65536 + ((195766423245049*frac + 971821376*frac^2 + 5127*frac^3 + 2^47) >> 48)
+//! target   = floor(anchor_target * factor * 2^(shifts - 16)),  clamped to [1, pow_limit]
 //! ```
 //!
 //! `2^frac` for the fractional part uses the aserti3-2d cubic in 16-bit
-//! fixed point; the integer part is an exact bit shift.
+//! fixed point; the product with the anchor target is exact and the net shift
+//! is applied once, as in aserti3-2d. The normative executable definition is
+//! `reference/gnb_difficulty.py`; `reference/difficulty_vectors.json` pins it
+//! and `tests/difficulty_vectors.rs` checks this module against those vectors.
 
 use core::cmp::Ordering;
 use core::fmt;
@@ -155,24 +161,38 @@ pub fn meets_target(out: &[u8; 32], target: &Target) -> bool {
     out < &target.0
 }
 
-/// Expected number of evaluations to meet `target`, approximately
-/// 2^256 / target (the spec's `work`), at least 1, saturating at `u128::MAX`.
-/// The zero target has work 0: it never validates and must never add weight.
+/// Chain-work contribution of `target`: an approximation of the expected
+/// number of evaluations, 2^256 / target. CONSENSUS DEFINITION (blue work is
+/// the sum of these values), exactly:
 ///
-/// Computed as floor((2^128 - 1) / ((target >> 128) + 1)), which never
-/// overstates the exact value; chain work only needs a monotone, conservative
-/// measure.
+/// ```text
+/// work(target) = max(floor((2^128 - 1) / (floor(target / 2^128) + 1)), 1)   for 1 <= target < 2^256
+/// work(0)      = 0
+/// ```
+///
+/// This is the definition of `work` in the normative references
+/// (`reference/gnb_smh.py`, `reference/gnb_difficulty.py`), pinned by
+/// `reference/difficulty_vectors.json`. It is neither floor(2^256 / target)
+/// nor Bitcoin Core's floor(2^256 / (target + 1)) (`GetBlockProof`): it never
+/// exceeds either, falls short of the latter (`core`) by at most
+/// core / floor(target / 2^128) + 2, i.e. by less than one part in 2^64 (plus
+/// 2) for every target at or above 2^192, and is monotone (a harder target
+/// never carries less work). Targets below 2^128 saturate at
+/// `u128::MAX` = 2^128 - 1. The zero target (malformed bits) has work 0: it
+/// never validates and must never add weight.
 pub fn work(target: &Target) -> u128 {
     if target.is_zero() {
         return 0;
     }
     let idx = target.0.iter().position(|&x| x != 0).unwrap_or(31);
     if idx >= 16 {
-        // target < 2^128, so 2^256 / target >= 2^128: saturate.
+        // target < 2^128: floor(target / 2^128) = 0, so the formula gives
+        // (2^128 - 1) / 1 = u128::MAX.
         return u128::MAX;
     }
-    // target >= 2^128: work = 2^256 / target < 2^128. Use the top 16 bytes
-    // (target >> 128) + 1 as the divisor of 2^128.
+    // target >= 2^128: divide 2^128 - 1 by floor(target / 2^128) + 1 (the
+    // top 16 bytes plus one); the sum overflows only for a top half of all
+    // ones, where the quotient is 0 and the result is clamped to 1.
     let mut hi: u128 = 0;
     for &x in &target.0[..16] {
         hi = (hi << 8) | x as u128;
@@ -234,6 +254,10 @@ impl fmt::Display for AsertError {
 impl std::error::Error for AsertError {}
 
 /// Target for the block at `height` whose parent has timestamp `parent_time`.
+///
+/// On GnB the caller passes the latest timestamp among the block's parents
+/// and `height = max(parent heights) + 1` (see `docs/CONSENSUS.md`); this
+/// function itself is a pure function of its arguments.
 pub fn asert_next_target(
     params: &AsertParams,
     anchor: &AsertAnchor,
@@ -252,7 +276,13 @@ pub fn asert_next_target(
         .checked_mul(height_delta)
         .ok_or(AsertError::ArithmeticOverflow)?;
     let ahead = time_delta.checked_sub(schedule).ok_or(AsertError::ArithmeticOverflow)?;
-    // Exponent in 1/65536 units, floor division (toward -inf) like aserti3-2d.
+    // Exponent in 1/65536 units: floor(ahead * 65536 / halflife), i.e. the
+    // quotient rounded toward negative infinity (`div_euclid` with a positive
+    // half-life). This is NOT the rounding of BCHN's aserti3-2d, whose C++ `/`
+    // truncates toward zero: the two agree when `ahead * 65536` is >= 0 or a
+    // multiple of the half-life, and otherwise GnB's exponent is one unit
+    // (2^-16 of a half-life) lower, i.e. very slightly harder. GnB's rule is
+    // pinned by `reference/gnb_difficulty.py` and its vectors.
     let exponent = (ahead.checked_mul(65_536).ok_or(AsertError::ArithmeticOverflow)?)
         .div_euclid(params.halflife as i128);
 
@@ -266,23 +296,28 @@ pub fn asert_next_target(
             + (1u128 << 47))
             >> 48) as u64;
 
-    let mut t = mul_u64_shr16(&anchor_target.0, factor);
     if shifts >= 256 {
         return Ok(params.pow_limit);
     }
-    if shifts > 0 {
-        for _ in 0..shifts {
-            if shl1(&mut t) {
-                return Ok(params.pow_limit);
-            }
-        }
-    } else if shifts < 0 {
-        let n = (-shifts).min(256);
-        for _ in 0..n {
-            shr1(&mut t);
-        }
-    }
-    let mut out = Target(t);
+    // aserti3-2d fixed-point step: multiply the full anchor target by the
+    // 17-bit factor (exact, in 320 bits) and apply the net shift
+    // `shifts - 16` once. No intermediate is truncated or saturated, so the
+    // result is floor(anchor_target * factor * 2^(shifts - 16)) exactly; a
+    // value of 2^256 or more is clamped to the pow limit like any other
+    // value above it.
+    //
+    // (Before the 2026-10 audit fix AUD-1 the product was shifted right by 16
+    // and saturated at 2^256 - 1 first, then shifted bit by bit. That
+    // saturation made anchors at or above ~2^255 up to 2x too hard after a
+    // negative shift. For anchors below 2^255, including GnB's genesis anchor
+    // (~2^244), the two orders give the same compact `bits`: they differ only
+    // in bits below position `shifts`, which the compact form never keeps.)
+    let product = mul_wide(&anchor_target.0, factor);
+    let net = shifts - 16;
+    let mut out = match shift_to_u256(&product, net) {
+        Some(t) => Target(t),
+        None => return Ok(params.pow_limit), // >= 2^256: above any pow limit
+    };
     if out > params.pow_limit {
         out = params.pow_limit;
     }
@@ -305,48 +340,71 @@ pub fn asert_next_bits(
     asert_next_target(params, anchor, parent_time, height).map(|t| target_to_bits(&t))
 }
 
-/// (t * factor) >> 16, saturating at 2^256 - 1. `factor` < 2^17.
-fn mul_u64_shr16(t: &[u8; 32], factor: u64) -> [u8; 32] {
-    // 35 bytes hold t * factor < 2^273. Each step: byte * factor + carry < 2^26.
-    let mut wide = [0u8; 35];
-    let mut carry: u64 = 0;
-    for i in (0..32).rev() {
-        let p = t[i] as u64 * factor + carry;
-        wide[i + 3] = p as u8;
-        carry = p >> 8;
+/// Number of 64-bit limbs of the ASERT intermediate: 320 bits hold
+/// `target * factor` < 2^256 * 2^17.
+const WIDE_LIMBS: usize = 5;
+
+/// `t * factor` exactly, as little-endian 64-bit limbs. `factor` < 2^17.
+fn mul_wide(t: &[u8; 32], factor: u64) -> [u64; WIDE_LIMBS] {
+    let mut out = [0u64; WIDE_LIMBS];
+    let mut carry: u128 = 0;
+    for (i, limb) in out.iter_mut().take(4).enumerate() {
+        // Limb i (little-endian) is big-endian bytes [32 - 8(i+1), 32 - 8i).
+        let mut be = [0u8; 8];
+        be.copy_from_slice(&t[32 - 8 * (i + 1)..32 - 8 * i]);
+        let p = u64::from_be_bytes(be) as u128 * factor as u128 + carry;
+        *limb = p as u64;
+        carry = p >> 64;
     }
-    wide[2] = carry as u8;
-    wide[1] = (carry >> 8) as u8;
-    wide[0] = (carry >> 16) as u8;
-    // >> 16 drops the two lowest bytes, leaving wide[0..33]; anything in
-    // wide[0] is at or above 2^256.
-    if wide[0] != 0 {
-        return [0xFF; 32];
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&wide[1..33]);
+    out[4] = carry as u64;
     out
 }
 
-/// In-place ×2; returns true on overflow.
-fn shl1(t: &mut [u8; 32]) -> bool {
-    let mut carry = 0u8;
-    for b in t.iter_mut().rev() {
-        let v = ((*b as u16) << 1) | carry as u16;
-        *b = v as u8;
-        carry = (v >> 8) as u8;
+/// `floor(v * 2^net)` as a 256-bit big-endian integer, or `None` when the
+/// result is 2^256 or more. A right shift of 320 bits or more yields zero.
+fn shift_to_u256(v: &[u64; WIDE_LIMBS], net: i128) -> Option<[u8; 32]> {
+    const BITS: i128 = 64 * WIDE_LIMBS as i128;
+    let len = v
+        .iter()
+        .rposition(|&l| l != 0)
+        .map_or(0, |i| 64 * i as i128 + 64 - v[i].leading_zeros() as i128);
+    let mut r = [0u64; WIDE_LIMBS];
+    if len == 0 || net <= -BITS {
+        // Zero stays zero; a shift past every bit leaves nothing.
+    } else if net >= 0 {
+        if len + net > 256 {
+            return None;
+        }
+        // len >= 1 and len + net <= 256, so 0 <= net <= 255.
+        let (limbs, bits) = ((net / 64) as usize, (net % 64) as u32);
+        for i in (limbs..WIDE_LIMBS).rev() {
+            let src = i - limbs;
+            let mut x = v[src] << bits;
+            if bits != 0 && src >= 1 {
+                x |= v[src - 1] >> (64 - bits);
+            }
+            r[i] = x;
+        }
+    } else {
+        let s = -net; // 1..BITS-1
+        let (limbs, bits) = ((s / 64) as usize, (s % 64) as u32);
+        for i in 0..WIDE_LIMBS - limbs {
+            let src = i + limbs;
+            let mut x = v[src] >> bits;
+            if bits != 0 && src + 1 < WIDE_LIMBS {
+                x |= v[src + 1] << (64 - bits);
+            }
+            r[i] = x;
+        }
     }
-    carry != 0
-}
-
-/// In-place floor(÷2).
-fn shr1(t: &mut [u8; 32]) {
-    let mut carry = 0u8;
-    for b in t.iter_mut() {
-        let v = ((carry as u16) << 8) | *b as u16;
-        *b = (v >> 1) as u8;
-        carry = (v & 1) as u8;
+    if r[4] != 0 {
+        return None;
     }
+    let mut out = [0u8; 32];
+    for (i, limb) in r.iter().take(4).enumerate() {
+        out[32 - 8 * (i + 1)..32 - 8 * i].copy_from_slice(&limb.to_be_bytes());
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -354,6 +412,83 @@ mod tests {
     use super::*;
 
     const LIMIT_BITS: u32 = 0x2100_FFFF;
+
+    /// In-place ×2; returns true on overflow.
+    fn shl1(t: &mut [u8; 32]) -> bool {
+        let mut carry = 0u8;
+        for b in t.iter_mut().rev() {
+            let v = ((*b as u16) << 1) | carry as u16;
+            *b = v as u8;
+            carry = (v >> 8) as u8;
+        }
+        carry != 0
+    }
+
+    /// In-place floor(÷2).
+    fn shr1(t: &mut [u8; 32]) {
+        let mut carry = 0u8;
+        for b in t.iter_mut() {
+            let v = ((carry as u16) << 8) | *b as u16;
+            *b = (v >> 1) as u8;
+            carry = (v & 1) as u8;
+        }
+    }
+
+    /// The ASERT step as written before audit fix AUD-1: `(t * factor) >> 16`
+    /// saturated at 2^256 - 1, then shifted one bit at a time. Kept only to
+    /// prove that the fix leaves every compact result for anchors below
+    /// 2^255 (GnB's genesis anchor among them) unchanged.
+    fn legacy_asert_bits(p: &AsertParams, a: &AsertAnchor, parent_time: i64, height: u64) -> u32 {
+        let anchor_target = try_bits_to_target(a.bits).unwrap();
+        let ahead = parent_time as i128
+            - a.timestamp as i128
+            - p.target_spacing as i128 * (height - a.height - 1) as i128;
+        let exponent = (ahead * 65_536).div_euclid(p.halflife as i128);
+        let shifts = exponent >> 16;
+        let frac = (exponent & 0xFFFF) as u128;
+        let factor = 65_536
+            + ((195_766_423_245_049u128 * frac
+                + 971_821_376u128 * frac.pow(2)
+                + 5_127u128 * frac.pow(3)
+                + (1u128 << 47))
+                >> 48) as u64;
+        let mut wide = [0u8; 35];
+        let mut carry: u64 = 0;
+        for i in (0..32).rev() {
+            let v = anchor_target.0[i] as u64 * factor + carry;
+            wide[i + 3] = v as u8;
+            carry = v >> 8;
+        }
+        wide[2] = carry as u8;
+        wide[1] = (carry >> 8) as u8;
+        wide[0] = (carry >> 16) as u8;
+        let mut t = [0xFFu8; 32];
+        if wide[0] == 0 {
+            t.copy_from_slice(&wide[1..33]);
+        }
+        if shifts >= 256 {
+            return target_to_bits(&p.pow_limit);
+        }
+        if shifts > 0 {
+            for _ in 0..shifts {
+                if shl1(&mut t) {
+                    return target_to_bits(&p.pow_limit);
+                }
+            }
+        } else {
+            for _ in 0..(-shifts).min(256) {
+                shr1(&mut t);
+            }
+        }
+        let mut out = Target(t);
+        if out > p.pow_limit {
+            out = p.pow_limit;
+        }
+        if out.is_zero() {
+            out.0[31] = 1;
+        }
+        target_to_bits(&out)
+    }
 
     fn params() -> AsertParams {
         AsertParams { target_spacing: 30, halflife: 7_200, pow_limit: bits_to_target(LIMIT_BITS) }
@@ -464,5 +599,86 @@ mod tests {
         // Extreme timestamps do not panic.
         let _ = asert_next_bits(&p, &a, i64::MIN, u64::MAX);
         let _ = asert_next_bits(&p, &a, i64::MAX, 1);
+    }
+
+    /// AUD-1: an anchor near the pow limit, eight half-lives behind schedule.
+    /// The saturating legacy step returned 0x1f7fffff; the exact aserti3-2d
+    /// arithmetic gives 0x2000a349.
+    #[test]
+    fn high_anchor_negative_shift_does_not_saturate() {
+        let p = params();
+        let a = AsertAnchor { bits: 0x2100_A34E, ..anchor() };
+        let parent_time = a.timestamp - 57_601;
+        assert_eq!(asert_next_bits(&p, &a, parent_time, 1).unwrap(), 0x2000_A349);
+        assert_eq!(legacy_asert_bits(&p, &a, parent_time, 1), 0x1F7F_FFFF, "legacy saturated");
+        // Anchor 2^255 exactly eight half-lives behind: 2^247, no saturation.
+        let a = AsertAnchor { bits: 0x2100_8000, ..anchor() };
+        let t = asert_next_target(&p, &a, a.timestamp - 8 * 7_200, 1).unwrap();
+        let mut expect = [0u8; 32];
+        expect[1] = 0x80;
+        assert_eq!(t, Target(expect));
+    }
+
+    /// The fix changes no compact result for anchors below 2^255: sweep the
+    /// genesis anchor and others over heights and skews on both sides of the
+    /// schedule, including both clamps.
+    #[test]
+    fn low_anchor_bits_match_legacy_order() {
+        let p = params();
+        for bits in [0x1F0E_9036u32, 0x1D00_FFFF, 0x2000_FFFF, 0x207F_FFFF] {
+            let a = AsertAnchor { bits, ..anchor() };
+            for height in (1u64..=4_000_001).step_by(99_991) {
+                for skew in (-4_000_000i64..=4_000_000).step_by(9_973) {
+                    let parent_time = a.timestamp + 30 * (height as i64 - 1) + skew;
+                    assert_eq!(
+                        asert_next_bits(&p, &a, parent_time, height).unwrap(),
+                        legacy_asert_bits(&p, &a, parent_time, height),
+                        "anchor={bits:#x} height={height} skew={skew}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shift_to_u256_boundaries() {
+        let one = [1u64, 0, 0, 0, 0];
+        let bit = |n: usize| {
+            let mut t = [0u8; 32];
+            t[31 - n / 8] = 1 << (n % 8);
+            t
+        };
+        assert_eq!(shift_to_u256(&one, 255), Some(bit(255)));
+        assert_eq!(shift_to_u256(&one, 256), None);
+        assert_eq!(shift_to_u256(&one, 0), Some(bit(0)));
+        assert_eq!(shift_to_u256(&one, -1), Some([0u8; 32]));
+        let high = [0, 0, 0, 0, 1u64]; // 2^256
+        assert_eq!(shift_to_u256(&high, 0), None);
+        assert_eq!(shift_to_u256(&high, -1), Some(bit(255)));
+        assert_eq!(shift_to_u256(&high, -256), Some(bit(0)));
+        assert_eq!(shift_to_u256(&high, -257), Some([0u8; 32]));
+        assert_eq!(shift_to_u256(&high, -320), Some([0u8; 32]));
+        assert_eq!(shift_to_u256(&high, i128::MIN / 2), Some([0u8; 32]));
+        assert_eq!(shift_to_u256(&[0; 5], 1_000), Some([0u8; 32]));
+        // Bits cross limb boundaries in both directions.
+        let v = [0x8000_0000_0000_0001u64, 0x1, 0, 0, 0]; // 2^64 + 2^63 + 1
+        let mut e = [0u8; 32];
+        e[23] = 0x03; // 2^65 + 2^64
+        e[31] = 0x02;
+        assert_eq!(shift_to_u256(&v, 1), Some(e));
+        let mut e = [0u8; 32];
+        e[24] = 0xC0; // 2^63 + 2^62
+        assert_eq!(shift_to_u256(&v, -1), Some(e));
+    }
+
+    #[test]
+    fn mul_wide_is_exact() {
+        // (2^256 - 1)(2^17 - 1) = 2^273 - 2^256 - 2^17 + 1
+        let max = mul_wide(&[0xFF; 32], 131_071);
+        assert_eq!(max[4], (1u64 << 17) - 2);
+        assert_eq!(max[3], u64::MAX);
+        assert_eq!(max[2], u64::MAX);
+        assert_eq!(max[1], u64::MAX);
+        assert_eq!(max[0], (1u64 << 17).wrapping_neg() + 1);
     }
 }
