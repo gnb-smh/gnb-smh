@@ -1467,6 +1467,50 @@ fn net12_explorer_statistics_read_a_bounded_number_of_entries() {
     assert!(s1.total_txs < s2.total_txs && p1.holders < p2.holders);
 }
 
+/// Review finding (hashrate): every DAG block — merged blue and red ones
+/// included — cost a block's worth of work, so the hashrate is derived from
+/// the interval between ALL DAG blocks over the sampled span, not between
+/// selected-chain blocks. A "ladder" DAG with two blocks per level (each
+/// chain block merges the other block of the level below) has twice the
+/// chain-only hashrate. Pre-fix `hashrate_hs` counted chain blocks only and
+/// reported half.
+#[test]
+fn net12_hashrate_counts_every_dag_block() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Storage::open(&tmp.path().join("db")).unwrap();
+    let dag = RwLock::new(GhostDAG::with_default_k());
+    dag.write().add_genesis([0u8; 32], 1_000);
+    let id = |lvl: u64, side: u8| {
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&lvl.to_le_bytes());
+        h[8] = side;
+        h[31] = 0x1A;
+        h
+    };
+    let mut prev = vec![[0u8; 32]];
+    for lvl in 1..=60u64 {
+        for side in 0..2u8 {
+            dag.write().add_block(id(lvl, side), prev.clone(), 1_000 + 30 * lvl, 1).unwrap();
+        }
+        prev = vec![id(lvl, 0), id(lvl, 1)];
+    }
+    let never = AtomicBool::new(false);
+    let s = analytics::chain_stats_bounded(&store, &dag, 1_000 + 30 * 60 + 10, &never).unwrap();
+    assert!((s.avg_block_time - 30.0).abs() < 1e-9, "chain interval {}", s.avg_block_time);
+    assert!((s.avg_dag_block_interval - 15.0).abs() < 1e-9, "DAG interval {}", s.avg_dag_block_interval);
+    let chain_only = analytics::estimate_hashrate(s.current_difficulty, s.avg_block_time);
+    assert!((s.hashrate_estimate / chain_only - 2.0).abs() < 1e-9, "{} vs {}", s.hashrate_estimate, chain_only);
+
+    // A plain chain: both intervals agree.
+    let dag = RwLock::new(GhostDAG::with_default_k());
+    dag.write().add_genesis([0u8; 32], 1_000);
+    for lvl in 1..=60u64 {
+        dag.write().add_block(id(lvl, 0), vec![if lvl == 1 { [0u8; 32] } else { id(lvl - 1, 0) }], 1_000 + 30 * lvl, 1).unwrap();
+    }
+    let s = analytics::chain_stats_bounded(&store, &dag, 1_000 + 30 * 60 + 10, &never).unwrap();
+    assert!((s.avg_dag_block_interval - s.avg_block_time).abs() < 1e-9);
+}
+
 /// NET-12: long work checks a cancellation flag (the RPC sets it when its
 /// dispatch timeout fires) and stops at once.
 #[test]
@@ -1482,8 +1526,10 @@ fn net12_long_work_is_cancellable() {
     let cancel = AtomicBool::new(true);
     let st = &sim.store;
     let r0 = st.storage_reads();
-    assert_eq!(analytics::chain_stats_bounded(st, &dag, 5_000, &cancel).unwrap_err(), "cancelled");
-    assert!(analytics::rich_list_bounded(st, 0, 100, &cancel).unwrap_err().contains("cancelled"));
+    assert!(matches!(analytics::chain_stats_bounded(st, &dag, 5_000, &cancel), Err(analytics::StatsError::Cancelled)));
+    // The cancellation surfaces inside the storage walk as a StorageError;
+    // it is reported as Cancelled, never as a storage failure.
+    assert!(matches!(analytics::rich_list_bounded(st, 0, 100, &cancel), Err(analytics::StatsError::Cancelled)));
     assert!(st.recompute_aggregates(&cancel).is_err());
     assert!(st.balance_at_height_cancellable(&[1; 20], u64::MAX, &cancel).is_err());
     assert!(st.storage_reads() - r0 <= 3, "nothing was walked after the flag was seen");

@@ -247,17 +247,30 @@ pub(super) fn get_block_dag(params: Option<&Value>, state: &AppState) -> Value {
 /// Selected-chain blocks from the tip backwards, at most `n`, as
 /// `(hash, height, timestamp)`. An O(n) walk of selected parents under a
 /// short DAG read lock; no storage access (NET-12/NET-15).
-fn chain_tail(state: &AppState, n: usize) -> Vec<([u8; 32], u64, u64)> {
+///
+/// `None` = the request was cancelled (also while it waited for the lock) —
+/// never a partial tail: callers answer `{"error": "cancelled"}`, which
+/// HeavyGate never caches. Returning a truncated tail as a success let a
+/// cancelled request cache zero block-time percentiles and an empty
+/// difficulty history for 30 s (review finding).
+fn chain_tail(state: &AppState, n: usize) -> Option<Vec<([u8; 32], u64, u64)>> {
+    use std::sync::atomic::Ordering::Relaxed;
     let dag = state.dag.read();
+    if state.cancel.load(Relaxed) {
+        return None;
+    }
     let mut out = Vec::with_capacity(n.min(4096));
     let mut cur = dag.selected_tip();
     while let Some(h) = cur {
-        if out.len() >= n || state.cancel.load(std::sync::atomic::Ordering::Relaxed) { break; }
+        if out.len() >= n { break; }
+        if state.cancel.load(Relaxed) {
+            return None;
+        }
         let Some(d) = dag.get_block_data(&h) else { break };
         out.push((h, d.height, d.timestamp));
         cur = d.selected_parent;
     }
-    out
+    Some(out)
 }
 
 /// Upper bound on blocks read by `getdifficultyhistory`, per point asked.
@@ -270,7 +283,9 @@ const DIFFICULTY_SCAN_PER_POINT: usize = 4;
 /// body, decoded and sorted on every call).
 pub(super) fn get_difficulty_history(params: Option<&Value>, state: &AppState) -> Value {
     let limit = (params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(20) as usize).clamp(1, 100);
-    let tail = chain_tail(state, limit * DIFFICULTY_SCAN_PER_POINT);
+    let Some(tail) = chain_tail(state, limit * DIFFICULTY_SCAN_PER_POINT) else {
+        return json!({ "error": "cancelled" });
+    };
     let mut items: Vec<Value> = Vec::new();
     let mut last_bits: Option<u32> = None;
     for (hash, height, timestamp) in tail {
@@ -301,7 +316,9 @@ pub(super) fn get_difficulty_history(params: Option<&Value>, state: &AppState) -
 /// body, decoded and sorted on every call).
 pub(super) fn get_block_time_percentiles(params: Option<&Value>, state: &AppState) -> Value {
     let window = (params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(100) as usize).clamp(10, 1000);
-    let tail = chain_tail(state, window + 1);
+    let Some(tail) = chain_tail(state, window + 1) else {
+        return json!({ "error": "cancelled" });
+    };
     let mut deltas: Vec<u64> = tail.windows(2).map(|w| w[0].2.saturating_sub(w[1].2)).collect();
     deltas.sort_unstable();
     let n = deltas.len();
@@ -445,7 +462,7 @@ pub(super) fn get_rich_list(params: Option<&Value>, state: &AppState) -> Value {
                 "share":   if page.total_supply > 0 { e.balance as f64 / page.total_supply as f64 } else { 0.0 },
             })).collect::<Vec<_>>(),
         }),
-        Err(e) => json!({ "error": e }),
+        Err(e) => super::stats_err_response(&e),
     }
 }
 
@@ -466,6 +483,6 @@ pub(super) fn get_supply_distribution(state: &AppState) -> Value {
                 })).collect::<Vec<_>>(),
             })
         }
-        Err(e) => json!({ "error": e }),
+        Err(e) => super::stats_err_response(&e),
     }
 }

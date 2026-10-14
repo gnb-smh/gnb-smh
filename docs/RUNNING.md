@@ -57,4 +57,8 @@ scanning. Every start-up also checks that the stored aggregates describe the
 connected chain on disk (block count and a fingerprint of the connected
 blocks against the undo records), so a data directory that an older release
 moved forward after a downgrade is rebuilt too instead of serving stale
-statistics.
+statistics. `hashrate_hs` counts every DAG block (the selected-chain blocks
+and the blue and red blocks they merge, `avg_dag_block_interval_secs`);
+`avg_block_time_secs` is the interval between selected-chain blocks. A
+storage failure behind any of these methods is answered with the generic
+`STORAGE_ERROR` response; the detail only goes to the node's log.

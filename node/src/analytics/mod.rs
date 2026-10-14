@@ -18,6 +18,10 @@
 //!   flag, and read the per-block cumulative totals at the two ends only;
 //! * the rich list reads at most `offset + limit` index entries, with
 //!   `offset ≤` [`MAX_RICHLIST_OFFSET`] and `limit ≤` [`MAX_RICHLIST_PAGE`].
+//!
+//! Errors are typed ([`StatsError`]): the RPC layer answers a storage
+//! failure with the sanitised `STORAGE_ERROR` response (audit L-5) and never
+//! with the storage detail (paths, RocksDB internals).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -25,7 +29,7 @@ use parking_lot::RwLock;
 
 use crate::consensus::GhostDAG;
 use crate::storage::aggregates::{HolderEntry, TierTotals};
-use crate::storage::Storage;
+use crate::storage::{Storage, StorageError};
 use crate::mempool::Mempool;
 use crate::core::TARGET_BLOCK_TIME;
 
@@ -41,8 +45,42 @@ pub const MAX_RICHLIST_PAGE: usize = 100;
 
 const NOT_READY: &str = "explorer aggregates are not built yet (they are rebuilt at node start-up)";
 
-fn cancelled(cancel: &AtomicBool) -> Result<(), String> {
-    if cancel.load(Ordering::Relaxed) { Err("cancelled".into()) } else { Ok(()) }
+/// Why an explorer statistic could not be computed.
+#[derive(Debug)]
+pub enum StatsError {
+    /// The aggregates are not built yet (start-up rebuild pending).
+    NotReady,
+    /// The request's cancellation flag was set (dispatch timeout).
+    Cancelled,
+    /// The DAG has no selected tip yet.
+    NoTip,
+    /// A storage failure. Its detail is for the node's log only: the RPC
+    /// layer answers with the sanitised `STORAGE_ERROR` response (audit L-5).
+    Storage(StorageError),
+}
+
+impl std::fmt::Display for StatsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StatsError::NotReady => write!(f, "{}", NOT_READY),
+            StatsError::Cancelled => write!(f, "cancelled"),
+            StatsError::NoTip => write!(f, "no selected tip yet"),
+            StatsError::Storage(_) => write!(f, "internal storage error"),
+        }
+    }
+}
+
+impl std::error::Error for StatsError {}
+
+/// A storage error seen by a cancellable computation: `aggregates::cancelled`
+/// is itself a `StorageError`, so a set flag means the request was
+/// cancelled, not that storage failed.
+fn storage(cancel: &AtomicBool, e: StorageError) -> StatsError {
+    if cancel.load(Ordering::Relaxed) { StatsError::Cancelled } else { StatsError::Storage(e) }
+}
+
+fn cancelled(cancel: &AtomicBool) -> Result<(), StatsError> {
+    if cancel.load(Ordering::Relaxed) { Err(StatsError::Cancelled) } else { Ok(()) }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -66,8 +104,16 @@ pub struct ChainStats {
     pub txs_last_24h:        Option<u64>,
     /// The 24 h window hit [`STATS_WINDOW_MAX_BLOCKS`].
     pub window_capped:       bool,
+    /// Average interval between SELECTED-CHAIN blocks over the last
+    /// [`BLOCK_TIME_SAMPLE`] chain blocks.
     pub avg_block_time:      f64,
+    /// Average interval between DAG blocks over the same span: the chain
+    /// blocks plus every block they merged (blue and red). Each of them cost
+    /// a block's worth of work.
+    pub avg_dag_block_interval: f64,
     pub current_difficulty:  u32,
+    /// Network hashrate: hashes per block / [`Self::avg_dag_block_interval`]
+    /// (every DAG block counts, merged blue and red included).
     pub hashrate_estimate:   f64,
 }
 
@@ -79,28 +125,40 @@ pub fn chain_stats_bounded(
     dag: &RwLock<GhostDAG>,
     now_unix: u64,
     cancel: &AtomicBool,
-) -> Result<ChainStats, String> {
+) -> Result<ChainStats, StatsError> {
     if !store.aggregates_ready() {
-        return Err(NOT_READY.into());
+        return Err(StatsError::NotReady);
     }
     let applied_tip = store.get_meta("tip_hash").ok().flatten()
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
     let cutoff = now_unix.saturating_sub(86_400);
 
     // In-memory walks under the DAG read lock; no storage access here.
-    struct Walk { tip: [u8; 32], dag_blocks: u64, in_window: u64, boundary: Option<([u8; 32], bool)>, capped: bool, sample: Vec<u64> }
+    struct Walk {
+        tip: [u8; 32], dag_blocks: u64, in_window: u64, boundary: Option<([u8; 32], bool)>, capped: bool,
+        sample: Vec<u64>,
+        /// DAG blocks mined after the oldest sampled chain block.
+        dag_in_sample: u64,
+    }
     let w = {
         let d = dag.read();
         let tip = applied_tip.filter(|t| d.has_block(t)).or_else(|| d.selected_tip())
-            .ok_or_else(|| "no selected tip yet".to_string())?;
+            .ok_or(StatsError::NoTip)?;
+        // Each chain block stands for itself plus its mergeset (the merged
+        // blue and red blocks, the selected parent excluded): summed over
+        // the newest n-1 sampled chain blocks, exactly the DAG blocks mined
+        // after the oldest one.
         let mut sample = Vec::with_capacity(BLOCK_TIME_SAMPLE);
+        let mut merged: Vec<u64> = Vec::with_capacity(BLOCK_TIME_SAMPLE);
         let mut cur = Some(tip);
         while let Some(h) = cur {
             if sample.len() >= BLOCK_TIME_SAMPLE { break; }
             let Some(data) = d.get_block_data(&h) else { break };
             sample.push(data.timestamp);
+            merged.push(1 + data.mergeset_blues.len() as u64 + data.mergeset_reds.len() as u64);
             cur = data.selected_parent;
         }
+        let dag_in_sample: u64 = if sample.len() >= 2 { merged[..sample.len() - 1].iter().sum() } else { 0 };
         let (mut in_window, mut boundary, mut capped) = (0u64, None, false);
         let mut cur = Some(tip);
         while let Some(h) = cur {
@@ -121,10 +179,10 @@ pub fn chain_stats_bounded(
             in_window += 1;
             cur = data.selected_parent;
         }
-        Walk { tip, dag_blocks: d.block_count() as u64, in_window, boundary, capped, sample }
+        Walk { tip, dag_blocks: d.block_count() as u64, in_window, boundary, capped, sample, dag_in_sample }
     };
 
-    let totals = store.chain_totals().map_err(|e| e.to_string())?;
+    let totals = store.chain_totals().map_err(|e| storage(cancel, e))?;
     let at = |h: &[u8; 32], genesis: bool| -> Option<u64> {
         match store.chain_cumulative(h) {
             Ok(Some(t)) => Some(t.txs),
@@ -143,11 +201,13 @@ pub fn chain_stats_bounded(
         _ => None,
     };
 
-    let avg_block_time = if w.sample.len() >= 2 {
+    let (avg_block_time, avg_dag_block_interval) = if w.sample.len() >= 2 {
         let span = w.sample[0].saturating_sub(*w.sample.last().unwrap_or(&w.sample[0]));
-        span as f64 / (w.sample.len() - 1) as f64
+        let chain = span as f64 / (w.sample.len() - 1) as f64;
+        let dag = if w.dag_in_sample > 0 { span as f64 / w.dag_in_sample as f64 } else { chain };
+        (chain, dag)
     } else {
-        TARGET_BLOCK_TIME as f64
+        (TARGET_BLOCK_TIME as f64, TARGET_BLOCK_TIME as f64)
     };
     let bits = store.get_block(&w.tip).ok().flatten().map(|b| b.header.bits)
         .unwrap_or(crate::core::GENESIS_BITS);
@@ -161,8 +221,9 @@ pub fn chain_stats_bounded(
         txs_last_24h,
         window_capped: w.capped,
         avg_block_time,
+        avg_dag_block_interval,
         current_difficulty: bits,
-        hashrate_estimate: estimate_hashrate(bits, avg_block_time),
+        hashrate_estimate: estimate_hashrate(bits, avg_dag_block_interval),
     })
 }
 
@@ -185,14 +246,14 @@ pub struct RichListPage {
 /// NET-12: `limit` (1..=[`MAX_RICHLIST_PAGE`]) holders from rank `offset`
 /// (clamped to [`MAX_RICHLIST_OFFSET`]): one read of the tier totals plus
 /// at most `offset + limit` index entries.
-pub fn rich_list_bounded(store: &Storage, offset: usize, limit: usize, cancel: &AtomicBool) -> Result<RichListPage, String> {
+pub fn rich_list_bounded(store: &Storage, offset: usize, limit: usize, cancel: &AtomicBool) -> Result<RichListPage, StatsError> {
     if !store.aggregates_ready() {
-        return Err(NOT_READY.into());
+        return Err(StatsError::NotReady);
     }
     let offset = offset.min(MAX_RICHLIST_OFFSET);
     let limit = limit.clamp(1, MAX_RICHLIST_PAGE);
-    let tiers = store.tier_totals().map_err(|e| e.to_string())?;
-    let items = store.rich_list_page(offset, limit, cancel).map_err(|e| e.to_string())?;
+    let tiers = store.tier_totals().map_err(|e| storage(cancel, e))?;
+    let items = store.rich_list_page(offset, limit, cancel).map_err(|e| storage(cancel, e))?;
     Ok(RichListPage {
         holders: tiers.iter().map(|t| t.holders).sum(),
         total_supply: tiers.iter().fold(0u64, |a, t| a.saturating_add(t.sats)),
@@ -202,16 +263,16 @@ pub fn rich_list_bounded(store: &Storage, offset: usize, limit: usize, cancel: &
 }
 
 /// NET-12: the supply distribution — one read.
-pub fn supply_distribution_bounded(store: &Storage) -> Result<Vec<TierTotals>, String> {
+pub fn supply_distribution_bounded(store: &Storage) -> Result<Vec<TierTotals>, StatsError> {
     if !store.aggregates_ready() {
-        return Err(NOT_READY.into());
+        return Err(StatsError::NotReady);
     }
-    store.tier_totals().map_err(|e| e.to_string())
+    store.tier_totals().map_err(StatsError::Storage)
 }
 
 /// NET-12: `(holders, their UTXOs)` — one read (was a scan of the whole
 /// address index).
-pub fn address_count_bounded(store: &Storage) -> Result<(u64, u64), String> {
+pub fn address_count_bounded(store: &Storage) -> Result<(u64, u64), StatsError> {
     let tiers = supply_distribution_bounded(store)?;
     Ok((tiers.iter().map(|t| t.holders).sum(), tiers.iter().map(|t| t.utxos).sum()))
 }

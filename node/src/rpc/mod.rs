@@ -591,6 +591,17 @@ fn storage_err_response(e: &StorageError) -> Value {
     json!({ "error": "internal storage error", "code": "STORAGE_ERROR" })
 }
 
+/// The response for a failed explorer statistic: a storage failure gets the
+/// sanitised L-5 response (its detail only reaches the log); cancellation,
+/// not-ready and no-tip keep their plain message (HeavyGate never caches
+/// any of them).
+fn stats_err_response(e: &crate::analytics::StatsError) -> Value {
+    match e {
+        crate::analytics::StatsError::Storage(se) => storage_err_response(se),
+        other => json!({ "error": other.to_string() }),
+    }
+}
+
 /// Height of the selected tip — the number a confirmation count is relative to.
 ///
 /// # Why this exists as a function
@@ -1096,7 +1107,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     "utxo_entries":           utxos,
                     "note": "distinct 20-byte addresses currently holding >=1 UTXO (on-chain wallets with a non-zero balance) and their UTXOs; addresses that spent to zero or never held a UTXO are not counted",
                 }),
-                Err(e) => json!({ "error": e }),
+                Err(e) => stats_err_response(&e),
             }
         }
 
@@ -1537,12 +1548,13 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     "txs_last_24h":         s.txs_last_24h,
                     "window_capped":        s.window_capped,
                     "avg_block_time_secs":  s.avg_block_time,
+                    "avg_dag_block_interval_secs": s.avg_dag_block_interval,
                     "current_difficulty":   s.current_difficulty,
                     "hashrate_hs":          s.hashrate_estimate,
                     "hashrate_human":       format_hashrate(s.hashrate_estimate),
-                    "note": "total_blocks: blocks in the DAG; chain_blocks/total_txs/*_last_24h: the applied selected chain (the ledger)",
+                    "note": "total_blocks: blocks in the DAG; chain_blocks/total_txs/*_last_24h: the applied selected chain (the ledger); avg_block_time_secs: interval between selected-chain blocks; hashrate_hs: from the interval between ALL DAG blocks (chain blocks and the blue and red blocks they merged, avg_dag_block_interval_secs) over the last 50 chain blocks",
                 }),
-                Err(e) => json!({ "error": e }),
+                Err(e) => stats_err_response(&e),
             }
         }
 
@@ -1559,9 +1571,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     "hashrate_hs":          s.hashrate_estimate,
                     "hashrate_human":       format_hashrate(s.hashrate_estimate),
                     "avg_block_time_secs":  s.avg_block_time,
+                    "avg_dag_block_interval_secs": s.avg_dag_block_interval,
                     "current_difficulty":   s.current_difficulty,
+                    "note": "hashrate_hs counts every DAG block (chain blocks and the blue and red blocks they merged): hashes per block / avg_dag_block_interval_secs over the last 50 chain blocks",
                 }),
-                Err(e) => json!({ "error": e }),
+                Err(e) => stats_err_response(&e),
             }
         }
 
@@ -1988,6 +2002,29 @@ mod l5_storage_error_sanitization_tests {
             "column-family internal name leaked into the RPC response: {}",
             rendered
         );
+    }
+
+    /// Review finding (NET-12 regression of L-5): the explorer statistics
+    /// (`getrichlist`, `getsupplydistribution`, `getaddresscount`,
+    /// `getchainstats`, `gethashrate`) return a typed `StatsError`; a
+    /// storage failure is answered with the sanitised response and its
+    /// detail never reaches the caller. (`StatsError` is not `Serialize`
+    /// and its `Display` of a storage failure carries no detail, so no
+    /// handler can echo it.) Pre-fix they returned `e.to_string()` of the
+    /// `StorageError` — e.g. a RocksDB message with the data-dir path.
+    #[test]
+    fn stats_storage_errors_are_sanitised() {
+        use crate::analytics::StatsError;
+        let sensitive = StatsError::Storage(StorageError::ReadFailed(
+            "IO error: /var/lib/gnb/db/000123.sst: No such file or directory".into(),
+        ));
+        let r = stats_err_response(&sensitive);
+        assert_eq!(r, json!({ "error": "internal storage error", "code": "STORAGE_ERROR" }));
+        assert!(!r.to_string().contains("/var/lib"), "{r}");
+        assert!(!sensitive.to_string().contains("/var/lib"), "Display carries no detail either");
+        assert_eq!(stats_err_response(&StatsError::Cancelled), json!({ "error": "cancelled" }));
+        assert!(stats_err_response(&StatsError::NotReady)["error"].as_str().unwrap().contains("not built"));
+        assert!(stats_err_response(&StatsError::NoTip).get("code").is_none());
     }
 
     /// Every `StorageError` variant must produce the SAME stable response —
@@ -2506,6 +2543,40 @@ mod audit_2026_10_rpc_tests {
         let gate = HeavyGate::new(HEAVY_READ_CACHE_TTL);
         assert_eq!(gate.run("k".into(), || json!({ "error": "cancelled" }))["error"], "cancelled");
         assert_eq!(gate.run("k".into(), || json!(7)), json!(7), "the failure was not cached");
+    }
+
+    /// Review finding (chain_tail): a cancelled request is an ERROR for the
+    /// two selected-chain walks, also when the flag was set while the
+    /// request waited for the DAG lock, and HeavyGate never caches it — the
+    /// next uncancelled call computes real values. Pre-fix `chain_tail`
+    /// stopped silently and returned an empty tail: `{sample_size: 0,
+    /// p50_secs: 0, ...}` and `{count: 0, points: []}` as successes, cached
+    /// for 30 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn net12_cancelled_chain_walks_are_errors_and_never_cached() {
+        let (_tmp, state) = state_with_chain(60);
+        let mut cancelled = state.clone();
+        cancelled.cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        for m in ["getblocktimepercentiles", "getdifficultyhistory"] {
+            let r = dispatch(m, Some(&json!([10])), &cancelled).await;
+            assert_eq!(r["error"], "cancelled", "{m}: {r}");
+        }
+        // Exactly as the server runs a heavy method: HeavyGate around a
+        // blocking dispatch, both states sharing one gate.
+        let run = |st: AppState| {
+            let h = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                st.heavy_gate.clone().run("getblocktimepercentiles|[10]".into(), || {
+                    h.block_on(dispatch("getblocktimepercentiles", Some(&json!([10])), &st))
+                })
+            })
+        };
+        let r = run(cancelled).await.unwrap();
+        assert_eq!(r["error"], "cancelled");
+        let r = run(state).await.unwrap();
+        assert!(r.get("error").is_none(), "{r}");
+        assert_eq!(r["sample_size"], 10, "computed, not served from a cached failure: {r}");
+        assert_eq!(r["p50_secs"], 60);
     }
 
     /// MEM-6: `getmempoolinfo` reports the relay policy in force.
