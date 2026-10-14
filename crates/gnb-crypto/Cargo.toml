@@ -81,7 +81,8 @@ aes-gcm = "0.10"
 
 # Secrets / encoding.
 zeroize = { version = "1", features = ["derive"] }
-bip39   = "2"
+# CRY-4: `zeroize` makes `bip39::Mnemonic` wipe its word indices on drop.
+bip39   = { version = "2", features = ["zeroize"] }
 rand    = "0.9"
 hex     = "0.4"
 base64  = "0.22"

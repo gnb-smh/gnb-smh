@@ -697,15 +697,21 @@ impl Transaction {
 
     /// Parse sig + pubkey out of script_sig
     pub fn parse_script_sig(script_sig: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        // CRY-8: checked arithmetic. On 64-bit targets no sum below can
+        // overflow (lengths are u32), so acceptance is unchanged; on 32-bit
+        // targets a huge declared length now returns None instead of panicking.
         if script_sig.len() < 8 { return None; }
-        let sig_len = u32::from_le_bytes(script_sig[..4].try_into().ok()?) as usize;
-        if script_sig.len() < 4 + sig_len + 4 { return None; }
-        let sig = script_sig[4..4 + sig_len].to_vec();
-        let pk_len = u32::from_le_bytes(
-            script_sig[4 + sig_len..8 + sig_len].try_into().ok()?
-        ) as usize;
-        if script_sig.len() < 8 + sig_len + pk_len { return None; }
-        let pk = script_sig[8 + sig_len..8 + sig_len + pk_len].to_vec();
+        let sig_len = usize::try_from(u32::from_le_bytes(script_sig[..4].try_into().ok()?)).ok()?;
+        let sig_end = sig_len.checked_add(4)?;
+        let pk_len_end = sig_end.checked_add(4)?;
+        if script_sig.len() < pk_len_end { return None; }
+        let sig = script_sig[4..sig_end].to_vec();
+        let pk_len = usize::try_from(u32::from_le_bytes(
+            script_sig[sig_end..pk_len_end].try_into().ok()?
+        )).ok()?;
+        let pk_end = pk_len_end.checked_add(pk_len)?;
+        if script_sig.len() < pk_end { return None; }
+        let pk = script_sig[pk_len_end..pk_end].to_vec();
         Some((sig, pk))
     }
 

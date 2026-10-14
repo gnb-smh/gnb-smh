@@ -118,6 +118,27 @@ impl Address {
         Ok(Self { hash, network })
     }
 
+    /// Parse an address and require it to belong to `network` (CRY-7).
+    ///
+    /// The 4-byte checksum covers only the 20-byte hash, NOT the prefix, so
+    /// `gnb1q…` and `gnb1t…` forms of the same hash both pass [`Self::parse`].
+    /// Every place that turns a user-supplied address into a script_pubkey
+    /// for a specific chain (node `--miner-address`, wallet recipients) must
+    /// therefore compare the network explicitly; this helper does that.
+    ///
+    /// Residual risk (documented, unchanged for interoperability): the
+    /// checksum format itself is not network-bound, so a prefix typo between
+    /// gnb1q and gnb1t is not caught by the checksum. It is caught by this
+    /// network comparison wherever the expected network is known; binding the
+    /// prefix into the checksum (bech32m-style) needs a new address version.
+    pub fn parse_for_network(s: &str, network: Network) -> Result<Self, AddressError> {
+        let address = Self::parse(s)?;
+        if address.network != network {
+            return Err(AddressError::WrongNetwork { expected: network, got: address.network });
+        }
+        Ok(address)
+    }
+
     /// The 20-byte pubkey hash (for storage, script_pubkey, etc.)
     pub fn hash(&self) -> &[u8; 20] {
         &self.hash
@@ -178,6 +199,8 @@ pub enum AddressError {
     BadHex,
     #[error("checksum mismatch")]
     BadChecksum,
+    #[error("address is for {got:?}, expected {expected:?}")]
+    WrongNetwork { expected: Network, got: Network },
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -229,6 +252,21 @@ mod tests {
     fn parse_rejects_bad_length() {
         let result = Address::parse("gnb1qshort");
         assert!(matches!(result, Err(AddressError::BadLength { .. })));
+    }
+
+    #[test]
+    fn parse_for_network_rejects_the_other_prefix_with_a_valid_checksum() {
+        let main = Address::from_hash([0x42; 20], Network::Mainnet).to_string();
+        let swapped = main.replacen("gnb1q", "gnb1t", 1);
+        // The checksum does not cover the prefix (documented residual risk)...
+        assert!(Address::parse(&swapped).is_ok());
+        // ...so callers that know their network must reject the swap.
+        assert_eq!(
+            Address::parse_for_network(&swapped, Network::Mainnet),
+            Err(AddressError::WrongNetwork { expected: Network::Mainnet, got: Network::Testnet }),
+        );
+        assert!(Address::parse_for_network(&main, Network::Mainnet).is_ok());
+        assert!(Address::parse_for_network(&swapped, Network::Testnet).is_ok());
     }
 
     #[test]

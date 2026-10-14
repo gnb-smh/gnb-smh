@@ -6,11 +6,12 @@
 //
 // KAT: Falcon-1024 through Bloch's `gnb::crypto::falcon` wrapper.
 //
-// HONESTY: Falcon signing uses floating-point Gaussian sampling. Its signature
-// bytes are NOT reproducible across platforms/toolchains, so — unlike the
-// ML-DSA-65 half — the Falcon half is NEVER byte-pinned into a portable golden
-// value (this mirrors the caveat in crates/gnb-crypto/src/crypto/mod.rs:79-81
-// and tests/kat_hybrid_signer.rs). This file therefore pins only:
+// NOTE: production Falcon signing is randomized (fresh salt per signature),
+// so this file does not byte-pin signatures. The implementation is PQClean's
+// integer-only `clean` variant (no native floating point), whose seeded
+// keygen and signing are bit-exact on every platform; that determinism is
+// pinned by the seeded KAT `falcon_clean_seeded_kat_is_byte_stable_and_verifies`
+// in crates/gnb-crypto/src/crypto/mod.rs. This file pins only:
 //   (1) the Falcon-1024 public-key length (1793, exposed via the wrapper),
 //   (2) sizes reported by the linked `pqcrypto_falcon::falcon1024` primitive,
 //   (3) sign→verify accepts; tamper / wrong-key / wrong-message reject,

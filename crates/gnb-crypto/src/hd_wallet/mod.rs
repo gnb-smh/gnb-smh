@@ -311,8 +311,14 @@ impl HdWallet {
         if crypto::address_from_pubkey(&keypair.public_key, testnet) != keypair.address {
             return Err("imported keypair public key does not match address".into());
         }
+        // CRY-5: `sign_message` now verifies its own output under the public
+        // key, so a key pair that does not match fails here already.
         let proof = keypair.sign_message(IMPORT_KEY_AUTH_CHALLENGE)
-            .map_err(|_| "imported keypair private key is invalid".to_string())?;
+            .map_err(|e| if e.contains("does not verify under the wallet public key") {
+                "imported keypair private/public keys do not match".to_string()
+            } else {
+                "imported keypair private key is invalid".to_string()
+            })?;
         if !Keypair::verify_message(&keypair.public_key, IMPORT_KEY_AUTH_CHALLENGE, &proof) {
             return Err("imported keypair private/public keys do not match".into());
         }

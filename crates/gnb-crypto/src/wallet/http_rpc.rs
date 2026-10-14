@@ -1,5 +1,10 @@
 //! Bounded synchronous HTTP/1 RPC transport for the retained CLI callers.
 //! HTTP only; this is not a TLS transport or a complete G4 wallet adapter.
+//!
+//! WAL-7 / NET-16: because the transport is plaintext, an API key is only
+//! ever sent to a loopback address (every resolved address must be
+//! loopback). Reach a remote node through an SSH tunnel or a local TLS
+//! proxy (`ssh -L 17210:127.0.0.1:17210 node`), never with the key in clear.
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
@@ -33,6 +38,10 @@ fn call_with_limits(authority: &str, method: &str, params: &Value, api_key: Opti
     }).map_err(|_| "RPC DNS worker unavailable")?;
     let addresses = receive.recv_timeout(remaining(deadline)?).map_err(|_| "RPC DNS deadline exceeded")?
         .map_err(|_| "RPC DNS resolution failed")?;
+    if api_key.is_some() && !key_may_travel_to(&addresses) {
+        return Err("refusing to send the RPC API key over plain HTTP to a non-loopback host; \
+                    use an SSH tunnel or TLS proxy to a loopback port".into());
+    }
     let mut connected = None;
     for address in addresses {
         if let Ok(stream) = TcpStream::connect_timeout(&address, remaining(deadline)?) { connected = Some(stream); break; }
@@ -61,6 +70,11 @@ fn call_with_limits(authority: &str, method: &str, params: &Value, api_key: Opti
         return Err(format!("RPC error code {code}"));
     }
     response.get("result").cloned().ok_or_else(|| "RPC response missing result".into())
+}
+
+/// The plaintext transport may carry an API key only to loopback addresses.
+fn key_may_travel_to(addresses: &[std::net::SocketAddr]) -> bool {
+    !addresses.is_empty() && addresses.iter().all(|a| a.ip().is_loopback())
 }
 
 fn read_response(stream: &mut TcpStream, deadline: Instant, cap: usize) -> Result<Vec<u8>, String> {
@@ -228,6 +242,16 @@ mod tests {
         assert_eq!(call_with_limits(&address, "test", &Value::Null, None, 4096, Duration::from_secs(2)).unwrap(), "é");
         worker.join().unwrap();
         assert!(call("127.0.0.1:1", "test", &Value::Null, Some("key\r\ninjected")).unwrap_err().contains("control"));
+    }
+
+    /// WAL-7 regression: the API key never travels in clear to a remote host.
+    #[test]
+    fn api_key_is_refused_for_non_loopback_hosts() {
+        let error = call("192.0.2.1:17210", "getblockcount", &Value::Null, Some("0123456789abcdef0123")).unwrap_err();
+        assert!(error.contains("refusing to send the RPC API key"), "{error}");
+        assert!(key_may_travel_to(&["127.0.0.1:1".parse().unwrap(), "[::1]:1".parse().unwrap()]));
+        assert!(!key_may_travel_to(&["127.0.0.1:1".parse().unwrap(), "10.0.0.1:1".parse().unwrap()]));
+        assert!(!key_may_travel_to(&[]));
     }
 
     #[test]
