@@ -1,6 +1,6 @@
 //! Regression tests for the block-ingress fixes (audit POW-2, NET-2, POW-3,
-//! POW-4, POW-8, NET-6, DAG-7). Each test asserts the FIXED behaviour; the
-//! matching proofs of concept in `audit/poc/` assert the original bugs.
+//! POW-4, POW-8, NET-6, DAG-7). Each test asserts the FIXED behaviour, the
+//! inverse of the audit's proof of concept for the same finding.
 //!
 //! Note: node test builds enable gnb-crypto's `test-pow-limit` feature, which
 //! pins `expected_bits` to the pow limit. Floors are therefore exercised with

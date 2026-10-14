@@ -1,7 +1,6 @@
 //! Regression tests for the P2P peer-policy fixes (audit NET-5, NET-7, NET-8,
-//! NET-9, NET-10, NET-11). Each asserts the FIXED behaviour; the matching
-//! proofs of concept in `audit/poc/node/tests/audit_poc_net.rs` asserted the
-//! original bugs.
+//! NET-9, NET-10, NET-11). Each asserts the FIXED behaviour, the inverse of
+//! the audit's proof of concept for the same finding.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};

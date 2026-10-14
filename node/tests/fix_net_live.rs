@@ -1,7 +1,6 @@
 //! Live (real `NetworkNode` swarms on loopback) regression tests for the
 //! network fixes NET-2, NET-4, NET-5, NET-6 and NET-11. Each test is the
-//! inverse of the corresponding live proof of concept in
-//! `audit/poc/node/tests/audit_poc_net.rs`.
+//! inverse of the live proof of concept written during the 2026-10-14 audit.
 //!
 //! Blocks here are a harness payload (`SimPayload`), not real PoW blocks: the
 //! point is the transport/relay policy, not block validation.
