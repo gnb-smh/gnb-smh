@@ -55,6 +55,16 @@ impl PolicyAddress {
         Self { hash: policy.hash(), network }
     }
 
+    /// Address of any policy output script (`0x02 ‖ hash`), e.g. a policy tree.
+    pub fn from_script(script: &[u8], network: Network) -> Option<Self> {
+        if script.len() != crate::core::policy::POLICY_SPK_LEN || script[0] != crate::core::policy::POLICY_TAG {
+            return None;
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&script[1..]);
+        Some(Self { hash, network })
+    }
+
     pub fn network(&self) -> Network {
         self.network
     }

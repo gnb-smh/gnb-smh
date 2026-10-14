@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::address::Network;
-use crate::core::policy::{PolicyWitness, SpendPolicy};
+use crate::core::policy::{BranchWitness, PolicyTree, PolicyWitness, SpendPolicy};
 use crate::core::{self, ChainId, Transaction, TxInput, TxOutput};
 use crate::crypto;
 
@@ -27,7 +27,10 @@ use crate::crypto;
 #[derive(Debug, Clone)]
 pub struct PolicySpend {
     pub network: Network,
+    /// The policy that signs: the whole policy, or the revealed branch of `tree`.
     pub policy: SpendPolicy,
+    /// For a policy-tree output: the tree and the branch being used.
+    pub tree: Option<(PolicyTree, u8)>,
     pub tx: Transaction,
     /// Per input: key index → signature.
     pub signatures: Vec<BTreeMap<u8, Vec<u8>>>,
@@ -37,6 +40,10 @@ pub struct PolicySpend {
 struct SpendFile {
     network: String,
     policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch: Option<u8>,
     tx: String,
     signatures: Vec<BTreeMap<String, String>>,
 }
@@ -44,6 +51,11 @@ struct SpendFile {
 /// Upper bound on a policy witness (sets the fee before anyone signs).
 pub fn max_witness_size(policy: &SpendPolicy) -> usize {
     1 + 4 + policy.encode().len() + 1 + policy.threshold as usize * (1 + 4 + core::SIG_SIZE)
+}
+
+/// Upper bound on a branch witness of a policy tree.
+pub fn max_branch_witness_size(branch: &SpendPolicy) -> usize {
+    max_witness_size(branch) + 2 + 2 * 32
 }
 
 impl PolicySpend {
@@ -97,7 +109,66 @@ impl PolicySpend {
         } else {
             tx.outputs.pop(); // sub-dust change goes to the fee
         }
-        Ok(Self { network, policy, tx, signatures: vec![BTreeMap::new(); inputs.len()] })
+        Ok(Self { network, policy, tree: None, tx, signatures: vec![BTreeMap::new(); inputs.len()] })
+    }
+
+    /// Unsigned spend of policy-tree `inputs` through branch `branch`, paying
+    /// exactly `outputs` (in order), with change back to the tree last. The
+    /// fee is raised to the consensus minimum for the largest witnesses and
+    /// taken from the change.
+    pub fn new_branch(
+        network: Network,
+        tree: PolicyTree,
+        branch: u8,
+        inputs: &[([u8; 32], u32, u64)],
+        outputs: Vec<TxOutput>,
+        fee: u64,
+        locktime: u32,
+    ) -> Result<Self, String> {
+        let policy = tree.branches.get(branch as usize).cloned().ok_or("no such branch")?;
+        if inputs.is_empty() || outputs.is_empty() {
+            return Err("no inputs or outputs".into());
+        }
+        for o in &outputs {
+            if core::policy::output_kind(&o.script_pubkey).is_none() {
+                return Err("unsupported output script".into());
+            }
+            if o.value < core::DUST_THRESHOLD {
+                return Err("output below the dust threshold".into());
+            }
+        }
+        if policy.after != 0 && locktime < policy.after {
+            return Err(format!("branch is time-locked until height {}: set locktime ≥ {}", policy.after, policy.after));
+        }
+        let total = inputs.iter().try_fold(0u64, |t, (_, _, v)| t.checked_add(*v)).ok_or("input total overflows")?;
+        let paid = outputs.iter().try_fold(0u64, |t, o| t.checked_add(o.value)).ok_or("output total overflows")?;
+        let mut tx = Transaction {
+            version: 1,
+            inputs: inputs.iter().map(|(txid, vout, _)| TxInput {
+                prev_txid: *txid, prev_index: *vout, script_sig: Vec::new(), sequence: u32::MAX,
+            }).collect(),
+            outputs,
+            locktime,
+        };
+        tx.outputs.push(TxOutput { value: 0, script_pubkey: tree.script_pubkey() });
+        let size = tx.to_wire_bytes(true).len() + max_branch_witness_size(&policy) * inputs.len();
+        let fee = fee.max(core::tokenomics::min_tx_fee_sat(size));
+        let change = total.checked_sub(paid).and_then(|r| r.checked_sub(fee))
+            .ok_or_else(|| format!("insufficient funds: {} available, {} + fee {} needed", total, paid, fee))?;
+        if change >= core::DUST_THRESHOLD {
+            tx.outputs.last_mut().expect("change").value = change;
+        } else {
+            tx.outputs.pop();
+        }
+        Ok(Self { network, policy, tree: Some((tree, branch)), tx, signatures: vec![BTreeMap::new(); inputs.len()] })
+    }
+
+    /// The script the inputs are locked by (and change returns to).
+    pub fn locking_script(&self) -> Vec<u8> {
+        match &self.tree {
+            Some((t, _)) => t.script_pubkey(),
+            None => self.policy.script_pubkey(),
+        }
     }
 
     pub fn chain_id(&self) -> ChainId {
@@ -163,7 +234,16 @@ impl PolicySpend {
                 }
                 signatures.push((*k, sig));
             }
-            input.script_sig = PolicyWitness { policy: self.policy.clone(), signatures }.encode();
+            input.script_sig = match &self.tree {
+                None => PolicyWitness { policy: self.policy.clone(), signatures }.encode(),
+                Some((tree, b)) => BranchWitness {
+                    n_branches: tree.branches.len() as u8,
+                    index: *b,
+                    path: tree.path(*b as usize),
+                    branch: self.policy.clone(),
+                    signatures,
+                }.encode(),
+            };
         }
         Ok(tx)
     }
@@ -172,6 +252,8 @@ impl PolicySpend {
         let file = SpendFile {
             network: match self.network { Network::Mainnet => "mainnet", Network::Testnet => "testnet" }.into(),
             policy: hex::encode(self.policy.encode()),
+            tree: self.tree.as_ref().map(|(t, _)| hex::encode(t.encode())),
+            branch: self.tree.as_ref().map(|(_, b)| *b),
             tx: hex::encode(self.tx.to_wire_bytes(true)),
             signatures: self.signatures.iter().map(|m| {
                 m.iter().map(|(k, v)| (k.to_string(), hex::encode(v))).collect()
@@ -205,13 +287,31 @@ impl PolicySpend {
             }
             signatures.push(out);
         }
-        // The change output, if any, must return to this policy.
-        if let Some(change) = tx.outputs.get(1) {
-            if change.script_pubkey != policy.script_pubkey() {
-                return Err("change output does not return to the policy".into());
+        let tree = match (f.tree, f.branch) {
+            (Some(t), Some(b)) => {
+                let tree = PolicyTree::decode(&hex::decode(&t).map_err(|_| "tree hex")?)
+                    .map_err(|e| format!("tree: {}", e))?;
+                if tree.branches.get(b as usize) != Some(&policy) {
+                    return Err("policy is not the named branch of the tree".into());
+                }
+                Some((tree, b))
             }
+            (None, None) => None,
+            _ => return Err("tree and branch must come together".into()),
+        };
+        match &tree {
+            // Single policy: the change output, if any, must return to it.
+            None => {
+                if let Some(change) = tx.outputs.get(1) {
+                    if change.script_pubkey != policy.script_pubkey() {
+                        return Err("change output does not return to the policy".into());
+                    }
+                }
+            }
+            // Tree: fixed outputs first; the last output, if it pays the tree, is change.
+            Some(_) => {}
         }
-        Ok(Self { network, policy, tx, signatures })
+        Ok(Self { network, policy, tree, tx, signatures })
     }
 }
 

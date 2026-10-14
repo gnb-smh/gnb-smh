@@ -237,6 +237,43 @@ fn main() {
             return;
         }
 
+        // ── Bloch bridge vault (docs/SIDECHAIN-BLOCH.md) ──────────────
+        "vaultcreate" => {
+            require_params(params, 1, VAULT_CREATE_USAGE);
+            do_vault_create(params);
+            return;
+        }
+        "vaultlock" => {
+            require_params(params, 4, "vaultlock <wallet.json> <vault.json> <amount GNB> <0xL2address> [--fee GNB]");
+            do_vault_lock(params, &rpc_host, rpc_port);
+            return;
+        }
+        "vaultchecklock" => {
+            require_params(params, 2, "vaultchecklock <vault.json> <txid> [--min-conf N] [--min-amount SATS] [--finalized]");
+            do_vault_check_lock(params, &rpc_host, rpc_port);
+            return;
+        }
+        "vaultrelease" => {
+            require_params(params, 4, "vaultrelease <vault.json> <burn_id hex> <gnb1 recipient> <burn amount SATS> --utxo TXID:VOUT:SATS ... --out spend.json");
+            do_vault_release(params);
+            return;
+        }
+        "vaultcheckrelease" => {
+            require_params(params, 5, "vaultcheckrelease <vault.json> <spend.json> <burn_id hex> <gnb1 recipient> <burn amount SATS>");
+            do_vault_check_release(params, &rpc_host, rpc_port);
+            return;
+        }
+        "vaultrecover" => {
+            require_params(params, 3, "vaultrecover <vault.json> <gnb1 destination> <amount GNB> --utxo TXID:VOUT:SATS ... --out spend.json");
+            do_vault_recover(params);
+            return;
+        }
+        "vaultutxos" => {
+            require_params(params, 1, "vaultutxos <vault.json>");
+            do_vault_utxos(params, &rpc_host, rpc_port);
+            return;
+        }
+
         // ── Diagnostic: key format (no secret leaked — lengths/suite only) ─────
         "keyinfo" => {
             require_params(params, 1, "keyinfo <wallet.json>");
@@ -753,6 +790,11 @@ fn do_new_wallet(output_path: &str) {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn read_password(prompt: &str) -> String {
+    // Automation (signer programs): the password may come from the
+    // environment instead of a terminal prompt.
+    if let Ok(p) = std::env::var("GNB_WALLET_PASSWORD") {
+        return p;
+    }
     eprint!("{}", prompt);
     rpassword::read_password().unwrap_or_else(|e| {
         eprintln!("Failed to read password: {}", e);
@@ -894,7 +936,7 @@ fn do_policy_spend(params: &[&str]) {
 fn print_spend_summary(spend: &gnb::wallet::policy_spend::PolicySpend) {
     println!("Network:  {:?}", spend.network);
     for (i, o) in spend.tx.outputs.iter().enumerate() {
-        let kind = if o.script_pubkey == spend.policy.script_pubkey() { " (change, back to the policy)" } else { "" };
+        let kind = if o.script_pubkey == spend.locking_script() { " (change, back to the policy)" } else { "" };
         println!("Output {}: {} GNB → script {}{}", i, o.value as f64 / 1e8, hex::encode(&o.script_pubkey), kind);
     }
     println!("Locktime: {}", spend.tx.locktime);
@@ -936,6 +978,215 @@ fn require_params(params: &[&str], min: usize, usage: &str) {
         eprintln!("Usage: gnb-cli {}", usage);
         process::exit(1);
     }
+}
+
+// ── Bloch bridge vault ──────────────────────────────────────────────────────
+
+const VAULT_CREATE_USAGE: &str = "vaultcreate <out.json> --release K <signer keys...> --recovery R <cold keys...> --older BLOCKS [--testnet]";
+
+fn load_vault(path: &str) -> gnb::bridge::Vault {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("read {}: {}", path, e)));
+    let v: gnb::bridge::Vault = serde_json::from_str(&text).unwrap_or_else(|e| die(&format!("vault file: {}", e)));
+    v.tree().unwrap_or_else(|e| die(&e));
+    v
+}
+
+fn utxo_args(params: &[&str]) -> Vec<([u8; 32], u32, u64)> {
+    params.windows(2).filter(|w| w[0] == "--utxo").map(|w| {
+        let parts: Vec<&str> = w[1].split(':').collect();
+        if parts.len() != 3 { die("--utxo must be TXID:VOUT:SATS"); }
+        let txid: [u8; 32] = hex::decode(parts[0]).ok().and_then(|v| v.try_into().ok())
+            .unwrap_or_else(|| die("--utxo: TXID must be 32-byte hex"));
+        (txid, parts[1].parse().unwrap_or_else(|_| die("--utxo: VOUT")),
+         parts[2].parse().unwrap_or_else(|_| die("--utxo: SATS")))
+    }).collect()
+}
+
+fn do_vault_create(params: &[&str]) {
+    let out = params[0];
+    let network = if params.contains(&"--testnet") { gnb::address::Network::Testnet } else { gnb::address::Network::Mainnet };
+    let section = |flag: &str| -> (u8, Vec<Vec<u8>>) {
+        let start = params.iter().position(|p| *p == flag).unwrap_or_else(|| die(VAULT_CREATE_USAGE));
+        let t: u8 = params.get(start + 1).and_then(|v| v.parse().ok()).unwrap_or_else(|| die(VAULT_CREATE_USAGE));
+        let keys = params[start + 2..].iter().take_while(|p| !p.starts_with("--")).map(|k| hex_arg(k)).collect();
+        (t, keys)
+    };
+    let (k, signers) = section("--release");
+    let (r, cold) = section("--recovery");
+    let older: u32 = flag_value(params, "--older").and_then(|v| v.parse().ok()).unwrap_or_else(|| die(VAULT_CREATE_USAGE));
+    let v = gnb::bridge::Vault::create(network, k, signers, r, cold, older).unwrap_or_else(|e| die(&e));
+    std::fs::write(out, serde_json::to_string_pretty(&v).unwrap()).unwrap_or_else(|e| die(&format!("write {}: {}", out, e)));
+    println!("Vault written to {}", out);
+    println!("Address:  {}", v.address);
+    println!("Release:  {}-of-{} signer keys, no timelock", v.release_threshold, v.signers);
+    println!("Recovery: {}-of-{} cold keys, {} blocks after each deposit", v.recovery_threshold, v.recovery_keys, v.recovery_older);
+    println!("Publish this file once; signers and users check the address against it.");
+}
+
+fn do_vault_lock(params: &[&str], rpc_host: &str, rpc_port: u16) {
+    let vault = load_vault(params[1]);
+    let amount = bloch_to_sats(params[2]);
+    let l2: [u8; 20] = hex::decode(params[3].trim_start_matches("0x")).ok().and_then(|v| v.try_into().ok())
+        .unwrap_or_else(|| die("L2 address must be 0x + 40 hex digits"));
+    let fee = gnb::wallet::parse_bloch_satoshis(flag_value(params, "--fee").unwrap_or("0.0005")).unwrap_or_else(|m| die(m));
+    let keypair = load_keypair(params[0]);
+    let utxos = rpc_call(rpc_host, rpc_port, "getutxos", &serde_json::json!([keypair.address, 50]))
+        .unwrap_or_else(|e| die(&format!("RPC: {}", e)));
+    let rows = utxos.get("utxos").and_then(|u| u.as_array()).cloned().unwrap_or_default();
+    let available = parse_send_utxos(&rows).unwrap_or_else(|m| die(m));
+    let outputs = gnb::bridge::lock_outputs(&vault.script().unwrap(), amount, l2);
+    let mut fee = fee;
+    let mut tx = None;
+    for _ in 0..16 {
+        let built = gnb::wallet::TxBuilder::build_outputs(&keypair, &available, outputs.clone(), fee)
+            .unwrap_or_else(|e| die(&e));
+        let min = gnb::core::tokenomics::min_tx_fee_sat(built.to_wire_bytes(true).len());
+        if fee >= min { tx = Some(built); break; }
+        fee = fee.max(min);
+    }
+    let tx = tx.unwrap_or_else(|| die("could not settle the fee"));
+    // Self-check: the transaction parses back as a lock of this vault.
+    let lock = gnb::bridge::parse_lock(&tx.outputs, &vault.script().unwrap(), 0).unwrap_or_else(|e| die(&e));
+    let raw = hex::encode(tx.to_wire_bytes(true));
+    let res = rpc_call(rpc_host, rpc_port, "sendrawtransaction", &serde_json::json!([raw]))
+        .unwrap_or_else(|e| die(&format!("broadcast: {}", e)));
+    if let Some(e) = res.get("error").and_then(|e| e.as_str()) { die(&format!("broadcast rejected: {}", e)); }
+    println!("{}", serde_json::json!({
+        "lock_txid": hex::encode(tx.txid()), "lock_vout": 0, "amount": lock.amount.to_string(),
+        "l2_recipient": format!("0x{}", hex::encode(lock.l2_recipient)), "fee": fee.to_string(),
+    }));
+}
+
+/// Read a transaction from the node: (outputs, block_height, confirmations).
+fn fetch_tx(rpc_host: &str, rpc_port: u16, txid: &str) -> Result<(Vec<gnb::core::TxOutput>, u64, u64, String), String> {
+    let r = rpc_call(rpc_host, rpc_port, "gettransaction", &serde_json::json!([txid]))?;
+    if let Some(e) = r.get("error").and_then(|e| e.as_str()) { return Err(e.to_string()); }
+    let outs = r["transaction"]["outputs"].as_array().ok_or("no outputs")?.iter().map(|o| {
+        Ok(gnb::core::TxOutput {
+            value: o["value"].as_str().ok_or("value")?.parse::<u64>().map_err(|e| e.to_string())?,
+            script_pubkey: hex::decode(o["script_pubkey"].as_str().ok_or("script")?).map_err(|e| e.to_string())?,
+        })
+    }).collect::<Result<Vec<_>, String>>()?;
+    Ok((outs, r["block_height"].as_u64().unwrap_or(0), r["confirmations"].as_u64().unwrap_or(0),
+        r["block_hash"].as_str().unwrap_or("").to_string()))
+}
+
+fn do_vault_check_lock(params: &[&str], rpc_host: &str, rpc_port: u16) {
+    let vault = load_vault(params[0]);
+    let txid = params[1];
+    let min_conf: u64 = flag_value(params, "--min-conf").and_then(|v| v.parse().ok()).unwrap_or(1000);
+    let min_amount: u64 = flag_value(params, "--min-amount").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let want_final = params.contains(&"--finalized");
+    let verdict = (|| -> Result<serde_json::Value, String> {
+        let (outs, height, conf, block_hash) = fetch_tx(rpc_host, rpc_port, txid)?;
+        let lock = gnb::bridge::parse_lock(&outs, &vault.script()?, min_amount)?;
+        let deep = if want_final {
+            let p = rpc_call(rpc_host, rpc_port, "getpowitinfo", &serde_json::Value::Null)?;
+            let fh = p["finalized"]["block_height"].as_u64().ok_or("PoWit finality not available")?;
+            height <= fh
+        } else {
+            conf >= min_conf
+        };
+        Ok(serde_json::json!({
+            "ok": deep, "reason": if deep { "" } else { "not deep enough yet" },
+            "lock_txid": txid, "lock_vout": 0, "amount": lock.amount.to_string(),
+            "l2_recipient": format!("0x{}", hex::encode(lock.l2_recipient)),
+            "block_hash": block_hash, "block_height": height, "confirmations": conf,
+        }))
+    })();
+    match verdict {
+        Ok(v) => println!("{}", v),
+        Err(e) => println!("{}", serde_json::json!({ "ok": false, "reason": e, "lock_txid": txid })),
+    }
+}
+
+fn burn_id_arg(s: &str) -> [u8; 32] {
+    hex::decode(s.trim_start_matches("0x")).ok().and_then(|v| v.try_into().ok())
+        .unwrap_or_else(|| die("burn id must be 32-byte hex"))
+}
+
+fn do_vault_release(params: &[&str]) {
+    let vault = load_vault(params[0]);
+    let burn = burn_id_arg(params[1]);
+    let (network, recipient) = gnb::address::destination_script(params[2]).unwrap_or_else(|_| die("invalid recipient"));
+    let burn_amount: u64 = params[3].parse().unwrap_or_else(|_| die("burn amount in base units"));
+    let out = flag_value(params, "--out").unwrap_or_else(|| die("--out spend.json is required"));
+    let inputs = utxo_args(params);
+    let tree = vault.tree().unwrap_or_else(|e| die(&e));
+    // The vault pays exactly the burned amount: payout = burn - marker - fee.
+    // Learn the fee with a probe, then build the real spend with it.
+    let build = |payout: u64, fee: u64| gnb::wallet::policy_spend::PolicySpend::new_branch(
+        network, tree.clone(), gnb::bridge::RELEASE_BRANCH, &inputs,
+        gnb::bridge::release_outputs(&recipient, payout, &burn), fee, 0);
+    let probe_payout = burn_amount.checked_sub(gnb::bridge::MARKER_VALUE + 1).unwrap_or_else(|| die("burn too small"));
+    let probe = build(probe_payout, 0).unwrap_or_else(|e| die(&e));
+    // The probe's change returns to the vault, so inputs − outputs is its fee.
+    let in_total: u64 = inputs.iter().map(|i| i.2).sum();
+    let fee = in_total.saturating_sub(probe.outputs_total());
+    let payout = burn_amount.checked_sub(gnb::bridge::MARKER_VALUE + fee).unwrap_or_else(|| die("burn smaller than marker + fee"));
+    let spend = build(payout, fee).unwrap_or_else(|e| die(&e));
+    let check = gnb::bridge::check_release(&spend.tx.outputs,
+        &inputs.iter().map(|i| (i.2, vault.script().unwrap())).collect::<Vec<_>>(),
+        &vault.script().unwrap(), &recipient, burn_amount, &burn);
+    if let Err(e) = check { die(&format!("built release fails its own check: {}", e)); }
+    std::fs::write(out, spend.to_json().unwrap_or_else(|e| die(&e))).unwrap_or_else(|e| die(&format!("write {}: {}", out, e)));
+    println!("Unsigned release written to {} (payout {} sats, fee {} sats, needs {} signatures)",
+        out, payout, fee, spend.policy.threshold);
+}
+
+fn do_vault_check_release(params: &[&str], rpc_host: &str, rpc_port: u16) {
+    let vault = load_vault(params[0]);
+    let text = std::fs::read_to_string(params[1]).unwrap_or_else(|e| die(&format!("read {}: {}", params[1], e)));
+    let spend = gnb::wallet::policy_spend::PolicySpend::from_json(&text).unwrap_or_else(|e| die(&e));
+    let burn = burn_id_arg(params[2]);
+    let verdict = (|| -> Result<serde_json::Value, String> {
+        let (_, recipient) = gnb::address::destination_script(params[3]).map_err(|_| "invalid recipient")?;
+        let burn_amount: u64 = params[4].parse().map_err(|_| "burn amount")?;
+        if spend.tree.as_ref().map(|(_, b)| *b) != Some(gnb::bridge::RELEASE_BRANCH)
+            || spend.locking_script() != vault.script()? {
+            return Err("not a release-branch spend of this vault".into());
+        }
+        // Inputs as the signer's own node sees them.
+        let mut inputs = Vec::new();
+        for inp in &spend.tx.inputs {
+            let (outs, _, _, _) = fetch_tx(rpc_host, rpc_port, &hex::encode(inp.prev_txid))?;
+            let o = outs.get(inp.prev_index as usize).ok_or("input index out of range")?;
+            inputs.push((o.value, o.script_pubkey.clone()));
+        }
+        let fee = gnb::bridge::check_release(&spend.tx.outputs, &inputs, &vault.script()?, &recipient, burn_amount, &burn)?;
+        // Anti-replay: no output with this burn's marker may already exist.
+        let marker = gnb::bridge::release_marker(&burn);
+        let marker_addr = gnb::crypto::address_from_hash(&marker, vault.network() == gnb::address::Network::Testnet);
+        let seen = rpc_call(rpc_host, rpc_port, "getutxos", &serde_json::json!([marker_addr, 1]))?;
+        if seen.get("utxos").and_then(|u| u.as_array()).is_some_and(|a| !a.is_empty()) {
+            return Err("a release for this burn already exists on chain".into());
+        }
+        Ok(serde_json::json!({ "ok": true, "fee": fee.to_string(), "burn_marker": marker_addr }))
+    })();
+    match verdict {
+        Ok(v) => println!("{}", v),
+        Err(e) => println!("{}", serde_json::json!({ "ok": false, "reason": e })),
+    }
+}
+
+fn do_vault_recover(params: &[&str]) {
+    let vault = load_vault(params[0]);
+    let (network, dest) = gnb::address::destination_script(params[1]).unwrap_or_else(|_| die("invalid destination"));
+    let amount = bloch_to_sats(params[2]);
+    let out = flag_value(params, "--out").unwrap_or_else(|| die("--out spend.json is required"));
+    let spend = gnb::wallet::policy_spend::PolicySpend::new_branch(network, vault.tree().unwrap_or_else(|e| die(&e)),
+        gnb::bridge::RECOVERY_BRANCH, &utxo_args(params),
+        vec![gnb::core::TxOutput { value: amount, script_pubkey: dest }], 0, 0).unwrap_or_else(|e| die(&e));
+    std::fs::write(out, spend.to_json().unwrap_or_else(|e| die(&e))).unwrap_or_else(|e| die(&format!("write {}: {}", out, e)));
+    println!("Unsigned recovery written to {}: valid only {} blocks after each input confirmed; needs {} cold signature(s)",
+        out, vault.recovery_older, spend.policy.threshold);
+}
+
+fn do_vault_utxos(params: &[&str], rpc_host: &str, rpc_port: u16) {
+    let vault = load_vault(params[0]);
+    let r = rpc_call(rpc_host, rpc_port, "getutxos", &serde_json::json!([vault.address, 500]))
+        .unwrap_or_else(|e| die(&format!("RPC: {}", e)));
+    println!("{}", r);
 }
 
 fn die(msg: &str) -> ! {

@@ -54,7 +54,9 @@ const MAX_PK_LEN: usize = 8 * 1024;
 /// size, or valid policy spends (a 2-of-3 is about 20 KB) cannot be relayed.
 pub const MAX_POLICY_WITNESS_LEN: usize = 1 + 4
     + (3 + MAX_POLICY_KEYS * (4 + MAX_PK_LEN) + 8)
-    + 1 + MAX_POLICY_KEYS * (1 + 4 + MAX_SIG_LEN);
+    + 1 + MAX_POLICY_KEYS * (1 + 4 + MAX_SIG_LEN)
+    // a branch witness adds n_branches, index and a 2-level Merkle path
+    + 2 + 2 * 32;
 
 /// The two output types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +88,7 @@ pub enum PolicyError {
     TooLarge,
     BadTag,
     WrongSignatureCount { got: usize, want: usize },
+    BadBranchCount,
     KeyIndexOrder,
 }
 
@@ -237,6 +240,266 @@ impl PolicyWitness {
     }
 }
 
+// ── Policy trees (version 2): alternative branches ───────────────────────────
+//
+// A policy tree commits to 2..=4 alternative branches, each an ordinary
+// [`SpendPolicy`] (m-of-n plus its own timelocks), through a Merkle root:
+//
+//   leaf_i      = SHA3("GNB-POLICY-v2/leaf" ‖ branch_i.encode())
+//   empty leaf  = SHA3("GNB-POLICY-v2/empty")          (pads to a power of two)
+//   node        = SHA3("GNB-POLICY-v2/node" ‖ left ‖ right)
+//   commitment  = 0x02 ‖ u8(n_branches) ‖ root           (never a v1 encoding: those start 0x01)
+//   script      = 0x02 ‖ SHA3("GNB-POLICY-v1" ‖ commitment)   (the same 33-byte output type)
+//
+// A spend reveals ONE branch, its index and its Merkle path ([`BranchWitness`]);
+// the other branches (e.g. a cold recovery quorum) stay private. Consensus
+// from `core::powit_height()` (off on mainnet): before it a branch witness is
+// invalid and policy-tree outputs, though creatable, cannot be spent.
+
+/// Most branches a tree may have.
+pub const MAX_POLICY_BRANCHES: usize = 4;
+const TREE_VERSION: u8 = 2;
+/// Witness tag of a branch spend (a v1 policy witness starts with 0x02).
+pub const BRANCH_WITNESS_TAG: u8 = 0x03;
+
+fn tree_leaf(branch: &SpendPolicy) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(b"GNB-POLICY-v2/leaf");
+    h.update(branch.encode());
+    h.finalize().into()
+}
+
+fn tree_empty() -> [u8; 32] {
+    Sha3_256::digest(b"GNB-POLICY-v2/empty").into()
+}
+
+fn tree_node(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(b"GNB-POLICY-v2/node");
+    h.update(l);
+    h.update(r);
+    h.finalize().into()
+}
+
+fn tree_depth(n: usize) -> usize {
+    if n <= 2 { 1 } else { 2 }
+}
+
+fn commitment_script(n: usize, root: &[u8; 32]) -> Vec<u8> {
+    let mut c = vec![TREE_VERSION, n as u8];
+    c.extend_from_slice(root);
+    let mut h = Sha3_256::new();
+    h.update(POLICY_DOMAIN);
+    h.update(&c);
+    let mut s = Vec::with_capacity(POLICY_SPK_LEN);
+    s.push(POLICY_TAG);
+    s.extend_from_slice(&h.finalize());
+    s
+}
+
+fn fold_path(leaf: [u8; 32], index: usize, path: &[[u8; 32]]) -> [u8; 32] {
+    let mut node = leaf;
+    let mut i = index;
+    for sib in path {
+        node = if i & 1 == 0 { tree_node(&node, sib) } else { tree_node(sib, &node) };
+        i >>= 1;
+    }
+    node
+}
+
+/// 2..=4 alternative spend branches under one output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyTree {
+    pub branches: Vec<SpendPolicy>,
+}
+
+impl PolicyTree {
+    pub fn new(branches: Vec<SpendPolicy>) -> Result<Self, PolicyError> {
+        if branches.len() < 2 || branches.len() > MAX_POLICY_BRANCHES {
+            return Err(PolicyError::BadBranchCount);
+        }
+        Ok(PolicyTree { branches })
+    }
+
+    fn leaves(&self) -> Vec<[u8; 32]> {
+        let width = 1usize << tree_depth(self.branches.len());
+        let mut v: Vec<[u8; 32]> = self.branches.iter().map(tree_leaf).collect();
+        v.resize(width, tree_empty());
+        v
+    }
+
+    pub fn root(&self) -> [u8; 32] {
+        let mut level = self.leaves();
+        while level.len() > 1 {
+            level = level.chunks(2).map(|c| tree_node(&c[0], &c[1])).collect();
+        }
+        level[0]
+    }
+
+    /// The 33-byte output script (same type as a single policy).
+    pub fn script_pubkey(&self) -> Vec<u8> {
+        commitment_script(self.branches.len(), &self.root())
+    }
+
+    /// Merkle path of branch `index`.
+    pub fn path(&self, index: usize) -> Vec<[u8; 32]> {
+        let mut level = self.leaves();
+        let mut i = index;
+        let mut path = Vec::new();
+        while level.len() > 1 {
+            path.push(level[i ^ 1]);
+            level = level.chunks(2).map(|c| tree_node(&c[0], &c[1])).collect();
+            i >>= 1;
+        }
+        path
+    }
+
+    /// Canonical encoding for tools (not consensus): `0x02 ‖ n ‖ (u32 len ‖ branch)*`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![TREE_VERSION, self.branches.len() as u8];
+        for b in &self.branches {
+            let e = b.encode();
+            out.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            out.extend_from_slice(&e);
+        }
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, PolicyError> {
+        let mut r = Reader(bytes);
+        if r.u8()? != TREE_VERSION {
+            return Err(PolicyError::BadVersion);
+        }
+        let n = r.u8()? as usize;
+        if !(2..=MAX_POLICY_BRANCHES).contains(&n) {
+            return Err(PolicyError::BadBranchCount);
+        }
+        let mut branches = Vec::with_capacity(n);
+        for _ in 0..n {
+            branches.push(SpendPolicy::decode(r.bytes(MAX_POLICY_KEYS * (MAX_PK_LEN + 4) + 16)?)?);
+        }
+        r.end()?;
+        Self::new(branches)
+    }
+}
+
+/// `script_sig` spending a policy-tree output through one branch.
+///
+/// Encoding: `0x03 ‖ u8 n_branches ‖ u8 index ‖ path (depth × 32) ‖ u32le len ‖ branch policy
+/// ‖ u8 count ‖ (u8 key index ‖ u32le len ‖ sig)*`, exactly `threshold` signatures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchWitness {
+    pub n_branches: u8,
+    pub index: u8,
+    pub path: Vec<[u8; 32]>,
+    pub branch: SpendPolicy,
+    pub signatures: Vec<(u8, Vec<u8>)>,
+}
+
+impl BranchWitness {
+    /// The output script this witness opens.
+    pub fn script_pubkey(&self) -> Vec<u8> {
+        let root = fold_path(tree_leaf(&self.branch), self.index as usize, &self.path);
+        commitment_script(self.n_branches as usize, &root)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let branch = self.branch.encode();
+        let mut out = vec![BRANCH_WITNESS_TAG, self.n_branches, self.index];
+        for n in &self.path {
+            out.extend_from_slice(n);
+        }
+        out.extend_from_slice(&(branch.len() as u32).to_le_bytes());
+        out.extend_from_slice(&branch);
+        out.push(self.signatures.len() as u8);
+        for (idx, sig) in &self.signatures {
+            out.push(*idx);
+            out.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+            out.extend_from_slice(sig);
+        }
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, PolicyError> {
+        let mut r = Reader(bytes);
+        if r.u8()? != BRANCH_WITNESS_TAG {
+            return Err(PolicyError::BadTag);
+        }
+        let n_branches = r.u8()?;
+        if !(2..=MAX_POLICY_BRANCHES).contains(&(n_branches as usize)) {
+            return Err(PolicyError::BadBranchCount);
+        }
+        let index = r.u8()?;
+        if index >= n_branches {
+            return Err(PolicyError::BadBranchCount);
+        }
+        let mut path = Vec::new();
+        for _ in 0..tree_depth(n_branches as usize) {
+            path.push(r.take(32)?.try_into().expect("32 bytes"));
+        }
+        let branch = SpendPolicy::decode(r.bytes(MAX_POLICY_KEYS * (MAX_PK_LEN + 4) + 16)?)?;
+        let count = r.u8()? as usize;
+        if count != branch.threshold as usize {
+            return Err(PolicyError::WrongSignatureCount { got: count, want: branch.threshold as usize });
+        }
+        let mut signatures = Vec::with_capacity(count);
+        let mut prev: Option<u8> = None;
+        for _ in 0..count {
+            let idx = r.u8()?;
+            if idx as usize >= branch.pubkeys.len() || prev.is_some_and(|p| idx <= p) {
+                return Err(PolicyError::KeyIndexOrder);
+            }
+            prev = Some(idx);
+            signatures.push((idx, r.bytes(MAX_SIG_LEN)?.to_vec()));
+        }
+        r.end()?;
+        Ok(Self { n_branches, index, path, branch, signatures })
+    }
+}
+
+/// Either kind of policy spend, told apart by the first byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnyPolicyWitness {
+    Single(PolicyWitness),
+    Branch(BranchWitness),
+}
+
+impl AnyPolicyWitness {
+    pub fn decode(bytes: &[u8]) -> Result<Self, PolicyError> {
+        match bytes.first() {
+            Some(&POLICY_TAG) => PolicyWitness::decode(bytes).map(AnyPolicyWitness::Single),
+            Some(&BRANCH_WITNESS_TAG) => BranchWitness::decode(bytes).map(AnyPolicyWitness::Branch),
+            _ => Err(PolicyError::BadTag),
+        }
+    }
+
+    /// The policy whose keys and timelocks govern this spend.
+    pub fn policy(&self) -> &SpendPolicy {
+        match self {
+            AnyPolicyWitness::Single(w) => &w.policy,
+            AnyPolicyWitness::Branch(w) => &w.branch,
+        }
+    }
+
+    pub fn signatures(&self) -> &[(u8, Vec<u8>)] {
+        match self {
+            AnyPolicyWitness::Single(w) => &w.signatures,
+            AnyPolicyWitness::Branch(w) => &w.signatures,
+        }
+    }
+
+    pub fn script_pubkey(&self) -> Vec<u8> {
+        match self {
+            AnyPolicyWitness::Single(w) => w.policy.script_pubkey(),
+            AnyPolicyWitness::Branch(w) => w.script_pubkey(),
+        }
+    }
+
+    pub fn is_branch(&self) -> bool {
+        matches!(self, AnyPolicyWitness::Branch(_))
+    }
+}
+
 struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
@@ -340,5 +603,49 @@ mod tests {
         let mut b = w(vec![(0, vec![1]), (2, vec![2])]);
         b.push(0);
         assert_eq!(PolicyWitness::decode(&b), Err(PolicyError::TrailingBytes));
+    }
+
+    #[test]
+    fn policy_tree_roundtrips_and_commits_to_every_branch() {
+        let b0 = SpendPolicy::new(2, keys(3), 0, 0).unwrap();
+        let b1 = SpendPolicy::new(1, keys(2), 0, 1_000).unwrap();
+        let b2 = SpendPolicy::new(1, keys(1), 5_000, 0).unwrap();
+        let t2 = PolicyTree::new(vec![b0.clone(), b1.clone()]).unwrap();
+        let t3 = PolicyTree::new(vec![b0.clone(), b1.clone(), b2.clone()]).unwrap();
+        assert_eq!(PolicyTree::decode(&t3.encode()).unwrap(), t3);
+        assert_ne!(t2.script_pubkey(), t3.script_pubkey(), "branch count is committed");
+        assert_ne!(t2.script_pubkey(), b0.script_pubkey(), "a tree is never a single policy");
+        assert_eq!(output_kind(&t3.script_pubkey()), Some(OutputKind::Policy));
+        // Every branch's witness opens the same output.
+        for (i, b) in t3.branches.iter().enumerate() {
+            let w = BranchWitness { n_branches: 3, index: i as u8, path: t3.path(i), branch: b.clone(),
+                                    signatures: (0..b.threshold).map(|k| (k, vec![1])).collect() };
+            assert_eq!(w.script_pubkey(), t3.script_pubkey(), "branch {i}");
+            assert_eq!(BranchWitness::decode(&w.encode()).unwrap(), w);
+            assert!(AnyPolicyWitness::decode(&w.encode()).unwrap().is_branch());
+        }
+        // Swapping branch order changes the output.
+        let swapped = PolicyTree::new(vec![b1, b0]).unwrap();
+        assert_ne!(swapped.script_pubkey(), t2.script_pubkey());
+    }
+
+    #[test]
+    fn policy_tree_limits_and_strict_witnesses() {
+        let b = || SpendPolicy::new(1, keys(1), 0, 0).unwrap();
+        assert_eq!(PolicyTree::new(vec![b()]), Err(PolicyError::BadBranchCount));
+        assert_eq!(PolicyTree::new(vec![b(), b(), b(), b(), b()]), Err(PolicyError::BadBranchCount));
+        let t = PolicyTree::new(vec![b(), b()]).unwrap();
+        let w = BranchWitness { n_branches: 2, index: 0, path: t.path(0), branch: t.branches[0].clone(),
+                                signatures: vec![(0, vec![1])] };
+        let mut bad = w.encode();
+        bad.push(0);
+        assert_eq!(BranchWitness::decode(&bad), Err(PolicyError::TrailingBytes));
+        let mut bad = w.encode();
+        bad[2] = 2; // index out of range for 2 branches
+        assert_eq!(BranchWitness::decode(&bad), Err(PolicyError::BadBranchCount));
+        let mut bad = w.encode();
+        bad[1] = 9;
+        assert_eq!(BranchWitness::decode(&bad), Err(PolicyError::BadBranchCount));
+        assert_eq!(AnyPolicyWitness::decode(&[0x07]), Err(PolicyError::BadTag));
     }
 }

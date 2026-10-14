@@ -95,3 +95,51 @@ gnb-cli policysend spend.json
 ```
 
 `policysign` prints the outputs before asking for the password; check them.
+
+## Policy trees (alternative branches)
+
+From `core::powit_height()` (on in testnets, **off on mainnet**), a policy
+output can commit to 2 to 4 alternative branches. Each branch is an ordinary
+policy, m-of-n plus its own `after` and `older`:
+
+```text
+leaf_i     = SHA3("GNB-POLICY-v2/leaf" ‖ branch_i)       empty leaves pad to a power of two
+node       = SHA3("GNB-POLICY-v2/node" ‖ left ‖ right)
+commitment = 0x02 ‖ u8(n_branches) ‖ root
+script     = 0x02 ‖ SHA3("GNB-POLICY-v1" ‖ commitment)    the same 33-byte output type
+```
+
+A spend reveals one branch, its index and its Merkle path (witness tag
+`0x03`), then that branch's signatures. The branch's own timelocks apply, and
+the other branches stay private. Before activation a branch witness is
+invalid, so a tree output can be created but not spent.
+
+## Bridge vault (`gnb-cli`)
+
+The Bloch bridge vault is a two-branch tree: branch 0 is `k`-of-`n` signers
+with no timelock, and branch 1 is `r`-of-`s` cold keys after a long `older`.
+See [SIDECHAIN-BLOCH.md](SIDECHAIN-BLOCH.md).
+
+```sh
+# Deployment, once: write and publish the vault definition.
+gnb-cli vaultcreate vault.json --testnet --release 3 s1.pub s2.pub s3.pub s4.pub s5.pub \
+        --recovery 2 c1.pub c2.pub c3.pub --older 1051200
+
+# User: lock GNB for an L2 address (vault in output 0, 20-byte destination marker in output 1).
+gnb-cli vaultlock wallet.json vault.json 10 0xAbC…
+
+# Signer: verify a lock on its own node (JSON verdict; --finalized uses PoWit finality).
+gnb-cli vaultchecklock vault.json <txid> --min-conf 1000
+
+# Release after a finalized burn: build, check on each signer, sign k times, send.
+gnb-cli vaultrelease vault.json <burn_id> gnb1t… <burn_sats> --utxo TXID:VOUT:SATS --out rel.json
+gnb-cli vaultcheckrelease vault.json rel.json <burn_id> gnb1t… <burn_sats>   # each signer
+gnb-cli policysign rel.json signer.json                                     # k signers
+gnb-cli policysend rel.json
+
+# Disaster only: cold keys, valid `older` blocks after each deposit confirmed.
+gnb-cli vaultrecover vault.json gnb1t… 10 --utxo TXID:VOUT:SATS --out rec.json
+```
+
+`GNB_WALLET_PASSWORD` replaces the password prompt, so signer programs can
+run unattended.

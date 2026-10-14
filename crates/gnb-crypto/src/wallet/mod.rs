@@ -1098,15 +1098,37 @@ impl TxBuilder {
         amount_sats:     u64,
         fee_sats:        u64,
     ) -> Result<Transaction, String> {
-        let total_needed = amount_sats.checked_add(fee_sats)
-            .ok_or("amount + fee overflow")?;
-
         let to_bytes = hex::decode(to_address_hex)
             .map_err(|_| "invalid destination address hex")?;
-        // A 20-byte key hash or a 33-byte policy script (core::policy).
-        if crate::core::policy::output_kind(&to_bytes).is_none() {
-            return Err("destination must be a 20-byte key hash or a 33-byte policy script".into());
+        Self::build_outputs(keypair, available_utxos,
+                            vec![TxOutput { value: amount_sats, script_pubkey: to_bytes }], fee_sats)
+    }
+
+    /// Build and sign a transaction paying exactly `outputs` (in order),
+    /// change last, back to the wallet. Every output must be a valid script
+    /// and at least the dust threshold.
+    pub fn build_outputs(
+        keypair:         &Keypair,
+        available_utxos: &[(Vec<u8>, u32, TxOutput)],
+        outputs:         Vec<TxOutput>,
+        fee_sats:        u64,
+    ) -> Result<Transaction, String> {
+        if outputs.is_empty() {
+            return Err("no outputs".into());
         }
+        let mut amount_sats: u64 = 0;
+        for o in &outputs {
+            // A 20-byte key hash or a 33-byte policy script (core::policy).
+            if crate::core::policy::output_kind(&o.script_pubkey).is_none() {
+                return Err("destination must be a 20-byte key hash or a 33-byte policy script".into());
+            }
+            if o.value < crate::core::DUST_THRESHOLD {
+                return Err("output below the dust threshold".into());
+            }
+            amount_sats = amount_sats.checked_add(o.value).ok_or("output total overflow")?;
+        }
+        let total_needed = amount_sats.checked_add(fee_sats)
+            .ok_or("amount + fee overflow")?;
         let mut outpoints = std::collections::BTreeSet::new();
         for (txid, index, _) in available_utxos {
             if txid.len() != 32 {
@@ -1144,8 +1166,8 @@ impl TxBuilder {
             TxInput { prev_txid, prev_index: *idx, script_sig: vec![], sequence: u32::MAX }
         }).collect();
 
-        // Build outputs (destination was validated before coin selection/signing).
-        let mut outputs = vec![TxOutput { value: amount_sats, script_pubkey: to_bytes }];
+        // Outputs (validated above), then change.
+        let mut outputs = outputs;
 
         // Change output
         let change = selected_total - total_needed;

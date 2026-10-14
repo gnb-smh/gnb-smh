@@ -196,26 +196,32 @@ fn verify_policy_input(
     ctx: &SpendContext<'_>,
 ) -> Result<(), String> {
     let inp = &tx.inputs[i];
-    let w = policy::PolicyWitness::decode(&inp.script_sig)
+    let w = policy::AnyPolicyWitness::decode(&inp.script_sig)
         .map_err(|e| format!("{}malformed policy witness at input {}: {}", WITNESS_ERR, i, e))?;
-    if w.policy.script_pubkey() != utxo.script_pubkey {
+    // Policy trees (one revealed branch) are consensus from the PoWit
+    // activation height only.
+    if w.is_branch() && !core::powit_active(ctx.height) {
+        return Err(format!("{}policy-tree spend before activation at input {}", WITNESS_ERR, i));
+    }
+    if w.script_pubkey() != utxo.script_pubkey {
         return Err(format!("{}policy does not match the output at input {}", WITNESS_ERR, i));
     }
-    // The policy is now fixed by the committed output, so timelock failures
-    // are failures over committed data.
-    if w.policy.after != 0 && tx.locktime < w.policy.after {
-        return Err(format!("input {}: absolute timelock: locktime {} < {}", i, tx.locktime, w.policy.after));
+    let pol = w.policy();
+    // The policy (or the revealed branch) is now fixed by the committed
+    // output, so timelock failures are failures over committed data.
+    if pol.after != 0 && tx.locktime < pol.after {
+        return Err(format!("input {}: absolute timelock: locktime {} < {}", i, tx.locktime, pol.after));
     }
-    if w.policy.older != 0 {
+    if pol.older != 0 {
         let confirmed = (ctx.confirm_height)(&inp.prev_txid)?
             .ok_or_else(|| format!("{}confirmation height of input {} unknown", STORAGE_ERR, i))?;
         let age = ctx.height.saturating_sub(confirmed);
-        if age < u64::from(w.policy.older) {
-            return Err(format!("input {}: relative timelock: {} confirmations < {}", i, age, w.policy.older));
+        if age < u64::from(pol.older) {
+            return Err(format!("input {}: relative timelock: {} confirmations < {}", i, age, pol.older));
         }
     }
-    for (idx, sig) in &w.signatures {
-        let pk = &w.policy.pubkeys[*idx as usize];
+    for (idx, sig) in w.signatures() {
+        let pk = &pol.pubkeys[*idx as usize];
         if !crypto::verify_enveloped_canonical(pk, sighash, sig) {
             return Err(format!("{}invalid signature by policy key {} at input {}", WITNESS_ERR, idx, i));
         }
