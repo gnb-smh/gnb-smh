@@ -1135,9 +1135,10 @@ impl Storage {
 
     // ── Sprint U.1: Undo data for reorg rollback ─────────────────────────
     //
-    // Each accepted block writes one UndoData record keyed by block hash.
-    // Sprint U.2 will add rollback_block() which reads it; Sprint U.3 will
-    // prune records whose block has dropped below finalized_height.
+    // Each connected block writes one UndoData record keyed by block hash,
+    // deleted only when the block is rolled back. Undo records are NEVER
+    // pruned: there is no reorg-depth limit (audit DAG-6), so a reorg of any
+    // depth must be able to disconnect any connected block.
 
     /// Persist the undo record for a block. Should be called once per block,
     /// immediately after all UTXO/index mutations for that block complete.
@@ -1188,8 +1189,9 @@ impl Storage {
         Ok(out)
     }
 
-    /// Remove an undo record. Called when the block has passed the finality
-    /// window and can no longer be part of a reorg candidate chain.
+    /// Remove an undo record (rollback). Never call it on a block that stays
+    /// connected: with no reorg-depth limit (audit DAG-6) every connected
+    /// block must remain disconnectable.
     pub fn delete_undo_data(&self, block_hash: &[u8; 32]) -> Result<(), StorageError> {
         let cf = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
         self.db.delete_cf(&cf, block_hash).map_err(|e| StorageError::WriteFailed(e.to_string()))
@@ -1223,9 +1225,8 @@ impl Storage {
     ///
     /// Returns Err if the undo record is missing or if the block body is
     /// missing. These are abnormal conditions: an accepted-post-U.1 block
-    /// should always have both. In practice U.3 should never attempt to
-    /// rollback a block outside the finality window where undo records have
-    /// been pruned.
+    /// always has an undo record. (The batched reorg path,
+    /// `reorg::connect_plan`, also handles a pruned body.)
     ///
     /// Individual inner ops use `let _ =` for idempotent sub-operations: if
     /// a delete target was never present (e.g. intra-block chains that

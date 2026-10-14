@@ -267,9 +267,9 @@ pub fn compute_connect_plan(
 /// identically to what `accept_block` produces for forward accepts. This
 /// symmetry is load-bearing: `rollback_block` (U.2) works on either.
 ///
-/// Intended for use when a block was accepted and its UndoData was later
-/// pruned (shouldn't normally happen within finality window) OR when reorg
-/// re-applies a block from the new chain.
+/// Non-atomic (one write at a time): the acceptance pipeline uses the
+/// batched twin (`apply_block_utxo_mutations_batched` via `connect_plan`);
+/// this one remains for tests and tools.
 ///
 /// # Errors
 ///
@@ -1003,9 +1003,10 @@ pub fn connect_plan(
 ///
 /// # Preconditions
 ///
-/// * Every hash in `plan.to_rollback` has a persisted block body and undo
-///   record (post-U.1 accepts always do; pre-U.1 blocks within the reorg
-///   window should never exist in practice).
+/// * Every hash in `plan.to_rollback` has an undo record (every connected
+///   block keeps one; pruning never removes it). Its body may have been
+///   pruned: the rollback then works from the undo record and the
+///   pruned-body record (audit DAG-6).
 /// * Every hash in `plan.to_apply` has a persisted block body whose UTXO
 ///   mutations have NOT been applied yet. (This is true for blocks that
 ///   were inserted into the DAG as non-selected tips.)
@@ -1023,8 +1024,8 @@ pub fn connect_plan(
 ///
 /// # Caller concerns (NOT handled here)
 ///
-/// * Updating `selected_chain_tip` / `current_bits` / `finalized_height`
-///   meta keys — that's U.4's plumbing.
+/// * Updating `selected_chain_tip` / `current_bits` meta keys — that's
+///   U.4's plumbing.
 /// * Locking the DAG / node_state — U.4 coordinates higher-level locks.
 /// * RPC event emission — U.4 emits reorg events post-hoc from the outcome.
 pub fn execute_reorg(
@@ -1215,11 +1216,13 @@ mod reorg_hardening_unit_tests {
     fn plan_deeper_than_the_old_cap_is_not_refused() {
         let (_tmp, store) = mk_storage();
         let mempool = Mempool::new();
+        let target = mk_block_at(1, 0x0E0E, vec![mk_coinbase(0xEE, 100, 1, 9)]);
+        store.put_block_body(&target).unwrap();
 
         let plan = ReorgPlan {
             lca:         [0u8; 32],
             to_rollback: (0..=DEEP_REORG_ALERT_DEPTH).map(hash_of).collect(), // old cap + 1
-            to_apply:    vec![[0xEE; 32]],
+            to_apply:    vec![target.block_hash()],
         };
         let err = execute_reorg(&store, &mempool, &plan).unwrap_err();
         assert!(!err.contains("depth"), "no depth refusal any more: {}", err);

@@ -92,11 +92,14 @@ pub fn backfill_decision(height: u64, tip_h: u64, awaited: bool) -> BackfillDeci
     }
 }
 
-/// DAG-7 / POW-3: global budget of deep (below-finality) block insertions that
-/// the "awaited" exemption may grant. Inserting one deep block costs seconds
-/// under the DAG write lock; an orphan can make its deep parents "awaited", so
-/// the exemption is rationed instead of unconditional. An honest node needs it
-/// almost never; a denied block is simply re-requested by the orphan sweep.
+/// DAG-7 / POW-3: global budget of deep (more than `CHECKPOINT_DEPTH` below
+/// the tip) MERGE-BACKED block insertions (see [`WorkAdmission::MergeBacked`]).
+/// Inserting one deep block costs a reachability reindex under the DAG write
+/// lock, and a single crafted orphan merging a deep block makes it needed, so
+/// these insertions are rationed. A deep block backed by the work of its own
+/// announced chain (`ChainBacked`, an honest deep fork) does not use it. An
+/// honest node needs it almost never; a denied block is simply re-requested
+/// by the orphan sweep.
 pub struct DeepBackfillBudget {
     bucket: crate::network::ratelimit::TokenBuckets<()>,
 }

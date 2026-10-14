@@ -1252,8 +1252,8 @@ mod validate_coinbase_value_tests {
 // blue work replaces the current selected chain, UTXOs mutated by the
 // losing branch must be reverted. We persist an UndoData record per block
 // so the eventual rollback_block() primitive (Sprint U.2) can replay the
-// mutations in reverse. Kept in storage only while the block is within the
-// finality window; records below finalized_height are pruned in Sprint U.3.
+// mutations in reverse. Kept for every connected block (never pruned): there
+// is no reorg-depth limit (audit DAG-6).
 
 /// A single input consumed by a block that must be restored on rollback.
 /// Captures the full pre-spend output so we can re-insert it verbatim.
