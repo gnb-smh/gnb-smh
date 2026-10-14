@@ -1590,6 +1590,34 @@ mod snapshot_row_tests {
     }
 }
 
+#[cfg(test)]
+mod shielded_cf_tests {
+    use super::*;
+
+    /// Audit COH-2 added the `shielded` column family. A data-dir written
+    /// before it still opens read-only (the replay harness inspects old
+    /// snapshots), and a read-write open adds the family.
+    #[test]
+    fn data_dir_without_the_shielded_family_opens_read_only_and_upgrades() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            let old: Vec<ColumnFamilyDescriptor> =
+                Storage::cf_descriptors().into_iter().filter(|d| d.name() != CF_SHIELDED).collect();
+            let db = DB::open_cf_descriptors(&opts, tmp.path(), old).unwrap();
+            db.put_cf(&db.cf_handle(CF_META).unwrap(), b"tip_hash", [7u8; 32]).unwrap();
+        }
+        let ro = Storage::open_read_only(tmp.path()).expect("a pre-COH-2 data-dir opens read-only");
+        assert_eq!(ro.get_meta("tip_hash").unwrap(), Some(vec![7u8; 32]));
+        assert!(ro.get_shielded(b"T").is_err(), "the family does not exist read-only");
+        drop(ro);
+        let rw = Storage::open(tmp.path()).unwrap();
+        assert_eq!(rw.get_shielded(b"T").unwrap(), None);
+    }
+}
+
 // ── Bloch Genesis-3 carryover ingestion ─────────────────────────────────────
 
 impl Storage {
