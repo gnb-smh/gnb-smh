@@ -17,10 +17,11 @@
 //!  2. size: canonical wire size and bincode size within `MAX_TX_SIZE` — this
 //!     bounds the quadratic `Transaction::sighash` cost before any signature
 //!     is checked (the sighash itself is consensus and is NOT changed);
-//!  3. standardness: canonical-encoding limits (VAL-12), MoneyRange (VAL-11),
+//!  3. known: already pooled, already confirmed, or recently rejected (a
+//!     replay costs one size-bounded hash);
+//!  4. standardness: canonical-encoding limits (VAL-12), MoneyRange (VAL-11),
 //!     no dust output (the consensus `Block::validate_dust` rule), no
 //!     zero-value output (policy: UTXO-set bloat, VAL-11 note);
-//!  4. known: already pooled, already confirmed, or recently rejected;
 //!  5. conflicts: an input already spent by a pooled tx (first-seen wins —
 //!     the explicit replacement rule is "no replacement", MEM-6);
 //!  6. duplicate inputs within the tx (C-R3-2);
@@ -223,6 +224,13 @@ pub fn verify_input_scripts(tx: &Transaction, prevouts: &[TxOutput]) -> Result<(
 
 /// Standardness rules that need no chain state (steps 1–3).
 pub fn check_standard(tx: &Transaction) -> Result<(), AdmissionError> {
+    check_structure_and_size(tx)?;
+    check_policy(tx)
+}
+
+/// Steps 1–2: structure and size. Run before anything that hashes or walks
+/// the whole transaction, so their cost is bounded by `MAX_TX_SIZE`.
+fn check_structure_and_size(tx: &Transaction) -> Result<(), AdmissionError> {
     if tx.is_coinbase() {
         return Err(AdmissionError::Rejected("coinbase not accepted".into()));
     }
@@ -242,6 +250,11 @@ pub fn check_standard(tx: &Transaction) -> Result<(), AdmissionError> {
         return Err(AdmissionError::Rejected(format!(
             "transaction too large: {} bytes (max {})", size, MAX_TX_SIZE)));
     }
+    Ok(())
+}
+
+/// Step 3: canonical limits, MoneyRange, dust, zero-value outputs.
+fn check_policy(tx: &Transaction) -> Result<(), AdmissionError> {
     core::limits::check_tx_canonical_limits(tx).map_err(AdmissionError::Rejected)?;
     core::limits::check_tx_money_range(tx).map_err(AdmissionError::Rejected)?;
     for (i, o) in tx.outputs.iter().enumerate() {
@@ -267,20 +280,24 @@ pub fn check_transaction(
     tx: &Transaction,
     policy: &AdmissionPolicy,
 ) -> Result<u64, AdmissionError> {
-    check_standard(tx)?;
+    check_structure_and_size(tx)?;
 
+    // Known: pooled, recently rejected (a replay costs one bounded hash), or
+    // already confirmed.
     let txid = tx.txid();
     if let Some(mp) = mempool {
         if mp.contains(&txid) {
             return Err(AdmissionError::Duplicate("duplicate transaction".into()));
         }
         if policy.use_reject_filter && mp.is_recently_rejected(&wtxid(tx)) {
-            return Err(AdmissionError::Rejected("recently rejected".into()));
+            return Err(AdmissionError::Duplicate("recently rejected".into()));
         }
     }
     if let Ok(Some(_)) = store.get_tx_location(&txid) {
         return Err(AdmissionError::Duplicate("transaction already confirmed".into()));
     }
+
+    check_policy(tx)?;
 
     // Conflicts with the pool and duplicate inputs (cheap, no I/O).
     let mut seen: HashSet<([u8; 32], u32)> = HashSet::with_capacity(tx.inputs.len());

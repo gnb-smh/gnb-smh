@@ -138,6 +138,14 @@ fn stage_dag_record_for(
             let gi = store.stage_dag_record(batch, &sp, &gd, &[], &[], None)
                 .map_err(|e| e.to_string())?;
             parent_override = Some(gi);
+        } else if missing {
+            // Checked BEFORE draining the reachability delta below, so a
+            // refused batch does not lose it.
+            return Err(format!(
+                "DAG record: integrity record of selected parent {} is missing; refusing to \
+                 write a zero-filled chain link",
+                hex::encode(&sp[..8])
+            ));
         }
     }
     let (ups, rems) = if dag.read().maintains_reachability_index() {
@@ -569,6 +577,15 @@ pub fn accept_block(
     //    encoding limits). No-ops for every block that went through the wire
     //    parser; they stop an in-process block that could not be read back.
     core::limits::check_block_context_free(block)
+        .map_err(|e| format!("consensus rejection: {}", e))?;
+    // The connect-time validator treats transaction 0 as the coinbase and
+    // keys in-block prevouts by txid. Every ingress path already enforces
+    // both rules through `validate_structure`; re-checking them here (cheap)
+    // keeps the pipeline sound for any in-process caller that does not.
+    if !block.validate_coinbase_format() {
+        return Err("consensus rejection: invalid coinbase format".into());
+    }
+    block.validate_no_duplicate_txs()
         .map_err(|e| format!("consensus rejection: {}", e))?;
 
     // Shielded transactions cannot validate without an active verifier

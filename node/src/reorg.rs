@@ -1,9 +1,14 @@
 //! Bloch-SIS Protocol — Reorg detection & execution (Sprint U.3).
 //!
-//! Pure functions that compute *what* a reorg looks like (`compute_reorg_plan`)
-//! and *perform* one against storage + mempool (`execute_reorg`). This module
-//! is deliberately disconnected from `accept_block` in main.rs — Sprint U.4 is
-//! responsible for wiring these primitives into the node event loop.
+//! Pure functions that compute *what* a chain move looks like
+//! (`compute_reorg_plan`, `compute_connect_plan`) and *perform* one atomically
+//! against storage (`connect_plan`, used by the acceptance pipeline in
+//! `accept.rs` for extensions AND reorgs, audit DAG-1/DAG-11) or against
+//! storage + mempool (`execute_reorg`, the standalone U.3 entry point).
+//!
+//! (Historical note below: U.4 has since wired these primitives into the
+//! node; `accept::accept_block` now drives every chain move through
+//! `connect_plan`.)
 //!
 //! # Rationale for splitting U.3 / U.4
 //!
@@ -908,8 +913,15 @@ pub fn connect_plan(
 ///    rolled-back block, collect non-coinbase txs as reinject candidates.
 /// 2. **Apply** each block in `plan.to_apply` (LCA-first). Each apply
 ///    captures fresh UndoData so the new chain is also reorg-capable.
-/// 3. **Reinject** candidate txs into the mempool, validating each against
-///    the now-current UTXO set. Invalid ones are counted as discarded.
+/// 3. **Reinject** candidate txs into the mempool through the shared
+///    admission function (`reinject_disconnected`, audit MEM-7): UTXO
+///    presence, maturity and minimum fees at the new tip. Rejected ones are
+///    counted as discarded.
+///
+/// Fork blocks are re-validated with the audit-H1 UTXO-state rules
+/// (`validate_fork_block_state`). The acceptance pipeline does not call this
+/// function: it calls [`connect_plan`] directly with the FULL in-context
+/// block validator.
 ///
 /// # Preconditions
 ///
