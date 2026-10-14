@@ -693,7 +693,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let s = state.node_state.read();
             let pruned_h = state.store.pruned_height();
             json!({
-                "network":         "mainnet",
+                "network":         match crate::core::node_chain_id() {
+                    crate::core::ChainId::Mainnet => "mainnet",
+                    crate::core::ChainId::Testnet => "testnet",
+                },
+                "chain_id":        format!("0x{:08X}", crate::core::node_chain_id().to_u32()),
                 "version":         s.version,
                 "protocol":        PROTOCOL_VERSION,
                 "net_protocol":    crate::network::PROTOCOL_VERSION,
