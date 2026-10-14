@@ -42,3 +42,15 @@ new chain.
 JSON-RPC on 127.0.0.1:17210. Useful methods: `getblockcount`, `getdaginfo`,
 `getblocktemplate`, `submitblock`, `getsupplyinfo`, `getbalance`,
 `sendrawtransaction`. See `node/src/rpc/mod.rs`.
+
+Transaction relay and mempool policy (unconfirmed chains, child-pays-for-parent
+templates, full-RBF, orphan transactions): `docs/MEMPOOL.md`;
+`getmempoolinfo` reports the parameters in force.
+
+The explorer statistics (`getchainstats`, `gethashrate`, `getrichlist`,
+`getsupplydistribution`, `getaddresscount`) are served from aggregates the
+node keeps in the same write batches as its UTXO set. A data directory
+written by an older node gets them built once at start-up (log line
+"NET-12: explorer aggregates rebuilt …", one pass over the UTXO set and the
+undo records); until then those methods answer with an error instead of
+scanning.
