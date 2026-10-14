@@ -2,11 +2,16 @@
 //!
 //! Oracle: the fixed-point step of BCHN `CalculateASERT` (src/pow.cpp), ported
 //! in `gnb_audit_consistency::bchn_asert_target`, which multiplies the full
-//! target by the 17-bit factor before a single shift. GnB shifts the product
-//! right by 16 first and then shifts left bit by bit, so full 256-bit targets
-//! may differ in their lowest bits; consensus compares compact `bits`, which
-//! keep only the top 23 significant bits. These tests require the compact
-//! results to be identical and report how often the full targets differ.
+//! target by the 17-bit factor before a single shift.
+//!
+//! Before audit fix AUD-1, GnB shifted the product right by 16 first
+//! (saturating at 2^256 - 1) and then shifted bit by bit, so full 256-bit
+//! targets differed from the oracle in their lowest bits and anchors at or
+//! above ~2^255 could come out up to 2x too hard. GnB now multiplies exactly
+//! and applies the net shift once, so these tests require the full targets
+//! (not only the compact `bits`, which consensus compares) to equal the
+//! oracle. A port of the pre-fix step (`legacy_gnb_asert_target`) proves the
+//! fix changed no compact result for GnB's real parameters and anchor.
 //!
 //! Also checked as properties over GnB's real consensus parameters: the
 //! result is in [1, pow_limit]; it is monotone in the parent timestamp; one
@@ -17,7 +22,50 @@ use gnb_audit_consistency::{bchn_asert_target, u256_from_be, u256_to_be};
 use gnb_smh::difficulty::{
     asert_next_target, target_to_bits, try_bits_to_target, AsertAnchor, AsertParams, Target,
 };
+use primitive_types::{U256, U512};
 use proptest::prelude::*;
+
+/// GnB's ASERT step as it was before fix AUD-1 (crates/gnb-smh/src/
+/// difficulty.rs at commit 125e9e5): `(target * factor) >> 16` saturated at
+/// 2^256 - 1, then shifted one bit at a time, overflow on a left shift
+/// clamping to the pow limit.
+fn legacy_gnb_asert_target(params: &AsertParams, anchor: &AsertAnchor, parent_time: i64, height: u64) -> Target {
+    let anchor_target = u256_from_be(&try_bits_to_target(anchor.bits).unwrap().0);
+    let pow_limit = u256_from_be(&params.pow_limit.0);
+    let ahead = parent_time as i128
+        - anchor.timestamp as i128
+        - params.target_spacing as i128 * (height - anchor.height - 1) as i128;
+    let exponent = (ahead * 65_536).div_euclid(params.halflife as i128);
+    let shifts = exponent >> 16;
+    let frac = (exponent & 0xFFFF) as u128;
+    let factor: u128 = 65_536
+        + ((195_766_423_245_049u128 * frac + 971_821_376u128 * frac * frac + 5_127u128 * frac * frac * frac
+            + (1u128 << 47))
+            >> 48);
+    let wide = (U512::from(anchor_target) * U512::from(factor)) >> 16;
+    let mut t = if wide > U512::from(U256::MAX) { U256::MAX } else { U256::try_from(wide).unwrap() };
+    if shifts >= 256 {
+        return params.pow_limit;
+    }
+    if shifts > 0 {
+        for _ in 0..shifts {
+            if t.bit(255) {
+                return params.pow_limit;
+            }
+            t <<= 1;
+        }
+    } else if shifts < 0 {
+        let n = (-shifts).min(256) as usize;
+        t = if n >= 256 { U256::zero() } else { t >> n };
+    }
+    if t > pow_limit {
+        t = pow_limit;
+    }
+    if t.is_zero() {
+        t = U256::one();
+    }
+    Target(u256_to_be(t))
+}
 
 fn gnb_params() -> (AsertParams, AsertAnchor) {
     (gnb_crypto::core::asert_params(), gnb_crypto::core::asert_anchor())
@@ -38,10 +86,14 @@ fn oracle(params: &AsertParams, anchor: &AsertAnchor, parent_time: i64, height: 
 }
 
 fn arb_anchor_bits() -> impl Strategy<Value = u32> {
-    // Valid compact values from very hard (exponent 4) up to exponent 0x20,
-    // i.e. anchor targets below 2^255, where GnB's fixed-point multiply never
-    // saturates (see `high_anchor_saturation_diverges_from_aserti3_2d`).
-    (4u32..=0x20, 0x0001_0000u32..0x0080_0000).prop_map(|(e, m)| (e << 24) | m)
+    // Valid compact values from very hard (exponent 4) up to the pow limit
+    // (0x2100ffff). Exponent 0x21 covers anchors from 2^240 to the limit,
+    // including the band at and above 2^255 where the pre-fix step saturated
+    // (see `high_anchor_saturation_diverges_from_aserti3_2d`).
+    prop_oneof![
+        (4u32..=0x20, 0x0001_0000u32..0x0080_0000).prop_map(|(e, m)| (e << 24) | m),
+        (0x0000_0001u32..=0x0000_ffff).prop_map(|m| (0x21 << 24) | m),
+    ]
 }
 
 proptest! {
@@ -60,6 +112,23 @@ proptest! {
         let gnb = asert_next_target(&params, &anchor, parent_time, height).unwrap();
         let ora = oracle(&params, &anchor, parent_time, height);
         prop_assert_eq!(target_to_bits(&gnb), target_to_bits(&ora),
+            "height={} skew={}", height, skew);
+        prop_assert_eq!(gnb, ora, "full target: height={} skew={}", height, skew);
+    }
+
+    /// AUD-1 consensus proof: on GnB's real parameters and genesis anchor the
+    /// fixed step yields exactly the compact `bits` of the pre-fix step.
+    #[test]
+    fn gnb_asert_bits_unchanged_by_the_aud1_fix(
+        height in 1u64..=(1u64 << 32),
+        skew in -630_720_000i64..=630_720_000i64,
+    ) {
+        let (params, anchor) = gnb_params();
+        let schedule = anchor.timestamp + params.target_spacing * (height as i64 - 1);
+        let parent_time = schedule + skew;
+        let new = asert_next_target(&params, &anchor, parent_time, height).unwrap();
+        let old = legacy_gnb_asert_target(&params, &anchor, parent_time, height);
+        prop_assert_eq!(target_to_bits(&new), target_to_bits(&old),
             "height={} skew={}", height, skew);
     }
 
@@ -84,6 +153,8 @@ proptest! {
         let ora = oracle(&params, &anchor, parent_time, height);
         prop_assert_eq!(target_to_bits(&gnb), target_to_bits(&ora),
             "anchor={:#010x}@{} height={} skew={}", anchor_bits, anchor_height, height, skew);
+        prop_assert_eq!(gnb, ora,
+            "full target: anchor={:#010x}@{} height={} skew={}", anchor_bits, anchor_height, height, skew);
     }
 
     #[test]
@@ -130,15 +201,17 @@ fn one_halflife_ahead_doubles_the_target() {
 
 #[test]
 fn full_target_low_bit_divergence_is_measured() {
-    // Deterministic sweep: count full-target differences between GnB's
-    // shift-then-multiply order and BCHN's multiply-then-shift order.
+    // Deterministic sweep over GnB's real parameters and anchor: count
+    // full-target and compact differences against BCHN's multiply-then-shift
+    // order, and compact differences against the pre-AUD-1 step.
     let (params, anchor) = gnb_params();
-    let (mut n, mut diff, mut bits_diff) = (0u64, 0u64, 0u64);
+    let (mut n, mut diff, mut bits_diff, mut legacy_bits_diff, mut legacy_full_diff) = (0u64, 0u64, 0u64, 0u64, 0u64);
     for height in (1u64..=2_000_001).step_by(9_973) {
         for skew in (-3_000_000i64..=3_000_000).step_by(7_919) {
             let schedule = anchor.timestamp + params.target_spacing * (height as i64 - 1);
             let g = asert_next_target(&params, &anchor, schedule + skew, height).unwrap();
             let o = oracle(&params, &anchor, schedule + skew, height);
+            let l = legacy_gnb_asert_target(&params, &anchor, schedule + skew, height);
             n += 1;
             if g != o {
                 diff += 1;
@@ -146,20 +219,33 @@ fn full_target_low_bit_divergence_is_measured() {
             if target_to_bits(&g) != target_to_bits(&o) {
                 bits_diff += 1;
             }
+            if g != l {
+                legacy_full_diff += 1;
+            }
+            if target_to_bits(&g) != target_to_bits(&l) {
+                legacy_bits_diff += 1;
+            }
         }
     }
-    println!("asert sweep: {n} points; full-target differences {diff}; compact-bits differences {bits_diff}");
+    println!(
+        "asert sweep: {n} points; vs oracle: full-target differences {diff}, compact-bits differences \
+         {bits_diff}; vs pre-AUD-1 step: full-target differences {legacy_full_diff}, compact-bits \
+         differences {legacy_bits_diff}"
+    );
+    assert_eq!(diff, 0, "GnB now computes the aserti3-2d step exactly");
     assert_eq!(bits_diff, 0);
+    assert_eq!(legacy_bits_diff, 0, "the AUD-1 fix must not change any consensus bits");
 }
 
-/// Finding AUD-ASERT-SAT: `mul_u64_shr16` saturates `target * factor >> 16` at
-/// 2^256 - 1 *before* the right shift by a negative exponent. For anchor
-/// targets of about 2^255 and above this returns a target up to ~2x harder
-/// than the aserti3-2d arithmetic (BCHN instead requires 32 spare leading
-/// bits in pow_limit, so its intermediate never overflows). GnB's deployed
-/// anchor is the genesis target (~2^244), far below the threshold, so
-/// mainnet consensus is unaffected; the divergence matters only if ASERT is
-/// ever re-anchored at a target near the pow limit (0x2100ffff ~ 2^256).
+/// Finding AUD-1 (AUD-ASERT-SAT), now fixed: the pre-fix `mul_u64_shr16`
+/// saturated `target * factor >> 16` at 2^256 - 1 *before* the right shift by
+/// a negative exponent. For anchor targets of about 2^255 and above this
+/// returned a target up to ~2x harder than the aserti3-2d arithmetic (BCHN
+/// instead requires 32 spare leading bits in pow_limit, so its intermediate
+/// never overflows). GnB now holds the product in 320 bits and applies the
+/// net shift once, so the result equals the oracle. GnB's deployed anchor is
+/// the genesis target (~2^244), far below the threshold, so mainnet
+/// consensus was never affected (`gnb_asert_bits_unchanged_by_the_aud1_fix`).
 #[test]
 fn high_anchor_saturation_diverges_from_aserti3_2d() {
     let (params, mut anchor) = gnb_params();
@@ -168,9 +254,11 @@ fn high_anchor_saturation_diverges_from_aserti3_2d() {
     let parent_time = anchor.timestamp - 57_601; // eight half-lives behind
     let gnb = asert_next_target(&params, &anchor, parent_time, height).unwrap();
     let ora = oracle(&params, &anchor, parent_time, height);
-    assert_eq!(target_to_bits(&gnb), 0x1f7f_ffff, "pinned current GnB behaviour");
+    let old = legacy_gnb_asert_target(&params, &anchor, parent_time, height);
+    assert_eq!(target_to_bits(&old), 0x1f7f_ffff, "pre-fix GnB behaviour (saturated)");
     assert_eq!(target_to_bits(&ora), 0x2000_a349, "exact aserti3-2d arithmetic");
-    assert!(gnb < ora, "saturation makes the target harder than specified");
+    assert_eq!(target_to_bits(&gnb), 0x2000_a349, "fixed GnB equals the oracle");
+    assert_eq!(gnb, ora, "full target equals the oracle");
 
     // The deployed anchor keeps at least 11 bits of headroom below 2^255.
     let genesis = try_bits_to_target(gnb_crypto::core::GENESIS_BITS).unwrap();
