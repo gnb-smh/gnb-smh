@@ -1,0 +1,288 @@
+[
+ {
+  "title": "7.1 Proof of work and difficulty",
+  "rows": [
+   [
+    "Design",
+    "GnB-SMH v1: scrypt-ROMix structure over single-permutation SHAKE-256, 64 MiB, 2^20 dependent Keccak-f[1600] calls; ASERT (aserti3-2d construction) anchored at genesis, 2 h half-life, 30 s spacing; pow limit `0x2100ffff`",
+    "SHA-256d; 2016-block retarget clamped to x4; pow limit with 32 spare bits; `PermittedDifficultyTransition`"
+   ],
+   [
+    "Verified correct",
+    "Compact codec identical to Core on all 587,202,560 decodable-exponent values; ASERT bit-identical to the aserti3-2d fixed-point step on more than 350,000 cases; Rust = Python reference on 103 inputs; strict `out < target`; timestamps >= latest parent and <= now + 600 s bound easing to 5.96% and exclude timewarp",
+    "`DeriveTarget`/`CheckProofOfWorkImpl`; MTP rule; BIP-94 timewarp fix only on testnet4/regtest"
+   ],
+   [
+    "Weaknesses",
+    "PoW runs on self-declared bits before cheap checks (NET-2); free blocks on deep forks (POW-3); work() differs from spec (POW-6); latent ASERT saturation for high anchors (AUD-1); difficulty tests masked by `test-pow-limit` (POW-5)",
+    "Mainnet timewarp still possible in consensus"
+   ],
+   [
+    "Tests",
+    "gnb-smh 14 unit + 1 vector test, 7 Python vectors, 3 node pow tests; mutation score 82.6% (176/213)",
+    "pow_tests.cpp (15 cases), arith_uint256_tests.cpp, headers_sync_chainwork_tests.cpp; fuzz `pow`, `pow_transition`, `headers_sync_state`, `p2p_headers_presync`; feature_minchainwork.py, mining_basic.py"
+   ],
+   [
+    "Score (GnB / Core)",
+    "6 correctness, 3 defensive, 3 tests",
+    "9 / 9 / 9"
+   ]
+  ]
+ },
+ {
+  "title": "7.2 Chain selection, GhostDAG and reorganisation",
+  "rows": [
+   [
+    "Design",
+    "GhostDAG k = 10 with reachability index; selected-parent chain applied to the UTXO set; `MAX_REORG_DEPTH` = 1,000 and a local finality height",
+    "Longest most-work chain; `ActivateBestChain`, `ConnectTip`/`DisconnectTip`; no reorg-depth limit"
+   ],
+   [
+    "Verified correct",
+    "Deterministic, parent-order-independent tie-breaks (proptests); atomic reorg WriteBatch with re-validation; integrity hash chain checked at boot; reachability self-check against brute force",
+    "`CheckBlockIndex` invariants; `InvalidateBlock`/`PreciousBlock`; `m_chainstate_mutex` + `cs_main`"
+   ],
+   [
+    "Weaknesses",
+    "Validation against the local tip splits honest nodes (DAG-1); blue work ignores merged blues and merged blocks never reach the ledger (DAG-3); k-cluster violation (DAG-4); node-local reorg cap (DAG-6); unbounded per-block cost (DAG-7); no acceptance lock (DAG-10); non-atomic extension commit (DAG-11)",
+    "None material at the code level reviewed"
+   ],
+   [
+    "Tests",
+    "~120 tests incl. 5 proptests; convergence tests bypass state validation; differential compares two implementations with the same bug",
+    "validation_chainstatemanager_tests.cpp (12), validation_block_tests.cpp (10-thread ordering); fuzz `block_index_tree`, `chain`, `connect_block`; feature_block.py, rpc_invalidateblock.py, feature_chain_tiebreaks.py"
+   ],
+   [
+    "Score (GnB / Core)",
+    "2 / 4 / 4",
+    "9 / 9 / 9"
+   ]
+  ],
+  "note": "GHOSTDAG adds coloring, reachability reindexing, mergesets and multi-parent templates. Kaspa bounds that surface with mergeset-size, parent-count, merge-depth and finality-point rules; GnB has none of them and, because merged blue work is not counted, gains none of the DAG's security benefit. The complexity is therefore scored as attack surface."
+ },
+ {
+  "title": "7.3 Block and transaction validation, UTXO set and storage",
+  "rows": [
+   [
+    "Design",
+    "UTXO model; txid excludes script_sig; Merkle over txids (Bitcoin construction); RocksDB column families; undo records",
+    "UTXO model with segwit witness commitment; LevelDB coins view with head-block markers"
+   ],
+   [
+    "Verified correct",
+    "Checked sums (inputs, outputs, fees, subsidy + fees); unconditional duplicate-input check; same-block later-output spends blocked; duplicate-tx rule; one coinbase at index 0 with one output <= subsidy + fees; carryover snapshot verified (SHA3, 452,726 rows, 99,999,999,789,793 sat)",
+    "MoneyRange; BIP30/34; `IsBlockMutated`; `DisconnectBlock` with unclean handling; `ReplayBlocks`"
+   ],
+   [
+    "Weaknesses",
+    "No BIP30/34 (VAL-2); same-block coinbase spend (VAL-3); witness malleation (CRY-1); non-atomic commit (DAG-11); size rules split (VAL-12); no 64-byte-tx rule (VAL-10)",
+    "Historical: CVE-2010-5139, CVE-2012-2459, CVE-2018-17144 (all fixed)"
+   ],
+   [
+    "Tests",
+    "~110 targeted single-node regressions; sprint_v1_quickwins.rs compiled out; shipped-snapshot test ignored; no crash or fork-context tests",
+    "transaction_tests (16), coins_tests (15); tx_valid.json and tx_invalid.json; fuzz `transaction`, `block`, `coins_view`, `connect_block`, `utxo_total_supply`; feature_block.py, feature_dbcrash.py, p2p_mutated_blocks.py"
+   ],
+   [
+    "Score (GnB / Core)",
+    "2 / 5 / 3",
+    "9 / 9 / 10"
+   ]
+  ]
+ },
+ {
+  "title": "7.4 Signatures, sighash and addresses",
+  "rows": [
+   [
+    "Design",
+    "Hybrid ML-DSA-65 AND Falcon-1024 (`clean` integer variant), 4-byte suite envelope; SHA3 sighash with 16-byte domain, version and chain id; 160-bit address hash with 4-byte SHA3d checksum",
+    "ECDSA/Schnorr on secp256k1; legacy, BIP143 and BIP341 sighash; bech32/bech32m"
+   ],
+   [
+    "Verified correct",
+    "AND semantics with exact-length parsing; strict ML-DSA hint and Falcon compact decoding; fail-closed RNG, no C fallback; seeded RNG scoped to key generation; official ACVP and round-3 vectors",
+    "Strict DER, low-S, NULLFAIL; sign-then-verify; secure allocator; exhaustive and constant-time library tests"
+   ],
+   [
+    "Weaknesses",
+    "Lenient consensus verifier and no witness commitment (CRY-1); separable suites (CRY-2); no amount commitment, library-defined preimage (CRY-3); no zeroization (CRY-4); unchecked Falcon signer (CRY-5); network-blind checksum (CRY-7)",
+    "Classical-only signatures (threat-model difference, not scored)"
+   ],
+   [
+    "Tests",
+    "~140 tests; 15 ACVP sigVer cases; 3 Falcon round-3 vectors; no pinned sighash vectors",
+    "sighash.json (500 vectors), script_tests.json (1,258); fuzz `signature_checker`, `script_interpreter`, `key`, `sighash_cache`"
+   ],
+   [
+    "Score (GnB / Core)",
+    "7 / 6 / 4",
+    "9 / 9 / 9"
+   ]
+  ]
+ },
+ {
+  "title": "7.5 Peer-to-peer networking and synchronisation",
+  "rows": [
+   [
+    "Design",
+    "libp2p gossipsub (signed, strict), directed request-response sync, Kyber768 + Ed25519 transport upgrade, PEX",
+    "Custom P2P with v2 encrypted transport (BIP324), headers-first sync, addrman, compact blocks"
+   ],
+   [
+    "Verified correct",
+    "Decoders bounded before allocation (`with_limit`, per-field caps); directed sync rejects trailing bytes; handshake capped at 16 KiB; connection limits; SHA-256 message ids",
+    "Validation before relay; `Misbehaving`; headers presync; per-peer in-transit limits; inbound eviction"
+   ],
+   [
+    "Weaknesses",
+    "Remote panic (POW-2); relay before validation (NET-2); orphan memory (POW-4); misattributed penalties (NET-4, NET-5); IBD latch (NET-6); O(N^2) amplification (NET-7); unbounded maps (NET-8, NET-10); eclipse exposure (NET-11)",
+    "None material at the code level reviewed"
+   ],
+   [
+    "Tests",
+    "~430 tests incl. live swarms; no proptest, no coverage-guided fuzzing; message processor (main.rs) untested",
+    "63 p2p_*.py functional tests; fuzz `process_message`, `process_messages`, `addrman`, `connman`, `net`, `p2p_transport_serialization`, `bip324_cipher_roundtrip`"
+   ],
+   [
+    "Score (GnB / Core)",
+    "2 / 5 / 4",
+    "8 / 9 / 9"
+   ]
+  ]
+ },
+ {
+  "title": "7.6 RPC, explorer and web front end",
+  "rows": [
+   [
+    "Design",
+    "axum JSON-RPC on loopback with API key, rate limits and CORS; Python explorer API; Cloudflare Worker proxy; browser wallet (WASM)",
+    "libevent HTTP RPC with cookie or rpcauth; no explorer or browser wallet"
+   ],
+   [
+    "Verified correct",
+    "Loopback default; key validation and constant-time compare; Host/Origin gate; body, concurrency and timeout caps; wallet CSP, COOP, frame-ancestors",
+    "Cookie file permissions, HMAC rpcauth, 250 ms auth-failure delay, work-queue limits"
+   ],
+   [
+    "Weaknesses",
+    "Plaintext origin link with shared secret (WAL-2); explorer XSS sinks without CSP (WAL-3); API slowloris (WAL-4); full-chain scans (NET-12); unbounded metric labels (NET-13)",
+    "Not applicable for web surfaces"
+   ],
+   [
+    "Tests",
+    "auth.rs 54 and sprint_m_auth 18 tests; no HTTP end-to-end, JS, Worker or explorer-API tests",
+    "rpc_bind.py, interface_http.py, rpc_whitelist.py; fuzz `http_request`, `rpc`"
+   ],
+   [
+    "Score (GnB / Core)",
+    "4 / 6 / 4",
+    "9 / 9 / 9"
+   ]
+  ]
+ },
+ {
+  "title": "7.7 Mempool and block production",
+  "rows": [
+   [
+    "Design",
+    "Fee-rate index with count and byte caps, first-seen, no orphans, no RBF; internal CPU miner and getblocktemplate",
+    "Cluster mempool, RBF, orphanage, package relay; weight-bounded BlockAssembler"
+   ],
+   [
+    "Verified correct",
+    "O(log n) index with invariant checker; checked sums; spawn_blocking for verification; self-mined blocks go through the full acceptance path (fail-safe)",
+    "Standardness, removeConflicts, removeForReorg, Expire, TrimToSize, TestBlockValidity"
+   ],
+   [
+    "Weaknesses",
+    "MEM-1, MEM-2 (Critical), MEM-3, MEM-4, MEM-5 (High), MEM-6, MEM-7",
+    "None material at the code level reviewed"
+   ],
+   [
+    "Tests",
+    "14 tests on the data structure only; gossip admission untested",
+    "mempool_tests, miner_tests; fuzz `tx_pool`, `tx_pool_standard`, `tx_package_eval`, `rbf`, `package_rbf`, `txorphan`; 20 mempool_*.py"
+   ],
+   [
+    "Score (GnB / Core)",
+    "3 / 4 / 3",
+    "9 / 9 / 10"
+   ]
+  ]
+ },
+ {
+  "title": "7.8 Wallet and key management",
+  "rows": [
+   [
+    "Design",
+    "Hybrid PQ keys per index derived with SHA3; Argon2id + AES-256-GCM keystores; CLI, light wallet, WASM browser wallet",
+    "Descriptor wallets, BIP32, SQLite; SHA-512-iterated KDF + AES-256-CBC"
+   ],
+   [
+    "Verified correct",
+    "Argon2id 256 MiB t=4 p=4, bounded untrusted KDF parameters, fresh nonces, authenticated v1 keyfiles, 0600 atomic writes, BIP39 vectors, prior audit findings CR-05/06/07/10 fixed",
+    "Values from own chain state, -maxtxfee, waste-based selection (BnB, CoinGrinder, knapsack, SRD)"
+   ],
+   [
+    "Weaknesses",
+    "WAL-1, WAL-2 (High); WAL-3, WAL-4; WAL-5, WAL-6, CRY-4, CRY-7",
+    "KDF is not memory-hard"
+   ],
+   [
+    "Tests",
+    "~153 Rust tests; no JS, Worker, Python or wasm32-target tests",
+    "83 wallet unit cases; 13 wallet fuzz targets (`crypter`, `coinselection_*`, `coin_grinder`, `scriptpubkeyman`, `wallet_create_transaction`, ...); 68 wallet_*.py"
+   ],
+   [
+    "Score (GnB / Core)",
+    "6 / 7 / 5",
+    "7 / 8 / 9"
+   ]
+  ]
+ },
+ {
+  "title": "7.9 Shielded pool, attestation and ledger v1 (inactive in consensus)",
+  "rows": [
+   [
+    "Status",
+    "Shielded spends rejected (`RejectAll`); attestation not used for trust; ledger v1 is a research prototype outside the node",
+    "No equivalents"
+   ],
+   [
+    "Findings",
+    "COH-1 (Critical if enabled), COH-2 (latent), LED-1 (sound SMT; open items), ATT-1",
+    "-"
+   ],
+   [
+    "Tests",
+    "coherence 43 tests (proofs mocked); ledger 12 Rust + 11 Python tests with 28 single-fault vectors",
+    "-"
+   ]
+  ]
+ },
+ {
+  "title": "7.10 Build, CI and supply chain",
+  "rows": [
+   [
+    "CI",
+    "Python reference + standalone `rust/` crate only; no workspace build, clippy, deny, audit, fuzz, sanitizer or Miri job",
+    "26 CI configurations, lint suite, fuzzing with sanitizers, previous-release compatibility"
+   ],
+   [
+    "Dependencies",
+    "cargo-audit: 11 advisories (5 not compiled, 6 reachable); deny.toml stale and failing; PQClean crates unmaintained upstream; dead blst/secp256k1 deps",
+    "Few vendored subtrees (secp256k1, leveldb, crc32c, minisketch) with guix reproducible builds"
+   ],
+   [
+    "Positive",
+    "Pinned toolchain, exact PQ crate pins, vendored-source hash pins, yamux advisory fork with lockfile guard (both guards pass when run in isolation)",
+    "-"
+   ],
+   [
+    "Score (GnB / Core)",
+    "1",
+    "10"
+   ]
+  ]
+ }
+]

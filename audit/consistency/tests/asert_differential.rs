@@ -39,7 +39,8 @@ fn oracle(params: &AsertParams, anchor: &AsertAnchor, parent_time: i64, height: 
 
 fn arb_anchor_bits() -> impl Strategy<Value = u32> {
     // Valid compact values from very hard (exponent 4) up to exponent 0x20,
-    // all of which decode and lie below GnB's pow limit (0x2100ffff).
+    // i.e. anchor targets below 2^255, where GnB's fixed-point multiply never
+    // saturates (see `high_anchor_saturation_diverges_from_aserti3_2d`).
     (4u32..=0x20, 0x0001_0000u32..0x0080_0000).prop_map(|(e, m)| (e << 24) | m)
 }
 
@@ -62,22 +63,27 @@ proptest! {
             "height={} skew={}", height, skew);
     }
 
-    /// Random anchors (hard to easy) under GnB's spacing and half-life.
+    /// Random anchors (hard to easy, at any height) under GnB's spacing and
+    /// half-life. GnB anchors at genesis (height 0); a non-zero anchor height
+    /// pins the generic library rule as well.
     #[test]
     fn random_anchor_bits_match_bchn_construction(
         anchor_bits in arb_anchor_bits(),
-        height in 1u64..=10_000_000,
+        anchor_height in 0u64..=1_000_000,
+        blocks in 1u64..=10_000_000,
         skew in -100_000_000i64..=100_000_000i64,
     ) {
         let (params, mut anchor) = gnb_params();
         anchor.bits = anchor_bits;
+        anchor.height = anchor_height;
+        let height = anchor_height + blocks;
         prop_assert!(try_bits_to_target(anchor_bits).unwrap() <= params.pow_limit);
-        let schedule = anchor.timestamp + params.target_spacing * (height as i64 - 1);
+        let schedule = anchor.timestamp + params.target_spacing * (blocks as i64 - 1);
         let parent_time = schedule + skew;
         let gnb = asert_next_target(&params, &anchor, parent_time, height).unwrap();
         let ora = oracle(&params, &anchor, parent_time, height);
         prop_assert_eq!(target_to_bits(&gnb), target_to_bits(&ora),
-            "anchor={:#010x} height={} skew={}", anchor_bits, height, skew);
+            "anchor={:#010x}@{} height={} skew={}", anchor_bits, anchor_height, height, skew);
     }
 
     #[test]
@@ -109,8 +115,10 @@ fn one_halflife_ahead_doubles_the_target() {
     // Choose an anchor far below the limit so the doubling is not clamped.
     anchor.bits = 0x1d00_ffff;
     let anchor_t = u256_from_be(&try_bits_to_target(anchor.bits).unwrap().0);
-    for height in [1u64, 2, 1_000, 2_000_000] {
-        let schedule = anchor.timestamp + params.target_spacing * (height as i64 - 1);
+    for (anchor_h, blocks) in [0u64, 777].into_iter().flat_map(|a| [1u64, 2, 1_000, 2_000_000].map(|b| (a, b))) {
+        anchor.height = anchor_h;
+        let height = anchor_h + blocks;
+        let schedule = anchor.timestamp + params.target_spacing * (blocks as i64 - 1);
         let on = asert_next_target(&params, &anchor, schedule, height).unwrap();
         let ahead = asert_next_target(&params, &anchor, schedule + params.halflife, height).unwrap();
         let behind = asert_next_target(&params, &anchor, schedule - params.halflife, height).unwrap();
@@ -142,4 +150,43 @@ fn full_target_low_bit_divergence_is_measured() {
     }
     println!("asert sweep: {n} points; full-target differences {diff}; compact-bits differences {bits_diff}");
     assert_eq!(bits_diff, 0);
+}
+
+/// Finding AUD-ASERT-SAT: `mul_u64_shr16` saturates `target * factor >> 16` at
+/// 2^256 - 1 *before* the right shift by a negative exponent. For anchor
+/// targets of about 2^255 and above this returns a target up to ~2x harder
+/// than the aserti3-2d arithmetic (BCHN instead requires 32 spare leading
+/// bits in pow_limit, so its intermediate never overflows). GnB's deployed
+/// anchor is the genesis target (~2^244), far below the threshold, so
+/// mainnet consensus is unaffected; the divergence matters only if ASERT is
+/// ever re-anchored at a target near the pow limit (0x2100ffff ~ 2^256).
+#[test]
+fn high_anchor_saturation_diverges_from_aserti3_2d() {
+    let (params, mut anchor) = gnb_params();
+    anchor.bits = 0x2100_a34e; // ~0.64 * 2^256, below the pow limit
+    let height = 1;
+    let parent_time = anchor.timestamp - 57_601; // eight half-lives behind
+    let gnb = asert_next_target(&params, &anchor, parent_time, height).unwrap();
+    let ora = oracle(&params, &anchor, parent_time, height);
+    assert_eq!(target_to_bits(&gnb), 0x1f7f_ffff, "pinned current GnB behaviour");
+    assert_eq!(target_to_bits(&ora), 0x2000_a349, "exact aserti3-2d arithmetic");
+    assert!(gnb < ora, "saturation makes the target harder than specified");
+
+    // The deployed anchor keeps at least 11 bits of headroom below 2^255.
+    let genesis = try_bits_to_target(gnb_crypto::core::GENESIS_BITS).unwrap();
+    let headroom = u256_from_be(&genesis.0).leading_zeros();
+    assert!(headroom >= 11, "genesis anchor has {headroom} leading zero bits");
+}
+
+/// Results between the pow limit (0xffff << 240) and 2^256 must be clamped to
+/// the limit even when the fixed-point step does not overflow 256 bits.
+#[test]
+fn clamps_to_pow_limit_inside_the_non_overflowing_band() {
+    let (params, mut anchor) = gnb_params();
+    anchor.bits = gnb_crypto::core::POW_LIMIT_BITS; // anchor exactly at the limit
+    for ahead in [1i64, 60, 600, 3_600] {
+        let parent_time = anchor.timestamp + ahead;
+        let t = asert_next_target(&params, &anchor, parent_time, 1).unwrap();
+        assert_eq!(t, params.pow_limit, "ahead={ahead}s must clamp to the pow limit");
+    }
 }

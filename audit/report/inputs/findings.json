@@ -1,0 +1,1022 @@
+[
+ {
+  "id": "DAG-1",
+  "severity": "Critical",
+  "area": "Consensus / GhostDAG",
+  "title": "Fork and parallel blocks are validated against the selected-chain UTXO set: honest nodes split permanently in ordinary operation",
+  "refs": [
+   "node/src/main.rs:2054-2066,2096",
+   "node/src/main.rs:2706-2721,2824-2884",
+   "node/src/main.rs:2203-2211",
+   "docs/LEDGER.md (section 7)"
+  ],
+  "evidence": "Confirmed by test (audit_poc_dag.rs, mirrored accept_block) and by reading (lead auditor re-verified); independently reproduced by the validation reviewer",
+  "description": "`accept_block` validates every transaction of every incoming block, including blocks that will only be fork-losers or merged siblings, by resolving inputs through `store.get_utxo`, i.e. the node's single UTXO set at its current selected tip. Any failure rejects the whole block before it enters the DAG, and nothing remembers it, so it is re-rejected each time it is fetched. Validity therefore depends on what the node already applied, i.e. on arrival order. This contradicts docs/LEDGER.md section 7, which says a conflicting transaction in a parallel block becomes a rejected transaction, not an invalid block.",
+  "scenario": "Two miners on the same tip both include mempool transaction T (siblings a1 and b1). Node X sees a1 first, spends T's input, and rejects b1; node Y does the opposite. X's descendants of a1 become orphans at Y, Y fetches a1 and rejects it again, forever, no matter how much work accumulates on X's side. The same happens to any fork block that spends an output created earlier on its own fork.",
+  "btc": "`AcceptBlock` stores side-branch blocks after context-free and contextual header/block checks only; UTXO validation happens in `ConnectBlock` when `ActivateBestChainStep` connects the branch after `DisconnectTip` unwinds to the fork point (src/validation.cpp).",
+  "recommendation": "Separate acceptance from connection: admit DAG blocks after stateless and contextual checks, validate transactions only when a block is connected to the selected chain or merged (with the section 7 mergeset rules), and cache invalidity only for permanent failures."
+ },
+ {
+  "id": "MEM-1",
+  "severity": "Critical",
+  "area": "Mempool / mining",
+  "title": "A single gossiped dust transaction halts block production on every node that mines from its mempool",
+  "refs": [
+   "node/src/main.rs:1234-1256",
+   "node/src/main.rs:2689-2762",
+   "node/src/mempool/mod.rs:148-273",
+   "node/src/rpc/mod.rs:1717-1732",
+   "crates/gnb-crypto/src/core/mod.rs:982-991"
+  ],
+  "evidence": "Confirmed by test (template level) and by reading (gossip path); independently reproduced by the validation reviewer",
+  "description": "Consensus rejects any block containing a non-coinbase output with `0 < value < 546` (`Block::validate_dust`, called from `validate_structure`). The RPC submission path applies the same dust rule at admission, but the gossip path (`NetworkMessage::NewTransaction` -> `validate_tx_standalone` -> `Mempool::add`) does not. A dust transaction is therefore admitted from any peer, never expires, is re-broadcast by the node itself every ~30 s, and is selected by fee rate into every template (`get_for_block(2000)`). Every self-mined or `getblocktemplate` block then fails `validate_structure`; the miner only logs `miner bug` and retries with the same template.",
+  "scenario": "An unauthenticated peer gossips one transaction with a 1-sat output and a high fee rate. All honest nodes admit it and every template becomes consensus-invalid. The attacker pays nothing because the transaction can never be mined.",
+  "btc": "`MemPoolAccept::PreChecks` (src/validation.cpp) runs `IsStandardTx` (dust, weight) before any script work on every ingress path, and the miner validates its own template with `TestBlockValidity` (src/node/miner.cpp).",
+  "recommendation": "Use one standardness function for every ingress path (gossip, RPC, reorg re-injection) that is a superset of the block rules; validate templates with the block rules before hashing and evict offending transactions automatically."
+ },
+ {
+  "id": "MEM-2",
+  "severity": "Critical",
+  "area": "Mempool / mining",
+  "title": "Block templates have no byte budget: ~116 ordinary pending transactions make every template exceed MAX_BLOCK_SIZE",
+  "refs": [
+   "node/src/mempool/mod.rs:310-325",
+   "node/src/main.rs:1618",
+   "node/src/rpc/mod.rs:1141",
+   "crates/gnb-crypto/src/core/mod.rs:82,1012"
+  ],
+  "evidence": "Confirmed by test (audit_poc_mempool.rs); independently reproduced by the validation reviewer",
+  "description": "`Mempool::get_for_block(limit)` caps templates by transaction count (2,000) only. A one-input hybrid ML-DSA-65 + Falcon-1024 transaction is about 8.6 kB, so 120 ordinary transactions produce a 1,035,636-byte template that `validate_structure` rejects as `block too large`. Three 390 kB transactions do the same.",
+  "scenario": "Normal load, or an attacker paying ~120 minimum fees, stops the internal miner and every `getblocktemplate` consumer from producing valid blocks until the mempool drains, which it cannot do because nothing is mined.",
+  "btc": "`BlockAssembler` (src/node/miner.cpp) packages by fee rate under a weight budget (`nBlockMaxWeight`) and calls `TestBlockValidity` before returning the template.",
+  "recommendation": "Select by fee rate under a byte (or weight) budget that reserves space for the header and coinbase; add a template self-check."
+ },
+ {
+  "id": "NET-2",
+  "severity": "Critical",
+  "area": "P2P / block ingress",
+  "title": "Zero-cost network-wide CPU exhaustion: blocks are relayed before validation, the 64 MiB PoW runs on self-declared bits before cheap checks, and invalid senders are never penalised",
+  "refs": [
+   "node/src/network/mod.rs:670-690,1050-1064",
+   "node/src/main.rs:1133,1852,1890,1985-2052",
+   "crates/gnb-crypto/src/core/mod.rs:907-932,1010-1019",
+   "docs/CONSENSUS.md:33-54"
+  ],
+  "evidence": "Confirmed by test (785-826 ms per invalid-PoW block in release, no penalty; three reviewers independently: POW-1, VAL-7, NET-2; lead auditor confirmed no `validate_messages` / `report_message_validation_result` call exists)",
+  "description": "Gossipsub is built without `validate_messages()`, so libp2p forwards every frame to the mesh before the application sees it, and `report_message_validation_result` is never called, so the configured invalid-delivery penalties never fire. Each node then runs `validate_structure()`, which ends with the full GnB-SMH evaluation against the header's own `bits`, inline on the single message-processing task and before the cheap contextual checks (`expected_bits`, known parents, height) in `accept_block`. Failures are not cached. `docs/CONSENSUS.md` states the opposite ordering.",
+  "scenario": "An unauthenticated peer publishes junk `NewBlock` frames (random parents, valid Merkle root, any nonce). About 1.3 frames per second saturate the processor of every node in the mesh, and the bounded ingest queue then drops honest blocks. With `bits = 0x2100ffff` the junk even passes and is inserted into the PoW cache.",
+  "btc": "Blocks and transactions are relayed only after validation; the PoW check is a cheap SHA-256d done first; invalid data leads to `Misbehaving`/discouragement (src/net_processing.cpp); headers presync and `MinimumChainWork` gate any expensive work.",
+  "recommendation": "Enable `validate_messages()` and report Accept/Reject; check expected bits, height and parent presence before PoW; remove PoW from `validate_structure`; apply per-peer PoW budgets and disconnects; run evaluations on a bounded worker pool."
+ },
+ {
+  "id": "POW-2",
+  "severity": "Critical",
+  "area": "P2P / block ingress",
+  "title": "One unauthenticated gossip frame panics the block-processing task (integer overflow on a wire-supplied height), repeatable network-wide",
+  "refs": [
+   "node/src/main.rs:1074-1078,1103-1130",
+   "node/src/network/mod.rs:83-88",
+   "node/src/main.rs:766-767,1296-1316",
+   "Cargo.toml:38"
+  ],
+  "evidence": "Confirmed by test (overflow on the exact expression) and by reading (reachability; lead auditor re-verified); independently reproduced by the networking reviewer",
+  "description": "`NetworkMessage::NewBlock.height` is only required to equal `block.height`, and neither is committed to the block id or the PoW preimage. The backfill-flood guard then evaluates `height + core::CHECKPOINT_DEPTH < tip_h` before any proof-of-work check. Release builds set `overflow-checks = true`, so `height = u64::MAX` panics as soon as the tip is above 1,000 blocks (already true on mainnet). The supervisor catches the panic, wipes the orphan pool and restarts the loop after an exponential backoff that is never reset (cap 30 s); frames arriving meanwhile are dropped from the bounded queue.",
+  "scenario": "An attacker builds any block (no valid PoW needed), sets both heights to `u64::MAX`, and publishes it. Gossipsub forwards it to the whole mesh before application validation (MEM-5), so every node's processor panics. Re-sending a byte-mutated copy every ~30 s keeps block processing stopped on all nodes.",
+  "btc": "Core derives height from the block index rather than trusting peer metadata, does arithmetic on validated values, and punishes malformed messages (`Misbehaving`, src/net_processing.cpp); its fuzz targets (`process_message`, `process_messages`) exercise this class of input continuously.",
+  "recommendation": "Drop the wire height (derive it from parents) or reject heights above `tip + slack` before any arithmetic; use checked/saturating arithmetic on every peer-supplied integer; reset the backoff after a healthy period; add a regression test and a fuzz target for `NewBlock` handling."
+ },
+ {
+  "id": "DAG-11",
+  "severity": "High",
+  "area": "Storage / crash consistency",
+  "title": "The extension commit path is not atomic and write errors are ignored",
+  "refs": [
+   "node/src/main.rs:2230-2238,2353,2355",
+   "node/src/storage/mod.rs:645-647",
+   "node/src/reorg.rs:813-892"
+  ],
+  "evidence": "Confirmed by test (simulated crash and restart) and by reading",
+  "description": "An apply error is logged and processing continues; the DAG, integrity and reachability persists and `tip_hash` are `.ok()`-ignored; UTXO effects land before CF_DAG. A crash in between leaves applied effects for a block not in the DAG, which is then rejected on re-receipt (inputs already spent). A missing parent integrity record is zero-filled, leading to a fatal boot error, and there is no start-up reconciliation. The reorg path, by contrast, uses one atomic WriteBatch.",
+  "btc": "`FlushStateToDisk` with head-block markers and `ReplayBlocks` recovery at start-up (src/validation.cpp).",
+  "recommendation": "Commit UTXO effects, undo data, DAG data and tip in one WriteBatch (as the reorg path does), propagate errors, and reconcile at start-up."
+ },
+ {
+  "id": "DAG-2",
+  "severity": "High",
+  "area": "Mining / GhostDAG",
+  "title": "More than 256 tips halts all mining that uses the stock template code",
+  "refs": [
+   "node/src/main.rs:1560,1654,1715-1732",
+   "node/src/rpc/mod.rs:1108",
+   "crates/gnb-crypto/src/core/mod.rs:366,1011"
+  ],
+  "evidence": "Confirmed by test (301 tips: template rejected with `too many parents`; wire decode fails)",
+  "description": "The internal miner and `getblocktemplate` use every bodied tip as a parent, but `validate_structure` and the wire decoder reject more than `MAX_PARENTS = 256`. Nobody using the stock code can merge the tips, so the condition persists. Leaf blocks are cheap to create on deep forks (POW-3).",
+  "btc": "Not applicable (single parent); Kaspa bounds parents (10) and mergeset size.",
+  "recommendation": "Select at most `MAX_PARENTS` parents by blue work, and add mergeset-size and merge-depth limits."
+ },
+ {
+  "id": "DAG-3",
+  "severity": "High",
+  "area": "Consensus / GhostDAG",
+  "title": "Fork choice ignores merged blue work, and merged blocks never reach the ledger",
+  "refs": [
+   "node/src/consensus/mod.rs:1062-1066,1153-1167,1426-1440",
+   "node/src/reorg.rs:161-224",
+   "node/src/main.rs:2203-2243"
+  ],
+  "evidence": "Confirmed by test (a tip with 15 blue blocks in its past loses to a bare 11-block chain)",
+  "description": "`blue_work = selected_parent.blue_work + own work`; the comment calls this Kaspa-aligned, but GHOSTDAG/Kaspa add the work of every blue block in the mergeset. UTXO state is applied only along the selected-parent chain, so transactions and coinbases of merged blue or red blocks are never applied. The DAG coloring therefore affects neither fork-choice weight nor the ledger: honest parallel blocks add no weight against an attacker chain, and their miners are not paid.",
+  "btc": "Bitcoin's most-work rule counts every block on the chain; there is no merged-but-ignored work.",
+  "recommendation": "Compute blue work over all mergeset blues and implement the mergeset transaction semantics of docs/LEDGER.md section 7 (or document the chain as selected-chain-only and stop advertising GHOSTDAG security)."
+ },
+ {
+  "id": "DAG-6",
+  "severity": "High",
+  "area": "Consensus / reorg",
+  "title": "Reorg depth cap and finality are node-local and history-dependent: nodes can diverge permanently",
+  "refs": [
+   "node/src/reorg.rs:42,808-814",
+   "node/src/main.rs:1525-1532,1924-1929,2192-2200,2384-2394"
+  ],
+  "evidence": "Confirmed by test (node X refuses a 1,101-block reorg; node Z, fed the same blocks interleaved, follows the heavier fork)",
+  "description": "`MAX_REORG_DEPTH = 1000` and the finality gate use each node's own history. A node that saw the honest chain first refuses a heavier fork deeper than the cap, while a node syncing fresh, or on the other side of a partition, follows it. There is no invalidate/reconsider tool, and `FINALITY_FROZEN`, documented to allow a heavier chain to deep-reorg the node back, is defeated by the independent cap.",
+  "btc": "No reorg-depth limit and no checkpoints on master; operators have `invalidateblock`/`reconsiderblock` (src/validation.cpp `InvalidateBlock`, `PreciousBlock`).",
+  "recommendation": "Replace the local cap by an objective DAG rule (finality point / bounded merge depth evaluated from the DAG itself) and add operator recovery commands."
+ },
+ {
+  "id": "DAG-7",
+  "severity": "High",
+  "area": "Consensus / DoS",
+  "title": "Unbounded per-block cost: O(past) mergeset computation, full-subtree reachability reindex, no mergeset or merge-depth limit",
+  "refs": [
+   "node/src/consensus/mod.rs:417,1326-1364",
+   "node/src/consensus/reachability.rs:233-297",
+   "node/src/main.rs:1103-1130"
+  ],
+  "evidence": "Confirmed by test (timings) and by reading (guard bypass)",
+  "description": "`compute_mergeset` always walks `compute_past(selected_parent)`, the reachability reindex recomputes subtree sizes per child, `candidate_anticone_blues` walks the selected chain with no k+1 early exit, and everything runs under the global DAG write lock. Measured at 12,000 blocks (release, loaded host): tip extension 5.8-6.2 ms; deep side-block insertion 1.1-4.4 s; one genesis sibling 6.2-10.2 s; one merge block with a 1,000-block mergeset 7.2-10.2 s. The backfill guard can be bypassed by making the deep block `awaited` through a crafted orphan.",
+  "btc": "Header-first sync with anti-DoS work thresholds; no per-block cost proportional to history.",
+  "recommendation": "Use the reachability index for incremental past/mergeset computation, add a mergeset-size limit, a merge-depth bound, k+1 early exit, stored subtree sizes and a reindex window."
+ },
+ {
+  "id": "MEM-3",
+  "severity": "High",
+  "area": "Mempool",
+  "title": "Mempool is never conflict-swept, revalidated after reorgs, or expired; one double-spend wedges the local miner",
+  "refs": [
+   "node/src/mempool/mod.rs:347-366",
+   "node/src/main.rs:2241,2311",
+   "node/src/reorg.rs:894-905"
+  ],
+  "evidence": "Confirmed by test (mempool) and by reading; independently reproduced by the validation reviewer",
+  "description": "`remove_confirmed` removes only transactions whose txids appear in a new block. A pooled transaction whose input was spent by a different confirmed transaction, or whose input disappears in a reorg, stays in the pool indefinitely and keeps being selected into templates, which `accept_block` then rejects with `UTXO not found`.",
+  "scenario": "Any ordinary double-spend or fee bump in which the competing transaction confirms first wedges the miner of every node that saw the losing version, until restart.",
+  "btc": "`CTxMemPool::removeForBlock` -> `removeConflicts`, `MaybeUpdateMempoolForReorg`/`removeForReorg`, `Expire` (336 h default), `TrimToSize` and the `CTxMemPool::check` consistency audit (src/txmempool.cpp).",
+  "recommendation": "On every connected block remove conflicting transactions; on reorg revalidate the pool against the new tip; add expiry and a periodic consistency check."
+ },
+ {
+  "id": "MEM-4",
+  "severity": "High",
+  "area": "Mempool",
+  "title": "Gossip admission checks coinbase maturity against the DAG block count instead of the chain height",
+  "refs": [
+   "node/src/main.rs:1239",
+   "node/src/main.rs:2891-2908",
+   "node/src/consensus/mod.rs:1523-1525",
+   "node/src/rpc/mod.rs:955-963"
+  ],
+  "evidence": "Confirmed by reading; also reported by the validation reviewer",
+  "description": "The gossip path passes `dag.block_count()` (every DAG block, including merged/red blocks) as `current_height` to `validate_tx_standalone`. In a BlockDAG the block count exceeds the selected-chain height (the RPC path's own comment records a 10,769-block gap), so immature coinbase spends pass the gossip check while `accept_block` correctly rejects them using `block.height`.",
+  "scenario": "Any coinbase owner gossips a spend of an immature coinbase; it enters every pool and poisons templates for up to 100 blocks (same wedge as MEM-1/MEM-3).",
+  "btc": "Core checks maturity with `CheckTxInputs` against the active chain height on every path (src/consensus/tx_verify.cpp).",
+  "recommendation": "Use the selected-tip height and the shared `core::check_coinbase_maturity` on all ingress paths; add a regression test at the gossip boundary (today `validate_tx_standalone` lives in the binary and is untested)."
+ },
+ {
+  "id": "MEM-5",
+  "severity": "High",
+  "area": "Mempool / P2P",
+  "title": "Transaction admission performs O(inputs x size) signature work before cheap size, duplicate and standardness checks, with no peer penalty",
+  "refs": [
+   "node/src/main.rs:1234-1256",
+   "crates/gnb-crypto/src/core/mod.rs:572-612,645-663",
+   "node/src/mempool/mod.rs:164,195",
+   "node/src/network/mod.rs:665-690"
+  ],
+  "evidence": "Cost confirmed by test (57 ms -> 2,940 ms for 30 -> 235 inputs); end-to-end plausible",
+  "description": "Signature verification runs before the 400 kB `MAX_TX_SIZE` and duplicate checks. `Transaction::sighash` deep-clones and re-encodes the whole transaction per input, so cost grows quadratically. Gossipsub is configured without application-level validation (`validate_messages()`), so frames are forwarded before checking; `from_wire_bytes` accepts trailing bytes, which defeats message-id de-duplication; invalid transactions only produce a debug log and there is no recent-rejects filter.",
+  "scenario": "An attacker holding ~235 UTXOs signs one 4 MB transaction that is never admitted (oversize), so the inputs are never spent, and replays byte-mutated copies; each copy costs every node about 3 s on the single message-processing task, delaying or dropping block frames from the shared 1,000-slot queue.",
+  "btc": "`PreChecks` enforces size and standardness and rejects `txn-already-in-mempool` before `PolicyScriptChecks`; BIP143/BIP341 sighash precomputation makes hashing linear; misbehaving peers are scored and disconnected; `m_lazy_recent_rejects` drops repeats (src/node/txdownloadman_impl.cpp).",
+  "recommendation": "Order checks cheap-to-expensive (size, standardness, duplicates, UTXO presence, fee, then signatures); cache sighash midstates; reject trailing bytes; validate gossip before forwarding and penalise peers; add a rolling reject filter."
+ },
+ {
+  "id": "NET-4",
+  "severity": "High",
+  "area": "P2P",
+  "title": "Honest relays are penalised for frames they merely forwarded, cutting honest paths",
+  "refs": [
+   "node/src/network/mod.rs:394-452,1050-1064"
+  ],
+  "evidence": "Confirmed by test (live 4-node topology)",
+  "description": "Wire-bound penalties are charged to `propagation_source`, i.e. the neighbour that forwarded the frame, and the tracker never decays or evicts. Because gossip forwards before validation (NET-2), an attacker's malformed frames make honest nodes score their honest neighbours below the gossip threshold.",
+  "scenario": "Attacker A, honest C and D each connected only to hub B: five malformed frames from A make C and D score B at -200, prune it from the mesh and ignore its IHAVE; D's next block reaches B but never C, while TCP stays up.",
+  "btc": "Misbehaviour is attributed to the peer that sent invalid data after validation, and discouragement is per peer.",
+  "recommendation": "Validate before forwarding and use gossipsub Reject so penalties follow the author; decay application scores."
+ },
+ {
+  "id": "NET-5",
+  "severity": "High",
+  "area": "P2P / sync",
+  "title": "A requester penalises an honest server for rate-limiting it",
+  "refs": [
+   "node/src/network/mod.rs:1544,1588-1594",
+   "node/src/network/sync_rr.rs:222-229"
+  ],
+  "evidence": "Confirmed by test (unit and live)",
+  "description": "When `SyncRequestLimiter` refuses a request it drops the response channel; libp2p closes the stream cleanly, the requester reads an empty frame, decodes it as invalid data and applies a -100 protocol-violation penalty to the honest server.",
+  "scenario": "An ordinary IBD burst of 200 pulls makes the syncing node stop receiving the honest server's blocks.",
+  "btc": "Explicit `notfound` responses and per-peer in-flight limits with stall timeouts (`MAX_BLOCKS_IN_TRANSIT_PER_PEER`, `BLOCK_STALLING_TIMEOUT`).",
+  "recommendation": "Send an explicit Busy response, treat EOF as a transport failure, and cap in-flight requests on the client side."
+ },
+ {
+  "id": "NET-6",
+  "severity": "High",
+  "area": "P2P / sync",
+  "title": "One Version frame latches IBD mode network-wide and pauses mining",
+  "refs": [
+   "node/src/network/mod.rs:1996-2007",
+   "node/src/sync/peer_state.rs:117-119",
+   "node/src/main.rs:837-841,1284-1287,1525-1540,2529"
+  ],
+  "evidence": "Confirmed by test (live; release predicate replicated)",
+  "description": "Peer tip claims are clamped to our height + 1,000,000, but IBD is released only within +16; the table is monotonic-max and keyed to the relaying peer; directed Tips responses never update it, so the verified release path is dead. Unclamped values set `is_syncing`. The miner pauses, and after the 90 s stall valve it mines with `FINALITY_FROZEN = true`.",
+  "scenario": "One unauthenticated Version or PeerTip claim keeps every receiving node in IBD mode with mining paused or degraded.",
+  "btc": "Sync state is driven by PoW-validated headers with `MinimumChainWork`; unverified peer claims do not change mining behaviour.",
+  "recommendation": "Trust only work-backed claims, attribute them to the author, and decay them."
+ },
+ {
+  "id": "NET-7",
+  "severity": "High",
+  "area": "P2P",
+  "title": "Gossip requests produce mesh-wide broadcast replies (O(N^2) amplification)",
+  "refs": [
+   "node/src/main.rs:919-943,1023-1051",
+   "node/src/network/mod.rs:285-286,1152-1180,1596-1600"
+  ],
+  "evidence": "Confirmed by test (100 unique message ids decode to the same request); amplification by reading",
+  "description": "Any peer's gossip `GetHeaders`, `GetBlock` or `PeerRequest` makes every node broadcast a reply on gossip (up to 2,000 headers, a full block body or a `BlockNotFound` with a fresh nonce, or the whole known-peers table). `decode_wire_message` ignores trailing bytes, so requests can be made byte-unique and gossip de-duplication never stops them; failed directed pulls also re-publish on gossip.",
+  "btc": "Requests are point-to-point; `getaddr` answers from a cached sample once per connection and address relay is rate-limited (0.1 addr/s token bucket).",
+  "recommendation": "Serve pulls only over directed request-response, reject trailing bytes, and rate-limit per author."
+ },
+ {
+  "id": "OPS-1",
+  "severity": "High",
+  "area": "CI / release engineering",
+  "title": "CI never builds or tests the consensus workspace; documented guards and fuzz targets do not exist",
+  "refs": [
+   ".github/workflows/ci.yml",
+   "Cargo.toml:12",
+   "node/Cargo.toml:91",
+   "crates/gnb-crypto/Cargo.toml:68",
+   "crates/gnb-crypto/src/crypto/mod.rs:723,1552",
+   "node/src/mempool/mod.rs:376",
+   "node/fuzz/corpus/"
+  ],
+  "evidence": "Confirmed by reading and by running the workspace locally (the suites do pass when run: 61 binaries, 1,040 executions, 0 failures)",
+  "description": "CI runs only the Python reference and the standalone `rust/` crate, which is excluded from the workspace. The node, `gnb-crypto`, `coherence-core`, the consensus copy of the PoW in `crates/gnb-smh` and the wallet are never compiled or tested in CI; there is no clippy, cargo-deny, cargo-audit, fuzzing, sanitizer or Miri job. Comments cite `scripts/falcon-clean-guard.sh` and cargo-fuzz targets (`pow_verify`, `mempool_ops`) that do not exist; `node/fuzz` holds only seed corpora, replayed by `parser_corpus_floor.rs`.",
+  "btc": "Bitcoin Core CI runs 26 configurations including ASan/UBSan/integer, MSan, TSan, valgrind, fuzzing with sanitizers, clang-tidy, IWYU, big-endian s390x and cross-OS builds (ci/test/00_setup_env_*.sh), plus a lint suite (test/lint).",
+  "recommendation": "Run `cargo test --workspace --release --locked`, clippy with `-D warnings`, cargo-deny and cargo-audit on every push; add cargo-fuzz targets for the wire decoders, PoW verify and mempool; add the Falcon guard or remove the claims."
+ },
+ {
+  "id": "POW-3",
+  "severity": "High",
+  "area": "Difficulty / DAG",
+  "title": "Near-free blocks on deep forks: absolute-schedule ASERT, a pow limit of ~2^256 and no anti-DoS work rule",
+  "refs": [
+   "crates/gnb-crypto/src/core/mod.rs:150,185-203",
+   "node/src/main.rs:1103-1186,2024-2032,2182-2200,2546-2592",
+   "node/src/sync/parent_fetch.rs:94",
+   "node/src/consensus/mod.rs:1512-1521"
+  ],
+  "evidence": "ASERT part confirmed by test; acceptance path by reading; mining-halt and recursion depth plausible",
+  "description": "`POW_LIMIT_BITS = 0x2100ffff` is the largest decodable target (any nonce succeeds with probability 65535/65536, `work() = 1`). Expected bits depend only on the block's own parents, so a fork from any parent at least 24.27 h behind schedule needs one honest-difficulty proof and then yields unlimited children and siblings at the pow limit; forking from genesis six days after launch yields ~14,367 consecutive free heights. Blocks below finality are deliberately retained as fork-losers, and there is no minimum-chain-work or merge-depth rule. The backfill guard is bypassed by first sending a near-tip orphan that makes the node request (and therefore await) the deep fork blocks.",
+  "scenario": "Unbounded DAG/disk growth at about one evaluation per block, with multi-second insertions under the global DAG write lock. Because templates use every bodied tip as a parent, more than 256 tips would make every template violate `MAX_PARENTS` (plausible mining halt). `process_orphans` recurses once per accepted orphan, so a very deep chain risks stack exhaustion (plausible).",
+  "btc": "Retargets are clamped (x4), `PermittedDifficultyTransition` bounds unverified headers, `MinimumChainWork`/`GetAntiDoSWorkThreshold` and presync reject low-work chains, and unrequested blocks need more work than the tip.",
+  "recommendation": "Add an anti-DoS blue-work threshold relative to the tip, reject parents below finality or merge depth, cap template parents (highest blue work first), make orphan processing iterative, and lower the pow limit to a target that costs real work."
+ },
+ {
+  "id": "POW-4",
+  "severity": "High",
+  "area": "P2P / orphan pool",
+  "title": "Orphan pool admission is gated only by self-declared bits: memory exhaustion and eviction of honest orphans",
+  "refs": [
+   "node/src/main.rs:771,1144-1189",
+   "deploy/gnb-node.service (MemoryMax)"
+  ],
+  "evidence": "Confirmed by test (a 951,270-byte orphan with nonexistent parents admitted after one evaluation; ~19 GB per node at the 10,000-entry cap, versus MemoryMax=6G in the shipped unit) and by reading",
+  "description": "Orphans (unknown parents) are admitted after `validate_structure`, so pow-limit bits make them free. Each entry stores the parsed block and its raw bytes (up to `MAX_BLOCK_SIZE` = 1 MB each, 10,000 entries), and eviction removes the lowest claimed height first, so attacker orphans with huge claimed heights are never evicted while honest ones are. `process_orphans` recurses once per accepted orphan on a 2 MiB worker stack, so a long attacker chain can also exhaust the stack (plausible).",
+  "scenario": "About 10 GB of upload pins about 20 GB of RAM (out-of-memory on typical hosts) and blocks honest orphan resolution during sync.",
+  "btc": "Core keeps no orphan-block pool; it requests headers first and stores only blocks it asked for on chains with sufficient work.",
+  "recommendation": "Do not admit orphans on self-declared bits; cap the pool by bytes and per peer; evict by arrival and peer, never by claimed height."
+ },
+ {
+  "id": "VAL-2",
+  "severity": "High",
+  "area": "Validation / UTXO",
+  "title": "No BIP30/BIP34 protection: duplicate coinbase txids overwrite UTXOs and rollback deletes the earlier block's coin",
+  "refs": [
+   "crates/gnb-crypto/src/core/mod.rs:935-941",
+   "node/src/reorg.rs:272-277,559-567"
+  ],
+  "evidence": "Confirmed by test (audit_poc_validation.rs val2)",
+  "description": "Nothing forces coinbases to be unique (no height commitment in the coinbase, no check against overwriting an unspent output). A miner can produce the same coinbase (same script, value and address within one halving epoch) in two blocks, giving one txid. `put_utxo` overwrites the coin, and when the second block is reorged out its rollback deletes the coin and its coinbase record on nodes that applied it, while nodes that never applied it keep them.",
+  "scenario": "A later spend of that coin is valid on one set of nodes and invalid on the other: a chain split triggered by a miner.",
+  "btc": "BIP34 height in coinbase (`bad-cb-height`), BIP30 no-overwrite checks, and `DisconnectBlock` handling of overwritten coins (`DISCONNECT_UNCLEAN`) in src/validation.cpp.",
+  "recommendation": "Commit the height in the coinbase, refuse outputs that would overwrite an unspent coin, and make undo restore overwritten coins."
+ },
+ {
+  "id": "VAL-3",
+  "severity": "High",
+  "area": "Validation",
+  "title": "A block may spend its own coinbase (maturity bypass), while the reorg path forbids it: miner-triggerable split",
+  "refs": [
+   "node/src/main.rs:2859-2882",
+   "crates/gnb-crypto/src/core/mod.rs:91-113",
+   "node/src/reorg.rs:654-658"
+  ],
+  "evidence": "Confirmed by test (val3) and by reading (lead auditor re-verified)",
+  "description": "The in-block prevout map includes `transactions[0]`, and `check_coinbase_maturity` only rejects inputs whose coinbase height is already stored, which is not yet the case for the block's own coinbase. A non-coinbase transaction can therefore spend the coinbase of the same block with zero confirmations. The reorg re-validation path rejects the same block (`immature same-block coinbase`).",
+  "scenario": "Nodes receiving the block as an extension apply it; nodes that held a sibling first store it as a fork-loser but can never reorg onto it. A miner can launder fresh subsidy immediately and split the network.",
+  "btc": "`CheckTxInputs` enforces `COINBASE_MATURITY` for every spend, including within the block (src/consensus/tx_verify.cpp).",
+  "recommendation": "Exclude the coinbase from the in-block prevout map and use one shared rule function for acceptance and reorg."
+ },
+ {
+  "id": "WAL-1",
+  "severity": "High",
+  "area": "Wallet",
+  "title": "Wallets sign with UTXO values supplied by the node/API and have no maximum-fee guard",
+  "refs": [
+   "crates/gnb-crypto/src/wallet/mod.rs:376-436,1093-1174",
+   "crates/gnb-wallet-wasm/src/lib.rs:101-134",
+   "crates/gnb-crypto/src/wallet/client.rs:152-170",
+   "site/wallet/app.js:214-220"
+  ],
+  "evidence": "Confirmed by test (audit_poc_wallet.rs)",
+  "description": "Because the sighash does not commit to spent amounts (CRY-3), a wallet that is told a wrong value for its own UTXO produces byte-identical signatures. Every builder (Rust `TxBuilder`, `Wallet::build_tx`, the WASM `pay`, both CLIs) trusts the values from RPC, none enforces a fee ceiling, and the web review screen shows the fee computed from the claimed values. `WalletClient::send` also accepts a node-chosen absolute fee.",
+  "scenario": "A compromised or spoofed API (see WAL-2) reports a 100 GNB coin as 1.0005 GNB; the user pays 1 GNB and the UI shows a 0.0005 GNB fee, while 99 GNB go to the miner.",
+  "btc": "Core's wallet reads values from its own validated chain state, BIP143/BIP341 sighashes commit to amounts so a lie invalidates the signature, and `-maxtxfee` (default 0.1 BTC) is enforced (src/wallet/spend.cpp).",
+  "recommendation": "Enforce absolute and per-kB fee ceilings in every builder; verify input values (fetch and hash the previous transactions) before display; plan a sighash version that commits to spent amounts."
+ },
+ {
+  "id": "WAL-2",
+  "severity": "High",
+  "area": "Web infrastructure",
+  "title": "The Cloudflare Worker reaches the explorer origin over plain HTTP with the shared secret, and caches per origin headers",
+  "refs": [
+   "worker/index.js:9,33,46-47,70"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "The origins are hard-coded `http://` endpoints on port 2086. The `x-gnb-key` secret, every UTXO and balance response, and every broadcast transaction cross the Internet unencrypted, and any origin response with `max-age>=1` is stored in the edge cache. No HSTS header is set.",
+  "scenario": "An on-path attacker between the edge and a VPS steals the API key, forges UTXO values (driving WAL-1 for every web-wallet user), injects markup into explorer data (WAL-3), and makes the forgery persist at the edge with a long `max-age`.",
+  "btc": "Not applicable: Bitcoin Core ships no hosted web wallet or proxy; this is additional attack surface.",
+  "recommendation": "Use TLS or an authenticated tunnel to the origin, ignore origin cache headers in favour of fixed short TTLs, and add HSTS."
+ },
+ {
+  "id": "CRY-1",
+  "severity": "Medium",
+  "area": "Signatures / block format",
+  "title": "Consensus accepts third-party witness malleation and nothing commits to script_sig bytes",
+  "refs": [
+   "crates/gnb-crypto/src/crypto/mod.rs:229-234,280-288,752-760",
+   "crates/gnb-crypto/src/core/mod.rs:626-629,678-710,876-895",
+   "node/src/main.rs:2726-2744"
+  ],
+  "evidence": "Confirmed by test (audit_poc_crypto.rs); also reported by the validation and PoW reviewers",
+  "description": "Non-coinbase txids exclude `script_sig` (anti-malleability, like a segwit txid), and the Merkle root is built from txids, but there is no witness commitment. On top of that, the consensus verifier is lenient: a third party can strip or add the 4-byte suite envelope, zero-pad the compact Falcon signature to the 1,280-byte padded form, and append arbitrary bytes after the public key (up to the 10,000-byte script cap). The repository already contains a strict `verify_enveloped_canonical`, but consensus does not use it.",
+  "scenario": "A relay pads the witnesses of a valid near-full block. Block id, Merkle root and txids are unchanged, but `size_bytes()` grows (+1,659 bytes per input in the PoC), so `MAX_BLOCK_SIZE` and the size-based minimum-fee rule give a different verdict for the same block id. Nodes can also store and serve different bytes for one id. No invalid-block-id cache exists, and gossip ids hash the full payload, so permanent rejection of the honest block was not observed.",
+  "btc": "Strict DER, low-S and NULLFAIL rules (src/script/interpreter.cpp) remove ECDSA malleability; segwit commits witnesses through the coinbase witness commitment (`BlockWitnessMerkleRoot`, src/consensus/merkle.cpp) checked by `CheckWitnessMalleation` (src/validation.cpp), and `ComputeMerkleRoot` reports mutation.",
+  "recommendation": "In the next hard fork require an exact-length `script_sig`, a mandatory envelope and canonical Falcon encoding (`verify_enveloped_canonical`), and commit to witness data (header or coinbase witness root). Keep never caching invalidity by block id."
+ },
+ {
+  "id": "DAG-10",
+  "severity": "Medium",
+  "area": "Consensus / concurrency",
+  "title": "accept_block is not serialized across ingress paths",
+  "refs": [
+   "node/src/main.rs:1194,1715,1893,2061,2077,2096,2154,2230"
+  ],
+  "evidence": "Plausible (narrow race window, traced by reading)",
+  "description": "The network processor, the miner and RPC `submitblock` call `accept_block` concurrently without a global lock; tip snapshot, transaction validation, DAG insertion, new-tip read and UTXO application are separate critical sections. Interleavings can apply two sibling extensions (UTXO set T+a+b while the selected chain is T->b) or accept a child validated before its parent was applied. Because both siblings can be applied, a conflicting spend can be applied twice, inflating supply, and the undo record then misses the input.",
+  "btc": "`m_chainstate_mutex` plus `cs_main`, with `processnewblock_signals_ordering` driving `ProcessNewBlock` from 10 threads in src/test/validation_block_tests.cpp.",
+  "recommendation": "Hold one acceptance mutex across the whole pipeline and add a multi-threaded test."
+ },
+ {
+  "id": "DAG-4",
+  "severity": "Medium",
+  "area": "Consensus / GhostDAG",
+  "title": "The live (fast) GHOSTDAG coloring violates the k-cluster rule",
+  "refs": [
+   "node/src/consensus/mod.rs:1253-1254,1278-1364,1396-1423"
+  ],
+  "evidence": "Confirmed by test (k=10: a side block under a 30-block chain is colored blue; random differential vs an exact PHANTOM reference: 443 of 920 blocks get a different blue set)",
+  "description": "The selected parent is stripped from `mergeset_blues`, but the ported bounded chain walk assumes Kaspa's layout where it is element 0, so selected-chain blocks below the immediate selected parent are never counted in a candidate's anticone; historical anticone sizes are reset to 0. The legacy path has the same omission, so the Legacy-vs-Fast differential test cannot detect it. Effect: inflated blue scores, which feed tie-breaks, IBD ordering and RPC.",
+  "recommendation": "Test against an exact GHOSTDAG reference (and Kaspa vectors) and fix the anticone walk."
+ },
+ {
+  "id": "NET-10",
+  "severity": "Medium",
+  "area": "P2P / sync",
+  "title": "Unbounded frontier state and fan-out from unsolicited frames",
+  "refs": [
+   "node/src/sync/frontier.rs:88-103",
+   "node/src/main.rs:898-913,962-978"
+  ],
+  "evidence": "Confirmed by test (2,000 Tips frames -> 512,000 in-flight entries and 512,000 GetBlocks)",
+  "description": "Tips frames are bounded individually but not in total, overheard Headers also trigger fetches, and the abandoned set is never pruned; IBD stays latched.",
+  "recommendation": "Bound frontier state globally and per peer and only act on solicited responses."
+ },
+ {
+  "id": "NET-11",
+  "severity": "Medium",
+  "area": "P2P / peer management",
+  "title": "Weak peer exchange and eclipse resistance",
+  "refs": [
+   "node/src/network/mod.rs:841-847,1181-1248,1501-1513",
+   "node/src/network/pex_validator.rs:296-307",
+   "node/src/network/sync_rr.rs:157",
+   "node/src/main.rs:1294"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "Unsolicited relayed PeerExchange messages trigger immediate dials to up to 20 attacker-chosen addresses per message, rate-limited per relayer rather than per author (a reflection and port-scan amplifier). The known-peers table uses arbitrary eviction with no netgroup buckets, tried/new tables, anchors or feeler connections; inbound slots are first-come; three free identities confirm the external address; directed GetPeers answers are discarded.",
+  "btc": "addrman with keyed netgroup buckets and new/tried tables (src/addrman_impl.h), inbound eviction protecting diverse peers (`AttemptToEvictConnection`), anchors, feelers and block-relay-only connections (src/net.cpp).",
+  "recommendation": "Adopt an addrman-like design and dial only from the table, never directly from received messages."
+ },
+ {
+  "id": "NET-12",
+  "severity": "Medium",
+  "area": "RPC / explorer",
+  "title": "The public explorer chain allows unbounded full-chain scans",
+  "refs": [
+   "worker/index.js",
+   "deploy/explorer-api/gnb_explorer_api.py",
+   "node/src/rpc/auth.rs:150,417",
+   "node/src/rpc/mod.rs:189-202,620-652,904-918",
+   "node/src/storage/mod.rs:297-315"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "Public requests flow through the Worker (no rate limit) and the explorer API (which allows `getdifficultyhistory` with 500 parameter values, `getblocktimepercentiles` and `getutxos`) to the node RPC over loopback, which is exempt from rate limiting. Two of these methods iterate every block body and are not classed as heavy reads; aborting the blocking task does not stop a running scan, so the 256-request concurrency cap does not bound work; `getutxos` loads all of an address's UTXOs before applying the limit.",
+  "recommendation": "Class scanning methods as heavy, precompute their results, add cancellation, and rate-limit by original client."
+ },
+ {
+  "id": "NET-8",
+  "severity": "Medium",
+  "area": "P2P",
+  "title": "Rate-limit and penalty maps never evict",
+  "refs": [
+   "node/src/network/sync_rr.rs:427-483",
+   "node/src/network/mod.rs:394-452"
+  ],
+  "evidence": "Confirmed by test",
+  "description": "`SyncRequestLimiter` fails closed with no eviction: after 1,024 free identities every new peer is refused forever (and, through NET-5, newcomers then penalise the victim). `WirePenaltyTracker` saturates at 1,024 identities and keeps later offenders at -100 forever.",
+  "recommendation": "Use bounded LRU maps with time-based decay."
+ },
+ {
+  "id": "NET-9",
+  "severity": "Medium",
+  "area": "P2P / sync",
+  "title": "A single attacker can capture and stall all IBD pulls",
+  "refs": [
+   "node/src/network/sync_rr.rs:513-537,568-577",
+   "node/src/sync/frontier.rs:117-130"
+  ],
+  "evidence": "Confirmed by test",
+  "description": "`select_pull_peer` prefers peers that declare themselves archival in the identify agent string, then the highest announced score, with no stall detection or rotation; two `NotFound` replies abandon a tip.",
+  "btc": "Parallel download from several peers with stalling detection and disconnection (`BLOCK_STALLING_TIMEOUT`, `CHAIN_SYNC_TIMEOUT`).",
+  "recommendation": "Rotate peers, detect stalls, and ignore self-declared capabilities for selection."
+ },
+ {
+  "id": "OPS-2",
+  "severity": "Medium",
+  "area": "Supply chain",
+  "title": "Dependency policy is stale and not enforced; reachable advisories are ignored",
+  "refs": [
+   "deny.toml",
+   "Cargo.lock"
+  ],
+  "evidence": "Confirmed by running cargo-deny 0.20.2 and cargo-audit 0.22.2",
+  "description": "`cargo deny check` fails the project's own license policy (the three first-party AGPL crates are not allowed) and reports 5 unmatched and 2 unnecessary skips and 15 license entries never encountered (inherited from Bloch, including SP1 dependencies that are no longer present). cargo-audit reports 11 vulnerabilities in `Cargo.lock`: quinn-proto (5; in the lockfile but not compiled for any target), rustls 0.23.45 (4; reachable through reqwest and libp2p-websocket, fixed in 0.23.46) and hickory-proto 0.25.2 (2; DoS, reachable through libp2p-dns/mdns; ignored in deny.toml without rationale). The PQClean-based crates are flagged unmaintained (upstream archived).",
+  "recommendation": "Repair deny.toml, enforce it in CI, upgrade rustls and hickory, prune the lockfile, and plan a maintained PQ backend."
+ },
+ {
+  "id": "POW-5",
+  "severity": "Medium",
+  "area": "Difficulty / tests",
+  "title": "Consensus difficulty code is weakly tested: feature unification disables the real ASERT path in workspace tests, 37 mutants survive, no external oracle",
+  "refs": [
+   "crates/gnb-crypto/Cargo.toml (test-pow-limit)",
+   "node/Cargo.toml (dev-dependencies)",
+   "crates/gnb-crypto/src/core/mod.rs:1297",
+   "crates/gnb-smh/src/difficulty.rs:249,255",
+   "reference/gnb_smh.py"
+  ],
+  "evidence": "Confirmed by reading, by build fingerprints, by mutation testing (cargo-mutants 27.1.0) and by execution: the PoW proof-of-concept tests in gnb-crypto pass 5/5 when the crate is tested alone and 2 of them fail when it is built in the same cargo invocation as the node, because the node dev-dependency feature `test-pow-limit` is unified into gnb-crypto",
+  "description": "`cargo test --workspace` unifies the node's dev-dependency feature `test-pow-limit` into `gnb-crypto`, so `expected_bits_at_schedule_is_genesis_bits` is ignored and every node test uses a constant expected target. The normative Python reference defines no difficulty rule. Mutation testing of `crates/gnb-smh` left 37 of 213 viable mutants alive (82.6% score); besides equivalent mutants they include a schedule off-by-one (`height - anchor - 1` -> `+ 1`), the strict PoW comparison (`<` -> `<=`), `verify`, `hash` and `work`. GnB's code comment calls its floor-division exponent `like aserti3-2d`; under C++-style truncation the reviewer's model disagrees on 42% of sampled compact results, while the audit harness (floor division, BCHN fixed point) agrees bit-for-bit, so GnB's rule is only pinned by its own code.",
+  "btc": "src/test/pow_tests.cpp, arith_uint256_tests.cpp and headers_sync_chainwork_tests.cpp, plus fuzz targets `pow`, `pow_transition` and `headerssync`, run in CI on every configuration.",
+  "recommendation": "Test `gnb-crypto` without `test-pow-limit` in a separate CI job; publish ASERT and chain-work vectors in the Python reference; adopt the audit harness (audit/consistency) in CI; fix the comment to state the exact rounding rule."
+ },
+ {
+  "id": "WAL-3",
+  "severity": "Medium",
+  "area": "Web wallet / explorer",
+  "title": "Explorer and landing pages have no CSP and render API data through innerHTML without escaping",
+  "refs": [
+   "worker/index.js:88-96",
+   "wrangler.toml:17",
+   "site/explorer.html:219,334,351,357,399,415-420,430,489",
+   "site/wallet/app.js:181"
+  ],
+  "evidence": "Wallet sink confirmed by test; explorer by reading",
+  "description": "The CSP is applied only under `/wallet`. The explorer interpolates API fields (links, counts, percentiles, ranks) into `innerHTML`, and the wallet inserts `utxo_count` raw. In the wallet, the strict CSP blocks script execution but HTML injection and meta-refresh remain; on the explorer, a forged API response (WAL-2) yields script execution on the same origin, enough for a convincing fake wallet. On-chain strings (coinbase text, addresses) are escaped or canonical.",
+  "recommendation": "Escape every interpolation or use `textContent`, validate numeric and hex types, and apply a strict CSP site-wide."
+ },
+ {
+  "id": "WAL-4",
+  "severity": "Medium",
+  "area": "Explorer API",
+  "title": "Explorer API is exhaustible by idle connections and is not firewalled to the proxy",
+  "refs": [
+   "deploy/explorer-api/gnb_explorer_api.py:34,245",
+   "deploy/explorer-api/cloudflare-ips-v4.txt",
+   "node/src/rpc/auth.rs:295"
+  ],
+  "evidence": "Confirmed by test (50 idle connections held 50 threads)",
+  "description": "`ThreadingHTTPServer` binds 0.0.0.0:2086 with unbounded threads and no socket timeout, so a slowloris-style client exhausts it before the key check. The Cloudflare IP list is shipped but never applied. Its `sendrawtransaction` calls reach the node from loopback, which is exempt from the node's RPC rate limiter.",
+  "recommendation": "Set handler timeouts and a concurrency cap, bind to loopback or a tunnel, apply the IP allow-list, and rate-limit by original client."
+ },
+ {
+  "id": "AUD-1",
+  "severity": "Low",
+  "area": "Difficulty (latent)",
+  "title": "ASERT saturates its intermediate product before a negative shift: up to ~2x too hard for anchors near the pow limit",
+  "refs": [
+   "crates/gnb-smh/src/difficulty.rs:270-283,306-330",
+   "audit/consistency/tests/asert_differential.rs (high_anchor_saturation_diverges_from_aserti3_2d)"
+  ],
+  "evidence": "Confirmed by the audit harness (differential against the aserti3-2d fixed-point step)",
+  "description": "`mul_u64_shr16` clamps `target * factor >> 16` to 2^256 - 1 before the right shift by a negative exponent. For anchor targets of roughly 2^255 and above, the result is harder than the exact arithmetic (for anchor `0x2100a34e`, eight half-lives behind schedule, GnB yields `0x1f7fffff` where the exact rule yields `0x2000a349`). BCHN avoids this by requiring 32 spare leading bits in the pow limit. The deployed genesis anchor (`0x1f0e9036`, about 2^244) has 11 bits of headroom, so current consensus is unaffected; the defect becomes live only if ASERT is re-anchored near the pow limit.",
+  "recommendation": "Compute the product in 288+ bits and apply the net shift once (as aserti3-2d does), or require headroom between the anchor and 2^256."
+ },
+ {
+  "id": "AUD-2",
+  "severity": "Low",
+  "area": "Supply chain / tests",
+  "title": "The vendored crates' own guard tests cannot be run in place",
+  "refs": [
+   "crates/pqcrypto-internals/tests/vendor_pin.rs",
+   "crates/libp2p-yamux/tests/lockfile_guard.rs",
+   "Cargo.toml:5-12"
+  ],
+  "evidence": "Confirmed by running cargo (`current package believes it's in a workspace when it's not`)",
+  "description": "`crates/pqcrypto-internals` and `crates/libp2p-yamux` are patched path dependencies but neither workspace members nor excluded, so `cargo test` refuses to run inside them and `--workspace` does not include them. The PQClean source-pin and yamux lockfile guards described in the manifests therefore never run. Copied into an isolated workspace they pass (vendor_pin 2/2, lockfile_guard 2/2, plus 17 and 2 unit tests).",
+  "recommendation": "Add both crates to `workspace.members` (or `exclude` with their own `[workspace]`) and run them in CI."
+ },
+ {
+  "id": "COH-2",
+  "severity": "Low",
+  "area": "Shielded pool (inactive)",
+  "title": "Shielded state is mutated before the block's disposition is known and never rolled back",
+  "refs": [
+   "node/src/main.rs:2093,2099-2340",
+   "node/src/reorg.rs:841-871",
+   "node/src/main.rs:715-716"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "`apply_block_self` runs before `add_block` and before the finality and refused-reorg exits, fork-loser blocks also mutate it, reorgs never disconnect it, and the state lives only in memory. Inert today (no shielded transaction is accepted); if enabled it would make state depend on arrival order and forget nullifiers across restarts. `apply_block` is also quadratic (full clones and O(n) inserts).",
+  "recommendation": "Apply shielded state only for blocks that become part of the selected chain, include it in undo data, and persist it."
+ },
+ {
+  "id": "CRY-2",
+  "severity": "Low",
+  "area": "Signatures",
+  "title": "ML-DSA-only suite 0x0002 is live without activation and hybrid signatures are separable",
+  "refs": [
+   "crates/gnb-crypto/src/crypto/mod.rs:270-275,365,373,457-470"
+  ],
+  "evidence": "Confirmed by test",
+  "description": "`crypto::verify` dispatches the single-algorithm suite with no height gate, `is_hybrid_public_key` has no caller, and the per-component messages do not bind the suite id, so stripping the Falcon half and relabelling a hybrid signature as 0x0002 yields a valid ML-DSA-only signature for the 0x0002-wrapped key. Addresses hash the enveloped key, so existing hybrid outputs cannot be downgraded, but anyone can lock funds to single-algorithm outputs today.",
+  "recommendation": "Gate suite 0x0002 by height or policy and bind suite id and a domain tag into each component signature (composite-signature practice)."
+ },
+ {
+  "id": "CRY-3",
+  "severity": "Low",
+  "area": "Signatures",
+  "title": "Sighash preimage is defined by a serialization library and does not commit to spent amounts",
+  "refs": [
+   "crates/gnb-crypto/src/core/mod.rs:645-676"
+  ],
+  "evidence": "Confirmed by test (independent encoder matches)",
+  "description": "SIGHASH_ALL covers version, all outpoints and sequences, the signed input index (via a marker), all outputs, locktime, a 16-byte domain, a version byte and the chain id, which is sound against replay. The body bytes are whatever `bincode` 2 serde emits, so consensus depends on a library's encoding rather than a specification, and there is no golden vector in the repository. Spent values and scripts are bound only through the outpoint, which matters for offline signers (see WAL-1). An out-of-range input index silently omits the marker.",
+  "btc": "BIP143 (`SignatureHash`) commits the spent amount; BIP341 (`SignatureHashSchnorr`) commits all spent amounts and scripts under a tagged hash; `src/test/data/sighash.json` pins 500 vectors.",
+  "recommendation": "Specify the preimage byte-by-byte, add amount and script commitments in a new sighash version, assert the index is in range, and pin golden vectors."
+ },
+ {
+  "id": "CRY-4",
+  "severity": "Low",
+  "area": "Keys / memory hygiene",
+  "title": "Secret keys, mnemonics and passwords are not reliably zeroized",
+  "refs": [
+   "crates/gnb-crypto/src/crypto/mod.rs:86-97,203,746",
+   "crates/gnb-crypto/src/hd_wallet/mod.rs:142,202-204",
+   "node/src/bin/gnb-cli.rs:652-658",
+   "crates/gnb-wallet-wasm/src/lib.rs:52,72"
+  ],
+  "evidence": "Confirmed by test and by reading",
+  "description": "pqcrypto `SecretKey` types are `Copy` without `Drop`; `generate_keypair` returns the secret as a plain `Vec`; `bip39` is built without its `zeroize` feature and the wallet keeps the `Mnemonic` for its lifetime; the CLI reads passwords and mnemonics into plain `String`s; the WASM core keeps the password in a `serde_json::Value`.",
+  "btc": "Wallet secrets use `secure_allocator` (locked, wiped pages) and `memory_cleanse` (src/support/allocators/secure.h, src/wallet/crypter.h).",
+  "recommendation": "Wrap all secret buffers in `Zeroizing`, enable `bip39/zeroize`, and avoid copying `SecretKey` values."
+ },
+ {
+  "id": "CRY-5",
+  "severity": "Low",
+  "area": "Signatures",
+  "title": "Falcon signer return code is discarded and signatures are not verified after signing",
+  "refs": [
+   "crates/gnb-crypto/src/crypto/mod.rs:203,746",
+   "pqcrypto-falcon falcon1024.rs:296-309 (dependency)"
+  ],
+  "evidence": "Confirmed by test",
+  "description": "With a corrupted Falcon secret key `crypto::sign` returns `Ok` with an empty Falcon half; the failure only surfaces when the transaction is rejected. The behaviour is fail-closed but silent.",
+  "btc": "`CKey::Sign` verifies every signature before returning it (src/key.cpp).",
+  "recommendation": "Check the output length and verify each signature before returning it."
+ },
+ {
+  "id": "CRY-7",
+  "severity": "Low",
+  "area": "Addresses / keystores",
+  "title": "Address checksum and the default keystore format do not bind the network",
+  "refs": [
+   "crates/gnb-crypto/src/address.rs:109-116",
+   "crates/gnb-crypto/src/wallet/mod.rs:996-999,1044,1071,1161-1165",
+   "node/src/main.rs:186"
+  ],
+  "evidence": "Confirmed by test",
+  "description": "The 4-byte checksum covers only the key hash, so `gnb1q`<->`gnb1t` swaps pass, and the node's `address_to_script_pubkey` ignores the network. The keystore v2 written by every front end encrypts with empty AAD and ignores its `network` field, so editing the prefix in the file loads the key for the other network. The v1 keyfile binds network and public key in AAD and rejects the same edit. The wallet already rejects cross-network recipients (prior finding CR-05).",
+  "recommendation": "Use a checksum over prefix and payload (e.g. bech32m-style) in a new address version and bind network and public key in the v2 keystore AAD."
+ },
+ {
+  "id": "DAG-5",
+  "severity": "Low",
+  "area": "Consensus / persistence",
+  "title": "Restart re-marks interior blocks as tips",
+  "refs": [
+   "node/src/consensus/mod.rs:895,953"
+  ],
+  "evidence": "Confirmed by test (tips go from 1 to 2 after reload)",
+  "description": "`load_persisted*` inserts blocks in blue-score order, which is not topological for non-selected parents, so after a restart such parents become tips again (redundant template parents; tip sets differ between nodes).",
+  "recommendation": "Reload in topological order and recompute tips."
+ },
+ {
+  "id": "DAG-8",
+  "severity": "Low",
+  "area": "Consensus",
+  "title": "DAG height and header height disagree",
+  "refs": [
+   "node/src/consensus/mod.rs:306-308,1041",
+   "node/src/main.rs:2012"
+  ],
+  "evidence": "Confirmed by test (required header height 6, DAG height 2)",
+  "description": "`GhostdagData.height = selected_parent.height + 1`, but the header must declare `max(parent heights) + 1`. They diverge whenever the selected parent is not the highest parent, which also invalidates the height shortcut in the legacy `is_ancestor`.",
+  "recommendation": "Use one definition of height throughout."
+ },
+ {
+  "id": "MEM-6",
+  "severity": "Low",
+  "area": "Mempool",
+  "title": "Policy gaps: no rolling minimum fee, no replacement policy, no package/orphan handling; fee estimate defaults below the consensus minimum",
+  "refs": [
+   "node/src/mempool/mod.rs:231-259,338-344",
+   "node/src/rpc/mod.rs:1031-1039",
+   "crates/gnb-crypto/src/core/tokenomics.rs:85"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "Eviction does not raise an incremental relay fee, first-seen is final, child transactions of unconfirmed parents are not supported, and `estimatefee` returns a median absolute fee that defaults to 1,000 sat while the consensus minimum is 10,000 sat.",
+  "recommendation": "Add a rolling minimum fee and an explicit replacement rule; return fee rates bounded below by the consensus minimum."
+ },
+ {
+  "id": "MEM-7",
+  "severity": "Low",
+  "area": "Mempool / reorg",
+  "title": "Reorg re-injection skips maturity and minimum-fee re-checks",
+  "refs": [
+   "node/src/reorg.rs:695-734"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "Transactions from disconnected blocks re-enter the pool without the maturity and fee checks applied at normal admission, so a reorg to a lower height can re-admit immature spends that then poison templates.",
+  "recommendation": "Route re-injected transactions through the same admission function as gossip."
+ },
+ {
+  "id": "NET-13",
+  "severity": "Low",
+  "area": "RPC / metrics",
+  "title": "RPC method strings become unbounded Prometheus labels and log lines",
+  "refs": [
+   "node/src/rpc/mod.rs:519-528,655-676"
+  ],
+  "evidence": "Confirmed by test (2,000 series created)",
+  "description": "The method name (up to the 1 MiB body) is used as a permanent metrics label and logged at info level on every path, including forbidden requests evaluated before the rate limiter.",
+  "recommendation": "Map unknown methods to a single label and truncate logged values."
+ },
+ {
+  "id": "NET-14",
+  "severity": "Low",
+  "area": "Node lifecycle",
+  "title": "The node exits if the metrics or RPC server fails to bind",
+  "refs": [
+   "node/src/metrics/mod.rs:422-448",
+   "node/src/rpc/mod.rs:319-324,391-394",
+   "node/src/main.rs:1791-1818"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "A bad address or failed bind returns from the server task, which ends the top-level `select!` and stops the node (for example `--metrics-addr ::1` fails to parse).",
+  "recommendation": "Validate addresses at start-up and treat auxiliary server failures as non-fatal."
+ },
+ {
+  "id": "NET-15",
+  "severity": "Low",
+  "area": "RPC / explorer",
+  "title": "Explorer calls hold the DAG read lock across storage reads",
+  "refs": [
+   "node/src/rpc/explorer.rs:29-64,178-214"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "Explorer handlers keep `dag.read()` across per-transaction and per-input RocksDB reads and rebuild an O(chain) cache, which can starve the `accept_block` writer.",
+  "recommendation": "Copy the needed DAG data and release the lock before storage access."
+ },
+ {
+  "id": "NET-16",
+  "severity": "Low",
+  "area": "Secrets / RPC auth",
+  "title": "Secret file and authentication hygiene",
+  "refs": [
+   "node/src/network/mod.rs:1808,1823-1827",
+   "node/src/main.rs:269-289",
+   "node/src/rpc/auth.rs:302,426"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "`p2p_identity.bin` is written with default umask permissions; `known_peers` is written non-atomically; API key file permissions are not checked; the constant-time comparison short-circuits on length (leaking key length); failed authentication has no delay; `gnb-cli` sends the key over plain HTTP.",
+  "btc": "Cookie authentication with restricted file permissions, salted HMAC `rpcauth` with `TimingResistantEqual`, and a 250 ms delay after failed authentication (src/httprpc.cpp).",
+  "recommendation": "Write secrets 0600 atomically, compare in constant time over fixed-length digests, and delay failed attempts."
+ },
+ {
+  "id": "OPS-3",
+  "severity": "Low",
+  "area": "Deployment",
+  "title": "Systemd units lack most sandboxing directives; installer quoting issues",
+  "refs": [
+   "deploy/gnb-node.service",
+   "deploy/explorer-api/gnb-explorer-api.service",
+   "deploy/install-host.sh",
+   "deploy/gnb-launch"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "The node unit sets `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp` and `MemoryMax`, but not `PrivateDevices`, `ProtectKernel*`, `RestrictAddressFamilies`, `RestrictNamespaces`, `SystemCallFilter`, `CapabilityBoundingSet=` or `MemoryDenyWriteExecute`; the explorer API runs as the same user. `install-host.sh` writes operator input into an env file through an unquoted heredoc and `gnb-launch` expands `GNB_PEERS` unquoted. RPC and metrics bind to loopback (positive).",
+  "recommendation": "Add the missing directives, run the API as a separate user, and quote operator input."
+ },
+ {
+  "id": "POW-6",
+  "severity": "Low",
+  "area": "Difficulty",
+  "title": "work() deviates from the normative definition floor(2^256 / target)",
+  "refs": [
+   "crates/gnb-smh/src/difficulty.rs:165-184",
+   "reference/gnb_smh.py:109-113"
+  ],
+  "evidence": "Confirmed by test (100,497 of 198,463 sampled targets differ; harness bounds the error)",
+  "description": "The Rust code computes floor((2^128 - 1) / ((t >> 128) + 1)); the Python specification says floor(2^256 / t), and Bitcoin Core uses floor(2^256 / (t + 1)). The audit harness shows GnB never overstates work and understates it by less than 2^-64 relative for every target GnB can reach, so Rust nodes agree with each other; an implementation written from the specification would compute different blue work.",
+  "recommendation": "Make the specification and the code identical (preferably exact 256-bit arithmetic) and pin vectors."
+ },
+ {
+  "id": "POW-7",
+  "severity": "Low",
+  "area": "Difficulty / documentation",
+  "title": "The difficulty input is documented as the selected parent but is the latest timestamp over all parents; two notions of height coexist",
+  "refs": [
+   "node/src/pow/mod.rs:6-7",
+   "crates/gnb-crypto/src/core/mod.rs:140-142,185-188,966",
+   "node/src/consensus/mod.rs:1041"
+  ],
+  "evidence": "Confirmed by reading and by test",
+  "description": "Consensus uses `max(parent timestamps)` and `max(parent heights) + 1`, while the DAG's own height is selected-parent height + 1. The result is deterministic but couples block validity to GhostDAG ordering in a way the documentation does not describe.",
+  "recommendation": "Document the exact rule in docs/CONSENSUS.md and add multi-parent difficulty tests under real ASERT."
+ },
+ {
+  "id": "POW-8",
+  "severity": "Low",
+  "area": "Block format",
+  "title": "Wire metadata (height, blue_score) is not committed by the block id; blue_score is never validated",
+  "refs": [
+   "crates/gnb-crypto/src/core/mod.rs:311-320,344-358,805-811",
+   "node/src/main.rs:1030,1188,1911"
+  ],
+  "evidence": "Confirmed by test",
+  "description": "`blue_score` travels with the block, is persisted and re-served without validation, and a later copy with different metadata overwrites an honest orphan with the same id. No invalid-id cache exists, so nothing is poisoned permanently.",
+  "recommendation": "Stop transmitting derived metadata, or validate it against the locally computed values before storing or serving it."
+ },
+ {
+  "id": "VAL-10",
+  "severity": "Low",
+  "area": "Block format",
+  "title": "Merkle tree has no leaf/inner-node domain separation and no 64-byte transaction rule",
+  "refs": [
+   "crates/gnb-crypto/src/core/mod.rs:678-696"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "A 64-byte stripped transaction (one input, one output, 5-byte script) can be constructed, so an inner node can be presented as a leaf in a Merkle proof. Full nodes are protected by the duplicate-transaction rule, coinbase-first rule and absence of an invalid cache; the impact is limited to light clients and proofs.",
+  "btc": "`IsBlockMutated` rejects 64-byte transactions (src/validation.cpp); BIP-proposals separate leaf and node hashing.",
+  "recommendation": "Use tagged hashes for leaves and inner nodes in the next block version, or forbid 64-byte transactions."
+ },
+ {
+  "id": "VAL-12",
+  "severity": "Low",
+  "area": "Validation",
+  "title": "Script size limits live only in the wire parser; block size uses a different encoding than fees",
+  "refs": [
+   "crates/gnb-crypto/src/core/mod.rs:589,604,1012,1021"
+  ],
+  "evidence": "Confirmed by test (in-process block with a 12.6 kB script_sig is accepted, then `get_block` fails)",
+  "description": "The 10,000-byte script limits are enforced only when parsing wire bytes, so a block constructed in-process (RPC, stratum, miner) can carry larger scripts, be accepted and persisted, and then fail to load, breaking rollback and serving. `MAX_BLOCK_SIZE` is measured in bincode while fees use the wire size. Not reachable from current network ingress.",
+  "recommendation": "Enforce all size rules in the consensus validation functions on the canonical encoding."
+ },
+ {
+  "id": "WAL-5",
+  "severity": "Low",
+  "area": "Web wallet supply chain",
+  "title": "WASM wallet core is loaded without an integrity check and the committed binary is not reproducibly tied to source",
+  "refs": [
+   "site/wallet/core.js:6-12",
+   "site/wallet/app.js:47",
+   "scripts/build-wallet-wasm.sh"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "`loadCore` supports a SHA-256 check but is called without one; scripts carry no SRI; `site/wallet/gnb_wallet.wasm` is a committed artifact whose hash is printed by the build script but pinned nowhere.",
+  "recommendation": "Build the WASM reproducibly in CI, publish and pin its hash, and pass it to `loadCore`."
+ },
+ {
+  "id": "WAL-6",
+  "severity": "Low",
+  "area": "Wallet",
+  "title": "Coin selection and fee handling: smallest-first greedy selection, size-blind fees, silent dust-to-fee",
+  "refs": [
+   "crates/gnb-crypto/src/wallet/mod.rs:422,1118-1150",
+   "crates/gnb-crypto/src/wallet/cli.rs:266",
+   "crates/gnb-crypto/src/wallet/client.rs:118",
+   "crates/gnb-wallet-wasm/src/lib.rs:128-131"
+  ],
+  "evidence": "Confirmed by test",
+  "description": "Paying 1 GNB selected six 0.2 GNB inputs (~50 kB) over one 10 GNB coin. Some send paths use fixed fees, one fallback (10,000 sat) is below the consensus minimum for any one-input transaction, change of 546 sat or less is silently added to the fee while the WASM reports the requested fee, and the dust comparison differs between two code paths (`>=` vs `>`).",
+  "recommendation": "Use size-aware fees from the consensus formula, a waste-based selector, and report the actual fee."
+ },
+ {
+  "id": "ATT-1",
+  "severity": "Info",
+  "area": "Attestation (inactive)",
+  "title": "Remote attestation is not used for consensus or peer trust and fails closed",
+  "refs": [
+   "node/src/attestation/mod.rs:294-306",
+   "node/src/attestation/sev_snp.rs:63-77",
+   "node/src/attestation/mobile.rs:29-41"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "Only the `getattestation` RPC exposes it, returning an honest no-TEE report; the SEV-SNP provider returns `None`, the mobile verifiers reject, and `verify()` fails closed without a quote verifier.",
+  "recommendation": "No action needed; keep it out of consensus."
+ },
+ {
+  "id": "COH-1",
+  "severity": "Info",
+  "area": "Shielded pool (inactive)",
+  "title": "Shielded spend statement does not bind spending authority (known CR-01); unreachable today",
+  "refs": [
+   "crates/coherence-core/src/lib.rs:425-483",
+   "crates/coherence-core/tests/known_unsafe_v1_authorization.rs",
+   "node/src/coherence/verifier.rs:40",
+   "node/src/main.rs:2093"
+  ],
+  "evidence": "Confirmed by test (8 spends of one 1,000-value note)",
+  "description": "`check_spend` does not bind the nullifier key to the note's `pk_d`, so anyone with the note plaintext can spend it and one leaf yields unlimited fresh nullifiers. Today the only compiled verifier is `RejectAll`, the `sp1-verify` feature does not exist, the verification-key pin is empty, and any block containing a shielded transaction is rejected, so there is no inflation path. It would be Critical if the shielded pool were enabled as-is.",
+  "recommendation": "Keep the pool disabled until the statement binds authority and the state handling in COH-2 is fixed; remove the dormant code from consensus builds."
+ },
+ {
+  "id": "CRY-6",
+  "severity": "Info",
+  "area": "Dependencies",
+  "title": "Unused cryptographic dependencies are compiled (blst, secp256k1)",
+  "refs": [
+   "node/Cargo.toml:59,146"
+  ],
+  "evidence": "Confirmed by reading (no .rs reference; C/asm built, not linked)",
+  "description": "`blst` and `secp256k1` (with `rand-std`) are declared but referenced by no source file. Their C/assembly is compiled on every build (supply-chain surface) although no symbol reaches the binary.",
+  "recommendation": "Remove both dependencies."
+ },
+ {
+  "id": "CRY-8",
+  "severity": "Info",
+  "area": "Signatures",
+  "title": "Minor: 32-bit overflow in script parsing, message-signing domain without chain id, stale comments",
+  "refs": [
+   "crates/gnb-crypto/src/core/mod.rs:702",
+   "crates/gnb-crypto/src/crypto/mod.rs:172,1372-1376",
+   "node/tests/kat_falcon1024.rs:9-14"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "`4 + sig_len + 4` can overflow (and panic, overflow checks are on) on 32-bit targets; the only wasm32 caller is a test. Signed messages use `BLOCH-SIGNED-MESSAGE-v1` with no chain id, so message signatures carry over between Bloch, GnB mainnet and testnet, which share keys. Several comments still describe Falcon as floating-point and non-reproducible although the clean variant is pinned by a KAT.",
+  "recommendation": "Use checked arithmetic, add the chain id to the message domain, and refresh the comments."
+ },
+ {
+  "id": "DAG-12",
+  "severity": "Info",
+  "area": "Consensus",
+  "title": "Minor GhostDAG observations",
+  "refs": [
+   "node/src/consensus/mod.rs:1548,1564",
+   "node/src/consensus/reachability.rs:18",
+   "node/src/storage/mod.rs:223",
+   "node/src/main.rs:933"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "`is_final` compares blue score with a height constant; `is_blue` uses the bounded legacy walk; doc comments describe disabled gates that are live; `put_block` overwrites the height->hash index with fork-losers, so `getblockhash` and pruning can act on the wrong block; duplicate parents are allowed; the gossip `GetHeaders` limit is not clamped (the directed path is). No attacker-reachable panic was found in the DAG code itself.",
+  "recommendation": "Clean up as part of the consensus fixes."
+ },
+ {
+  "id": "LED-1",
+  "severity": "Info",
+  "area": "Ledger v1 prototype",
+  "title": "Ledger v1 sparse Merkle tree: no soundness defect found; witnesses uncommitted and coinbase uniqueness not required",
+  "refs": [
+   "rust/src/ledger.rs:134-264,416-435,626-631,798-812",
+   "reference/gnb_ledger.py"
+  ],
+  "evidence": "Confirmed by reading and by the vector suites",
+  "description": "Leaf and node hashing are domain-separated, depth is fixed, the default-subtree shortcut equals the computed node, proofs are canonical and decoders reject trailing bytes; Rust and Python agree on every rule and error code. Open items for the prototype (not wired into the node): an uncommitted witness lets a bad final proof cost up to ~8.4M Keccak-f calls per attempt, identical coinbases at one height make the second block permanently invalid, and authorization is test-only.",
+  "recommendation": "Commit the witness bundle, require coinbase uniqueness, and add a randomized Rust-vs-Python differential before wiring it in."
+ },
+ {
+  "id": "NET-17",
+  "severity": "Info",
+  "area": "P2P",
+  "title": "Dead or diverging networking code",
+  "refs": [
+   "node/src/dandelion.rs:74,108-121",
+   "node/src/transport/mod.rs",
+   "node/src/transport/upgrade.rs",
+   "node/src/network/mod.rs:577-587",
+   "node/tests/wire_decoder_fuzz.rs:8"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "Dandelion++ has no callers (and deviates from the protocol: per-transaction coin, single successor, fixed embargo, unbounded map), so transactions are gossiped directly from their origin. The ML-DSA handshake in `transport/mod.rs` is unused; the live transport uses Ed25519 plus round-3 Kyber768 rather than ML-KEM. Some comments and test headers reference fuzz targets and backends that do not exist.",
+  "recommendation": "Remove dead code or wire it in, and correct the documentation."
+ },
+ {
+  "id": "POW-9",
+  "severity": "Info",
+  "area": "PoW",
+  "title": "Minor PoW observations",
+  "refs": [
+   "crates/gnb-crypto/src/core/mod.rs:330-335,785-932",
+   "crates/gnb-smh/src/lib.rs:188-202",
+   "crates/gnb-smh/src/difficulty.rs:91-128",
+   "rust/Cargo.toml"
+  ],
+  "evidence": "Confirmed by reading and by test",
+  "description": "Pow-limit blocks can churn the 16,384-entry PoW cache; each verifying thread keeps a 64 MiB thread-local scratchpad for its lifetime; non-canonical compact encodings decode (17.7 M of 268 M accepted values in the exhaustive sweep), which is safe only because consensus compares `bits` to `expected_bits` as a u32; `validate_pow` has no explicit `target <= pow_limit` check (unreachable today because the largest decodable target equals the limit); `rust/Cargo.toml` lacks `overflow-checks`; `dag_hash()` is dead code; mainnet and testnet share the genesis and ASERT anchor.",
+  "recommendation": "Add the explicit pow-limit check, reject non-canonical bits at decode, and remove dead code."
+ },
+ {
+  "id": "VAL-11",
+  "severity": "Info",
+  "area": "Monetary policy",
+  "title": "No MoneyRange check and no supply-sum audit; the 10 M GNB cap is implied, not enforced",
+  "refs": [
+   "crates/gnb-crypto/src/core/tokenomics.rs:27,52-62",
+   "crates/gnb-crypto/src/core/mod.rs:948-963,982-991"
+  ],
+  "evidence": "Confirmed by reading; schedule verified by the audit harness (899,999,851,392,253 sat of 900,000,000,000,000 mined)",
+  "description": "The cap follows from subsidy <= INITIAL >> halvings, coinbase <= subsidy + fees and value conservation; nothing compares values with `MAX_SUPPLY_SAT` at validation time and there is no UTXO-set total audit. Zero-value outputs to arbitrary scripts are allowed, which can bloat the UTXO set. All sums use checked arithmetic, so CVE-2010-5139-style wrap-around is not possible.",
+  "btc": "`MoneyRange` on every output, input sum and fee (src/consensus/tx_check.cpp, tx_verify.cpp); `gettxoutsetinfo` and the `utxo_total_supply` fuzz target audit total supply.",
+  "recommendation": "Add MoneyRange-style checks as defence in depth and a supply invariant test."
+ },
+ {
+  "id": "WAL-7",
+  "severity": "Info",
+  "area": "Wallet UX / transport",
+  "title": "Wallet design notes: no mnemonic backup for default wallets, network chosen by file name, HTTP-only RPC client",
+  "refs": [
+   "crates/gnb-wallet-wasm/src/lib.rs:64-69",
+   "crates/gnb-crypto/src/wallet/cli.rs:156",
+   "node/src/bin/gnb-cli.rs:279,431,631",
+   "crates/gnb-crypto/src/wallet/http_rpc.rs:1-23"
+  ],
+  "evidence": "Confirmed by reading",
+  "description": "Default wallets are random keys whose only backup is the encrypted file; `gnb-cli` picks the network from whether the file name contains `testnet`; the RPC client is HTTP-only and sends the API key in clear to any `--rpc-host`; neither CLI asks for confirmation before broadcasting.",
+  "recommendation": "Offer mnemonic-backed creation by default, record the network in the file, support TLS, and confirm before broadcast."
+ }
+]

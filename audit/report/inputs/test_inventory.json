@@ -1,0 +1,938 @@
+[
+ {
+  "path": "audit/consistency/tests/amount_consistency.rs",
+  "kind": "audit-harness",
+  "tests": 5,
+  "ignored": 0,
+  "tags": "property",
+  "purpose": "CVE-2010-5139 overflow detection; subsidy schedule within allocation; fee function totality"
+ },
+ {
+  "path": "audit/consistency/tests/asert_differential.rs",
+  "kind": "audit-harness",
+  "tests": 8,
+  "ignored": 0,
+  "tags": "property",
+  "purpose": "ASERT vs the aserti3-2d (BCHN) fixed-point step; bounds, monotonicity, half-life, extreme inputs, saturation finding AUD-1"
+ },
+ {
+  "path": "audit/consistency/tests/compact_core_vectors.rs",
+  "kind": "audit-harness",
+  "tests": 3,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "Bitcoin Core bignum_SetCompact and CheckProofOfWork vectors applied to GnB"
+ },
+ {
+  "path": "audit/consistency/tests/compact_differential.rs",
+  "kind": "audit-harness",
+  "tests": 5,
+  "ignored": 0,
+  "tags": "property",
+  "purpose": "Exhaustive 587,202,560-value decode differential vs Core SetCompact/DeriveTarget; encode vs Core GetCompact and rust-bitcoin (proptest)"
+ },
+ {
+  "path": "audit/consistency/tests/merkle_consistency.rs",
+  "kind": "audit-harness",
+  "tests": 4,
+  "ignored": 0,
+  "tags": "property",
+  "purpose": "Merkle root vs rust-bitcoin and Core; CVE-2012-2459 collision; block id excludes signatures"
+ },
+ {
+  "path": "audit/consistency/tests/pow_check_semantics.rs",
+  "kind": "audit-harness",
+  "tests": 7,
+  "ignored": 0,
+  "tags": "property",
+  "purpose": "Strict PoW boundary vs Core's <=; verify(); chain work vs Core GetBlockProof"
+ },
+ {
+  "path": "audit/consistency/tests/pow_reference_differential.rs",
+  "kind": "audit-harness",
+  "tests": 3,
+  "ignored": 0,
+  "tags": "property, vectors, differential",
+  "purpose": "GnB-SMH vs normative Python on 96 random cases; scratchpad reuse; per-thread pad"
+ },
+ {
+  "path": "audit/poc/crates/coherence-core/tests/audit_poc_coherence.rs",
+  "kind": "audit-poc",
+  "tests": 3,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Reviewer proof-of-concept: each passing test demonstrates a finding or confirms a control"
+ },
+ {
+  "path": "audit/poc/crates/gnb-crypto/tests/audit_poc_crypto.rs",
+  "kind": "audit-poc",
+  "tests": 11,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "Reviewer proof-of-concept: each passing test demonstrates a finding or confirms a control"
+ },
+ {
+  "path": "audit/poc/crates/gnb-crypto/tests/audit_poc_pow.rs",
+  "kind": "audit-poc",
+  "tests": 5,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Reviewer proof-of-concept: each passing test demonstrates a finding or confirms a control"
+ },
+ {
+  "path": "audit/poc/crates/gnb-crypto/tests/audit_poc_wallet.rs",
+  "kind": "audit-poc",
+  "tests": 6,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Reviewer proof-of-concept: each passing test demonstrates a finding or confirms a control"
+ },
+ {
+  "path": "audit/poc/crates/gnb-smh/tests/audit_poc_pow.rs",
+  "kind": "audit-poc",
+  "tests": 10,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "Reviewer proof-of-concept: each passing test demonstrates a finding or confirms a control"
+ },
+ {
+  "path": "audit/poc/node/tests/audit_poc_dag.rs",
+  "kind": "audit-poc",
+  "tests": 9,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Reviewer proof-of-concept: each passing test demonstrates a finding or confirms a control"
+ },
+ {
+  "path": "audit/poc/node/tests/audit_poc_mempool.rs",
+  "kind": "audit-poc",
+  "tests": 5,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Reviewer proof-of-concept: each passing test demonstrates a finding or confirms a control"
+ },
+ {
+  "path": "audit/poc/node/tests/audit_poc_net.rs",
+  "kind": "audit-poc",
+  "tests": 13,
+  "ignored": 0,
+  "tags": "async",
+  "purpose": "Reviewer proof-of-concept: each passing test demonstrates a finding or confirms a control"
+ },
+ {
+  "path": "audit/poc/node/tests/audit_poc_validation.rs",
+  "kind": "audit-poc",
+  "tests": 11,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Reviewer proof-of-concept: each passing test demonstrates a finding or confirms a control"
+ },
+ {
+  "path": "crates/coherence-core/src/lib.rs",
+  "kind": "inline",
+  "tests": 12,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "Shielded primitives: determinism, Merkle round trips, inflation and forgery, count binding, position guard, nullifier-set order independence, domain separation"
+ },
+ {
+  "path": "crates/gnb-crypto/src/address.rs",
+  "kind": "inline",
+  "tests": 7,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Address format, checksum, length and prefix rejection"
+ },
+ {
+  "path": "crates/gnb-crypto/src/core/carryover.rs",
+  "kind": "inline",
+  "tests": 5,
+  "ignored": 1,
+  "tags": "unit",
+  "purpose": "Bloch Genesis-3 carryover conversion, vout fixes, duplicate and malformed rows (shipped-snapshot test ignored)"
+ },
+ {
+  "path": "crates/gnb-crypto/src/core/mod.rs",
+  "kind": "inline",
+  "tests": 13,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "Coinbase value (overflow rejected, exact limit, genesis, one output); difficulty and genesis PoW; chain-id sighash separation and cross-chain replay"
+ },
+ {
+  "path": "crates/gnb-crypto/src/core/tokenomics.rs",
+  "kind": "inline",
+  "tests": 5,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Subsidy schedule examples, issuance below cap, minimum fee"
+ },
+ {
+  "path": "crates/gnb-crypto/src/crypto/mod.rs",
+  "kind": "inline",
+  "tests": 35,
+  "ignored": 2,
+  "tags": "vectors",
+  "purpose": "Sign/verify round trips, seed determinism, diversified addresses (12); Falcon canonical vs padded encoding, native-FP symbol tripwire, clean seeded KAT (4); KAT module: primitive offsets, legacy/magic ambiguity, strict verifiers, ML-DSA goldens, AND-combiner tamper matrix, hedging, suite isolation, no-panic fuzz loops (19)"
+ },
+ {
+  "path": "crates/gnb-crypto/src/hd_wallet/mod.rs",
+  "kind": "inline",
+  "tests": 34,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "HD wallet round trip, v1/v2 compatibility, derived-key authentication (17); recovery limits, preflight, import consistency (17)"
+ },
+ {
+  "path": "crates/gnb-crypto/src/types/heights.rs",
+  "kind": "inline",
+  "tests": 9,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Height newtype arithmetic"
+ },
+ {
+  "path": "crates/gnb-crypto/src/util.rs",
+  "kind": "inline",
+  "tests": 6,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "Bounded file reads; atomic 0600 writes"
+ },
+ {
+  "path": "crates/gnb-crypto/src/wallet/cli.rs",
+  "kind": "inline",
+  "tests": 10,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "CLI amounts, network, UTXO rows, canonical flags"
+ },
+ {
+  "path": "crates/gnb-crypto/src/wallet/client.rs",
+  "kind": "inline",
+  "tests": 12,
+  "ignored": 0,
+  "tags": "async, vectors",
+  "purpose": "RPC client input, HTTP budget, redirect refusal, envelope and id checks (2 tests are tautological)"
+ },
+ {
+  "path": "crates/gnb-crypto/src/wallet/disclosure.rs",
+  "kind": "inline",
+  "tests": 13,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Disclosure bundles: tamper, splice, canonical encoding, no secrets"
+ },
+ {
+  "path": "crates/gnb-crypto/src/wallet/encryption.rs",
+  "kind": "inline",
+  "tests": 22,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Keyfile round trips, wrong password, AAD/version tamper, length guards, password policy"
+ },
+ {
+  "path": "crates/gnb-crypto/src/wallet/http_rpc.rs",
+  "kind": "inline",
+  "tests": 5,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "HTTP framing, slow-drip budget, error redaction"
+ },
+ {
+  "path": "crates/gnb-crypto/src/wallet/mod.rs",
+  "kind": "inline",
+  "tests": 40,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "Seed versions, sign/verify, build_tx change and network (16); legacy keystore KDF bounds, nonce shape, weak passwords, redaction, signed-message domain (14); transaction boundaries, coin-selection inputs, exact decimals, Bloch keystore compatibility (10)"
+ },
+ {
+  "path": "crates/gnb-crypto/src/wallet/seed.rs",
+  "kind": "inline",
+  "tests": 13,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "BIP39 official vectors, passphrase, V1 pinning"
+ },
+ {
+  "path": "crates/gnb-smh/src/difficulty.rs",
+  "kind": "inline",
+  "tests": 9,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Malformed compact bits rejected; round trip; round-down; work monotone; ASERT on-schedule, half-life, monotone fraction, clamps, extreme inputs"
+ },
+ {
+  "path": "crates/gnb-smh/src/lib.rs",
+  "kind": "inline",
+  "tests": 5,
+  "ignored": 0,
+  "tags": "vectors, differential",
+  "purpose": "Keccak step equals SHAKE-256; big-endian target compare; nonce/header sensitivity; log2_n bounds; canonical-parameter assert"
+ },
+ {
+  "path": "crates/gnb-wallet-wasm/src/lib.rs",
+  "kind": "inline",
+  "tests": 1,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Create, export, open and pay on the host (not on wasm32)"
+ },
+ {
+  "path": "crates/libp2p-yamux/src/lib.rs",
+  "kind": "inline",
+  "tests": 2,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Vendored yamux config (runs only outside the workspace)"
+ },
+ {
+  "path": "crates/pqcrypto-internals/src/lib.rs",
+  "kind": "inline",
+  "tests": 18,
+  "ignored": 1,
+  "tags": "unit",
+  "purpose": "Seeded-RNG scope cleanup on return and unwind, nesting, TLS teardown, determinism, fail-closed abort on RNG failure (runs only outside the workspace)"
+ },
+ {
+  "path": "node/src/analytics/mod.rs",
+  "kind": "inline",
+  "tests": 4,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Chain analytics helpers"
+ },
+ {
+  "path": "node/src/attestation/mod.rs",
+  "kind": "inline",
+  "tests": 11,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Attestation verify() fails closed; nonce, digest, TEE and verity checks"
+ },
+ {
+  "path": "node/src/bin/gnb-cli.rs",
+  "kind": "inline",
+  "tests": 3,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "Send-command input validation"
+ },
+ {
+  "path": "node/src/coherence/mod.rs",
+  "kind": "inline",
+  "tests": 8,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Shielded pool validate/apply, exact undo, LIFO order, anchor bound, atomic double-spend rejection"
+ },
+ {
+  "path": "node/src/coherence/verifier.rs",
+  "kind": "inline",
+  "tests": 10,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Fail-closed RejectAll verifier, public-value binding, vkey pin, mock-prover refusal"
+ },
+ {
+  "path": "node/src/consensus/mod.rs",
+  "kind": "inline",
+  "tests": 20,
+  "ignored": 0,
+  "tags": "property",
+  "purpose": "GhostDAG basics, tips, error paths (15) and proptests: determinism, parent-order independence, blue-score monotonicity, topological order on DAGs of <= 17 blocks (5)"
+ },
+ {
+  "path": "node/src/consensus/reachability.rs",
+  "kind": "inline",
+  "tests": 4,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Ancestry queries, persistence round trip, delta drain"
+ },
+ {
+  "path": "node/src/dandelion.rs",
+  "kind": "inline",
+  "tests": 7,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Dandelion stem/fluff logic (module has no callers)"
+ },
+ {
+  "path": "node/src/main.rs",
+  "kind": "inline",
+  "tests": 19,
+  "ignored": 0,
+  "tags": "async, vectors",
+  "purpose": "Address parsing; submission gating (structure, self-mined, deep-reorg tip poisoning, below-finality fork-loser, bits); intra-tx duplicate inputs, minimum fee, template fee inflation; out-of-order same-block spends"
+ },
+ {
+  "path": "node/src/metrics/mod.rs",
+  "kind": "inline",
+  "tests": 8,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Prometheus metric registration and labels"
+ },
+ {
+  "path": "node/src/network/mod.rs",
+  "kind": "inline",
+  "tests": 28,
+  "ignored": 0,
+  "tags": "async, vectors",
+  "purpose": "Wire decode bounds, penalties, PEX handling, connection limits"
+ },
+ {
+  "path": "node/src/network/pex_validator.rs",
+  "kind": "inline",
+  "tests": 1,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "Peer-exchange address validation"
+ },
+ {
+  "path": "node/src/network/sync_rr.rs",
+  "kind": "inline",
+  "tests": 21,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Directed sync codec bounds, trailing-byte rejection, request limiter, pull-peer selection"
+ },
+ {
+  "path": "node/src/pow/mod.rs",
+  "kind": "inline",
+  "tests": 3,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Mine then verify; malformed bits; stop flag"
+ },
+ {
+  "path": "node/src/reorg.rs",
+  "kind": "inline",
+  "tests": 6,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Column families exist, write-error propagation, depth-cap boundary, batch atomicity"
+ },
+ {
+  "path": "node/src/rpc/auth.rs",
+  "kind": "inline",
+  "tests": 54,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "API-key validation, constant-time compare, Host/Origin gate, rate limiting, IPv6 /64 aggregation"
+ },
+ {
+  "path": "node/src/rpc/mod.rs",
+  "kind": "inline",
+  "tests": 20,
+  "ignored": 0,
+  "tags": "async",
+  "purpose": "RPC handlers, CORS layer, heavy-read gate"
+ },
+ {
+  "path": "node/src/storage/mod.rs",
+  "kind": "inline",
+  "tests": 11,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Address-history index and snapshot rows (no UTXO/undo atomicity tests)"
+ },
+ {
+  "path": "node/src/sync/parent_fetch.rs",
+  "kind": "inline",
+  "tests": 7,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Orphan-parent fetch scheduling, backoff and give-up"
+ },
+ {
+  "path": "node/src/transport/stream.rs",
+  "kind": "inline",
+  "tests": 4,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "KyberStream framing and limits"
+ },
+ {
+  "path": "rust/src/ledger.rs",
+  "kind": "inline",
+  "tests": 9,
+  "ignored": 0,
+  "tags": "vectors, differential",
+  "purpose": "Ledger v1: FIPS-202 fast path, random SMT operations vs proofs, non-canonical and truncated proofs, limits, wire strictness"
+ },
+ {
+  "path": "rust/src/lib.rs",
+  "kind": "inline",
+  "tests": 5,
+  "ignored": 0,
+  "tags": "vectors, differential",
+  "purpose": "Duplicate of the gnb-smh unit tests in the standalone crate (the only Rust tests CI runs)"
+ },
+ {
+  "path": "crates/coherence-core/tests/fuzz_robustness.rs",
+  "kind": "integration",
+  "tests": 1,
+  "ignored": 0,
+  "tags": "corpus",
+  "purpose": "80,000 random Merkle-path verifications never panic"
+ },
+ {
+  "path": "crates/coherence-core/tests/known_unsafe_v1_authorization.rs",
+  "kind": "integration",
+  "tests": 4,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Characterises the known CR-01 authorization gap and the duplicate-leaf mitigation"
+ },
+ {
+  "path": "crates/gnb-crypto/tests/acvp_mldsa.rs",
+  "kind": "integration",
+  "tests": 3,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "Official NIST ACVP ML-DSA-65 sigVer cases (15) and keyGen tc26 interoperability"
+ },
+ {
+  "path": "crates/gnb-crypto/tests/falcon_submission.rs",
+  "kind": "integration",
+  "tests": 2,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "Official Falcon round-3 verify vectors; hybrid signature with an official Falcon half"
+ },
+ {
+  "path": "crates/gnb-smh/tests/vectors.rs",
+  "kind": "integration",
+  "tests": 1,
+  "ignored": 0,
+  "tags": "vectors, differential",
+  "purpose": "7 normative Python vectors with intermediates (cross-implementation)"
+ },
+ {
+  "path": "crates/libp2p-yamux/tests/lockfile_guard.rs",
+  "kind": "integration",
+  "tests": 2,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Exactly one yamux >= 0.13.10 in Cargo.lock (cannot run in place)"
+ },
+ {
+  "path": "crates/pqcrypto-internals/tests/vendor_pin.rs",
+  "kind": "integration",
+  "tests": 2,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "SHA-256 pins of every vendored PQClean C file and exact file set (cannot run in place)"
+ },
+ {
+  "path": "node/tests/announce_then_pull.rs",
+  "kind": "integration",
+  "tests": 1,
+  "ignored": 0,
+  "tags": "async",
+  "purpose": "Live two-swarm directed pull"
+ },
+ {
+  "path": "node/tests/backfill_flood_lab.rs",
+  "kind": "integration",
+  "tests": 1,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Measurement lab for deep-backfill insertion cost (618 s)"
+ },
+ {
+  "path": "node/tests/coherence_block_serde.rs",
+  "kind": "integration",
+  "tests": 3,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Shielded transactions survive the block wire format and are Merkle-bound"
+ },
+ {
+  "path": "node/tests/coherence_invariants.rs",
+  "kind": "integration",
+  "tests": 1,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Property test over 2,000 random blocks: no double spend, atomicity, consistency (proof check mocked)"
+ },
+ {
+  "path": "node/tests/dst_harness.rs",
+  "kind": "integration",
+  "tests": 5,
+  "ignored": 0,
+  "tags": "async",
+  "purpose": "Deterministic-simulation skeleton; equivocation on a bare GhostDAG"
+ },
+ {
+  "path": "node/tests/frontier_sync.rs",
+  "kind": "integration",
+  "tests": 3,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Deterministic simulation of the IBD release gate"
+ },
+ {
+  "path": "node/tests/ghostdag_differential.rs",
+  "kind": "integration",
+  "tests": 11,
+  "ignored": 1,
+  "tags": "unit",
+  "purpose": "Legacy (bounded BFS) vs fast interval-index coloring produce byte-identical GhostdagData"
+ },
+ {
+  "path": "node/tests/ghostdag_replay_snapshot.rs",
+  "kind": "integration",
+  "tests": 3,
+  "ignored": 3,
+  "tags": "unit",
+  "purpose": "Replay of a real Bloch snapshot (all ignored: needs external data)"
+ },
+ {
+  "path": "node/tests/kat_address.rs",
+  "kind": "integration",
+  "tests": 2,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "Self-generated address vectors"
+ },
+ {
+  "path": "node/tests/kat_falcon1024.rs",
+  "kind": "integration",
+  "tests": 4,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "Falcon-1024 sizes, round trip, rejection, malformed input"
+ },
+ {
+  "path": "node/tests/kat_mldsa65.rs",
+  "kind": "integration",
+  "tests": 4,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "FIPS 204 sizes, seeded golden, rejection, malformed input"
+ },
+ {
+  "path": "node/tests/mempool_index_prop.rs",
+  "kind": "integration",
+  "tests": 3,
+  "ignored": 0,
+  "tags": "property",
+  "purpose": "Seeded random operation sequences preserve fee-rate index invariants and ordering"
+ },
+ {
+  "path": "node/tests/parser_corpus_floor.rs",
+  "kind": "integration",
+  "tests": 6,
+  "ignored": 0,
+  "tags": "corpus",
+  "purpose": "Replays the node/fuzz seed corpora through the parsers (no coverage-guided fuzzing exists)"
+ },
+ {
+  "path": "node/tests/peer_addr_churn_lab.rs",
+  "kind": "integration",
+  "tests": 5,
+  "ignored": 0,
+  "tags": "async, vectors",
+  "purpose": "Peer-address graylist mechanics (3 live)"
+ },
+ {
+  "path": "node/tests/reachability_persistence.rs",
+  "kind": "integration",
+  "tests": 3,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Durable reachability index: reload and rebuild equivalence, migration"
+ },
+ {
+  "path": "node/tests/reorg_hardening.rs",
+  "kind": "integration",
+  "tests": 8,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Reorg aborts and restores on invalid fork blocks; A->B->A byte symmetry; mempool re-injection counts"
+ },
+ {
+  "path": "node/tests/security_audit.rs",
+  "kind": "integration",
+  "tests": 17,
+  "ignored": 1,
+  "tags": "vectors",
+  "purpose": "Coinbase value, maturity helper, dust, duplicate-transaction Merkle (CVE-2012-2459), PoW/bits/timestamp checks"
+ },
+ {
+  "path": "node/tests/sighash_security.rs",
+  "kind": "integration",
+  "tests": 2,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Sighash commits to outputs, outpoints and input index (relative comparisons); txid excludes script_sig"
+ },
+ {
+  "path": "node/tests/sprint1b_storage_migration.rs",
+  "kind": "integration",
+  "tests": 7,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Block storage round trip; corrupt bytes yield errors"
+ },
+ {
+  "path": "node/tests/sprint1d_tx_wire.rs",
+  "kind": "integration",
+  "tests": 6,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Transaction wire format round trip"
+ },
+ {
+  "path": "node/tests/sprint_a1_transport_tests.rs",
+  "kind": "integration",
+  "tests": 20,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "ML-DSA handshake and AEAD primitives (the handshake is not used by the live transport)"
+ },
+ {
+  "path": "node/tests/sprint_a2_stream_tests.rs",
+  "kind": "integration",
+  "tests": 5,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "KyberStream framing round trip"
+ },
+ {
+  "path": "node/tests/sprint_a2_upgrade_tests.rs",
+  "kind": "integration",
+  "tests": 5,
+  "ignored": 2,
+  "tags": "unit",
+  "purpose": "libp2p upgrade integration (2 tamper tests ignored)"
+ },
+ {
+  "path": "node/tests/sprint_b6_hybrid_sig.rs",
+  "kind": "integration",
+  "tests": 2,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Hybrid signature end to end through script_sig; both halves required"
+ },
+ {
+  "path": "node/tests/sprint_bb_merkle_newtype.rs",
+  "kind": "integration",
+  "tests": 7,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "MerkleRoot newtype: serialization invariance and Merkle basics"
+ },
+ {
+  "path": "node/tests/sprint_dd_mined_undo.rs",
+  "kind": "integration",
+  "tests": 2,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Locally mined blocks write undo data and can be rolled back"
+ },
+ {
+  "path": "node/tests/sprint_ee_convergence.rs",
+  "kind": "integration",
+  "tests": 3,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Bare GhostDAG converges under different arrival orders"
+ },
+ {
+  "path": "node/tests/sprint_ee_transport_convergence.rs",
+  "kind": "integration",
+  "tests": 3,
+  "ignored": 0,
+  "tags": "async, vectors",
+  "purpose": "Live two-node convergence, equivocation and inbound cap"
+ },
+ {
+  "path": "node/tests/sprint_gg_pre_ibd_mining.rs",
+  "kind": "integration",
+  "tests": 4,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "is_syncing gating of the miner before IBD"
+ },
+ {
+  "path": "node/tests/sprint_k_address_tests.rs",
+  "kind": "integration",
+  "tests": 9,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Strict checksummed address parsing"
+ },
+ {
+  "path": "node/tests/sprint_m_auth_tests.rs",
+  "kind": "integration",
+  "tests": 18,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "RPC authentication decisions and rate limits"
+ },
+ {
+  "path": "node/tests/sprint_n_mempool_tests.rs",
+  "kind": "integration",
+  "tests": 11,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Mempool::add structural checks: duplicate, empty, conflict, oversize, coinbase, removal (no signatures)"
+ },
+ {
+  "path": "node/tests/sprint_p_pex_tests.rs",
+  "kind": "integration",
+  "tests": 24,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "PEX validator, limiter and cap"
+ },
+ {
+  "path": "node/tests/sprint_s_crypto_sizes.rs",
+  "kind": "integration",
+  "tests": 4,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Hybrid size constants are consistent"
+ },
+ {
+  "path": "node/tests/sprint_t1_seed_determinism.rs",
+  "kind": "integration",
+  "tests": 5,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Seeded key generation is stable and does not leak into later random key generation"
+ },
+ {
+  "path": "node/tests/sprint_u1_undo_data.rs",
+  "kind": "integration",
+  "tests": 9,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "Undo-record CRUD and encoding"
+ },
+ {
+  "path": "node/tests/sprint_u2_rollback.rs",
+  "kind": "integration",
+  "tests": 10,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "rollback_block restores exact prior UTXO state"
+ },
+ {
+  "path": "node/tests/sprint_u3_reorg.rs",
+  "kind": "integration",
+  "tests": 16,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Common-ancestor search, reorg plan shapes, execution"
+ },
+ {
+  "path": "node/tests/sprint_u4_reorg_e2e.rs",
+  "kind": "integration",
+  "tests": 5,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Disposition logic end to end (without transaction validation)"
+ },
+ {
+  "path": "node/tests/sprint_v1_quickwins.rs",
+  "kind": "integration",
+  "tests": 7,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Disabled: the whole file is compiled out with #![cfg(any())]"
+ },
+ {
+  "path": "node/tests/sprint_y_integrity_chain.rs",
+  "kind": "integration",
+  "tests": 11,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Hash-chained integrity of persisted GhostdagData detects tampering"
+ },
+ {
+  "path": "node/tests/sync_frontier.rs",
+  "kind": "integration",
+  "tests": 18,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Frontier reconciliation unit tests"
+ },
+ {
+  "path": "node/tests/sync_locator.rs",
+  "kind": "integration",
+  "tests": 8,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Block locator construction"
+ },
+ {
+  "path": "node/tests/sync_peer_state.rs",
+  "kind": "integration",
+  "tests": 13,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Per-peer chain-state table (pins the monotonic hints exploited in NET-6)"
+ },
+ {
+  "path": "node/tests/sync_wire.rs",
+  "kind": "integration",
+  "tests": 7,
+  "ignored": 0,
+  "tags": "vectors",
+  "purpose": "GetTips/Tips wire frames and shared bounds"
+ },
+ {
+  "path": "node/tests/wire_decoder_fuzz.rs",
+  "kind": "integration",
+  "tests": 3,
+  "ignored": 0,
+  "tags": "corpus",
+  "purpose": "SplitMix-generated inputs (20,000 cases) never panic the block/tx/header decoders"
+ },
+ {
+  "path": "node/tests/wire_roundtrip_props.rs",
+  "kind": "integration",
+  "tests": 2,
+  "ignored": 0,
+  "tags": "unit",
+  "purpose": "Pseudo-random round trips of consensus wire formats (not proptest)"
+ },
+ {
+  "path": "rust/tests/ledger_vectors.rs",
+  "kind": "integration",
+  "tests": 3,
+  "ignored": 0,
+  "tags": "vectors, differential",
+  "purpose": "Rust vs Python ledger vectors: 6 SMT steps, 3 proofs, 5 valid blocks, 23 single-fault invalid blocks with error codes"
+ },
+ {
+  "path": "rust/tests/vectors.rs",
+  "kind": "integration",
+  "tests": 1,
+  "ignored": 0,
+  "tags": "vectors, differential",
+  "purpose": "Python PoW vectors against the standalone crate"
+ },
+ {
+  "path": "reference/check_vectors.py",
+  "kind": "python",
+  "tests": 7,
+  "ignored": 0,
+  "tags": "vectors, differential",
+  "purpose": "Python reference reproduces the 7 PoW vectors"
+ },
+ {
+  "path": "reference/test_ledger.py",
+  "kind": "python",
+  "tests": 11,
+  "ignored": 0,
+  "tags": "vectors, differential",
+  "purpose": "Python ledger vectors, random SMT operations, limits, producer-vs-validator differential over 25 random blocks"
+ }
+]
