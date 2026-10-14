@@ -113,8 +113,11 @@ rand         = "0.9"
 
 rocksdb      = { version = "0.22", optional = true }
 
-# FIX: libp2p 0.53 → 0.56 (pulls ring 0.17+, fixes AES panic vulnerability)
-libp2p       = { version = "0.56", features = ["tcp", "noise", "yamux", "gossipsub", "mdns", "tokio", "dns", "websocket", "identify", "ping", "macros", "ed25519", "request-response"], optional = true }
+# FIX: libp2p 0.53 → 0.56 (pulls ring 0.17+, fixes AES panic vulnerability).
+# Audit OPS-2: 0.56 → 0.57 — hickory 0.26.3 (RUSTSEC-2026-0118/0119 fixed) and
+# upstream libp2p-yamux 0.48 (single yamux 0.14 backend; the vendored fork that
+# removed the vulnerable yamux 0.12 backend is retired).
+libp2p       = { version = "0.57", features = ["tcp", "noise", "yamux", "gossipsub", "mdns", "tokio", "dns", "websocket", "identify", "ping", "macros", "ed25519", "request-response"], optional = true }
 
 # FIX: jsonrpc-http-server uses net2+instant (unmaintained) → replace with axum
 axum         = { version = "0.8", optional = true }
@@ -129,7 +132,6 @@ hex          = "0.4"
 chrono       = { version = "0.4",  features = ["serde"] }
 thiserror    = "2"
 base64       = "0.22"
-async-trait  = "0.1"
 reqwest      = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 pbkdf2       = "0.12"
 hmac         = "0.12"

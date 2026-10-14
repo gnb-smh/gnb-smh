@@ -93,16 +93,17 @@ jobs:
           cargo test -p gnb-crypto --locked --lib expected_bits_at_schedule_is_genesis_bits 2>&1 \
             | tee /dev/stderr | grep -q "test result: ok. 1 passed; 0 failed; 0 ignored"
 
-  # Vendored forks: PQClean source pin (VENDOR.toml), the yamux lockfile guard
-  # (GHSA-vxx9-2994-q338), and the Falcon clean-variant guard.
+  # Vendored fork: PQClean source pin (VENDOR.toml), and the Falcon
+  # clean-variant guard. (The libp2p-yamux fork was retired with libp2p 0.57,
+  # audit OPS-2; its yamux lockfile guard, GHSA-vxx9-2994-q338, now lives in
+  # node/tests/supply_chain_lockfile_guard.rs and runs in workspace-test, and
+  # `cargo deny` in supply-chain refuses a second yamux.)
   vendored-guards:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: pqcrypto-internals (tests/vendor_pin.rs + unit tests)
         run: cargo test -p pqcrypto-internals --locked
-      - name: libp2p-yamux (tests/lockfile_guard.rs + unit tests)
-        run: cargo test -p libp2p-yamux --locked
       - name: Falcon clean-variant guard
         run: sh scripts/falcon-clean-guard.sh
 

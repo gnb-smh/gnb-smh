@@ -821,13 +821,17 @@ struct BlochBehaviour {
 /// bulk payload; gossip is capped at 4 MiB per message elsewhere).
 ///
 /// NET-17 (audit) — corrected: upstream libp2p-yamux 0.47 switched to the
-/// yamux 0.12 backend as soon as ANY config setter ran. This workspace
-/// patches `libp2p-yamux` with the vendored fork in `crates/libp2p-yamux`,
-/// which REMOVES the 0.12 backend (GHSA-vxx9-2994-q338): `set_max_num_streams`
-/// configures yamux 0.13 directly, and 4096 is exactly the largest cap the
-/// 0.13 default receive window allows. A NOT-yet-updated remote still
-/// enforces 512 on ITS side of the connection, so the churn only fully stops
-/// once both endpoints run this build.
+/// yamux 0.12 backend as soon as ANY config setter ran, which is why this
+/// workspace used to patch in a vendored fork without that backend
+/// (GHSA-vxx9-2994-q338). Since libp2p 0.57 (audit OPS-2) the upstream
+/// libp2p-yamux 0.48 has a single yamux 0.14 backend, the fork is retired, and
+/// `node/tests/supply_chain_lockfile_guard.rs` keeps a second (or pre-0.13.10)
+/// yamux out of Cargo.lock. `set_max_num_streams` configures that backend
+/// directly, and 4096 is exactly the largest cap its default receive window
+/// allows (yamux asserts `max_connection_receive_window >= 256 KiB × streams`).
+/// A NOT-yet-updated remote still enforces 512 on ITS side of the
+/// connection, so the churn only fully stops once both endpoints run this
+/// build.
 const MAX_YAMUX_STREAMS: usize = 4096;
 
 /// Builder for the swarm's yamux config — passed to `with_tcp` /

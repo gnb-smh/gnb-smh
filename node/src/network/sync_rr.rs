@@ -38,7 +38,6 @@
 //! request that exhausts its attempts is dropped; the processor's own retry
 //! paths (frontier expiry, orphan sweep, the 30 s nudge) re-issue it.
 
-use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::request_response::{self, Codec as RrCodec, Config as RrConfig, ProtocolSupport};
 use libp2p::{PeerId, StreamProtocol};
@@ -181,7 +180,8 @@ pub fn response_to_message(resp: SyncResponse) -> Option<NetworkMessage> {
 #[derive(Clone, Default)]
 pub struct BlochSyncCodec;
 
-#[async_trait]
+// libp2p-request-response 0.30 declares the codec methods as
+// `fn … -> impl Future + Send` (no `#[async_trait]`); `async fn` implements them.
 impl RrCodec for BlochSyncCodec {
     type Protocol = StreamProtocol;
     type Request = SyncRequest;

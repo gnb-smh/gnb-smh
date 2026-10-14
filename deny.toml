@@ -43,26 +43,10 @@ ignore = [
     "RUSTSEC-2025-0141", # bincode unmaintained
     # paste: compile-time proc-macro helper (transitive), no runtime code.
     "RUSTSEC-2024-0436", # paste unmaintained
-    # ── Vulnerabilities with no compatible fix: not compiled / not reachable ──
-    # hickory-proto 0.25.2 comes in through libp2p 0.56 only: libp2p-dns 0.44
-    # (`hickory-resolver ^0.25.2`) and libp2p-mdns 0.48 (`hickory-proto
-    # ^0.25.2`). The fixed hickory 0.26.x needs libp2p 0.57 (libp2p-dns
-    # 0.45), a breaking upgrade of the node's networking code; no 0.25.x
-    # release carries the fixes. Exposure in this build:
-    #  * RUSTSEC-2026-0118 is in `DnssecDnsHandle`, compiled only with the
-    #    `dnssec-ring` / `dnssec-aws-lc-rs` features. Neither is enabled
-    #    (features in the graph: std, tokio, futures-io, socket2, mdns), so
-    #    the vulnerable code is not in the binary.
-    #  * RUSTSEC-2026-0119 is quadratic name compression while ENCODING a
-    #    message. hickory encodes only the node's own resolver queries (one
-    #    name); libp2p-mdns uses hickory to parse packets and builds its own
-    #    responses. The resolver is reached through libp2p's WebSocket
-    #    transport (/dns*/ multiaddrs; /dns4/ TCP peers go through
-    #    tokio::net::lookup_host instead), and mDNS is off unless the
-    #    operator passes --enable-mdns.
-    # ACTION: remove both when the node moves to libp2p >= 0.57.
-    "RUSTSEC-2026-0118", # hickory-proto NSEC3 closest-encloser loop (DNSSEC only)
-    "RUSTSEC-2026-0119", # hickory-proto O(n^2) name compression when encoding
+    # (Audit OPS-2: the hickory-proto 0.25.2 ignores RUSTSEC-2026-0118 and
+    # RUSTSEC-2026-0119 were removed when the node moved to libp2p 0.57, which
+    # brings hickory 0.26.3; node/tests/supply_chain_lockfile_guard.rs keeps
+    # hickory at a fixed release.)
 ]
 
 [bans]
@@ -83,20 +67,32 @@ allow-wildcard-paths = true # path deps in the workspace are fine
 #   * rand / rand_core / rand_chacha 0.8 vs 0.9, getrandom 0.2 / 0.3 / 0.4,
 #     r-efi, wit-bindgen, windows-sys: rand-ecosystem and OS-shim splits
 #     (the shims are target-gated and never co-linked).
-#   * thiserror 1 vs 2, hashbrown, hashlink, socket2, unsigned-varint,
-#     webpki-roots: ordinary ecosystem lag inside libp2p / reqwest, no
-#     crypto-facing surface shared between the copies.
+#   * thiserror 1 vs 2, hashbrown, base64 0.22 vs 0.23, syn 2 vs 3:
+#     ordinary ecosystem lag inside libp2p / reqwest, no crypto-facing
+#     surface shared between the copies.
+#   * libp2p 0.57 (audit OPS-2) moved its identity/noise stack to the
+#     RustCrypto 0.11 generation: sha2 0.11, hmac 0.13, hkdf 0.13,
+#     crypto-common 0.2, cpufeatures 0.3, chacha20 0.10, curve25519-dalek 5,
+#     fiat-crypto 0.3. The 0.10-generation copies are the node's and
+#     gnb-crypto's own (aes-gcm, hmac, hkdf, sha2 pins of the consensus and
+#     wallet code) and snow 0.10's; nothing passes values between the copies.
 skip = [
+    { crate = "base64@=0.22.1" },
     { crate = "bindgen@=0.69.5" },
     { crate = "block-buffer@=0.9.0" },
     { crate = "block-buffer@=0.10.4" },
+    { crate = "chacha20@=0.9.1" },
+    { crate = "cpufeatures@=0.2.17" },
+    { crate = "crypto-common@=0.1.7" },
+    { crate = "curve25519-dalek@=4.1.3" },
     { crate = "digest@=0.9.0" },
     { crate = "digest@=0.10.7" },
+    { crate = "fiat-crypto@=0.2.9" },
     { crate = "getrandom@=0.2.17" },
     { crate = "getrandom@=0.3.4" },
     { crate = "hashbrown@=0.14.5" },
-    { crate = "hashbrown@=0.15.5" },
-    { crate = "hashlink@=0.9.1" },
+    { crate = "hkdf@=0.12.4" },
+    { crate = "hmac@=0.12.1" },
     { crate = "r-efi@=5.3.0" },
     { crate = "rand@=0.8.6" },
     { crate = "rand@=0.9.4" },
@@ -105,11 +101,10 @@ skip = [
     { crate = "rand_core@=0.9.5" },
     { crate = "rustc-hash@=1.1.0" },
     { crate = "sha2@=0.9.9" },
-    { crate = "socket2@=0.5.10" },
+    { crate = "sha2@=0.10.9" },
+    { crate = "syn@=2.0.117" },
     { crate = "thiserror@=1.0.69" },
     { crate = "thiserror-impl@=1.0.69" },
-    { crate = "unsigned-varint@=0.7.2" },
-    { crate = "webpki-roots@=0.26.11" },
     { crate = "windows-sys@=0.52.0" },
     { crate = "windows-sys@=0.59.0" },
     { crate = "wit-bindgen@=0.51.0" },
