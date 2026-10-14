@@ -284,6 +284,14 @@ impl Storage {
         self.db.delete_cf(&cf_b, hash).map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
+    /// Whether a body is stored for `hash` (no decoding).
+    pub fn has_block_body(&self, hash: &[u8; 32]) -> Result<bool, StorageError> {
+        let cf = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
+        Ok(self.db.get_pinned_cf(&cf, hash)
+            .map_err(|e| StorageError::ReadFailed(e.to_string()))?
+            .is_some())
+    }
+
     pub fn get_block(&self, hash: &[u8; 32]) -> Result<Option<Block>, StorageError> {
         let cf = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
         match self.db.get_cf(&cf, hash).map_err(|e| StorageError::ReadFailed(e.to_string()))? {

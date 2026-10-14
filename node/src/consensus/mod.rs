@@ -763,7 +763,22 @@ pub struct GhostDAG {
     /// (set by `load_invalid`). The acceptance pipeline loads it lazily on
     /// first use if start-up did not.
     invalid_loaded: bool,
+    /// The roots of the PERSISTENT part of `invalid`: blocks passed to
+    /// `mark_invalid` / `load_invalid` (a failure the block id commits to).
+    invalid_roots: HashSet<BlockHash>,
+    /// Blocks waiting for a (different) body, in memory only: their stored
+    /// body failed a rule that depends on bytes the block id does not commit
+    /// to (non-coinbase `script_sig`s below the hardening activation), or the
+    /// body is missing. They are roots of `invalid` (with their selected-chain
+    /// descendants) until a body that passes arrives, but the block id is not
+    /// disqualified: nothing is persisted. The value lists the witness roots
+    /// of the bodies already rejected for this id (most recent last, at most
+    /// [`MAX_REJECTED_BODIES`]), so the same bad body is refused cheaply.
+    body_pending: HashMap<BlockHash, Vec<[u8; 32]>>,
 }
+
+/// Rejected-body witness roots remembered per body-pending block.
+pub const MAX_REJECTED_BODIES: usize = 8;
 
 /// Result of [`GhostDAG::compute_block`]: everything `add_block` needs,
 /// computed without mutating the DAG.
@@ -788,6 +803,8 @@ impl GhostDAG {
             merge_skip: HashMap::new(),
             invalid: HashSet::new(),
             invalid_loaded: false,
+            invalid_roots: HashSet::new(),
+            body_pending: HashMap::new(),
         }
     }
 
@@ -1453,6 +1470,8 @@ impl GhostDAG {
         self.store.tips.remove(hash);
         self.store.children.remove(hash);
         self.invalid.remove(hash);
+        self.invalid_roots.remove(hash);
+        self.body_pending.remove(hash);
         // Exact inverse of `DagStore::insert`: drop the child edge from each
         // parent; a parent becomes a tip again iff it is still stored and now
         // has no children at all.
@@ -2283,6 +2302,15 @@ impl GhostDAG {
     /// maintains for later arrivals). Returns the blocks newly marked, in
     /// discovery order. Unknown hashes are ignored.
     pub fn mark_invalid(&mut self, hash: BlockHash) -> Vec<BlockHash> {
+        if self.store.has(&hash) {
+            self.invalid_roots.insert(hash);
+        }
+        self.propagate_invalid(hash)
+    }
+
+    /// Mark `hash` and its selected-chain descendants in `invalid` (no root
+    /// bookkeeping). Returns the blocks newly marked.
+    fn propagate_invalid(&mut self, hash: BlockHash) -> Vec<BlockHash> {
         let mut newly = Vec::new();
         let mut stack = vec![hash];
         while let Some(h) = stack.pop() {
@@ -2318,6 +2346,92 @@ impl GhostDAG {
     /// Whether `load_invalid` has run on this instance.
     pub fn invalid_set_loaded(&self) -> bool {
         self.invalid_loaded
+    }
+
+    /// Wait for a different body of `hash` (see the `body_pending` field):
+    /// `hash` and its selected-chain descendants are disqualified IN MEMORY
+    /// ONLY. `rejected_witness_root` is the witness root of the body just
+    /// rejected (`None` when the body is merely missing). Returns the blocks
+    /// newly marked invalid. Unknown hashes are ignored.
+    pub fn mark_body_pending(&mut self, hash: BlockHash, rejected_witness_root: Option<[u8; 32]>) -> Vec<BlockHash> {
+        if !self.store.has(&hash) {
+            return Vec::new();
+        }
+        let rejected = self.body_pending.entry(hash).or_default();
+        if let Some(wr) = rejected_witness_root {
+            if !rejected.contains(&wr) {
+                rejected.push(wr);
+                if rejected.len() > MAX_REJECTED_BODIES {
+                    rejected.remove(0);
+                }
+            }
+        }
+        self.propagate_invalid(hash)
+    }
+
+    /// True iff `hash` waits for a body (see `mark_body_pending`).
+    pub fn is_body_pending(&self, hash: &BlockHash) -> bool {
+        self.body_pending.contains_key(hash)
+    }
+
+    /// Every block waiting for a body, sorted.
+    pub fn body_pending_blocks(&self) -> Vec<BlockHash> {
+        let mut v: Vec<BlockHash> = self.body_pending.keys().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// True iff a body of `hash` with this witness root was already rejected.
+    pub fn body_rejected_before(&self, hash: &BlockHash, witness_root: &[u8; 32]) -> bool {
+        self.body_pending.get(hash).is_some_and(|v| v.contains(witness_root))
+    }
+
+    /// A body of `hash` is available again: stop waiting and re-derive the
+    /// disqualified set from the remaining roots, so the blocks that were
+    /// disqualified only through `hash` become candidates again. Returns
+    /// `false` (no change) if `hash` was not waiting for a body.
+    pub fn clear_body_pending(&mut self, hash: &BlockHash) -> bool {
+        if self.body_pending.remove(hash).is_none() {
+            return false;
+        }
+        self.recompute_invalid();
+        true
+    }
+
+    /// Rebuild `invalid` from the roots. Every disqualified block is
+    /// reachable from a root: `mark_invalid`, `mark_body_pending` and
+    /// `add_block` only ever extend a root's selected-chain descendants.
+    fn recompute_invalid(&mut self) {
+        self.invalid.clear();
+        let mut roots: Vec<BlockHash> = self.invalid_roots.iter()
+            .chain(self.body_pending.keys())
+            .copied()
+            .collect();
+        roots.sort_unstable();
+        roots.dedup();
+        for r in roots {
+            self.propagate_invalid(r);
+        }
+    }
+
+    /// True iff `hash` is disqualified for a reason the block id commits to:
+    /// a persistent root lies on its selected-parent chain. `false` for a
+    /// valid block and for one disqualified only because it waits for a body
+    /// or descends from such a block, whose mark must never be persisted.
+    pub fn is_invalid_persistently(&self, hash: &BlockHash) -> bool {
+        let mut cur = *hash;
+        loop {
+            if !self.invalid.contains(&cur) {
+                return false;
+            }
+            if self.invalid_roots.contains(&cur) {
+                return true;
+            }
+            match self.store.get(&cur).and_then(|d| d.selected_parent) {
+                Some(sp) => cur = sp,
+                None => return false,
+            }
+        }
     }
 
     /// True iff `hash` is chain-disqualified.

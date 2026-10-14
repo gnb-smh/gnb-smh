@@ -30,8 +30,9 @@
 //! (inputs, double spends, coinbase maturity, signatures, fees, coinbase
 //! value). Merged (non-selected) blocks never affect the UTXO set — as before.
 //!
-//! **Invalid blocks**: a connect-time failure is a deterministic property of
-//! the block and its selected-parent chain, so it is permanent. The failing
+//! **Invalid blocks**: a connect-time failure that depends only on data the
+//! block id commits to is a deterministic property of the block and its
+//! selected-parent chain, so it is permanent. The failing
 //! block and every block whose selected-parent chain passes through it are
 //! marked chain-disqualified, in memory (`GhostDAG::mark_invalid`) and on disk
 //! (`Storage::stage_invalid_block`), and the next-best block is tried; the
@@ -39,6 +40,20 @@
 //! selected, applied or offered as a template parent, and a new block whose
 //! selected parent is disqualified is disqualified on arrival. `accept_block`
 //! reports such blocks as rejected (`Err`).
+//!
+//! **Witness-dependent failures below the hardening activation**: there the
+//! block id does not commit to non-coinbase `script_sig` bytes, so a relay
+//! can alter them (breaking a signature, padding past the minimum fee)
+//! without changing the id. Such a failure (`BlockInvalidity::
+//! witness_dependent`) is a property of THIS BODY, not of the block: the body
+//! is deleted, nothing is persisted, and the block (with its selected-chain
+//! descendants) waits in memory for another body
+//! (`GhostDAG::mark_body_pending`). The ingress paths do not treat it as
+//! known (`is_known_block`), the processor re-requests it from peers, and a
+//! copy with a different witness root replaces the body and is re-evaluated.
+//! A block whose body is missing waits the same way. At/after the activation
+//! the witness commitment is checked before the block is stored, so every
+//! connect-time failure is permanent.
 //!
 //! Disqualified blocks are KEPT in the DAG (their insertion is not rolled
 //! back) on purpose: whether a node evaluates a block at all depends on
@@ -119,6 +134,51 @@ pub fn ensure_invalid_set_loaded(
     }
 }
 
+/// True iff `hash` is in the DAG but a body for it is still wanted: it waits
+/// for a body after a witness-dependent failure
+/// (`GhostDAG::is_body_pending`), or its body is missing although it was
+/// never pruned (a body dropped after such a failure, before a restart). A
+/// copy of such a block is processed (and re-requested from peers) instead of
+/// being discarded as already known.
+pub fn awaits_body(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    hash: &BlockHash,
+) -> bool {
+    awaits_body_in(&dag.read(), store, hash)
+}
+
+/// [`awaits_body`] under a DAG guard the caller already holds.
+pub fn awaits_body_in(d: &consensus::GhostDAG, store: &storage::Storage, hash: &BlockHash) -> bool {
+    if d.is_body_pending(hash) {
+        return true;
+    }
+    let dag_height = match d.get_block_data(hash) {
+        Some(data) if !data.parents.is_empty() => data.height,
+        _ => return false, // unknown, or the genesis
+    };
+    // Pruning removes bodies by HEADER height, which is >= the DAG height:
+    // a block whose DAG height is at or above the pruning cursor was never
+    // pruned.
+    dag_height >= store.pruned_height() && matches!(store.has_block_body(hash), Ok(false))
+}
+
+/// True iff `hash` needs no further copy: it is in the DAG and does not
+/// [`awaits_body`]. The dedup every ingress path (gossip, pulls, IBD,
+/// `submitblock`) applies before `accept_block`.
+pub fn is_known_block(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    hash: &BlockHash,
+) -> bool {
+    is_known_block_in(&dag.read(), store, hash)
+}
+
+/// [`is_known_block`] under a DAG guard the caller already holds.
+pub fn is_known_block_in(d: &consensus::GhostDAG, store: &storage::Storage, hash: &BlockHash) -> bool {
+    d.has_block(hash) && !awaits_body_in(d, store, hash)
+}
+
 /// Stage the CF_DAG (+ integrity, + reachability delta) record of `hash`. If
 /// the selected parent is the genesis and its integrity record was never
 /// written (fixture stores), the genesis record is staged lazily in the same
@@ -163,6 +223,34 @@ fn stage_dag_record_for(
 
 // ── In-context block validation ──────────────────────────────────────────────
 
+/// A connect-time rejection, classified by what it depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockInvalidity {
+    pub reason: String,
+    /// The failure depends on bytes the block id does not commit to: a
+    /// non-coinbase `script_sig` (script parse, pubkey hash, signature, and
+    /// the size-based minimum fee) of a block below the hardening activation.
+    /// Another body with the same id may be valid, so the id must not be
+    /// disqualified. Always `false` at/after the activation, where the
+    /// witness commitment (checked before the block is stored) fixes every
+    /// byte of the body.
+    pub witness_dependent: bool,
+}
+
+/// A transaction-level rejection; `witness` = it depends on the
+/// transaction's `script_sig` bytes (see [`BlockInvalidity`]).
+#[derive(Debug)]
+struct TxFailure {
+    reason: String,
+    witness: bool,
+}
+
+impl From<String> for TxFailure {
+    fn from(reason: String) -> Self {
+        Self { reason, witness: false }
+    }
+}
+
 /// Validate `tx` (the transaction at index `idx` of `block`) against `view`
 /// plus the outputs of the transactions STRICTLY BEFORE it in the block
 /// (`earlier`). Coinbase maturity uses the block's header height. When
@@ -175,13 +263,13 @@ fn validate_tx_in_view(
     spent_in_block: &mut HashSet<([u8; 32], u32)>,
     current_height: u64,
     same_block_coinbase: Option<&[u8; 32]>,
-) -> Result<u64, String> {
+) -> Result<u64, TxFailure> {
     if let Some(cb) = same_block_coinbase {
         if let Some(i) = tx.inputs.iter().position(|inp| &inp.prev_txid == cb) {
             return Err(format!(
                 "coinbase maturity: input {} spends the coinbase of its own block (0 confirmations, need {})",
                 i, core::COINBASE_MATURITY
-            ));
+            ).into());
         }
     }
     core::check_coinbase_maturity(tx, current_height, |txid| {
@@ -193,7 +281,7 @@ fn validate_tx_in_view(
         }
         view.view_utxo(txid, idx)
     };
-    validate_tx_inputs(tx, &lookup, Some(spent_in_block))
+    validate_tx_inputs_classified(tx, &lookup, Some(spent_in_block))
 }
 
 /// Full in-context validation of a block's transactions against `view` (the
@@ -227,17 +315,35 @@ pub fn validate_block_in_view_at(
     block: &core::Block,
     activation_height: u64,
 ) -> Result<(), String> {
+    validate_block_in_view_classified_at(view, block, activation_height).map_err(|e| e.reason)
+}
+
+/// [`validate_block_in_view`] with the failure classified (see
+/// [`BlockInvalidity`]): the acceptance pipeline uses the class to decide
+/// whether the block id is disqualified (persisted) or only this body is
+/// dropped. The verdict (`Ok` / `Err`) is exactly `validate_block_in_view`'s.
+pub fn validate_block_in_view_classified(view: &dyn UtxoView, block: &core::Block) -> Result<(), BlockInvalidity> {
+    validate_block_in_view_classified_at(view, block, core::activation::hardening_activation_height())
+}
+
+/// [`validate_block_in_view_classified`] for an explicit activation height.
+pub fn validate_block_in_view_classified_at(
+    view: &dyn UtxoView,
+    block: &core::Block,
+    activation_height: u64,
+) -> Result<(), BlockInvalidity> {
+    let committed = |reason: String| BlockInvalidity { reason, witness_dependent: false };
     let height = block.height;
     let hardened = core::block_rules::rules_active_at(height, activation_height);
     if hardened {
         for tx in &block.transactions {
             let txid = tx.txid();
             for j in 0..tx.outputs.len() as u32 {
-                if view.view_utxo(&txid, j)?.is_some() {
-                    return Err(format!(
+                if view.view_utxo(&txid, j).map_err(committed)?.is_some() {
+                    return Err(committed(format!(
                         "BIP30: output {}:{} would overwrite an unspent coin",
                         hex::encode(&txid[..8]), j
-                    ));
+                    )));
                 }
             }
         }
@@ -254,9 +360,13 @@ pub fn validate_block_in_view_at(
         if i > 0 {
             let fee = validate_tx_in_view(
                 tx, view, &earlier, &mut spent_in_block, height, same_block_coinbase.as_ref(),
-            )?;
+            ).map_err(|f| BlockInvalidity {
+                reason: f.reason,
+                // At/after the activation the witness commitment fixed the body.
+                witness_dependent: f.witness && !hardened,
+            })?;
             total_fees = core::limits::money_add(total_fees, fee)
-                .map_err(|e| format!("block fee sum: {}", e))?;
+                .map_err(|e| committed(format!("block fee sum: {}", e)))?;
         }
         if hardened && i == 0 {
             continue; // VAL-3: the coinbase's outputs are not spendable in its own block
@@ -267,7 +377,7 @@ pub fn validate_block_in_view_at(
         }
     }
     block.validate_coinbase_value(total_fees)
-        .map_err(|e| format!("coinbase rejected: {}", e))
+        .map_err(|e| committed(format!("coinbase rejected: {}", e)))
 }
 
 // ── Shielded state (COH-2) ───────────────────────────────────────────────────
@@ -394,10 +504,28 @@ enum ResolveStop {
     Failed(String),
 }
 
+/// Where `resolve_best_chain` records what it found on the way.
+#[derive(Default)]
+struct ResolveLog {
+    /// (root, reason) for every newly disqualified root (persisted).
+    invalid: Vec<(BlockHash, String)>,
+    /// (block, reason) for every block whose body was dropped after a
+    /// witness-dependent failure (never persisted; see `drop_body_and_wait`).
+    body_rejected: Vec<(BlockHash, String)>,
+}
+
 /// Move the applied chain to the best valid block, marking blocks invalid as
-/// they fail. `trigger` is the block whose insertion prompted the call (its
-/// DAG record is folded into the commit batch). `invalid_log` accumulates
-/// (root, reason) for every newly disqualified root.
+/// they fail. `trigger` is the block whose insertion prompted the call (the
+/// finality rule applies to it); its DAG record is folded into the commit
+/// batch when `stage_trigger_record` (a new insertion, not a body
+/// replacement). `log` accumulates the disqualified roots and the dropped
+/// bodies.
+///
+/// A block of the plan whose body is missing, or whose body fails a rule
+/// that depends on witness bytes its id does not commit to (below the
+/// hardening activation), is NOT disqualified: its body is dropped and it
+/// waits, in memory only, for another body (`GhostDAG::mark_body_pending`);
+/// the next-best chain is tried meanwhile.
 #[allow(clippy::too_many_arguments)]
 fn resolve_best_chain(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
@@ -405,12 +533,14 @@ fn resolve_best_chain(
     shielded: &Arc<RwLock<ShieldedPool>>,
     applied_tip: BlockHash,
     trigger: Option<BlockHash>,
+    stage_trigger_record: bool,
     trigger_header_height: u64,
     finalized_height: u64,
-    invalid_log: &mut Vec<(BlockHash, String)>,
+    log: &mut ResolveLog,
 ) -> Result<Resolution, ResolveStop> {
-    // Each iteration either commits, stops, or disqualifies at least one more
-    // block; the DAG is finite, so this terminates. The bound is a guard.
+    // Each iteration either commits, stops, or disqualifies (or parks) at
+    // least one more block; the DAG is finite, so this terminates. The bound
+    // is a guard.
     for _ in 0..10_000 {
         let cand = match dag.read().selected_tip() {
             Some(c) => c,
@@ -441,10 +571,30 @@ fn resolve_best_chain(
             }
         }
 
+        // A block without a stored body cannot be connected: wait for one.
+        let mut missing = None;
+        for h in &plan.to_apply {
+            match store.has_block_body(h) {
+                Ok(true) => {}
+                Ok(false) => {
+                    missing = Some(*h);
+                    break;
+                }
+                Err(e) => return Err(ResolveStop::Failed(e.to_string())),
+            }
+        }
+        if let Some(h) = missing {
+            warn!("block {} has no stored body; waiting for one before connecting its chain",
+                hex::encode(&h[..8]));
+            dag.write().mark_body_pending(h, None);
+            continue;
+        }
+
         let next_shielded = match shielded_after_plan(shielded, store, &plan) {
             Ok(s) => s,
             Err(ConnectError::Invalid { block, reason, .. }) => {
-                disqualify(dag, block, reason, invalid_log);
+                // The shielded bytes are committed by the header root.
+                disqualify(dag, block, reason, &mut log.invalid);
                 continue;
             }
             Err(e) => return Err(ResolveStop::Failed(e.to_string())),
@@ -457,11 +607,24 @@ fn resolve_best_chain(
             crate::metrics::observe_reorg_depth(reorg_depth as f64);
         }
 
-        let validate = |view: &dyn UtxoView, b: &core::Block| validate_block_in_view(view, b);
+        // The validator reports, beside the verdict, whether the failure
+        // depends on witness bytes (block id, witness root of the body).
+        let witness_failure: std::cell::Cell<Option<(BlockHash, [u8; 32])>> = std::cell::Cell::new(None);
+        let validate = |view: &dyn UtxoView, b: &core::Block| -> Result<(), String> {
+            match validate_block_in_view_classified(view, b) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    witness_failure.set(e.witness_dependent.then(|| {
+                        (b.block_hash(), core::block_rules::witness_root(&b.transactions).0)
+                    }));
+                    Err(e.reason)
+                }
+            }
+        };
         let new_tip = cand;
-        let log_snapshot = invalid_log.clone();
+        let log_snapshot = log.invalid.clone();
         let stage_extra = |st: &storage::Storage, batch: &mut rocksdb::WriteBatch| -> Result<(), String> {
-            if let Some(t) = trigger {
+            if let (Some(t), true) = (trigger, stage_trigger_record) {
                 if dag.read().has_block(&t) {
                     stage_dag_record_for(dag, st, batch, &t)?;
                 }
@@ -475,12 +638,17 @@ fn resolve_best_chain(
                 if reorg_depth > 0 { crate::metrics::inc_reorg_success(); }
                 *shielded.write() = next_shielded;
                 // Marks were persisted in the batch.
-                invalid_log.clear();
+                log.invalid.clear();
                 return Ok(Resolution::Connected { plan, outcome });
             }
             Err(ConnectError::Invalid { block, reason, .. }) => {
                 if reorg_depth > 0 { crate::metrics::inc_reorg_failure(); }
-                disqualify(dag, block, reason, invalid_log);
+                match witness_failure.take() {
+                    Some((h, witness_root)) if h == block => {
+                        drop_body_and_wait(dag, store, block, witness_root, reason, &mut log.body_rejected);
+                    }
+                    _ => disqualify(dag, block, reason, &mut log.invalid),
+                }
                 continue;
             }
             Err(ConnectError::Refused(m)) => {
@@ -494,6 +662,35 @@ fn resolve_best_chain(
         }
     }
     Err(ResolveStop::Failed("resolve_best_chain: iteration guard reached".into()))
+}
+
+/// `block`'s stored body failed a rule that depends on witness bytes its id
+/// does not commit to (below the hardening activation a relay can change a
+/// non-coinbase `script_sig` without changing the block id). Unlike
+/// [`disqualify`], nothing is persisted and the block id is not poisoned:
+/// the body is deleted (so it is never served to peers again) and the block,
+/// with its selected-chain descendants, waits in memory for a different body
+/// (`GhostDAG::mark_body_pending`), which every ingress path accepts
+/// (`awaits_body`) and the message processor re-requests from peers.
+fn drop_body_and_wait(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    block: BlockHash,
+    witness_root: [u8; 32],
+    reason: String,
+    body_log: &mut Vec<(BlockHash, String)>,
+) {
+    let marked = dag.write().mark_body_pending(block, Some(witness_root));
+    if let Err(e) = store.delete_block_body(&block) {
+        error!("could not delete the rejected body of {}: {}", hex::encode(&block[..8]), e);
+    }
+    warn!(
+        "block {} body rejected ({}): the failure depends on witness bytes the block id does not \
+         commit to, so the id is NOT disqualified; body dropped, waiting for another copy \
+         ({} selected-chain descendant(s) wait with it)",
+        hex::encode(&block[..8]), reason, marked.len().saturating_sub(1)
+    );
+    body_log.push((block, reason));
 }
 
 /// Disqualify `block` (and its selected-chain descendants) in memory and
@@ -579,12 +776,30 @@ pub fn accept_block(
     let old_tip = { dag.read().selected_tip() };
 
     // ── Early dedup ──────────────────────────────────────────────────
-    if dag.read().get_block_data(&block_hash).is_some() {
-        return Err(format!(
-            "consensus rejection: block already in DAG: {}",
-            hex::encode(block_hash)
-        ));
-    }
+    // A block already in the DAG is refused, unless it waits for a body
+    // (its previous body failed a witness-dependent rule, or is missing):
+    // then this copy REPLACES the body and is re-evaluated, after the same
+    // acceptance checks as a new block.
+    let in_dag = dag.read().has_block(&block_hash);
+    let replacing = if in_dag {
+        if !awaits_body(dag, store, &block_hash) {
+            return Err(format!(
+                "consensus rejection: block already in DAG: {}",
+                hex::encode(block_hash)
+            ));
+        }
+        let witness_root = core::block_rules::witness_root(&block.transactions).0;
+        if dag.read().body_rejected_before(&block_hash, &witness_root) {
+            return Err(format!(
+                "consensus rejection: block already in DAG: {} (this body was already rejected; \
+                 waiting for a different one)",
+                hex::encode(block_hash)
+            ));
+        }
+        true
+    } else {
+        false
+    };
 
     // ── Parents must be known (cheap, before anything else) ──────────
     if block.header.parents.is_empty() {
@@ -676,20 +891,44 @@ pub fn accept_block(
         Some(t) => t,
         None => return Err("consensus rejection: DAG has no genesis".into()),
     };
-    let work = pow::work_from_bits(block.header.bits);
-    dag.write().add_block(block_hash, block.header.parents.clone(), block.header.timestamp, work)
-        .map_err(|e| format!("consensus rejection: {}", e))?;
-    if let Err(e) = store.put_block_body(block) {
-        dag.write().remove_block(&block_hash);
-        return Err(e.to_string());
+    if replacing {
+        // Same id (header, txids, coinbase), different witness bytes: store
+        // this body and let the blocks that waited for it compete again.
+        store.put_block_body(block).map_err(|e| e.to_string())?;
+        dag.write().clear_body_pending(&block_hash);
+        info!("block {} h={}: new body stored for a block that waited for one; re-evaluating",
+            hex::encode(&block_hash[..8]), block.height);
+    } else {
+        let work = pow::work_from_bits(block.header.bits);
+        dag.write().add_block(block_hash, block.header.parents.clone(), block.header.timestamp, work)
+            .map_err(|e| format!("consensus rejection: {}", e))?;
+        if let Err(e) = store.put_block_body(block) {
+            dag.write().remove_block(&block_hash);
+            return Err(e.to_string());
+        }
     }
     // Informational only (RPC / tip notifications).
     let _ = store.put_meta("current_bits", &block.header.bits.to_le_bytes());
 
-    let mut invalid_log: Vec<(BlockHash, String)> = Vec::new();
-    if dag.read().is_invalid(&block_hash) {
+    // Undo this call's storage effects (nothing was committed): a new block
+    // leaves the DAG; a replacement body is dropped again and the block keeps
+    // waiting for one.
+    let roll_back = |why: &str| {
+        let _ = store.delete_block_body(&block_hash);
+        if replacing {
+            dag.write().mark_body_pending(block_hash, None);
+        } else if !dag.write().remove_block(&block_hash) {
+            warn!("could not roll back DAG insertion of {} ({})", hex::encode(&block_hash[..8]), why);
+        }
+    };
+
+    let mut log = ResolveLog::default();
+    // A new block whose selected parent is disqualified for a reason the
+    // block id commits to is disqualified with it (persisted). One that only
+    // descends from a block waiting for a body is not: it waits too.
+    if !replacing && dag.read().is_invalid(&block_hash) && dag.read().is_invalid_persistently(&block_hash) {
         let sp = dag.read().get_block_data(&block_hash).and_then(|d| d.selected_parent);
-        invalid_log.push((block_hash, format!(
+        log.invalid.push((block_hash, format!(
             "selected parent {} is invalid",
             sp.map(|p| hex::encode(&p[..8])).unwrap_or_default()
         )));
@@ -697,22 +936,19 @@ pub fn accept_block(
 
     // ── Connect the best valid chain ─────────────────────────────────
     let resolution = resolve_best_chain(
-        dag, store, shielded, applied_tip, Some(block_hash), block.height,
-        finalized_height, &mut invalid_log,
+        dag, store, shielded, applied_tip, Some(block_hash), !replacing, block.height,
+        finalized_height, &mut log,
     );
 
     let resolution = match resolution {
         Ok(r) => r,
         Err(stop) => {
-            // Policy refusal or storage failure: roll the in-memory insertion
+            // Policy refusal or storage failure: roll the in-memory change
             // back (nothing was committed), drop the body, but keep any
             // deterministic invalid marks discovered on the way.
-            if !dag.write().remove_block(&block_hash) {
-                warn!("could not roll back DAG insertion of {}", hex::encode(&block_hash[..8]));
-            }
-            let _ = store.delete_block_body(&block_hash);
-            if !invalid_log.is_empty() {
-                if let Err(e) = persist_unchanged(dag, store, None, &invalid_log) {
+            roll_back("resolution stopped");
+            if !log.invalid.is_empty() {
+                if let Err(e) = persist_unchanged(dag, store, None, &log.invalid) {
                     error!("failed to persist invalid-block marks: {}", e);
                 }
             }
@@ -726,12 +962,12 @@ pub fn accept_block(
 
     let connected = match &resolution {
         Resolution::Unchanged => {
-            if let Err(e) = persist_unchanged(dag, store, Some(block_hash), &invalid_log) {
+            let record = if replacing { None } else { Some(block_hash) };
+            if let Err(e) = persist_unchanged(dag, store, record, &log.invalid) {
                 // The DAG record of a non-applied block failed to persist:
                 // undo the in-memory insertion so memory and disk agree.
                 error!("failed to persist DAG record of {}: {}", hex::encode(&block_hash[..8]), e);
-                dag.write().remove_block(&block_hash);
-                let _ = store.delete_block_body(&block_hash);
+                roll_back("DAG record not persisted");
                 return Err(format!("block {} not committed: {}", hex::encode(&block_hash[..8]), e));
             }
             false
@@ -761,7 +997,26 @@ pub fn accept_block(
     // The arriving block itself is disqualified: it is reported as rejected
     // (it is kept in the DAG — see the module docs — but never selected or
     // applied). Computed now, returned after the tip bookkeeping below.
-    let trigger_invalid: Option<String> = if dag.read().is_invalid(&block_hash) {
+    //
+    // Its BODY was rejected for a witness-dependent reason: reported as
+    // rejected too, but the id is not disqualified (a different body is
+    // re-evaluated). A block that only waits for an ancestor's body is
+    // accepted into the DAG (like a fork-loser) and connects when that body
+    // arrives.
+    let trigger_invalid: Option<String> = if !dag.read().is_invalid(&block_hash) {
+        None
+    } else if dag.read().is_body_pending(&block_hash) {
+        let reason = log.body_rejected.iter().rev()
+            .find(|(h, _)| *h == block_hash)
+            .map(|(_, r)| r.clone())
+            .unwrap_or_else(|| "body missing".to_string());
+        Some(format!(
+            "consensus rejection: block {} body rejected ({}); the block id commits to no witness \
+             bytes below the hardening activation, so it is not disqualified and a different body \
+             will be re-evaluated",
+            hex::encode(&block_hash[..8]), reason
+        ))
+    } else if dag.read().is_invalid_persistently(&block_hash) {
         let reason = store.invalid_block_reason(&block_hash).ok().flatten()
             .unwrap_or_else(|| "descends from an invalid block".to_string());
         Some(format!(
@@ -769,6 +1024,8 @@ pub fn accept_block(
             hex::encode(&block_hash[..8]), reason
         ))
     } else {
+        info!("block {} waits for the body of an ancestor before it can be connected",
+            hex::encode(&block_hash[..8]));
         None
     };
 
@@ -918,11 +1175,11 @@ pub fn reconcile_on_startup(
         if applied != best && dag.read().has_block(&applied) {
             warn!("reconcile: applied tip {} != best valid block {}; reconnecting",
                 hex::encode(&applied[..8]), hex::encode(&best[..8]));
-            let mut log = Vec::new();
-            match resolve_best_chain(dag, store, shielded, applied, None, 0, 0, &mut log) {
+            let mut log = ResolveLog::default();
+            match resolve_best_chain(dag, store, shielded, applied, None, false, 0, 0, &mut log) {
                 Ok(_) => {
-                    if !log.is_empty() {
-                        persist_unchanged(dag, store, None, &log)?;
+                    if !log.invalid.is_empty() {
+                        persist_unchanged(dag, store, None, &log.invalid)?;
                     }
                 }
                 Err(ResolveStop::Refused(m)) | Err(ResolveStop::Failed(m)) => {
@@ -946,8 +1203,22 @@ pub fn reconcile_on_startup(
 pub fn validate_tx_inputs(
     tx:           &core::Transaction,
     utxo_lookup:  &dyn Fn(&[u8; 32], u32) -> Result<Option<core::TxOutput>, String>,
-    mut spent_set: Option<&mut HashSet<([u8; 32], u32)>>,
+    spent_set:    Option<&mut HashSet<([u8; 32], u32)>>,
 ) -> Result<u64, String> {
+    validate_tx_inputs_classified(tx, utxo_lookup, spent_set).map_err(|f| f.reason)
+}
+
+/// [`validate_tx_inputs`] with the failure classified: script failures (the
+/// `script_sig` must parse, its public key must hash to the prevout's
+/// script_pubkey, its signature must verify) and the minimum fee (measured on
+/// the wire size, `script_sig` included) depend on witness bytes; every other
+/// check depends only on data the txid commits to.
+fn validate_tx_inputs_classified(
+    tx:           &core::Transaction,
+    utxo_lookup:  &dyn Fn(&[u8; 32], u32) -> Result<Option<core::TxOutput>, String>,
+    mut spent_set: Option<&mut HashSet<([u8; 32], u32)>>,
+) -> Result<u64, TxFailure> {
+    let witness = |reason: String| TxFailure { reason, witness: true };
     let mut total_in = 0u64;
 
     // C-R3-2: the intra-tx duplicate-outpoint check is UNCONDITIONAL.
@@ -959,7 +1230,7 @@ pub fn validate_tx_inputs(
         let cross_tx_dup = spent_set.as_ref().is_some_and(|s| s.contains(&outpoint));
         if cross_tx_dup || !local_spent.insert(outpoint) {
             return Err(format!("double-spend: {}:{} already consumed",
-                hex::encode(&inp.prev_txid[..8]), inp.prev_index));
+                hex::encode(&inp.prev_txid[..8]), inp.prev_index).into());
         }
         let utxo = utxo_lookup(&inp.prev_txid, inp.prev_index)?
             .ok_or_else(|| format!("UTXO {}:{} not found",
@@ -969,7 +1240,7 @@ pub fn validate_tx_inputs(
         prevouts.push(utxo);
     }
 
-    admission::verify_input_scripts(tx, &prevouts)?;
+    admission::verify_input_scripts(tx, &prevouts).map_err(witness)?;
 
     if let Some(spent) = spent_set.as_mut() {
         for inp in &tx.inputs {
@@ -980,10 +1251,10 @@ pub fn validate_tx_inputs(
     let total_out = core::limits::check_tx_money_range(tx)
         .map_err(|e| format!("output sum overflow: {}", e))?;
     if total_in < total_out {
-        return Err(format!("inputs {} < outputs {}", total_in, total_out));
+        return Err(format!("inputs {} < outputs {}", total_in, total_out).into());
     }
     let fee = total_in - total_out;
-    core::check_min_fee(tx, fee)?;
+    core::check_min_fee(tx, fee).map_err(witness)?;
     Ok(fee)
 }
 
@@ -1066,6 +1337,7 @@ pub fn validate_tx_in_block_with_maturity(
         .collect();
     let view: &storage::Storage = store;
     validate_tx_in_view(tx, view, &earlier, spent_in_block, current_height, same_block_coinbase.as_ref())
+        .map_err(|f| f.reason)
 }
 
 /// Standalone tx validation (no mempool context): the shared admission rules

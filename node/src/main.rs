@@ -940,7 +940,7 @@ async fn main() {
                         let d = dag2.read();
                         frontier2.lock().to_request_capped(
                             &advertised,
-                            |h| d.has_block(h) || orphans.contains(h),
+                            |h| accept::is_known_block_in(&d, &store2, h) || orphans.contains(h),
                             now,
                             sync::frontier::MAX_NEW_TIPS_PER_RESPONSE,
                         )
@@ -963,7 +963,7 @@ async fn main() {
                     let missing: Vec<[u8; 32]> = {
                         let d = dag2.read();
                         entries.iter()
-                            .filter(|e| !d.has_block(&e.hash) && !orphans.contains(&e.hash))
+                            .filter(|e| !accept::is_known_block_in(&d, &store2, &e.hash) && !orphans.contains(&e.hash))
                             .map(|e| e.hash).collect()
                     };
                     if !missing.is_empty() {
@@ -1012,7 +1012,11 @@ async fn main() {
                 network::NetworkMessage::NewBlock { block_data, block_hash, height, .. } => {
                     let now = std::time::Instant::now();
                     let verdict: network::GossipVerdict = 'blk: {
-                        if dag2.read().has_block(&block_hash) || orphans.contains(&block_hash) {
+                        // A block in the DAG that waits for a body (its stored
+                        // body failed a witness-dependent rule below the
+                        // hardening activation) is NOT known: this copy may be
+                        // the honest one (`accept::awaits_body`).
+                        if accept::is_known_block(&dag2, &store2, &block_hash) || orphans.contains(&block_hash) {
                             break 'blk network::GossipVerdict::Ignore;
                         }
                         let tip_h = selected_tip_height(&dag2);
@@ -1198,6 +1202,10 @@ async fn main() {
                         }
                     };
                     report_verdict(&vtx2, &origin, verdict);
+                    // A body rejected for a witness-dependent reason (or found
+                    // missing) during this acceptance: ask peers for another
+                    // copy now; the orphan sweep retries with backoff.
+                    request_awaited_bodies(&dag2, &mut parent_fetch, &otx2).await;
                 }
 
                 // Local heartbeat only: a PeerCount from a peer would let it set
@@ -1829,7 +1837,9 @@ fn make_rpc_submit_block_cb(
 ) -> Arc<rpc::SubmitBlockFn> {
     Arc::new(move |block: core::Block| -> Result<String, String> {
         let block_hash = block.block_hash();
-        if dag.read().has_block(&block_hash) {
+        // A block waiting for a body (witness-dependent failure of its
+        // previous body) is not a duplicate: this copy is re-evaluated.
+        if accept::is_known_block(&dag, &store, &block_hash) {
             // DAG-1: a disqualified block stays in the DAG; tell the
             // submitter it is invalid rather than merely a duplicate.
             if dag.read().is_invalid(&block_hash) {
@@ -2082,6 +2092,14 @@ async fn sweep_orphan_parents(
                 chased.push(p);
             }
         }
+        // Blocks in the DAG waiting for a body (a witness-dependent failure
+        // below the hardening activation dropped theirs): fetched like a
+        // missing parent until a body arrives.
+        for h in d.body_pending_blocks() {
+            if !chased.contains(&h) {
+                chased.push(h);
+            }
+        }
         (ready, chased)
     };
     let (retry, give_up) = parent_fetch.sweep(&chased, now);
@@ -2109,6 +2127,30 @@ async fn sweep_orphan_parents(
 /// becomes fetchable, it re-enters the pool.
 fn drop_orphan_subtree(root_parent: [u8; 32], orphans: &mut ingress::OrphanPool) -> usize {
     orphans.drop_subtree(&root_parent)
+}
+
+/// Ask peers for the body of every block that waits for one (its stored body
+/// failed a rule that depends on witness bytes the block id does not commit
+/// to, or is missing — `GhostDAG::mark_body_pending`) and is not already
+/// being fetched. Reuses the missing-parent machinery: the request is tracked
+/// by `parent_fetch`, so the periodic sweep retries it with backoff (from
+/// another peer, `PullPeerSelector`) and the backfill guard admits the
+/// solicited answer even when it is deep below the tip. NOT consensus.
+async fn request_awaited_bodies(
+    dag:          &Arc<RwLock<consensus::GhostDAG>>,
+    parent_fetch: &mut sync::parent_fetch::ParentFetchTracker,
+    otx:          &tokio::sync::mpsc::Sender<network::NetworkMessage>,
+) {
+    let wanted: Vec<[u8; 32]> = dag.read().body_pending_blocks().into_iter()
+        .filter(|h| !parent_fetch.is_awaited(h))
+        .collect();
+    let now = std::time::Instant::now();
+    for h in wanted {
+        info!("requesting another body of block {} (its previous body was rejected or is missing)",
+            hex::encode(&h[..8]));
+        parent_fetch.note_requested(h, now);
+        let _ = otx.send(network::NetworkMessage::GetBlock { block_hash: h, nonce: getblock_nonce() }).await;
+    }
 }
 
 #[cfg(test)]
@@ -2253,6 +2295,47 @@ mod ingress_processor_tests {
             Arc::new(parking_lot::Mutex::new(sync::frontier::FrontierState::new())),
             Arc::new(RwLock::new(rpc::NodeState::default())),
         )
+    }
+
+    /// A block whose body was rejected for a witness-dependent reason (below
+    /// the hardening activation) waits for another body: the processor asks
+    /// peers for it at once through the missing-parent tracker (so the
+    /// backfill guard admits the solicited answer), does not ask twice, and
+    /// the periodic sweep chases it like a missing parent.
+    #[tokio::test]
+    async fn blocks_waiting_for_a_body_are_requested_and_swept() {
+        let (dag, _, _, _) = release_fixture();
+        let waiting = [0xB0u8; 32];
+        dag.write().add_block(waiting, vec![[0xAA; 32]], 1_001, 1).expect("child of genesis");
+        dag.write().mark_body_pending(waiting, Some([0x11; 32]));
+        let (otx, mut orx) = tokio::sync::mpsc::channel::<network::NetworkMessage>(8);
+
+        let mut tracker = sync::parent_fetch::ParentFetchTracker::new();
+        request_awaited_bodies(&dag, &mut tracker, &otx).await;
+        match orx.try_recv() {
+            Ok(network::NetworkMessage::GetBlock { block_hash, .. }) => assert_eq!(block_hash, waiting),
+            other => panic!("expected a GetBlock, got {:?}", other.map(|_| "another message")),
+        }
+        assert!(tracker.is_awaited(&waiting), "tracked: the backfill guard admits the answer");
+        request_awaited_bodies(&dag, &mut tracker, &otx).await;
+        assert!(orx.try_recv().is_err(), "already being fetched: no duplicate request");
+
+        // The sweep (a fresh tracker, e.g. after the record was given up on)
+        // re-requests it although no orphan waits for it.
+        let mut fresh = sync::parent_fetch::ParentFetchTracker::new();
+        let mut orphans = ingress::OrphanPool::default();
+        sweep_orphan_parents(&mut orphans, &mut fresh, &dag, &otx).await;
+        match orx.try_recv() {
+            Ok(network::NetworkMessage::GetBlock { block_hash, .. }) => assert_eq!(block_hash, waiting),
+            other => panic!("expected a GetBlock from the sweep, got {:?}", other.map(|_| "another message")),
+        }
+
+        // Once a body is accepted the block no longer waits: nothing to chase.
+        dag.write().clear_body_pending(&waiting);
+        let mut fresh = sync::parent_fetch::ParentFetchTracker::new();
+        sweep_orphan_parents(&mut orphans, &mut fresh, &dag, &otx).await;
+        request_awaited_bodies(&dag, &mut fresh, &otx).await;
+        assert!(orx.try_recv().is_err());
     }
 
     /// NET-6: an inflated tip claim (even u64::MAX from a connected peer) can

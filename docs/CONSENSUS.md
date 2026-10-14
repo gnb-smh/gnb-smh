@@ -101,7 +101,9 @@ obtain from a future timestamp to about 6%.
 
 `accept_block` runs the cheap checks first and the proof of work last:
 
-1. not already known; parents present in the DAG;
+1. not already known (a block in the DAG that waits for a body after a
+   witness-dependent failure below the activation is not "known"; see
+   "Coinbase commitment"); parents present in the DAG;
 2. height = max parent height + 1;
 3. `bits == expected_bits(parents, height)`;
 4. timestamp bounds;
@@ -428,6 +430,42 @@ block is stored, and before any signature work. A copy whose witnesses were
 altered in transit is therefore refused without being stored or marked
 invalid, and the honest copy of the same id is still accepted. Making the
 witness encoding itself canonical is a separate rule (package P2).
+
+**Below the activation (node-local, all heights of the old rules).** The
+blocks below the activation (109,999 on mainnet) stay malleable forever, so a
+node must not let a mutated copy disqualify their ids. This is node policy,
+not a consensus rule: it changes no verdict, only what a node remembers. A
+connect-time failure of a block below the activation is classified by what it
+depends on (`accept::BlockInvalidity::witness_dependent`):
+
+- witness-dependent: a non-coinbase `script_sig` that does not parse, a public
+  key that does not hash to the prevout's `script_pubkey` (the key lives in
+  the `script_sig`), a signature that does not verify, and the consensus
+  minimum fee (measured on the wire size, `script_sig` included). Size limits
+  measured with witnesses are context-free and checked before a block is
+  stored, so they never reach this point;
+- id-committed: everything else (missing or double-spent inputs, coinbase
+  maturity, values and MoneyRange, coinbase value, shielded state, and at/after
+  the activation BIP30 and the same-block coinbase spend).
+
+An id-committed failure disqualifies the block and its selected-chain
+descendants and is persisted (`invalid_block/<id>`), as before. A
+witness-dependent failure does not: the stored body is deleted (so it is no
+longer served to peers), nothing is persisted, and the block, with its
+selected-chain descendants, waits in memory for another body
+(`GhostDAG::mark_body_pending`); the next-best chain is used meanwhile. Every
+ingress path (gossip, directed pulls, header sync, `submitblock`) treats such
+a block as not yet known (`accept::is_known_block`), the message processor
+requests its body from peers through the missing-parent fetch tracker (retried
+by the periodic sweep), and `accept_block` takes a copy of the same id whose
+witness root differs from every body already rejected for it: the copy passes
+the same acceptance checks as a new block, replaces the body, and the chain is
+re-evaluated. A block in the DAG whose body is missing (for example after a
+restart) is treated the same way. At/after the activation the witness
+commitment fixes every byte of a stored body, so every connect-time failure is
+id-committed and is persisted as before. `node/tests/fix_block_rules.rs`
+(`witness_corrupted_*`) covers the corrupted-then-honest order, restarts, and
+a corrupted fork-loser whose branch later becomes the heaviest.
 
 **Uniqueness of coinbase txids (VAL-2).** The header height alone does NOT
 make coinbases unique on GnB. The header height is `max(parent DAG heights) +

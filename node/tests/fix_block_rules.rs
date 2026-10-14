@@ -788,3 +788,294 @@ fn templates_at_h_minus_1_and_h_are_accepted_by_the_real_pipeline() {
         assert_eq!(n.mempool.size(), 0);
     }
 }
+
+// ── Pre-activation witness mutation must not poison the block id ────────────
+//
+// Below the activation the block id commits to txids, which exclude
+// non-coinbase `script_sig`s, so a relay can change those bytes without
+// changing the id. A connect-time failure caused by such bytes (script parse,
+// pubkey hash, signature, the size-based minimum fee) must not disqualify the
+// id: the body is dropped, nothing is persisted, and a later copy of the same
+// id with a different body replaces it and is re-evaluated.
+
+/// One signed spend of `fund` paying `fee`, and the honest block carrying it.
+fn witness_fixture(n: &Node, k: &Key, fund: &([u8; 32], u32, TxOutput), fee: u64, parent: BlockHash,
+    pred: impl Fn(&BlockHash) -> bool) -> Block
+{
+    let tx = signed_spend(k, &[(fund.0, fund.1)], vec![out(fund.2.value - fee, &[0x9A; 20])]);
+    let h = n.dag.read().get_block_data(&parent).unwrap().height + 1;
+    build_where(n, vec![parent], vec![coinbase("witness", subsidy(h) + fee, vec![0x9B; 20]), tx], pred)
+}
+
+/// The block left waiting for another body: in the DAG, body dropped, no
+/// persisted mark, not offered as known to the ingress paths.
+fn assert_waits_for_body(n: &Node, id: &BlockHash) {
+    let d = n.dag.read();
+    assert!(d.has_block(id), "the id stays known to the DAG");
+    assert!(d.is_body_pending(id), "waiting for another body");
+    assert!(d.is_invalid(id), "never selected while waiting");
+    assert!(!d.is_invalid_persistently(id), "not disqualified");
+    drop(d);
+    assert!(n.store.get_block(id).unwrap().is_none(), "the rejected body is dropped (never served)");
+    assert!(n.store.invalid_block_reason(id).unwrap().is_none(), "no persisted invalid mark");
+    assert!(n.store.load_invalid_blocks().unwrap().is_empty());
+    assert!(pipeline::awaits_body(&n.dag, &n.store, id));
+    assert!(!pipeline::is_known_block(&n.dag, &n.store, id), "gossip/pull/RPC dedup lets a new copy in");
+}
+
+/// The finding's attack, for every witness-dependent rule: a node first
+/// receives a copy whose non-coinbase `script_sig` was altered in transit
+/// (same block id), then the honest copy. It ends on the honest block, and a
+/// child of it connects. The same corrupted body is refused cheaply when
+/// re-delivered.
+#[test]
+fn witness_corrupted_copy_then_honest_copy_ends_on_the_honest_block() {
+    let _g = activation::scoped_override(activation::NEVER);
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0xA1u8; 32], 0u32, out(5_000_000, &k.spk));
+    // A fee just above the consensus minimum of the honest size, so padding
+    // the witness drops it below the minimum.
+    let probe = signed_spend(&k, &[(fund.0, 0)], vec![out(4_000_000, &[0x9A; 20])]);
+    let honest_size = probe.to_wire_bytes(true).len();
+    let fee = core::tokenomics::min_tx_fee_sat(honest_size) + 500;
+    assert!(fee < core::tokenomics::min_tx_fee_sat(honest_size + 1_000));
+
+    type Corrupt = fn(&mut Vec<u8>);
+    let corruptions: [(&str, Corrupt, &str); 4] = [
+        ("signature byte flipped", |ss| ss[100] ^= 0x01, "invalid signature"),
+        ("public key byte flipped", |ss| { let i = ss.len() - 10; ss[i] ^= 0x01 }, "pubkey mismatch"),
+        ("script_sig truncated", |ss| ss.truncate(6), "malformed script_sig"),
+        ("witness padded past the minimum fee", |ss| ss.extend_from_slice(&[0u8; 1_000]), "below consensus minimum"),
+    ];
+    for (what, corrupt, expect) in corruptions {
+        let n = node_with(&genesis, std::slice::from_ref(&fund));
+        let honest = witness_fixture(&n, &k, &fund, fee, gh, |_| true);
+        let id = honest.block_hash();
+        let mut bad = honest.clone();
+        corrupt(&mut bad.transactions[1].inputs[0].script_sig);
+        assert_eq!(bad.block_hash(), id, "{what}: same block id");
+        assert_ne!(block_rules::witness_root(&bad.transactions), block_rules::witness_root(&honest.transactions));
+
+        let err = accept(&n, &bad).expect_err(what);
+        assert!(err.contains("body rejected") && err.contains(expect), "{what}: {err}");
+        assert_waits_for_body(&n, &id);
+        assert_eq!(sel_tip(&n), Some(gh));
+        assert_eq!(applied_tip(&n), Some(gh));
+        assert!(n.store.get_utxo(&fund.0, 0).unwrap().is_some(), "{what}: no UTXO effect");
+
+        let again = accept(&n, &bad).expect_err("the same rejected body again");
+        assert!(again.contains("already rejected"), "{what}: {again}");
+
+        accept(&n, &honest).unwrap_or_else(|e| panic!("{what}: the honest copy: {e}"));
+        assert_eq!(sel_tip(&n), Some(id), "{what}");
+        assert_eq!(applied_tip(&n), Some(id), "{what}");
+        assert!(!n.dag.read().is_invalid(&id) && !n.dag.read().is_body_pending(&id));
+        assert_eq!(n.store.get_block(&id).unwrap().map(|b| b.to_wire_bytes()), Some(honest.to_wire_bytes()),
+            "{what}: the honest body is stored");
+        assert!(n.store.get_utxo(&honest.transactions[1].txid(), 0).unwrap().is_some());
+        assert!(n.store.get_utxo(&fund.0, 0).unwrap().is_none());
+        assert!(n.store.load_invalid_blocks().unwrap().is_empty(), "{what}: nothing was ever persisted");
+        let again = accept(&n, &honest).expect_err("now a plain duplicate");
+        assert!(again.contains("already in DAG"), "{again}");
+
+        let child = empty_child(&n, id, "after-honest");
+        accept(&n, &child).expect("a child of the honest block connects");
+        assert_eq!(applied_tip(&n), Some(child.block_hash()));
+    }
+}
+
+/// The same attack across restarts: the corrupted copy arrives, the node
+/// restarts (nothing was persisted, the dropped body is found missing and the
+/// block waits again), the honest copy is accepted, and after another
+/// restart the node is still on the honest block.
+#[test]
+fn witness_corrupted_copy_then_restart_then_honest_copy() {
+    let _g = activation::scoped_override(activation::NEVER);
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0xA2u8; 32], 0u32, out(5_000_000, &k.spk));
+    let mut n = node_with(&genesis, std::slice::from_ref(&fund));
+    let honest = witness_fixture(&n, &k, &fund, 100_000, gh, |_| true);
+    let id = honest.block_hash();
+    let mut bad = honest.clone();
+    bad.transactions[1].inputs[0].script_sig[200] ^= 0x80;
+    assert_eq!(bad.block_hash(), id);
+    accept(&n, &bad).expect_err("signature-corrupted copy");
+    assert_waits_for_body(&n, &id);
+
+    restart(&mut n);
+    assert!(n.dag.read().has_block(&id), "the DAG record survives");
+    assert_eq!(sel_tip(&n), Some(gh), "a block without a body is never selected");
+    assert_eq!(applied_tip(&n), Some(gh));
+    assert!(n.dag.read().is_body_pending(&id), "start-up found the body missing: waits again");
+    assert!(pipeline::awaits_body(&n.dag, &n.store, &id));
+    assert!(!pipeline::is_known_block(&n.dag, &n.store, &id));
+    assert!(n.store.load_invalid_blocks().unwrap().is_empty());
+
+    accept(&n, &honest).expect("the honest copy after the restart");
+    assert_eq!(applied_tip(&n), Some(id));
+    assert!(n.store.get_utxo(&honest.transactions[1].txid(), 0).unwrap().is_some());
+
+    restart(&mut n);
+    assert_eq!(sel_tip(&n), Some(id));
+    assert_eq!(applied_tip(&n), Some(id));
+    assert!(!n.dag.read().is_invalid(&id));
+    let child = empty_child(&n, id, "after-restart");
+    accept(&n, &child).expect("the chain grows on the honest block");
+    assert_eq!(applied_tip(&n), Some(child.block_hash()));
+}
+
+/// The corrupted copy arrives as a fork-loser (stored, not evaluated); a
+/// child makes its branch the heaviest, the corrupted body fails, and the
+/// branch WAITS instead of being disqualified: the child is accepted into
+/// the DAG, the old tip stays applied, nothing is persisted. A second child
+/// arriving meanwhile also waits. When the honest body arrives the branch is
+/// re-evaluated and connected by reorg, also after a restart.
+#[test]
+fn witness_corrupted_fork_loser_waits_and_reorgs_once_the_honest_body_arrives() {
+    let _g = activation::scoped_override(activation::NEVER);
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0xA3u8; 32], 0u32, out(5_000_000, &k.spk));
+    let mut n = node_with(&genesis, std::slice::from_ref(&fund));
+    let m1 = empty_child(&n, gh, "main-1");
+    accept(&n, &m1).unwrap();
+    let honest = witness_fixture(&n, &k, &fund, 100_000, gh, |h| *h < m1.block_hash());
+    let f = honest.block_hash();
+    let mut bad = honest.clone();
+    bad.transactions[1].inputs[0].script_sig[300] ^= 0x04;
+    accept(&n, &bad).expect("a fork-loser is stored without evaluation");
+    assert_eq!(applied_tip(&n), Some(m1.block_hash()));
+
+    let g = empty_child(&n, f, "fork-child");
+    accept(&n, &g).expect("the child waits for its ancestor's body; it is not disqualified");
+    assert_waits_for_body(&n, &f);
+    assert!(n.dag.read().is_invalid(&g.block_hash()) && !n.dag.read().is_invalid_persistently(&g.block_hash()));
+    assert_eq!(sel_tip(&n), Some(m1.block_hash()));
+    assert_eq!(applied_tip(&n), Some(m1.block_hash()), "the old tip stays applied");
+    assert!(n.store.get_utxo(&fund.0, 0).unwrap().is_some());
+
+    let g2 = empty_child(&n, g.block_hash(), "fork-grandchild");
+    accept(&n, &g2).expect("a later descendant waits too");
+    assert!(n.store.load_invalid_blocks().unwrap().is_empty(), "nothing persisted for the waiting branch");
+
+    restart(&mut n);
+    assert_eq!(applied_tip(&n), Some(m1.block_hash()));
+    assert!(n.dag.read().is_body_pending(&f), "re-derived at start-up from the missing body");
+
+    accept(&n, &honest).expect("the honest body of F");
+    assert_eq!(sel_tip(&n), Some(g2.block_hash()));
+    assert_eq!(applied_tip(&n), Some(g2.block_hash()), "reorg onto the honest branch");
+    assert!(n.store.get_utxo(&fund.0, 0).unwrap().is_none());
+    assert!(n.store.get_utxo(&honest.transactions[1].txid(), 0).unwrap().is_some());
+    assert!(n.store.get_utxo(&m1.transactions[0].txid(), 0).unwrap().is_none(), "main-1 rolled back");
+    restart(&mut n);
+    assert_eq!(applied_tip(&n), Some(g2.block_hash()));
+}
+
+/// Failures the block id commits to stay persisted exactly as before: below
+/// the activation a spend of a missing coin; at/after it, an invalid
+/// signature too, because the witness commitment (checked before the block
+/// is stored) fixes every byte of the body.
+#[test]
+fn id_committed_failures_are_still_persisted_on_both_sides_of_the_activation() {
+    // Below: a spend of a coin that does not exist (txid-committed).
+    {
+        let _g = activation::scoped_override(activation::NEVER);
+        let genesis = mk_genesis(unix_now() - 10_000);
+        let gh = genesis.block_hash();
+        let k = key();
+        let n = node_with(&genesis, &[]);
+        let ghost = signed_spend(&k, &[([0xEEu8; 32], 0)], vec![out(1_000_000, &[0x01; 20])]);
+        let b = build(&n, vec![gh], vec![coinbase("ghost", subsidy(1), vec![0x9C; 20]), ghost]);
+        let err = accept(&n, &b).unwrap_err();
+        assert!(err.contains("not found") && err.contains("invalid in its own chain context"), "{err}");
+        assert!(n.dag.read().is_invalid_persistently(&b.block_hash()));
+        assert!(!n.dag.read().is_body_pending(&b.block_hash()));
+        assert!(n.store.invalid_block_reason(&b.block_hash()).unwrap().is_some(), "persisted as before");
+        assert!(n.store.get_block(&b.block_hash()).unwrap().is_some(), "body kept as before");
+    }
+    // At/after: a block whose own miner committed to a bad signature.
+    {
+        let _g = activation::scoped_override(0);
+        let genesis = mk_genesis(unix_now() - 10_000);
+        let gh = genesis.block_hash();
+        let k = key();
+        let fund = ([0xA4u8; 32], 0u32, out(5_000_000, &k.spk));
+        let n = node_with(&genesis, std::slice::from_ref(&fund));
+        let mut tx = signed_spend(&k, &[(fund.0, 0)], vec![out(4_900_000, &[0x9A; 20])]);
+        tx.inputs[0].script_sig[100] ^= 0x01;
+        let b = build(&n, vec![gh], vec![coinbase("committed-bad-sig", subsidy(1) + 100_000, vec![0x9D; 20]), tx]);
+        assert_eq!(block_rules::check_block_hardened_at(&b, 0), Ok(()), "the commitment covers the bad witness");
+        let err = accept(&n, &b).unwrap_err();
+        assert!(err.contains("invalid signature") && err.contains("invalid in its own chain context"), "{err}");
+        assert!(n.dag.read().is_invalid_persistently(&b.block_hash()));
+        assert!(!n.dag.read().is_body_pending(&b.block_hash()));
+        assert!(n.store.invalid_block_reason(&b.block_hash()).unwrap().is_some());
+        let again = accept(&n, &b).unwrap_err();
+        assert!(again.contains("already in DAG"), "{again}");
+    }
+}
+
+/// The classification behind the pipeline, on `validate_block_in_view`'s
+/// own terms: the same signature failure is witness-dependent below the
+/// activation and id-committed at/after it; the verdict is unchanged.
+#[test]
+fn connect_failures_are_classified_by_what_the_block_id_commits_to() {
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0xA5u8; 32], 0u32, out(5_000_000, &k.spk));
+    let n = node_with(&genesis, std::slice::from_ref(&fund));
+    let mut tx = signed_spend(&k, &[(fund.0, 0)], vec![out(4_900_000, &[0x9A; 20])]);
+    tx.inputs[0].script_sig[100] ^= 0x01;
+    let txs = vec![coinbase("classify", subsidy(1) + 100_000, vec![0x9E; 20]), tx];
+    let mut b = raw_block(&n, vec![gh], txs);
+    b.header.merkle_root = b.body_merkle_root_at(activation::NEVER);
+    let view: &Storage = &n.store;
+    let below = pipeline::validate_block_in_view_classified_at(view, &b, activation::NEVER).unwrap_err();
+    assert!(below.witness_dependent && below.reason.contains("invalid signature"), "{below:?}");
+    let at = pipeline::validate_block_in_view_classified_at(view, &b, 1).unwrap_err();
+    assert!(!at.witness_dependent && at.reason.contains("invalid signature"), "{at:?}");
+    assert_eq!(pipeline::validate_block_in_view_at(view, &b, activation::NEVER).unwrap_err(), below.reason);
+    // An over-claiming coinbase is id-committed on both sides.
+    let mut over = raw_block(&n, vec![gh], vec![coinbase("over", subsidy(1) + 1, vec![0x9F; 20])]);
+    over.header.merkle_root = over.body_merkle_root_at(activation::NEVER);
+    let e = pipeline::validate_block_in_view_classified_at(view, &over, activation::NEVER).unwrap_err();
+    assert!(!e.witness_dependent, "{e:?}");
+}
+
+/// GhostDAG bookkeeping behind the fix: a body-pending root disqualifies its
+/// selected-chain descendants in memory only; clearing it re-derives the set
+/// from the remaining roots (a persistent mark below is kept), and a block
+/// arriving under a waiting parent waits too.
+#[test]
+fn body_pending_marks_are_in_memory_roots_that_clear_cleanly() {
+    let mut dag = gnb::consensus::GhostDAG::with_default_k();
+    let g = [0x01u8; 32];
+    dag.add_genesis(g, 1_000);
+    let a = [0x0Au8; 32];
+    let b = [0x0Bu8; 32];
+    let c = [0x0Cu8; 32];
+    let x = [0x0Du8; 32];
+    dag.add_block(a, vec![g], 1_001, 1).unwrap();
+    dag.add_block(b, vec![a], 1_002, 1).unwrap();
+    dag.add_block(x, vec![g], 1_001, 1).unwrap();
+    let marked = dag.mark_body_pending(a, Some([0x77; 32]));
+    assert_eq!(marked.len(), 2, "a and its selected child b");
+    assert!(dag.is_invalid(&b) && !dag.is_invalid_persistently(&b));
+    assert!(dag.body_rejected_before(&a, &[0x77; 32]) && !dag.body_rejected_before(&a, &[0x78; 32]));
+    dag.add_block(c, vec![b], 1_003, 1).unwrap();
+    assert!(dag.is_invalid(&c) && !dag.is_invalid_persistently(&c), "a later arrival waits too");
+    dag.mark_invalid(x);
+    assert!(dag.is_invalid_persistently(&x));
+    assert!(dag.clear_body_pending(&a));
+    assert!(!dag.is_invalid(&a) && !dag.is_invalid(&b) && !dag.is_invalid(&c));
+    assert!(dag.is_invalid(&x), "persistent marks survive the recompute");
+    assert!(!dag.clear_body_pending(&a), "nothing left to clear");
+    assert_eq!(dag.selected_tip().map(|t| t == c), Some(true));
+}
