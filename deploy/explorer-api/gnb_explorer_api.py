@@ -94,6 +94,7 @@ ADDRESS = _re(ADDR, "gnb1q/gnb1t address")
 U32 = _int(0, 2**32 - 1)
 PAGE = _int(1, 100)
 OFFSET = _int(0, 10**9)
+RICH_OFFSET = _int(0, 10_000)
 
 # method -> (list of parameter checkers, cache seconds)
 ALLOWED = {
@@ -117,7 +118,9 @@ ALLOWED = {
     "getaddresshistory":       ([ADDRESS, PAGE, OFFSET], 5),
     "getbalance":              ([ADDRESS], 5),
     "getutxos":                ([ADDRESS, _int(1, 50)], 2),
-    "getrichlist":             ([PAGE, OFFSET], 60),
+    # NET-12: served from the node's incremental holder index; the node
+    # serves offsets up to analytics::MAX_RICHLIST_OFFSET = 10,000.
+    "getrichlist":             ([PAGE, RICH_OFFSET], 60),
     "getsupplydistribution":   ([], 60),
     "validateaddress":         ([_re(re.compile(r"^.{1,80}$"), "string")], 60),
 }

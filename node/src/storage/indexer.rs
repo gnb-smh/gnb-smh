@@ -36,6 +36,7 @@ pub struct AddrHistoryEntry {
     pub amount:    u64,
 }
 
+#[allow(dead_code)] // library API (the RPC streams balances since NET-12)
 impl AddrHistoryEntry {
     pub fn is_incoming(&self) -> bool { self.direction == DIR_OUT }
     pub fn is_outgoing(&self) -> bool { self.direction == DIR_IN }
@@ -325,17 +326,53 @@ impl Storage {
 
     /// Compute balance at a specific height by replaying the address history.
     /// balance(height) = sum(received up to height) - sum(spent up to height)
+    #[allow(dead_code)] // library API; the RPC uses the cancellable form
     pub fn balance_at_height(&self, addr_hash: &[u8; 20], height: u64) -> Result<u64, StorageError> {
-        let entries = self.query_address_history(addr_hash, 0, height, usize::MAX, 0)?;
+        self.balance_at_height_cancellable(addr_hash, height, &std::sync::atomic::AtomicBool::new(false))
+            .map(|(b, _)| b)
+    }
+
+    /// NET-12: [`Self::balance_at_height`] that streams the history (no
+    /// collected vector) and checks `cancel` on every entry, so an aborted
+    /// heavy RPC stops instead of finishing a long walk in the background.
+    /// Returns `(balance, entries replayed)`.
+    pub fn balance_at_height_cancellable(
+        &self,
+        addr_hash: &[u8; 20],
+        height: u64,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(u64, u64), StorageError> {
+        let cf = self.db.cf_handle(CF_ADDR_TX_HISTORY)
+            .ok_or_else(|| StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
+        let mut lower = Vec::with_capacity(36);
+        lower.extend_from_slice(addr_hash);
+        lower.extend_from_slice(&0u64.to_be_bytes());
+        lower.extend_from_slice(&[0u8; 8]);
+        let mut upper = Vec::with_capacity(36);
+        upper.extend_from_slice(addr_hash);
+        upper.extend_from_slice(&height.saturating_add(1).to_be_bytes());
+        upper.extend_from_slice(&[0u8; 8]);
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_iterate_upper_bound(upper);
+        let iter = self.db.iterator_cf_opt(&cf, read_opts, IteratorMode::From(&lower, rocksdb::Direction::Forward));
         let mut balance: i128 = 0;
-        for e in entries.iter() {
-            if e.is_incoming() {
-                balance += e.amount as i128;
-            } else {
-                balance -= e.amount as i128;
+        let mut entries = 0u64;
+        for item in iter {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(super::aggregates::cancelled());
+            }
+            self.note_reads(1);
+            let (key, value) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            if key.len() < 20 || &key[..20] != addr_hash { break; }
+            if let (Some(_), Some((_, dir, amt))) = (parse_key(&key), parse_value(&value)) {
+                entries += 1;
+                if dir == DIR_OUT {
+                    balance += amt as i128;
+                } else {
+                    balance -= amt as i128;
+                }
             }
         }
-        if balance < 0 { return Ok(0); }
-        Ok(balance as u64)
+        Ok((balance.clamp(0, u64::MAX as i128) as u64, entries))
     }
 }

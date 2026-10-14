@@ -807,6 +807,15 @@ pub fn reconcile_on_startup(
     let _guard = store.acceptance_lock();
     ensure_invalid_set_loaded(dag, store);
 
+    // NET-12: a database written before the explorer aggregates existed gets
+    // them built once, from scratch (later connects keep them current in the
+    // same batches as the UTXO changes).
+    match store.ensure_aggregates() {
+        Ok(true) => info!("NET-12: explorer aggregates rebuilt from the UTXO set and undo records"),
+        Ok(false) => {}
+        Err(e) => error!("NET-12: explorer aggregates could not be rebuilt: {} (explorer statistics stay unavailable)", e),
+    }
+
     // Step 2: applied-but-unrecorded blocks.
     let mut orphan_applied: Vec<(u64, BlockHash)> = Vec::new();
     for h in store.undo_block_hashes().map_err(|e| e.to_string())? {

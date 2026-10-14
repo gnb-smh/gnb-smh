@@ -7,6 +7,7 @@ import http.client
 import importlib.util
 import json
 import os
+import re
 import socket
 import stat
 import tempfile
@@ -72,6 +73,33 @@ class ExplorerApiTests(unittest.TestCase):
         self.assertEqual(status, 400)
         status, _ = self.server.get("/v1/getdifficultyhistory?p=[500]")
         self.assertEqual(status, 400, "the node caps difficulty history at 100")
+
+    def test_allow_list_matches_the_node_rpc(self):
+        """Audit P4 / NET-12: every allowed method exists in the node's RPC
+        dispatcher (KNOWN_RPC_METHODS), the Worker's cache table names no
+        method the API does not serve, and the rich-list offset bound is the
+        node's MAX_RICHLIST_OFFSET."""
+        root = os.path.dirname(os.path.dirname(HERE))
+        with open(os.path.join(root, "node", "src", "rpc", "mod.rs"), encoding="utf-8") as fh:
+            src = fh.read()
+        block = src[src.index("const KNOWN_RPC_METHODS"):]
+        block = block[:block.index("];")]
+        known = set(re.findall(r'"([a-z_]+)"', block))
+        self.assertTrue(set(api.ALLOWED) <= known, sorted(set(api.ALLOWED) - known))
+        with open(os.path.join(root, "worker", "index.js"), encoding="utf-8") as fh:
+            worker = fh.read()
+        ttl = worker[worker.index("const TTL = {"):]
+        ttl = ttl[:ttl.index("};")]
+        cached = set(re.findall(r"([a-z]+):\s*\d+", ttl))
+        self.assertTrue(cached <= set(api.ALLOWED) | {"carryover"}, sorted(cached - set(api.ALLOWED)))
+        with open(os.path.join(root, "node", "src", "analytics", "mod.rs"), encoding="utf-8") as fh:
+            m = re.search(r"pub const MAX_RICHLIST_OFFSET: usize = ([0-9_]+);", fh.read())
+        node_max = int(m.group(1).replace("_", ""))
+        self.assertEqual(api.ALLOWED["getrichlist"][0][1](node_max), node_max)
+        with self.assertRaises(ValueError):
+            api.ALLOWED["getrichlist"][0][1](node_max + 1)
+        status, _ = self.server.get("/v1/getrichlist?p=[100,10001]")
+        self.assertEqual(status, 400)
 
     def test_idle_connection_is_closed_by_the_handler_timeout(self):
         s = socket.create_connection(("127.0.0.1", self.server.port), timeout=10)
