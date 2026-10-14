@@ -45,6 +45,7 @@ H(label, data) = SHAKE256(enc("GNB-LEDGER-v1/" || label) || data, 32)
 | `txnode`, `txroot` | | transaction tree |
 | `state` | utxo_root ‖ nullifier_root | state commitment in the header |
 | `block` | header ‖ u64le(nonce) | block id |
+| `witness` | witness bundle bytes | `witness_root` in the header |
 | `test-owner` | secret | test-only authorization |
 
 ## 3. State tree
@@ -77,7 +78,7 @@ that commitment goes.
 
 ```
 tx_bytes = u32le(1) || u8(kind)
-           || [kind = coinbase: u64le(height) || enc(extra)]
+           || [kind = coinbase: u64le(height) || parents_root[32] || enc(extra)]
            || u32le(n_in)  || (txid[32] || u32le(vout)) * n_in
            || u32le(n_out) || (u64le(amount) || owner[32]) * n_out
 wire     = tx_bytes || u32le(n_auth) || enc(auth_i) * n_auth
@@ -93,7 +94,12 @@ invalid):
 - A regular transaction has 1 to 1,024 distinct inputs, one authorization entry per input of at most
   16,384 bytes, and no coinbase fields.
 - The coinbase is the first transaction and only the first, has no inputs, at most 100 bytes of
-  `extra`, and carries the block height.
+  `extra`, and carries the block height and the header's `parents_root` (a regular transaction
+  carries neither). Two blocks can therefore share a coinbase, and with it the coinbase's output
+  keys, only if they are built on the same parent set at the same height and pay the same outputs
+  with the same `extra`: a choice of their own producer. Another miner cannot force a collision on
+  a block without mining a sibling block on the same parents that pays that block's payee exactly
+  (see open item 1 for the mergeset rule).
 - Per block: at most 65,536 transactions, at most 16,384 inputs plus outputs, at most 4,000,000 bytes
   of transactions.
 
@@ -103,10 +109,19 @@ ML-DSA-65 ‖ Falcon-1024 scheme over the txid. That rule is not specified yet (
 
 ## 5. Witness bundle and outcomes
 
-A block travels with a witness bundle. The header does not commit to it, because any full-state
-holder can rebuild it and a wrong one cannot make an invalid block pass. It lists one entry per
-transaction, regular transactions first in block order, then the coinbase. Every proof is checked
-against the root left by the previous operation.
+A block travels with a witness bundle, and the header commits to it:
+`witness_root = H(witness, bundle)`. It lists one entry per transaction, regular transactions first
+in block order, then the coinbase. Every proof is checked against the root left by the previous
+operation.
+
+The commitment bounds the work a bad bundle can cause. A bundle that does not hash to
+`witness_root` is rejected after one hash over its bytes, before any proof is checked (transient:
+fetch it again). A bundle that does hash to it but proves something false makes the block
+permanently invalid, so a node runs the proof checks of a block id (up to 16,384 witness checks,
+about 8.4 M Keccak-f permutations with the updates) to completion at most once, and every further
+attempt needs a new header with valid proof of work. Without the commitment a peer could resend
+the same header with a bundle whose last proof is wrong and make the node redo all of that work,
+without bound.
 
 | Tag | Entry | Proves |
 | --- | --- | --- |
@@ -127,13 +142,13 @@ is already taken, the entry can instead be a `REJECT_OUTPUT_EXISTS` proof, which
 invalid.
 
 Rejected transactions pay no fee but still cost witness checks. The per-block cap on inputs plus
-outputs bounds that cost at 16,384 witness checks per block.
+outputs bounds that cost at 16,384 witness checks per block, once per block id.
 
 ## 6. Header and validation order
 
 ```
-header = u32le(version) || parents_root[32] || tx_root[32] || state_commitment[32]
-         || u64le(timestamp) || target[32, big-endian]                        (140 bytes)
+header = u32le(version) || parents_root[32] || tx_root[32] || witness_root[32]
+         || state_commitment[32] || u64le(timestamp) || target[32, big-endian]   (172 bytes)
 tx_root = H(txroot, u32le(count) || top)   top = binary tree of H(txnode, l ‖ r) over wtxids,
                                            odd node promoted unchanged
 PoW     = GnB-SMH(header, nonce) < target
@@ -147,21 +162,23 @@ Validation runs in two stages, and every failure has a class:
 
 1. **Header** (cacheable per block id): length and version (`header`), 1 ≤ target ≤ max
    (`target`), GnB-SMH below target (`pow`).
-2. **Body**: the received transactions must hash to `tx_root` (`tx-root`); then come the block byte
-   limit and decoding (`isolation`), the isolation rules (`isolation`), the witness bundle
-   (`witness-format`, `noncanonical-proof`, `witness-mismatch`, `accept-invalid`,
-   `reject-invalid`), the coinbase claim (`coinbase`), and finally the state commitment
-   (`state-commitment`).
+2. **Body**: the received transactions must hash to `tx_root` (`tx-root`) and the received bundle
+   to `witness_root` (`witness-commitment`); then come the block byte limit and decoding
+   (`isolation`), the isolation rules (`isolation`, including the coinbase's height and
+   `parents_root`), the witness bundle (`witness-format`, `noncanonical-proof`,
+   `witness-mismatch`, `accept-invalid`, `reject-invalid`), the coinbase claim (`coinbase`), and
+   finally the state commitment (`state-commitment`).
 
 | Class | Codes | Meaning | Node action |
 | --- | --- | --- | --- |
-| Permanent | header, target, pow, isolation, coinbase, state-commitment | the committed block is invalid | mark the block id invalid |
-| Transient | tx-root, witness-format, noncanonical-proof, witness-mismatch, accept-invalid, reject-invalid | the body or witness received does not fit the header | penalize the peer, fetch again |
+| Permanent | header, target, pow, isolation, witness-format, noncanonical-proof, witness-mismatch, accept-invalid, reject-invalid, coinbase, state-commitment | the committed block (transactions and bundle) is invalid | mark the block id invalid |
+| Transient | tx-root, witness-commitment | the body or bundle received does not hash to the header's commitments | penalize the peer, fetch again |
 
-`coinbase` and `state-commitment` are reachable only after every regular outcome has been proven, so
-they cannot be triggered by a damaged witness. A header replayed with junk bodies costs no second
-GnB-SMH run if nodes cache the header verdict. Peers' oversized bodies should be cut at the network
-layer.
+A relayer cannot damage a block into a permanent verdict: any change to the transactions or the
+bundle fails one of the two hash checks first. A header replayed with junk bodies or bundles costs
+one hash per attempt and no second GnB-SMH run if nodes cache the header verdict. Peers' oversized
+bodies and bundles should be cut at the network layer (there is no consensus cap on the bundle's
+size yet; open item 6).
 
 ## 7. GhostDAG
 
@@ -208,8 +225,10 @@ store must compress single-leaf chains.
 ## 10. Open items
 
 1. **GhostDAG mergeset rules:** acceptance order, one coinbase per merged block, fee attribution, and
-   coinbase uniqueness. Two parallel blocks at the same height can produce identical coinbases, so
-   the coinbase must bind to the block's DAG position, as BIP34 bound it to height.
+   what happens to a merged block whose coinbase output keys are already taken. The coinbase now
+   binds to the block's height and `parents_root` (section 4), the DAG analogue of BIP34, so only
+   blocks on the same parent set paying identical outputs can collide; whether such a collision in
+   a mergeset forfeits the merged block's reward or invalidates the merging block is still open.
 2. **Authorization:** the hybrid ML-DSA-65 ‖ Falcon-1024 rule, its sighash, and its per-input
    encoding. Wallets and mempools must track outcomes by wtxid. A producer can include a copy of a
    user's transaction with garbage authorization; that copy is rejected without effect, and the
@@ -221,7 +240,8 @@ store must compress single-leaf chains.
 5. **Weight-cap anchor:** the GnB-SMH spec anchors its heavy-block cap to an FFG-finalized block,
    which does not exist without a committee. Proposed: anchor it to an objective point, such as the
    block's own selected-chain ancestor at a fixed depth.
-6. **Witness relay:** multiproofs that share upper tree levels across a block, and relay limits.
+6. **Witness relay:** multiproofs that share upper tree levels across a block, relay limits, and a
+   consensus cap on the bundle's size (it is committed and hashed in full before use).
 7. **Header sync cost:** a GnB-SMH header takes about 0.55 s to check, and the ledger does not change
    that. Options are FlyClient-style sampling, or proving header PoW inside the recursive STARK.
 8. **Recursive proof system:** choose between SP1 and Plonky3 over FRI. In-circuit hybrid

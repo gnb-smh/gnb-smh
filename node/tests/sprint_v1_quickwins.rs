@@ -1,5 +1,3 @@
-#![cfg(any())] // C8a: V1 emission curve test, disabled under V2 tokenomics.                   // The L-5 emission math invariant tested here was specific to                   // V1's 2381-BLOCH block reward + 14-halving deflation cap. V2                   // uses 1905 BLOCH initial + tail floor at halving 7. Equivalent                   // V2 coverage exists in src/core/tokenomics.rs unit tests                   // (12/12 passing). Kept on disk for git history reference.
-
 //! Sprint V.1 — quick-win audit remediations.
 //!
 //! This file pins regressions for the audit fixes bundled into Sprint V.1
@@ -9,11 +7,19 @@
 //!   - M-10 (gossipsub MessageId) — deterministic SHA-256 based IDs.
 //!   - L-1  (crypto::verify)      — returns `false` on parse failure
 //!                                   without panicking or crashing.
-//!   - L-5  (BLOCK_REWARD comment) — emission math sanity: `99 %` of
-//!                                   supply is reached near block
-//!                                   2,100,000 × 7 (halving 7), NOT
-//!                                   at 13 halvings as the audit draft
-//!                                   suggested.
+//!   - L-5  (emission curve)      — emission math sanity. Originally
+//!                                   written against Bloch V1's
+//!                                   `BLOCK_REWARD` / `MAX_SUPPLY`; ported
+//!                                   (2026-10 audit, test hygiene) to GnB's
+//!                                   monetary policy in `core::tokenomics`:
+//!                                   the same geometric-sum milestones (half
+//!                                   the mining allocation in the first
+//!                                   epoch, 99 % by halving 7, 99.99 % by
+//!                                   halving 14) checked against the
+//!                                   consensus subsidy functions.
+//!
+//! This file was compiled out (`#![cfg(any())]`) after Bloch's V2 tokenomics
+//! removed the V1 constants it referenced; it runs again since the port.
 //!
 //! M-9 (add_block Result) and H-5 (past_blue_set bound) are covered
 //! directly by the in-module `#[cfg(test)] mod tests` in
@@ -29,7 +35,10 @@
 //! brittle and the warn message itself would not be part of any
 //! stable contract.
 
-use gnb::core::{BLOCK_REWARD, HALVING_INTERVAL, MAX_SUPPLY};
+use gnb::core::tokenomics::{
+    block_subsidy_sat, issued_through_sat, HALVING_INTERVAL, INITIAL_SUBSIDY_SAT,
+    MINING_ALLOCATION_SAT,
+};
 use gnb::crypto;
 use sha2::{Digest, Sha256};
 
@@ -109,69 +118,68 @@ fn l1_verify_returns_false_when_empty() {
 
 // ─── L-5: emission curve math cross-check ─────────────────────────────────
 
-/// Cross-check the new `BLOCK_REWARD` comment against the closed-form
-/// emission formula: `total(n) = MAX_SUPPLY · (1 − 1/2^n)`.
-///
-/// The original audit suggested "~13 years to 99%" but the real 99 %
-/// point is at halving 7, which at 243 days per halving is ~4.7 years.
-/// This test fails if someone regresses the constants in a way that
-/// breaks the commented milestones.
+/// Mining subsidy issued by the first `n` halving epochs, from the closed-form
+/// geometric sum: sum_{k<n} (INITIAL_SUBSIDY >> k) * HALVING_INTERVAL, minus
+/// the genesis block, which pays nothing.
+fn total_mined_after_halvings(n: u32) -> u128 {
+    let mut total: u128 = 0;
+    for k in 0..n {
+        let reward = (INITIAL_SUBSIDY_SAT as u128) >> k; // integer halving
+        total += reward * (HALVING_INTERVAL as u128);
+    }
+    total - INITIAL_SUBSIDY_SAT as u128 // height 0 pays nothing
+}
+
+/// Cross-check the emission milestones against the consensus subsidy
+/// functions: the closed form equals `issued_through_sat` at halving
+/// boundaries; half the mining allocation is issued in the first epoch, 99 %
+/// by halving 7 and 99.99 % by halving 14.
 #[test]
 fn l5_emission_curve_reaches_99pct_by_halving_7() {
-    // Compute total supply mined after exactly N halvings using the
-    // discrete geometric sum: sum_{k=0..N} BLOCK_REWARD/2^k * HALVING_INTERVAL
-    fn total_mined_after_halvings(n: u32) -> u128 {
-        let mut total: u128 = 0;
-        for k in 0..n {
-            let reward = (BLOCK_REWARD as u128) >> k; // integer halving
-            total += reward * (HALVING_INTERVAL as u128);
-        }
-        total
+    let allocation = MINING_ALLOCATION_SAT as u128;
+    for n in [1u32, 2, 7, 14, 27] {
+        let height = n as u64 * HALVING_INTERVAL - 1;
+        assert_eq!(
+            total_mined_after_halvings(n),
+            issued_through_sat(height) as u128,
+            "closed form vs consensus issuance after {n} halvings"
+        );
     }
+    assert_eq!(block_subsidy_sat(HALVING_INTERVAL - 1), INITIAL_SUBSIDY_SAT);
+    assert_eq!(block_subsidy_sat(HALVING_INTERVAL), INITIAL_SUBSIDY_SAT >> 1);
 
-    let max_supply = MAX_SUPPLY as u128;
-
-    // After halving 1 (2.1M blocks): ~50 % of supply
+    // After halving 1 (one epoch): ~50 % of the mining allocation.
     let after_h1 = total_mined_after_halvings(1);
-    assert!(after_h1 >= max_supply * 49 / 100);
-    assert!(after_h1 <= max_supply * 51 / 100);
+    assert!(after_h1 >= allocation * 49 / 100);
+    assert!(after_h1 <= allocation * 51 / 100);
 
-    // After halving 7 (14.7M blocks): should be >= 99 % of supply
+    // After halving 7: >= 99 % of the mining allocation.
     let after_h7 = total_mined_after_halvings(7);
     assert!(
-        after_h7 >= max_supply * 99 / 100,
-        "after 7 halvings we should have mined >= 99% of max supply; \
+        after_h7 >= allocation * 99 / 100,
+        "after 7 halvings we should have mined >= 99% of the mining allocation; \
          got {} out of {} ({}%)",
-        after_h7, max_supply, after_h7 * 100 / max_supply,
+        after_h7, allocation, after_h7 * 100 / allocation,
     );
 
-    // After halving 14 (29.4M blocks): should be >= 99.99 %
+    // After halving 14: >= 99.99 %.
     let after_h14 = total_mined_after_halvings(14);
     assert!(
-        after_h14 >= max_supply * 9999 / 10000,
-        "after 14 halvings we should have mined >= 99.99% of max supply",
+        after_h14 >= allocation * 9999 / 10000,
+        "after 14 halvings we should have mined >= 99.99% of the mining allocation",
     );
 }
 
-/// Independent check: the audit's "~13 years" claim would require 99 %
-/// to land around halving 19 (13 × 365 / 243 ≈ 19.5 halvings). This
-/// test deliberately asserts the *opposite* to document that the
-/// audit's suggested fix was numerically wrong — 99 % is reached by
-/// halving 7, long before halving 19.
+/// The audit draft's "~13 years to 99 %" figure (Bloch) was numerically
+/// wrong. On GnB's schedule 99 % of the mining allocation is issued by
+/// halving 7, and nothing is issued once the subsidy reaches zero at halving
+/// 27, so total issuance never exceeds the allocation.
 #[test]
 fn l5_audit_13_years_figure_was_inaccurate() {
-    fn total_mined_after_halvings(n: u32) -> u128 {
-        let mut total: u128 = 0;
-        for k in 0..n {
-            let reward = (BLOCK_REWARD as u128) >> k;
-            total += reward * (HALVING_INTERVAL as u128);
-        }
-        total
-    }
-
-    // By halving 7 (~4.7 years), we already have >= 99 % mined.
-    // The audit's "~13 years" claim (~19 halvings) would be vastly
-    // past the 99 % threshold.
     let after_h7 = total_mined_after_halvings(7);
-    assert!(after_h7 >= (MAX_SUPPLY as u128) * 99 / 100);
+    assert!(after_h7 >= (MINING_ALLOCATION_SAT as u128) * 99 / 100);
+    let all = issued_through_sat(u64::MAX) as u128;
+    assert_eq!(all, total_mined_after_halvings(27));
+    assert!(all <= MINING_ALLOCATION_SAT as u128);
+    assert_eq!(block_subsidy_sat(27 * HALVING_INTERVAL), 0);
 }

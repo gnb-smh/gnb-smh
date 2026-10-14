@@ -19,11 +19,43 @@ LimitNOFILE=65536
 # 64 MiB per mining thread plus ~1-2 GB for the node.
 MemoryMax=6G
 Nice=10
+UMask=0077
+
+# ── Sandboxing (audit OPS-3) ────────────────────────────────────────────────
+# Check with `systemd-analyze security gnb-node`.
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/gnb
 ProtectHome=true
 PrivateTmp=true
+# No device nodes beyond /dev/null, /dev/zero, /dev/urandom... (a build with
+# the optional `sev-snp` feature needs /dev/sev-guest: add
+# `DeviceAllow=/dev/sev-guest rw` and `PrivateDevices=false` for that build).
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+# No capabilities at all: the node listens on unprivileged ports only.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# AF_NETLINK is required: libp2p-tcp watches interfaces through rtnetlink
+# (if-watch) when listening on 0.0.0.0 and fails to listen without it.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# No JIT or other writable-executable mappings anywhere in the node (Rust,
+# RocksDB, PQClean C code): W^X can be enforced.
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# A syscall outside the filter fails with EPERM instead of killing the node.
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target
