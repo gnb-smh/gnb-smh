@@ -47,7 +47,20 @@ pub struct GhostdagData {
     pub blues_anticone_sizes: HashMap<BlockHash, usize>,
     /// This block's parents
     pub parents: Vec<BlockHash>,
-    /// Height (longest path from genesis)
+    /// DAG height: `selected_parent.height + 1` (genesis = 0). NOT the
+    /// longest path from genesis and NOT the header height.
+    ///
+    /// Audit DAG-8 — the node uses two heights:
+    ///   * this DAG height, a function of the selected-parent chain only;
+    ///   * the HEADER height (`Block::height`), which `accept_block` requires
+    ///     to equal `max(parent DAG heights) + 1`.
+    /// They diverge whenever the selected (highest blue-work) parent is not
+    /// the parent with the greatest DAG height. Consequently the DAG height
+    /// is monotone along selected-parent edges but NOT along merge edges: a
+    /// non-selected parent can have a GREATER DAG height than its child.
+    /// Nothing may treat "a.height >= b.height" as proof that `a` is not an
+    /// ancestor of `b` (the legacy `is_ancestor` did; fixed). Unifying the two
+    /// definitions would change which headers are valid and is out of scope.
     pub height: u64,
     /// Timestamp
     pub timestamp: u64,
@@ -279,13 +292,23 @@ impl DagStore {
 
 // ── Reachability ─────────────────────────────────────────────────────────────
 
-/// Check if `ancestor` is in the past of `descendant`.
+/// Check if `ancestor` is in the past of `descendant` (legacy, bounded).
 ///
-/// Optimizations over naive BFS:
-///   1. Blue-score shortcut: if ancestor.blue_score > descendant.blue_score,
-///      ancestor cannot be in descendant's past (DAG is monotonic).
-///   2. Height shortcut: if ancestor.height >= descendant.height, impossible.
-///   3. Bounded BFS: stops after visiting MAX_REACHABILITY_DEPTH levels.
+/// Only the `Legacy` coloring path uses this; GnB colors every block with the
+/// interval index (`CORRECTED_COLORING_ACTIVATION_HEIGHT = 0`), so it is not on
+/// the live consensus path.
+///
+/// Audit DAG-8 fix: the old version short-circuited on
+/// `ancestor.height >= descendant.height` and on blue_score, and pruned the
+/// BFS below the ancestor's height. Neither the DAG height (selected-parent
+/// based, see [`GhostdagData::height`]) nor blue_score is monotone along MERGE
+/// edges, so both shortcuts returned false negatives for a merged ancestor
+/// with a larger height / score than its descendant. The only quantity that is
+/// monotone along EVERY parent edge is `blue_work`
+/// (`child = selected_parent.blue_work + work`, and the selected parent has
+/// the maximum blue_work among the parents), so `blue_work` is now the sole
+/// shortcut and pruning bound. The visited-node safety cap stays (bounded
+/// legacy semantics) and still warns when it truncates the search.
 ///
 /// Production improvement: interval-based reachability tree (O(1)).
 const MAX_REACHABILITY_DEPTH: u64 = 1024;
@@ -297,58 +320,46 @@ pub fn is_ancestor(
 ) -> bool {
     if ancestor == descendant { return false; }
 
-    // Shortcut: compare blue_score — ancestor must have lower score
-    let a_score = store.get(ancestor).map(|d| d.blue_score).unwrap_or(u64::MAX);
-    let d_score = store.get(descendant).map(|d| d.blue_score).unwrap_or(0);
-    if a_score >= d_score { return false; }
+    let (a_work, d_work) = match (store.get(ancestor), store.get(descendant)) {
+        (Some(a), Some(d)) => (a.blue_work, d.blue_work),
+        _ => return false,
+    };
+    // Sound shortcut: blue_work never decreases along a parent edge, so an
+    // ancestor can never carry MORE blue_work than its descendant.
+    if a_work > d_work { return false; }
 
-    // Shortcut: compare height — ancestor must have lower height
-    let a_height = store.get(ancestor).map(|d| d.height).unwrap_or(u64::MAX);
-    let d_height = store.get(descendant).map(|d| d.height).unwrap_or(0);
-    if a_height >= d_height { return false; }
-
-    // Bounded BFS from descendant backwards.
-    //
-    // Audit M-3 fix: when the height-diff between the two blocks would
-    // exceed MAX_REACHABILITY_DEPTH, we silently clamp and the BFS might
-    // fail to find a true ancestor. That's a silent consensus split at
-    // the DAG-reachability layer. Log a warning when the clamp triggers
-    // so production deployments can spot it before it matters.
+    // Bounded BFS from descendant backwards, pruning every block whose
+    // blue_work is below the ancestor's (it cannot have the ancestor in its
+    // past).
+    let visit_cap = MAX_REACHABILITY_DEPTH * 10;
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
     queue.push_back(*descendant);
-    let raw_depth_limit = d_height.saturating_sub(a_height) + 1;
-    let depth_limit = raw_depth_limit.min(MAX_REACHABILITY_DEPTH);
-    if raw_depth_limit > MAX_REACHABILITY_DEPTH {
-        warn!(
-            "is_ancestor: height-diff {} exceeds MAX_REACHABILITY_DEPTH={} \
-             when checking ancestor {} → descendant {}. Clamping bound; \
-             ancestry check may return a false negative. If this repeats, \
-             a reachability tree upgrade is required for correctness.",
-            raw_depth_limit,
-            MAX_REACHABILITY_DEPTH,
-            hex::encode(ancestor),
-            hex::encode(descendant),
-        );
-    }
-    let mut depth = 0u64;
+    let mut visits = 0u64;
 
     while let Some(h) = queue.pop_front() {
         if &h == ancestor { return true; }
         if visited.insert(h) {
             if let Some(d) = store.get(&h) {
-                // Don't go below ancestor's height
-                if d.height > a_height || d.height == 0 {
-                    for p in &d.parents {
-                        if !visited.contains(p) {
-                            queue.push_back(*p);
-                        }
+                for p in &d.parents {
+                    if visited.contains(p) { continue; }
+                    let p_work = store.get(p).map(|pd| pd.blue_work).unwrap_or(0);
+                    if p == ancestor || p_work >= a_work {
+                        queue.push_back(*p);
                     }
                 }
             }
         }
-        depth += 1;
-        if depth > depth_limit * 10 { break; } // safety bound on visited nodes
+        visits += 1;
+        if visits > visit_cap {
+            warn!(
+                "is_ancestor: visited-node cap {} hit when checking ancestor {} → \
+                 descendant {}; ancestry check may return a false negative (legacy \
+                 bounded path — the interval index is exact).",
+                visit_cap, hex::encode(ancestor), hex::encode(descendant),
+            );
+            break;
+        }
     }
     false
 }
@@ -485,6 +496,65 @@ fn topological_sort(store: &DagStore, blocks: Vec<BlockHash>) -> Vec<BlockHash> 
     result
 }
 
+/// Deterministic topological order over persisted entries (DAG-5): every
+/// entry comes after all of its parents that are present in `entries`; ties
+/// are broken by (blue_score, hash). Parents absent from `entries` impose no
+/// constraint. Cycles cannot occur in a hash-linked DAG; if the input were
+/// cyclic anyway, the remaining entries are appended in (blue_score, hash)
+/// order so nothing is silently dropped.
+fn topological_entries(entries: Vec<(BlockHash, GhostdagData)>) -> Vec<(BlockHash, GhostdagData)> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let mut by_hash: HashMap<BlockHash, GhostdagData> = HashMap::with_capacity(entries.len());
+    for (h, d) in entries {
+        by_hash.insert(h, d);
+    }
+    let mut indegree: HashMap<BlockHash, usize> = HashMap::with_capacity(by_hash.len());
+    let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
+    for (h, d) in &by_hash {
+        let mut deg = 0usize;
+        let mut seen: HashSet<BlockHash> = HashSet::new();
+        for p in &d.parents {
+            if by_hash.contains_key(p) && seen.insert(*p) {
+                deg += 1;
+                children.entry(*p).or_default().push(*h);
+            }
+        }
+        indegree.insert(*h, deg);
+    }
+    let mut ready: BinaryHeap<Reverse<(u64, BlockHash)>> = indegree.iter()
+        .filter(|(_, &deg)| deg == 0)
+        .map(|(h, _)| Reverse((by_hash[h].blue_score, *h)))
+        .collect();
+    let mut order: Vec<BlockHash> = Vec::with_capacity(by_hash.len());
+    while let Some(Reverse((_, h))) = ready.pop() {
+        order.push(h);
+        if let Some(ch) = children.get(&h) {
+            for c in ch {
+                if let Some(deg) = indegree.get_mut(c) {
+                    *deg = deg.saturating_sub(1);
+                    if *deg == 0 {
+                        ready.push(Reverse((by_hash[c].blue_score, *c)));
+                    }
+                }
+            }
+        }
+    }
+    if order.len() < by_hash.len() {
+        let placed: HashSet<BlockHash> = order.iter().copied().collect();
+        let mut rest: Vec<(u64, BlockHash)> = by_hash.iter()
+            .filter(|(h, _)| !placed.contains(*h))
+            .map(|(h, d)| (d.blue_score, *h))
+            .collect();
+        rest.sort();
+        order.extend(rest.into_iter().map(|(_, h)| h));
+    }
+    order.into_iter()
+        .filter_map(|h| by_hash.remove(&h).map(|d| (h, d)))
+        .collect()
+}
+
 // ── GhostDAG protocol ────────────────────────────────────────────────────────
 
 /// Selects how `classify_mergeset` computes the blue/red partition.
@@ -594,6 +664,19 @@ pub struct GhostDAG {
     /// Interval reachability index. Maintained only while `coloring == Fast`;
     /// left empty (zero overhead) in `Legacy` mode. Never consensus state.
     reach: ReachabilityStore,
+    /// Audit DAG-1: chain-disqualified blocks. A block is in this set iff it,
+    /// or a block on its selected-parent chain, failed connect-time (UTXO /
+    /// in-context) validation. The set is closed under "selected-parent
+    /// child": `add_block` and `mark_invalid` keep that invariant. Such blocks
+    /// stay in the DAG (they can still be merged as non-selected parents, which
+    /// is what makes the outcome arrival-order independent) but are never
+    /// returned by `selected_tip()` or offered as template parents. Persisted
+    /// by the acceptance pipeline (`Storage::load_invalid_blocks`).
+    invalid: HashSet<BlockHash>,
+    /// Whether the persisted invalid set has been loaded into `invalid`
+    /// (set by `load_invalid`). The acceptance pipeline loads it lazily on
+    /// first use if start-up did not.
+    invalid_loaded: bool,
 }
 
 impl GhostDAG {
@@ -603,6 +686,8 @@ impl GhostDAG {
             store: DagStore::new(),
             coloring: ColoringMode::Legacy,
             reach: ReachabilityStore::new(),
+            invalid: HashSet::new(),
+            invalid_loaded: false,
         }
     }
 
@@ -612,6 +697,8 @@ impl GhostDAG {
             store: DagStore::new(),
             coloring: ColoringMode::Legacy,
             reach: ReachabilityStore::new(),
+            invalid: HashSet::new(),
+            invalid_loaded: false,
         }
     }
 
@@ -623,6 +710,8 @@ impl GhostDAG {
             store: DagStore::new(),
             coloring: ColoringMode::Fast,
             reach: ReachabilityStore::new(),
+            invalid: HashSet::new(),
+            invalid_loaded: false,
         }
     }
 
@@ -887,20 +976,33 @@ impl GhostDAG {
     }
 
     /// Reconstruct DAG from persisted GhostdagData entries.
-    /// Entries are sorted by blue_score to approximate topological order,
-    /// then inserted directly (no re-computation of PHANTOM — the stored
-    /// data already contains mergeset_blues/reds, selected_parent, etc.).
-    pub fn load_persisted(&mut self, mut entries: Vec<(BlockHash, GhostdagData)>) {
-        // Sort by blue_score (ascending) to insert parents before children
-        entries.sort_by_key(|(_, d)| d.blue_score);
-
-        for (hash, data) in entries {
+    ///
+    /// Audit DAG-5 fix: entries used to be inserted in blue_score order, which
+    /// is NOT topological for non-selected parents (a merged parent can carry
+    /// a larger blue_score than its child). `DagStore::insert` marks every new
+    /// block as a tip, so a parent inserted after its child came back as a tip
+    /// after every restart (redundant template parents, tip sets that differ
+    /// between nodes). Entries are now inserted in a deterministic topological
+    /// order and the tip set is recomputed from the children index afterwards.
+    /// The stored GhostDAG data is inserted verbatim (no recomputation).
+    pub fn load_persisted(&mut self, entries: Vec<(BlockHash, GhostdagData)>) {
+        for (hash, data) in topological_entries(entries) {
             if data.parents.is_empty() {
                 // Genesis
                 self.store.genesis = Some(hash);
             }
             self.store.insert(hash, data);
         }
+        self.recompute_tips();
+    }
+
+    /// Recompute `tips` as exactly the stored blocks without children.
+    fn recompute_tips(&mut self) {
+        let tips: HashSet<BlockHash> = self.store.data.keys()
+            .filter(|h| self.store.children.get(*h).map_or(true, |c| c.is_empty()))
+            .copied()
+            .collect();
+        self.store.tips = tips;
     }
 
     /// Sprint Y (M-2): verified variant of `load_persisted`.
@@ -946,11 +1048,10 @@ impl GhostDAG {
             });
         };
 
-        // Sort by blue_score so parents process before children. This is
-        // load-bearing for the chain check: we need parent's integrity
-        // hash computed and available when we validate the child.
-        let mut sorted = entries;
-        sorted.sort_by_key(|(_, d)| d.blue_score);
+        // Topological order (parents before children, DAG-5) — load-bearing
+        // for the chain check: the selected parent's integrity hash must be
+        // computed before the child is validated.
+        let sorted = topological_entries(entries);
 
         let mut computed: std::collections::HashMap<BlockHash, [u8; 32]> =
             std::collections::HashMap::with_capacity(sorted.len());
@@ -996,6 +1097,7 @@ impl GhostDAG {
             }
             self.store.insert(hash, data);
         }
+        self.recompute_tips();
 
         Ok(LoadedIntegrity {
             blocks_loaded: total,
@@ -1086,6 +1188,12 @@ impl GhostDAG {
 
         let result = data.clone();
         self.store.insert(hash, data);
+        // DAG-1: a block whose selected parent is chain-disqualified is
+        // itself disqualified (its UTXO context does not exist). It still
+        // enters the DAG so other blocks can merge it deterministically.
+        if self.invalid.contains(&selected_parent) {
+            self.invalid.insert(hash);
+        }
         Ok(result)
     }
 
@@ -1131,6 +1239,7 @@ impl GhostDAG {
         }
         self.store.tips.remove(hash);
         self.store.children.remove(hash);
+        self.invalid.remove(hash);
         // Exact inverse of `DagStore::insert`: drop the child edge from each
         // parent; a parent becomes a tip again iff it is still stored and now
         // has no children at all.
@@ -1422,21 +1531,156 @@ impl GhostDAG {
         blue
     }
 
+    // ── Chain-disqualified (invalid) blocks — audit DAG-1 ─────────────────
+
+    /// Mark `hash` chain-disqualified, together with every block whose
+    /// selected-parent chain passes through it (the invariant `add_block`
+    /// maintains for later arrivals). Returns the blocks newly marked, in
+    /// discovery order. Unknown hashes are ignored.
+    pub fn mark_invalid(&mut self, hash: BlockHash) -> Vec<BlockHash> {
+        let mut newly = Vec::new();
+        let mut stack = vec![hash];
+        while let Some(h) = stack.pop() {
+            if !self.store.has(&h) || !self.invalid.insert(h) {
+                continue;
+            }
+            newly.push(h);
+            if let Some(children) = self.store.children.get(&h) {
+                let mut ch: Vec<BlockHash> = children.iter()
+                    .filter(|c| self.store.get(c).and_then(|d| d.selected_parent) == Some(h))
+                    .copied()
+                    .collect();
+                ch.sort_unstable();
+                stack.extend(ch);
+            }
+        }
+        newly
+    }
+
+    /// Re-apply a persisted invalid set after a reload (propagates to
+    /// selected-chain descendants loaded since). Returns how many blocks are
+    /// now marked.
+    pub fn load_invalid<I: IntoIterator<Item = BlockHash>>(&mut self, hashes: I) -> usize {
+        let mut roots: Vec<BlockHash> = hashes.into_iter().collect();
+        roots.sort_unstable();
+        for h in roots {
+            self.mark_invalid(h);
+        }
+        self.invalid_loaded = true;
+        self.invalid.len()
+    }
+
+    /// Whether `load_invalid` has run on this instance.
+    pub fn invalid_set_loaded(&self) -> bool {
+        self.invalid_loaded
+    }
+
+    /// True iff `hash` is chain-disqualified.
+    pub fn is_invalid(&self, hash: &BlockHash) -> bool {
+        self.invalid.contains(hash)
+    }
+
+    /// Number of chain-disqualified blocks.
+    pub fn invalid_count(&self) -> usize {
+        self.invalid.len()
+    }
+
+    /// GhostDAG tip ordering key: (blue_work, blue_score, hash), larger wins —
+    /// the same order `select_parent` uses.
+    fn order_key(&self, h: &BlockHash) -> (u128, u64, BlockHash) {
+        let d = self.store.get(h);
+        (
+            d.map(|d| d.blue_work).unwrap_or(0),
+            d.map(|d| d.blue_score).unwrap_or(0),
+            *h,
+        )
+    }
+
+    /// Non-disqualified blocks none of whose children is non-disqualified:
+    /// the tips of the valid sub-DAG. Equal to `tips()` when nothing is
+    /// marked invalid. Unordered.
+    pub fn valid_tips(&self) -> Vec<BlockHash> {
+        if self.invalid.is_empty() {
+            return self.tips();
+        }
+        let mut out = Vec::new();
+        let mut visited: HashSet<BlockHash> = HashSet::new();
+        let mut stack: Vec<BlockHash> = self.store.tips.iter().copied().collect();
+        while let Some(h) = stack.pop() {
+            if !visited.insert(h) {
+                continue;
+            }
+            if self.invalid.contains(&h) {
+                if let Some(d) = self.store.get(&h) {
+                    stack.extend(d.parents.iter().copied());
+                }
+                continue;
+            }
+            if !self.store.has(&h) {
+                continue;
+            }
+            let all_children_invalid = self.store.children.get(&h)
+                .map_or(true, |c| c.iter().all(|x| self.invalid.contains(x)));
+            if all_children_invalid {
+                out.push(h);
+            }
+        }
+        out
+    }
+
     // ── Public query API ────────────────────────────────────────────────────
 
-    /// Best tip: highest blue_work, then blue_score, then hash
+    /// Best tip: highest blue_work, then blue_score, then hash, among blocks
+    /// that are NOT chain-disqualified (DAG-1). With no invalid block this is
+    /// exactly the maximum over `tips()`. Otherwise a best-first search from
+    /// the tips through disqualified blocks finds the best valid block: every
+    /// descendant of the best valid block is disqualified (a valid descendant
+    /// would carry more blue_work), so it is reached through them.
     pub fn selected_tip(&self) -> Option<BlockHash> {
-        self.store.tips.iter()
-            .max_by(|a, b| {
-                let da = self.store.get(a);
-                let db = self.store.get(b);
-                let wa = da.map(|d| d.blue_work).unwrap_or(0);
-                let wb = db.map(|d| d.blue_work).unwrap_or(0);
-                let sa = da.map(|d| d.blue_score).unwrap_or(0);
-                let sb = db.map(|d| d.blue_score).unwrap_or(0);
-                wa.cmp(&wb).then(sa.cmp(&sb)).then(a.cmp(b))
-            })
-            .cloned()
+        if self.invalid.is_empty() {
+            return self.store.tips.iter()
+                .max_by(|a, b| self.order_key(a).cmp(&self.order_key(b)))
+                .cloned();
+        }
+        use std::collections::BinaryHeap;
+        let mut heap: BinaryHeap<(u128, u64, BlockHash)> = BinaryHeap::new();
+        let mut pushed: HashSet<BlockHash> = HashSet::new();
+        for t in &self.store.tips {
+            if pushed.insert(*t) {
+                heap.push(self.order_key(t));
+            }
+        }
+        while let Some((_, _, h)) = heap.pop() {
+            if !self.invalid.contains(&h) {
+                return Some(h);
+            }
+            if let Some(d) = self.store.get(&h) {
+                for p in &d.parents {
+                    if self.store.has(p) && pushed.insert(*p) {
+                        heap.push(self.order_key(p));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Template parents (audit DAG-2): the bodied valid tips, highest
+    /// (blue_work, blue_score, hash) first, capped at `max`. The first entry
+    /// is therefore the template's selected parent. Header-only tips are
+    /// skipped; when no valid tip has a body, falls back to the best bodied
+    /// valid ancestor (see `best_bodied_tip`). Shared by the internal miner
+    /// and `getblocktemplate` so both stay under `core::MAX_PARENTS`.
+    pub fn template_parents<F: Fn(&BlockHash) -> bool>(&self, max: usize, has_body: F) -> Vec<BlockHash> {
+        let mut cands: Vec<BlockHash> = self.valid_tips().into_iter()
+            .filter(|h| has_body(h))
+            .collect();
+        if cands.is_empty() {
+            return self.best_bodied_tip(has_body).into_iter().collect();
+        }
+        cands.sort_by(|a, b| self.order_key(b).cmp(&self.order_key(a)));
+        cands.truncate(max.max(1));
+        cands
     }
 
     pub fn tip_blue_score(&self) -> u64 {
@@ -1478,8 +1722,10 @@ impl GhostDAG {
         // bodied tip win selection and the chain advance. Recomputed from the
         // store on every call — no persisted latch, so this is restart-safe.
         let mut best: Option<BlockHash> = None;
-        for tip in self.store.tips.iter() {
-            // Nearest bodied block at or below this tip.
+        for tip in self.valid_tips().iter() {
+            // Nearest bodied block at or below this tip. (Selected-parent
+            // ancestors of a valid tip are valid: the invalid set is closed
+            // under selected-parent children.)
             let mut cur = Some(*tip);
             let candidate = loop {
                 match cur {
@@ -1510,9 +1756,8 @@ impl GhostDAG {
     /// every tip is header-only, falls back to the nearest bodied ancestor
     /// via [`best_bodied_tip`] so mining never stalls on a phantom parent.
     pub fn bodied_tips<F: Fn(&BlockHash) -> bool>(&self, has_body: F) -> Vec<BlockHash> {
-        let bodied: Vec<BlockHash> = self.store.tips.iter()
+        let bodied: Vec<BlockHash> = self.valid_tips().into_iter()
             .filter(|h| has_body(h))
-            .cloned()
             .collect();
         if !bodied.is_empty() {
             return bodied;

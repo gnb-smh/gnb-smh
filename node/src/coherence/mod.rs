@@ -318,6 +318,25 @@ impl ShieldedPool {
         self.engine.disconnect_block(expected)
     }
 
+    /// Audit COH-2: disconnect `block_id` while the acceptance pipeline rolls
+    /// the selected chain back (tip-first). The pipeline now applies shielded
+    /// state ONLY for blocks that join the selected chain, in chain order, so
+    /// the undo stack mirrors the applied chain and an exact LIFO reversal is
+    /// the normal case. A block that carried NO shielded transactions changed
+    /// nothing but its own (empty) undo record; when that record is absent —
+    /// the engine is in-memory, so blocks connected before a restart have
+    /// none — there is nothing to reverse and the disconnect succeeds. A block
+    /// WITH shielded transactions and no matching record is refused, exactly
+    /// like `disconnect_block_self`.
+    pub fn disconnect_for_reorg(&mut self, block_id: [u8; 32], had_shielded_txs: bool) -> Result<(), TxError> {
+        match self.engine.disconnect_block(block_id) {
+            Ok(()) => Ok(()),
+            Err(TxError::ReorgBeyondUndoHorizon) | Err(TxError::ReorgOrderMismatch { .. })
+                if !had_shielded_txs => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn anchor(&self) -> [u8; 32] { self.engine.anchor() }
     pub fn mempool_len(&self) -> usize { self.mempool.len() }
 

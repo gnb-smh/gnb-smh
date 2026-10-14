@@ -35,6 +35,17 @@ mod coherence;    // Coherence C2 shielded pool
 mod dandelion;    // Coherence P3 Dandelion++ tx-relay privacy
 mod tip;
 mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer
+mod accept;       // Block acceptance pipeline (accept/connect split, DAG-1)
+mod template;     // Block templates for the miner + getblocktemplate (MEM-2, DAG-2)
+
+// The acceptance pipeline lives in `accept.rs` (shared with the library so
+// integration tests drive the real path); same names and signatures as the
+// functions that used to be defined in this file.
+#[allow(unused_imports)]
+use accept::{
+    accept_block, validate_tx_standalone, validate_tx_inputs, miner_template_total_fees,
+    validate_tx_in_block, validate_tx_in_block_with_maturity, FINALITY_FROZEN, ARCHIVE_MODE,
+};
 
 use clap::Parser;
 use log::{info, warn, error, debug};
@@ -715,6 +726,12 @@ async fn main() {
     // Coherence C2: the node's shielded-pool engine (in-memory).
     let shielded = Arc::new(RwLock::new(crate::coherence::ShieldedPool::new()));
 
+    // DAG-1 / DAG-11: load the persisted invalid-block set and reconcile any
+    // state a pre-fix non-atomic commit left behind, before any block is accepted.
+    if let Err(e) = accept::reconcile_on_startup(&dag, &store, &shielded) {
+        error!("start-up chain-state reconciliation failed: {}", e);
+    }
+
     // ── Message processor ─────────────────────────────────────────────────────
     let store2    = store.clone();
     let shielded2 = shielded.clone();
@@ -1233,26 +1250,33 @@ async fn main() {
 
                 // Add validated tx to mempool
                 network::NetworkMessage::NewTransaction { tx_data, .. } => {
-                    // Sprint 1.d: Bitcoin-format tx wire.
-                    if let Ok(tx) = core::Transaction::from_wire_bytes(&tx_data) {
-                        if !tx.is_coinbase() {
-                            let height = dag2.read().block_count() as u64;
-                            // P0 (roadmap §1.2 / §2.5 #6): move CPU-bound PQ
-                            // signature verification off the async reactor so a
-                            // gossiped valid-tx flood can't stall this task's
-                            // worker thread. Logic unchanged — only the thread.
+                    // Sprint 1.d: Bitcoin-format tx wire. MEM-5: strict decode —
+                    // trailing bytes are refused, so one tx has exactly one
+                    // encoding (no gossipsub-dedup bypass by byte mutation).
+                    match mempool::admission::decode_tx_strict(&tx_data) {
+                        Ok(tx) => {
+                            // MEM-1/4/5: the shared admission function (same rules
+                            // as sendrawtransaction and reorg re-injection): size,
+                            // standardness incl. dust, known/recent-reject, UTXO,
+                            // maturity at the NEXT block height (selected-tip DAG
+                            // height + 1 — never dag.block_count()), fees, and
+                            // signatures last. P0: it runs on the blocking pool so
+                            // PQ signature work cannot stall this task's reactor.
+                            let next_height = mempool::admission::next_block_height(&dag2.read());
                             let store_v = store2.clone();
-                            let tx_v = tx.clone();
-                            let verified = tokio::task::spawn_blocking(move || {
-                                validate_tx_standalone(&tx_v, &store_v, height)
+                            let mem_v = mem2.clone();
+                            let admitted = tokio::task::spawn_blocking(move || {
+                                let policy = mempool::admission::AdmissionPolicy::relay(next_height);
+                                mempool::admission::admit(&store_v, &mem_v, tx, &policy)
                             }).await;
-                            match verified {
-                                Ok(Ok(fee)) => { let _ = mem2.add(tx, fee); }
-                                Ok(Err(e))  => debug!("mempool reject: {}", e),
-                                Err(e)      => warn!("tx verify task failed: {}", e),
+                            match admitted {
+                                Ok(Ok(_))  => {}
+                                Ok(Err(e)) => debug!("mempool reject: {}", e),
+                                Err(e)     => warn!("tx verify task failed: {}", e),
                             }
+                            state2.write().mempool_size = mem2.size();
                         }
-                        state2.write().mempool_size = mem2.size();
+                        Err(e) => debug!("tx decode rejected: {}", e),
                     }
                 }
 
@@ -1548,49 +1572,6 @@ async fn main() {
                     was_syncing_last_tick = false;
                 }
 
-                let (tips, current_bits, current_height, current_blue_score) = {
-                    let d = dag_m.read();
-                    // Mine only on BODIED tips: a header-only tip (accepted via
-                    // headers-first sync but whose body never arrived) is
-                    // unmineable — a candidate built on it can't be validated by
-                    // accept_block, so the miner silently stalls on a phantom
-                    // parent. This is exactly what wedged the founder behind a
-                    // bodyless header. Fall back to the nearest bodied ancestor
-                    // when every tip is header-only.
-                    let tips = d.bodied_tips(|h| store_m.get_block(h).ok().flatten().is_some());
-                    let h = tips.iter()
-                        .filter_map(|t| d.get_block_data(t))
-                        .map(|data| data.height)
-                        .max()
-                        .unwrap_or(0);
-                    // blue_score from the bodied parents only — NOT
-                    // tip_blue_score(), which follows the bodyless selected_tip.
-                    let bs = tips.iter()
-                        .filter_map(|t| d.get_block_data(t))
-                        .map(|data| data.blue_score)
-                        .max()
-                        .unwrap_or(0);
-                    // ASERT anchored at genesis over the latest parent
-                    // timestamp — the exact function accept_block applies to
-                    // `tips`, the parents this block will carry.
-                    let parent_ts = core::difficulty_parent_timestamp(
-                        tips.iter().filter_map(|t| d.get_block_data(t)).map(|data| data.timestamp));
-                    let bits_res = pow::expected_bits(parent_ts, h + 1).map(|b| (b, parent_ts));
-                    (tips, bits_res, h, bs)
-                };
-
-                // Fail closed: never mine on a guessed target.
-                let (current_bits, parent_ts) = match current_bits {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!("⛏  cannot derive expected bits for next block (h={}): {} — \
-                               skipping mining round (fail-closed, no guessed target)",
-                              current_height + 1, e);
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        continue;
-                    }
-                };
-
                 // Re-broadcast mempool TXs before mining
                 {
                     let pending = mem_m.get_for_block(100);
@@ -1615,56 +1596,47 @@ async fn main() {
                     }
                 }
                 mining_round += 1;
-                let txs = mem_m.get_for_block(2000);
 
-                // FIX VULN-05: Compute fees and include in coinbase. See
-                // `miner_template_total_fees`'s doc comment for N-7 (the
-                // duplicate-outpoint fee-inflation fix).
-                let total_fees: u64 = miner_template_total_fees(&txs, &store_m);
-
-                let block_height = current_height + 1;
-                // Fair launch: 100% of subsidy + fees to the miner, one output.
-                let subsidy = core::tokenomics::block_subsidy_sat(block_height);
-                let cb_outputs = vec![core::TxOutput {
-                    value:         subsidy.saturating_add(total_fees),
-                    script_pubkey: miner_spk.clone(),
-                }];
-
-                let coinbase = core::Transaction {
-                    version: 1,
-                    inputs: vec![core::TxInput {
-                        prev_txid:  [0u8; 32],
-                        prev_index: u32::MAX,
-                        // Height plus a random tag: two blocks at the same
-                        // height (common in a DAG) must never share a
-                        // coinbase txid.
-                        script_sig: format!("gnb:h{}:{:016x}", block_height, rand::random::<u64>()).into_bytes(),
-                        sequence:   u32::MAX,
-                    }],
-                    outputs: cb_outputs,
-                    locktime: 0,
+                // ── Block template (audit MEM-2 / DAG-2 / MEM-1 / MEM-3) ──────
+                // Shared with getblocktemplate (`template::build_block_template`):
+                // at most MAX_PARENTS bodied, non-disqualified tips by blue work
+                // (header-only tips are unmineable, see GhostDAG::bodied_tips);
+                // expected ASERT bits for exactly those parents (fail closed if
+                // underivable — never mine on a guessed target); transactions by
+                // fee rate under a byte budget measured exactly like the
+                // consensus size rule, each re-validated against the UTXO set
+                // (offenders are evicted from the mempool); coinbase fees
+                // recomputed from the UTXO set (N-7 duplicate-outpoint safe).
+                // Coinbase reserve: our own coinbase at its widest encoding.
+                let cb_reserve = template::miner_coinbase(u64::MAX, u64::MAX, miner_spk.clone())
+                    .actual_size();
+                let tmpl = match template::build_block_template(&dag_m, &store_m, &mem_m, cb_reserve) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("⛏  cannot build a block template: {} — skipping mining round \
+                               (fail-closed, no guessed target)", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
                 };
-
-                let all_txs: Vec<core::Transaction> = std::iter::once(coinbase).chain(txs).collect();
-                let merkle = core::Transaction::merkle_root(&all_txs);
-
-                let mut block = core::Block {
-                    header: core::BlockHeader {
-                        version:     1,
-                        parents:     tips.clone(),
-                        merkle_root: merkle,
-                        // Never before a parent (validate_timestamp).
-                        timestamp:   std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default().as_secs()
-                            .max(parent_ts),
-                        bits:        current_bits,
-                        nonce:       0,
-                    },
-                    transactions: all_txs,
-                    blue_score:   current_blue_score + 1,
-                    height:       block_height,
-                    shielded_transactions: Vec::new(),
+                // Fair launch: 100% of subsidy + fees to the miner, one output.
+                let coinbase = template::miner_coinbase(
+                    tmpl.height,
+                    tmpl.subsidy.saturating_add(tmpl.total_fees),
+                    miner_spk.clone(),
+                );
+                let now_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs();
+                // Never before a parent (validate_timestamp); the template
+                // self-check runs every structural rule except the PoW.
+                let mut block = match template::assemble_block(&tmpl, coinbase, now_ts) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!("⛏  block template failed its self-check: {} — skipping round", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
                 };
 
                 // GnB-SMH search. Short rounds (MINE_ROUND_ATTEMPTS nonces per
@@ -1726,6 +1698,13 @@ async fn main() {
                                 "mining: our own block {} was rejected by accept_block: {} — discarding (miner bug)",
                                 hex::encode(hash), e,
                             );
+                            // MEM-1/MEM-3: never retry with the same poisoned
+                            // template — drop every pooled tx no longer minable.
+                            let next_height = mempool::admission::next_block_height(&dag_m.read());
+                            let dropped = accept::revalidate_mempool(&store_m, &mem_m, next_height);
+                            if dropped > 0 {
+                                warn!("mining: evicted {} stale tx(s) after the rejected block", dropped);
+                            }
                             continue;
                         }
 
@@ -1943,520 +1922,8 @@ fn getblock_nonce() -> u64 {
 /// never starve itself; a SYNCED node stops reacting to overheard streams.
 const HEADERS_SOLICITED_WINDOW_MS: u64 = 60_000;
 
-static FINALITY_FROZEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Set once from `--archive` at startup. Same static-flag shape as
-/// FINALITY_FROZEN above: accept_block runs far from the CLI struct and
-/// threading a bool through every caller would be noise for a value that is
-/// fixed for the process lifetime.
-static ARCHIVE_MODE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Validate TX contents, add block to DAG + storage, update UTXO set.
-/// Returns Ok(block_hash) on success.
-fn accept_block(
-    block:      &core::Block,
-    block_hash: [u8; 32],
-    height:     u64,
-    dag:        &Arc<RwLock<consensus::GhostDAG>>,
-    store:      &Arc<storage::Storage>,
-    mempool:    &Arc<mempool::Mempool>,
-    node_state: &Arc<RwLock<rpc::NodeState>>,
-    // Sprint 2.c: tip-change broadcast for stratum re-notify.
-    // None disables notification (tests, CLI without --stratum).
-    tip_tx:     Option<&broadcast::Sender<tip::TipChanged>>,
-    // Coherence C2: the node's shielded-pool engine. Block's shielded txs are
-    // validated + applied here before the block is committed.
-    shielded:   &Arc<RwLock<crate::coherence::ShieldedPool>>,
-) -> Result<[u8; 32], String> {
-
-    // Sprint 2.c: snapshot selected tip BEFORE any DAG mutation so we
-    // can detect whether this block changed the chain's head. Nested
-    // {} scope ensures the lock drops immediately.
-    let old_tip = { dag.read().selected_tip() };
-
-    // ── Early dedup ──────────────────────────────────────────────────
-    // A block already in the DAG needs no re-validation. Return the same
-    // "already in DAG" rejection `add_block` produces, but BEFORE tx
-    // validation — so a re-gossip / IBD re-request flood of known blocks
-    // stays cheap now that the finality gate below no longer rejects (and
-    // thereby short-circuits) below-finality blocks.
-    if dag.read().get_block_data(&block_hash).is_some() {
-        return Err(format!(
-            "consensus rejection: block already in DAG: {}",
-            hex::encode(block_hash)
-        ));
-    }
-
-    // ── Parents must be known (cheap, before anything else) ──────────
-    // Height, timestamp and difficulty below are all derived from the
-    // parents' DAG entries; an unknown parent would silently skew them.
-    if block.header.parents.is_empty() {
-        return Err("consensus rejection: non-genesis block without parents".into());
-    }
-    let parent_data: Vec<(u64, u64)> = {
-        let d = dag.read();
-        let mut v = Vec::with_capacity(block.header.parents.len());
-        for p in &block.header.parents {
-            match d.get_block_data(p) {
-                Some(data) => v.push((data.height, data.timestamp)),
-                None => return Err(format!(
-                    "consensus rejection: unknown parent {}", hex::encode(p))),
-            }
-        }
-        v
-    };
-
-    // ── FIX VULN-02: height = max parent height + 1 ──────────────────
-    let expected_height = parent_data.iter().map(|(h, _)| *h).max().unwrap_or(0) + 1;
-    if block.height != expected_height || height != expected_height {
-        return Err(format!(
-            "invalid height: block claims h={} but expected h={}",
-            block.height, expected_height
-        ));
-    }
-
-    // ── FIX VULN-01: difficulty bits must equal the ASERT schedule ───
-    // A pure function of the parent set (latest parent timestamp) and the
-    // height, shared with the miner and getblocktemplate. Checked for every
-    // block, before the proof of work.
-    let parent_ts = core::difficulty_parent_timestamp(parent_data.iter().map(|(_, t)| *t));
-    let expected_bits = pow::expected_bits(parent_ts, block.height)
-        .map_err(|e| format!("invalid difficulty: {}", e))?;
-    if block.header.bits != expected_bits {
-        return Err(format!(
-            "invalid difficulty: block bits 0x{:08x} != expected 0x{:08x}",
-            block.header.bits, expected_bits
-        ));
-    }
-
-    let finalized_height = store.get_meta("finalized_height").ok().flatten()
-        .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
-        .unwrap_or(0);
-
-    // ── FIX VULN-04: Validate timestamp ──────────────────────────────
-    {
-        let parent_ts = block.header.parents.iter()
-            .filter_map(|p| dag.read().get_block_data(p).map(|d| d.timestamp))
-            .max()
-            .unwrap_or(0);
-        block.validate_timestamp(parent_ts)
-            .map_err(|e| format!("timestamp rejected: {}", e))?;
-    }
-
-    // ── Proof of work (expensive: 64 MiB GnB-SMH, cached by block id) ─
-    // Runs only after every cheap contextual check above has passed.
-    if !block.validate_pow() {
-        return Err("consensus rejection: invalid GnB-SMH proof of work".into());
-    }
-
-    // ── Validate non-coinbase TXs + compute fees ─────────────────────
-    // Coinbase maturity uses the block's consensus-checked height, identical
-    // on every honest node.
-    let current_height = block.height;
-    let mut spent_in_block: HashSet<([u8; 32], u32)> = HashSet::new();
-    let mut total_fees: u64 = 0;
-
-    for tx in block.transactions.iter().skip(1) {
-        let fee = validate_tx_in_block_with_maturity(
-            block, tx, store, &mut spent_in_block, current_height
-        )?;
-        total_fees = total_fees.checked_add(fee).ok_or("block fee sum overflow")?;
-    }
-
-    // ── FIX VULN-05: Validate coinbase value includes fees ───────────
-    block.validate_coinbase_value(total_fees)
-        .map_err(|e| format!("coinbase rejected: {}", e))?;
-
-    // ── Add to DAG ───────────────────────────────────────────────────
-    //
-    // Sprint U.4 — capture the selected tip BEFORE add_block so we can
-    // classify what this block did to the selected chain once GhostDAG
-    // recomputes after insertion.
-    let old_selected_tip = dag.read().selected_tip();
-
-    let ts      = block.header.timestamp;
-    let parents = block.header.parents.clone();
-    let work    = pow::work_from_bits(block.header.bits);
-    // M-9: propagate consensus rejection upward instead of panicking.
-    // NoParents / DuplicateBlock here mean the caller (the sync path or
-    // gossipsub) handed us a structurally-broken block; we reject with
-    // a string error just like the other validation steps above.
-    // Coherence C2/P1: validate + apply this block's shielded transactions
-    // before committing, using the pool's configured ShieldedVerifier — RejectAll
-    // by default (safe: no unverifiable value admitted), or the SP1/FRI verifier
-    // with `GNB_SHIELDED_VERIFY=sp1` (feature `sp1-verify`). Transparent blocks
-    // (no shielded txs) are a no-op. NOTE: the shielded state does not yet track
-    // reorgs; that lands with the live SP1 verifier. Merkle-binding already
-    // commits the shielded txs into the PoW, so they are non-malleable.
-    shielded.write().apply_block_self(block_hash, &block.shielded_transactions)
-        .map_err(|e| format!("shielded consensus rejection: {:?}", e))?;
-
-    dag.write().add_block(block_hash, parents, ts, work)
-        .map_err(|e| format!("consensus rejection: {}", e))?;
-
-    // CONSENSUS-HALT FIX (DAG-vs-UTXO ordering): the CF_DAG /
-    // CF_DAG_INTEGRITY persist that used to happen right here is DEFERRED
-    // until after the disposition match below succeeds. `add_block` above is
-    // still needed first (GhostDAG selection is the single source of truth
-    // for classifying this block), but if the disposition is REFUSED — e.g.
-    // `execute_reorg` rejects an over-deep fork flip — the in-memory
-    // insertion is rolled back via `GhostDAG::remove_block` and nothing was
-    // persisted, so DAG store, CF_DAG and the applied UTXO state move
-    // together or not at all. Previously the insertion was persisted
-    // unconditionally: a refused deep reorg left `selected_tip()` pinned to
-    // the attacker fork forever (every legitimate extension misclassified as
-    // ForkLoser) — a durable consensus halt.
-
-    // Persist block body — even if this block ends up in a losing fork, we
-    // keep its bytes so a future reorg can apply it without re-downloading.
-    // This must happen BEFORE the disposition match: `execute_reorg` reads
-    // the bodies of `to_apply` blocks (including this one) from CF_BLOCKS.
-    // Block bodies are not consensus state — selected-tip / blue-work
-    // decisions are driven solely by CF_DAG, which is only written after
-    // success — so a body left behind by a rejected block is inert.
-    // On a body-persist failure, roll the in-memory insertion back.
-    if let Err(e) = store.put_block(block) {
-        dag.write().remove_block(&block_hash);
-        return Err(e.to_string());
-    }
-
-    // Informational only (RPC / tip notifications): the bits of the most
-    // recently accepted block. Consensus never reads this; expected bits are
-    // derived from each block's parents (pow::expected_bits).
-    let _ = store.put_meta("current_bits", &block.header.bits.to_le_bytes());
-
-    // ── Sprint U.4: disposition-based state application (closes C-1) ──
-    //
-    // Classify how this block affected the selected chain, then apply
-    // UTXO mutations only when appropriate:
-    //
-    //   * FORK-LOSER   — the selected tip didn't move to this block.
-    //                    Persist block + DAG data only; do NOT touch
-    //                    UTXO set or mempool. The block lives in the DAG
-    //                    and may win later (triggering a reorg).
-    //
-    //   * EXTENSION    — this block IS the new selected tip, and its
-    //                    selected_parent is exactly the old tip. Apply
-    //                    forward just like the pre-U.4 path.
-    //
-    //   * REORG        — this block IS the new selected tip, but its
-    //                    selected_parent is NOT the old tip. The fork
-    //                    that contains this block has outgrown the old
-    //                    chain. Roll back old chain blocks to the LCA,
-    //                    apply new chain blocks from LCA to this block,
-    //                    reinject still-valid mempool txs.
-    //
-    // The match is exhaustive over the (old, new) tuple; unexpected
-    // transitions (e.g. add_block produced no tip) log a warning and
-    // leave state untouched so we don't corrupt anything.
-    let new_selected_tip = dag.read().selected_tip();
-
-    enum Disposition {
-        Extension,
-        ForkLoser,
-        Reorg,
-        Unexpected,
-    }
-
-    let disposition = match (old_selected_tip, new_selected_tip) {
-        (None, Some(t)) if t == block_hash => {
-            // Post-genesis first block — no prior tip. Treat as extension.
-            Disposition::Extension
-        }
-        (Some(old), Some(new)) if new == old => Disposition::ForkLoser,
-        (Some(old), Some(new)) if new == block_hash => {
-            let selected_parent = dag.read()
-                .get_block_data(&block_hash)
-                .and_then(|d| d.selected_parent);
-            if selected_parent == Some(old) {
-                Disposition::Extension
-            } else {
-                Disposition::Reorg
-            }
-        }
-        _ => Disposition::Unexpected,
-    };
-
-    // ── Finality invariant: below-finality blocks stay inert ─────────
-    // A block at or below the finalized height is welcome in the DAG as a
-    // fork-loser (its body was retained above), but it must NEVER become the
-    // selected tip — that would rewrite finalized history. In practice an
-    // Extension cannot reach here below finality (it extends a tip already
-    // above it), and a Reorg flipping the tip below finality is over-deep and
-    // also refused by MAX_REORG_DEPTH; this guard makes the invariant explicit
-    // and independent of that constant. Roll the in-memory insertion back the
-    // same way the refused-reorg path does (nothing is persisted to CF_DAG
-    // yet; the body left in CF_BLOCKS is inert).
-    if block.height <= finalized_height
-        && matches!(disposition, Disposition::Extension | Disposition::Reorg)
-    {
-        dag.write().remove_block(&block_hash);
-        return Err(format!(
-            "finality: block h={} may not become the selected tip at or below finalized height {}",
-            block.height, finalized_height
-        ));
-    }
-
-    match disposition {
-        Disposition::ForkLoser => {
-            info!(
-                "block h={} {} accepted into fork (not selected tip)",
-                block.height, hex::encode(&block_hash[..8])
-            );
-            // Intentional no-op on UTXO / mempool / tip_hash. The block is
-            // now reachable via CF_BLOCKS + DAG; a future reorg can bring
-            // it into the selected chain.
-        }
-
-        Disposition::Extension => {
-            // Apply this block's mutations forward. Uses the shared helper
-            // (src/reorg.rs) so extension and reorg re-apply go through
-            // identical code — they must produce byte-identical UndoData.
-            // Legacy L-1: `apply_block_utxo_mutations` now propagates every
-            // write error instead of silently discarding it (previously
-            // only `put_undo_data` failures were even visible here). This
-            // call site does NOT yet roll back or abort on failure — doing
-            // so safely requires the atomic single-WriteBatch commit and
-            // startup reconciliation check tracked as Legacy M-7 (not yet
-            // implemented: mid-block failure here can already leave the
-            // UTXO set, block body, and tip in different states, and
-            // returning early now — without a rollback path — would not
-            // fix that, only change WHICH state is inconsistent). Until
-            // M-7 lands, a failure here is a fleet-visible, actionable
-            // signal (error!, not warn!) that this node's UTXO set may have
-            // diverged and needs `--verify-carryover`-style reconciliation.
-            if let Err(e) = reorg::apply_block_utxo_mutations(store, block) {
-                error!(
-                    "U.4/L-1: apply_block_utxo_mutations FAILED for h={}: {} — this node's \
-                     UTXO set may now be inconsistent with its block/DAG state (Legacy M-7: \
-                     atomic commit + startup reconciliation not yet implemented). Investigate \
-                     storage health immediately.",
-                    block.height, e
-                );
-            }
-
-            let confirmed: Vec<[u8; 32]> = block.transactions.iter().map(|t| t.txid()).collect();
-            mempool.remove_confirmed(&confirmed);
-            store.put_meta("tip_hash", &block_hash).ok();
-        }
-
-        Disposition::Reorg => {
-            // new_selected_tip must be Some here (we matched on it).
-            let new_tip = new_selected_tip.expect("reorg disposition implies Some(new_tip)");
-            let old_tip = old_selected_tip.expect("reorg disposition implies Some(old_tip)");
-
-            let plan = {
-                let d = dag.read();
-                reorg::compute_reorg_plan(&d, &old_tip, &new_tip)
-            };
-            let plan = match plan {
-                Some(p) => p,
-                None => {
-                    // CONSENSUS-HALT FIX: roll the in-memory DAG insertion
-                    // back before rejecting — nothing has been persisted to
-                    // CF_DAG yet, so DAG and applied UTXO state stay in sync.
-                    dag.write().remove_block(&block_hash);
-                    return Err(format!(
-                        "U.4: tip changed to {} via reorg but compute_reorg_plan returned None (old={}, new={})",
-                        hex::encode(&new_tip[..8]),
-                        hex::encode(&old_tip[..8]),
-                        hex::encode(&new_tip[..8]),
-                    ));
-                }
-            };
-
-            info!(
-                "🔀 Reorg at h={}: rollback {} blocks, apply {} blocks (lca={})",
-                block.height,
-                plan.to_rollback.len(),
-                plan.to_apply.len(),
-                hex::encode(&plan.lca[..8]),
-            );
-
-            let outcome = match reorg::execute_reorg(store, mempool, &plan) {
-                Ok(o) => o,
-                Err(e) => {
-                    // CONSENSUS-HALT FIX: a refused reorg (e.g. deeper than
-                    // reorg::MAX_REORG_DEPTH) or a failed one left the UTXO
-                    // store untouched by design. The in-memory DAG insertion
-                    // must be undone as well — otherwise selected_tip()
-                    // permanently adopts a fork whose state was never
-                    // applied, and every legitimate extension of the real
-                    // chain is misclassified as ForkLoser: a durable halt.
-                    // Nothing was persisted to CF_DAG (deferred until after
-                    // this match), so the undo is purely in-memory.
-                    if !dag.write().remove_block(&block_hash) {
-                        warn!(
-                            "U.4: failed to roll back DAG insertion of {} after refused reorg \
-                             (block gained children concurrently?) — tip may be inconsistent",
-                            hex::encode(&block_hash[..8]),
-                        );
-                    }
-                    return Err(format!("U.4: execute_reorg failed: {}", e));
-                }
-            };
-
-            info!(
-                "   reorg done: rolled_back={}, applied={}, txs_reinjected={}, txs_discarded={}",
-                outcome.rolled_back, outcome.applied,
-                outcome.txs_reinjected, outcome.txs_discarded,
-            );
-
-            // execute_reorg already applied all to_apply blocks (including
-            // the one we just accepted). Now remove those txs from mempool
-            // in case any had slipped in between rollback and apply.
-            let confirmed: Vec<[u8; 32]> = block.transactions.iter().map(|t| t.txid()).collect();
-            mempool.remove_confirmed(&confirmed);
-            store.put_meta("tip_hash", &new_tip).ok();
-        }
-
-        Disposition::Unexpected => {
-            warn!(
-                "U.4: unexpected selected-tip transition during accept of block h={} \
-                 (old={:?}, new={:?}, block={})",
-                block.height, old_selected_tip, new_selected_tip, hex::encode(&block_hash[..8])
-            );
-            // Refuse to mutate state on an unexpected transition.
-            // CONSENSUS-HALT FIX: previously the block stayed in the DAG
-            // (and was persisted) while UTXO state was left untouched — the
-            // same DAG-vs-UTXO divergence as the refused-reorg case. Roll
-            // the in-memory insertion back and reject, so a re-submission
-            // can be classified cleanly later.
-            dag.write().remove_block(&block_hash);
-            return Err(format!(
-                "U.4: unexpected selected-tip transition (old={:?}, new={:?}); block {} rejected",
-                old_selected_tip, new_selected_tip, hex::encode(&block_hash[..8]),
-            ));
-        }
-    }
-
-    // CONSENSUS-HALT FIX: the DAG entry is persisted only NOW, after the
-    // disposition above has been applied successfully. Every refusal path
-    // above rolled the in-memory insertion back and returned Err, so CF_DAG
-    // can never adopt a fork tip whose chain state was refused.
-    // NOTE: bind the cloned data in its own `let` so the `dag.read()` guard is
-    // released at the `;` — parking_lot's RwLock is NOT reentrant, so keeping a
-    // read guard alive across `dag.write()` below deadlocks (write parks waiting
-    // for the reader that this same thread holds). Harmless while Legacy left the
-    // index untouched; a hard hang once the reachability gate arms `dag.write()`.
-    let ddata_opt = dag.read().get_block_data(&block_hash).cloned();
-    if let Some(ddata) = ddata_opt {
-        // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
-        // Phase 1: when the reachability index is maintained, fold its delta
-        // (which may span several blocks if this insert triggered a reindex)
-        // into the SAME WriteBatch, so a crash here leaves CF_DAG and
-        // CF_REACHABILITY consistent all-or-nothing. Live Legacy: unchanged.
-        if dag.read().maintains_reachability_index() {
-            let (upserts, removals) = dag.write().reach_take_delta();
-            store.put_dag_with_integrity_and_reach(&block_hash, &ddata, &upserts, &removals).ok();
-        } else {
-            store.put_dag_with_integrity(&block_hash, &ddata).ok();
-        }
-    }
-
-    // ── Update node state ────────────────────────────────────────────
-    {
-        let mut s = node_state.write();
-        s.tip_blue_score = dag.read().tip_blue_score();
-        s.block_count    = dag.read().block_count() as u64;
-        s.mempool_size   = mempool.size();
-    }
-    info!("✓ block h={} accepted", height);
-
-    // ── Update finality checkpoint ───────────────────────────────────
-    // Once tip is CHECKPOINT_DEPTH ahead, finalize everything below.
-    // NOTE: this MUST be the selected tip's *height*, not tip_blue_score().
-    // finalized_height is compared against block.height at the finality gate
-    // above; feeding it blue_score (which runs ahead of height by the DAG
-    // width) makes the node "finalize" a height above its own tip once the
-    // skew exceeds CHECKPOINT_DEPTH, permanently rejecting every
-    // chain-extending block. Same height unit feeds the pruning block below.
-    let tip_height = {
-        let d = dag.read();
-        d.selected_tip()
-            .and_then(|h| d.get_block_data(&h).map(|data| data.height))
-            .unwrap_or(0)
-    };
-    // [no-fork] Do not advance finality while mining through a stalled latch —
-    // freezing finalized_height keeps a heavier chain able to reorg us back.
-    if tip_height > core::CHECKPOINT_DEPTH
-        && !FINALITY_FROZEN.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        let new_finalized = tip_height - core::CHECKPOINT_DEPTH;
-        let current_finalized = store.get_meta("finalized_height").ok().flatten()
-            .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
-            .unwrap_or(0);
-        if new_finalized > current_finalized {
-            store.put_meta("finalized_height", &new_finalized.to_le_bytes()).ok();
-        }
-    }
-
-    // ── Prune old block bodies ───────────────────────────────────────
-    // Remove full block data beyond PRUNING_DEPTH (keeps height→hash, DAG, TX index)
-    if ARCHIVE_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-        // Archival node: keep everything. Logged once per prune window so an
-        // operator can see the choice is in effect rather than inferring it.
-        if tip_height % 10_000 == 0 {
-            info!("archival mode: retaining ALL block bodies (h={}); pruning disabled", tip_height);
-        }
-    } else if tip_height > core::PRUNING_DEPTH {
-        let prune_below = tip_height - core::PRUNING_DEPTH;
-        let last_pruned = store.pruned_height();
-        if prune_below > last_pruned + 1000 { // batch: prune every 1000 blocks
-            match store.prune_blocks_below(prune_below) {
-                Ok(n) if n > 0 => info!("Pruned {} block bodies below h={}", n, prune_below),
-                Err(e)         => warn!("Prune failed: {}", e),
-                _ => {}
-            }
-        }
-    }
-
-    // ── Sprint 2.c: emit TipChanged if the selected tip moved ────────
-    //
-    // This hook runs regardless of how the block got here (network
-    // gossipsub, stratum submit, orphan resurrection, miner loop —
-    // miner loop has its own inline hook because it doesn't route
-    // through this function). If `tip_tx` is None (no subscriber or
-    // unit test) the work is skipped entirely.
-    //
-    // Semantics of TipChanged fields: describe the CURRENT tip
-    // (post-accept). Stratum consumers use this + dag.tips() +
-    // current_bits to build a fresh template for the NEXT block.
-    if let Some(tip_tx) = tip_tx {
-        // Bodied tip only: a header-only tip is unmineable, so stratum must
-        // be notified on the best BODIED tip / parents, never a phantom.
-        let has_body = |h: &[u8; 32]| store.get_block(h).ok().flatten().is_some();
-        let new_tip = { dag.read().best_bodied_tip(has_body) };
-        if new_tip != old_tip {
-            if let Some(tip_hash) = new_tip {
-                let d = dag.read();
-                if let Some(data) = d.get_block_data(&tip_hash).cloned() {
-                    let tips_parents: Vec<[u8; 32]> = d.bodied_tips(has_body);
-                    drop(d);
-
-                    let bits = store.get_meta("current_bits").ok().flatten()
-                        .and_then(|b| b.as_slice().try_into().ok().map(u32::from_le_bytes))
-                        .unwrap_or(0x1d00ffff_u32);
-
-                    // send() returns Err(SendError) iff there are 0
-                    // receivers — we intentionally ignore that case
-                    // since stratum might not be running.
-                    let _ = tip_tx.send(tip::TipChanged {
-                        hash:       tip_hash,
-                        height:     data.height,
-                        blue_score: data.blue_score,
-                        parents:    tips_parents,
-                        bits,
-                    });
-                }
-            }
-        }
-    }
-
-    Ok(block_hash)
-}
+// `FINALITY_FROZEN`, `ARCHIVE_MODE` and `accept_block` moved to `accept.rs`
+// (audit DAG-1/DAG-10/DAG-11); imported at the top of this file.
 
 /// Blue_work-VERIFIED IBD release — the ONLY path that clears `is_syncing`.
 ///
@@ -2682,237 +2149,9 @@ fn drop_orphan_subtree(
 }
 
 // ── Unified TX validation ────────────────────────────────────────────────────
-// FIX #10: Single validation core used by all code paths.
+// `validate_tx_inputs`, `miner_template_total_fees`, `validate_tx_in_block*`
+// and `validate_tx_standalone` moved to `accept.rs`; imported at the top.
 
-/// Core input validation logic shared by all TX validation paths.
-/// Resolves each input's UTXO, checks pubkey hash match, verifies ML-DSA-65
-/// signature, and accumulates total input value.
-fn validate_tx_inputs(
-    tx:           &core::Transaction,
-    utxo_lookup:  &dyn Fn(&[u8; 32], u32) -> Result<Option<core::TxOutput>, String>,
-    mut spent_set: Option<&mut HashSet<([u8; 32], u32)>>,
-) -> Result<u64, String> {
-    let mut total_in = 0u64;
-
-    // C-R3-2: the intra-tx duplicate-outpoint check is UNCONDITIONAL. The
-    // standalone (gossip-relay) path passes `spent_set = None`, and the old
-    // Some-gated check let a tx list the SAME outpoint N times — its value
-    // was counted N times below, so a doubled-fee double-spend was admitted
-    // to the mempool. `local_spent` catches duplicates within THIS tx on
-    // every path; the caller's `spent_set` (when provided) still tracks
-    // cross-tx conflicts inside a block.
-    let mut local_spent: HashSet<([u8; 32], u32)> = HashSet::new();
-
-    for (i, inp) in tx.inputs.iter().enumerate() {
-        let outpoint = (inp.prev_txid, inp.prev_index);
-
-        // FIX #9 + C-R3-2: double-spend within the same validation context —
-        // cross-tx via the caller's set (when present), intra-tx ALWAYS via
-        // the local insert-as-check.
-        let cross_tx_dup = spent_set.as_ref().is_some_and(|s| s.contains(&outpoint));
-        if cross_tx_dup || !local_spent.insert(outpoint) {
-            return Err(format!("double-spend: {}:{} already consumed",
-                hex::encode(&inp.prev_txid[..8]), inp.prev_index));
-        }
-
-        // Resolve UTXO
-        let utxo = utxo_lookup(&inp.prev_txid, inp.prev_index)?
-            .ok_or_else(|| format!("UTXO {}:{} not found",
-                hex::encode(&inp.prev_txid[..8]), inp.prev_index))?;
-
-        total_in = total_in.checked_add(utxo.value).ok_or("input overflow")?;
-
-        // Parse and verify script_sig
-        let (sig, pk) = core::Transaction::parse_script_sig(&inp.script_sig)
-            .ok_or_else(|| format!("malformed script_sig at input {}", i))?;
-
-        // Verify pubkey hash matches UTXO script_pubkey
-        let pk_hash = {
-            use sha3::{Sha3_256, Digest};
-            Sha3_256::digest(&pk)[..20].to_vec()
-        };
-        if pk_hash != utxo.script_pubkey {
-            return Err(format!("pubkey mismatch at input {}", i));
-        }
-
-        // Verify hybrid ML-DSA-65 ‖ Falcon-1024 signature. Chain-id (Roadmap #8)
-        // is the node-level single source of truth — miner and validator share it
-        // (see core::node_chain_id / set_node_chain_id).
-        let sighash = tx.sighash(i, core::node_chain_id());
-        if !crypto::verify(&pk, &sighash, &sig) {
-            return Err(format!("invalid signature at input {}", i));
-        }
-
-        // Mark outpoint as spent
-        if let Some(spent) = spent_set.as_mut() {
-            spent.insert(outpoint);
-        }
-    }
-
-    let total_out: u64 = tx.outputs.iter()
-        .try_fold(0u64, |acc, o| acc.checked_add(o.value))
-        .ok_or("output sum overflow")?;
-    if total_in < total_out {
-        return Err(format!("inputs {} < outputs {}", total_in, total_out));
-    }
-    let fee = total_in - total_out;
-    core::check_min_fee(tx, fee)?;
-    Ok(fee)
-}
-
-/// Compute the total fee the miner's OWN block template may claim across
-/// `txs` (the candidate set selected from the mempool), reading prevout
-/// values from the persistent UTXO set.
-///
-/// SECURITY (Legacy N-7): counts each of a transaction's outpoints ONCE —
-/// insert-as-check, mirroring the C-R3-2 duplicate-outpoint rejection real
-/// admission applies (`validate_tx_inputs`'s `local_spent`). This used to
-/// `filter_map`+`sum` over `tx.inputs` unconditionally, so a transaction
-/// listing the SAME outpoint N times had that outpoint's value summed N
-/// times, inflating the fee the coinbase this template builds is allowed to
-/// claim. Such a transaction is rejected outright by real consensus
-/// validation (the identical insert-as-check, re-run when this self-mined
-/// block is committed through the normal `accept_block` path) — it can never
-/// legitimately contribute ANY fee, so this estimate must not act as if it
-/// could either. Concretely: without this fix, a template that included such
-/// a transaction would build a coinbase `validate_coinbase_value` then
-/// rejects when the self-mined block is committed — wasting the mined block
-/// (a liveness bug) rather than minting anything (accept_block's real,
-/// non-inflating fee computation is still the actual consensus gate) — but
-/// the template must not rely on that backstop to compute a correct number.
-fn miner_template_total_fees(
-    txs:   &[core::Transaction],
-    store: &storage::Storage,
-) -> u64 {
-    txs.iter().map(|tx| {
-        let mut seen_outpoints: HashSet<([u8; 32], u32)> = HashSet::new();
-        let mut has_duplicate_outpoint = false;
-        let mut total_in: u64 = 0;
-        for inp in &tx.inputs {
-            if !seen_outpoints.insert((inp.prev_txid, inp.prev_index)) {
-                has_duplicate_outpoint = true;
-                continue;
-            }
-            if let Ok(Some(out)) = store.get_utxo(&inp.prev_txid, inp.prev_index) {
-                total_in = total_in.saturating_add(out.value);
-            }
-        }
-        if has_duplicate_outpoint {
-            return 0;
-        }
-        let total_out: u64 = tx.outputs.iter()
-            .try_fold(0u64, |acc, o| acc.checked_add(o.value))
-            .unwrap_or(u64::MAX); // overflow → caller (validate_coinbase_value) will reject
-        total_in.saturating_sub(total_out)
-    }).sum()
-}
-
-/// Validate a transaction within a block context.
-/// Uses both in-block outputs and persistent UTXO set, with double-spend tracking.
-fn validate_tx_in_block(
-    block:          &core::Block,
-    tx:             &core::Transaction,
-    store:          &Arc<storage::Storage>,
-    spent_in_block: &mut HashSet<([u8; 32], u32)>,
-) -> Result<(), String> {
-    validate_tx_in_block_with_maturity(block, tx, store, spent_in_block, 0)?;
-    Ok(())
-}
-
-/// FIX VULN-03: Validate TX within a block, including coinbase maturity check.
-/// Returns the fee (total_in - total_out) for coinbase value validation.
-fn validate_tx_in_block_with_maturity(
-    block:          &core::Block,
-    tx:             &core::Transaction,
-    store:          &Arc<storage::Storage>,
-    spent_in_block: &mut HashSet<([u8; 32], u32)>,
-    current_height: u64,
-) -> Result<u64, String> {
-    // SECURITY (Legacy C-2): build the in-block prevout map from ONLY the
-    // transactions STRICTLY BEFORE `tx` in `block.transactions` — never from
-    // the whole block. This used to `flat_map` over ALL of
-    // `block.transactions` unconditionally, so a transaction could spend the
-    // output of a LATER transaction in the same block: `tx[i]` validates
-    // (and is fee-accounted, and its own outputs get created) as if it had
-    // genuinely spent `tx[j]`'s (j > i) output, while the actual UTXO
-    // application (`reorg::apply_block_utxo_mutations`) writes each
-    // transaction's outputs THEN deletes its inputs, walking the block IN
-    // ORDER — so `tx[j]`'s output is written to storage only AFTER `tx[i]`'s
-    // (no-op, not-yet-existent-key) delete already ran, leaving it
-    // permanently unspent. The value tx[i] was credited for spending is
-    // never actually removed from the UTXO set: a supply-inflating mint,
-    // out-of-order-block-only, requiring no signature forgery.
-    //
-    // A transaction MAY legitimately spend an EARLIER same-block
-    // transaction's output (ordinary same-block chaining, e.g. a miner
-    // including a child of a transaction it also included) — that is
-    // exactly what the apply-order above expects and this preserves. It may
-    // never spend its own or a later transaction's not-yet-created output.
-    //
-    // `tx` is identified by TXID (content hash) rather than by reference
-    // identity so this is correct whether the caller passes a reference
-    // borrowed from `block.transactions` (the real consensus path) or an
-    // owned clone with identical content (as some call sites do); if `tx`'s
-    // txid is not found in `block.transactions` at all (a misuse this
-    // function's real callers never trigger), this falls back to the full
-    // block — permissive only for that out-of-invariant case.
-    let tx_txid = tx.txid();
-    let cutoff = block.transactions.iter()
-        .position(|t| t.txid() == tx_txid)
-        .unwrap_or(block.transactions.len());
-    let block_utxos: std::collections::HashMap<([u8; 32], u32), core::TxOutput> = block.transactions[..cutoff]
-        .iter()
-        .flat_map(|t| {
-            let txid = t.txid();
-            t.outputs.iter().enumerate().map(move |(i, o)| ((txid, i as u32), o.clone()))
-        })
-        .collect();
-
-    // Coinbase maturity check (VULN-03). Single source of truth in
-    // core::check_coinbase_maturity; this call site is one of two.
-    core::check_coinbase_maturity(tx, current_height, |txid| {
-        store.get_coinbase_height(txid).ok().flatten()
-    })?;
-
-    let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
-        if let Some(out) = block_utxos.get(&(*txid, idx)) {
-            return Ok(Some(out.clone()));
-        }
-        store.get_utxo(txid, idx).map_err(|e| e.to_string())
-    };
-
-    validate_tx_inputs(tx, &lookup, Some(spent_in_block))
-}
-
-
-/// Standalone tx validation (for mempool / sendrawtransaction).
-/// Returns the fee (total_in - total_out).
-/// Also checks coinbase maturity (VULN-03).
-fn validate_tx_standalone(
-    tx:    &core::Transaction,
-    store: &Arc<storage::Storage>,
-    current_height: u64,
-) -> Result<u64, String> {
-    // Coinbase maturity check
-    if current_height > 0 {
-        for (i, inp) in tx.inputs.iter().enumerate() {
-            if let Ok(Some(cb_height)) = store.get_coinbase_height(&inp.prev_txid) {
-                let depth = current_height.saturating_sub(cb_height);
-                if depth < core::COINBASE_MATURITY {
-                    return Err(format!(
-                        "coinbase maturity: input {} needs {} more confirmations",
-                        i, core::COINBASE_MATURITY - depth
-                    ));
-                }
-            }
-        }
-    }
-    let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
-        store.get_utxo(txid, idx).map_err(|e| e.to_string())
-    };
-
-    validate_tx_inputs(tx, &lookup, None)
-}
 // v0.2.0 PoI
 // v0.2.1 reconnect
 // v0.2.2 ws+pex
@@ -3199,17 +2438,32 @@ mod external_submission_tests {
             msg.contains("coinbase"),
             "rejection must come from the coinbase-value consensus check, got: {}", msg,
         );
-        // The pre-fix path persisted the block BEFORE any validation — the
-        // whole point of the fix is that a rejected block leaves no trace.
+        // UPDATED for audit DAG-1 (accept/connect split). The pre-fix path
+        // deleted a block that failed transaction validation. Transaction
+        // validity is now a connect-time property of the block's own chain
+        // context; a block failing it is recorded as CHAIN-DISQUALIFIED and
+        // kept in the DAG (so a peer that merged it as a non-selected parent
+        // stays acceptable — arrival-order independence), but it is never
+        // selected, never applied and never broadcast. What this test guards —
+        // the producer refuses its own invalid block and nothing of it reaches
+        // the chain state — is unchanged:
+        assert!(node.dag.read().is_invalid(&hash), "must be recorded as disqualified");
         assert!(
-            node.store.get_block(&hash).expect("store read").is_none(),
-            "rejected self-mined block must NOT be persisted",
+            node.store.invalid_block_reason(&hash).expect("meta read").is_some(),
+            "the disqualification must be persisted",
+        );
+        assert_eq!(
+            node.dag.read().selected_tip(), Some(genesis.block_hash()),
+            "a rejected self-mined block must never become the selected tip",
         );
         assert!(
-            node.dag.read().get_block_data(&hash).is_none(),
-            "rejected self-mined block must NOT enter the DAG",
+            node.store.get_utxo(&bad.transactions[0].txid(), 0).expect("utxo read").is_none(),
+            "a rejected self-mined block must have no UTXO effect",
         );
-        assert_eq!(node.dag.read().block_count(), 1, "DAG must contain only genesis");
+        assert!(
+            node.store.get_meta("tip_hash").expect("meta read").is_none(),
+            "the applied tip pointer must not move",
+        );
     }
 
     /// Structural gate parity: the self-miner gets no structural bypass

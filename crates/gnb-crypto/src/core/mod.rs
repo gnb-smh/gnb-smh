@@ -13,6 +13,9 @@ pub mod tokenomics;
 /// Bloch Genesis-3 carryover: verified, converted opening ledger.
 pub mod carryover;
 
+/// MoneyRange and canonical-encoding size helpers (audit VAL-11 / VAL-12).
+pub mod limits;
+
 // ── Network identity ─────────────────────────────────────────────────────────
 
 pub const MAINNET_PREFIX:        &str  = "gnb1q";
