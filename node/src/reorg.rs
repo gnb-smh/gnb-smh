@@ -438,6 +438,8 @@ struct ReorgBatch<'a> {
     holders: crate::storage::aggregates::HolderDeltas,
     /// NET-12: running connected-chain totals.
     chain: crate::storage::aggregates::ChainTotals,
+    /// NET-12: running XOR of the connected blocks' hashes (`agg/conn`).
+    conn: [u8; 32],
     _agg: parking_lot::MutexGuard<'a, ()>,
 }
 
@@ -445,6 +447,7 @@ impl<'a> ReorgBatch<'a> {
     fn new(store: &'a Storage) -> Result<Self, String> {
         let agg = store.agg_lock();
         let chain = store.chain_totals().map_err(|e| format!("reorg batch: aggregates: {}", e))?;
+        let conn = store.conn_fingerprint().map_err(|e| format!("reorg batch: aggregates: {}", e))?.unwrap_or_default();
         Ok(ReorgBatch {
             store,
             batch: rocksdb::WriteBatch::default(),
@@ -452,6 +455,7 @@ impl<'a> ReorgBatch<'a> {
             coinbase_overlay: HashMap::new(),
             holders: Default::default(),
             chain,
+            conn,
             _agg: agg,
         })
     }
@@ -578,6 +582,7 @@ impl<'a> ReorgBatch<'a> {
             self.chain.blocks = self.chain.blocks.saturating_sub(1);
             self.chain.txs = self.chain.txs.saturating_sub(txs);
         }
+        crate::storage::aggregates::xor_into(&mut self.conn, hash);
         let rec = if joined { Some(self.chain) } else { None };
         self.store.stage_chain_cumulative(&mut self.batch, hash, rec)
             .map_err(|e| format!("reorg batch: aggregates: {}", e))
@@ -589,7 +594,7 @@ impl<'a> ReorgBatch<'a> {
     fn commit(mut self) -> Result<(), String> {
         self.store.stage_holder_deltas(&mut self.batch, &self.holders)
             .map_err(|e| format!("reorg batch: aggregates: {}", e))?;
-        self.store.stage_chain_totals(&mut self.batch, self.chain)
+        self.store.stage_chain_totals(&mut self.batch, self.chain, &self.conn)
             .map_err(|e| format!("reorg batch: aggregates: {}", e))?;
         let ReorgBatch { store, batch, _agg, .. } = self;
         let r = store.db().write(batch)

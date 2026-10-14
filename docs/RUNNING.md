@@ -53,4 +53,8 @@ node keeps in the same write batches as its UTXO set. A data directory
 written by an older node gets them built once at start-up (log line
 "NET-12: explorer aggregates rebuilt …", one pass over the UTXO set and the
 undo records); until then those methods answer with an error instead of
-scanning.
+scanning. Every start-up also checks that the stored aggregates describe the
+connected chain on disk (block count and a fingerprint of the connected
+blocks against the undo records), so a data directory that an older release
+moved forward after a downgrade is rebuilt too instead of serving stale
+statistics.

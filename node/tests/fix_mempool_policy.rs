@@ -1310,6 +1310,96 @@ fn net12_preexisting_database_is_rebuilt_at_startup() {
     sim.check(1);
 }
 
+/// Every `agg/*` key and value in CF_META (what a binary that does not know
+/// the aggregates leaves untouched).
+fn agg_keys(store: &Storage) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let db = store.db();
+    let cf = db.cf_handle("meta").unwrap();
+    db.iterator_cf(cf, rocksdb::IteratorMode::Start)
+        .filter_map(|r| r.ok())
+        .filter(|(k, _)| k.starts_with(b"agg/"))
+        .map(|(k, v)| (k.to_vec(), v.to_vec()))
+        .collect()
+}
+
+/// Put back `saved` as the only `agg/*` keys: the state a release without
+/// the aggregates leaves after moving the chain.
+fn restore_agg_keys(store: &Storage, saved: &[(Vec<u8>, Vec<u8>)]) {
+    let db = store.db();
+    let cf = db.cf_handle("meta").unwrap();
+    for (k, _) in agg_keys(store) {
+        db.delete_cf(cf, k).unwrap();
+    }
+    for (k, v) in saved {
+        db.put_cf(cf, k, v).unwrap();
+    }
+}
+
+/// Reopen the store of `sim` (a node restart).
+fn reopen(sim: Sim) -> Sim {
+    let path = sim._tmp.path().join("db");
+    let Sim { _tmp, store, chain, base, rng, serial, .. } = sim;
+    drop(store);
+    let store = Arc::new(Storage::open(&path).unwrap());
+    Sim { _tmp, store, base, chain, alt: None, rng, serial, reorgs: 0 }
+}
+
+/// Review finding (version marker only): the chain moved under aggregates
+/// that a release without them left untouched — a downgrade then a
+/// re-upgrade. The version marker survives, so pre-fix the stale rich list,
+/// tiers and chain totals were served indefinitely. Start-up now compares
+/// the stored block count and connected-set fingerprint with the undo
+/// records and rebuilds on a mismatch — including a reorg that leaves the
+/// block count unchanged, and a P4 database written before the fingerprint
+/// existed. An untouched database is not rebuilt.
+#[test]
+fn net12_aggregates_left_stale_by_another_binary_are_rebuilt_at_startup() {
+    let mut sim = Sim::new(21);
+    for _ in 0..6 { sim.extend(); }
+    sim.check(0);
+    let mut sim = reopen(sim);
+    assert!(!sim.store.ensure_aggregates().unwrap(), "current aggregates are not rebuilt");
+    assert!(sim.store.aggregates_match_connected_chain().unwrap());
+
+    // (a) The old binary connected three blocks and rolled one back.
+    let saved = agg_keys(&sim.store);
+    for _ in 0..3 { sim.extend(); }
+    sim.rollback(1);
+    restore_agg_keys(&sim.store, &saved);
+    let mut sim = reopen(sim);
+    assert!(sim.store.aggregates_ready(), "the marker survived: the bug's precondition");
+    assert_ne!(sim.store.aggregate_snapshot().unwrap(), sim.store.recompute_aggregates(&AtomicBool::new(false)).unwrap(),
+        "stale aggregates");
+    assert!(!sim.store.aggregates_match_connected_chain().unwrap());
+    assert!(sim.store.ensure_aggregates().unwrap(), "rebuilt at start-up");
+    sim.check(1);
+    sim.extend();
+    sim.check(2);
+
+    // (b) Same block count, different connected set (a one-block reorg).
+    let saved = agg_keys(&sim.store);
+    let blocks = sim.chain.len();
+    sim.rollback(1);
+    sim.extend();
+    assert_eq!(sim.chain.len(), blocks);
+    restore_agg_keys(&sim.store, &saved);
+    let sim = reopen(sim);
+    assert_eq!(sim.store.chain_totals().unwrap().blocks, blocks as u64, "the count alone matches");
+    assert!(sim.store.ensure_aggregates().unwrap(), "the fingerprint does not");
+    sim.check(3);
+
+    // (c) A database written by the P4 binary before `agg/conn` existed.
+    {
+        let db = sim.store.db();
+        let cf = db.cf_handle("meta").unwrap();
+        db.delete_cf(cf, b"agg/conn").unwrap();
+    }
+    let sim = reopen(sim);
+    assert!(sim.store.ensure_aggregates().unwrap());
+    sim.check(4);
+    assert_eq!(sim.store.conn_fingerprint().unwrap(), Some(sim.store.connected_fingerprint_from_undo().unwrap().1));
+}
+
 /// NET-12: bounded cost. The explorer statistics read a CONSTANT number of
 /// storage entries whatever the chain length and the number of holders
 /// (counted by the store, not timed); a full scan reads one per block.

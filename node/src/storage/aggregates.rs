@@ -12,6 +12,7 @@
 //! |---|---|
 //! | `agg/version` | `u32 LE` = [`AGG_VERSION`]: the aggregates are complete |
 //! | `agg/chain` | connected selected-chain blocks `u64 LE` ‖ their transactions `u64 LE` (genesis excluded) |
+//! | `agg/conn` | XOR of the hashes of those connected blocks (32 bytes): the fingerprint of the connected set |
 //! | `agg/cum/<32-byte block hash>` | the same two totals through that connected block |
 //! | `agg/bal/<20-byte address>` | balance `u64 LE` ‖ UTXO count `u64 LE` (present iff count > 0) |
 //! | `agg/rich/<u64 BE (u64::MAX − balance)><20-byte address>` | UTXO count `u64 LE` — iterates highest balance first, ties by address |
@@ -24,6 +25,15 @@
 //! value from scratch (UTXO set + undo records) and is used both to build the
 //! aggregates of a pre-existing database at start-up and, in tests, to prove
 //! that the incremental values equal a full recomputation.
+//!
+//! The version marker alone does not prove the aggregates current: a binary
+//! that does not know them (an older release run during a downgrade) moves
+//! the chain without touching `agg/*`, and the marker survives. At start-up
+//! [`Storage::ensure_aggregates`] therefore also compares the stored block
+//! count and connected-set fingerprint (`agg/chain`, `agg/conn`) with one
+//! pass over the undo-record keys, and rebuilds on any mismatch (review
+//! finding: a downgrade and re-upgrade served a stale rich list, tiers and
+//! chain totals indefinitely).
 //!
 //! These are node-local indexes: no consensus rule reads them.
 
@@ -41,6 +51,7 @@ pub const AGG_VERSION: u32 = 1;
 
 const K_VERSION: &[u8] = b"agg/version";
 const K_CHAIN: &[u8] = b"agg/chain";
+const K_CONN: &[u8] = b"agg/conn";
 const K_TIERS: &[u8] = b"agg/tiers";
 const P_CUM: &[u8] = b"agg/cum/";
 const P_BAL: &[u8] = b"agg/bal/";
@@ -85,10 +96,20 @@ pub struct TierTotals {
     pub utxos:   u64,
 }
 
+/// XOR of the hashes of a set of blocks (order-free fingerprint; adding or
+/// removing a block toggles its hash in).
+pub fn xor_into(acc: &mut [u8; 32], hash: &[u8; 32]) {
+    for (a, h) in acc.iter_mut().zip(hash) {
+        *a ^= h;
+    }
+}
+
 /// Every stored aggregate, or a from-scratch recomputation of them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AggregateSnapshot {
     pub chain:      ChainTotals,
+    /// XOR of the hashes of the connected blocks (`agg/conn`).
+    pub conn:       [u8; 32],
     pub cumulative: BTreeMap<[u8; 32], ChainTotals>,
     pub holders:    BTreeMap<[u8; 20], HolderEntry>,
     /// Holders in rich-list order (balance descending, address ascending).
@@ -232,8 +253,10 @@ impl Storage {
                 };
                 if empty_cf(CF_UTXO)? && empty_cf(CF_UNDO)? {
                     let cf = self.meta_cf()?;
-                    self.db.put_cf(cf, K_VERSION, AGG_VERSION.to_le_bytes())
-                        .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+                    let mut batch = WriteBatch::default();
+                    batch.put_cf(cf, K_CONN, [0u8; 32]);
+                    batch.put_cf(cf, K_VERSION, AGG_VERSION.to_le_bytes());
+                    self.write_batch(batch)?;
                     true
                 } else {
                     false
@@ -245,14 +268,52 @@ impl Storage {
     }
 
     /// Rebuild the aggregates from scratch if they are not complete (a
-    /// database written before NET-12). One full scan, at start-up only.
-    /// Returns whether a rebuild ran.
+    /// database written before NET-12) or do not describe the connected
+    /// chain on disk (another binary moved the chain since they were
+    /// written: [`Self::aggregates_match_connected_chain`]). At start-up
+    /// only: one pass over the undo-record keys, plus one full scan when a
+    /// rebuild is needed. Returns whether a rebuild ran.
     pub fn ensure_aggregates(&self) -> Result<bool, StorageError> {
         if self.aggregates_ready() {
-            return Ok(false);
+            if self.aggregates_match_connected_chain()? {
+                return Ok(false);
+            }
+            log::warn!("NET-12: the explorer aggregates do not describe the connected chain on disk \
+                        (written before a downgrade?); rebuilding them");
+            self.agg_ready.store(false, Ordering::Release);
         }
         self.rebuild_aggregates(&AtomicBool::new(false))?;
         Ok(true)
+    }
+
+    /// `(blocks, XOR of their hashes)` of the connected chain on disk: the
+    /// blocks with an undo record (one pass over the CF_UNDO keys).
+    pub fn connected_fingerprint_from_undo(&self) -> Result<(u64, [u8; 32]), StorageError> {
+        let cf_undo = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
+        let (mut count, mut xor) = (0u64, [0u8; 32]);
+        let mut it = self.db.raw_iterator_cf(cf_undo);
+        it.seek_to_first();
+        while let Some(k) = it.key() {
+            if let Ok(h) = <[u8; 32]>::try_from(k) {
+                count += 1;
+                xor_into(&mut xor, &h);
+            }
+            it.next();
+        }
+        it.status().map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+        Ok((count, xor))
+    }
+
+    /// True iff the stored block count (`agg/chain`) and connected-set
+    /// fingerprint (`agg/conn`, required) match the undo records on disk.
+    pub fn aggregates_match_connected_chain(&self) -> Result<bool, StorageError> {
+        let (count, xor) = self.connected_fingerprint_from_undo()?;
+        Ok(self.chain_totals()?.blocks == count && self.conn_fingerprint()? == Some(xor))
+    }
+
+    /// The stored connected-set fingerprint (`agg/conn`), if any.
+    pub fn conn_fingerprint(&self) -> Result<Option<[u8; 32]>, StorageError> {
+        Ok(self.meta_get_raw(K_CONN)?.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()))
     }
 
     /// Connected-chain totals.
@@ -377,12 +438,14 @@ impl Storage {
         Ok(())
     }
 
-    /// Stage the connected-chain totals.
-    pub(crate) fn stage_chain_totals(&self, batch: &mut WriteBatch, t: ChainTotals) -> Result<(), StorageError> {
+    /// Stage the connected-chain totals and the connected-set fingerprint.
+    pub(crate) fn stage_chain_totals(&self, batch: &mut WriteBatch, t: ChainTotals, conn: &[u8; 32]) -> Result<(), StorageError> {
         if !self.aggregates_ready() {
             return Ok(());
         }
-        batch.put_cf(self.meta_cf()?, K_CHAIN, enc2(t.blocks, t.txs));
+        let cf = self.meta_cf()?;
+        batch.put_cf(cf, K_CHAIN, enc2(t.blocks, t.txs));
+        batch.put_cf(cf, K_CONN, conn);
         Ok(())
     }
 
@@ -412,8 +475,10 @@ impl Storage {
         let mut t = self.chain_totals()?;
         t.blocks += 1;
         t.txs = t.txs.saturating_add(txs);
+        let mut conn = self.conn_fingerprint()?.unwrap_or_default();
+        xor_into(&mut conn, hash);
         let mut batch = WriteBatch::default();
-        self.stage_chain_totals(&mut batch, t)?;
+        self.stage_chain_totals(&mut batch, t, &conn)?;
         self.stage_chain_cumulative(&mut batch, hash, Some(t))?;
         self.write_batch(batch)
     }
@@ -425,8 +490,10 @@ impl Storage {
         let mut t = self.chain_totals()?;
         t.blocks = t.blocks.saturating_sub(1);
         t.txs = t.txs.saturating_sub(txs);
+        let mut conn = self.conn_fingerprint()?.unwrap_or_default();
+        xor_into(&mut conn, hash);
         let mut batch = WriteBatch::default();
-        self.stage_chain_totals(&mut batch, t)?;
+        self.stage_chain_totals(&mut batch, t, &conn)?;
         self.stage_chain_cumulative(&mut batch, hash, None)?;
         self.write_batch(batch)
     }
@@ -437,6 +504,7 @@ impl Storage {
         let cf = self.meta_cf()?;
         let mut snap = AggregateSnapshot {
             chain: self.chain_totals()?,
+            conn: self.conn_fingerprint()?.unwrap_or_default(),
             tiers: self.tier_totals()?,
             ..Default::default()
         };
@@ -497,12 +565,14 @@ impl Storage {
         connected.sort();
         let mut running = ChainTotals::default();
         let mut cumulative = BTreeMap::new();
+        let mut conn = [0u8; 32];
         for (_, hash, txs) in connected {
             running.blocks += 1;
             running.txs = running.txs.saturating_add(txs);
             cumulative.insert(hash, running);
+            xor_into(&mut conn, &hash);
         }
-        Ok(AggregateSnapshot { chain: running, cumulative, holders, rich_order, tiers })
+        Ok(AggregateSnapshot { chain: running, conn, cumulative, holders, rich_order, tiers })
     }
 
     /// Replace the stored aggregates by a full recomputation, atomically,
@@ -520,6 +590,7 @@ impl Storage {
             }
         }
         batch.put_cf(cf, K_CHAIN, enc2(snap.chain.blocks, snap.chain.txs));
+        batch.put_cf(cf, K_CONN, snap.conn);
         for (h, t) in &snap.cumulative {
             batch.put_cf(cf, key(P_CUM, h), enc2(t.blocks, t.txs));
         }
