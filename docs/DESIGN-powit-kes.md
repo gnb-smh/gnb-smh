@@ -1,7 +1,8 @@
 # PoWit KES: forward-secure witness keys ("Proof of Context and Time")
 
-Status: **design, being implemented on `feature/powit`.** PoWit is not active
-on mainnet, so its attestation format can still change without a fork.
+Status: **implemented** (`crates/gnb-crypto/src/core/kes.rs`, commit 7feeb99) and
+consensus from `core::powit_height()`, which is off on mainnet. Tested by
+unit tests and on a 3-node testnet, including signing with a stolen key file.
 
 ## Problem
 

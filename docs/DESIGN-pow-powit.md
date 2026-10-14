@@ -61,7 +61,7 @@ pass p: V[i] = SHAKE256(V[i-1] ‖ V[r] ‖ i ‖ p),  r = V[i-1] mod N
 out  = SHAKE256(DS_FINAL ‖ V[N-1])        N = 2^15 blocks of 128 B (4 MiB), 2 passes
 ```
 
-| | v1 (live) | v3 draft |
+| | v1 (live) | v3 (from activation) |
 | --- | --- | --- |
 | Memory | 64 MiB | 4 MiB |
 | Verify (Mac, 1 core) | 527 ms | 90 ms |
@@ -71,36 +71,50 @@ out  = SHAKE256(DS_FINAL ‖ V[N-1])        N = 2^15 blocks of 128 B (4 MiB), 2 
 The hash is replaceable: the same structure with SHA-256 is a one-function
 change (see v2). Off-the-shelf Bitcoin ASICs still cannot run it.
 
-## 2. Witness shares (implemented as a draft)
+## 2. Witness shares
 
-A GnB-SMH proof 16× easier than a block that attests one of the last 16
-blocks; every nonce pulls 8 random 64-byte chunks of that block's
-transactions (signatures included) into the PoW input. 20% of the subsidy
-pays up to 16 shares per block. See `DESIGN-witness-shares.md`.
+A GnB-SMH v3 proof 16× easier than a block that attests one of the last 16
+blocks on the including block's selected chain. Every nonce pulls 8 random
+64-byte chunks of that block's transactions (signatures included) into the
+PoW input. 20% of the subsidy pays up to 16 shares per block. Each share
+names the witness id it credits and pays any valid script. See
+[DESIGN-witness-shares.md](DESIGN-witness-shares.md).
 
 ## 3. The witness set (deterministic, from the DAG)
 
-- Epoch = 720 blocks (~6 h). Window K = 28 epochs (~7 days).
-- Weight of a key in epoch e = total work of its shares included in blocks
-  of epochs e-K … e-1. Keys are the PQ public keys behind the payout scripts.
-- W_e = the 256 heaviest keys (ties by key hash). Every node computes the
-  same W_e from the selected chain: no registration, no stake, no vote.
+- Epoch = 720 blocks (~6 h). Window = 28 epochs (~7 days).
+- The weight of a witness id in epoch `e` is the total work of the shares
+  credited to it in selected-chain blocks of epochs `e-1-window … e-2`. The
+  two-epoch lag means forks shallower than an epoch agree on the set.
+- W_e = the **64** heaviest witness ids (ties by id), minus barred ids, with
+  inactivity decay applied. Every node computes the same W_e from the chain:
+  no registration, no stake, no vote.
 
 ## 4. Checkpoint attestations
 
-- Checkpoint every 60 blocks: the selected-chain block at that blue score.
-- Each member of W_e signs `DS ‖ chain_id ‖ e ‖ checkpoint hash ‖ blue score`
-  with its hybrid ML-DSA-65 ‖ Falcon-1024 key.
-- Attestations are gossiped and included in blocks (inclusion bonus, like shares).
-- **Final** when blocks carry attestations worth ≥ 2/3 of W_e's weight.
-  Nodes never reorg away a final checkpoint.
+- A checkpoint slot every 60 heights from activation. Slot `c` names the
+  highest selected-chain block with height strictly below `c`.
+- Each member of W_e signs a link `source → target` (source = the chain's
+  current justified checkpoint) over `DS ‖ chain_id ‖ source ‖ target`. The
+  signature uses its forward-secure KES key, with the leaf of the target's
+  epoch ([DESIGN-powit-kes.md](DESIGN-powit-kes.md)).
+- Attestations are gossiped as `NewPowitItem` (kind 2), validated before
+  relay, and included in blocks (up to 32 per block).
+- Links worth ≥ 2/3 of W_e's weight **justify** the target. A justified
+  target exactly one interval above its source **finalizes** the source.
+  Nodes never reorganise below the finalized block.
 
 ## 5. Accountability without stake
 
-Share rewards mature only after K epochs (escrow). Two signatures by one key
-for different checkpoints at the same height are an equivocation proof:
-any block may include it; the key's escrowed rewards are burned and it is
-excluded from W for K epochs.
+Two attestations by one witness with the same target slot and different
+blocks (double vote), or one link surrounding another (surround vote), form
+an equivocation proof. Any block may carry it (kind 3 on the wire). The
+witness is barred from the witness set and from share rewards for
+`ban_epochs` (28 epochs on mainnet).
+
+Burning rewards already paid to the witness (escrow) is designed in
+[DESIGN-powit-escrow.md](DESIGN-powit-escrow.md) but **not implemented**.
+Today the penalty is the ban.
 
 ## 6. Liveness fallback
 
@@ -212,4 +226,4 @@ Honest limits:
 - Long-range forks that rebuild W from far back are stopped by nodes already
   online and, for new nodes, by `MIN_CHAIN_WORK` and the release checkpoint
   (weak subjectivity).
-- Unreviewed design; parameters (K, epoch, 2/3, 256) need simulation.
+- Not externally reviewed; parameters (window, epoch, 2/3, 64) need simulation at mainnet scale.

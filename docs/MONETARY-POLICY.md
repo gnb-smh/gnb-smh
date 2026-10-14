@@ -13,7 +13,10 @@ Consensus rules, defined in `crates/gnb-crypto/src/core/tokenomics.rs` and
 | Mining | 72% | 9,000,000 GNB (8,999,998.51392253 issued after rounding) |
 | **Total issued** | | **12,499,998.51182046 GNB** |
 
-No pools. 100% of every subsidy and fee goes to the miner.
+No pools. **Until PoWit activates**, 100% of every subsidy and fee goes to the
+miner. From `powit_height()`, 20% of the subsidy pays witness shares (see
+[Mining subsidy](#mining-subsidy)); fees still go 100% to the miner. Mainnet
+keeps PoWit off (`POWIT_HEIGHT_MAINNET = u64::MAX`).
 
 ## Team and founder allocations (locked)
 
@@ -46,8 +49,17 @@ Until the file holds the keys, nodes refuse to create a genesis ledger.
 - The subsidy reaches zero after 27 halvings (height 113,529,600, about 108
   years) and stays zero. There is no tail emission.
 - The genesis block pays nothing; mining starts at height 1.
-- The coinbase has exactly one output, worth at most subsidy + fees, paid to
-  an address of the miner's choice. 100% of fees go to the miner.
+- **Before PoWit:** the coinbase has exactly one output, worth at most
+  subsidy + fees, paid to an address of the miner's choice. 100% of fees go
+  to the miner.
+- **From PoWit activation:** the subsidy splits 80% to the miner and 20% to
+  16 witness-share slots (`core::witness_share::split_subsidy`). Each
+  included share pays 90% of a slot to its payout script, and the miner gets
+  the other 10% as an inclusion bonus. Coinbase output 0 pays the miner (at
+  most its part plus 100% of fees); outputs `1..=n` pay the shares exactly.
+  Empty slots are not issued, so mined issuance can only fall below the
+  schedule above, never exceed it. See
+  [DESIGN-witness-shares.md](DESIGN-witness-shares.md).
 
 ## Fees
 
