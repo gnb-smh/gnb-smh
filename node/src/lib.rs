@@ -51,6 +51,8 @@ pub mod coherence;    // Coherence C2 — shielded pool (notes, tree, spend stat
 pub mod dandelion;    // Coherence P3 — Dandelion++ tx-relay metadata privacy
 #[cfg(feature = "node")]
 pub mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer (frontier reconciliation)
+#[cfg(feature = "node")]
+pub mod ingress;      // audit fixes: block-ingress / orphan / IBD-latch policy
 
 /// Convenience re-exports for consumers of the library (wallet UIs,
 /// block explorers, etc.). Import with `use gnb::prelude::*`.
