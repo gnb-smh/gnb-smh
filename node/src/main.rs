@@ -1222,6 +1222,9 @@ async fn main() {
 
                 // Add validated tx to mempool
                 network::NetworkMessage::NewTransaction { tx_data, .. } => {
+                    // Gossip relays the frame only if the mempool admitted it
+                    // (the verdict was deferred to us, as for blocks).
+                    let mut admitted_ok = false;
                     // Sprint 1.d: Bitcoin-format tx wire. MEM-5: strict decode —
                     // trailing bytes are refused, so one tx has exactly one
                     // encoding (no gossipsub-dedup bypass by byte mutation).
@@ -1242,7 +1245,7 @@ async fn main() {
                                 mempool::admission::admit(&store_v, &mem_v, tx, &policy)
                             }).await;
                             match admitted {
-                                Ok(Ok(_))  => {}
+                                Ok(Ok(_))  => admitted_ok = true,
                                 Ok(Err(e)) => debug!("mempool reject: {}", e),
                                 Err(e)     => warn!("tx verify task failed: {}", e),
                             }
@@ -1250,6 +1253,7 @@ async fn main() {
                         }
                         Err(e) => debug!("tx decode rejected: {}", e),
                     }
+                    report_verdict(&vtx2, &origin, ingress::verdict_for_tx_admission(admitted_ok));
                 }
 
                 // NET-6: same claim handling as PeerTip (rate-limited directed

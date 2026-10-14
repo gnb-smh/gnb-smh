@@ -187,8 +187,8 @@ pub enum GossipDisposition {
 
 /// Decide [`GossipDisposition`] for a decoded, bounds-valid gossip frame.
 /// `validator_attached`: a processor that reports verdicts is wired
-/// ([`NetworkNode::run_validated`]); otherwise blocks are accepted on decode
-/// (legacy [`NetworkNode::run`]). `claim_ok`: the frame is a tip claim from
+/// ([`NetworkNode::run_validated`]); otherwise blocks and transactions are
+/// accepted on decode (legacy [`NetworkNode::run`]). `claim_ok`: the frame is a tip claim from
 /// a directly connected author within its rate limit.
 pub fn gossip_disposition(msg: &NetworkMessage, validator_attached: bool, claim_ok: bool) -> GossipDisposition {
     use GossipDisposition::*;
@@ -196,9 +196,15 @@ pub fn gossip_disposition(msg: &NetworkMessage, validator_attached: bool, claim_
         NetworkMessage::NewBlock { .. } => {
             if validator_attached { DeliverDeferred } else { Deliver(GossipVerdict::Accept) }
         }
-        // Transaction relay semantics are unchanged (validated by the mempool
-        // owner); relayed on decode as before.
-        NetworkMessage::NewTransaction { .. } => Deliver(GossipVerdict::Accept),
+        // Transactions, like blocks, are relayed only after the processor
+        // judged them: the mempool admission decides (relayed iff admitted).
+        // They used to be accepted on decode, so any peer could put junk
+        // frames (no inputs, no fee, a fresh key each) into every node's
+        // gossip window for free — the volume that made IHAVEs oversized.
+        // Legacy `run` keeps relaying on decode.
+        NetworkMessage::NewTransaction { .. } => {
+            if validator_attached { DeliverDeferred } else { Deliver(GossipVerdict::Accept) }
+        }
         // Tip claims: consumed locally (author-attributed), never relayed —
         // every node floods its own claims to all of its direct peers.
         NetworkMessage::PeerTip { .. } | NetworkMessage::Version { .. } => {
@@ -838,10 +844,83 @@ const MAX_YAMUX_STREAMS: usize = 4096;
 /// `with_websocket` in place of `yamux::Config::default` (the builder accepts
 /// any `FnOnce() -> Config`). See `MAX_YAMUX_STREAMS` for why and for the
 /// 0.13→0.12 backend consequence.
-fn yamux_config() -> yamux::Config {
+pub fn yamux_config() -> yamux::Config {
     let mut cfg = yamux::Config::default();
     cfg.set_max_num_streams(MAX_YAMUX_STREAMS);
     cfg
+}
+
+/// Length of a gossipsub message id: SHA-256 of the frame, truncated.
+pub const GOSSIP_MESSAGE_ID_LEN: usize = 16;
+
+/// Most message ids this node puts in one IHAVE (and asks for in IWANTs per
+/// peer per heartbeat). One IHAVE is one RPC and gossipsub never splits it by
+/// size; with 16-byte ids every id costs 18 bytes on the wire (field tag,
+/// length, id), so 800 ids are about 14.4 KB, under the 16 KiB control limit a
+/// default-config libp2p-gossipsub 0.50 receiver enforces. gossipsub's default
+/// (5000 ids, about 90 KB) made a node's own IHAVE undecodable for such a peer:
+/// the receiver closes its inbound gossipsub stream and every later frame on
+/// the link (blocks included) is lost. Anyone can fill the tx topic's gossip
+/// window cheaply, so that was a remote way to cut honest links.
+pub const GOSSIP_MAX_CONTROL_IDS: usize = 800;
+
+/// Largest control part (IHAVE / IWANT / GRAFT / PRUNE / subscriptions) of one
+/// inbound RPC this node decodes. It covers what peers on gossipsub's default
+/// send side produce (5000 ids, about 90 KB: libp2p 0.49 nodes, other
+/// implementations) and stays far below `max_transmit_size` (4 MiB).
+pub const GOSSIP_MAX_CONTROL_BYTES: usize = 128 * 1024;
+
+/// The control-size limit a libp2p-gossipsub 0.50 peer applies with its
+/// default configuration; what this node sends must fit in it.
+pub const GOSSIP_PEER_DEFAULT_CONTROL_BYTES: usize = 16 * 1024;
+
+/// Bytes one message id costs inside an IHAVE / IWANT (tag, length, id).
+pub const GOSSIP_ID_WIRE_COST: usize = 2 + GOSSIP_MESSAGE_ID_LEN;
+
+/// Audit M-10 fix: SHA-256 (truncated to 16 bytes) message ids are
+/// deterministic across toolchains, unlike std's DefaultHasher.
+pub fn gossip_message_id(m: &gossipsub::Message) -> gossipsub::MessageId {
+    let digest = Sha256::digest(&m.data);
+    gossipsub::MessageId::from(&digest[..GOSSIP_MESSAGE_ID_LEN])
+}
+
+/// The node's gossipsub settings, before `build()` (tests derive topologies
+/// from it, e.g. a peer outside the mesh).
+pub fn gossipsub_config_builder() -> gossipsub::ConfigBuilder {
+    let mut b = gossipsub::ConfigBuilder::default();
+    b.heartbeat_interval(Duration::from_secs(1))
+        .validation_mode(ValidationMode::Strict)
+        .message_id_fn(gossip_message_id)
+        .max_transmit_size(4 * 1024 * 1024)
+        // NET-2 (audit): do NOT relay a frame before the application has
+        // validated it. Without this, libp2p forwarded every frame to the
+        // mesh first (an invalid-PoW block reached every node at zero
+        // cost to its author) and the configured invalid-delivery (P4)
+        // penalties could never fire.
+        .validate_messages()
+        // Keep unvalidated frames long enough for the processor to judge
+        // them (a block verdict waits behind its 64 MiB PoW check).
+        .history_length(12)
+        // Mesh fix (fresh-joiner IBD): gossipsub's duplicate_cache_time
+        // defaults to 60s — the SAME period as tip_announce below, which
+        // made byte-identical periodic PeerTips Duplicate-dropped locally.
+        // 30s guarantees the 60s periodic announce always clears the
+        // cache; the tip-carrying Version (fresh timestamp → unique bytes)
+        // published alongside it can never be dedup-dropped at all.
+        .duplicate_cache_time(Duration::from_secs(30))
+        // Send small enough IHAVEs for a default 0.50 receiver, accept the
+        // large ones older or differently configured peers send (see
+        // GOSSIP_MAX_CONTROL_IDS / GOSSIP_MAX_CONTROL_BYTES).
+        .max_control_messages_sent(GOSSIP_MAX_CONTROL_IDS)
+        .max_control_message_size(GOSSIP_MAX_CONTROL_BYTES);
+    b
+}
+
+/// The node's gossipsub configuration (see [`gossipsub_config_builder`]).
+pub fn gossipsub_config() -> Result<gossipsub::Config, NetworkError> {
+    gossipsub_config_builder()
+        .build()
+        .map_err(|e| NetworkError::StartFailed(format!("gossipsub: {}", e)))
 }
 
 pub struct NetworkNode {
@@ -890,7 +969,8 @@ impl NetworkNode {
     /// Gossipsub is configured with `validate_messages()`: a received frame is
     /// relayed only after a verdict is reported. Frames are delivered on
     /// `inbound_tx` with their [`InboundOrigin`]; for every frame whose
-    /// origin carries a pending message id (gossip `NewBlock`), the consumer
+    /// origin carries a pending message id (gossip `NewBlock` and
+    /// `NewTransaction`), the consumer
     /// MUST send exactly one [`GossipValidation`] on the channel whose
     /// receiver is `verdict_rx`. Frames it never answers are simply not
     /// relayed (they expire from gossipsub's message cache).
@@ -925,36 +1005,7 @@ impl NetworkNode {
         listen_report:   Option<mpsc::UnboundedSender<Multiaddr>>,
     ) -> Result<(), NetworkError> {
         use std::time::Instant;
-        // Audit M-10 fix: SHA-256 (truncated to 16 bytes) message ids are
-        // deterministic across toolchains, unlike std's DefaultHasher.
-        let msg_id_fn = |m: &gossipsub::Message| {
-            let digest = Sha256::digest(&m.data);
-            gossipsub::MessageId::from(&digest[..16])
-        };
-
-        let gs_cfg = gossipsub::ConfigBuilder::default()
-            .heartbeat_interval(Duration::from_secs(1))
-            .validation_mode(ValidationMode::Strict)
-            .message_id_fn(msg_id_fn)
-            .max_transmit_size(4 * 1024 * 1024)
-            // NET-2 (audit): do NOT relay a frame before the application has
-            // validated it. Without this, libp2p forwarded every frame to the
-            // mesh first (an invalid-PoW block reached every node at zero
-            // cost to its author) and the configured invalid-delivery (P4)
-            // penalties could never fire.
-            .validate_messages()
-            // Keep unvalidated frames long enough for the processor to judge
-            // them (a block verdict waits behind its 64 MiB PoW check).
-            .history_length(12)
-            // Mesh fix (fresh-joiner IBD): gossipsub's duplicate_cache_time
-            // defaults to 60s — the SAME period as tip_announce below, which
-            // made byte-identical periodic PeerTips Duplicate-dropped locally.
-            // 30s guarantees the 60s periodic announce always clears the
-            // cache; the tip-carrying Version (fresh timestamp → unique bytes)
-            // published alongside it can never be dedup-dropped at all.
-            .duplicate_cache_time(Duration::from_secs(30))
-            .build()
-            .map_err(|e| NetworkError::StartFailed(format!("gossipsub: {}", e)))?;
+        let gs_cfg = gossipsub_config()?;
 
         // ── Peer scoring: penalize invalid messages, reward participation ──
         let peer_score_params = {
@@ -2984,6 +3035,47 @@ mod tests {
         assert_eq!(gossip_disposition(&v, true, true), GossipDisposition::Deliver(GossipVerdict::Ignore),
             "claims are consumed locally, never relayed");
         assert_eq!(gossip_disposition(&v, true, false), GossipDisposition::Drop(GossipVerdict::Ignore));
+    }
+
+    /// Gossip transactions are judged by the mempool before they are relayed
+    /// (deferred verdict); only the legacy loop relays them on decode.
+    #[test]
+    fn gossip_transactions_are_relayed_only_after_the_mempool_verdict() {
+        let tx = NetworkMessage::NewTransaction { txid: [1u8; 32], tx_data: vec![0u8; 8] };
+        assert_eq!(gossip_disposition(&tx, true, false), GossipDisposition::DeliverDeferred);
+        assert_eq!(gossip_disposition(&tx, true, true), GossipDisposition::DeliverDeferred);
+        assert_eq!(gossip_disposition(&tx, false, false), GossipDisposition::Deliver(GossipVerdict::Accept));
+    }
+
+    /// The IHAVEs this node sends fit the 16 KiB control limit of a default
+    /// libp2p-gossipsub 0.50 receiver, and it decodes the largest IHAVE a
+    /// default-configured sender (5000 ids, e.g. libp2p 0.49) produces.
+    #[test]
+    fn gossip_control_limits_are_consistent_in_both_directions() {
+        let cfg = gossipsub_config().expect("config builds");
+        // One IHAVE RPC: per id 18 bytes, plus at most 64 bytes of framing
+        // (RPC control field, ControlIHave, topic id "gnb/txs/1").
+        assert_eq!(GOSSIP_ID_WIRE_COST, 18);
+        assert!(cfg.max_control_messages_sent() * GOSSIP_ID_WIRE_COST + 64 <= GOSSIP_PEER_DEFAULT_CONTROL_BYTES,
+            "{} ids per IHAVE overflow a default receiver", cfg.max_control_messages_sent());
+        assert!(cfg.max_control_message_size() >= 5000 * GOSSIP_ID_WIRE_COST + 64,
+            "a default sender's 5000-id IHAVE must decode");
+        assert!(cfg.max_control_message_size() < cfg.max_transmit_size());
+        // IWANT replies stay generous: a peer may ask for 800 ids per heartbeat.
+        assert!(cfg.max_control_messages_sent() >= 500);
+        // The id size the arithmetic assumes.
+        let m = gossipsub::Message {
+            source: None, data: b"frame".to_vec(), sequence_number: None,
+            topic: IdentTopic::new(TOPIC_TXS).hash(),
+        };
+        assert_eq!(gossip_message_id(&m).0.len(), GOSSIP_MESSAGE_ID_LEN);
+        assert_eq!(cfg.message_id(&m), gossip_message_id(&m));
+        // The rest of the node's settings are unchanged by the refactor.
+        assert!(cfg.validate_messages());
+        assert_eq!(cfg.max_transmit_size(), 4 * 1024 * 1024);
+        assert_eq!(cfg.history_length(), 12);
+        assert_eq!(cfg.heartbeat_interval(), Duration::from_secs(1));
+        assert_eq!(cfg.duplicate_cache_time(), Duration::from_secs(30));
     }
 
     // ── NET-16 regressions ─────────────────────────────────────────────────

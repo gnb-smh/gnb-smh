@@ -249,6 +249,16 @@ pub fn verdict_for_accept_error(err: &str) -> GossipVerdict {
     }
 }
 
+/// Gossip verdict for a `NewTransaction` frame once the mempool decided
+/// (audit follow-up to OPS-2): relayed (`Accept`) only if it was admitted.
+/// Every refusal — undecodable, non-standard, missing or spent inputs, low
+/// fee, bad signature, already known — is `Ignore`: not relayed and never
+/// penalized, because most refusals depend on local state and older nodes
+/// still relay transactions on decode.
+pub fn verdict_for_tx_admission(admitted: bool) -> GossipVerdict {
+    if admitted { GossipVerdict::Accept } else { GossipVerdict::Ignore }
+}
+
 // ── POW-2: supervisor back-off ───────────────────────────────────────────────
 
 /// A processor run that lasted at least this long counts as healthy: the next
@@ -580,6 +590,14 @@ mod tests {
         for _ in 0..20 { b.on_panic(Duration::ZERO); }
         assert_eq!(b.on_panic(Duration::ZERO), Duration::from_secs(30), "capped");
         assert_eq!(b.on_panic(SUPERVISOR_HEALTHY_RESET), Duration::from_millis(100), "reset after a healthy run");
+    }
+
+    /// Transactions are relayed only once the mempool admitted them; a
+    /// refusal is never a penalty.
+    #[test]
+    fn tx_verdict_follows_mempool_admission() {
+        assert_eq!(verdict_for_tx_admission(true), GossipVerdict::Accept);
+        assert_eq!(verdict_for_tx_admission(false), GossipVerdict::Ignore);
     }
 
     #[test]
