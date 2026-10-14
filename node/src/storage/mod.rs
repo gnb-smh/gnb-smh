@@ -69,6 +69,9 @@ pub fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, StorageErro
         .map_err(|e| StorageError::DeserializeFailed(e.to_string()))
 }
 
+/// `(txid, block_hash)`: one CF_TX_INDEX row (`Storage::tx_index_entries`).
+pub type TxIndexEntry = ([u8; 32], [u8; 32]);
+
 /// CF_UNDO key prefix of a [`PrunedBodyRecord`]. Undo records are keyed by
 /// the bare 32-byte block hash; these keys are longer, so
 /// `Storage::undo_block_hashes` never mistakes one for an undo record.
@@ -909,8 +912,8 @@ impl Storage {
         if self.get_block_hash_at_height(height)? == Some(*hash) {
             let cf_h = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
             let cf_t = self.db.cf_handle(CF_TIMESTAMPS).ok_or(StorageError::CfNotFound(CF_TIMESTAMPS.into()))?;
-            batch.delete_cf(&cf_h, &height.to_be_bytes());
-            batch.delete_cf(&cf_t, &height.to_be_bytes());
+            batch.delete_cf(&cf_h, height.to_be_bytes());
+            batch.delete_cf(&cf_t, height.to_be_bytes());
         }
         Ok(())
     }
@@ -1343,7 +1346,7 @@ impl Storage {
 
         for h in 0..below_height {
             let key = h.to_be_bytes();
-            let Some(hash_bytes) = self.db.get_cf(&cf_height, &key)
+            let Some(hash_bytes) = self.db.get_cf(&cf_height, key)
                 .map_err(|e| StorageError::ReadFailed(e.to_string()))?
             else { continue };
             let Ok(hash) = <BlockHash>::try_from(hash_bytes.as_slice()) else { continue };
@@ -1429,7 +1432,7 @@ impl Storage {
 
     /// Every `(txid, block_hash)` pair of CF_TX_INDEX (start-up chain-state
     /// check, DAG-11). O(indexed transactions).
-    pub fn tx_index_entries(&self) -> Result<Vec<([u8; 32], [u8; 32])>, StorageError> {
+    pub fn tx_index_entries(&self) -> Result<Vec<TxIndexEntry>, StorageError> {
         let cf = self.db.cf_handle(CF_TX_INDEX).ok_or(StorageError::CfNotFound(CF_TX_INDEX.into()))?;
         let mut out = Vec::new();
         for item in self.db.iterator_cf(&cf, IteratorMode::Start) {

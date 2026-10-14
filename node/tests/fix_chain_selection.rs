@@ -227,7 +227,7 @@ fn dag6_deep_fork_converges_whatever_the_arrival_order() {
 
     // Node X: honest chain first, then the heavier fork.
     let t = std::time::Instant::now();
-    let mut x = node_with(&genesis, &[fund.clone()]);
+    let mut x = node_with(&genesis, std::slice::from_ref(&fund));
     for blk in &honest {
         accept(&x, blk).expect("honest block");
     }
@@ -244,7 +244,7 @@ fn dag6_deep_fork_converges_whatever_the_arrival_order() {
     // is strictly ahead after every step, so Z never adopts the honest
     // chain and never reorganizes).
     let t = std::time::Instant::now();
-    let z = node_with(&genesis, &[fund.clone()]);
+    let z = node_with(&genesis, std::slice::from_ref(&fund));
     accept(&z, &fork[0]).expect("fork block on Z");
     accept(&z, &fork[1]).expect("fork block on Z");
     for i in 0..honest.len() {
@@ -255,7 +255,7 @@ fn dag6_deep_fork_converges_whatever_the_arrival_order() {
     println!("Z: interleaved in {:.2?}", t.elapsed());
 
     // Node W: only the fork (fresh sync from the network that has it).
-    let w = node_with(&genesis, &[fund.clone()]);
+    let w = node_with(&genesis, std::slice::from_ref(&fund));
     for blk in &fork {
         accept(&w, blk).unwrap();
     }
@@ -363,7 +363,7 @@ fn dag6_random_arrival_orders_converge_on_several_dag_shapes() {
     ];
 
     for (label, blocks) in shapes {
-        let reference = node_with(&genesis, &[fund.clone()]);
+        let reference = node_with(&genesis, std::slice::from_ref(&fund));
         deliver(&reference, &blocks);
         let want_tip = sel_tip(&reference).unwrap();
         let want_digest = digest(&reference);
@@ -376,7 +376,7 @@ fn dag6_random_arrival_orders_converge_on_several_dag_shapes() {
         for round in 0..4 {
             let mut order = blocks.clone();
             rng.shuffle(&mut order);
-            let n = node_with(&genesis, &[fund.clone()]);
+            let n = node_with(&genesis, std::slice::from_ref(&fund));
             deliver(&n, &order);
             assert_eq!(sel_tip(&n), Some(want_tip), "{label} round {round}: selected tip");
             assert_eq!(tip_meta(&n), want_tip, "{label} round {round}: applied tip");
@@ -416,7 +416,7 @@ fn dag6_reorg_through_pruned_bodies_is_exact() {
     honest.extend(b.chain(h1.block_hash(), 59, "ph"));
     let fork = b.chain(gh, 62, "pf");
 
-    let x = node_with(&genesis, &[fund.clone()]);
+    let x = node_with(&genesis, std::slice::from_ref(&fund));
     for blk in &honest {
         accept(&x, blk).unwrap();
     }
@@ -439,7 +439,7 @@ fn dag6_reorg_through_pruned_bodies_is_exact() {
     for blk in &fork {
         accept(&x, blk).expect("fork block");
     }
-    let w = node_with(&genesis, &[fund.clone()]);
+    let w = node_with(&genesis, std::slice::from_ref(&fund));
     for blk in &fork {
         accept(&w, blk).unwrap();
     }
@@ -484,7 +484,7 @@ fn dag6_reorg_through_pruned_bodies_is_exact() {
     }
     assert_eq!(refetched, 39, "the 39 pruned honest bodies (genesis is never re-applied)");
     assert_eq!(tip_meta(&x), more.last().unwrap().block_hash());
-    let v = node_with(&genesis, &[fund.clone()]);
+    let v = node_with(&genesis, std::slice::from_ref(&fund));
     deliver(&v, &honest);
     deliver(&v, &more);
     assert_eq!(digest(&x), digest(&v), "back on the honest chain with its exact UTXO set");
@@ -524,15 +524,15 @@ fn dag6_invalidateblock_and_reconsiderblock_persist_and_converge() {
     let mut bb = vec![b1.clone()];
     bb.extend(b.chain(b1.block_hash(), 3, "ib")); // b1..b4 (lighter)
 
-    let mut n = node_with(&genesis, &[fund.clone()]);
+    let mut n = node_with(&genesis, std::slice::from_ref(&fund));
     deliver(&n, &a);
     deliver(&n, &bb);
     let a_tip = a.last().unwrap().block_hash();
     let b_tip = bb.last().unwrap().block_hash();
     assert_eq!(tip_meta(&n), a_tip);
-    let only_a = node_with(&genesis, &[fund.clone()]);
+    let only_a = node_with(&genesis, std::slice::from_ref(&fund));
     deliver(&only_a, &a);
-    let only_b = node_with(&genesis, &[fund.clone()]);
+    let only_b = node_with(&genesis, std::slice::from_ref(&fund));
     deliver(&only_b, &bb);
 
     // Errors: unknown block, genesis.
@@ -563,7 +563,7 @@ fn dag6_invalidateblock_and_reconsiderblock_persist_and_converge() {
     let r = reconsider(&n, a[1].block_hash()).expect("reconsiderblock");
     assert_eq!(r.tip, a7.block_hash());
     assert_eq!(tip_meta(&n), a7.block_hash());
-    deliver(&only_a, &[a7.clone()]);
+    deliver(&only_a, std::slice::from_ref(&a7));
     assert_eq!(digest(&n), digest(&only_a));
     assert!(n.store.invalid_block_reason(&a[1].block_hash()).unwrap().is_none());
     restart(&mut n);
@@ -573,7 +573,7 @@ fn dag6_invalidateblock_and_reconsiderblock_persist_and_converge() {
     let r = invalidate(&n, a7.block_hash()).expect("invalidate the tip");
     assert_eq!((r.tip, r.rolled_back, r.connected), (a_tip, 1, 0));
     assert_eq!(tip_meta(&n), a_tip);
-    let only_a6 = node_with(&genesis, &[fund.clone()]);
+    let only_a6 = node_with(&genesis, std::slice::from_ref(&fund));
     deliver(&only_a6, &a);
     assert_eq!(digest(&n), digest(&only_a6));
     let r = reconsider(&n, a7.block_hash()).expect("reconsider the tip");

@@ -2346,7 +2346,8 @@ mod audit_2026_10_rpc_tests {
         let r = dispatch("invalidateblock", Some(&json!([hex::encode([7u8; 32])])), &state).await;
         assert!(r["error"].as_str().unwrap().contains("not wired"), "{r}");
 
-        let calls: Arc<parking_lot::Mutex<Vec<(ChainAdminOp, [u8; 32])>>> = Arc::default();
+        type Calls = parking_lot::Mutex<Vec<(ChainAdminOp, [u8; 32])>>;
+        let calls: Arc<Calls> = Arc::default();
         let seen = calls.clone();
         state.chain_admin = Some(Arc::new(move |op, h| {
             seen.lock().push((op, h));
