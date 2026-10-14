@@ -117,3 +117,7 @@ tokio    = { version = "1", features = ["full"] }
 # Property-based invariant tests for the Genesis-locked emission / halving /
 # founder-vesting math in src/core/tokenomics_v2.rs (consensus-critical).
 proptest = "1"
+# Reads the shipped genesis/bloch-g3-carryover.tsv.gz in the carryover
+# snapshot test (core::carryover::tests::shipped_snapshot_verifies). Pure-Rust
+# miniz_oxide backend; test-only, never linked into a build artifact.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

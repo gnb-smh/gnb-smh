@@ -1,134 +1,93 @@
-# cargo-deny — supply-chain policy for Bloch-SIS.
-# Run: cargo deny check   (advisories, bans, licenses, sources)
+# cargo-deny: supply-chain policy for the GnB workspace.
+# Run: cargo deny check   (advisories, bans, licenses, sources). Enforced in CI
+# (.github/workflows/ci.yml, job `supply-chain`), together with cargo-audit.
 #
-# Enforces the project's development best practices: no known-vulnerable or
-# yanked deps; permissive licenses only, with MPL-2.0 tolerated for unmodified
-# aggregation (file-level copyleft — linking unmodified MPL code does not
-# infect the work; AGPL/GPL/LGPL remain excluded, matching the "permissive
-# TEE / permissive everything" ethos); and NO external git/unknown-registry
-# deps (the pqcrypto fork is vendored + Cargo.lock committed, so the workspace
-# is self-contained).
+# Policy: no known-vulnerable or yanked dependency without a written,
+# reachability-based exception below; permissive licenses only, plus the
+# first-party AGPL crates named explicitly; no git or unknown-registry
+# sources (the forks are vendored under crates/ and Cargo.lock is committed).
+#
+# REVIEW BY 2027-01-15, and after every dependency bump: cargo-deny reports
+# unmatched ignores, skips and license entries as warnings; delete them.
 
 [advisories]
 version = 2
 yanked = "deny"
-# `cargo deny check advisories` pulls the RUSTSEC DB and fails on unfixed
-# vulnerabilities; add explicit `ignore = ["RUSTSEC-XXXX-YYYY"]` entries only with
-# a written rationale.
-#
-# The ignores below are limited to `unmaintained`/`notice`-class advisories with
-# a written rationale (no fix path). Actual `vulnerability`-class advisories are
-# NEVER ignored here — they must be fixed by bumping the offending dependency.
-# See SECURITY_TOOLING.md §Advisory-posture for the full disposition table.
+# Every ignore carries its reason. Unmaintained notices are accepted only
+# where there is no drop-in replacement; vulnerabilities only where the
+# vulnerable code is not compiled or not reachable and no compatible fixed
+# release exists (see the hickory entries).
 ignore = [
-    # ── Post-quantum crypto: vendored, intentionally pinned ────────────────
-    # PQClean upstream is being archived, so the pqcrypto-* wrappers are flagged
-    # `unmaintained`. Bloch VENDORS these (crates/pqcrypto-internals, seeded-RNG
-    # override) precisely so the exact FIPS-204/Falcon reference impl is frozen
-    # under Cargo.lock. There is no drop-in replacement that keeps the same
-    # KATs; migration is a deliberate crypto-review event, not a `cargo update`.
-    "RUSTSEC-2026-0165", # pqcrypto-falcon  unmaintained (PQClean archived)
-    "RUSTSEC-2026-0166", # pqcrypto-mldsa   unmaintained (PQClean archived)
-    "RUSTSEC-2026-0162", # pqcrypto-traits  unmaintained (PQClean archived)
-    "RUSTSEC-2024-0381", # pqcrypto-kyber   superseded by pqcrypto-mlkem (transitive)
-    # ── Transitive, no first-party call path ──────────────────────────────
-    "RUSTSEC-2025-0141", # bincode 1.3.3 unmaintained — first-party restart cache;
-                         # checksummed, build-bound and validated on restore.
-                         # Accepted maintenance risk, not unreachable code.
-    "RUSTSEC-2024-0436", # paste unmaintained — transitive proc-macro helper,
-                         # compile-time only, no runtime attack surface.
-    "RUSTSEC-2026-0163", # pqcrypto-internals unmaintained (PQClean archived) —
-                         # same disposition as the pqcrypto-* wrappers above; it
-                         # is the VENDORED crate (crates/pqcrypto-internals),
-                         # frozen under Cargo.lock with the seeded-RNG override.
-                         # Migration is a deliberate crypto-review event.
-    # ── SP1 prover / zk host-side toolchain (NOT the node runtime path) ────
-    # The following are pulled EXCLUSIVELY through the pinned SP1 zkVM prover
-    # stack (sp1-sdk / sp1-core-machine / arkworks) — host-side proof
-    # generation and CLI UX, never the consensus, mempool, or P2P runtime of
-    # the node. They are unmaintained with no drop-in that keeps the pinned
-    # SP1 4.2.1 build reproducible; replacing them means patching sp1-sdk.
-    "RUSTSEC-2025-0012", # backoff unmaintained — retry helper, via sp1-sdk only.
-    "RUSTSEC-2024-0384", # instant unmaintained — time shim, via backoff (SP1).
-    "RUSTSEC-2021-0139", # ansi_term unmaintained — terminal colour, via
-                         # tracing-forest → sp1-core-machine (prover logging).
-    "RUSTSEC-2024-0388", # derivative unmaintained — derive macro, via ark-ff
-                         # (arkworks field arithmetic in the SP1/zk stack);
-                         # proc-macro, compile-time only, no runtime surface.
-    "RUSTSEC-2025-0119", # number_prefix unmaintained — via indicatif progress
-                         # bars in the SP1 prover CLI; host-side UX only.
-    "RUSTSEC-2026-0002", # lru UNSOUND (IterMut Stacked-Borrows aliasing) — pulled
-                         # ONLY by sp1-prover (host-side proving), not the node
-                         # runtime; the unsoundness manifests only under Miri /
-                         # strict-aliasing, and sp1-prover 4.2.1 pins this lru.
-    "RUSTSEC-2026-0253", # lru 0.12.5 UNSOUND (LruCache::pop() panic safety) —
-                         # EXCEPTION added 2026-09-05 (finding SC1-advisories),
-                         # re-review by 2026-12-01; mirrors audit.toml. Fix is
-                         # lru >= 0.18.2 but sp1-prover 4.2.1 pins `lru ^0.12.4`,
-                         # so there is no bump path without forking the pinned
-                         # SP1 stack. Host-side proving only, not the node
-                         # runtime. REMOVE when SP1 repins lru >= 0.18.2.
-    "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained — compile-time proc-macro
-                         # helper (derive-macro diagnostics); no runtime surface.
-    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained — PEM decode, superseded by
-                         # rustls-pki-types; transitive via the rustls/reqwest TLS
-                         # stack, not a first-party parse path.
-    # ── REAL VULNERABILITIES with NO upstream fix available yet (TRACKED) ──────
-    # These are genuine advisories, NOT unmaintained-notices. They are ignored
-    # ONLY because the fix (hickory 0.26.x, which moved DnssecDnsHandle/NSEC3 code
-    # to hickory-net) is not yet reachable: libp2p 0.56.0 pins hickory-proto 0.25.2
-    # via libp2p-dns + libp2p-mdns. We cannot bump hickory without a libp2p release
-    # that repins it. Reachability: the DNS surface is /dns4/ multiaddr resolution
-    # (libp2p-dns) and LAN-only mDNS peer discovery — the node's canonical peering
-    # uses /ip4/ addresses (no DNS resolution), and DNSSEC validation is not enabled,
-    # so the practical exposure is a self-inflicted malicious resolver / hostile LAN.
-    # ACTION: remove these two the moment a libp2p release pins hickory >= 0.26.x.
-    # Documented as an OPEN finding in SECURITY_TOOLING.md — accepted, not dismissed.
-    "RUSTSEC-2026-0118", # hickory-proto NSEC3 closest-encloser unbounded loop (DoS)
-    "RUSTSEC-2026-0119", # hickory-proto O(n^2) name compression CPU exhaustion (DoS)
+    # ── Post-quantum signatures: PQClean upstream archived ─────────────────
+    # The pqcrypto-* wrappers are flagged unmaintained because PQClean is
+    # archived. GnB pins them exactly (gnb-crypto: pqcrypto-mldsa =0.1.2,
+    # pqcrypto-falcon =0.4.1) and vendors pqcrypto-internals (seeded-RNG
+    # fork, crates/pqcrypto-internals, source pin in VENDOR.toml checked by
+    # tests/vendor_pin.rs) so the ML-DSA-65 / Falcon-1024 code and its KATs
+    # are frozen. No drop-in replacement keeps the same keys and KATs;
+    # moving to a maintained backend is a planned crypto-review event, not a
+    # `cargo update`.
+    "RUSTSEC-2026-0165", # pqcrypto-falcon unmaintained (PQClean archived)
+    "RUSTSEC-2026-0166", # pqcrypto-mldsa unmaintained (PQClean archived)
+    "RUSTSEC-2026-0162", # pqcrypto-traits unmaintained (PQClean archived)
+    # pqcrypto-kyber is "replaced by pqcrypto-mlkem": the node's P2P
+    # transport handshake (node/src/transport) uses Kyber-1024 directly.
+    # Switching to ML-KEM changes the handshake wire format for every peer,
+    # so it is a coordinated network upgrade, not a dependency bump.
+    "RUSTSEC-2024-0381", # pqcrypto-kyber superseded by pqcrypto-mlkem
+    # ── Unmaintained, no runtime alternative needed ────────────────────────
+    # bincode 2.0.1 is unmaintained (no advisory against its code). Used for
+    # the node's local caches and the bounded gossip decoder
+    # (network::decode_wire_message: byte limit + post-decode bounds,
+    # fuzzed by node/fuzz). Replacing it is a wire/data-format migration.
+    "RUSTSEC-2025-0141", # bincode unmaintained
+    # paste: compile-time proc-macro helper (transitive), no runtime code.
+    "RUSTSEC-2024-0436", # paste unmaintained
+    # ── Vulnerabilities with no compatible fix: not compiled / not reachable ──
+    # hickory-proto 0.25.2 comes in through libp2p 0.56 only: libp2p-dns 0.44
+    # (`hickory-resolver ^0.25.2`) and libp2p-mdns 0.48 (`hickory-proto
+    # ^0.25.2`). The fixed hickory 0.26.x needs libp2p 0.57 (libp2p-dns
+    # 0.45), a breaking upgrade of the node's networking code; no 0.25.x
+    # release carries the fixes. Exposure in this build:
+    #  * RUSTSEC-2026-0118 is in `DnssecDnsHandle`, compiled only with the
+    #    `dnssec-ring` / `dnssec-aws-lc-rs` features. Neither is enabled
+    #    (features in the graph: std, tokio, futures-io, socket2, mdns), so
+    #    the vulnerable code is not in the binary.
+    #  * RUSTSEC-2026-0119 is quadratic name compression while ENCODING a
+    #    message. hickory encodes only the node's own resolver queries (one
+    #    name); libp2p-mdns uses hickory to parse packets and builds its own
+    #    responses. The resolver is reached through libp2p's WebSocket
+    #    transport (/dns*/ multiaddrs; /dns4/ TCP peers go through
+    #    tokio::net::lookup_host instead), and mDNS is off unless the
+    #    operator passes --enable-mdns.
+    # ACTION: remove both when the node moves to libp2p >= 0.57.
+    "RUSTSEC-2026-0118", # hickory-proto NSEC3 closest-encloser loop (DNSSEC only)
+    "RUSTSEC-2026-0119", # hickory-proto O(n^2) name compression when encoding
 ]
 
 [bans]
-# Audit finding SC3-yamux-dedupe (Round 2): "warn" let yamux 0.12.1
-# (GHSA-vxx9-2994-q338, CVSS 8.7, reachable by any peer) sit in the graph next
-# to the fixed 0.13.10 — an advisory fixed in one copy stayed live in the
-# other, and libp2p-yamux actually RAN the 0.12 copy. Duplicates now FAIL the
-# blocking `supply-chain` CI job unless allowlisted below.
+# Audit finding SC3-yamux-dedupe (Bloch, round 2): "warn" let yamux 0.12.1
+# (GHSA-vxx9-2994-q338) sit next to the fixed 0.13.10, and libp2p-yamux ran
+# the 0.12 copy. Duplicates fail unless allowlisted below.
 multiple-versions = "deny"
 wildcards = "warn"          # avoid `*` version reqs
 allow-wildcard-paths = true # path deps in the workspace are fine
 
-# ── Known-benign duplicate allowlist ──────────────────────────────────────
-# REVIEW BY 2026-12-05 (quarterly): re-run `cargo deny check bans` after any
-# dependency bump; delete entries cargo-deny reports as unmatched.
-#
-# Every entry pins the EXACT older version present today, so this list cannot
-# silently absorb a new vulnerable copy: any duplicate pair not literally
-# listed here — yamux deliberately is not, and must never be — fails the
-# pipeline, and a graph move that resolves a duplicate leaves an unmatched
-# skip warning telling us to prune the entry.
-#
-# Why these exist (all semver-major splits, not unifiable by `cargo update`;
-# the pins live in dependencies this workspace deliberately does not move):
-#   * bincode — Genesis-4's local state cache still uses the 1.3 wire format,
-#     while bloch-crypto and the frozen Genesis-3 node use the incompatible 2.x
-#     API.  Changing either serializer is a reviewed data-format migration.
-#   * secp256k1(-sys), bitcoin_hashes, hex-conservative — rust-bitcoin
-#     lineages pinned by stratum-sv2 (legacy Genesis-3 pool, kept buildable
-#     for audit) vs bitcoin 0.32 (bloch-btc-wallet / bloch-pq-vault).
-#   * sha2/digest/block-buffer, rand/rand_core/rand_chacha/getrandom —
-#     RustCrypto & rand ecosystem splits dragged in by the frozen Genesis-3
-#     node and the sv2 stack. NOTE: none of these old copies is on the
-#     Genesis-4 consensus path — bloch-pos-committee is sha3-only and
-#     bloch-crypto's ML-DSA/Falcon use the vendored pqcrypto-internals.
-#   * windows-sys, r-efi — OS shims, target-gated, never co-linked.
-#   * the rest — ordinary ecosystem major-version lag (thiserror 1/2, syn
-#     1/2, itertools, hashbrown, ...) with no network- or crypto-facing
-#     surface shared between the copies.
+# Known-benign duplicate allowlist. Every entry pins the EXACT older version
+# present today, so a new duplicate (yamux deliberately is not listed, and
+# must never be) fails the job, and a graph move that resolves a duplicate
+# leaves an unmatched-skip warning telling us to prune the entry. All are
+# semver-major splits that `cargo update` cannot unify:
+#   * bindgen 0.69 (librocksdb-sys build) vs 0.72; rustc-hash 1 vs 2 with it.
+#   * sha2 / digest / block-buffer 0.9: the node's `sha2_v9` alias.
+#   * rand / rand_core / rand_chacha 0.8 vs 0.9, getrandom 0.2 / 0.3 / 0.4,
+#     r-efi, wit-bindgen, windows-sys: rand-ecosystem and OS-shim splits
+#     (the shims are target-gated and never co-linked).
+#   * thiserror 1 vs 2, hashbrown, hashlink, socket2, unsigned-varint,
+#     webpki-roots: ordinary ecosystem lag inside libp2p / reqwest, no
+#     crypto-facing surface shared between the copies.
 skip = [
     { crate = "bindgen@=0.69.5" },
-    { crate = "bincode@=1.3.3" },
-    { crate = "bitcoin_hashes@=0.13.1" },
     { crate = "block-buffer@=0.9.0" },
     { crate = "block-buffer@=0.10.4" },
     { crate = "digest@=0.9.0" },
@@ -138,7 +97,6 @@ skip = [
     { crate = "hashbrown@=0.14.5" },
     { crate = "hashbrown@=0.15.5" },
     { crate = "hashlink@=0.9.1" },
-    { crate = "hex-conservative@=0.1.2" },
     { crate = "r-efi@=5.3.0" },
     { crate = "rand@=0.8.6" },
     { crate = "rand@=0.9.4" },
@@ -146,10 +104,6 @@ skip = [
     { crate = "rand_core@=0.6.4" },
     { crate = "rand_core@=0.9.5" },
     { crate = "rustc-hash@=1.1.0" },
-    { crate = "secp256k1@=0.28.2" },
-    { crate = "secp256k1@=0.29.1" },
-    { crate = "secp256k1-sys@=0.9.2" },
-    { crate = "secp256k1-sys@=0.10.1" },
     { crate = "sha2@=0.9.9" },
     { crate = "socket2@=0.5.10" },
     { crate = "thiserror@=1.0.69" },
@@ -164,9 +118,11 @@ skip = [
 [licenses]
 version = 2
 confidence-threshold = 0.9
-# Permissive only, plus MPL-2.0 tolerated for UNMODIFIED aggregation (its
-# copyleft is file-scoped; we do not modify MPL-licensed files). Deliberately
-# excludes AGPL/GPL/LGPL copyleft.
+# Permissive licenses only. AGPL/GPL/LGPL are NOT allowed globally: the
+# first-party AGPL crates are named in the exceptions below, so any
+# third-party copyleft dependency still fails. Entries that cargo-deny reports
+# as never encountered are removed (add one back only for a reviewed
+# dependency that needs it).
 allow = [
     "MIT",
     "Apache-2.0",
@@ -175,92 +131,36 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Zlib",
-    "Unicode-DFS-2016",
     "Unicode-3.0",
-    "MPL-2.0",
     "CC0-1.0",
-    "0BSD",
 ]
 
-# ── First-party AGPL exceptions ───────────────────────────────────────────
-# The project relicensed its OWN workspace crates MIT→AGPL-3.0-or-later.
-# cargo-deny applies the license policy to workspace members too, so without
-# these the build rejects Bloch's own code. AGPL is allowed ONLY for the
-# first-party crates named below — it is deliberately NOT in the global
-# `allow` above, so any THIRD-PARTY AGPL/GPL/LGPL dependency still fails the
-# gate.
-#
-# THIS LIST MUST EQUAL the set of AGPL workspace members in the root
-# Cargo.toml `members`. It is not maintained by hand alone: the blocking
-# `deny-license-exceptions` CI job runs
-# `python3 scripts/deny-license-exceptions-guard.py`, which derives the AGPL
-# member set from the workspace manifests and fails closed on a member with no
-# exception (the gate cannot pass, so the whole pipeline is red) AND on an
-# exception that names no AGPL member (a rename or typo silently widening the
-# policy). Add a crate to `members` and the guard tells you to add it here.
-#
-# (coherence-prover is AGPL but is `exclude`d from the workspace — SP1/nightly
-# toolchain — so it is outside the scan graph. Give it the same block, and the
-# guard will then require it, if it ever becomes a member.)
-
-# Genesis-4, proof of stake — the live chain.
+# ── First-party AGPL crates ──────────────────────────────────────────────────
+# cargo-deny applies the license policy to workspace members too. These are
+# exactly the AGPL-3.0-or-later members of the root Cargo.toml; keep the two
+# lists equal (a renamed member fails the check, a stale entry warns as
+# "license exception was not encountered").
 [[licenses.exceptions]]
-name = "bloch-pos-committee"
+name = "gnb"                # node/
 allow = ["AGPL-3.0-or-later"]
 [[licenses.exceptions]]
-name = "bloch-pos-node"
+name = "gnb-crypto"         # crates/gnb-crypto
 allow = ["AGPL-3.0-or-later"]
 [[licenses.exceptions]]
-name = "genesis4-ceremony"
+name = "gnb-wallet-wasm"    # crates/gnb-wallet-wasm
 allow = ["AGPL-3.0-or-later"]
 [[licenses.exceptions]]
-name = "bloch-indexer"
+name = "coherence-core"     # crates/coherence-core
 allow = ["AGPL-3.0-or-later"]
 
-# Shared protocol crates — used by both eras.
-[[licenses.exceptions]]
-name = "bloch-crypto"
-allow = ["AGPL-3.0-or-later"]
-[[licenses.exceptions]]
-name = "bloch-ustav"
-allow = ["AGPL-3.0-or-later"]
-[[licenses.exceptions]]
-name = "coherence-core"
-allow = ["AGPL-3.0-or-later"]
-[[licenses.exceptions]]
-name = "bloch-btc-wallet"
-allow = ["AGPL-3.0-or-later"]
-[[licenses.exceptions]]
-name = "bloch-pq-vault"
-allow = ["AGPL-3.0-or-later"]
-
-# Genesis-3, proof of work — closed, kept buildable for audit.
-[[licenses.exceptions]]
-name = "bloch"
-allow = ["AGPL-3.0-or-later"]
-[[licenses.exceptions]]
-name = "bloch-euvm"
-allow = ["AGPL-3.0-or-later"]
-[[licenses.exceptions]]
-name = "bloch-ffg"
-allow = ["AGPL-3.0-or-later"]
-
-# ── Third-party permissive-data license ───────────────────────────────────
-# webpki-roots (Mozilla CA set, pulled transitively via reqwest/libp2p-websocket)
-# ships the CA data under CDLA-Permissive-2.0 — a permissive data-sharing
-# license with no copyleft on the linking code. Scoped to webpki-roots so the
-# global policy is not widened. Covers both 0.26.x and 1.x in the tree.
+# ── Third-party permissive-data license ─────────────────────────────────────
+# webpki-roots (Mozilla CA set, via reqwest / libp2p-websocket) ships the CA
+# data under CDLA-Permissive-2.0: permissive, no copyleft on linking code.
+# Scoped to this crate so the global policy is not widened.
 [[licenses.exceptions]]
 name = "webpki-roots"
 allow = ["CDLA-Permissive-2.0"]
 
-# hex_lit (compile-time hex literal macro, transitive) ships under MITNFA
-# (MIT No False Attribution) — permissive, MIT plus a no-false-attribution
-# clause. Scoped so the global policy is not widened.
-[[licenses.exceptions]]
-name = "hex_lit"
-allow = ["MITNFA"]
-
 [sources]
 unknown-registry = "deny"
-unknown-git = "deny"   # no external git deps — the fork is vendored in crates/
+unknown-git = "deny"   # no external git deps: the forks are vendored in crates/
