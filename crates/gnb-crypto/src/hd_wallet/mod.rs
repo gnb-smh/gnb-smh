@@ -1396,8 +1396,9 @@ mod tests {
 
     #[test]
     fn create_save_load_roundtrip() {
-        let tmp = std::env::temp_dir().join("bloch-hd-test.json");
-        let _ = std::fs::remove_file(&tmp);
+        // Unique per run: a fixed name made concurrent test runs race.
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("hd-wallet.json");
 
         let w = HdWallet::create("test-password-12345!", Some("my-passphrase"), true).unwrap();
         let mnemonic = w.mnemonic.to_string();
