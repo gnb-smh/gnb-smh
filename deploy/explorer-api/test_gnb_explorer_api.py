@@ -157,6 +157,17 @@ class ExplorerApiTests(unittest.TestCase):
         self.assertEqual(self.server.get("/v1/getblockcount", a)[0], 429)
         self.assertEqual(self.server.get("/v1/getblockcount", b)[0], 200)
 
+    def test_node_errors_are_not_cached(self):
+        # A cancelled heavy read on the node is an error; the next caller
+        # must get a fresh computation, not the cached failure.
+        answers = [{"error": "cancelled"}, {"result": {"sample_size": 10}}]
+        api.rpc = lambda method, params: answers.pop(0)
+        status, body = self.server.get("/v1/getblocktimepercentiles")
+        self.assertEqual((status, body), (404, {"error": "cancelled"}))
+        status, body = self.server.get("/v1/getblocktimepercentiles")
+        self.assertEqual((status, body), (200, {"result": {"sample_size": 10}}))
+        self.assertEqual(self.server.get("/v1/getblocktimepercentiles")[1], {"result": {"sample_size": 10}}, "successes are cached")
+
     def test_default_bind_is_loopback_and_key_file_mode_is_checked(self):
         with open(os.path.join(HERE, "gnb-explorer-api.service"), encoding="utf-8") as fh:
             self.assertIn("Environment=GNB_API_BIND=127.0.0.1", fh.read())

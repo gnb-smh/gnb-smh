@@ -144,12 +144,18 @@ def rpc(method, params):
 
 
 def cached(key, ttl, fn):
+    """Serve `key` from the cache while fresh, else compute it with `fn`.
+    Only successes are cached: a node error (a cancelled or timed-out heavy
+    read, aggregates not built yet, busy) must not answer the next callers
+    for `ttl` seconds - the node's HeavyGate never caches one either."""
     now = time.monotonic()
     with _cache_lock:
         hit = _cache.get(key)
         if hit and hit[0] > now:
             return hit[1]
     value = fn()
+    if "error" in value:
+        return value
     with _cache_lock:
         if len(_cache) >= CACHE_MAX:
             _cache.clear()
