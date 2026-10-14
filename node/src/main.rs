@@ -855,15 +855,17 @@ async fn main() {
         loop {
           let run_started = std::time::Instant::now();
           let processor = async {
-            // POW-4 (audit): orphan pool bounded by entries AND bytes, globally
-            // and per delivering peer, evicting by ARRIVAL order (never by the
-            // self-declared height); first copy of an id wins (POW-8). It also
-            // owns the reverse index parent -> waiting orphans.
-            let mut orphans = ingress::OrphanPool::default();
-            // Orphan-deadlock fix: per-missing-parent retry state. The one-shot
-            // GetBlock below is recorded here; the periodic sweep re-requests
-            // lost ones with backoff and prunes hopeless ones.
-            let mut parent_fetch = sync::parent_fetch::ParentFetchTracker::new();
+            // The block-ingress core (`ingress::BlockIngress`, shared with the
+            // integration tests): the orphan pool (POW-4: bounded by entries
+            // AND bytes, globally and per delivering peer, evicting by ARRIVAL
+            // order; first copy of an id wins, POW-8; reverse index parent ->
+            // waiting orphans; POW-3 announced work), the missing-parent
+            // retry tracker (orphan-deadlock fix: the periodic sweep
+            // re-requests lost parents with backoff and prunes hopeless ones),
+            // the deep-insertion budget (DAG-7 / POW-3) and the POW-3 anti-DoS
+            // work rule. Lives inside the restartable closure: a panic
+            // rebuilds it empty (peers resend).
+            let mut ingress_core = ingress::BlockIngress::new();
             let mut orphan_sweep = tokio::time::interval(sync::parent_fetch::SWEEP_PERIOD);
             orphan_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Never fire immediately on (re)start — tick 0 is now.
@@ -871,9 +873,10 @@ async fn main() {
             // NET-6: tip claims only trigger (rate-limited) directed pulls and
             // reciprocal announcements; they never latch IBD.
             let mut claims = ingress::ClaimPolicy::new();
-            // DAG-7 / POW-3: ration deep (below-finality) insertions that the
-            // "awaited orphan parent" exemption may grant.
-            let mut deep_budget = ingress::DeepBackfillBudget::new();
+            let ctx = ingress::AcceptCtx {
+                dag: &dag2, store: &store2, mempool: &mem2, node_state: &state2,
+                tip_tx: Some(&tip_tx2), shielded: &shielded2,
+            };
 
             loop {
             // Orphan-deadlock fix: select between the inbound channel and the
@@ -882,19 +885,15 @@ async fn main() {
                 m = block_rx.recv() => match m { Some(m) => m, None => break },
                 _ = orphan_sweep.tick() => {
                     let ready = sweep_orphan_parents(
-                        &mut orphans, &mut parent_fetch, &dag2, &otx2,
+                        &mut ingress_core.orphans, &mut ingress_core.parent_fetch, &dag2, &otx2,
                     ).await;
                     // Defensive liveness: a waited-on parent that is ALREADY in
                     // the DAG (its accept raced the waiting_for insert) would
                     // otherwise strand its orphans forever — drain them now.
                     for p in ready {
-                        process_orphans(
-                            p, &mut orphans,
-                            &dag2, &store2, &mem2, &state2,
-                            Some(&tip_tx2), &shielded2,
-                        );
+                        ingress_core.drain_orphans(p, &ctx);
                     }
-                    frontier2.lock().set_orphan_evidence(orphans.max_evidence_height());
+                    frontier2.lock().set_orphan_evidence(ingress_core.orphans.max_evidence_height());
                     maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                     continue;
                 }
@@ -971,7 +970,7 @@ async fn main() {
                         let d = dag2.read();
                         frontier2.lock().to_request_capped(
                             &advertised,
-                            |h| d.has_block(h) || orphans.contains(h),
+                            |h| d.has_block(h) || ingress_core.orphans.contains(h),
                             now,
                             sync::frontier::MAX_NEW_TIPS_PER_RESPONSE,
                         )
@@ -994,7 +993,7 @@ async fn main() {
                     let missing: Vec<[u8; 32]> = {
                         let d = dag2.read();
                         entries.iter()
-                            .filter(|e| !d.has_block(&e.hash) && !orphans.contains(&e.hash))
+                            .filter(|e| !d.has_block(&e.hash) && !ingress_core.orphans.contains(&e.hash))
                             .map(|e| e.hash).collect()
                     };
                     if !missing.is_empty() {
@@ -1043,7 +1042,7 @@ async fn main() {
                 network::NetworkMessage::NewBlock { block_data, block_hash, height, .. } => {
                     let now = std::time::Instant::now();
                     let verdict: network::GossipVerdict = 'blk: {
-                        if dag2.read().has_block(&block_hash) || orphans.contains(&block_hash) {
+                        if dag2.read().has_block(&block_hash) || ingress_core.orphans.contains(&block_hash) {
                             break 'blk network::GossipVerdict::Ignore;
                         }
                         let tip_h = selected_tip_height(&dag2);
@@ -1056,7 +1055,7 @@ async fn main() {
                             break 'blk network::GossipVerdict::Ignore;
                         }
                         // Sprint 1.c: Bitcoin-format wire.
-                        let mut block = match core::Block::from_wire_bytes(&block_data) {
+                        let block = match core::Block::from_wire_bytes(&block_data) {
                             Ok(b) => b,
                             Err(e) => {
                                 warn!("block deserialise: {}", e);
@@ -1077,154 +1076,92 @@ async fn main() {
                             break 'blk network::GossipVerdict::Reject;
                         }
 
-                        // ── BACKFILL-FLOOD guard ──────────────────────────────
-                        // A block far BELOW our selected tip that nobody asked
-                        // for is backfill a healthy node PULLS, never something a
-                        // peer should PUSH; ingesting one costs seconds under the
-                        // DAG write lock (tests/backfill_flood_lab.rs). Not
-                        // consensus: declining to ingest an ancient gossiped block
-                        // changes no validation rule.
-                        //
-                        // POW-2: overflow-free (`ingress::backfill_decision`).
-                        // DAG-7 / POW-3: the "awaited" exemption (a parent some
-                        // buffered orphan needs) can no longer be minted for free
-                        // — an orphan only enters the pool after passing the
-                        // anti-DoS work floor AND its proof of work — and each
-                        // deep insertion it grants is rationed by `deep_budget`.
-                        let awaited = orphans.is_waited_on(&block_hash) || parent_fetch.is_awaited(&block_hash);
-                        match ingress::backfill_decision(height, tip_h, awaited) {
-                            ingress::BackfillDecision::Pass => {}
-                            ingress::BackfillDecision::DropUnsolicitedDeep => {
-                                debug!(
-                                    "backfill-flood guard: dropped unsolicited deep block h={} \
-                                     (tip h={}, {} below) — backfill must be pulled",
-                                    height, tip_h, tip_h.saturating_sub(height)
-                                );
-                                crate::metrics::inc_block_backfill_dropped();
-                                break 'blk network::GossipVerdict::Ignore;
-                            }
-                            ingress::BackfillDecision::AwaitedDeep => {
-                                if !deep_budget.allow_at(now) {
-                                    debug!("backfill-flood guard: deep awaited block h={} deferred (deep-insertion budget exhausted; the orphan sweep re-requests it)", height);
-                                    crate::metrics::inc_block_backfill_dropped();
-                                    break 'blk network::GossipVerdict::Ignore;
-                                }
-                            }
-                        }
-
-                        // Cheap structural validation (merkle, coinbase format,
-                        // duplicates, dust, size, parent count) — NO PoW yet.
-                        if let Err(reason) = block.validate_structure_without_pow() {
-                            warn!("block {} rejected ({})", hex::encode(&block_hash[..8]), reason);
-                            break 'blk network::GossipVerdict::Reject;
-                        }
-
-                        let missing_parents: Vec<[u8; 32]> = {
-                            let d = dag2.read();
-                            block.header.parents.iter().filter(|p| !d.has_block(p)).cloned().collect()
-                        };
-
-                        if !missing_parents.is_empty() {
-                            // Orphan: its expected bits cannot be derived without
-                            // its parents. NET-2 / POW-4: require bits no easier
-                            // than the anti-DoS floor (derived from OUR tip and the
-                            // clock) BEFORE evaluating the proof — a pow-limit
-                            // orphan with fake parents used to be admitted after a
-                            // single (free) evaluation.
-                            let now_unix = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs()).unwrap_or(0);
-                            let floor = ingress::orphan_admission_floor(tip_h, now_unix);
-                            if !ingress::bits_meet_floor(block.header.bits, &floor) {
-                                debug!("orphan {} bits 0x{:08x} easier than the anti-DoS floor; ignored",
-                                    hex::encode(&block_hash[..8]), block.header.bits);
-                                break 'blk network::GossipVerdict::Ignore;
-                            }
-                            if !block.validate_pow() {
-                                warn!("orphan {} rejected (invalid PoW)", hex::encode(&block_hash[..8]));
-                                break 'blk network::GossipVerdict::Reject;
-                            }
-                            let evidence = ingress::orphan_is_sync_evidence(block.header.bits, height, tip_h, now_unix);
-                            // Kaspa-style ancestor resolution: request each missing
-                            // parent that nobody is waiting for and that is not
-                            // itself buffered (a deep gap fans out one level at a time).
-                            let fresh: Vec<[u8; 32]> = missing_parents.iter()
-                                .filter(|mp| !orphans.is_waited_on(mp) && !orphans.contains(mp))
-                                .copied().collect();
-                            match orphans.insert(block_hash, block, height, block_data.len(), origin.peer(), evidence, &missing_parents) {
-                                ingress::OrphanInsert::Inserted { evicted } => {
-                                    if !evicted.is_empty() {
-                                        debug!("orphan pool full: evicted {} oldest orphan(s)", evicted.len());
-                                    }
-                                }
-                                ingress::OrphanInsert::Duplicate | ingress::OrphanInsert::TooLarge => {
-                                    break 'blk network::GossipVerdict::Ignore;
-                                }
-                            }
-                            debug!("orphan block h={} (missing {} parents), buffered (pool={} / {} bytes)",
-                                height, missing_parents.len(), orphans.len(), orphans.total_bytes());
-                            for mp in fresh {
-                                // Orphan-deadlock fix: record the attempt so the sweep
-                                // can re-request it if the response is lost.
-                                parent_fetch.note_requested(mp, now);
-                                let _ = otx2.send(network::NetworkMessage::GetBlock {
-                                    block_hash: mp, nonce: getblock_nonce(),
-                                }).await;
-                            }
-                            {
-                                let mut fr = frontier2.lock();
-                                fr.note_received(&block_hash);
-                                fr.set_orphan_evidence(orphans.max_evidence_height());
-                            }
-                            // NET-6: the IBD latch is set ONLY by work-backed
-                            // evidence — a full-difficulty orphan claiming to be
-                            // well ahead of our tip.
-                            if evidence {
-                                let mut s = state2.write();
-                                if !s.is_syncing {
-                                    info!("IBD latched: work-backed orphan claims h={} (tip h={})", height, tip_h);
-                                }
-                                s.is_syncing = true;
-                            }
-                            maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
-                            break 'blk network::GossipVerdict::Accept;
-                        }
-
-                        // All parents present. POW-8: never persist the wire
-                        // blue_score — derive it from the verified parents.
-                        normalize_wire_metadata(&mut block, &dag2);
-                        // accept_block checks height, expected bits and timestamp
-                        // BEFORE the proof of work (NET-2), then everything else.
+                        // Everything else is the ingress core (shared with the
+                        // integration tests), cheapest checks first:
+                        //  * structure without PoW;
+                        //  * ORPHAN (a parent unknown): backfill-flood guard (an
+                        //    unsolicited far-below-tip orphan is dropped — backfill
+                        //    is pulled), the anti-DoS bits floor BEFORE the proof
+                        //    (NET-2 / POW-4), the proof, then the bounded pool;
+                        //  * parents known: the POW-3 anti-DoS WORK rule — the
+                        //    block's chain must come within ANTI_DOS_WINDOW_BLOCKS
+                        //    of our tip's work, or be backed by a proof-of-work-
+                        //    verified orphan chain announced on top of it (deep
+                        //    merge-backed blocks are rationed, DAG-7) — BEFORE the
+                        //    proof, storage or DAG insertion; then POW-8 metadata
+                        //    normalization, `accept_block` (height, expected bits,
+                        //    timestamp before the proof, NET-2) and the iterative
+                        //    orphan drain (POW-3 / POW-4).
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs()).unwrap_or(0);
                         let t_validate = std::time::Instant::now();
-                        match accept_block(
-                            &block, block_hash, height,
-                            &dag2, &store2, &mem2, &state2,
-                            Some(&tip_tx2), &shielded2,
-                        ) {
-                            Err(e) => {
-                                crate::metrics::observe_block_validation(t_validate.elapsed().as_secs_f64());
-                                crate::metrics::inc_block_rejected();
-                                warn!("block {} h={} REJECTED: {}", hex::encode(&block_hash[..8]), height, e);
-                                ingress::verdict_for_accept_error(&e)
+                        match ingress_core.handle_block(block, block_hash, block_data.len(), origin.peer(), now, now_unix, &ctx) {
+                            ingress::BlockOutcome::Known | ingress::BlockOutcome::PoolRefused => {
+                                network::GossipVerdict::Ignore
                             }
-                            Ok(accepted_hash) => {
-                                crate::metrics::observe_block_validation(t_validate.elapsed().as_secs_f64());
-                                crate::metrics::inc_block_accepted();
-                                // Process any orphans that were waiting for this block
-                                // (iteratively — POW-3/POW-4).
-                                process_orphans(
-                                    accepted_hash,
-                                    &mut orphans,
-                                    &dag2, &store2, &mem2, &state2,
-                                    Some(&tip_tx2), &shielded2,
-                                );
+                            ingress::BlockOutcome::Dropped(reason) => {
+                                debug!("block {} h={} dropped before PoW: {:?} (tip h={})",
+                                    hex::encode(&block_hash[..8]), height, reason, tip_h);
+                                crate::metrics::inc_block_backfill_dropped();
+                                network::GossipVerdict::Ignore
+                            }
+                            ingress::BlockOutcome::Invalid(reason) => {
+                                warn!("block {} rejected ({})", hex::encode(&block_hash[..8]), reason);
+                                network::GossipVerdict::Reject
+                            }
+                            ingress::BlockOutcome::Buffered { request, evidence, evicted } => {
+                                if evicted > 0 {
+                                    debug!("orphan pool full: evicted {} oldest orphan(s)", evicted);
+                                }
+                                for mp in request {
+                                    // Orphan-deadlock fix: the attempt was recorded
+                                    // by the core so the sweep can re-request it.
+                                    let _ = otx2.send(network::NetworkMessage::GetBlock {
+                                        block_hash: mp, nonce: getblock_nonce(),
+                                    }).await;
+                                }
                                 {
                                     let mut fr = frontier2.lock();
                                     fr.note_received(&block_hash);
-                                    fr.set_orphan_evidence(orphans.max_evidence_height());
+                                    fr.set_orphan_evidence(ingress_core.orphans.max_evidence_height());
+                                }
+                                // NET-6: the IBD latch is set ONLY by work-backed
+                                // evidence — a full-difficulty orphan claiming to be
+                                // well ahead of our tip.
+                                if evidence {
+                                    let mut s = state2.write();
+                                    if !s.is_syncing {
+                                        info!("IBD latched: work-backed orphan claims h={} (tip h={})", height, tip_h);
+                                    }
+                                    s.is_syncing = true;
                                 }
                                 maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                                 network::GossipVerdict::Accept
+                            }
+                            ingress::BlockOutcome::Processed { admission, result, drained } => {
+                                crate::metrics::observe_block_validation(t_validate.elapsed().as_secs_f64());
+                                match result {
+                                    Err(e) => {
+                                        crate::metrics::inc_block_rejected();
+                                        warn!("block {} h={} REJECTED: {}", hex::encode(&block_hash[..8]), height, e);
+                                        ingress::verdict_for_accept_error(&e)
+                                    }
+                                    Ok(_) => {
+                                        crate::metrics::inc_block_accepted();
+                                        if admission != ingress::WorkAdmission::NearTip {
+                                            info!("block {} h={} admitted as {:?} (POW-3 work rule); {} orphan(s) drained",
+                                                hex::encode(&block_hash[..8]), height, admission, drained.len());
+                                        }
+                                        {
+                                            let mut fr = frontier2.lock();
+                                            fr.note_received(&block_hash);
+                                            fr.set_orphan_evidence(ingress_core.orphans.max_evidence_height());
+                                        }
+                                        maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
+                                        network::GossipVerdict::Accept
+                                    }
+                                }
                             }
                         }
                     };
@@ -2049,67 +1986,9 @@ fn selected_tip_height(dag: &Arc<RwLock<consensus::GhostDAG>>) -> u64 {
         .unwrap_or(0)
 }
 
-/// POW-8 (audit): the wire `blue_score` is not committed by the block id and
-/// used to be persisted and re-served verbatim. Replace it with the value
-/// derived from the block's VERIFIED parents before the block is stored.
-/// (`height` needs no rewrite: `accept_block` rejects any block whose height
-/// differs from max(parent height) + 1.)
-fn normalize_wire_metadata(block: &mut core::Block, dag: &Arc<RwLock<consensus::GhostDAG>>) {
-    let d = dag.read();
-    block.blue_score = ingress::derived_blue_score(
-        block.header.parents.iter().filter_map(|p| d.get_block_data(p).map(|x| x.blue_score)),
-    );
-}
-
-/// After accepting a block, accept every buffered orphan that can now be
-/// connected, transitively.
-///
-/// POW-3 / POW-4 (audit): ITERATIVE (a work queue), not recursive — an
-/// attacker-built chain of thousands of orphans used to recurse once per
-/// accepted orphan on a 2 MiB worker stack.
-#[allow(clippy::too_many_arguments)]
-fn process_orphans(
-    accepted_hash: [u8; 32],
-    orphans:       &mut ingress::OrphanPool,
-    dag:           &Arc<RwLock<consensus::GhostDAG>>,
-    store:         &Arc<storage::Storage>,
-    mempool:       &Arc<mempool::Mempool>,
-    node_state:    &Arc<RwLock<rpc::NodeState>>,
-    // Sprint 2.c: propagate tip broadcast through orphan resurrection.
-    tip_tx:        Option<&broadcast::Sender<tip::TipChanged>>,
-    shielded:      &Arc<RwLock<crate::coherence::ShieldedPool>>,
-) {
-    let mut queue: std::collections::VecDeque<[u8; 32]> = std::collections::VecDeque::new();
-    queue.push_back(accepted_hash);
-    while let Some(parent) = queue.pop_front() {
-        for orphan_hash in orphans.take_waiters(&parent) {
-            let all_parents_present = orphans.get(&orphan_hash)
-                .map(|e| {
-                    let d = dag.read();
-                    e.block.header.parents.iter().all(|p| d.has_block(p))
-                })
-                .unwrap_or(false);
-            // Still waiting on another parent: it stays registered under that
-            // parent and is retried when it arrives.
-            if !all_parents_present { continue; }
-
-            if let Some(entry) = orphans.remove(&orphan_hash) {
-                let height = entry.height;
-                let mut block = entry.block;
-                normalize_wire_metadata(&mut block, dag);
-                match accept_block(&block, orphan_hash, height, dag, store, mempool, node_state, tip_tx, shielded) {
-                    Ok(hash) => {
-                        info!("✓ orphan h={} accepted (pool={})", height, orphans.len());
-                        queue.push_back(hash);
-                    }
-                    Err(e) => {
-                        warn!("orphan h={} rejected: {}", height, e);
-                    }
-                }
-            }
-        }
-    }
-}
+// `normalize_wire_metadata` (POW-8) and `process_orphans` (iterative orphan
+// drain, POW-3 / POW-4) moved to the library's `ingress` module, where the
+// processor core (`ingress::BlockIngress`) and the integration tests use them.
 
 /// Orphan-deadlock fix: periodic (~30s) sweep over the missing-parent set.
 ///
@@ -2176,6 +2055,7 @@ mod ingress_processor_tests {
     //! binary: iterative orphan draining with derived metadata (POW-3/4/8)
     //! and the evidence-driven IBD latch release (NET-6).
     use super::*;
+    use crate::ingress::{normalize_wire_metadata, process_orphans};
 
     fn unix_now() -> u64 {
         std::time::SystemTime::now()

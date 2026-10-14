@@ -704,3 +704,234 @@ fn dag11_applied_without_undo_and_interrupted_rebuild_are_detected() {
     assert!(err.contains("pruned"), "{err}");
     assert_eq!(digest(&n), before, "a refused rebuild changes nothing");
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// POW-3 (node-local anti-DoS half): the work rule of the ingress core
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// These drive `gnb::ingress::BlockIngress::handle_block`, the same core the
+// node's message processor (main.rs, NewBlock arm) calls for every gossiped
+// or pulled block, with a simulated network: a Buffered outcome's parent
+// requests are answered next, and an announced tip is re-announced when the
+// pipeline stalls (the node's 30 s GetTips nudge).
+
+use gnb::ingress::{self, BlockIngress, BlockOutcome, DropReason, OrphanLimits, WorkAdmission};
+
+fn ctx(n: &Node) -> ingress::AcceptCtx<'_> {
+    ingress::AcceptCtx {
+        dag: &n.dag, store: &n.store, mempool: &n.mempool, node_state: &n.node_state,
+        tip_tx: Some(&n.tip_tx), shielded: &n.shielded,
+    }
+}
+
+fn feed(core: &mut BlockIngress, n: &Node, b: &Block) -> BlockOutcome {
+    core.handle_block(b.clone(), b.block_hash(), b.to_wire_bytes().len(), None,
+        std::time::Instant::now(), unix_now(), &ctx(n))
+}
+
+/// (a) A flood of low-work blocks forking deep below the tip (siblings of
+/// deep blocks, genesis siblings, and orphan chains built on them) is refused
+/// before any proof-of-work evaluation, storage or DAG insertion — cheaply —
+/// while the same blocks were inserted before (the old height guard only
+/// covered blocks more than 1,000 below the tip). Orphan chains on top stay
+/// in the bounded pool and, carrying too little work, never make their base
+/// acceptable.
+#[test]
+fn pow3_low_work_flood_is_refused_before_pow_storage_or_insertion() {
+    let genesis = mk_genesis(unix_now() - 50_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let honest = b.chain(gh, 800, "lw");
+    let x = node_with(&genesis, &[]);
+    for blk in &honest {
+        accept(&x, blk).unwrap();
+    }
+    let threshold = ingress::anti_dos_work_threshold(&x.dag.read());
+    assert_eq!(threshold, 440 * core::bits_to_work(core::POW_LIMIT_BITS),
+        "the work of the selected-chain block 360 below the tip");
+    let count_before = x.dag.read().block_count();
+    let digest_before = digest(&x);
+
+    // 1,500 connectable flood blocks: children of blocks at heights 0..400.
+    let mut rng = Rng(0x0F00_D000_0000_0003);
+    let mut flood = Vec::new();
+    for i in 0..1_500 {
+        let parent = if i % 5 == 0 { gh } else { honest[rng.below(400)].block_hash() };
+        flood.push(b.empty(vec![parent], &format!("flood{i}")));
+    }
+    let mut core = BlockIngress::with_limits(OrphanLimits {
+        max_entries: 200, max_bytes: 64 << 20, max_entries_per_peer: 200, max_bytes_per_peer: 64 << 20,
+    });
+    let t = std::time::Instant::now();
+    for blk in &flood {
+        assert!(matches!(feed(&mut core, &x, blk), BlockOutcome::Dropped(DropReason::LowWork)));
+    }
+    let refused = t.elapsed();
+    assert_eq!(x.dag.read().block_count(), count_before, "nothing inserted");
+    assert!(flood.iter().all(|blk| x.store.get_block(&blk.block_hash()).unwrap().is_none()), "nothing stored");
+    assert_eq!(digest(&x), digest_before);
+
+    // An orphan chain of 300 blocks on top of a refused genesis sibling:
+    // buffered (the pool stays bounded), and 1 + 300 blocks of work still do
+    // not reach the threshold (440), so the base stays refused.
+    let base = flood[0].clone();
+    assert_eq!(base.header.parents, vec![gh]);
+    let mut chain_on_base = b.chain(base.block_hash(), 300, "flood-chain");
+    chain_on_base.reverse(); // tip first, as a backward fetch delivers them
+    for blk in &chain_on_base {
+        let out = feed(&mut core, &x, blk);
+        assert!(matches!(out, BlockOutcome::Buffered { .. }), "{out:?}");
+        assert!(core.orphans.len() <= 200, "the pool stays bounded");
+    }
+    assert!(matches!(feed(&mut core, &x, &base), BlockOutcome::Dropped(DropReason::LowWork)));
+    assert_eq!(x.dag.read().block_count(), count_before);
+
+    // Before: the same blocks went straight into accept_block.
+    let y = node_with(&genesis, &[]);
+    for blk in &honest {
+        accept(&y, blk).unwrap();
+    }
+    let t = std::time::Instant::now();
+    for blk in &flood[..100] {
+        accept(&y, blk).expect("pre-fix: a low-work fork block was stored and inserted");
+    }
+    let inserted = t.elapsed();
+    let per_refusal = refused / flood.len() as u32;
+    let per_insertion = inserted / 100;
+    println!("POW-3 flood: {} refusals in {:.2?} ({:.2?} each, no PoW/storage/insertion); \
+              pre-fix insertion {:.2?} each (without the 64 MiB proof evaluation a real node also paid)",
+        flood.len(), refused, per_refusal, per_insertion);
+    assert!(per_refusal < per_insertion, "refusing must be cheaper than inserting");
+}
+
+/// Simulated network: deliver `want_tip` (the fork tip, as a frontier tip),
+/// answer every parent request at once, and re-announce the tip whenever the
+/// pipeline stalls, until `n` selects `want_tip`. Returns the admissions of
+/// processed blocks, the drops and the number of announcements.
+#[allow(clippy::type_complexity)]
+fn sync_tip_first(
+    core: &mut BlockIngress,
+    n: &Node,
+    by_hash: &HashMap<BlockHash, Block>,
+    want_tip: BlockHash,
+) -> (Vec<(BlockHash, WorkAdmission)>, Vec<(BlockHash, DropReason)>, usize) {
+    let mut admissions = Vec::new();
+    let mut drops = Vec::new();
+    let mut queue: std::collections::VecDeque<BlockHash> = std::collections::VecDeque::new();
+    let mut rounds = 0usize;
+    let mut deliveries = 0usize;
+    while sel_tip(n) != Some(want_tip) {
+        let Some(h) = queue.pop_front() else {
+            rounds += 1;
+            assert!(rounds <= 50, "the fork must be followed in a bounded number of re-announcements");
+            queue.push_back(want_tip);
+            continue;
+        };
+        deliveries += 1;
+        assert!(deliveries < 100_000);
+        let blk = &by_hash[&h];
+        match feed(core, n, blk) {
+            BlockOutcome::Buffered { request, .. } => {
+                for p in request.into_iter().rev() {
+                    queue.push_front(p);
+                }
+            }
+            BlockOutcome::Processed { admission, result, .. } => {
+                result.expect("fork block accepted");
+                admissions.push((h, admission));
+            }
+            BlockOutcome::Dropped(r) => drops.push((h, r)),
+            BlockOutcome::Known | BlockOutcome::PoolRefused => {}
+            BlockOutcome::Invalid(e) => panic!("invalid: {e}"),
+        }
+    }
+    (admissions, drops, rounds)
+}
+
+/// (b) A heavier honest fork that branches deep (1,150 blocks below a
+/// 1,200-block tip, so its first ~150 blocks are more than 1,000 below the
+/// tip) is followed when it is fetched the way a node fetches it — tip first,
+/// parent by parent — through an orphan pool much smaller than the fork. Its
+/// work is proven by the announced orphan chain (remembered across
+/// evictions), so its deep blocks are admitted as chain-backed, without the
+/// deep-insertion budget that used to throttle them to one per 30 s, and the
+/// node ends on the fork with exactly the UTXO set of a node that received
+/// it in order.
+#[test]
+fn pow3_heavier_fork_branching_deep_is_followed_tip_first() {
+    let genesis = mk_genesis(unix_now() - 50_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let honest = b.chain(gh, 1_200, "hb");
+    let fork = b.chain(honest[49].block_hash(), 1_200, "fb"); // tip at height 1,250
+    let fork_tip = fork.last().unwrap().block_hash();
+    let by_hash: HashMap<BlockHash, Block> = fork.iter().map(|x| (x.block_hash(), x.clone())).collect();
+
+    let x = node_with(&genesis, &[]);
+    for blk in &honest {
+        accept(&x, blk).unwrap();
+    }
+    let mut core = BlockIngress::with_limits(OrphanLimits {
+        max_entries: 400, max_bytes: 64 << 20, max_entries_per_peer: 400, max_bytes_per_peer: 64 << 20,
+    });
+    let (admissions, drops, rounds) = sync_tip_first(&mut core, &x, &by_hash, fork_tip);
+    println!("POW-3 deep fork: followed after {} announcement(s); {} admissions; drops {:?}",
+        rounds, admissions.len(), drops);
+    assert!(drops.is_empty(), "no fork block was refused: {drops:?}");
+    let first = admissions.iter().find(|(h, _)| *h == fork[0].block_hash()).expect("first fork block");
+    assert_eq!(first.1, WorkAdmission::ChainBacked, "deep, low own work, backed by the announced chain");
+    assert!(rounds > 1, "the fork is longer than the pool: remembered work carried it across rounds");
+    assert_eq!(tip_meta(&x), fork_tip);
+
+    let w = node_with(&genesis, &[]);
+    for blk in &honest[..50] {
+        accept(&w, blk).unwrap();
+    }
+    for blk in &fork {
+        accept(&w, blk).unwrap();
+    }
+    assert_eq!(digest(&x), digest(&w));
+}
+
+/// Coordination with the existing deep-insertion budget (DAG-7): a deep
+/// low-work block that is needed only because a buffered orphan MERGES it
+/// (the orphan's own work comes from its other parent) is admitted as
+/// merge-backed, and such deep admissions are rationed by
+/// `DeepBackfillBudget` — the crafted-orphan bypass of the audit costs one
+/// real orphan per insertion and is cut off after the burst.
+#[test]
+fn pow3_merge_backed_deep_blocks_are_rationed() {
+    let genesis = mk_genesis(unix_now() - 50_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let honest = b.chain(gh, 1_100, "mb");
+    let x = node_with(&genesis, &[]);
+    for blk in &honest {
+        accept(&x, blk).unwrap();
+    }
+    let mut core = BlockIngress::new();
+    let mut tip = honest.last().unwrap().block_hash();
+    let mut admitted = 0;
+    for i in 0..(ingress::DEEP_BACKFILL_BURST as usize + 1) {
+        let deep = b.empty(vec![honest[10 + i].block_hash()], &format!("deep{i}"));
+        assert!(matches!(feed(&mut core, &x, &deep), BlockOutcome::Dropped(DropReason::LowWork)),
+            "alone it is refused");
+        let merger = b.empty(vec![tip, deep.block_hash()], &format!("merger{i}"));
+        assert!(matches!(feed(&mut core, &x, &merger), BlockOutcome::Buffered { .. }));
+        match feed(&mut core, &x, &deep) {
+            BlockOutcome::Processed { admission, result, drained } => {
+                assert_eq!(admission, WorkAdmission::MergeBacked);
+                result.expect("deep block stored as a fork-loser");
+                assert_eq!(drained, vec![merger.block_hash()]);
+                tip = merger.block_hash();
+                admitted += 1;
+            }
+            BlockOutcome::Dropped(DropReason::DeepBudgetExhausted) => {
+                assert_eq!(admitted, ingress::DEEP_BACKFILL_BURST as usize, "only after the burst");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(admitted, ingress::DEEP_BACKFILL_BURST as usize);
+    assert_eq!(tip_meta(&x), tip);
+}
