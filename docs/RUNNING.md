@@ -42,3 +42,46 @@ new chain.
 JSON-RPC on 127.0.0.1:17210. Useful methods: `getblockcount`, `getdaginfo`,
 `getblocktemplate`, `submitblock`, `getsupplyinfo`, `getbalance`,
 `sendrawtransaction`. See `node/src/rpc/mod.rs`.
+
+## Chain selection and operator recovery
+
+The node always follows the best valid chain of the blocks it holds, at any
+depth: there is no reorg-depth limit and no finality checkpoint. A reorg of
+more than 1,000 blocks is logged at error level ("DEEP REORG committed") and
+counted in `gnb_deep_reorgs_total`; it is never refused.
+
+To leave a chain anyway (for example while an incident is investigated), or
+to return to it:
+
+```sh
+GNB_RPC_API_KEY=<key> gnb-cli invalidateblock <block-hash>
+GNB_RPC_API_KEY=<key> gnb-cli reconsiderblock <block-hash>
+```
+
+`invalidateblock` disqualifies the block and every block whose selected chain
+passes through it, rolls the node back past it if needed and moves to the
+best remaining chain. `reconsiderblock` removes the marks of the block, of its
+selected-chain ancestors and of its selected-chain descendants, then lets the
+node re-evaluate (a block that really is invalid is disqualified again). Both
+are persisted and survive restarts, and they are the RPC methods of the same
+name (parameter: the block hash in hex). They are never served to an
+anonymous caller: they need the configured API key (`--rpc-api-key` /
+`--rpc-api-key-file`) or a trusted caller (`--rpc-trust-loopback`).
+
+## Chain-state check at start-up
+
+At every start the node checks its chain state for the footprint of an
+interrupted or failed commit written by releases before the 2026-10 audit
+fixes (UTXO effects of a block without its undo record). If it finds one it
+rebuilds the UTXO set and its indexes from the block bodies, which needs the
+carryover snapshot:
+
+```sh
+./target/release/gnb --data-dir ./gnb-data \
+    --carryover-snapshot genesis/bloch-g3-carryover.tsv
+```
+
+Without `--carryover-snapshot`, or on a pruned node whose old block bodies are
+gone, it refuses to start and says why; resync from a fresh `--data-dir` (or
+from an archival node's data dir). Data dirs written by this release cannot
+produce the footprint: every chain move is committed in one atomic batch.

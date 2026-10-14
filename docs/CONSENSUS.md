@@ -152,6 +152,33 @@ The selected parent of B is the parent with the largest `(blue_work,
 blue_score, hash)`. The selected tip is the tip with the largest
 `(blue_work, blue_score, hash)`. These rules are unchanged at every height.
 
+The applied chain (the UTXO set, see "Ledger semantics" below) is the
+selected-parent chain of the best block, in that order, that is valid in its
+own selected-chain context. Blocks that fail connect-time validation, and
+every block whose selected-parent chain passes through one, are disqualified
+and never selected.
+
+There is no reorg-depth limit and no finality checkpoint (audit DAG-6). The
+former 1,000-block `MAX_REORG_DEPTH` and the `finalized_height` gate compared
+a fork with the node's own history, so nodes that received the same blocks in
+different orders could end on different chains. As in Bitcoin Core (no depth
+limit, no checkpoints), a node ends on the best valid chain of the blocks it
+holds, whatever their arrival order and however deep the fork. What bounds
+merging objectively is the merge depth below, a function of each block's
+past. Reorgs deeper than 1,000 selected-chain blocks are logged and counted
+(`gnb_deep_reorgs_total`), never refused. Undo records are kept for every
+connected block and a pruned body leaves a rollback record, so a reorg of any
+depth also works on a pruned node. (A pruned node that has reorganized AWAY
+from blocks whose bodies it had pruned cannot re-apply them without
+downloading them again: like a pruned Bitcoin Core node, it must resync.)
+
+An operator can override the choice, node-locally and persistently, with the
+RPCs `invalidateblock <hash>` (disqualify the block and every block whose
+selected chain passes through it, and move to the best remaining chain) and
+`reconsiderblock <hash>` (remove those marks for the block, its
+selected-chain ancestors and descendants, and re-evaluate); see
+`docs/RUNNING.md`. These are not consensus rules.
+
 ### Blue work
 
 ```text
@@ -201,7 +228,7 @@ so it can color blue a block with more than k blues in its anticone.
   is rejected with `MergesetTooLarge` before any coloring work.
 - Merge depth: let R be the highest selected-chain block of B with
   `blue_score(R) ≤ blue_score(B) - MERGE_DEPTH`, where `MERGE_DEPTH = 360`
-  (3 hours at 30 s, under the 1,000-block finality depth). Every red in B's
+  (3 hours at 30 s). Every red in B's
   mergeset must be R itself, in the future of R, or in the past of a blue in
   B's mergeset that is in the future of R (Kaspa's "kosherizing" rule).
   Otherwise B is rejected with `MergeDepthViolation`. Blues need no check: a
@@ -251,6 +278,39 @@ At the audit's 12,000-block scenario (dev profile), these changes reduced a
 deep side block from 10–26 s to 50–84 ms, a genesis sibling that forces a
 reindex from 46 s to 0.1 s, and the 1,000-block side-chain merge from 35 s to
 29 ms. After activation, that merge is rejected in under 1 ms.
+
+What remained proportional to the DAG is the reachability reindex that one
+genesis sibling or one deep side block triggers on insertion (about 100 ms at
+12,000 blocks, dev profile) and, before activation, the coloring walk for a
+candidate that forks deep. Neither block is inserted any more unless a chain
+carrying enough work backs it: the node-local anti-DoS work rule below runs
+before the proof of work, storage or insertion of every block whose parents
+are known. GhostDAG's results and the reachability index are unchanged by
+it. Measured in `node/tests/fix_ghostdag_dag7_perf.rs` (80 such blocks,
+dev profile): 747 ms of insertions at 12,000 blocks become 0.5 ms of
+refusals.
+
+### Anti-DoS work rule (node-local policy, not consensus)
+
+Audit POW-3. Blocks on deep forks can be nearly free (absolute-schedule ASERT).
+A node therefore stores and processes a block B whose parents are all in its
+DAG only if, with `T` = the blue work of the selected-chain block 360
+(`ANTI_DOS_WINDOW_BLOCKS` = `MERGE_DEPTH`) below its selected tip (0 for a
+shorter chain) and `lb(B)` = the largest parent blue work + `work(B)`, a lower
+bound of B's blue work:
+
+1. `lb(B) ≥ T`; or
+2. `lb(B)` + the work of an orphan chain announced on top of B reaches `T`
+   (the orphans are buffered or were evicted from the bounded orphan pool;
+   each passed the orphan bits floor and its proof of work); or
+3. a buffered orphan whose own lower bound reaches `T` needs B as a parent;
+   such blocks more than 1,000 blocks below the tip are rationed (4, then one
+   per 30 s).
+
+Otherwise B is ignored without penalty. A chain that carries the work is
+always accepted (this is Bitcoin's anti-DoS work threshold, with the orphan
+pool as the header buffer), so for honest data the final chain is the same
+with or without the rule.
 
 ## Mining
 
