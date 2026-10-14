@@ -48,7 +48,7 @@ fn stored_block(store: &Storage, parent: Hash, height: u64, nonce: u64, shielded
         header: BlockHeader {
             version: 1,
             parents: vec![parent],
-            merkle_root: Transaction::merkle_root(&[cb.clone()]),
+            merkle_root: Transaction::merkle_root(std::slice::from_ref(&cb)),
             timestamp: 1_000 + height,
             bits: 0x2100ffff,
             nonce,

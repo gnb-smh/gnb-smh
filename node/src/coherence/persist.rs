@@ -70,7 +70,7 @@ fn encode_anchors(anchors: &[[u8; 32]]) -> Vec<u8> {
 }
 
 fn decode_anchors(bytes: &[u8]) -> Result<Vec<[u8; 32]>, String> {
-    if bytes.is_empty() || bytes.len() % 32 != 0 || bytes.len() / 32 > ANCHOR_HISTORY {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(32) || bytes.len() / 32 > ANCHOR_HISTORY {
         return Err(format!("persisted anchor window has a malformed length ({} bytes)", bytes.len()));
     }
     Ok(bytes.chunks(32).map(|c| <[u8; 32]>::try_from(c).expect("32-byte chunk")).collect())

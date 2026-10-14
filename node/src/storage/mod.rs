@@ -59,6 +59,9 @@ pub(crate) const CF_FFG_PENDING_COMMITTEE:    &str = "ffg_pending_committee";   
 /// Stored as `CF_POBRS_META["schema_version"] = u32 LE`.
 pub const POBRS_SCHEMA_VERSION: u32 = 1;
 
+/// (key, value) rows read from a column family, in key order.
+pub type KeyValueRows = Vec<(Vec<u8>, Vec<u8>)>;
+
 fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, StorageError> {
     bincode::serde::encode_to_vec(v, bincode::config::standard())
         .map_err(|e| StorageError::SerializeFailed(e.to_string()))
@@ -915,7 +918,7 @@ impl Storage {
 
     /// Every CF_SHIELDED (key, value) whose key starts with `prefix`, in key
     /// order.
-    pub fn scan_shielded_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    pub fn scan_shielded_prefix(&self, prefix: &[u8]) -> Result<KeyValueRows, StorageError> {
         let cf = self.db.cf_handle(CF_SHIELDED).ok_or(StorageError::CfNotFound(CF_SHIELDED.into()))?;
         let mut out = Vec::new();
         for item in self.db.iterator_cf(&cf, IteratorMode::From(prefix, rocksdb::Direction::Forward)) {
