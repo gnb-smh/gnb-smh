@@ -121,7 +121,7 @@ pub fn legacy_merkle_root(ids: &[[u8; 32]]) -> MerkleRoot {
     }
     let mut hashes: Vec<[u8; 32]> = ids.to_vec();
     while hashes.len() > 1 {
-        if hashes.len() % 2 != 0 {
+        if !hashes.len().is_multiple_of(2) {
             if let Some(last) = hashes.last().copied() {
                 hashes.push(last);
             }
@@ -176,7 +176,7 @@ pub fn coinbase_merkle_branch(ids: &[[u8; 32]], hardened: bool) -> Vec<[u8; 32]>
                 })
                 .collect();
         } else {
-            if level.len() % 2 != 0 {
+            if !level.len().is_multiple_of(2) {
                 let last = level[level.len() - 1];
                 level.push(last);
             }

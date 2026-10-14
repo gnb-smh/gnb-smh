@@ -173,7 +173,7 @@ fn val2_bip30_overwrite_of_an_unspent_coin_is_invalid_after_activation() {
         let gh = genesis.block_hash();
         let k = key();
         let fund = ([0x30u8; 32], 0u32, out(2_000_000, &k.spk));
-        let n = node_with(&genesis, &[fund.clone()]);
+        let n = node_with(&genesis, std::slice::from_ref(&fund));
         let spend = signed_spend(&k, &[(fund.0, 0)], vec![out(1_900_000, &[0x31; 20])]);
         let b = build(&n, vec![gh], vec![coinbase("bip30", subsidy(1) + 100_000, vec![0xB3; 20]), spend.clone()]);
 
@@ -440,7 +440,7 @@ fn cry1_witness_padding_and_swap_rejected_without_storing_the_block() {
         let gh = genesis.block_hash();
         let k = key();
         let fund = ([0x41u8; 32], 0u32, out(3_000_000, &k.spk));
-        let n = node_with(&genesis, &[fund.clone()]);
+        let n = node_with(&genesis, std::slice::from_ref(&fund));
         let tx = signed_spend(&k, &[(fund.0, 0)], vec![out(2_900_000, &[0x42; 20])]);
         let honest = build(&n, vec![gh], vec![coinbase("cry1", subsidy(1) + 100_000, vec![0xC1; 20]), tx.clone()]);
 
