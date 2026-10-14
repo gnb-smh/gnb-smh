@@ -472,6 +472,23 @@ fn storage_err_response(e: &StorageError) -> Value {
 ///
 /// One definition, called three times — not three call sites each free to pick
 /// a plausible-looking counter.
+/// Hash of the SELECTED-chain block at `height`, walking selected parents
+/// down from the tip. The height column family (`get_block_hash_at_height`)
+/// is written for every stored block, fork siblings included, so it can name
+/// a block that is not on the chain. `None` when the chain has no block at
+/// exactly that height.
+fn selected_hash_at_height(state: &AppState, height: u64) -> Option<[u8; 32]> {
+    let dag = state.dag.read();
+    let mut cur = dag.selected_tip();
+    while let Some(h) = cur {
+        let d = dag.get_block_data(&h)?;
+        if d.height == height { return Some(h); }
+        if d.height < height { return None; }
+        cur = d.selected_parent;
+    }
+    None
+}
+
 fn selected_tip_height(state: &AppState) -> u64 {
     let dag = state.dag.read();
     dag.selected_tip()
@@ -724,10 +741,9 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
         "getblockhash" => {
             let height = params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(0);
-            match state.store.get_block_hash_at_height(height) {
-                Ok(Some(h)) => json!(hex::encode(h)),
-                Ok(None)    => json!({ "error": "height not found" }),
-                Err(e)      => storage_err_response(&e),
+            match selected_hash_at_height(&state, height) {
+                Some(h) => json!(hex::encode(h)),
+                None    => json!({ "error": "height not found" }),
             }
         }
 
@@ -776,8 +792,8 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         "getblockbyheight" => {
             let height = params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(0);
             let verbose = params.and_then(|p| p.get(1)).and_then(|v| v.as_bool()).unwrap_or(false);
-            match state.store.get_block_hash_at_height(height) {
-                Ok(Some(hash)) => match state.store.get_block(&hash) {
+            match selected_hash_at_height(&state, height) {
+                Some(hash) => match state.store.get_block(&hash) {
                     Ok(Some(b)) => {
                         let mut result = json!({
                             "hash":        hex::encode(hash),
@@ -809,8 +825,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     Ok(None)  => json!({ "error": "block data not found" }),
                     Err(e)    => storage_err_response(&e),
                 },
-                Ok(None) => json!({ "error": "height not found" }),
-                Err(e)   => storage_err_response(&e),
+                None => json!({ "error": "height not found" }),
             }
         }
 
@@ -822,22 +837,28 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // too, and on 2026-08-13 exceeded the chain height by 10,769. Using
             // it here made the scan start ~10k heights above anything that
             // exists and walk down through nothing.
-            let tip_height = selected_tip_height(&state).saturating_add(1);
+            let chain: Vec<[u8; 32]> = {
+                let dag = state.dag.read();
+                let mut out = Vec::new();
+                let mut cur = dag.selected_tip();
+                while let Some(h) = cur {
+                    if out.len() >= count as usize { break; }
+                    out.push(h);
+                    cur = dag.get_block_data(&h).and_then(|d| d.selected_parent);
+                }
+                out
+            };
             let mut blocks = Vec::new();
-            // Iterate ALL heights until we find enough blocks (DAG may have gaps)
-            for h in (0..tip_height).rev() {
-                if blocks.len() >= count as usize { break; }
-                if let Ok(Some(hash)) = state.store.get_block_hash_at_height(h) {
-                    if let Ok(Some(b)) = state.store.get_block(&hash) {
-                        blocks.push(json!({
-                            "hash":      hex::encode(hash),
-                            "height":    b.height,
-                            "tx_count":  b.transactions.len(),
-                            "timestamp": b.header.timestamp,
-                            "size":      b.size_bytes(),
-                            "bits":      b.header.bits,
-                        }));
-                    }
+            for hash in chain {
+                if let Ok(Some(b)) = state.store.get_block(&hash) {
+                    blocks.push(json!({
+                        "hash":      hex::encode(hash),
+                        "height":    b.height,
+                        "tx_count":  b.transactions.len(),
+                        "timestamp": b.header.timestamp,
+                        "size":      b.size_bytes(),
+                        "bits":      b.header.bits,
+                    }));
                 }
             }
             json!(blocks)
@@ -1656,12 +1677,12 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         })
                     } else {
                         // try parse as height-as-string
-                        s.parse::<u64>().ok().and_then(|h| state.store.get_block_hash_at_height(h).ok().flatten())
+                        s.parse::<u64>().ok().and_then(|h| selected_hash_at_height(&state, h))
                     }
                 }
                 Some(v) if v.is_u64() => {
                     let h = v.as_u64().unwrap();
-                    state.store.get_block_hash_at_height(h).ok().flatten()
+                    selected_hash_at_height(&state, h)
                 }
                 _ => None,
             };
