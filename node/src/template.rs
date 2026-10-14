@@ -252,11 +252,27 @@ pub fn build_block_template_with(
 ) -> Result<BlockTemplate, String> {
     let coinbase_reserve = options.coinbase_reserve;
     let _guard = store.acceptance_lock();
+    let activation_height = core::activation::hardening_activation_height();
 
     let (parents, height, blue_score, parent_ts) = {
         let d = dag.read();
+        // A parent candidate needs a body, and (defense in depth behind the
+        // start-up recheck, `accept::recheck_stored_blocks_under_hardening`)
+        // a body that passes the hardening block rules of its own height: a
+        // block a pre-upgrade binary stored can never be accepted by an
+        // upgraded peer, and neither can a block that references it.
         let parents = d.template_parents(core::MAX_PARENTS, |h| {
-            store.get_block(h).ok().flatten().is_some()
+            match store.get_block(h) {
+                Ok(Some(b)) => match core::block_rules::check_block_hardened_at(&b, activation_height) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::error!("template: parent candidate {} fails the hardening block rules ({}); skipped",
+                            hex::encode(&h[..8]), e);
+                        false
+                    }
+                },
+                _ => false,
+            }
         });
         if parents.is_empty() {
             return Err("node has no bodied tip yet (still syncing genesis?)".into());
@@ -281,7 +297,6 @@ pub fn build_block_template_with(
         .map_err(|e| format!("expected bits not derivable: {}", e))?;
     // The rules of the template's height (header height, as accept_block
     // will judge the block).
-    let activation_height = core::activation::hardening_activation_height();
     let hardened = core::block_rules::rules_active_at(height, activation_height);
 
     let budget = core::MAX_BLOCK_SIZE

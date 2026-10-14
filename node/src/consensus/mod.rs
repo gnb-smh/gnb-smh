@@ -766,6 +766,14 @@ pub struct GhostDAG {
     /// The roots of the PERSISTENT part of `invalid`: blocks passed to
     /// `mark_invalid` / `load_invalid` (a failure the block id commits to).
     invalid_roots: HashSet<BlockHash>,
+    /// Roots whose disqualification spreads through EVERY parent edge, not
+    /// only selected-parent edges: blocks stored by a pre-upgrade binary that
+    /// fail the hardening block rules (no upgraded node ever stores them, so
+    /// no block referencing them can be accepted anywhere else).
+    invalid_all_edges_roots: HashSet<BlockHash>,
+    /// Closure of `invalid_all_edges_roots` under "child" (any parent edge).
+    /// A subset of `invalid`; `add_block` keeps it closed for later arrivals.
+    invalid_all_edges: HashSet<BlockHash>,
     /// Blocks waiting for a (different) body, in memory only: their stored
     /// body failed a rule that depends on bytes the block id does not commit
     /// to (non-coinbase `script_sig`s below the hardening activation), or the
@@ -804,6 +812,8 @@ impl GhostDAG {
             invalid: HashSet::new(),
             invalid_loaded: false,
             invalid_roots: HashSet::new(),
+            invalid_all_edges_roots: HashSet::new(),
+            invalid_all_edges: HashSet::new(),
             body_pending: HashMap::new(),
         }
     }
@@ -1315,6 +1325,13 @@ impl GhostDAG {
         if self.invalid.contains(&selected_parent) {
             self.invalid.insert(hash);
         }
+        // A block referencing (through any parent edge) a block that fails
+        // the hardening block rules can never be accepted by an upgraded node
+        // that never stored that parent: same treatment.
+        if result.parents.iter().any(|p| self.invalid_all_edges.contains(p)) {
+            self.invalid_all_edges.insert(hash);
+            self.invalid.insert(hash);
+        }
         Ok(result)
     }
 
@@ -1471,6 +1488,8 @@ impl GhostDAG {
         self.store.children.remove(hash);
         self.invalid.remove(hash);
         self.invalid_roots.remove(hash);
+        self.invalid_all_edges_roots.remove(hash);
+        self.invalid_all_edges.remove(hash);
         self.body_pending.remove(hash);
         // Exact inverse of `DagStore::insert`: drop the child edge from each
         // parent; a parent becomes a tip again iff it is still stored and now
@@ -2348,6 +2367,62 @@ impl GhostDAG {
         self.invalid_loaded
     }
 
+    /// Disqualify `hash` and EVERY block that descends from it through any
+    /// parent edge (selected or merged), and keep later arrivals that
+    /// reference one of them disqualified too (`add_block`). For blocks that
+    /// fail a context-free rule no upgraded node would ever have stored (the
+    /// start-up hardening recheck): a block merging one of them can never be
+    /// accepted by such a node, so it must not stay a template parent.
+    /// Returns the blocks newly added to the all-edges closure. Unknown
+    /// hashes are ignored.
+    pub fn mark_invalid_all_edges(&mut self, hash: BlockHash) -> Vec<BlockHash> {
+        if !self.store.has(&hash) {
+            return Vec::new();
+        }
+        self.invalid_all_edges_roots.insert(hash);
+        self.propagate_all_edges(hash)
+    }
+
+    fn propagate_all_edges(&mut self, hash: BlockHash) -> Vec<BlockHash> {
+        let mut newly = Vec::new();
+        let mut stack = vec![hash];
+        while let Some(h) = stack.pop() {
+            if !self.store.has(&h) || !self.invalid_all_edges.insert(h) {
+                continue;
+            }
+            self.invalid.insert(h);
+            newly.push(h);
+            if let Some(children) = self.store.children.get(&h) {
+                let mut ch: Vec<BlockHash> = children.iter().copied().collect();
+                ch.sort_unstable();
+                stack.extend(ch);
+            }
+        }
+        newly
+    }
+
+    /// [`load_invalid`](Self::load_invalid) for persisted roots of both
+    /// kinds: `selected` spread along selected-parent chains, `all_edges`
+    /// through every parent edge.
+    pub fn load_invalid_sets<I, J>(&mut self, selected: I, all_edges: J) -> usize
+    where
+        I: IntoIterator<Item = BlockHash>,
+        J: IntoIterator<Item = BlockHash>,
+    {
+        let mut roots: Vec<BlockHash> = all_edges.into_iter().collect();
+        roots.sort_unstable();
+        for h in roots {
+            self.mark_invalid_all_edges(h);
+        }
+        self.load_invalid(selected)
+    }
+
+    /// True iff `hash` is in the all-edges closure (see
+    /// [`mark_invalid_all_edges`](Self::mark_invalid_all_edges)).
+    pub fn is_invalid_all_edges(&self, hash: &BlockHash) -> bool {
+        self.invalid_all_edges.contains(hash)
+    }
+
     /// Wait for a different body of `hash` (see the `body_pending` field):
     /// `hash` and its selected-chain descendants are disqualified IN MEMORY
     /// ONLY. `rejected_witness_root` is the witness root of the body just
@@ -2398,11 +2473,18 @@ impl GhostDAG {
         true
     }
 
-    /// Rebuild `invalid` from the roots. Every disqualified block is
-    /// reachable from a root: `mark_invalid`, `mark_body_pending` and
-    /// `add_block` only ever extend a root's selected-chain descendants.
+    /// Rebuild `invalid` (and the all-edges closure) from the roots. Every
+    /// disqualified block is reachable from a root: `mark_invalid`,
+    /// `mark_body_pending` and `add_block` only ever extend a root's
+    /// selected-chain (or, for all-edges roots, any-edge) descendants.
     fn recompute_invalid(&mut self) {
         self.invalid.clear();
+        self.invalid_all_edges.clear();
+        let mut all_edges: Vec<BlockHash> = self.invalid_all_edges_roots.iter().copied().collect();
+        all_edges.sort_unstable();
+        for r in all_edges {
+            self.propagate_all_edges(r);
+        }
         let mut roots: Vec<BlockHash> = self.invalid_roots.iter()
             .chain(self.body_pending.keys())
             .copied()
@@ -2415,16 +2497,17 @@ impl GhostDAG {
     }
 
     /// True iff `hash` is disqualified for a reason the block id commits to:
-    /// a persistent root lies on its selected-parent chain. `false` for a
-    /// valid block and for one disqualified only because it waits for a body
-    /// or descends from such a block, whose mark must never be persisted.
+    /// a persistent root (or an all-edges block) lies on its selected-parent
+    /// chain. `false` for a valid block and for one disqualified only because
+    /// it waits for a body or descends from such a block, whose mark must
+    /// never be persisted.
     pub fn is_invalid_persistently(&self, hash: &BlockHash) -> bool {
         let mut cur = *hash;
         loop {
             if !self.invalid.contains(&cur) {
                 return false;
             }
-            if self.invalid_roots.contains(&cur) {
+            if self.invalid_roots.contains(&cur) || self.invalid_all_edges.contains(&cur) {
                 return true;
             }
             match self.store.get(&cur).and_then(|d| d.selected_parent) {
@@ -2432,6 +2515,27 @@ impl GhostDAG {
                 None => return false,
             }
         }
+    }
+
+    /// Every non-genesis block whose HEADER height (`max(parent DAG heights)
+    /// + 1`, the height `accept_block` validated it at) is at least
+    /// `min_height`, sorted. Computed from the DAG alone (no body is read).
+    pub fn blocks_with_header_height_at_least(&self, min_height: u64) -> Vec<BlockHash> {
+        let mut out: Vec<BlockHash> = self.store.data.iter()
+            .filter(|(_, d)| !d.parents.is_empty())
+            .filter(|(_, d)| {
+                let hh = d.parents.iter()
+                    .filter_map(|p| self.store.get(p))
+                    .map(|p| p.height)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                hh >= min_height
+            })
+            .map(|(h, _)| *h)
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     /// True iff `hash` is chain-disqualified.

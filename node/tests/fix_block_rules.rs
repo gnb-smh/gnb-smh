@@ -1079,3 +1079,125 @@ fn body_pending_marks_are_in_memory_roots_that_clear_cleanly() {
     assert!(!dag.clear_body_pending(&a), "nothing left to clear");
     assert_eq!(dag.selected_tip().map(|t| t == c), Some(true));
 }
+
+// ── Blocks stored by a pre-upgrade binary (review finding) ──────────────────
+
+/// A node runs the OLD binary past the activation height A: it stores (and
+/// applies) a legacy-format block P at header height A and a child of it.
+/// After the upgrade the start-up recheck disqualifies P and every block that
+/// descends from it, rolls the applied chain back, and never offers them as
+/// template parents: the template is built on the honest tip, at height A,
+/// in the new format, and is accepted by a node that never stored P. A later
+/// block that merges P as a NON-selected parent is disqualified on arrival,
+/// and the marks survive another restart.
+#[test]
+fn stored_blocks_failing_the_hardening_rules_are_disqualified_at_startup() {
+    const A: u64 = 3;
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let miner_spk = vec![0xCB; 20];
+    let (mut n, m1, m2, p, pc) = {
+        let _old = activation::scoped_override(activation::NEVER);
+        let n = node_with(&genesis, &[]);
+        let m1 = build(&n, vec![gh], vec![coinbase("m1", subsidy(1), vec![0xE1; 20])]);
+        accept(&n, &m1).unwrap();
+        let m2 = build(&n, vec![m1.block_hash()], vec![coinbase("m2", subsidy(2), vec![0xE2; 20])]);
+        accept(&n, &m2).unwrap();
+        let p = build(&n, vec![m2.block_hash()], vec![coinbase("legacy-P", subsidy(3), vec![0xE3; 20])]);
+        accept(&n, &p).expect("old binary: a legacy block at height A is valid");
+        let pc = build(&n, vec![p.block_hash()], vec![coinbase("legacy-PC", subsidy(4), vec![0xE4; 20])]);
+        accept(&n, &pc).unwrap();
+        assert_eq!(applied_tip(&n), Some(pc.block_hash()));
+        (n, m1, m2, p, pc)
+    };
+    let _new = activation::scoped_override(A);
+    assert_eq!(block_rules::check_block_hardened_at(&p, A), Err("invalid merkle root"));
+    assert!(matches!(pipeline::classify_stored_block(&p, A), pipeline::StoredBlockCheck::IdCommitted(_)));
+
+    restart(&mut n);
+    for (b, what) in [(&p, "P"), (&pc, "P's child")] {
+        let d = n.dag.read();
+        assert!(d.is_invalid(&b.block_hash()) && d.is_invalid_all_edges(&b.block_hash()), "{what}");
+    }
+    let reason = n.store.invalid_block_reason(&p.block_hash()).unwrap().unwrap();
+    assert!(reason.starts_with(pipeline::HARDENING_RECHECK_REASON), "{reason}");
+    assert_eq!(n.store.get_meta(pipeline::HARDENING_RECHECK_META).unwrap(), Some(A.to_le_bytes().to_vec()));
+    assert_eq!(sel_tip(&n), Some(m2.block_hash()));
+    assert_eq!(applied_tip(&n), Some(m2.block_hash()), "the applied chain left the legacy branch");
+    assert!(n.store.get_utxo(&p.transactions[0].txid(), 0).unwrap().is_none());
+    assert!(n.store.get_utxo(&m2.transactions[0].txid(), 0).unwrap().is_some());
+
+    let has_body = |h: &BlockHash| n.store.get_block(h).ok().flatten().is_some();
+    let parents = n.dag.read().template_parents(core::MAX_PARENTS, has_body);
+    assert_eq!(parents, vec![m2.block_hash()]);
+    let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::miner_coinbase_reserve(&miner_spk)).unwrap();
+    assert_eq!(tmpl.height, A);
+    assert!(tmpl.hardened);
+    let cb = template::miner_coinbase(tmpl.height, tmpl.subsidy + tmpl.total_fees, miner_spk.clone());
+    let blk = mine(template::assemble_block(&tmpl, cb, unix_now()).expect("self-check"), |_| true);
+    accept(&n, &blk).expect("the template block");
+    assert_eq!(applied_tip(&n), Some(blk.block_hash()));
+
+    // A node that never stored P accepts the same chain and refuses P.
+    let fresh = node_with(&genesis, &[]);
+    for b in [&m1, &m2, &blk] {
+        accept(&fresh, b).expect("the upgraded node accepts the honest chain");
+    }
+    assert!(accept(&fresh, &p).unwrap_err().contains("invalid merkle root"));
+
+    // A block that merges P as a non-selected parent.
+    let blk2 = build(&n, vec![blk.block_hash()], vec![coinbase("honest-4", subsidy(4), vec![0xE5; 20])]);
+    accept(&n, &blk2).unwrap();
+    let h5 = n.dag.read().get_block_data(&blk2.block_hash()).unwrap().height + 1;
+    let y = build(&n, vec![blk2.block_hash(), p.block_hash()], vec![coinbase("merges-P", subsidy(h5), vec![0xE6; 20])]);
+    assert_eq!(block_rules::check_block_hardened_at(&y, A), Ok(()), "Y itself is well-formed");
+    let err = accept(&n, &y).unwrap_err();
+    assert!(err.contains(pipeline::HARDENING_RECHECK_REASON), "{err}");
+    assert_eq!(n.dag.read().get_block_data(&y.block_hash()).unwrap().selected_parent, Some(blk2.block_hash()),
+        "P is a merged (non-selected) parent of Y");
+    assert!(n.dag.read().is_invalid(&y.block_hash()));
+    assert_eq!(applied_tip(&n), Some(blk2.block_hash()));
+    let parents = n.dag.read().template_parents(core::MAX_PARENTS, has_body);
+    assert_eq!(parents, vec![blk2.block_hash()]);
+
+    restart(&mut n);
+    for b in [&p, &pc, &y] {
+        assert!(n.dag.read().is_invalid_all_edges(&b.block_hash()));
+    }
+    assert_eq!(applied_tip(&n), Some(blk2.block_hash()));
+    let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::miner_coinbase_reserve(&miner_spk)).unwrap();
+    assert_eq!(tmpl.parents, vec![blk2.block_hash()]);
+}
+
+/// The recheck's classification: a legacy block at/after the activation
+/// fails for every body (id-committed); a block whose only problem is its
+/// witnesses fails only for this body; a valid one and one below the
+/// activation pass.
+#[test]
+fn classify_stored_block_separates_id_committed_from_body_only_failures() {
+    let _g = activation::scoped_override(1);
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0xA6u8; 32], 0u32, out(5_000_000, &k.spk));
+    let n = node_with(&genesis, std::slice::from_ref(&fund));
+    let tx = signed_spend(&k, &[(fund.0, 0)], vec![out(4_900_000, &[0x9A; 20])]);
+    let good = build(&n, vec![gh], vec![coinbase("cls", subsidy(1) + 100_000, vec![0x9B; 20]), tx]);
+    assert_eq!(pipeline::classify_stored_block(&good, 1), pipeline::StoredBlockCheck::Valid);
+
+    let mut witness = good.clone();
+    witness.transactions[1].inputs[0].script_sig[100] ^= 1;
+    assert_eq!(witness.block_hash(), good.block_hash());
+    assert!(matches!(pipeline::classify_stored_block(&witness, 1), pipeline::StoredBlockCheck::BodyOnly(_)));
+
+    let mut legacy = good.clone();
+    legacy.transactions[0].inputs[0].script_sig = b"no commitment".to_vec();
+    legacy.header.merkle_root = legacy.body_merkle_root_at(activation::NEVER);
+    assert!(matches!(pipeline::classify_stored_block(&legacy, 1), pipeline::StoredBlockCheck::IdCommitted(_)));
+    assert_eq!(pipeline::classify_stored_block(&legacy, 2), pipeline::StoredBlockCheck::Valid, "below the activation");
+
+    let mut wrong_height = good.clone();
+    wrong_height.transactions[0].inputs[0].script_sig[8] ^= 1;
+    wrong_height.header.merkle_root = wrong_height.body_merkle_root_at(1);
+    assert!(matches!(pipeline::classify_stored_block(&wrong_height, 1), pipeline::StoredBlockCheck::IdCommitted(_)));
+}

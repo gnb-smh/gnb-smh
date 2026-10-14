@@ -904,18 +904,23 @@ impl Storage {
 
     /// Every persisted chain-disqualified block hash.
     pub fn load_invalid_blocks(&self) -> Result<Vec<BlockHash>, StorageError> {
+        Ok(self.load_invalid_blocks_with_reasons()?.into_iter().map(|(h, _)| h).collect())
+    }
+
+    /// Every persisted chain-disqualified block hash with its recorded reason.
+    pub fn load_invalid_blocks_with_reasons(&self) -> Result<Vec<(BlockHash, String)>, StorageError> {
         let cf = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
         let mut out = Vec::new();
         let iter = self.db.iterator_cf(&cf, IteratorMode::From(Self::INVALID_PREFIX, rocksdb::Direction::Forward));
         for item in iter {
-            let (k, _) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            let (k, v) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
             if !k.starts_with(Self::INVALID_PREFIX) {
                 break;
             }
             if k.len() == Self::INVALID_PREFIX.len() + 32 {
                 let mut h = [0u8; 32];
                 h.copy_from_slice(&k[Self::INVALID_PREFIX.len()..]);
-                out.push(h);
+                out.push((h, String::from_utf8_lossy(&v).into_owned()));
             }
         }
         Ok(out)

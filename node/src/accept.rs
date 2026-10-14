@@ -55,6 +55,14 @@
 //! the witness commitment is checked before the block is stored, so every
 //! connect-time failure is permanent.
 //!
+//! **Blocks stored by a pre-upgrade binary**: at start-up
+//! (`reconcile_on_startup`) the stored blocks at header height >= the
+//! hardening activation are rechecked once against the context-free
+//! hardening rules (`recheck_stored_blocks_under_hardening`); one that fails
+//! for a reason its id commits to is disqualified with every DAG descendant
+//! through ANY parent edge, since no upgraded peer can accept a block that
+//! references it.
+//!
 //! Disqualified blocks are KEPT in the DAG (their insertion is not rolled
 //! back) on purpose: whether a node evaluates a block at all depends on
 //! arrival order (a fork-loser is never connected), so a block one node
@@ -114,6 +122,11 @@ pub static ARCHIVE_MODE: std::sync::atomic::AtomicBool =
 
 // ── Invalid-set persistence ──────────────────────────────────────────────────
 
+/// Reason prefix of the persisted marks written by the start-up hardening
+/// recheck ([`recheck_stored_blocks_under_hardening`]). Such marks are
+/// reloaded as all-edges roots (`GhostDAG::mark_invalid_all_edges`).
+pub const HARDENING_RECHECK_REASON: &str = "fails the hardening block rules";
+
 /// Load the persisted chain-disqualified set into `dag` once (start-up does it
 /// via `reconcile_on_startup`; this is the lazy fallback).
 pub fn ensure_invalid_set_loaded(
@@ -123,9 +136,14 @@ pub fn ensure_invalid_set_loaded(
     if dag.read().invalid_set_loaded() {
         return;
     }
-    match store.load_invalid_blocks() {
-        Ok(hashes) => {
-            let n = dag.write().load_invalid(hashes);
+    match store.load_invalid_blocks_with_reasons() {
+        Ok(marks) => {
+            let (all_edges, selected): (Vec<_>, Vec<_>) = marks.into_iter()
+                .partition(|(_, reason)| reason.starts_with(HARDENING_RECHECK_REASON));
+            let n = dag.write().load_invalid_sets(
+                selected.into_iter().map(|(h, _)| h),
+                all_edges.into_iter().map(|(h, _)| h),
+            );
             if n > 0 {
                 info!("loaded {} chain-disqualified block(s)", n);
             }
@@ -424,8 +442,11 @@ pub fn update_mempool_after_connect(
     mempool: &mempool::Mempool,
     outcome: &ConnectOutcome,
 ) {
+    // After a disconnect-only move the new tip is the parent of the lowest
+    // disconnected block, whose height that block's height bounds.
     let next_height = outcome.connected.last()
         .map(|b| b.height.saturating_add(1))
+        .or_else(|| outcome.disconnected.last().map(|b| b.height))
         .unwrap_or(0);
     let confirmed: Vec<[u8; 32]> = outcome.connected.iter()
         .flat_map(|b| b.transactions.iter().map(|t| t.txid()))
@@ -551,7 +572,11 @@ fn resolve_best_chain(
         }
         let plan = {
             let d = dag.read();
+            // The best valid block can be an ANCESTOR of the applied tip when
+            // applied blocks were disqualified (start-up hardening recheck):
+            // then the plan only disconnects.
             reorg::compute_connect_plan(&d, &applied_tip, &cand)
+                .or_else(|| reorg::compute_rollback_plan(&d, &applied_tip, &cand))
         };
         let plan = match plan {
             Some(p) => p,
@@ -926,7 +951,14 @@ pub fn accept_block(
     // A new block whose selected parent is disqualified for a reason the
     // block id commits to is disqualified with it (persisted). One that only
     // descends from a block waiting for a body is not: it waits too.
-    if !replacing && dag.read().is_invalid(&block_hash) && dag.read().is_invalid_persistently(&block_hash) {
+    if !replacing && dag.read().is_invalid_all_edges(&block_hash) {
+        // It references (through any parent edge) a block that fails the
+        // hardening block rules: no upgraded node can ever accept it.
+        log.invalid.push((block_hash, format!(
+            "{}: references a block stored by a pre-upgrade binary that fails them",
+            HARDENING_RECHECK_REASON
+        )));
+    } else if !replacing && dag.read().is_invalid(&block_hash) && dag.read().is_invalid_persistently(&block_hash) {
         let sp = dag.read().get_block_data(&block_hash).and_then(|d| d.selected_parent);
         log.invalid.push((block_hash, format!(
             "selected parent {} is invalid",
@@ -1110,11 +1142,180 @@ pub fn accept_block(
     }
 }
 
+// ── Start-up recheck of stored blocks under the hardening rules ─────────────
+
+/// Meta key recording the hardening activation height the stored DAG was
+/// last rechecked against ([`recheck_stored_blocks_under_hardening`]).
+pub const HARDENING_RECHECK_META: &str = "hardening_block_rules_checked";
+
+/// Verdict of the hardening block rules on a STORED body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredBlockCheck {
+    /// The body passes (or the rules do not apply at its height).
+    Valid,
+    /// It fails for a reason the block id commits to: every body with this
+    /// id fails (the header Merkle root, the coinbase — its txid covers its
+    /// `script_sig`, hence the commitment's tag, height and parents — or a
+    /// transaction's txid preimage). The block must be disqualified.
+    IdCommitted(&'static str),
+    /// Only this body fails (its witness root differs from the committed
+    /// one, or its transaction list does not match the header at all):
+    /// another body with the same id may be valid.
+    BodyOnly(&'static str),
+}
+
+/// Classify a stored body against the context-free hardening rules
+/// (`check_block_hardened_at` + `validate_structure_without_pow_at`) at
+/// `activation_height`.
+pub fn classify_stored_block(b: &core::Block, activation_height: u64) -> StoredBlockCheck {
+    use core::block_rules;
+    let reason = match block_rules::check_block_hardened_at(b, activation_height)
+        .and_then(|()| b.validate_structure_without_pow_at(activation_height))
+    {
+        Ok(()) => return StoredBlockCheck::Valid,
+        Err(e) => e,
+    };
+    if !b.validate_merkle_at(activation_height) {
+        // The header root is not the tagged root of these txids. If it is
+        // their LEGACY root, the id commits to a legacy-format block, which
+        // no body can turn into a valid one; otherwise this body's
+        // transaction list is simply not the id's.
+        return if b.validate_merkle_at(core::activation::NEVER) {
+            StoredBlockCheck::IdCommitted(reason)
+        } else {
+            StoredBlockCheck::BodyOnly(reason)
+        };
+    }
+    // The header root matches: the txids (and so the coinbase and every
+    // txid preimage) are the id's.
+    if !b.validate_coinbase_format()
+        || b.transactions.iter().any(|t| block_rules::check_tx_not_64_bytes(t).is_err())
+    {
+        return StoredBlockCheck::IdCommitted(reason);
+    }
+    match block_rules::check_coinbase_commitment(b) {
+        // Tag, height and parents match but not the witness root: a body
+        // with other witness bytes.
+        Err(e) if e.starts_with("bad witness commitment") => StoredBlockCheck::BodyOnly(e),
+        // Ok: the witness root matches, so this body IS the committed one
+        // and any other failure (size, duplicates, dust) is the id's.
+        _ => StoredBlockCheck::IdCommitted(reason),
+    }
+}
+
+/// What [`recheck_stored_blocks_under_hardening`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RecheckReport {
+    /// `false` when the DAG had already been rechecked at this activation.
+    pub ran: bool,
+    /// Blocks checked (stored bodies at header height >= the activation).
+    pub checked: usize,
+    /// Blocks disqualified (with all their DAG descendants).
+    pub disqualified: Vec<BlockHash>,
+    /// Blocks whose body was dropped to wait for another one.
+    pub bodies_dropped: Vec<BlockHash>,
+    /// Candidates without a stored body (pruned): not checkable.
+    pub unchecked: usize,
+}
+
+/// Recheck the blocks a PRE-UPGRADE binary may have stored at header height
+/// >= the hardening activation against the context-free hardening rules
+/// (wire size, tagged Merkle root, 64-byte transactions, coinbase
+/// commitment). An upgraded node never stores such a block, so one left in
+/// the DAG (a legacy-format fork-loser, or a legacy chain the node applied
+/// while it still ran the old binary) would stay a valid template parent and
+/// make this node's blocks unacceptable to every upgraded peer.
+///
+/// A block failing for a reason its id commits to is disqualified together
+/// with EVERY block that descends from it through any parent edge
+/// (`GhostDAG::mark_invalid_all_edges`; later arrivals referencing one of
+/// them are disqualified on insertion), and persisted with a reason starting
+/// with [`HARDENING_RECHECK_REASON`] so the next start reloads it with the
+/// same reach. A block whose only failure is its witness root (only this
+/// body is wrong) is not disqualified: an unapplied one drops its body and
+/// waits for another (`GhostDAG::mark_body_pending`).
+///
+/// Runs once per activation height (meta key [`HARDENING_RECHECK_META`]);
+/// it reads no body when no stored block is at or above the activation (a
+/// mainnet node upgraded before it). Call it BEFORE reconnecting the best
+/// chain, so the reconnect rolls the applied tip off a disqualified branch.
+pub fn recheck_stored_blocks_under_hardening(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    activation_height: u64,
+) -> Result<RecheckReport, String> {
+    let done = store.get_meta(HARDENING_RECHECK_META).map_err(|e| e.to_string())?
+        .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok().map(u64::from_le_bytes));
+    if done == Some(activation_height) {
+        return Ok(RecheckReport::default());
+    }
+    let mut report = RecheckReport { ran: true, ..Default::default() };
+    let candidates = dag.read().blocks_with_header_height_at_least(activation_height.max(1));
+    let mut batch = rocksdb::WriteBatch::default();
+    for h in candidates {
+        if dag.read().is_invalid_all_edges(&h) {
+            continue; // already disqualified through an ancestor checked earlier
+        }
+        let body = match store.get_block(&h).map_err(|e| e.to_string())? {
+            Some(b) => b,
+            None => {
+                report.unchecked += 1;
+                continue;
+            }
+        };
+        report.checked += 1;
+        match classify_stored_block(&body, activation_height) {
+            StoredBlockCheck::Valid => {}
+            StoredBlockCheck::IdCommitted(reason) => {
+                let marked = dag.write().mark_invalid_all_edges(h);
+                error!(
+                    "stored block {} h={} fails the hardening block rules ({}); it was stored by a \
+                     pre-upgrade binary: disqualified with {} descendant(s)",
+                    hex::encode(&h[..8]), body.height, reason, marked.len().saturating_sub(1)
+                );
+                store.stage_invalid_block(&mut batch, &h, &format!(
+                    "{}: {} (stored by a pre-upgrade binary)", HARDENING_RECHECK_REASON, reason
+                )).map_err(|e| e.to_string())?;
+                report.disqualified.push(h);
+            }
+            StoredBlockCheck::BodyOnly(reason) => {
+                if store.get_undo_data(&h).map_err(|e| e.to_string())?.is_some() {
+                    // Applied: its body is needed to roll it back. Cannot
+                    // happen for a body stored by any binary (the old one
+                    // never stores a tagged root, the new one checks the
+                    // commitment first); left alone and reported.
+                    error!("applied block {} has a body whose witnesses do not match its commitment ({}); \
+                            left in place", hex::encode(&h[..8]), reason);
+                    continue;
+                }
+                warn!("stored body of {} fails the hardening rules only by its witnesses ({}); \
+                       dropped, waiting for another copy", hex::encode(&h[..8]), reason);
+                let wr = core::block_rules::witness_root(&body.transactions).0;
+                dag.write().mark_body_pending(h, Some(wr));
+                store.delete_block_body(&h).map_err(|e| e.to_string())?;
+                report.bodies_dropped.push(h);
+            }
+        }
+    }
+    store.stage_meta(&mut batch, HARDENING_RECHECK_META, &activation_height.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    store.write_batch(batch).map_err(|e| e.to_string())?;
+    if !report.disqualified.is_empty() || !report.bodies_dropped.is_empty() || report.unchecked > 0 {
+        warn!(
+            "hardening recheck at activation {}: {} checked, {} disqualified, {} bodies dropped, {} without a body",
+            activation_height, report.checked, report.disqualified.len(), report.bodies_dropped.len(), report.unchecked
+        );
+    }
+    Ok(report)
+}
+
 // ── Start-up reconciliation (DAG-11) ─────────────────────────────────────────
 
 /// Reconcile the chain state on boot, before any block is accepted:
 ///
-/// 1. load the persisted chain-disqualified set into the DAG;
+/// 1. load the persisted chain-disqualified set into the DAG, then recheck
+///    the blocks a pre-upgrade binary may have stored at or above the
+///    hardening activation ([`recheck_stored_blocks_under_hardening`]);
 /// 2. roll back the UTXO effects of any block that has an undo record but no
 ///    CF_DAG record — the footprint of the pre-fix, non-atomic extension
 ///    commit crashing between "apply UTXO effects" and "persist DAG data"
@@ -1133,6 +1334,15 @@ pub fn reconcile_on_startup(
 ) -> Result<(), String> {
     let _guard = store.acceptance_lock();
     ensure_invalid_set_loaded(dag, store);
+    let recheck = match recheck_stored_blocks_under_hardening(
+        dag, store, core::activation::hardening_activation_height(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("reconcile: hardening recheck of stored blocks failed: {}", e);
+            RecheckReport::default()
+        }
+    };
 
     // Step 2: applied-but-unrecorded blocks.
     let mut orphan_applied: Vec<(u64, BlockHash)> = Vec::new();
@@ -1184,6 +1394,13 @@ pub fn reconcile_on_startup(
                 }
                 Err(ResolveStop::Refused(m)) | Err(ResolveStop::Failed(m)) => {
                     error!("reconcile: cannot reconnect the best valid chain: {}", m);
+                    if !recheck.disqualified.is_empty() {
+                        error!(
+                            "reconcile: the applied chain contains blocks a pre-upgrade binary stored that \
+                             fail the hardening block rules, and leaving them needs a rollback this node \
+                             refuses (deeper than the reorg cap); resynchronize this data directory"
+                        );
+                    }
                     return Err(m);
                 }
             }

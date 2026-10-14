@@ -251,6 +251,22 @@ pub fn compute_connect_plan(
     Some(ReorgPlan { lca, to_rollback, to_apply })
 }
 
+/// A plan that only DISCONNECTS blocks: `to` is a selected-chain ancestor of
+/// `from`, so moving the applied tip from `from` to `to` rolls back the
+/// blocks in between and applies nothing. Needed when blocks of the applied
+/// chain itself are disqualified (the start-up hardening recheck of blocks a
+/// pre-upgrade binary stored and applied). `None` when `to` is not a strict
+/// selected-chain ancestor of `from`.
+pub fn compute_rollback_plan(
+    dag: &GhostDAG,
+    from: &BlockHash,
+    to: &BlockHash,
+) -> Option<ReorgPlan> {
+    if from == to { return None; }
+    let to_rollback = selected_path_to(dag, from, to)?;
+    Some(ReorgPlan { lca: *to, to_rollback, to_apply: Vec::new() })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Block UTXO mutation (forward apply)
 // ─────────────────────────────────────────────────────────────────────────────

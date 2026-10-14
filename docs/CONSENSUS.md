@@ -553,3 +553,30 @@ back to at most the genesis target if the chain was running easier.
 `expected_bits_at(parent_time, height, activation)` is the real ASERT rule
 for any activation height. The dev-only `test-pow-limit` feature pins every
 target to `POW_LIMIT_BITS` and is rejected by the node binary.
+
+### Blocks stored before the upgrade (node-local)
+
+A node that ran a binary without these rules past the activation height may
+hold blocks at header height >= the activation that the rules reject (a
+legacy-format fork-loser, or a legacy chain it applied). An upgraded node
+never stores such a block, so neither it nor any block referencing it can be
+accepted elsewhere. At start-up, before the applied chain is reconnected,
+`accept::recheck_stored_blocks_under_hardening` checks every stored block at
+header height >= the activation (computed from the DAG; no body is read when
+there is none) against the context-free rules above, once per activation
+height (meta key `hardening_block_rules_checked`, u64 LE). A failure the
+block id commits to (legacy or wrong header root, coinbase format, a 64-byte
+transaction, the commitment's tag, height or parents, or any failure of a body
+whose witness root matches) disqualifies the block and EVERY block that
+descends from it through any parent edge, merged edges included
+(`GhostDAG::mark_invalid_all_edges`); a block arriving later that references
+one of them is disqualified on insertion. The roots are persisted with a reason
+starting with `fails the hardening block rules`, which reloads them with the
+same reach. The reconnect then rolls the applied chain back off a
+disqualified branch (a disconnect-only plan); a rollback deeper than the reorg
+cap is refused and the node logs that the data directory must be
+resynchronized. A block whose only failure is its witness root keeps its id:
+its body is dropped and it waits for another copy, as above. The template
+builder also skips any parent whose stored body fails these rules.
+`stored_blocks_failing_the_hardening_rules_are_disqualified_at_startup`
+covers the scenario.
