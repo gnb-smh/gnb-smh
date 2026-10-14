@@ -145,7 +145,10 @@ fn included_share_ids(store: &Storage, recent: &[(Hash, u64)]) -> Result<HashSet
 /// share is not already included there, and its proof is valid.
 fn check_share(store: &Storage, share: &WitnessShare, height: u64, recent: &[(Hash, u64)],
                included: &HashSet<Hash>) -> Result<(KeyId, u128), String> {
-    let key = share.key_id().ok_or("witness share must pay a pay-to-pubkey-hash script")?;
+    if !share.payout_is_valid() {
+        return Err("witness share pays an invalid script".into());
+    }
+    let key = share.key_id();
     let (_, ah) = recent.iter().find(|(h, _)| *h == share.attested)
         .ok_or("witness share attests a block that is not on this selected chain")?;
     if *ah >= height || height - ah > SHARE_WINDOW {
@@ -273,7 +276,9 @@ impl PowitPool {
     pub fn admit_attestation(&self, att: Attestation, dag: &GhostDAG, store: &Storage) -> Result<Hash, String> {
         let id = att.id();
         let chain = core::node_chain_id();
-        if !att.verify_signature(chain) {
+        let p = powit::params();
+        let act = core::powit_height();
+        if !att.verify_signature(chain, &p, act) {
             return Err("invalid attestation signature".into());
         }
         let key = att.key_id();
@@ -284,7 +289,7 @@ impl PowitPool {
             }
             // Equivocation detection against every link this node has seen.
             let conflicting = g.seen_links.get(&key).and_then(|v| v.iter().find(|o| {
-                Equivocation { a: (*o).clone(), b: att.clone() }.verify(chain).is_ok()
+                Equivocation { a: (*o).clone(), b: att.clone() }.verify(chain, &p, act).is_ok()
             }).cloned());
             if let Some(o) = conflicting {
                 g.evidence.entry(key).or_insert(Equivocation { a: o, b: att.clone() });
@@ -299,7 +304,6 @@ impl PowitPool {
         if att.source != st.justified {
             return Err("attestation source is not the tip's justified checkpoint".into());
         }
-        let p = powit::params();
         let te = p.epoch(st.activation, att.target.height);
         if !st.witness_set(&p, te).iter().any(|(k, _)| *k == key) {
             return Err("attester is not in the witness set".into());
@@ -314,7 +318,7 @@ impl PowitPool {
 
     /// Admit an equivocation proof (verified).
     pub fn admit_evidence(&self, ev: Equivocation) -> Result<KeyId, String> {
-        let key = ev.verify(core::node_chain_id()).map_err(|e| e.to_string())?;
+        let key = ev.verify(core::node_chain_id(), &powit::params(), core::powit_height()).map_err(|e| e.to_string())?;
         self.inner.lock().evidence.entry(key).or_insert(ev);
         Ok(key)
     }
@@ -410,40 +414,38 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
 
 // ── Witness duty ─────────────────────────────────────────────────────────────
 
-/// A witness's signing key and its persistent vote record. The record makes
-/// a double or surround vote impossible even across restarts and reorgs:
-/// a link is signed only if it conflicts with nothing ever signed before.
+/// A witness's forward-secure KES key, its payout script and its persistent
+/// vote record. The KES state evolves to each target's epoch (erasing every
+/// earlier seed, on disk first) before signing, and the record makes a double
+/// or surround vote impossible even across restarts and reorgs.
 pub struct WitnessDuty {
-    pub pubkey: Vec<u8>,
-    secret: zeroize::Zeroizing<Vec<u8>>,
     pub key_id: KeyId,
     pub payout_script: Vec<u8>,
+    key_path: PathBuf,
+    password: zeroize::Zeroizing<String>,
+    signer: Mutex<gnb_crypto::core::kes::KesSigner>,
     record_path: PathBuf,
     signed: Mutex<Vec<(Checkpoint, Checkpoint)>>,
 }
 
 impl WitnessDuty {
-    /// Load an encrypted `gnb-cli newwallet` file; the password is read from
-    /// `password_file` (first line), never from the command line.
-    pub fn load(wallet: &Path, password_file: &Path, data_dir: &Path) -> Result<Self, String> {
+    /// Load a KES witness key (`gnb-cli witnesskeygen`); the password is read
+    /// from `password_file` (first line), never from the command line.
+    pub fn load(key: &Path, password_file: &Path, payout_script: Vec<u8>, data_dir: &Path) -> Result<Self, String> {
         let pw = std::fs::read_to_string(password_file).map_err(|e| format!("witness password file: {e}"))?;
-        let pw = pw.lines().next().unwrap_or("").trim().to_string();
-        // `gnb-cli newwallet` files are Keypair files; seed wallets also work.
-        let kp = match gnb_crypto::wallet::Keypair::load_encrypted(wallet, &pw) {
-            Ok(k) => k,
-            Err(e1) => gnb_crypto::wallet::Wallet::load_encrypted(wallet, &pw)
-                .map(|w| w.into_keypair())
-                .map_err(|e2| format!("witness wallet: {e1} / {e2:?}"))?,
-        };
-        let key_id = powit::key_id(&kp.public_key);
+        let password = zeroize::Zeroizing::new(pw.lines().next().unwrap_or("").trim().to_string());
+        let file = gnb_crypto::core::kes::KesKeyFile::load(key)?;
+        let signer = file.open(&password)?;
+        let key_id = signer.public().witness_id();
         let record_path = data_dir.join(format!("powit-votes-{}.json", hex::encode(key_id)));
         let signed: Vec<(Checkpoint, Checkpoint)> = std::fs::read(&record_path).ok()
             .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         Ok(WitnessDuty {
-            pubkey: kp.public_key.clone(),
-            secret: zeroize::Zeroizing::new(kp.private_key.clone()),
             key_id,
-            payout_script: key_id.to_vec(),
+            payout_script,
+            key_path: key.to_path_buf(),
+            password,
+            signer: Mutex::new(signer),
             record_path,
             signed: Mutex::new(signed),
         })
@@ -488,7 +490,18 @@ impl WitnessDuty {
         if self.conflicts(&source, &target) {
             return Ok(None);
         }
-        let att = Attestation::sign(core::node_chain_id(), source, target, &self.pubkey, &self.secret)?;
+        let mut signer = self.signer.lock();
+        if te < signer.epoch() {
+            return Ok(None); // that epoch's leaf is gone: forward security
+        }
+        if te > signer.epoch() {
+            // Erase every earlier seed, ON DISK FIRST, then in memory.
+            let mut next_state = gnb_crypto::core::kes::KesKeyFile::load(&self.key_path)?.open(&self.password)?;
+            next_state.evolve_to(te)?;
+            gnb_crypto::core::kes::KesKeyFile::seal(&next_state, &self.password)?.save(&self.key_path)?;
+            *signer = next_state;
+        }
+        let att = Attestation::sign(core::node_chain_id(), source, target, &signer)?;
         {
             let mut g = self.signed.lock();
             g.push((source, target));
@@ -505,15 +518,15 @@ impl WitnessDuty {
 // ── Share mining ─────────────────────────────────────────────────────────────
 
 /// Try `attempts` nonces for a share attesting `attested` (normally the
-/// current tip), paying `payout` (a 20-byte pay-to-pubkey-hash script).
+/// current tip), crediting `witness` and paying `payout` (any valid script).
 /// GnB-SMH v3, 4 MiB. Takes no lock: the caller reads the tip first.
-pub fn mine_share(attested: &Block, attested_hash: Hash, payout: &[u8], start_nonce: u64, attempts: u64,
-                  stop: &std::sync::atomic::AtomicBool) -> Option<WitnessShare> {
+pub fn mine_share(attested: &Block, attested_hash: Hash, witness: KeyId, payout: &[u8], start_nonce: u64,
+                  attempts: u64, stop: &std::sync::atomic::AtomicBool) -> Option<WitnessShare> {
     let stream = witness_share::tx_stream(attested);
     let root = attested.witness_root();
     let target = witness_share::share_target(&gnb_smh::difficulty::bits_to_target(attested.header.bits));
     let mut sp = gnb_smh::v3::Scratchpad::new(gnb_smh::v3::LOG2_N);
-    let mut share = WitnessShare { attested: attested_hash, payout: payout.to_vec(),
+    let mut share = WitnessShare { attested: attested_hash, witness, payout: payout.to_vec(),
                                    bits: attested.header.bits, nonce: 0 };
     for i in 0..attempts {
         if stop.load(std::sync::atomic::Ordering::Relaxed) {

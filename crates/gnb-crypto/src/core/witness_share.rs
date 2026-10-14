@@ -56,7 +56,10 @@ pub const MAX_PAYOUT_SCRIPT: usize = 128;
 pub struct WitnessShare {
     /// Block id (`Block::block_hash`) of the attested block.
     pub attested: [u8; 32],
-    /// script_pubkey that receives the attester's reward.
+    /// Witness id credited with this share's work (`KesPublic::witness_id`).
+    pub witness: [u8; 20],
+    /// script_pubkey that receives the reward: any valid output, so the
+    /// witness identity and its money are separate (e.g. a cold wallet).
     pub payout: Vec<u8>,
     /// Compact bits of the attested block (the share target derives from it).
     pub bits: u32,
@@ -134,13 +137,20 @@ pub fn sample_indices(attested: &[u8; 32], payout: &[u8], nonce: u64, n: u64) ->
 
 /// GnB-SMH input for one attempt. `stream` and `witness_root` belong to the
 /// attested block; a miner precomputes them once per attested block.
+/// What a share's work is bound to besides the attested block: the witness
+/// credited and the payout (neither can be swapped after mining).
+fn binding(share: &WitnessShare) -> Vec<u8> {
+    [&share.witness[..], &sha3(&[&share.payout])[..]].concat()
+}
+
 pub fn pow_preimage(share: &WitnessShare, witness_root: &[u8; 32], stream: &[u8]) -> Vec<u8> {
-    let idx = sample_indices(&share.attested, &share.payout, share.nonce, n_chunks(stream));
+    let idx = sample_indices(&share.attested, &binding(share), share.nonce, n_chunks(stream));
     let mut b = Vec::with_capacity(4 + DS_POW.len() + 32 * 3 + 4 + SAMPLE_CHUNKS * CHUNK_BYTES);
     b.extend_from_slice(&(DS_POW.len() as u32).to_le_bytes());
     b.extend_from_slice(DS_POW);
     b.extend_from_slice(&share.attested);
     b.extend_from_slice(witness_root);
+    b.extend_from_slice(&share.witness);
     b.extend_from_slice(&sha3(&[&share.payout]));
     b.extend_from_slice(&share.bits.to_le_bytes());
     for i in idx {
@@ -164,10 +174,11 @@ pub fn share_target(block_target: &Target) -> Target {
 }
 
 impl WitnessShare {
-    /// Wire: attested 32 ‖ varint len ‖ payout ‖ bits u32le ‖ nonce u64le.
+    /// Wire: attested 32 ‖ witness 20 ‖ varint len ‖ payout ‖ bits u32le ‖ nonce u64le.
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(32 + 9 + self.payout.len() + 12);
+        let mut out = Vec::with_capacity(52 + 9 + self.payout.len() + 12);
         out.extend_from_slice(&self.attested);
+        out.extend_from_slice(&self.witness);
         super::write_varint(&mut out, self.payout.len() as u64);
         out.extend_from_slice(&self.payout);
         out.extend_from_slice(&self.bits.to_le_bytes());
@@ -177,20 +188,21 @@ impl WitnessShare {
 
     pub fn read_wire(cur: &mut std::io::Cursor<&[u8]>) -> Result<Self, String> {
         let attested = super::powit::read_array32(cur)?;
+        let witness = super::powit::read_fixed::<20>(cur)?;
         let payout = super::powit::read_bytes(cur, MAX_PAYOUT_SCRIPT, "share payout")?;
         let bits = super::powit::read_u32(cur)?;
         let nonce = super::powit::read_u64(cur)?;
-        Ok(WitnessShare { attested, payout, bits, nonce })
+        Ok(WitnessShare { attested, witness, payout, bits, nonce })
     }
 
-    /// The witness key this share credits: the payout must be a
-    /// pay-to-pubkey-hash script, whose 20 bytes are the key id.
-    pub fn key_id(&self) -> Option<super::powit::KeyId> {
-        (self.payout.len() == super::policy::PKH_SPK_LEN).then(|| {
-            let mut k = [0u8; 20];
-            k.copy_from_slice(&self.payout);
-            k
-        })
+    /// The witness this share credits.
+    pub fn key_id(&self) -> super::powit::KeyId {
+        self.witness
+    }
+
+    /// The payout must be a valid output script.
+    pub fn payout_is_valid(&self) -> bool {
+        super::policy::output_kind(&self.payout).is_some()
     }
 }
 
@@ -201,7 +213,7 @@ pub fn smh_v3(pre: &[u8], nonce: u64) -> [u8; 32] {
 
 /// Unique id of a share (duplicates are refused across a block).
 pub fn share_id(share: &WitnessShare) -> [u8; 32] {
-    sha3(&[DS_ID, &share.attested, &sha3(&[&share.payout]), &share.bits.to_le_bytes(),
+    sha3(&[DS_ID, &share.attested, &share.witness, &sha3(&[&share.payout]), &share.bits.to_le_bytes(),
            &share.nonce.to_le_bytes()])
 }
 
@@ -307,7 +319,7 @@ mod tests {
     }
 
     fn mine(b: &Block, payout: &[u8]) -> WitnessShare {
-        let mut s = WitnessShare { attested: b.block_hash(), payout: payout.to_vec(), bits: b.header.bits, nonce: 0 };
+        let mut s = WitnessShare { attested: b.block_hash(), witness: [9; 20], payout: payout.to_vec(), bits: b.header.bits, nonce: 0 };
         while verify_share(&s, b, stub).is_err() {
             s.nonce += 1;
         }

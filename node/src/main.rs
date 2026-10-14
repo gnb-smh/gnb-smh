@@ -78,12 +78,15 @@ struct Cli {
     /// finality). TESTNET ONLY: refused without --testnet. Mainnet activation
     /// is a consensus constant (core::POWIT_HEIGHT_MAINNET).
     #[arg(long)]                                         powit_height: Option<u64>,
-    /// PoWit witness: an encrypted `gnb-cli newwallet` file. The node mines
-    /// witness shares paying this key and, once it is in the witness set,
-    /// signs checkpoints with it. Needs --witness-password-file.
-    #[arg(long)]                                         witness_wallet: Option<PathBuf>,
-    /// File whose first line is the witness wallet password (keep it 0600).
+    /// PoWit witness: a forward-secure KES key from `gnb-cli witnesskeygen`.
+    /// The node mines witness shares credited to it and, once it is in the
+    /// witness set, signs checkpoints with the leaf of each target's epoch.
+    /// Needs --witness-password-file and --witness-payout.
+    #[arg(long)]                                         witness_key: Option<PathBuf>,
+    /// File whose first line is the witness key password (keep it 0600).
     #[arg(long)]                                         witness_password_file: Option<PathBuf>,
+    /// Address that receives this witness's share rewards (may be a cold wallet).
+    #[arg(long)]                                         witness_payout: Option<String>,
     /// Threads mining witness shares (GnB-SMH v3, 4 MiB each). Default 2 when
     /// a witness wallet is set.
     #[arg(long)]                                         share_threads: Option<usize>,
@@ -1563,12 +1566,17 @@ async fn main() {
 
 
     // ── PoWit witness: share mining + checkpoint attestations ──────────────
-    if let Some(wallet) = cli.witness_wallet.clone() {
+    if let Some(key) = cli.witness_key.clone() {
         let Some(pw) = cli.witness_password_file.clone() else {
-            eprintln!("--witness-wallet needs --witness-password-file");
+            eprintln!("--witness-key needs --witness-password-file");
             std::process::exit(2);
         };
-        let duty = match powit::WitnessDuty::load(&wallet, &pw, &data_path) {
+        let payout = match cli.witness_payout.as_deref().map(address_to_script_pubkey) {
+            Some(Ok(spk)) => spk,
+            Some(Err(e)) => { eprintln!("--witness-payout: {:?}", e); std::process::exit(2); }
+            None => { eprintln!("--witness-key needs --witness-payout <address>"); std::process::exit(2); }
+        };
+        let duty = match powit::WitnessDuty::load(&key, &pw, payout, &data_path) {
             Ok(d) => Arc::new(d),
             Err(e) => { eprintln!("witness: {}", e); std::process::exit(2); }
         };
@@ -1622,7 +1630,8 @@ async fn main() {
         // Share miners: read the tip under a short lock, mine without it.
         let threads = cli.share_threads.unwrap_or(2);
         for t in 0..threads {
-            let (dag_s, store_s, otx_s, payout) = (dag.clone(), store.clone(), outbound_tx.clone(), duty.payout_script.clone());
+            let (dag_s, store_s, otx_s, payout, witness) =
+                (dag.clone(), store.clone(), outbound_tx.clone(), duty.payout_script.clone(), duty.key_id);
             std::thread::Builder::new().name(format!("share-miner-{t}")).spawn(move || {
                 let stop = std::sync::atomic::AtomicBool::new(false);
                 loop {
@@ -1638,7 +1647,7 @@ async fn main() {
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         continue;
                     };
-                    if let Some(share) = powit::mine_share(&attested, tip, &payout, rand::random(), 16, &stop) {
+                    if let Some(share) = powit::mine_share(&attested, tip, witness, &payout, rand::random(), 16, &stop) {
                         let admitted = {
                             let d = dag_s.read();
                             powit::pool().admit_share(share.clone(), &d, &store_s)

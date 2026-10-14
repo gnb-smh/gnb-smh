@@ -10,7 +10,8 @@
 //!   `e-1-window ..= e-2` (lagged two epochs, so forks shallower than an
 //!   epoch agree on it). Banned keys are excluded; inactive keys decay.
 //! - **Attestations**: a member signs a link `source -> target` between two
-//!   checkpoints with its hybrid ML-DSA-65 ‖ Falcon-1024 key. Included in
+//!   checkpoints with its forward-secure KES key (`core::kes`, hybrid
+//!   ML-DSA-65 ‖ Falcon-1024 leaves), using the leaf of the target's epoch. Included in
 //!   blocks; counted only when `source` is the chain's current justified
 //!   checkpoint and `target` is on the including block's selected chain.
 //! - **Justification / finality** (Casper-style): links worth >= 2/3 of
@@ -30,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 
 use super::witness_share::WitnessShare;
+use super::kes::{self, KesPublic, KesSignature, KesSigner};
 use super::{read_varint, write_varint, ChainId};
 
 /// 20-byte key id: SHA3-256(public key)[0..20], the same hash a
@@ -128,17 +130,14 @@ pub struct Checkpoint {
 const DS_ATTEST: &[u8] = b"GNB-POWIT-v1/attest";
 const DS_BODY: &[u8] = b"GNB-POWIT-v1/body";
 
-/// Hybrid public keys and signatures are bounded by the spend rules too.
-pub const MAX_ATTEST_PUBKEY_LEN: usize = 8 * 1024;
-pub const MAX_ATTEST_SIG_LEN: usize = 8 * 1024;
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attestation {
     pub source: Checkpoint,
     pub target: Checkpoint,
-    /// Hybrid public key (suite envelope), whose `key_id` is the witness.
-    pub pubkey: Vec<u8>,
-    pub signature: Vec<u8>,
+    /// The witness's forward-secure key (`core::kes`); its id is the witness.
+    pub witness: KesPublic,
+    /// Signature by the leaf of `epoch(target.height)`.
+    pub sig: KesSignature,
 }
 
 /// The digest a witness signs for a link.
@@ -156,7 +155,7 @@ pub fn attestation_message(chain: ChainId, source: &Checkpoint, target: &Checkpo
 
 impl Attestation {
     pub fn key_id(&self) -> KeyId {
-        key_id(&self.pubkey)
+        self.witness.witness_id()
     }
 
     /// Unique id (gossip and in-block dedup).
@@ -164,50 +163,48 @@ impl Attestation {
         Sha3_256::digest(self.to_wire_bytes()).into()
     }
 
-    /// Bounds + canonical hybrid signature over the link.
-    pub fn verify_signature(&self, chain: ChainId) -> bool {
-        self.pubkey.len() <= MAX_ATTEST_PUBKEY_LEN
-            && self.signature.len() <= MAX_ATTEST_SIG_LEN
-            && self.target.height > self.source.height
-            && crate::crypto::verify_canonical(
-                &self.pubkey,
-                &attestation_message(chain, &self.source, &self.target),
-                &self.signature,
-            )
+    /// The KES epoch this attestation must be signed in: the PoWit epoch of
+    /// its target. `None` for a target below activation (never valid).
+    pub fn kes_epoch(&self, p: &PowitParams, act: u64) -> Option<u64> {
+        (self.target.height >= act).then(|| p.epoch(act, self.target.height))
     }
 
-    /// Sign a link (witness software).
-    pub fn sign(chain: ChainId, source: Checkpoint, target: Checkpoint, pubkey: &[u8], secret: &[u8])
-        -> Result<Self, String>
-    {
-        let sig = crate::crypto::sign(secret, &attestation_message(chain, &source, &target))
-            .map_err(|e| format!("sign: {e:?}"))?;
-        Ok(Attestation { source, target, pubkey: pubkey.to_vec(), signature: sig })
+    /// Link shape + forward-secure signature by the target epoch's leaf.
+    pub fn verify_signature(&self, chain: ChainId, p: &PowitParams, act: u64) -> bool {
+        let Some(e) = self.kes_epoch(p, act) else { return false };
+        self.target.height > self.source.height
+            && kes::verify(&self.witness, e, &attestation_message(chain, &self.source, &self.target), &self.sig)
+    }
+
+    /// Sign a link with a KES signer already evolved to the target's epoch.
+    pub fn sign(chain: ChainId, source: Checkpoint, target: Checkpoint, signer: &KesSigner) -> Result<Self, String> {
+        let sig = signer.sign(&attestation_message(chain, &source, &target))?;
+        Ok(Attestation { source, target, witness: signer.public(), sig })
     }
 
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(96 + self.pubkey.len() + self.signature.len());
+        let mut out = Vec::with_capacity(9_000);
         out.extend_from_slice(&self.source.height.to_le_bytes());
         out.extend_from_slice(&self.source.hash);
         out.extend_from_slice(&self.target.height.to_le_bytes());
         out.extend_from_slice(&self.target.hash);
-        write_varint(&mut out, self.pubkey.len() as u64);
-        out.extend_from_slice(&self.pubkey);
-        write_varint(&mut out, self.signature.len() as u64);
-        out.extend_from_slice(&self.signature);
+        out.push(self.witness.depth);
+        out.extend_from_slice(&self.witness.root);
+        self.sig.write_wire(&mut out);
         out
     }
 
     pub fn read_wire(cur: &mut std::io::Cursor<&[u8]>) -> Result<Self, String> {
         let source = read_checkpoint(cur)?;
         let target = read_checkpoint(cur)?;
-        let pubkey = read_bytes(cur, MAX_ATTEST_PUBKEY_LEN, "attestation pubkey")?;
-        let signature = read_bytes(cur, MAX_ATTEST_SIG_LEN, "attestation signature")?;
-        Ok(Attestation { source, target, pubkey, signature })
+        let depth = read_fixed::<1>(cur)?[0];
+        let root = read_array32(cur)?;
+        let sig = KesSignature::read_wire(cur)?;
+        Ok(Attestation { source, target, witness: KesPublic { depth, root }, sig })
     }
 }
 
-/// Proof that one key signed two conflicting links.
+/// Proof that one witness signed two conflicting links.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Equivocation {
     pub a: Attestation,
@@ -215,15 +212,16 @@ pub struct Equivocation {
 }
 
 impl Equivocation {
-    /// Both signatures valid, same key, and a double or surround vote.
-    pub fn verify(&self, chain: ChainId) -> Result<KeyId, &'static str> {
-        if self.a.pubkey != self.b.pubkey {
-            return Err("equivocation: different keys");
+    /// Both signatures valid under the same witness key, and a double or
+    /// surround vote.
+    pub fn verify(&self, chain: ChainId, p: &PowitParams, act: u64) -> Result<KeyId, &'static str> {
+        if self.a.witness != self.b.witness {
+            return Err("equivocation: different witnesses");
         }
         if self.a == self.b {
             return Err("equivocation: identical attestations");
         }
-        if !self.a.verify_signature(chain) || !self.b.verify_signature(chain) {
+        if !self.a.verify_signature(chain, p, act) || !self.b.verify_signature(chain, p, act) {
             return Err("equivocation: invalid signature");
         }
         let (a, b) = (&self.a, &self.b);
@@ -348,7 +346,7 @@ pub(crate) fn read_array32(cur: &mut std::io::Cursor<&[u8]>) -> Result<[u8; 32],
     read_fixed::<32>(cur)
 }
 
-fn read_fixed<const N: usize>(cur: &mut std::io::Cursor<&[u8]>) -> Result<[u8; N], String> {
+pub(crate) fn read_fixed<const N: usize>(cur: &mut std::io::Cursor<&[u8]>) -> Result<[u8; N], String> {
     let pos = cur.position() as usize;
     let buf = *cur.get_ref();
     if pos + N > buf.len() {
@@ -507,7 +505,7 @@ impl PowitState {
 
         // ── Equivocation proofs ──────────────────────────────────────────
         for ev in b.evidence {
-            let k = ev.verify(chain).map_err(|e| format!("powit: {e}"))?;
+            let k = ev.verify(chain, p, act).map_err(|e| format!("powit: {e}"))?;
             if s.is_banned(&k, epoch) {
                 return Err("powit: equivocation for an already barred key".into());
             }
@@ -563,8 +561,8 @@ impl PowitState {
                     }
                 }
             }
-            if !a.verify_signature(chain) {
-                return Err("powit: invalid attestation signature".into());
+            if !a.verify_signature(chain, p, act) {
+                return Err("powit: invalid attestation signature (KES leaf must be the target's epoch)".into());
             }
             s.votes.entry(t).or_default().insert(k, weight);
             s.links.entry(k).or_default().push((a.source.height, t.height, t.hash));

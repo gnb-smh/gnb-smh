@@ -12,6 +12,7 @@ pub mod tokenomics;
 pub mod policy;      // m-of-n multisig + absolute/relative timelocks
 pub mod vesting;     // locked team and founder allocations (genesis ledger)
 pub mod witness_share; // reward for proven witness custody (from powit_height)
+pub mod kes;           // forward-secure (key-evolving) hybrid signatures for witnesses
 pub mod powit;         // Proof of Witnesses: witness-set finality (from powit_height)
 
 /// Bloch Genesis-3 carryover: verified, converted opening ledger.
@@ -1305,8 +1306,7 @@ impl Block {
     }
 
     /// Context-free PoWit checks: empty below activation; bounded counts;
-    /// every share pays a pay-to-pubkey-hash script and attests with the
-    /// block's own difficulty; no duplicate share ids.
+    /// every share pays a valid script; no duplicate share ids.
     pub fn validate_powit_structure(&self) -> Result<(), &'static str> {
         if !powit_active(self.height) {
             return if self.powit.is_empty() { Ok(()) } else { Err("PoWit section before activation") };
@@ -1317,7 +1317,7 @@ impl Block {
         if self.powit.evidence.len() > p.max_evidence_per_block { return Err("too many equivocation proofs"); }
         let mut ids = std::collections::HashSet::with_capacity(self.powit.shares.len());
         for sh in &self.powit.shares {
-            if sh.key_id().is_none() { return Err("witness share must pay a pay-to-pubkey-hash script"); }
+            if !sh.payout_is_valid() { return Err("witness share pays an invalid script"); }
             if !ids.insert(witness_share::share_id(sh)) { return Err("duplicate witness share"); }
         }
         Ok(())

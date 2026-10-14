@@ -120,17 +120,45 @@ fn main() {
             let kind: u64 = params[0].parse().unwrap_or(0);
             ("submitpowititem", serde_json::json!([kind, params[1]]))
         }
-        // Sign a PoWit link with a wallet key and print the attestation hex
-        // (kind 2). For witness operators and tests; the node's own witness
-        // duty never signs conflicting links, this command does not check.
+        // Create a forward-secure PoWit witness key (KES). Password from
+        // GNB_WALLET_PASSWORD or a prompt; the seed never leaves the file
+        // unencrypted.
+        "witnesskeygen" => {
+            require_params(params, 1, "witnesskeygen <out.json> [depth=12]");
+            let depth: u8 = params.get(1).and_then(|d| d.parse().ok()).unwrap_or(gnb::core::kes::DEFAULT_DEPTH);
+            let pw = std::env::var("GNB_WALLET_PASSWORD").unwrap_or_else(|_| {
+                let a = read_password("Set witness key password: ");
+                let b = read_password("Confirm: ");
+                if a != b { eprintln!("Passwords don't match."); process::exit(1); }
+                a
+            });
+            let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+            rand::fill(&mut seed[..]);
+            let total = 1u64 << depth;
+            eprintln!("Generating {} epoch keys (hybrid ML-DSA-65 + Falcon-1024)...", total);
+            let signer = gnb::core::kes::KesSigner::generate(depth, *seed, |i| {
+                if i % 256 == 0 || i == total { eprint!("\r  {}/{}", i, total); }
+            }).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            eprintln!();
+            let file = gnb::core::kes::KesKeyFile::seal(&signer, &pw)
+                .unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            file.save(std::path::Path::new(params[0])).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            println!("Witness key saved: {}", params[0]);
+            println!("Witness id:        {}", hex::encode(signer.public().witness_id()));
+            println!("Epochs:            {} (depth {})", total, depth);
+            println!("Back up ONLY this file. Older copies of it can sign past epochs.");
+            return;
+        }
+        // Sign a PoWit link with a KES witness key and print the attestation
+        // hex (kind 2). For operators and tests: unlike the node's witness duty
+        // this does not consult a vote record, and it evolves the key file.
         "powitattest" => {
             require_params(params, 6,
-                "powitattest <wallet.json> <mainnet|testnet> <src_slot> <src_hash> <tgt_slot> <tgt_hash>");
-            let pw = std::env::var("GNB_WALLET_PASSWORD").unwrap_or_else(|_| read_password("Wallet password: "));
-            let kp = match gnb::wallet::Keypair::load_encrypted(std::path::Path::new(params[0]), &pw) {
-                Ok(k) => k,
-                Err(e) => { eprintln!("load failed: {}", e); process::exit(1); }
-            };
+                "powitattest <witness-key.json> <mainnet|testnet> <src_slot> <src_hash> <tgt_slot> <tgt_hash> [activation]");
+            let pw = std::env::var("GNB_WALLET_PASSWORD").unwrap_or_else(|_| read_password("Witness key password: "));
+            let path = std::path::Path::new(params[0]);
+            let file = gnb::core::kes::KesKeyFile::load(path).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            let mut signer = file.open(&pw).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
             let chain = if params[1] == "testnet" { gnb::core::ChainId::Testnet } else { gnb::core::ChainId::Mainnet };
             let cp = |slot: &str, h: &str| -> gnb::core::powit::Checkpoint {
                 let mut hash = [0u8; 32];
@@ -139,9 +167,21 @@ fn main() {
                 hash.copy_from_slice(&b);
                 gnb::core::powit::Checkpoint { height: slot.parse().unwrap_or(0), hash }
             };
-            let att = gnb::core::powit::Attestation::sign(chain, cp(params[2], params[3]), cp(params[4], params[5]),
-                                                          &kp.public_key, &kp.private_key)
-                .unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            let (src, tgt) = (cp(params[2], params[3]), cp(params[4], params[5]));
+            let act: u64 = params.get(6).and_then(|a| a.parse().ok()).unwrap_or(0);
+            let p = gnb::core::powit::params_for(chain);
+            if tgt.height < act { eprintln!("target below activation"); process::exit(1); }
+            let e = p.epoch(act, tgt.height);
+            if e > signer.epoch() {
+                signer.evolve_to(e).unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
+                gnb::core::kes::KesKeyFile::seal(&signer, &pw).and_then(|f| f.save(path))
+                    .unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
+            } else if e < signer.epoch() {
+                eprintln!("epoch {} already erased (key is at {}): forward security", e, signer.epoch());
+                process::exit(1);
+            }
+            let att = gnb::core::powit::Attestation::sign(chain, src, tgt, &signer)
+                .unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
             println!("{}", hex::encode(att.to_wire_bytes()));
             return;
         }
@@ -914,6 +954,7 @@ fn print_usage() {
     gnb-cli peers                         Peer info
     gnb-cli dag                           DAG info (tips, chain, scores)
     gnb-cli powit                         PoW + PoWit: checkpoints, finality, witness set
+    gnb-cli witnesskeygen <out> [depth]   Create a forward-secure PoWit witness key (KES)
 
   BLOCKS
     gnb-cli block <height> [verbose]      Get block by height

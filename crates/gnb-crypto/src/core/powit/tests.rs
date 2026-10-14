@@ -2,6 +2,7 @@
 //! Real hybrid keys and signatures; a simulated selected chain.
 
 use super::*;
+use crate::core::kes::KesSigner;
 use crate::core::ChainId;
 use std::collections::HashMap;
 
@@ -10,20 +11,26 @@ const P: PowitParams = TESTNET_PARAMS;
 const ACT: u64 = 1_000;
 
 struct Key {
-    pk: Vec<u8>,
-    sk: Vec<u8>,
+    signer: std::cell::RefCell<KesSigner>,
 }
 
 impl Key {
+    /// Depth 6 = 64 epochs, enough for every test below.
     fn new(seed: u8) -> Key {
-        let (pk, sk) = crate::crypto::generate_keypair_from_seed(&[seed; 32]).unwrap();
-        Key { pk, sk }
+        Key { signer: std::cell::RefCell::new(KesSigner::generate(6, [seed; 32], |_| {}).unwrap()) }
     }
     fn id(&self) -> KeyId {
-        key_id(&self.pk)
+        self.signer.borrow().public().witness_id()
     }
+    /// Sign with the leaf of the target's epoch, evolving forward as needed.
     fn attest(&self, source: Checkpoint, target: Checkpoint) -> Attestation {
-        Attestation::sign(CHAIN, source, target, &self.pk, &self.sk).unwrap()
+        let e = P.epoch(ACT, target.height);
+        let mut s = self.signer.borrow_mut();
+        if e > s.epoch() {
+            s.evolve_to(e).unwrap();
+        }
+        assert_eq!(e, s.epoch(), "tests sign epochs in order");
+        Attestation::sign(CHAIN, source, target, &s).unwrap()
     }
 }
 
@@ -181,22 +188,22 @@ fn equivocations_are_proven_and_bar_the_key() {
     let k = &keys[0];
     // Double vote: same target height, different hash (different fork).
     let double = Equivocation { a: k.attest(src, cp(0, ACT + 45)), b: k.attest(src, cp(5, ACT + 45)) };
-    assert_eq!(double.verify(CHAIN), Ok(k.id()));
+    assert_eq!(double.verify(CHAIN, &P, ACT), Ok(k.id()));
     // Surround vote.
     let surround = Equivocation {
         a: k.attest(cp(0, ACT), cp(0, ACT + 50)),
         b: k.attest(cp(0, ACT + 40), cp(0, ACT + 45)),
     };
-    assert_eq!(surround.verify(CHAIN), Ok(k.id()));
+    assert_eq!(surround.verify(CHAIN, &P, ACT), Ok(k.id()));
     // Not conflicting: consecutive links.
     let fine = Equivocation {
         a: k.attest(cp(0, ACT), cp(0, ACT + 45)),
         b: k.attest(cp(0, ACT + 45), cp(0, ACT + 50)),
     };
-    assert!(fine.verify(CHAIN).is_err());
+    assert!(fine.verify(CHAIN, &P, ACT).is_err());
     // Different keys are not an equivocation.
     let two = Equivocation { a: k.attest(src, cp(0, ACT + 45)), b: keys[1].attest(src, cp(5, ACT + 45)) };
-    assert!(two.verify(CHAIN).is_err());
+    assert!(two.verify(CHAIN, &P, ACT).is_err());
 
     let barred = apply_one(&st, ACT + 46, &[], &[double.clone()]).unwrap();
     let e = P.epoch(ACT, ACT + 46);
@@ -273,7 +280,7 @@ fn wire_roundtrip() {
     let k = Key::new(9);
     let a = k.attest(cp(0, ACT), cp(0, ACT + 5));
     let body = PowitBody {
-        shares: vec![WitnessShare { attested: [3; 32], payout: vec![7; 20], bits: 0x1f00_ffff, nonce: 42 }],
+        shares: vec![WitnessShare { attested: [3; 32], witness: [5; 20], payout: vec![7; 20], bits: 0x1f00_ffff, nonce: 42 }],
         attestations: vec![a.clone()],
         evidence: vec![Equivocation { a: a.clone(), b: k.attest(cp(0, ACT), cp(1, ACT + 5)) }],
     };
@@ -291,4 +298,25 @@ fn wire_roundtrip() {
     let mut huge = Vec::new();
     crate::core::write_varint(&mut huge, 1_000_000);
     assert!(PowitBody::read_wire(&mut std::io::Cursor::new(huge.as_slice())).is_err());
+}
+
+#[test]
+fn a_leaf_from_another_epoch_is_refused() {
+    let (keys, st) = warmed();
+    let src = st.justified;
+    // Key 0 signs slot ACT+45 (epoch 2) with the epoch-3 leaf: forge by
+    // evolving first, then sign the epoch-2 message.
+    let k = Key::new(1);
+    {
+        let mut s = k.signer.borrow_mut();
+        s.evolve_to(3).unwrap();
+    }
+    let target = cp(0, ACT + 45);
+    let wrong = Attestation::sign(CHAIN, src, target, &k.signer.borrow()).unwrap();
+    assert_eq!(wrong.sig.index, 3);
+    assert!(!wrong.verify_signature(CHAIN, &P, ACT), "epoch-3 leaf cannot sign an epoch-2 target");
+    assert!(apply_one(&st, ACT + 46, &[wrong], &[]).is_err());
+    // And once a signer has moved past epoch 2, it cannot produce one at all.
+    assert!(k.signer.borrow_mut().evolve_to(2).is_err());
+    let _ = keys;
 }
