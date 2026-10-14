@@ -12,7 +12,10 @@
 //! code and fault class.
 //!
 //! Seeds: a fixed set, plus `GNB_LEDGER_DIFF_SEED` if set, else one derived from
-//! the clock (printed, so a failure can be replayed). Needs `python3` (>= 3.10).
+//! the clock. Each seed is printed BEFORE it runs, and a panic inside the Rust
+//! ledger or the mutator is re-raised naming the seed and the case, so any
+//! failure can be replayed with `GNB_LEDGER_DIFF_SEED=<seed>`. Needs `python3`
+//! (>= 3.10).
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -173,6 +176,22 @@ fn mutate(rng: &mut Rng, base: &Value) -> Value {
     c
 }
 
+/// Run `f`; if it panics, panic again naming the seed (and `what`), so the
+/// clock-derived seed that found a crash is never lost.
+fn replayable<T>(seed: u64, what: &dyn Fn() -> String, f: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic".into());
+            panic!("seed {seed}: panicked on {}: {msg} (replay with GNB_LEDGER_DIFF_SEED={seed})", what());
+        }
+    }
+}
+
 fn run_seed(seed: u64) -> (usize, usize) {
     let base = python(&["gen", &seed.to_string(), &BASE_CASES.to_string()], None);
     let base = base.as_array().unwrap();
@@ -181,9 +200,10 @@ fn run_seed(seed: u64) -> (usize, usize) {
     let mut cases = Vec::new();
     for b in base {
         // The unmutated case must agree with the verdict `gen` recorded.
-        assert_eq!(rust_verdict(b), b["verdict"], "seed {seed}: base case disagrees: {b}");
+        let verdict = replayable(seed, &|| format!("base case {b}"), || rust_verdict(b));
+        assert_eq!(verdict, b["verdict"], "seed {seed}: base case disagrees: {b}");
         for _ in 0..MUTATIONS_PER_CASE {
-            cases.push(mutate(&mut rng, b));
+            cases.push(replayable(seed, &|| format!("a mutation of {b}"), || mutate(&mut rng, b)));
         }
     }
     let input = serde_json::to_vec(&cases).unwrap();
@@ -192,7 +212,7 @@ fn run_seed(seed: u64) -> (usize, usize) {
     assert_eq!(verdicts.len(), cases.len());
     let mut rejected = 0;
     for (c, py) in cases.iter().zip(verdicts) {
-        let rs = rust_verdict(c);
+        let rs = replayable(seed, &|| format!("case {c}"), || rust_verdict(c));
         assert_eq!(&rs, py, "seed {seed}: Rust and Python disagree on case {c}");
         rejected += usize::from(!py["ok"].as_bool().unwrap());
     }
@@ -208,11 +228,21 @@ fn rust_and_python_agree_on_random_blocks() {
     };
     seeds.push(extra);
     for seed in seeds {
+        // Printed first: libtest shows a failing test's captured stderr.
+        eprintln!("ledger differential: seed {seed} (replay with GNB_LEDGER_DIFF_SEED={seed})");
         let (n, rejected) = run_seed(seed);
         eprintln!("ledger differential: seed {seed}: {n} mutated cases, {rejected} rejected, all verdicts equal");
         // The mutations must exercise both outcomes.
         assert!(rejected > n / 4 && rejected < n, "seed {seed}: {rejected} of {n} rejected");
     }
+}
+
+/// The seed is never lost: a panic in the Rust ledger or the mutator is
+/// re-raised with the seed and the replay variable.
+#[test]
+#[should_panic(expected = "seed 4242: panicked on case X: boom (replay with GNB_LEDGER_DIFF_SEED=4242)")]
+fn a_panic_names_its_seed() {
+    replayable::<()>(4242, &|| "case X".to_string(), || panic!("boom"));
 }
 
 /// Fee-paying twins (same template, transactions already spent by the first
