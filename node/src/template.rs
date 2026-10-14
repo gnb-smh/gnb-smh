@@ -43,8 +43,66 @@ use crate::storage::Storage;
 
 /// Bytes reserved for a coinbase the template builder does not construct
 /// itself (`getblocktemplate` consumers build their own coinbase). Far above
-/// the node's own coinbase (~80 bytes).
+/// the node's own coinbase (~80 bytes). The WHOLE external coinbase, measured
+/// with the template's size rule, must fit in it: a template filled to its
+/// budget leaves no other room ([`external_coinbase_max_extra`]).
 pub const EXTERNAL_COINBASE_RESERVE: usize = 1_000;
+
+/// Largest `script_pubkey` (in bytes) of the single coinbase output that
+/// [`external_coinbase_max_extra`] budgets for (`getblocktemplate` reports it
+/// as `max_coinbase_script_pubkey_bytes`). Covers this chain's 20-byte pubkey
+/// hash and any 32-byte script hash with room to spare.
+pub const EXTERNAL_COINBASE_MAX_SPK: usize = 64;
+
+/// Size of the WIDEST coinbase with one input carrying a `script_sig_len`-byte
+/// `script_sig` and one output carrying a `spk_len`-byte `script_pubkey`, in
+/// the measure of the size rule (wire encoding when `hardened`, bincode
+/// otherwise): every other field at its widest encoding (version, locktime,
+/// sequence and value at their maxima). Non-decreasing in both lengths.
+fn widest_coinbase_size(script_sig_len: usize, spk_len: usize, hardened: bool) -> usize {
+    let cb = Transaction {
+        version: u32::MAX,
+        inputs: vec![TxInput {
+            prev_txid: [0xFF; 32],
+            prev_index: u32::MAX,
+            script_sig: vec![0xFF; script_sig_len],
+            sequence: u32::MAX,
+        }],
+        outputs: vec![TxOutput { value: u64::MAX, script_pubkey: vec![0xFF; spk_len] }],
+        locktime: u32::MAX,
+    };
+    if hardened { cb.wire_size(true) } else { cb.actual_size() }
+}
+
+/// The number of miner bytes an external coinbase may append after its
+/// `prefix_len` commitment bytes (`getblocktemplate`'s
+/// `max_coinbase_extra_bytes`): the largest `extra` such that a coinbase with
+/// one input (`script_sig` of `prefix_len + extra` bytes) and one output
+/// (`script_pubkey` of at most [`EXTERNAL_COINBASE_MAX_SPK`] bytes) fits in
+/// `reserve` bytes under the size rule of the template's height (`hardened`:
+/// wire, otherwise bincode), capped by the consensus `script_sig` limit.
+///
+/// Why the reserve and not the `script_sig` cap: the template selects
+/// transactions up to `MAX_BLOCK_SIZE - framing_upper_bound - reserve`, so on
+/// a full mempool only `reserve` bytes (plus the framing slack) remain for the
+/// coinbase. Advertising the consensus cap (9,920 extra bytes) let an external
+/// miner build a block over `MAX_BLOCK_SIZE` after spending the proof of work.
+pub fn external_coinbase_max_extra(prefix_len: usize, hardened: bool, reserve: usize) -> usize {
+    let fits = |extra: usize| {
+        widest_coinbase_size(prefix_len + extra, EXTERNAL_COINBASE_MAX_SPK, hardened) <= reserve
+    };
+    let cap = core::limits::MAX_SCRIPT_SIG_SIZE.saturating_sub(prefix_len);
+    if !fits(0) {
+        return 0;
+    }
+    // `fits` is monotone: binary search for the largest fitting value.
+    let (mut lo, mut hi) = (0usize, cap);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid) { lo = mid } else { hi = mid - 1 }
+    }
+    lo
+}
 
 /// A block template: everything needed to assemble a candidate block.
 #[derive(Clone, Debug)]
@@ -415,4 +473,38 @@ pub fn check_template_block_at(block: &Block, total_fees: u64, activation_height
     core::limits::check_block_context_free(block)?;
     block.validate_coinbase_value(total_fees).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod external_coinbase_tests {
+    use super::*;
+
+    /// `max_coinbase_extra_bytes` is exactly the largest value whose widest
+    /// coinbase fits the reserve in the template's size measure (one more
+    /// byte does not), and the values pinned in docs/CONSENSUS.md ("Mining").
+    #[test]
+    fn external_coinbase_max_extra_is_tight_against_the_reserve() {
+        for (hardened, prefix, pinned) in [(true, 80usize, 794usize), (false, 0, 869)] {
+            let e = external_coinbase_max_extra(prefix, hardened, EXTERNAL_COINBASE_RESERVE);
+            assert!(widest_coinbase_size(prefix + e, EXTERNAL_COINBASE_MAX_SPK, hardened) <= EXTERNAL_COINBASE_RESERVE);
+            assert!(widest_coinbase_size(prefix + e + 1, EXTERNAL_COINBASE_MAX_SPK, hardened) > EXTERNAL_COINBASE_RESERVE);
+            assert_eq!(e, pinned, "hardened={hardened}");
+            // Any coinbase the miner may build within the two fields is no
+            // larger than the widest one.
+            let cb = Transaction {
+                version: 1,
+                inputs: vec![TxInput { prev_txid: [0; 32], prev_index: u32::MAX,
+                    script_sig: vec![7; prefix + e], sequence: 0 }],
+                outputs: vec![TxOutput { value: 50 * 100_000_000, script_pubkey: vec![1; EXTERNAL_COINBASE_MAX_SPK] }],
+                locktime: 0,
+            };
+            let size = if hardened { cb.wire_size(true) } else { cb.actual_size() };
+            assert!(size <= EXTERNAL_COINBASE_RESERVE, "{size}");
+        }
+        // Capped by the consensus script_sig limit when the reserve allows more.
+        assert_eq!(external_coinbase_max_extra(80, true, 1_000_000), core::limits::MAX_SCRIPT_SIG_SIZE - 80);
+        assert_eq!(external_coinbase_max_extra(0, false, 1_000_000), core::limits::MAX_SCRIPT_SIG_SIZE);
+        // A reserve too small for any coinbase.
+        assert_eq!(external_coinbase_max_extra(80, true, 100), 0);
+    }
 }

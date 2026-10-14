@@ -276,8 +276,22 @@ height: `hardening_active`, `merkle_rule` (`sha256d-duplicate-last` or
 `gnb-tagged-v1`), `size_rule` (`bincode` or `wire`),
 `coinbase_script_sig_prefix` (the 80-byte coinbase commitment for exactly the
 listed transactions in that order, empty before the activation),
-`max_coinbase_extra_bytes`, and `coinbase_merkle_branch` (the siblings from
-the coinbase leaf to the header root under `merkle_rule`).
+`max_coinbase_extra_bytes`, `max_coinbase_script_pubkey_bytes`, and
+`coinbase_merkle_branch` (the siblings from the coinbase leaf to the header
+root under `merkle_rule`).
+
+The listed transactions may fill the block up to `max_block_size` minus a
+framing bound minus `coinbase_reserve` (1,000 bytes), so the WHOLE coinbase,
+measured with `size_rule`, must fit in `coinbase_reserve`.
+`max_coinbase_extra_bytes` (the miner bytes allowed after the prefix) already
+includes that bound: it is the largest number of extra bytes for which a
+coinbase with one input and one output whose `script_pubkey` is at most
+`max_coinbase_script_pubkey_bytes` (64) bytes, with every other field at its
+widest encoding, fits in `coinbase_reserve`, capped by the 10,000-byte
+`script_sig` limit (`template::external_coinbase_max_extra`). That is 794
+bytes at/after the activation (wire measure, 80-byte prefix) and 869 bytes
+before it (bincode measure, no prefix). A coinbase within both fields never
+pushes a block built from the template over `max_block_size`.
 
 ## Block rules at the hardening activation
 

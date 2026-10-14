@@ -1258,8 +1258,20 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // `max_coinbase_extra_bytes` miner bytes; the header Merkle root
             // uses the tagged tree; the size limit is measured on the wire
             // encoding. Below it, all three are as before.
+            //
+            // The WHOLE coinbase, measured with `size_rule`, must fit in
+            // `coinbase_reserve`: the listed transactions may fill the rest of
+            // the block. `max_coinbase_extra_bytes` already includes that
+            // bound for a coinbase with one output whose script_pubkey is at
+            // most `max_coinbase_script_pubkey_bytes` bytes (and the consensus
+            // script_sig cap), so a miner that stays within both fields can
+            // never produce a block over `max_block_size`.
             let commitment = tmpl.coinbase_commitment();
-            let script_sig_cap = crate::core::limits::MAX_SCRIPT_SIG_SIZE;
+            let max_extra = crate::template::external_coinbase_max_extra(
+                commitment.map(|c| c.len()).unwrap_or(0),
+                tmpl.hardened,
+                crate::template::EXTERNAL_COINBASE_RESERVE,
+            );
 
             json!({
                 "hardening_active":     tmpl.hardened,
@@ -1267,8 +1279,8 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 "merkle_rule":          if tmpl.hardened { "gnb-tagged-v1" } else { "sha256d-duplicate-last" },
                 "size_rule":            if tmpl.hardened { "wire" } else { "bincode" },
                 "coinbase_script_sig_prefix": commitment.map(hex::encode).unwrap_or_default(),
-                "max_coinbase_extra_bytes": script_sig_cap
-                    - commitment.map(|c| c.len()).unwrap_or(0),
+                "max_coinbase_extra_bytes": max_extra,
+                "max_coinbase_script_pubkey_bytes": crate::template::EXTERNAL_COINBASE_MAX_SPK,
                 // Siblings from the coinbase leaf to the header root (fold the
                 // coinbase txid through them with the `merkle_rule`).
                 "coinbase_merkle_branch": tmpl.coinbase_merkle_branch().iter().map(hex::encode).collect::<Vec<_>>(),
@@ -1290,7 +1302,8 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // `Block::size_bytes` before the activation, the wire encoding
                 // `Block::to_wire_bytes` from it), must stay <= max_block_size;
                 // the listed transactions leave coinbase_reserve bytes for the
-                // coinbase.
+                // WHOLE coinbase (in the same measure), which is what
+                // max_coinbase_extra_bytes is derived from.
                 "max_block_size":       crate::core::MAX_BLOCK_SIZE,
                 "coinbase_reserve":     crate::template::EXTERNAL_COINBASE_RESERVE,
                 "max_parents":          crate::core::MAX_PARENTS,
@@ -2502,7 +2515,16 @@ mod block_rules_template_tests {
             let prefix = hex::decode(t["coinbase_script_sig_prefix"].as_str().unwrap()).unwrap();
             assert_eq!(prefix.len(), block_rules::COINBASE_COMMITMENT_LEN);
             assert_eq!(&prefix[..8], b"GNB-CB01");
-            assert_eq!(t["max_coinbase_extra_bytes"], core::limits::MAX_SCRIPT_SIG_SIZE - 80);
+            // The whole coinbase must fit the reserve: far below the
+            // script_sig cap (9,920), which a full template has no room for.
+            let max_extra = t["max_coinbase_extra_bytes"].as_u64().unwrap() as usize;
+            assert_eq!(max_extra, crate::template::external_coinbase_max_extra(80, true, 1_000));
+            assert!(max_extra > 700 && max_extra < 1_000 - 80, "{max_extra}");
+            assert_eq!(t["max_coinbase_script_pubkey_bytes"], crate::template::EXTERNAL_COINBASE_MAX_SPK);
+            let block = external_block(&t, &vec![0xE5; max_extra]);
+            assert!(block.transactions[0].wire_size(true) <= t["coinbase_reserve"].as_u64().unwrap() as usize);
+            assert_eq!(block_rules::check_block_hardened_at(&block, 1), Ok(()));
+            assert_eq!(block.validate_structure_without_pow_at(1), Ok(()));
             let block = external_block(&t, b"pool-extranonce");
             assert_eq!(block_rules::check_block_hardened_at(&block, 1), Ok(()));
             assert_eq!(block.validate_structure_without_pow_at(1), Ok(()));
@@ -2517,6 +2539,12 @@ mod block_rules_template_tests {
             assert_eq!(t["merkle_rule"], "sha256d-duplicate-last");
             assert_eq!(t["size_rule"], "bincode");
             assert_eq!(t["coinbase_script_sig_prefix"], "");
+            let max_extra = t["max_coinbase_extra_bytes"].as_u64().unwrap() as usize;
+            assert_eq!(max_extra, crate::template::external_coinbase_max_extra(0, false, 1_000));
+            assert!(max_extra > 800 && max_extra < 1_000, "{max_extra}");
+            let block = external_block(&t, &vec![0xE5; max_extra]);
+            assert!(block.transactions[0].actual_size() <= t["coinbase_reserve"].as_u64().unwrap() as usize);
+            assert_eq!(block.validate_structure_without_pow_at(activation::NEVER), Ok(()));
             let block = external_block(&t, b"height:1 pool");
             assert_eq!(block.validate_structure_without_pow_at(activation::NEVER), Ok(()));
             assert_eq!(block.header.merkle_root, core::Transaction::merkle_root(&block.transactions));

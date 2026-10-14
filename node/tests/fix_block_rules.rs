@@ -624,6 +624,83 @@ fn val12_template_budgets_with_the_wire_measure_after_activation() {
     assert_eq!(block.validate_structure_without_pow(), Ok(()));
 }
 
+/// Review finding (getblocktemplate): the template leaves only
+/// `EXTERNAL_COINBASE_RESERVE` bytes for an external coinbase, so the
+/// advertised `max_coinbase_extra_bytes` must fit in it. With a mempool larger
+/// than a block, a coinbase carrying exactly `max_coinbase_extra_bytes` miner
+/// bytes and a `max_coinbase_script_pubkey_bytes` script keeps the block
+/// within `MAX_BLOCK_SIZE` in the template's size measure on both sides of
+/// the activation; the value advertised before the fix (the script_sig cap,
+/// 9,920 / 10,000 bytes) made the same block too large.
+#[test]
+fn getblocktemplate_max_coinbase_extra_fits_a_full_template() {
+    for hardened in [false, true] {
+        let act = if hardened { 0 } else { activation::NEVER };
+        let _g = activation::scoped_override(act);
+        let genesis = mk_genesis(unix_now() - 10_000);
+        let n = node_with(&genesis, &[]);
+        // ~1.3 MB of ~330-byte transactions: more than one block.
+        for i in 0..4_000u32 {
+            let mut prev = [0u8; 32];
+            prev[..4].copy_from_slice(&i.to_le_bytes());
+            prev[31] = 0xBD;
+            n.store.put_utxo(&prev, 0, &out(1_000_000, &[0x55; 20])).unwrap();
+            let fee = 50_000 + i as u64;
+            let tx = Transaction {
+                version: 1,
+                inputs: vec![TxInput { prev_txid: prev, prev_index: 0, script_sig: vec![0xA6; 250 + (i % 7) as usize], sequence: u32::MAX }],
+                outputs: vec![TxOutput { value: 1_000_000 - fee, script_pubkey: vec![0x13; 20] }],
+                locktime: 0,
+            };
+            n.mempool.add(tx, fee).unwrap();
+        }
+        let tmpl = template::build_block_template_with(&n.dag, &n.store, &n.mempool, &template::TemplateOptions {
+            coinbase_reserve: template::EXTERNAL_COINBASE_RESERVE, verify_scripts: false,
+        }).unwrap();
+        assert_eq!(tmpl.hardened, hardened);
+        assert!(tmpl.transactions.len() < 4_000, "the mempool holds more than one block");
+        let prefix: Vec<u8> = tmpl.coinbase_commitment().map(|c| c.to_vec()).unwrap_or_default();
+        let max_extra = template::external_coinbase_max_extra(prefix.len(), hardened, template::EXTERNAL_COINBASE_RESERVE);
+
+        // Assemble the block as an external miner does from the RPC fields.
+        let external = |extra: usize| -> Block {
+            let mut script_sig = prefix.clone();
+            script_sig.extend(std::iter::repeat_n(0xE7u8, extra));
+            let cb = Transaction {
+                version: 1,
+                inputs: vec![TxInput { prev_txid: [0; 32], prev_index: u32::MAX, script_sig, sequence: u32::MAX }],
+                outputs: vec![TxOutput {
+                    value: tmpl.subsidy + tmpl.total_fees,
+                    script_pubkey: vec![0x44; template::EXTERNAL_COINBASE_MAX_SPK],
+                }],
+                locktime: 0,
+            };
+            let root = block_rules::merkle_root_from_coinbase_branch(&cb.txid(), &tmpl.coinbase_merkle_branch(), hardened);
+            Block {
+                header: BlockHeader {
+                    version: 1, parents: tmpl.parents.clone(), merkle_root: root,
+                    timestamp: tmpl.parent_timestamp + 1, bits: tmpl.bits, nonce: 0,
+                },
+                transactions: std::iter::once(cb).chain(tmpl.transactions.iter().map(|(t, _)| t.clone())).collect(),
+                blue_score: tmpl.blue_score,
+                height: tmpl.height,
+                shielded_transactions: vec![],
+            }
+        };
+        let ok = external(max_extra);
+        let size = block_rules::block_size_for_rules(&ok, hardened);
+        assert!(size <= core::MAX_BLOCK_SIZE, "size {size}");
+        assert!(size > core::MAX_BLOCK_SIZE - 2_000, "the template is full: {size}");
+        assert_eq!(ok.validate_structure_without_pow_at(act), Ok(()));
+        assert_eq!(block_rules::check_block_hardened_at(&ok, act), Ok(()));
+        assert_eq!(template::check_template_block_at(&ok, tmpl.total_fees, act), Ok(()));
+
+        // The pre-fix advertisement: the consensus script_sig cap.
+        let old = external(core::limits::MAX_SCRIPT_SIG_SIZE - prefix.len());
+        assert_eq!(old.validate_structure_without_pow_at(act), Err("block too large"));
+    }
+}
+
 // ── POW-3: pow limit ─────────────────────────────────────────────────────────
 
 /// The real ASERT path (`expected_bits_at`, never pinned by the dev-only
