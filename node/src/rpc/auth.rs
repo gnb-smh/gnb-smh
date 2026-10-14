@@ -87,6 +87,7 @@ pub const WRITE_METHODS: &[&str] = &[
     "sendrawtransaction",
     "submitblock",
     "getblocktemplate",
+    "submitpowititem",
 ];
 
 /// Type alias for a direct (non-keyed) in-memory rate limiter.

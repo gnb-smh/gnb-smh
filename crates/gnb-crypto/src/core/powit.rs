@@ -374,10 +374,16 @@ pub struct BlockInput<'a> {
 }
 
 /// The including block's selected chain, for target checks.
+///
+/// Checkpoint slot `c` names the highest block on the selected chain whose
+/// height is strictly below `c`. Heights along a selected chain can skip
+/// (a selected parent need not be the tallest parent), so a slot always has
+/// a block, and the same slot names the same block on every node that shares
+/// that part of the chain.
 pub trait ChainView {
-    /// Hash of the selected-chain block at `height` (strictly below the
-    /// including block), or `None` if out of range.
-    fn selected_at(&self, height: u64) -> Option<[u8; 32]>;
+    /// The block slot `c` names, on the including block's selected chain
+    /// (which excludes the including block itself), or `None` if unknown.
+    fn selected_at(&self, slot: u64) -> Option<[u8; 32]>;
 }
 
 /// PoWit state after a block. Stored per block; deterministic.
@@ -405,8 +411,10 @@ pub struct PowitState {
 }
 
 impl PowitState {
-    /// State at the activation block itself: it is the first checkpoint,
-    /// justified and final by definition.
+    /// Base state for the first block at or above activation on a chain:
+    /// the checkpoint at slot `activation` (the last selected-chain block
+    /// below activation) is justified and final by definition. The first
+    /// activated block is then applied on top of it like any other.
     pub fn genesis(activation: u64, activation_hash: [u8; 32]) -> Self {
         let cp = Checkpoint { height: activation, hash: activation_hash };
         PowitState {
@@ -460,8 +468,8 @@ impl PowitState {
         -> Result<PowitState, String>
     {
         let act = self.activation;
-        if b.height <= act {
-            return Err("powit: block at or below activation".into());
+        if b.height < act {
+            return Err("powit: block below activation".into());
         }
         if b.attestations.len() > p.max_attestations_per_block {
             return Err("powit: too many attestations".into());
@@ -523,8 +531,8 @@ impl PowitState {
         for a in b.attestations {
             let k = a.key_id();
             let t = a.target;
-            if !p.is_checkpoint(act, t.height) || t.height >= b.height {
-                return Err("powit: target is not a past checkpoint".into());
+            if !p.is_checkpoint(act, t.height) || t.height > b.height {
+                return Err("powit: target is not a checkpoint slot at or below this block".into());
             }
             if b.height > t.height + p.vote_ttl {
                 return Err("powit: attestation expired".into());

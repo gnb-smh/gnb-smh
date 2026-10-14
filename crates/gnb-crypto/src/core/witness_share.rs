@@ -54,7 +54,7 @@ pub const MAX_PAYOUT_SCRIPT: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WitnessShare {
-    /// DAG hash of the attested block.
+    /// Block id (`Block::block_hash`) of the attested block.
     pub attested: [u8; 32],
     /// script_pubkey that receives the attester's reward.
     pub payout: Vec<u8>,
@@ -215,7 +215,7 @@ where
     if share.payout.len() > MAX_PAYOUT_SCRIPT {
         return Err(ShareError::PayoutTooLong);
     }
-    if share.attested != attested.header.dag_hash() {
+    if share.attested != attested.block_hash() {
         return Err(ShareError::WrongAttestedBlock);
     }
     if share.bits != attested.header.bits {
@@ -307,7 +307,7 @@ mod tests {
     }
 
     fn mine(b: &Block, payout: &[u8]) -> WitnessShare {
-        let mut s = WitnessShare { attested: b.header.dag_hash(), payout: payout.to_vec(), bits: b.header.bits, nonce: 0 };
+        let mut s = WitnessShare { attested: b.block_hash(), payout: payout.to_vec(), bits: b.header.bits, nonce: 0 };
         while verify_share(&s, b, stub).is_err() {
             s.nonce += 1;
         }

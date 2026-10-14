@@ -1544,6 +1544,29 @@ impl GhostDAG {
         self.best_bodied_tip(has_body).into_iter().collect()
     }
 
+    /// Parents for a block template: bodied tips by blue work (heaviest
+    /// first), at most `MAX_TEMPLATE_PARENTS`, then the lightest dropped until
+    /// the mergeset fits `MERGESET_SIZE_LIMIT`. Using every tip let a fast
+    /// network (many parallel tips) build templates whose mergeset broke the
+    /// limit, so the node rejected its own blocks.
+    pub fn template_parents<F: Fn(&BlockHash) -> bool>(&self, has_body: F) -> Vec<BlockHash> {
+        let mut tips = self.bodied_tips(has_body);
+        tips.sort_by(|a, b| {
+            let wa = self.store.get(a).map(|d| d.blue_work).unwrap_or(0);
+            let wb = self.store.get(b).map(|d| d.blue_work).unwrap_or(0);
+            wb.cmp(&wa).then(a.cmp(b))
+        });
+        tips.truncate(MAX_TEMPLATE_PARENTS);
+        while tips.len() > 1 {
+            let Some(sp) = self.preview_selected_parent(&tips) else { break };
+            if compute_mergeset(&self.store, &tips, &sp).len() <= MERGESET_SIZE_LIMIT {
+                break;
+            }
+            tips.pop();
+        }
+        tips
+    }
+
     pub fn block_count(&self) -> usize {
         self.store.data.len()
     }
@@ -1689,6 +1712,9 @@ pub enum ConsensusError {
 /// chain). With k = 10 and 30-second blocks an honest mergeset stays near k;
 /// the live chain's has never exceeded 2. Bounds coloring and validation work
 /// per block (Kaspa enforces the same kind of limit).
+/// Parents a template references at most (Kaspa uses 10).
+pub const MAX_TEMPLATE_PARENTS: usize = 10;
+
 pub const MERGESET_SIZE_LIMIT: usize = 64;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

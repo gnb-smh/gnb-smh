@@ -310,6 +310,11 @@ pub enum NetworkMessage {
         timestamp:  u64,
     },
     VersionAck,
+    /// PoWit item (witness share, attestation or equivocation proof), relayed
+    /// like a transaction: only after the node validated it (`TxVerdict`
+    /// keyed by `id`). Appended last so older peers decode it as malformed
+    /// (ignored), never as another variant.
+    NewPowitItem { id: [u8; 32], kind: u8, data: Vec<u8> },
 }
 
 
@@ -332,6 +337,7 @@ impl NetworkMessage {
         match self {
             NetworkMessage::NewBlock { .. } => "NewBlock",
             NetworkMessage::NewTransaction { .. } => "NewTransaction",
+            NetworkMessage::NewPowitItem { .. } => "NewPowitItem",
             NetworkMessage::PeerTip { .. } => "PeerTip",
             NetworkMessage::PeerExchange { .. } => "PeerExchange",
             NetworkMessage::PeerRequest => "PeerRequest",
@@ -398,6 +404,9 @@ pub const MAX_WIRE_LOCATOR: usize = 64;
 pub const MAX_WIRE_GETHEADERS_LIMIT: u32 = 2000;
 /// Max user_agent length in a Version handshake.
 pub const MAX_WIRE_USER_AGENT_LEN: usize = 128;
+/// Largest PoWit gossip item: an equivocation proof (two attestations, each
+/// with an 8 KiB key and signature bound) fits well inside.
+pub const MAX_WIRE_POWIT_ITEM: usize = 40 * 1024;
 /// Max peer_id string length in a PeerTip (base58 libp2p PeerIds are ~52 chars).
 pub const MAX_WIRE_PEER_ID_LEN: usize = 128;
 
@@ -481,6 +490,14 @@ fn validate_wire_bounds(msg: &NetworkMessage) -> Result<(), WireDecodeError> {
         NetworkMessage::NewTransaction { tx_data, .. } => {
             if tx_data.len() > MAX_WIRE_BYTES {
                 return Err(Bounds("tx_data larger than MAX_WIRE_BYTES"));
+            }
+        }
+        NetworkMessage::NewPowitItem { data, kind, .. } => {
+            if data.len() > MAX_WIRE_POWIT_ITEM {
+                return Err(Bounds("PoWit item larger than MAX_WIRE_POWIT_ITEM"));
+            }
+            if !(1..=3).contains(kind) {
+                return Err(Bounds("unknown PoWit item kind"));
             }
         }
         NetworkMessage::PeerTip { peer_id, .. } => {
@@ -1327,7 +1344,8 @@ impl NetworkNode {
                                 }
                                 WireReaction::Accept(NetworkMessage::NewBlock { .. }) => {}
                                 // Decided below: rate limit, then the mempool verdict.
-                                WireReaction::Accept(NetworkMessage::NewTransaction { .. })
+                                WireReaction::Accept(NetworkMessage::NewTransaction { .. }
+                                                     | NetworkMessage::NewPowitItem { .. })
                                     if tx_verdict_rx.is_some() => {}
                                 WireReaction::Accept(_) => {
                                     let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
@@ -1520,7 +1538,8 @@ impl NetworkNode {
                                         &mut swarm, propagation_source, Some(message_id), msg,
                                         true, "gossip",
                                     );
-                                } else if let (NetworkMessage::NewTransaction { txid, .. }, true) =
+                                } else if let (NetworkMessage::NewTransaction { txid, .. }
+                                               | NetworkMessage::NewPowitItem { id: txid, .. }, true) =
                                     (&msg, tx_verdict_rx.is_some())
                                 {
                                     let now = Instant::now();
@@ -1983,6 +2002,7 @@ impl NetworkNode {
                     let (topic, topic_name) = match &msg {
                         NetworkMessage::NewBlock { .. }        => (block_t.clone(), "blocks"),
                         NetworkMessage::NewTransaction { .. }  => (tx_t.clone(),    "txs"),
+                        NetworkMessage::NewPowitItem { .. }    => (tx_t.clone(),    "txs"),
                         _                                      => (sync_t.clone(),  "sync"),
                     };
                     if let Ok(data) = bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {

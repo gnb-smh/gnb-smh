@@ -36,6 +36,7 @@ mod coherence;    // Coherence C2 shielded pool
 mod dandelion;    // Coherence P3 Dandelion++ tx-relay privacy
 mod tip;
 mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer
+mod powit;        // PoW + PoWit: witness shares, attestations, finality (node side)
 
 use clap::Parser;
 use log::{info, warn, error, debug};
@@ -77,6 +78,15 @@ struct Cli {
     /// finality). TESTNET ONLY: refused without --testnet. Mainnet activation
     /// is a consensus constant (core::POWIT_HEIGHT_MAINNET).
     #[arg(long)]                                         powit_height: Option<u64>,
+    /// PoWit witness: an encrypted `gnb-cli newwallet` file. The node mines
+    /// witness shares paying this key and, once it is in the witness set,
+    /// signs checkpoints with it. Needs --witness-password-file.
+    #[arg(long)]                                         witness_wallet: Option<PathBuf>,
+    /// File whose first line is the witness wallet password (keep it 0600).
+    #[arg(long)]                                         witness_password_file: Option<PathBuf>,
+    /// Threads mining witness shares (GnB-SMH v3, 4 MiB each). Default 2 when
+    /// a witness wallet is set.
+    #[arg(long)]                                         share_threads: Option<usize>,
     #[arg(long, default_value = "./gnb-data")]            data_dir: String,
     /// RPC bind address. SECURITY: defaults to 127.0.0.1 (local only).
     /// Use --rpc-public to bind 0.0.0.0, which exposes RPC to the internet.
@@ -1322,6 +1332,28 @@ async fn main() {
                 }
 
                 // Add validated tx to mempool
+                // PoWit items (shares, attestations, equivocation proofs):
+                // validated off the reactor, then the same verdict channel as
+                // transactions decides whether the network loop relays them.
+                network::NetworkMessage::NewPowitItem { id: claimed, kind, data } => {
+                    let valid = if powit::item_id(kind, &data) != claimed {
+                        false
+                    } else {
+                        let dag_v = dag2.clone();
+                        let store_v = store2.clone();
+                        let r = tokio::task::spawn_blocking(move || {
+                            let d = dag_v.read();
+                            powit::admit_item(kind, &data, &d, &store_v)
+                        }).await;
+                        match r {
+                            Ok(Ok(())) => true,
+                            Ok(Err(e)) => { debug!("PoWit item rejected: {}", e); false }
+                            Err(e) => { warn!("PoWit verify task failed: {}", e); false }
+                        }
+                    };
+                    let _ = tx_verdict2.send(network::TxVerdict { txid: claimed, valid });
+                }
+
                 network::NetworkMessage::NewTransaction { txid: claimed, tx_data } => {
                     // Every gossiped transaction gets a verdict, so the network
                     // loop relays exactly the ones this mempool accepted.
@@ -1530,6 +1562,102 @@ async fn main() {
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
 
+    // ── PoWit witness: share mining + checkpoint attestations ──────────────
+    if let Some(wallet) = cli.witness_wallet.clone() {
+        let Some(pw) = cli.witness_password_file.clone() else {
+            eprintln!("--witness-wallet needs --witness-password-file");
+            std::process::exit(2);
+        };
+        let duty = match powit::WitnessDuty::load(&wallet, &pw, &data_path) {
+            Ok(d) => Arc::new(d),
+            Err(e) => { eprintln!("witness: {}", e); std::process::exit(2); }
+        };
+        info!("🛡  PoWit witness key {} (activation {})", hex::encode(duty.key_id),
+              match core::powit_height() { u64::MAX => "off".to_string(), h => h.to_string() });
+
+        // Duty loop: prune the pool, sign the newest checkpoint once, gossip
+        // equivocation proofs.
+        {
+            let (dag_w, store_w, otx_w, duty_w) = (dag.clone(), store.clone(), outbound_tx.clone(), duty.clone());
+            let mut tip_rx_w = tip_tx.subscribe();
+            tokio::spawn(async move {
+                let mut sent_evidence: HashSet<[u8; 20]> = HashSet::new();
+                loop {
+                    // Every new tip, or every 2 s.
+                    tokio::select! {
+                        _ = tip_rx_w.recv() => {}
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                    }
+                    let (dag_b, store_b, duty_b) = (dag_w.clone(), store_w.clone(), duty_w.clone());
+                    let out = tokio::task::spawn_blocking(move || {
+                        let d = dag_b.read();
+                        powit::pool().prune(&d, &store_b);
+                        let att = match duty_b.maybe_attest(&d, &store_b) {
+                            Ok(Some(a)) => {
+                                let _ = powit::pool().admit_attestation(a.clone(), &d, &store_b);
+                                Some(a)
+                            }
+                            Ok(None) => None,
+                            Err(e) => { warn!("witness: {}", e); None }
+                        };
+                        (att, powit::pool_evidence())
+                    }).await;
+                    let Ok((att, evidence)) = out else { continue };
+                    if let Some(a) = att {
+                        info!("🛡  attested checkpoint slot {} ({})", a.target.height, hex::encode(&a.target.hash[..8]));
+                        let (id, kind, data) = powit::attestation_item(&a);
+                        let _ = otx_w.try_send(network::NetworkMessage::NewPowitItem { id, kind, data });
+                    }
+                    for ev in evidence {
+                        if sent_evidence.insert(ev.a.key_id()) {
+                            warn!("🛡  equivocation by witness {} — proof gossiped", hex::encode(ev.a.key_id()));
+                            let (id, kind, data) = powit::evidence_item(&ev);
+                            let _ = otx_w.try_send(network::NetworkMessage::NewPowitItem { id, kind, data });
+                        }
+                    }
+                }
+            });
+        }
+
+        // Share miners: read the tip under a short lock, mine without it.
+        let threads = cli.share_threads.unwrap_or(2);
+        for t in 0..threads {
+            let (dag_s, store_s, otx_s, payout) = (dag.clone(), store.clone(), outbound_tx.clone(), duty.payout_script.clone());
+            std::thread::Builder::new().name(format!("share-miner-{t}")).spawn(move || {
+                let stop = std::sync::atomic::AtomicBool::new(false);
+                loop {
+                    let tip = {
+                        let d = dag_s.read();
+                        d.selected_tip().and_then(|h| d.get_block_data(&h).map(|bd| (h, bd.height)))
+                    };
+                    let Some((tip, tip_h)) = tip.filter(|(_, h)| core::powit_active(h + 1)) else {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        continue;
+                    };
+                    let Some(attested) = store_s.get_block(&tip).ok().flatten() else {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        continue;
+                    };
+                    if let Some(share) = powit::mine_share(&attested, tip, &payout, rand::random(), 16, &stop) {
+                        let admitted = {
+                            let d = dag_s.read();
+                            powit::pool().admit_share(share.clone(), &d, &store_s)
+                        };
+                        match admitted {
+                            Ok(_) => {
+                                debug!("share found on h={}", tip_h);
+                                let (id, kind, data) = powit::share_item(&share);
+                                let _ = otx_s.try_send(network::NetworkMessage::NewPowitItem { id, kind, data });
+                            }
+                            Err(e) => debug!("own share not admitted: {}", e),
+                        }
+                    }
+                }
+            }).expect("spawn share miner");
+        }
+        info!("🛡  {} share-miner thread(s)", threads);
+    }
+
     // ── Continuous Mining Loop ────────────────────────────────────────────────
     if cli.mine {
         // Fresh-miner fork guard: if the operator configured a bootstrap peer
@@ -1671,7 +1799,7 @@ async fn main() {
                     // parent. This is exactly what wedged the founder behind a
                     // bodyless header. Fall back to the nearest bodied ancestor
                     // when every tip is header-only.
-                    let tips = d.bodied_tips(|h| store_m.get_block(h).ok().flatten().is_some());
+                    let tips = d.template_parents(|h| store_m.get_block(h).ok().flatten().is_some());
                     let h = tips.iter()
                         .filter_map(|t| d.get_block_data(t))
                         .map(|data| data.height)
@@ -1752,12 +1880,20 @@ async fn main() {
                     }
                     (txs, fees)
                 };
-                // Fair launch: 100% of subsidy + fees to the miner, one output.
-                let subsidy = core::tokenomics::block_subsidy_sat(block_height);
-                let cb_outputs = vec![core::TxOutput {
-                    value:         subsidy.saturating_add(total_fees),
-                    script_pubkey: miner_spk.clone(),
-                }];
+                // PoWit section (from powit_height): shares, attestations and
+                // equivocation proofs from the pool, re-checked against this
+                // template's own selected chain so the block is always valid.
+                let powit_body = {
+                    let d = dag_m.read();
+                    match d.preview_selected_parent(&tips) {
+                        Some(sp) => powit::template_body(powit::pool(), &d, &store_m, sp, block_height),
+                        None => Default::default(),
+                    }
+                };
+                // Coinbase: below activation 100% of subsidy + fees to the
+                // miner; from it, the miner's part plus one output per share.
+                let cb_outputs = core::Block::coinbase_outputs(
+                    block_height, miner_spk.clone(), total_fees, &powit_body.shares);
 
                 let coinbase = core::Transaction {
                     version: 1,
@@ -1793,11 +1929,12 @@ async fn main() {
                     transactions: all_txs,
                     blue_score:   current_blue_score + 1,
                     height:       block_height,
-                    shielded_transactions: Vec::new(), powit: Default::default(),
+                    shielded_transactions: Vec::new(), powit: powit_body,
                 };
                 // From WITNESS_COMMITMENT_HEIGHT the coinbase commits to every
                 // witness (refreshes the merkle root).
                 block.commit_witnesses();
+                block.header.merkle_root = block.body_merkle_root();
 
                 // GnB-SMH search. Short rounds (MINE_ROUND_ATTEMPTS nonces per
                 // thread, ~10-20 s on a typical core) so the template — tips,
@@ -2343,6 +2480,25 @@ fn accept_block(
         }
     }
 
+    // ── PoWit section, in context (from powit_height) ────────────────
+    // Share proofs, attested blocks and share uniqueness against this
+    // block's own selected chain, then the witness-set state transition
+    // (attestations, equivocation proofs, justification, finality). The
+    // block hash commits to the section, so a rule failure is a verdict on
+    // the block; `storage:` errors are local and reject only this copy.
+    let powit_state = {
+        let d = dag.read();
+        powit::block_state(block, &block_hash, &d, store)
+    };
+    let powit_state = match powit_state {
+        Ok(s) => s,
+        Err(e) if e.starts_with("storage:") => return Err(e),
+        Err(e) => {
+            reorg::mark_block_invalid(store, &block_hash);
+            return Err(format!("consensus rejection: {}", e));
+        }
+    };
+
     // ── Add to DAG ───────────────────────────────────────────────────
     //
     // Sprint U.4 — capture the selected tip BEFORE add_block so we can
@@ -2394,6 +2550,14 @@ fn accept_block(
     if let Err(e) = store.put_block(block) {
         dag.write().remove_block(&block_hash);
         return Err(e.to_string());
+    }
+    // The block's PoWit state, keyed by its hash (deterministic; inert if the
+    // block never joins the selected chain).
+    if let Some(st) = &powit_state {
+        if let Err(e) = powit::save_state(store, &block_hash, st) {
+            dag.write().remove_block(&block_hash);
+            return Err(e);
+        }
     }
 
     // Informational only (RPC / tip notifications): the bits of the most
@@ -2543,6 +2707,18 @@ fn accept_block(
                 }
             };
 
+            // Never roll back a finalized block: with PoWit the finalized
+            // checkpoint can sit far closer to the tip than MAX_REORG_DEPTH.
+            if finality_on {
+                let lca_h = dag.read().get_block_data(&plan.lca).map(|d| d.height).unwrap_or(0);
+                if lca_h < finalized_height {
+                    dag.write().remove_block(&block_hash);
+                    return Err(format!(
+                        "finality: reorg forks at h={} below the finalized height {}",
+                        lca_h, finalized_height));
+                }
+            }
+
             info!(
                 "🔀 Reorg at h={}: rollback {} blocks, apply {} blocks (lca={})",
                 block.height,
@@ -2646,11 +2822,23 @@ fn accept_block(
         let d = dag.read();
         d.selected_tip().and_then(|h| d.get_block_data(&h)).map(|bd| bd.blue_work).unwrap_or(0)
     };
-    if tip_height > core::CHECKPOINT_DEPTH
+    // PoWit: the height of the block the tip's chain has finalized by witness
+    // attestations (one read-lock scope; no nested read guards).
+    let powit_finalized = {
+        let d = dag.read();
+        d.selected_tip()
+            .and_then(|t| powit::load_state(store, &t))
+            // The activation checkpoint is final only by definition; it must
+            // not pin fork choice (two chains may compete right at activation).
+            .filter(|st| st.finalized.height > st.activation)
+            .and_then(|st| d.get_block_data(&st.finalized.hash).map(|bd| bd.height))
+    };
+    if (tip_height > core::CHECKPOINT_DEPTH || powit_finalized.is_some())
         && !FINALITY_FROZEN.load(std::sync::atomic::Ordering::Relaxed)
         && core::finality_active(tip_work)
     {
-        let new_finalized = tip_height - core::CHECKPOINT_DEPTH;
+        let new_finalized = tip_height.saturating_sub(core::CHECKPOINT_DEPTH)
+            .max(powit_finalized.unwrap_or(0));
         let current_finalized = store.get_meta("finalized_height").ok().flatten()
             .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
             .unwrap_or(0);

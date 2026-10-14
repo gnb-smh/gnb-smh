@@ -1,15 +1,56 @@
-# PoW + PoWit (Proof of Witnesses) — draft, not consensus
+# PoW + PoWit (Proof of Witnesses)
 
 A pure proof-of-work chain (no stake, no appointed validators) in which the
 miners who *proved custody of the chain's witness data* over the last week
 deterministically form the set that finalizes checkpoints with post-quantum
 signatures. Built from three pieces:
 
-| Piece | Status |
+| Piece | Code |
 | --- | --- |
-| Block PoW: GnB-SMH v3 (4 MiB, Argon2d-style fill) | draft, `crates/gnb-smh/src/v3.rs` |
-| Witness shares (custody proof + reward) | draft, `crates/gnb-crypto/src/core/witness_share.rs` |
-| Witness set + checkpoint attestations + finality rule (rev. 2: ebb-and-flow, accountable safety, inactivity decay) | this document (not implemented) |
+| Block PoW: GnB-SMH v3 (4 MiB, Argon2d-style fill) | `crates/gnb-smh/src/v3.rs`, `core::pow_algo` |
+| Witness shares (custody proof + reward) | `core::witness_share`, `node/src/powit.rs` |
+| Witness set, attestations, justification/finality, equivocation, decay | `core::powit` (pure state machine), `node/src/powit.rs` |
+
+## Status
+
+Implemented and consensus from `core::powit_height()`. **Mainnet keeps it
+OFF** (`POWIT_HEIGHT_MAINNET = u64::MAX`) until a release fixes the height;
+a testnet node sets it with `--testnet --powit-height <h>`.
+
+Implementation choices that refine the design below:
+
+- **Witness set size 64** (not 256): every attestation carries a hybrid
+  public key and signature (~8 KiB), so 64 members keep a full round of votes
+  under ~0.5 MB per checkpoint.
+- **Checkpoint slots.** Slot `c` names the highest selected-chain block with
+  height strictly below `c`. Heights along a selected chain can skip, so a
+  slot always resolves, identically on every node sharing that chain.
+- **Work continuity.** v3 targets are 4x harder than the ASERT schedule and
+  each v3 block's chain work is divided by 4, so cumulative work (and
+  `MIN_CHAIN_WORK`) stays comparable across the switch.
+- **Accountability.** An equivocation bars the key from the witness set and
+  from share rewards for `ban_epochs`; burning already-paid share rewards
+  (escrow) is not implemented.
+- **Witness node.** `--witness-wallet <gnb-cli wallet> --witness-password-file <f>`
+  mines shares paying that key (`--share-threads`, default 2) and signs the
+  newest checkpoint once it is a member, with a persistent vote record that
+  refuses any double or surround vote, across restarts and reorgs.
+- **Node finality.** The node never reorganises below the height of the block
+  its tip's chain finalized (`finalized_height`), in addition to the depth rule.
+
+Parameters (`core::powit::MAINNET_PARAMS` / `TESTNET_PARAMS`):
+
+| | Mainnet | Testnet |
+| --- | --- | --- |
+| Epoch | 720 blocks (~6 h) | 20 |
+| Checkpoint interval | 60 (~30 min) | 5 |
+| Window | 28 epochs (~7 days) | 3 |
+| Witnesses | 64 | 64 |
+| Attestations / block | 32 | 32 |
+| Vote lifetime | 720 blocks | 20 |
+| Decay starts after | 4 epochs without finality | 4 |
+| Ban | 28 epochs | 3 |
+
 
 ## 1. Block PoW: GnB-SMH v3
 

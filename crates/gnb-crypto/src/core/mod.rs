@@ -1249,7 +1249,7 @@ impl Block {
         if let Some(input) = self.transactions[0].inputs.first_mut() {
             input.script_sig.extend_from_slice(&commitment);
         }
-        self.header.merkle_root = Transaction::merkle_root(&self.transactions);
+        self.header.merkle_root = self.body_merkle_root();
     }
 
     /// From [`WITNESS_COMMITMENT_HEIGHT`], the coinbase commits to every

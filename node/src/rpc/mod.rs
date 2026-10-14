@@ -1244,6 +1244,37 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             }
         }
 
+        // submitpowititem [kind, hex]: kind 1 = witness share, 2 = attestation,
+        // 3 = equivocation proof. Validated like a gossiped item, then relayed.
+        "submitpowititem" => {
+            let kind = params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(0);
+            let data = match params.and_then(|p| p.get(1)).and_then(|v| v.as_str()).map(hex::decode) {
+                Some(Ok(d)) => d,
+                _ => return json!({ "error": "usage: submitpowititem [kind, hex]" }),
+            };
+            if !(1..=3).contains(&kind) || data.len() > crate::network::MAX_WIRE_POWIT_ITEM {
+                return json!({ "error": "bad kind or item too large" });
+            }
+            let kind = kind as u8;
+            let res = {
+                let dag = state.dag.read();
+                crate::powit::admit_item(kind, &data, &dag, &state.store)
+            };
+            match res {
+                Ok(()) => {
+                    let id = crate::powit::item_id(kind, &data);
+                    let _ = state.outbound_tx.try_send(NetworkMessage::NewPowitItem { id, kind, data });
+                    json!({ "accepted": true, "id": hex::encode(id) })
+                }
+                Err(e) => json!({ "accepted": false, "error": e }),
+            }
+        }
+
+        "getpowitinfo" => {
+            let dag = state.dag.read();
+            crate::powit::info_json(&dag, &state.store)
+        }
+
         "getdaginfo" => {
             let dag = state.dag.read();
             let tips = dag.tips();

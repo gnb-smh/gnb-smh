@@ -115,6 +115,39 @@ fn main() {
             ("decoderawtransaction", serde_json::json!([params[0]]))
         }
 
+        "submitpowit" => {
+            require_params(params, 2, "submitpowit <kind 1|2|3> <hex>");
+            let kind: u64 = params[0].parse().unwrap_or(0);
+            ("submitpowititem", serde_json::json!([kind, params[1]]))
+        }
+        // Sign a PoWit link with a wallet key and print the attestation hex
+        // (kind 2). For witness operators and tests; the node's own witness
+        // duty never signs conflicting links, this command does not check.
+        "powitattest" => {
+            require_params(params, 6,
+                "powitattest <wallet.json> <mainnet|testnet> <src_slot> <src_hash> <tgt_slot> <tgt_hash>");
+            let pw = std::env::var("GNB_WALLET_PASSWORD").unwrap_or_else(|_| read_password("Wallet password: "));
+            let kp = match gnb::wallet::Keypair::load_encrypted(std::path::Path::new(params[0]), &pw) {
+                Ok(k) => k,
+                Err(e) => { eprintln!("load failed: {}", e); process::exit(1); }
+            };
+            let chain = if params[1] == "testnet" { gnb::core::ChainId::Testnet } else { gnb::core::ChainId::Mainnet };
+            let cp = |slot: &str, h: &str| -> gnb::core::powit::Checkpoint {
+                let mut hash = [0u8; 32];
+                let b = hex::decode(h).unwrap_or_default();
+                if b.len() != 32 { eprintln!("hash must be 32 bytes hex"); process::exit(1); }
+                hash.copy_from_slice(&b);
+                gnb::core::powit::Checkpoint { height: slot.parse().unwrap_or(0), hash }
+            };
+            let att = gnb::core::powit::Attestation::sign(chain, cp(params[2], params[3]), cp(params[4], params[5]),
+                                                          &kp.public_key, &kp.private_key)
+                .unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            println!("{}", hex::encode(att.to_wire_bytes()));
+            return;
+        }
+        "getpowitinfo" | "powit" => {
+            ("getpowitinfo", serde_json::Value::Null)
+        }
         "getdaginfo" | "dag" => {
             ("getdaginfo", serde_json::Value::Null)
         }
@@ -880,6 +913,7 @@ fn print_usage() {
     gnb-cli mempool                       Mempool info
     gnb-cli peers                         Peer info
     gnb-cli dag                           DAG info (tips, chain, scores)
+    gnb-cli powit                         PoW + PoWit: checkpoints, finality, witness set
 
   BLOCKS
     gnb-cli block <height> [verbose]      Get block by height
