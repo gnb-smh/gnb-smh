@@ -10,7 +10,8 @@
 #
 # Targets and the seed corpus each starts from (corpus/<target>/; the seeds are
 # generated and replayed on stable by node/tests/parser_corpus_floor.rs for
-# the first nine targets and node/tests/fuzz_seed_corpus.rs for the others):
+# the first nine targets except header_parse, and by
+# node/tests/fuzz_seed_corpus.rs for header_parse and the others):
 #
 #   tx_parse          Transaction::from_wire_bytes (+ decode/encode idempotence)
 #   block_parse       Block::from_wire_bytes (+ idempotence)
