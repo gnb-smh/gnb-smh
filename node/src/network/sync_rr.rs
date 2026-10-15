@@ -154,6 +154,17 @@ pub fn as_pull_request(msg: &NetworkMessage) -> Option<SyncRequest> {
     }
 }
 
+/// Whether a directed pull, answered with `resp` by one peer, must be tried on
+/// another peer: `Busy` (back-pressure, NET-5) and `BlockNotFound` (that peer
+/// does not have the body; the selector picks peers without knowing who
+/// announced the block, so it is often not the peer that has it). Every other
+/// answer completes the pull. `BlockNotFound` used to complete it: after a
+/// partition healed, a node asked the one peer that lacked a block and waited
+/// for the 30-60 s sweeps (test/functional/feature_partition_heal.py).
+pub fn retry_pull_elsewhere(resp: &SyncResponse) -> bool {
+    matches!(resp, SyncResponse::Busy | SyncResponse::BlockNotFound { .. })
+}
+
 /// Convert a received `SyncResponse` into the `NetworkMessage` the existing
 /// `main.rs` message-processor already understands, so directed-pull answers
 /// flow through the SAME ingest path as the legacy gossip answers — no change
@@ -815,6 +826,23 @@ mod tests {
             },
             SyncResponse::Busy,
         ]
+    }
+
+    /// Only Busy and BlockNotFound send a pull to another peer; every other
+    /// answer completes it (a BlockNotFound that completed the pull left a
+    /// healing partition waiting for the 30-60 s sweeps). The swarm loop's
+    /// use of it is tested in network/mod.rs (`on_pull_response`).
+    #[test]
+    fn not_found_and_busy_retry_on_another_peer() {
+        // sample_responses(): Block, BlockNotFound, Headers, Tips, Peers, Busy.
+        let expected = [false, true, false, false, false, true];
+        let responses = sample_responses();
+        assert_eq!(responses.len(), expected.len());
+        for (resp, want) in responses.iter().zip(expected) {
+            assert_eq!(retry_pull_elsewhere(resp), want, "{resp:?}");
+        }
+        assert!(!retry_pull_elsewhere(&SyncResponse::Tips { tips: vec![], locator: vec![] }));
+        assert!(!retry_pull_elsewhere(&SyncResponse::Headers { entries: vec![] }));
     }
 
     // 1. Pure bincode frame round-trip for every request/response variant.

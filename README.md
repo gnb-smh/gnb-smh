@@ -30,7 +30,8 @@ Status: pre-release. Not audited.
 | `genesis/` | The Bloch Genesis-3 terminal snapshot the genesis ledger is built from |
 | `crates/pqcrypto-internals` | Vendored fork (patched in through `[patch.crates-io]`), a workspace member so its guard test runs. (The `libp2p-yamux` fork was retired with libp2p 0.57; `node/tests/supply_chain_lockfile_guard.rs` keeps a single yamux >= 0.13.10 and hickory >= 0.26.1 in `Cargo.lock`.) |
 | `node/fuzz` | cargo-fuzz targets (own workspace, nightly): wire decoders and round trips, difficulty, PoW and signature verify, Merkle paths, mempool, block rules, sighash, witnesses, undo records, keystores, addresses, the sync codec, block acceptance in any arrival order ([docs/testing/FUZZING.md](docs/testing/FUZZING.md)) |
-| `docs/` | Protocol notes: [consensus](docs/CONSENSUS.md), [monetary policy and carryover](docs/MONETARY-POLICY.md), [running a node](docs/RUNNING.md), [ledger v1](docs/LEDGER.md); testing: [sanitizers, Miri, 32-bit](docs/testing/SANITIZERS.md), [fuzzing](docs/testing/FUZZING.md) |
+| `docs/` | Protocol notes: [consensus](docs/CONSENSUS.md), [monetary policy and carryover](docs/MONETARY-POLICY.md), [running a node](docs/RUNNING.md), [ledger v1](docs/LEDGER.md); testing: [sanitizers, Miri, 32-bit](docs/testing/SANITIZERS.md), [fuzzing](docs/testing/FUZZING.md), [functional tests](docs/testing/FUNCTIONAL.md) |
+| `test/functional` | Multi-node functional tests and their framework (Python, stdlib only) |
 | `reference/`, `rust/`, `analysis/` | Standalone GnB-SMH v1 reference implementation and GnB ledger v1 (see below) |
 
 ## Build and test
@@ -45,6 +46,9 @@ cargo test -p gnb-smh --locked
 cargo test -p gnb-crypto --locked
 cargo clippy --workspace --all-targets --locked
 cargo deny check && cargo audit
+# Functional tests: real gnb / gnb-cli processes on loopback, built with the
+# test-only `test-pow-limit` feature (docs/testing/FUNCTIONAL.md)
+python3 test/functional/test_runner.py
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of these, the Python references, the

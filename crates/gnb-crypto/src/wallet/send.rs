@@ -6,7 +6,9 @@
 //!    height = `next_block_height`, or `tip_height` + 1 from an older node;
 //!    it selects the transaction version: 3 with sighash v3 at/after the
 //!    hardening activation, 1 below it);
-//! 2. coin selection on the claimed values;
+//! 2. coin selection on the claimed values, among the outputs spendable in
+//!    the next block (a coinbase output, `coinbase_height` in its row, only
+//!    from `COINBASE_MATURITY` blocks after its coinbase);
 //! 3. version 1 only: `getrawtransaction` for every selected outpoint, hashed
 //!    against its txid, so a lying server is detected before anything is
 //!    signed. A version-3 signature commits to every spent value and script,
@@ -111,6 +113,46 @@ pub fn parse_utxo_rows(result: &Value) -> Result<Vec<Utxo>, String> {
     }).collect()
 }
 
+/// Whether the `getutxos` row `row` is spendable in the block at
+/// `next_block_height`: a row carrying `coinbase_height` (an output of a
+/// coinbase) only from `coinbase_height + COINBASE_MATURITY` on
+/// (`core::check_coinbase_maturity`); a row without the field (an older node,
+/// or not a coinbase) is. A malformed field is refused. The one rule every
+/// wallet path selects coins by: `gnb-cli` / `gnb-wallet` (`prepare_send`),
+/// `WalletClient::send_payment` and the browser wallet core
+/// (crates/gnb-wallet-wasm). Selecting an immature output produced a
+/// transaction every node refuses (test/functional/wallet_coinbase_maturity.py).
+pub fn utxo_row_spendable_at(row: &Value, next_block_height: u64) -> Result<bool, String> {
+    match row.get("coinbase_height") {
+        None | Some(Value::Null) => Ok(true),
+        Some(v) => {
+            let h = v.as_u64().ok_or("UTXO coinbase_height must be an integer")?;
+            Ok(next_block_height.saturating_sub(h) >= crate::core::COINBASE_MATURITY)
+        }
+    }
+}
+
+/// Why a payment cannot be built when every coin of `address` is an immature
+/// coinbase output (`immature` of them) at `next_block_height`.
+pub fn all_immature_message(address: &str, immature: usize, next_block_height: u64) -> String {
+    format!("no spendable UTXOs for {address}: {immature} coinbase output(s) still immature at height \
+        {next_block_height} (coinbase outputs mature after {} blocks)", crate::core::COINBASE_MATURITY)
+}
+
+/// `getutxos` rows spendable in the block at `next_block_height`
+/// ([`utxo_row_spendable_at`]), and how many were left out. A malformed row
+/// is refused, like every other malformed row.
+pub fn spendable_utxo_rows(result: &Value, next_block_height: u64) -> Result<(Vec<Utxo>, usize), String> {
+    let utxos = parse_utxo_rows(result)?;
+    let rows = result.get("utxos").and_then(Value::as_array).ok_or("RPC response missing UTXO array")?;
+    let mut spendable = Vec::with_capacity(utxos.len());
+    let mut immature = 0;
+    for (utxo, row) in utxos.into_iter().zip(rows) {
+        if utxo_row_spendable_at(row, next_block_height)? { spendable.push(utxo) } else { immature += 1 }
+    }
+    Ok((spendable, immature))
+}
+
 /// The height of the next block from a `getdaginfo` result: its
 /// `next_block_height` (the height the node's mempool admission and block
 /// template check a transaction against; it can exceed `tip_height` + 1 when
@@ -135,13 +177,18 @@ pub fn prepare_send(rpc: &RpcFn<'_>, req: &SendRequest<'_>) -> Result<PreparedSe
     if let Some(e) = result_error(&result) {
         return Err(format!("getutxos: {e}"));
     }
-    let utxos = parse_utxo_rows(&result)?;
-    if utxos.is_empty() {
+    let all = parse_utxo_rows(&result)?;
+    if all.is_empty() {
         return Err(format!("no UTXOs found for {}", req.keypair.address));
     }
-    let value_seen = utxos.iter().try_fold(0u64, |t, u| t.checked_add(u.output.value))
+    let value_seen = all.iter().try_fold(0u64, |t, u| t.checked_add(u.output.value))
         .ok_or("UTXO value total exceeds u64")?;
     let next_block_height = next_block_height_from_daginfo(&rpc("getdaginfo", &json!([]))?)?;
+    // Coinbase outputs not yet mature at the next block are never selected.
+    let (utxos, immature) = spendable_utxo_rows(&result, next_block_height)?;
+    if utxos.is_empty() {
+        return Err(all_immature_message(&req.keypair.address, immature, next_block_height));
+    }
     let chain_id = ChainId::for_network(req.keypair.network()?);
 
     let mut prevs = PrevTxs::new();
@@ -170,7 +217,7 @@ pub fn prepare_send(rpc: &RpcFn<'_>, req: &SendRequest<'_>) -> Result<PreparedSe
         ..PaymentOptions::default()
     };
     let payment = TxBuilder::build_payment(req.keypair, &utxos, req.to, req.amount, &opts)?;
-    Ok(PreparedSend { payment, utxos_seen: utxos.len(), value_seen })
+    Ok(PreparedSend { payment, utxos_seen: all.len(), value_seen })
 }
 
 /// Step 6: broadcast and check the node echoes the right txid.
@@ -347,6 +394,70 @@ mod tests {
             crate::core::ChainId::Mainnet, act, act);
         assert!(verify(&claimed).is_ok());
         assert!(verify(&real).unwrap_err().contains("invalid signature"));
+    }
+
+    /// Rows for `spendable_utxo_rows` / `prepare_send`: (value, coinbase_height).
+    fn rows(kp: &Keypair, coins: &[(u64, Option<u64>)]) -> Value {
+        let list: Vec<Value> = coins.iter().enumerate().map(|(i, (value, cb))| {
+            let mut row = json!({"txid": hex::encode([i as u8 + 1; 32]), "index": 0,
+                "value": value.to_string(), "script_pubkey": hex::encode(kp.address_bytes())});
+            if let Some(h) = cb { row["coinbase_height"] = json!(h); }
+            row
+        }).collect();
+        json!({ "utxos": list })
+    }
+
+    /// Coinbase outputs are spendable from `coinbase_height +
+    /// COINBASE_MATURITY` on: one below that is left out, at it kept; rows
+    /// without the field are kept; a malformed field is refused.
+    #[test]
+    fn immature_coinbase_rows_are_not_spendable() {
+        use crate::core::COINBASE_MATURITY as M;
+        let kp = super::super::generate_keypair(false);
+        let r = rows(&kp, &[(SAT, None), (2 * SAT, Some(500)), (3 * SAT, Some(500 - M))]);
+        let (ok, immature) = spendable_utxo_rows(&r, 500 + M - 1).unwrap();
+        assert_eq!((ok.iter().map(|u| u.output.value).collect::<Vec<_>>(), immature), (vec![SAT, 3 * SAT], 1));
+        let (ok, immature) = spendable_utxo_rows(&r, 500 + M).unwrap();
+        assert_eq!((ok.len(), immature), (3, 0));
+        let mut bad = r.clone();
+        bad["utxos"][1]["coinbase_height"] = json!("500");
+        assert!(spendable_utxo_rows(&bad, 1_000).is_err());
+    }
+
+    /// The send flow never selects an immature coinbase output, even when it
+    /// is the only coin that covers the payment alone (the old selection
+    /// picked it and the node refused the broadcast), and says why when only
+    /// immature coins are left.
+    #[test]
+    fn cli_send_skips_immature_coinbase_outputs() {
+        let kp = super::super::generate_keypair(false);
+        let to = Address::from_hash([7; 20], Network::Mainnet);
+        let tip = 1_000u64;
+        let utxos = rows(&kp, &[(100 * SAT, Some(tip)), (2 * SAT, Some(tip - 200)), (2 * SAT, None)]);
+        let rpc = |method: &str, _p: &Value| -> Result<Value, String> {
+            Ok(match method {
+                "getdaginfo" => json!({"tip_height": tip, "next_block_height": tip + 1}),
+                "getutxos" => utxos.clone(),
+                _ => json!({"error": "unknown method"}),
+            })
+        };
+        let req = SendRequest { amount: 3 * SAT, ..request(&kp, &to) };
+        let prepared = prepare_send(&rpc, &req).unwrap();
+        let spent: Vec<[u8; 32]> = prepared.payment.tx.inputs.iter().map(|i| i.prev_txid).collect();
+        assert_eq!(spent.len(), 2);
+        assert!(!spent.contains(&[1u8; 32]), "the immature 100 GNB coinbase output was selected");
+        assert_eq!(prepared.utxos_seen, 3);
+
+        let only_immature = rows(&kp, &[(100 * SAT, Some(tip))]);
+        let rpc = |method: &str, _p: &Value| -> Result<Value, String> {
+            Ok(match method {
+                "getdaginfo" => json!({"tip_height": tip}),
+                "getutxos" => only_immature.clone(),
+                _ => json!({"error": "unknown method"}),
+            })
+        };
+        let err = prepare_send(&rpc, &request(&kp, &to)).err().unwrap();
+        assert!(err.contains("immature"), "{err}");
     }
 
     #[test]

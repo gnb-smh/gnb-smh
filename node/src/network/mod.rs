@@ -1390,7 +1390,12 @@ impl NetworkNode {
         let mut recent_block_publishes: std::collections::HashMap<[u8; 32], std::time::Instant> =
             std::collections::HashMap::new();
         const REGOSSIP_SUPPRESS_TTL: Duration = Duration::from_secs(30);
-        let mut heartbeat   = tokio::time::interval(Duration::from_secs(30));
+        // First tick after one period, not at once: at start-up no connection
+        // is established yet, so an immediate tick saw 0 peers and re-dialed
+        // every bootstrap peer the loop above had just dialed (two
+        // connections per peer).
+        let mut heartbeat   = tokio::time::interval_at(
+            tokio::time::Instant::now() + HEARTBEAT_PERIOD, HEARTBEAT_PERIOD);
         let mut save_peers  = tokio::time::interval(Duration::from_secs(60));
         // Sprint CC: periodic tip announce (every 60s).
         let mut tip_announce = tokio::time::interval(Duration::from_secs(60));
@@ -1455,6 +1460,21 @@ impl NetworkNode {
                                     recent_block_publishes.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
                                     recent_block_publishes.insert(*block_hash, now);
                                 }
+                                // Receipt trace of a gossiped transaction, off by
+                                // default (`GOSSIP_RX_TX_LOG_TARGET`): the
+                                // functional tests check with it that an invalid
+                                // transaction never reaches a peer. The decode
+                                // runs only when the trace is enabled.
+                                NetworkMessage::NewTransaction { tx_data, .. }
+                                    if log::log_enabled!(target: GOSSIP_RX_TX_LOG_TARGET, log::Level::Debug) =>
+                                {
+                                    match crate::core::Transaction::from_wire_bytes(tx_data) {
+                                        Ok(tx) => debug!(target: GOSSIP_RX_TX_LOG_TARGET, "← tx {} from {}",
+                                            hex::encode(&tx.txid()[..8]), propagation_source),
+                                        Err(_) => debug!(target: GOSSIP_RX_TX_LOG_TARGET, "← tx (undecodable, {} bytes) from {}",
+                                            tx_data.len(), propagation_source),
+                                    }
+                                }
                                 NetworkMessage::PeerTip { blue_score, height, .. }
                                 | NetworkMessage::Version { blue_score, height, .. } => {
                                     // NET-6: claims are attributed to their signed AUTHOR
@@ -1470,6 +1490,21 @@ impl NetworkNode {
                                             let ht = clamp_announced_blue_score(*height, our_count);
                                             peer_state.observe_claim(a, bs, ht, now);
                                             claim_ok = true;
+                                            // A claim ahead of us: pull the frontier
+                                            // from its AUTHOR, the peer known to have
+                                            // it. The processor's own pulls for this
+                                            // claim go to the selector's choice
+                                            // (rotation, NET-9), often a peer without
+                                            // the blocks. Tips answers are
+                                            // deduplicated by the frontier tracker, so
+                                            // the extra pull fetches nothing twice
+                                            // (Headers answers are not: header pulls
+                                            // stay with the processor). Bounded by
+                                            // the per-author claim limiter above.
+                                            if claim_warrants_directed_pull(bs, our_score) {
+                                                send_directed_pull(&mut swarm, &mut selector, &mut inflight_pull, a,
+                                                    NetworkMessage::GetTips, now);
+                                            }
                                         }
                                     }
                                     if let NetworkMessage::Version { version, user_agent, .. } = &msg {
@@ -1508,13 +1543,22 @@ impl NetworkNode {
                                 }
                             }
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                             info!("✓ connected: {}", peer_id);
                             // DO NOT call gossipsub.add_explicit_peer() here: explicit
                             // peers are excluded from the mesh (libp2p-gossipsub
                             // behaviour.rs), which once made the mesh unbuildable.
-                            peer_count = peer_count.saturating_add(1);
-                            crate::metrics::set_peer_count(peer_count as i64);
+                            let first_connection = num_established.get() == 1;
+                            // The count is of distinct peers, not connections, and the
+                            // processor (RPC `peers`, the miner's has-peers check) sees
+                            // it at once, not at the next 30 s heartbeat.
+                            if first_connection {
+                                peer_count = peer_count.saturating_add(1);
+                                crate::metrics::set_peer_count(peer_count as i64);
+                                sink.deliver(NetworkMessage::PeerCount {
+                                    count: peer_count, addresses: known_peers.iter().cloned().collect(),
+                                }, InboundOrigin::Local, "connect");
+                            }
                             peer_state.on_connect(peer_id, Instant::now());
                             selector.on_connect(peer_id);
                             // PROPAGAÇÃO-CHURN fix: persist only the canonical form of
@@ -1574,6 +1618,18 @@ impl NetworkNode {
                                 attempts: MAX_PULL_ATTEMPTS,
                                 tried: vec![peer_id],
                             }, peer_id));
+                            // Directed frontier exchange with the new peer: its tips,
+                            // asked of IT. The gossip announcements above reach a
+                            // second peer connecting within the same second as
+                            // byte-identical frames, which gossipsub drops as
+                            // duplicates, so a healed partition used to wait for
+                            // the 30 s nudge / 60 s announce (about 60 s;
+                            // test/functional/feature_partition_heal.py). Both ends
+                            // do this, so each learns the other's frontier now.
+                            if first_connection {
+                                send_directed_pull(&mut swarm, &mut selector, &mut inflight_pull, peer_id,
+                                    NetworkMessage::GetTips, now);
+                            }
                             drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, now);
                         }
                         // Mesh fix (fresh-joiner IBD): THIS event is the moment the
@@ -1610,9 +1666,12 @@ impl NetworkNode {
                         }
                         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                             info!("✗ disconnected: {}", peer_id);
-                            peer_count = peer_count.saturating_sub(1);
-                            crate::metrics::set_peer_count(peer_count as i64);
                             if num_established == 0 {
+                                peer_count = peer_count.saturating_sub(1);
+                                crate::metrics::set_peer_count(peer_count as i64);
+                                sink.deliver(NetworkMessage::PeerCount {
+                                    count: peer_count, addresses: known_peers.iter().cloned().collect(),
+                                }, InboundOrigin::Local, "disconnect");
                                 peer_state.on_disconnect(&peer_id);
                                 selector.on_disconnect(&peer_id);
                                 if let Some(tx) = &self.peer_events {
@@ -1701,15 +1760,12 @@ impl NetworkNode {
                                 libp2p::request_response::Message::Response { request_id, response } => {
                                     let now = Instant::now();
                                     let entry = inflight_pull.remove(&request_id);
-                                    if matches!(response, sync_rr::SyncResponse::Busy) {
-                                        // NET-5: back-pressure, not an offence. Back
-                                        // off from this peer and retry elsewhere.
-                                        selector.on_busy(&peer, now);
-                                        if let Some((p, _)) = entry {
-                                            requeue_pull(&mut pending_pulls, p, peer);
-                                        }
-                                    } else {
-                                        selector.on_success(&peer);
+                                    // NET-5 / NET-9: selector bookkeeping, and Busy /
+                                    // BlockNotFound send the pull to another peer
+                                    // (`on_pull_response`); the processor still sees
+                                    // a NotFound below (NET-9 count).
+                                    on_pull_response(entry, &response, peer, &mut selector, &mut pending_pulls, now);
+                                    if !matches!(response, sync_rr::SyncResponse::Busy) {
                                         match response {
                                             sync_rr::SyncResponse::Peers { peers } => {
                                                 // NET-11: solicited addresses go to the
@@ -2014,6 +2070,73 @@ fn requeue_pull(pending: &mut std::collections::VecDeque<PendingPull>, mut p: Pe
     }
     if pending.len() < MAX_PENDING_PULLS {
         pending.push_back(p);
+    }
+}
+
+/// Log target of the debug-level receipt trace of gossiped transactions
+/// (`RUST_LOG=info,gnb_gossip_rx_tx=debug`). Every gossiped block is logged
+/// at info (`← block h=… <hash>`); transactions only with this target.
+pub const GOSSIP_RX_TX_LOG_TARGET: &str = "gnb_gossip_rx_tx";
+
+/// Period of the network heartbeat (peer count, housekeeping, re-subscribe,
+/// bootstrap re-dial with no peers).
+const HEARTBEAT_PERIOD: Duration = Duration::from_secs(30);
+
+/// Whether a tip claim, clamped to `claimed` (blue score), is worth a directed
+/// pull from its author: only a claim ahead of our own selected tip.
+fn claim_warrants_directed_pull(claimed: u64, our_score: u64) -> bool {
+    claimed > our_score
+}
+
+/// Send the pull `msg` (GetTips / GetHeaders / GetBlock / PeerRequest) to
+/// `peer` itself, bypassing the selector's choice: a request about THAT
+/// peer's state (its frontier on connect; the headers and frontier it claims
+/// to have). Never retried on another peer (`attempts` = MAX_PULL_ATTEMPTS);
+/// the answer flows through the same `on_pull_response` / processor path as
+/// any other pull.
+fn send_directed_pull(
+    swarm:    &mut libp2p::Swarm<BlochBehaviour>,
+    selector: &mut sync_rr::PullPeerSelector,
+    inflight: &mut std::collections::HashMap<libp2p::request_response::OutboundRequestId, (PendingPull, PeerId)>,
+    peer:     PeerId,
+    msg:      NetworkMessage,
+    now:      std::time::Instant,
+) {
+    let Some(req) = sync_rr::as_pull_request(&msg) else { return };
+    let id = swarm.behaviour_mut().sync_rr.send_request(&peer, req.clone());
+    debug!("→ directed pull [{}] to {} (its own state)", msg.kind_name(), peer);
+    selector.on_sent(peer, now);
+    inflight.insert(id, (PendingPull { msg, req, attempts: MAX_PULL_ATTEMPTS, tried: vec![peer] }, peer));
+}
+
+/// The answer `response` from `peer` to a directed pull (`entry`: the pull
+/// and the peer it was sent to, `None` for an unknown request id). Updates the
+/// selector (`Busy`: a short back-off; any other answer: a success) and puts
+/// the pull back in `pending` for ANOTHER peer when the answer does not
+/// complete it (`sync_rr::retry_pull_elsewhere`: `Busy`, and `BlockNotFound`,
+/// a peer that does not have the body; bounded by `MAX_PULL_ATTEMPTS`). Every
+/// other answer completes the pull. The swarm loop calls this for every
+/// response, so the retry decision is unit-tested where it is made:
+/// a `BlockNotFound` that completed the pull left a healing partition
+/// waiting for the 30-60 s sweeps (test/functional/feature_partition_heal.py).
+fn on_pull_response(
+    entry:    Option<(PendingPull, PeerId)>,
+    response: &sync_rr::SyncResponse,
+    peer:     PeerId,
+    selector: &mut sync_rr::PullPeerSelector,
+    pending:  &mut std::collections::VecDeque<PendingPull>,
+    now:      std::time::Instant,
+) {
+    if matches!(response, sync_rr::SyncResponse::Busy) {
+        // NET-5: back-pressure, not an offence.
+        selector.on_busy(&peer, now);
+    } else {
+        selector.on_success(&peer);
+    }
+    if sync_rr::retry_pull_elsewhere(response) {
+        if let Some((p, _)) = entry {
+            requeue_pull(pending, p, peer);
+        }
     }
 }
 
@@ -3396,5 +3519,108 @@ mod tests {
             ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, &peers, false, &me, &HashSet::new());
         }
         assert!(book.len() <= pex_validator::PEX_MAX_PER_WINDOW);
+    }
+
+    // ── Directed-pull answers (`on_pull_response`) ──────────────────────────
+
+    use std::time::Instant;
+
+    fn get_block_pull(attempts: u8, tried: Vec<PeerId>) -> PendingPull {
+        let msg = NetworkMessage::GetBlock { block_hash: [5u8; 32], nonce: 1 };
+        let req = sync_rr::as_pull_request(&msg).expect("GetBlock is a directed pull");
+        PendingPull { msg, req, attempts, tried }
+    }
+
+    /// A selector with `peers` connected and one pull in flight to `sent_to`.
+    fn selector_with(peers: &[PeerId], sent_to: PeerId, now: Instant) -> sync_rr::PullPeerSelector {
+        let mut sel = sync_rr::PullPeerSelector::new(HashSet::new());
+        for p in peers {
+            sel.on_connect(*p);
+        }
+        sel.on_sent(sent_to, now);
+        sel
+    }
+
+    /// THE regression for the BlockNotFound retry (feature_partition_heal.py
+    /// waited 80 s to more than 120 s): a peer that does not have the body
+    /// answers NotFound, and the pull goes back in the queue, one attempt
+    /// used, that peer recorded as tried, so the next drain sends it to the
+    /// OTHER peer. The answer counts as a success for the answering peer (no
+    /// back-off). Deleting the requeue fails this test.
+    #[test]
+    fn block_not_found_requeues_the_pull_for_another_peer() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let now = Instant::now();
+        let mut sel = selector_with(&[a, b], a, now);
+        let mut pending = std::collections::VecDeque::new();
+        let not_found = sync_rr::SyncResponse::BlockNotFound { block_hash: [5u8; 32] };
+        on_pull_response(Some((get_block_pull(0, vec![]), a)), &not_found, a, &mut sel, &mut pending, now);
+
+        assert_eq!(pending.len(), 1, "the pull must be retried, not completed");
+        let p = &pending[0];
+        assert_eq!((p.attempts, p.tried.clone()), (1, vec![a]));
+        assert!(matches!(p.req, sync_rr::SyncRequest::GetBlock { block_hash } if block_hash == [5u8; 32]));
+        assert_eq!(sel.in_flight(&a), 0);
+        assert!(!sel.is_cooling_down(&a, now), "NotFound is an answer, not back-pressure");
+        assert_eq!(sel.select(now, &p.tried), Some(b), "the retry goes to the peer not tried yet");
+
+        // B does not have it either: the third attempt would exceed
+        // MAX_PULL_ATTEMPTS, so the pull is dropped (the processor's sweeps
+        // re-issue anything still needed).
+        let p = pending.pop_front().unwrap();
+        sel.on_sent(b, now);
+        on_pull_response(Some((p, b)), &not_found, b, &mut sel, &mut pending, now);
+        assert_eq!((pending.len(), pending[0].attempts, pending[0].tried.clone()), (1, 2, vec![a, b]));
+        let p = pending.pop_front().unwrap();
+        sel.on_sent(a, now);
+        on_pull_response(Some((p, a)), &not_found, a, &mut sel, &mut pending, now);
+        assert!(pending.is_empty(), "dropped after MAX_PULL_ATTEMPTS ({MAX_PULL_ATTEMPTS})");
+    }
+
+    /// Busy (NET-5): back-pressure. The peer backs off and the pull is
+    /// retried elsewhere.
+    #[test]
+    fn busy_backs_the_peer_off_and_requeues_the_pull() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let now = Instant::now();
+        let mut sel = selector_with(&[a, b], a, now);
+        let mut pending = std::collections::VecDeque::new();
+        on_pull_response(Some((get_block_pull(0, vec![]), a)), &sync_rr::SyncResponse::Busy, a,
+            &mut sel, &mut pending, now);
+        assert!(sel.is_cooling_down(&a, now));
+        assert_eq!(sel.in_flight(&a), 0);
+        assert_eq!((pending.len(), pending[0].attempts, pending[0].tried.clone()), (1, 1, vec![a]));
+        assert_eq!(sel.select(now, &[]), Some(b));
+    }
+
+    /// Every other answer completes the pull: nothing is requeued, and an
+    /// answer to an unknown request id requeues nothing either.
+    #[test]
+    fn answers_that_complete_a_pull_do_not_requeue_it() {
+        let entry = || SyncEntry { hash: [1u8; 32], blue_score: 1, height: 1 };
+        for resp in [
+            sync_rr::SyncResponse::Block { block_hash: [5u8; 32], blue_score: 1, height: 1, block_data: vec![1] },
+            sync_rr::SyncResponse::Headers { entries: vec![entry()] },
+            sync_rr::SyncResponse::Headers { entries: vec![] },
+            sync_rr::SyncResponse::Tips { tips: vec![entry()], locator: vec![] },
+            sync_rr::SyncResponse::Peers { peers: vec![] },
+        ] {
+            let a = PeerId::random();
+            let now = Instant::now();
+            let mut sel = selector_with(&[a], a, now);
+            let mut pending = std::collections::VecDeque::new();
+            on_pull_response(Some((get_block_pull(0, vec![]), a)), &resp, a, &mut sel, &mut pending, now);
+            assert!(pending.is_empty(), "{resp:?} completes the pull");
+            assert_eq!(sel.in_flight(&a), 0, "{resp:?}");
+            assert!(!sel.is_cooling_down(&a, now), "{resp:?}");
+        }
+        let a = PeerId::random();
+        let now = Instant::now();
+        let mut sel = selector_with(&[a], a, now);
+        let mut pending = std::collections::VecDeque::new();
+        on_pull_response(None, &sync_rr::SyncResponse::BlockNotFound { block_hash: [5u8; 32] }, a,
+            &mut sel, &mut pending, now);
+        assert!(pending.is_empty());
+        assert_eq!(sel.in_flight(&a), 0);
     }
 }

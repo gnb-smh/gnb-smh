@@ -54,7 +54,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 gnb = { path = ".." }
-# `test-pow-limit` (tests only, the node refuses to start with it) pins every
+# `test-pow-limit` (tests only; a gnb binary with it refuses mainnet, and an
+# optimised one every network: `test_pow_limit_guard` in node/src/main.rs) pins every
 # expected target to the pow limit: one GnB-SMH evaluation seals a block, which
 # is what lets `accept_dag` drive the real pipeline. No other target reads the
 # expected bits or the pow limit.

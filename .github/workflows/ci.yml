@@ -86,6 +86,33 @@ jobs:
           key: workspace-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - name: Build
         run: cargo build --workspace --locked
+      # The functional-test feature `test-pow-limit` (node feature forwarding
+      # gnb-crypto's dev feature; every target is the pow limit) must never be
+      # part of an artifact build: not enabled by the default feature graph of
+      # the build above, not a default feature of the node, and the binary just
+      # built must not be a test build (a test build refuses mainnet with exit
+      # code 2; a production build gets past that guard and stops at the
+      # missing carryover snapshot with exit code 1).
+      - name: Artifact builds never enable test-pow-limit
+        run: |
+          tree=$(cargo tree --workspace --locked -e features,normal,build -i gnb-crypto)
+          echo "$tree"
+          if echo "$tree" | grep -q 'test-pow-limit'; then
+            echo "::error::test-pow-limit is enabled in the artifact build graph"; exit 1
+          fi
+          cargo metadata --locked --no-deps --format-version 1 | python3 -c '
+          import json, sys
+          gnb = next(p for p in json.load(sys.stdin)["packages"] if p["name"] == "gnb")
+          default = gnb["features"].get("default", [])
+          assert "test-pow-limit" not in default, f"test-pow-limit is a default feature: {default}"
+          print("gnb default features:", default)'
+          set +e
+          out=$(./target/debug/gnb --data-dir "$RUNNER_TEMP/artifact-probe" 2>&1); code=$?
+          set -e
+          echo "$out" | tail -3
+          if [ "$code" -eq 2 ] || echo "$out" | grep -q "test-pow-limit"; then
+            echo "::error::target/debug/gnb is a test-pow-limit build"; exit 1
+          fi
       - name: Test
         run: cargo test --workspace --locked
 
@@ -124,6 +151,41 @@ jobs:
         run: |
           cargo test -p gnb-smh --locked --release --lib integer_overflow_panics_in_this_profile 2>&1 \
             | tee /dev/stderr | grep -q "test result: ok. 1 passed; 0 failed; 0 ignored"
+
+  # Functional tests (test/functional, docs/testing/FUNCTIONAL.md): real gnb
+  # node processes on loopback, driven over JSON-RPC and gnb-cli. Needs the
+  # TEST-ONLY build (node feature test-pow-limit, debug profile); that binary
+  # refuses mainnet and is never published.
+  functional:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies (librocksdb-sys needs clang/libclang)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: functional-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Build the test-only binaries (gnb, gnb-cli; feature test-pow-limit)
+        run: cargo build -p gnb --features test-pow-limit --bin gnb --bin gnb-cli --locked
+      - name: Functional tests
+        run: >
+          python3 test/functional/test_runner.py --no-build --jobs 2 --timeout 300
+          --tmpdir "$RUNNER_TEMP/functional" --cachedir "$RUNNER_TEMP/functional-cache" --keep-failed
+      - name: Node logs of failed tests
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: functional-logs
+          path: ${{ runner.temp }}/functional
+          retention-days: 7
 
   # Vendored fork: PQClean source pin (VENDOR.toml), and the Falcon
   # clean-variant guard. (The libp2p-yamux fork was retired with libp2p 0.57,

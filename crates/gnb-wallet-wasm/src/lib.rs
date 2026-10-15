@@ -18,6 +18,8 @@
 //!                             `mnemonic: false` makes a random key with no phrase.
 //! restore {words}             unlock the key of a 24-word phrase
 //! export {password}           encrypted keystore v3 JSON of the unlocked key
+//! (`utxos` are the node's getutxos rows; a coinbase output, `coinbase_height`
+//! in its row, is never selected before it is mature at `next_height`.)
 //! plan {utxos, to, amount, fee, next_height}
 //!                             the transaction `version` a payment targeting block
 //!                             `next_height` (the node's getdaginfo next_block_height)
@@ -45,6 +47,7 @@
 use gnb_crypto::address::{Address, Network};
 use gnb_crypto::core::{tokenomics, ChainId, TxOutput};
 use gnb_crypto::wallet::payment::amounts_committed_at;
+use gnb_crypto::wallet::send::{all_immature_message, utxo_row_spendable_at};
 use gnb_crypto::wallet::{
     generate_keypair, generate_mnemonic_keypair, keypair_from_mnemonic, FeeChoice, FeePolicy,
     Keypair, PaymentOptions, PrevTxs, TxBuilder, Utxo, Wallet,
@@ -144,10 +147,10 @@ pub fn handle(req: &Value) -> Result<Value, String> {
             with_session(|kp| kp.to_encrypted_json(&pw).map(|j| json!({ "keystore": j })))
         }
         "plan" => {
-            let utxos = parse_utxos(req.get("utxos").ok_or("missing `utxos`")?)?;
+            let next_height = parse_height(req)?;
+            let utxos = parse_spendable_utxos(req.get("utxos").ok_or("missing `utxos`")?, next_height)?;
             let amount = parse_amount(req, "amount")?;
             let fee = FeeChoice::AtLeast(parse_amount(req, "fee")?);
-            let next_height = parse_height(req)?;
             with_session(|kp| {
                 let chain = ChainId::for_network(kp.network()?);
                 let opts = PaymentOptions { next_block_height: Some(next_height), ..PaymentOptions::default() };
@@ -162,10 +165,10 @@ pub fn handle(req: &Value) -> Result<Value, String> {
             })
         }
         "pay" => {
-            let utxos = parse_utxos(req.get("utxos").ok_or("missing `utxos`")?)?;
+            let next_height = parse_height(req)?;
+            let utxos = parse_spendable_utxos(req.get("utxos").ok_or("missing `utxos`")?, next_height)?;
             let amount = parse_amount(req, "amount")?;
             let fee = parse_amount(req, "fee")?;
-            let next_height = parse_height(req)?;
             let to = s(req, "to")?;
             let mut prevs = PrevTxs::new();
             if let Some(map) = req.get("prevtxs").and_then(Value::as_object) {
@@ -245,6 +248,26 @@ fn pay(kp: &Keypair, utxos: &[Utxo], to: &str, amount: u64, opts: &PaymentOption
         // WAL-1 full fix: version 3 (sighash v3) commits every spent value.
         "version": paid.tx.version, "amounts_committed": paid.amounts_committed,
     }))
+}
+
+/// The `getutxos` rows spendable in the block at `next_height`: a coinbase
+/// output (`coinbase_height` in its row) only from `COINBASE_MATURITY` blocks
+/// after its coinbase (`send::utxo_row_spendable_at`, the rule `gnb-cli send`
+/// applies too). Selecting an immature one signed a transaction every node
+/// refuses; with only immature coins left, nothing is signed.
+fn parse_spendable_utxos(rows: &Value, next_height: u64) -> Result<Vec<Utxo>, String> {
+    let utxos = parse_utxos(rows)?;
+    let rows = rows.as_array().ok_or("`utxos` must be an array")?;
+    let mut spendable = Vec::with_capacity(utxos.len());
+    let mut immature = 0;
+    for (utxo, row) in utxos.into_iter().zip(rows) {
+        if utxo_row_spendable_at(row, next_height)? { spendable.push(utxo) } else { immature += 1 }
+    }
+    if spendable.is_empty() && immature > 0 {
+        let address = with_session(|kp| Ok(kp.address.clone())).unwrap_or_else(|_| "this wallet".into());
+        return Err(all_immature_message(&address, immature, next_height));
+    }
+    Ok(spendable)
 }
 
 fn parse_utxos(rows: &Value) -> Result<Vec<Utxo>, String> {
@@ -406,6 +429,41 @@ mod tests {
             &tx, std::slice::from_ref(spent), gnb_crypto::core::ChainId::Mainnet, act, act);
         assert!(verify(&claimed).is_ok(), "valid for the value it was signed over");
         assert!(verify(&real).is_err(), "the lie invalidates it against the real coin");
+
+        // ── Coinbase maturity: an immature coinbase output is never selected ─
+        // (it used to be, largest-first, and every node refused the payment).
+        let m = gnb_crypto::core::COINBASE_MATURITY;
+        let row = |txid: &str, value: &str, cb: Option<u64>| {
+            let mut r = json!({"txid": txid.repeat(32), "index": 0, "value": value, "script_pubkey": hex::encode(&spk)});
+            if let Some(h) = cb { r["coinbase_height"] = json!(h); }
+            r
+        };
+        let coins = json!([
+            row("33", "10000000000", Some(1_000)),       // 100 GNB, immature at 1_001
+            row("44", "200000000", Some(1_001 - m)),     // mature at 1_001 exactly
+            row("55", "200000000", None),                // not a coinbase output
+        ]);
+        let pay_at = |utxos: &Value, h: u64| handle(&json!({"op": "pay", "utxos": utxos, "to": to,
+            "amount": "300000000", "fee": "0", "next_height": h.to_string()}));
+        let spent = |r: &Value| -> Vec<[u8; 32]> {
+            let tx = Transaction::from_wire_bytes(&hex::decode(r["raw"].as_str().unwrap()).unwrap()).unwrap();
+            tx.inputs.iter().map(|i| i.prev_txid).collect()
+        };
+        let r = pay_at(&coins, 1_001).unwrap();
+        assert_eq!(r["inputs"], 2);
+        assert!(!spent(&r).contains(&[0x33; 32]), "the immature coinbase output was selected");
+        let plan = handle(&json!({"op": "plan", "utxos": coins, "to": to, "amount": "300000000", "fee": "0",
+            "next_height": 1_001})).unwrap();
+        assert!(!plan["prev_txids"].as_array().unwrap().contains(&json!("33".repeat(32))), "{plan}");
+        // At coinbase_height + COINBASE_MATURITY it is spendable (and, the
+        // largest coin, chosen alone).
+        assert_eq!(spent(&pay_at(&coins, 1_000 + m).unwrap()), vec![[0x33; 32]]);
+        // Only immature coins: refused before anything is signed.
+        let err = pay_at(&json!([row("33", "10000000000", Some(1_000))]), 1_001).unwrap_err();
+        assert!(err.contains("immature"), "{err}");
+        let mut bad = coins.clone();
+        bad[0]["coinbase_height"] = json!("1000");
+        assert!(pay_at(&bad, 1_001).is_err(), "a malformed coinbase_height is refused");
         handle(&json!({"op": "wipe"})).unwrap();
     }
 

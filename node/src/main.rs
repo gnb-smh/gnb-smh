@@ -273,6 +273,75 @@ mod address_to_script_pubkey_tests {
     }
 }
 
+/// Start-up guard for builds with gnb-crypto's `test-pow-limit` (the node's
+/// `--features test-pow-limit`, or the feature reached any other way, such as
+/// a dev-dependency unified into the binary by `cargo test`): every expected
+/// target is pinned to the pow limit, so such a node mines and accepts blocks
+/// at about one GnB-SMH evaluation each. Keyed on gnb-crypto's constant, not
+/// on a feature name, so no route to the feature escapes it:
+///
+/// - an optimised build (`debug_assertions` off: the release profile, every
+///   artifact) with it refuses to run on any network;
+/// - a debug build with it refuses mainnet (on mainnet it would fork the node
+///   off the network with worthless blocks) and runs on `--testnet`, which is
+///   what the functional tests (test/functional) need;
+/// - a build without it passes everywhere.
+fn test_pow_limit_guard(test_pow_limit: bool, testnet: bool, debug_assertions: bool) -> Result<(), &'static str> {
+    if test_pow_limit && !debug_assertions {
+        return Err("this binary is an optimised build with gnb-crypto's test-pow-limit feature \
+                    (functional tests only: every target is the pow limit) and refuses to run; \
+                    test builds are debug builds");
+    }
+    if test_pow_limit && !testnet {
+        return Err("this binary was built with the test-pow-limit feature (functional tests \
+                    only: every target is the pow limit) and refuses to run on mainnet; \
+                    start it with --testnet");
+    }
+    Ok(())
+}
+
+// The node's `test-pow-limit` feature exists for debug functional-test builds;
+// a release build with it does not compile. (gnb-crypto's feature reached any
+// other way compiles, and `test_pow_limit_guard` refuses to run it.)
+#[cfg(all(feature = "test-pow-limit", not(debug_assertions)))]
+compile_error!("the test-pow-limit feature is for debug functional-test builds only; \
+                never enable it in a release build");
+
+#[cfg(test)]
+mod test_pow_limit_guard_tests {
+    use super::test_pow_limit_guard;
+
+    /// A debug test build refuses mainnet and runs on testnet. Dropping the
+    /// guard's condition, or inverting its network check, fails here.
+    #[test]
+    fn test_build_refuses_mainnet_and_runs_on_testnet() {
+        let refusal = test_pow_limit_guard(true, false, true).expect_err("mainnet must be refused");
+        assert!(refusal.contains("test-pow-limit") && refusal.contains("mainnet"), "{refusal}");
+        assert_eq!(test_pow_limit_guard(true, true, true), Ok(()));
+    }
+
+    /// An optimised (release-profile) build with the feature refuses every
+    /// network, testnet included: `cargo build --release --features
+    /// gnb-crypto/test-pow-limit` and `cargo test --release` compile such a
+    /// binary.
+    #[test]
+    fn optimised_test_build_refuses_every_network() {
+        for testnet in [false, true] {
+            let refusal = test_pow_limit_guard(true, testnet, false)
+                .expect_err("an optimised test-pow-limit build must never run");
+            assert!(refusal.contains("optimised build") && refusal.contains("test-pow-limit"), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn production_build_runs_on_both_networks_in_every_profile() {
+        for debug_assertions in [false, true] {
+            assert_eq!(test_pow_limit_guard(false, false, debug_assertions), Ok(()));
+            assert_eq!(test_pow_limit_guard(false, true, debug_assertions), Ok(()));
+        }
+    }
+}
+
 // Floor the worker count at 4. The default is the core count, and the
 // production nodes are 2-core boxes: with only two workers, any pair of tasks
 // that blocks (a held `node_state`/`dag` lock, a synchronous RocksDB read)
@@ -289,9 +358,13 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    if core::TEST_POW_LIMIT {
-        eprintln!("❌ this binary was built with gnb-crypto/test-pow-limit (tests only); refusing to run a node.");
+    if let Err(refusal) = test_pow_limit_guard(core::TEST_POW_LIMIT, cli.testnet, cfg!(debug_assertions)) {
+        eprintln!("❌ {refusal}");
         std::process::exit(2);
+    }
+    if core::TEST_POW_LIMIT {
+        eprintln!("⚠  TEST BUILD (test-pow-limit): every expected target is the pow limit. \
+                   For functional tests on a local testnet only.");
     }
 
     // Roadmap #8: wire the node-level chain-id ONCE at startup from the runtime
