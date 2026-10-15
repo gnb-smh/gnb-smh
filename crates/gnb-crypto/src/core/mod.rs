@@ -1481,6 +1481,57 @@ mod wire_canonical_tests {
         }
     }
 
+    /// `is_non_minimal_varint_error` names the minimal-varint refusals of
+    /// every decoder and no other decode error. The node answers the former
+    /// with Ignore and every other malformed block with Reject
+    /// (`ingress::verdict_for_block_decode_error`), so a classifier that
+    /// matched any error would spare every malformed block its penalty.
+    #[test]
+    fn non_minimal_varint_error_names_only_that_refusal() {
+        fn refusal<T>(r: Result<T, String>, what: &str) -> String {
+            match r {
+                Ok(_) => panic!("{what}: accepted"),
+                Err(e) => e,
+            }
+        }
+        let t = tx(12, 0);
+        let e = t.to_wire_bytes(true);
+        let b = block(vec![t.clone()]);
+        let h = b.header.to_wire_bytes(2, 2);
+        let w = b.to_wire_bytes();
+        let widened = [
+            refusal(Transaction::from_wire_bytes(&widen(&e, 4)), "tx input count"),
+            refusal(Transaction::read_wire_bytes(&widen(&e, 4 + 1 + 32 + 4)), "tx script_sig length"),
+            refusal(BlockHeader::from_wire_bytes(&widen(&h, 4)), "header parent count"),
+            refusal(Block::from_wire_bytes(&widen(&w, h.len())), "block tx count"),
+            refusal(Block::from_wire_bytes(&widen(&w, w.len() - 1)), "block shielded count"),
+        ];
+        for err in &widened {
+            assert!(is_non_minimal_varint_error(err), "{err}");
+        }
+
+        let mut trailing = w.clone();
+        trailing.push(0);
+        let mut too_many = w.clone();
+        too_many[h.len()] = 2; // two transactions announced, one present
+        let mut bad_tag = w.clone();
+        bad_tag[h.len()] = 0xFD; // a 3-byte tx count with its bytes missing
+        bad_tag.truncate(h.len() + 2);
+        let other = [
+            refusal(Block::from_wire_bytes(&w[..w.len() - 1]), "block truncated"),
+            refusal(Block::from_wire_bytes(&trailing), "block with a trailing byte"),
+            refusal(Block::from_wire_bytes(&too_many), "block missing a transaction"),
+            refusal(Block::from_wire_bytes(&bad_tag), "block with a cut varint"),
+            refusal(Block::from_wire_bytes(&[]), "empty block"),
+            refusal(BlockHeader::from_wire_bytes(&h[..h.len() - 1]), "header truncated"),
+            refusal(Transaction::from_wire_bytes(&e[..e.len() - 1]), "tx truncated"),
+            refusal(Transaction::from_wire_bytes(&[]), "empty tx"),
+        ];
+        for err in &other {
+            assert!(!is_non_minimal_varint_error(err), "{err}");
+        }
+    }
+
     /// The pre-fix decoder accepted these bytes: the transaction's script
     /// length is `FD 0C 00` (two bytes longer than minimal), the block parser
     /// then read the shielded count from the transaction's last two locktime
