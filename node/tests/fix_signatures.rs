@@ -303,7 +303,7 @@ fn mempool_and_templates_follow_the_next_block_height() {
     admit(&n, &a).expect("v2 admitted for H-1");
     admit(&n, &b).expect("v2 admitted for H-1");
     let err = admit(&n, &c).unwrap_err();
-    assert!(matches!(&err, AdmissionError::Rejected(m) if m.contains("non-standard-version")), "{err}");
+    assert!(matches!(&err, AdmissionError::NonStandard(m) if m.contains("non-standard-version")), "{err}");
 
     // The template at H-1 carries both version-1 transactions.
     let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
@@ -458,14 +458,14 @@ fn mldsa_only_suite_is_nonstandard_but_consensus_valid() {
 
     let t1 = v2_spend(&k2, &[(f1.0, 0)], vec![out(2 * SAT - FEE, &[0x72; 20])]);
     let err = admit(&n, &t1).unwrap_err();
-    assert!(matches!(&err, AdmissionError::Rejected(m) if m.contains("single-algorithm")), "{err}");
+    assert!(matches!(&err, AdmissionError::NonStandard(m) if m.contains("single-algorithm")), "{err}");
     extend(&n, vec![t1]).expect("0x0002 v2 spend is consensus-valid below H");
     assert!(spent(&n, &f1));
 
     assert_eq!(next_height(&n), H);
     let t2 = v3_spend(&k2, &[(f2.0, 0)], std::slice::from_ref(&f2.2), vec![out(2 * SAT - FEE, &[0x73; 20])]);
     let err = admit(&n, &t2).unwrap_err();
-    assert!(matches!(&err, AdmissionError::Rejected(m) if m.contains("single-algorithm")), "{err}");
+    assert!(matches!(&err, AdmissionError::NonStandard(m) if m.contains("single-algorithm")), "{err}");
     extend(&n, vec![t2]).expect("0x0002 v3 spend is consensus-valid from H");
     assert!(spent(&n, &f2));
 }
@@ -490,7 +490,7 @@ fn non_canonical_witnesses_policy_at_all_heights_consensus_from_activation() {
         let canonical = v2_spend(&k, &[(f.0, 0)], vec![out(2 * SAT - FEE, &[0x84; 20])]);
         let bad = mutate(&canonical, *m);
         let err = admit(&n, &bad).unwrap_err();
-        assert!(matches!(&err, AdmissionError::Rejected(e) if e.contains("non-standard")), "{m:?}: {err}");
+        assert!(matches!(&err, AdmissionError::NonStandard(e) if e.contains("non-standard")), "{m:?}: {err}");
         mined.push(bad);
     }
     extend(&n, mined).expect("non-canonical v2 witnesses are consensus-valid below H");
@@ -748,7 +748,7 @@ fn pre_activation_version_3_with_the_v2_digest_is_valid_but_non_standard() {
     // Policy: refused by admission (gossip / RPC)...
     for t in [&v3_old, &v4_old] {
         let err = admit(&n, t).unwrap_err();
-        assert!(matches!(&err, AdmissionError::Rejected(m) if m.contains("non-standard-version")), "{err}");
+        assert!(matches!(&err, AdmissionError::NonStandard(m) if m.contains("non-standard-version")), "{err}");
         assert!(!n.mempool.contains(&t.txid()));
     }
     // ...and never mined from the pool: a template at H-1 evicts one that
@@ -1074,7 +1074,7 @@ fn admission_rechecks_the_next_height_under_the_acceptance_lock() {
     admission::check_transaction(&n.store, Some(&n.mempool), &v1, &AdmissionPolicy::relay(checked_for))
         .expect("valid at the height it was checked for");
     let err = admission::admit(&n.store, &n.mempool, v1.clone(), &AdmissionPolicy::relay(checked_for)).unwrap_err();
-    assert!(matches!(&err, AdmissionError::Rejected(m) if m.contains("bad-txns-version") && m.contains("moved")), "{err}");
+    assert!(matches!(&err, AdmissionError::NonStandard(m) if m.contains("bad-txns-version") && m.contains("moved")), "{err}");
     assert!(!n.mempool.contains(&v1.txid()));
 
     // Reverse: a version-3 spend checked for H, inserted after the next
@@ -1082,7 +1082,7 @@ fn admission_rechecks_the_next_height_under_the_acceptance_lock() {
     let v3 = v3_spend(&k, &[(f[1].0, 0)], std::slice::from_ref(&f[1].2), vec![out(2 * SAT - FEE, &[0xED; 20])]);
     n.mempool.set_next_height(H - 1);
     let err = admission::admit(&n.store, &n.mempool, v3.clone(), &AdmissionPolicy::relay(H)).unwrap_err();
-    assert!(matches!(&err, AdmissionError::Rejected(m) if m.contains("non-standard-version")), "{err}");
+    assert!(matches!(&err, AdmissionError::NonStandard(m) if m.contains("non-standard-version")), "{err}");
     n.mempool.set_next_height(H);
     admission::admit(&n.store, &n.mempool, v3.clone(), &AdmissionPolicy::relay(H)).expect("current height");
     assert!(n.mempool.contains(&v3.txid()));

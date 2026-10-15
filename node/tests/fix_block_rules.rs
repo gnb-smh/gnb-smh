@@ -96,6 +96,16 @@ fn accept_direct(n: &Node, b: &Block) -> Result<BlockHash, String> {
         Some(&n.tip_tx), &n.shielded)
 }
 
+/// NET-12 (merge P1 x P4): the explorer aggregates kept in the UTXO write
+/// batches equal a full recomputation, and the start-up check finds them
+/// describing the connected chain (no rebuild needed).
+fn assert_aggregates_consistent(store: &Storage, what: &str) {
+    let stored = store.aggregate_snapshot().unwrap();
+    let full = store.recompute_aggregates(&std::sync::atomic::AtomicBool::new(false)).unwrap();
+    assert_eq!(stored, full, "{what}: incremental aggregates != full recomputation");
+    assert!(store.aggregates_match_connected_chain().unwrap(), "{what}: the start-up rebuild check would fire");
+}
+
 /// The block left no trace: not in the DAG, no body, no invalid mark.
 fn assert_not_stored(n: &Node, b: &Block) {
     let id = b.block_hash();
@@ -229,6 +239,7 @@ fn val2_overwrite_then_rollback_converges_with_a_node_that_never_applied_it() {
     let b2 = build(&a, vec![b1.block_hash()], vec![dup.clone()]);
     accept(&a, &b2).unwrap();
     assert_eq!(applied_tip(&a), Some(b2.block_hash()));
+    assert_aggregates_consistent(&a.store, "B2 overwrote B1's coin");
     let undo = a.store.get_undo_data(&b2.block_hash()).unwrap().unwrap();
     assert_eq!(undo.overwritten.utxos.len(), 1, "the replaced coin is in the undo record");
     assert_eq!(undo.overwritten.coinbase_heights, vec![(c, 1)]);
@@ -252,6 +263,9 @@ fn val2_overwrite_then_rollback_converges_with_a_node_that_never_applied_it() {
     assert_eq!(a.store.get_coinbase_height(&c).unwrap(), Some(1));
     assert_eq!(a.store.get_coinbase_height(&c).unwrap(), b.store.get_coinbase_height(&c).unwrap());
     assert_eq!(a.store.get_tx_location(&c).unwrap(), b.store.get_tx_location(&c).unwrap());
+    // The explorer aggregates converge too (merge P1 x P4).
+    assert_aggregates_consistent(&a.store, "B2 rolled back");
+    assert_eq!(a.store.aggregate_snapshot().unwrap(), b.store.aggregate_snapshot().unwrap(), "same aggregates");
 }
 
 /// The same convergence on the standalone storage primitives
@@ -273,13 +287,88 @@ fn val2_storage_rollback_restores_the_overwritten_rows() {
     store.put_block(&b1).unwrap();
     reorg::apply_block_utxo_mutations(&store, &b1).unwrap();
     let before = store.iter_utxos_sorted().unwrap();
+    let aggregates_before = store.aggregate_snapshot().unwrap();
     store.put_block(&b2).unwrap();
     reorg::apply_block_utxo_mutations(&store, &b2).unwrap();
     assert_eq!(store.get_coinbase_height(&c).unwrap(), Some(2));
+    assert_aggregates_consistent(&store, "standalone overwrite");
     store.rollback_block(&b2.block_hash()).unwrap();
     assert_eq!(store.iter_utxos_sorted().unwrap(), before);
+    assert_aggregates_consistent(&store, "standalone rollback");
+    assert_eq!(store.aggregate_snapshot().unwrap().holders, aggregates_before.holders);
     assert_eq!(store.get_coinbase_height(&c).unwrap(), Some(1));
     assert_eq!(store.get_tx_location(&c).unwrap(), Some((b1.block_hash(), 1)));
+}
+
+/// Merge P1 x P4 (NET-12): the coin a block overwrites belongs to ANOTHER
+/// holder with another value (the BIP30 case: a coin already sits at the
+/// outpoint of a later transaction's output, valid before the activation).
+/// Connecting the block moves the balance to the new owner; disconnecting it
+/// — through a reorg (`reorg::connect_plan`, one batch) and through the
+/// standalone primitives (`Storage::rollback_block`) — restores the old
+/// owner's coin from `UndoData.overwritten`, and the holder aggregates,
+/// supply tiers and rich list follow every step (equal to a full
+/// recomputation; the start-up check needs no rebuild; a rebuild changes
+/// nothing).
+#[test]
+fn val2_overwritten_coin_restore_keeps_the_explorer_aggregates() {
+    use std::sync::atomic::AtomicBool;
+    let _g = activation::scoped_override(activation::NEVER);
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0x3Au8; 32], 0u32, out(2_000_000, &k.spk));
+    let n = node_with(&genesis, std::slice::from_ref(&fund));
+    let spend = signed_spend(&k, &[(fund.0, 0)], vec![out(1_900_000, &[0x3B; 20])]);
+    let (old_owner, new_owner) = ([0x77u8; 20], [0x3Bu8; 20]);
+    let holder = |st: &Storage, a: &[u8; 20]| st.holder(a).unwrap().map(|h| (h.balance, h.utxos));
+
+    // (a) Through the acceptance pipeline and a reorg.
+    n.store.put_utxo(&spend.txid(), 0, &out(777, &old_owner)).unwrap();
+    assert_aggregates_consistent(&n.store, "stale coin placed");
+    assert_eq!(holder(&n.store, &old_owner), Some((777, 1)));
+    let b = build(&n, vec![gh], vec![coinbase("ow", subsidy(1) + 100_000, vec![0xB4; 20]), spend.clone()]);
+    accept(&n, &b).expect("old rules: overwriting is allowed");
+    assert_eq!(applied_tip(&n), Some(b.block_hash()));
+    assert_eq!(n.store.get_undo_data(&b.block_hash()).unwrap().unwrap().overwritten.utxos.len(), 1);
+    assert_aggregates_consistent(&n.store, "overwrite connected");
+    assert_eq!(holder(&n.store, &old_owner), None, "the old owner's coin was overwritten");
+    assert_eq!(holder(&n.store, &new_owner), Some((1_900_000, 1)));
+    let f1 = build_where(&n, vec![gh], vec![coinbase("f1", subsidy(1), vec![0xF1; 20])], |h| *h < b.block_hash());
+    accept(&n, &f1).unwrap();
+    let f2 = build(&n, vec![f1.block_hash()], vec![coinbase("f2", subsidy(2), vec![0xF2; 20])]);
+    accept(&n, &f2).expect("reorg away from the overwriting block");
+    assert_eq!(applied_tip(&n), Some(f2.block_hash()));
+    assert_eq!(n.store.get_utxo(&spend.txid(), 0).unwrap().map(|o| o.value), Some(777), "restored");
+    assert_aggregates_consistent(&n.store, "overwrite rolled back by a reorg");
+    assert_eq!(holder(&n.store, &old_owner), Some((777, 1)), "the old owner's balance is back");
+    assert_eq!(holder(&n.store, &new_owner), None);
+    assert!(!n.store.ensure_aggregates().unwrap(), "no start-up rebuild needed");
+    let snap = n.store.aggregate_snapshot().unwrap();
+    assert_eq!(n.store.rebuild_aggregates(&AtomicBool::new(false)).unwrap(), snap, "a rebuild changes nothing");
+
+    // (b) The standalone primitives.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Storage::open(&tmp.path().join("db")).unwrap();
+    let mk = |height: u64, txs: Vec<Transaction>| Block {
+        header: BlockHeader { version: 1, parents: vec![], merkle_root: MerkleRoot::ZERO, timestamp: 1, bits: 0, nonce: height },
+        transactions: txs,
+        blue_score: height,
+        height,
+        shielded_transactions: vec![],
+    };
+    store.put_utxo(&fund.0, 0, &fund.2).unwrap();
+    store.put_utxo(&spend.txid(), 0, &out(777, &old_owner)).unwrap();
+    let b1 = mk(1, vec![coinbase("sb", 5_000, vec![0xB5; 20]), spend.clone()]);
+    store.put_block(&b1).unwrap();
+    reorg::apply_block_utxo_mutations(&store, &b1).unwrap();
+    assert_aggregates_consistent(&store, "standalone overwrite");
+    assert_eq!(holder(&store, &old_owner), None);
+    store.rollback_block(&b1.block_hash()).unwrap();
+    assert_aggregates_consistent(&store, "standalone rollback");
+    assert_eq!(holder(&store, &old_owner), Some((777, 1)));
+    assert_eq!(holder(&store, &new_owner), None);
+    assert_eq!(store.chain_totals().unwrap().blocks, 0);
 }
 
 // ── VAL-3: no spend of the same block's coinbase ─────────────────────────────

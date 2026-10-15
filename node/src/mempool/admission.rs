@@ -31,23 +31,43 @@
 //!     hardening activation height; below it version >= 3 is non-standard
 //!     although consensus-valid with sighash v2) and, at/after the
 //!     activation, no 64-byte txid preimage (VAL-10);
-//!  6. conflicts: an input already spent by a pooled tx (first-seen wins —
-//!     the explicit replacement rule is "no replacement", MEM-6);
-//!  7. duplicate inputs within the tx (C-R3-2);
-//!  8. UTXO presence (no unconfirmed parents: package relay is not supported);
-//!  9. coinbase maturity at the height of the NEXT block (the node's next
+//!  6. duplicate inputs within the tx (C-R3-2);
+//!  7. inputs: each one in the UTXO set OR an output of a pooled transaction
+//!     (MEM-6: chains of unconfirmed transactions); otherwise "missing
+//!     inputs" (the gossip relay buffers it in the orphanage). The spent
+//!     outputs (amount and `script_pubkey`, taken from the pooled parent for
+//!     an unconfirmed input) are the prevouts the witness check and sighash
+//!     v3 commit to;
+//!  8. coinbase maturity at the height of the NEXT block (the node's next
 //!     template height, `Mempool::next_height`; never `dag.block_count()`,
 //!     MEM-4);
-//! 10. value: inputs ≥ outputs, MoneyRange of the input sum, consensus
+//!  9. value: inputs ≥ outputs, MoneyRange of the input sum, consensus
 //!     minimum fee, relay fee rate, rolling minimum fee (MEM-6);
+//! 10. pool policy (MEM-6): a conflict with pooled transactions is resolved
+//!     by the full-RBF replacement rules (BIP125 rules 2-6, see the
+//!     `mempool` module docs) and the ancestor / descendant limits must hold
+//!     (`Mempool::preflight`);
 //! 11. scripts: the consensus input-script rule at the next block's height
 //!     ([`verify_input_scripts`]: witnesses, pubkey hash, signatures under
 //!     the digest the version selects), LAST, with a bounded
-//!     verified-signature cache shared with block validation.
+//!     verified-signature cache shared with block validation. A caller may
+//!     put a gate in front of this step (`admit_gated`): the gossip relay
+//!     charges the delivering connection's signature budget there (MEM-5),
+//!     only on a cache miss ([`signatures_cached`], same key as the cache).
 //!
-//! Rejections other than "missing inputs" are remembered in the mempool's
-//! bounded recent-rejects filter until the selected tip changes, so a peer
-//! replaying the same invalid transaction costs a hash lookup (MEM-5).
+//! Every error says whether the transaction is consensus-INVALID
+//! ([`AdmissionError::Rejected`]: no honest node relays it, so the gossip
+//! relay penalises its author) or merely refused by local policy (every
+//! other variant). Relay policy (the version policy, canonical witnesses,
+//! suite 0x0002, zero-value outputs, size) and every rule whose verdict
+//! depends on the next block's height (the version rule, the 64-byte rule,
+//! coinbase maturity) are policy refusals ([`AdmissionError::NonStandard`] /
+//! [`AdmissionError::Immature`]): a peer running older software, or one
+//! block behind across the activation, relays such a transaction honestly.
+//! Rejections other than "missing inputs", duplicates and rate limiting are
+//! remembered in the mempool's bounded recent-rejects filter until the
+//! selected tip changes, so a peer replaying the same invalid transaction
+//! costs a hash lookup (MEM-5).
 //!
 //! # Which height
 //!
@@ -69,7 +89,7 @@ use std::collections::HashSet;
 
 use crate::core::sighash::SighashVersion;
 use crate::core::{self, Transaction, TxOutput};
-use crate::mempool::{Mempool, MempoolError, MAX_TX_SIZE, MIN_RELAY_FEE_RATE};
+use crate::mempool::{AddOutcome, Mempool, MempoolError, MAX_TX_SIZE, MIN_RELAY_FEE_RATE};
 use crate::storage::Storage;
 
 /// Which checks an admission runs.
@@ -106,19 +126,39 @@ impl AdmissionPolicy {
 /// Why a transaction was not admitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmissionError {
-    /// Permanently invalid or non-standard for this exact transaction.
+    /// Consensus-INVALID for this exact transaction: it can never be mined
+    /// in any block (bad signature, inputs < outputs, below the consensus
+    /// minimum fee, dust, MoneyRange, canonical limits, duplicate inputs, no
+    /// inputs, a coinbase outside a block). The gossip relay reports
+    /// `Reject` and the author is penalised.
     Rejected(String),
-    /// An input is not in the UTXO set (unknown parent, or already spent by
-    /// a confirmed transaction). Not cached: it may become valid later.
+    /// Refused by local relay policy only (size above `MAX_TX_SIZE`, no
+    /// outputs, a zero-value output, a non-canonical witness or a
+    /// single-algorithm suite, the version policy) or by a rule whose
+    /// verdict depends on this node's next block height (the version rule,
+    /// the 64-byte rule: [`check_tx_for_next_block`]). The relay reports
+    /// `Ignore`.
+    NonStandard(String),
+    /// An input is neither in the UTXO set nor an output of a pooled
+    /// transaction (unknown parent, or already spent by a confirmed
+    /// transaction). Not cached: it may become valid later.
     MissingInputs(String),
-    /// Conflicts with a pooled transaction (first-seen wins).
+    /// Conflicts with a pooled transaction and replacement was not possible.
     Conflict(String),
+    /// MEM-6: conflicts with pooled transactions and fails the full-RBF
+    /// replacement rules.
+    Replacement(String),
+    /// MEM-6: would exceed the ancestor / descendant limits.
+    ChainLimit(String),
     /// Coinbase input not yet mature at the next block height.
     Immature(String),
     /// Fee below the relay or rolling minimum (pool policy).
     LowFee(String),
-    /// Already pooled / already confirmed.
+    /// Already pooled / already confirmed / recently rejected.
     Duplicate(String),
+    /// MEM-5: the delivering connection's signature-verification budget is
+    /// spent. Not cached: the transaction may be perfectly valid.
+    RateLimited(String),
     /// The pool refused it (full, or another mempool-level rule).
     Pool(String),
 }
@@ -126,7 +166,15 @@ pub enum AdmissionError {
 impl AdmissionError {
     /// Whether the rejection belongs in the recent-rejects filter.
     pub fn is_cacheable(&self) -> bool {
-        !matches!(self, AdmissionError::MissingInputs(_) | AdmissionError::Duplicate(_))
+        !matches!(
+            self,
+            AdmissionError::MissingInputs(_) | AdmissionError::Duplicate(_) | AdmissionError::RateLimited(_)
+        )
+    }
+
+    /// True iff the transaction is consensus-invalid (see [`Self::Rejected`]).
+    pub fn is_consensus_invalid(&self) -> bool {
+        matches!(self, AdmissionError::Rejected(_))
     }
 }
 
@@ -134,13 +182,28 @@ impl std::fmt::Display for AdmissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AdmissionError::Rejected(m)
+            | AdmissionError::NonStandard(m)
             | AdmissionError::MissingInputs(m)
             | AdmissionError::Conflict(m)
+            | AdmissionError::Replacement(m)
+            | AdmissionError::ChainLimit(m)
             | AdmissionError::Immature(m)
             | AdmissionError::LowFee(m)
             | AdmissionError::Duplicate(m)
+            | AdmissionError::RateLimited(m)
             | AdmissionError::Pool(m) => write!(f, "{}", m),
         }
+    }
+}
+
+/// Map a mempool insertion error onto the admission error space.
+fn from_mempool_error(e: MempoolError) -> AdmissionError {
+    match e {
+        MempoolError::Duplicate => AdmissionError::Duplicate(e.to_string()),
+        MempoolError::Conflict { .. } => AdmissionError::Conflict(e.to_string()),
+        MempoolError::Replacement(_) => AdmissionError::Replacement(e.to_string()),
+        MempoolError::ChainLimit(_) => AdmissionError::ChainLimit(e.to_string()),
+        other => AdmissionError::Pool(other.to_string()),
     }
 }
 
@@ -253,6 +316,28 @@ fn activation_height() -> u64 {
     core::activation::hardening_activation_height()
 }
 
+/// True iff the signatures of `tx` spending `prevouts` in a block at header
+/// height `block_height` are in the verified-signature cache, i.e.
+/// [`verify_input_scripts`] would skip the expensive step. Same key as the
+/// cache ([`sig_cache_key`]: regime, activation state, wtxid, prevouts), so
+/// a hit under one regime or prevout set never answers for another. `false`
+/// when the version is invalid at that height. The gossip relay charges a
+/// peer's signature budget only on a miss (MEM-5).
+pub fn signatures_cached(tx: &Transaction, prevouts: &[TxOutput], block_height: u64) -> bool {
+    signatures_cached_at(tx, prevouts, block_height, activation_height())
+}
+
+/// [`signatures_cached`] for an explicit hardening activation height.
+pub fn signatures_cached_at(tx: &Transaction, prevouts: &[TxOutput], block_height: u64, act: u64) -> bool {
+    match core::sighash::check_tx_version(tx.version, block_height, act) {
+        Ok(version) => {
+            let key = sig_cache_key(tx, version, core::activation::is_active_at(block_height, act), prevouts);
+            sig_cache().lock().0.contains(&key)
+        }
+        Err(_) => false,
+    }
+}
+
 /// The consensus input-script rule of a non-coinbase transaction in a block
 /// at header height `block_height` — the ONE function block acceptance and
 /// connect (`accept::validate_tx_inputs`), reorg connect, template self-check
@@ -320,23 +405,29 @@ pub fn check_standard(tx: &Transaction) -> Result<(), AdmissionError> {
 /// Steps 1–2: structure and size. Run before anything that hashes or walks
 /// the whole transaction, so their cost is bounded by `MAX_TX_SIZE`.
 fn check_structure_and_size(tx: &Transaction) -> Result<(), AdmissionError> {
+    // Consensus: a coinbase is only valid as the first transaction of a
+    // block, and a transaction without inputs pays a zero fee (below the
+    // consensus minimum) — neither can ever be mined.
     if tx.is_coinbase() {
         return Err(AdmissionError::Rejected("coinbase not accepted".into()));
     }
     if tx.inputs.is_empty() {
         return Err(AdmissionError::Rejected("no inputs".into()));
     }
+    // Policy (MEM-5 verdicts): an output-less transaction or one above
+    // MAX_TX_SIZE can be consensus-valid inside a block; refusing to RELAY
+    // it is local policy, never grounds for penalising the sender.
     if tx.outputs.is_empty() {
-        return Err(AdmissionError::Rejected("no outputs".into()));
+        return Err(AdmissionError::NonStandard("no outputs".into()));
     }
     let wire = tx.to_wire_bytes(true).len();
     if wire > MAX_TX_SIZE {
-        return Err(AdmissionError::Rejected(format!(
+        return Err(AdmissionError::NonStandard(format!(
             "transaction too large: {} bytes (max {})", wire, MAX_TX_SIZE)));
     }
     let size = tx.actual_size();
     if size > MAX_TX_SIZE {
-        return Err(AdmissionError::Rejected(format!(
+        return Err(AdmissionError::NonStandard(format!(
             "transaction too large: {} bytes (max {})", size, MAX_TX_SIZE)));
     }
     Ok(())
@@ -354,7 +445,7 @@ fn check_policy(tx: &Transaction) -> Result<(), AdmissionError> {
                 "output {} below dust threshold ({} < {} sats)", i, o.value, core::DUST_THRESHOLD)));
         }
         if o.value == 0 {
-            return Err(AdmissionError::Rejected(format!(
+            return Err(AdmissionError::NonStandard(format!(
                 "output {} has zero value (non-standard)", i)));
         }
     }
@@ -444,6 +535,23 @@ pub fn check_transaction(
     tx: &Transaction,
     policy: &AdmissionPolicy,
 ) -> Result<u64, AdmissionError> {
+    check_transaction_gated(store, mempool, tx, policy, &mut |_| Ok(()))
+}
+
+/// The gate type of [`check_transaction_gated`] / [`admit_gated`]: called
+/// once, right before the signatures are verified, and only when they are
+/// not already in the verified-signature cache. An `Err` aborts the
+/// admission with that error.
+pub type SignatureGate<'a> = dyn FnMut(&Transaction) -> Result<(), AdmissionError> + 'a;
+
+/// [`check_transaction`] with a [`SignatureGate`] in front of step 11.
+pub fn check_transaction_gated(
+    store: &Storage,
+    mempool: Option<&Mempool>,
+    tx: &Transaction,
+    policy: &AdmissionPolicy,
+    gate: &mut SignatureGate<'_>,
+) -> Result<u64, AdmissionError> {
     check_structure_and_size(tx)?;
 
     // Known: pooled, recently rejected (a replay costs one bounded hash), or
@@ -466,15 +574,22 @@ pub fn check_transaction(
         // Witness standardness travels with the signature policy: a
         // re-injected transaction was already mined (its witness accepted by
         // consensus), relayed ones must be standard.
-        check_standard_witnesses(tx).map_err(AdmissionError::Rejected)?;
+        // Policy, not invalidity (MEM-5 verdicts): a non-canonical witness
+        // or a suite-0x0002 key is consensus-valid below the activation, so
+        // the sender is not penalised.
+        check_standard_witnesses(tx).map_err(AdmissionError::NonStandard)?;
     }
     // Version rule / policy (CRY-3) and the 64-byte rule (VAL-10), judged at
     // the height of the block the transaction would be mined in: neither a
     // version-1 transaction nor a 64-byte txid preimage can be mined at/after
-    // the activation, so neither is pooled there.
-    check_tx_for_next_block(tx, policy.next_block_height).map_err(AdmissionError::Rejected)?;
+    // the activation, so neither is pooled there. A policy refusal: the
+    // verdict depends on this node's next height (a peer one block behind
+    // across the activation relays it honestly) and on the version policy.
+    check_tx_for_next_block(tx, policy.next_block_height).map_err(AdmissionError::NonStandard)?;
 
-    // Conflicts with the pool and duplicate inputs (cheap, no I/O).
+    // Duplicate inputs (cheap, no I/O). Conflicts with the pool are NOT an
+    // early exit any more: they are resolved by the replacement rules in
+    // step 10 (MEM-6, full-RBF).
     let mut seen: HashSet<([u8; 32], u32)> = HashSet::with_capacity(tx.inputs.len());
     for inp in &tx.inputs {
         let op = (inp.prev_txid, inp.prev_index);
@@ -482,23 +597,22 @@ pub fn check_transaction(
             return Err(AdmissionError::Rejected(format!(
                 "double-spend: {}:{} already consumed", hex::encode(&inp.prev_txid[..8]), inp.prev_index)));
         }
-        if let Some(mp) = mempool {
-            if mp.spends_outpoint(&op) {
-                return Err(AdmissionError::Conflict(format!(
-                    "conflicts with a mempool tx: outpoint {}:{} already spent",
-                    hex::encode(&inp.prev_txid[..8]), inp.prev_index)));
-            }
-        }
     }
 
-    // UTXO presence + input sum.
+    // Input presence + input sum: the UTXO set, else (MEM-6) an output of a
+    // pooled transaction.
     let mut prevouts: Vec<TxOutput> = Vec::with_capacity(tx.inputs.len());
     let mut total_in: u64 = 0;
     for inp in &tx.inputs {
-        let out = store.get_utxo(&inp.prev_txid, inp.prev_index)
-            .map_err(|e| AdmissionError::Pool(format!("storage: {}", e)))?
-            .ok_or_else(|| AdmissionError::MissingInputs(format!(
-                "UTXO {}:{} not found", hex::encode(&inp.prev_txid[..8]), inp.prev_index)))?;
+        let confirmed = store.get_utxo(&inp.prev_txid, inp.prev_index)
+            .map_err(|e| AdmissionError::Pool(format!("storage: {}", e)))?;
+        let out = match confirmed {
+            Some(o) => o,
+            None => mempool
+                .and_then(|mp| mp.pool_output(&inp.prev_txid, inp.prev_index))
+                .ok_or_else(|| AdmissionError::MissingInputs(format!(
+                    "UTXO {}:{} not found", hex::encode(&inp.prev_txid[..8]), inp.prev_index)))?,
+        };
         total_in = core::limits::money_add(total_in, out.value)
             .map_err(|e| AdmissionError::Rejected(format!("input total: {}", e)))?;
         prevouts.push(out);
@@ -526,6 +640,9 @@ pub fn check_transaction(
             return Err(AdmissionError::LowFee(format!(
                 "fee {} below the mempool's rolling minimum ({} sat/byte)", fee, mp.rolling_min_fee_rate())));
         }
+        // MEM-6: replacement rules (when it conflicts) and chain limits,
+        // still before any signature work.
+        mp.preflight(tx, fee).map_err(from_mempool_error)?;
     }
 
     // Signatures last (the most expensive step). Re-injection skips them only
@@ -534,10 +651,16 @@ pub fn check_transaction(
     // at every height. From the activation the scripts are verified again (a
     // verified-signature cache hit when the disconnected block was itself at
     // or after it): a version-3 transaction mined BELOW the activation was
-    // checked against the v2 digest, which says nothing about v3.
+    // checked against the v2 digest, which says nothing about v3. The
+    // prevouts of an unconfirmed input are the pooled parent's outputs.
     let regime_may_have_changed = !policy.check_signatures
         && core::activation::is_active_at(policy.next_block_height, activation_height());
     if policy.check_signatures || regime_may_have_changed {
+        // Behind the caller's gate (MEM-5: the relay's per-connection
+        // budget), charged only when the work is not already cached.
+        if !signatures_cached(tx, &prevouts, policy.next_block_height) {
+            gate(tx)?;
+        }
         verify_input_scripts(tx, &prevouts, policy.next_block_height).map_err(AdmissionError::Rejected)?;
     }
     Ok(fee)
@@ -546,23 +669,38 @@ pub fn check_transaction(
 /// Check and insert `tx` into `mempool`. On success returns the txid.
 ///
 /// The final insert runs under the store's acceptance lock with a re-check
-/// that every input is still unspent, so it cannot race a block connect that
+/// that every input is still available (unspent in the UTXO set, or an
+/// output of a pooled transaction), so it cannot race a block connect that
 /// spends an input and sweeps conflicts (MEM-3) between the check and the
-/// insert. Under the same lock the height-dependent rules (version rule and
-/// policy, the 64-byte rule, coinbase maturity: [`check_tx_for_next_block`]
-/// and `core::check_coinbase_maturity`) are re-checked against the pool's
-/// CURRENT next height (`Mempool::next_height`) when it differs from the
-/// height the checks ran at: a block connected meanwhile (whose post-connect
-/// eviction ran before this insert) cannot let in a transaction invalid for
-/// the new next block. Signatures need no re-check: a version that passes the policy at
-/// both heights selects the same digest at both.
+/// insert. Conflicting pooled transactions are replaced when the full-RBF
+/// rules hold (MEM-6). Under the same lock the height-dependent rules
+/// (version rule and policy, the 64-byte rule, coinbase maturity:
+/// [`check_tx_for_next_block`] and `core::check_coinbase_maturity`) are
+/// re-checked against the pool's CURRENT next height (`Mempool::next_height`)
+/// when it differs from the height the checks ran at: a block connected
+/// meanwhile (whose post-connect eviction ran before this insert) cannot let
+/// in a transaction invalid for the new next block. Signatures need no
+/// re-check: a version that passes the policy at both heights selects the
+/// same digest at both.
 pub fn admit(
     store: &Storage,
     mempool: &Mempool,
     tx: Transaction,
     policy: &AdmissionPolicy,
 ) -> Result<[u8; 32], AdmissionError> {
-    let fee = match check_transaction(store, Some(mempool), &tx, policy) {
+    admit_gated(store, mempool, tx, policy, &mut |_| Ok(())).map(|o| o.txid)
+}
+
+/// [`admit`] with a [`SignatureGate`]; returns what the insertion did
+/// (including any replaced transactions).
+pub fn admit_gated(
+    store: &Storage,
+    mempool: &Mempool,
+    tx: Transaction,
+    policy: &AdmissionPolicy,
+    gate: &mut SignatureGate<'_>,
+) -> Result<AddOutcome, AdmissionError> {
+    let fee = match check_transaction_gated(store, Some(mempool), &tx, policy, gate) {
         Ok(fee) => fee,
         Err(e) => {
             if policy.use_reject_filter && e.is_cacheable() {
@@ -573,22 +711,47 @@ pub fn admit(
     };
     let _guard = store.acceptance_lock();
     for inp in &tx.inputs {
-        match store.get_utxo(&inp.prev_txid, inp.prev_index) {
-            Ok(Some(_)) => {}
-            _ => return Err(AdmissionError::MissingInputs(format!(
-                "UTXO {}:{} spent while admitting", hex::encode(&inp.prev_txid[..8]), inp.prev_index))),
+        let confirmed = matches!(store.get_utxo(&inp.prev_txid, inp.prev_index), Ok(Some(_)));
+        if !confirmed && mempool.pool_output(&inp.prev_txid, inp.prev_index).is_none() {
+            return Err(AdmissionError::MissingInputs(format!(
+                "UTXO {}:{} spent while admitting", hex::encode(&inp.prev_txid[..8]), inp.prev_index)));
         }
     }
     let current = mempool.next_height();
     if current != 0 && current != policy.next_block_height {
-        check_tx_for_next_block(&tx, current).map_err(|e| AdmissionError::Rejected(format!(
+        check_tx_for_next_block(&tx, current).map_err(|e| AdmissionError::NonStandard(format!(
             "{e} (the next block moved to height {current} while the transaction was being checked)")))?;
         core::check_coinbase_maturity(&tx, current, |t| store.get_coinbase_height(t).ok().flatten())
             .map_err(AdmissionError::Immature)?;
     }
-    mempool.add(tx, fee).map_err(|e| match e {
-        MempoolError::Duplicate => AdmissionError::Duplicate(e.to_string()),
-        MempoolError::Conflict { .. } => AdmissionError::Conflict(e.to_string()),
-        other => AdmissionError::Pool(other.to_string()),
+    mempool.add_with_replacement(tx, fee).map_err(from_mempool_error)
+}
+
+/// Parent txids of `tx` that are neither confirmed (an unspent output in
+/// the UTXO set) nor pooled — what an orphan is waiting for (MEM-6).
+pub fn missing_parents(store: &Storage, mempool: &Mempool, tx: &Transaction) -> std::collections::BTreeSet<[u8; 32]> {
+    tx.inputs.iter()
+        .filter(|i| {
+            !matches!(store.get_utxo(&i.prev_txid, i.prev_index), Ok(Some(_)))
+                && mempool.pool_output(&i.prev_txid, i.prev_index).is_none()
+        })
+        .map(|i| i.prev_txid)
+        .collect()
+}
+
+/// True iff some input of `tx` is neither confirmed nor pooled. Stops at the
+/// first missing input — use it wherever only emptiness of
+/// [`missing_parents`] matters (the orphan re-try path, review finding).
+pub fn has_missing_input(store: &Storage, mempool: &Mempool, tx: &Transaction) -> bool {
+    tx.inputs.iter().any(|i| {
+        !matches!(store.get_utxo(&i.prev_txid, i.prev_index), Ok(Some(_)))
+            && mempool.pool_output(&i.prev_txid, i.prev_index).is_none()
     })
+}
+
+/// True iff the transaction `txid` is pooled or confirmed: one lookup per
+/// recorded missing parent is the cheap pre-filter of the periodic orphan
+/// sweep (a parent that is neither cannot have made its child admissible).
+pub fn parent_available(store: &Storage, mempool: &Mempool, txid: &[u8; 32]) -> bool {
+    mempool.contains(txid) || matches!(store.get_tx_location(txid), Ok(Some(_)))
 }

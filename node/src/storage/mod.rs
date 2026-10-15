@@ -1,6 +1,8 @@
 //! Bloch-SIS Protocol — Storage (RocksDB)
 
 pub mod indexer;
+/// Audit NET-12: explorer aggregates maintained in the UTXO write batches.
+pub mod aggregates;
 
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, IteratorMode};
 use std::path::Path;
@@ -101,6 +103,14 @@ pub struct Storage {
     accept_lock: parking_lot::ReentrantMutex<()>,
     /// Memo of pure verdicts on stored block bodies ([`Storage::body_verdict`]).
     body_verdicts: parking_lot::Mutex<BodyVerdicts>,
+    /// NET-12: serialises every read-modify-write of the explorer
+    /// aggregates (`aggregates.rs`). Never held while taking `accept_lock`.
+    agg_lock: parking_lot::Mutex<()>,
+    /// NET-12: the aggregates are complete (cached `agg/version`).
+    agg_ready: std::sync::atomic::AtomicBool,
+    /// NET-12: number of storage reads served (diagnostics; lets tests prove
+    /// that an RPC's cost does not grow with the chain).
+    reads: std::sync::atomic::AtomicU64,
 }
 
 /// Upper bound on the entries of the body-verdict memo. Reaching it clears
@@ -120,6 +130,29 @@ struct BodyVerdicts {
 }
 
 impl Storage {
+    fn with_db(db: DB) -> Self {
+        Self {
+            db,
+            accept_lock: parking_lot::ReentrantMutex::new(()),
+            body_verdicts: Default::default(),
+            agg_lock: parking_lot::Mutex::new(()),
+            agg_ready: std::sync::atomic::AtomicBool::new(false),
+            reads: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn note_reads(&self, n: u64) {
+        self.reads.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// NET-12: total storage reads served by this handle so far (point
+    /// reads plus iterator steps of the instrumented accessors).
+    #[allow(dead_code)] // library API (tests, diagnostics)
+    pub fn storage_reads(&self) -> u64 {
+        self.reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Build the full column-family descriptor list. Shared by the read-write
     /// [`open`] and the read-only [`open_read_only`] paths so both agree on the
     /// exact schema (CF names + per-CF options) — the read-only replay harness
@@ -195,7 +228,9 @@ impl Storage {
         opts.set_write_buffer_size(64 * 1024 * 1024);
         let db = DB::open_cf_descriptors(&opts, path, Self::cf_descriptors())
             .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
-        Ok(Self { db, accept_lock: parking_lot::ReentrantMutex::new(()), body_verdicts: Default::default() })
+        let store = Self::with_db(db);
+        store.init_aggregates_marker()?;
+        Ok(store)
     }
 
     /// Open an existing snapshot **read-only**. RocksDB is opened with
@@ -214,7 +249,12 @@ impl Storage {
         // mutates the primary.
         let db = DB::open_cf_descriptors_read_only(&opts, path, Self::cf_descriptors(), false)
             .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
-        Ok(Self { db, accept_lock: parking_lot::ReentrantMutex::new(()), body_verdicts: Default::default() })
+        let store = Self::with_db(db);
+        // Read-only: report the marker, never write it.
+        let ready = store.get_meta("agg/version").ok().flatten()
+            .is_some_and(|v| v.as_slice() == aggregates::AGG_VERSION.to_le_bytes());
+        store.agg_ready.store(ready, std::sync::atomic::Ordering::Release);
+        Ok(store)
     }
 
     /// Take the acceptance mutex (audit DAG-10). See the field documentation.
@@ -379,6 +419,7 @@ impl Storage {
     }
 
     pub fn get_block(&self, hash: &[u8; 32]) -> Result<Option<Block>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
         match self.db.get_cf(&cf, hash).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) => Ok(Some(
@@ -390,6 +431,7 @@ impl Storage {
     }
 
     pub fn get_block_hash_at_height(&self, height: u64) -> Result<Option<[u8; 32]>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
         match self.db.get_cf(&cf, &height.to_be_bytes()).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) if d.len() == 32 => { let mut h = [0u8;32]; h.copy_from_slice(&d); Ok(Some(h)) }
@@ -398,6 +440,7 @@ impl Storage {
     }
 
     pub fn get_timestamp_at_height(&self, height: u64) -> Result<Option<u64>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_TIMESTAMPS).ok_or(StorageError::CfNotFound(CF_TIMESTAMPS.into()))?;
         match self.db.get_cf(&cf, &height.to_be_bytes()).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) if d.len() == 8 => Ok(Some(u64::from_le_bytes(d[..8].try_into().unwrap()))),
@@ -405,23 +448,32 @@ impl Storage {
         }
     }
 
+    /// Create (or overwrite) one UTXO with its address-index row. NET-12:
+    /// the explorer aggregates change in the SAME write batch.
     pub fn put_utxo(&self, txid: &[u8], index: u32, output: &TxOutput) -> Result<(), StorageError> {
         let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
         let key = utxo_key(txid, index);
-        self.db.put_cf(&cf, &key, &encode(output)?)
-            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        let _agg = self.agg_lock();
+        let mut deltas = aggregates::HolderDeltas::default();
+        if let Some(prev) = self.get_utxo(txid, index)? {
+            deltas.remove(&prev);
+        }
+        deltas.add(output);
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&cf, &key, &encode(output)?);
 
         // Address index: key = [20B address][32B txid][4B index], value = empty
         if output.script_pubkey.len() >= 20 {
             let cf_ai = self.db.cf_handle(CF_ADDR_UTXO).ok_or(StorageError::CfNotFound(CF_ADDR_UTXO.into()))?;
             let ai_key = addr_utxo_key(&output.script_pubkey, txid, index);
-            self.db.put_cf(&cf_ai, &ai_key, &[])
-                .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+            batch.put_cf(&cf_ai, &ai_key, []);
         }
-        Ok(())
+        self.stage_holder_deltas(&mut batch, &deltas)?;
+        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
     pub fn get_utxo(&self, txid: &[u8], index: u32) -> Result<Option<TxOutput>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
         match self.db.get_cf(&cf, &utxo_key(txid, index)).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) => Ok(Some(decode(&d)?)),
@@ -434,6 +486,7 @@ impl Storage {
         if let Some(cf) = self.db.cf_handle(CF_BLOCKS) {
             let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
             for item in iter {
+                self.note_reads(1);
                 if let Ok((key, val)) = item {
                     if key.len() == 32 {
                         let mut hash = [0u8; 32];
@@ -471,6 +524,7 @@ impl Storage {
         let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
         let mut out: Vec<(Vec<u8>, u32, u64, Vec<u8>)> = Vec::new();
         for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            self.note_reads(1);
             let (key, val) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
             // Fail the whole export on corruption; a partial ledger cannot
             // be advertised as a complete carryover set. Preserve historical
@@ -485,29 +539,45 @@ impl Storage {
 
     pub fn clear_utxos(&self) -> Result<(), StorageError> {
         let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
+        let _agg = self.agg_lock();
+        let mut deltas = aggregates::HolderDeltas::default();
         let mut batch = rocksdb::WriteBatch::default();
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         for item in iter {
-            if let Ok((key, _)) = item { batch.delete_cf(&cf, &key); }
+            if let Ok((key, val)) = item {
+                if let Ok(out) = decode::<TxOutput>(&val) {
+                    deltas.remove(&out);
+                }
+                batch.delete_cf(&cf, &key);
+            }
         }
+        self.stage_holder_deltas(&mut batch, &deltas)?;
         self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         Ok(())
     }
 
+    /// Delete one UTXO with its address-index row. NET-12: the explorer
+    /// aggregates change in the SAME write batch.
     pub fn delete_utxo(&self, txid: &[u8], index: u32) -> Result<(), StorageError> {
         // Fetch the UTXO first to get the address for index cleanup
         let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
+        let _agg = self.agg_lock();
+        let mut deltas = aggregates::HolderDeltas::default();
+        let mut batch = rocksdb::WriteBatch::default();
         if let Some(data) = self.db.get_cf(&cf, &utxo_key(txid, index))
             .map_err(|e| StorageError::ReadFailed(e.to_string()))?
         {
             if let Ok(output) = decode::<TxOutput>(&data) {
                 if output.script_pubkey.len() >= 20 {
                     let cf_ai = self.db.cf_handle(CF_ADDR_UTXO).ok_or(StorageError::CfNotFound(CF_ADDR_UTXO.into()))?;
-                    let _ = self.db.delete_cf(&cf_ai, &addr_utxo_key(&output.script_pubkey, txid, index));
+                    batch.delete_cf(&cf_ai, addr_utxo_key(&output.script_pubkey, txid, index));
                 }
+                deltas.remove(&output);
             }
         }
-        self.db.delete_cf(&cf, &utxo_key(txid, index)).map_err(|e| StorageError::WriteFailed(e.to_string()))
+        batch.delete_cf(&cf, utxo_key(txid, index));
+        self.stage_holder_deltas(&mut batch, &deltas)?;
+        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
     /// O(k) balance query via address index (was O(n) full UTXO scan)
@@ -522,6 +592,7 @@ impl Storage {
         let (mut total, mut count) = (0u64, 0usize);
         let iter = self.db.prefix_iterator_cf(&cf_ai, &prefix);
         for item in iter {
+            self.note_reads(2);
             if let Ok((k, _)) = item {
                 // Stop when prefix no longer matches
                 if k.len() < address_bytes.len() || &k[..address_bytes.len()] != address_bytes { break; }
@@ -554,6 +625,7 @@ impl Storage {
         let mut set = std::collections::HashSet::<[u8; 20]>::new();
         let mut utxos = 0usize;
         for item in self.db.iterator_cf(&cf_ai, IteratorMode::Start) {
+            self.note_reads(1);
             if let Ok((k, _)) = item {
                 if k.len() >= 20 {
                     let mut addr = [0u8; 20];
@@ -578,6 +650,7 @@ impl Storage {
         let mut result = Vec::new();
         let iter = self.db.prefix_iterator_cf(&cf_ai, &prefix);
         for item in iter {
+            self.note_reads(2);
             if let Ok((k, _)) = item {
                 let alen = address_bytes.len();
                 if k.len() < alen || &k[..alen] != address_bytes { break; }
@@ -616,6 +689,7 @@ impl Storage {
         let expected = alen + 36;
         let mut result = Vec::new();
         for (k, _) in self.db.prefix_iterator_cf(&cf_ai, address_bytes).flatten() {
+            self.note_reads(2);
             if k.len() < alen || &k[..alen] != address_bytes { break; }
             if k.len() != expected { continue; }
             let Some(v) = self.db.get_cf(&cf_utxo, &k[alen..expected])
@@ -642,6 +716,7 @@ impl Storage {
 
     /// Load GhostDAG data for a single block
     pub fn get_dag_data(&self, hash: &BlockHash) -> Result<Option<GhostdagData>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_DAG).ok_or(StorageError::CfNotFound(CF_DAG.into()))?;
         match self.db.get_cf(&cf, hash).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) => Ok(Some(decode(&d)?)),
@@ -1090,6 +1165,7 @@ impl Storage {
     /// Get the height at which a coinbase transaction was created.
     /// Returns None if the txid is not a coinbase.
     pub fn get_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_COINBASE).ok_or(StorageError::CfNotFound(CF_COINBASE.into()))?;
         match self.db.get_cf(&cf, txid).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) if d.len() == 8 => Ok(Some(u64::from_le_bytes(d[..8].try_into().unwrap()))),
@@ -1118,6 +1194,7 @@ impl Storage {
 
     /// Lookup transaction location: returns (block_hash, block_height)
     pub fn get_tx_location(&self, txid: &[u8; 32]) -> Result<Option<([u8; 32], u64)>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_TX_INDEX).ok_or(StorageError::CfNotFound(CF_TX_INDEX.into()))?;
         match self.db.get_cf(&cf, txid).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) if d.len() == 40 => {
@@ -1143,6 +1220,7 @@ impl Storage {
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
         self.db.get_cf(&cf, key.as_bytes()).map_err(|e| StorageError::ReadFailed(e.to_string()))
     }
@@ -1171,6 +1249,7 @@ impl Storage {
     pub fn get_undo_data(&self, block_hash: &[u8; 32])
         -> Result<Option<crate::core::UndoData>, StorageError>
     {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
         match self.db.get_cf(&cf, block_hash).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             // Records written before the VAL-2 extension decode unchanged.
@@ -1337,6 +1416,10 @@ impl Storage {
         //    earlier step erred after we deleted this first, the caller
         //    would have no way to retry or to introspect the record.
         self.delete_undo_data(block_hash)?;
+
+        // NET-12: the block left the connected chain (holder aggregates
+        // already followed the put/delete calls above).
+        self.note_block_disconnected(block_hash, undo.tx_index_keys.len() as u64)?;
 
         Ok(undo)
     }
@@ -1667,11 +1750,19 @@ impl Storage {
             .ok_or(StorageError::CfNotFound(CF_ADDR_UTXO.into()))?;
         let cf_meta = self.db.cf_handle(CF_META)
             .ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        let _agg = self.agg_lock();
+        let mut deltas = aggregates::HolderDeltas::default();
         let mut batch = rocksdb::WriteBatch::default();
         for u in &snap.utxos {
+            if let Some(prev) = self.get_utxo(&u.txid, u.vout)? {
+                deltas.remove(&prev);
+            }
             batch.put_cf(&cf_utxo, utxo_key(&u.txid, u.vout), encode(&u.output)?);
             batch.put_cf(&cf_ai, addr_utxo_key(&u.output.script_pubkey, &u.txid, u.vout), [0u8; 0]);
+            deltas.add(&u.output);
         }
+        // NET-12: holder aggregates in the same batch.
+        self.stage_holder_deltas(&mut batch, &deltas)?;
         batch.put_cf(&cf_meta, b"carryover_sha3", snap.sha3);
         self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         Ok(snap.utxos.len() as u64)

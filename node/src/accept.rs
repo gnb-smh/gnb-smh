@@ -516,9 +516,9 @@ pub fn update_mempool_after_connect(
         }
     }
     if !outcome.disconnected.is_empty() {
-        let candidates: Vec<core::Transaction> = outcome.disconnected.iter()
-            .flat_map(|b| b.transactions.iter().filter(|t| !t.is_coinbase()).cloned())
-            .collect();
+        // Oldest disconnected block first: a child confirmed after its parent
+        // is re-admitted after it, as an in-pool chain (MEM-6).
+        let candidates: Vec<core::Transaction> = outcome.disconnected_txs_oldest_first();
         let (re, dropped) = reorg::reinject_disconnected(store, mempool, candidates, next_height);
         let stale = revalidate_mempool(store, mempool, next_height);
         info!("reorg: mempool reinjected={} discarded={} invalidated={}", re, dropped, stale);
@@ -542,21 +542,28 @@ pub fn evict_version_invalid(mempool: &mempool::Mempool, next_height: u64) -> us
 /// UTXO set (an input missing, an immature coinbase input at `next_height`,
 /// a fee below the consensus minimum, a version invalid or non-standard at
 /// `next_height`, or a 64-byte txid preimage at/after the activation:
-/// `admission::check_tx_for_next_block`). Signature-free and cheap. Returns
-/// how many were removed.
+/// `admission::check_tx_for_next_block`). An input may also be an output of
+/// another pooled tx (MEM-6 chains); a tx that fails is removed together
+/// with its in-pool descendants. Signature-free and cheap. Returns how many
+/// were removed.
 pub fn revalidate_mempool(store: &storage::Storage, mempool: &mempool::Mempool, next_height: u64) -> usize {
-    mempool.retain_valid(|e| {
+    mempool.retain_valid_with(|e, pool_output| {
         if admission::check_tx_for_next_block(&e.tx, next_height).is_err() {
             return false;
         }
         let mut total_in: u64 = 0;
         for inp in &e.tx.inputs {
-            match store.get_utxo(&inp.prev_txid, inp.prev_index) {
-                Ok(Some(o)) => match core::limits::money_add(total_in, o.value) {
+            let prev = match store.get_utxo(&inp.prev_txid, inp.prev_index) {
+                Ok(Some(o)) => Some(o),
+                Ok(None) => pool_output(&inp.prev_txid, inp.prev_index),
+                Err(_) => None,
+            };
+            match prev {
+                Some(o) => match core::limits::money_add(total_in, o.value) {
                     Ok(t) => total_in = t,
                     Err(_) => return false,
                 },
-                _ => return false,
+                None => return false,
             }
         }
         if core::check_coinbase_maturity(&e.tx, next_height, |t| store.get_coinbase_height(t).ok().flatten()).is_err() {
@@ -1447,6 +1454,15 @@ pub fn reconcile_on_startup(
             RecheckReport::default()
         }
     };
+
+    // NET-12: a database written before the explorer aggregates existed gets
+    // them built once, from scratch (later connects keep them current in the
+    // same batches as the UTXO changes).
+    match store.ensure_aggregates() {
+        Ok(true) => info!("NET-12: explorer aggregates rebuilt from the UTXO set and undo records"),
+        Ok(false) => {}
+        Err(e) => error!("NET-12: explorer aggregates could not be rebuilt: {} (explorer statistics stay unavailable)", e),
+    }
 
     // Step 2: applied-but-unrecorded blocks.
     let mut orphan_applied: Vec<(u64, BlockHash)> = Vec::new();

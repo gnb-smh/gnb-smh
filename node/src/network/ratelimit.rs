@@ -10,9 +10,14 @@
 //! deterministic in tests.
 //!
 //! Evicting a key can only ever GRANT that key a fresh full bucket; it never
-//! refuses a key it has not seen. Identity cycling therefore buys an attacker
-//! nothing it could not get by opening a new connection, which libp2p's
-//! connection limits already bound.
+//! refuses a key it has not seen. This bounds an attacker only when the keys
+//! are bound to connections (the peer id of a connected neighbour, the
+//! `propagation_source` of a gossip frame, the responder of a directed
+//! pull): cycling such keys costs a new connection, which libp2p's connection
+//! limits bound. A key the sender chooses freely — the signed gossip AUTHOR
+//! of a frame, which any connection can mint per frame — is NOT a bound: a
+//! fresh key is a fresh full bucket (review finding on the transaction
+//! signature budget, now keyed by the delivering connection).
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -71,6 +76,48 @@ impl<K: Hash + Eq + Copy> TokenBuckets<K> {
         let granted = (n as f64).min(avail);
         b.tokens -= granted;
         granted as usize
+    }
+
+    /// Consume exactly `n` tokens for `key` at `now`, or none at all.
+    /// Returns `true` iff all `n` were available (MEM-5: a transaction's
+    /// signature checks are charged as one unit — a partial grant would let
+    /// the work run while charging less than its cost).
+    pub fn try_take_n_at(&mut self, key: K, n: usize, now: Instant) -> bool {
+        if !self.buckets.contains_key(&key) && self.buckets.len() >= self.max_tracked {
+            self.evict_one(now);
+        }
+        let cap = self.capacity;
+        let rate = self.refill_per_sec;
+        let b = self.buckets.entry(key).or_insert(Bucket { tokens: cap, last_refill: now, last_used: now });
+        let elapsed = now.saturating_duration_since(b.last_refill).as_secs_f64();
+        if elapsed > 0.0 {
+            b.tokens = (b.tokens + elapsed * rate).min(cap);
+            b.last_refill = now;
+        }
+        b.last_used = now;
+        let need = n as f64;
+        if b.tokens.floor() >= need {
+            b.tokens -= need;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Give back up to `n` tokens to `key` (capped at the burst). No-op for
+    /// an untracked key. MEM-5: the transaction relay refunds the signature
+    /// budget of a transaction that entered the pool, so a connection is
+    /// charged only for verification that did not lead to admission.
+    pub fn refund_n(&mut self, key: K, n: usize) {
+        let cap = self.capacity;
+        if let Some(b) = self.buckets.get_mut(&key) {
+            b.tokens = (b.tokens + n as f64).min(cap);
+        }
+    }
+
+    /// Forget `key` (its connection closed).
+    pub fn remove(&mut self, key: &K) {
+        self.buckets.remove(key);
     }
 
     /// Drop keys whose bucket has refilled completely (they carry no state a
@@ -148,6 +195,33 @@ mod tests {
         // At t0+5s key 1 is full again (idle): it is evicted, key 2 keeps its empty bucket.
         assert!(tb.allow_at(3, t0 + Duration::from_secs(5)));
         assert!(!tb.allow_at(2, t0 + Duration::from_secs(5)), "key 2 state survived eviction");
+    }
+
+    #[test]
+    fn try_take_n_is_all_or_nothing() {
+        let t0 = Instant::now();
+        let mut tb: TokenBuckets<u32> = TokenBuckets::new(10, 1.0, 16);
+        assert!(tb.try_take_n_at(1, 7, t0));
+        assert!(!tb.try_take_n_at(1, 4, t0), "only 3 left: nothing is taken");
+        assert!(tb.try_take_n_at(1, 3, t0), "the refused request consumed nothing");
+        assert!(!tb.try_take_n_at(1, 1, t0));
+        assert!(tb.try_take_n_at(1, 2, t0 + Duration::from_secs(2)));
+        assert!(!tb.try_take_n_at(2, 11, t0), "more than the burst never passes");
+    }
+
+    #[test]
+    fn refund_is_capped_and_remove_forgets() {
+        let t0 = Instant::now();
+        let mut tb: TokenBuckets<u32> = TokenBuckets::new(10, 0.0, 16);
+        assert!(tb.try_take_n_at(1, 8, t0));
+        tb.refund_n(1, 5);
+        assert!(tb.try_take_n_at(1, 7, t0), "2 + 5 refunded");
+        tb.refund_n(1, 1_000);
+        assert!(tb.try_take_n_at(1, 10, t0) && !tb.try_take_n_at(1, 1, t0), "refund capped at the burst");
+        tb.refund_n(2, 5); // untracked: no-op
+        assert_eq!(tb.tracked(), 1);
+        tb.remove(&1);
+        assert_eq!(tb.tracked(), 0);
     }
 
     #[test]

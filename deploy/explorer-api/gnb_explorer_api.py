@@ -94,6 +94,7 @@ ADDRESS = _re(ADDR, "gnb1q/gnb1t address")
 U32 = _int(0, 2**32 - 1)
 PAGE = _int(1, 100)
 OFFSET = _int(0, 10**9)
+RICH_OFFSET = _int(0, 10_000)
 
 # method -> (list of parameter checkers, cache seconds)
 ALLOWED = {
@@ -117,7 +118,9 @@ ALLOWED = {
     "getaddresshistory":       ([ADDRESS, PAGE, OFFSET], 5),
     "getbalance":              ([ADDRESS], 5),
     "getutxos":                ([ADDRESS, _int(1, 50)], 2),
-    "getrichlist":             ([PAGE, OFFSET], 60),
+    # NET-12: served from the node's incremental holder index; the node
+    # serves offsets up to analytics::MAX_RICHLIST_OFFSET = 10,000.
+    "getrichlist":             ([PAGE, RICH_OFFSET], 60),
     "getsupplydistribution":   ([], 60),
     "validateaddress":         ([_re(re.compile(r"^.{1,80}$"), "string")], 60),
 }
@@ -141,12 +144,18 @@ def rpc(method, params):
 
 
 def cached(key, ttl, fn):
+    """Serve `key` from the cache while fresh, else compute it with `fn`.
+    Only successes are cached: a node error (a cancelled or timed-out heavy
+    read, aggregates not built yet, busy) must not answer the next callers
+    for `ttl` seconds - the node's HeavyGate never caches one either."""
     now = time.monotonic()
     with _cache_lock:
         hit = _cache.get(key)
         if hit and hit[0] > now:
             return hit[1]
     value = fn()
+    if "error" in value:
+        return value
     with _cache_lock:
         if len(_cache) >= CACHE_MAX:
             _cache.clear()

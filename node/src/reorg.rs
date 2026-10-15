@@ -353,7 +353,11 @@ pub fn apply_block_utxo_mutations(
     }
 
     store.put_undo_data(&block_hash, &undo)
-        .map_err(|e| format!("apply_block_utxo_mutations: put_undo_data failed: {}", e))
+        .map_err(|e| format!("apply_block_utxo_mutations: put_undo_data failed: {}", e))?;
+    // NET-12: the block joined the connected chain (holder aggregates already
+    // followed the put/delete calls above).
+    store.note_block_connected(&block_hash, block.transactions.len() as u64)
+        .map_err(|e| format!("apply_block_utxo_mutations: aggregates: {}", e))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -444,6 +448,11 @@ impl<'a> UtxoView for ReorgBatch<'a> {
 
 /// All chain-switch mutations staged for one atomic commit, with an overlay
 /// so staged UTXO / coinbase state is readable before the commit.
+///
+/// NET-12: the explorer aggregates (holder balances, supply tiers, chain
+/// totals and per-block cumulative totals — `storage::aggregates`) are
+/// updated in the SAME batch, so they follow every connect and disconnect
+/// atomically. The aggregate lock is held from creation to commit/drop.
 struct ReorgBatch<'a> {
     store: &'a Storage,
     batch: rocksdb::WriteBatch,
@@ -454,17 +463,31 @@ struct ReorgBatch<'a> {
     /// txid → Some((block, height)) if staged-put, None if staged-deleted
     /// (read back when a block replaces a tx-index row, audit VAL-2).
     tx_index_overlay: HashMap<[u8; 32], Option<([u8; 32], u64)>>,
+    /// NET-12: net holder changes of every staged UTXO mutation.
+    holders: crate::storage::aggregates::HolderDeltas,
+    /// NET-12: running connected-chain totals.
+    chain: crate::storage::aggregates::ChainTotals,
+    /// NET-12: running XOR of the connected blocks' hashes (`agg/conn`).
+    conn: [u8; 32],
+    _agg: parking_lot::MutexGuard<'a, ()>,
 }
 
 impl<'a> ReorgBatch<'a> {
-    fn new(store: &'a Storage) -> Self {
-        ReorgBatch {
+    fn new(store: &'a Storage) -> Result<Self, String> {
+        let agg = store.agg_lock();
+        let chain = store.chain_totals().map_err(|e| format!("reorg batch: aggregates: {}", e))?;
+        let conn = store.conn_fingerprint().map_err(|e| format!("reorg batch: aggregates: {}", e))?.unwrap_or_default();
+        Ok(ReorgBatch {
             store,
             batch: rocksdb::WriteBatch::default(),
             utxo_overlay: HashMap::new(),
             coinbase_overlay: HashMap::new(),
             tx_index_overlay: HashMap::new(),
-        }
+            holders: Default::default(),
+            chain,
+            conn,
+            _agg: agg,
+        })
     }
 
     fn cf(&self, name: &str) -> Result<&'a rocksdb::ColumnFamily, String> {
@@ -501,6 +524,10 @@ impl<'a> ReorgBatch<'a> {
 
     /// Mirrors `Storage::put_utxo` (CF_UTXO row + CF_ADDR_UTXO index row).
     fn put_utxo(&mut self, txid: &[u8; 32], index: u32, output: &TxOutput) -> Result<(), String> {
+        if let Some(prev) = self.get_utxo(txid, index)? {
+            self.holders.remove(&prev);
+        }
+        self.holders.add(output);
         let key = utxo_key(txid, index);
         let cf_u = self.cf(CF_UTXO)?;
         self.batch.put_cf(cf_u, &key, &bc_encode(output)?);
@@ -521,6 +548,7 @@ impl<'a> ReorgBatch<'a> {
                 let cf_ai = self.cf(CF_ADDR_UTXO)?;
                 self.batch.delete_cf(cf_ai, &addr_utxo_key(&output.script_pubkey, txid, index));
             }
+            self.holders.remove(&output);
         }
         let key = utxo_key(txid, index);
         let cf_u = self.cf(CF_UTXO)?;
@@ -585,11 +613,36 @@ impl<'a> ReorgBatch<'a> {
         Ok(())
     }
 
+    /// NET-12: a block left (`delta = -1`) or joined (`+1`) the connected
+    /// chain with `txs` transactions; stage the running totals and the
+    /// block's cumulative record.
+    fn note_chain_move(&mut self, hash: &[u8; 32], txs: u64, joined: bool) -> Result<(), String> {
+        if joined {
+            self.chain.blocks += 1;
+            self.chain.txs = self.chain.txs.saturating_add(txs);
+        } else {
+            self.chain.blocks = self.chain.blocks.saturating_sub(1);
+            self.chain.txs = self.chain.txs.saturating_sub(txs);
+        }
+        crate::storage::aggregates::xor_into(&mut self.conn, hash);
+        let rec = if joined { Some(self.chain) } else { None };
+        self.store.stage_chain_cumulative(&mut self.batch, hash, rec)
+            .map_err(|e| format!("reorg batch: aggregates: {}", e))
+    }
+
     /// Commit every staged mutation atomically. Consumes the batch; RocksDB
-    /// applies a WriteBatch all-or-nothing.
-    fn commit(self) -> Result<(), String> {
-        self.store.db().write(self.batch)
-            .map_err(|e| format!("reorg batch: atomic commit failed: {}", e))
+    /// applies a WriteBatch all-or-nothing. The NET-12 aggregates are staged
+    /// last, from the committed values plus this batch's net changes.
+    fn commit(mut self) -> Result<(), String> {
+        self.store.stage_holder_deltas(&mut self.batch, &self.holders)
+            .map_err(|e| format!("reorg batch: aggregates: {}", e))?;
+        self.store.stage_chain_totals(&mut self.batch, self.chain, &self.conn)
+            .map_err(|e| format!("reorg batch: aggregates: {}", e))?;
+        let ReorgBatch { store, batch, _agg, .. } = self;
+        let r = store.db().write(batch)
+            .map_err(|e| format!("reorg batch: atomic commit failed: {}", e));
+        drop(_agg);
+        r
     }
 }
 
@@ -687,6 +740,9 @@ fn rollback_block_batched(
     batch.store.stage_chain_unindex(&mut batch.batch, block)
         .map_err(|e| format!("rollback: chain unindex failed: {}", e))?;
 
+    // 8. NET-12: the block leaves the connected chain.
+    batch.note_chain_move(block_hash, undo.tx_index_keys.len() as u64, false)?;
+
     Ok(())
 }
 
@@ -754,7 +810,9 @@ fn apply_block_utxo_mutations_batched(
     }
 
     stage_index(batch, &undo)?;
-    batch.put_undo_data(&block_hash, &undo)
+    batch.put_undo_data(&block_hash, &undo)?;
+    // NET-12: the block joins the connected chain.
+    batch.note_chain_move(&block_hash, block.transactions.len() as u64, true)
 }
 
 /// SECURITY (audit H1): re-validate a fork block's transactions against the
@@ -900,6 +958,21 @@ pub struct ConnectOutcome {
     pub connected: Vec<Block>,
 }
 
+impl ConnectOutcome {
+    /// The non-coinbase transactions of the disconnected blocks in the order
+    /// they must be re-admitted to the mempool: OLDEST disconnected block
+    /// first, block order inside each block (Bitcoin Core's
+    /// `DisconnectedBlockTransactions`). A child confirmed one block after its
+    /// parent therefore comes back after the parent, as an in-pool chain
+    /// (MEM-6); `disconnected` itself is tip-first, and re-admitting in that
+    /// order refused the child with "missing inputs" and lost it.
+    pub fn disconnected_txs_oldest_first(&self) -> Vec<Transaction> {
+        self.disconnected.iter().rev()
+            .flat_map(|b| b.transactions.iter().filter(|t| !t.is_coinbase()).cloned())
+            .collect()
+    }
+}
+
 /// Hooks the caller plugs into [`connect_plan`].
 pub struct ConnectHooks<'h> {
     /// Validate one block against the staged view of ITS OWN selected-chain
@@ -932,7 +1005,7 @@ pub fn connect_plan(
         )));
     }
 
-    let mut batch = ReorgBatch::new(store);
+    let mut batch = ReorgBatch::new(store).map_err(ConnectError::Failed)?;
     let mut outcome = ConnectOutcome::default();
 
     for hash in &plan.to_rollback {
@@ -987,8 +1060,11 @@ pub fn connect_plan(
 ///    captures fresh UndoData so the new chain is also reorg-capable.
 /// 3. **Reinject** candidate txs into the mempool through the shared
 ///    admission function (`reinject_disconnected`, audit MEM-7): UTXO
-///    presence, maturity and minimum fees at the new tip. Rejected ones are
-///    counted as discarded.
+///    presence, maturity and minimum fees at the new tip. Candidates are
+///    re-admitted OLDEST disconnected block first, in block order
+///    ([`ConnectOutcome::disconnected_txs_oldest_first`]), so a parent is
+///    back in the pool before a child confirmed in a later block. Rejected
+///    ones are counted as discarded.
 ///
 /// Fork blocks are re-validated with the audit-H1 UTXO-state rules
 /// (`validate_fork_block_state`). The acceptance pipeline does not call this
@@ -1064,10 +1140,9 @@ fn execute_reorg_inner(
     let outcome = connect_plan(store, plan, &hooks).map_err(|e| e.to_string())?;
 
     // Phase 3: re-admit the disconnected blocks' transactions through the
-    // shared admission function, evaluated at the new tip (MEM-7).
-    let candidates: Vec<Transaction> = outcome.disconnected.iter()
-        .flat_map(|b| b.transactions.iter().filter(|t| !t.is_coinbase()).cloned())
-        .collect();
+    // shared admission function, evaluated at the new tip (MEM-7), oldest
+    // disconnected block first so parents precede their children (MEM-6).
+    let candidates: Vec<Transaction> = outcome.disconnected_txs_oldest_first();
     // The next block's height: this storage-only entry point has no DAG, so
     // it uses the new tip's DAG height + 1 (its CF_DAG record) — the template
     // height when the new tip is the only tip — never the tip's HEADER height

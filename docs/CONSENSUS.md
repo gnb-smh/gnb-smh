@@ -526,7 +526,11 @@ H-1 is mined in H-1 or evicted when the next block is H); the template
 self-check applies the same rules at the template height. Relay policy is
 never a block-validity verdict: a block below the activation that carries a
 non-standard transaction (version ≥ 3 signed over sighash v2, a non-canonical
-witness, a suite 0x0002 key) is valid.
+witness, a suite 0x0002 key) is valid. Nor is it a verdict on the peer that
+relayed it: the gossip relay answers these refusals, and the next-height
+rules above, `Ignore` without a penalty (`docs/MEMPOOL.md`, §2), since a peer
+running an older release or one block behind across the activation relays
+such a transaction honestly.
 
 ### Signers
 

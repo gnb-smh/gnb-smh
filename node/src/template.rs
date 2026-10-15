@@ -8,34 +8,42 @@
 //!   [`template_parents_and_height`]) — the stock code
 //!   used EVERY tip, so more than 256 tips made every template invalid
 //!   (`too many parents`) with nobody able to merge them (DAG-2).
-//! * Transactions: highest fee rate first under a BYTE budget measured exactly
-//!   as the consensus rule measures AT THE TEMPLATE'S HEIGHT (bincode
-//!   `Block::size_bytes` below the hardening activation, the canonical wire
-//!   encoding `Block::wire_size` at/after it, audit VAL-12): the budget is
-//!   `MAX_BLOCK_SIZE` minus an upper bound of the header and block framing
-//!   (every varint at its maximum width) minus a coinbase reserve. A
-//!   count-only cap let ~116 ordinary transactions push every template past
-//!   `MAX_BLOCK_SIZE` (MEM-2).
+//! * Transactions: whole ANCESTOR PACKAGES by package fee rate, parents
+//!   before children (child-pays-for-parent, audit MEM-6 —
+//!   `mempool::select_packages`; without in-pool chains this is highest fee
+//!   rate first), under a BYTE budget measured exactly as the consensus rule
+//!   measures AT THE TEMPLATE'S HEIGHT (bincode `Block::size_bytes` below the
+//!   hardening activation, the canonical wire encoding `Block::wire_size`
+//!   at/after it, audit VAL-12 — package sizes and fee rates use the same
+//!   measure): the budget is `MAX_BLOCK_SIZE` minus an upper bound of the
+//!   header and block framing (every varint at its maximum width) minus a
+//!   coinbase reserve. A count-only cap let ~116 ordinary transactions push
+//!   every template past `MAX_BLOCK_SIZE` (MEM-2).
 //! * Hardening rules (docs/CONSENSUS.md, "Block rules at the hardening
 //!   activation"): a template at/after the activation height gets the
 //!   tagged Merkle root and a coinbase whose `script_sig` starts with the
 //!   80-byte commitment (height, parents, witness root) —
 //!   [`assemble_block`] writes it — and never contains a 64-byte
 //!   transaction or a spend of its own coinbase (inputs must be in the UTXO
-//!   set). A template below the height is built exactly as before.
+//!   set or outputs of pooled transactions placed earlier in the template).
+//!   A template below the height is built exactly as before.
 //! * Self-check: every selected transaction is re-validated against the
-//!   current UTXO set (standardness, inputs present and not already used by
+//!   current UTXO set plus the outputs of the transactions placed before it
+//!   in the template (standardness, inputs present and not already used by
 //!   the template, coinbase maturity at the template height, the
 //!   transaction-version rule and policy and the 64-byte rule at the template
 //!   height (`admission::check_tx_for_next_block`, CRY-3 / VAL-10
-//!   activation), MoneyRange, consensus minimum fee, input scripts — normally
-//!   verified-signature cache hits). A transaction that fails is EVICTED from
-//!   the mempool instead of making every template invalid (MEM-1, MEM-3) —
-//!   except a transaction that fails ONLY those height rules at the template
-//!   height while it passes them at the pool's own next height
-//!   (`Mempool::next_height`), which is skipped, never evicted. The fees the
-//!   coinbase may claim are recomputed from the UTXO set, never taken from
-//!   the pool.
+//!   activation), MoneyRange, consensus minimum fee, input scripts at the
+//!   template height, with the spent amounts and scripts of in-template
+//!   parents as sighash-v3 prevouts — normally verified-signature cache
+//!   hits). A transaction that fails is EVICTED from the mempool together
+//!   with its in-pool descendants instead of making every template invalid
+//!   (MEM-1, MEM-3, MEM-6) — except a transaction that fails ONLY those
+//!   height rules at the template height while it passes them at the pool's
+//!   own next height (`Mempool::next_height`), which is skipped, never
+//!   evicted (its in-pool descendants are not selected either). A package
+//!   is included all-or-nothing. The fees the coinbase may claim are
+//!   recomputed from those inputs, never taken from the pool.
 //! * Height: [`template_parents_and_height`] — the ONE "next block height"
 //!   of the node. Mempool admission, post-connect eviction, re-injection and
 //!   wallets (`getdaginfo.next_block_height`) use the same value
@@ -47,15 +55,18 @@
 //! The template is built under the store's acceptance lock, so the DAG and
 //! UTXO snapshot it reads are consistent with each other.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
 use crate::consensus::{BlockHash, GhostDAG};
 use crate::core::{self, Block, BlockHeader, MerkleRoot, Transaction, TxInput, TxOutput};
-use crate::mempool::{admission, Mempool};
+use crate::mempool::{self, admission, Mempool};
 use crate::storage::Storage;
+
+/// `(txid, output index)`.
+type Outpoint = ([u8; 32], u32);
 
 /// Bytes reserved for a coinbase the template builder does not construct
 /// itself (`getblocktemplate` consumers build their own coinbase). Far above
@@ -365,9 +376,10 @@ pub fn build_block_template_with(
         .saturating_sub(framing_upper_bound(&parents, hardened))
         .saturating_sub(coinbase_reserve);
 
-    // Fee-rate order, byte budget, self-check, eviction.
-    let mut used = 0usize;
+    // Ancestor packages by package fee rate (CPFP), byte budget, self-check
+    // of every package member in block order, eviction.
     let mut spent_by_template: HashSet<([u8; 32], u32)> = HashSet::new();
+    let mut created_by_template: HashMap<([u8; 32], u32), TxOutput> = HashMap::new();
     let mut selected: Vec<(Transaction, u64)> = Vec::new();
     let mut total_fees: u64 = 0;
     let mut evict: HashSet<[u8; 32]> = HashSet::new();
@@ -378,34 +390,54 @@ pub fn build_block_template_with(
         0 => height,
         h => h,
     };
-    for (tx, _pool_fee, pool_size) in mempool.entries_by_fee_rate() {
-        // The pool records bincode sizes; the consensus measure at/after the
-        // activation is the wire encoding (VAL-12).
-        let size = if hardened { tx.wire_size(true) } else { pool_size };
-        if used.saturating_add(size) > budget {
-            continue; // a smaller, lower-rate tx may still fit
-        }
-        match self_check(store, &tx, height, pool_height, &spent_by_template, options.verify_scripts) {
-            Ok(fee) => {
-                let new_total = match core::limits::money_add(total_fees, fee) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                for inp in &tx.inputs {
-                    spent_by_template.insert((inp.prev_txid, inp.prev_index));
+    // The pool records bincode sizes; the consensus measure at/after the
+    // activation is the wire encoding (VAL-12): package sizes, package fee
+    // rates and the budget all use the measure of the template's height.
+    let candidates = mempool.package_candidates_with(|tx, pool_size| {
+        if hardened { tx.wire_size(true) } else { pool_size }
+    });
+    mempool::select_packages(&candidates, budget, usize::MAX, |package| {
+        // Dry-run the whole package against the template state; commit only
+        // if every member passes (all-or-nothing).
+        let mut local_spent: HashSet<([u8; 32], u32)> = HashSet::new();
+        let mut local_created: HashMap<([u8; 32], u32), TxOutput> = HashMap::new();
+        let mut local_fees = total_fees;
+        let mut staged: Vec<(Transaction, u64)> = Vec::with_capacity(package.len());
+        for txid in package {
+            let Some(tx) = mempool.get_tx(txid) else { return Err(*txid) };
+            let is_spent = |op: &([u8; 32], u32)| spent_by_template.contains(op) || local_spent.contains(op);
+            let created = |op: &([u8; 32], u32)| {
+                local_created.get(op).or_else(|| created_by_template.get(op)).cloned()
+            };
+            match self_check(store, &tx, height, pool_height, &is_spent, &created, options.verify_scripts) {
+                Ok(fee) => {
+                    local_fees = match core::limits::money_add(local_fees, fee) {
+                        Ok(t) => t,
+                        Err(_) => return Err(*txid),
+                    };
+                    for inp in &tx.inputs {
+                        local_spent.insert((inp.prev_txid, inp.prev_index));
+                    }
+                    for (j, o) in tx.outputs.iter().enumerate() {
+                        local_created.insert((*txid, j as u32), o.clone());
+                    }
+                    staged.push((tx, fee));
                 }
-                used = used.saturating_add(size);
-                total_fees = new_total;
-                selected.push((tx, fee));
+                Err(TemplateReject::Evict(reason)) => {
+                    log::info!("template: evicting tx {} (and its descendants) from the mempool: {}",
+                        hex::encode(&txid[..8]), reason);
+                    evict.insert(*txid);
+                    return Err(*txid);
+                }
+                Err(TemplateReject::Skip) => return Err(*txid),
             }
-            Err(TemplateReject::Evict(reason)) => {
-                log::info!("template: evicting tx {} from the mempool: {}",
-                    hex::encode(&tx.txid()[..8]), reason);
-                evict.insert(tx.txid());
-            }
-            Err(TemplateReject::Skip) => {}
         }
-    }
+        spent_by_template.extend(local_spent);
+        created_by_template.extend(local_created);
+        total_fees = local_fees;
+        selected.extend(staged);
+        Ok(())
+    });
     let evicted = evict.len();
     if evicted > 0 {
         mempool.retain_valid(|e| !evict.contains(&e.tx.txid()));
@@ -437,14 +469,17 @@ enum TemplateReject {
     Skip,
 }
 
-/// In-context check of one candidate (see the module docs). `pool_height` is
-/// the mempool's next height (normally equal to `height`).
+/// In-context check of one candidate (see the module docs): its inputs come
+/// from `created` (outputs of transactions placed earlier in the template —
+/// MEM-6 package parents) or the UTXO set. `pool_height` is the mempool's
+/// next height (normally equal to `height`).
 fn self_check(
     store: &Storage,
     tx: &Transaction,
     height: u64,
     pool_height: u64,
-    spent_by_template: &HashSet<([u8; 32], u32)>,
+    spent_by_template: &dyn Fn(&Outpoint) -> bool,
+    created: &dyn Fn(&Outpoint) -> Option<TxOutput>,
     verify_scripts: bool,
 ) -> Result<u64, TemplateReject> {
     admission::check_standard(tx).map_err(|e| TemplateReject::Evict(e.to_string()))?;
@@ -470,14 +505,18 @@ fn self_check(
         if !seen.insert(op) {
             return Err(TemplateReject::Evict("duplicate input".into()));
         }
-        if spent_by_template.contains(&op) {
+        if spent_by_template(&op) {
             return Err(TemplateReject::Skip);
         }
-        let out = match store.get_utxo(&inp.prev_txid, inp.prev_index) {
-            Ok(Some(o)) => o,
-            Ok(None) => return Err(TemplateReject::Evict(format!(
-                "input {}:{} is not in the UTXO set", hex::encode(&inp.prev_txid[..8]), inp.prev_index))),
-            Err(_) => return Err(TemplateReject::Skip),
+        let out = match created(&op) {
+            Some(o) => o,
+            None => match store.get_utxo(&inp.prev_txid, inp.prev_index) {
+                Ok(Some(o)) => o,
+                Ok(None) => return Err(TemplateReject::Evict(format!(
+                    "input {}:{} is neither in the UTXO set nor created earlier in the template",
+                    hex::encode(&inp.prev_txid[..8]), inp.prev_index))),
+                Err(_) => return Err(TemplateReject::Skip),
+            },
         };
         total_in = core::limits::money_add(total_in, out.value)
             .map_err(TemplateReject::Evict)?;
