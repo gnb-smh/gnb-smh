@@ -161,6 +161,62 @@ jobs:
       - name: Consistency harness (release)
         run: cargo test --release --locked
 
+  # Sanitizers over the consensus crates (scripts/sanitizers.sh,
+  # docs/testing/SANITIZERS.md). AddressSanitizer + LeakSanitizer instrument
+  # the Rust code (nightly -Zsanitizer=address) AND the PQClean C code that
+  # the pqcrypto build scripts compile (clang -fsanitize=address); then
+  # UndefinedBehaviorSanitizer instruments that C code (gcc, no recovery).
+  # Each mode checks that every PQClean archive really is instrumented.
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+      - name: clang and the UBSan runtime
+        run: sudo apt-get update && sudo apt-get install -y clang libubsan1
+      # Older ASan runtimes crash under the runner kernel's 32-bit mmap ASLR
+      # entropy; 28 bits is what they support. Harmless for current ones.
+      - name: ASLR entropy compatible with the ASan shadow layout
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: AddressSanitizer + LeakSanitizer (gnb-smh, gnb-crypto, pqcrypto-internals; Rust and C)
+        run: sh scripts/sanitizers.sh asan
+      - name: UndefinedBehaviorSanitizer (PQClean C under gnb-crypto and pqcrypto-internals)
+        run: sh scripts/sanitizers.sh ubsan
+
+  # Miri: undefined behaviour in the pure-Rust consensus arithmetic (gnb-smh
+  # difficulty/compact/ASERT/work, gnb-crypto core::limits, tokenomics,
+  # block_rules, sighash, activation) and in the unsafe RNG override of
+  # pqcrypto-internals; then gnb-smh on a 32-bit and a big-endian target.
+  # Miri-incompatible tests carry #[cfg_attr(miri, ignore = "<why>")].
+  miri:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120   # local reference: about 15 minutes in total
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nightly toolchain with Miri
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri,rust-src
+          cargo +nightly miri setup
+      - name: Miri (host)
+        run: sh scripts/sanitizers.sh miri
+      - name: Miri (gnb-smh on i686 and s390x)
+        run: sh scripts/sanitizers.sh miri-cross
+
+  # 32-bit build and tests (usize = 32 bits: the CRY-8 overflow class) of the
+  # consensus crates on i686-unknown-linux-gnu, pinned toolchain.
+  i686:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 32-bit target and multilib gcc (PQClean C)
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc-multilib
+          cargo --version   # installs the rust-toolchain.toml toolchain
+          rustup target add i686-unknown-linux-gnu
+      - name: gnb-smh, gnb-crypto, coherence-core, pqcrypto-internals on i686
+        run: sh scripts/sanitizers.sh i686
+
   # Builds every cargo-fuzz target (node/fuzz, nightly + libFuzzer) and runs
   # each briefly over its committed seed corpus.
   fuzz:
