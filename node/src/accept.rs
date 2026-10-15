@@ -1122,9 +1122,49 @@ pub struct ChainOverride {
     pub affected: usize,
 }
 
+/// Why an operator chain override changed nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverrideError {
+    /// Refused or failed (unknown block, genesis, storage error, ...).
+    Failed(String),
+    /// Pruned nodes: the chain to move to must apply blocks whose bodies this
+    /// node pruned (`reorg::ERR_MISSING_BODIES`). Nothing was committed and
+    /// the marks are as before the call. `missing` are the next bodies to
+    /// re-fetch (unapplied selected-chain blocks without a body, nearest the
+    /// new tip first, at most `ingress::MAX_BODY_REFETCH`); once they are
+    /// restored, the same call is retried (and asks for the next ones).
+    MissingBodies { missing: Vec<BlockHash>, reason: String },
+}
+
+impl std::fmt::Display for OverrideError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OverrideError::Failed(m) => f.write_str(m),
+            OverrideError::MissingBodies { missing, reason } => write!(
+                f, "{} block bod(ies) must be re-fetched first ({})", missing.len(), reason),
+        }
+    }
+}
+
+impl std::error::Error for OverrideError {}
+
+impl From<String> for OverrideError {
+    fn from(m: String) -> Self {
+        OverrideError::Failed(m)
+    }
+}
+
+impl From<&str> for OverrideError {
+    fn from(m: &str) -> Self {
+        OverrideError::Failed(m.to_string())
+    }
+}
+
 /// Shared tail of the two operator calls: move the applied chain to the best
 /// valid block, persisting `log` marks and removing `cleared` marks in the
-/// same batch, then refresh the mempool and the RPC-visible state.
+/// same batch, then refresh the mempool and the RPC-visible state. The
+/// caller's in-memory marks are still in place on return; on `Err` the caller
+/// restores them from disk (nothing was committed).
 #[allow(clippy::too_many_arguments)]
 fn apply_operator_override(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
@@ -1136,12 +1176,30 @@ fn apply_operator_override(
     mut log: Vec<(BlockHash, String)>,
     cleared: &[BlockHash],
     affected: usize,
-) -> Result<ChainOverride, String> {
+) -> Result<ChainOverride, OverrideError> {
     let applied = store.get_meta("tip_hash").map_err(|e| e.to_string())?
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
         .ok_or("no applied tip pointer")?;
     let (mut rolled_back, mut connected) = (0usize, 0usize);
-    match resolve_best_chain(dag, store, shielded, applied, None, &mut log, cleared)? {
+    let resolution = match resolve_best_chain(dag, store, shielded, applied, None, &mut log, cleared) {
+        Ok(r) => r,
+        Err(m) if m.contains(reorg::ERR_MISSING_BODIES) => {
+            // DAG-6, pruned nodes: name the bodies to re-fetch while the
+            // operator's marks still select the candidate that needs them.
+            let cand = dag.read().selected_tip();
+            let missing = match cand {
+                Some(c) => missing_bodies_below(dag, store, &[c], crate::ingress::MAX_BODY_REFETCH),
+                None => Vec::new(),
+            };
+            return Err(if missing.is_empty() {
+                OverrideError::Failed(m)
+            } else {
+                OverrideError::MissingBodies { missing, reason: m }
+            });
+        }
+        Err(m) => return Err(OverrideError::Failed(m)),
+    };
+    match resolution {
         Resolution::Unchanged => persist_unchanged(dag, store, None, &log, cleared)?,
         Resolution::Connected { plan, outcome } => {
             rolled_back = outcome.rolled_back();
@@ -1189,6 +1247,8 @@ fn apply_operator_override(
 /// [`OPERATOR_INVALIDATE_REASON`]) and move the applied chain to the best
 /// valid block that remains — rolling back past `hash` if it was applied —
 /// in one atomic batch. Survives restarts; undone by [`reconsider_block`].
+/// On a pruned node whose new chain needs pruned bodies it changes nothing
+/// and returns [`OverrideError::MissingBodies`] (re-fetch them, then retry).
 #[allow(clippy::too_many_arguments)]
 pub fn invalidate_block(
     hash: BlockHash,
@@ -1198,11 +1258,11 @@ pub fn invalidate_block(
     node_state: &Arc<RwLock<rpc::NodeState>>,
     tip_tx: Option<&broadcast::Sender<tip::TipChanged>>,
     shielded: &Arc<RwLock<ShieldedPool>>,
-) -> Result<ChainOverride, String> {
+) -> Result<ChainOverride, OverrideError> {
     let _guard = store.acceptance_lock();
     ensure_invalid_set_loaded(dag, store);
     if !dag.read().has_block(&hash) {
-        return Err(format!("block {} not found", hex::encode(hash)));
+        return Err(format!("block {} not found", hex::encode(hash)).into());
     }
     if dag.read().store.genesis == Some(hash) {
         return Err("the genesis block cannot be invalidated".into());
@@ -1227,7 +1287,9 @@ pub fn invalidate_block(
 /// the disqualified set from the remaining marks, and move the applied chain
 /// to the best valid block (which re-validates the reconsidered chain in its
 /// own context: a block that really is invalid is disqualified again, with a
-/// consensus reason), all in one atomic batch.
+/// consensus reason), all in one atomic batch. Like [`invalidate_block`], it
+/// returns [`OverrideError::MissingBodies`] and changes nothing when the
+/// chain to move to needs bodies this pruned node no longer has.
 #[allow(clippy::too_many_arguments)]
 pub fn reconsider_block(
     hash: BlockHash,
@@ -1237,11 +1299,11 @@ pub fn reconsider_block(
     node_state: &Arc<RwLock<rpc::NodeState>>,
     tip_tx: Option<&broadcast::Sender<tip::TipChanged>>,
     shielded: &Arc<RwLock<ShieldedPool>>,
-) -> Result<ChainOverride, String> {
+) -> Result<ChainOverride, OverrideError> {
     let _guard = store.acceptance_lock();
     ensure_invalid_set_loaded(dag, store);
     if !dag.read().has_block(&hash) {
-        return Err(format!("block {} not found", hex::encode(hash)));
+        return Err(format!("block {} not found", hex::encode(hash)).into());
     }
     let roots = store.load_invalid_blocks().map_err(|e| e.to_string())?;
     let (cleared, kept): (Vec<BlockHash>, Vec<BlockHash>) = {

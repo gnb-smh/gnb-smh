@@ -834,6 +834,15 @@ async fn main() {
     let getheaders_sent_ms = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
     let getheaders_sent2   = getheaders_sent_ms.clone();
 
+    // DAG-6, pruned nodes: the bodies this node requested because a connect
+    // needs them again. Shared by the processor's ingress core (failed block
+    // connects; the only place bodies are restored) and the operator overrides
+    // (`invalidateblock` / `reconsiderblock`, RPC task); it survives
+    // processor restarts.
+    let wanted_bodies: ingress::SharedWantedBodies =
+        Arc::new(parking_lot::Mutex::new(ingress::WantedBodies::new()));
+    let wanted_bodies2 = wanted_bodies.clone();
+
     tokio::spawn(async move {
         use futures::future::FutureExt;
         // ── P0 supervision (roadmap §2.5, top reliability risk #1) ───────────
@@ -865,7 +874,8 @@ async fn main() {
             // the deep-insertion budget (DAG-7 / POW-3) and the POW-3 anti-DoS
             // work rule. Lives inside the restartable closure: a panic
             // rebuilds it empty (peers resend).
-            let mut ingress_core = ingress::BlockIngress::new();
+            let mut ingress_core = ingress::BlockIngress::with_wanted_bodies(
+                ingress::OrphanLimits::default(), wanted_bodies2.clone());
             let mut orphan_sweep = tokio::time::interval(sync::parent_fetch::SWEEP_PERIOD);
             orphan_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Never fire immediately on (re)start — tick 0 is now.
@@ -892,6 +902,13 @@ async fn main() {
                     // otherwise strand its orphans forever — drain them now.
                     for p in ready {
                         ingress_core.drain_orphans(p, &ctx);
+                    }
+                    {
+                        let mut w = wanted_bodies2.lock();
+                        w.expire(std::time::Instant::now());
+                        if !w.is_empty() {
+                            debug!("{} requested block bod(ies) outstanding (DAG-6 re-fetch)", w.len());
+                        }
                     }
                     frontier2.lock().set_orphan_evidence(ingress_core.orphans.max_evidence_height());
                     maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
@@ -1042,11 +1059,16 @@ async fn main() {
                 network::NetworkMessage::NewBlock { block_data, block_hash, height, .. } => {
                     let now = std::time::Instant::now();
                     let verdict: network::GossipVerdict = 'blk: {
-                        // Known = in the DAG WITH its body (a pruned body that a
-                        // reorg needs again is re-fetched, DAG-6), or buffered.
-                        let in_dag_with_body = dag2.read().has_block(&block_hash)
-                            && store2.has_block_body(&block_hash).unwrap_or(true);
-                        if in_dag_with_body || ingress_core.orphans.contains(&block_hash) {
+                        // Known = buffered, or in the DAG — unless it is the
+                        // answer to our own pull of a body this node requested
+                        // because a connect needs it again (DAG-6, pruned
+                        // nodes). Any other copy of a DAG block, a pushed old
+                        // body included, is ignored here before decoding.
+                        let known_in_dag = dag2.read().has_block(&block_hash)
+                            && (!origin.is_solicited()
+                                || !ingress_core.awaits_body(&block_hash, now)
+                                || store2.has_block_body(&block_hash).unwrap_or(true));
+                        if known_in_dag || ingress_core.orphans.contains(&block_hash) {
                             break 'blk network::GossipVerdict::Ignore;
                         }
                         let tip_h = selected_tip_height(&dag2);
@@ -1100,7 +1122,8 @@ async fn main() {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs()).unwrap_or(0);
                         let t_validate = std::time::Instant::now();
-                        match ingress_core.handle_block(block, block_hash, block_data.len(), origin.peer(), now, now_unix, &ctx) {
+                        match ingress_core.handle_block(block, block_hash, block_data.len(), origin.peer(),
+                                                        origin.is_solicited(), now, now_unix, &ctx) {
                             ingress::BlockOutcome::Known | ingress::BlockOutcome::PoolRefused => {
                                 network::GossipVerdict::Ignore
                             }
@@ -1669,7 +1692,7 @@ async fn main() {
     // Audit DAG-6: operator recovery (invalidateblock / reconsiderblock).
     let rpc_chain_admin: Arc<rpc::ChainAdminFn> = make_chain_admin_cb(
         dag.clone(), store.clone(), mempool.clone(), node_state.clone(),
-        shielded.clone(), tip_tx.clone(),
+        shielded.clone(), tip_tx.clone(), outbound_tx.clone(), wanted_bodies.clone(),
     );
 
     let metrics_state = std::sync::Arc::new(
@@ -1868,6 +1891,12 @@ fn make_rpc_submit_block_cb(
 /// atomically with the chain move, and refresh mempool, RPC state and the
 /// stratum tip notification. Authorization is the RPC layer's
 /// (`rpc::auth::ADMIN_METHODS`: never anonymous).
+///
+/// On a pruned node the chain to move to may need bodies it pruned: the call
+/// then changes nothing, requests the next batch of missing bodies from the
+/// peers (recorded in `wanted`, so the processor restores them) and asks the
+/// operator to retry; each retry fetches the next batch until it succeeds.
+#[allow(clippy::too_many_arguments)]
 fn make_chain_admin_cb(
     dag:        Arc<RwLock<consensus::GhostDAG>>,
     store:      Arc<storage::Storage>,
@@ -1875,14 +1904,48 @@ fn make_chain_admin_cb(
     node_state: Arc<RwLock<rpc::NodeState>>,
     shielded:   Arc<RwLock<crate::coherence::ShieldedPool>>,
     tip_tx:     broadcast::Sender<tip::TipChanged>,
+    otx:        tokio::sync::mpsc::Sender<network::NetworkMessage>,
+    wanted:     ingress::SharedWantedBodies,
 ) -> Arc<rpc::ChainAdminFn> {
     Arc::new(move |op: rpc::ChainAdminOp, hash: [u8; 32]| -> Result<serde_json::Value, String> {
-        let r = match op {
+        let res = match op {
             rpc::ChainAdminOp::Invalidate => accept::invalidate_block(
                 hash, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
             rpc::ChainAdminOp::Reconsider => accept::reconsider_block(
                 hash, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
-        }?;
+        };
+        let r = match res {
+            Ok(r) => r,
+            Err(accept::OverrideError::MissingBodies { missing, .. }) => {
+                let n = missing.len();
+                {
+                    let now = std::time::Instant::now();
+                    let mut w = wanted.lock();
+                    for h in &missing {
+                        w.note(*h, now);
+                    }
+                }
+                let otx = otx.clone();
+                let send = async move {
+                    for h in missing {
+                        let _ = otx.send(network::NetworkMessage::GetBlock {
+                            block_hash: h, nonce: getblock_nonce(),
+                        }).await;
+                    }
+                };
+                match tokio::runtime::Handle::try_current() {
+                    Ok(rt) => { rt.spawn(send); }
+                    Err(_) => return Err("no runtime to request the missing bodies".into()),
+                }
+                warn!("{:?} {}: the chain to move to needs {} pruned block bod(ies); re-fetching them",
+                    op, hex::encode(&hash[..8]), n);
+                return Err(format!(
+                    "nothing changed: this pruned node needs {n} block bod(ies) it pruned to move to the \
+                     best remaining chain; they are being re-fetched from peers. Retry the same call \
+                     once they have arrived (each retry requests the next missing ones)"));
+            }
+            Err(e) => return Err(e.to_string()),
+        };
         Ok(serde_json::json!({
             "block":       hex::encode(hash),
             "affected":    r.affected,

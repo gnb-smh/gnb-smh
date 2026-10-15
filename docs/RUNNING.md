@@ -68,6 +68,17 @@ name (parameter: the block hash in hex). They are never served to an
 anonymous caller: they need the configured API key (`--rpc-api-key` /
 `--rpc-api-key-file`) or a trusted caller (`--rpc-trust-loopback`).
 
+On a pruned node (the default; not `--archive`) the chain to move to may
+contain blocks whose bodies were pruned: for example, `invalidateblock` on the
+first block of a fork the node followed in a reorg deeper than the pruning
+depth, or `reconsiderblock` after an `invalidateblock` that rolled the node
+back through pruned blocks. The call then changes nothing and returns an error
+saying how many block bodies it is re-fetching from the peers (at most 4,096
+per call, nearest the new tip first). Repeat the same call once they have
+arrived (a few seconds to minutes, depending on the count); each retry
+requests the next missing bodies, until the call succeeds. Only bodies the
+node requested this way are accepted.
+
 ## Chain-state check at start-up
 
 At every start the node checks its chain state for the footprint of an

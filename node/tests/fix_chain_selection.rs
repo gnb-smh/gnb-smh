@@ -490,17 +490,173 @@ fn dag6_reorg_through_pruned_bodies_is_exact() {
     assert_eq!(digest(&x), digest(&v), "back on the honest chain with its exact UTXO set");
 }
 
+/// A pruned node that reorganized away from bodies it had pruned: node X
+/// followed chain A (60 blocks, `a1` pays `fund`), pruned the bodies below
+/// height 40, then reorganized to the heavier fork B (62 blocks). A's pruned
+/// blocks are in X's DAG without bodies and unapplied (no undo record).
+struct PrunedReorged {
+    genesis: Block,
+    fund:    ([u8; 32], u32, TxOutput),
+    b:       Builder,
+    honest:  Vec<Block>,
+    fork:    Vec<Block>,
+    x:       Node,
+}
+
+fn pruned_then_reorged(tag: &str, fund_byte: u8) -> PrunedReorged {
+    let genesis = mk_genesis(unix_now() - 50_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([fund_byte; 32], 0u32, out(5_000_000, &k.spk));
+    let mut b = Builder::new(&genesis);
+    let pay = signed_spend(&k, &[(fund.0, fund.1)], vec![out(4_900_000, &[fund_byte; 20])]);
+    let h1 = b.with_txs(vec![gh], &format!("{tag}a1"), 100_000, vec![pay]);
+    let mut honest = vec![h1.clone()];
+    honest.extend(b.chain(h1.block_hash(), 59, &format!("{tag}a")));
+    let fork = b.chain(gh, 62, &format!("{tag}b"));
+    let x = node_with(&genesis, std::slice::from_ref(&fund));
+    deliver(&x, &honest);
+    assert_eq!(x.store.prune_blocks_below(40).unwrap(), 40);
+    deliver(&x, &fork);
+    assert_eq!(tip_meta(&x), fork.last().unwrap().block_hash());
+    PrunedReorged { genesis, fund, b, honest, fork, x }
+}
+
+/// Audit DAG-6 follow-up (review): a re-fetched body used to be stored with
+/// whatever `height` the peer put on the wire — the block id commits neither
+/// `height` nor `blue_score`. One forged copy (height 0) of a pruned block
+/// was stored, made the next connect fail ("coinbase rejected": the subsidy
+/// at height 0 is 0), disqualified the heavier chain persistently, and the
+/// honest body was ignored ever after: the node stayed on the lighter chain.
+/// Now a restored body must carry the height the DAG verified, and it is
+/// stored byte for byte as `accept_block` stored it (derived `blue_score`).
+#[test]
+fn dag6_restored_body_is_bound_to_the_dag_height() {
+    let mut f = pruned_then_reorged("rh", 0x71);
+    let more = f.b.chain(f.honest.last().unwrap().block_hash(), 4, "rh-more"); // A: 64 > 62
+    let mut core = BlockIngress::new();
+    // A grows past B: the first block that makes it the heaviest cannot be
+    // connected, and the connect names the pruned bodies to re-fetch.
+    let mut trigger = 0;
+    let missing = loop {
+        match feed(&mut core, &f.x, &more[trigger]) {
+            BlockOutcome::Processed { result: Ok(_), .. } => trigger += 1,
+            BlockOutcome::Processed { result: Err(e), missing_bodies, .. } => {
+                assert!(e.contains(gnb::reorg::ERR_MISSING_BODIES), "{e}");
+                break missing_bodies;
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(missing.len(), 39, "A's pruned bodies above genesis");
+    let a10 = f.honest[9].clone();
+    assert!(missing.contains(&a10.block_hash()));
+
+    // The answer carries the real header and transactions, but height 0.
+    let mut forged = a10.clone();
+    forged.height = 0;
+    assert_eq!(forged.block_hash(), a10.block_hash(), "the id does not commit the height");
+    match feed(&mut core, &f.x, &forged) {
+        BlockOutcome::Invalid(e) => assert!(e.contains("DAG height is 10"), "{e}"),
+        other => panic!("a body with a forged height must be refused: {other:?}"),
+    }
+    assert!(!f.x.store.has_block_body(&a10.block_hash()).unwrap(), "nothing stored");
+    // A wrong wire blue_score is replaced as on acceptance.
+    let mut odd = a10.clone();
+    odd.blue_score = u64::MAX;
+    assert!(matches!(feed(&mut core, &f.x, &odd), BlockOutcome::BodyRestored));
+    let v = node_with(&f.genesis, std::slice::from_ref(&f.fund));
+    deliver(&v, &f.honest);
+    deliver(&v, &more);
+    assert_eq!(
+        f.x.store.get_block(&a10.block_hash()).unwrap().unwrap().to_wire_bytes(),
+        v.store.get_block(&a10.block_hash()).unwrap().unwrap().to_wire_bytes(),
+        "the restored body is exactly the body accept_block stores",
+    );
+
+    // The other bodies arrive honestly; the heavier chain is followed.
+    for h in &missing {
+        if *h == a10.block_hash() {
+            continue;
+        }
+        let body = f.honest.iter().find(|x| x.block_hash() == *h).unwrap();
+        assert!(matches!(feed(&mut core, &f.x, body), BlockOutcome::BodyRestored));
+    }
+    for blk in &more[trigger..] {
+        match feed(&mut core, &f.x, blk) {
+            BlockOutcome::Processed { result: Ok(_), .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(tip_meta(&f.x), more.last().unwrap().block_hash());
+    assert_eq!(f.x.dag.read().invalid_count(), 0, "nothing was disqualified");
+    assert_eq!(digest(&f.x), digest(&v));
+}
+
+/// Audit DAG-6 follow-up (review): any peer could push the body of any
+/// pruned block, and each one cost a full 64 MiB proof evaluation plus a disk
+/// write, without penalty and outside the work rule (before the re-fetch
+/// change, a block in the DAG was simply ignored). Now a body is restored
+/// only if this node requested it, only from a directed answer, and never
+/// for an applied block (rollbacks use undo data): everything else is
+/// `Known` before any check. Shown with a TAMPERED copy (its transactions do
+/// not match the header's merkle root): had any validation run, it would be
+/// `Invalid`; it is `Known`, so neither the structure check nor the proof of
+/// work (which comes after it) ran.
+#[test]
+fn dag6_unrequested_old_bodies_are_known_without_any_work() {
+    let f = pruned_then_reorged("ur", 0x72);
+    // Also prune the applied chain B below 30: those bodies are pruned and
+    // APPLIED (undo records).
+    f.x.store.prune_blocks_below(30).unwrap();
+    let b10 = f.fork[9].clone();
+    let a10 = f.honest[9].clone();
+    assert!(!f.x.store.has_block_body(&b10.block_hash()).unwrap());
+    assert!(!f.x.store.has_block_body(&a10.block_hash()).unwrap());
+    let tamper = |blk: &Block| {
+        let mut t = blk.clone();
+        t.transactions[0].outputs[0].value += 1;
+        assert_eq!(t.block_hash(), blk.block_hash());
+        assert!(t.validate_structure_without_pow().is_err(), "the tampered copy fails the first check");
+        t
+    };
+    let mut core = BlockIngress::new();
+    let len = |b: &Block| b.to_wire_bytes().len();
+    for blk in [&b10, &a10] {
+        let t = tamper(blk);
+        // Pushed by gossip, or answered without a request: Known, no work.
+        for (copy, solicited) in [(blk, false), (blk, true), (&t, false), (&t, true)] {
+            assert!(matches!(feed_as(&mut core, &f.x, copy, None, solicited, len(copy)), BlockOutcome::Known));
+        }
+        assert!(!f.x.store.has_block_body(&blk.block_hash()).unwrap(), "not stored");
+    }
+    // Requested, but an applied block's body is never needed: Known.
+    core.note_wanted_bodies(&[b10.block_hash()], std::time::Instant::now());
+    assert!(matches!(feed(&mut core, &f.x, &tamper(&b10)), BlockOutcome::Known));
+    assert!(!core.awaits_body(&b10.block_hash(), std::time::Instant::now()), "request dropped");
+    assert!(!f.x.store.has_block_body(&b10.block_hash()).unwrap());
+    // Requested and unapplied: a gossiped copy still does nothing; the
+    // directed answer is checked (the tampered one is invalid) and restored.
+    core.note_wanted_bodies(&[a10.block_hash()], std::time::Instant::now());
+    assert!(matches!(feed_as(&mut core, &f.x, &a10, None, false, len(&a10)), BlockOutcome::Known));
+    assert!(matches!(feed(&mut core, &f.x, &tamper(&a10)), BlockOutcome::Invalid(_)));
+    assert!(matches!(feed(&mut core, &f.x, &a10), BlockOutcome::BodyRestored));
+    assert!(f.x.store.has_block_body(&a10.block_hash()).unwrap());
+    assert!(matches!(feed(&mut core, &f.x, &a10), BlockOutcome::Known), "once only");
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // DAG-6: operator recovery — invalidateblock / reconsiderblock
 // ═════════════════════════════════════════════════════════════════════════════
 
-fn invalidate(n: &Node, h: BlockHash) -> Result<accept::ChainOverride, String> {
+fn invalidate(n: &Node, h: BlockHash) -> Result<accept::ChainOverride, accept::OverrideError> {
     accept::invalidate_block(h, &n.dag, &n.store, &n.mempool, &n.node_state, Some(&n.tip_tx), &n.shielded)
 }
 
-fn reconsider(n: &Node, h: BlockHash) -> Result<accept::ChainOverride, String> {
+fn reconsider(n: &Node, h: BlockHash) -> Result<accept::ChainOverride, accept::OverrideError> {
     accept::reconsider_block(h, &n.dag, &n.store, &n.mempool, &n.node_state, Some(&n.tip_tx), &n.shielded)
 }
+
 
 /// `invalidateblock` makes the node leave the heaviest chain for the best
 /// chain that does not contain the block (rolling back past it), persists
@@ -536,8 +692,8 @@ fn dag6_invalidateblock_and_reconsiderblock_persist_and_converge() {
     deliver(&only_b, &bb);
 
     // Errors: unknown block, genesis.
-    assert!(invalidate(&n, [0x99; 32]).unwrap_err().contains("not found"));
-    assert!(invalidate(&n, gh).unwrap_err().contains("genesis"));
+    assert!(invalidate(&n, [0x99; 32]).unwrap_err().to_string().contains("not found"));
+    assert!(invalidate(&n, gh).unwrap_err().to_string().contains("genesis"));
 
     // Invalidate a2: chain A is left; the best remaining chain is B.
     let r = invalidate(&n, a[1].block_hash()).expect("invalidateblock");
@@ -589,6 +745,86 @@ fn dag6_invalidateblock_and_reconsiderblock_persist_and_converge() {
     assert_eq!(n.dag.read().invalid_count(), 0);
     assert!(n.store.load_invalid_blocks().unwrap().is_empty());
     assert_eq!(digest(&n), digest(&only_a));
+}
+
+/// Audit DAG-6 follow-up (review): on a pruned node, `invalidateblock` /
+/// `reconsiderblock` could never move to a chain whose bodies were pruned —
+/// the connect failed on the missing bodies and nothing ever requested them.
+/// Now the call changes nothing (marks restored, nothing committed, the
+/// applied tip stays the DAG's selected tip) and names the bodies to
+/// re-fetch; main.rs records and pulls them, the ingress core restores them,
+/// and the retried call succeeds — with the UTXO set of a node that only saw
+/// the chain it ends on. The same holds for `reconsiderblock` after a
+/// rollback through pruned bodies.
+#[test]
+fn dag6_operator_overrides_on_a_pruned_node_refetch_bodies_and_retry() {
+    let f = pruned_then_reorged("op", 0x73);
+    let b1 = f.fork[0].block_hash();
+    let a_tip = f.honest.last().unwrap().block_hash();
+    let b_tip = f.fork.last().unwrap().block_hash();
+    let only_a = node_with(&f.genesis, std::slice::from_ref(&f.fund));
+    deliver(&only_a, &f.honest);
+    let only_b = node_with(&f.genesis, std::slice::from_ref(&f.fund));
+    deliver(&only_b, &f.fork);
+    let before = digest(&f.x);
+    assert_eq!(before, digest(&only_b));
+
+    let restore = |core: &mut BlockIngress, n: &Node, missing: &[BlockHash], from: &[Block]| {
+        // What main.rs does with the override's answer.
+        core.note_wanted_bodies(missing, std::time::Instant::now());
+        for h in missing {
+            let body = from.iter().find(|x| x.block_hash() == *h).expect("a pruned block");
+            assert!(matches!(feed(core, n, body), BlockOutcome::BodyRestored));
+        }
+    };
+    let mut core = BlockIngress::new();
+
+    // invalidateblock B1: the best remaining chain is A, whose bodies below
+    // 40 were pruned.
+    let missing = match invalidate(&f.x, b1) {
+        Err(accept::OverrideError::MissingBodies { missing, reason }) => {
+            assert!(reason.contains(gnb::reorg::ERR_MISSING_BODIES), "{reason}");
+            missing
+        }
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(missing.len(), 39, "A's pruned bodies above genesis, nearest the new tip first");
+    assert_eq!(missing[0], f.honest[38].block_hash());
+    // Nothing changed.
+    assert_eq!((sel_tip(&f.x), tip_meta(&f.x)), (Some(b_tip), b_tip));
+    assert_eq!(digest(&f.x), before);
+    assert!(!f.x.dag.read().is_invalid(&b1));
+    assert!(f.x.store.load_invalid_blocks().unwrap().is_empty());
+    restore(&mut core, &f.x, &missing, &f.honest);
+    let r = invalidate(&f.x, b1).expect("the retried invalidateblock succeeds");
+    assert_eq!((r.tip, r.rolled_back, r.connected), (a_tip, 62, 60));
+    assert_eq!(tip_meta(&f.x), a_tip);
+    assert_eq!(digest(&f.x), digest(&only_a));
+    // And back: B's bodies are all there.
+    let r = reconsider(&f.x, b1).expect("reconsiderblock");
+    assert_eq!(r.tip, b_tip);
+    assert_eq!(digest(&f.x), digest(&only_b));
+
+    // reconsiderblock after a deep invalidateblock on a pruned chain: the
+    // rollback only needs undo data; going back needs the pruned bodies.
+    let y = node_with(&f.genesis, std::slice::from_ref(&f.fund));
+    deliver(&y, &f.honest);
+    y.store.prune_blocks_below(40).unwrap();
+    let a5 = f.honest[4].block_hash();
+    let r = invalidate(&y, a5).expect("a rollback through pruned bodies");
+    assert_eq!(r.tip, f.honest[3].block_hash());
+    let missing = match reconsider(&y, a5) {
+        Err(accept::OverrideError::MissingBodies { missing, .. }) => missing,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(missing.len(), 35, "a5..a39");
+    assert!(y.store.invalid_block_reason(&a5).unwrap().is_some(), "the mark is kept until it succeeds");
+    let mut core_y = BlockIngress::new();
+    restore(&mut core_y, &y, &missing, &f.honest);
+    let r = reconsider(&y, a5).expect("the retried reconsiderblock succeeds");
+    assert_eq!(r.tip, a_tip);
+    assert!(y.store.load_invalid_blocks().unwrap().is_empty());
+    assert_eq!(digest(&y), digest(&only_a));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -760,8 +996,23 @@ fn ctx(n: &Node) -> ingress::AcceptCtx<'_> {
     }
 }
 
+/// Deliver `b` as the answer to one of the node's directed pulls (how parent
+/// fetches, frontier tips and re-fetched bodies arrive).
 fn feed(core: &mut BlockIngress, n: &Node, b: &Block) -> BlockOutcome {
-    core.handle_block(b.clone(), b.block_hash(), b.to_wire_bytes().len(), None,
+    feed_as(core, n, b, None, true, b.to_wire_bytes().len())
+}
+
+/// Deliver `b` from `peer`, as a directed answer (`solicited`) or gossip,
+/// with `wire_bytes` charged to the peer's orphan quota.
+fn feed_as(
+    core: &mut BlockIngress,
+    n: &Node,
+    b: &Block,
+    peer: Option<libp2p::PeerId>,
+    solicited: bool,
+    wire_bytes: usize,
+) -> BlockOutcome {
+    core.handle_block(b.clone(), b.block_hash(), wire_bytes, peer, solicited,
         std::time::Instant::now(), unix_now(), &ctx(n))
 }
 

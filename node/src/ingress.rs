@@ -26,7 +26,10 @@
 //!   [`ANTI_DOS_WINDOW_BLOCKS`] selected-chain blocks of work of our tip, or
 //!   if a proof-of-work-verified orphan chain announced on top of it does
 //!   (see [`work_admission`]). A chain that carries the work is always
-//!   accepted, so the final outcome for honest data is unchanged.
+//!   accepted, so the final outcome for honest data is unchanged;
+//! * DAG-6, pruned nodes: a body of a block already in the DAG is restored
+//!   only if this node requested it, from a directed answer, and bound to
+//!   the DAG's verified height (see [`WantedBodies`]).
 //!
 //! [`BlockIngress`] is the processor's per-block core (orphan pool,
 //! missing-parent tracker, deep-insertion budget, the decisions above, the
@@ -908,13 +911,102 @@ pub enum DropReason {
 /// (`accept::missing_bodies_below`); a later attempt asks for the next ones.
 pub const MAX_BODY_REFETCH: usize = 4_096;
 
+/// Bound of the set of bodies this node asked for ([`WantedBodies`]).
+pub const WANTED_BODIES_MAX: usize = 4 * MAX_BODY_REFETCH;
+
+/// A requested body is accepted for this long after it was (last) requested.
+pub const WANTED_BODY_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// DAG-6, pruned nodes: the bodies of DAG blocks this node REQUESTED because
+/// a connect needs them again (`accept::missing_bodies_below`, from a failed
+/// block connect or an operator override). Only these are ever restored, and
+/// only from the answer to a directed pull: any other frame carrying a DAG
+/// block is "known" before any decoding, proof of work or storage (a pruned
+/// node used to evaluate the 64 MiB proof of, and store, any old body pushed
+/// to it). Bounded ([`WANTED_BODIES_MAX`], oldest request first) and timed
+/// ([`WANTED_BODY_TTL`]).
+#[derive(Debug, Default)]
+pub struct WantedBodies {
+    at:    HashMap<[u8; 32], (Instant, u64)>,
+    order: BTreeMap<(Instant, u64), [u8; 32]>,
+    seq:   u64,
+}
+
+/// [`WantedBodies`] shared by the processor's ingress core and the operator
+/// overrides (`invalidateblock` / `reconsiderblock`), which run on the RPC
+/// task.
+pub type SharedWantedBodies = Arc<parking_lot::Mutex<WantedBodies>>;
+
+impl WantedBodies {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `h`'s body was requested at `now` (refreshes the time).
+    pub fn note(&mut self, h: [u8; 32], now: Instant) {
+        if let Some(old) = self.at.remove(&h) {
+            self.order.remove(&old);
+        }
+        let key = (now, self.seq);
+        self.seq = self.seq.wrapping_add(1);
+        self.at.insert(h, key);
+        self.order.insert(key, h);
+        while self.at.len() > WANTED_BODIES_MAX {
+            match self.order.pop_first() {
+                Some((_, old)) => {
+                    self.at.remove(&old);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// True iff `h` was requested within [`WANTED_BODY_TTL`] of `now`.
+    pub fn is_wanted(&self, h: &[u8; 32], now: Instant) -> bool {
+        self.at.get(h).is_some_and(|(t, _)| now.saturating_duration_since(*t) < WANTED_BODY_TTL)
+    }
+
+    /// Forget `h` (its body arrived, or is no longer needed).
+    pub fn take(&mut self, h: &[u8; 32]) -> bool {
+        match self.at.remove(h) {
+            Some(k) => {
+                self.order.remove(&k);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drop every request older than [`WANTED_BODY_TTL`].
+    pub fn expire(&mut self, now: Instant) {
+        while let Some((&(t, n), h)) = self.order.iter().next() {
+            if now.saturating_duration_since(t) < WANTED_BODY_TTL {
+                break;
+            }
+            let h = *h;
+            self.order.remove(&(t, n));
+            self.at.remove(&h);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.at.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.at.is_empty()
+    }
+}
+
 /// What [`BlockIngress::handle_block`] did with one block.
 #[derive(Debug)]
 pub enum BlockOutcome {
-    /// Already in the DAG (with its body) or buffered.
+    /// Already in the DAG or buffered (a DAG block without a body counts as
+    /// known unless its body was requested, see [`WantedBodies`]).
     Known,
     /// DAG-6, pruned nodes: the block was in the DAG without a body (pruned,
-    /// then reorganized away from); the re-fetched body was verified and
+    /// then reorganized away from) and this node had requested it; the body
+    /// was bound to the DAG's verified height, checked like any block and
     /// stored, so a chain through it can be connected again.
     BodyRestored,
     /// Dropped before any proof-of-work evaluation.
@@ -948,6 +1040,8 @@ pub struct BlockIngress {
     /// `(selected tip, anti_dos_work_threshold)` of the last work check: the
     /// threshold only changes when the selected tip does.
     threshold_cache:  Option<(BlockHash, u128)>,
+    /// DAG-6: bodies this node asked for (shared with the operator calls).
+    wanted:           SharedWantedBodies,
 }
 
 impl Default for BlockIngress {
@@ -962,12 +1056,33 @@ impl BlockIngress {
     }
 
     pub fn with_limits(limits: OrphanLimits) -> Self {
+        Self::with_wanted_bodies(limits, Arc::new(parking_lot::Mutex::new(WantedBodies::new())))
+    }
+
+    /// A core whose requested-body set is `wanted` (main.rs shares it with
+    /// the operator overrides and keeps it across processor restarts).
+    pub fn with_wanted_bodies(limits: OrphanLimits, wanted: SharedWantedBodies) -> Self {
         Self {
             orphans: OrphanPool::new(limits),
             parent_fetch: ParentFetchTracker::new(),
             deep_budget: DeepBackfillBudget::new(),
             threshold_cache: None,
+            wanted,
         }
+    }
+
+    /// Record that the bodies `hashes` are being requested (a connect needs
+    /// them again).
+    pub fn note_wanted_bodies(&self, hashes: &[[u8; 32]], now: Instant) {
+        let mut w = self.wanted.lock();
+        for h in hashes {
+            w.note(*h, now);
+        }
+    }
+
+    /// True iff this node requested `hash`'s body (DAG-6 re-fetch).
+    pub fn awaits_body(&self, hash: &[u8; 32], now: Instant) -> bool {
+        self.wanted.lock().is_wanted(hash, now)
     }
 
     /// True iff some buffered orphan, an outstanding parent request or a
@@ -1019,6 +1134,8 @@ impl BlockIngress {
     /// an orphan is evaluated only after its floor check, and that of a block
     /// with known parents only inside `accept_block` (after height, expected
     /// bits, timestamp), and only if the POW-3 work rule admitted it.
+    /// `solicited`: the block is the answer to one of this node's directed
+    /// pulls (`InboundOrigin::is_solicited`), not gossip.
     #[allow(clippy::too_many_arguments)]
     pub fn handle_block(
         &mut self,
@@ -1026,27 +1143,13 @@ impl BlockIngress {
         hash: [u8; 32],
         wire_bytes: usize,
         peer: Option<PeerId>,
+        solicited: bool,
         now: Instant,
         now_unix: u64,
         ctx: &AcceptCtx,
     ) -> BlockOutcome {
         if ctx.dag.read().has_block(&hash) {
-            // DAG-6, pruned nodes: a DAG block whose body is missing (pruned,
-            // then reorganized away from) gets its re-fetched body back,
-            // after the same structure and proof checks as any block.
-            if ctx.store.has_block_body(&hash).unwrap_or(true) {
-                return BlockOutcome::Known;
-            }
-            if let Err(reason) = block.validate_structure_without_pow() {
-                return BlockOutcome::Invalid(reason.to_string());
-            }
-            if !block.validate_pow() {
-                return BlockOutcome::Invalid("invalid PoW".into());
-            }
-            return match ctx.store.put_block_body(&block) {
-                Ok(()) => BlockOutcome::BodyRestored,
-                Err(e) => BlockOutcome::Invalid(format!("body not stored: {e}")),
-            };
+            return self.restore_body(block, hash, solicited, now, ctx);
         }
         if self.orphans.contains(&hash) {
             return BlockOutcome::Known;
@@ -1125,13 +1228,69 @@ impl BlockIngress {
                     self.orphans.forget(h);
                     (self.drain_orphans(*h, ctx), Vec::new())
                 }
-                Err(e) if e.contains(crate::reorg::ERR_MISSING_BODIES) => (
-                    Vec::new(),
-                    crate::accept::missing_bodies_below(ctx.dag, ctx.store, &block.header.parents, MAX_BODY_REFETCH),
-                ),
+                Err(e) if e.contains(crate::reorg::ERR_MISSING_BODIES) => {
+                    let missing = crate::accept::missing_bodies_below(
+                        ctx.dag, ctx.store, &block.header.parents, MAX_BODY_REFETCH);
+                    // The caller requests exactly these; only they may be
+                    // restored (see `restore_body`).
+                    self.note_wanted_bodies(&missing, now);
+                    (Vec::new(), missing)
+                }
                 Err(_) => (Vec::new(), Vec::new()),
             };
             BlockOutcome::Processed { admission, result, drained, missing_bodies }
+        }
+    }
+
+    /// A block that is already in the DAG. DAG-6, pruned nodes: its body is
+    /// restored only if this node REQUESTED it (a connect needs it again, see
+    /// [`WantedBodies`]) and it arrived as the answer to a directed pull.
+    /// Anything else is `Known` before any decoding work, proof of work or
+    /// storage — the bodies of applied blocks are never needed (a rollback
+    /// works from undo data), and an unrequested old body used to cost a
+    /// 64 MiB proof evaluation and a disk write, for free. A restored body
+    /// must carry the height the DAG verified when the block was accepted
+    /// (`height` and `blue_score` are not committed by the block id), and is
+    /// stored with the metadata `accept_block` stored it with.
+    fn restore_body(
+        &mut self,
+        mut block: core::Block,
+        hash: [u8; 32],
+        solicited: bool,
+        now: Instant,
+        ctx: &AcceptCtx,
+    ) -> BlockOutcome {
+        if !solicited || !self.awaits_body(&hash, now) {
+            return BlockOutcome::Known;
+        }
+        // Not (or no longer) needed: the body is there, or the block is on
+        // the applied chain (it has an undo record).
+        if ctx.store.has_block_body(&hash).unwrap_or(true) || ctx.store.has_undo_data(&hash).unwrap_or(true) {
+            self.wanted.lock().take(&hash);
+            return BlockOutcome::Known;
+        }
+        let dag_height = match ctx.dag.read().get_block_data(&hash) {
+            Some(d) => d.height,
+            None => return BlockOutcome::Known,
+        };
+        if block.height != dag_height {
+            return BlockOutcome::Invalid(format!(
+                "restored body claims h={} but the block's DAG height is {}", block.height, dag_height));
+        }
+        if let Err(reason) = block.validate_structure_without_pow() {
+            return BlockOutcome::Invalid(reason.to_string());
+        }
+        if !block.validate_pow() {
+            return BlockOutcome::Invalid("invalid PoW".into());
+        }
+        // POW-8: the wire blue_score is replaced exactly as on acceptance.
+        normalize_wire_metadata(&mut block, ctx.dag);
+        match ctx.store.put_block_body(&block) {
+            Ok(()) => {
+                self.wanted.lock().take(&hash);
+                BlockOutcome::BodyRestored
+            }
+            Err(e) => BlockOutcome::Invalid(format!("body not stored: {e}")),
         }
     }
 
@@ -1331,6 +1490,26 @@ mod tests {
         pool.forget(&o(3));
         assert!(!pool.remembers(&o(3)));
         assert_eq!(pool.announced_work_above(&x), 3 * w, "only the buffered o1..o3 are left");
+    }
+
+    #[test]
+    fn wanted_bodies_are_bounded_and_expire() {
+        let mut wb = WantedBodies::new();
+        let t0 = Instant::now();
+        wb.note(h(1), t0);
+        assert!(wb.is_wanted(&h(1), t0 + Duration::from_secs(1)));
+        assert!(!wb.is_wanted(&h(1), t0 + WANTED_BODY_TTL), "expired");
+        assert!(!wb.is_wanted(&h(2), t0));
+        wb.note(h(1), t0 + WANTED_BODY_TTL); // re-requested: fresh again
+        assert!(wb.is_wanted(&h(1), t0 + WANTED_BODY_TTL + Duration::from_secs(1)));
+        for i in 0..(WANTED_BODIES_MAX as u64 + 10) {
+            wb.note(h(100 + i), t0 + WANTED_BODY_TTL);
+        }
+        assert_eq!(wb.len(), WANTED_BODIES_MAX, "bounded, oldest request first");
+        assert!(!wb.is_wanted(&h(1), t0 + WANTED_BODY_TTL), "the oldest went first");
+        assert!(wb.take(&h(100 + WANTED_BODIES_MAX as u64 + 9)));
+        wb.expire(t0 + 2 * WANTED_BODY_TTL + Duration::from_secs(1));
+        assert!(wb.is_empty());
     }
 
     #[test]
