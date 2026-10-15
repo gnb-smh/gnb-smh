@@ -24,7 +24,9 @@
 //! enforces them on the in-memory value, so every accepted block is guaranteed
 //! to round-trip through its canonical wire encoding. Again a no-op for every
 //! block that arrives over the network (it was parsed, so it already obeys
-//! the caps). `limits_match_the_wire_parser` keeps the two in sync.
+//! the caps). `limits_match_the_wire_parser` (script lengths) and
+//! `count_and_size_caps_match_the_wire_parser` (every other cap) keep the two
+//! in sync, each cap at and one past its value.
 //!
 //! Block SIZE (`MAX_BLOCK_SIZE`) is not measured here. Below the hardening
 //! activation the consensus rule is `Block::size_bytes()` (bincode); at and
@@ -210,6 +212,109 @@ mod tests {
         let big_spk = tx(10, MAX_SCRIPT_PUBKEY_SIZE + 1, 1);
         assert!(Transaction::from_wire_bytes(&big_spk.to_wire_bytes(true)).is_err());
         assert!(check_tx_canonical_limits(&big_spk).is_err());
+    }
+
+    /// Every count and length cap of the parser other than the scripts (above),
+    /// at the cap and one past it: at the cap the value passes the consensus
+    /// helper and its wire encoding parses back to the same encoding; one
+    /// past, the parser refuses it ON THAT CAP (its own "implausible ..."
+    /// error, not a truncation) and the helper refuses it too. An off-by-one
+    /// between `check_*_canonical_limits` and the parser on any cap fails
+    /// here. (The fuzz target `wire_roundtrip` generates values at and past
+    /// the script and parent caps only: the count caps need megabytes.)
+    /// Peak memory about 150 MB (a block of 1,000,001 empty transactions).
+    #[test]
+    fn count_and_size_caps_match_the_wire_parser() {
+        use coherence_core::ShieldedTx;
+
+        fn bare_tx(n_in: usize, n_out: usize) -> Transaction {
+            Transaction {
+                version: 1,
+                inputs: vec![TxInput { prev_txid: [2u8; 32], prev_index: 0, script_sig: vec![], sequence: 0 }; n_in],
+                outputs: vec![TxOutput { value: 1, script_pubkey: vec![] }; n_out],
+                locktime: 0,
+            }
+        }
+        fn stx(nullifiers: usize, outputs: usize, proof: usize, sig: usize) -> ShieldedTx {
+            ShieldedTx {
+                anchor: [3u8; 32],
+                nullifiers: vec![[4u8; 32]; nullifiers],
+                outputs: vec![[5u8; 32]; outputs],
+                fee: 0,
+                proof: vec![6u8; proof],
+                binding_sig: vec![7u8; sig],
+            }
+        }
+        fn check_tx(tx: &Transaction, within: bool, refusal: &str) {
+            let bytes = tx.to_wire_bytes(true);
+            assert_eq!(check_tx_canonical_limits(tx).is_ok(), within, "{refusal}: consensus helper");
+            match Transaction::from_wire_bytes(&bytes) {
+                Ok(back) => {
+                    assert!(within, "{refusal}: the parser accepted a value past the cap");
+                    assert!(back.to_wire_bytes(true) == bytes, "{refusal}: round trip changed the encoding");
+                }
+                Err(e) => {
+                    assert!(!within, "{refusal}: the parser refused a value at the cap: {e}");
+                    assert!(e.contains(refusal), "{refusal}: refused for another reason: {e}");
+                }
+            }
+        }
+        fn check_block(b: &Block, within: bool, refusal: &str) {
+            let bytes = b.to_wire_bytes();
+            assert_eq!(check_block_canonical_limits(b).is_ok(), within, "{refusal}: consensus helper");
+            match Block::from_wire_bytes(&bytes) {
+                Ok(back) => {
+                    assert!(within, "{refusal}: the parser accepted a value past the cap");
+                    assert!(back.to_wire_bytes() == bytes, "{refusal}: round trip changed the encoding");
+                }
+                Err(e) => {
+                    assert!(!within, "{refusal}: the parser refused a value at the cap: {e}");
+                    assert!(e.contains(refusal), "{refusal}: refused for another reason: {e}");
+                }
+            }
+        }
+
+        // Inputs and outputs per transaction.
+        for (n, within) in [(MAX_TX_INPUTS, true), (MAX_TX_INPUTS + 1, false)] {
+            check_tx(&bare_tx(n, 1), within, "implausible input count");
+        }
+        for (n, within) in [(MAX_TX_OUTPUTS, true), (MAX_TX_OUTPUTS + 1, false)] {
+            check_tx(&bare_tx(1, n), within, "implausible output count");
+        }
+
+        // Parents per header.
+        for (n, within) in [(MAX_PARENTS, true), (MAX_PARENTS + 1, false)] {
+            let mut b = block_with(vec![]);
+            b.header.parents = vec![[9u8; 32]; n];
+            check_block(&b, within, "implausible parent count");
+        }
+
+        // Transactions per block (empty transactions: 10 wire bytes each).
+        for (n, within) in [(MAX_BLOCK_TXS, true), (MAX_BLOCK_TXS + 1, false)] {
+            check_block(&block_with(vec![bare_tx(0, 0); n]), within, "implausible tx count");
+        }
+
+        // Shielded transactions per block, and each shielded field.
+        let shielded = |txs: Vec<ShieldedTx>| {
+            let mut b = block_with(vec![]);
+            b.shielded_transactions = txs;
+            b
+        };
+        for (n, within) in [(MAX_BLOCK_SHIELDED_TXS, true), (MAX_BLOCK_SHIELDED_TXS + 1, false)] {
+            check_block(&shielded(vec![stx(0, 0, 0, 0); n]), within, "implausible shielded count");
+        }
+        for (n, within) in [(MAX_SHIELDED_NULLIFIERS, true), (MAX_SHIELDED_NULLIFIERS + 1, false)] {
+            check_block(&shielded(vec![stx(n, 0, 0, 0)]), within, "implausible nullifier count");
+        }
+        for (n, within) in [(MAX_SHIELDED_OUTPUTS, true), (MAX_SHIELDED_OUTPUTS + 1, false)] {
+            check_block(&shielded(vec![stx(0, n, 0, 0)]), within, "implausible output count");
+        }
+        for (n, within) in [(MAX_SHIELDED_PROOF_SIZE, true), (MAX_SHIELDED_PROOF_SIZE + 1, false)] {
+            check_block(&shielded(vec![stx(0, 0, n, 0)]), within, "implausible proof length");
+        }
+        for (n, within) in [(MAX_SHIELDED_BINDING_SIG_SIZE, true), (MAX_SHIELDED_BINDING_SIG_SIZE + 1, false)] {
+            check_block(&shielded(vec![stx(0, 0, 0, n)]), within, "implausible binding_sig length");
+        }
     }
 
     /// VAL-12 regression: an in-process block with a 12.6 kB script_sig (the

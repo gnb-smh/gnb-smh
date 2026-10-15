@@ -7,7 +7,13 @@
 //!   specification, and `wire_size` equals its length;
 //! * `decode(encode(x)) == x` exactly when `x` obeys the parser caps
 //!   (`limits::check_*_canonical_limits`, which promise that round trip);
-//!   values at and one past each cap are generated on purpose;
+//!   values at and one past the script-length caps (10,000 bytes) and the
+//!   parent cap (256) are generated on purpose. The count and size caps
+//!   (inputs, outputs, block and shielded transactions, nullifiers, shielded
+//!   outputs, proof and binding signature) take 100 KB to 10 MB to reach and
+//!   are not generated here: the unit test
+//!   `core::limits::tests::count_and_size_caps_match_the_wire_parser`
+//!   checks each of them at and one past its cap;
 //! * every proper prefix of `encode(x)` is refused, and so is one extra byte
 //!   for the decoders that promise to be strict (`Block`, `BlockHeader`, the
 //!   gossip/RPC transaction decoder `admission::decode_tx_strict`).
