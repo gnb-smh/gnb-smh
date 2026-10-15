@@ -223,6 +223,69 @@ mod tests {
         assert!(parse_and_convert(short_spk.as_bytes()).is_err());
     }
 
+    /// Failure reporting: the first five bad lines are named (1-based), and a
+    /// sixth or later bad line adds one summary with the total.
+    #[test]
+    fn failure_report_names_five_lines_then_summarises() {
+        let good = row(1, 0, 5, 7);
+        let bad = |n: usize| -> String { (0..n).map(|_| "garbage\n").collect::<String>() };
+        let f = parse_and_convert(format!("{good}{}", bad(1)).as_bytes()).unwrap_err();
+        assert_eq!(f, vec!["line 2 is malformed (want txid\\tvout\\tvalue\\tspk20)".to_string()]);
+        let f = parse_and_convert(bad(5).as_bytes()).unwrap_err();
+        assert_eq!(f.len(), 5);
+        assert!(f[0].starts_with("line 1 is malformed") && f[4].starts_with("line 5 is malformed"));
+        let f = parse_and_convert(bad(6).as_bytes()).unwrap_err();
+        assert_eq!(f.len(), 6);
+        assert_eq!(f[5], "... 6 bad line(s) in total");
+        let f = parse_and_convert(bad(9).as_bytes()).unwrap_err();
+        assert_eq!(f.len(), 6);
+        assert_eq!(f[5], "... 9 bad line(s) in total");
+        // Duplicates count as bad lines and are named with their outpoint.
+        let f = parse_and_convert([row(1, 0, 5, 7), row(1, 0, 6, 7)].concat().as_bytes()).unwrap_err();
+        assert_eq!(f, vec![format!("line 2 duplicates outpoint {}:0", hex::encode([1u8; 32]))]);
+        let dups = row(1, 0, 5, 7).repeat(8);
+        let f = parse_and_convert(dups.as_bytes()).unwrap_err();
+        assert_eq!(f.len(), 6);
+        assert_eq!(f[5], "... 7 bad line(s) in total");
+    }
+
+    /// Totals and counters of a parsed snapshot, and the trailing-newline rule.
+    #[test]
+    fn parsed_totals_and_counters() {
+        let text = [row(1, 0, 3, 7), row(2, 5, 8_400 * SAT_PER_GNB, 8), row(3, 0, 0, 9)].concat();
+        let c = parse_and_convert(text.as_bytes()).unwrap();
+        assert_eq!(c.source_rows, 3);
+        assert_eq!(c.source_total_sat, 3 + 8_400 * SAT_PER_GNB as u128);
+        assert_eq!(c.converted_total_sat, 220_429_396);
+        assert_eq!((c.dropped_zero, c.fixed_vouts), (2, 0), "1 sat and 0 sat both convert to 0");
+        assert_eq!(c.utxos.len(), 1);
+        assert_eq!((c.utxos[0].txid, c.utxos[0].vout), ([2; 32], 5));
+        // Without the final newline: the same rows.
+        let c2 = parse_and_convert(text.trim_end().as_bytes()).unwrap();
+        assert_eq!(c2.source_rows, 3);
+        // An empty line in the middle is a malformed row.
+        let gap = [row(1, 0, 3, 7), "\n".to_string(), row(2, 0, 3, 7)].concat();
+        assert!(parse_and_convert(gap.as_bytes()).is_err());
+        // A fifth column is malformed.
+        let five = format!("{}\t0\t5\t{}\textra\n", hex::encode([1u8; 32]), hex::encode([7u8; 20]));
+        assert!(parse_and_convert(five.as_bytes()).is_err());
+    }
+
+    /// Every constant check of `verify_and_convert` reports its own failure.
+    #[test]
+    fn verify_reports_every_mismatch() {
+        let text = [row(1, 0, 8_400 * SAT_PER_GNB, 7), row(2, 0, 0, 8)].concat();
+        let f = verify_and_convert(text.as_bytes()).unwrap_err();
+        assert_eq!(f.len(), 5, "{f:?}");
+        assert!(f[0].starts_with("snapshot SHA3-256 "));
+        assert_eq!(f[1], format!("snapshot has 2 rows, chain requires {CARRYOVER_SOURCE_ROWS}"));
+        assert_eq!(f[2], format!("snapshot sums to {} BLCH sat, chain requires {CARRYOVER_SOURCE_TOTAL_SAT}", 8_400 * SAT_PER_GNB));
+        assert_eq!(f[3], format!("1 converted UTXOs, chain requires {CARRYOVER_CONVERTED_UTXOS}"));
+        assert_eq!(f[4], format!("converted total 220429396 sat, chain requires {CARRYOVER_CONVERTED_TOTAL_SAT}"));
+        // A structurally broken snapshot reports the parse failures only.
+        assert_eq!(verify_and_convert(b"x\n").unwrap_err().len(), 1);
+    }
+
     #[test]
     fn bloch_address_maps_to_gnb_address_with_same_hash_and_checksum() {
         let hash = [0x5au8; 20];

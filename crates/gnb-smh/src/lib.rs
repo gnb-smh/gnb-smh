@@ -273,4 +273,62 @@ mod tests {
         let mut sp = Scratchpad::new(8);
         let _ = verify_with(&mut sp, b"gnb", 0, &[0xFF; 32]);
     }
+
+    #[test]
+    fn scratchpad_reports_its_parameter_and_size() {
+        for (log2_n, bytes) in [(1u32, 256usize), (8, 32_768), (10, 131_072)] {
+            let sp = Scratchpad::new(log2_n);
+            assert_eq!(sp.log2_n(), log2_n);
+            assert_eq!(sp.bytes(), (1usize << log2_n) * BLOCK);
+            assert_eq!(sp.bytes(), bytes);
+        }
+    }
+
+    /// `lane16` is the SHAKE-256 padding of the 133-byte message as one lane:
+    /// bytes 0..4 = i, byte 4 = tag, byte 5 = 0x1F, byte 7 = 0x80.
+    #[test]
+    fn lane16_layout() {
+        let l = lane16(0x0403_0201, TAG_MIX);
+        assert_eq!(l.to_le_bytes(), [0x01, 0x02, 0x03, 0x04, 0x02, 0x1F, 0x00, 0x80]);
+        assert_eq!(lane16(u32::MAX, TAG_FILL).to_le_bytes(), [0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x1F, 0x00, 0x80]);
+    }
+
+    /// Canonical reference vector (reference/test_vectors.json, log2_n = 19,
+    /// header "gnb", nonce 0).
+    const CANONICAL_OUT: &str = "c05129a877e99e4fd8f1bd6bd39963a95c9ece39bc5055047db51bfaa4f44bef";
+
+    fn canonical_out() -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (k, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&CANONICAL_OUT[2 * k..2 * k + 2], 16).unwrap();
+        }
+        out
+    }
+
+    /// `out + 1` as a big-endian integer (the vector's out does not end in 0xFF).
+    fn plus_one(mut t: [u8; 32]) -> [u8; 32] {
+        assert_ne!(t[31], 0xFF);
+        t[31] += 1;
+        t
+    }
+
+    /// Every canonical entry point (`hash`, `hash_thread_local`,
+    /// `verify_with`, `verify`) reproduces the reference output and decides
+    /// validity exactly at `out < target`.
+    #[test]
+    fn canonical_entry_points_match_the_reference_vector() {
+        let out = canonical_out();
+        assert_eq!(hash(b"gnb", 0), out);
+        assert_eq!(hash_thread_local(b"gnb", 0), out);
+
+        let mut sp = Scratchpad::new(LOG2_N);
+        assert!(verify_with(&mut sp, b"gnb", 0, &plus_one(out)), "out < out + 1");
+        assert!(!verify_with(&mut sp, b"gnb", 0, &out), "out < out is false");
+        assert!(!verify_with(&mut sp, b"gnb", 0, &[0u8; 32]), "the zero target never validates");
+
+        use difficulty::Target;
+        assert!(verify(b"gnb", 0, &Target(plus_one(out))));
+        assert!(!verify(b"gnb", 0, &Target(out)));
+        assert!(!verify(b"gnb", 0, &Target::ZERO));
+    }
 }

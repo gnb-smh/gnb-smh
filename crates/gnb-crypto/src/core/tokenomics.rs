@@ -146,11 +146,52 @@ mod tests {
     }
 
     #[test]
+    fn hard_cap_and_allocations() {
+        assert_eq!(MAX_SUPPLY_SAT, 1_000_000_000_000_000);
+        assert_eq!(CARRYOVER_ALLOCATION_SAT, 100_000_000_000_000);
+        assert_eq!(MINING_ALLOCATION_SAT, 900_000_000_000_000);
+        assert_eq!(LAST_SUBSIDY_HEIGHT_EXCLUSIVE, 27 * 4_204_800);
+    }
+
+    /// The shift guard: from the 64th halving on the subsidy is zero without
+    /// shifting by 64 or more (which would overflow).
+    #[test]
+    fn subsidy_and_issuance_past_the_sixty_fourth_halving() {
+        for h in [63 * HALVING_INTERVAL, 64 * HALVING_INTERVAL - 1, 64 * HALVING_INTERVAL, 65 * HALVING_INTERVAL] {
+            assert_eq!(block_subsidy_sat(h), 0, "h={h}");
+        }
+        let total = issued_through_sat(u64::MAX);
+        assert_eq!(issued_through_sat(64 * HALVING_INTERVAL), total);
+        assert_eq!(issued_through_sat(64 * HALVING_INTERVAL - 1), total);
+        assert_eq!(issued_through_sat(70 * HALVING_INTERVAL), total);
+    }
+
+    /// The closed form matches the block-by-block sum around every boundary
+    /// of the first epochs, including the genesis (which pays nothing).
+    #[test]
+    fn issuance_at_epoch_edges() {
+        let b = HALVING_INTERVAL;
+        assert_eq!(issued_through_sat(0), 0);
+        assert_eq!(issued_through_sat(1), INITIAL_SUBSIDY_SAT);
+        assert_eq!(issued_through_sat(b - 1), (b - 1) * INITIAL_SUBSIDY_SAT);
+        let e1 = (b - 1) * INITIAL_SUBSIDY_SAT;
+        assert_eq!(issued_through_sat(b + 1), e1 + 2 * (INITIAL_SUBSIDY_SAT >> 1));
+        let e2 = e1 + b * (INITIAL_SUBSIDY_SAT >> 1);
+        assert_eq!(issued_through_sat(2 * b - 1), e2);
+        assert_eq!(issued_through_sat(2 * b), e2 + (INITIAL_SUBSIDY_SAT >> 2));
+        assert_eq!(issued_through_sat(3 * b + 5), e2 + b * (INITIAL_SUBSIDY_SAT >> 2) + 6 * (INITIAL_SUBSIDY_SAT >> 3));
+    }
+
+    #[test]
     fn min_fee_has_a_floor_and_scales_with_size() {
         assert_eq!(min_tx_fee_sat(0), MIN_TX_FEE_SAT);
         assert_eq!(min_tx_fee_sat(5_000), MIN_TX_FEE_SAT);
         assert_eq!(min_tx_fee_sat(8_600), 17_200);
         assert_eq!(min_tx_fee_sat(8_601), 17_202);
+        // The floor and the size rule meet at 5,000 bytes; 5,001 rounds up.
+        assert_eq!(min_tx_fee_sat(5_001), 10_002);
+        assert_eq!(min_tx_fee_sat(1), MIN_TX_FEE_SAT);
+        assert_eq!(MIN_FEE_RATE_SAT_PER_KB, 2_000);
         assert_eq!(min_tx_fee_sat(usize::MAX), u64::MAX.div_ceil(1000));
     }
 }
