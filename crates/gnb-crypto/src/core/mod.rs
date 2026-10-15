@@ -495,15 +495,26 @@ fn varint_len(n: u64) -> usize {
     }
 }
 
+/// Read one CompactSize varint. Only the minimal encoding of a value is
+/// accepted (Bitcoin Core's `ReadCompactSize`, "non-canonical
+/// ReadCompactSize()"), so every wire value has exactly one encoding.
+/// Accepting `FD 05 00` for 5 gave every block, header and transaction many
+/// byte-distinct encodings, and made `Block::from_wire_bytes` frame the next
+/// transaction at the re-encoded length of the previous one, fewer bytes than
+/// it consumed (fuzz target `wire_roundtrip`, docs/testing/FUZZING.md).
 fn read_varint(cur: &mut Cursor<&[u8]>) -> Result<u64, String> {
     let mut tag = [0u8; 1];
     cur.read_exact(&mut tag).map_err(|_| "varint: unexpected EOF on tag".to_string())?;
-    match tag[0] {
-        0xFF => { let mut b = [0u8; 8]; cur.read_exact(&mut b).map_err(|_| "varint u64 EOF")?; Ok(u64::from_le_bytes(b)) }
-        0xFE => { let mut b = [0u8; 4]; cur.read_exact(&mut b).map_err(|_| "varint u32 EOF")?; Ok(u32::from_le_bytes(b) as u64) }
-        0xFD => { let mut b = [0u8; 2]; cur.read_exact(&mut b).map_err(|_| "varint u16 EOF")?; Ok(u16::from_le_bytes(b) as u64) }
-        n    => Ok(n as u64),
+    let (value, min) = match tag[0] {
+        0xFF => { let mut b = [0u8; 8]; cur.read_exact(&mut b).map_err(|_| "varint u64 EOF")?; (u64::from_le_bytes(b), 0x1_0000_0000) }
+        0xFE => { let mut b = [0u8; 4]; cur.read_exact(&mut b).map_err(|_| "varint u32 EOF")?; (u32::from_le_bytes(b) as u64, 0x1_0000) }
+        0xFD => { let mut b = [0u8; 2]; cur.read_exact(&mut b).map_err(|_| "varint u16 EOF")?; (u16::from_le_bytes(b) as u64, 0xFD) }
+        n    => return Ok(n as u64),
+    };
+    if value < min {
+        return Err(format!("non-canonical varint: {value} encoded with the 0x{:02X} form", tag[0]));
     }
+    Ok(value)
 }
 
 fn read_u32_le(cur: &mut Cursor<&[u8]>) -> Result<u32, String> {
@@ -658,10 +669,19 @@ impl Transaction {
     /// Parse a Transaction from its stratum/Bitcoin-format serialization.
     /// Inverse of `to_wire_bytes(true)` — requires `include_script_sig=true`
     /// bytes since a round-trip without script_sig cannot recover the input's
-    /// signature.
+    /// signature. Bytes after the transaction are ignored (the gossip/RPC
+    /// decoder `mempool::admission::decode_tx_strict` refuses them); every
+    /// varint must be minimal, so the bytes consumed are exactly
+    /// `to_wire_bytes(true)` of the result.
     ///
     /// Returns Err with a short diagnostic on malformed input.
     pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, String> {
+        Self::read_wire_bytes(bytes).map(|(tx, _)| tx)
+    }
+
+    /// Parse a transaction from the front of `bytes`: the transaction and the
+    /// number of bytes it occupies (the framing `Block::from_wire_bytes` uses).
+    pub fn read_wire_bytes(bytes: &[u8]) -> Result<(Self, usize), String> {
         let mut cur = Cursor::new(bytes);
 
         let version = read_u32_le(&mut cur)?;
@@ -700,7 +720,7 @@ impl Transaction {
 
         let locktime = read_u32_le(&mut cur)?;
 
-        Ok(Transaction { version, inputs, outputs, locktime })
+        Ok((Transaction { version, inputs, outputs, locktime }, cur.position() as usize))
     }
 
     /// Transaction ID. SHA-256d over stratum-format bytes.
@@ -973,7 +993,9 @@ impl Block {
             + varint_len(self.shielded_transactions.len() as u64) + shielded
     }
 
-    /// Strict inverse of `to_wire_bytes`: trailing bytes are rejected.
+    /// Strict inverse of `to_wire_bytes`: trailing bytes and non-minimal
+    /// varints are rejected, so an accepted `bytes` is exactly
+    /// `to_wire_bytes()` of the result.
     pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, String> {
         let (header, blue_score, height, header_len) = BlockHeader::read_wire_bytes(bytes)?;
         let body = &bytes[header_len..];
@@ -988,9 +1010,12 @@ impl Block {
         let mut transactions = Vec::with_capacity((tx_count as usize).min(remaining / 10 + 1));
         let mut offset = cur.position() as usize;
         for i in 0..tx_count {
-            let tx = Transaction::from_wire_bytes(&body[offset..])
+            // Advance by the bytes the transaction decoder consumed, never by
+            // the length of a re-encoding (a different frame for any input
+            // that does not round-trip byte for byte).
+            let (tx, used) = Transaction::read_wire_bytes(&body[offset..])
                 .map_err(|e| format!("tx[{}] parse: {}", i, e))?;
-            offset += tx.to_wire_bytes(true).len();
+            offset += used;
             transactions.push(tx);
         }
 
@@ -1328,6 +1353,131 @@ mod structure_split_tests {
         b.transactions.clear();
         b.header.merkle_root = b.body_merkle_root();
         assert_eq!(b.validate_structure_without_pow(), Err("invalid coinbase format"));
+    }
+}
+
+#[cfg(test)]
+mod wire_canonical_tests {
+    //! Regressions found by the `wire_roundtrip` fuzz target: the wire
+    //! decoders accepted non-minimal CompactSize varints, so a block, header
+    //! or transaction had many byte encodings, and `Block::from_wire_bytes`
+    //! advanced past each transaction by the length of its RE-ENCODING, not by
+    //! the bytes it consumed.
+    use super::*;
+
+    fn tx(script_len: usize, locktime: u32) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [7; 32], prev_index: 1, script_sig: vec![0xAB; script_len], sequence: 9 }],
+            outputs: vec![TxOutput { value: 1_000, script_pubkey: vec![0x5A; 20] }],
+            locktime,
+        }
+    }
+
+    fn block(txs: Vec<Transaction>) -> Block {
+        Block {
+            header: BlockHeader { version: 1, parents: vec![[1; 32]], merkle_root: MerkleRoot::ZERO, timestamp: 5, bits: POW_LIMIT_BITS, nonce: 3 },
+            transactions: txs,
+            blue_score: 2,
+            height: 2,
+            shielded_transactions: vec![],
+        }
+    }
+
+    /// Replace the one-byte varint at `at` (value < 0xFD) by `FD v 00`.
+    fn widen(bytes: &[u8], at: usize) -> Vec<u8> {
+        assert!(bytes[at] < 0xFD);
+        let mut v = bytes[..at].to_vec();
+        v.extend_from_slice(&[0xFD, bytes[at], 0x00]);
+        v.extend_from_slice(&bytes[at + 1..]);
+        v
+    }
+
+    /// Each form accepts exactly the values the shorter forms cannot hold.
+    #[test]
+    fn varint_minimality_boundaries() {
+        let rd = |b: &[u8]| read_varint(&mut Cursor::new(b));
+        assert_eq!(rd(&[0xFC]), Ok(0xFC));
+        assert!(rd(&[0xFD, 0xFC, 0x00]).is_err());
+        assert_eq!(rd(&[0xFD, 0xFD, 0x00]), Ok(0xFD));
+        assert_eq!(rd(&[0xFD, 0xFF, 0xFF]), Ok(0xFFFF));
+        assert!(rd(&[0xFE, 0xFF, 0xFF, 0x00, 0x00]).is_err());
+        assert_eq!(rd(&[0xFE, 0x00, 0x00, 0x01, 0x00]), Ok(0x1_0000));
+        assert!(rd(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]).is_err());
+        assert_eq!(rd(&[0xFF, 0, 0, 0, 0, 1, 0, 0, 0]), Ok(0x1_0000_0000));
+        for n in [0u64, 0xFC, 0xFD, 0xFFFF, 0x1_0000, 0xFFFF_FFFF, 0x1_0000_0000, u64::MAX] {
+            let mut v = Vec::new();
+            write_varint(&mut v, n);
+            assert_eq!(v.len(), varint_len(n));
+            let mut c = Cursor::new(&v[..]);
+            assert_eq!(read_varint(&mut c), Ok(n));
+            assert_eq!(c.position() as usize, v.len());
+        }
+    }
+
+    #[test]
+    fn non_minimal_varints_are_refused_by_every_decoder() {
+        let t = tx(12, 0);
+        let enc = t.to_wire_bytes(true);
+        // input count (offset 4), script_sig length (4 + 1 + 36), output
+        // count, script_pubkey length.
+        let sig_len_at = 4 + 1 + 32 + 4;
+        let out_count_at = sig_len_at + 1 + 12 + 4;
+        for at in [4, sig_len_at, out_count_at, out_count_at + 1 + 8] {
+            let wide = widen(&enc, at);
+            assert!(Transaction::from_wire_bytes(&wide).is_err(), "tx varint at {at} accepted in a 3-byte form");
+        }
+        // The 5- and 9-byte forms of a small value.
+        let mut five = enc[..4].to_vec();
+        five.extend_from_slice(&[0xFE, 1, 0, 0, 0]);
+        five.extend_from_slice(&enc[5..]);
+        assert!(Transaction::from_wire_bytes(&five).is_err());
+        let mut nine = enc[..4].to_vec();
+        nine.extend_from_slice(&[0xFF, 1, 0, 0, 0, 0, 0, 0, 0]);
+        nine.extend_from_slice(&enc[5..]);
+        assert!(Transaction::from_wire_bytes(&nine).is_err());
+
+        // Header parent count, block tx count, shielded count.
+        let b = block(vec![t.clone()]);
+        let h = b.header.to_wire_bytes(2, 2);
+        assert!(BlockHeader::from_wire_bytes(&widen(&h, 4)).is_err(), "parent count");
+        let w = b.to_wire_bytes();
+        assert!(Block::from_wire_bytes(&widen(&w, h.len())).is_err(), "tx count");
+        assert!(Block::from_wire_bytes(&widen(&w, w.len() - 1)).is_err(), "shielded count");
+        assert!(Block::from_wire_bytes(&w).is_ok());
+
+        // Minimal multi-byte forms stay valid at the boundaries.
+        for n in [0xFC, 0xFD, 0xFE, 0xFF, 0x100, 9_999] {
+            let t = tx(n, 1);
+            let e = t.to_wire_bytes(true);
+            let (back, used) = Transaction::read_wire_bytes(&e).unwrap();
+            assert_eq!((back.inputs[0].script_sig.len(), used), (n, e.len()));
+        }
+    }
+
+    /// The pre-fix decoder accepted these bytes: the transaction's script
+    /// length is `FD 0C 00` (two bytes longer than minimal), the block parser
+    /// then read the shielded count from the transaction's last two locktime
+    /// bytes (`FD 00`) plus the real count byte, and the frame "fit".
+    #[test]
+    fn block_transactions_are_framed_by_the_bytes_consumed() {
+        let t = tx(12, u32::from_le_bytes([0x11, 0x22, 0xFD, 0x00]));
+        let b = block(vec![t]);
+        let w = b.to_wire_bytes();
+        let hdr = b.header.to_wire_bytes(2, 2).len();
+        let sig_len_at = hdr + 1 + 4 + 1 + 32 + 4;
+        assert_eq!(w[sig_len_at], 12);
+        let crafted = widen(&w, sig_len_at);
+        assert!(Block::from_wire_bytes(&crafted).is_err(), "a mis-framed block encoding was accepted");
+        // Canonical encodings: consumed bytes == encoding length.
+        for t in &b.transactions {
+            let e = t.to_wire_bytes(true);
+            let mut longer = e.clone();
+            longer.extend_from_slice(&[1, 2, 3]);
+            assert_eq!(Transaction::read_wire_bytes(&longer).unwrap().1, e.len());
+        }
+        let back = Block::from_wire_bytes(&w).unwrap();
+        assert_eq!(back.to_wire_bytes(), w);
     }
 }
 
