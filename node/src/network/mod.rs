@@ -1302,6 +1302,21 @@ impl NetworkNode {
                                     recent_block_publishes.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
                                     recent_block_publishes.insert(*block_hash, now);
                                 }
+                                // Receipt trace of a gossiped transaction, off by
+                                // default (`GOSSIP_RX_TX_LOG_TARGET`): the
+                                // functional tests check with it that an invalid
+                                // transaction never reaches a peer. The decode
+                                // runs only when the trace is enabled.
+                                NetworkMessage::NewTransaction { tx_data, .. }
+                                    if log::log_enabled!(target: GOSSIP_RX_TX_LOG_TARGET, log::Level::Debug) =>
+                                {
+                                    match crate::core::Transaction::from_wire_bytes(tx_data) {
+                                        Ok(tx) => debug!(target: GOSSIP_RX_TX_LOG_TARGET, "← tx {} from {}",
+                                            hex::encode(&tx.txid()[..8]), propagation_source),
+                                        Err(_) => debug!(target: GOSSIP_RX_TX_LOG_TARGET, "← tx (undecodable, {} bytes) from {}",
+                                            tx_data.len(), propagation_source),
+                                    }
+                                }
                                 NetworkMessage::PeerTip { blue_score, height, .. }
                                 | NetworkMessage::Version { blue_score, height, .. } => {
                                     // NET-6: claims are attributed to their signed AUTHOR
@@ -1879,6 +1894,11 @@ fn requeue_pull(pending: &mut std::collections::VecDeque<PendingPull>, mut p: Pe
         pending.push_back(p);
     }
 }
+
+/// Log target of the debug-level receipt trace of gossiped transactions
+/// (`RUST_LOG=info,gnb_gossip_rx_tx=debug`). Every gossiped block is logged
+/// at info (`← block h=… <hash>`); transactions only with this target.
+pub const GOSSIP_RX_TX_LOG_TARGET: &str = "gnb_gossip_rx_tx";
 
 /// Period of the network heartbeat (peer count, housekeeping, re-subscribe,
 /// bootstrap re-dial with no peers).

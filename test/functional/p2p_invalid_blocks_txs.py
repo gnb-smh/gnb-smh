@@ -6,9 +6,17 @@ are rejected with the right reason, change nothing and are never relayed.
 gossip ingress runs the same `accept_block` / `admission::admit` code, and
 node/tests + node/fuzz cover the wire decoders.)
 
-node0 is the target, node1 a connected observer that must never see an
+node0 is the target, node1 a connected observer that must never RECEIVE an
 invalid object, node2 an isolated node used only to obtain a genuinely
 signed transaction T (gnb-cli wallet) that node0 has never seen.
+
+"Never relayed" is checked on delivery, not on storage: node1 would drop
+most invalid objects itself, so "node1 does not have it" proves nothing.
+node1 logs every gossiped block it receives (`← block h=<height> <hash>`,
+info) and, with the debug target `gnb_gossip_rx_tx`, every gossiped
+transaction (`← tx <txid>`); no rejected block hash or transaction id may
+appear there. T and the valid blocks do appear (positive control: the trace
+sees a relayed object).
 
 Transactions (sendrawtransaction at node0): bad hex, garbage, trailing bytes,
 a coinbase, a duplicated input, a missing input, outputs above inputs, a
@@ -19,14 +27,22 @@ copy and T again are refused.
 Blocks (submitblock at node0), each built from a valid template with one
 defect: bad hex, truncated, trailing bytes, bad Merkle root, legacy Merkle
 root, missing / wrong-height / wrong-parents / wrong-witness coinbase
-commitment, no coinbase, two coinbases, duplicate transaction, bits above
-the pow limit, bits other than expected, wrong height, unknown parent,
+commitment, no coinbase, two coinbases, duplicate transaction, undecodable
+compact bits, bits other than expected, wrong height, unknown parent,
 timestamps in the future and before the parent, coinbase over-claim, two
-coinbase outputs, a transaction already confirmed. The selected tip never
-moves, node1 never receives any of them, and a valid block afterwards is
-relayed at once.
+coinbase outputs, a transaction already confirmed (BIP30: its outputs are
+unspent). The
+selected tip never moves, node1 never receives any of them, and a valid
+block afterwards is relayed at once.
+
+Not reachable here: a target above the pow limit (POW-9, POW-3). The test
+build pins every target, and the pow limit, to 0x2100ffff, the largest
+target compact bits can encode; any easier `bits` fails to decode first
+(the vector above). The Rust tests cover the limit itself
+(`validate_pow_enforces_the_height_pow_limit`).
 """
 
+import re
 import time
 
 from test_framework.messages import (
@@ -47,14 +63,33 @@ class InvalidBlocksTxsTest(GnbTestFramework):
     def setup_network(self):
         n0, n1, n2 = self.nodes
         n0.start()
-        n1.start(peers=[n0.p2p_addr])
+        # node1 traces every gossiped transaction it receives (debug target).
+        n1.start(peers=[n0.p2p_addr],
+                 env={"RUST_LOG": "info,libp2p_gossipsub=warn,libp2p_swarm=warn,gnb_gossip_rx_tx=debug"})
         n2.start()  # isolated signer
         self.wait_for_peers(pairs=[(n0, n1)])
+
+    def received_by_node1(self) -> tuple:
+        """(block hash prefixes, txid prefixes) node1 received over gossip."""
+        log = self.nodes[1].log_since_start().decode("utf-8", "replace")
+        return (set(re.findall(r"← block h=\d+ ([0-9a-f]{16})", log)),
+                set(re.findall(r"← tx ([0-9a-f]{16})", log)))
 
     # ── helpers ──────────────────────────────────────────────────────────
 
     def tx_rejected(self, raw_hex: str, reason: str):
         assert_raises_rpc_error(reason, self.nodes[0].sendrawtransaction, raw_hex)
+        self.note_rejected_tx(raw_hex)
+
+    def note_rejected_tx(self, raw_hex: str):
+        """Remember the txid of a rejected, decodable transaction that is not
+        T itself (T is relayed legitimately)."""
+        try:
+            txid = Tx.deserialize(bytes.fromhex(raw_hex)).txid_hex()
+        except Exception:  # noqa: BLE001 - malformed: it has no txid, nothing to trace
+            return
+        if txid != self.txid:
+            self.rejected_txs.append(txid)
 
     def block_rejected(self, block, reason: str, *, search_nonce: bool = True):
         n0, n1 = self.nodes[0], self.nodes[1]
@@ -75,9 +110,11 @@ class InvalidBlocksTxsTest(GnbTestFramework):
         n0, n1, n2 = self.nodes
         spk = address_to_script_pubkey(MINER)
         self.rejected = []
+        self.rejected_txs = []
 
         self.log.info("a signed payment T, made on the isolated node2")
         txid = n2.cli_send(self.wallet_copy(), PAYEE, "2")
+        self.txid = txid
         raw = n2.getrawtransaction(txid)["hex"]
         tx = Tx.deserialize(bytes.fromhex(raw))
         assert_equal(n0.mempool(), [])
@@ -115,6 +152,7 @@ class InvalidBlocksTxsTest(GnbTestFramework):
             t.outputs[0].value -= 1  # a bigger fee: valid amounts, forged signature
         e = assert_raises_rpc_error(None, n0.sendrawtransaction, variant(forged))
         assert_true("signature" in e.message.lower() or "verify" in e.message.lower(), e.message)
+        self.note_rejected_tx(variant(forged))
         assert_equal(n0.mempool(), [])
 
         self.log.info("T itself is accepted and relayed; a conflicting copy and T again are refused")
@@ -163,7 +201,7 @@ class InvalidBlocksTxsTest(GnbTestFramework):
         b = block_from_template(tmpl, spk, txs=[tx, tx])
         self.block_rejected(b, "duplicate transaction")
         b = block_from_template(tmpl, spk)
-        b.bits = 0x2200FFFF  # target above the pow limit (POW-9)
+        b.bits = 0x2200FFFF  # undecodable compact bits (mantissa overflow); not POW-9, see the docstring
         self.block_rejected(b, "invalid PoW", search_nonce=False)
 
         self.log.info("contextually invalid blocks are refused")
@@ -190,15 +228,25 @@ class InvalidBlocksTxsTest(GnbTestFramework):
         confirmed = n0.generate(1, MINER)[0]
         assert_equal(n0.gettransaction(txid)["block_hash"], confirmed)
         tmpl2 = self.template()
-        self.block_rejected(block_from_template(tmpl2, spk, txs=[tx]), "rejected")
+        # BIP30: its outputs exist, unspent, so the repeat would overwrite them.
+        self.block_rejected(block_from_template(tmpl2, spk, txs=[tx]),
+                            f"BIP30: output {txid[:16]}:0 would overwrite an unspent coin")
 
-        self.log.info("node1 never saw any rejected block; a valid one is relayed at once")
+        self.log.info("node1 never received a rejected block or transaction")
+        blocks, txs = self.received_by_node1()
+        assert_equal((len(self.rejected), len(self.rejected_txs)), (18, 8), "every vector is traced")
+        leaked = ([f"block {b[:16]}" for b in self.rejected if b[:16] in blocks]
+                  + [f"tx {t[:16]}" for t in self.rejected_txs if t[:16] in txs])
+        assert_equal(leaked, [], "rejected objects reached node1")
+
+        self.log.info("the trace sees what node0 does relay; a valid block is relayed at once")
         self.sync_blocks([n0, n1])
-        for h in self.rejected:
-            assert_true(not n1.has_block(h), f"invalid block {h[:16]} reached node1")
         h = n0.generate(1, MINER)[0]
         wait_until(lambda: n1.tip() == h, timeout=30, desc="node1 receives the valid block")
         self.assert_same_chain_state([MINER, PAYEE], [n0, n1])
+        blocks, txs = self.received_by_node1()
+        assert_true({confirmed[:16], h[:16]} <= blocks, f"node1's block trace misses relayed blocks: {blocks}")
+        assert_true(txid[:16] in txs, f"node1's transaction trace misses T: {txs}")
 
 
 if __name__ == "__main__":
