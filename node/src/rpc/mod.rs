@@ -771,7 +771,13 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let s = state.node_state.read();
             let pruned_h = state.store.pruned_height();
             json!({
-                "network":         "mainnet",
+                // The chain this node runs (`--testnet`), as set once at
+                // start-up. Was the literal "mainnet" on every node
+                // (test/functional/feature_test_build_guard.py).
+                "network":         match crate::core::node_chain_id() {
+                    crate::core::ChainId::Testnet => "testnet",
+                    crate::core::ChainId::Mainnet => "mainnet",
+                },
                 "version":         s.version,
                 "protocol":        PROTOCOL_VERSION,
                 "net_protocol":    crate::network::PROTOCOL_VERSION,
