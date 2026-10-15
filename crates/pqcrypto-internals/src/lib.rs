@@ -313,21 +313,53 @@ pub unsafe extern "C" fn PQCRYPTO_RUST_randombytes(buf: *mut u8, len: size_t) ->
 mod tests {
     use super::*;
 
+    /// A guard "forgotten" inside a scope: its `Drop` never runs there, exactly
+    /// as with `std::mem::forget`. Unlike `mem::forget`, the test reclaims the
+    /// guard afterwards, so the run is leak-free under LeakSanitizer (the
+    /// forgotten guard's `Rc` was the only allocation `mem::forget` leaked;
+    /// see docs/testing/SANITIZERS.md).
+    fn forget_guard(parked: &mut Vec<core::mem::ManuallyDrop<SeededRngGuard>>, seed: &[u8; 32]) {
+        parked.push(core::mem::ManuallyDrop::new(with_seeded_rng(seed)));
+    }
+
+    /// Late drop of guards the scope already cleaned up removes nothing: a
+    /// live sentinel override pushed first must survive those drops, still
+    /// active and at the start of its stream. (Called with an empty stack, so
+    /// without the sentinel a wrong `SeededRngGuard::drop` could not show.)
+    fn drop_parked(parked: Vec<core::mem::ManuallyDrop<SeededRngGuard>>) {
+        assert!(SEEDED_RNG_STACK.with(|s| s.borrow().is_empty()));
+        let sentinel_seed = [9; 32];
+        let sentinel = with_seeded_rng(&sentinel_seed);
+        for guard in parked {
+            drop(core::mem::ManuallyDrop::into_inner(guard));
+        }
+        assert_eq!(SEEDED_RNG_STACK.with(|s| s.borrow().len()), 1, "a late drop removed the live override");
+        let (mut want, mut got) = ([0; 32], [0; 32]);
+        ChaCha20Rng::from_seed(sentinel_seed).fill_bytes(&mut want);
+        randombytes_fill(&mut got).unwrap();
+        assert_eq!(got, want, "a late drop disturbed the live override's stream");
+        drop(sentinel);
+        assert!(SEEDED_RNG_STACK.with(|s| s.borrow().is_empty()));
+    }
+
     #[test]
     fn scoped_rng_cleans_forgotten_nested_guards_on_return_and_unwind() {
         for unwind in [false, true] {
-            let result = std::panic::catch_unwind(|| {
+            let mut parked = Vec::new();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 with_seeded_rng_scope(&[1; 32], || {
-                    std::mem::forget(with_seeded_rng(&[2; 32]));
+                    forget_guard(&mut parked, &[2; 32]);
                     with_seeded_rng_scope(&[3; 32], || {
-                        std::mem::forget(with_seeded_rng(&[4; 32]));
+                        forget_guard(&mut parked, &[4; 32]);
                     });
                     assert_eq!(SEEDED_RNG_STACK.with(|s| s.borrow().len()), 2);
                     if unwind { panic!("intentional scope unwind"); }
                 });
-            });
+            }));
             assert_eq!(result.is_err(), unwind);
             assert!(SEEDED_RNG_STACK.with(|s| s.borrow().is_empty()));
+            assert_eq!(parked.len(), 2);
+            drop_parked(parked);
         }
     }
 
@@ -353,11 +385,13 @@ mod tests {
     #[test]
     fn scoped_rng_cleanup_survives_outer_guard_removed_inside_closure() {
         let outer = with_seeded_rng(&[1; 32]);
+        let mut parked = Vec::new();
         with_seeded_rng_scope(&[2; 32], || {
             drop(outer);
-            std::mem::forget(with_seeded_rng(&[3; 32]));
+            forget_guard(&mut parked, &[3; 32]);
         });
         assert!(SEEDED_RNG_STACK.with(|s| s.borrow().is_empty()));
+        drop_parked(parked);
     }
 
     #[test]
@@ -538,6 +572,7 @@ mod tests {
 
     /// Audit K-H1 REGRESSION: an OS RNG failure must abort, not return `-1`.
     #[test]
+    #[cfg_attr(miri, ignore = "re-executes the test binary as a child process (std::process::Command), which Miri does not support")]
     fn os_rng_failure_aborts_instead_of_failing_open() {
         assert_failed_closed(&run_abort_case("os_rng_failure"), "os_rng_failure");
     }
@@ -545,6 +580,7 @@ mod tests {
     /// Audit K-H1 REGRESSION: a NULL buffer with `len > 0` must abort too —
     /// there is no way to return randomness, and an error code is discarded.
     #[test]
+    #[cfg_attr(miri, ignore = "re-executes the test binary as a child process (std::process::Command), which Miri does not support")]
     fn null_buffer_aborts_instead_of_failing_open() {
         assert_failed_closed(&run_abort_case("null_buffer"), "null_buffer");
     }

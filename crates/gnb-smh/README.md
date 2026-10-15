@@ -13,7 +13,7 @@ The full specification and security analysis live in the GnB-SMH spec doc.
 | --- | --- |
 | `reference/gnb_smh.py` | Normative definition (Python standard library only) |
 | `reference/gen_vectors.py` | Regenerates `test_vectors.json` with intermediates |
-| `reference/test_vectors.json` | 7 vectors: log2_n = 10 (5) and 19 (2) |
+| `reference/test_vectors.json` | 17 vectors: log2_n = 1 (5), 2 (5), 10 (5) and 19 (2); the log2_n <= 2 ones also run under Miri on s390x and i686 |
 | `src/lib.rs` | The crate (`#![forbid(unsafe_code)]`): evaluation, scratchpad, verification |
 | `src/difficulty.rs` | Compact targets, chain work, ASERT |
 | `src/bin/smh-bench.rs` | Benchmark and toy miner |

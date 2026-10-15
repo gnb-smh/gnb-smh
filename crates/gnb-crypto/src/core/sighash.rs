@@ -581,6 +581,11 @@ mod tests {
     /// O(size) bytes; the v2 digest hashes O(size) bytes PER input. Counted,
     /// not timed, so the test is deterministic.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "absorbs ~40 KB into SHA3-256 (~300 Keccak-f[1600] permutations, ~0.4 s each under \
+                  Miri); a byte-counting cost test, its arithmetic also runs in v3_commits_to_every_field"
+    )]
     fn v3_cost_is_linear_in_the_input_count() {
         let cost_v3 = |n: usize| {
             let (tx, spent) = tx_with(n, 2, 3);
@@ -672,6 +677,11 @@ mod tests {
     /// At/after the activation: a correctly signed version-3 transaction
     /// verifies, and every single fault is rejected with its own error.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "generates hybrid keys and signs/verifies through the PQClean ML-DSA-65 and Falcon-1024 C code, \
+                  which Miri cannot execute (it runs under ASan, UBSan and i686: scripts/sanitizers.sh)"
+    )]
     fn v3_scripts_verify_and_every_fault_is_rejected() {
         use SighashVersion::V3;
         let (h, main) = (100, ChainId::Mainnet);
@@ -725,6 +735,11 @@ mod tests {
 
     /// Below the activation: the historical v2 rule, lenient framing included.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "generates hybrid keys and signs/verifies through the PQClean ML-DSA-65 and Falcon-1024 C code, \
+                  which Miri cannot execute (it runs under ASan, UBSan and i686: scripts/sanitizers.sh)"
+    )]
     fn v2_scripts_verify_below_the_activation() {
         use SighashVersion::V2;
         let (h, main) = (100, ChainId::Mainnet);

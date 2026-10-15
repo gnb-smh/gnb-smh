@@ -664,10 +664,14 @@ mod tests {
     #[test]
     fn low_anchor_bits_match_legacy_order() {
         let p = params();
+        // ~132,000 points natively; a coarse grid over the same ranges (132
+        // points) under Miri, where the legacy bit-by-bit shifts make each
+        // point ~0.45 s.
+        let (height_step, skew_step) = if cfg!(miri) { (1_999_993, 799_999) } else { (99_991, 9_973) };
         for bits in [0x1F0E_9036u32, 0x1D00_FFFF, 0x2000_FFFF, 0x207F_FFFF] {
             let a = AsertAnchor { bits, ..anchor() };
-            for height in (1u64..=4_000_001).step_by(99_991) {
-                for skew in (-4_000_000i64..=4_000_000).step_by(9_973) {
+            for height in (1u64..=4_000_001).step_by(height_step) {
+                for skew in (-4_000_000i64..=4_000_000).step_by(skew_step) {
                     let parent_time = a.timestamp + 30 * (height as i64 - 1) + skew;
                     assert_eq!(
                         asert_next_bits(&p, &a, parent_time, height).unwrap(),

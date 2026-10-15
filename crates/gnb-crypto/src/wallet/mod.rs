@@ -2148,7 +2148,7 @@ mod legacy_keystore_tests {
     #[test]
     fn save_encrypted_rejects_weak_password() {
         let kp = generate_keypair(false);
-        let tmp = std::env::temp_dir().join("bloch-kp-weak-pw-test.json");
+        let tmp = std::env::temp_dir().join(format!("bloch-kp-weak-pw-test-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let result = kp.save_encrypted(&tmp, "short");
         assert!(result.is_err(), "a short password must be rejected");
@@ -2161,7 +2161,7 @@ mod legacy_keystore_tests {
     #[test]
     fn load_encrypted_corrupt_nonce_returns_error_not_panic() {
         let kp = generate_keypair(false);
-        let tmp = std::env::temp_dir().join("bloch-kp-corrupt-nonce-test.json");
+        let tmp = std::env::temp_dir().join(format!("bloch-kp-corrupt-nonce-test-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         kp.save_encrypted(&tmp, "correct-horse-battery-9!").unwrap();
 
@@ -2182,7 +2182,7 @@ mod legacy_keystore_tests {
     #[test]
     fn load_encrypted_rejects_out_of_bounds_kdf_params() {
         let kp = generate_keypair(false);
-        let tmp = std::env::temp_dir().join("bloch-kp-bad-kdf-test.json");
+        let tmp = std::env::temp_dir().join(format!("bloch-kp-bad-kdf-test-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         kp.save_encrypted(&tmp, "correct-horse-battery-9!").unwrap();
 
@@ -2253,7 +2253,7 @@ mod legacy_keystore_tests {
     #[test]
     fn save_load_roundtrip_still_works() {
         let kp = generate_keypair(false);
-        let tmp = std::env::temp_dir().join("bloch-kp-roundtrip-test.json");
+        let tmp = std::env::temp_dir().join(format!("bloch-kp-roundtrip-test-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         kp.save_encrypted(&tmp, "correct-horse-battery-9!").unwrap();
         let file_len = std::fs::metadata(&tmp).unwrap().len() as usize;

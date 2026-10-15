@@ -448,9 +448,15 @@ mod tests {
         assert!(!rules_active_at(u64::MAX - 1, activation::NEVER));
     }
 
+    /// Tree sizes for the Merkle tests. Under Miri one SHA-256 compression
+    /// takes ~0.2 s (docs/testing/SANITIZERS.md), so it covers the shapes that
+    /// matter (empty, one leaf, odd and even levels, a carried-up odd node)
+    /// and stops at 5 leaves.
+    const MAX_LEAVES: u8 = if cfg!(miri) { 5 } else { 17 };
+
     #[test]
     fn legacy_root_is_bit_identical_to_transaction_merkle_root() {
-        for n in 0..12u8 {
+        for n in 0..12u8.min(MAX_LEAVES + 1) {
             let txs: Vec<Transaction> = (0..n).map(|i| spend(i, 20)).collect();
             let ids: Vec<[u8; 32]> = txs.iter().map(Transaction::txid).collect();
             assert_eq!(legacy_merkle_root(&ids), Transaction::merkle_root(&txs), "n={n}");
@@ -492,7 +498,7 @@ mod tests {
     /// keeps the legacy root but never the tagged one.
     #[test]
     fn duplicate_last_mutation_changes_the_tagged_root_only() {
-        for n in 1..10u8 {
+        for n in 1..10u8.min(MAX_LEAVES + 1) {
             let ids: Vec<[u8; 32]> = (1..=n).map(id).collect();
             let mut dup = ids.clone();
             dup.push(*ids.last().unwrap());
@@ -512,7 +518,7 @@ mod tests {
     #[test]
     fn coinbase_branch_reproduces_the_root() {
         for hardened in [false, true] {
-            for n in 1..=17u8 {
+            for n in 1..=MAX_LEAVES {
                 let ids: Vec<[u8; 32]> = (1..=n).map(id).collect();
                 let want = if hardened { tagged_merkle_root(&ids) } else { legacy_merkle_root(&ids) };
                 let branch = coinbase_merkle_branch(&ids, hardened);
