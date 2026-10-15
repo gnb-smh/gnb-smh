@@ -250,6 +250,11 @@ jobs:
         run: sh scripts/sanitizers.sh ubsan
       - name: UBSan on a CPU without AVX2 (clean ML-DSA C code; ML-DSA, wallet signing and ACVP tests)
         run: sh scripts/sanitizers.sh ubsan-noavx2
+      # The whole gnb-crypto suite on that CPU: about 10 minutes of emulation
+      # (the keystore KDFs), so nightly and on demand only.
+      - name: UBSan on a CPU without AVX2, every gnb-crypto test (nightly)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: sh scripts/sanitizers.sh ubsan-noavx2-full
 
   # Miri: undefined behaviour in the pure-Rust consensus arithmetic (gnb-smh
   # difficulty/compact/ASERT/work, gnb-crypto core::limits, tokenomics,
@@ -257,10 +262,12 @@ jobs:
   # pqcrypto-internals; then gnb-smh (with the Python PoW vectors) on a
   # 32-bit and a big-endian target, and the wasm wallet's C ABI on i686.
   # Miri-incompatible tests carry #[cfg_attr(miri, ignore = "<why>")]; the
-  # script fails a step whose passed-test count drops below its minimum.
+  # script fails a step whose passed-test count drops below its minimum, and
+  # bounds each Miri command at 30 minutes (SANITIZER_MIRI_TIMEOUT): a test
+  # Miri cannot finish would otherwise hold the job until its timeout.
   miri:
     runs-on: ubuntu-latest
-    timeout-minutes: 120   # local reference: about 15 minutes in total
+    timeout-minutes: 75   # about 15 minutes in total, locally and on GitHub
     steps:
       - uses: actions/checkout@v4
       - name: Nightly toolchain with Miri (pinned)
@@ -275,6 +282,25 @@ jobs:
         run: sh scripts/sanitizers.sh miri
       - name: Miri (gnb-smh on i686 and s390x, gnb-wallet-wasm C ABI on i686)
         run: sh scripts/sanitizers.sh miri-cross
+
+  # The node itself (gnb: RocksDB, libp2p, every unit and integration test) on
+  # i686. Its untrusted-input decoders must give a 32-bit build the verdicts
+  # a 64-bit one gives: bincode truncates declared lengths there (found by
+  # this run; node/src/network/mod.rs). About 25 minutes of building and
+  # testing, so nightly and on demand only.
+  i686-node:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: 32-bit target, multilib gcc and g++, libclang (RocksDB, PQClean C)
+        run: |
+          sudo apt-get update && sudo apt-get install -y g++-multilib clang libclang-dev
+          cargo --version   # installs the rust-toolchain.toml toolchain
+          rustup target add i686-unknown-linux-gnu
+      - name: gnb (lib, bins, integration tests) on i686
+        run: sh scripts/sanitizers.sh i686-node
 
   # 32-bit build and tests (usize = 32 bits: the CRY-8 overflow class) of the
   # consensus crates and the wasm wallet core on i686-unknown-linux-gnu,
