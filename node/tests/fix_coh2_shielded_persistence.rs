@@ -197,6 +197,50 @@ fn connect_then_disconnect_restores_the_previous_state() {
     assert_eq!(snap(&reloaded(&f.store)), before);
 }
 
+/// Merge P3 x P5 (audit DAG-6: no reorg-depth limit, so a reorg disconnects
+/// blocks whose body was pruned): the shielded side of a rollback through
+/// pruned bodies takes "did the block carry shielded transactions" from the
+/// record written when the body was pruned, or — a body pruned by an older
+/// release, without a record — from the persisted shielded undo record
+/// (never pruned), and disconnects exactly as with the body.
+#[test]
+fn disconnect_through_pruned_bodies_uses_the_pruned_record_and_the_undo() {
+    let f = fixture();
+    let mut pool = reloaded(&f.store);
+    let empty = snap(&pool);
+    let b1 = stored_block(&f.store, f.genesis, 1, 1, vec![stx(pool.anchor(), vec![h(1, 1)], vec![h(2, 1)])]);
+    connect(&f.store, &mut pool, &extend(f.genesis, &[b1])).unwrap();
+    let b2 = stored_block(&f.store, b1, 2, 2, vec![stx(pool.anchor(), vec![h(1, 2)], vec![h(2, 2)])]);
+    let b3 = stored_block(&f.store, b2, 3, 3, vec![]);
+    connect(&f.store, &mut pool, &extend(b1, &[b2, b3])).unwrap();
+    // The node's selected-chain height index (what pruning walks).
+    let mut batch = rocksdb::WriteBatch::default();
+    for h in [f.genesis, b1, b2, b3] {
+        let blk = f.store.get_block(&h).unwrap().unwrap();
+        f.store.stage_chain_index(&mut batch, &blk, &std::collections::HashMap::new()).unwrap();
+    }
+    f.store.write_batch(batch).unwrap();
+    assert_eq!(f.store.prune_blocks_below(3).unwrap(), 3, "genesis, b1 and b2 pruned");
+    for h in [b1, b2] {
+        assert!(f.store.get_block(&h).unwrap().is_none());
+        assert!(f.store.get_pruned_body_record(&h).unwrap().unwrap().had_shielded);
+    }
+    // b1 as if pruned by an older release: no record.
+    let mut batch = rocksdb::WriteBatch::default();
+    f.store.stage_delete_pruned_body_record(&mut batch, &b1).unwrap();
+    f.store.write_batch(batch).unwrap();
+
+    let back = ReorgPlan { lca: f.genesis, to_rollback: vec![b3, b2, b1], to_apply: vec![] };
+    connect(&f.store, &mut pool, &back).unwrap();
+    assert_eq!(snap(&pool), empty, "in memory: back to the genesis state");
+    assert_eq!(pool.tip(), Some(f.genesis));
+    let disk = reloaded(&f.store);
+    assert_eq!(snap(&disk), empty, "on disk too");
+    for h in [b1, b2] {
+        assert!(gnb::coherence::persist::read_undo(&f.store, &h).unwrap().is_none(), "undo consumed");
+    }
+}
+
 /// A block whose shielded transactions are invalid in its context is
 /// reported as `Invalid` (the pipeline disqualifies it) and the pool is
 /// restored exactly, including the effects of earlier blocks of the plan.

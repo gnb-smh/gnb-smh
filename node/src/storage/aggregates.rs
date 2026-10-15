@@ -444,6 +444,20 @@ impl Storage {
         Ok(())
     }
 
+    /// Chain-state rebuild (audit DAG-11): mark the aggregates incomplete
+    /// (version marker deleted in `batch`, in-memory flag cleared now) BEFORE
+    /// the chain state is cleared, so the reconnect that follows stages no
+    /// incremental change on top of values describing the old state. The
+    /// rebuild recomputes them from scratch at its end
+    /// ([`Self::rebuild_aggregates`]); a crash in between leaves the marker
+    /// absent, and the next start-up rebuilds them ([`Self::ensure_aggregates`]).
+    pub fn stage_aggregates_incomplete(&self, batch: &mut WriteBatch) -> Result<(), StorageError> {
+        let _g = self.agg_lock();
+        batch.delete_cf(self.meta_cf()?, K_VERSION);
+        self.agg_ready.store(false, Ordering::Release);
+        Ok(())
+    }
+
     /// Stage the connected-chain totals and the connected-set fingerprint.
     pub(crate) fn stage_chain_totals(&self, batch: &mut WriteBatch, t: ChainTotals, conn: &[u8; 32]) -> Result<(), StorageError> {
         if !self.aggregates_ready() {

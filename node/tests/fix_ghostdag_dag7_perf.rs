@@ -130,3 +130,103 @@ fn dag7_profile_pre_activation() {
 fn dag7_profile_post_activation() {
     profile("post-activation", 0);
 }
+
+/// DAG-7 residual (package P3). After the earlier fixes, inserting a genesis
+/// sibling still costs a reachability reindex proportional to the whole DAG,
+/// and a deep side block one proportional to the subtree under its parent.
+/// The bound is the POW-3 anti-DoS work rule
+/// (`gnb::ingress::BlockIngress::work_check`, run on every block whose
+/// parents are known before its proof of work, storage or insertion): a
+/// block whose selected parent is so deep that its chain cannot come within
+/// `ANTI_DOS_WINDOW_BLOCKS` of the tip's work is not inserted unless a
+/// proof-of-work-verified chain built on it carries that work (honest deep
+/// forks), or a buffered orphan merges it — and then deep insertions are
+/// rationed by `DeepBackfillBudget`. Outcome-neutral: a block any heavier
+/// chain needs is fetched again through that chain's orphans
+/// (`node/tests/fix_chain_selection.rs`, pow3_*).
+///
+/// Measured: the same flood of genesis siblings and deep side blocks
+/// inserted into GhostDAG (what reached `accept_block` before) versus
+/// decided by the work rule (after). The honest DAG's GhostDAG data and its
+/// reachability index are byte-identical with and without the refused flood.
+/// The honest chain carries real per-block work (1,000); flood blocks carry
+/// the pow-limit work, as the audit's near-free deep-fork blocks do.
+#[test]
+fn dag7_residual_deep_inserts_are_bounded_by_the_work_rule() {
+    use gnb::consensus::canonical_encode;
+    use gnb::core::{Block, BlockHeader, MerkleRoot, POW_LIMIT_BITS};
+    use gnb::ingress::{BlockIngress, DropReason};
+
+    let n = env_u64("GNB_DAG7_N", 3_000);
+    let siblings = env_u64("GNB_DAG7_SIBLINGS", 80);
+    let g = hx(0xEE, 0);
+    let build = || {
+        let mut dag = GhostDAG::with_k_and_activation(GHOSTDAG_K, NEVER);
+        dag.add_genesis(g, 0);
+        for i in 1..=n {
+            dag.add_block(hx(1, i), vec![if i == 1 { g } else { hx(1, i - 1) }], i, 1_000).unwrap();
+        }
+        dag
+    };
+    let flood: Vec<(BlockHash, Block)> = (0..siblings)
+        .map(|j| {
+            // Genesis siblings, and side blocks under n/2 and n/4.
+            let parent = match j % 3 { 0 => g, 1 => hx(1, n / 2), _ => hx(1, n / 4) };
+            let b = Block {
+                header: BlockHeader {
+                    version: 1, parents: vec![parent], merkle_root: MerkleRoot::ZERO,
+                    timestamp: j, bits: POW_LIMIT_BITS, nonce: j,
+                },
+                transactions: vec![], blue_score: 0, height: 1, shielded_transactions: vec![],
+            };
+            (b.block_hash(), b)
+        })
+        .collect();
+
+    // Before: every flood block reached GhostDAG.
+    let mut before = build();
+    let (mut total_b, mut worst_b) = (Duration::ZERO, Duration::ZERO);
+    for (h, b) in &flood {
+        let t = Instant::now();
+        before.add_block(*h, b.header.parents.clone(), b.header.timestamp, 1).unwrap();
+        let e = t.elapsed();
+        total_b += e;
+        worst_b = worst_b.max(e);
+    }
+
+    // After: the work rule decides first; nothing is inserted.
+    let after = build();
+    let mut core = BlockIngress::new();
+    let (mut total_a, mut worst_a) = (Duration::ZERO, Duration::ZERO);
+    for (h, b) in &flood {
+        let t = Instant::now();
+        let verdict = core.work_check(b, h, n, Instant::now(), &after);
+        let e = t.elapsed();
+        total_a += e;
+        worst_a = worst_a.max(e);
+        assert_eq!(verdict, Err(DropReason::LowWork));
+    }
+    let reference = build();
+    let snapshot = |d: &GhostDAG| -> Vec<Vec<u8>> {
+        (1..=n).map(|i| canonical_encode(d.get_block_data(&hx(1, i)).unwrap())).collect()
+    };
+    assert_eq!(snapshot(&after), snapshot(&reference), "GhostDAG outputs unchanged");
+    assert_eq!(after.reach_export_all(), reference.reach_export_all(), "reachability index unchanged");
+    assert_eq!(after.block_count(), reference.block_count());
+    assert_eq!(snapshot(&before), snapshot(&reference), "insertions never change existing blocks' data");
+    // The work rule still admits the honest tip's children.
+    let child = Block {
+        header: BlockHeader {
+            version: 1, parents: vec![hx(1, n)], merkle_root: MerkleRoot::ZERO,
+            timestamp: n + 1, bits: POW_LIMIT_BITS, nonce: 0,
+        },
+        transactions: vec![], blue_score: 0, height: n + 1, shielded_transactions: vec![],
+    };
+    assert!(core.work_check(&child, &child.block_hash(), n, Instant::now(), &after).is_ok());
+
+    println!(
+        "DAG7 residual n={n}: {siblings} low-work deep blocks (genesis siblings + side blocks at n/2, n/4): \
+         inserted (before) total {total_b:.2?} worst {worst_b:.2?}; work rule (after) total {total_a:.2?} \
+         worst {worst_a:.2?}, none inserted"
+    );
+}

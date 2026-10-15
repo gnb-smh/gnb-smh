@@ -8,7 +8,7 @@ use fix_common::*;
 use std::sync::Arc;
 
 use gnb::core::{self, Block};
-use gnb::{accept, reorg};
+use gnb::reorg;
 
 /// DAG-10: many threads accept conflicting sibling blocks (all spending the
 /// same outpoint) and their children concurrently into ONE node. With the
@@ -217,8 +217,16 @@ fn reconciliation_repairs_a_pre_fix_reorg_crash_before_the_dag_write() {
         .unwrap();
     assert_eq!(applied_tip(&n), Some(a1.block_hash()), "crash state: tip pointer not rewritten");
     assert!(n.store.get_utxo(&b1.transactions[0].txid(), 0).unwrap().is_some(), "crash state: B1 applied");
+    // Merge P3 x P5: the DAG-11 residual chain-state check (`check_chain_state`)
+    // would misfire on this state BEFORE reconciliation's step 2 repaired it
+    // (the tip pointer names A1, which lost its undo record with the
+    // disconnect), so it runs after step 2 — inside `reconcile_on_startup`,
+    // and in `gnb` only when reconciliation refuses.
+    assert!(gnb::accept::check_chain_state(&n.dag, &n.store).unwrap()
+        .contains(&gnb::accept::ChainStateFault::AppliedWithoutUndo { block: a1.block_hash() }));
 
     restart(&mut n);
+    assert!(gnb::accept::check_chain_state(&n.dag, &n.store).unwrap().is_empty(), "repaired: no fault left");
     assert_eq!(sel_tip(&n), Some(a1.block_hash()));
     assert_eq!(applied_tip(&n), Some(a1.block_hash()));
     assert_eq!(n.shielded.read().tip(), Some(a1.block_hash()));
@@ -281,6 +289,8 @@ fn reconciliation_keeps_blocks_a_pre_fix_binary_connected_after_the_crash() {
     assert!(n.store.get_utxo(&fund_x.0, 0).unwrap().is_none(), "crash state: X's effects applied under Z");
 
     restart(&mut n);
+    assert!(gnb::accept::check_chain_state(&n.dag, &n.store).unwrap().is_empty(),
+        "the chain-state check runs after step 2 and finds nothing to rebuild");
     assert_eq!(sel_tip(&n), Some(z.block_hash()));
     assert_eq!(applied_tip(&n), Some(z.block_hash()), "the tip stays on the block the UTXO set sits on");
     assert_eq!(n.shielded.read().tip(), Some(z.block_hash()));
@@ -341,5 +351,4 @@ fn height_index_tracks_the_selected_chain_only() {
     for (h, b) in [(1u64, &m1), (2, &m2), (3, &m3)] {
         assert_eq!(n.store.get_block_hash_at_height(h).unwrap(), Some(b.block_hash()), "height {h}");
     }
-    let _ = accept::FINALITY_FROZEN.load(std::sync::atomic::Ordering::Relaxed);
 }

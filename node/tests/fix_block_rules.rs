@@ -1339,6 +1339,22 @@ fn stored_blocks_failing_the_hardening_rules_are_disqualified_at_startup() {
     assert!(n.store.get_utxo(&p.transactions[0].txid(), 0).unwrap().is_none());
     assert!(n.store.get_utxo(&m2.transactions[0].txid(), 0).unwrap().is_some());
 
+    // Merge P1 x P3 (operator overrides, audit DAG-6): `reconsiderblock`
+    // re-validates a hardening-recheck mark instead of lifting it — P's
+    // stored body still fails the rules, so nothing changes — and
+    // `invalidateblock` never turns it into an operator mark.
+    let r = pipeline::reconsider_block(p.block_hash(), &n.dag, &n.store, &n.mempool, &n.node_state,
+        Some(&n.tip_tx), &n.shielded).expect("reconsiderblock");
+    assert_eq!((r.tip, r.rolled_back, r.connected), (m2.block_hash(), 0, 0));
+    let r = pipeline::invalidate_block(p.block_hash(), &n.dag, &n.store, &n.mempool, &n.node_state,
+        Some(&n.tip_tx), &n.shielded).expect("invalidateblock on a disqualified block is a no-op");
+    assert_eq!((r.tip, r.rolled_back, r.connected, r.affected), (m2.block_hash(), 0, 0, 0));
+    assert_eq!(n.store.invalid_block_reason(&p.block_hash()).unwrap().as_deref(), Some(reason.as_str()));
+    for b in [&p, &pc] {
+        assert!(n.dag.read().is_invalid_all_edges(&b.block_hash()));
+    }
+    assert_eq!(applied_tip(&n), Some(m2.block_hash()));
+
     let has_body = |h: &BlockHash| n.store.get_block(h).ok().flatten().is_some();
     let parents = n.dag.read().template_parents(core::MAX_PARENTS, has_body);
     assert_eq!(parents, vec![m2.block_hash()]);

@@ -51,7 +51,7 @@ mod template;     // Block templates for the miner + getblocktemplate (MEM-2, DA
 #[allow(unused_imports)]
 use accept::{
     accept_block, validate_tx_standalone, validate_tx_inputs, miner_template_total_fees,
-    validate_tx_in_block, validate_tx_in_block_with_maturity, FINALITY_FROZEN, ARCHIVE_MODE,
+    validate_tx_in_block, validate_tx_in_block_with_maturity, ARCHIVE_MODE,
 };
 
 use clap::Parser;
@@ -693,30 +693,9 @@ async fn main() {
         }
     }
 
-    // ── Heal poisoned finality checkpoint (blue-score/height unit bug) ─────────
-    // Older builds persisted finalized_height = tip_blue_score − CHECKPOINT_DEPTH,
-    // which runs ahead of the selected tip's *height* by the DAG width and can
-    // exceed it once the skew passes CHECKPOINT_DEPTH — bricking block ingestion
-    // (every chain-extending block is <= finalized_height and gets rejected). The
-    // monotonic guard in accept_block cannot lower the value, so clamp it down to
-    // a height-based ceiling here, once, at startup.
-    {
-        let tip_h = {
-            let d = dag.read();
-            d.selected_tip()
-                .and_then(|h| d.get_block_data(&h).map(|x| x.height))
-                .unwrap_or(0)
-        };
-        let cap = tip_h.saturating_sub(core::CHECKPOINT_DEPTH);
-        let cur = store.get_meta("finalized_height").ok().flatten()
-            .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
-            .unwrap_or(0);
-        if cur > cap {
-            warn!("finalized_height {} exceeds height-based cap {} \
-                   (blue-score/height unit bug) — clamping to heal ingestion", cur, cap);
-            store.put_meta("finalized_height", &cap.to_le_bytes()).ok();
-        }
-    }
+    // (The start-up clamp of `finalized_height` is gone with the finality
+    // checkpoint itself — audit DAG-6. The meta key, if present in an old
+    // data dir, is no longer read.)
 
     // ── Mempool + Network ─────────────────────────────────────────────────────
     let mempool  = Arc::new(mempool::Mempool::new());
@@ -785,9 +764,69 @@ async fn main() {
     };
 
     // DAG-1 / DAG-11: load the persisted invalid-block set and reconcile any
-    // state a pre-fix non-atomic commit left behind, before any block is accepted.
+    // state a pre-fix non-atomic commit left behind, before any block is
+    // accepted. Reconciliation runs its repairs first (step 2: blocks with
+    // applied effects but no DAG record are rolled back onto the block the
+    // UTXO set sits on) and only then the DAG-11 residual chain-state check
+    // (`accept::check_chain_state`), so the check never misfires on a state
+    // step 2 repairs.
     if let Err(e) = accept::reconcile_on_startup(&dag, &store, &shielded) {
-        error!("start-up chain-state reconciliation failed: {}", e);
+        // DAG-11 residual: the footprint of the pre-fix NON-atomic extension
+        // commit (UTXO effects without an undo record), which reconciliation
+        // cannot repair, makes it refuse; rebuild the chain state from the
+        // block bodies. A node must not run on an inconsistent UTXO set: it
+        // would disqualify valid blocks and leave the network, so without the
+        // means to rebuild it refuses to start.
+        let faults = match accept::check_chain_state(&dag, &store) {
+            Ok(f) => f,
+            Err(ce) => {
+                error!("chain-state check failed: {ce}. Refusing to start.");
+                std::process::exit(1);
+            }
+        };
+        if faults.is_empty() {
+            error!("start-up chain-state reconciliation failed: {}", e);
+        } else {
+            for f in &faults {
+                error!("chain-state check: {}", f);
+            }
+            let Some(snap_path) = cli.carryover_snapshot.as_ref() else {
+                error!("the chain state is inconsistent (interrupted pre-fix commit). Restart with \
+                        --carryover-snapshot <bloch-g3-carryover.tsv> to rebuild it from the block \
+                        bodies. Refusing to start.");
+                std::process::exit(1);
+            };
+            let snap = match std::fs::read(snap_path).map_err(|e| vec![e.to_string()])
+                .and_then(|b| core::carryover::verify_and_convert(&b))
+            {
+                Ok(s) => s,
+                Err(failures) => {
+                    for f in &failures { error!("carryover for the rebuild: {f}"); }
+                    error!("cannot rebuild the chain state without a valid carryover snapshot. Refusing to start.");
+                    std::process::exit(1);
+                }
+            };
+            let genesis = core::genesis_block();
+            let gh = genesis.block_hash();
+            let seed = |st: &storage::Storage, batch: &mut rocksdb::WriteBatch| -> Result<(), String> {
+                st.stage_carryover(batch, &snap).map_err(|e| e.to_string())?;
+                // Exactly what first boot writes for the genesis block.
+                for tx in &genesis.transactions {
+                    st.stage_tx_index(batch, &tx.txid(), &gh, 0).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            };
+            match accept::rebuild_chain_state(&dag, &store, &shielded, &seed) {
+                Ok(r) => info!("chain state rebuilt: {} block(s) re-applied from genesis", r.connected_blocks),
+                Err(e) => {
+                    error!("chain-state rebuild failed: {e}. Refusing to start.");
+                    std::process::exit(1);
+                }
+            }
+            if let Err(e) = accept::reconcile_on_startup(&dag, &store, &shielded) {
+                error!("start-up chain-state reconciliation failed after the rebuild: {}", e);
+            }
+        }
     }
     // The ONE next-block height of mempool admission, eviction, templates
     // and getdaginfo (wallets): the node's next template height. Kept
@@ -830,6 +869,15 @@ async fn main() {
     let getheaders_sent_ms = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
     let getheaders_sent2   = getheaders_sent_ms.clone();
 
+    // DAG-6, pruned nodes: the bodies an operator override (`invalidateblock`
+    // / `reconsiderblock`, RPC task) needs wait for one in the DAG
+    // (`accept::request_bodies`, the same record the acceptance pipeline
+    // uses); this wakes the processor to request them at once through its
+    // missing-parent tracker — the one request path for wanted bodies (the
+    // periodic sweep would pick them up within `SWEEP_PERIOD` anyway).
+    let body_requests = Arc::new(tokio::sync::Notify::new());
+    let body_requests2 = body_requests.clone();
+
     tokio::spawn(async move {
         use futures::future::FutureExt;
         // ── P0 supervision (roadmap §2.5, top reliability risk #1) ───────────
@@ -851,15 +899,17 @@ async fn main() {
         loop {
           let run_started = std::time::Instant::now();
           let processor = async {
-            // POW-4 (audit): orphan pool bounded by entries AND bytes, globally
-            // and per delivering peer, evicting by ARRIVAL order (never by the
-            // self-declared height); first copy of an id wins (POW-8). It also
-            // owns the reverse index parent -> waiting orphans.
-            let mut orphans = ingress::OrphanPool::default();
-            // Orphan-deadlock fix: per-missing-parent retry state. The one-shot
-            // GetBlock below is recorded here; the periodic sweep re-requests
-            // lost ones with backoff and prunes hopeless ones.
-            let mut parent_fetch = sync::parent_fetch::ParentFetchTracker::new();
+            // The block-ingress core (`ingress::BlockIngress`, shared with the
+            // integration tests): the orphan pool (POW-4: bounded by entries
+            // AND bytes, globally and per delivering peer, evicting by ARRIVAL
+            // order; first copy of an id wins, POW-8; reverse index parent ->
+            // waiting orphans; POW-3 announced work), the missing-parent
+            // retry tracker (orphan-deadlock fix: the periodic sweep
+            // re-requests lost parents with backoff and prunes hopeless ones),
+            // the deep-insertion budget (DAG-7 / POW-3) and the POW-3 anti-DoS
+            // work rule. Lives inside the restartable closure: a panic
+            // rebuilds it empty (peers resend).
+            let mut ingress_core = ingress::BlockIngress::with_limits(ingress::OrphanLimits::default());
             let mut orphan_sweep = tokio::time::interval(sync::parent_fetch::SWEEP_PERIOD);
             orphan_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Never fire immediately on (re)start — tick 0 is now.
@@ -867,9 +917,6 @@ async fn main() {
             // NET-6: tip claims only trigger (rate-limited) directed pulls and
             // reciprocal announcements; they never latch IBD.
             let mut claims = ingress::ClaimPolicy::new();
-            // DAG-7 / POW-3: ration deep (below-finality) insertions that the
-            // "awaited orphan parent" exemption may grant.
-            let mut deep_budget = ingress::DeepBackfillBudget::new();
             // MEM-5 / MEM-6: validated transaction relay — per-connection
             // signature budgets and the bounded orphan-transaction pool.
             // Shared with the blocking pool, where admission runs.
@@ -879,12 +926,21 @@ async fn main() {
             // OrphanEvents: Accept / Reject / Ignore) and re-announcements.
             let mut deferred: mempool::relay::DeferredVerdicts<network::InboundOrigin> =
                 mempool::relay::DeferredVerdicts::new();
+            let ctx = ingress::AcceptCtx {
+                dag: &dag2, store: &store2, mempool: &mem2, node_state: &state2,
+                tip_tx: Some(&tip_tx2), shielded: &shielded2,
+            };
 
             loop {
             // Orphan-deadlock fix: select between the inbound channel and the
             // ~30s orphan sweep.
             let inbound = tokio::select! {
                 m = block_rx.recv() => match m { Some(m) => m, None => break },
+                // DAG-6: an operator override made bodies wait for one.
+                _ = body_requests2.notified() => {
+                    request_awaited_bodies(&dag2, &mut ingress_core.parent_fetch, &otx2).await;
+                    continue;
+                }
                 // MEM-5 / MEM-6: a connection closed — forget its signature
                 // budget and the orphans it delivered.
                 Some(ev) = peer_ev_rx.recv() => {
@@ -895,20 +951,17 @@ async fn main() {
                 }
                 _ = orphan_sweep.tick() => {
                     let ready = sweep_orphan_parents(
-                        &mut orphans, &mut parent_fetch, &dag2, &otx2,
+                        &mut ingress_core.orphans, &mut ingress_core.parent_fetch, &dag2, &otx2,
                     ).await;
                     // Defensive liveness: a waited-on parent that is ALREADY in
                     // the DAG (its accept raced the waiting_for insert) would
                     // otherwise strand its orphans forever — drain them now.
-                    let mut chain = accept::ChainMove::default();
                     for p in ready {
-                        process_orphans(
-                            p, &mut orphans,
-                            &dag2, &store2, &mem2, &state2,
-                            Some(&tip_tx2), &shielded2, &mut chain,
-                        );
+                        ingress_core.drain_orphans(p, &ctx);
                     }
-                    frontier2.lock().set_orphan_evidence(orphans.max_evidence_height());
+                    // MEM-6: what the drained blocks did to the applied chain.
+                    let chain = ingress_core.take_chain_move();
+                    frontier2.lock().set_orphan_evidence(ingress_core.orphans.max_evidence_height());
                     maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                     // MEM-6: expire orphan transactions and re-try those
                     // whose parents arrived through any path (miner, RPC) —
@@ -1021,7 +1074,7 @@ async fn main() {
                         let d = dag2.read();
                         frontier2.lock().to_request_capped(
                             &advertised,
-                            |h| accept::is_known_block_in(&d, &store2, h) || orphans.contains(h),
+                            |h| accept::is_known_block_in(&d, &store2, h) || ingress_core.orphans.contains(h),
                             now,
                             sync::frontier::MAX_NEW_TIPS_PER_RESPONSE,
                         )
@@ -1044,7 +1097,7 @@ async fn main() {
                     let missing: Vec<[u8; 32]> = {
                         let d = dag2.read();
                         entries.iter()
-                            .filter(|e| !accept::is_known_block_in(&d, &store2, &e.hash) && !orphans.contains(&e.hash))
+                            .filter(|e| !accept::is_known_block_in(&d, &store2, &e.hash) && !ingress_core.orphans.contains(&e.hash))
                             .map(|e| e.hash).collect()
                     };
                     if !missing.is_empty() {
@@ -1092,19 +1145,19 @@ async fn main() {
                 // dropped without penalty.
                 network::NetworkMessage::NewBlock { block_data, block_hash, height, .. } => {
                     let now = std::time::Instant::now();
-                    // MEM-6: what this block (and the orphan blocks it
-                    // unblocked) did to the APPLIED chain, for the
-                    // orphan-transaction bookkeeping that runs AFTER the
-                    // block's verdict (never on its relay path). Empty for a
-                    // fork-loser or merge candidate, which applies none of
-                    // its transactions (selected-chain-only ledger).
-                    let mut chain = accept::ChainMove::default();
                     let verdict: network::GossipVerdict = 'blk: {
-                        // A block in the DAG that waits for a body (its stored
-                        // body failed a witness-dependent rule below the
-                        // hardening activation) is NOT known: this copy may be
-                        // the honest one (`accept::awaits_body`).
-                        if accept::is_known_block(&dag2, &store2, &block_hash) || orphans.contains(&block_hash) {
+                        // Known = buffered, or in the DAG — unless a body of
+                        // it is wanted (`accept::awaits_body`: its body was
+                        // rejected for a witness-dependent reason, or a
+                        // connect / operator override needs its missing —
+                        // e.g. pruned, DAG-6 — body) and this is the answer
+                        // to one of our own directed pulls (how wanted bodies
+                        // are requested). Any other copy of a DAG block, a
+                        // pushed old body included, is ignored here before
+                        // decoding.
+                        let known_in_dag = dag2.read().has_block(&block_hash)
+                            && (!origin.is_solicited() || accept::is_known_block(&dag2, &store2, &block_hash));
+                        if known_in_dag || ingress_core.orphans.contains(&block_hash) {
                             break 'blk network::GossipVerdict::Ignore;
                         }
                         let tip_h = selected_tip_height(&dag2);
@@ -1117,7 +1170,7 @@ async fn main() {
                             break 'blk network::GossipVerdict::Ignore;
                         }
                         // Sprint 1.c: Bitcoin-format wire.
-                        let mut block = match core::Block::from_wire_bytes(&block_data) {
+                        let block = match core::Block::from_wire_bytes(&block_data) {
                             Ok(b) => b,
                             Err(e) => {
                                 warn!("block deserialise: {}", e);
@@ -1138,165 +1191,123 @@ async fn main() {
                             break 'blk network::GossipVerdict::Reject;
                         }
 
-                        // ── BACKFILL-FLOOD guard ──────────────────────────────
-                        // A block far BELOW our selected tip that nobody asked
-                        // for is backfill a healthy node PULLS, never something a
-                        // peer should PUSH; ingesting one costs seconds under the
-                        // DAG write lock (tests/backfill_flood_lab.rs). Not
-                        // consensus: declining to ingest an ancient gossiped block
-                        // changes no validation rule.
-                        //
-                        // POW-2: overflow-free (`ingress::backfill_decision`).
-                        // DAG-7 / POW-3: the "awaited" exemption (a parent some
-                        // buffered orphan needs) can no longer be minted for free
-                        // — an orphan only enters the pool after passing the
-                        // anti-DoS work floor AND its proof of work — and each
-                        // deep insertion it grants is rationed by `deep_budget`.
-                        let awaited = orphans.is_waited_on(&block_hash) || parent_fetch.is_awaited(&block_hash);
-                        match ingress::backfill_decision(height, tip_h, awaited) {
-                            ingress::BackfillDecision::Pass => {}
-                            ingress::BackfillDecision::DropUnsolicitedDeep => {
-                                debug!(
-                                    "backfill-flood guard: dropped unsolicited deep block h={} \
-                                     (tip h={}, {} below) — backfill must be pulled",
-                                    height, tip_h, tip_h.saturating_sub(height)
-                                );
-                                crate::metrics::inc_block_backfill_dropped();
-                                break 'blk network::GossipVerdict::Ignore;
-                            }
-                            ingress::BackfillDecision::AwaitedDeep => {
-                                if !deep_budget.allow_at(now) {
-                                    debug!("backfill-flood guard: deep awaited block h={} deferred (deep-insertion budget exhausted; the orphan sweep re-requests it)", height);
-                                    crate::metrics::inc_block_backfill_dropped();
-                                    break 'blk network::GossipVerdict::Ignore;
-                                }
-                            }
-                        }
-
-                        // Cheap structural validation (merkle, coinbase format,
-                        // duplicates, dust, size, parent count) — NO PoW yet.
-                        if let Err(reason) = block.validate_structure_without_pow() {
-                            warn!("block {} rejected ({})", hex::encode(&block_hash[..8]), reason);
-                            break 'blk network::GossipVerdict::Reject;
-                        }
-
-                        let missing_parents: Vec<[u8; 32]> = {
-                            let d = dag2.read();
-                            block.header.parents.iter().filter(|p| !d.has_block(p)).cloned().collect()
-                        };
-
-                        if !missing_parents.is_empty() {
-                            // Orphan: its expected bits cannot be derived without
-                            // its parents. NET-2 / POW-4: require bits no easier
-                            // than the anti-DoS floor (derived from OUR tip and the
-                            // clock) BEFORE evaluating the proof — a pow-limit
-                            // orphan with fake parents used to be admitted after a
-                            // single (free) evaluation.
-                            let now_unix = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs()).unwrap_or(0);
-                            let floor = ingress::orphan_admission_floor(tip_h, now_unix);
-                            if !ingress::bits_meet_floor(block.header.bits, &floor) {
-                                debug!("orphan {} bits 0x{:08x} easier than the anti-DoS floor; ignored",
-                                    hex::encode(&block_hash[..8]), block.header.bits);
-                                break 'blk network::GossipVerdict::Ignore;
-                            }
-                            if !block.validate_pow() {
-                                warn!("orphan {} rejected (invalid PoW)", hex::encode(&block_hash[..8]));
-                                break 'blk network::GossipVerdict::Reject;
-                            }
-                            let evidence = ingress::orphan_is_sync_evidence(block.header.bits, height, tip_h, now_unix);
-                            // Kaspa-style ancestor resolution: request each missing
-                            // parent that nobody is waiting for and that is not
-                            // itself buffered (a deep gap fans out one level at a time).
-                            let fresh: Vec<[u8; 32]> = missing_parents.iter()
-                                .filter(|mp| !orphans.is_waited_on(mp) && !orphans.contains(mp))
-                                .copied().collect();
-                            match orphans.insert(block_hash, block, height, block_data.len(), origin.peer(), evidence, &missing_parents) {
-                                ingress::OrphanInsert::Inserted { evicted } => {
-                                    if !evicted.is_empty() {
-                                        debug!("orphan pool full: evicted {} oldest orphan(s)", evicted.len());
-                                    }
-                                }
-                                ingress::OrphanInsert::Duplicate | ingress::OrphanInsert::TooLarge => {
-                                    break 'blk network::GossipVerdict::Ignore;
-                                }
-                            }
-                            debug!("orphan block h={} (missing {} parents), buffered (pool={} / {} bytes)",
-                                height, missing_parents.len(), orphans.len(), orphans.total_bytes());
-                            for mp in fresh {
-                                // Orphan-deadlock fix: record the attempt so the sweep
-                                // can re-request it if the response is lost.
-                                parent_fetch.note_requested(mp, now);
-                                let _ = otx2.send(network::NetworkMessage::GetBlock {
-                                    block_hash: mp, nonce: getblock_nonce(),
-                                }).await;
-                            }
-                            {
-                                let mut fr = frontier2.lock();
-                                fr.note_received(&block_hash);
-                                fr.set_orphan_evidence(orphans.max_evidence_height());
-                            }
-                            // NET-6: the IBD latch is set ONLY by work-backed
-                            // evidence — a full-difficulty orphan claiming to be
-                            // well ahead of our tip.
-                            if evidence {
-                                let mut s = state2.write();
-                                if !s.is_syncing {
-                                    info!("IBD latched: work-backed orphan claims h={} (tip h={})", height, tip_h);
-                                }
-                                s.is_syncing = true;
-                            }
-                            maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
-                            break 'blk network::GossipVerdict::Accept;
-                        }
-
-                        // All parents present. POW-8: never persist the wire
-                        // blue_score — derive it from the verified parents.
-                        normalize_wire_metadata(&mut block, &dag2);
-                        // accept_block checks height, expected bits and timestamp
-                        // BEFORE the proof of work (NET-2), then everything else.
+                        // Everything else is the ingress core (shared with the
+                        // integration tests), cheapest checks first:
+                        //  * structure without PoW;
+                        //  * ORPHAN (a parent unknown): backfill-flood guard (an
+                        //    unsolicited far-below-tip orphan is dropped — backfill
+                        //    is pulled), the anti-DoS bits floor BEFORE the proof
+                        //    (NET-2 / POW-4), the proof, then the bounded pool;
+                        //  * parents known: the POW-3 anti-DoS WORK rule — the
+                        //    block's chain must come within ANTI_DOS_WINDOW_BLOCKS
+                        //    of our tip's work, or be backed by a proof-of-work-
+                        //    verified orphan chain announced on top of it (deep
+                        //    merge-backed blocks are rationed, DAG-7) — BEFORE the
+                        //    proof, storage or DAG insertion; then POW-8 metadata
+                        //    normalization, `accept_block` (height, expected bits,
+                        //    timestamp before the proof, NET-2) and the iterative
+                        //    orphan drain (POW-3 / POW-4).
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs()).unwrap_or(0);
                         let t_validate = std::time::Instant::now();
-                        match accept::accept_block_tracking(
-                            &block, block_hash, height,
-                            &dag2, &store2, &mem2, &state2,
-                            Some(&tip_tx2), &shielded2, &mut chain,
-                        ) {
-                            Err(e) => {
-                                crate::metrics::observe_block_validation(t_validate.elapsed().as_secs_f64());
-                                crate::metrics::inc_block_rejected();
-                                warn!("block {} h={} REJECTED: {}", hex::encode(&block_hash[..8]), height, e);
-                                ingress::verdict_for_accept_error(&e)
+                        match ingress_core.handle_block(block, block_hash, block_data.len(), origin.peer(),
+                                                        origin.is_solicited(), now, now_unix, &ctx) {
+                            ingress::BlockOutcome::Known | ingress::BlockOutcome::PoolRefused => {
+                                network::GossipVerdict::Ignore
                             }
-                            Ok(accepted_hash) => {
-                                crate::metrics::observe_block_validation(t_validate.elapsed().as_secs_f64());
-                                crate::metrics::inc_block_accepted();
-                                // Process any orphans that were waiting for this block
-                                // (iteratively — POW-3/POW-4).
-                                process_orphans(
-                                    accepted_hash,
-                                    &mut orphans,
-                                    &dag2, &store2, &mem2, &state2,
-                                    Some(&tip_tx2), &shielded2, &mut chain,
-                                );
-                                // MEM-6: orphan-transaction bookkeeping runs after
-                                // the verdict below (review finding: it used to
-                                // delay the block's relay).
+                            ingress::BlockOutcome::BodyRestored => {
+                                info!("wanted body of block {} h={} stored (it waited for one: rejected \
+                                       for a witness-dependent reason, or pruned and needed again)",
+                                    hex::encode(&block_hash[..8]), height);
+                                network::GossipVerdict::Ignore
+                            }
+                            ingress::BlockOutcome::Dropped(reason) => {
+                                debug!("block {} h={} dropped before PoW: {:?} (tip h={})",
+                                    hex::encode(&block_hash[..8]), height, reason, tip_h);
+                                crate::metrics::inc_block_backfill_dropped();
+                                network::GossipVerdict::Ignore
+                            }
+                            ingress::BlockOutcome::Invalid(reason) => {
+                                warn!("block {} rejected ({})", hex::encode(&block_hash[..8]), reason);
+                                network::GossipVerdict::Reject
+                            }
+                            ingress::BlockOutcome::Buffered { request, evidence, evicted } => {
+                                if evicted > 0 {
+                                    debug!("orphan pool full: evicted {} oldest orphan(s)", evicted);
+                                }
+                                for mp in request {
+                                    // Orphan-deadlock fix: the attempt was recorded
+                                    // by the core so the sweep can re-request it.
+                                    let _ = otx2.send(network::NetworkMessage::GetBlock {
+                                        block_hash: mp, nonce: getblock_nonce(),
+                                    }).await;
+                                }
                                 {
                                     let mut fr = frontier2.lock();
                                     fr.note_received(&block_hash);
-                                    fr.set_orphan_evidence(orphans.max_evidence_height());
+                                    fr.set_orphan_evidence(ingress_core.orphans.max_evidence_height());
+                                }
+                                // NET-6: the IBD latch is set ONLY by work-backed
+                                // evidence — a full-difficulty orphan claiming to be
+                                // well ahead of our tip.
+                                if evidence {
+                                    let mut s = state2.write();
+                                    if !s.is_syncing {
+                                        info!("IBD latched: work-backed orphan claims h={} (tip h={})", height, tip_h);
+                                    }
+                                    s.is_syncing = true;
                                 }
                                 maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                                 network::GossipVerdict::Accept
                             }
+                            ingress::BlockOutcome::Processed { admission, result, drained, missing_bodies } => {
+                                crate::metrics::observe_block_validation(t_validate.elapsed().as_secs_f64());
+                                // Bodies the chain needs that are missing (e.g.
+                                // pruned, DAG-6) or were rejected for a
+                                // witness-dependent reason wait for one; they
+                                // are requested right after the verdict
+                                // (`request_awaited_bodies`).
+                                if !missing_bodies.is_empty() {
+                                    warn!("{} block bod(ies) wanted to follow the chain through {}; requesting them",
+                                        missing_bodies.len(), hex::encode(&block_hash[..8]));
+                                }
+                                match result {
+                                    Err(e) => {
+                                        crate::metrics::inc_block_rejected();
+                                        warn!("block {} h={} REJECTED: {}", hex::encode(&block_hash[..8]), height, e);
+                                        ingress::verdict_for_accept_error(&e)
+                                    }
+                                    Ok(_) => {
+                                        crate::metrics::inc_block_accepted();
+                                        if admission != ingress::WorkAdmission::NearTip {
+                                            info!("block {} h={} admitted as {:?} (POW-3 work rule); {} orphan(s) drained",
+                                                hex::encode(&block_hash[..8]), height, admission, drained.len());
+                                        }
+                                        {
+                                            let mut fr = frontier2.lock();
+                                            fr.note_received(&block_hash);
+                                            fr.set_orphan_evidence(ingress_core.orphans.max_evidence_height());
+                                        }
+                                        maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
+                                        network::GossipVerdict::Accept
+                                    }
+                                }
+                            }
                         }
                     };
                     report_verdict(&vtx2, &origin, verdict);
-                    // A body rejected for a witness-dependent reason (or found
-                    // missing) during this acceptance: ask peers for another
-                    // copy now; the orphan sweep retries with backoff.
-                    request_awaited_bodies(&dag2, &mut parent_fetch, &otx2).await;
+                    // A body rejected for a witness-dependent reason, or found
+                    // missing (pruned, DAG-6) during this acceptance: ask peers
+                    // for it now; the orphan sweep retries with backoff.
+                    request_awaited_bodies(&dag2, &mut ingress_core.parent_fetch, &otx2).await;
+                    // MEM-6: what this block (and the orphan blocks it
+                    // unblocked) did to the APPLIED chain, for the
+                    // orphan-transaction bookkeeping that runs AFTER the
+                    // block's verdict (never on its relay path). Empty for a
+                    // fork-loser or merge candidate, which applies none of
+                    // its transactions (selected-chain-only ledger).
+                    let chain = ingress_core.take_chain_move();
                     // MEM-6: orphan transactions the applied chain now
                     // confirms or conflicts with are dropped; those waiting
                     // on a transaction it gained (or lost back to the pool)
@@ -1639,8 +1650,8 @@ async fn main() {
                 // During IBD the DAG tip reflects the local view, which
                 // lags the network by up to thousands of blocks. Mining
                 // against a stale tip produces blocks at low height
-                // which the rest of the network rejects via the finality
-                // rule (block at or below finalized_height). Pre-fix,
+                // which lose to the network chain on blue work (and were,
+                // before audit DAG-6, refused by its finality rule). Pre-fix,
                 // fresh miners would burn CPU for hours producing
                 // orphan blocks that never paid out — an awful new-user
                 // experience that looked like a protocol fault.
@@ -1661,14 +1672,11 @@ async fn main() {
                 }
                 let sync_stalled = last_tip_advance.elapsed()
                     >= std::time::Duration::from_secs(SYNC_STALL_SECS);
-                // [no-fork] Freeze finality while mining through a stall (the
-                // announced heaviest tip is unreachable and we mine our local
-                // tip to stay live): a strictly-heavier chain must still be able
-                // to deep-reorg us back once its holder becomes reachable, so
-                // mine-through can never self-finalize a solo fork. Unfrozen
-                // whenever we are synced or catching up normally.
-                FINALITY_FROZEN.store(syncing_now && sync_stalled,
-                    std::sync::atomic::Ordering::Relaxed);
+                // (Mining through a stall can no longer self-finalize a solo
+                // fork: there is no finality checkpoint and no reorg-depth
+                // limit, audit DAG-6 — a strictly heavier chain reorgs us at
+                // any depth once its blocks arrive. The old FINALITY_FROZEN
+                // flag is gone.)
                 if syncing_now && !sync_stalled {
                     if !was_syncing_last_tick {
                         info!("⛏  IBD in progress — miner paused, will resume when sync completes");
@@ -1852,6 +1860,11 @@ async fn main() {
         dag.clone(), store.clone(), mempool.clone(), node_state.clone(),
         shielded.clone(), outbound_tx.clone(), tip_tx.clone(),
     );
+    // Audit DAG-6: operator recovery (invalidateblock / reconsiderblock).
+    let rpc_chain_admin: Arc<rpc::ChainAdminFn> = make_chain_admin_cb(
+        dag.clone(), store.clone(), mempool.clone(), node_state.clone(),
+        shielded.clone(), tip_tx.clone(), body_requests.clone(),
+    );
 
     let metrics_state = std::sync::Arc::new(
         crate::metrics::MetricsState::new(
@@ -1924,6 +1937,8 @@ async fn main() {
         node_state.clone(), store.clone(), mempool.clone(), dag.clone(), outbound_tx.clone(),
         // B5f pool seam: submitblock hook (see rpc::SubmitBlockFn).
         Some(rpc_submit_block.clone()),
+        // Audit DAG-6: invalidateblock / reconsiderblock (see rpc::ChainAdminFn).
+        Some(rpc_chain_admin.clone()),
     ));
     // Sprint EE (S3): `None` = no listen-addr report; production behavior
     // is byte-identical to before the harness affordance was added.
@@ -1945,7 +1960,7 @@ async fn main() {
 /// ingress: structural gate first (same call + error shape as
 /// `make_rpc_submit_block_cb` / `make_stratum_accept_block_cb`), then the
 /// shared `accept_block` (consensus validation, DAG insert, storage,
-/// UTXO/undo mutations, retarget meta, mempool cleanup, finality, stratum
+/// UTXO/undo mutations, retarget meta, mempool cleanup, stratum
 /// tip notification), then the RPC-visible state refresh. Broadcasting to
 /// the network stays with the caller — the miner loop only gossips a block
 /// its OWN acceptor has admitted.
@@ -2043,14 +2058,63 @@ fn make_rpc_submit_block_cb(
     })
 }
 
+/// Build the `invalidateblock` / `reconsiderblock` hook (audit DAG-6): both
+/// run through the acceptance pipeline (`accept::invalidate_block` /
+/// `accept::reconsider_block`) under the acceptance lock, persist their marks
+/// atomically with the chain move, and refresh mempool, RPC state and the
+/// stratum tip notification. Authorization is the RPC layer's
+/// (`rpc::auth::ADMIN_METHODS`: never anonymous).
+///
+/// On a pruned node the chain to move to may need bodies it pruned: the call
+/// then changes nothing, the next batch of missing bodies waits for a body in
+/// the DAG (`accept::request_bodies`, done by the override) and the processor
+/// is woken (`body_requests`) to request them through its tracker — the same
+/// path that fetches every wanted body — and the operator is asked to retry;
+/// each retry fetches the next batch until it succeeds.
+#[allow(clippy::too_many_arguments)]
+fn make_chain_admin_cb(
+    dag:        Arc<RwLock<consensus::GhostDAG>>,
+    store:      Arc<storage::Storage>,
+    mempool:    Arc<mempool::Mempool>,
+    node_state: Arc<RwLock<rpc::NodeState>>,
+    shielded:   Arc<RwLock<crate::coherence::ShieldedPool>>,
+    tip_tx:     broadcast::Sender<tip::TipChanged>,
+    body_requests: Arc<tokio::sync::Notify>,
+) -> Arc<rpc::ChainAdminFn> {
+    Arc::new(move |op: rpc::ChainAdminOp, hash: [u8; 32]| -> Result<serde_json::Value, String> {
+        let res = match op {
+            rpc::ChainAdminOp::Invalidate => accept::invalidate_block(
+                hash, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
+            rpc::ChainAdminOp::Reconsider => accept::reconsider_block(
+                hash, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
+        };
+        let r = match res {
+            Ok(r) => r,
+            Err(accept::OverrideError::MissingBodies { missing, .. }) => {
+                let n = missing.len();
+                body_requests.notify_one();
+                warn!("{:?} {}: the chain to move to needs {} pruned block bod(ies); re-fetching them",
+                    op, hex::encode(&hash[..8]), n);
+                return Err(format!(
+                    "nothing changed: this pruned node needs {n} block bod(ies) it pruned to move to the \
+                     best remaining chain; they are being re-fetched from peers. Retry the same call \
+                     once they have arrived (each retry requests the next missing ones)"));
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        Ok(serde_json::json!({
+            "block":       hex::encode(hash),
+            "affected":    r.affected,
+            "rolled_back": r.rolled_back,
+            "connected":   r.connected,
+            "tip":         hex::encode(r.tip),
+            "tip_height":  r.tip_height,
+        }))
+    })
+}
+
 // ── Block acceptance + Orphan processing ─────────────────────────────────────
 
-/// [no-fork] Set true while the miner is mining through a stalled IBD latch
-/// (the announced heaviest tip is unreachable and we mine our locally-heaviest
-/// validated tip to keep the chain live). While frozen we do NOT advance
-/// `finalized_height`, so a strictly-heavier chain can still deep-reorg us back
-/// once its holder becomes reachable — mine-through can never self-finalize a
-/// solo fork. Driven by the miner loop; cleared when synced / catching up.
 /// A per-request nonce whose ONLY job is to make each GetBlock unique on the
 /// wire, so gossipsub's duplicate cache cannot swallow a retry. Monotonic rather
 /// than random: retries must differ from each other, and a counter guarantees
@@ -2067,8 +2131,9 @@ fn getblock_nonce() -> u64 {
 /// never starve itself; a SYNCED node stops reacting to overheard streams.
 const HEADERS_SOLICITED_WINDOW_MS: u64 = 60_000;
 
-// `FINALITY_FROZEN`, `ARCHIVE_MODE` and `accept_block` moved to `accept.rs`
-// (audit DAG-1/DAG-10/DAG-11); imported at the top of this file.
+// `ARCHIVE_MODE` and `accept_block` moved to `accept.rs` (audit
+// DAG-1/DAG-10/DAG-11); imported at the top of this file. `FINALITY_FROZEN`
+// was removed with the finality checkpoint (audit DAG-6).
 
 /// Blue_work-VERIFIED / evidence-based IBD release — the ONLY path that clears
 /// `is_syncing`.
@@ -2206,70 +2271,9 @@ fn selected_tip_height(dag: &Arc<RwLock<consensus::GhostDAG>>) -> u64 {
         .unwrap_or(0)
 }
 
-/// POW-8 (audit): the wire `blue_score` is not committed by the block id and
-/// used to be persisted and re-served verbatim. Replace it with the value
-/// derived from the block's VERIFIED parents before the block is stored.
-/// (`height` needs no rewrite: `accept_block` rejects any block whose height
-/// differs from max(parent height) + 1.)
-fn normalize_wire_metadata(block: &mut core::Block, dag: &Arc<RwLock<consensus::GhostDAG>>) {
-    let d = dag.read();
-    block.blue_score = ingress::derived_blue_score(
-        block.header.parents.iter().filter_map(|p| d.get_block_data(p).map(|x| x.blue_score)),
-    );
-}
-
-/// After accepting a block, accept every buffered orphan that can now be
-/// connected, transitively.
-///
-/// POW-3 / POW-4 (audit): ITERATIVE (a work queue), not recursive — an
-/// attacker-built chain of thousands of orphans used to recurse once per
-/// accepted orphan on a 2 MiB worker stack.
-#[allow(clippy::too_many_arguments)]
-fn process_orphans(
-    accepted_hash: [u8; 32],
-    orphans:       &mut ingress::OrphanPool,
-    dag:           &Arc<RwLock<consensus::GhostDAG>>,
-    store:         &Arc<storage::Storage>,
-    mempool:       &Arc<mempool::Mempool>,
-    node_state:    &Arc<RwLock<rpc::NodeState>>,
-    // Sprint 2.c: propagate tip broadcast through orphan resurrection.
-    tip_tx:        Option<&broadcast::Sender<tip::TipChanged>>,
-    shielded:      &Arc<RwLock<crate::coherence::ShieldedPool>>,
-    // MEM-6: accumulates what the drained orphans did to the applied chain
-    // (for the orphan-transaction bookkeeping).
-    chain:         &mut accept::ChainMove,
-) {
-    let mut queue: std::collections::VecDeque<[u8; 32]> = std::collections::VecDeque::new();
-    queue.push_back(accepted_hash);
-    while let Some(parent) = queue.pop_front() {
-        for orphan_hash in orphans.take_waiters(&parent) {
-            let all_parents_present = orphans.get(&orphan_hash)
-                .map(|e| {
-                    let d = dag.read();
-                    e.block.header.parents.iter().all(|p| d.has_block(p))
-                })
-                .unwrap_or(false);
-            // Still waiting on another parent: it stays registered under that
-            // parent and is retried when it arrives.
-            if !all_parents_present { continue; }
-
-            if let Some(entry) = orphans.remove(&orphan_hash) {
-                let height = entry.height;
-                let mut block = entry.block;
-                normalize_wire_metadata(&mut block, dag);
-                match accept::accept_block_tracking(&block, orphan_hash, height, dag, store, mempool, node_state, tip_tx, shielded, chain) {
-                    Ok(hash) => {
-                        info!("✓ orphan h={} accepted (pool={})", height, orphans.len());
-                        queue.push_back(hash);
-                    }
-                    Err(e) => {
-                        warn!("orphan h={} rejected: {}", height, e);
-                    }
-                }
-            }
-        }
-    }
-}
+// `normalize_wire_metadata` (POW-8) and `process_orphans` (iterative orphan
+// drain, POW-3 / POW-4) moved to the library's `ingress` module, where the
+// processor core (`ingress::BlockIngress`) and the integration tests use them.
 
 /// Orphan-deadlock fix: periodic (~30s) sweep over the missing-parent set.
 ///
@@ -2318,8 +2322,9 @@ async fn sweep_orphan_parents(
         }).await;
     }
     if !retry.is_empty() {
-        info!("orphan sweep: re-requested {} missing parent(s) (orphans={} bytes={})",
-            retry.len(), orphans.len(), orphans.total_bytes());
+        let (skeletons, paths) = orphans.remembered_len();
+        info!("orphan sweep: re-requested {} missing parent(s) (orphans={} bytes={}, remembered evicted={} paths={})",
+            retry.len(), orphans.len(), orphans.total_bytes(), skeletons, paths);
     }
     for (h, attempts) in give_up {
         let dropped = drop_orphan_subtree(h, orphans);
@@ -2340,22 +2345,27 @@ fn drop_orphan_subtree(root_parent: [u8; 32], orphans: &mut ingress::OrphanPool)
 
 /// Ask peers for the body of every block that waits for one (its stored body
 /// failed a rule that depends on witness bytes the block id does not commit
-/// to, or is missing — `GhostDAG::mark_body_pending`) and is not already
-/// being fetched. Reuses the missing-parent machinery: the request is tracked
-/// by `parent_fetch`, so the periodic sweep retries it with backoff (from
-/// another peer, `PullPeerSelector`) and the backfill guard admits the
-/// solicited answer even when it is deep below the tip. NOT consensus.
+/// to, or is missing — pruned and needed again by a connect or an operator
+/// override, audit DAG-6 — `GhostDAG::mark_body_pending`) and is not already
+/// being fetched (`ingress::awaited_bodies_to_request`, at most
+/// `ingress::MAX_BODY_REFETCH` at once). The one request path for wanted
+/// bodies; it reuses the missing-parent machinery: the request is tracked by
+/// `parent_fetch`, so the periodic sweep retries it with backoff (from another
+/// peer, `PullPeerSelector`), and the answer — a directed pull — is what the
+/// ingress core accepts as a body (`BlockIngress::handle_block`). NOT
+/// consensus.
 async fn request_awaited_bodies(
     dag:          &Arc<RwLock<consensus::GhostDAG>>,
     parent_fetch: &mut sync::parent_fetch::ParentFetchTracker,
     otx:          &tokio::sync::mpsc::Sender<network::NetworkMessage>,
 ) {
-    let wanted: Vec<[u8; 32]> = dag.read().body_pending_blocks().into_iter()
-        .filter(|h| !parent_fetch.is_awaited(h))
-        .collect();
+    let wanted = ingress::awaited_bodies_to_request(&dag.read(), parent_fetch, ingress::MAX_BODY_REFETCH);
+    if wanted.len() > 1 {
+        info!("requesting the bodies of {} block(s) waiting for one", wanted.len());
+    }
     let now = std::time::Instant::now();
     for h in wanted {
-        info!("requesting another body of block {} (its previous body was rejected or is missing)",
+        debug!("requesting a body of block {} (its previous body was rejected or is missing)",
             hex::encode(&h[..8]));
         parent_fetch.note_requested(h, now);
         let _ = otx.send(network::NetworkMessage::GetBlock { block_hash: h, nonce: getblock_nonce() }).await;
@@ -2368,6 +2378,7 @@ mod ingress_processor_tests {
     //! binary: iterative orphan draining with derived metadata (POW-3/4/8)
     //! and the evidence-driven IBD latch release (NET-6).
     use super::*;
+    use crate::ingress::{normalize_wire_metadata, process_orphans};
 
     fn unix_now() -> u64 {
         std::time::SystemTime::now()
@@ -2715,7 +2726,7 @@ mod external_submission_tests {
     }
 
     /// Build a height-1 child of the fixture genesis that satisfies every
-    /// check `accept_block` performs (bits, height, finality, timestamp,
+    /// check `accept_block` performs (bits, height, timestamp,
     /// coinbase value). With `mine == false` the block carries NO Module-SIS
     /// witness and a stale merkle root, so it fails `validate_structure()`
     /// while still being acceptable to `accept_block` — exactly the H2 gap.
@@ -2942,15 +2953,15 @@ mod external_submission_tests {
         assert_eq!(node.node_state.read().block_count, 2, "RPC state must be refreshed");
     }
 
-    // ── CONSENSUS-HALT regression (DAG-vs-UTXO ordering) ────────────────────
+    // ── Audit DAG-6: no reorg-depth limit ───────────────────────────────────
     //
-    // Drive the REAL `accept_block` pipeline (add_block → disposition →
-    // execute_reorg) — NOT a synthetic ReorgPlan — with an attacker fork
-    // whose accumulated blue_work beats the live chain but whose reorg depth
-    // exceeds reorg::MAX_REORG_DEPTH. On the unfixed baseline the flipping
-    // fork block is inserted + persisted into the DAG BEFORE the depth cap
-    // runs; the refusal then leaves selected_tip() pinned to the fork
-    // forever, freezing the real chain (durable halt).
+    // Drive the REAL `accept_block` pipeline (add_block → resolve → atomic
+    // connect) with a fork that out-weighs the live chain only once it is
+    // deeper than the live chain itself. The old pipeline refused such a
+    // reorg once it exceeded `MAX_REORG_DEPTH` (a node-local cap, so nodes
+    // that saw the blocks in different orders split); it is now followed at
+    // any depth. The >1,000-block audit scenario, with two nodes and UTXO
+    // digests, is `node/tests/fix_chain_selection.rs`.
 
     /// Submit a block through the real `accept_block` pipeline. This is the
     /// exact function the stratum/RPC callbacks delegate to; those wrappers
@@ -2967,7 +2978,7 @@ mod external_submission_tests {
 
     /// Build an H2-fixture-style (structurally lax) child of `parent` at
     /// `height` that satisfies every check `accept_block` performs (bits,
-    /// height, finality, timestamp, coinbase value). The merkle root is
+    /// height, timestamp, coinbase value). The merkle root is
     /// ZERO for these fixtures, so `nonce` is what differentiates
     /// same-position blocks on competing chains (block_hash covers it).
     fn mk_block_at(
@@ -2997,20 +3008,14 @@ mod external_submission_tests {
         }
     }
 
-    /// Acceptance regression for the DAG-vs-UTXO ordering halt.
-    ///
-    /// FAILS on baseline cad723c (tip poisoned by the refused fork; real
-    /// chain frozen as ForkLoser), PASSES with the fix (GhostDAG undo +
-    /// deferred CF_DAG persist).
+    /// Audit DAG-6 (replaces `refused_deep_reorg_must_not_poison_dag_selected_tip`,
+    /// which pinned the removed depth cap): a heavier fork that branches at
+    /// genesis, deeper than the whole live chain, is adopted — selected AND
+    /// applied — and a later extension of the old chain is an ordinary
+    /// fork-loser. The DAG and the applied state never disagree.
     #[tokio::test(flavor = "multi_thread")]
-    async fn refused_deep_reorg_must_not_poison_dag_selected_tip() {
-        let d = reorg::MAX_REORG_DEPTH;
-        assert!(
-            d <= 16,
-            "this regression builds chains of length MAX_REORG_DEPTH+2 through \
-             the real accept path; keep the cfg(test) cap small (got {})", d,
-        );
-
+    async fn heavier_fork_is_followed_at_any_depth() {
+        const D: u64 = 6;
         let g_ts    = unix_now();
         let genesis = mk_genesis(g_ts);
         let node    = node_with_genesis(&genesis);
@@ -3018,94 +3023,56 @@ mod external_submission_tests {
 
         // (a) Real chain R: genesis → r1 … r_{D+1}, all through accept_block.
         let mut parent = gh;
-        for i in 1..=(d + 1) {
+        for i in 1..=(D + 1) {
             let b = mk_block_at(&node, parent, i, g_ts + 30 * i, i);
             accept(&node, &b).expect("real-chain block must be accepted");
             parent = b.block_hash();
         }
         let real_tip = parent;
-        assert_eq!(
-            node.dag.read().selected_tip(), Some(real_tip),
-            "sanity: R's head is the selected tip before the attack",
-        );
+        assert_eq!(node.dag.read().selected_tip(), Some(real_tip));
 
-        // (b) Attacker fork F branching at genesis: f1 … f_{D+2}, same
-        // per-height timestamps as R (so expected bits — hence per-block
-        // work — match per height) but distinct nonces (distinct hashes).
-        // The fork block at height D+1 TIES R's tip on blue_work; grind its
-        // nonce so its hash LOSES the deterministic tie-break (blue_work,
-        // then blue_score, then lexicographic hash — larger wins) and stays
-        // a fork-loser. The flip then happens deterministically at f_{D+2},
-        // which strictly out-weighs R and forces to_rollback.len() == D+1 > D.
+        // (b) Fork F from genesis: f1 … f_{D+2}. f_{D+1} ties R's tip on
+        // blue_work and is ground to lose the hash tie-break; f_{D+2}
+        // strictly out-weighs R and needs a reorg of all D+1 blocks of R.
         let mut fparent = gh;
-        let mut flip_res: Result<[u8; 32], String> = Err("unreached".into());
-        for i in 1..=(d + 2) {
+        let mut fork_tip = gh;
+        for i in 1..=(D + 2) {
             let mut nonce = 1_000_000 + i;
             let mut fb = mk_block_at(&node, fparent, i, g_ts + 30 * i, nonce);
-            if i == d + 1 {
+            if i == D + 1 {
                 while fb.block_hash() >= real_tip {
                     nonce += 1;
                     fb = mk_block_at(&node, fparent, i, g_ts + 30 * i, nonce);
                 }
             }
             let res = accept(&node, &fb);
-            if i <= d + 1 {
-                assert!(
-                    res.is_ok(),
-                    "non-flipping fork block f{} must be accepted as a \
-                     fork-loser, got: {:?}", i, res,
-                );
-                assert_eq!(
-                    node.dag.read().selected_tip(), Some(real_tip),
-                    "fork-loser f{} must not move the selected tip", i,
-                );
+            assert!(res.is_ok(), "fork block f{} must be accepted, got: {:?}", i, res);
+            if i <= D + 1 {
+                assert_eq!(node.dag.read().selected_tip(), Some(real_tip),
+                    "fork-loser f{} must not move the selected tip", i);
             }
             fparent = fb.block_hash();
-            flip_res = res;
+            fork_tip = fparent;
         }
 
-        // (1) The flipping fork block is REFUSED by the reorg depth cap.
-        let err = flip_res.expect_err(
-            "over-deep flipping fork block must be rejected by accept_block",
-        );
-        assert!(
-            err.contains(reorg::ERR_REORG_DEPTH),
-            "rejection must be the depth-cap refusal, got: {}", err,
-        );
+        // (1) The heavier fork is followed: selected tip and applied tip.
+        assert_eq!(node.dag.read().selected_tip(), Some(fork_tip));
+        let tip_meta = node.store.get_meta("tip_hash").expect("meta read").expect("tip_hash");
+        assert_eq!(tip_meta.as_slice(), &fork_tip[..], "the applied state follows the fork");
 
-        // (2) HALT GUARD: the refusal must leave the DAG selected tip on the
-        // real chain. Baseline fails HERE: add_block already adopted (and
-        // persisted) the fork tip before execute_reorg refused.
-        assert_eq!(
-            node.dag.read().selected_tip(), Some(real_tip),
-            "refused deep reorg must NOT poison the DAG selected tip",
-        );
-
-        // (3) LIVENESS GUARD: a further legitimate extension of the real
-        // chain is still accepted AND applied. Baseline fails here too: with
-        // the tip pinned to the poison fork, R_next is misclassified and the
-        // applied chain state never advances.
-        let r_next = mk_block_at(
-            &node, real_tip, d + 2, g_ts + 30 * (d + 2), 424_242,
-        );
-        let r_next_hash = r_next.block_hash();
-        let res = accept(&node, &r_next);
-        assert!(
-            res.is_ok(),
-            "legitimate extension of the real chain must still be accepted \
-             after the refused fork, got: {:?}", res,
-        );
-        assert_eq!(
-            node.dag.read().selected_tip(), Some(r_next_hash),
-            "real chain must re-take / keep the selected tip",
-        );
-        let tip_meta = node.store.get_meta("tip_hash")
-            .expect("meta read").expect("tip_hash meta present");
-        assert_eq!(
-            tip_meta.as_slice(), &r_next_hash[..],
-            "applied chain state (tip_hash meta / UTXO apply) must advance \
-             with the real chain",
-        );
+        // (2) An extension of the old chain that only TIES the fork (and is
+        // ground to lose the hash tie-break) is a fork-loser: accepted into
+        // the DAG, applied tip unchanged.
+        let mut nonce = 424_242;
+        let mut r_next = mk_block_at(&node, real_tip, D + 2, g_ts + 30 * (D + 2), nonce);
+        while r_next.block_hash() >= fork_tip {
+            nonce += 1;
+            r_next = mk_block_at(&node, real_tip, D + 2, g_ts + 30 * (D + 2), nonce);
+        }
+        assert!(accept(&node, &r_next).is_ok());
+        assert_eq!(node.dag.read().selected_tip(), Some(fork_tip));
+        let tip_meta = node.store.get_meta("tip_hash").expect("meta read").expect("tip_hash");
+        assert_eq!(tip_meta.as_slice(), &fork_tip[..]);
     }
 
     /// Root-cause regression for the red/side-block body-retention starvation
@@ -3136,8 +3103,8 @@ mod external_submission_tests {
         }
         let real_tip = parent;
 
-        // Simulate a finalized checkpoint at height 3 (as a live node sets once
-        // its tip is CHECKPOINT_DEPTH ahead).
+        // An old data dir may still carry a `finalized_height` meta key (here
+        // 3). Since audit DAG-6 it is ignored: nothing below must change.
         node.store.put_meta("finalized_height", &3u64.to_le_bytes())
             .expect("set finalized_height");
 
@@ -3205,7 +3172,7 @@ mod external_submission_tests {
         }
         let real_tip = parent;
 
-        // Finalize at height 3.
+        // A stale `finalized_height` meta key (ignored since audit DAG-6).
         node.store.put_meta("finalized_height", &3u64.to_le_bytes())
             .expect("set finalized_height");
 

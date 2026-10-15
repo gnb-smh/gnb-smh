@@ -55,6 +55,42 @@ pub fn make_key(addr_hash: &[u8; 20], height: u64, tx_index: u32, io_index: u32)
     key
 }
 
+/// Every CF_ADDR_TX_HISTORY key that connecting `block` to the selected chain
+/// writes (`Storage::stage_chain_index`): one row per output whose script
+/// carries a 20-byte address, and one per non-coinbase input whose spent
+/// output — resolved through `spent`, the block's undo capture — does.
+///
+/// Single definition used to un-index a block on rollback and to record the
+/// keys when its body is pruned, so a reorg of any depth can still un-index a
+/// pruned block exactly (audit DAG-6).
+pub fn addr_history_keys(
+    block: &crate::core::Block,
+    spent: &std::collections::HashMap<([u8; 32], u32), crate::core::TxOutput>,
+) -> Vec<Vec<u8>> {
+    let mut keys = Vec::new();
+    for (tx_idx, tx) in block.transactions.iter().enumerate() {
+        for (vout, out) in tx.outputs.iter().enumerate() {
+            if out.script_pubkey.len() >= 20 {
+                let mut addr = [0u8; 20];
+                addr.copy_from_slice(&out.script_pubkey[..20]);
+                keys.push(make_key(&addr, block.height, tx_idx as u32, vout as u32));
+            }
+        }
+        if !tx.is_coinbase() {
+            for (vin, inp) in tx.inputs.iter().enumerate() {
+                if let Some(prev) = spent.get(&(inp.prev_txid, inp.prev_index)) {
+                    if prev.script_pubkey.len() >= 20 {
+                        let mut addr = [0u8; 20];
+                        addr.copy_from_slice(&prev.script_pubkey[..20]);
+                        keys.push(make_key(&addr, block.height, tx_idx as u32, 0x8000_0000 | vin as u32));
+                    }
+                }
+            }
+        }
+    }
+    keys
+}
+
 /// Compose the value bytes for a history entry.
 pub fn make_value(txid: &[u8; 32], direction: u8, amount: u64) -> Vec<u8> {
     let mut val = Vec::with_capacity(ENTRY_SIZE);

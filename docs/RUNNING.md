@@ -78,6 +78,74 @@ resolution, connect, the TLS handshake, the request and the response; every
 socket read and write gets only the time left, so a server that stalls or
 drips its answer cannot hold the wallet longer than that.
 
+## Chain selection and operator recovery
+
+The node always follows the best valid chain of the blocks it holds, at any
+depth: there is no reorg-depth limit and no finality checkpoint. A reorg of
+more than 1,000 blocks is logged at error level ("DEEP REORG committed") and
+counted in `gnb_deep_reorgs_total`; it is never refused.
+
+To leave a chain anyway (for example while an incident is investigated), or
+to return to it:
+
+```sh
+GNB_RPC_API_KEY=<key> gnb-cli invalidateblock <block-hash>
+GNB_RPC_API_KEY=<key> gnb-cli reconsiderblock <block-hash>
+```
+
+`invalidateblock` disqualifies the block and every block whose selected chain
+passes through it, rolls the node back past it if needed and moves to the
+best remaining chain. `reconsiderblock` reconsiders the marks of the block, of
+its selected-chain ancestors and of its selected-chain descendants and lets the
+node re-evaluate: operator marks (and marks a block only inherited from a
+marked ancestor) are removed; a block the node found invalid itself keeps its
+mark unless it is re-validated — a block that failed the hardening block rules
+at start-up (stored by an older release) only if its stored body now passes
+them, a block that failed in its chain context only when the move connects it
+after validating it again (a block that really is invalid is disqualified
+again). Both
+are persisted and survive restarts, and they are the RPC methods of the same
+name (parameter: the block hash in hex). They are never served to an
+anonymous caller: they need the configured API key (`--rpc-api-key` /
+`--rpc-api-key-file`) or a trusted caller (`--rpc-trust-loopback`).
+
+On a pruned node (the default; not `--archive`) the chain to move to may
+contain blocks whose bodies were pruned: for example, `invalidateblock` on the
+first block of a fork the node followed in a reorg deeper than the pruning
+depth, or `reconsiderblock` after an `invalidateblock` that rolled the node
+back through pruned blocks. The call then changes nothing and returns an error
+saying how many block bodies it is re-fetching from the peers (at most 4,096
+per call, nearest the new tip first). Repeat the same call once they have
+arrived (a few seconds to minutes, depending on the count); each retry
+requests the next missing bodies, until the call succeeds. Ordinary block
+acceptance needs no retry: when a heavier chain needs pruned bodies, the node
+accepts its blocks, fetches the bodies and moves to it once they are back.
+A body of a block the node already holds is accepted only while the node waits
+for it (it requested it, or the body it had was rejected) and only as the
+answer to its own request; it is checked like a new block (height implied by
+its parents, difficulty, timestamp, proof of work, the witness commitment
+rules) before it is stored.
+
+## Chain-state check at start-up
+
+At every start the node checks its chain state for the footprint of an
+interrupted or failed commit written by releases before the 2026-10 audit
+fixes (UTXO effects of a block without its undo record), after the repairs the
+start-up reconciliation makes on its own. If it finds one it rebuilds the
+chain state from the block bodies — the UTXO set and its indexes, the undo
+records, the shielded-pool state and the explorer statistics — which needs the
+carryover snapshot:
+
+```sh
+./target/release/gnb --data-dir ./gnb-data \
+    --carryover-snapshot genesis/bloch-g3-carryover.tsv
+```
+
+Without `--carryover-snapshot`, or on a pruned node whose old block bodies are
+gone, it refuses to start and says why; resync from a fresh `--data-dir` (or
+from an archival node's data dir). Data dirs written by this release cannot
+produce the footprint: every chain move is committed in one atomic batch.
+
 ## Upgrading and downgrading
 
 The upgrade to a release that keeps the shielded-pool state on disk (audit

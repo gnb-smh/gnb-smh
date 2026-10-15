@@ -986,7 +986,7 @@ fn mem6_disconnected_txs_are_ordered_oldest_block_first() {
     };
     let (a, b, c, d) = (syn(&[(ext(1), 0)], &[9], 1, 4), syn(&[(ext(2), 0)], &[9], 2, 4), syn(&[(ext(3), 0)], &[9], 3, 4), syn(&[(ext(4), 0)], &[9], 4, 4));
     // `disconnected` is tip-first: [B2 (c, d), B1 (a, b)].
-    let outcome = reorg::ConnectOutcome { disconnected: vec![mk("b2", vec![c.clone(), d.clone()]), mk("b1", vec![a.clone(), b.clone()])], connected: vec![] };
+    let outcome = reorg::ConnectOutcome { disconnected: vec![mk("b2", vec![c.clone(), d.clone()]), mk("b1", vec![a.clone(), b.clone()])], ..Default::default() };
     let ids: Vec<_> = outcome.disconnected_txs_oldest_first().iter().map(|t| t.txid()).collect();
     assert_eq!(ids, vec![a.txid(), b.txid(), c.txid(), d.txid()]);
 }
@@ -1459,9 +1459,14 @@ fn orphan_bookkeeping_follows_the_applied_chain_only() {
 
     // A plan undone by a later one cancels out.
     let mut m = ChainMove::default();
-    m.record(reorg::ConnectOutcome { disconnected: vec![], connected: vec![a1.clone(), a2.clone()] });
-    m.record(reorg::ConnectOutcome { disconnected: vec![a2.clone()], connected: vec![f2.clone()] });
+    m.record(reorg::ConnectOutcome { connected: vec![a1.clone(), a2.clone()], ..Default::default() });
+    m.record(reorg::ConnectOutcome { disconnected: vec![a2.clone()], connected: vec![f2.clone()], ..Default::default() });
     assert_eq!(hashes(&m.connected), vec![a1.block_hash(), f2.block_hash()]);
+    assert!(m.disconnected.is_empty());
+    // DAG-6: a block rolled back from its undo record alone (body pruned)
+    // has no transactions to report; it only cancels its earlier connect.
+    m.record(reorg::ConnectOutcome { disconnected_pruned: vec![f2.block_hash()], ..Default::default() });
+    assert_eq!(hashes(&m.connected), vec![a1.block_hash()]);
     assert!(m.disconnected.is_empty());
 }
 
@@ -1540,6 +1545,13 @@ struct Sim {
     /// Such blocks rolled back (the overwritten coin restored from
     /// `UndoData.overwritten`).
     restores: usize,
+    /// Merge P3 x P4 (audit DAG-6): bodies of connected blocks are pruned now
+    /// and then (`Storage::prune_blocks_below`), driven by this separate
+    /// stream so the operation sequence stays the same; their rollbacks run
+    /// from the undo record and the pruned-body record.
+    prune_rng: Rng,
+    /// Blocks rolled back without their body.
+    pruned_rollbacks: usize,
 }
 
 const ADDRS: u8 = 9;
@@ -1551,7 +1563,8 @@ impl Sim {
         assert!(store.aggregates_ready(), "a fresh database is complete from the start");
         let mut sim = Sim {
             _tmp: tmp, store, base: BTreeMap::new(), chain: Vec::new(), alt: None, rng: Rng(seed), serial: 0, reorgs: 0,
-            dups: BTreeSet::new(), restores: 0,
+            dups: BTreeSet::new(), restores: 0, prune_rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
+            pruned_rollbacks: 0,
         };
         for i in 0..12u64 {
             let o = sim.random_output();
@@ -1656,6 +1669,9 @@ impl Sim {
 
     fn connect(&mut self, plan: &ReorgPlan, new_tip: [u8; 32]) {
         self.restores += plan.to_rollback.iter().filter(|h| self.dups.contains(*h)).count();
+        self.pruned_rollbacks += plan.to_rollback.iter()
+            .filter(|h| !self.store.has_block_body(h).unwrap())
+            .count();
         let validate = |_: &dyn UtxoView, _: &Block| -> Result<(), String> { Ok(()) };
         let stage = |st: &Storage, b: &mut rocksdb::WriteBatch| -> Result<(), String> {
             st.stage_meta(b, "tip_hash", &new_tip).map_err(|e| e.to_string())
@@ -1681,10 +1697,28 @@ impl Sim {
         self.alt = Some((keep, gone));
     }
 
+    /// Merge P3 x P4: now and then prune the bodies of the connected blocks
+    /// below a random height (the node prunes the selected chain's bodies
+    /// below tip − PRUNING_DEPTH; here any depth).
+    fn maybe_prune(&mut self) {
+        if self.chain.is_empty() || self.prune_rng.below(3) != 0 {
+            return;
+        }
+        let below = 1 + self.prune_rng.below(self.chain.len() as u64 + 1);
+        self.store.prune_blocks_below(below).unwrap();
+    }
+
     /// Reorg back onto the stored alternative branch.
     fn switch(&mut self) {
         let Some((fork, branch)) = self.alt.take() else { return };
         if fork > self.chain.len() { return; }
+        // Blocks of the branch pruned before it was rolled back need their
+        // bodies again to be connected: the node re-fetches them (DAG-6).
+        for (b, _) in &branch {
+            if !self.store.has_block_body(&b.block_hash()).unwrap() {
+                self.store.put_block_body(b).unwrap();
+            }
+        }
         let to_rollback: Vec<_> = self.chain[fork..].iter().rev().map(|(b, _)| b.block_hash()).collect();
         let to_apply: Vec<_> = branch.iter().map(|(b, _)| b.block_hash()).collect();
         let new_tip = branch.last().map(|(b, _)| b.block_hash());
@@ -1728,14 +1762,18 @@ impl Sim {
 /// recomputation from the UTXO set and the undo records — and the model —
 /// and pass the start-up rebuild check. Merge P1 x P4: the sequences include
 /// blocks that overwrite an unspent coin (a repeated coinbase) and their
-/// rollbacks, which restore it from `UndoData.overwritten`.
+/// rollbacks, which restore it from `UndoData.overwritten`. Merge P3 x P4
+/// (audit DAG-6): bodies of connected blocks are pruned along the way, so
+/// rollbacks and reorgs also disconnect blocks whose body is gone (from the
+/// undo record and the pruned-body record alone).
 #[test]
 fn net12_incremental_aggregates_equal_full_recomputation_after_random_reorgs() {
-    let (mut dups, mut restores) = (0usize, 0usize);
+    let (mut dups, mut restores, mut pruned_rollbacks) = (0usize, 0usize, 0usize);
     for seed in [1u64, 2, 3, 4] {
         let mut sim = Sim::new(0xA66 ^ seed);
         sim.check(0);
         for step in 1..=60 {
+            sim.maybe_prune();
             match sim.rng.below(10) {
                 0..=5 => sim.extend(),
                 6 | 7 => { let k = 1 + sim.rng.below(3) as usize; sim.rollback(k) }
@@ -1746,8 +1784,10 @@ fn net12_incremental_aggregates_equal_full_recomputation_after_random_reorgs() {
         assert!(sim.reorgs >= 2, "seed {seed}: the sequence must include real reorgs ({})", sim.reorgs);
         dups += sim.dups.len();
         restores += sim.restores;
+        pruned_rollbacks += sim.pruned_rollbacks;
     }
     assert!(dups >= 4 && restores >= 2, "overwrites ({dups}) and their rollbacks ({restores}) are covered");
+    assert!(pruned_rollbacks >= 4, "rollbacks through pruned bodies are covered ({pruned_rollbacks})");
 }
 
 /// NET-12: the direct (non-batched) mutation paths keep the aggregates
@@ -1800,7 +1840,8 @@ fn net12_preexisting_database_is_rebuilt_at_startup() {
     assert!(analytics::supply_distribution_bounded(&store).is_err(), "never served incomplete");
     assert!(store.ensure_aggregates().unwrap());
     assert!(store.aggregates_ready());
-    let mut sim = Sim { _tmp, store, base, chain, alt: None, rng, serial, reorgs: 0, dups, restores: 0 };
+    let mut sim = Sim { _tmp, store, base, chain, alt: None, rng, serial, reorgs: 0, dups, restores: 0,
+        prune_rng: Rng(1), pruned_rollbacks: 0 };
     sim.check(0);
     sim.extend();
     sim.rollback(2);
@@ -1838,7 +1879,8 @@ fn reopen(sim: Sim) -> Sim {
     let Sim { _tmp, store, chain, base, rng, serial, dups, .. } = sim;
     drop(store);
     let store = Arc::new(Storage::open(&path).unwrap());
-    Sim { _tmp, store, base, chain, alt: None, rng, serial, reorgs: 0, dups, restores: 0 }
+    Sim { _tmp, store, base, chain, alt: None, rng, serial, reorgs: 0, dups, restores: 0,
+        prune_rng: Rng(1), pruned_rollbacks: 0 }
 }
 
 /// Review finding (version marker only): the chain moved under aggregates

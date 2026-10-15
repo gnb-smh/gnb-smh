@@ -140,8 +140,8 @@ pub const DNS_SEED_DOMAIN: &str = "";
 /// No public seed infrastructure yet; peers are supplied with --peer.
 pub const DEFAULT_SEEDS: &[&str] = &[];
 
-pub const CHECKPOINT_DEPTH:      u64   = 1_000;      // finality: reorgs deeper than this rejected
-pub const PRUNING_DEPTH:         u64   = 10_000;     // block bodies pruned below tip - this
+pub const CHECKPOINT_DEPTH:      u64   = 1_000;      // node-local ingress window + deep-reorg alert depth; NOT a reorg-depth limit, no finality (audit DAG-6)
+pub const PRUNING_DEPTH:         u64   = 10_000;     // block bodies pruned below tip - this; undo records are kept, so reorgs of any depth still work
 
 // Hybrid ML-DSA-65 ‖ Falcon-1024 sizes, including the 4-byte crypto-agility
 // suite header. SIG_SIZE is an upper bound (Falcon is variable length) used
@@ -1402,8 +1402,8 @@ mod validate_coinbase_value_tests {
 // blue work replaces the current selected chain, UTXOs mutated by the
 // losing branch must be reverted. We persist an UndoData record per block
 // so the eventual rollback_block() primitive (Sprint U.2) can replay the
-// mutations in reverse. Kept in storage only while the block is within the
-// finality window; records below finalized_height are pruned in Sprint U.3.
+// mutations in reverse. Kept for every connected block (never pruned): there
+// is no reorg-depth limit (audit DAG-6).
 
 /// A single input consumed by a block that must be restored on rollback.
 /// Captures the full pre-spend output so we can re-insert it verbatim.
@@ -1927,5 +1927,33 @@ mod hardening_core_tests {
         // Below the activation the pow-limit target is allowed: almost any
         // nonce passes (one or two evaluations).
         while !b.validate_pow() { b.header.nonce += 1; }
+    }
+}
+
+// Test-only fixture support, kept at the END of the file: the code the
+// browser wallet core compiles keeps its line numbers (panic locations are
+// part of the reproducible WASM, audit WAL-5).
+#[cfg(feature = "test-pow-limit")]
+impl Block {
+    /// TEST FIXTURES ONLY — compiled only with the `test-pow-limit` feature,
+    /// which the node binary refuses to run with. Records this block's id in
+    /// the proof-of-work cache WITHOUT evaluating GnB-SMH, so integration
+    /// tests can build thousand-block chains (one evaluation takes most of a
+    /// second in a dev build). `validate_pow` still decodes `bits` and
+    /// enforces the pow limit before it consults the cache, and every check
+    /// after the proof (height, expected bits, timestamp, transactions,
+    /// GhostDAG, connect) runs unchanged.
+    pub fn test_only_assume_pow_valid(&self) {
+        let id = self.block_hash();
+        if let Ok(mut cache) = pow_cache().lock() {
+            if cache.set.insert(id) {
+                cache.order.push_back(id);
+                if cache.order.len() > POW_CACHE_CAPACITY {
+                    if let Some(old) = cache.order.pop_front() {
+                        cache.set.remove(&old);
+                    }
+                }
+            }
+        }
     }
 }

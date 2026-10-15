@@ -269,13 +269,27 @@ impl ShieldedPool {
         let body = |h: &[u8; 32]| -> Result<crate::core::Block, ConnectError> {
             store.get_block(h).map_err(|e| ConnectError::Failed(e.to_string()))?
                 .ok_or_else(|| ConnectError::Failed(format!(
-                    "block body {} missing for the shielded state", hex::encode(&h[..8]))))
+                    "{}: block body {} missing for the shielded state",
+                    crate::reorg::ERR_MISSING_BODIES, hex::encode(&h[..8]))))
         };
         let mut anchors_changed = false;
 
         for h in &plan.to_rollback {
-            let block = body(h)?;
-            if block.shielded_transactions.is_empty() {
+            // Whether the block carried shielded transactions: from its body,
+            // or — its body pruned (audit DAG-6: a reorg of any depth
+            // disconnects pruned blocks) — from the record written when it was
+            // pruned; a body pruned by an older release has no record, and
+            // then the persisted shielded undo record answers (every applied
+            // block that carried shielded transactions has one, and undo
+            // records are never pruned).
+            let had_shielded = match store.get_block(h).map_err(|e| ConnectError::Failed(e.to_string()))? {
+                Some(block) => !block.shielded_transactions.is_empty(),
+                None => match store.get_pruned_body_record(h).map_err(|e| ConnectError::Failed(e.to_string()))? {
+                    Some(rec) => rec.had_shielded,
+                    None => read_undo(store, h).map_err(ConnectError::Failed)?.is_some(),
+                },
+            };
+            if !had_shielded {
                 continue;
             }
             let undo = read_undo(store, h).map_err(ConnectError::Failed)?.ok_or_else(|| ConnectError::Failed(
@@ -335,6 +349,16 @@ impl ShieldedPool {
             }
         }
         self.tip = staged.prev_tip;
+    }
+
+    /// Chain-state rebuild (audit DAG-11): back to the empty genesis state
+    /// with no shielded tip (the next committed plan sets it), keeping the
+    /// configured proof verifier. The caller deletes the persisted state in
+    /// the same batch as the rest of the chain state
+    /// (`Storage::stage_clear_chain_state`).
+    pub fn reset_for_rebuild(&mut self) {
+        let verifier = self.verifier.clone();
+        *self = ShieldedPool { verifier, ..ShieldedPool::new() };
     }
 
     /// Re-point the shielded tip at `new_tip` after `rolled_back` blocks were
