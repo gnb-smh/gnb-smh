@@ -550,6 +550,42 @@ fn selected_tip_height(state: &AppState) -> u64 {
         .unwrap_or(0)
 }
 
+/// HeavyGate cache key of a heavy method call: the method and its params,
+/// and for `getblocktemplate` also the state the template is a function of
+/// (the DAG's tips and block count, the mempool's transaction set). Keyed by
+/// method and params alone, a template was served for up to
+/// HEAVY_READ_CACHE_TTL after a new block or transaction arrived: parents a
+/// block behind and transactions already confirmed, so an external miner kept
+/// building forks of the tip (test/functional/mining_getblocktemplate_submitblock.py).
+/// Bitcoin Core likewise rebuilds its template whenever the tip changes. The
+/// single-flight bound of the gate is unchanged, and the method is
+/// auth-gated (`auth::WRITE_METHODS`).
+fn heavy_cache_key(method: &str, params: Option<&Value>, state: &AppState) -> String {
+    let mut key = format!("{}|{}", method, params.map(|p| p.to_string()).unwrap_or_default());
+    if method == "getblocktemplate" {
+        use sha3::{Digest as _, Sha3_256};
+        let (mut tips, blocks) = {
+            let dag = state.dag.read();
+            (dag.tips(), dag.block_count())
+        };
+        tips.sort_unstable();
+        let mut h = Sha3_256::new();
+        for t in &tips {
+            h.update(t);
+        }
+        // Order-independent digest of the pool's transaction set.
+        let mut pool = [0u8; 32];
+        for txid in state.mempool.txids() {
+            for (a, b) in pool.iter_mut().zip(txid) {
+                *a ^= b;
+            }
+        }
+        key.push_str(&format!("|tips={}|blocks={}|pool={}:{}",
+            hex::encode(h.finalize()), blocks, state.mempool.size(), hex::encode(pool)));
+    }
+    key
+}
+
 async fn handle_rpc(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -660,11 +696,7 @@ async fn handle_rpc(
                 // R3-audit H-R3-5: heavy O(chain) analytics reads go through
                 // the HeavyGate — TTL cache + at most one scan in flight.
                 if HeavyGate::is_heavy(&d_method) {
-                    let key = format!(
-                        "{}|{}",
-                        d_method,
-                        d_params.as_ref().map(|p| p.to_string()).unwrap_or_default(),
-                    );
+                    let key = heavy_cache_key(&d_method, d_params.as_ref(), &d_state);
                     d_state.heavy_gate.clone().run(key, || {
                         d_handle.block_on(dispatch(&d_method, d_params.as_ref(), &d_state))
                     })
@@ -2320,6 +2352,34 @@ mod audit_2026_10_rpc_tests {
         }
         let known: std::collections::BTreeSet<String> = KNOWN_RPC_METHODS.iter().map(|s| s.to_string()).collect();
         assert_eq!(arms, known);
+    }
+
+    /// A cached `getblocktemplate` never outlives the tips or the mempool it
+    /// was built from: its HeavyGate key changes with a new block and with a
+    /// new pool transaction, while other heavy methods keep the plain
+    /// method|params key. Functional counterpart:
+    /// test/functional/mining_getblocktemplate_submitblock.py.
+    #[test]
+    fn template_cache_key_follows_tips_and_mempool() {
+        let (_tmp, state) = state_with_chain(3);
+        let k0 = heavy_cache_key("getblocktemplate", None, &state);
+        assert_eq!(k0, heavy_cache_key("getblocktemplate", None, &state), "stable while nothing changes");
+        assert_eq!(heavy_cache_key("getchainstats", None, &state), "getchainstats|");
+
+        state.dag.write().add_block([9; 32], vec![[3; 32]], 2_000, 1).unwrap();
+        let k1 = heavy_cache_key("getblocktemplate", None, &state);
+        assert_ne!(k1, k0, "a new tip must miss the cached template");
+
+        let tx = crate::core::Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [7; 32], prev_index: 0, script_sig: vec![1; 8], sequence: 0 }],
+            outputs: vec![TxOutput { value: 10_000, script_pubkey: vec![2; 20] }],
+            locktime: 0,
+        };
+        state.mempool.add(tx, 1_000_000).expect("pool accepts the fixture");
+        let k2 = heavy_cache_key("getblocktemplate", None, &state);
+        assert_ne!(k2, k1, "a new pool transaction must miss the cached template");
+        assert_eq!(heavy_cache_key("getchainstats", None, &state), "getchainstats|");
     }
 
     #[test]
