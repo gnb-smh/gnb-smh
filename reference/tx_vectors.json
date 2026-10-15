@@ -1257,7 +1257,7 @@
   },
   {
    "id": "decode/non-minimal-varint",
-   "description": "The input count written as FD 01 00: decodes, but re-encodes differently (non-canonical).",
+   "description": "The input count written as FD 01 00, not the minimal encoding of 1: the decoder refuses it.",
    "network": "mainnet",
    "activation_height": "1000",
    "activation_source": "explicit",

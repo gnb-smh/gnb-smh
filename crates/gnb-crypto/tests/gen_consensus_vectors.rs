@@ -678,7 +678,7 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         for (id, bytes, desc) in [
             ("decode/truncated", truncated, "A correctly signed transaction with its last byte removed."),
             ("decode/trailing-byte", trailing, "A correctly signed transaction followed by one extra byte: not the canonical encoding."),
-            ("decode/non-minimal-varint", nonminimal, "The input count written as FD 01 00: decodes, but re-encodes differently (non-canonical)."),
+            ("decode/non-minimal-varint", nonminimal, "The input count written as FD 01 00, not the minimal encoding of 1: the decoder refuses it."),
             ("decode/empty", vec![], "Zero bytes."),
             ("decode/input-count-above-cap", many_inputs, "An input count of 100,001 (the decoder's cap is 100,000)."),
             ("decode/output-count-above-cap", many_outputs, "No inputs and an output count of 100,001 (cap 100,000)."),
@@ -1958,6 +1958,35 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         let bytes = b257.to_wire_bytes();
         c.push_full("structure/257-parents/post".into(), "257 parents: the header decoder refuses more than 256.", ACT, b257, vec![], Some("decode"), "full", Pow::Skip);
         c.cases.last_mut().unwrap().raw = Some(bytes);
+
+        // Minimal varints only (docs/CONSENSUS.md, "Wire encoding"), in both
+        // regimes: a valid block's bytes with one one-byte varint written in
+        // the 3-byte form `FD v 00`. The block id and the decoded contents
+        // would be the same; the bytes do not decode.
+        let widen = |w: &[u8], at: usize| -> Vec<u8> {
+            assert!(w[at] < 0xFD, "a one-byte varint at {at}");
+            let mut v = w[..at].to_vec();
+            v.extend_from_slice(&[0xFD, w[at], 0x00]);
+            v.extend_from_slice(&w[at + 1..]);
+            v
+        };
+        let w = base.to_wire_bytes();
+        let hdr = base.header.to_wire_bytes(base.blue_score, base.height).len();
+        c.push_full("decode/non-minimal-tx-count/post".into(),
+            "The two-parent commitment base block with its transaction count written as FD 02 00 (same block id and contents): not the minimal encoding of 2, the decoder refuses the bytes.",
+            ACT, base.clone(), vec![], Some("decode"), "full", Pow::Skip);
+        c.cases.last_mut().unwrap().raw = Some(widen(&w, hdr));
+        let mut pre = raw_block(Pre.height(), ACT, one_parent(), vec![coinbase(subsidy(Pre.height()), "block/decode/pre", b"")]);
+        reroot(&mut pre, ACT);
+        let w = pre.to_wire_bytes();
+        let hdr = pre.header.to_wire_bytes(pre.blue_score, pre.height).len();
+        // Transaction count, version, input count, outpoint, script_sig length.
+        let ss_len_at = hdr + 1 + 4 + 1 + 36;
+        assert_eq!(w[ss_len_at] as usize, pre.transactions[0].inputs[0].script_sig.len());
+        c.push_full("decode/non-minimal-script-sig-length/pre".into(),
+            "A coinbase-only block below the activation with the coinbase's script_sig length written in the 3-byte form (same block id and contents): the decoder refuses the bytes at every height. Decoders before the fix accepted it and framed the next field at the re-encoded length, two bytes early.",
+            ACT, pre, vec![], Some("decode"), "full", Pow::Skip);
+        c.cases.last_mut().unwrap().raw = Some(widen(&w, ss_len_at));
     }
 
     // ── Same-block coinbase spend (VAL-3) ───────────────────────────────────
