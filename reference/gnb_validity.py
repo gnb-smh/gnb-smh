@@ -581,7 +581,7 @@ def admission(tx: mk.Tx, view: View, height: int, activation: int, out: Outcome)
     if tx.is_coinbase():
         raise Invalid("coinbase-format")
     if not tx.inputs:
-        raise Invalid("non-standard-no-inputs")
+        raise Invalid("no-inputs")
     if not tx.outputs:
         raise Invalid("non-standard-no-outputs")
     if len(tx.wire(True)) > MAX_TX_SIZE or len(tx_bincode(tx)) > MAX_TX_SIZE:

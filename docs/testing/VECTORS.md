@@ -38,7 +38,7 @@ What the vectors do NOT pin:
 
 | What | Where |
 | --- | --- |
-| Transaction vectors (185 cases) | `reference/tx_vectors.json` |
+| Transaction vectors (187 cases) | `reference/tx_vectors.json` |
 | Block vectors (100 cases) | `reference/block_vectors.json` |
 | Generator (deterministic Rust, seeded keys and signatures) | `crates/gnb-crypto/tests/gen_consensus_vectors.rs` |
 | Runner through gnb-crypto (real pow limit, explicit chain ids) | `crates/gnb-crypto/tests/consensus_vectors.rs` |
@@ -59,7 +59,7 @@ GNB_WRITE_VECTORS=1 cargo test -p gnb-crypto --test gen_consensus_vectors -- --i
 
 1. **The generator writes the expected verdicts by hand.** Next to every
    construction (`c.valid(..)`, `c.invalid(.., "min-fee")`,
-   `c.invalid_refused(.., "min-fee", "non-standard-no-inputs")`) the
+   `c.invalid_refused(.., "min-fee", "no-inputs")`) the
    expected verdict, class, mempool verdict and refusal class are literals.
    The generator never calls a validation function to decide a verdict, and
    boundary values (dust 546,
@@ -224,17 +224,33 @@ rules before its copies of the consensus rules (structure, already
 confirmed, MoneyRange / dust / zero value, the witness framing of every
 input and then the hybrid suite, the version rule and policy, the 64-byte
 rule, duplicate inputs, presence, maturity, value, the minimum fee, the
-relay fee, signatures: `docs/MEMPOOL.md` section 1), so 20 of the 120
-invalid cases are refused for a policy reason (`non-standard-witness` for a
-non-canonical witness below the activation, `non-standard-suite` for a
-0x0002 key, `non-standard-version`, `non-standard-no-inputs`,
-`missing-input` for the block's own coinbase, `already-confirmed` for the
-BIP30 case); the other 100 are refused by the admission's own copy of the
-violated rule, with the consensus class. That includes the 17
-post-activation cases whose version-3 witness is not canonical: from the
-activation the witness check of admission is the consensus rule (CRY-1,
+relay fee, signatures: `docs/MEMPOOL.md` section 1), so 21 of the 121
+invalid cases are refused by an earlier admission rule, whose class differs
+from the consensus class:
+
+- 17 by relay policy (`NonStandard`): 13 `non-standard-witness` (a
+  non-canonical witness where it is not the consensus rule: below the
+  activation, or on a version other than 3), 3 `non-standard-suite` (a
+  0x0002 key) and 1 `non-standard-version`;
+- 2 by admission's own consensus rule "no inputs" (`Rejected`, class
+  `no-inputs`: a zero fee is below the consensus minimum, so the consensus
+  class of `struct/no-inputs/*` is `min-fee`);
+- 1 as `missing-input` (`MissingInputs`: the block's own coinbase) and 1 as
+  `already-confirmed` (`Duplicate`: the BIP30 case).
+
+The other 100 are refused by the admission's own copy of the violated
+rule, with the consensus class. That includes the 17 post-activation cases
+whose version-3 witness is not canonical: from the activation the witness
+check of admission is the consensus rule for version 3 (CRY-1,
 `admission::check_witnesses_for_next_block`), so their refusal class is
-`witness-non-canonical`. The node runner fails on a different class, and on
+`witness-non-canonical`. The gate of that consensus refusal is the version
+rule's verdict at the next block's height (`check_tx_version(..) == V3`),
+and two cases pin it from both sides:
+`witness/version-1-one-trailing-byte-from-the-activation/post` (version 1
+at the activation: consensus `bad-version`, refused as
+`non-standard-witness`) and `witness/version-3-sighash-v2-one-trailing-byte/pre`
+(version 3 below the activation: consensus-valid, refused as
+`non-standard-witness`). The node runner fails on a different class, and on
 a storage or pool error.
 
 The node runner also pins the relay verdict of every refusal, the
@@ -245,7 +261,7 @@ other variant is `Ignore`:
 
 | Variant | Policy classes |
 | --- | --- |
-| `Rejected` (consensus-invalid for this exact transaction) | `coinbase-format`, `non-standard-no-inputs` (a zero fee is below the consensus minimum), `canonical-limit`, `value-out-of-range`, `dust`, `witness-non-canonical`, `double-spend`, `inputs-below-outputs`, `min-fee`, `pubkey-mismatch`, `bad-signature` |
+| `Rejected` (consensus-invalid for this exact transaction) | `coinbase-format`, `no-inputs` (a zero fee is below the consensus minimum), `canonical-limit`, `value-out-of-range`, `dust`, `witness-non-canonical`, `double-spend`, `inputs-below-outputs`, `min-fee`, `pubkey-mismatch`, `bad-signature` |
 | `NonStandard` (relay policy, or a rule of the next block's height) | `non-standard-no-outputs`, `non-standard-size`, `non-standard-zero-value`, `non-standard-witness`, `non-standard-suite`, `non-standard-version`, `bad-version`, `tx-64-bytes` |
 | `MissingInputs`, `Immature`, `LowFee`, `Duplicate` | `missing-input`, `immature-coinbase`, `low-relay-fee`, `already-confirmed` |
 
@@ -352,21 +368,27 @@ from in `consensus_vectors_common::classify`):
 | `bad-bits` | the compact bits do not decode | runner (`try_bits_to_target`) |
 | `bad-pow` | the GnB-SMH output is not below the target of the bits | `Block::validate_pow` false |
 
-Policy classes (`policy.error_class` of a refused case): any consensus class
-above that admission's own copy of the rule decides (`decode` for bytes
-`admission::decode_tx_strict` refuses; `witness-non-canonical` for a
-version-3 transaction at/after the activation), plus `non-standard-witness`
-(a non-canonical witness where it is policy: below the activation, or a
-version other than 3), `non-standard-version` (version >= 3
-below the activation), `non-standard-suite` (a suite-0x0002 key),
-`non-standard-zero-value`, `non-standard-no-outputs`,
-`non-standard-no-inputs`, `missing-input` (an unconfirmed coin: the block's
-own coinbase), `already-confirmed` (the txid is already in the transaction
-index).
+Policy classes (`policy.error_class` of a refused case; the
+`AdmissionError` variant of each is in the table under `tx_vectors.json`):
+
+- any consensus class above that admission's own copy of the rule decides
+  (`decode` for bytes `admission::decode_tx_strict` refuses;
+  `witness-non-canonical` for a version-3 transaction at/after the
+  activation), plus `no-inputs`, admission's own consensus rule for a
+  transaction without inputs (`Rejected`; such a case's consensus class is
+  `min-fee`);
+- relay policy (`NonStandard`): `non-standard-witness` (a non-canonical
+  witness where it is policy: below the activation, or a version other than
+  3), `non-standard-version` (version >= 3 below the activation),
+  `non-standard-suite` (a suite-0x0002 key), `non-standard-zero-value`,
+  `non-standard-no-outputs`;
+- pool state: `missing-input` (an unconfirmed coin: the block's own
+  coinbase), `already-confirmed` (the txid is already in the transaction
+  index).
 
 ## Coverage
 
-Transactions (185: 97 pre-activation, 88 post-activation; 65 valid; 180 on mainnet, 5 on testnet):
+Transactions (187: 98 pre-activation, 89 post-activation; 66 valid; 182 on mainnet, 5 on testnet):
 
 | Area | Cases | What |
 | --- | --- | --- |
@@ -381,7 +403,7 @@ Transactions (185: 97 pre-activation, 88 post-activation; 65 valid; 180 on mainn
 | `net/` | 5 | testnet-signed on testnet (both regimes), mainnet-signed on testnet, the testnet schedule (activation 0, `schedule`) |
 | `suite/` | 16 | split-and-relabel of a hybrid signature to 0x0002 (valid pre: the CRY-2 weakness kept below the activation; invalid post), genuine 0x0002 spends (valid, non-standard), cross-suite key/signature pairs, relabelled to reserved 0x0000 / 0xffff and unknown 0x0003, a 3,310-byte 0x0002 body |
 | `raw/` | 8 | raw carry-over public keys with enveloped and raw signatures, and the address committing to the exact key encoding |
-| `witness/` | 22 | trailing bytes, signature without envelope, Falcon in the 1,280-byte zero-padded form (valid pre, non-canonical post), an extra non-zero Falcon byte, truncated Falcon, empty signature, sig_len beyond the script, empty and 7-byte script_sigs, pk_len one short |
+| `witness/` | 24 | trailing bytes, signature without envelope, Falcon in the 1,280-byte zero-padded form (valid pre, non-canonical post), an extra non-zero Falcon byte, truncated Falcon, empty signature, sig_len beyond the script, empty and 7-byte script_sigs, pk_len one short; the version gate of admission's witness verdict (a trailing byte on version 1 at the activation and on version 3 over sighash v2 below it: both `non-standard-witness`) |
 | `tx64/` | 8 | 63 / 64 / 65-byte txid preimages in both regimes; the mainnet boundary |
 | `bip30/` | 2 | an output on an unspent coin's outpoint (valid pre, invalid post) |
 
@@ -400,7 +422,9 @@ Blocks (100: 41 pre-activation, 59 post-activation; 34 valid):
 
 `crates/gnb-crypto/tests/consensus_vectors.rs::vector_coverage` fails if a
 class, a policy class, a network x regime pair, a network's schedule case, a
-version x regime pair, a raw key, a 0x0002 key, the mined and the failing
+version x regime pair, either side of the witness refusal's version gate (a
+`non-standard-witness` refusal on a version other than 3 at/after the
+activation, and on version 3 below it), a raw key, a 0x0002 key, the mined and the failing
 proof at the genesis target or the block-total MoneyRange case disappears
 from the files.
 
@@ -480,6 +504,29 @@ refusal class of `witness/one-trailing-byte/post` set to its consensus class
 that of `struct/no-inputs/pre` set to `min-fee`, and `basic/activation-zero/height-1`
 labelled `schedule`.
 
+**Third round** (review of the vectors merge, 2026-10-15). The gate of
+admission's consensus witness refusal (`check_witnesses_for_next_block_at`:
+`Rejected` only when `check_tx_version(tx.version, next_block_height, act)`
+selects sighash v3) had no vector on either side: every non-canonical
+witness in the files was version 1 below the activation or version 3 from
+it. Each gate below replaced the version-rule verdict, in the node
+(`node/src/mempool/admission.rs`) and in the Python model
+(`reference/gnb_validity.py::admission`, `version_rule(..) == "v3"`). The
+node runner (`tx_vectors_mainnet`) was rebuilt and run against the files
+with and without the two cases added in this round; the baselines passed.
+
+| Gate mutation | Without the two cases | Now: cases that fail |
+| --- | --- | --- |
+| the height alone (`is_active_at(next_block_height, act)`; Python `tx_rules_active(height, activation)`) | node runner and Python check passed | node runner and Python check: `witness/version-1-one-trailing-byte-from-the-activation/post` (refusal class) |
+| the version alone (`tx.version == 3`) | node runner and Python check passed | node runner and Python check: `witness/version-3-sighash-v2-one-trailing-byte/pre` (refusal class) |
+
+Without the two cases, `vector_coverage` fails ("no non-standard witness on
+a version other than 3 at/after the activation"). Both mutations also fail
+the node's unit test
+`mempool::admission::tests::non_canonical_witness_is_rejected_only_where_consensus_requires_it`,
+which checks version 3 at, after and below an explicit activation height and
+version 1 at it.
+
 ## History
 
 - **Mempool-policy merge (MEM-5 verdicts).** Admission's refusals were split
@@ -504,6 +551,19 @@ labelled `schedule`.
   `dust/output-1/*` and `dust/output-545/*` (variant) and the 17 cases above
   (class); against the pre-merge file, the Python check reports exactly
   those 17 refusal classes.
+
+- **Review of the vectors merge.** Two cases pin the version gate of
+  admission's witness verdict from both sides
+  (`witness/version-1-one-trailing-byte-from-the-activation/post`,
+  `witness/version-3-sighash-v2-one-trailing-byte/pre`; see "Effectiveness",
+  third round), and `vector_coverage` requires both. The refusal class
+  `non-standard-no-inputs` was renamed `no-inputs` (`struct/no-inputs/*`, 2
+  cases): admission refuses a transaction without inputs with its own
+  consensus rule (`AdmissionError::Rejected`: a zero fee is below the
+  consensus minimum), so the class no longer names it relay policy. The
+  generator also refuses to record `witness-non-canonical` as the refusal
+  class of anything but a version-3 transaction at/after the activation. No
+  other case changed; `block_vectors.json` is unchanged.
 
 ## Findings while building the vectors
 

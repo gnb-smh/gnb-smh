@@ -434,8 +434,10 @@ fn exact_fee(total_in: u64, delta: i64, make: impl Fn(u64, u32) -> Transaction) 
 /// transaction for a block at the case height. A refusal always names the
 /// class of the admission rule that refuses it FIRST: for a consensus-invalid
 /// case that is usually the admission's own copy of the violated consensus
-/// rule (`TxCases::invalid`), but an earlier relay-policy rule decides where
-/// the admission order says so (`TxCases::invalid_refused`).
+/// rule (`TxCases::invalid`), but an earlier admission rule (relay policy,
+/// the pool's view of the inputs, or admission's own consensus "no inputs"
+/// rule) decides where the admission order says so
+/// (`TxCases::invalid_refused`).
 #[derive(Clone)]
 enum Policy {
     Accept,
@@ -488,9 +490,14 @@ impl TxCases {
         // witness of a version-3 transaction for a block at/after the
         // activation is refused by the consensus witness rule, never as
         // non-standard (see `Regime::witness_refusal`).
+        // Conversely, that consensus refusal is reserved to exactly those
+        // transactions: any other version at/after the activation, and every
+        // version below it, gets the policy class.
         let v3_post = bytes.len() >= 4 && bytes[..4] == 3u32.to_le_bytes() && height >= activation;
         assert!(!(v3_post && matches!(policy, Policy::Reject("non-standard-witness"))),
             "{id}: version 3 at/after the activation: a non-canonical witness is `witness-non-canonical`");
+        assert!(v3_post || !matches!(policy, Policy::Reject("witness-non-canonical")),
+            "{id}: only version 3 at/after the activation is refused with `witness-non-canonical`; elsewhere it is `non-standard-witness`");
         self.cases.push(TxCase { id, description: description.into(), chain, activation, height, prevouts, bytes, error, policy });
     }
 
@@ -511,8 +518,9 @@ impl TxCases {
     }
 
     /// A consensus-invalid case that mempool admission refuses earlier, for
-    /// `policy_class` (a relay-policy rule that runs before the admission's
-    /// copy of the violated consensus rule).
+    /// `policy_class` (an admission rule that runs before the admission's
+    /// copy of the violated consensus rule: relay policy, the pool's view of
+    /// the inputs, or the consensus "no inputs" rule).
     #[allow(clippy::too_many_arguments)]
     fn invalid_refused(&mut self, id: &str, r: Regime, description: &str, prevouts: Vec<Prev>, tx: &Transaction, class: &'static str, policy_class: &'static str) {
         self.push(id, r, description, prevouts, tx, Some(class), Policy::Reject(policy_class));
@@ -596,8 +604,8 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
 
         let tx = Transaction { version: r.version(), inputs: vec![], outputs: vec![pay(0, "struct/no-inputs")], locktime: 0 };
         c.invalid_refused("struct/no-inputs", r,
-            "No inputs (one zero-value output): there is no input-count rule, but the fee is 0, below the consensus minimum. The mempool refuses it first as non-standard (no inputs).",
-            vec![], &tx, "min-fee", "non-standard-no-inputs");
+            "No inputs (one zero-value output): there is no input-count rule, but the fee is 0, below the consensus minimum. Mempool admission refuses it first with its own consensus rule \"no inputs\" (`AdmissionError::Rejected`: a zero fee can never be mined).",
+            vec![], &tx, "min-fee", "no-inputs");
 
         let mut tx = Transaction {
             version: 1,
@@ -1313,6 +1321,30 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         c.invalid_refused("witness/pk-length-one-short", r,
             "pk_len one byte short: the lenient framing reads a truncated key (whose hash does not match the coin) and ignores the last byte; the exact framing refuses the trailing byte first.",
             vec![p], &with_ss(&tx, 0, ss), cls_pk, nsw);
+    }
+
+    // The gate of that consensus refusal is the VERSION RULE's verdict at the
+    // next block's height (`check_tx_version(..) == V3`), neither the height
+    // alone nor the version alone: a non-canonical witness on any other
+    // version at/after the activation, or on version 3 below it (where
+    // version 3 is verified with sighash v2 and the lenient framing), is
+    // relay policy (`NonStandard`).
+    {
+        let l = "witness/version-1-one-trailing-byte-from-the-activation";
+        let (tx, p) = simple(ka, Pre, &format!("{l}/post"));
+        let mut ss = tx.inputs[0].script_sig.clone();
+        ss.push(0);
+        c.invalid_refused(l, Post,
+            "Version 1 (signed over sighash v2, as a legacy wallet would) with one byte after the public key, from the activation: consensus refuses the version first. Mempool admission's witness check runs before its version rule and refuses the non-canonical witness as relay policy: the canonical witness is the consensus rule only for version 3 from the activation.",
+            vec![p], &with_ss(&tx, 0, ss), "bad-version", "non-standard-witness");
+
+        let l = "witness/version-3-sighash-v2-one-trailing-byte";
+        let (tx, p) = simple_with(ka, Pre, &format!("{l}/pre"), |t| t.version = 3);
+        let mut ss = tx.inputs[0].script_sig.clone();
+        ss.push(0);
+        c.push(l, Pre,
+            "Version 3 signed over sighash v2 with one byte after the public key, below the activation: version 3 is verified there with sighash v2 and the lenient framing, which ignores the byte (consensus-valid). Mempool admission refuses the non-canonical witness as relay policy (before its version policy): below the activation the canonical witness is not a consensus rule for any version.",
+            vec![p], &with_ss(&tx, 0, ss), None, Policy::Reject("non-standard-witness"));
     }
 
     // ── 64-byte transactions (VAL-10) ───────────────────────────────────────

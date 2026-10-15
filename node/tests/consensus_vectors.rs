@@ -108,7 +108,9 @@ fn policy_class(e: &AdmissionError) -> String {
         }
         AdmissionError::Rejected(m) => {
             if m == "no inputs" {
-                "non-standard-no-inputs".into()
+                // Admission's own consensus rule (a zero fee is below the
+                // consensus minimum): `Rejected`, not relay policy.
+                "no-inputs".into()
             } else if m == "coinbase not accepted" {
                 "coinbase-format".into()
             } else if m.contains("bad-witness: the canonical witness is a consensus rule") {

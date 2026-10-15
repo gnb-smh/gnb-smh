@@ -284,7 +284,7 @@ fn vector_coverage() {
     }
     for policy in [
         "non-standard-witness", "non-standard-version", "non-standard-suite", "non-standard-zero-value",
-        "non-standard-no-outputs", "non-standard-no-inputs", "already-confirmed", "missing-input",
+        "non-standard-no-outputs", "no-inputs", "already-confirmed", "missing-input",
     ] {
         assert!(has(&|c| c.policy_class.as_deref() == Some(policy)), "policy {policy} not covered");
     }
@@ -293,7 +293,16 @@ fn vector_coverage() {
     // `check_witnesses_for_next_block`).
     assert!(has(&|c| c.policy_class.as_deref() == Some("non-standard-witness") && c.height < c.activation));
     assert!(has(&|c| c.policy_class.as_deref() == Some("witness-non-canonical") && c.height >= c.activation));
-    // Consensus-invalid cases refused by an earlier relay-policy rule, and
+    // Its gate is the version rule's verdict (version 3 at/after the
+    // activation), not the height alone nor the version alone: a version
+    // other than 3 at/after the activation, and version 3 below it, keep the
+    // policy class.
+    let version = |c: &TxVector| decode_tx(&c.bytes).map(|t| t.version);
+    assert!(has(&|c| c.policy_class.as_deref() == Some("non-standard-witness") && c.height >= c.activation
+        && version(c).is_some_and(|v| v != 3)), "no non-standard witness on a version other than 3 at/after the activation");
+    assert!(has(&|c| c.policy_class.as_deref() == Some("non-standard-witness") && c.height < c.activation
+        && version(c) == Some(3)), "no non-standard witness on version 3 below the activation");
+    // Consensus-invalid cases refused by an earlier admission rule, and
     // ones refused by the admission's own copy of the consensus rule.
     assert!(has(&|c| c.error.is_some() && c.policy_class.as_deref() != c.error.as_deref()));
     assert!(has(&|c| c.error.is_some() && c.policy_class.as_deref() == c.error.as_deref()));
