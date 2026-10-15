@@ -179,9 +179,11 @@ types the password at the prompt, exactly as a user would:
 | `feature_test_build_guard.py` | 1 | The test build refuses mainnet (exit 2, nothing written) with any command line, runs on testnet, asks for the pow limit, and `getnetworkinfo` reports `testnet`. |
 | `p2p_block_propagation.py` | 3, line topology | The internal miner's blocks reach the far node through the middle one (validate-then-relay); afterwards every node has the same block at every height, each paying the miner; a block submitted at the far end travels back. |
 | `mempool_tx_relay.py` | 3 | `gnb-cli send` (version 3 transaction) reaches every mempool with the same bytes and fee; a block mined elsewhere confirms it on all nodes; balances and UTXO lists agree; a second payment from another node does the same. |
+| `mempool_replacement.py` | 3 | Full-RBF (MEM-6) end to end: a `gnb-cli send` conflicting with a pooled payment at the same fee fails the replacement rules on the node it is sent to and the original stays everywhere; with a higher fee it replaces the original on all three nodes; a block mined at the third node confirms the replacement everywhere. |
 | `wallet_coinbase_maturity.py` | 1 | `getutxos` marks coinbase outputs; `gnb-cli send` never selects an immature one, and a wallet with only immature coins refuses before signing. |
 | `feature_partition_heal.py` | 3 | A partition with competing branches (one confirming a payment) heals within 30 s: the branch with more blue work is selected everywhere, both branch tips are kept, a merging block joins them, and every node ends with the same chain state. The payment follows the ledger rule: unconfirmed on every node while its branch is off the selected chain (payee empty, the payment back in side A's mempools), then confirmed in the merging block on every node, the payee holding exactly 3 GNB. |
 | `feature_restart_persistence.py` | 2 | Stop/start keeps tip, tips, heights, block hashes, balances, tx index and P2P identity; the mempool is memory-only by design and a re-broadcast re-admits the transaction; SIGKILL right after a block is accepted loses nothing. |
+| `feature_invalidateblock.py` | 2 | Operator `invalidateblock` / `reconsiderblock` (DAG-6): invalidating the block that confirmed a payment rolls node0 back two blocks and re-admits the payment to its mempool while node1 keeps the blocks; `submitblock` of a block on the invalidated chain is refused; node0 mines a competing block (re-confirming the payment) that node1 stores as a fork block; the invalidation survives a restart; `reconsiderblock` re-qualifies the chain, including the descendant whose mark was inherited, moves node0 to it (1 block rolled back, 3 connected) and both nodes converge on the same chain state. |
 | `mining_getblocktemplate_submitblock.py` | 2 | External mining: template fields and coinbase commitment match the Python encoding; a Python-built block is accepted, relayed and becomes the template's parent at once (the cached template never outlives the tips); duplicates refused; a mempool transaction is offered with its fee within the 5 s template cache period; a coinbase claiming one satoshi too much is refused and not relayed; two blocks on one template are both kept and merged by the next template. |
 | `rpc_auth.py` | 2 | `getblocktemplate`, `submitblock`, `sendrawtransaction` without or with a wrong key: 401 / -32001 and no effect; a wrong key is refused for reads too and answered slowly; the key works as `X-API-Key` and `Bearer`; browser Origin / foreign Host refused; batches refused; `gnb-cli` without the key cannot write; `GNB_RPC_REQUIRE_AUTH_FOR_READS=1`; start-up refusals (auth without key, loose or empty key file, short key). |
 | `p2p_invalid_blocks_txs.py` | 3 | Invalid transactions (malformed, coinbase, duplicate input, missing input, outputs above inputs, dust, version 1, forged signature, conflicts under full-RBF: one at T's fee rate fails the replacement rules before any signature work, one paying more fails the signature check; duplicate) and invalid blocks (malformed, bad / legacy Merkle root, every coinbase-commitment defect, no / two coinbases, duplicate tx, undecodable or unexpected bits, wrong height, unknown parent, timestamps, coinbase over-claim, two coinbase outputs, a confirmed tx again: BIP30) are rejected with the right reason and never move the tip. None of them is delivered to the observer node: checked on its receipt trace (every gossiped block is logged at info, every gossiped transaction with the debug target `gnb_gossip_rx_tx`), not on its storage, since the observer would drop most of them itself; the trace does show the valid transaction and blocks node0 relays. |
@@ -266,15 +268,10 @@ prefer `generate` over the internal miner unless the miner is what is tested.
 
 ## Follow-ups
 
-To add once the corresponding changes are merged (they were not in the tree
-the framework was written against):
-
-- `invalidateblock` / `reconsiderblock`: invalidate the tip on one node, check
-  it reorganises to the best valid branch while peers keep the invalidated
-  one; reconsider and converge again; invalidation survives a restart;
-  `submitblock` of a descendant of an invalidated block is refused; mempool
-  re-admission of the invalidated blocks' transactions.
-- Mempool policy changes: replacement / package rules, eviction and the
-  rolling minimum fee under a full pool, expiry across restarts, and
-  re-broadcast of unconfirmed transactions (today only a mining node
-  re-broadcasts), each end to end on three nodes like `mempool_tx_relay.py`.
+Added after the operator-RPC (P3) and mempool-policy (P4) merges:
+`feature_invalidateblock.py` and `mempool_replacement.py` above. Still to add,
+each end to end on three nodes like `mempool_tx_relay.py`: mempool policy
+beyond replacement (package / ancestor-descendant limits, eviction and the
+rolling minimum fee under a full pool, expiry, and re-broadcast of
+unconfirmed transactions; today only a mining node re-broadcasts). They need
+a wallet that can spend unconfirmed outputs and a quick way to fill the pool.
