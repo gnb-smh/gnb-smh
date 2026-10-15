@@ -417,9 +417,18 @@ pub fn check_version_for_next_block(tx: &Transaction, next_block_height: u64) ->
 /// `accept::revalidate_mempool` and the template self-check share, so a pool
 /// whose next height crosses the activation drops (or a template at another
 /// height skips) every transaction that block could not contain.
+///
+/// ONE gate for both rules: the transaction-rule predicate
+/// `activation::is_active_at(next_block_height, activation)` that the
+/// version rule uses. For every height a next block can have (>= 1,
+/// `template::next_template_height`) it equals the block-rule predicate
+/// `block_rules::rules_active_at` the connect path applies to the 64-byte
+/// rule; at `next_block_height = 0` (only callers without a height context,
+/// such as `accept::validate_tx_standalone(.., 0)`) both rules still switch
+/// together (docs/CONSENSUS.md, "Activation").
 pub fn check_tx_for_next_block(tx: &Transaction, next_block_height: u64) -> Result<(), String> {
     check_version_for_next_block(tx, next_block_height)?;
-    if core::block_rules::rules_active_at(next_block_height, activation_height()) {
+    if core::activation::is_active_at(next_block_height, activation_height()) {
         core::block_rules::check_tx_not_64_bytes(tx).map_err(str::to_string)?;
     }
     Ok(())

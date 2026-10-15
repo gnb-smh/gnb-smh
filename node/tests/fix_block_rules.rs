@@ -1458,3 +1458,41 @@ fn in_block_helper_applies_bip30_to_its_transaction() {
         }
     }
 }
+
+/// Review finding: the block rules use `h >= 1 && h >= activation`, the
+/// transaction rules `h >= activation` (pinned by the version-rule vectors).
+/// The two agree at every height a validated block or a next block can have
+/// (>= 1); `check_tx_for_next_block` gates its two rules with ONE predicate,
+/// so even at the height-0 convention of callers without a height context
+/// (`validate_tx_standalone(.., 0)`) the version rule and the 64-byte rule
+/// switch together (before, with activation 0, the version rule applied
+/// there and the 64-byte rule did not).
+#[test]
+fn block_and_transaction_rule_predicates_agree_at_every_next_block_height() {
+    for act in [0, 1, 2, 7, 109_999, 110_000, activation::NEVER] {
+        for h in [1, 2, 6, 7, 8, 109_998, 109_999, 110_000, 110_001, u64::MAX] {
+            assert_eq!(block_rules::rules_active_at(h, act), activation::is_active_at(h, act), "h={h} act={act}");
+        }
+    }
+    assert!(!block_rules::rules_active_at(0, 0), "the genesis is never subject to the block rules");
+    assert!(activation::is_active_at(0, 0), "sighash_vectors.json: version_rule (v1, h 0, act 0) is invalid");
+
+    let _g = activation::scoped_override(0);
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let k = key();
+    let f1 = ([0x93u8; 32], 0u32, out(2_000_000, &k.spk));
+    let f2 = ([0x94u8; 32], 0u32, out(2_000_000, &k.spk));
+    let n = node_with(&genesis, &[f1.clone(), f2.clone()]);
+    assert!(template::next_template_height(&n.dag.read(), &n.store) >= 1);
+    let tx64_v3 = signed_spend_at(&k, &[(f1.0, 0)], std::slice::from_ref(&f1.2), vec![out(1_900_000, &[0x05; 5])], 1);
+    assert_eq!((tx64_v3.version, tx64_v3.to_wire_bytes(false).len()), (3, 64));
+    let tx_v1 = signed_spend(&k, &[(f2.0, 0)], vec![out(1_900_000, &[0x06; 20])]);
+    for h in [0, 1] {
+        let e = admission::check_tx_for_next_block(&tx64_v3, h).unwrap_err();
+        assert!(e.contains("64-byte"), "h={h}: {e}");
+        let e = admission::check_tx_for_next_block(&tx_v1, h).unwrap_err();
+        assert!(e.contains("bad-txns-version"), "h={h}: {e}");
+    }
+    let e = pipeline::validate_tx_standalone(&tx64_v3, &n.store, 0).unwrap_err();
+    assert!(e.contains("64-byte"), "{e}");
+}

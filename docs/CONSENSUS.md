@@ -166,17 +166,32 @@ activation height:
 
 A GhostDAG rule applies to block B iff `height(B) >= activation`, where
 `height(B)` is `GhostdagData::height`, the selected parent's height + 1, which
-depends only on B's parents. A block or transaction rule applies iff
-`B.height >= activation` (and `B.height >= 1`: the genesis is never subject to
-them), where `B.height` is the header height that `accept_block` requires to
-equal `max(parent DAG heights) + 1`; these rules are checked before a block
-reaches GhostDAG, as the activation module prescribes. The two heights differ
-only for a block that merges a parent with a greater DAG height than its
-selected parent (DAG-8). Everything that decides for a block not yet built
-(mempool admission and eviction, reorg re-injection, templates,
-`getblocktemplate`, wallets) evaluates the block and transaction rules at ONE
-next-block height, the header height of the node's own next template (see
-"Transaction signatures", "Which height").
+depends only on B's parents. The block and transaction rules compare
+`B.height`, the header height that `accept_block` requires to equal
+`max(parent DAG heights) + 1`; these rules are checked before a block reaches
+GhostDAG, as the activation module prescribes. The two heights differ only for
+a block that merges a parent with a greater DAG height than its selected
+parent (DAG-8). The predicates:
+
+```text
+block rule applies at h        iff  h >= 1 and h >= activation   // block_rules::rules_active_at
+transaction rule applies at h  iff  h >= activation              // activation::is_active_at (core::sighash::check_tx_version)
+```
+
+The block-rule predicate excludes the genesis (height 0), a constant checked
+by its hash and proof. The transaction-rule predicate is the one the "Version
+rule" table and `reference/sighash_vectors.json` (`version_rule`) pin. The two
+agree at every height `h >= 1`, which is every height a validated block or a
+next block can have (`template::next_template_height` is never below 1); they
+differ only at `h = 0` with activation 0, a height no block other than the
+genesis has. `admission::check_tx_for_next_block`, which applies the version
+rule and the 64-byte rule at a next-block height, gates both with the
+transaction-rule predicate, so the two switch together even for a caller that
+passes `h = 0`. Everything that decides for a block not yet built (mempool
+admission and eviction, reorg re-injection, templates, `getblocktemplate`,
+wallets) evaluates the block and transaction rules at ONE next-block height,
+the header height of the node's own next template (see "Transaction
+signatures", "Which height").
 
 Below the activation, every GhostDAG rule in this section is replaced by the
 pre-activation rule named with it (the block and transaction rules state their
@@ -586,17 +601,19 @@ GhostDAG rules (mainnet 110,000; testnet and regtest 0). The code is
 
 ### Which height
 
-These are block and transaction rules. They compare the block's HEADER
-height `B.height`, which `accept_block` requires to equal
-`max(parent DAG heights) + 1` (see "Difficulty input"), not
-`GhostdagData::height`. A rule applies to B iff
+These are block rules. They compare the block's HEADER height `B.height`,
+which `accept_block` requires to equal `max(parent DAG heights) + 1` (see
+"Difficulty input"), not `GhostdagData::height`. A rule applies to B iff
 
 ```text
 B.height >= 1  and  B.height >= activation_height
 ```
 
 The genesis block (height 0) is a constant checked by its hash and proof, and
-it is never subject to these rules. Mempool admission and eviction, block
+it is never subject to these rules. (The transaction rules of "Transaction
+signatures" use `h >= activation_height` without the `h >= 1` term; the two
+predicates agree at every height >= 1, see "GhostDAG rules, ledger semantics
+and the hardening activation", "Activation".) Mempool admission and eviction, block
 templates and `getblocktemplate` use the height of the block being built: the
 node's next template height (`template::next_template_height`, the largest
 DAG height among the template parents + 1, the same height the transaction
