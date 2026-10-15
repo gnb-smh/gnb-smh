@@ -1,0 +1,64 @@
+# cargo-mutants configuration: mutation testing of the consensus code.
+# Method, commands, results and the equivalent-mutant table:
+# docs/testing/MUTATION.md. Run each package in its own invocation (never
+# together with the node crate `gnb`, whose dev-dependency feature
+# `test-pow-limit` would pin every expected target):
+#
+#   cargo mutants -p gnb-smh    --test-tool cargo -j 2
+#   cargo mutants -p gnb-crypto --test-tool cargo -j 2
+
+# The consensus scope. gnb-smh: the library (GnB-SMH, compact bits, chain
+# work, ASERT). The benchmark binary src/bin/smh-bench.rs is not linked into
+# anything and only prints wall-clock timings; it is out of scope.
+# gnb-crypto: the consensus modules of `core`.
+examine_globs = [
+    "crates/gnb-smh/src/lib.rs",
+    "crates/gnb-smh/src/difficulty.rs",
+    "crates/gnb-crypto/src/core/mod.rs",
+    "crates/gnb-crypto/src/core/block_rules.rs",
+    "crates/gnb-crypto/src/core/sighash.rs",
+    "crates/gnb-crypto/src/core/limits.rs",
+    "crates/gnb-crypto/src/core/activation.rs",
+    "crates/gnb-crypto/src/core/tokenomics.rs",
+    "crates/gnb-crypto/src/core/carryover.rs",
+]
+
+# Non-consensus code in core/mod.rs: the wallet's pre-signing fee estimators
+# and statistics ("Sprint A" helpers, never called by validation), and the
+# human-facing difficulty float used only by RPC/explorer output.
+exclude_re = [
+    "core/mod\\.rs:.* Transaction::(estimate_size|calc_fee|estimate_fee|actual_size|total_output|unique_output_addresses)\\b",
+    "core/mod\\.rs:.* (difficulty_from_bits|difficulty_to_target|u256_to_f64)\\b",
+    "core/mod\\.rs:.*<impl std::fmt::(Debug|Display) for MerkleRoot>",
+
+    # Equivalent mutants (no input distinguishes them from the original
+    # code). Each one is justified in the equivalent-mutant table of
+    # docs/testing/MUTATION.md. Matched by file, function and operator (and
+    # column where a function has several candidates), not by line, so that
+    # unrelated edits do not resurrect them; any NEW survivor still fails CI.
+    #
+    # E1: `|` -> `^` on disjoint bit fields (i: bits 0-31, tag 1 or 2: bits
+    # 32-39, 0x1F: bits 40-44, 0x80: bits 56-63).
+    "gnb-smh/src/lib\\.rs:\\d+:\\d+: replace \\| with \\^ in lane16$",
+    # E2: `|` -> `^` on disjoint bytes of the compact mantissa / exponent.
+    "gnb-smh/src/difficulty\\.rs:\\d+:\\d+: replace \\| with \\^ in target_to_bits$",
+    # E3: `(hi << 8) | x`: the low byte of `hi << 8` is zero.
+    "gnb-smh/src/difficulty\\.rs:\\d+:\\d+: replace \\| with \\^ in work$",
+    # E4: `if out > pow_limit { out = pow_limit }`: at equality the
+    # assignment is a no-op.
+    "gnb-smh/src/difficulty\\.rs:\\d+:12: replace > with >= in asert_next_target$",
+    # E5: `if by_size > MIN_TX_FEE_SAT { by_size } else { MIN_TX_FEE_SAT }`:
+    # at equality both branches return the same value.
+    "core/tokenomics\\.rs:\\d+:\\d+: replace > with >= in min_tx_fee_sat$",
+]
+
+test_tool = "cargo"
+additional_cargo_args = ["--locked"]
+# Unit + integration tests (no doctests). The wallet/keystore tests (Argon2,
+# HD derivation) take ~30 s per run and do not exercise the consensus scope
+# beyond what the core tests do; skipping them can only turn a caught mutant
+# into a missed one, never the reverse.
+additional_cargo_test_args = ["--tests", "--", "--skip", "wallet::"]
+# Per-mutant test timeout: 5x the baseline test time, at least 60 s.
+timeout_multiplier = 5.0
+minimum_test_timeout = 60
