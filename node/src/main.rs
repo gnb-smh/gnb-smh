@@ -488,7 +488,17 @@ async fn main() {
         Ok(s)  => { info!("storage ready"); Arc::new(s) }
         Err(e) => { error!("storage: {}", e); std::process::exit(1); }
     };
-
+    // Audit POW-9: mainnet and testnet share the genesis, so the genesis
+    // check below cannot tell the other network's data dir apart; the data
+    // dir records its chain id (docs/RUNNING.md).
+    match store.check_chain_marker(core::node_chain_id().to_u32()) {
+        Ok(true) => info!("data dir marked for chain id {:#010x}", core::node_chain_id().to_u32()),
+        Ok(false) => {}
+        Err(e) => {
+            error!("{e}. Refusing to start: use a separate --data-dir for each network.");
+            std::process::exit(1);
+        }
+    }
 
 
     // ── Consensus ─────────────────────────────────────────────────────────────
@@ -795,7 +805,8 @@ async fn main() {
         enable_mdns:     cli.enable_mdns,
         archive:         cli.archive,
     };
-    let mut node = match network::NetworkNode::new(net_cfg) {
+    // Audit POW-9: the node speaks its own network's protocol identifiers.
+    let mut node = match network::NetworkNode::new(net_cfg).map(|n| n.with_chain(core::node_chain_id())) {
         Ok(n)  => { info!("P2P: {}", n.peer_id); n }
         Err(e) => { error!("network: {}", e); std::process::exit(1); }
     };

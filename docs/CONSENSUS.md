@@ -22,6 +22,22 @@ The easiest allowed target is `POW_LIMIT_BITS = 0x2100ffff` below the
 hardening activation and the genesis target `0x1f0e9036` at and after it
 (see "Block rules at the hardening activation", POW-3).
 
+Non-canonical encodings never validate either (audit POW-9, every height):
+`bits` must be the encoding `target_to_bits` produces for the target it
+decodes to, `target_to_bits(target(bits)) == bits`
+(`gnb_smh::difficulty::is_canonical_bits`; `reference/gnb_difficulty.py`
+`is_canonical_bits`). Decoding itself keeps Bitcoin Core's `SetCompact`
+semantics (`try_bits_to_target` decodes `0x21007fff` and `0x207fff00` to the
+same target), and `Block::validate_pow` refuses the non-canonical one before
+any evaluation. The rule changes no verdict: every block must also carry
+`bits == expected_bits(parents, height)`, checked before the proof, and
+`expected_bits` is a `target_to_bits` output, which is always canonical
+(`expected_bits_are_always_canonical`). Like Bitcoin Core, whose consensus
+compares `nBits` with the expected value as a u32, GnB never relied on
+decoding to reject a non-canonical header; the explicit check only makes
+that independent of the equality check. Vector:
+`block_vectors.json` `pow/non-canonical-bits`.
+
 ## Difficulty
 
 ASERT (aserti3-2d construction) anchored at the genesis block
@@ -96,6 +112,44 @@ formula, not floor(2^256 / target), or they compute different blue work.
 Block timestamps must be at least the latest parent timestamp and at most
 600 s ahead of the validator's clock, which bounds the easing a miner can
 obtain from a future timestamp to about 6%.
+
+## Networks (mainnet and testnet)
+
+Mainnet and testnet share the genesis block (`core::genesis_block()`, the
+same id `837f7d5c…`), so they also share the ASERT anchor (the genesis time
+and target) and the carryover genesis ledger. They differ in the chain id
+(`ChainId`: mainnet `0x474E0001`, testnet `0x474E0002`, set with
+`--testnet`) and in the hardening activation height derived from it
+(mainnet 110,000, testnet 0). Consequences, and what separates them (audit
+POW-9):
+
+- **Transactions cannot be replayed across networks.** Every signature digest
+  commits to the chain id: sighash v2 and v3 both hash `chain_id u32 LE`
+  right after the version byte ("Transaction signatures"), so a mainnet
+  signature never verifies on testnet and vice versa, below and after the
+  activation (`core::chain_id_tests::cross_chain_id_replay_is_rejected`;
+  vectors `net/*` in `tx_vectors.json`). A transaction is replayable only
+  where its digest is, i.e. on its own network.
+- **Blocks cannot be valid on both networks**, but only because their rules
+  differ, not because a block names its network. A block above the genesis
+  at header height h < 110,000 follows the pre-activation rules on mainnet
+  (legacy Merkle root, free-form coinbase) and the hardening rules on
+  testnet (tagged Merkle root, 80-byte coinbase commitment), which exclude
+  each other. From 110,000 the rules agree, but every block there descends
+  from blocks of one network only, which the other never accepts, so its
+  parents are unknown to the other network.
+- **The networks are separated on the wire** (node-local), as Bitcoin Core
+  separates them with per-network message start bytes: each network has its
+  own gossip topics, directed-sync protocol and identify protocol version
+  (`network::chain_separation`; mainnet keeps `gnb/blocks/1`,
+  `gnb/txs/1`, `gnb/sync/1`, `/gnb/sync/1` and `/gnb/1.0.0`, testnet uses
+  `gnb-testnet/...`), so neither network subscribes to, pulls from or serves
+  the other's frames, and a peer that identifies with another network's
+  protocol version is disconnected (`node/tests/fix_pow9_network_separation.rs`).
+- **A data directory belongs to one network**: the genesis check at start-up
+  cannot tell the networks apart, so the data dir records its chain id in
+  CF_META (`chain_id`, written on its first start) and a node of the other
+  network refuses it (`Storage::check_chain_marker`; docs/RUNNING.md).
 
 ## Acceptance order
 

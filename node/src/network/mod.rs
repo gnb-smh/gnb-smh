@@ -5,6 +5,7 @@
 //! FIX #6: Peer memory (known_peers.json).
 //! Sprint P: PEX hardening (rate limit, address validation, known_peers cap).
 
+pub mod chain_separation;
 pub mod pex_validator;
 pub mod ratelimit;
 pub mod sync_rr;
@@ -1017,6 +1018,9 @@ pub struct NetworkNode {
     local_key:   identity::Keypair,
     control_rx:  Option<mpsc::Receiver<NetworkControl>>,
     peer_events: Option<mpsc::Sender<PeerEvent>>,
+    /// The network this node speaks (audit POW-9: its protocol identifiers,
+    /// [`chain_separation`]). The node's chain id unless overridden.
+    chain:       crate::core::ChainId,
 }
 
 impl NetworkNode {
@@ -1026,7 +1030,17 @@ impl NetworkNode {
         let local_key = load_or_create_identity(&key_path)?;
         let peer_id   = PeerId::from(local_key.public());
         info!("P2P identity: {} ({})", peer_id, key_path.display());
-        Ok(Self { peer_id, config, local_key, control_rx: None, peer_events: None })
+        Ok(Self {
+            peer_id, config, local_key, control_rx: None, peer_events: None,
+            chain: crate::core::node_chain_id(),
+        })
+    }
+
+    /// Speak `chain`'s protocol identifiers instead of the node chain id's
+    /// (in-process harnesses that run nodes of two networks).
+    pub fn with_chain(mut self, chain: crate::core::ChainId) -> Self {
+        self.chain = chain;
+        self
     }
 
     /// Accept [`NetworkControl`] requests from the processor on `rx`.
@@ -1107,6 +1121,9 @@ impl NetworkNode {
     ) -> Result<(), NetworkError> {
         use std::time::Instant;
         let gs_cfg = gossipsub_config()?;
+        // Audit POW-9: this network's protocol identifiers (topics, sync
+        // protocol, identify version), so no frame crosses networks.
+        let protos = chain_separation::chain_protocols(self.chain);
 
         // ── Peer scoring: penalize invalid messages, reward participation ──
         let peer_score_params = {
@@ -1169,9 +1186,9 @@ impl NetworkNode {
                 ..Default::default()
             };
 
-            params.topics.insert(IdentTopic::new(TOPIC_BLOCKS).hash(), block_topic_params);
-            params.topics.insert(IdentTopic::new(TOPIC_TXS).hash(), tx_topic_params);
-            params.topics.insert(IdentTopic::new(TOPIC_SYNC).hash(), sync_topic_params);
+            params.topics.insert(IdentTopic::new(protos.blocks_topic).hash(), block_topic_params);
+            params.topics.insert(IdentTopic::new(protos.txs_topic).hash(), tx_topic_params);
+            params.topics.insert(IdentTopic::new(protos.sync_topic).hash(), sync_topic_params);
             params
         };
 
@@ -1233,7 +1250,7 @@ impl NetworkNode {
                 // (`gnb/<ver>/a|n`) for operators, but NET-9: peers no longer
                 // use this self-declared bit to choose whom to pull from.
                 let identify = identify::Behaviour::new(
-                    identify::Config::new("/gnb/1.0.0".into(), key.public())
+                    identify::Config::new(protos.identify.into(), key.public())
                         .with_agent_version(sync_rr::agent_version(archive)),
                 );
                 // Cap connections at the swarm layer to match max_peers. We
@@ -1252,7 +1269,7 @@ impl NetworkNode {
                     gossipsub: gs,
                     mdns,
                     identify,
-                    sync_rr: sync_rr::new_behaviour(),
+                    sync_rr: sync_rr::new_behaviour(protos.sync_protocol.clone()),
                     connection_limits,
                 })
             })
@@ -1260,9 +1277,9 @@ impl NetworkNode {
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
             .build();
 
-        let block_t = IdentTopic::new(TOPIC_BLOCKS);
-        let tx_t    = IdentTopic::new(TOPIC_TXS);
-        let sync_t  = IdentTopic::new(TOPIC_SYNC);
+        let block_t = IdentTopic::new(protos.blocks_topic);
+        let tx_t    = IdentTopic::new(protos.txs_topic);
+        let sync_t  = IdentTopic::new(protos.sync_topic);
 
         for t in [&block_t, &tx_t, &sync_t] {
             swarm.behaviour_mut().gossipsub.subscribe(t)
@@ -1712,6 +1729,16 @@ impl NetworkNode {
                         // identify: our observed address (quorum-confirmed before it
                         // is advertised). Peer listen addrs are NOT persisted.
                         SwarmEvent::Behaviour(BlochBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                            // Audit POW-9: a peer of another network (or not
+                            // GnB at all) is dropped, as Bitcoin Core drops a
+                            // connection carrying another network's magic. Its
+                            // observed address of us is not counted either.
+                            if !chain_separation::same_network(&protos, &info.protocol_version) {
+                                info!("peer {} identifies as {:?}, not {:?}: another network; disconnecting",
+                                    peer_id, truncate_utf8(&info.protocol_version, 64), protos.identify);
+                                let _ = swarm.disconnect_peer_id(peer_id);
+                                continue;
+                            }
                             let cand = canonical_peer_addr(&info.observed_addr, &self.peer_id);
                             if is_valid_public_multiaddr(&cand, allow_private)
                                 && (observed_by.len() < OBSERVED_ADDR_CAP

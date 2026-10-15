@@ -2062,6 +2062,8 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         ("pow/zero-mantissa-bits", ACT, ACT - 1, 0x1F00_0000, Pow::Limit, Some("bad-bits"), "bits with a zero mantissa: malformed."),
         ("pow/exponent-out-of-range-bits", ACT, ACT - 1, 0x2300_0001, Pow::Limit, Some("bad-bits"), "bits with exponent 0x23: the target does not fit 256 bits."),
         ("pow/mantissa-overflow-bits", ACT, ACT - 1, 0x2201_0000, Pow::Limit, Some("bad-bits"), "bits 0x22010000: the target is 2^264."),
+        ("pow/non-canonical-bits", ACT, ACT - 1, 0x2100_7FFF, Pow::Limit, Some("bad-bits"),
+            "bits 0x21007fff decode (as Bitcoin Core's SetCompact decodes them) to 0x7fff << 240, within the pow limit, but the canonical encoding of that target is 0x207fff00: non-canonical bits never validate (audit POW-9), at every height. No block an expected_bits check accepts is affected (expected bits are always canonical)."),
     ] {
         let mut b = raw_block(hh, act, vec![parent("p1")], vec![coinbase(subsidy(hh), &format!("block/{id}"), b"")]);
         b.header.bits = bits;

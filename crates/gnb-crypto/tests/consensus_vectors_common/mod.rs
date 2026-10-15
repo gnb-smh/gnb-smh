@@ -284,7 +284,8 @@ pub fn decode_tx(bytes: &[u8]) -> Option<Transaction> {
 /// The pow-limit rule (`pow: limit` / `full`): bits must decode and the
 /// target must be within the pow limit of the block's height.
 pub fn pow_limit(block: &Block, activation: u64) -> Result<(), &'static str> {
-    let target = gnb_smh::difficulty::try_bits_to_target(block.header.bits).map_err(|_| "bad-bits")?;
+    // Malformed or non-canonical bits (audit POW-9), as `Block::validate_pow`.
+    let target = gnb_smh::difficulty::try_canonical_bits_to_target(block.header.bits).ok_or("bad-bits")?;
     if !Block::target_within_pow_limit_at(&target.0, block.height, activation) {
         return Err("pow-limit");
     }

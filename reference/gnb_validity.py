@@ -528,6 +528,8 @@ def check_pow_limit(b: Block, activation: int) -> None:
         target = df.bits_to_target(b.header.bits)
     except df.BitsError:
         raise Invalid("bad-bits")
+    if not df.is_canonical_bits(b.header.bits):  # audit POW-9, all heights
+        raise Invalid("bad-bits")
     limit = HARDENED_POW_LIMIT_BITS if block_rules_active(b.height, activation) else POW_LIMIT_BITS
     if target > df.bits_to_target(limit):
         raise Invalid("pow-limit")

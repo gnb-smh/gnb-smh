@@ -55,20 +55,29 @@ fn compact_decoding_and_work_from_bits() {
     let d = doc();
     let cases = d["compact"].as_array().unwrap();
     assert!(cases.len() >= 60);
+    let mut non_canonical = 0usize;
     for v in cases {
         let bits = u32_of(&v["bits"]);
         match try_bits_to_target(bits) {
             Ok(t) => {
                 assert_eq!(t, target_of(&v["target_hex"]), "bits {bits:#010x}");
                 assert_eq!(target_to_bits(&t), u32_of(&v["reencoded_bits"]), "bits {bits:#010x}");
+                // Audit POW-9: canonical iff the re-encoding is the input.
+                let canonical = u32_of(&v["reencoded_bits"]) == bits;
+                assert_eq!(gnb_smh::difficulty::is_canonical_bits(bits), canonical, "bits {bits:#010x}");
+                assert_eq!(gnb_smh::difficulty::try_canonical_bits_to_target(bits), canonical.then_some(t));
+                non_canonical += usize::from(!canonical);
             }
             Err(e) => {
                 assert_eq!(bits_error_name(e), v["error"].as_str().unwrap(), "bits {bits:#010x}");
+                assert!(!gnb_smh::difficulty::is_canonical_bits(bits));
+                assert_eq!(gnb_smh::difficulty::try_canonical_bits_to_target(bits), None);
                 assert_eq!(bits_to_target(bits), Target::ZERO);
             }
         }
         assert_eq!(work_from_bits(bits), work_of(&v["work"]), "work of bits {bits:#010x}");
     }
+    assert!(non_canonical > 0, "the vectors include decodable non-canonical encodings");
 }
 
 #[test]

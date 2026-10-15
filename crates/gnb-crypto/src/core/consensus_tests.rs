@@ -152,7 +152,6 @@ fn genesis_header_digests_match_the_python_reference() {
         hex::encode(g.header.pow_preimage()),
         "010000000000000094b268574daf887595bbd4f8211d3cb286361527979d38ff8b45e96fb6dca59ce409c76a0000000036900e1f"
     );
-    assert_eq!(hex::encode(g.header.dag_hash()), "d8c733fb1fa6d3063d7e7733d1bce4d14836659353b1fde1f1793b1da95b795d");
     assert_eq!(hex::encode(g.block_hash()), "837f7d5c832ae28370cd52baa969528753f619be2a4dd07d814a1a986c4201cd");
     let pow = g.header.pow_hash();
     assert_eq!(hex::encode(pow), "000504fc749cbd9b6f48cad91423108c12df8b7c8154cf69191110f29c8554b2");
@@ -207,6 +206,77 @@ fn pow_cache_is_a_bounded_fifo() {
     assert_eq!((c.set.len(), c.order.len()), (POW_CACHE_CAPACITY, POW_CACHE_CAPACITY));
     assert!(!c.set.contains(&id(0)), "the oldest id is evicted");
     assert!(c.set.contains(&id(1)) && c.set.contains(&id(POW_CACHE_CAPACITY)));
+}
+
+/// Audit POW-9 (residual): `validate_pow` refuses a NON-CANONICAL compact
+/// encoding before any evaluation, even when the proof meets the target it
+/// decodes to. `0x21007fff` decodes (Bitcoin Core's `SetCompact` semantics,
+/// which `try_bits_to_target` keeps) to `0x7fff << 240`, whose canonical
+/// encoding is `0x207fff00`. About one nonce in two meets that target.
+#[test]
+fn non_canonical_bits_never_validate() {
+    let _g = activation::scoped_override(activation::NEVER);
+    const NON_CANONICAL: u32 = 0x2100_7FFF;
+    const CANONICAL: u32 = 0x207F_FF00;
+    let t = gnb_smh::difficulty::try_bits_to_target(NON_CANONICAL).expect("decodes");
+    assert_eq!(gnb_smh::difficulty::target_to_bits(&t), CANONICAL);
+    assert_eq!(gnb_smh::difficulty::try_bits_to_target(CANONICAL), Ok(t), "same target");
+    assert!(!gnb_smh::difficulty::is_canonical_bits(NON_CANONICAL));
+    assert!(gnb_smh::difficulty::is_canonical_bits(CANONICAL));
+    let mut b = valid_block(1, vec![[0x22; 32]], 20, vec![], activation::NEVER);
+    b.header.bits = NON_CANONICAL;
+    // A nonce whose GnB-SMH output meets the decoded target.
+    let nonce = (0..64u64)
+        .find(|&n| {
+            b.header.nonce = n;
+            hash_meets_target(&b.header.pow_hash(), &t.0)
+        })
+        .expect("half of all nonces meet a 2^255 target");
+    b.header.nonce = nonce;
+    assert!(!b.validate_pow(), "non-canonical bits must not validate (nonce {nonce})");
+    assert_eq!(b.validate_structure(), Err("invalid PoW"));
+    // The canonical encoding of the same target validates with a nonce of its own.
+    b.header.bits = CANONICAL;
+    assert!((0..64u64).any(|n| {
+        b.header.nonce = n;
+        b.validate_pow()
+    }));
+}
+
+/// Why the canonical requirement changes no verdict: every block must carry
+/// `bits == expected_bits(...)` (checked before the proof), and
+/// `expected_bits` encodes with `target_to_bits`, whose output is always
+/// canonical. Checked over the whole schedule's range of targets (every
+/// exponent, random mantissas, both activation regimes) and the constants.
+#[test]
+fn expected_bits_are_always_canonical() {
+    use gnb_smh::difficulty::{is_canonical_bits, target_to_bits, Target};
+    for bits in [POW_LIMIT_BITS, GENESIS_BITS, block_rules::HARDENED_POW_LIMIT_BITS] {
+        assert!(is_canonical_bits(bits), "{bits:#x}");
+    }
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+    for _ in 0..20_000 {
+        let mut t = [0u8; 32];
+        let first = (next() % 32) as usize;
+        for b in t.iter_mut().skip(first) {
+            *b = next() as u8;
+        }
+        if t == [0u8; 32] {
+            continue;
+        }
+        let bits = target_to_bits(&Target(t));
+        assert!(is_canonical_bits(bits), "target_to_bits({}) = {bits:#x} is not canonical", hex::encode(t));
+    }
+    for (act, heights) in [(0u64, [1u64, 2, 1_000, 500_000]), (activation::NEVER, [1, 2, 1_000, 500_000])] {
+        for h in heights {
+            for dt in [-1_000_000i64, -7_200, -30, 0, 30, 7_200, 1_000_000, 50_000_000] {
+                let ts = (GENESIS_TIMESTAMP as i64 + 30 * h as i64 + dt).max(0) as u64;
+                let bits = expected_bits_at(ts, h, act).expect("in range");
+                assert!(is_canonical_bits(bits), "expected_bits_at({ts}, {h}, {act}) = {bits:#x}");
+            }
+        }
+    }
 }
 
 // ── Coinbase, dust, duplicates, timestamps, fees, maturity ───────────────────

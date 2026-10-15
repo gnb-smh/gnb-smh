@@ -1359,6 +1359,34 @@ impl Storage {
         self.db.get_cf(&cf, key.as_bytes()).map_err(|e| StorageError::ReadFailed(e.to_string()))
     }
 
+    /// CF_META key of the network a data dir belongs to (u32 LE chain id).
+    pub const CHAIN_ID_META: &'static str = "chain_id";
+
+    /// Audit POW-9: mainnet and testnet share the genesis block, so the
+    /// genesis check at start-up cannot tell a data dir of the other network
+    /// apart (opening a mainnet data dir on testnet would recheck its blocks
+    /// under testnet's activation schedule and disqualify them). The data dir
+    /// records the chain id it was created for: `Ok(true)` when the marker
+    /// was absent and has been written (a new data dir, or one created before
+    /// the marker existed), `Ok(false)` when it matches, `Err` when it names
+    /// another network.
+    pub fn check_chain_marker(&self, chain_id: u32) -> Result<bool, String> {
+        match self.get_meta(Self::CHAIN_ID_META).map_err(|e| e.to_string())? {
+            None => {
+                self.put_meta(Self::CHAIN_ID_META, &chain_id.to_le_bytes()).map_err(|e| e.to_string())?;
+                Ok(true)
+            }
+            Some(v) if v.as_slice() == chain_id.to_le_bytes() => Ok(false),
+            Some(v) => Err(format!(
+                "this data dir belongs to chain id {} but the node runs chain id {:#010x}",
+                <[u8; 4]>::try_from(v.as_slice())
+                    .map(|b| format!("{:#010x}", u32::from_le_bytes(b)))
+                    .unwrap_or_else(|_| format!("<{} bytes>", v.len())),
+                chain_id,
+            )),
+        }
+    }
+
     // ── Sprint U.1: Undo data for reorg rollback ─────────────────────────
     //
     // Each connected block writes one UndoData record keyed by block hash,
@@ -1821,6 +1849,23 @@ mod sprint_f_tests {
             outputs: vec![mk_output(addr_byte, value)],
             locktime: 0,
         }
+    }
+
+    /// Audit POW-9: a data dir records its network; the other network's node
+    /// is refused, the same network passes, an unmarked dir is marked once.
+    #[test]
+    fn chain_marker_refuses_the_other_network() {
+        let (_t, s) = mk_storage();
+        let main = crate::core::ChainId::Mainnet.to_u32();
+        let test = crate::core::ChainId::Testnet.to_u32();
+        assert_eq!(s.check_chain_marker(main), Ok(true), "first open marks the dir");
+        assert_eq!(s.get_meta(Storage::CHAIN_ID_META).unwrap(), Some(main.to_le_bytes().to_vec()));
+        assert_eq!(s.check_chain_marker(main), Ok(false));
+        let err = s.check_chain_marker(test).unwrap_err();
+        assert!(err.contains("0x474e0001") && err.contains("0x474e0002"), "{err}");
+        assert_eq!(s.get_meta(Storage::CHAIN_ID_META).unwrap(), Some(main.to_le_bytes().to_vec()), "unchanged");
+        s.put_meta(Storage::CHAIN_ID_META, &[1, 2]).unwrap();
+        assert!(s.check_chain_marker(main).unwrap_err().contains("<2 bytes>"));
     }
 
     #[test]

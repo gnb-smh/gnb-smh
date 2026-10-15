@@ -39,7 +39,7 @@ What the vectors do NOT pin:
 | What | Where |
 | --- | --- |
 | Transaction vectors (187 cases) | `reference/tx_vectors.json` |
-| Block vectors (102 cases) | `reference/block_vectors.json` |
+| Block vectors (103 cases) | `reference/block_vectors.json` |
 | Generator (deterministic Rust, seeded keys and signatures) | `crates/gnb-crypto/tests/gen_consensus_vectors.rs` |
 | Runner through gnb-crypto (real pow limit, explicit chain ids) | `crates/gnb-crypto/tests/consensus_vectors.rs` |
 | Runner through the node (connect path, mempool admission, testnet) | `node/tests/consensus_vectors.rs` |
@@ -365,7 +365,7 @@ from in `consensus_vectors_common::classify`):
 | `coinbase-output-count` | the coinbase does not have exactly one output | `coinbase must have 1 output` |
 | `coinbase-value` | the coinbase claims more than subsidy + fees | `miner coinbase output exceeds allowed amount` |
 | `pow-limit` | the target is above the pow limit of the height (POW-3) | runner (`pow_limit_bits_at`) |
-| `bad-bits` | the compact bits do not decode | runner (`try_bits_to_target`) |
+| `bad-bits` | the compact bits do not decode, or are not the canonical encoding of the target they decode to (audit POW-9) | runner (`try_canonical_bits_to_target`, as `Block::validate_pow`) |
 | `bad-pow` | the GnB-SMH output is not below the target of the bits | `Block::validate_pow` false |
 
 Policy classes (`policy.error_class` of a refused case; the
@@ -407,7 +407,7 @@ Transactions (187: 98 pre-activation, 89 post-activation; 66 valid; 182 on mainn
 | `tx64/` | 8 | 63 / 64 / 65-byte txid preimages in both regimes; the mainnet boundary |
 | `bip30/` | 2 | an output on an unspent coin's outpoint (valid pre, invalid post) |
 
-Blocks (102: 42 pre-activation, 60 post-activation; 34 valid):
+Blocks (103: 43 pre-activation, 60 post-activation; 34 valid):
 
 | Area | Cases | What |
 | --- | --- | --- |
@@ -417,7 +417,7 @@ Blocks (102: 42 pre-activation, 60 post-activation; 34 valid):
 | `decode/` | 2 | a valid block's bytes with one varint in the non-minimal 3-byte form (the transaction count post; a coinbase script_sig length pre, with a coinbase locktime ending `FD 00` so that the decoder before the rule, which framed each transaction at its re-encoded length, accepted the bytes as the same block): the decoder accepts only minimal varints, at every height (docs/CONSENSUS.md, "Wire encoding"). The decoder before the rule (the Python reference before H-fuzz too) accepts both byte strings |
 | `commitment/`, `structure/` | 17 | two parents; script_sig of 79 bytes; bad tag; height + 1 and big-endian; parents reordered and dropped; witness root zero, over txids, and with the coinbase's own wtxid; 10,000-byte script_sig (valid) and one byte more (decode); a wrong commitment ignored pre; the mainnet boundary; 256 parents (valid) and 257 (decode) |
 | `same-block-coinbase/` | 3 | valid pre; `connect` scope post; `full` scope post (the commitment cannot match) |
-| `pow/` | 13 | the GnB-SMH proof at the genesis target: a mined nonce (valid) and a failing nonce (`bad-pow`), post; 0x2100ffff evaluated pre (limit only), refused post; the genesis target exactly and one unit above, in both regimes; the mainnet boundary; four malformed bits |
+| `pow/` | 14 | the GnB-SMH proof at the genesis target: a mined nonce (valid) and a failing nonce (`bad-pow`), post; 0x2100ffff evaluated pre (limit only), refused post; the genesis target exactly and one unit above, in both regimes; the mainnet boundary; four malformed bits; a decodable but non-canonical encoding, `0x21007fff` (audit POW-9) |
 | `size/` | 6 | 1 MB blocks: wire 1,000,001 with bincode below (valid pre, invalid post), wire exactly 1,000,000 (valid post), bincode 1,000,001 with wire below (invalid pre, valid post), bincode exactly 1,000,000 (valid pre) |
 | `value/`, `maturity/`, `sig/`, `tx64/`, `bip30/`, `version/`, `witness/` | 18 | the transaction rules inside a block: dust, the block-wide output total above `MAX_SUPPLY_SAT` with every transaction in range (VAL-11), an immature spend, a bad signature, a 64-byte transaction, BIP30 on a spend's and on the coinbase's output, the version rule, a padded witness under the same block id (valid pre, witness commitment post) |
 
@@ -565,6 +565,17 @@ version 1 at it.
   generator also refuses to record `witness-non-canonical` as the refusal
   class of anything but a version-3 transaction at/after the activation. No
   other case changed; `block_vectors.json` is unchanged.
+
+- **Phase 4, package R1b (audit POW-9 residual).** One block case was
+  added, `pow/non-canonical-bits` (bits `0x21007fff`, a decodable but
+  non-canonical encoding of `0x7fff << 240`, whose canonical encoding is
+  `0x207fff00`): `bad-bits` at every height. `Block::validate_pow` now
+  accepts canonical encodings only (`gnb_smh::difficulty::
+  try_canonical_bits_to_target`), and so do the Python model
+  (`gnb_difficulty.is_canonical_bits` in `check_pow_limit`) and the runners'
+  pow-limit stage. No other case changed: every case whose bits decode is
+  canonical, and every block an `expected_bits` check accepts has canonical
+  bits (docs/CONSENSUS.md, "Block header and proof of work").
 
 ## Findings while building the vectors
 

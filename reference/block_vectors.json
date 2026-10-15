@@ -3488,6 +3488,36 @@
    }
   },
   {
+   "id": "pow/non-canonical-bits",
+   "description": "bits 0x21007fff decode (as Bitcoin Core's SetCompact decodes them) to 0x7fff << 240, within the pow limit, but the canonical encoding of that target is 0x207fff00: non-canonical bits never validate (audit POW-9), at every height. No block an expected_bits check accepts is affected (expected bits are always canonical).",
+   "network": "mainnet",
+   "activation_height": "1000",
+   "activation_source": "explicit",
+   "height": "999",
+   "regime": "pre-activation",
+   "scope": "full",
+   "pow": "limit",
+   "prevouts": [],
+   "block": "01000000013a4fcd317475f0734a21a5bb2b56ed0857ef5fccdb212a77ef51627abc8885fe2408fcd68b15dfd925f76e22d86c0bbbfff8ca9e5575cac4d36119b4221358d1f67ec76a00000000ff7f00210000000000000000e703000000000000e7030000000000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2f676e622d626c6f636b2d766563746f72732f626c6f636b2f706f772f6e6f6e2d63616e6f6e6963616c2d626974732fffffffff01030161060000000014c40bed0aae69ce05de9d6f67fa92e42d573a36190000000000",
+   "expected": {
+    "verdict": "invalid",
+    "error_class": "bad-bits"
+   },
+   "derived": {
+    "block_hash": "5471a6a7048d9b246790fe2f97f2b5d0ec8da8cfdf245b697b70495eb97de2d9",
+    "txids": [
+     "2408fcd68b15dfd925f76e22d86c0bbbfff8ca9e5575cac4d36119b4221358d1"
+    ],
+    "legacy_merkle_root": "2408fcd68b15dfd925f76e22d86c0bbbfff8ca9e5575cac4d36119b4221358d1",
+    "tagged_merkle_root": "0304ed373bd8a8dbf1ea51be034852b5f29c2e3254e1de3cec5109ca435f2a27",
+    "witness_root": "d970168d7ab96cf00e27d7600b8ba51e294ef1708fc990ef1758792061211826",
+    "parents_commitment": "5a508f0bb132ab3f9ed46448f7a89f695bf1415e9916844c3903673f535e608a",
+    "subsidy": "107020547",
+    "wire_size": 234,
+    "bincode_size": 205
+   }
+  },
+  {
    "id": "pow/genesis-bits-mined/post",
    "description": "bits = 0x1f0e9036 (the genesis target, the pow limit from the activation) and a nonce (4440) whose GnB-SMH output is below the target: the proof is evaluated and holds.",
    "network": "mainnet",

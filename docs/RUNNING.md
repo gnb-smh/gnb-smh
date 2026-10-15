@@ -21,6 +21,16 @@ The node verifies the snapshot, writes the 452,725 carryover UTXOs, verifies
 the genesis proof of work and starts syncing. Later boots only need
 `--data-dir`; a data-dir from another chain or genesis is refused.
 
+Use one data dir per network. Mainnet and testnet (`--testnet`) share the
+genesis block, so the genesis check alone cannot tell their data dirs apart;
+the data dir records the chain id of the network it was first started on
+(CF_META `chain_id`; a data dir from an earlier release is marked with the
+network of its first start under this release), and a node of the other
+network refuses it with "this data dir belongs to chain id ...". The two
+networks also use different gossip topics and sync protocols, and a node
+disconnects a peer of the other network after the identify exchange
+(docs/CONSENSUS.md, "Networks").
+
 ## Mining
 
 ```sh
