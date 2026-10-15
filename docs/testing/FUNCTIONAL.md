@@ -46,18 +46,28 @@ cargo build -p gnb --features test-pow-limit --bin gnb --bin gnb-cli
 
 `test-pow-limit` (node/Cargo.toml) forwards gnb-crypto's dev feature of the
 same name: every expected target is the pow limit (`0x2100ffff`), so about one
-GnB-SMH evaluation (well under a second) finds a block. Everything else is
-the production code path, including the evaluation itself, which every node
-still runs for every block.
+GnB-SMH evaluation (well under a second) finds a block. The pow limit
+itself is pinned to that value too (`Block::pow_limit_target_for_height`),
+which is the largest target compact bits can encode: a block above the pow
+limit (POW-9, and POW-3's lower limit after the activation) cannot be built
+with this binary, and those rules are covered by Rust tests only. Everything
+else is the production code path, including the evaluation itself, which
+every node still runs for every block.
 
 The feature is consensus-breaking, so it is fenced in four ways:
 
 | Guard | Where | What it checks |
 | --- | --- | --- |
-| Runtime refusal | `test_pow_limit_guard`, node/src/main.rs | A test build started without `--testnet` exits with code 2 before it creates the data dir, opens a port or reads a key file. Unit tests `test_pow_limit_guard_tests`; functional test `feature_test_build_guard.py`. |
-| No release build | `compile_error!` in node/src/main.rs | `--features test-pow-limit` with the release profile does not compile. |
-| CI assertion | job `workspace-test`, step "Artifact builds never enable test-pow-limit" | The workspace build graph (`cargo tree -e features,normal,build -i gnb-crypto`) does not reach the feature, it is not a default feature of `gnb`, and the binary CI built gets past the guard (it is not a test build). |
+| Runtime refusal | `test_pow_limit_guard`, node/src/main.rs | Keyed on gnb-crypto's `TEST_POW_LIMIT`, so it holds however the feature was enabled. An optimised build (debug assertions off: the release profile) with it exits with code 2 on every network. A debug build with it exits with code 2 without `--testnet`, before it creates the data dir, opens a port or reads a key file, and runs on `--testnet`. Unit tests `test_pow_limit_guard_tests`; functional test `feature_test_build_guard.py`. |
+| No release build of the node feature | `compile_error!` in node/src/main.rs | `--features test-pow-limit` with the release profile does not compile. gnb-crypto's feature reached another way (`--features gnb-crypto/test-pow-limit`, or the dev-dependency that `cargo test --release` unifies into the binary) compiles, and the runtime refusal stops that binary. |
+| CI assertion | job `workspace-test`, step "Artifact builds never enable test-pow-limit" | Before `cargo test` runs: the workspace build graph (`cargo tree -e features,normal,build -i gnb-crypto`) does not reach the feature, it is not a default feature of `gnb`, and the binary CI built gets past the guard (it is not a test build). |
 | Framework probe | `binaries.verify_test_build` | Before any test runs, the binary must refuse mainnet with the guard message; a production binary, or a test binary without the guard, fails the suite. |
+
+What is not fenced: after a plain `cargo test`, `target/debug/gnb` is a
+debug test build (the node's dev-dependency enables the feature for every
+target cargo builds in that invocation). It refuses mainnet and runs on
+testnet, like the binary the functional tests build on purpose. No artifact
+is a debug build.
 
 Because the test build refuses mainnet, every functional test runs on
 testnet, where the hardening activation height is 0 (see
@@ -78,10 +88,14 @@ rebuild during a run cannot swap them.
 3. starts the nodes (`node.py`, `TestNode`) and connects them
    (`setup_network`, default: node *i* dials nodes 0..*i*-1);
 4. runs `run_test()`;
-5. on failure prints the tail of every node's log;
-6. always stops every node (SIGTERM, then SIGKILL) and removes the temp dir,
-   also when the test is interrupted (SIGTERM / SIGINT are turned into an
-   exception that unwinds through the cleanup).
+5. always stops every node (SIGTERM, then SIGKILL), also when the test is
+   interrupted (SIGTERM / SIGINT are turned into an exception that unwinds
+   through the cleanup), and fails the test, even when `run_test()` passed,
+   if a node had exited on its own (a crash; `kill()` is the deliberate
+   way), exited on SIGTERM with another code or needed SIGKILL, or logged a
+   panic (`panicked at` anywhere in its log: a panic in a spawned task does
+   not end the process);
+6. on failure prints the tail of every node's log; removes the temp dir.
 
 Every node runs with:
 
@@ -122,18 +136,24 @@ tests running in parallel share it. Only `db/` is copied into a node (its
   tagged Merkle root, wire encoding) and `submitblock`. The node computes
   GnB-SMH; on "invalid PoW" (probability 2^-16 at the pow limit) the next
   nonce is tried. Deterministic: no background miner.
+- The node caches `getblocktemplate` while its DAG tips are unchanged: a new
+  block misses the cache at once, a mempool change shows within 5 s
+  (`TEMPLATE_CACHE_TTL`, as Bitcoin Core). `generate` uses
+  `node.fresh_template()`, which waits until the template offers every
+  mempool transaction (at most one cache period).
 - `node.start(mine=True, miner_address=...)`: the node's own miner (`--mine`,
   one thread), for tests of the production mining loop. A miner started with
-  `--peer` waits for the 30 s network heartbeat and a remote tip before it
-  mines (fresh-miner fork guard); start it without peers when that matters.
+  `--peer` waits for a connected peer and a remote tip before it mines
+  (fresh-miner fork guard); start it without peers when that matters.
 
 ### Synchronisation helpers
 
 - `wait_until(predicate, timeout=...)`: polls; every timeout scales with
   `--timeout-factor`.
 - `wait_for_peers(pairs=...)`: both ends log `✓ connected: <peer id>`, then
-  two gossipsub heartbeats. The RPC peer count is only refreshed by the
-  30 s network heartbeat, so it is not used.
+  two gossipsub heartbeats. (The RPC peer count, distinct peers, is updated
+  on every connect and disconnect; the log line is still the earliest
+  signal.)
 - `sync_blocks()`: same selected tip and same valid tips
   (`getblocktemplate` parents) on every node. `getdaginfo.tips` also lists
   disqualified blocks a node keeps in its DAG (DAG-1), which only the node
@@ -159,36 +179,39 @@ types the password at the prompt, exactly as a user would:
 | `p2p_block_propagation.py` | 3, line topology | The internal miner's blocks reach the far node through the middle one (validate-then-relay); afterwards every node has the same block at every height, each paying the miner; a block submitted at the far end travels back. |
 | `mempool_tx_relay.py` | 3 | `gnb-cli send` (version 3 transaction) reaches every mempool with the same bytes and fee; a block mined elsewhere confirms it on all nodes; balances and UTXO lists agree; a second payment from another node does the same. |
 | `wallet_coinbase_maturity.py` | 1 | `getutxos` marks coinbase outputs; `gnb-cli send` never selects an immature one, and a wallet with only immature coins refuses before signing. |
-| `feature_partition_heal.py` | 3 | A partition with competing branches (one confirming a payment) heals: the branch with more blue work is selected everywhere, both branch tips are kept, a merging block joins them, and every node ends with the same chain state and the same payment status. |
+| `feature_partition_heal.py` | 3 | A partition with competing branches (one confirming a payment) heals within 30 s: the branch with more blue work is selected everywhere, both branch tips are kept, a merging block joins them, and every node ends with the same chain state. The payment follows the ledger rule: unconfirmed on every node while its branch is off the selected chain (payee empty, the payment back in side A's mempools), then confirmed in the merging block on every node, the payee holding exactly 3 GNB. |
 | `feature_restart_persistence.py` | 2 | Stop/start keeps tip, tips, heights, block hashes, balances, tx index and P2P identity; the mempool is memory-only by design and a re-broadcast re-admits the transaction; SIGKILL right after a block is accepted loses nothing. |
-| `mining_getblocktemplate_submitblock.py` | 2 | External mining: template fields and coinbase commitment match the Python encoding; a Python-built block is accepted, relayed and becomes the template's parent at once; duplicates refused; a mempool transaction is offered with its fee; a coinbase claiming one satoshi too much is refused and not relayed; two blocks on one template are both kept and merged by the next template. |
+| `mining_getblocktemplate_submitblock.py` | 2 | External mining: template fields and coinbase commitment match the Python encoding; a Python-built block is accepted, relayed and becomes the template's parent at once (the cached template never outlives the tips); duplicates refused; a mempool transaction is offered with its fee within the 5 s template cache period; a coinbase claiming one satoshi too much is refused and not relayed; two blocks on one template are both kept and merged by the next template. |
 | `rpc_auth.py` | 2 | `getblocktemplate`, `submitblock`, `sendrawtransaction` without or with a wrong key: 401 / -32001 and no effect; a wrong key is refused for reads too and answered slowly; the key works as `X-API-Key` and `Bearer`; browser Origin / foreign Host refused; batches refused; `gnb-cli` without the key cannot write; `GNB_RPC_REQUIRE_AUTH_FOR_READS=1`; start-up refusals (auth without key, loose or empty key file, short key). |
-| `p2p_invalid_blocks_txs.py` | 3 | Invalid transactions (malformed, coinbase, duplicate input, missing input, outputs above inputs, dust, version 1, forged signature, conflict, duplicate) and invalid blocks (malformed, bad / legacy Merkle root, every coinbase-commitment defect, no / two coinbases, duplicate tx, bits above the limit or unexpected, wrong height, unknown parent, timestamps, coinbase over-claim, two coinbase outputs, a confirmed tx again) are rejected with the right reason, never move the tip and never reach the observer node; a valid block afterwards is relayed at once. |
+| `p2p_invalid_blocks_txs.py` | 3 | Invalid transactions (malformed, coinbase, duplicate input, missing input, outputs above inputs, dust, version 1, forged signature, conflict, duplicate) and invalid blocks (malformed, bad / legacy Merkle root, every coinbase-commitment defect, no / two coinbases, duplicate tx, undecodable or unexpected bits, wrong height, unknown parent, timestamps, coinbase over-claim, two coinbase outputs, a confirmed tx again: BIP30) are rejected with the right reason and never move the tip. None of them is delivered to the observer node: checked on its receipt trace (every gossiped block is logged at info, every gossiped transaction with the debug target `gnb_gossip_rx_tx`), not on its storage, since the observer would drop most of them itself; the trace does show the valid transaction and blocks node0 relays. |
 | `feature_activation_testnet.py` | 2 | Testnet activation 0: the template announces the hardened rules at height 1; the pre-activation block format, and each half of the change alone, is rejected at height 1; the hardened block is accepted; blocks from the internal miner satisfy the rules, checked in Python. |
 
-The whole suite takes about 100 s with two jobs (plus about 100 s once to
-build the cached chain); the partition test is the longest (about 75 s, see
-below). CI (`.github/workflows/ci.yml`, job `functional`) builds the test
+The whole suite takes about 75 s with two jobs (plus about 100 s once to
+build the cached chain); no test takes more than about 25 s. CI (`.github/workflows/ci.yml`, job `functional`) builds the test
 binaries and runs `test_runner.py --jobs 2 --timeout 300`, uploading the logs
 of failed tests.
 
 ## Behaviour the tests rely on (and document)
 
-- The RPC peer count, and the miner's "has peers" check, are refreshed by the
-  30 s network heartbeat.
+- The RPC peer count, and the miner's "has peers" check, count distinct
+  peers and change on every connect and disconnect.
 - A disqualified block stays in the DAG and in `getdaginfo.tips` (DAG-1), but
   is never selected, never offered as a parent and never relayed.
 - The mempool is not persisted across restarts.
 - Peer exchange ignores loopback addresses unless `--allow-private-peers`, so
   a test's topology is exactly what its `--peer` flags say.
-- After a partition heals, convergence takes about 60 s without new blocks:
-  the header and tip pulls a peer's higher tip claim triggers are sent to the
-  pull selector's choice, not to the claiming peer, and an on-connect tip
-  announcement to a second peer within the same second is dropped as a
-  gossipsub duplicate, so the 30 s nudge and the 60 s periodic announce do
-  the work. (A pulled block a peer does not have, `BlockNotFound`, used to
-  wait for those sweeps too; it is now retried on another peer at once.) The
-  test allows 120 s.
+- After a partition heals, nodes converge in a few seconds without new
+  blocks (4-7 s in `feature_partition_heal.py`, counted from node2 being
+  back up, the 2 s connection settle included): on connect each node asks
+  the new peer for its
+  frontier directly (a directed `GetTips`), and a tip claim ahead of ours
+  makes the node ask the claiming peer for its frontier. A pulled block a
+  peer does not have (`BlockNotFound`) is retried on another peer at once.
+  Before these, the on-connect gossip announcements to a second peer within
+  the same second were dropped as gossipsub duplicates and the claim-
+  triggered pulls went to the pull selector's choice, so the 30 s nudge and
+  the 60 s announce did the work (about 60 s; the test then allowed 120 s).
+  The test allows 30 s.
 
 ## Out of scope
 
@@ -198,6 +221,10 @@ of failed tests.
   `node/tests`.
 - The mainnet side of the activation (110,000): unreachable by a build that
   refuses mainnet; covered by Rust tests with `activation::scoped_override`.
+- A target above the pow limit (POW-9, POW-3): the test build pins the pow
+  limit to the largest encodable target, so no such block exists for it;
+  covered by `validate_pow_enforces_the_height_pow_limit` and the
+  difficulty tests.
 - An invalid proof of work at the pow limit (a failing nonce occurs once in
   2^16 evaluations; Python would need minutes per evaluation to find one).
   Covered by `gnb-crypto` and `node` unit tests.
@@ -250,6 +277,3 @@ the framework was written against):
   rolling minimum fee under a full pool, expiry across restarts, and
   re-broadcast of unconfirmed transactions (today only a mining node
   re-broadcasts), each end to end on three nodes like `mempool_tx_relay.py`.
-- Once claim-triggered pulls go to the claiming peer and on-connect tip
-  announcements are not deduplicated away, tighten
-  `feature_partition_heal.py`'s convergence bound from 120 s.
