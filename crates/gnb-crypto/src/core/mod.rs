@@ -165,7 +165,8 @@ pub const SIG_SIZE:     usize = 4 + 3309 + 1462; // 4775
 
 /// True when built with the `test-pow-limit` feature, which pins every
 /// expected target to the pow limit so tests do not depend on the wall clock.
-/// Consensus-breaking; the node refuses to start when this is set.
+/// Consensus-breaking; a node binary with it refuses mainnet, and an
+/// optimised one every network (node/src/main.rs `test_pow_limit_guard`).
 pub const TEST_POW_LIMIT: bool = cfg!(feature = "test-pow-limit");
 
 /// Easiest target the chain accepts below the hardening activation (≈ one
@@ -1115,8 +1116,9 @@ impl Block {
     /// The pow limit `validate_pow` enforces for a block at header height
     /// `height` under the process-wide activation height. Under the dev-only
     /// `test-pow-limit` feature every expected target is pinned to
-    /// `POW_LIMIT_BITS`, so the limit stays `POW_LIMIT_BITS` there too (the
-    /// node refuses to start with that feature).
+    /// `POW_LIMIT_BITS`, so the limit stays `POW_LIMIT_BITS` there too (a
+    /// node binary with that feature refuses mainnet; POW-9 / POW-3 are
+    /// therefore not reachable in the functional tests).
     pub fn pow_limit_target_for_height(height: u64) -> [u8; 32] {
         if TEST_POW_LIMIT {
             return bits_to_target(POW_LIMIT_BITS);

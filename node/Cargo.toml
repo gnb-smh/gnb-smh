@@ -55,10 +55,12 @@ mobile  = ["dep:x509-parser", "dep:ciborium"]
 # FUNCTIONAL TESTS ONLY (test/functional, docs/testing/FUNCTIONAL.md): forwards
 # gnb-crypto's dev feature, which pins every expected target to the pow limit
 # (about one GnB-SMH evaluation per block). Consensus-breaking, so it is off by
-# default and never part of an artifact: the binary refuses to start on
-# mainnet with it (`test_pow_limit_guard` in main.rs), a release-profile build
-# with it does not compile, and CI asserts that the default build graph does
-# not enable it (.github/workflows/ci.yml, job `workspace-test`).
+# default and fenced: a binary with gnb-crypto's feature, however enabled,
+# refuses to start on mainnet, and an optimised one on every network
+# (`test_pow_limit_guard` in main.rs); a release-profile build with THIS
+# feature does not compile; CI asserts that the default build graph does not
+# enable it and that the binary it builds is not a test build
+# (.github/workflows/ci.yml, job `workspace-test`).
 #   cargo build -p gnb --features test-pow-limit --bin gnb --bin gnb-cli
 test-pow-limit = ["gnb-crypto/test-pow-limit"]
 
