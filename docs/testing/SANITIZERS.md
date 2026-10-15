@@ -139,10 +139,10 @@ clock access). What runs:
 
 | Crate | Tests | Notes |
 | --- | --- | --- |
-| `gnb-smh` | every unit test (compact bits, chain work, ASERT including the AUD-1 wide multiply and shift, the lane-level Keccak step, the scratchpad) and `tests/difficulty_vectors.rs` | `tests/vectors.rs` ignored (below) |
+| `gnb-smh` | every unit test (compact bits, chain work, ASERT including the AUD-1 wide multiply and shift, the lane-level Keccak step, the scratchpad), `tests/difficulty_vectors.rs` and `tests/vectors.rs` (the Python PoW vectors with log2_n = 1 and 2) | the log2_n = 10 and 19 PoW vectors skipped (below) |
 | `gnb-crypto` | `core::limits`, `core::tokenomics`, `core::block_rules` (Merkle roots, coinbase branch, coinbase commitment, witness root), `core::sighash`, `core::activation` (29 tests) | `v3_cost_is_linear_in_the_input_count` ignored |
 | `pqcrypto-internals` | the library tests: the `unsafe extern "C"` RNG entry point and the thread-local seeded-RNG stack, including guard drops after TLS destruction | the two re-exec tests ignored |
-| `gnb-smh` on `i686-unknown-linux-gnu` and `s390x-unknown-linux-gnu` | the same `gnb-smh` tests on a 32-bit and a big-endian target | `miri-cross`; std for the target is built by `cargo miri setup` |
+| `gnb-smh` on `i686-unknown-linux-gnu` and `s390x-unknown-linux-gnu` | the same `gnb-smh` tests on a 32-bit and a big-endian target, including the whole PoW pipeline against the Python reference | `miri-cross`; std for the target is built by `cargo miri setup` |
 
 Result: no undefined behaviour (`gnb-smh` 19 unit and 4 vector tests,
 `gnb-crypto` 29 tests, `pqcrypto-internals` 15 tests). The `miri` mode takes
@@ -164,7 +164,7 @@ ignored with the reason in the attribute:
 | `gnb-smh` `low_anchor_bits_match_legacy_order` | 132-point grid over the same ranges (~132,000 natively) | ~0.45 s per point (bit-by-bit legacy shifts) |
 | `gnb-smh` `tests/difficulty_vectors.rs` | the vector file is parsed once per binary | 35 s per parse; natively unchanged |
 | `gnb-crypto` Merkle tests (`legacy_root_is_bit_identical_...`, `duplicate_last_mutation_...`, `coinbase_branch_reproduces_the_root`) | trees up to 5 leaves (17 natively) | SHA-256 cost; empty, single, odd and even levels and a carried-up node are still covered |
-| `gnb-smh` `matches_python_reference` | ignored | 64 MiB scratchpads and at least 2^11 Keccak permutations per vector |
+| `gnb-smh` `matches_python_reference` | the 10 vectors with log2_n = 1 and 2 (all 17 natively); fails if fewer than 10 ran | log2_n = 10 and 19 cost 2^11 and 2^20 Keccak permutations per vector; log2_n <= 2 is at most 8 inner permutations and still runs seed, fill, data-dependent mix and final digest |
 | `gnb-crypto` `v3_cost_is_linear_in_the_input_count` | ignored | ~300 Keccak permutations of byte counting; its arithmetic also runs in `v3_commits_to_every_field` |
 | `pqcrypto-internals` `os_rng_failure_aborts_instead_of_failing_open`, `null_buffer_aborts_instead_of_failing_open` | ignored | they re-execute the test binary (`std::process::Command`), which Miri does not support |
 | `pqcrypto-internals` `tests/vendor_pin.rs` | not run (`--lib`) | reads files (isolation); no unsafe code |
@@ -183,10 +183,19 @@ Positive controls:
   constructing invalid value of type &mut [u8]: encountered a dangling
   reference (going beyond the bounds of its allocation)` at the
   `slice::from_raw_parts_mut` call, the case ASan misses.
-- Endianness: writing the PoW lanes with `to_ne_bytes` instead of
-  `to_le_bytes` in `gnb-smh`'s `lanes_to_bytes` passes every native test on
-  x86_64, the Python reference vectors included (little-endian hides it), and
-  fails `step_matches_shake256` under Miri on s390x.
+- Endianness: each of four byte-order slips in `gnb-smh` passes every
+  native test on x86_64, the Python reference vectors included
+  (little-endian hides them), and fails `matches_python_reference` under Miri
+  on s390x (`cargo miri test -p gnb-smh --target s390x-unknown-linux-gnu
+  --test vectors`, 6 to 12 s): `u64::from_ne_bytes` in `bytes_to_lanes`
+  ("fill log2_n=1 nonce=0"), `nonce.to_ne_bytes()` in `seed` ("seed log2_n=1
+  nonce=1"), `len.to_ne_bytes()` in `enc` ("seed log2_n=1 nonce=0") and
+  `to_ne_bytes` in `lanes_to_bytes` (also caught by `step_matches_shake256`).
+  The first three were invisible to Miri until the log2_n = 1 and 2 vectors
+  existed: the only independent PoW check, `tests/vectors.rs`, was ignored
+  under Miri, and the unit tests compare outputs only with each other
+  (review finding; the reviewer's own log2_n = 1 known answer for
+  `(b"gnb", 0)`, `62665881...45d7af5`, is one of the new vectors).
 
 ## 32-bit build and tests (`i686`)
 

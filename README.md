@@ -102,7 +102,7 @@ Research prototype, not yet wired into the node.
 | Path | What it is |
 | --- | --- |
 | `reference/gnb_smh.py` | GnB-SMH normative definition (Python standard library only) |
-| `reference/check_vectors.py`, `test_vectors.json` | 7 PoW vectors and the checker of both vector files |
+| `reference/check_vectors.py`, `test_vectors.json` | 17 PoW vectors (log2_n = 1, 2, 10, 19) and the checker of both vector files |
 | `reference/gnb_difficulty.py` | Difficulty normative definition: compact bits, chain work, ASERT, GnB's difficulty input |
 | `reference/gen_difficulty_vectors.py`, `difficulty_vectors.json` | Compact, chain-work, ASERT and multi-parent expected-bits vectors, checked by `crates/gnb-smh` and `crates/gnb-crypto` |
 | `reference/gnb_sighash.py`, `sighash_vectors.json` | Transaction signature digests (sighash v2 byte by byte, sighash v3, v3 component messages) and their vectors (`python3 reference/gnb_sighash.py` regenerates them), checked by `crates/gnb-crypto/tests/sighash_vectors.rs` |
