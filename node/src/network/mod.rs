@@ -1232,7 +1232,12 @@ impl NetworkNode {
         let mut recent_block_publishes: std::collections::HashMap<[u8; 32], std::time::Instant> =
             std::collections::HashMap::new();
         const REGOSSIP_SUPPRESS_TTL: Duration = Duration::from_secs(30);
-        let mut heartbeat   = tokio::time::interval(Duration::from_secs(30));
+        // First tick after one period, not at once: at start-up no connection
+        // is established yet, so an immediate tick saw 0 peers and re-dialed
+        // every bootstrap peer the loop above had just dialed (two
+        // connections per peer).
+        let mut heartbeat   = tokio::time::interval_at(
+            tokio::time::Instant::now() + HEARTBEAT_PERIOD, HEARTBEAT_PERIOD);
         let mut save_peers  = tokio::time::interval(Duration::from_secs(60));
         // Sprint CC: periodic tip announce (every 60s).
         let mut tip_announce = tokio::time::interval(Duration::from_secs(60));
@@ -1312,6 +1317,21 @@ impl NetworkNode {
                                             let ht = clamp_announced_blue_score(*height, our_count);
                                             peer_state.observe_claim(a, bs, ht, now);
                                             claim_ok = true;
+                                            // A claim ahead of us: pull the frontier
+                                            // from its AUTHOR, the peer known to have
+                                            // it. The processor's own pulls for this
+                                            // claim go to the selector's choice
+                                            // (rotation, NET-9), often a peer without
+                                            // the blocks. Tips answers are
+                                            // deduplicated by the frontier tracker, so
+                                            // the extra pull fetches nothing twice
+                                            // (Headers answers are not: header pulls
+                                            // stay with the processor). Bounded by
+                                            // the per-author claim limiter above.
+                                            if claim_warrants_directed_pull(bs, our_score) {
+                                                send_directed_pull(&mut swarm, &mut selector, &mut inflight_pull, a,
+                                                    NetworkMessage::GetTips, now);
+                                            }
                                         }
                                     }
                                     if let NetworkMessage::Version { version, user_agent, .. } = &msg {
@@ -1350,13 +1370,22 @@ impl NetworkNode {
                                 }
                             }
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                             info!("✓ connected: {}", peer_id);
                             // DO NOT call gossipsub.add_explicit_peer() here: explicit
                             // peers are excluded from the mesh (libp2p-gossipsub
                             // behaviour.rs), which once made the mesh unbuildable.
-                            peer_count = peer_count.saturating_add(1);
-                            crate::metrics::set_peer_count(peer_count as i64);
+                            let first_connection = num_established.get() == 1;
+                            // The count is of distinct peers, not connections, and the
+                            // processor (RPC `peers`, the miner's has-peers check) sees
+                            // it at once, not at the next 30 s heartbeat.
+                            if first_connection {
+                                peer_count = peer_count.saturating_add(1);
+                                crate::metrics::set_peer_count(peer_count as i64);
+                                sink.deliver(NetworkMessage::PeerCount {
+                                    count: peer_count, addresses: known_peers.iter().cloned().collect(),
+                                }, InboundOrigin::Local, "connect");
+                            }
                             peer_state.on_connect(peer_id, Instant::now());
                             selector.on_connect(peer_id);
                             // PROPAGAÇÃO-CHURN fix: persist only the canonical form of
@@ -1416,6 +1445,18 @@ impl NetworkNode {
                                 attempts: MAX_PULL_ATTEMPTS,
                                 tried: vec![peer_id],
                             }, peer_id));
+                            // Directed frontier exchange with the new peer: its tips,
+                            // asked of IT. The gossip announcements above reach a
+                            // second peer connecting within the same second as
+                            // byte-identical frames, which gossipsub drops as
+                            // duplicates, so a healed partition used to wait for
+                            // the 30 s nudge / 60 s announce (about 60 s;
+                            // test/functional/feature_partition_heal.py). Both ends
+                            // do this, so each learns the other's frontier now.
+                            if first_connection {
+                                send_directed_pull(&mut swarm, &mut selector, &mut inflight_pull, peer_id,
+                                    NetworkMessage::GetTips, now);
+                            }
                             drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, now);
                         }
                         // Mesh fix (fresh-joiner IBD): THIS event is the moment the
@@ -1452,9 +1493,12 @@ impl NetworkNode {
                         }
                         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                             info!("✗ disconnected: {}", peer_id);
-                            peer_count = peer_count.saturating_sub(1);
-                            crate::metrics::set_peer_count(peer_count as i64);
                             if num_established == 0 {
+                                peer_count = peer_count.saturating_sub(1);
+                                crate::metrics::set_peer_count(peer_count as i64);
+                                sink.deliver(NetworkMessage::PeerCount {
+                                    count: peer_count, addresses: known_peers.iter().cloned().collect(),
+                                }, InboundOrigin::Local, "disconnect");
                                 peer_state.on_disconnect(&peer_id);
                                 selector.on_disconnect(&peer_id);
                             }
@@ -1834,6 +1878,37 @@ fn requeue_pull(pending: &mut std::collections::VecDeque<PendingPull>, mut p: Pe
     if pending.len() < MAX_PENDING_PULLS {
         pending.push_back(p);
     }
+}
+
+/// Period of the network heartbeat (peer count, housekeeping, re-subscribe,
+/// bootstrap re-dial with no peers).
+const HEARTBEAT_PERIOD: Duration = Duration::from_secs(30);
+
+/// Whether a tip claim, clamped to `claimed` (blue score), is worth a directed
+/// pull from its author: only a claim ahead of our own selected tip.
+fn claim_warrants_directed_pull(claimed: u64, our_score: u64) -> bool {
+    claimed > our_score
+}
+
+/// Send the pull `msg` (GetTips / GetHeaders / GetBlock / PeerRequest) to
+/// `peer` itself, bypassing the selector's choice: a request about THAT
+/// peer's state (its frontier on connect; the headers and frontier it claims
+/// to have). Never retried on another peer (`attempts` = MAX_PULL_ATTEMPTS);
+/// the answer flows through the same `on_pull_response` / processor path as
+/// any other pull.
+fn send_directed_pull(
+    swarm:    &mut libp2p::Swarm<BlochBehaviour>,
+    selector: &mut sync_rr::PullPeerSelector,
+    inflight: &mut std::collections::HashMap<libp2p::request_response::OutboundRequestId, (PendingPull, PeerId)>,
+    peer:     PeerId,
+    msg:      NetworkMessage,
+    now:      std::time::Instant,
+) {
+    let Some(req) = sync_rr::as_pull_request(&msg) else { return };
+    let id = swarm.behaviour_mut().sync_rr.send_request(&peer, req.clone());
+    debug!("→ directed pull [{}] to {} (its own state)", msg.kind_name(), peer);
+    selector.on_sent(peer, now);
+    inflight.insert(id, (PendingPull { msg, req, attempts: MAX_PULL_ATTEMPTS, tried: vec![peer] }, peer));
 }
 
 /// The answer `response` from `peer` to a directed pull (`entry`: the pull
