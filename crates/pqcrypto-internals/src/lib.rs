@@ -322,13 +322,24 @@ mod tests {
         parked.push(core::mem::ManuallyDrop::new(with_seeded_rng(seed)));
     }
 
-    /// Late drop of guards the scope already cleaned up removes nothing.
+    /// Late drop of guards the scope already cleaned up removes nothing: a
+    /// live sentinel override pushed first must survive those drops, still
+    /// active and at the start of its stream. (Called with an empty stack, so
+    /// without the sentinel a wrong `SeededRngGuard::drop` could not show.)
     fn drop_parked(parked: Vec<core::mem::ManuallyDrop<SeededRngGuard>>) {
-        let before = SEEDED_RNG_STACK.with(|s| s.borrow().len());
+        assert!(SEEDED_RNG_STACK.with(|s| s.borrow().is_empty()));
+        let sentinel_seed = [9; 32];
+        let sentinel = with_seeded_rng(&sentinel_seed);
         for guard in parked {
             drop(core::mem::ManuallyDrop::into_inner(guard));
         }
-        assert_eq!(SEEDED_RNG_STACK.with(|s| s.borrow().len()), before);
+        assert_eq!(SEEDED_RNG_STACK.with(|s| s.borrow().len()), 1, "a late drop removed the live override");
+        let (mut want, mut got) = ([0; 32], [0; 32]);
+        ChaCha20Rng::from_seed(sentinel_seed).fill_bytes(&mut want);
+        randombytes_fill(&mut got).unwrap();
+        assert_eq!(got, want, "a late drop disturbed the live override's stream");
+        drop(sentinel);
+        assert!(SEEDED_RNG_STACK.with(|s| s.borrow().is_empty()));
     }
 
     #[test]
