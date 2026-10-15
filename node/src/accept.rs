@@ -670,7 +670,9 @@ struct MarkClears {
     /// Marks of genuine connect-time consensus failures: removed only by the
     /// batch that RE-VALIDATES the block (it is in the committed plan's
     /// `to_apply`, every block of which `connect_plan` validated in its own
-    /// context). A block the move does not apply keeps its mark.
+    /// context; `resolve_best_chain` lifts the consensus mark of every such
+    /// block). A block the move does not apply keeps its mark, also in memory
+    /// ([`remark_unvalidated`]).
     if_applied: Vec<BlockHash>,
 }
 
@@ -679,7 +681,11 @@ struct MarkClears {
 /// DAG record is folded into the commit batch when `stage_trigger_record` (a
 /// new insertion, not a body replacement). `log` accumulates the
 /// disqualified roots and the dropped bodies; `clears` lists persisted marks
-/// to delete in the same batch (operator `reconsiderblock`).
+/// to delete in the same batch (operator `reconsiderblock`). Whatever the
+/// caller, a committed move also deletes the persisted consensus or inherited
+/// mark of every block it applies (validated in its own context just before):
+/// an applied block never carries a mark that would disqualify it again at
+/// the next start.
 ///
 /// A block of the plan whose body fails a rule that depends on witness bytes
 /// its id does not commit to (below the hardening activation) is NOT
@@ -793,13 +799,30 @@ fn resolve_best_chain(
                     stage_dag_record_for(dag, st, batch, &t)?;
                 }
             }
-            // Operator `reconsiderblock`: a consensus mark goes only with
-            // the batch that re-validated its block (`connect_plan` validated
-            // every block of `to_apply` before this runs).
-            for h in clears.always.iter()
-                .chain(clears.if_applied.iter().filter(|h| plan.to_apply.contains(h)))
-            {
+            // Operator `reconsiderblock`: the marks it removes in any case.
+            for h in &clears.always {
                 st.stage_clear_invalid_block(batch, h).map_err(|e| e.to_string())?;
+            }
+            // A consensus (or inherited) mark goes with the batch that
+            // RE-VALIDATED its block: `connect_plan` validated every block of
+            // `to_apply` in its own context before this runs. This covers the
+            // `reconsiderblock` marks (`clears.if_applied`) and any stale mark
+            // whose block connects through an ordinary acceptance, so an
+            // applied block never keeps a mark that would disqualify it again
+            // at the next restart.
+            for h in &plan.to_apply {
+                if let Some(reason) = st.invalid_block_reason(h).map_err(|e| e.to_string())? {
+                    match mark_kind(&reason) {
+                        MarkKind::Consensus | MarkKind::Inherited => {
+                            st.stage_clear_invalid_block(batch, h).map_err(|e| e.to_string())?;
+                        }
+                        // Never lifted by a connect: only `reconsiderblock`
+                        // removes these (it re-checks a hardening mark).
+                        kind @ (MarkKind::Operator | MarkKind::Hardening) => warn!(
+                            "block {} connects although it carries a persisted {:?} mark ({}); \
+                             the mark is kept", hex::encode(&h[..8]), kind, reason),
+                    }
+                }
             }
             stage_invalid_marks(dag, st, batch, &log_snapshot)?;
             // COH-2: the shielded state of the plan, in the same batch.
@@ -2199,6 +2222,10 @@ fn apply_operator_override(
         }
         Err(m) => return Err(OverrideError::Failed(m)),
     };
+    // First, before anything reads the valid tips (the next template height
+    // below, the TipChanged parents): the consensus marks this move did not
+    // re-validate are persisted still, so they hold in memory again.
+    remark_unvalidated(dag, store, &clears.if_applied);
     match resolution {
         Resolution::Unchanged => {
             persist_unchanged(dag, store, None, &rlog.invalid, &clears.always)?;
@@ -2214,15 +2241,6 @@ fn apply_operator_override(
             // (never the new tip's header height + 1, DAG-8).
             let next_height = crate::template::next_template_height(&dag.read(), store);
             update_mempool_after_connect(store, mempool, &outcome, next_height);
-        }
-    }
-    // A consensus mark whose block this move did not re-validate (it is not
-    // applied now, and was not disqualified again) stays persisted: mark it
-    // in memory again. It is not an ancestor of the new applied tip (that one
-    // was applied), so the selected tip does not move.
-    for r in &clears.if_applied {
-        if !store.has_undo_data(r).unwrap_or(false) && !dag.read().is_invalid(r) {
-            dag.write().mark_invalid(*r);
         }
     }
     let (tip, tip_height, score) = {
@@ -2256,6 +2274,31 @@ fn apply_operator_override(
         }
     }
     Ok(ChainOverride { tip, tip_height, rolled_back, connected, affected })
+}
+
+/// After a committed `reconsiderblock` move: every consensus mark in
+/// `if_applied` whose block the move did not re-validate (not applied now)
+/// is still persisted, so it holds in memory again, as a persistent root.
+/// Also when the block is already disqualified in memory only through a
+/// body-pending mark (its stored body was just rejected for a
+/// witness-dependent reason, or it waits for an ancestor's body): that mark
+/// is cleared when a body arrives, and without the root the block would
+/// then connect while `invalid_block/<id>` stays on disk, to be disqualified
+/// again at the next start (review of the P3 merge). The block is not an
+/// ancestor of the applied tip (it is not applied), so the selected tip does
+/// not move. Call before anything reads the valid tips.
+fn remark_unvalidated(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    if_applied: &[BlockHash],
+) {
+    for r in if_applied {
+        // A read error counts as "still persisted" (the stricter memory).
+        let persisted = store.invalid_block_reason(r).map(|m| m.is_some()).unwrap_or(true);
+        if persisted && !store.has_undo_data(r).unwrap_or(false) {
+            dag.write().mark_invalid(*r);
+        }
+    }
 }
 
 /// After an override that committed nothing: restore the in-memory marks from

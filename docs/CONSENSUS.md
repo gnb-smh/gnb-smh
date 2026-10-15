@@ -257,7 +257,12 @@ hardening block rules (start-up recheck of blocks an older release stored) is
 removed only if the stored body now passes those rules; a mark for a
 connect-time failure is removed only by the atomic batch that connects the
 block after validating it again in its own context (a block the move does not
-connect keeps its mark; one that fails again is disqualified again). On a
+connect keeps its mark, on disk and in memory, also when the move dropped its
+stored body as witness-rejected; one that fails again is disqualified again).
+Conversely every committed move — an override or an ordinary acceptance —
+deletes the connect-time or inherited mark of each block it applies, which it
+has just validated in its own context, so an applied block never carries a
+mark that would disqualify it again at the next start. On a
 pruned node, an override whose new chain needs pruned bodies changes nothing,
 requests the next (at most 4,096) of those bodies and asks to be retried.
 

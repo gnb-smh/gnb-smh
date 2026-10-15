@@ -977,6 +977,180 @@ fn merge_reconsiderblock_revalidates_consensus_and_hardening_marks() {
     assert!(n.dag.read().is_invalid(&b3h), "the other marks are untouched");
 }
 
+/// Review of the P3 merge (1): `reconsiderblock` on a block R whose
+/// consensus mark an older release wrote for a relay-altered body (the
+/// pre-P1 behaviour) that it still stores. The move re-validates that body,
+/// the witness-dependent failure drops it and R waits for another body; R
+/// was not applied, so its mark stays on disk — and now also in memory (as a
+/// persistent root, not only through the body-pending mark). Pre-fix the
+/// re-mark skipped R (already invalid through the pending mark), the honest
+/// body then connected R's chain while `invalid_block/R` stayed on disk, and
+/// the next restart disqualified R again and rolled the node back off the
+/// chain it followed. Now memory and disk agree throughout; a second
+/// `reconsiderblock` with the honest body re-validates R, connects it and
+/// lifts the mark, and a restart keeps the node there.
+#[test]
+fn merge_reconsidered_mark_is_kept_until_its_block_is_revalidated() {
+    let genesis = mk_genesis(unix_now() - 50_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0x6Au8; 32], 0u32, out(5_000_000, &k.spk));
+    let mut b = Builder::new(&genesis);
+    let a = b.chain(gh, 3, "ka");
+    let a_tip = a.last().unwrap().block_hash();
+    let pay = signed_spend(&k, &[(fund.0, fund.1)], vec![out(4_900_000, &[0xB8; 20])]);
+    let r = b.with_txs(vec![gh], "kr", 100_000, vec![pay.clone()]);
+    let rh = r.block_hash();
+    let mut bb = vec![r.clone()];
+    bb.extend(b.chain(rh, 4, "kb")); // R + 4: heavier than A
+    let b_tip = bb.last().unwrap().block_hash();
+    let mut bad = r.clone();
+    bad.transactions[1].inputs[0].script_sig[100] ^= 0x01;
+    assert_eq!(bad.block_hash(), rh, "same id below the activation");
+    let only_b = node_with(&genesis, std::slice::from_ref(&fund));
+    deliver(&only_b, &bb);
+
+    // The state an older release left: R disqualified with a consensus
+    // reason, its relay-altered body stored, the node on A.
+    let mut n = node_with(&genesis, std::slice::from_ref(&fund));
+    deliver(&n, &a);
+    deliver(&n, &bb);
+    assert_eq!(tip_meta(&n), b_tip);
+    invalidate(&n, rh).expect("leave B");
+    assert_eq!(tip_meta(&n), a_tip);
+    {
+        let mut batch = rocksdb::WriteBatch::default();
+        n.store.stage_invalid_block(&mut batch, &rh, "invalid hybrid signature (older release)").unwrap();
+        n.store.write_batch(batch).unwrap();
+    }
+    n.store.put_block_body(&bad).unwrap();
+    restart(&mut n);
+    let reason = n.store.invalid_block_reason(&rh).unwrap().expect("marked");
+    assert_eq!(accept::mark_kind(&reason), accept::MarkKind::Consensus);
+    assert_eq!(tip_meta(&n), a_tip);
+
+    // reconsiderblock: the stored body fails for a witness-dependent reason,
+    // is dropped, and R waits for another body. The move does not apply R.
+    let r1 = reconsider(&n, rh).expect("reconsiderblock");
+    assert_eq!((r1.tip, r1.connected), (a_tip, 0));
+    assert!(!n.store.has_block_body(&rh).unwrap(), "the rejected body is dropped");
+    assert!(accept::awaits_body(&n.dag, &n.store, &rh), "a body is wanted");
+    assert_eq!(n.store.invalid_block_reason(&rh).unwrap().as_deref(), Some(reason.as_str()),
+        "not re-validated: the mark stays on disk");
+    assert!(n.dag.read().is_invalid_persistently(&rh),
+        "... and in memory, as a persistent root (pre-fix: only the body-pending mark)");
+
+    // The honest body arrives as the answer to the node's pull: stored, but
+    // R stays disqualified, as on disk. Pre-fix: B connected here with the
+    // mark still on disk.
+    let mut core = BlockIngress::new();
+    assert!(matches!(feed(&mut core, &n, &r), BlockOutcome::BodyRestored));
+    assert!(n.store.has_block_body(&rh).unwrap());
+    assert_eq!(tip_meta(&n), a_tip, "a persisted mark keeps its block off the chain");
+    assert!(n.dag.read().is_invalid(&rh));
+    assert!(n.store.invalid_block_reason(&rh).unwrap().is_some());
+    // A restart changes nothing (pre-fix: it rolled the node back off B).
+    restart(&mut n);
+    assert_eq!((sel_tip(&n), tip_meta(&n)), (Some(a_tip), a_tip));
+
+    // reconsiderblock again: the honest body is re-validated, B connects and
+    // the mark goes in the same batch.
+    let r2 = reconsider(&n, rh).expect("reconsiderblock");
+    assert_eq!(r2.tip, b_tip);
+    assert_eq!(tip_meta(&n), b_tip);
+    assert!(n.store.invalid_block_reason(&rh).unwrap().is_none());
+    assert_eq!(digest(&n), digest(&only_b));
+    restart(&mut n);
+    assert_eq!((sel_tip(&n), tip_meta(&n)), (Some(b_tip), b_tip));
+    assert_eq!(digest(&n), digest(&only_b));
+}
+
+/// Review of the P3 merge (1, the stronger guard): a connect deletes the
+/// persisted consensus or inherited mark of every block it applies (each was
+/// just validated in its own context), whatever triggered it — here an
+/// ordinary acceptance, for marks memory does not hold. Pre-fix only an
+/// operator override's batch removed marks, so an applied block could keep
+/// one and be disqualified again (the node rolled back) at the next restart.
+#[test]
+fn merge_a_connect_lifts_stale_marks_of_the_blocks_it_applies() {
+    let genesis = mk_genesis(unix_now() - 50_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let a = b.chain(gh, 4, "sa");
+    let fork = b.chain(gh, 3, "sb"); // lighter, stored unapplied
+    let mut n = node_with(&genesis, &[]);
+    deliver(&n, &a);
+    deliver(&n, &fork);
+    assert_eq!(tip_meta(&n), a.last().unwrap().block_hash());
+    let (f1, f2) = (fork[0].block_hash(), fork[1].block_hash());
+    {
+        let mut batch = rocksdb::WriteBatch::default();
+        n.store.stage_invalid_block(&mut batch, &f1, "bad-txns-inputs-missingorspent (stale)").unwrap();
+        n.store.stage_invalid_block(&mut batch, &f2,
+            &format!("{}{} is invalid", accept::INHERITED_REASON_PREFIX, hex::encode(&f1[..8]))).unwrap();
+        n.store.write_batch(batch).unwrap();
+    }
+    assert!(!n.dag.read().is_invalid(&f1), "memory does not hold the marks");
+    // The fork grows past A and connects through f1, f2.
+    let more = b.chain(fork.last().unwrap().block_hash(), 3, "sc");
+    deliver(&n, &more);
+    let tip = more.last().unwrap().block_hash();
+    assert_eq!(tip_meta(&n), tip);
+    assert!(n.store.invalid_block_reason(&f1).unwrap().is_none(), "consensus mark lifted by the connect");
+    assert!(n.store.invalid_block_reason(&f2).unwrap().is_none(), "inherited mark lifted by the connect");
+    restart(&mut n);
+    assert_eq!((sel_tip(&n), tip_meta(&n)), (Some(tip), tip), "no rollback at the next start");
+}
+
+/// Review of the P3 merge (2): `reconsiderblock` computed the mempool's next
+/// block height while the consensus marks it had lifted (to let the move
+/// re-validate them) were still lifted in memory, and only re-marked them
+/// afterwards. Here the reconsidered block b2 lies on a TALL but lighter
+/// branch (a 5-block chain against a 2-high wide DAG, heavier under the
+/// hardened rules' Kaspa blue work): the move stays on the wide DAG and b2
+/// keeps its mark, but pre-fix the branch tip counted as a template parent
+/// for the next height (6 instead of 3) until the next acceptance —
+/// admission, eviction and wallets used the wrong height.
+#[test]
+fn merge_reconsiderblock_sets_the_next_height_after_restoring_marks() {
+    let _hardened = gnb::core::activation::scoped_override(0);
+    let genesis = mk_genesis(unix_now() - 50_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let b1 = b.empty(vec![gh], "nb1");
+    // Its coinbase claims fees it does not collect: fails its connect.
+    let b2 = b.with_txs(vec![b1.block_hash()], "nb2", 100_000, vec![]);
+    let b2h = b2.block_hash();
+    let tall = b.chain(b2h, 3, "nb"); // b3..b5, DAG height 5
+    let tall_tip = tall.last().unwrap().block_hash();
+    let par: Vec<Block> = (0..6).map(|i| b.empty(vec![gh], &format!("na{i}"))).collect();
+    let m = b.empty(par.iter().map(|x| x.block_hash()).collect(), "nm"); // DAG height 2, heavier
+    let n = node_with(&genesis, &[]);
+    assert!(n.dag.read().is_hardened_at(1));
+    deliver(&n, &[b1.clone(), b2.clone()]);
+    deliver(&n, &tall);
+    let reason = n.store.invalid_block_reason(&b2h).unwrap().expect("b2 fails its connect");
+    assert_eq!(accept::mark_kind(&reason), accept::MarkKind::Consensus, "{reason}");
+    deliver(&n, &par);
+    deliver(&n, std::slice::from_ref(&m));
+    assert_eq!(tip_meta(&n), m.block_hash());
+    let next = |n: &Node| gnb::template::next_template_height(&n.dag.read(), &n.store);
+    assert_eq!(next(&n), 3);
+    assert_eq!(n.mempool.next_height(), 3);
+    let mut tips = n.tip_tx.subscribe();
+
+    let r = reconsider(&n, b2h).expect("reconsiderblock");
+    assert_eq!((r.tip, r.connected, r.rolled_back), (m.block_hash(), 0, 0));
+    assert!(n.dag.read().is_invalid(&tall_tip), "b2 keeps its mark: its branch is not a template parent");
+    assert!(n.store.invalid_block_reason(&b2h).unwrap().is_some());
+    assert_eq!(next(&n), 3);
+    assert_eq!(n.mempool.next_height(), 3, "the pool's next height is the template's (pre-fix: 6)");
+    let changed = tips.try_recv().expect("TipChanged");
+    assert!(!changed.parents.contains(&tall_tip));
+    assert_eq!(changed.parents.iter().map(|p| b.height(p)).max().unwrap() + 1, 3,
+        "the announced template and the pool agree");
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // DAG-11 residual: interrupted pre-fix commit → detect, rebuild
 // ═════════════════════════════════════════════════════════════════════════════

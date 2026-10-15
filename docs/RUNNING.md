@@ -103,7 +103,9 @@ mark unless it is re-validated — a block that failed the hardening block rules
 at start-up (stored by an older release) only if its stored body now passes
 them, a block that failed in its chain context only when the move connects it
 after validating it again (a block that really is invalid is disqualified
-again). Both
+again; a block the move cannot connect yet, for example because its stored
+body is rejected and dropped or a body below it must be re-fetched, keeps its
+mark: run `reconsiderblock` again once the body is back). Both
 are persisted and survive restarts, and they are the RPC methods of the same
 name (parameter: the block hash in hex). They are never served to an
 anonymous caller: they need the configured API key (`--rpc-api-key` /
