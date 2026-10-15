@@ -372,6 +372,15 @@ fn seeds() -> BTreeMap<&'static str, Vec<Vec<u8>>> {
     // stays in the DAG so that a merger is accepted in every order).
     d.push(vec![0, 1, 2, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0x11, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0x12,
         1, 0, 2, 0, 1, 0, 0x80, 0, 0, 0, 0, 0x13, 2, 0, 1, 0]);
+    // Wrong difficulty bits that still meet their own (easy) target (flags 3:
+    // one mantissa unit below the pow limit; flags 0x48: half of it): the
+    // block passes the proof-of-work check and is refused by accept_block's
+    // difficulty rule, its child stays an orphan, an honest sibling is
+    // accepted. Legacy rules, then the hardening rules from genesis.
+    let wrong_bits = |act: u8, flags: u8| vec![act, 0, 2, 0, 0, 0, 0, 0, flags, 0, 0, 0, 0, 0x31,
+        0, 0, 1, 0, 0x80, 0, 0, 0, 0, 0x32, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0x33, 0, 0, 0, 0];
+    d.push(wrong_bits(0, 3));
+    d.push(wrong_bits(1, 0x48));
     m.insert("accept_dag", d);
     m
 }

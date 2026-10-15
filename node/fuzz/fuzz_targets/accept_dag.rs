@@ -10,7 +10,18 @@
 //! signed spends of four funded outputs (two conflicting families, chains of
 //! spends, version 3 or 1, a broken signature, a missing input), and
 //! deliberate faults (coinbase over-claim, wrong height, wrong bits,
-//! timestamp before a parent, a duplicated transaction).
+//! timestamp before a parent, a duplicated transaction). The wrong-bits
+//! block is sealed at its own (wrong but easy) target, so it is refused by
+//! `accept_block`'s difficulty rule, not by the proof-of-work check.
+//!
+//! Not covered here: with `test-pow-limit` the expected bits are always the
+//! pre-activation pow limit and `validate_pow` enforces that limit at every
+//! height, so neither the ASERT schedule nor the hardened pow limit of audit
+//! POW-3 (the genesis target) is exercised by this target, under any of its
+//! activation regimes. Both are covered by gnb-crypto's own tests (run
+//! without the feature: `expected_bits_at`, `pow_limit_bits_at`,
+//! `validate_pow` at the hardened limit); the ASERT arithmetic is also
+//! fuzzed by `pow_decode` (with the pre-activation pow limit only).
 //!
 //! The same block set is delivered to two fresh nodes in two different
 //! arrival orders (the build order and an input-chosen permutation; a block
@@ -19,6 +30,9 @@
 //! * no panic anywhere in the pipeline;
 //! * both nodes end with the same selected tip, the same applied tip, the
 //!   same UTXO set (digest of every entry) and the same DAG block set;
+//! * a block built with a wrong height, a timestamp before a parent, wrong
+//!   difficulty bits or a duplicated transaction is in neither node's DAG
+//!   (refused whatever the arrival order);
 //! * optionally, a node reloaded from its own storage (`reconcile_on_startup`,
 //!   as after a restart) ends in that same state.
 #![no_main]
@@ -165,6 +179,11 @@ fn signed(s: Slot, v3_digest: bool) -> Transaction {
 struct Built {
     block: Block,
     hash: [u8; 32],
+    /// A fault every node must refuse, whatever the arrival order: a wrong
+    /// header height, a timestamp before a parent, wrong difficulty bits, a
+    /// duplicated transaction. (A coinbase over-claim is not one of them: the
+    /// block stays in the DAG, disqualified at connect time, audit DAG-1.)
+    must_refuse: Option<&'static str>,
 }
 
 /// Build up to MAX_BLOCKS sealed blocks from the input.
@@ -197,9 +216,18 @@ fn build(inp: &mut Input, genesis: &Block) -> Vec<Built> {
         // Few distinct timestamps: blocks recur across inputs and the proof of
         // work cache (keyed by block id) keeps the target fast.
         let ts = if flags % 23 == 2 { parent_ts.saturating_sub(1) } else { parent_ts + 1 + inp.below(4) as u64 };
-        let mut bits = pow::expected_bits(parent_ts, header_height).expect("expected bits");
+        let expected = pow::expected_bits(parent_ts, header_height).expect("expected bits");
+        let mut bits = expected;
         if flags % 23 == 3 {
-            bits = core::GENESIS_BITS; // not the expected bits
+            // Wrong bits that still seal: a target within the pow limit that
+            // one or two evaluations meet (one mantissa unit below the limit,
+            // or half of it), so the block passes the proof-of-work check of
+            // `validate_structure` and reaches `accept_block`'s difficulty
+            // rule ("invalid difficulty"). A target as hard as the genesis
+            // target would almost never seal, and its block would only ever
+            // be refused as "invalid PoW".
+            bits = if flags & 0x40 == 0 { 0x2100_FFFE } else { 0x2100_8000 };
+            assert_ne!(bits, expected, "the wrong-bits fault must not be the expected bits");
         }
         let hardened = block_rules::rules_active(header_height);
 
@@ -217,7 +245,8 @@ fn build(inp: &mut Input, genesis: &Block) -> Vec<Built> {
             txs.push(signed(slot, activation::hardening_active_at(header_height)));
             fees += STEP_FEE;
         }
-        if flags % 23 == 4 && !txs.is_empty() {
+        let duplicated = flags % 23 == 4 && !txs.is_empty();
+        if duplicated {
             txs.push(txs[0].clone()); // duplicate transaction
         }
         let mut cb_value = core::tokenomics::block_subsidy_sat(header_height);
@@ -253,17 +282,23 @@ fn build(inp: &mut Input, genesis: &Block) -> Vec<Built> {
             b.transactions[0].inputs[0].script_sig = block_rules::coinbase_script_sig(&c, &extra);
         }
         b.header.merkle_root = b.body_merkle_root();
-        // Seal (bad bits never validate: leave such a block unsealed).
-        if flags % 23 != 3 {
-            let mut tries = 0;
-            while !b.validate_pow() && tries < 64 {
-                b.header.nonce += 1;
-                tries += 1;
-            }
+        // Seal every block, the wrong-bits fault included (its target is
+        // within the pow limit and met after about two tries at worst).
+        let mut tries = 0;
+        while !b.validate_pow() && tries < 64 {
+            b.header.nonce += 1;
+            tries += 1;
         }
         let hash = b.block_hash();
         known.push((hash, header_height, ts));
-        out.push(Built { block: b, hash });
+        let must_refuse = match flags % 23 {
+            1 => Some("a wrong height"),
+            2 => Some("a timestamp before its parent"),
+            3 => Some("wrong difficulty bits"),
+            4 if duplicated => Some("a duplicated transaction"),
+            _ => None,
+        };
+        out.push(Built { block: b, hash, must_refuse });
     }
     out
 }
@@ -309,6 +344,14 @@ fn deliver(n: &Node, b: &Built) -> Result<[u8; 32], String> {
     accept::accept_block(
         &b.block, b.hash, b.block.height, &n.dag, &n.store, &n.mempool, &n.node_state, None, &n.shielded,
     )
+}
+
+/// `ACCEPT_DAG_LOG=1` prints every delivery verdict of the first arrival
+/// order to stderr (`accept_dag A b<i>: ok | <rejection>`), to see which
+/// rules a corpus reaches when replaying it.
+fn verbose() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("ACCEPT_DAG_LOG").is_some())
 }
 
 /// Deliver `blocks` in `order`; a block with an unknown parent waits and is
@@ -409,6 +452,11 @@ fuzz_target!(|data: &[u8]| {
 
     let a = new_node(&g);
     let log_a = run(&a, &blocks, &natural);
+    if verbose() {
+        for l in &log_a {
+            eprintln!("accept_dag A {l}");
+        }
+    }
     let mut b = new_node(&g);
     let log_b = run(&b, &blocks, &perm);
     let (sa, sb) = (state(&a, &blocks), state(&b, &blocks));
@@ -416,6 +464,14 @@ fuzz_target!(|data: &[u8]| {
         sa, sb,
         "arrival order changed the outcome (activation {act})\norder A {natural:?}: {log_a:#?}\norder B {perm:?}: {log_b:#?}"
     );
+    for (i, blk) in blocks.iter().enumerate() {
+        if let Some(fault) = blk.must_refuse {
+            assert!(
+                !sa.dag_blocks[i] && !sb.dag_blocks[i],
+                "b{i} with {fault} was accepted (activation {act})\norder A {natural:?}: {log_a:#?}\norder B {perm:?}: {log_b:#?}"
+            );
+        }
+    }
     if do_restart {
         restart(&mut b);
         let sr = state(&b, &blocks);
