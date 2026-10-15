@@ -1510,9 +1510,13 @@ pub fn recheck_stored_blocks_under_hardening(
 ///    CF_DAG record — the footprint of the pre-fix, non-atomic extension
 ///    commit crashing between "apply UTXO effects" and "persist DAG data"
 ///    (audit VAL-4 / DAG-11). Its inputs would otherwise read as spent and the
-///    block would be refused forever on re-receipt;
+///    block would be refused forever on re-receipt. The tip pointer (and the
+///    shielded tip) is set, in the same batch, to the block the UTXO set then
+///    describes: the heaviest DAG block that holds an undo record, even when
+///    step 1 disqualified it (not the DAG's selected tip);
 /// 3. if the applied tip pointer is not the best valid block, connect the
-///    best valid chain with the same atomic machinery as `accept_block`.
+///    best valid chain with the same atomic machinery as `accept_block` (a
+///    rollback-only plan when step 1 disqualified applied blocks).
 ///
 /// Every step is idempotent and cheap (one scan of CF_UNDO keys). New writes
 /// can no longer produce a state that needs step 2: an extension now commits
@@ -1550,10 +1554,13 @@ pub fn reconcile_on_startup(
 
     // Step 2: applied-but-unrecorded blocks.
     let mut orphan_applied: Vec<(u64, BlockHash)> = Vec::new();
-    for h in store.undo_block_hashes().map_err(|e| e.to_string())? {
+    let mut orphan_parents: Vec<BlockHash> = Vec::new();
+    let undo_hashes = store.undo_block_hashes().map_err(|e| e.to_string())?;
+    for &h in &undo_hashes {
         if !dag.read().has_block(&h) {
             if let Ok(Some(b)) = store.get_block(&h) {
                 orphan_applied.push((b.height, h));
+                orphan_parents.extend_from_slice(&b.header.parents);
             } else {
                 warn!("reconcile: undo record for unknown block {} without a body; ignoring",
                     hex::encode(&h[..8]));
@@ -1563,37 +1570,58 @@ pub fn reconcile_on_startup(
     if !orphan_applied.is_empty() {
         orphan_applied.sort_by(|a, b| b.cmp(a)); // tip-first
         let to_rollback: Vec<BlockHash> = orphan_applied.iter().map(|(_, h)| *h).collect();
-        let back_to = dag.read().selected_tip();
+        // Once they are gone, the UTXO set describes the chain of the DAG
+        // blocks that still hold an undo record (every connect writes one,
+        // every disconnect deletes it), so its tip is the heaviest of those:
+        // they are all its ancestors. Neither pointer the node keeps is a
+        // witness for it:
+        // - the DAG's selected tip: step 1 may have disqualified applied
+        //   blocks (they stay applied until step 3 disconnects them), and a
+        //   pre-fix reorg that crashed before its DAG write left the UTXO set
+        //   on a branch the DAG alone does not select;
+        // - meta tip_hash: that crashed reorg had not rewritten it, and the
+        //   crashed extension may have written it as the unrecorded block;
+        // - the unrecorded blocks' parents: a pre-fix binary that kept
+        //   running after the crash connected later blocks on top of them.
+        // Pointing the tip (and the shielded tip) at a block the UTXO set does
+        // not sit on would leave effects applied under a tip that excludes
+        // them, or drop effects of blocks it includes, with nothing to
+        // repair it. When no DAG block holds an undo record (genesis has
+        // none; a chain connected before undo records existed neither) the
+        // unrecorded blocks sit on their selected parent. Step 3 then moves
+        // the chain from this real applied tip to the best valid block.
+        let back_to = {
+            let d = dag.read();
+            let recorded: Vec<BlockHash> = undo_hashes.iter().copied().filter(|h| d.has_block(h)).collect();
+            d.heaviest_among(&recorded).or_else(|| d.heaviest_among(&orphan_parents))
+        };
+        let Some(back_to) = back_to else {
+            return Err(format!(
+                "reconcile: {} block(s) have applied UTXO effects but no DAG record, and the DAG holds \
+                 neither an applied block nor one of their parents, so the chain position of the UTXO \
+                 set is unknown; resynchronize this data directory",
+                to_rollback.len()));
+        };
         warn!(
             "reconcile: {} block(s) have applied UTXO effects but no DAG record (interrupted \
-             pre-fix commit); rolling them back atomically",
-            to_rollback.len()
+             pre-fix commit); rolling them back atomically to {}",
+            to_rollback.len(), hex::encode(&back_to[..8])
         );
         // COH-2: these blocks predate shielded persistence; the shielded tip
         // follows the UTXO tip in the same batch.
-        let staged_shielded = match back_to {
-            Some(t) => Some(shielded.write().stage_retip(store, &to_rollback, t)
-                .map_err(|e| format!("reconcile rollback: {e}"))?),
-            None => None,
-        };
-        let plan = reorg::ReorgPlan { lca: back_to.unwrap_or([0u8; 32]), to_rollback, to_apply: vec![] };
+        let staged_shielded = shielded.write().stage_retip(store, &to_rollback, back_to)
+            .map_err(|e| format!("reconcile rollback: {e}"))?;
+        let plan = reorg::ReorgPlan { lca: back_to, to_rollback, to_apply: vec![] };
         let validate = |_: &dyn UtxoView, _: &core::Block| -> Result<(), String> { Ok(()) };
         let stage_extra = |st: &storage::Storage, batch: &mut rocksdb::WriteBatch| -> Result<(), String> {
-            if let Some(t) = back_to {
-                st.stage_meta(batch, "tip_hash", &t).map_err(|e| e.to_string())?;
-            }
-            if let Some(s) = &staged_shielded {
-                s.stage_into(st, batch)?;
-            }
-            Ok(())
+            st.stage_meta(batch, "tip_hash", &back_to).map_err(|e| e.to_string())?;
+            staged_shielded.stage_into(st, batch)
         };
         let hooks = ConnectHooks { validate: &validate, stage_extra: &stage_extra };
         let result = reorg::connect_plan(store, &plan, &hooks);
-        if let Some(s) = staged_shielded {
-            match &result {
-                Ok(_) => shielded.write().commit_staged(s),
-                Err(_) => shielded.write().revert_staged(s),
-            }
+        match &result {
+            Ok(_) => shielded.write().commit_staged(staged_shielded),
+            Err(_) => shielded.write().revert_staged(staged_shielded),
         }
         result.map_err(|e| format!("reconcile rollback: {}", e))?;
     }

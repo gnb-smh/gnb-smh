@@ -1526,6 +1526,20 @@ impl GhostDAG {
         }).expect("parents non-empty")
     }
 
+    /// The block GhostDAG ranks heaviest among `blocks`, in the order of
+    /// parent selection (highest blue_work, then blue_score, then hash),
+    /// considering only the blocks this DAG holds; `None` when it holds none
+    /// of them. Validity plays no part: a chain-disqualified block ranks like
+    /// any other. A block ranks strictly above each of its parents (its
+    /// blue_work is at least its selected parent's, its blue_score larger),
+    /// so among blocks that are all ancestors of one block B (B included),
+    /// this is B. Start-up reconciliation uses it to find the block the UTXO
+    /// set sits on (audit DAG-11).
+    pub fn heaviest_among(&self, blocks: &[BlockHash]) -> Option<BlockHash> {
+        let known: Vec<BlockHash> = blocks.iter().copied().filter(|p| self.store.has(p)).collect();
+        (!known.is_empty()).then(|| self.select_parent(&known))
+    }
+
     /// Classify mergeset blocks as blue or red.
     ///
     /// A block C from the mergeset is blue if BOTH:
