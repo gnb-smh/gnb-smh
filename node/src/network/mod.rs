@@ -428,6 +428,17 @@ pub struct SyncEntry {
 // String headers before the bounds check rejects it. That is bounded and
 // short-lived (not the multi-GB pre-allocation this fixes), but tightening it
 // to zero would need a custom `Deserialize` impl — not done here.
+//
+// 32-bit targets (i686, wasm32, 32-bit ARM; the audit's CRY-8 class): bincode
+// 2.0.1's serde bridge reads every sequence and map length with
+// `usize::decode`, which casts the declared u64 with `as usize`. There a
+// declared length of 2^32 + n decodes as n, so a frame every 64-bit node
+// rejects (it announces more bytes than it has) decoded on a 32-bit node into
+// a different message (found by running the node's tests on i686:
+// `wire_decode_rejects_multi_gb_declared_vec`, docs/testing/SANITIZERS.md).
+// The one-encoding rule (`WireDecodeError::NonCanonical`) refuses it on every
+// target: the decoded message re-encodes with a 1- to 5-byte length, not the
+// 9 bytes the frame used.
 
 /// Hard ceiling on any single gossip frame. Must match gossipsub's
 /// `max_transmit_size` configured in `run()`.
@@ -486,16 +497,26 @@ pub enum WireDecodeError {
     /// let an attacker make any request byte-unique (fresh gossip message id)
     /// and so bypass gossipsub's de-duplication.
     TrailingBytes(usize),
+    /// The frame decoded but is not the encoding of what it decoded to:
+    /// bincode accepts non-minimal varints (`FB 05 00` for 5), so without
+    /// this check one message had many byte encodings, each a fresh gossip
+    /// message id — the NET-7 de-duplication bypass without trailing bytes
+    /// (fuzz target `netmsg_decode`, docs/testing/FUZZING.md). A compliant
+    /// encoder never produces them.
+    NonCanonical,
 }
 
 impl WireDecodeError {
-    /// Oversized and bounds-violating frames are deliberate protocol
-    /// violations — a compliant node cannot produce them. Malformed frames
-    /// may just be a newer/older protocol version.
+    /// Oversized, bounds-violating, padded and non-canonical frames are
+    /// deliberate protocol violations — a compliant node cannot produce them.
+    /// Malformed frames may just be a newer/older protocol version.
     pub fn is_protocol_violation(&self) -> bool {
         matches!(
             self,
-            WireDecodeError::Oversized(_) | WireDecodeError::Bounds(_) | WireDecodeError::TrailingBytes(_)
+            WireDecodeError::Oversized(_)
+                | WireDecodeError::Bounds(_)
+                | WireDecodeError::TrailingBytes(_)
+                | WireDecodeError::NonCanonical
         )
     }
 }
@@ -526,7 +547,11 @@ pub fn decode_wire_message(data: &[u8]) -> Result<NetworkMessage, WireDecodeErro
         Err(e) => return Err(WireDecodeError::Malformed(e.to_string())),
     };
     validate_wire_bounds(&msg)?;
-    Ok(msg)
+    // One encoding per message: the frame must be what the encoder writes.
+    match bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {
+        Ok(canonical) if canonical == data => Ok(msg),
+        _ => Err(WireDecodeError::NonCanonical),
+    }
 }
 
 /// Explicit bounds on every variable-length field of NetworkMessage.
@@ -3091,6 +3116,82 @@ mod tests {
             match decode_wire_message(&padded) {
                 Err(e @ WireDecodeError::TrailingBytes(4)) => assert!(e.is_protocol_violation()),
                 other => panic!("trailing bytes must be rejected, got {:?}", other.map(|m| m.kind_name())),
+            }
+        }
+    }
+
+    /// The frame must be the canonical encoding of the message it decodes to.
+    ///
+    /// (a) NET-7 on every target: a non-minimal varint (the enum tag, an
+    ///     integer field, a length) is a byte-distinct frame of the same
+    ///     message, so a fresh gossip message id. Each decoded before the
+    ///     check, on x86_64 too.
+    /// (b) CRY-8 on 32-bit targets: a `block_data` length of 2^32 + 3 written
+    ///     as a 9-byte varint, then 3 bytes. A 64-bit node rejects it (read
+    ///     limit); on i686 bincode truncated the length to 3 and the frame
+    ///     decoded as a 3-byte `block_data`. Now rejected on every target.
+    #[test]
+    fn wire_decode_requires_the_canonical_encoding() {
+        let msg = NetworkMessage::NewBlock {
+            block_hash: [0u8; 32],
+            blue_score: 5,
+            height:     9,
+            block_data: vec![7u8; 3],
+        };
+        let cfg = bincode::config::standard();
+        let enc = bincode::serde::encode_to_vec(&msg, cfg).unwrap();
+        assert!(decode_wire_message(&enc).is_ok(), "the canonical frame decodes");
+        // Layout guard: tag, 32 hash bytes, blue_score 5, height 9, len 3, data.
+        assert!(enc[0] < 0xFB, "single-byte enum tag");
+        assert_eq!(&enc[33..35], &[5, 9], "bincode encoding layout changed; update this test");
+        assert!(enc.ends_with(&[3, 7, 7, 7]), "bincode encoding layout changed; update this test");
+        let head = &enc[..enc.len() - 4];
+
+        let splice = |at: usize, len: usize, with: &[u8]| -> Vec<u8> {
+            let mut f = enc[..at].to_vec();
+            f.extend_from_slice(with);
+            f.extend_from_slice(&enc[at + len..]);
+            f
+        };
+        let mut non_minimal = vec![
+            ("enum tag as u16", splice(0, 1, &[0xFB, enc[0], 0])),
+            ("blue_score as u16", splice(33, 1, &[0xFB, 5, 0])),
+            ("height as u64", splice(34, 1, &[0xFD, 9, 0, 0, 0, 0, 0, 0, 0])),
+            ("length as u16", splice(head.len(), 1, &[0xFB, 3, 0])),
+            ("length as u32", splice(head.len(), 1, &[0xFC, 3, 0, 0, 0])),
+            ("length as u64", splice(head.len(), 1, &[0xFD, 3, 0, 0, 0, 0, 0, 0, 0])),
+        ];
+        let mut truncated = head.to_vec();
+        truncated.push(0xFD);
+        truncated.extend_from_slice(&((1u64 << 32) + 3).to_le_bytes());
+        truncated.extend_from_slice(&[7, 7, 7]);
+        non_minimal.push(("length 2^32 + 3", truncated));
+
+        for (what, frame) in &non_minimal {
+            // Every non-minimal frame still carries the same logical message:
+            // bincode itself accepts it (on 64-bit targets except the length
+            // of 2^32 + 3, which only 32-bit targets accept).
+            if *what != "length 2^32 + 3" || cfg!(target_pointer_width = "32") {
+                let (m, used): (NetworkMessage, usize) =
+                    bincode::serde::decode_from_slice(frame, cfg).expect(what);
+                assert_eq!(used, frame.len(), "{what}");
+                assert_eq!(
+                    bincode::serde::encode_to_vec(&m, cfg).unwrap(),
+                    enc,
+                    "{what}: the same message as the canonical frame"
+                );
+            }
+            match decode_wire_message(frame) {
+                // 64-bit targets: the 9-byte length announces 2^32 + 3 bytes
+                // and the frame ends after 3 (Malformed, as before).
+                Err(e) if *what == "length 2^32 + 3" && cfg!(target_pointer_width = "64") => {
+                    assert!(matches!(e, WireDecodeError::Malformed(_)), "{what}: {e:?}");
+                }
+                Err(e) => {
+                    assert!(e.is_protocol_violation(), "{what}: {e:?}");
+                    assert!(matches!(e, WireDecodeError::NonCanonical), "{what}: {e:?}");
+                }
+                Ok(m) => panic!("{what}: a non-canonical frame must not decode, got {}", m.kind_name()),
             }
         }
     }

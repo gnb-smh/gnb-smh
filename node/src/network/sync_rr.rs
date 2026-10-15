@@ -320,12 +320,23 @@ pub fn decode_frame<M: for<'de> Deserialize<'de>>(buf: &[u8]) -> io::Result<M> {
     Ok(msg)
 }
 
+/// [`decode_frame`] plus the one-encoding rule of the gossip path
+/// (`network::WireDecodeError::NonCanonical`): bincode accepts non-minimal
+/// varints, so the frame must equal the re-encoding of what it decoded to.
+fn decode_canonical<M: Serialize + for<'de> Deserialize<'de>>(buf: &[u8]) -> io::Result<M> {
+    let msg: M = decode_frame(buf)?;
+    if encode_frame(&msg)? != buf {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "non-canonical sync frame (non-minimal varint)"));
+    }
+    Ok(msg)
+}
+
 /// Decode + bounds-validate an inbound [`SyncRequest`]. The directed-sync
 /// analogue of `network/mod.rs::decode_wire_message` for the gossip path:
 /// same read-limit discipline, same per-field bounds, so a peer cannot use
 /// the directed protocol to bypass limits enforced on the gossip one.
 pub fn decode_request(buf: &[u8]) -> io::Result<SyncRequest> {
-    let req: SyncRequest = decode_frame(buf)?;
+    let req: SyncRequest = decode_canonical(buf)?;
     validate_sync_request_bounds(&req)?;
     Ok(req)
 }
@@ -336,7 +347,7 @@ pub fn decode_request(buf: &[u8]) -> io::Result<SyncRequest> {
 /// (2000) the gossip path enforces, and the processor would then walk the
 /// whole thing and issue a `GetBlock` per unknown entry.
 pub fn decode_response(buf: &[u8]) -> io::Result<SyncResponse> {
-    let resp: SyncResponse = decode_frame(buf)?;
+    let resp: SyncResponse = decode_canonical(buf)?;
     validate_sync_response_bounds(&resp)?;
     Ok(resp)
 }
@@ -1035,6 +1046,43 @@ mod tests {
         // rejection is specifically about the trailing bytes.
         let clean: SyncRequest = decode_frame(&bytes[..clean_len]).unwrap();
         assert_eq!(clean, req);
+    }
+
+    /// The directed protocol has the gossip path's one-encoding rule: a
+    /// non-minimal varint, or a length of 2^32 + 3 (which bincode truncates
+    /// to 3 on 32-bit targets, where the frame then decoded as a 3-byte
+    /// `block_data`), is refused as a protocol violation on every target.
+    #[test]
+    fn non_canonical_frames_are_rejected() {
+        let resp = SyncResponse::Block {
+            block_hash: [0u8; 32],
+            blue_score: 5,
+            height: 9,
+            block_data: vec![7u8; 3],
+        };
+        let enc = encode_frame(&resp).unwrap();
+        assert_eq!(decode_response(&enc).unwrap(), resp);
+        assert!(enc.ends_with(&[3, 7, 7, 7]), "bincode encoding layout changed; update this test");
+        let head = &enc[..enc.len() - 4];
+        let with_len = |len: &[u8]| -> Vec<u8> {
+            let mut f = head.to_vec();
+            f.extend_from_slice(len);
+            f.extend_from_slice(&[7, 7, 7]);
+            f
+        };
+        let mut frames = vec![
+            with_len(&[0xFB, 3, 0]),
+            with_len(&[0xFD, 3, 0, 0, 0, 0, 0, 0, 0]),
+            with_len(&[0xFD, 3, 0, 0, 0, 1, 0, 0, 0]), // 2^32 + 3
+        ];
+        let mut tag = vec![0xFB, enc[0], 0];
+        tag.extend_from_slice(&enc[1..]);
+        frames.push(tag);
+        for frame in &frames {
+            let err = decode_response(frame).expect_err("non-canonical frame must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(is_sync_protocol_violation(&err));
+        }
     }
 
     /// GetHeaders.limit above MAX_WIRE_GETHEADERS_LIMIT must be rejected by
