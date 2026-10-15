@@ -73,7 +73,13 @@ input committed to the target's corpus (`regress_*`).
    docs/CONSENSUS.md ("Wire encoding"), and the consensus vectors
    `decode/non-minimal-tx-count/post` and
    `decode/non-minimal-script-sig-length/pre` pin it for the Rust runners and
-   the Python reference.
+   the Python reference: the decoder before the fix (and the Python
+   reference before it) accepts both byte strings, the second one (a
+   coinbase whose locktime ends `FD 00`) only through the old framing. A
+   widened copy relayed by an older node is dropped without a gossip penalty
+   (`ingress::verdict_for_block_decode_error`; every byte string the old
+   decoder accepts and the new one refuses fails on a non-minimal varint,
+   `core::wire_canonical_tests::pre_fix_acceptances_fail_on_a_non_minimal_varint`).
    The reproducer came from a seed written to probe the property (a header
    with a `FD 01 00` parent count); a 200-second run without that seed did not
    rediscover it. Tests: `core::wire_canonical_tests`,
@@ -87,7 +93,9 @@ input committed to the target's corpus (`regress_*`).
    closed for trailing bytes, reopened through the varints. The `/gnb/sync/1`
    codec had the same gap. Fixed in `network/mod.rs` (`decode_wire_message`
    refuses a frame that is not the re-encoding of its message:
-   `WireDecodeError::NonCanonical`, a penalized protocol violation) and
+   `WireDecodeError::NonCanonical`, a penalized protocol violation except
+   for `NewBlock` / `NewTransaction`, which older releases relay, see
+   docs/CONSENSUS.md "Wire encoding") and
    `network/sync_rr.rs` (`decode_request` / `decode_response`, `InvalidData`).
    Tests: `node/tests/fuzz_regressions.rs`. On the integration branch the
    same check arrived first with the sanitizers package (commit `6492ebc`,

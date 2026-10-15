@@ -15,7 +15,9 @@ fn bincode_of(m: &NetworkMessage) -> Vec<u8> {
 /// 5-byte bincode form (`FC 1F 00 00 00`) of 31 decoded to the same message as
 /// the canonical 1-byte form. Gossipsub message ids are SHA-256 of the frame,
 /// so every such variant was a fresh message id for the same message (the
-/// NET-7 de-duplication bypass, without trailing bytes).
+/// NET-7 de-duplication bypass, without trailing bytes). Such a frame is
+/// refused; it is a penalized protocol violation unless the message is one
+/// an older release relays (`NewBlock`, `NewTransaction`).
 #[test]
 fn gossip_frame_with_a_non_minimal_varint_is_a_protocol_violation() {
     let crash = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/corpus/netmsg_decode/regress_noncanonical_bincode_varint"))
@@ -25,9 +27,14 @@ fn gossip_frame_with_a_non_minimal_varint_is_a_protocol_violation() {
     let m = decode_wire_message(&canonical).expect("canonical Version frame");
     assert_eq!(bincode_of(&m), canonical);
     match decode_wire_message(&crash) {
-        Err(e @ WireDecodeError::NonCanonical) => assert!(e.is_protocol_violation()),
+        Err(e @ WireDecodeError::NonCanonical { relayable: false }) => assert!(e.is_protocol_violation()),
         other => panic!("non-minimal frame: {other:?}"),
     }
+    // The peer that sent it is penalized like any protocol violation: no
+    // honest node relays a `Version` frame.
+    let mut t = WirePenaltyTracker::new();
+    let peer = libp2p::PeerId::random();
+    assert!(matches!(t.classify(peer, &crash), WireReaction::Penalize { error: WireDecodeError::NonCanonical { .. }, .. }));
 
     // A block announcement: the same block id with a 3-byte `blue_score`.
     let nb = NetworkMessage::NewBlock { block_hash: [7; 32], blue_score: 5, height: 4, block_data: vec![1, 2, 3] };
@@ -38,12 +45,14 @@ fn gossip_frame_with_a_non_minimal_varint_is_a_protocol_violation() {
     let mut wide = enc[..at].to_vec();
     wide.extend_from_slice(&[0xFB, 5, 0]);
     wide.extend_from_slice(&enc[at + 1..]);
-    assert!(matches!(decode_wire_message(&wide), Err(WireDecodeError::NonCanonical)));
+    assert!(matches!(decode_wire_message(&wide), Err(WireDecodeError::NonCanonical { relayable: true })));
 
-    // The peer that sent it is penalized like any protocol violation.
-    let mut t = WirePenaltyTracker::new();
-    let peer = libp2p::PeerId::random();
-    assert!(matches!(t.classify(peer, &wide), WireReaction::Penalize { error: WireDecodeError::NonCanonical, .. }));
+    // Refused, but not penalized: releases before the one-encoding rule
+    // accept this frame and gossipsub relays the bytes they received, so it
+    // can come from an honest older relay (docs/CONSENSUS.md, "Wire encoding").
+    let peer2 = libp2p::PeerId::random();
+    assert!(matches!(t.classify(peer2, &wide), WireReaction::IgnoreMalformed(_)));
+    assert_eq!(t.score_of(&peer2), None);
 }
 
 /// The directed-sync codec had the same gap (bincode under `decode_frame`).

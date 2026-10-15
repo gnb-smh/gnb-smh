@@ -503,12 +503,23 @@ pub enum WireDecodeError {
     /// message id — the NET-7 de-duplication bypass without trailing bytes
     /// (fuzz target `netmsg_decode`, docs/testing/FUZZING.md). A compliant
     /// encoder never produces them.
-    NonCanonical,
+    ///
+    /// `relayable`: the message is one that nodes relay after validating it
+    /// (`NewBlock`, `NewTransaction`; see [`gossip_disposition`]). Releases
+    /// before this rule (origin/main) decode such a frame, accept the
+    /// message and gossipsub forwards the bytes they received, so it can be
+    /// delivered by an honest older relay: it is refused but not a protocol
+    /// violation ([`Self::is_protocol_violation`]), so it is dropped
+    /// without penalty. Any other message type is never relayed by an
+    /// honest node, so its non-canonical frame comes from its author.
+    NonCanonical { relayable: bool },
 }
 
 impl WireDecodeError {
     /// Oversized, bounds-violating, padded and non-canonical frames are
-    /// deliberate protocol violations — a compliant node cannot produce them.
+    /// deliberate protocol violations — a compliant node cannot produce them
+    /// — except a non-canonical frame of a relayable message, which an
+    /// honest older release relays (see [`WireDecodeError::NonCanonical`]).
     /// Malformed frames may just be a newer/older protocol version.
     pub fn is_protocol_violation(&self) -> bool {
         matches!(
@@ -516,7 +527,7 @@ impl WireDecodeError {
             WireDecodeError::Oversized(_)
                 | WireDecodeError::Bounds(_)
                 | WireDecodeError::TrailingBytes(_)
-                | WireDecodeError::NonCanonical
+                | WireDecodeError::NonCanonical { relayable: false }
         )
     }
 }
@@ -550,7 +561,9 @@ pub fn decode_wire_message(data: &[u8]) -> Result<NetworkMessage, WireDecodeErro
     // One encoding per message: the frame must be what the encoder writes.
     match bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {
         Ok(canonical) if canonical == data => Ok(msg),
-        _ => Err(WireDecodeError::NonCanonical),
+        _ => Err(WireDecodeError::NonCanonical {
+            relayable: matches!(msg, NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. }),
+        }),
     }
 }
 
@@ -642,7 +655,9 @@ pub enum WireReaction {
     /// `gossipsub.set_application_score`. With app_specific_weight 1.0 and
     /// graylist_threshold -400, the fourth violation graylists the peer.
     Penalize { error: WireDecodeError, score: f64 },
-    /// Malformed bincode — possibly benign version skew. Log-only, no penalty.
+    /// Malformed bincode — possibly benign version skew — or a non-canonical
+    /// frame of a relayable message (`WireDecodeError::NonCanonical`, which
+    /// an older release relays). Log-only, no penalty.
     IgnoreMalformed(String),
 }
 
@@ -677,10 +692,13 @@ impl WirePenaltyTracker {
     /// exact logic previously inline in `run()`:
     ///   - decodes via [`decode_wire_message`] (4 MiB frame/read limit +
     ///     post-decode bounds + no trailing bytes);
-    ///   - protocol violations (Oversized/Bounds/TrailingBytes) accumulate
+    ///   - protocol violations (Oversized/Bounds/TrailingBytes, and
+    ///     NonCanonical of a message that is never relayed) accumulate
     ///     [`WIRE_VIOLATION_PENALTY`] per offense, floored at
     ///     [`WIRE_PENALTY_FLOOR`];
-    ///   - plain-malformed frames are ignored (may be version skew).
+    ///   - plain-malformed frames and non-canonical frames of a relayable
+    ///     message (`NewBlock`, `NewTransaction`) are ignored (version skew:
+    ///     an older release accepts and relays the latter).
     pub fn classify(&mut self, peer: PeerId, data: &[u8]) -> WireReaction {
         match decode_wire_message(data) {
             Ok(msg) => WireReaction::Accept(msg),
@@ -3187,13 +3205,68 @@ mod tests {
                 Err(e) if *what == "length 2^32 + 3" && cfg!(target_pointer_width = "64") => {
                     assert!(matches!(e, WireDecodeError::Malformed(_)), "{what}: {e:?}");
                 }
+                // A block announcement: refused, but an older release
+                // relays it, so not a protocol violation (no penalty).
                 Err(e) => {
-                    assert!(e.is_protocol_violation(), "{what}: {e:?}");
-                    assert!(matches!(e, WireDecodeError::NonCanonical), "{what}: {e:?}");
+                    assert!(matches!(e, WireDecodeError::NonCanonical { relayable: true }), "{what}: {e:?}");
+                    assert!(!e.is_protocol_violation(), "{what}: {e:?}");
                 }
                 Ok(m) => panic!("{what}: a non-canonical frame must not decode, got {}", m.kind_name()),
             }
         }
+    }
+
+    /// Mixed-version rollout: releases before the one-encoding rule accept a
+    /// non-canonical `NewBlock` / `NewTransaction` frame and gossipsub relays
+    /// the bytes they received, so an upgraded node drops such a frame
+    /// WITHOUT penalty (four penalized frames would graylist an honest older
+    /// relay). A message that no honest node relays (here `GetHeaders`,
+    /// `PeerTip`) in a non-canonical frame comes from its author and is still
+    /// a penalized protocol violation.
+    #[test]
+    fn non_canonical_relayable_frames_are_dropped_without_penalty() {
+        let cfg = bincode::config::standard();
+        // Widen the varint at `at` (a value < 251) to bincode's 3-byte form.
+        let widen = |enc: &[u8], at: usize| -> Vec<u8> {
+            assert!(enc[at] < 0xFB);
+            let mut f = enc[..at].to_vec();
+            f.extend_from_slice(&[0xFB, enc[at], 0]);
+            f.extend_from_slice(&enc[at + 1..]);
+            f
+        };
+        let relayed = [
+            NetworkMessage::NewBlock { block_hash: [1; 32], blue_score: 5, height: 9, block_data: vec![7; 3] },
+            NetworkMessage::NewTransaction { txid: [2; 32], tx_data: vec![8; 4] },
+        ];
+        let authored = [
+            NetworkMessage::GetHeaders { from_blue_score: 5, limit: 9, nonce: 3 },
+            NetworkMessage::PeerTip { peer_id: "p".into(), blue_score: 5, height: 9 },
+        ];
+        let mut t = WirePenaltyTracker::new();
+        let peer = PeerId::random();
+        for (m, relayable) in relayed.iter().map(|m| (m, true)).chain(authored.iter().map(|m| (m, false))) {
+            let enc = bincode::serde::encode_to_vec(m, cfg).unwrap();
+            // The enum tag (index < 251) is the first byte of every frame.
+            let wide = widen(&enc, 0);
+            let (back, _): (NetworkMessage, usize) = bincode::serde::decode_from_slice(&wide, cfg).unwrap();
+            assert_eq!(bincode::serde::encode_to_vec(&back, cfg).unwrap(), enc, "{}: same message", m.kind_name());
+            match decode_wire_message(&wide) {
+                Err(e @ WireDecodeError::NonCanonical { .. }) => {
+                    assert!(matches!(e, WireDecodeError::NonCanonical { relayable: r } if r == relayable), "{e:?}");
+                    assert_eq!(e.is_protocol_violation(), !relayable, "{}", m.kind_name());
+                }
+                other => panic!("{}: {other:?}", m.kind_name()),
+            }
+            let before = t.score_of(&peer);
+            match t.classify(peer, &wide) {
+                WireReaction::IgnoreMalformed(_) if relayable => assert_eq!(t.score_of(&peer), before),
+                WireReaction::Penalize { error: WireDecodeError::NonCanonical { relayable: false }, score } if !relayable => {
+                    assert_eq!(score, before.unwrap_or(0.0) + WIRE_VIOLATION_PENALTY);
+                }
+                other => panic!("{}: {other:?}", m.kind_name()),
+            }
+        }
+        assert_eq!(t.score_of(&peer), Some(2.0 * WIRE_VIOLATION_PENALTY), "only the two authored frames were penalized");
     }
 
     /// Gossip pulls and gossip responses are neither delivered nor relayed;

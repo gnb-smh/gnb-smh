@@ -307,6 +307,32 @@ pub fn verdict_for_accept_error(err: &str) -> GossipVerdict {
     }
 }
 
+/// Map a `NewBlock` frame whose `block_data` does not decode
+/// (`core::Block::from_wire_bytes`) to a gossip verdict.
+///
+/// `Ignore` (not relayed, not penalized, nothing recorded about the id) when
+/// the decoder refused a non-minimal CompactSize varint
+/// (`core::is_non_minimal_varint_error`); `Reject` (the delivering peer takes
+/// gossipsub's P4 penalty) for every other malformed body. Releases before
+/// the minimal-varint rule (H-fuzz; origin/main) accept a widened copy of a
+/// valid block, return `Accept`, and gossipsub forwards the bytes they
+/// received, so such a copy can arrive from an honest older relay: `Reject`
+/// would let anyone who widens a varint of a fresh block get every upgraded
+/// node to graylist its older peers (three such frames within a couple of
+/// minutes pass the block topic's graylist threshold). Every byte string an
+/// older node accepts and this node refuses fails on a non-minimal varint
+/// (`core::wire_canonical_tests::pre_fix_acceptances_fail_on_a_non_minimal_varint`),
+/// so no such relay is penalized. The block itself is taken from its
+/// canonical encoding (another relay, or directed sync). docs/CONSENSUS.md,
+/// "Wire encoding".
+pub fn verdict_for_block_decode_error(err: &str) -> GossipVerdict {
+    if core::is_non_minimal_varint_error(err) {
+        GossipVerdict::Ignore
+    } else {
+        GossipVerdict::Reject
+    }
+}
+
 // ── POW-2: supervisor back-off ───────────────────────────────────────────────
 
 /// A processor run that lasted at least this long counts as healthy: the next
@@ -1662,6 +1688,9 @@ mod tests {
         assert_eq!(verdict_for_accept_error("consensus rejection: block already in DAG: ab"), GossipVerdict::Ignore);
         assert_eq!(verdict_for_accept_error("timestamp rejected: timestamp too far in the future"), GossipVerdict::Ignore);
         assert_eq!(verdict_for_accept_error("finality: block h=3 may not become the selected tip"), GossipVerdict::Ignore);
+        assert_eq!(verdict_for_block_decode_error("tx[0] parse: non-canonical varint: 12 encoded with the 0xFD form"),
+            GossipVerdict::Ignore);
+        assert_eq!(verdict_for_block_decode_error("trailing bytes in block body: parsed 5 of 7"), GossipVerdict::Reject);
     }
 
     #[test]

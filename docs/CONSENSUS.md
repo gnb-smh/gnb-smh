@@ -182,18 +182,49 @@ or the shielded count, at the re-encoded length, which is fewer bytes than
 the decoder consumed, so the body decoded from inside the previous
 transaction. Such bytes are now refused before the block id is computed:
 nothing is recorded about the id (no invalid mark, no orphan entry), the copy
-is dropped as a malformed frame, and the block is accepted from its canonical
-encoding, for example when a descendant's missing parent is fetched by
-directed sync. Vectors: `decode/non-minimal-tx-count/post` and
-`decode/non-minimal-script-sig-length/pre` (blocks), `decode/non-minimal-varint`
-(transactions); `core::wire_canonical_tests`; `node/tests/fuzz_regressions.rs`.
+is dropped, and the block is accepted from its canonical encoding, for
+example from another relay or when a descendant's missing parent is fetched
+by directed sync. Vectors: `decode/non-minimal-tx-count/post` and
+`decode/non-minimal-script-sig-length/pre` (blocks; the decoder before the
+rule accepts both byte strings, the second only through its framing at the
+re-encoded length), `decode/non-minimal-varint` (transactions);
+`core::wire_canonical_tests`; `node/tests/fuzz_regressions.rs`.
 
-In a network mixing binaries with and without this rule, an older node
-accepts a widened encoding and gossipsub relays the bytes it received, so an
-upgraded node refuses that relayed copy and penalizes the relaying peer, as
-it does for a non-canonical gossip frame (`WireDecodeError::NonCanonical`).
-Only a party that re-encodes a block on purpose produces such bytes. The
-block reaches the upgraded node in canonical form through sync.
+Mixed versions. A release without this rule (origin/main before H-fuzz)
+accepts a widened encoding of a valid block, answers `Accept`, and gossipsub
+forwards the bytes it received. Anyone can widen a varint of a fresh block
+and hand that copy to such nodes first, so an honest older node can deliver
+widened bytes to an upgraded one. The upgraded node therefore answers a
+`NewBlock` whose `block_data` fails with the minimal-varint error
+(`core::is_non_minimal_varint_error`) with `Ignore`: not relayed, no gossipsub
+invalid-delivery (P4) penalty, nothing recorded
+(`ingress::verdict_for_block_decode_error`). Every other malformed body is
+still `Reject` (P4 penalty on the delivering peer). With `Reject`, three such
+frames from one older peer within a couple of minutes (block topic: weight
+0.5, -100 per invalid delivery squared, decay 0.5 per minute) would pass the
+graylist threshold (-400) and the upgraded node would ignore all of that
+peer's gossip. The classification covers every older relay: the two
+decoders read the same fields with the same checks and differ only in the
+varint rule and in where the next transaction starts after a widened varint,
+so every byte string the older decoder accepts and this one refuses fails on
+a non-minimal varint
+(`core::wire_canonical_tests::pre_fix_acceptances_fail_on_a_non_minimal_varint`,
+`node/tests/fix_net_ingress.rs::widened_block_varints_are_ignored_and_other_malformed_bodies_rejected`).
+A party sending such bytes directly is not penalized either; it costs the
+receiver one decode. The same holds for the gossip envelope: a non-canonical
+bincode frame (`WireDecodeError::NonCanonical`) of a `NewBlock` or
+`NewTransaction`, the messages that nodes relay after validating them, is
+dropped without penalty (an older release relays it), while a non-canonical
+frame of any other message, which no honest node relays, is a penalized
+protocol violation (`network::tests::non_canonical_relayable_frames_are_dropped_without_penalty`).
+The transaction bytes inside a `NewTransaction` need no such rule: the older
+gossip decoder (`admission::decode_tx_strict`) already refused a transaction
+that is not its canonical length, so older nodes never relay a widened
+transaction. Once no
+release without the rule can be a peer, `Reject` can be restored for both
+classes; that needs a peer protocol version that older releases cannot
+advertise (they follow the hardening activation block, so the activation
+height cannot serve as the cut-off).
 
 ## GhostDAG
 

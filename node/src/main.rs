@@ -1169,12 +1169,23 @@ async fn main() {
                                 hex::encode(&block_hash[..8]), height, tip_h);
                             break 'blk network::GossipVerdict::Ignore;
                         }
-                        // Sprint 1.c: Bitcoin-format wire.
+                        // Sprint 1.c: Bitcoin-format wire. A widened varint
+                        // (which releases before the minimal-varint rule
+                        // accept and relay) is Ignored, not penalized; every
+                        // other malformed body is Rejected
+                        // (`ingress::verdict_for_block_decode_error`).
                         let block = match core::Block::from_wire_bytes(&block_data) {
                             Ok(b) => b,
                             Err(e) => {
-                                warn!("block deserialise: {}", e);
-                                break 'blk network::GossipVerdict::Reject;
+                                let v = ingress::verdict_for_block_decode_error(&e);
+                                if v == network::GossipVerdict::Ignore {
+                                    debug!("block {} not in its minimal encoding ({}); dropped without penalty \
+                                            (an older node may have relayed it; its canonical encoding is accepted)",
+                                        hex::encode(&block_hash[..8]), e);
+                                } else {
+                                    warn!("block deserialise: {}", e);
+                                }
+                                break 'blk v;
                             }
                         };
                         // SECURITY (audit H2): bind the wire-supplied block_hash /

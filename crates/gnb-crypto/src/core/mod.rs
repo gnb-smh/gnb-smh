@@ -512,9 +512,33 @@ fn read_varint(cur: &mut Cursor<&[u8]>) -> Result<u64, String> {
         n    => return Ok(n as u64),
     };
     if value < min {
-        return Err(format!("non-canonical varint: {value} encoded with the 0x{:02X} form", tag[0]));
+        return Err(format!("{NON_MINIMAL_VARINT}: {value} encoded with the 0x{:02X} form", tag[0]));
     }
     Ok(value)
+}
+
+/// The text of every wire decoder error caused by a non-minimal CompactSize
+/// varint (`read_varint`); see [`is_non_minimal_varint_error`].
+pub const NON_MINIMAL_VARINT: &str = "non-canonical varint";
+
+/// Whether an error of `Block::from_wire_bytes` (or of the header and
+/// transaction decoders) is the minimal-varint rule: the first thing the
+/// decoder refused was a CompactSize varint written in a longer form than its
+/// value needs.
+///
+/// Every byte string that the decoders before this rule accepted and the
+/// current ones refuse fails this way. Both decoders read the same fields in
+/// the same order with the same checks; they differ only in refusing a
+/// non-minimal varint and in where the next transaction of a block starts
+/// (the bytes consumed, or the re-encoded length). A transaction whose
+/// varints are minimal consumes exactly its re-encoded length, so the two
+/// agree byte for byte up to the first non-minimal varint, which the current
+/// decoder refuses with this error (`core::wire_canonical_tests::
+/// pre_fix_acceptances_fail_on_a_non_minimal_varint`). The node uses this to
+/// tell a widened copy that an older node may have accepted and relayed from
+/// other malformed bytes (`ingress::verdict_for_block_decode_error`).
+pub fn is_non_minimal_varint_error(err: &str) -> bool {
+    err.contains(NON_MINIMAL_VARINT)
 }
 
 fn read_u32_le(cur: &mut Cursor<&[u8]>) -> Result<u32, String> {
@@ -1478,6 +1502,196 @@ mod wire_canonical_tests {
         }
         let back = Block::from_wire_bytes(&w).unwrap();
         assert_eq!(back.to_wire_bytes(), w);
+        // The pre-fix decoder (below) read these bytes as the same block.
+        let old = pre_fix_block(&crafted).expect("the pre-fix decoder accepted the crafted bytes");
+        assert_eq!(old.to_wire_bytes(), w);
+        assert!(is_non_minimal_varint_error(&Block::from_wire_bytes(&crafted).unwrap_err()));
+    }
+
+    // ── The block decoder before the minimal-varint rule ────────────────────
+    // A copy of the decoder of the releases before H-fuzz (origin/main at
+    // 6321605): lenient varints, each transaction framed at its re-encoded
+    // length. Kept only to pin which bytes the rule newly refuses.
+
+    fn pre_fix_varint(cur: &mut Cursor<&[u8]>) -> Result<u64, String> {
+        let mut tag = [0u8; 1];
+        cur.read_exact(&mut tag).map_err(|_| "varint: unexpected EOF on tag".to_string())?;
+        match tag[0] {
+            0xFF => { let mut b = [0u8; 8]; cur.read_exact(&mut b).map_err(|_| "varint u64 EOF")?; Ok(u64::from_le_bytes(b)) }
+            0xFE => { let mut b = [0u8; 4]; cur.read_exact(&mut b).map_err(|_| "varint u32 EOF")?; Ok(u32::from_le_bytes(b) as u64) }
+            0xFD => { let mut b = [0u8; 2]; cur.read_exact(&mut b).map_err(|_| "varint u16 EOF")?; Ok(u16::from_le_bytes(b) as u64) }
+            n => Ok(n as u64),
+        }
+    }
+
+    fn pre_fix_tx(bytes: &[u8]) -> Result<Transaction, String> {
+        let mut cur = Cursor::new(bytes);
+        let version = read_u32_le(&mut cur)?;
+        let in_count = pre_fix_varint(&mut cur)?;
+        if in_count > 100_000 { return Err(format!("implausible input count {in_count}")); }
+        let mut inputs = Vec::new();
+        for _ in 0..in_count {
+            let prev_txid = read_32(&mut cur)?;
+            let prev_index = read_u32_le(&mut cur)?;
+            let sig_len = pre_fix_varint(&mut cur)?;
+            if sig_len > 10_000 { return Err(format!("implausible script_sig length {sig_len}")); }
+            let script_sig = read_bytes(&mut cur, sig_len as usize)?;
+            let sequence = read_u32_le(&mut cur)?;
+            inputs.push(TxInput { prev_txid, prev_index, script_sig, sequence });
+        }
+        let out_count = pre_fix_varint(&mut cur)?;
+        if out_count > 100_000 { return Err(format!("implausible output count {out_count}")); }
+        let mut outputs = Vec::new();
+        for _ in 0..out_count {
+            let value = read_u64_le(&mut cur)?;
+            let spk_len = pre_fix_varint(&mut cur)?;
+            if spk_len > 10_000 { return Err(format!("implausible script_pubkey length {spk_len}")); }
+            let script_pubkey = read_bytes(&mut cur, spk_len as usize)?;
+            outputs.push(TxOutput { value, script_pubkey });
+        }
+        let locktime = read_u32_le(&mut cur)?;
+        Ok(Transaction { version, inputs, outputs, locktime })
+    }
+
+    fn pre_fix_shielded(cur: &mut Cursor<&[u8]>) -> Result<coherence_core::ShieldedTx, String> {
+        let anchor = read_32(cur)?;
+        let nf_n = pre_fix_varint(cur)?;
+        if nf_n > 100_000 { return Err(format!("implausible nullifier count {nf_n}")); }
+        let mut nullifiers = Vec::new();
+        for _ in 0..nf_n { nullifiers.push(read_32(cur)?); }
+        let out_n = pre_fix_varint(cur)?;
+        if out_n > 100_000 { return Err(format!("implausible output count {out_n}")); }
+        let mut outputs = Vec::new();
+        for _ in 0..out_n { outputs.push(read_32(cur)?); }
+        let fee = read_u64_le(cur)?;
+        let proof_len = pre_fix_varint(cur)?;
+        if proof_len > 8_000_000 { return Err(format!("implausible proof length {proof_len}")); }
+        let proof = read_bytes(cur, proof_len as usize)?;
+        let sig_len = pre_fix_varint(cur)?;
+        if sig_len > 100_000 { return Err(format!("implausible binding_sig length {sig_len}")); }
+        let binding_sig = read_bytes(cur, sig_len as usize)?;
+        Ok(coherence_core::ShieldedTx { anchor, nullifiers, outputs, fee, proof, binding_sig })
+    }
+
+    fn pre_fix_block(bytes: &[u8]) -> Result<Block, String> {
+        let mut cur = Cursor::new(bytes);
+        let version = read_u32_le(&mut cur)?;
+        let n = pre_fix_varint(&mut cur)?;
+        if n > MAX_PARENTS as u64 { return Err(format!("implausible parent count {n}")); }
+        let mut parents = Vec::new();
+        for _ in 0..n { parents.push(read_32(&mut cur)?); }
+        let merkle_root = MerkleRoot(read_32(&mut cur)?);
+        let timestamp = read_u64_le(&mut cur)?;
+        let bits = read_u32_le(&mut cur)?;
+        let nonce = read_u64_le(&mut cur)?;
+        let blue_score = read_u64_le(&mut cur)?;
+        let height = read_u64_le(&mut cur)?;
+        let header = BlockHeader { version, parents, merkle_root, timestamp, bits, nonce };
+        let body = &bytes[cur.position() as usize..];
+        let mut cur = Cursor::new(body);
+        let tx_count = pre_fix_varint(&mut cur)?;
+        if tx_count > 1_000_000 { return Err(format!("implausible tx count {tx_count}")); }
+        let mut offset = cur.position() as usize;
+        let mut transactions = Vec::new();
+        for _ in 0..tx_count {
+            let tx = pre_fix_tx(&body[offset..])?;
+            offset += tx.to_wire_bytes(true).len();
+            transactions.push(tx);
+        }
+        let mut sh_cur = Cursor::new(&body[offset..]);
+        let sh_count = pre_fix_varint(&mut sh_cur)?;
+        if sh_count > 100_000 { return Err(format!("implausible shielded count {sh_count}")); }
+        let mut shielded_transactions = Vec::new();
+        for _ in 0..sh_count { shielded_transactions.push(pre_fix_shielded(&mut sh_cur)?); }
+        offset += sh_cur.position() as usize;
+        if offset != body.len() { return Err("trailing bytes in block body".into()); }
+        Ok(Block { header, transactions, blue_score, height, shielded_transactions })
+    }
+
+    /// Bytes the pre-fix decoder accepts are either accepted by the current
+    /// decoder as the same block, or refused with the minimal-varint error
+    /// (`is_non_minimal_varint_error`), never with another error: a node
+    /// can answer a widened copy relayed by an older node without a penalty
+    /// and keep the penalty for every other malformed block. Frames: every
+    /// one-byte value widened to the 3-, 5- and 9-byte forms, and seeded
+    /// random byte edits of those and of the canonical encodings.
+    #[test]
+    fn pre_fix_acceptances_fail_on_a_non_minimal_varint() {
+        let fd00 = u32::from_le_bytes([0x11, 0x22, 0xFD, 0x00]);
+        let mut shielded = block(vec![tx(3, 0)]);
+        shielded.shielded_transactions = vec![coherence_core::ShieldedTx {
+            anchor: [5; 32], nullifiers: vec![[6; 32]], outputs: vec![[7; 32], [8; 32]], fee: 3,
+            proof: vec![1, 2, 3], binding_sig: vec![4; 5],
+        }];
+        let bases = [
+            block(vec![tx(12, fd00)]),
+            block(vec![tx(0xFC, 7), tx(1, 0x00FD_0000), tx(12, fd00)]),
+            block(vec![tx(0xFD, 1), tx(0, 2)]),
+            shielded,
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let (mut frames, mut newly_refused, mut misframed) = (0usize, 0usize, 0usize);
+        for b in &bases {
+            let w = b.to_wire_bytes();
+            // The transactions' bytes (after the header and the 1-byte count).
+            let txs_at = b.header.to_wire_bytes(b.blue_score, b.height).len() + 1;
+            let txs_end = txs_at + b.transactions.iter().map(|t| t.wire_size(true)).sum::<usize>();
+            // (frame, widened inside a transaction)
+            let mut cands = vec![(w.clone(), false)];
+            for at in 0..w.len() {
+                if w[at] < 0xFD {
+                    for form in [&[0xFD, w[at], 0][..], &[0xFE, w[at], 0, 0, 0], &[0xFF, w[at], 0, 0, 0, 0, 0, 0, 0]] {
+                        let mut v = w[..at].to_vec();
+                        v.extend_from_slice(form);
+                        v.extend_from_slice(&w[at + 1..]);
+                        cands.push((v, (txs_at..txs_end).contains(&at)));
+                    }
+                }
+            }
+            for i in 0..cands.len() * 4 {
+                let mut v = cands[i % cands.len()].0.clone();
+                for _ in 0..1 + rnd(3) {
+                    let at = rnd(v.len());
+                    match rnd(3) {
+                        0 => v[at] = rnd(256) as u8,
+                        1 => v.insert(at, rnd(256) as u8),
+                        _ => { v.remove(at); }
+                    }
+                }
+                cands.push((v, false));
+            }
+            for (f, in_tx) in &cands {
+                frames += 1;
+                match (pre_fix_block(f), Block::from_wire_bytes(f)) {
+                    (old, Ok(new)) => {
+                        assert_eq!(new.to_wire_bytes(), *f, "an accepted frame is the encoding of its block");
+                        let old = old.expect("bytes the current decoder accepts were accepted before");
+                        assert_eq!(old.to_wire_bytes(), *f);
+                    }
+                    (Ok(_), Err(e)) => {
+                        assert!(is_non_minimal_varint_error(&e),
+                            "bytes the pre-fix decoder accepted are refused for another reason: {e}");
+                        newly_refused += 1;
+                        // Widened inside a transaction: framed at the
+                        // re-encoded length, the old decoder read the next
+                        // field from inside that transaction and still "fit".
+                        if *in_tx {
+                            misframed += 1;
+                        }
+                    }
+                    (Err(_), Err(_)) => {}
+                }
+            }
+        }
+        assert!(frames > 20_000, "{frames} frames");
+        assert!(newly_refused > 100, "{newly_refused} frames newly refused");
+        assert!(misframed >= 2, "{misframed} mis-framed acceptances");
     }
 }
 
