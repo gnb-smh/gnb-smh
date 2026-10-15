@@ -1,0 +1,15 @@
+# Mutants allowed to time out (scripts/mutants-gate.sh). Each one turns a
+# loop into an endless one, so the tests hang instead of passing; the reason
+# is in the "Timeouts" table of docs/testing/MUTATION.md. Names are
+# cargo-mutants' mutant names with the ":line:column" removed; each may time
+# out at most as many times as it is listed. Any other timeout fails the
+# gate: a mutant that only slows the tests down past the timeout is not
+# evidence that a test detects it.
+#
+# `while level.len() > 1` in the two Merkle-root functions.
+crates/gnb-crypto/src/core/block_rules.rs: replace > with == in tagged_merkle_root
+crates/gnb-crypto/src/core/block_rules.rs: replace > with >= in tagged_merkle_root
+crates/gnb-crypto/src/core/block_rules.rs: replace > with == in legacy_merkle_root
+crates/gnb-crypto/src/core/block_rules.rs: replace > with >= in legacy_merkle_root
+# `epoch += 1` in issued_through_sat.
+crates/gnb-crypto/src/core/tokenomics.rs: replace += with *= in issued_through_sat

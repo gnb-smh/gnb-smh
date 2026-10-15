@@ -101,9 +101,11 @@ obtain from a future timestamp to about 6%.
 
 `accept_block` runs the cheap checks first and the proof of work last:
 
-1. not already known (a block in the DAG that waits for a body after a
-   witness-dependent failure below the activation is not "known"; see
-   "Coinbase commitment"); parents present in the DAG;
+1. not already known (a block in the DAG that waits for a body — after a
+   witness-dependent failure below the activation, see "Coinbase commitment",
+   or because its body is missing, e.g. pruned and needed again, see "Selected
+   parent and fork choice" — is not "known": a copy replaces the body after
+   the same checks); parents present in the DAG;
 2. height = max parent height + 1;
 3. `bits == expected_bits(parents, height)`;
 4. timestamp bounds;
@@ -205,6 +207,65 @@ The selected parent of B is the parent with the largest `(blue_work,
 blue_score, hash)`. The selected tip is the tip with the largest
 `(blue_work, blue_score, hash)`. These rules are unchanged at every height.
 
+The applied chain (the UTXO set, see "Ledger semantics" below) is the
+selected-parent chain of the best block, in that order, that is valid in its
+own selected-chain context. Blocks that fail connect-time validation, and
+every block whose selected-parent chain passes through one, are disqualified
+and never selected.
+
+There is no reorg-depth limit and no finality checkpoint (audit DAG-6). The
+former 1,000-block `MAX_REORG_DEPTH` and the `finalized_height` gate compared
+a fork with the node's own history, so nodes that received the same blocks in
+different orders could end on different chains. As in Bitcoin Core (no depth
+limit, no checkpoints), a node ends on the best valid chain of the blocks it
+holds, whatever their arrival order and however deep the fork. What bounds
+merging objectively is the merge depth below, a function of each block's
+past. Reorgs deeper than 1,000 selected-chain blocks are logged and counted
+(`gnb_deep_reorgs_total`), never refused. Undo records are kept for every
+connected block and a pruned body leaves a rollback record, so a reorg of any
+depth also works on a pruned node. A pruned node that reorganized away from
+blocks whose bodies it had pruned and needs them again (the old chain became
+the heaviest once more, or an operator override below moves to it) re-fetches
+those bodies from its peers before it connects them; nothing is written in
+between. On acceptance the blocks of the best chain that lack a body wait for
+one, together, while the node stays on the best chain it can connect; the
+chain is connected once the last body is back. A block whose body was
+dropped because it failed a rule that depends on witness bytes the block id
+does not commit to (below the hardening activation, see "Ledger semantics")
+waits the same way: both are one state, "a body of this DAG block is wanted",
+decided in one place, fetched through one request path (the node's directed
+pulls of missing parents, retried with backoff, at most 1,024 bodies being
+fetched at once) and accepted through one path. The node accepts a copy of a block already in its DAG only while a body
+of it is wanted, only as the answer to its own directed pull, and only for a
+block that is not applied (an applied block is rolled back from its undo
+record); any other copy is ignored before decoding. A copy is checked exactly
+like a new block — header height = the largest parent DAG height + 1 (neither
+`height` nor `blue_score` is committed by the block id), expected bits,
+timestamp, the hardening block rules (the witness commitment at/after the
+activation), proof of work, and a witness root not rejected before for that
+block — and stored exactly as on acceptance.
+
+An operator can override the choice, node-locally and persistently, with the
+RPCs `invalidateblock <hash>` (disqualify the block and every block whose
+selected chain passes through it, and move to the best remaining chain) and
+`reconsiderblock <hash>` (reconsider those marks for the block, its
+selected-chain ancestors and descendants, and re-evaluate); see
+`docs/RUNNING.md`. These are not consensus rules. `reconsiderblock` never
+lifts a consensus verdict without re-validating it: operator marks and marks
+inherited from a disqualified selected parent are removed; a mark for the
+hardening block rules (start-up recheck of blocks an older release stored) is
+removed only if the stored body now passes those rules; a mark for a
+connect-time failure is removed only by the atomic batch that connects the
+block after validating it again in its own context (a block the move does not
+connect keeps its mark, on disk and in memory, also when the move dropped its
+stored body as witness-rejected; one that fails again is disqualified again).
+Conversely every committed move — an override or an ordinary acceptance —
+deletes the connect-time or inherited mark of each block it applies, which it
+has just validated in its own context, so an applied block never carries a
+mark that would disqualify it again at the next start. On a
+pruned node, an override whose new chain needs pruned bodies changes nothing,
+requests the next (at most 4,096) of those bodies and asks to be retried.
+
 ### Blue work
 
 ```text
@@ -254,7 +315,7 @@ so it can color blue a block with more than k blues in its anticone.
   is rejected with `MergesetTooLarge` before any coloring work.
 - Merge depth: let R be the highest selected-chain block of B with
   `blue_score(R) ≤ blue_score(B) - MERGE_DEPTH`, where `MERGE_DEPTH = 360`
-  (3 hours at 30 s, under the 1,000-block finality depth). Every red in B's
+  (3 hours at 30 s). Every red in B's
   mergeset must be R itself, in the future of R, or in the past of a blue in
   B's mergeset that is in the future of R (Kaspa's "kosherizing" rule).
   Otherwise B is rejected with `MergeDepthViolation`. Blues need no check: a
@@ -304,6 +365,98 @@ At the audit's 12,000-block scenario (dev profile), these changes reduced a
 deep side block from 10–26 s to 50–84 ms, a genesis sibling that forces a
 reindex from 46 s to 0.1 s, and the 1,000-block side-chain merge from 35 s to
 29 ms. After activation, that merge is rejected in under 1 ms.
+
+What remained proportional to the DAG is the reachability reindex that one
+genesis sibling or one deep side block triggers on insertion (about 100 ms at
+12,000 blocks, dev profile) and, before activation, the coloring walk for a
+candidate that forks deep. Neither block is inserted any more unless a chain
+carrying enough work backs it: the node-local anti-DoS work rule below runs
+before the proof of work, storage or insertion of every block whose parents
+are known. GhostDAG's results and the reachability index are unchanged by
+it. Measured in `node/tests/fix_ghostdag_dag7_perf.rs` (80 such blocks,
+dev profile): 747 ms of insertions at 12,000 blocks become 0.5 ms of
+refusals.
+
+Why a peer cannot reach the pre-activation coloring walk without passing the
+work rule:
+
+- The walk (`candidate_anticone_blues`) runs only inside
+  `GhostDAG::add_block`, and blocks from the network reach `add_block` only
+  through `accept::accept_block`. Genesis and the start-up load insert stored
+  `GhostdagData` and color nothing; storing a wanted body of a block already
+  in the DAG (a pruned body needed again, DAG-6, or a replacement for a body
+  rejected for its witness bytes) inserts nothing.
+- `accept_block` is called by the ingress core for a block whose parents are
+  all known, after the work rule admitted it; by the orphan drain, for a
+  buffered orphan whose last missing parent was just inserted (the orphan
+  passed the bits floor and its proof of work to be buffered, and it becomes
+  connectable only after that parent passed the work rule); by the RPC
+  `submitblock` (a write method, served on loopback by default: the
+  operator's own pool, which, like Bitcoin Core's `submitblock`, bypasses the
+  anti-DoS rule); and by the built-in miner. Every call checks the header
+  height, the exact ASERT bits, the timestamp and the proof of work before
+  insertion.
+
+What the rule still admits is bounded by work. For a candidate c merged by a
+new block B, the walk visits B's selected chain downward, skipping chain
+blocks that merged no blue, and stops at the first chain block in c's past
+or after k + 1 blues in c's anticone. A visited chain block that adds no blue
+merged only blues of c's past (none can be in c's future), so beyond k + 1
+steps each step is a distinct block of c's past that the selected chain
+merged as blue without that chain block being in c's past. All of these
+blocks, and c, entered the DAG through the work rule: within the 360-block
+window (a chain keeping pace with ours), merge-backed (each needs a buffered,
+proof-of-work-verified orphan whose blue-work bound reaches the threshold,
+and more than 1,000 blocks below the tip at most 4, then one per 30 s, from
+one shared budget), or chain-backed (announced orphans covering the fork's
+whole depth below the window). A walk therefore lengthens by at most one
+step per such paid admission. After activation, the mergeset limit and the
+merge depth bound every block's coloring outright.
+
+### Anti-DoS work rule (node-local policy, not consensus)
+
+Audit POW-3. Blocks on deep forks can be nearly free (absolute-schedule ASERT).
+A node therefore stores and processes a block B whose parents are all in its
+DAG only if, with `T` = the blue work of the selected-chain block 360
+(`ANTI_DOS_WINDOW_BLOCKS` = `MERGE_DEPTH`) below its selected tip (0 for a
+shorter chain) and `lb(B)` = the largest parent blue work + `work(B)`, a lower
+bound of B's blue work:
+
+1. `lb(B) ≥ T`; or
+2. `lb(B)` + the work announced on top of B reaches `T`. The announced work
+   is the summed header work of the distinct orphans that wait on B directly
+   or through one another, each counted once, whatever the shape of the fork
+   (a DAG-shaped fork is summed, not measured along one path: after
+   activation `T` includes merged blues, and a fork of parallel blocks must be
+   credited the same way). The orphans are buffered, or were evicted from the
+   bounded orphan pool and are kept without their bodies (at most 50,000,
+   by block id, so a re-sent orphan never counts twice); if larger, the work
+   of the heaviest single path of buffered orphans plus the work remembered
+   along an evicted path is used instead (it chains through any number of
+   evictions, so a linear fork deeper than every store still proves its work).
+   Each orphan passed the orphan bits floor (the target a child of the
+   selected tip would carry now, eased 16-fold and capped at the pow limit of
+   the height the orphan claims — the limit its own proof of work is checked
+   against: the genesis target at/after the hardening activation, the legacy
+   limit below it, see "Pow limit (POW-3)" — so the pre-activation blocks of
+   a fork that branches below the activation stay admissible after the tip
+   passed it) and its proof of work. Both
+   remembered stores are keyed only by an evicted orphan's missing parents
+   (at most 8), charged to the peer that delivered it (at most a quarter of
+   each store per peer) and, when full, give way only to an entry of greater
+   work, so orphans at the floor cannot flush them; or
+3. a buffered orphan whose own lower bound reaches `T` needs B as a parent;
+   such blocks more than 1,000 blocks below the tip are rationed (4, then one
+   per 30 s).
+
+Otherwise B is ignored without penalty (a refused block is not re-evaluated
+until the orphan pool, the DAG or the selected tip changes). A chain that
+carries the work is accepted (this is Bitcoin's anti-DoS work threshold, with
+the orphan pool as the header buffer), so for honest data the final chain is
+the same with or without the rule. The one bound is memory: a DAG-shaped fork
+with more blocks above its first block than the pool and the 50,000 kept
+evicted orphans hold is credited the summed work of the part they hold, or
+its heaviest path if larger.
 
 ## Transaction signatures (sighash v2 and v3, hardening activation)
 
@@ -565,6 +718,11 @@ transactions, plus `version_rule` vectors: the consensus verdict
 activations 0, 100 and `NEVER`. `crates/gnb-crypto/tests/sighash_vectors.rs`
 pins them, and CI regenerates the file and diffs it.
 
+Whole-transaction and whole-block verdicts in both regimes (signatures,
+witnesses, suites, versions, values, maturity, the block rules below) are
+pinned by the data-driven vectors `reference/tx_vectors.json` and
+`reference/block_vectors.json`; see `docs/testing/VECTORS.md`.
+
 ## Mining
 
 The built-in miner (`gnb --mine --miner-address gnb1q…`) uses one 64 MiB
@@ -775,14 +933,22 @@ descendants and is persisted (`invalid_block/<id>`), as before. A
 witness-dependent failure does not: the stored body is deleted (so it is no
 longer served to peers), nothing is persisted, and the block, with its
 selected-chain descendants, waits in memory for another body
-(`GhostDAG::mark_body_pending`); the next-best chain is used meanwhile. Every
-ingress path (gossip, directed pulls, header sync, `submitblock`) treats such
-a block as not yet known (`accept::is_known_block`), the message processor
-requests its body from peers through the missing-parent fetch tracker (retried
-by the periodic sweep), and `accept_block` takes a copy of the same id whose
-witness root differs from every body already rejected for it: the copy passes
-the same acceptance checks as a new block, replaces the body, and the chain is
-re-evaluated. A block in the DAG whose body is missing (for example after a
+(`GhostDAG::mark_body_pending`); the next-best chain is used meanwhile. Header
+sync and `submitblock` treat such a block as not yet known
+(`accept::is_known_block`). The message processor requests its body from a
+peer at once through the missing-parent fetch tracker (a directed pull,
+retried with backoff by the periodic sweep), and over block relay it takes
+only the answer to such a pull: an unsolicited gossip copy of a block already
+in the DAG is ignored before decoding and not relayed, also while a body of
+it is wanted, because every copy taken re-validates the chain through the
+block and a relay could otherwise make the node do that endlessly with
+re-malleated bodies (see "Selected parent and fork choice"). Recovery
+therefore depends on the directed pulls: a peer that answers with the same
+rejected body again is refused cheaply (rejected-witness-root memo below) and
+the pull is retried at the sweep's backoff. `accept_block` takes a copy of the
+same id whose witness root differs from every body already rejected for it:
+the copy passes the same acceptance checks as a new block, replaces the body,
+and the chain is re-evaluated. A block in the DAG whose body is missing (for example after a
 restart) is treated the same way. At/after the activation the witness
 commitment fixes every byte of a stored body, so every connect-time failure is
 id-committed and is persisted as before. `node/tests/fix_block_rules.rs`
@@ -895,9 +1061,10 @@ descends from it through any parent edge, merged edges included
 one of them is disqualified on insertion. The roots are persisted with a reason
 starting with `fails the hardening block rules`, which reloads them with the
 same reach. The reconnect then rolls the applied chain back off a
-disqualified branch (a disconnect-only plan); a rollback deeper than the reorg
-cap is refused and the node logs that the data directory must be
-resynchronized. A block whose only failure is its witness root keeps its id:
+disqualified branch (a disconnect-only plan), at any depth (there is no
+reorg-depth limit, audit DAG-6; the rollback also works through pruned
+bodies). `reconsiderblock` removes such a mark only if the stored body now
+passes these rules. A block whose only failure is its witness root keeps its id:
 its body is dropped and it waits for another copy, as above. The template
 builder also skips any parent whose stored body fails these rules, through the
 same function that gives the node's next block height
@@ -905,3 +1072,109 @@ same function that gives the node's next block height
 the template keep agreeing on that height.
 `stored_blocks_failing_the_hardening_rules_are_disqualified_at_startup`
 covers the scenario.
+
+## Shielded pool (inactive)
+
+No shielded transaction is valid today. The node compiles exactly one proof
+verifier, `RejectAll`, and `accept_block` rejects every block that carries a
+shielded transaction before it reaches the DAG. The rules below therefore
+change no block's validity and need no activation height. Enabling a
+verifier would be a separate consensus change with its own activation, and
+it is guarded in code (see "Verifier guard").
+
+### Spend statement v2 (audit COH-1)
+
+Version 1 of the statement took the nullifier key `nk` as a free witness.
+Anyone who knew a note's opening could spend it, and one note produced a
+fresh nullifier for every `nk` (the audit spent one 1,000-value note 8 times).
+Version 2 (`coherence_core::SPEND_STATEMENT_VERSION = 2`) binds spending
+authority. `H(x)` is SHAKE-256 squeezed to 32 bytes, `‖` is concatenation,
+the domain tags are ASCII without a terminator, and integers are unsigned
+little-endian:
+
+```text
+sk   : 32-byte spending key (private witness)
+ak   = H("gnb:coherence:ak:v2"  ‖ sk)
+nk   = H("gnb:coherence:nk:v2"  ‖ sk)
+pk_d = H("gnb:coherence:pkd:v2" ‖ ak ‖ nk)
+cm   = H("gnb:coherence:cm:v1"  ‖ v as u64 ‖ pk_d ‖ rho ‖ psi)     (unchanged)
+nf   = H("gnb:coherence:nf:v2"  ‖ nk ‖ cm ‖ position as u64)
+```
+
+The commitment tree is unchanged: depth 32, `parent = H("gnb:coherence:mt:v1"
+‖ left ‖ right)`, the empty leaf is `H("gnb:coherence:mt:v1" ‖ "empty-leaf")`,
+and a missing right child at height `d` is the empty subtree of height `d`.
+
+`check_spend(public, witness)` accepts iff all of the following hold:
+
+1. `|public.out_commitments| = |witness.outputs|` and
+   `|public.nullifiers| = |witness.inputs|`.
+2. No two inputs have the same position.
+3. For each input `i`:
+   - `position < 2^32`;
+   - `cm_i` is a member under `public.anchor` with the witness path;
+   - `pk_d(sk_i) = note_i.pk_d` (spending authority, otherwise `Unauthorized(i)`);
+   - `public.nullifiers[i] = nf(nk(sk_i), cm_i, position_i)`.
+4. `public.out_commitments[j] = cm(outputs[j])` for each output `j`.
+5. `Σ inputs.v = Σ outputs.v + public.fee`, computed in u128 with no
+   overflow.
+
+SHAKE-256 is collision resistant, so a note's `pk_d` fixes `(ak, nk)`. Each
+(note, position) therefore has exactly one nullifier, and only the holder of
+`sk` can produce it. `(ak, nk)` is a viewing key: it recognises `pk_d` and
+computes nullifiers, but the statement takes `sk`, so it cannot spend.
+
+Golden vectors, pinned by `crates/coherence-core/tests/statement_v2.rs` and
+reproduced independently with Python's `hashlib.shake_256`. The inputs are
+`sk = 00 01 02 … 1f`, `v = 1000`, `rho = 0x11 × 32`, `psi = 0x22 × 32`,
+`position = 5`:
+
+| value | hex |
+| --- | --- |
+| `ak` | `1d64f855d802d8d73b185b6c3c8666fce5ed176d3d2e1b480fa5f8620d981223` |
+| `nk` | `0004a2dfbb1a21b7ef2584349aa057e6980430a6bac9a0124159aa2f6ffa738d` |
+| `pk_d` | `d9a13fe370b6169dd975132432296e614e31902be55d0c542b606c3aaa20b551` |
+| `cm` | `ca6218f92e0f20ffb2e285a05af2e33efcc5f576e48989dd6cec2dd707a70a6f` |
+| `nf` | `f7c0d16ea5c3034bbf561e57da5a31da7080309bb1a922072106af8a6abc51ce` |
+| empty tree root | `91225423fd45e8d61ce70c068f075176eacdcebf5d0df94fdb80a1b4aa5d251a` |
+
+### Verifier guard and committed public values
+
+`node/src/coherence/verifier.rs` refuses any accepting verifier unless
+`statement_binds_authority(SPEND_STATEMENT_VERSION)` holds, which is true for
+version ≥ 2. A `const` assertion fails the build, `ShieldedVerifier::from_env`
+panics at start-up when an accepting backend is selected, and `verify` and
+`is_active` re-check the condition on every call. A proof's committed public
+values must equal the bincode-v1 (`legacy`, fixed-width little-endian)
+encoding of the pair `(SPEND_STATEMENT_VERSION, public)`:
+
+```text
+u32 version (= 2) ‖ anchor (32) ‖ u64 n ‖ nullifiers (32·n)
+                  ‖ u64 m ‖ out_commitments (32·m) ‖ u64 fee
+```
+
+A proof from a guest built for another version, including a v1 guest that
+committed only `SpendPublic`, never binds. No guest prover lives in this
+repository.
+
+### State (audit COH-2)
+
+The shielded state is the commitment tree, the spent-nullifier set and the
+window of the last 100 distinct tree roots that are accepted as anchors.
+Applying a transaction validates it against the accumulated state (known
+anchor, unseen nullifiers, no duplicate within the transaction, valid proof),
+marks its nullifiers spent, appends its output commitments, and records the
+new root as an anchor. A block is applied atomically: if any of its
+transactions fails, the block is invalid in its own context.
+
+Like the UTXO set, the state follows the applied selected chain only. A
+block is applied when it joins the selected chain and disconnected when a
+reorg removes it, in the same atomic RocksDB batch as its UTXO changes.
+`ShieldedPool::stage_plan` moves the state and `StagedShielded::stage_into`
+writes it. The batch carries the leaves, nullifiers, anchor window, a
+per-block undo record (tree length, spent nullifiers and anchor window
+before the block) and the shielded tip, laid out in column family `shielded`
+(`node/src/coherence/persist.rs`). At start-up the node reloads the state
+and refuses to run if a non-empty state's tip differs from the UTXO tip.
+Applying a block costs O(outputs × 32 + nullifiers): the tree is incremental,
+and nothing is cloned.

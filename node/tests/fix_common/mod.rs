@@ -272,6 +272,7 @@ pub fn restart(n: &mut Node) {
         d.rebuild_reachability_from_store().unwrap();
     }
     n.dag = Arc::new(RwLock::new(d));
-    n.shielded = Arc::new(RwLock::new(ShieldedPool::new()));
+    // As main() does: reload the persisted shielded state (audit COH-2).
+    n.shielded = Arc::new(RwLock::new(ShieldedPool::load(&n.store).expect("shielded state loads")));
     accept::reconcile_on_startup(&n.dag, &n.store, &n.shielded).expect("reconcile");
 }

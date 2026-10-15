@@ -38,6 +38,12 @@ pub const MAX_BLOCK_KEYS: usize = 16_384;
 pub const MAX_BLOCK_TX_BYTES: usize = 4_000_000;
 pub const MAX_COINBASE_EXTRA: usize = 100;
 pub const COINBASE_MATURITY: u64 = 100;
+/// Per block: the committed witness bundle (consensus cap, audit LED-1). A bundle
+/// above it is refused before it is hashed (`witness-size`, transient), so no attempt
+/// costs more hashing than this, and a block whose committed bundle is larger can never
+/// be validated. One maximal transaction (1,024 inputs and 1,024 outputs, every proof
+/// at full depth, about 17 MB) plus a maximal coinbase always fit.
+pub const MAX_WITNESS_BYTES: usize = 32 * 1024 * 1024;
 
 pub const TX_REGULAR: u8 = 0;
 pub const TX_COINBASE: u8 = 1;
@@ -61,6 +67,7 @@ pub enum ErrorCode {
     Target,
     Pow,
     TxRoot,
+    WitnessSize,
     WitnessCommitment,
     Isolation,
     WitnessFormat,
@@ -76,9 +83,11 @@ impl ErrorCode {
     /// Permanent codes prove the committed block is invalid; the witness bundle is
     /// committed by the header, so its faults are permanent too. The others (tx-root,
     /// witness-commitment) mean the body or bundle received does not hash to the
-    /// header's commitments: penalize the peer and fetch again.
+    /// header's commitments, or (witness-size) the bundle received is larger than any
+    /// committed bundle may be and was refused unhashed: penalize the peer and fetch
+    /// again.
     pub fn is_permanent(self) -> bool {
-        !matches!(self, ErrorCode::TxRoot | ErrorCode::WitnessCommitment)
+        !matches!(self, ErrorCode::TxRoot | ErrorCode::WitnessSize | ErrorCode::WitnessCommitment)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -87,6 +96,7 @@ impl ErrorCode {
             ErrorCode::Target => "target",
             ErrorCode::Pow => "pow",
             ErrorCode::TxRoot => "tx-root",
+            ErrorCode::WitnessSize => "witness-size",
             ErrorCode::WitnessCommitment => "witness-commitment",
             ErrorCode::Isolation => "isolation",
             ErrorCode::WitnessFormat => "witness-format",
@@ -722,6 +732,21 @@ fn create(root: &Hash, tid: &Hash, vout: u32, record: &UtxoRecord, sibs: &[Hash]
 /// Stateless transition. Regular transactions in order, then the coinbase (txs[0])
 /// last so it can claim the fees accepted in the same block.
 pub fn apply_block_txs(state: &State, txs: &[Tx], witness: &[u8], ctx: &Context) -> Result<(State, Vec<bool>), InvalidBlock> {
+    apply_txs(state, txs, witness, ctx, false)
+}
+
+/// [`apply_block_txs`] for a block of a chain block's MERGESET, under the mergeset
+/// coinbase-collision rule (audit LED-1; `merged=True` in the Python reference): a
+/// merged block whose coinbase output already exists (an identical coinbase at the
+/// same height on the same parents, i.e. a twin of a block applied before it) forfeits
+/// its coinbase. Its coinbase entry is then REJECT_OUTPUT_EXISTS proving that one of its
+/// output keys holds exactly the record this coinbase would create; no coinbase output
+/// is created, its other outcomes stand, and the merging block stays valid.
+pub fn apply_merged_block_txs(state: &State, txs: &[Tx], witness: &[u8], ctx: &Context) -> Result<(State, Vec<bool>), InvalidBlock> {
+    apply_txs(state, txs, witness, ctx, true)
+}
+
+fn apply_txs(state: &State, txs: &[Tx], witness: &[u8], ctx: &Context, merged: bool) -> Result<(State, Vec<bool>), InvalidBlock> {
     check_block_txs(txs, ctx)?;
     let mut r = Reader::new(witness, ErrorCode::WitnessFormat);
     if r.u32()? as usize != txs.len() {
@@ -800,8 +825,11 @@ pub fn apply_block_txs(state: &State, txs: &[Tx], witness: &[u8], ctx: &Context)
         return err(ErrorCode::WitnessFormat, "coinbase entry must be ACCEPT or a collision proof");
     }
     // Every regular outcome above is proven, so `fees` is forced: an overclaim is the block's fault.
+    // The one exception is a merged twin forfeiting its coinbase (checked below): it mints nothing,
+    // and its identical coinbase claimed the twin's fees when the twin was applied -- the same fees
+    // that make this block's own transactions fail now, so its `fees` here can be 0.
     let claimed: u128 = cb.outputs.iter().map(|o| o.amount as u128).sum();
-    if claimed > ctx.subsidy as u128 + fees {
+    if claimed > ctx.subsidy as u128 + fees && !(merged && tag == REJECT_OUTPUT_EXISTS) {
         return err(ErrorCode::Coinbase, "claims more than subsidy plus fees");
     }
     let cid = txid(cb);
@@ -818,7 +846,22 @@ pub fn apply_block_txs(state: &State, txs: &[Tx], witness: &[u8], ctx: &Context)
         if root_from(&key, &leaf_hash(&key, &value), &sibs) != root {
             return err(ErrorCode::WitnessMismatch, "claimed-existing coinbase output is absent");
         }
-        return err(ErrorCode::Coinbase, "coinbase output already exists");
+        if !merged {
+            return err(ErrorCode::Coinbase, "coinbase output already exists");
+        }
+        // Mergeset rule: the twin of an applied block forfeits its coinbase. The existing
+        // output must be exactly what this coinbase would create. A forfeit is exempt from
+        // the claim check above: nothing is minted, and the identical coinbase that holds the
+        // output passed that check when it was applied.
+        let out = &cb.outputs[o];
+        let twin = UtxoRecord { amount: out.amount, owner: out.owner, height: ctx.height, coinbase: true };
+        if value != utxo_value(&twin) {
+            return err(ErrorCode::Coinbase, "colliding output is not an identical coinbase output");
+        }
+        if !r.done() {
+            return err(ErrorCode::WitnessFormat, "trailing bytes");
+        }
+        return Ok((State { utxo_root: root, nullifier_root: state.nullifier_root }, accepted));
     }
     for (o, out) in cb.outputs.iter().enumerate() {
         let sibs = r.proof()?;
@@ -940,6 +983,9 @@ pub fn validate_body<W: AsRef<[u8]>>(
     let ids: Vec<Hash> = tx_wires.iter().map(|w| wtxid(w.as_ref())).collect();
     if tx_root(&ids) != hdr.tx_root {
         return err(ErrorCode::TxRoot, "mismatch");
+    }
+    if witness.len() > MAX_WITNESS_BYTES {
+        return err(ErrorCode::WitnessSize, "bundle exceeds MAX_WITNESS_BYTES");
     }
     if witness_commitment(witness) != hdr.witness_root {
         return err(ErrorCode::WitnessCommitment, "mismatch");
@@ -1179,9 +1225,33 @@ mod tests {
                      AcceptInvalid, RejectInvalid, Coinbase, StateCommitment] {
             assert!(code.is_permanent(), "{}", code.as_str());
         }
-        for code in [TxRoot, WitnessCommitment] {
+        for code in [TxRoot, WitnessSize, WitnessCommitment] {
             assert!(!code.is_permanent(), "{}", code.as_str());
         }
+    }
+
+    /// LED-1: a bundle above MAX_WITNESS_BYTES is refused before it is hashed
+    /// (transient); one at the cap is hashed and judged.
+    #[test]
+    fn witness_size_cap() {
+        let wires = vec![tx_wire(&cb())];
+        let ids: Vec<Hash> = wires.iter().map(|w| wtxid(w)).collect();
+        let big = vec![0u8; MAX_WITNESS_BYTES + 1];
+        let hdr = Header {
+            version: 1,
+            parents_root: EMPTY,
+            tx_root: tx_root(&ids),
+            witness_root: witness_commitment(&big),
+            state_commitment: EMPTY,
+            timestamp: 0,
+            target: [0x80; 32],
+        };
+        let e = validate_body(&State::genesis(), &hdr, &wires, &big, &ctx()).unwrap_err();
+        assert_eq!((e.code, e.code.as_str(), e.code.is_permanent()), (ErrorCode::WitnessSize, "witness-size", false));
+        let at_cap = vec![0u8; MAX_WITNESS_BYTES];
+        let hdr = Header { witness_root: witness_commitment(&at_cap), ..hdr };
+        let e = validate_body(&State::genesis(), &hdr, &wires, &at_cap, &ctx()).unwrap_err();
+        assert_eq!((e.code, e.code.is_permanent()), (ErrorCode::WitnessFormat, true));
     }
 
     #[test]

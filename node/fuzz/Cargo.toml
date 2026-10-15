@@ -49,7 +49,6 @@ members = ["."]
 [patch.crates-io]
 # Same patches as the root workspace.
 pqcrypto-internals = { path = "../../crates/pqcrypto-internals" }
-libp2p-yamux = { path = "../../crates/libp2p-yamux" }
 
 [profile.release]
 debug = 1

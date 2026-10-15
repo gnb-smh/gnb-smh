@@ -79,6 +79,10 @@ pub struct MetricsState {
     /// S5: per-attempt depth distribution. `fork_depth` is last-value-only
     /// (racy under scrape); the histogram records every attempt.
     pub reorg_depth:                     Histogram,
+    /// Audit DAG-6: committed chain moves deeper than
+    /// `reorg::DEEP_REORG_ALERT_DEPTH`. Alert series only: there is no
+    /// reorg-depth limit, so every such reorg was followed.
+    pub deep_reorgs_total:               IntCounter,
 
     // ── Histograms (Phase 2) ────────────────────────────────────
     pub block_validation_seconds:        Histogram,
@@ -199,17 +203,24 @@ impl MetricsState {
             registry
         ).expect("register reorg_success_total");
 
-        // Depth buckets anchored to the finality window: MAX_REORG_DEPTH =
-        // core::CHECKPOINT_DEPTH = 1_000 in production builds, so the top
-        // bucket sits at the cap and +Inf catches only refused over-deep plans.
+        // Depth buckets up to the deep-reorg alert depth
+        // (`reorg::DEEP_REORG_ALERT_DEPTH` = core::CHECKPOINT_DEPTH = 1_000);
+        // +Inf counts deeper reorgs, which are executed (no depth limit, audit
+        // DAG-6) and also counted by `gnb_deep_reorgs_total`.
         let reorg_depth = register_histogram_with_registry!(
             histogram_opts!(
                 "gnb_reorg_depth",
-                "Blocks rolled back per reorg attempt (observed before execution; includes failed and depth-refused attempts)",
+                "Blocks rolled back per reorg attempt (observed before execution; includes failed attempts)",
                 vec![1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 50.0, 100.0, 250.0, 500.0, 1000.0]
             ),
             registry
         ).expect("register reorg_depth");
+
+        let deep_reorgs_total = register_int_counter_with_registry!(
+            opts!("gnb_deep_reorgs_total",
+                  "Committed chain moves that rolled back more than the deep-reorg alert depth (1,000 blocks); followed, never refused"),
+            registry
+        ).expect("register deep_reorgs_total");
 
         // ── Histograms ───────────────────────────────────────────
         // Block validation buckets tuned for expected range: 1ms..10s
@@ -253,6 +264,7 @@ impl MetricsState {
             fork_depth,
             reorg_success_total,
             reorg_depth,
+            deep_reorgs_total,
             block_validation_seconds,
             rpc_latency_seconds,
         }
@@ -379,10 +391,17 @@ pub fn inc_reorg_success() {
 
 /// S5: observe the depth (blocks rolled back) of a reorg attempt. Called at
 /// the start of `execute_reorg` alongside `set_fork_depth`, so the histogram
-/// counts every attempt — including ones later refused by the depth cap.
+/// counts every attempt, including ones that later fail.
 #[inline]
 pub fn observe_reorg_depth(depth: f64) {
     if let Some(m) = METRICS.get() { m.reorg_depth.observe(depth); }
+}
+
+/// Audit DAG-6: a committed reorg rolled back more than
+/// `reorg::DEEP_REORG_ALERT_DEPTH` blocks (alert only; it was followed).
+#[inline]
+pub fn inc_deep_reorg() {
+    if let Some(m) = METRICS.get() { m.deep_reorgs_total.inc(); }
 }
 
 #[inline]

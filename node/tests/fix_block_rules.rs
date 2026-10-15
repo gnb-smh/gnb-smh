@@ -1332,8 +1332,28 @@ fn stored_blocks_failing_the_hardening_rules_are_disqualified_at_startup() {
     assert_eq!(n.store.get_meta(pipeline::HARDENING_RECHECK_META).unwrap(), Some(A.to_le_bytes().to_vec()));
     assert_eq!(sel_tip(&n), Some(m2.block_hash()));
     assert_eq!(applied_tip(&n), Some(m2.block_hash()), "the applied chain left the legacy branch");
+    // COH-2: the rollback-only plan moved the shielded state with the chain,
+    // in memory and in the same committed batch.
+    assert_eq!(n.shielded.read().tip(), Some(m2.block_hash()));
+    assert_eq!(gnb::coherence::ShieldedPool::load(&n.store).unwrap().tip(), Some(m2.block_hash()));
     assert!(n.store.get_utxo(&p.transactions[0].txid(), 0).unwrap().is_none());
     assert!(n.store.get_utxo(&m2.transactions[0].txid(), 0).unwrap().is_some());
+
+    // Merge P1 x P3 (operator overrides, audit DAG-6): `reconsiderblock`
+    // re-validates a hardening-recheck mark instead of lifting it — P's
+    // stored body still fails the rules, so nothing changes — and
+    // `invalidateblock` never turns it into an operator mark.
+    let r = pipeline::reconsider_block(p.block_hash(), &n.dag, &n.store, &n.mempool, &n.node_state,
+        Some(&n.tip_tx), &n.shielded).expect("reconsiderblock");
+    assert_eq!((r.tip, r.rolled_back, r.connected), (m2.block_hash(), 0, 0));
+    let r = pipeline::invalidate_block(p.block_hash(), &n.dag, &n.store, &n.mempool, &n.node_state,
+        Some(&n.tip_tx), &n.shielded).expect("invalidateblock on a disqualified block is a no-op");
+    assert_eq!((r.tip, r.rolled_back, r.connected, r.affected), (m2.block_hash(), 0, 0, 0));
+    assert_eq!(n.store.invalid_block_reason(&p.block_hash()).unwrap().as_deref(), Some(reason.as_str()));
+    for b in [&p, &pc] {
+        assert!(n.dag.read().is_invalid_all_edges(&b.block_hash()));
+    }
+    assert_eq!(applied_tip(&n), Some(m2.block_hash()));
 
     let has_body = |h: &BlockHash| n.store.get_block(h).ok().flatten().is_some();
     let parents = n.dag.read().template_parents(core::MAX_PARENTS, has_body);
@@ -1411,6 +1431,91 @@ fn next_block_height_and_template_skip_the_same_legacy_tip() {
     assert_eq!(admission::pool_next_height(&n.dag.read(), &n.store, &n.mempool), A);
     let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
     assert_eq!((tmpl.parents.clone(), tmpl.height, tmpl.hardened), (vec![m2.block_hash()], A, true));
+}
+
+/// Merge review (P1 x DAG-11 x COH-2): a pre-upgrade binary ran past the
+/// activation A, stored and applied a legacy block P at height A (spending a
+/// funded output) and its child PC, then crashed while committing X, a child
+/// of PC: X's UTXO effects and undo record are on disk, its DAG record is not
+/// (the pre-fix extension commit), with the tip pointer written or not.
+/// After the upgrade the hardening recheck disqualifies P and PC, so the DAG's
+/// best valid block is M2. Start-up reconciliation used to roll back only X
+/// and point the tip and the shielded tip at that best block, leaving P's
+/// and PC's effects applied under a tip that excludes them (P's input spent,
+/// their coinbases present), with nothing to repair it. Step 2 now rolls X
+/// back onto PC, the heaviest DAG block holding an undo record (the block
+/// the UTXO set sits on), and step 3 disconnects PC and P: the
+/// UTXO set, the tip pointer and the shielded tip all describe M2, exactly
+/// like a node that never stored P, and a hardened block spending P's input
+/// is accepted on both.
+#[test]
+fn startup_rolls_an_unrecorded_block_back_onto_its_disqualified_parent() {
+    const A: u64 = 3;
+    for tip_written in [false, true] {
+        let genesis = mk_genesis(unix_now() - 10_000);
+        let gh = genesis.block_hash();
+        let k = key();
+        let fund = ([0xA7u8; 32], 0u32, out(3_000_000, &k.spk));
+        let (mut n, m1, m2, p, pc, x, t, tx) = {
+            let _old = activation::scoped_override(activation::NEVER);
+            let n = node_with(&genesis, std::slice::from_ref(&fund));
+            let m1 = build(&n, vec![gh], vec![coinbase("rx-m1", subsidy(1), vec![0xE1; 20])]);
+            accept(&n, &m1).unwrap();
+            let m2 = build(&n, vec![m1.block_hash()], vec![coinbase("rx-m2", subsidy(2), vec![0xE2; 20])]);
+            accept(&n, &m2).unwrap();
+            let t = signed_spend(&k, &[(fund.0, 0)], vec![out(2_900_000, &k.spk)]);
+            let p = build(&n, vec![m2.block_hash()],
+                vec![coinbase("rx-legacy-P", subsidy(3), vec![0xE3; 20]), t.clone()]);
+            accept(&n, &p).expect("old binary: a legacy block at height A is valid");
+            let pc = build(&n, vec![p.block_hash()], vec![coinbase("rx-legacy-PC", subsidy(4), vec![0xE4; 20])]);
+            accept(&n, &pc).unwrap();
+            let tx = signed_spend(&k, &[(t.txid(), 0)], vec![out(2_800_000, &[0x9C; 20])]);
+            let x = build(&n, vec![pc.block_hash()],
+                vec![coinbase("rx-legacy-X", subsidy(5), vec![0xE5; 20]), tx.clone()]);
+            // The pre-fix extension commit, up to the crash point.
+            n.store.put_block(&x).unwrap();
+            reorg::apply_block_utxo_mutations(&n.store, &x).unwrap();
+            if tip_written {
+                n.store.put_meta("tip_hash", &x.block_hash()).unwrap();
+            }
+            assert!(n.store.get_dag_data(&x.block_hash()).unwrap().is_none());
+            (n, m1, m2, p, pc, x, t, tx)
+        };
+        let _new = activation::scoped_override(A);
+        let what = if tip_written { "tip pointer at X" } else { "tip pointer at PC" };
+
+        restart(&mut n);
+        assert!(n.dag.read().is_invalid(&p.block_hash()) && n.dag.read().is_invalid(&pc.block_hash()), "{what}");
+        assert_eq!(sel_tip(&n), Some(m2.block_hash()), "{what}");
+        assert_eq!(applied_tip(&n), Some(m2.block_hash()), "{what}");
+        assert_eq!(n.shielded.read().tip(), Some(m2.block_hash()), "{what}");
+        assert_eq!(gnb::coherence::ShieldedPool::load(&n.store).unwrap().tip(), Some(m2.block_hash()), "{what}");
+        for b in [&p, &pc, &x] {
+            assert!(n.store.get_undo_data(&b.block_hash()).unwrap().is_none(), "{what}: undo record left");
+        }
+
+        // The UTXO set equals that of a node that only ever connected M1, M2.
+        let reference = node_with(&genesis, std::slice::from_ref(&fund));
+        for b in [&m1, &m2] {
+            accept(&reference, b).unwrap();
+        }
+        let mut outpoints = vec![(fund.0, 0u32), (t.txid(), 0), (tx.txid(), 0)];
+        for b in [&m1, &m2, &p, &pc, &x] {
+            outpoints.push((b.transactions[0].txid(), 0));
+        }
+        assert_eq!(utxo_snapshot(&n, &outpoints), utxo_snapshot(&reference, &outpoints), "{what}");
+        assert!(n.store.get_utxo(&fund.0, 0).unwrap().is_some(), "{what}: P's input is unspent again");
+        assert_aggregates_consistent(&n.store, what);
+
+        // Both nodes accept the same hardened block at height A spending P's input.
+        let spend = signed_spend_at(&k, &[(fund.0, 0)], std::slice::from_ref(&fund.2),
+            vec![out(2_900_000, &[0x9D; 20])], A);
+        let blk = build(&n, vec![m2.block_hash()], vec![coinbase("rx-honest", subsidy(A), vec![0xE6; 20]), spend]);
+        accept(&n, &blk).expect("the input P spent is spendable on the honest chain");
+        accept(&reference, &blk).expect("the reference node agrees");
+        assert_eq!(applied_tip(&n), Some(blk.block_hash()));
+        assert_eq!(utxo_snapshot(&n, &outpoints), utxo_snapshot(&reference, &outpoints), "{what}");
+    }
 }
 
 /// The recheck's classification: a legacy block at/after the activation

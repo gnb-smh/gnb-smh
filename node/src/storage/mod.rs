@@ -23,6 +23,7 @@ const CF_ADDR_TX_HISTORY: &str = "addr_tx_history";  // addr → chronological t
 const CF_UNDO:       &str = "undo";        // Sprint U.1: per-block undo data for reorg rollback
 const CF_DAG_INTEGRITY: &str = "dag_integrity";  // Sprint Y (M-2): hash-chain over GhostdagData
 const CF_REACHABILITY: &str = "reachability";    // Phase 1: durable interval-reachability index (non-consensus cache)
+const CF_SHIELDED: &str = "shielded";            // audit COH-2: shielded-pool state + undo (layout: coherence::persist)
 
 // ── PoBRS Column Families (Sprint 1.5) ─────────────────────────────────
 // Persistence layer for the Proof-of-Blue-and-Red-Score subsystem.
@@ -60,6 +61,9 @@ pub(crate) const CF_FFG_PENDING_COMMITTEE:    &str = "ffg_pending_committee";   
 /// Stored as `CF_POBRS_META["schema_version"] = u32 LE`.
 pub const POBRS_SCHEMA_VERSION: u32 = 1;
 
+/// (key, value) rows read from a column family, in key order.
+pub type KeyValueRows = Vec<(Vec<u8>, Vec<u8>)>;
+
 fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, StorageError> {
     bincode::serde::encode_to_vec(v, bincode::config::standard())
         .map_err(|e| StorageError::SerializeFailed(e.to_string()))
@@ -69,6 +73,36 @@ pub fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, StorageErro
     bincode::serde::decode_from_slice(b, bincode::config::standard())
         .map(|(v, _)| v)
         .map_err(|e| StorageError::DeserializeFailed(e.to_string()))
+}
+
+/// `(txid, block_hash)`: one CF_TX_INDEX row (`Storage::tx_index_entries`).
+pub type TxIndexEntry = ([u8; 32], [u8; 32]);
+
+/// CF_UNDO key prefix of a [`PrunedBodyRecord`]. Undo records are keyed by
+/// the bare 32-byte block hash; these keys are longer, so
+/// `Storage::undo_block_hashes` never mistakes one for an undo record.
+pub const PRUNED_BODY_PREFIX: &[u8] = b"pruned_body/";
+
+/// CF_UNDO key of `hash`'s pruned-body record.
+pub fn pruned_body_key(hash: &BlockHash) -> Vec<u8> {
+    let mut k = PRUNED_BODY_PREFIX.to_vec();
+    k.extend_from_slice(hash);
+    k
+}
+
+/// What disconnecting a selected-chain block needs from its body, kept when
+/// the body is pruned (audit DAG-6): the UTXO effects are reversed from the
+/// undo record, which is never pruned; the address-history rows to delete and
+/// whether the block carried shielded transactions are kept here.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PrunedBodyRecord {
+    /// Header height of the pruned block.
+    pub height: u64,
+    /// The block carried shielded transactions.
+    pub had_shielded: bool,
+    /// Every CF_ADDR_TX_HISTORY key the block's connect wrote
+    /// (`indexer::addr_history_keys`).
+    pub addr_history_keys: Vec<Vec<u8>>,
 }
 
 /// Decode one exported UTXO row without silently omitting corrupt ledger data.
@@ -182,6 +216,10 @@ impl Storage {
             // value = encode_record() bytes. A rebuildable cache, never part of
             // the integrity chain; see docs/adr/ADR-035-durable-reachability-index.md.
             ColumnFamilyDescriptor::new(CF_REACHABILITY, Options::default()),
+            // Audit COH-2: shielded-pool consensus state (commitment-tree
+            // leaves, spent nullifiers, anchor window, per-block undo, tip),
+            // written in the same WriteBatch as the UTXO changes.
+            ColumnFamilyDescriptor::new(CF_SHIELDED, Options::default()),
             // ── PoBRS CFs (Sprint 1.5) ─────────────────────────────
             ColumnFamilyDescriptor::new(CF_POBRS_META,                Options::default()),
             ColumnFamilyDescriptor::new(CF_POBRS_ORACLES,             Options::default()),
@@ -244,10 +282,21 @@ impl Storage {
     /// The DB must already exist; this never creates column families.
     pub fn open_read_only(path: &Path) -> Result<Self, StorageError> {
         let opts = Options::default();
+        // A read-only open cannot create column families, so open only the
+        // ones the snapshot has: a data-dir written before a CF was added
+        // (e.g. `shielded`, audit COH-2) stays readable.
+        let existing: std::collections::HashSet<String> = DB::list_cf(&opts, path)
+            .map_err(|e| StorageError::OpenFailed(e.to_string()))?
+            .into_iter()
+            .collect();
+        let descriptors: Vec<ColumnFamilyDescriptor> = Self::cf_descriptors()
+            .into_iter()
+            .filter(|d| existing.contains(d.name()))
+            .collect();
         // `error_if_log_file_exist = false`: tolerate a live/unclean WAL so we
         // can inspect a running node's dir. Read-only mode never replays into or
         // mutates the primary.
-        let db = DB::open_cf_descriptors_read_only(&opts, path, Self::cf_descriptors(), false)
+        let db = DB::open_cf_descriptors_read_only(&opts, path, descriptors, false)
             .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
         let store = Self::with_db(db);
         // Read-only: report the marker, never write it.
@@ -1030,14 +1079,63 @@ impl Storage {
     pub fn stage_chain_unindex(&self, batch: &mut rocksdb::WriteBatch, block: &Block)
         -> Result<(), StorageError>
     {
-        let hash = block.block_hash();
-        if self.get_block_hash_at_height(block.height)? == Some(hash) {
+        self.stage_chain_unindex_at(batch, block.height, &block.block_hash())
+    }
+
+    /// [`stage_chain_unindex`](Self::stage_chain_unindex) from a height and a
+    /// hash alone, for a block whose body was pruned (both come from its undo
+    /// record), so a reorg of any depth can disconnect it (audit DAG-6).
+    pub fn stage_chain_unindex_at(&self, batch: &mut rocksdb::WriteBatch, height: u64, hash: &BlockHash)
+        -> Result<(), StorageError>
+    {
+        if self.get_block_hash_at_height(height)? == Some(*hash) {
             let cf_h = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
             let cf_t = self.db.cf_handle(CF_TIMESTAMPS).ok_or(StorageError::CfNotFound(CF_TIMESTAMPS.into()))?;
-            batch.delete_cf(&cf_h, &block.height.to_be_bytes());
-            batch.delete_cf(&cf_t, &block.height.to_be_bytes());
+            batch.delete_cf(&cf_h, height.to_be_bytes());
+            batch.delete_cf(&cf_t, height.to_be_bytes());
         }
         Ok(())
+    }
+
+    // ── Shielded-pool state (audit COH-2; key layout in coherence::persist) ──
+
+    /// Stage a CF_SHIELDED put.
+    pub fn stage_shielded_put(&self, batch: &mut rocksdb::WriteBatch, key: &[u8], value: &[u8])
+        -> Result<(), StorageError>
+    {
+        let cf = self.db.cf_handle(CF_SHIELDED).ok_or(StorageError::CfNotFound(CF_SHIELDED.into()))?;
+        batch.put_cf(&cf, key, value);
+        Ok(())
+    }
+
+    /// Stage a CF_SHIELDED delete.
+    pub fn stage_shielded_delete(&self, batch: &mut rocksdb::WriteBatch, key: &[u8])
+        -> Result<(), StorageError>
+    {
+        let cf = self.db.cf_handle(CF_SHIELDED).ok_or(StorageError::CfNotFound(CF_SHIELDED.into()))?;
+        batch.delete_cf(&cf, key);
+        Ok(())
+    }
+
+    /// Read one CF_SHIELDED value.
+    pub fn get_shielded(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        let cf = self.db.cf_handle(CF_SHIELDED).ok_or(StorageError::CfNotFound(CF_SHIELDED.into()))?;
+        self.db.get_cf(&cf, key).map_err(|e| StorageError::ReadFailed(e.to_string()))
+    }
+
+    /// Every CF_SHIELDED (key, value) whose key starts with `prefix`, in key
+    /// order.
+    pub fn scan_shielded_prefix(&self, prefix: &[u8]) -> Result<KeyValueRows, StorageError> {
+        let cf = self.db.cf_handle(CF_SHIELDED).ok_or(StorageError::CfNotFound(CF_SHIELDED.into()))?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(&cf, IteratorMode::From(prefix, rocksdb::Direction::Forward)) {
+            let (k, v) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            if !k.starts_with(prefix) {
+                break;
+            }
+            out.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(out)
     }
 
     // ── Chain-disqualified blocks (audit DAG-1) ─────────────────────────
@@ -1085,6 +1183,16 @@ impl Storage {
             }
         }
         Ok(out)
+    }
+
+    /// Stage removal of the persisted chain-disqualified mark of `hash`
+    /// (operator `reconsiderblock`, chain-state rebuild).
+    pub fn stage_clear_invalid_block(&self, batch: &mut rocksdb::WriteBatch, hash: &BlockHash)
+        -> Result<(), StorageError>
+    {
+        let cf = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        batch.delete_cf(&cf, Self::invalid_key(hash));
+        Ok(())
     }
 
     /// The recorded reason a block was disqualified, if it was.
@@ -1192,6 +1300,32 @@ impl Storage {
         self.db.put_cf(&cf, txid, &val).map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
+    /// Stage a CF_TX_INDEX row (same layout as [`put_tx_index`](Self::put_tx_index)).
+    pub fn stage_tx_index(&self, batch: &mut rocksdb::WriteBatch, txid: &[u8; 32], block_hash: &[u8; 32], height: u64)
+        -> Result<(), StorageError>
+    {
+        let cf = self.db.cf_handle(CF_TX_INDEX).ok_or(StorageError::CfNotFound(CF_TX_INDEX.into()))?;
+        let mut val = Vec::with_capacity(40);
+        val.extend_from_slice(block_hash);
+        val.extend_from_slice(&height.to_le_bytes());
+        batch.put_cf(&cf, txid, &val);
+        Ok(())
+    }
+
+    /// Stage a UTXO row and its address-index row (same layout as
+    /// [`put_utxo`](Self::put_utxo)).
+    pub fn stage_utxo(&self, batch: &mut rocksdb::WriteBatch, txid: &[u8], index: u32, output: &TxOutput)
+        -> Result<(), StorageError>
+    {
+        let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
+        batch.put_cf(&cf, utxo_key(txid, index), encode(output)?);
+        if output.script_pubkey.len() >= 20 {
+            let cf_ai = self.db.cf_handle(CF_ADDR_UTXO).ok_or(StorageError::CfNotFound(CF_ADDR_UTXO.into()))?;
+            batch.put_cf(&cf_ai, addr_utxo_key(&output.script_pubkey, txid, index), [0u8; 0]);
+        }
+        Ok(())
+    }
+
     /// Lookup transaction location: returns (block_hash, block_height)
     pub fn get_tx_location(&self, txid: &[u8; 32]) -> Result<Option<([u8; 32], u64)>, StorageError> {
         self.note_reads(1);
@@ -1227,9 +1361,10 @@ impl Storage {
 
     // ── Sprint U.1: Undo data for reorg rollback ─────────────────────────
     //
-    // Each accepted block writes one UndoData record keyed by block hash.
-    // Sprint U.2 will add rollback_block() which reads it; Sprint U.3 will
-    // prune records whose block has dropped below finalized_height.
+    // Each connected block writes one UndoData record keyed by block hash,
+    // deleted only when the block is rolled back. Undo records are NEVER
+    // pruned: there is no reorg-depth limit (audit DAG-6), so a reorg of any
+    // depth must be able to disconnect any connected block.
 
     /// Persist the undo record for a block. Should be called once per block,
     /// immediately after all UTXO/index mutations for that block complete.
@@ -1258,6 +1393,15 @@ impl Storage {
         }
     }
 
+    /// True iff `block_hash` has an undo record (its effects are applied),
+    /// without decoding it.
+    pub fn has_undo_data(&self, block_hash: &[u8; 32]) -> Result<bool, StorageError> {
+        let cf = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
+        Ok(self.db.get_pinned_cf(&cf, block_hash)
+            .map_err(|e| StorageError::ReadFailed(e.to_string()))?
+            .is_some())
+    }
+
     /// Every block hash that has an undo record (i.e. whose UTXO effects are
     /// currently applied). Used by start-up reconciliation (DAG-11) to find
     /// blocks a pre-fix, non-atomic commit applied but never recorded in
@@ -1276,8 +1420,9 @@ impl Storage {
         Ok(out)
     }
 
-    /// Remove an undo record. Called when the block has passed the finality
-    /// window and can no longer be part of a reorg candidate chain.
+    /// Remove an undo record (rollback). Never call it on a block that stays
+    /// connected: with no reorg-depth limit (audit DAG-6) every connected
+    /// block must remain disconnectable.
     pub fn delete_undo_data(&self, block_hash: &[u8; 32]) -> Result<(), StorageError> {
         let cf = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
         self.db.delete_cf(&cf, block_hash).map_err(|e| StorageError::WriteFailed(e.to_string()))
@@ -1311,9 +1456,8 @@ impl Storage {
     ///
     /// Returns Err if the undo record is missing or if the block body is
     /// missing. These are abnormal conditions: an accepted-post-U.1 block
-    /// should always have both. In practice U.3 should never attempt to
-    /// rollback a block outside the finality window where undo records have
-    /// been pruned.
+    /// always has an undo record. (The batched reorg path,
+    /// `reorg::connect_plan`, also handles a pruned body.)
     ///
     /// Individual inner ops use `let _ =` for idempotent sub-operations: if
     /// a delete target was never present (e.g. intra-block chains that
@@ -1427,37 +1571,147 @@ impl Storage {
     // ── Pruning ─────────────────────────────────────────────────────────
 
     /// Prune block bodies below `below_height`.
-    /// Keeps: height→hash mapping, DAG data, TX index, UTXO set.
+    /// Keeps: height→hash mapping, DAG data, TX index, UTXO set, undo records.
     /// Removes: full block data from CF_BLOCKS (saves ~90% of storage).
     /// Returns number of blocks pruned.
+    ///
+    /// Audit DAG-6: a reorg of ANY depth must be able to disconnect a pruned
+    /// block (there is no reorg-depth limit). The UTXO effects come back from
+    /// the undo record, which is never pruned; what the rollback still needed
+    /// from the body — the address-history keys to un-index and whether the
+    /// block carried shielded transactions — is recorded here, in the same
+    /// batch as the body deletion, as a [`PrunedBodyRecord`].
     pub fn prune_blocks_below(&self, below_height: u64) -> Result<usize, StorageError> {
         let cf_blocks = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
         let cf_height = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
+        let cf_undo = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
         let mut pruned = 0usize;
 
         for h in 0..below_height {
             let key = h.to_be_bytes();
-            if let Some(hash_bytes) = self.db.get_cf(&cf_height, &key)
+            let Some(hash_bytes) = self.db.get_cf(&cf_height, key)
+                .map_err(|e| StorageError::ReadFailed(e.to_string()))?
+            else { continue };
+            let Ok(hash) = <BlockHash>::try_from(hash_bytes.as_slice()) else { continue };
+            // Only prune if block data exists
+            let raw = match self.db.get_cf(&cf_blocks, hash)
                 .map_err(|e| StorageError::ReadFailed(e.to_string()))?
             {
-                // Only prune if block data exists
-                if self.db.get_cf(&cf_blocks, &hash_bytes)
-                    .map_err(|e| StorageError::ReadFailed(e.to_string()))?.is_some()
-                {
-                    self.db.delete_cf(&cf_blocks, &hash_bytes)
-                        .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
-                    if let Ok(hash) = <[u8; 32]>::try_from(hash_bytes.as_slice()) {
-                        self.forget_body_verdict(&hash);
-                    }
-                    pruned += 1;
+                Some(raw) => raw,
+                None => continue,
+            };
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.delete_cf(&cf_blocks, hash);
+            match Block::from_wire_bytes(&raw) {
+                Ok(body) => {
+                    let spent: std::collections::HashMap<([u8; 32], u32), TxOutput> = self
+                        .get_undo_data(&hash)?
+                        .map(|u| u.spent_utxos.into_iter()
+                            .map(|e| ((e.prev_txid, e.prev_index), e.output))
+                            .collect())
+                        .unwrap_or_default();
+                    let rec = PrunedBodyRecord {
+                        height: body.height,
+                        had_shielded: !body.shielded_transactions.is_empty(),
+                        addr_history_keys: indexer::addr_history_keys(&body, &spent),
+                    };
+                    batch.put_cf(&cf_undo, pruned_body_key(&hash), encode(&rec)?);
                 }
+                Err(e) => log::warn!(
+                    "prune: body of {} does not decode ({}); pruned without a rollback record",
+                    hex::encode(&hash[..8]), e
+                ),
             }
+            self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+            self.forget_body_verdict(&hash);
+            pruned += 1;
         }
 
         if pruned > 0 {
             self.put_meta("pruned_height", &below_height.to_le_bytes())?;
         }
         Ok(pruned)
+    }
+
+    /// The rollback record written when `hash`'s body was pruned, if any.
+    pub fn get_pruned_body_record(&self, hash: &BlockHash) -> Result<Option<PrunedBodyRecord>, StorageError> {
+        let cf = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
+        match self.db.get_cf(&cf, pruned_body_key(hash)).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
+            Some(d) => Ok(Some(decode(&d)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Stage removal of `hash`'s pruned-body record (the block is being
+    /// disconnected; a later re-connect needs the body again anyway).
+    pub fn stage_delete_pruned_body_record(&self, batch: &mut rocksdb::WriteBatch, hash: &BlockHash)
+        -> Result<(), StorageError>
+    {
+        let cf = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
+        batch.delete_cf(&cf, pruned_body_key(hash));
+        Ok(())
+    }
+
+    // ── Chain-state integrity (audit DAG-6 / DAG-11) ───────────────────
+
+    /// SHA3-256 commitment to the whole UTXO set: every CF_UTXO row in key
+    /// order, each fed as `len(key) ‖ key ‖ len(value) ‖ value` (u32 LE
+    /// lengths). A pure function of the set's contents, so two nodes (or one
+    /// node before and after a rebuild) hold the same UTXO set iff the
+    /// digests are equal. O(UTXO set).
+    pub fn utxo_set_digest(&self) -> Result<[u8; 32], StorageError> {
+        use sha3::{Digest, Sha3_256};
+        let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
+        let mut h = Sha3_256::new();
+        h.update(b"gnb/utxo-set/v1");
+        for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (k, v) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            h.update((k.len() as u32).to_le_bytes());
+            h.update(&k);
+            h.update((v.len() as u32).to_le_bytes());
+            h.update(&v);
+        }
+        Ok(h.finalize().into())
+    }
+
+    /// Every `(txid, block_hash)` pair of CF_TX_INDEX (start-up chain-state
+    /// check, DAG-11). O(indexed transactions).
+    pub fn tx_index_entries(&self) -> Result<Vec<TxIndexEntry>, StorageError> {
+        let cf = self.db.cf_handle(CF_TX_INDEX).ok_or(StorageError::CfNotFound(CF_TX_INDEX.into()))?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (k, v) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            if k.len() == 32 && v.len() >= 32 {
+                let mut t = [0u8; 32];
+                t.copy_from_slice(&k);
+                let mut b = [0u8; 32];
+                b.copy_from_slice(&v[..32]);
+                out.push((t, b));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Stage the deletion of every row of the chain-state column families —
+    /// UTXO set and its address index, coinbase heights, transaction index,
+    /// undo and pruned-body records, the selected-chain height / timestamp
+    /// indexes, the address history and the shielded-pool state with its
+    /// per-block undo records (audit COH-2) — for a rebuild from blocks
+    /// (DAG-11). Block bodies, GhostDAG data and CF_META are untouched (the
+    /// NET-12 aggregates in CF_META are marked incomplete and recomputed by
+    /// the rebuild itself). Returns the number of rows staged for deletion.
+    pub fn stage_clear_chain_state(&self, batch: &mut rocksdb::WriteBatch) -> Result<usize, StorageError> {
+        let mut n = 0usize;
+        for name in [CF_UTXO, CF_ADDR_UTXO, CF_COINBASE, CF_TX_INDEX, CF_UNDO, CF_HEIGHT,
+                     CF_TIMESTAMPS, CF_ADDR_TX_HISTORY, CF_SHIELDED] {
+            let cf = self.db.cf_handle(name).ok_or(StorageError::CfNotFound(name.into()))?;
+            for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+                let (k, _) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+                batch.delete_cf(&cf, &k);
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     /// Get the height below which blocks have been pruned
@@ -1733,6 +1987,53 @@ mod snapshot_row_tests {
     }
 }
 
+#[cfg(test)]
+mod shielded_cf_tests {
+    use super::*;
+
+    /// Audit COH-2 added the `shielded` column family. A data-dir written
+    /// before it still opens read-only (the replay harness inspects old
+    /// snapshots), and a read-write open adds the family.
+    #[test]
+    fn data_dir_without_the_shielded_family_opens_read_only_and_upgrades() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            let old: Vec<ColumnFamilyDescriptor> =
+                Storage::cf_descriptors().into_iter().filter(|d| d.name() != CF_SHIELDED).collect();
+            let db = DB::open_cf_descriptors(&opts, tmp.path(), old).unwrap();
+            db.put_cf(&db.cf_handle(CF_META).unwrap(), b"tip_hash", [7u8; 32]).unwrap();
+        }
+        let ro = Storage::open_read_only(tmp.path()).expect("a pre-COH-2 data-dir opens read-only");
+        assert_eq!(ro.get_meta("tip_hash").unwrap(), Some(vec![7u8; 32]));
+        assert!(ro.get_shielded(b"T").is_err(), "the family does not exist read-only");
+        drop(ro);
+        let rw = Storage::open(tmp.path()).unwrap();
+        assert_eq!(rw.get_shielded(b"T").unwrap(), None);
+    }
+
+    /// The upgrade is one-way (docs/RUNNING.md, "Upgrading and
+    /// downgrading"): once this release has opened a data-dir, the open an
+    /// earlier release performs (read-write, a fixed descriptor list without
+    /// `shielded`) is refused by RocksDB, so a downgrade needs a pre-upgrade
+    /// copy of the data directory or a resync.
+    #[test]
+    fn upgraded_data_dir_is_refused_by_the_open_of_an_earlier_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(Storage::open(tmp.path()).unwrap());
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let old: Vec<ColumnFamilyDescriptor> =
+            Storage::cf_descriptors().into_iter().filter(|d| d.name() != CF_SHIELDED).collect();
+        let err = DB::open_cf_descriptors(&opts, tmp.path(), old).expect_err("an earlier release cannot open it");
+        assert!(err.to_string().contains("Column families not opened: shielded"), "{err}");
+        drop(Storage::open(tmp.path()).expect("this release still opens it"));
+    }
+}
+
 // ── Bloch Genesis-3 carryover ingestion ─────────────────────────────────────
 
 impl Storage {
@@ -1744,27 +2045,45 @@ impl Storage {
         &self,
         snap: &crate::core::carryover::VerifiedCarryover,
     ) -> Result<u64, StorageError> {
+        let _agg = self.agg_lock();
+        let mut deltas = aggregates::HolderDeltas::default();
+        for u in &snap.utxos {
+            if let Some(prev) = self.get_utxo(&u.txid, u.vout)? {
+                deltas.remove(&prev);
+            }
+            deltas.add(&u.output);
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        self.stage_carryover(&mut batch, snap)?;
+        // NET-12: holder aggregates in the same batch.
+        self.stage_holder_deltas(&mut batch, &deltas)?;
+        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        Ok(snap.utxos.len() as u64)
+    }
+
+    /// Stage exactly the UTXO rows [`ingest_carryover`](Self::ingest_carryover)
+    /// writes (the carryover UTXOs, their address-index rows and the
+    /// `carryover_sha3` marker) into a caller-owned batch, WITHOUT the NET-12
+    /// holder aggregates: `ingest_carryover` stages those itself, and the
+    /// chain-state rebuild (audit DAG-11), which uses this to restore the
+    /// genesis state, recomputes every aggregate once it has reconnected the
+    /// chain (`Storage::rebuild_aggregates`).
+    pub fn stage_carryover(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        snap: &crate::core::carryover::VerifiedCarryover,
+    ) -> Result<(), StorageError> {
         let cf_utxo = self.db.cf_handle(CF_UTXO)
             .ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
         let cf_ai = self.db.cf_handle(CF_ADDR_UTXO)
             .ok_or(StorageError::CfNotFound(CF_ADDR_UTXO.into()))?;
         let cf_meta = self.db.cf_handle(CF_META)
             .ok_or(StorageError::CfNotFound(CF_META.into()))?;
-        let _agg = self.agg_lock();
-        let mut deltas = aggregates::HolderDeltas::default();
-        let mut batch = rocksdb::WriteBatch::default();
         for u in &snap.utxos {
-            if let Some(prev) = self.get_utxo(&u.txid, u.vout)? {
-                deltas.remove(&prev);
-            }
             batch.put_cf(&cf_utxo, utxo_key(&u.txid, u.vout), encode(&u.output)?);
             batch.put_cf(&cf_ai, addr_utxo_key(&u.output.script_pubkey, &u.txid, u.vout), [0u8; 0]);
-            deltas.add(&u.output);
         }
-        // NET-12: holder aggregates in the same batch.
-        self.stage_holder_deltas(&mut batch, &deltas)?;
         batch.put_cf(&cf_meta, b"carryover_sha3", snap.sha3);
-        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
-        Ok(snap.utxos.len() as u64)
+        Ok(())
     }
 }

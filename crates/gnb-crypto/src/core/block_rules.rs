@@ -448,9 +448,15 @@ mod tests {
         assert!(!rules_active_at(u64::MAX - 1, activation::NEVER));
     }
 
+    /// Tree sizes for the Merkle tests. Under Miri one SHA-256 compression
+    /// takes ~0.2 s (docs/testing/SANITIZERS.md), so it covers the shapes that
+    /// matter (empty, one leaf, odd and even levels, a carried-up odd node)
+    /// and stops at 5 leaves.
+    const MAX_LEAVES: u8 = if cfg!(miri) { 5 } else { 17 };
+
     #[test]
     fn legacy_root_is_bit_identical_to_transaction_merkle_root() {
-        for n in 0..12u8 {
+        for n in 0..12u8.min(MAX_LEAVES + 1) {
             let txs: Vec<Transaction> = (0..n).map(|i| spend(i, 20)).collect();
             let ids: Vec<[u8; 32]> = txs.iter().map(Transaction::txid).collect();
             assert_eq!(legacy_merkle_root(&ids), Transaction::merkle_root(&txs), "n={n}");
@@ -492,7 +498,7 @@ mod tests {
     /// keeps the legacy root but never the tagged one.
     #[test]
     fn duplicate_last_mutation_changes_the_tagged_root_only() {
-        for n in 1..10u8 {
+        for n in 1..10u8.min(MAX_LEAVES + 1) {
             let ids: Vec<[u8; 32]> = (1..=n).map(id).collect();
             let mut dup = ids.clone();
             dup.push(*ids.last().unwrap());
@@ -512,7 +518,7 @@ mod tests {
     #[test]
     fn coinbase_branch_reproduces_the_root() {
         for hardened in [false, true] {
-            for n in 1..=17u8 {
+            for n in 1..=MAX_LEAVES {
                 let ids: Vec<[u8; 32]> = (1..=n).map(id).collect();
                 let want = if hardened { tagged_merkle_root(&ids) } else { legacy_merkle_root(&ids) };
                 let branch = coinbase_merkle_branch(&ids, hardened);
@@ -593,6 +599,74 @@ mod tests {
         assert_eq!(check_block_hardened_at(&b, activation::NEVER), Ok(()));
         assert_eq!(check_block_hardened_at(&b, 6), Ok(()), "height 5 < activation 6");
         assert!(check_block_hardened_at(&b, 5).is_err(), "height 5 >= activation 5");
+    }
+
+    #[test]
+    fn process_wide_predicate_follows_the_override() {
+        let _g = activation::scoped_override(5);
+        assert!(!rules_active(0));
+        assert!(!rules_active(4));
+        assert!(rules_active(5));
+        let _g0 = activation::scoped_override(0);
+        assert!(!rules_active(0), "never the genesis");
+        assert!(rules_active(1));
+    }
+
+    /// Position 0 of the witness tree is the fixed coinbase placeholder
+    /// whatever the coinbase holds; every other position is the wtxid.
+    #[test]
+    fn witness_root_layout() {
+        let txs = vec![coinbase(vec![1; 90]), spend(1, 20), spend(2, 21)];
+        let want = tagged_merkle_root(&[COINBASE_WTXID, txs[1].wtxid(), txs[2].wtxid()]);
+        assert_eq!(witness_root(&txs), want);
+        let mut other_cb = txs.clone();
+        other_cb[0] = coinbase(vec![2; 7]);
+        assert_eq!(witness_root(&other_cb), want);
+        assert_ne!(txs[1].wtxid(), txs[1].txid(), "a witness id covers the script_sig");
+    }
+
+    #[test]
+    fn commitment_check_boundaries() {
+        // Exactly the 80-byte commitment, no extra miner bytes: valid.
+        let mut b = hardened_block(5, 0, vec![spend(1, 20)]);
+        let c = expected_coinbase_commitment(&b);
+        b.transactions[0].inputs[0].script_sig = c.to_vec();
+        assert_eq!(check_coinbase_commitment(&b), Ok(()));
+        let mut short = b.clone();
+        short.transactions[0].inputs[0].script_sig.pop();
+        assert_eq!(check_coinbase_commitment(&short),
+            Err("coinbase commitment missing (script_sig shorter than 80 bytes)"));
+        // No coinbase input, or no transaction at all.
+        let mut no_input = b.clone();
+        no_input.transactions[0].inputs.clear();
+        assert_eq!(check_coinbase_commitment(&no_input), Err("invalid coinbase format"));
+        let mut empty = b.clone();
+        empty.transactions.clear();
+        assert_eq!(check_coinbase_commitment(&empty), Err("invalid coinbase format"));
+    }
+
+    /// `check_block_hardened_at` reports each rule it runs.
+    #[test]
+    fn hardened_check_reports_each_rule() {
+        let b = hardened_block(5, 0, vec![spend(1, 20)]);
+        assert_eq!(check_block_hardened_at(&b, 0), Ok(()));
+        let mut bad_root = b.clone();
+        bad_root.header.merkle_root.0[0] ^= 1;
+        assert_eq!(check_block_hardened_at(&bad_root, 0), Err("invalid merkle root"));
+        // The legacy root is not the hardened root.
+        let mut legacy_root = b.clone();
+        legacy_root.header.merkle_root = legacy_root.body_merkle_root_at(activation::NEVER);
+        assert_eq!(check_block_hardened_at(&legacy_root, 0), Err("invalid merkle root"));
+        // A non-coinbase first transaction (with a matching root).
+        let mut no_cb = b.clone();
+        no_cb.transactions.remove(0);
+        no_cb.header.merkle_root = no_cb.body_merkle_root_at(0);
+        assert_eq!(check_block_hardened_at(&no_cb, 0), Err("invalid coinbase format"));
+        // A 64-byte transaction inside an otherwise valid block.
+        let b64 = hardened_block(5, 0, vec![spend(1, 20), spend(9, 5)]);
+        assert_eq!(check_block_hardened_at(&b64, 0), Err("64-byte transaction (txid preimage of exactly 64 bytes)"));
+        assert_eq!(check_hardened_body(&b64), Err("64-byte transaction (txid preimage of exactly 64 bytes)"));
+        assert_eq!(check_hardened_body(&b), Ok(()));
     }
 
     #[test]

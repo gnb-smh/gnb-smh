@@ -53,6 +53,49 @@ mod wallet_input_budget_tests {
     }
 }
 
+/// Write `contents` to a NEW sibling of `path` named `<file name><suffix>`, or
+/// `<file name><suffix>.<n>` (n = 1..=99) when that name is taken; an
+/// existing file is never overwritten. The file is created with mode 0600
+/// before the first byte is written, fsynced, and its directory fsynced.
+/// Returns the path written. On a write error the partial file is removed.
+pub fn write_new_backup(path: &Path, suffix: &str, contents: &[u8]) -> io::Result<std::path::PathBuf> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path has no file name")
+    })?;
+    for n in 0..100u32 {
+        let mut name = file_name.to_os_string();
+        name.push(suffix);
+        if n > 0 {
+            name.push(format!(".{n}"));
+        }
+        let candidate = parent.join(name);
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = match opts.open(&candidate) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = f.write_all(contents).and_then(|()| f.sync_all()) {
+            drop(f);
+            let _ = fs::remove_file(&candidate);
+            return Err(e);
+        }
+        #[cfg(unix)]
+        {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        return Ok(candidate);
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "every backup name is taken"))
+}
+
 /// Atomically write `contents` to `path`.
 ///
 /// Sprint T.5 — Audit L-4 fix.

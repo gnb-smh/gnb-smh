@@ -199,7 +199,10 @@ pub fn handle(req: &Value) -> Result<Value, String> {
             .map(|a| json!({ "address": a.to_string() }))
             .map_err(|e| format!("invalid address: {e:?}")),
         "minfee" => {
-            let size = req.get("size").and_then(Value::as_u64).ok_or("missing `size`")? as usize;
+            let size = req.get("size").and_then(Value::as_u64).ok_or("missing `size`")?;
+            // CRY-8: `as usize` wrapped modulo 2^32 on wasm32 and quoted the
+            // floor fee for sizes >= 2^32 (e.g. 2^32 + 100 -> 100 bytes).
+            let size = usize::try_from(size).map_err(|_| "`size` too large")?;
             Ok(json!({ "fee": tokenomics::min_tx_fee_sat(size).to_string() }))
         }
         other => Err(format!("unknown op `{other}`")),
@@ -305,6 +308,7 @@ mod tests {
 
     // The session is process-global: keep every flow in one test.
     #[test]
+    #[cfg_attr(miri, ignore = "key generation, signing and verification run the PQClean ML-DSA-65 and Falcon-1024 C code, which Miri cannot execute")]
     fn create_export_open_roundtrip_and_pay() {
         let created = handle(&json!({"op": "create"})).unwrap();
         let addr = created["address"].as_str().unwrap().to_string();
@@ -403,6 +407,62 @@ mod tests {
         assert!(verify(&claimed).is_ok(), "valid for the value it was signed over");
         assert!(verify(&real).is_err(), "the lie invalidates it against the real coin");
         handle(&json!({"op": "wipe"})).unwrap();
+    }
+
+    /// CRY-8: a size of 2^32 + 100 bytes must not be quoted as 100 bytes on a
+    /// 32-bit target (wasm32, i686). 64-bit: the exact fee; 32-bit: an error.
+    #[test]
+    fn minfee_does_not_truncate_sizes_on_32_bit_targets() {
+        let fee = |size: u64| handle(&json!({"op": "minfee", "size": size}));
+        assert_eq!(fee(100).unwrap()["fee"], tokenomics::MIN_TX_FEE_SAT.to_string());
+        let max32 = u64::from(u32::MAX);
+        assert_eq!(fee(max32).unwrap()["fee"], tokenomics::min_tx_fee_sat(u32::MAX as usize).to_string());
+        let huge = max32 + 101; // 2^32 + 100
+        if usize::BITS == 32 {
+            assert_eq!(fee(huge).unwrap_err(), "`size` too large");
+        } else {
+            assert_eq!(fee(huge).unwrap()["fee"], "8589934792");
+        }
+    }
+
+    /// One request through the C ABI exactly as `site/wallet/core.js` makes
+    /// it: gnb_alloc, write, gnb_call, gnb_free of the input, unpack
+    /// `(ptr << 32) | len`, read, gnb_free of the output. The packing is valid
+    /// only where pointers have 32 bits (wasm32), so this runs on i686: in the
+    /// `i686` job natively and under Miri in `miri-cross`
+    /// (scripts/sanitizers.sh), which checks every pointer, length and
+    /// (de)allocation layout on this path.
+    #[cfg(target_pointer_width = "32")]
+    fn call_through_abi(input: &[u8]) -> Value {
+        // SAFETY: the buffers come from gnb_alloc / gnb_call with the lengths
+        // they were created with, and each is freed exactly once.
+        unsafe {
+            let p = gnb_alloc(input.len());
+            std::ptr::copy_nonoverlapping(input.as_ptr(), p, input.len());
+            let packed = gnb_call(p, input.len());
+            gnb_free(p, input.len());
+            let out_ptr: *mut u8 = std::ptr::with_exposed_provenance_mut((packed >> 32) as usize);
+            let out_len = (packed & 0xFFFF_FFFF) as usize;
+            let out = serde_json::from_slice(std::slice::from_raw_parts(out_ptr, out_len)).unwrap();
+            gnb_free(out_ptr, out_len);
+            out
+        }
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn c_abi_roundtrip_on_32_bit() {
+        let call = |req: Value| call_through_abi(req.to_string().as_bytes());
+        assert_eq!(call(json!({"op": "minfee", "size": 100})), json!({"ok": {"fee": tokenomics::MIN_TX_FEE_SAT.to_string()}}));
+        assert_eq!(call(json!({"op": "minfee", "size": 1u64 << 32})), json!({"error": "`size` too large"}));
+        let to = Address::from_hash([7u8; 20], Network::Mainnet).to_string();
+        let bloch = format!("bloch1q{}", &to[5..]);
+        assert_eq!(call(json!({"op": "normalize", "address": bloch})), json!({"ok": {"address": to}}));
+        assert_eq!(call(json!({"op": "nope"})), json!({"error": "unknown op `nope`"}));
+        let bad = call_through_abi(b"{not json");
+        assert!(bad["error"].as_str().unwrap().starts_with("bad request: "), "{bad}");
+        // Empty request: gnb_alloc(0) still returns a freeable buffer.
+        assert!(call_through_abi(b"")["error"].as_str().unwrap().starts_with("bad request: "));
     }
 
     #[test]

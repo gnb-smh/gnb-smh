@@ -125,7 +125,8 @@ is kept in the orphan pool instead of being dropped:
 * an orphan expires after 20 minutes;
 * when a transaction enters the pool, or a block connected to the APPLIED
   (selected) chain confirms it, or a reorg disconnects the block that
-  confirmed it (it returns to the pool), the orphans waiting on it are
+  confirmed it (it returns to the pool — unless that block's body was
+  pruned, see section 6), the orphans waiting on it are
   re-tried (breadth-first through their own children, at most 25 orphans
   and 400 inputs per event); there is no scan of the whole orphan pool per
   block. A 30 s sweep finds orphans whose parents arrived by another path
@@ -215,6 +216,14 @@ coinbase commitment covers exactly the listed transactions in that order.
   normally a verified-signature cache hit), pooled transactions that spent
   their outputs become their children again, and the whole pool is
   re-validated against the new UTXO set plus the pool.
+  Exception: a disconnected block whose body this node had pruned is rolled
+  back from its undo record alone, so its transactions are not available to
+  re-admit. They leave the pool's view (and the orphan-transaction
+  bookkeeping), pooled transactions spending their outputs are evicted by
+  the re-validation, and they come back only if their senders (or peers)
+  rebroadcast them; the node logs how many such blocks a reorg rolled back.
+  Only a pruned node reorganizing deeper than its pruning depth is
+  affected.
 * Whenever the next block's height moves, transactions whose version or
   size (64-byte rule) the next block could not contain are evicted with
   their descendants.

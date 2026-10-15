@@ -270,6 +270,31 @@ mod tests {
         assert_eq!(hardening_activation_height(), before);
     }
 
+    /// Signers follow their own chain's schedule (never the node's global),
+    /// unless a test override is active on the thread.
+    #[test]
+    fn signer_height_follows_the_signer_chain_and_the_override() {
+        assert_eq!(hardening_activation_height_for_signer(ChainId::Mainnet), MAINNET_HARDENING_ACTIVATION_HEIGHT);
+        assert_eq!(hardening_activation_height_for_signer(ChainId::Testnet), TESTNET_HARDENING_ACTIVATION_HEIGHT);
+        let _g = scoped_override(7);
+        assert_eq!(hardening_activation_height_for_signer(ChainId::Mainnet), 7);
+        assert_eq!(hardening_activation_height_for_signer(ChainId::Testnet), 7);
+    }
+
+    #[test]
+    fn process_wide_predicate_uses_the_process_wide_height() {
+        let _g = scoped_override(1_000);
+        assert!(!hardening_active_at(0));
+        assert!(!hardening_active_at(999));
+        assert!(hardening_active_at(1_000));
+        assert!(hardening_active_at(u64::MAX));
+        if chain_id_unset() {
+            drop(_g);
+            assert!(!hardening_active_at(MAINNET_HARDENING_ACTIVATION_HEIGHT - 1));
+            assert!(hardening_active_at(MAINNET_HARDENING_ACTIVATION_HEIGHT));
+        }
+    }
+
     fn chain_id_unset() -> bool {
         super::super::NODE_CHAIN_ID.get().is_none()
     }

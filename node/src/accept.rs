@@ -48,10 +48,22 @@
 //! witness_dependent`) is a property of THIS BODY, not of the block: the body
 //! is deleted, nothing is persisted, and the block (with its selected-chain
 //! descendants) waits in memory for another body
-//! (`GhostDAG::mark_body_pending`). The ingress paths do not treat it as
-//! known (`is_known_block`), the processor re-requests it from peers, and a
-//! copy with a different witness root replaces the body and is re-evaluated.
-//! A block whose body is missing waits the same way. At/after the activation
+//! (`GhostDAG::mark_body_pending`). Header sync and `submitblock` do not
+//! treat it as known (`is_known_block`); the processor re-requests it from
+//! peers, and over block relay only the answer to that directed pull is taken
+//! (`ingress::BlockIngress::handle_block`: an unsolicited gossip copy is
+//! ignored, so nobody can make the node re-validate the chain through the
+//! block with an endless supply of re-malleated bodies). A copy with a
+//! different witness root replaces the body and is re-evaluated.
+//! A block whose body is missing waits the same way — also one whose body was
+//! PRUNED while it was on the selected chain and that a reorg left unapplied
+//! (audit DAG-6: without a reorg-depth limit the chain through it can become
+//! the best again): `resolve_best_chain` makes every bodiless block of the
+//! best chain wait at once, and the chain connects when the last body is
+//! back. One predicate ([`awaits_body`]) decides whether a body of a DAG block
+//! is wanted, one request path fetches it, and one acceptance path
+//! (`accept_block`'s body replacement) binds a copy to the header height the
+//! DAG parents imply and to the witness-root rules. At/after the activation
 //! the witness commitment is checked before the block is stored, so every
 //! connect-time failure is permanent.
 //!
@@ -72,15 +84,34 @@
 //! block's validity depends only on its selected-parent chain, keeping the
 //! disqualified block lets both nodes accept the merger and converge.
 //!
-//! Policy refusals (reorg deeper than `MAX_REORG_DEPTH`, a new selected tip at
-//! or below the finalized height) are NOT invalidity: the triggering block's
-//! DAG insertion is rolled back and nothing is recorded, as before.
+//! **No reorg-depth limit, no finality checkpoint (audit DAG-6)**: the old
+//! `MAX_REORG_DEPTH` cap and `finalized_height` gate compared a fork with THIS
+//! node's own history, so two nodes given the same blocks in different orders
+//! could end on different chains. Both are gone. Like Bitcoin Core, the node
+//! always ends on the best valid chain of the blocks it holds; deep reorgs are
+//! logged and counted (`reorg::DEEP_REORG_ALERT_DEPTH`), never refused.
+//! Bounded merging is enforced objectively by GhostDAG's merge depth after the
+//! hardening activation. Operators override the choice explicitly and
+//! persistently with [`invalidate_block`] / [`reconsider_block`] (the RPCs
+//! `invalidateblock` / `reconsiderblock`), which reuse the disqualification
+//! machinery below. `reconsiderblock` never removes a consensus verdict
+//! without re-validating it: a hardening-recheck mark goes only if the stored
+//! body now passes those rules, a connect-time mark only with the batch that
+//! re-validates and applies the block.
 //!
 //! **Arrival-order independence**: given the same block set, every node ends
 //! with the applied tip = the best block whose selected chain is valid in its
 //! own context, and the same UTXO set (the deterministic application of that
-//! chain), whatever order the blocks arrived in (within the reorg-depth and
-//! finality windows, which are local policy).
+//! chain), whatever order the blocks arrived in, at any depth
+//! (`node/tests/fix_chain_selection.rs`).
+//!
+//! **Chain-state check (audit DAG-11)**: [`check_chain_state`] detects, at
+//! start-up, the footprint a crash or write error of the pre-fix NON-atomic
+//! extension commit leaves (UTXO effects without an undo record), which
+//! [`reconcile_on_startup`] cannot repair (it runs after reconciliation's
+//! step 2, which repairs the states it can); [`rebuild_chain_state`] rebuilds
+//! the chain state — UTXO set and indexes, undo records, shielded state,
+//! explorer aggregates — from the block bodies.
 //!
 //! # Serialization (audit DAG-10)
 //!
@@ -104,21 +135,17 @@ use crate::rpc;
 use crate::storage;
 use crate::tip;
 
-/// [no-fork] Set true while the miner is mining through a stalled IBD latch
-/// (the announced heaviest tip is unreachable and we mine our locally-heaviest
-/// validated tip to keep the chain live). While frozen we do NOT advance
-/// `finalized_height`, so a strictly-heavier chain can still deep-reorg us back
-/// once its holder becomes reachable — mine-through can never self-finalize a
-/// solo fork. Driven by the miner loop; cleared when synced / catching up.
-pub static FINALITY_FROZEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Set once from `--archive` at startup. Same static-flag shape as
-/// FINALITY_FROZEN above: accept_block runs far from the CLI struct and
-/// threading a bool through every caller would be noise for a value that is
-/// fixed for the process lifetime.
+/// Set once from `--archive` at startup: accept_block runs far from the CLI
+/// struct and threading a bool through every caller would be noise for a
+/// value that is fixed for the process lifetime. (The former `FINALITY_FROZEN`
+/// flag is gone with the finality checkpoint it froze, audit DAG-6.)
 pub static ARCHIVE_MODE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Reason recorded with a disqualification made by the operator
+/// (`invalidateblock`). Marks carrying it survive a chain-state rebuild
+/// (DAG-11); consensus disqualifications are re-derived instead.
+pub const OPERATOR_INVALIDATE_REASON: &str = "invalidateblock (operator)";
 
 // ── Invalid-set persistence ──────────────────────────────────────────────────
 
@@ -138,12 +165,8 @@ pub fn ensure_invalid_set_loaded(
     }
     match store.load_invalid_blocks_with_reasons() {
         Ok(marks) => {
-            let (all_edges, selected): (Vec<_>, Vec<_>) = marks.into_iter()
-                .partition(|(_, reason)| reason.starts_with(HARDENING_RECHECK_REASON));
-            let n = dag.write().load_invalid_sets(
-                selected.into_iter().map(|(h, _)| h),
-                all_edges.into_iter().map(|(h, _)| h),
-            );
+            let (selected, all_edges) = split_marks(marks);
+            let n = dag.write().load_invalid_sets(selected, all_edges);
             if n > 0 {
                 info!("loaded {} chain-disqualified block(s)", n);
             }
@@ -152,12 +175,16 @@ pub fn ensure_invalid_set_loaded(
     }
 }
 
-/// True iff `hash` is in the DAG but a body for it is still wanted: it waits
-/// for a body after a witness-dependent failure
-/// (`GhostDAG::is_body_pending`), or its body is missing although it was
-/// never pruned (a body dropped after such a failure, before a restart). A
-/// copy of such a block is processed (and re-requested from peers) instead of
-/// being discarded as already known.
+/// True iff `hash` is in the DAG but a body for it is still wanted — THE one
+/// predicate for "a body of this DAG block is wanted" (see "Blocks in the DAG
+/// without a usable body" below): it waits for a body
+/// (`GhostDAG::is_body_pending`: its body failed a witness-dependent rule,
+/// or a connect of the best chain — or an operator override — needs a body
+/// that is missing, pruned ones included, audit DAG-6), or its body is
+/// missing although it was never pruned (a body dropped after such a
+/// failure, before a restart). A copy of such a block is processed (and
+/// requested from peers) instead of being discarded as already known; any
+/// other copy of a DAG block — an unrequested old body included — is known.
 pub fn awaits_body(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
@@ -182,8 +209,11 @@ pub fn awaits_body_in(d: &consensus::GhostDAG, store: &storage::Storage, hash: &
 }
 
 /// True iff `hash` needs no further copy: it is in the DAG and does not
-/// [`awaits_body`]. The dedup every ingress path (gossip, pulls, IBD,
-/// `submitblock`) applies before `accept_block`.
+/// [`awaits_body`]. The dedup header sync, directed pulls and `submitblock`
+/// apply before `accept_block`. Gossip is stricter: an unsolicited copy of a
+/// DAG block is ignored even while a body of it is wanted (only the answer to
+/// the node's own directed pull is taken, `ingress::BlockIngress::
+/// handle_block`; docs/CONSENSUS.md, "Ledger semantics").
 pub fn is_known_block(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
@@ -427,43 +457,28 @@ pub fn validate_block_in_view_classified_at(
 }
 
 // ── Shielded state (COH-2) ───────────────────────────────────────────────────
-
-/// Compute the shielded pool after moving the applied chain along `plan`
-/// (disconnect `to_rollback` tip-first, connect `to_apply` in order) on a
-/// CLONE. The caller swaps it in only after the RocksDB batch committed.
-fn shielded_after_plan(
-    shielded: &Arc<RwLock<ShieldedPool>>,
-    store: &storage::Storage,
-    plan: &reorg::ReorgPlan,
-) -> Result<ShieldedPool, ConnectError> {
-    let mut next = shielded.read().clone();
-    for h in &plan.to_rollback {
-        let had = store.get_block(h).ok().flatten()
-            .map(|b| !b.shielded_transactions.is_empty())
-            .unwrap_or(true);
-        next.disconnect_for_reorg(*h, had).map_err(|e| ConnectError::Failed(format!(
-            "shielded disconnect of {} failed: {:?}", hex::encode(&h[..8]), e)))?;
-    }
-    for h in &plan.to_apply {
-        let b = store.get_block(h).map_err(|e| ConnectError::Failed(e.to_string()))?
-            .ok_or_else(|| ConnectError::Failed("block body missing for shielded apply".into()))?;
-        if let Err(e) = next.apply_block_self(*h, &b.shielded_transactions) {
-            return Err(ConnectError::Invalid {
-                block: *h,
-                height: b.height,
-                reason: format!("shielded consensus rejection: {:?}", e),
-            });
-        }
-    }
-    Ok(next)
-}
+//
+// The shielded pool moves with the applied chain: `ShieldedPool::stage_plan`
+// moves it in memory along the plan (no clone: in-place apply/undo with an
+// exact revert journal) and returns its writes, which `stage_extra` folds into
+// the plan's WriteBatch; after the commit the staged plan is committed, on
+// any failure it is reverted. The shielded lock is taken only for those short
+// steps (acceptance is serialized by the acceptance lock, and the pipeline is
+// the only user of the pool).
+//
+// Rolled-back blocks whose body was pruned (audit DAG-6) are disconnected from
+// the shielded undo record (never pruned); whether they carried shielded
+// transactions comes from the record written when their body was pruned
+// (`storage::PrunedBodyRecord::had_shielded`), see `ShieldedPool::stage_plan`.
 
 // ── Mempool maintenance after a connect (MEM-3, MEM-7) ──────────────────────
 
 /// Bring the mempool in line with a committed chain move: drop confirmed txs
 /// and every tx conflicting with an outpoint the connected blocks spent;
 /// after a reorg re-admit the disconnected txs through the shared admission
-/// function and re-validate the whole pool against the new UTXO set; clear
+/// function (only those of blocks whose body is stored: a block rolled back
+/// from its undo record alone, body pruned, has none to re-admit) and
+/// re-validate the whole pool against the new UTXO set; clear
 /// the recent-rejects filter (the tip changed) and expire stale entries.
 ///
 /// `next_height` is the node's next template height on the DAG AFTER the
@@ -505,7 +520,7 @@ pub fn update_mempool_after_connect(
     // lost: run the full signature-free revalidation instead (a reorg runs it
     // below anyway).
     if !outcome.connected.is_empty() {
-        let lower = previous != 0 && next_height < previous && outcome.disconnected.is_empty();
+        let lower = previous != 0 && next_height < previous && outcome.rolled_back() == 0;
         let stale = if lower {
             revalidate_mempool(store, mempool, next_height)
         } else {
@@ -515,13 +530,22 @@ pub fn update_mempool_after_connect(
             info!("mempool: evicted {} tx(s) no longer valid for the next block at height {}", stale, next_height);
         }
     }
-    if !outcome.disconnected.is_empty() {
+    // Any rollback — also a pure one (operator `invalidateblock`, DAG-6) and
+    // one through pruned bodies, whose transactions cannot be re-admitted —
+    // re-validates the pool against the new UTXO set.
+    if outcome.rolled_back() > 0 {
         // Oldest disconnected block first: a child confirmed after its parent
         // is re-admitted after it, as an in-pool chain (MEM-6).
         let candidates: Vec<core::Transaction> = outcome.disconnected_txs_oldest_first();
         let (re, dropped) = reorg::reinject_disconnected(store, mempool, candidates, next_height);
         let stale = revalidate_mempool(store, mempool, next_height);
         info!("reorg: mempool reinjected={} discarded={} invalidated={}", re, dropped, stale);
+        if !outcome.disconnected_pruned.is_empty() {
+            // Rolled back from their undo records alone (docs/MEMPOOL.md §6).
+            warn!("reorg: {} disconnected block(s) had pruned bodies; their transactions cannot be \
+                   re-admitted to the mempool and must be rebroadcast by their senders",
+                outcome.disconnected_pruned.len());
+        }
     }
     mempool.clear_recent_rejects();
     let expired = mempool.expire_older_than(mempool::MEMPOOL_EXPIRY_SECS);
@@ -625,14 +649,6 @@ enum Resolution {
     Connected { plan: reorg::ReorgPlan, outcome: ConnectOutcome },
 }
 
-/// Why resolution stopped without a usable result.
-enum ResolveStop {
-    /// Policy refusal: roll the trigger back, nothing is invalid.
-    Refused(String),
-    /// Storage failure: roll the trigger back, retry later.
-    Failed(String),
-}
-
 /// Where `resolve_best_chain` records what it found on the way.
 #[derive(Default)]
 struct ResolveLog {
@@ -643,18 +659,59 @@ struct ResolveLog {
     body_rejected: Vec<(BlockHash, String)>,
 }
 
+/// What `resolve_best_chain` does when the plan to the best candidate must
+/// APPLY blocks whose body is not stored (dropped after a witness-dependent
+/// failure, or pruned and since reorganized away from, audit DAG-6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MissingBodies {
+    /// Acceptance and start-up: every such block waits for a body
+    /// (`GhostDAG::mark_body_pending`, in memory only: the one record of
+    /// "a body of this DAG block is wanted", see [`awaits_body`]), the
+    /// processor requests them, and the next-best chain is tried meanwhile.
+    Wait,
+    /// Operator overrides: stop with [`reorg::ERR_MISSING_BODIES`] before
+    /// anything is committed (the caller names the bodies and asks for a
+    /// retry once they are restored).
+    Stop,
+}
+
+/// Persisted disqualification marks an operator `reconsiderblock` removes
+/// (audit DAG-6), committed in the same batch as the chain move.
+#[derive(Default)]
+struct MarkClears {
+    /// Removed in any case (operator marks, marks inherited from a selected
+    /// parent, hardening-recheck marks whose stored body now passes).
+    always: Vec<BlockHash>,
+    /// Marks of genuine connect-time consensus failures: removed only by the
+    /// batch that RE-VALIDATES the block (it is in the committed plan's
+    /// `to_apply`, every block of which `connect_plan` validated in its own
+    /// context; `resolve_best_chain` lifts the consensus mark of every such
+    /// block). A block the move does not apply keeps its mark, also in memory
+    /// ([`remark_unvalidated`]).
+    if_applied: Vec<BlockHash>,
+}
+
 /// Move the applied chain to the best valid block, marking blocks invalid as
-/// they fail. `trigger` is the block whose insertion prompted the call (the
-/// finality rule applies to it); its DAG record is folded into the commit
-/// batch when `stage_trigger_record` (a new insertion, not a body
-/// replacement). `log` accumulates the disqualified roots and the dropped
-/// bodies.
+/// they fail. `trigger` is the block whose insertion prompted the call; its
+/// DAG record is folded into the commit batch when `stage_trigger_record` (a
+/// new insertion, not a body replacement). `log` accumulates the
+/// disqualified roots and the dropped bodies; `clears` lists persisted marks
+/// to delete in the same batch (operator `reconsiderblock`). Whatever the
+/// caller, a committed move also deletes the persisted consensus or inherited
+/// mark of every block it applies (validated in its own context just before):
+/// an applied block never carries a mark that would disqualify it again at
+/// the next start.
 ///
-/// A block of the plan whose body is missing, or whose body fails a rule
-/// that depends on witness bytes its id does not commit to (below the
-/// hardening activation), is NOT disqualified: its body is dropped and it
-/// waits, in memory only, for another body (`GhostDAG::mark_body_pending`);
-/// the next-best chain is tried meanwhile.
+/// A block of the plan whose body fails a rule that depends on witness bytes
+/// its id does not commit to (below the hardening activation) is NOT
+/// disqualified: its body is dropped and it waits, in memory only, for
+/// another body (`GhostDAG::mark_body_pending`); the next-best chain is tried
+/// meanwhile. Blocks of the plan without a stored body are handled as
+/// `missing` says ([`MissingBodies`]).
+///
+/// There is no depth limit and no finality gate (audit DAG-6): the plan to the
+/// best valid block is executed at any depth. `Err` is a storage / missing-
+/// data failure only (nothing committed; the caller rolls its trigger back).
 #[allow(clippy::too_many_arguments)]
 fn resolve_best_chain(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
@@ -663,10 +720,10 @@ fn resolve_best_chain(
     applied_tip: BlockHash,
     trigger: Option<BlockHash>,
     stage_trigger_record: bool,
-    trigger_header_height: u64,
-    finalized_height: u64,
     log: &mut ResolveLog,
-) -> Result<Resolution, ResolveStop> {
+    clears: &MarkClears,
+    missing: MissingBodies,
+) -> Result<Resolution, String> {
     // Each iteration either commits, stops, or disqualifies (or parks) at
     // least one more block; the DAG is finite, so this terminates. The bound
     // is a guard.
@@ -681,56 +738,51 @@ fn resolve_best_chain(
         let plan = {
             let d = dag.read();
             // The best valid block can be an ANCESTOR of the applied tip when
-            // applied blocks were disqualified (start-up hardening recheck):
-            // then the plan only disconnects.
+            // applied blocks were disqualified (start-up hardening recheck,
+            // operator `invalidateblock`): then the plan only disconnects.
             reorg::compute_connect_plan(&d, &applied_tip, &cand)
-                .or_else(|| reorg::compute_rollback_plan(&d, &applied_tip, &cand))
         };
         let plan = match plan {
             Some(p) => p,
-            None => return Err(ResolveStop::Failed(format!(
+            None => return Err(format!(
                 "U.4: unexpected selected-tip transition (applied={}, best={}): no connect plan",
-                hex::encode(&applied_tip[..8]), hex::encode(&cand[..8])))),
+                hex::encode(&applied_tip[..8]), hex::encode(&cand[..8]))),
         };
 
-        // Finality invariant: a block at or below the finalized height must
-        // never become the selected tip (it would rewrite finalized history).
-        if let Some(t) = trigger {
-            if plan.to_apply.contains(&t) && trigger_header_height <= finalized_height {
-                return Err(ResolveStop::Refused(format!(
-                    "finality: block h={} may not become the selected tip at or below finalized height {}",
-                    trigger_header_height, finalized_height
-                )));
-            }
-        }
-
-        // A block without a stored body cannot be connected: wait for one.
-        let mut missing = None;
+        // A block without a stored body cannot be connected.
+        let mut bodiless = Vec::new();
         for h in &plan.to_apply {
-            match store.has_block_body(h) {
-                Ok(true) => {}
-                Ok(false) => {
-                    missing = Some(*h);
-                    break;
-                }
-                Err(e) => return Err(ResolveStop::Failed(e.to_string())),
+            if !store.has_block_body(h).map_err(|e| e.to_string())? {
+                bodiless.push(*h);
             }
         }
-        if let Some(h) = missing {
-            warn!("block {} has no stored body; waiting for one before connecting its chain",
-                hex::encode(&h[..8]));
-            dag.write().mark_body_pending(h, None);
-            continue;
+        if let Some(first) = bodiless.first() {
+            match missing {
+                MissingBodies::Stop => return Err(format!(
+                    "{}: {} block(s) to connect have no body (first {})",
+                    reorg::ERR_MISSING_BODIES, bodiless.len(), hex::encode(&first[..8]))),
+                MissingBodies::Wait => {
+                    // All of them at once, so they are requested together.
+                    warn!("{} block(s) of the best chain have no stored body (first {}); waiting for \
+                           them before connecting it", bodiless.len(), hex::encode(&first[..8]));
+                    let mut d = dag.write();
+                    for h in &bodiless {
+                        d.mark_body_pending(*h, None);
+                    }
+                    continue;
+                }
+            }
         }
 
-        let next_shielded = match shielded_after_plan(shielded, store, &plan) {
+        let staged_shielded = shielded.write().stage_plan(store, &plan);
+        let staged_shielded = match staged_shielded {
             Ok(s) => s,
             Err(ConnectError::Invalid { block, reason, .. }) => {
                 // The shielded bytes are committed by the header root.
                 disqualify(dag, block, reason, &mut log.invalid);
                 continue;
             }
-            Err(e) => return Err(ResolveStop::Failed(e.to_string())),
+            Err(e) => return Err(e.to_string()),
         };
 
         let reorg_depth = plan.to_rollback.len();
@@ -762,14 +814,45 @@ fn resolve_best_chain(
                     stage_dag_record_for(dag, st, batch, &t)?;
                 }
             }
+            // Operator `reconsiderblock`: the marks it removes in any case.
+            for h in &clears.always {
+                st.stage_clear_invalid_block(batch, h).map_err(|e| e.to_string())?;
+            }
+            // A consensus (or inherited) mark goes with the batch that
+            // RE-VALIDATED its block: `connect_plan` validated every block of
+            // `to_apply` in its own context before this runs. This covers the
+            // `reconsiderblock` marks (`clears.if_applied`) and any stale mark
+            // whose block connects through an ordinary acceptance, so an
+            // applied block never keeps a mark that would disqualify it again
+            // at the next restart.
+            for h in &plan.to_apply {
+                if let Some(reason) = st.invalid_block_reason(h).map_err(|e| e.to_string())? {
+                    match mark_kind(&reason) {
+                        MarkKind::Consensus | MarkKind::Inherited => {
+                            st.stage_clear_invalid_block(batch, h).map_err(|e| e.to_string())?;
+                        }
+                        // Never lifted by a connect: only `reconsiderblock`
+                        // removes these (it re-checks a hardening mark).
+                        kind @ (MarkKind::Operator | MarkKind::Hardening) => warn!(
+                            "block {} connects although it carries a persisted {:?} mark ({}); \
+                             the mark is kept", hex::encode(&h[..8]), kind, reason),
+                    }
+                }
+            }
             stage_invalid_marks(dag, st, batch, &log_snapshot)?;
+            // COH-2: the shielded state of the plan, in the same batch.
+            staged_shielded.stage_into(st, batch)?;
             st.stage_meta(batch, "tip_hash", &new_tip).map_err(|e| e.to_string())
         };
         let hooks = ConnectHooks { validate: &validate, stage_extra: &stage_extra };
-        match reorg::connect_plan(store, &plan, &hooks) {
+        let result = reorg::connect_plan(store, &plan, &hooks);
+        match &result {
+            Ok(_) => shielded.write().commit_staged(staged_shielded),
+            Err(_) => shielded.write().revert_staged(staged_shielded),
+        }
+        match result {
             Ok(outcome) => {
                 if reorg_depth > 0 { crate::metrics::inc_reorg_success(); }
-                *shielded.write() = next_shielded;
                 // Marks were persisted in the batch.
                 log.invalid.clear();
                 return Ok(Resolution::Connected { plan, outcome });
@@ -784,17 +867,13 @@ fn resolve_best_chain(
                 }
                 continue;
             }
-            Err(ConnectError::Refused(m)) => {
-                if reorg_depth > 0 { crate::metrics::inc_reorg_failure(); }
-                return Err(ResolveStop::Refused(m));
-            }
             Err(ConnectError::Failed(m)) => {
                 if reorg_depth > 0 { crate::metrics::inc_reorg_failure(); }
-                return Err(ResolveStop::Failed(m));
+                return Err(m);
             }
         }
     }
-    Err(ResolveStop::Failed("resolve_best_chain: iteration guard reached".into()))
+    Err("resolve_best_chain: iteration guard reached".into())
 }
 
 /// `block`'s stored body failed a rule that depends on witness bytes its id
@@ -803,8 +882,10 @@ fn resolve_best_chain(
 /// [`disqualify`], nothing is persisted and the block id is not poisoned:
 /// the body is deleted (so it is never served to peers again) and the block,
 /// with its selected-chain descendants, waits in memory for a different body
-/// (`GhostDAG::mark_body_pending`), which every ingress path accepts
-/// (`awaits_body`) and the message processor re-requests from peers.
+/// (`GhostDAG::mark_body_pending`): the message processor re-requests it
+/// from peers and takes the answer to that pull (`awaits_body`; header sync
+/// and `submitblock` take a copy too, unsolicited gossip copies are
+/// ignored).
 fn drop_body_and_wait(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
@@ -858,20 +939,24 @@ fn stage_invalid_marks(
     Ok(())
 }
 
-/// Persist the trigger's DAG record (if it is still in the DAG) and every
-/// pending invalid mark in one batch — used when the applied chain did not
-/// move.
+/// Persist the trigger's DAG record (if it is still in the DAG), the removal
+/// of every `cleared` mark and every pending invalid mark in one batch — used
+/// when the applied chain did not move.
 fn persist_unchanged(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
     trigger: Option<BlockHash>,
     invalid_log: &[(BlockHash, String)],
+    cleared: &[BlockHash],
 ) -> Result<(), String> {
     let mut batch = rocksdb::WriteBatch::default();
     if let Some(t) = trigger {
         if dag.read().has_block(&t) {
             stage_dag_record_for(dag, store, &mut batch, &t)?;
         }
+    }
+    for h in cleared {
+        store.stage_clear_invalid_block(&mut batch, h).map_err(|e| e.to_string())?;
     }
     stage_invalid_marks(dag, store, &mut batch, invalid_log)?;
     store.write_batch(batch).map_err(|e| e.to_string())
@@ -896,8 +981,15 @@ pub struct ChainMove {
 }
 
 impl ChainMove {
-    /// Fold one committed plan's outcome in.
+    /// Fold one committed plan's outcome in. A block rolled back from its
+    /// undo record alone (body pruned, audit DAG-6) has no transactions to
+    /// report; it only cancels an earlier connect of the same block.
     pub fn record(&mut self, outcome: ConnectOutcome) {
+        for h in &outcome.disconnected_pruned {
+            if let Some(i) = self.connected.iter().position(|c| c.block_hash() == *h) {
+                self.connected.remove(i);
+            }
+        }
         for b in outcome.disconnected {
             let h = b.block_hash();
             match self.connected.iter().position(|c| c.block_hash() == h) {
@@ -1055,10 +1147,6 @@ pub fn accept_block_tracking(
         ));
     }
 
-    let finalized_height = store.get_meta("finalized_height").ok().flatten()
-        .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
-        .unwrap_or(0);
-
     // ── FIX VULN-04: Validate timestamp ──────────────────────────────
     {
         let parent_ts = parent_data.iter().map(|(_, t)| *t).max().unwrap_or(0);
@@ -1153,43 +1241,39 @@ pub fn accept_block_tracking(
     } else if !replacing && dag.read().is_invalid(&block_hash) && dag.read().is_invalid_persistently(&block_hash) {
         let sp = dag.read().get_block_data(&block_hash).and_then(|d| d.selected_parent);
         log.invalid.push((block_hash, format!(
-            "selected parent {} is invalid",
+            "{}{} is invalid", INHERITED_REASON_PREFIX,
             sp.map(|p| hex::encode(&p[..8])).unwrap_or_default()
         )));
     }
 
-    // ── Connect the best valid chain ─────────────────────────────────
+    // ── Connect the best valid chain (any depth, audit DAG-6) ────────
     let resolution = resolve_best_chain(
-        dag, store, shielded, applied_tip, Some(block_hash), !replacing, block.height,
-        finalized_height, &mut log,
+        dag, store, shielded, applied_tip, Some(block_hash), !replacing,
+        &mut log, &MarkClears::default(), MissingBodies::Wait,
     );
 
     let resolution = match resolution {
         Ok(r) => r,
-        Err(stop) => {
-            // Policy refusal or storage failure: roll the in-memory change
-            // back (nothing was committed), drop the body, but keep any
-            // deterministic invalid marks discovered on the way.
+        Err(m) => {
+            // Storage failure: roll the in-memory change back (nothing was
+            // committed), drop the body, but keep any deterministic invalid
+            // marks discovered on the way.
             roll_back("resolution stopped");
             if !log.invalid.is_empty() {
-                if let Err(e) = persist_unchanged(dag, store, None, &log.invalid) {
+                if let Err(e) = persist_unchanged(dag, store, None, &log.invalid, &[]) {
                     error!("failed to persist invalid-block marks: {}", e);
                 }
             }
             // Disqualifications found on the way change the valid tips.
             sync_mempool_next_height(dag, store, mempool);
-            return Err(match stop {
-                ResolveStop::Refused(m) if m.starts_with("finality:") => m,
-                ResolveStop::Refused(m) => format!("U.4: execute_reorg failed: {}", m),
-                ResolveStop::Failed(m) => format!("block {} not committed: {}", hex::encode(&block_hash[..8]), m),
-            });
+            return Err(format!("block {} not committed: {}", hex::encode(&block_hash[..8]), m));
         }
     };
 
     let connected = match resolution {
         Resolution::Unchanged => {
             let record = if replacing { None } else { Some(block_hash) };
-            if let Err(e) = persist_unchanged(dag, store, record, &log.invalid) {
+            if let Err(e) = persist_unchanged(dag, store, record, &log.invalid, &[]) {
                 // The DAG record of a non-applied block failed to persist:
                 // undo the in-memory insertion so memory and disk agree.
                 error!("failed to persist DAG record of {}: {}", hex::encode(&block_hash[..8]), e);
@@ -1275,28 +1359,20 @@ pub fn accept_block_tracking(
         info!("✓ block h={} accepted", height);
     }
 
-    // ── Update finality checkpoint ───────────────────────────────────
-    // NOTE: this MUST be the selected tip's DAG height, not tip_blue_score()
-    // (see the DAG-8 note on `GhostdagData::height`).
+    // (No finality checkpoint any more — audit DAG-6. The pruning cursor
+    // below uses the selected tip's DAG height, never tip_blue_score(); see
+    // the DAG-8 note on `GhostdagData::height`.)
     let tip_height = {
         let d = dag.read();
         d.selected_tip()
             .and_then(|h| d.get_block_data(&h).map(|data| data.height))
             .unwrap_or(0)
     };
-    if tip_height > core::CHECKPOINT_DEPTH
-        && !FINALITY_FROZEN.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        let new_finalized = tip_height - core::CHECKPOINT_DEPTH;
-        let current_finalized = store.get_meta("finalized_height").ok().flatten()
-            .and_then(|b| b.as_slice().try_into().ok().map(u64::from_le_bytes))
-            .unwrap_or(0);
-        if new_finalized > current_finalized {
-            store.put_meta("finalized_height", &new_finalized.to_le_bytes()).ok();
-        }
-    }
 
     // ── Prune old block bodies ───────────────────────────────────────
+    // Bodies only: undo records are kept for every connected block and a
+    // rollback record is written for each pruned body, so a reorg of any
+    // depth still works on a pruned node (DAG-6).
     if ARCHIVE_MODE.load(std::sync::atomic::Ordering::Relaxed) {
         if tip_height % 10_000 == 0 {
             info!("archival mode: retaining ALL block bodies (h={}); pruning disabled", tip_height);
@@ -1525,13 +1601,31 @@ pub fn recheck_stored_blocks_under_hardening(
 ///    CF_DAG record — the footprint of the pre-fix, non-atomic extension
 ///    commit crashing between "apply UTXO effects" and "persist DAG data"
 ///    (audit VAL-4 / DAG-11). Its inputs would otherwise read as spent and the
-///    block would be refused forever on re-receipt;
-/// 3. if the applied tip pointer is not the best valid block, connect the
-///    best valid chain with the same atomic machinery as `accept_block`.
+///    block would be refused forever on re-receipt. The tip pointer (and the
+///    shielded tip) is set, in the same batch, to the block the UTXO set then
+///    describes: the heaviest DAG block that holds an undo record, even when
+///    step 1 disqualified it (not the DAG's selected tip);
+/// 3. refuse (an error naming the faults) if the chain state still carries
+///    the footprint of an interrupted pre-fix commit that steps 1-2 cannot
+///    repair ([`check_chain_state`], audit DAG-11 residual; run only after
+///    step 2, which repairs the states it handles, so it never misfires on
+///    them): the caller rebuilds ([`rebuild_chain_state`]) and calls this
+///    again;
+/// 4. if the applied tip pointer is not the best valid block, connect the
+///    best valid chain with the same atomic machinery as `accept_block` (a
+///    rollback-only plan when step 1 disqualified applied blocks), at any
+///    depth (audit DAG-6); blocks of that chain whose body is missing wait
+///    for one, and the best chain the node can connect is connected
+///    meanwhile.
 ///
 /// Every step is idempotent and cheap (one scan of CF_UNDO keys). New writes
 /// can no longer produce a state that needs step 2: an extension now commits
 /// UTXO effects, undo data, DAG record and tip pointer in one batch.
+///
+/// `shielded` must be the state [`ShieldedPool::load`] returned for `store`
+/// (audit COH-2: it sits at the applied tip). Step 1 and the explorer
+/// aggregate rebuild (NET-12) leave the applied tip where it is; steps 2 and
+/// 4 move the shielded state with the chain, in the same batches.
 pub fn reconcile_on_startup(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &Arc<storage::Storage>,
@@ -1560,10 +1654,13 @@ pub fn reconcile_on_startup(
 
     // Step 2: applied-but-unrecorded blocks.
     let mut orphan_applied: Vec<(u64, BlockHash)> = Vec::new();
-    for h in store.undo_block_hashes().map_err(|e| e.to_string())? {
+    let mut orphan_parents: Vec<BlockHash> = Vec::new();
+    let undo_hashes = store.undo_block_hashes().map_err(|e| e.to_string())?;
+    for &h in &undo_hashes {
         if !dag.read().has_block(&h) {
             if let Ok(Some(b)) = store.get_block(&h) {
                 orphan_applied.push((b.height, h));
+                orphan_parents.extend_from_slice(&b.header.parents);
             } else {
                 warn!("reconcile: undo record for unknown block {} without a body; ignoring",
                     hex::encode(&h[..8]));
@@ -1573,25 +1670,77 @@ pub fn reconcile_on_startup(
     if !orphan_applied.is_empty() {
         orphan_applied.sort_by(|a, b| b.cmp(a)); // tip-first
         let to_rollback: Vec<BlockHash> = orphan_applied.iter().map(|(_, h)| *h).collect();
-        let back_to = dag.read().selected_tip();
+        // Once they are gone, the UTXO set describes the chain of the DAG
+        // blocks that still hold an undo record (every connect writes one,
+        // every disconnect deletes it), so its tip is the heaviest of those:
+        // they are all its ancestors. Neither pointer the node keeps is a
+        // witness for it:
+        // - the DAG's selected tip: step 1 may have disqualified applied
+        //   blocks (they stay applied until step 4 disconnects them), and a
+        //   pre-fix reorg that crashed before its DAG write left the UTXO set
+        //   on a branch the DAG alone does not select;
+        // - meta tip_hash: that crashed reorg had not rewritten it, and the
+        //   crashed extension may have written it as the unrecorded block;
+        // - the unrecorded blocks' parents: a pre-fix binary that kept
+        //   running after the crash connected later blocks on top of them.
+        // Pointing the tip (and the shielded tip) at a block the UTXO set does
+        // not sit on would leave effects applied under a tip that excludes
+        // them, or drop effects of blocks it includes, with nothing to
+        // repair it. When no DAG block holds an undo record (genesis has
+        // none; a chain connected before undo records existed neither) the
+        // unrecorded blocks sit on their selected parent. Step 4 then moves
+        // the chain from this real applied tip to the best valid block.
+        let back_to = {
+            let d = dag.read();
+            let recorded: Vec<BlockHash> = undo_hashes.iter().copied().filter(|h| d.has_block(h)).collect();
+            d.heaviest_among(&recorded).or_else(|| d.heaviest_among(&orphan_parents))
+        };
+        let Some(back_to) = back_to else {
+            return Err(format!(
+                "reconcile: {} block(s) have applied UTXO effects but no DAG record, and the DAG holds \
+                 neither an applied block nor one of their parents, so the chain position of the UTXO \
+                 set is unknown; resynchronize this data directory",
+                to_rollback.len()));
+        };
         warn!(
             "reconcile: {} block(s) have applied UTXO effects but no DAG record (interrupted \
-             pre-fix commit); rolling them back atomically",
-            to_rollback.len()
+             pre-fix commit); rolling them back atomically to {}",
+            to_rollback.len(), hex::encode(&back_to[..8])
         );
-        let plan = reorg::ReorgPlan { lca: back_to.unwrap_or([0u8; 32]), to_rollback, to_apply: vec![] };
+        // COH-2: these blocks predate shielded persistence; the shielded tip
+        // follows the UTXO tip in the same batch.
+        let staged_shielded = shielded.write().stage_retip(store, &to_rollback, back_to)
+            .map_err(|e| format!("reconcile rollback: {e}"))?;
+        let plan = reorg::ReorgPlan { lca: back_to, to_rollback, to_apply: vec![] };
         let validate = |_: &dyn UtxoView, _: &core::Block| -> Result<(), String> { Ok(()) };
         let stage_extra = |st: &storage::Storage, batch: &mut rocksdb::WriteBatch| -> Result<(), String> {
-            if let Some(t) = back_to {
-                st.stage_meta(batch, "tip_hash", &t).map_err(|e| e.to_string())?;
-            }
-            Ok(())
+            st.stage_meta(batch, "tip_hash", &back_to).map_err(|e| e.to_string())?;
+            staged_shielded.stage_into(st, batch)
         };
         let hooks = ConnectHooks { validate: &validate, stage_extra: &stage_extra };
-        reorg::connect_plan(store, &plan, &hooks).map_err(|e| format!("reconcile rollback: {}", e))?;
+        let result = reorg::connect_plan(store, &plan, &hooks);
+        match &result {
+            Ok(_) => shielded.write().commit_staged(staged_shielded),
+            Err(_) => shielded.write().revert_staged(staged_shielded),
+        }
+        result.map_err(|e| format!("reconcile rollback: {}", e))?;
     }
 
-    // Step 3: applied tip vs best valid block.
+    // DAG-11 residual: never connect anything on top of a chain state that
+    // carries the footprint of an interrupted pre-fix commit (step 4 would
+    // validate blocks against it and could disqualify valid ones). The
+    // caller rebuilds (`rebuild_chain_state`) or stops.
+    let faults = check_chain_state(dag, store)?;
+    if !faults.is_empty() {
+        let list: Vec<String> = faults.iter().map(|f| f.to_string()).collect();
+        return Err(format!(
+            "chain state inconsistent ({}); rebuild it from the block bodies \
+             (`rebuild_chain_state`, done by `gnb` at start-up with --carryover-snapshot)",
+            list.join("; ")
+        ));
+    }
+
+    // Step 4: applied tip vs best valid block.
     let applied = store.get_meta("tip_hash").ok().flatten()
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
     let best = dag.read().selected_tip();
@@ -1600,19 +1749,22 @@ pub fn reconcile_on_startup(
             warn!("reconcile: applied tip {} != best valid block {}; reconnecting",
                 hex::encode(&applied[..8]), hex::encode(&best[..8]));
             let mut log = ResolveLog::default();
-            match resolve_best_chain(dag, store, shielded, applied, None, false, 0, 0, &mut log) {
+            match resolve_best_chain(dag, store, shielded, applied, None, false, &mut log,
+                                     &MarkClears::default(), MissingBodies::Wait) {
                 Ok(_) => {
                     if !log.invalid.is_empty() {
-                        persist_unchanged(dag, store, None, &log.invalid)?;
+                        persist_unchanged(dag, store, None, &log.invalid, &[])?;
                     }
                 }
-                Err(ResolveStop::Refused(m)) | Err(ResolveStop::Failed(m)) => {
+                Err(m) => {
                     error!("reconcile: cannot reconnect the best valid chain: {}", m);
                     if !recheck.disqualified.is_empty() {
+                        // There is no reorg-depth limit (audit DAG-6): the
+                        // rollback off them failed on storage or missing data.
                         error!(
-                            "reconcile: the applied chain contains blocks a pre-upgrade binary stored that \
-                             fail the hardening block rules, and leaving them needs a rollback this node \
-                             refuses (deeper than the reorg cap); resynchronize this data directory"
+                            "reconcile: the applied chain still contains blocks a pre-upgrade binary stored \
+                             that fail the hardening block rules, and the rollback off them failed; \
+                             resynchronize this data directory if this persists"
                         );
                     }
                     return Err(m);
@@ -1621,6 +1773,694 @@ pub fn reconcile_on_startup(
         }
     }
     Ok(())
+}
+
+// ── Start-up chain-state check and rebuild (DAG-11 residual) ─────────────────
+
+/// CF_META flag set while [`rebuild_chain_state`] is between its two commits.
+pub const REBUILD_PENDING_META: &str = "chainstate_rebuild_pending";
+
+/// A footprint of the PRE-FIX, non-atomic extension commit that
+/// `reconcile_on_startup` cannot repair (audit DAG-11 residual).
+///
+/// The pre-fix extension wrote, one RocksDB write at a time and in this
+/// order: per transaction `tx_index` row, created outputs, then the coinbase
+/// row or the input deletions; the undo record LAST; then the tip pointer and
+/// the CF_DAG record — and a write error was only logged. RocksDB recovers a
+/// prefix of the issued writes after a crash, so:
+///
+/// * a crash (or error) before the undo record leaves `tx_index` rows of the
+///   block — the first write for every transaction whose effects started —
+///   pointing at a block WITHOUT an undo record: [`UnrecordedEffects`];
+/// * a write error followed by the (logged-and-ignored) tip / CF_DAG writes
+///   leaves the block on the applied chain without an undo record:
+///   [`AppliedWithoutUndo`].
+///
+/// This release cannot produce either: every chain move commits UTXO effects,
+/// undo record, chain indexes, DAG record and tip pointer in ONE batch
+/// (`reorg::connect_plan`), so a crash leaves all of them or none. The
+/// footprints can only come from a database written by an earlier release.
+///
+/// [`UnrecordedEffects`]: ChainStateFault::UnrecordedEffects
+/// [`AppliedWithoutUndo`]: ChainStateFault::AppliedWithoutUndo
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainStateFault {
+    /// `rows` CF_TX_INDEX rows point at `block`, which has no undo record.
+    UnrecordedEffects { block: BlockHash, rows: usize },
+    /// `block` is on the applied chain (tip pointer back to genesis) but has
+    /// no undo record.
+    AppliedWithoutUndo { block: BlockHash },
+    /// A previous [`rebuild_chain_state`] stopped between its two commits.
+    RebuildInterrupted,
+}
+
+impl std::fmt::Display for ChainStateFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChainStateFault::UnrecordedEffects { block, rows } => write!(
+                f, "{} transaction-index row(s) point at block {} which has no undo record \
+                    (UTXO effects of an interrupted pre-fix commit)", rows, hex::encode(&block[..8])),
+            ChainStateFault::AppliedWithoutUndo { block } => write!(
+                f, "block {} is on the applied chain but has no undo record", hex::encode(&block[..8])),
+            ChainStateFault::RebuildInterrupted => write!(f, "a chain-state rebuild was interrupted"),
+        }
+    }
+}
+
+/// Detect every [`ChainStateFault`]. Cheap enough for every start-up: one
+/// scan of the CF_UNDO keys and of CF_TX_INDEX, plus a walk of the applied
+/// chain. The genesis block has no undo record by construction and is
+/// exempt.
+pub fn check_chain_state(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+) -> Result<Vec<ChainStateFault>, String> {
+    let mut faults = Vec::new();
+    if store.get_meta(REBUILD_PENDING_META).map_err(|e| e.to_string())?.as_deref() == Some(&[1u8][..]) {
+        faults.push(ChainStateFault::RebuildInterrupted);
+    }
+    let genesis = dag.read().store.genesis;
+    let undo: HashSet<BlockHash> = store.undo_block_hashes().map_err(|e| e.to_string())?
+        .into_iter().collect();
+    let mut unrecorded: HashMap<BlockHash, usize> = HashMap::new();
+    for (_, block) in store.tx_index_entries().map_err(|e| e.to_string())? {
+        if Some(block) != genesis && !undo.contains(&block) {
+            *unrecorded.entry(block).or_insert(0) += 1;
+        }
+    }
+    let mut unrecorded: Vec<(BlockHash, usize)> = unrecorded.into_iter().collect();
+    unrecorded.sort_unstable();
+    faults.extend(unrecorded.into_iter()
+        .map(|(block, rows)| ChainStateFault::UnrecordedEffects { block, rows }));
+
+    let applied = store.get_meta("tip_hash").map_err(|e| e.to_string())?
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
+    if let Some(tip) = applied {
+        let d = dag.read();
+        // A tip pointer the DAG does not know is reconcile step 2's case.
+        let mut cur = if d.has_block(&tip) { Some(tip) } else { None };
+        while let Some(h) = cur {
+            if Some(h) == genesis {
+                break;
+            }
+            if !undo.contains(&h) {
+                faults.push(ChainStateFault::AppliedWithoutUndo { block: h });
+            }
+            cur = d.get_block_data(&h).and_then(|x| x.selected_parent);
+        }
+    }
+    Ok(faults)
+}
+
+/// What [`rebuild_chain_state`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RebuildReport {
+    /// Chain-state rows deleted before the rebuild.
+    pub cleared_rows: usize,
+    /// Consensus disqualification marks dropped (re-derived while connecting).
+    pub cleared_marks: usize,
+    /// Selected-chain blocks connected from genesis.
+    pub connected_blocks: usize,
+}
+
+/// Rebuild the chain state — UTXO set, coinbase heights, transaction index,
+/// undo records, selected-chain indexes, address history, the shielded-pool
+/// state (audit COH-2) and the explorer aggregates (audit NET-12) — from the
+/// block bodies (audit DAG-11 residual).
+///
+/// 1. Check that every block of the best valid chain whose body was PRUNED
+///    still has it (a pruned node cannot rebuild: it must resync from a fresh
+///    data dir or an archival copy; a body missing above the pruning cursor
+///    is waited for like on acceptance). Operator `invalidateblock` marks and
+///    the context-free hardening-recheck marks (they depend on the stored
+///    bodies only, and the recheck does not run again) are kept; connect-time
+///    consensus marks are dropped, since they may have been made against the
+///    inconsistent state, and are re-derived by step 3.
+/// 2. One batch: delete every chain-state row (shielded state included), mark
+///    the explorer aggregates incomplete, stage the genesis state (`seed`:
+///    the carryover UTXOs and the genesis transaction index, exactly what
+///    first boot writes), the genesis chain-index rows, the tip pointer =
+///    genesis and the `REBUILD_PENDING_META` flag; the in-memory shielded
+///    pool is reset to the genesis state.
+/// 3. Connect the best valid chain from genesis with the normal atomic
+///    machinery (`resolve_best_chain`: every block validated in its own
+///    context, the shielded state staged into the same batches), recompute
+///    the explorer aggregates from scratch, then clear the flag. If the
+///    process stops before the flag is cleared, the next start-up reports
+///    `RebuildInterrupted` and rebuilds again (each step is idempotent).
+///
+/// The result is the state a node that never crashed holds: the UTXO set is
+/// the deterministic application of the best valid chain to the genesis
+/// state (`node/tests/fix_chain_selection.rs` compares UTXO-set digests).
+pub fn rebuild_chain_state(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &Arc<storage::Storage>,
+    shielded: &Arc<RwLock<ShieldedPool>>,
+    seed: &dyn Fn(&storage::Storage, &mut rocksdb::WriteBatch) -> Result<(), String>,
+) -> Result<RebuildReport, String> {
+    let _guard = store.acceptance_lock();
+    ensure_invalid_set_loaded(dag, store);
+    let genesis = dag.read().store.genesis.ok_or("rebuild: the DAG has no genesis")?;
+
+    // 1. Marks, then the bodies of the best valid chain under them.
+    let marks = store.load_invalid_blocks_with_reasons().map_err(|e| e.to_string())?;
+    let (keep, drop): (Vec<_>, Vec<_>) = marks.into_iter()
+        .partition(|(_, r)| matches!(mark_kind(r), MarkKind::Operator | MarkKind::Hardening));
+    {
+        let (selected, all_edges) = split_marks(keep.iter().cloned());
+        dag.write().reset_invalid_sets(selected, all_edges);
+    }
+    let pruned_below = store.pruned_height();
+    let missing_body = {
+        let d = dag.read();
+        let mut cur = d.selected_tip();
+        let mut missing = None;
+        while let Some(h) = cur {
+            if h == genesis {
+                break;
+            }
+            let height = d.get_block_data(&h).map(|x| x.height).unwrap_or(0);
+            if height < pruned_below && !store.has_block_body(&h).map_err(|e| e.to_string())? {
+                missing = Some((h, height));
+                break;
+            }
+            cur = d.get_block_data(&h).and_then(|x| x.selected_parent);
+        }
+        missing
+    };
+    if let Some((h, height)) = missing_body {
+        // Nothing was written: restore the in-memory disqualified set.
+        reload_persisted_marks(dag, store);
+        return Err(format!(
+            "rebuild impossible: the body of selected-chain block {} (h={}) has been \
+             pruned. Resync from a fresh --data-dir (with --carryover-snapshot) or from \
+             an archival node's data dir.",
+            hex::encode(&h[..8]), height
+        ));
+    }
+
+    // 2. Clear + genesis state, one batch.
+    let mut batch = rocksdb::WriteBatch::default();
+    store.stage_aggregates_incomplete(&mut batch).map_err(|e| e.to_string())?;
+    let cleared_rows = store.stage_clear_chain_state(&mut batch).map_err(|e| e.to_string())?;
+    seed(store, &mut batch)?;
+    if let Some(gb) = store.get_block(&genesis).map_err(|e| e.to_string())? {
+        store.stage_chain_index(&mut batch, &gb, &HashMap::new()).map_err(|e| e.to_string())?;
+    }
+    for (h, _) in &drop {
+        store.stage_clear_invalid_block(&mut batch, h).map_err(|e| e.to_string())?;
+    }
+    store.stage_meta(&mut batch, "tip_hash", &genesis).map_err(|e| e.to_string())?;
+    store.stage_meta(&mut batch, REBUILD_PENDING_META, &[1u8]).map_err(|e| e.to_string())?;
+    store.write_batch(batch).map_err(|e| e.to_string())?;
+    shielded.write().reset_for_rebuild();
+
+    // 3. Connect the best valid chain from genesis.
+    let mut log = ResolveLog::default();
+    let connected_blocks = match resolve_best_chain(dag, store, shielded, genesis, None, false, &mut log,
+                                                    &MarkClears::default(), MissingBodies::Wait)? {
+        Resolution::Connected { outcome, .. } => outcome.connected.len(),
+        Resolution::Unchanged => {
+            if !log.invalid.is_empty() {
+                persist_unchanged(dag, store, None, &log.invalid, &[])?;
+            }
+            0
+        }
+    };
+    store.rebuild_aggregates(&std::sync::atomic::AtomicBool::new(false)).map_err(|e| e.to_string())?;
+    store.put_meta(REBUILD_PENDING_META, &[0u8]).map_err(|e| e.to_string())?;
+    warn!("chain state rebuilt from block bodies: {} row(s) cleared, {} consensus mark(s) re-derived, \
+           {} block(s) connected", cleared_rows, drop.len(), connected_blocks);
+    Ok(RebuildReport { cleared_rows, cleared_marks: drop.len(), connected_blocks })
+}
+
+// ── Blocks in the DAG without a usable body (audit DAG-6 / VAL-1x) ──────────
+//
+// Two situations leave a block in the DAG without a body the node can use:
+// its body failed a rule that depends on witness bytes the id does not commit
+// to (below the hardening activation, `drop_body_and_wait`), or its body was
+// pruned while it was on the selected chain and a reorg then left it
+// unapplied (DAG-6: no reorg-depth limit, so the chain through it can become
+// the best one again). Both are ONE state: the block waits for a body
+// (`GhostDAG::mark_body_pending`, in memory) — set by `resolve_best_chain`
+// for every block of the best chain it cannot connect, or by
+// [`request_bodies`] for the bodies an operator override needs —, and
+// [`awaits_body`] is the one predicate every ingress path consults (gossip
+// additionally takes only the answer to the node's own directed pull). The
+// message processor requests those bodies through its missing-parent tracker
+// (`ingress::awaited_bodies_to_request`, at most
+// `ingress::MAX_BODY_PULLS_IN_FLIGHT` being fetched at once), and a copy that
+// arrives goes through `accept_block`'s body-replacement path: bound to the
+// header height the DAG parents imply, the expected bits, the timestamp, the
+// hardening block rules (witness commitment), the proof of work and the
+// rejected-witness-root memo, then stored with the metadata acceptance
+// derives.
+
+/// The blocks a connect of a block with these `parents` would APPLY that
+/// have no stored body: its selected-chain ancestors that are not applied
+/// (no undo record), walking down from the parent of greatest
+/// `(blue_work, blue_score, hash)`, nearest first, at most `limit`.
+///
+/// Operator overrides name exactly these when the chain they move to needs
+/// bodies this pruned node no longer has ([`OverrideError::MissingBodies`]).
+pub fn missing_bodies_below(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    parents: &[BlockHash],
+    limit: usize,
+) -> Vec<BlockHash> {
+    let d = dag.read();
+    let genesis = d.store.genesis;
+    let mut cur = parents.iter()
+        .filter_map(|p| d.get_block_data(p).map(|x| (x.blue_work, x.blue_score, *p)))
+        .max()
+        .map(|(_, _, p)| p);
+    let mut out = Vec::new();
+    while let Some(h) = cur {
+        if out.len() >= limit || Some(h) == genesis || store.has_undo_data(&h).unwrap_or(true) {
+            break;
+        }
+        if !store.has_block_body(&h).unwrap_or(true) {
+            out.push(h);
+        }
+        cur = d.get_block_data(&h).and_then(|x| x.selected_parent);
+    }
+    out
+}
+
+/// Make the blocks of `hashes` whose body is wanted wait for one
+/// (`GhostDAG::mark_body_pending`), so [`awaits_body`] admits a copy and the
+/// message processor requests it: blocks in the DAG, not the genesis, without
+/// a stored body and NOT applied (an applied block never needs its body: a
+/// rollback works from its undo record), and not on the selected chain of
+/// the selected tip (marking those would move the selected tip without a
+/// connect; the acceptance pipeline marks the bodies the best chain needs
+/// itself). Returns the hashes marked. Used for the bodies an operator
+/// override needs (audit DAG-6).
+pub fn request_bodies(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    hashes: &[BlockHash],
+) -> Vec<BlockHash> {
+    let mut d = dag.write();
+    let genesis = d.store.genesis;
+    let tip = d.selected_tip();
+    let mut marked = Vec::new();
+    for h in hashes {
+        let wanted = d.has_block(h)
+            && Some(*h) != genesis
+            && matches!(store.has_block_body(h), Ok(false))
+            && matches!(store.has_undo_data(h), Ok(false))
+            && !tip.is_some_and(|t| d.is_on_selected_chain_of(h, &t));
+        if wanted {
+            d.mark_body_pending(*h, None);
+            marked.push(*h);
+        }
+    }
+    marked
+}
+
+// ── Operator recovery: invalidateblock / reconsiderblock (DAG-6) ─────────────
+
+/// Reason prefix of a mark a block inherits from its disqualified selected
+/// parent (`accept_block`, a new block on a disqualified chain).
+pub const INHERITED_REASON_PREFIX: &str = "selected parent ";
+
+/// What a persisted disqualification mark records, by its reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkKind {
+    /// Operator `invalidateblock` ([`OPERATOR_INVALIDATE_REASON`]).
+    Operator,
+    /// The context-free hardening block rules (start-up recheck of blocks a
+    /// pre-upgrade binary stored, or a block referencing one): reason
+    /// starting with [`HARDENING_RECHECK_REASON`], reloaded as an all-edges
+    /// root.
+    Hardening,
+    /// Inherited from a disqualified selected parent
+    /// ([`INHERITED_REASON_PREFIX`]): a consequence, not a verdict on the
+    /// block itself.
+    Inherited,
+    /// The block itself failed a connect-time consensus rule in its own
+    /// selected-chain context.
+    Consensus,
+}
+
+/// Classify a persisted mark by its recorded reason.
+pub fn mark_kind(reason: &str) -> MarkKind {
+    if reason == OPERATOR_INVALIDATE_REASON {
+        MarkKind::Operator
+    } else if reason.starts_with(HARDENING_RECHECK_REASON) {
+        MarkKind::Hardening
+    } else if reason.starts_with(INHERITED_REASON_PREFIX) {
+        MarkKind::Inherited
+    } else {
+        MarkKind::Consensus
+    }
+}
+
+/// Persisted marks as GhostDAG loads them: (roots spread along selected-parent
+/// chains, roots spread through every parent edge — hardening marks).
+fn split_marks<I: IntoIterator<Item = (BlockHash, String)>>(marks: I) -> (Vec<BlockHash>, Vec<BlockHash>) {
+    let mut selected = Vec::new();
+    let mut all_edges = Vec::new();
+    for (h, reason) in marks {
+        if mark_kind(&reason) == MarkKind::Hardening {
+            all_edges.push(h);
+        } else {
+            selected.push(h);
+        }
+    }
+    (selected, all_edges)
+}
+
+/// Re-derive the in-memory disqualified set from the persisted marks (the
+/// in-memory body-pending roots are kept): after an override that committed
+/// nothing.
+fn reload_persisted_marks(dag: &Arc<RwLock<consensus::GhostDAG>>, store: &storage::Storage) {
+    match store.load_invalid_blocks_with_reasons() {
+        Ok(marks) => {
+            let (selected, all_edges) = split_marks(marks);
+            dag.write().reset_invalid_sets(selected, all_edges);
+        }
+        Err(e) => error!("cannot re-read the persisted invalid-block set: {}", e),
+    }
+}
+
+/// Result of an operator chain override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainOverride {
+    /// The applied tip after the call.
+    pub tip: BlockHash,
+    /// Its DAG height.
+    pub tip_height: u64,
+    /// Selected-chain blocks rolled back / connected by the call.
+    pub rolled_back: usize,
+    pub connected: usize,
+    /// Blocks marked (invalidate) or unmarked (reconsider).
+    pub affected: usize,
+}
+
+/// Why an operator chain override changed nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverrideError {
+    /// Refused or failed (unknown block, genesis, storage error, ...).
+    Failed(String),
+    /// Pruned nodes: the chain to move to must apply blocks whose bodies this
+    /// node pruned (`reorg::ERR_MISSING_BODIES`). Nothing was committed and
+    /// the marks are as before the call. `missing` are the next bodies to
+    /// re-fetch (unapplied selected-chain blocks without a body, nearest the
+    /// new tip first, at most `ingress::MAX_BODY_REFETCH`); they now wait for
+    /// a body ([`request_bodies`]: the processor requests them), and once they
+    /// are restored the same call is retried (and asks for the next ones).
+    MissingBodies { missing: Vec<BlockHash>, reason: String },
+}
+
+impl std::fmt::Display for OverrideError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OverrideError::Failed(m) => f.write_str(m),
+            OverrideError::MissingBodies { missing, reason } => write!(
+                f, "{} block bod(ies) must be re-fetched first ({})", missing.len(), reason),
+        }
+    }
+}
+
+impl std::error::Error for OverrideError {}
+
+impl From<String> for OverrideError {
+    fn from(m: String) -> Self {
+        OverrideError::Failed(m)
+    }
+}
+
+impl From<&str> for OverrideError {
+    fn from(m: &str) -> Self {
+        OverrideError::Failed(m.to_string())
+    }
+}
+
+/// Shared tail of the two operator calls: move the applied chain to the best
+/// valid block, persisting `log` marks and removing the `clears` marks in the
+/// same batch (a consensus mark only if the move re-validated its block),
+/// then refresh the mempool and the RPC-visible state. The caller's in-memory
+/// marks are still in place on return; on `Err` the caller restores them from
+/// disk (nothing was committed).
+#[allow(clippy::too_many_arguments)]
+fn apply_operator_override(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &Arc<storage::Storage>,
+    mempool: &Arc<mempool::Mempool>,
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+    tip_tx: Option<&broadcast::Sender<tip::TipChanged>>,
+    shielded: &Arc<RwLock<ShieldedPool>>,
+    log: Vec<(BlockHash, String)>,
+    clears: MarkClears,
+    affected: usize,
+) -> Result<ChainOverride, OverrideError> {
+    let applied = store.get_meta("tip_hash").map_err(|e| e.to_string())?
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        .ok_or("no applied tip pointer")?;
+    let (mut rolled_back, mut connected) = (0usize, 0usize);
+    let mut rlog = ResolveLog { invalid: log, body_rejected: Vec::new() };
+    let resolution = match resolve_best_chain(dag, store, shielded, applied, None, false, &mut rlog,
+                                              &clears, MissingBodies::Stop) {
+        Ok(r) => r,
+        Err(m) if m.contains(reorg::ERR_MISSING_BODIES) => {
+            // DAG-6, pruned nodes: name the bodies to re-fetch while the
+            // operator's marks still select the candidate that needs them.
+            let cand = dag.read().selected_tip();
+            let missing = match cand {
+                Some(c) => missing_bodies_below(dag, store, &[c], crate::ingress::MAX_BODY_REFETCH),
+                None => Vec::new(),
+            };
+            return Err(if missing.is_empty() {
+                OverrideError::Failed(m)
+            } else {
+                OverrideError::MissingBodies { missing, reason: m }
+            });
+        }
+        Err(m) => return Err(OverrideError::Failed(m)),
+    };
+    // First, before anything reads the valid tips (the next template height
+    // below, the TipChanged parents): the consensus marks this move did not
+    // re-validate are persisted still, so they hold in memory again.
+    remark_unvalidated(dag, store, &clears.if_applied);
+    match resolution {
+        Resolution::Unchanged => {
+            persist_unchanged(dag, store, None, &rlog.invalid, &clears.always)?;
+            // The marks change the valid tips, hence the template height.
+            sync_mempool_next_height(dag, store, mempool);
+        }
+        Resolution::Connected { plan, outcome } => {
+            rolled_back = outcome.rolled_back();
+            connected = outcome.connected.len();
+            warn!("operator override: rolled back {} block(s), connected {} (lca={})",
+                rolled_back, connected, hex::encode(&plan.lca[..8]));
+            // The next height on the DAG after the move: the template height
+            // (never the new tip's header height + 1, DAG-8).
+            let next_height = crate::template::next_template_height(&dag.read(), store);
+            update_mempool_after_connect(store, mempool, &outcome, next_height);
+        }
+    }
+    let (tip, tip_height, score) = {
+        let d = dag.read();
+        let t = d.selected_tip().ok_or("DAG has no tip")?;
+        let data = d.get_block_data(&t).cloned().ok_or("tip vanished")?;
+        (t, data.height, data.blue_score)
+    };
+    {
+        let mut s = node_state.write();
+        s.tip_blue_score = score;
+        s.block_count = dag.read().block_count() as u64;
+        s.mempool_size = mempool.size();
+    }
+    if let Some(tx) = tip_tx {
+        // Presence only (no decode), as on acceptance.
+        let has_body = |h: &[u8; 32]| store.has_block_body(h).unwrap_or(false);
+        let d = dag.read();
+        if let Some(best) = d.best_bodied_tip(has_body) {
+            if let Some(data) = d.get_block_data(&best).cloned() {
+                // The template's own parents (memoized parent predicate).
+                let parents = crate::template::template_parents_and_height(&d, store).0;
+                drop(d);
+                let bits = store.get_meta("current_bits").ok().flatten()
+                    .and_then(|b| b.as_slice().try_into().ok().map(u32::from_le_bytes))
+                    .unwrap_or(0x1d00ffff_u32);
+                let _ = tx.send(tip::TipChanged {
+                    hash: best, height: data.height, blue_score: data.blue_score, parents, bits,
+                });
+            }
+        }
+    }
+    Ok(ChainOverride { tip, tip_height, rolled_back, connected, affected })
+}
+
+/// After a committed `reconsiderblock` move: every consensus mark in
+/// `if_applied` whose block the move did not re-validate (not applied now)
+/// is still persisted, so it holds in memory again, as a persistent root.
+/// Also when the block is already disqualified in memory only through a
+/// body-pending mark (its stored body was just rejected for a
+/// witness-dependent reason, or it waits for an ancestor's body): that mark
+/// is cleared when a body arrives, and without the root the block would
+/// then connect while `invalid_block/<id>` stays on disk, to be disqualified
+/// again at the next start (review of the P3 merge). The block is not an
+/// ancestor of the applied tip (it is not applied), so the selected tip does
+/// not move. Call before anything reads the valid tips.
+fn remark_unvalidated(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    if_applied: &[BlockHash],
+) {
+    for r in if_applied {
+        // A read error counts as "still persisted" (the stricter memory).
+        let persisted = store.invalid_block_reason(r).map(|m| m.is_some()).unwrap_or(true);
+        if persisted && !store.has_undo_data(r).unwrap_or(false) {
+            dag.write().mark_invalid(*r);
+        }
+    }
+}
+
+/// After an override that committed nothing: restore the in-memory marks from
+/// disk and, when the chain to move to needs pruned bodies, make them wait for
+/// a body ([`request_bodies`]) so the processor fetches them.
+fn after_failed_override(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    err: &OverrideError,
+) {
+    reload_persisted_marks(dag, store);
+    if let OverrideError::MissingBodies { missing, .. } = err {
+        let marked = request_bodies(dag, store, missing);
+        info!("operator override: {} pruned block bod(ies) requested; retry once they arrived",
+            marked.len());
+    }
+}
+
+/// Operator `invalidateblock` (Bitcoin Core's `InvalidateBlock`): disqualify
+/// `hash` and every block whose selected-parent chain passes through it,
+/// persist the mark (`invalid_block/<hash>`, reason
+/// [`OPERATOR_INVALIDATE_REASON`]) and move the applied chain to the best
+/// valid block that remains — rolling back past `hash` if it was applied —
+/// in one atomic batch. Survives restarts; undone by [`reconsider_block`].
+/// A block that already carries a persisted mark keeps it (a consensus or
+/// hardening verdict never becomes an operator mark the operator could clear
+/// without re-validation): the call changes nothing. On a pruned node whose
+/// new chain needs pruned bodies it changes nothing and returns
+/// [`OverrideError::MissingBodies`] (they are requested; retry).
+#[allow(clippy::too_many_arguments)]
+pub fn invalidate_block(
+    hash: BlockHash,
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &Arc<storage::Storage>,
+    mempool: &Arc<mempool::Mempool>,
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+    tip_tx: Option<&broadcast::Sender<tip::TipChanged>>,
+    shielded: &Arc<RwLock<ShieldedPool>>,
+) -> Result<ChainOverride, OverrideError> {
+    let _guard = store.acceptance_lock();
+    ensure_invalid_set_loaded(dag, store);
+    if !dag.read().has_block(&hash) {
+        return Err(format!("block {} not found", hex::encode(hash)).into());
+    }
+    if dag.read().store.genesis == Some(hash) {
+        return Err("the genesis block cannot be invalidated".into());
+    }
+    if let Some(reason) = store.invalid_block_reason(&hash).map_err(|e| e.to_string())? {
+        info!("invalidateblock {}: already disqualified ({}); nothing to do", hex::encode(&hash[..8]), reason);
+        return apply_operator_override(dag, store, mempool, node_state, tip_tx, shielded,
+                                       Vec::new(), MarkClears::default(), 0);
+    }
+    let marked = dag.write().mark_invalid(hash);
+    warn!("invalidateblock {}: {} block(s) disqualified by the operator",
+        hex::encode(&hash[..8]), marked.len());
+    let log = vec![(hash, OPERATOR_INVALIDATE_REASON.to_string())];
+    let res = apply_operator_override(dag, store, mempool, node_state, tip_tx, shielded, log,
+                                      MarkClears::default(), marked.len());
+    if let Err(e) = &res {
+        // Nothing was committed.
+        after_failed_override(dag, store, e);
+    }
+    res
+}
+
+/// Operator `reconsiderblock` (Bitcoin Core's `ReconsiderBlock`): consider
+/// every persisted disqualification whose root is `hash`, a selected-chain
+/// ancestor of `hash` or a block whose selected chain passes through `hash`,
+/// and move the applied chain to the best valid block, in one atomic batch:
+///
+/// * operator marks and marks inherited from a selected parent are removed;
+/// * a hardening-recheck mark (context-free, audit VAL/CRY hardening rules)
+///   is removed only if the stored body now passes those rules
+///   (`classify_stored_block`); otherwise it stays (a pruned body cannot be
+///   re-checked and stays too);
+/// * a connect-time consensus mark is removed only by the batch that
+///   RE-VALIDATES the block — the move applies it, after validating it in its
+///   own context; a block the move does not apply keeps its mark, and one
+///   that fails again is disqualified again with its new reason.
+///
+/// Like [`invalidate_block`], it returns [`OverrideError::MissingBodies`] and
+/// changes nothing when the chain to move to needs bodies this pruned node no
+/// longer has.
+#[allow(clippy::too_many_arguments)]
+pub fn reconsider_block(
+    hash: BlockHash,
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &Arc<storage::Storage>,
+    mempool: &Arc<mempool::Mempool>,
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+    tip_tx: Option<&broadcast::Sender<tip::TipChanged>>,
+    shielded: &Arc<RwLock<ShieldedPool>>,
+) -> Result<ChainOverride, OverrideError> {
+    let _guard = store.acceptance_lock();
+    ensure_invalid_set_loaded(dag, store);
+    if !dag.read().has_block(&hash) {
+        return Err(format!("block {} not found", hex::encode(hash)).into());
+    }
+    let marks = store.load_invalid_blocks_with_reasons().map_err(|e| e.to_string())?;
+    let activation = core::activation::hardening_activation_height();
+    let mut clears = MarkClears::default();
+    let mut kept: Vec<(BlockHash, String)> = Vec::new();
+    let mut still_failing = 0usize;
+    {
+        let d = dag.read();
+        for (r, reason) in marks {
+            if !(d.is_on_selected_chain_of(&r, &hash) || d.is_on_selected_chain_of(&hash, &r)) {
+                kept.push((r, reason));
+                continue;
+            }
+            match mark_kind(&reason) {
+                MarkKind::Operator | MarkKind::Inherited => clears.always.push(r),
+                MarkKind::Hardening => {
+                    let passes = matches!(store.get_block(&r), Ok(Some(b))
+                        if classify_stored_block(&b, activation) == StoredBlockCheck::Valid);
+                    if passes {
+                        clears.always.push(r);
+                    } else {
+                        still_failing += 1;
+                        kept.push((r, reason));
+                    }
+                }
+                MarkKind::Consensus => clears.if_applied.push(r),
+            }
+        }
+    }
+    if still_failing > 0 {
+        warn!("reconsiderblock {}: {} mark(s) kept: the block still fails the hardening block rules \
+               (or its body is pruned and cannot be re-checked)", hex::encode(&hash[..8]), still_failing);
+    }
+    let before = dag.read().invalid_count();
+    {
+        let (selected, all_edges) = split_marks(kept);
+        dag.write().reset_invalid_sets(selected, all_edges);
+    }
+    let affected = before.saturating_sub(dag.read().invalid_count());
+    info!("reconsiderblock {}: {} mark(s) removed, {} re-validated by the move, {} block(s) re-qualified",
+        hex::encode(&hash[..8]), clears.always.len(), clears.if_applied.len(), affected);
+    let res = apply_operator_override(dag, store, mempool, node_state, tip_tx, shielded, Vec::new(), clears, affected);
+    if let Err(e) = &res {
+        after_failed_override(dag, store, e);
+    }
+    res
 }
 
 // ── Unified TX validation ────────────────────────────────────────────────────

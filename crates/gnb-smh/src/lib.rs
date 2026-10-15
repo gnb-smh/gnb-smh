@@ -213,11 +213,16 @@ pub fn verify(header: &[u8], nonce: u64, target: &difficulty::Target) -> bool {
 mod tests {
     use super::*;
 
+    /// One Keccak-f[1600] permutation takes about 0.4 s under Miri (measured,
+    /// docs/testing/SANITIZERS.md), so the hashing tests below run a few
+    /// iterations there and the full count natively.
+    const HASH_TRIALS: u64 = if cfg!(miri) { 3 } else { 200 };
+
     /// The lane-level step must equal FIPS 202 SHAKE256(x || u32le(i) || tag, 128).
     #[test]
     fn step_matches_shake256() {
         let mut x = [0u64; LANES];
-        for trial in 0u64..200 {
+        for trial in 0u64..HASH_TRIALS {
             for (k, lane) in x.iter_mut().enumerate() {
                 *lane = trial
                     .wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -254,7 +259,8 @@ mod tests {
 
     #[test]
     fn nonce_and_header_change_output() {
-        let mut sp = Scratchpad::new(8);
+        // 2^8 blocks natively; 2 blocks (still both phases, both tags) under Miri.
+        let mut sp = Scratchpad::new(if cfg!(miri) { MIN_LOG2_N } else { 8 });
         let a = hash_with(&mut sp, b"gnb", 0);
         assert_ne!(a, hash_with(&mut sp, b"gnb", 1));
         assert_ne!(a, hash_with(&mut sp, b"gnc", 0));
@@ -267,10 +273,84 @@ mod tests {
         let _ = Scratchpad::new(MAX_LOG2_N + 1);
     }
 
+    /// Every profile must trap integer overflow (root Cargo.toml: release sets
+    /// `overflow-checks = true`, dev/test inherit it from debug assertions).
+    /// Checks the profile this binary was built with, so CI also runs it as
+    /// `cargo test --release -p gnb-smh --lib integer_overflow`.
+    #[test]
+    fn integer_overflow_panics_in_this_profile() {
+        let r = std::panic::catch_unwind(|| std::hint::black_box(u32::MAX) + std::hint::black_box(1u32));
+        assert!(r.is_err(), "overflow-checks are off in this build profile");
+    }
+
     #[test]
     #[should_panic]
     fn verify_rejects_non_canonical_scratchpad() {
         let mut sp = Scratchpad::new(8);
         let _ = verify_with(&mut sp, b"gnb", 0, &[0xFF; 32]);
+    }
+
+    #[test]
+    fn scratchpad_reports_its_parameter_and_size() {
+        for (log2_n, bytes) in [(1u32, 256usize), (8, 32_768), (10, 131_072)] {
+            let sp = Scratchpad::new(log2_n);
+            assert_eq!(sp.log2_n(), log2_n);
+            assert_eq!(sp.bytes(), (1usize << log2_n) * BLOCK);
+            assert_eq!(sp.bytes(), bytes);
+        }
+    }
+
+    /// `lane16` is the SHAKE-256 padding of the 133-byte message as one lane:
+    /// bytes 0..4 = i, byte 4 = tag, byte 5 = 0x1F, byte 7 = 0x80.
+    #[test]
+    fn lane16_layout() {
+        let l = lane16(0x0403_0201, TAG_MIX);
+        assert_eq!(l.to_le_bytes(), [0x01, 0x02, 0x03, 0x04, 0x02, 0x1F, 0x00, 0x80]);
+        assert_eq!(lane16(u32::MAX, TAG_FILL).to_le_bytes(), [0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x1F, 0x00, 0x80]);
+    }
+
+    /// Canonical reference vector (reference/test_vectors.json, log2_n = 19,
+    /// header "gnb", nonce 0).
+    const CANONICAL_OUT: &str = "c05129a877e99e4fd8f1bd6bd39963a95c9ece39bc5055047db51bfaa4f44bef";
+
+    fn canonical_out() -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (k, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&CANONICAL_OUT[2 * k..2 * k + 2], 16).unwrap();
+        }
+        out
+    }
+
+    /// `out + 1` as a big-endian integer (the vector's out does not end in 0xFF).
+    fn plus_one(mut t: [u8; 32]) -> [u8; 32] {
+        assert_ne!(t[31], 0xFF);
+        t[31] += 1;
+        t
+    }
+
+    /// Every canonical entry point (`hash`, `hash_thread_local`,
+    /// `verify_with`, `verify`) reproduces the reference output and decides
+    /// validity exactly at `out < target`.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "five canonical evaluations (log2_n = 19, 64 MiB, ~2^20 Keccak-f[1600] permutations each at \
+                  ~0.4 s per permutation under Miri); the log2_n <= 2 Python vectors in tests/vectors.rs run \
+                  the same pipeline there"
+    )]
+    fn canonical_entry_points_match_the_reference_vector() {
+        let out = canonical_out();
+        assert_eq!(hash(b"gnb", 0), out);
+        assert_eq!(hash_thread_local(b"gnb", 0), out);
+
+        let mut sp = Scratchpad::new(LOG2_N);
+        assert!(verify_with(&mut sp, b"gnb", 0, &plus_one(out)), "out < out + 1");
+        assert!(!verify_with(&mut sp, b"gnb", 0, &out), "out < out is false");
+        assert!(!verify_with(&mut sp, b"gnb", 0, &[0u8; 32]), "the zero target never validates");
+
+        use difficulty::Target;
+        assert!(verify(b"gnb", 0, &Target(plus_one(out))));
+        assert!(!verify(b"gnb", 0, &Target(out)));
+        assert!(!verify(b"gnb", 0, &Target::ZERO));
     }
 }

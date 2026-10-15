@@ -133,11 +133,12 @@ fn cheap_structure_check_runs_no_pow() {
 #[test]
 fn pow_limit_orphan_is_refused_by_the_floor() {
     let reference = core::bits_to_target(core::GENESIS_BITS);
-    let floor = ease_target(&reference, ORPHAN_WORK_FLOOR_SHIFT);
+    // Capped at the pow limit of the height (`pow_limit_bits_at`, POW-3).
+    let floor = ease_target(&reference, ORPHAN_WORK_FLOOR_SHIFT, 1);
     assert!(!bits_meet_floor(core::POW_LIMIT_BITS, &floor), "free pow-limit orphan refused");
     assert!(bits_meet_floor(core::GENESIS_BITS, &floor), "honest-difficulty orphan admitted");
     // Up to 2^SHIFT easier than the reference is still admitted.
-    let eased_bits = core::target_to_bits(&ease_target(&reference, ORPHAN_WORK_FLOOR_SHIFT));
+    let eased_bits = core::target_to_bits(&ease_target(&reference, ORPHAN_WORK_FLOOR_SHIFT, 1));
     assert!(bits_meet_floor(eased_bits, &floor));
     // Malformed bits never meet any floor (and cost no evaluation).
     assert!(!bits_meet_floor(0x0480_0001, &core::bits_to_target(core::POW_LIMIT_BITS)));

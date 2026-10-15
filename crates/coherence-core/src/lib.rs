@@ -1,17 +1,36 @@
 //! Coherence shielded-pool primitives — the lean, portable core.
 //!
-//! Single source of truth shared by the node (`bloch::coherence` re-exports
-//! this), the SP1 guest prover (`crates/coherence-prover`), and the mobile
-//! wallet. Implements the C1-frozen formats (`docs/specs/COHERENCE-C1.md`):
-//! SHAKE-256 note commitments, hash-derived nullifiers, a SHAKE-256 incremental
-//! Merkle accumulator, and `check_spend` — the exact statement the ZK circuit
-//! proves. No node/std-heavy dependencies, so it compiles for the zkVM target.
+//! Single source of truth shared by the node (`gnb::coherence` re-exports
+//! this), any zkVM guest prover, and wallets. Implements the C1 formats:
+//! SHAKE-256 note commitments, a SHAKE-256 incremental Merkle accumulator,
+//! the nullifier set, and `check_spend` — the exact statement a spend proof
+//! attests to. No node/std-heavy dependencies, so it compiles for a zkVM
+//! target. (No guest prover lives in this repository; the node's only
+//! compiled verifier is `RejectAll`.)
 //!
-//! SECURITY / CR-01: the current statement does not bind `nk` to recipient
-//! spending authority. A note plaintext holder can choose multiple nullifiers
-//! for one note. This is an unauthenticated research statement, not a safe
-//! funded-pool verifier. See `tests/known_unsafe_v1_authorization.rs` and
-//! `../coherence-prover/AUTHORIZATION-BLOCKER.md`.
+//! # Spend statement version 2 (audit COH-1, internal CR-01)
+//!
+//! Version 1 of the statement took the nullifier key `nk` as a free witness:
+//! anyone holding a note's plaintext could spend it, and one leaf yielded a
+//! fresh nullifier for every `nk` the prover chose (8 spends of one 1,000-value
+//! note all verified). Version 2 binds spending authority:
+//!
+//! ```text
+//! sk                                  32-byte spending key (secret witness)
+//! ak   = SHAKE256-32("gnb:coherence:ak:v2"  ‖ sk)
+//! nk   = SHAKE256-32("gnb:coherence:nk:v2"  ‖ sk)
+//! pk_d = SHAKE256-32("gnb:coherence:pkd:v2" ‖ ak ‖ nk)
+//! nf   = SHAKE256-32("gnb:coherence:nf:v2"  ‖ nk ‖ cm ‖ position as u64 LE)
+//! ```
+//!
+//! `check_spend` re-derives `ak`, `nk` and `pk_d` from the witness `sk`,
+//! requires `pk_d` to equal the spent note's `pk_d`, and derives the
+//! nullifier from that `nk`. SHAKE-256 is collision resistant, so a note's
+//! `pk_d` determines `(ak, nk)`: each (leaf, position) has exactly one
+//! nullifier, and only the holder of `sk` can produce it. `(ak, nk)` is a
+//! viewing key: it recognises `pk_d` and computes nullifiers but cannot spend.
+//! The byte-exact rule and golden vectors are in `docs/CONSENSUS.md`
+//! ("Shielded spend statement v2"), pinned by `tests/statement_v2.rs`.
 
 // I-4: no `unsafe` is needed anywhere in this crate (including the zkVM
 // guest target), so forbid it outright rather than merely avoid it.
@@ -23,8 +42,30 @@ use sha3::{Shake256, digest::{Update, ExtendableOutput, XofReader}};
 pub const TREE_DEPTH: usize = 32;
 
 const DOM_CM: &[u8] = b"gnb:coherence:cm:v1";
-const DOM_NF: &[u8] = b"gnb:coherence:nf:v1";
 const DOM_MT: &[u8] = b"gnb:coherence:mt:v1";
+// Statement v2: key hierarchy and nullifier (audit COH-1).
+const DOM_AK: &[u8] = b"gnb:coherence:ak:v2";
+const DOM_NK: &[u8] = b"gnb:coherence:nk:v2";
+const DOM_PKD: &[u8] = b"gnb:coherence:pkd:v2";
+const DOM_NF: &[u8] = b"gnb:coherence:nf:v2";
+
+/// Version of the spend statement implemented by [`check_spend`].
+///
+/// Version 1 (withdrawn, audit COH-1) did not bind spending authority.
+/// Version 2 derives the note's `pk_d` and the nullifier key from the
+/// witness spending key (see the crate documentation).
+pub const SPEND_STATEMENT_VERSION: u32 = 2;
+
+/// True iff spend statement `version` proves spending authority: the
+/// nullifier key is derived from a secret that also derives the note's
+/// `pk_d`, so a note has exactly one nullifier. Version 2 and later do.
+///
+/// A node must never run an accepting proof verifier for a statement for
+/// which this is false; the node's verifier guard checks it at compile time
+/// and when a verifier is constructed.
+pub const fn statement_binds_authority(version: u32) -> bool {
+    version >= 2
+}
 
 /// SHAKE-256 squeezed to 32 bytes over the concatenation of `parts`.
 fn shake256_32(parts: &[&[u8]]) -> [u8; 32] {
@@ -34,6 +75,30 @@ fn shake256_32(parts: &[&[u8]]) -> [u8; 32] {
     let mut out = [0u8; 32];
     xof.read(&mut out);
     out
+}
+
+// ── Keys (statement v2) ──────────────────────────────────────────────────────
+
+/// `ak = SHAKE256-32("gnb:coherence:ak:v2" ‖ sk)`: the authorizing half of the
+/// viewing key.
+pub fn derive_ak(sk: &[u8; 32]) -> [u8; 32] {
+    shake256_32(&[DOM_AK, sk])
+}
+
+/// `nk = SHAKE256-32("gnb:coherence:nk:v2" ‖ sk)`: the nullifier key.
+pub fn derive_nk(sk: &[u8; 32]) -> [u8; 32] {
+    shake256_32(&[DOM_NK, sk])
+}
+
+/// `pk_d = SHAKE256-32("gnb:coherence:pkd:v2" ‖ ak ‖ nk)`: the recipient
+/// value a note commits to. Computable from the viewing key `(ak, nk)`.
+pub fn derive_pk_d(ak: &[u8; 32], nk: &[u8; 32]) -> [u8; 32] {
+    shake256_32(&[DOM_PKD, ak, nk])
+}
+
+/// The `pk_d` of spending key `sk`: `derive_pk_d(derive_ak(sk), derive_nk(sk))`.
+pub fn pk_d_from_sk(sk: &[u8; 32]) -> [u8; 32] {
+    derive_pk_d(&derive_ak(sk), &derive_nk(sk))
 }
 
 // ── Notes ────────────────────────────────────────────────────────────────────
@@ -52,9 +117,13 @@ impl Note {
     pub fn commitment(&self) -> [u8; 32] {
         shake256_32(&[DOM_CM, &self.v.to_le_bytes(), &self.pk_d, &self.rho, &self.psi])
     }
-    /// Nullifier at `position` under nullifier key `nk`.
+    /// Statement-v2 nullifier of this note at `position` under nullifier key
+    /// `nk`: `SHAKE256-32("gnb:coherence:nf:v2" ‖ nk ‖ cm ‖ position LE)`.
+    ///
+    /// Only the `nk` derived from the spending key that derives this note's
+    /// `pk_d` gives a nullifier [`check_spend`] accepts.
     pub fn nullifier(&self, nk: &[u8; 32], position: u64) -> [u8; 32] {
-        shake256_32(&[DOM_NF, nk, &self.rho, &position.to_le_bytes()])
+        shake256_32(&[DOM_NF, nk, &self.commitment(), &position.to_le_bytes()])
     }
 }
 
@@ -271,78 +340,148 @@ pub fn verify_non_membership(nf: &[u8; 32], path: &[[u8; 32]], root: &[u8; 32]) 
 
 // ── Commitment tree (incremental, fixed depth, SHAKE-256) ─────────────────────
 
-/// Append-only Merkle accumulator of note commitments; the root is the anchor.
-#[derive(Debug, Clone, Default)]
-pub struct CommitmentTree {
-    leaves: Vec<[u8; 32]>,
-}
-
-impl CommitmentTree {
-    pub fn new() -> Self { Self { leaves: Vec::new() } }
-
-    pub fn append(&mut self, cm: [u8; 32]) -> u64 {
-        let pos = self.leaves.len() as u64;
-        self.leaves.push(cm);
-        pos
-    }
-
-    /// Number of appended leaves (commitments).
-    pub fn len(&self) -> usize { self.leaves.len() }
-    pub fn is_empty(&self) -> bool { self.leaves.is_empty() }
-
-    /// Drop leaves back to the first `n` (reorg undo). The root recomputes from
-    /// the remaining leaves; truncating to a prior length restores the exact
-    /// earlier root (append-only tree over a `Vec`).
-    pub fn truncate(&mut self, n: usize) { self.leaves.truncate(n); }
-
-    fn empty_roots() -> [[u8; 32]; TREE_DEPTH + 1] {
+/// `empty[d]` = root of an all-empty commitment subtree of height `d`.
+fn mt_empty_roots() -> &'static [[u8; 32]; TREE_DEPTH + 1] {
+    static EMPTY: std::sync::OnceLock<[[u8; 32]; TREE_DEPTH + 1]> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| {
         let mut e = [[0u8; 32]; TREE_DEPTH + 1];
         e[0] = shake256_32(&[DOM_MT, b"empty-leaf"]);
         for d in 1..=TREE_DEPTH {
             e[d] = merkle_parent(&e[d - 1], &e[d - 1]);
         }
         e
+    })
+}
+
+/// Maximum number of leaves: positions must fit in `TREE_DEPTH` bits.
+pub const TREE_CAPACITY: u64 = 1u64 << TREE_DEPTH;
+
+/// Append-only Merkle accumulator of note commitments; the root is the anchor.
+///
+/// Incremental (audit COH-2): every node of the tree is kept, level by level,
+/// so `append` and `truncate` cost `O(TREE_DEPTH)` hashes and `root` is a
+/// lookup, instead of rehashing every leaf (the previous `root` and `path`
+/// were `O(n)` each, which made applying a block quadratic). A node whose
+/// right child does not exist yet is hashed with the empty subtree of that
+/// height, exactly as the full recomputation does, so the roots and paths are
+/// bit-identical to the previous implementation (property-tested against it).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitmentTree {
+    /// `levels[0]` are the leaves; `levels[d][i]` is the node of height `d`
+    /// at index `i`; `levels[d].len() == ceil(len / 2^d)`. Empty until the
+    /// first append, then `TREE_DEPTH + 1` levels.
+    levels: Vec<Vec<[u8; 32]>>,
+}
+
+impl CommitmentTree {
+    pub fn new() -> Self { Self { levels: Vec::new() } }
+
+    /// Rebuild a tree from its leaves in order (`O(n)` hashes): used when the
+    /// node reloads its persisted shielded state.
+    ///
+    /// # Panics
+    /// If there are more than [`TREE_CAPACITY`] leaves.
+    pub fn from_leaves(leaves: Vec<[u8; 32]>) -> Self {
+        assert!(leaves.len() as u64 <= TREE_CAPACITY, "commitment tree over capacity");
+        if leaves.is_empty() {
+            return Self::new();
+        }
+        let empty = mt_empty_roots();
+        let mut levels = Vec::with_capacity(TREE_DEPTH + 1);
+        levels.push(leaves);
+        for d in 1..=TREE_DEPTH {
+            let below: &Vec<[u8; 32]> = &levels[d - 1];
+            let next: Vec<[u8; 32]> = below
+                .chunks(2)
+                .map(|pair| merkle_parent(&pair[0], pair.get(1).unwrap_or(&empty[d - 1])))
+                .collect();
+            levels.push(next);
+        }
+        Self { levels }
+    }
+
+    /// Append `cm` and return its position.
+    ///
+    /// # Panics
+    /// If the tree already holds [`TREE_CAPACITY`] leaves (callers check
+    /// [`CommitmentTree::remaining_capacity`] first).
+    pub fn append(&mut self, cm: [u8; 32]) -> u64 {
+        let pos = self.len() as u64;
+        assert!(pos < TREE_CAPACITY, "commitment tree full");
+        if self.levels.is_empty() {
+            self.levels = vec![Vec::new(); TREE_DEPTH + 1];
+        }
+        self.levels[0].push(cm);
+        let mut idx = pos as usize;
+        for d in 1..=TREE_DEPTH {
+            idx >>= 1;
+            self.set_node(d, idx);
+        }
+        pos
+    }
+
+    /// Recompute node `(d, idx)` from its children (d >= 1) and store it.
+    fn set_node(&mut self, d: usize, idx: usize) {
+        let empty = mt_empty_roots();
+        let below = &self.levels[d - 1];
+        let node = merkle_parent(&below[2 * idx], below.get(2 * idx + 1).unwrap_or(&empty[d - 1]));
+        let level = &mut self.levels[d];
+        if idx < level.len() {
+            level[idx] = node;
+        } else {
+            level.push(node);
+        }
+    }
+
+    /// Number of appended leaves (commitments).
+    pub fn len(&self) -> usize { self.levels.first().map_or(0, Vec::len) }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    /// How many more leaves fit.
+    pub fn remaining_capacity(&self) -> u64 { TREE_CAPACITY - self.len() as u64 }
+
+    /// The leaves (commitments) in position order.
+    pub fn leaves(&self) -> &[[u8; 32]] {
+        self.levels.first().map_or(&[], Vec::as_slice)
+    }
+
+    /// Drop leaves back to the first `n` (reorg undo) in `O(TREE_DEPTH)`
+    /// hashes. Truncating to a prior length restores the exact earlier root.
+    pub fn truncate(&mut self, n: usize) {
+        if n >= self.len() {
+            return;
+        }
+        if n == 0 {
+            self.levels.clear();
+            return;
+        }
+        for (d, level) in self.levels.iter_mut().enumerate() {
+            let keep = (n as u64 + (1u64 << d) - 1) >> d;
+            level.truncate(keep as usize);
+        }
+        // The last node of every level may have lost its right child.
+        for d in 1..=TREE_DEPTH {
+            let last = self.levels[d].len() - 1;
+            self.set_node(d, last);
+        }
     }
 
     pub fn root(&self) -> [u8; 32] {
-        let empty = Self::empty_roots();
-        let mut level: Vec<[u8; 32]> = self.leaves.clone();
-        for d in 0..TREE_DEPTH {
-            let mut next = Vec::with_capacity((level.len() + 1) / 2);
-            let mut i = 0;
-            while i < level.len() {
-                let l = level[i];
-                let r = if i + 1 < level.len() { level[i + 1] } else { empty[d] };
-                next.push(merkle_parent(&l, &r));
-                i += 2;
-            }
-            if next.is_empty() { next.push(empty[d + 1]); }
-            level = next;
+        match self.levels.get(TREE_DEPTH).and_then(|top| top.first()) {
+            Some(r) => *r,
+            None => mt_empty_roots()[TREE_DEPTH],
         }
-        level[0]
     }
 
+    /// Authentication path of the leaf at `index` (leaf-to-root siblings).
     pub fn path(&self, index: u64) -> Option<Vec<[u8; 32]>> {
-        if index as usize >= self.leaves.len() { return None; }
-        let empty = Self::empty_roots();
+        if index >= self.len() as u64 { return None; }
+        let empty = mt_empty_roots();
         let mut idx = index as usize;
-        let mut level: Vec<[u8; 32]> = self.leaves.clone();
         let mut path = Vec::with_capacity(TREE_DEPTH);
-        for d in 0..TREE_DEPTH {
-            let sib = idx ^ 1;
-            let s = if sib < level.len() { level[sib] } else { empty[d] };
-            path.push(s);
-            let mut next = Vec::with_capacity((level.len() + 1) / 2);
-            let mut i = 0;
-            while i < level.len() {
-                let l = level[i];
-                let r = if i + 1 < level.len() { level[i + 1] } else { empty[d] };
-                next.push(merkle_parent(&l, &r));
-                i += 2;
-            }
-            if next.is_empty() { next.push(empty[d + 1]); }
-            level = next;
-            idx /= 2;
+        for (d, empty_d) in empty.iter().enumerate().take(TREE_DEPTH) {
+            path.push(*self.levels[d].get(idx ^ 1).unwrap_or(empty_d));
+            idx >>= 1;
         }
         Some(path)
     }
@@ -382,12 +521,27 @@ pub struct SpendPublic {
     pub fee: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One spent note in the private witness.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SpendInput {
     pub note: Note,
     pub position: u64,
     pub path: Vec<[u8; 32]>,
-    pub nk: [u8; 32],
+    /// The spending key whose derived `pk_d` equals `note.pk_d` (statement
+    /// v2). The nullifier key is derived from it, never chosen freely.
+    pub sk: [u8; 32],
+}
+
+/// Redacts the spending key.
+impl std::fmt::Debug for SpendInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpendInput")
+            .field("note", &self.note)
+            .field("position", &self.position)
+            .field("path_len", &self.path.len())
+            .field("sk", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +558,9 @@ pub enum SpendError {
     /// the rejection reason is unambiguous: the witness is malformed, not
     /// merely non-member. See [`verify_path`] for why this must be rejected.
     PositionOutOfRange(usize),
+    /// `inputs[i].sk` does not derive `inputs[i].note.pk_d`: the prover does
+    /// not hold the note's spending key (statement v2, audit COH-1).
+    Unauthorized(usize),
     Nullifier(usize),
     /// The same commitment-tree position occurs more than once in this spend.
     DuplicateInputPosition(usize),
@@ -416,12 +573,17 @@ pub enum SpendError {
     Unbalanced { inputs: u128, outputs: u128, fee: u64 },
 }
 
-/// The current statement the ZK circuit proves (runs on the PRIVATE witness).
+/// Spend statement version [`SPEND_STATEMENT_VERSION`] (2): what a spend
+/// proof attests to, evaluated on the PRIVATE witness.
 ///
-/// SECURITY: this does not prove spending authority. `nk` is witness-chosen and
-/// is not bound to `note.pk_d`; successful verification does not establish that
-/// the recipient authorized this spend or that a note has one unique nullifier.
-/// Do not activate a funded pool with this statement (internal audit CR-01).
+/// For every input `i`: its position names a leaf of the depth-`TREE_DEPTH`
+/// tree, its note commitment is a member under `public.anchor`, the witness
+/// spending key derives the note's `pk_d` (spending authority), and
+/// `public.nullifiers[i]` is the nullifier derived from that key's `nk`.
+/// Inputs occupy distinct positions, the public vectors match the witness
+/// one-for-one, every output commitment opens to its witness note, and value
+/// balances (`Σ inputs = Σ outputs + fee`). A note therefore has exactly one
+/// nullifier, and only the holder of its spending key can produce it.
 pub fn check_spend(public: &SpendPublic, w: &SpendWitness) -> Result<(), SpendError> {
     // Bind the public vectors to the witness EXACTLY (C2 fix). Without these
     // binds a prover could append extra public out_commitments beyond the
@@ -440,10 +602,10 @@ pub fn check_spend(public: &SpendPublic, w: &SpendWitness) -> Result<(), SpendEr
             witness: w.inputs.len(),
         });
     }
-    // A leaf is one funded input. Reject repeated positions before membership
-    // work so witness-chosen nullifier keys cannot count one leaf twice. This
-    // is defense in depth only: CR-01 still permits different nullifiers in
-    // separate spends until a versioned recipient-authorization statement lands.
+    // A leaf is one funded input: reject repeated positions before membership
+    // work so one leaf is never counted twice in one witness. (Across separate
+    // spends the derived nullifier is unique per leaf, so the nullifier set
+    // refuses a second spend.)
     let mut positions = std::collections::BTreeSet::new();
     for (i, input) in w.inputs.iter().enumerate() {
         if !positions.insert(input.position) {
@@ -463,7 +625,13 @@ pub fn check_spend(public: &SpendPublic, w: &SpendWitness) -> Result<(), SpendEr
         if !verify_path(&cm, inp.position, &inp.path, &public.anchor) {
             return Err(SpendError::Membership(i));
         }
-        let nf = inp.note.nullifier(&inp.nk, inp.position);
+        // Spending authority (statement v2): the witness key must derive the
+        // note's recipient value, and the nullifier key is the one it derives.
+        let nk = derive_nk(&inp.sk);
+        if derive_pk_d(&derive_ak(&inp.sk), &nk) != inp.note.pk_d {
+            return Err(SpendError::Unauthorized(i));
+        }
+        let nf = inp.note.nullifier(&nk, inp.position);
         if public.nullifiers.get(i) != Some(&nf) {
             return Err(SpendError::Nullifier(i));
         }
@@ -510,7 +678,9 @@ mod tests {
     use super::*;
 
     fn note(v: u64, tag: u8) -> Note {
-        Note { v, pk_d: [tag; 32], rho: [tag ^ 0x11; 32], psi: [tag ^ 0x22; 32] }
+        // Statement v2: the recipient value is derived from the spending key
+        // `[tag; 32]`, so `sk = [tag; 32]` is the key that may spend it.
+        Note { v, pk_d: pk_d_from_sk(&[tag; 32]), rho: [tag ^ 0x11; 32], psi: [tag ^ 0x22; 32] }
     }
 
     #[test]
@@ -541,7 +711,8 @@ mod tests {
         let pos = t.append(inp.commitment());
         let anchor = t.root();
         let path = t.path(pos).unwrap();
-        let nk = [3u8; 32];
+        let sk = [7u8; 32];
+        let nk = derive_nk(&sk);
 
         let out = note(900, 8);
         let public = SpendPublic {
@@ -549,7 +720,7 @@ mod tests {
             out_commitments: vec![out.commitment()], fee: 100,
         };
         let w = SpendWitness {
-            inputs: vec![SpendInput { note: inp.clone(), position: pos, path: path.clone(), nk }],
+            inputs: vec![SpendInput { note: inp.clone(), position: pos, path: path.clone(), sk }],
             outputs: vec![out],
         };
         assert_eq!(check_spend(&public, &w), Ok(()));
@@ -561,7 +732,7 @@ mod tests {
             out_commitments: vec![big.commitment()], fee: 0,
         };
         let w2 = SpendWitness {
-            inputs: vec![SpendInput { note: inp.clone(), position: pos, path: path.clone(), nk }],
+            inputs: vec![SpendInput { note: inp.clone(), position: pos, path: path.clone(), sk }],
             outputs: vec![big],
         };
         assert!(matches!(check_spend(&pub2, &w2), Err(SpendError::Unbalanced { .. })));
@@ -582,7 +753,8 @@ mod tests {
         let pos = t.append(inp.commitment());
         let anchor = t.root();
         let path = t.path(pos).unwrap();
-        let nk = [3u8; 32];
+        let sk = [7u8; 32];
+        let nk = derive_nk(&sk);
         let out = note(900, 8);
 
         let honest = SpendPublic {
@@ -592,7 +764,7 @@ mod tests {
             fee: 100,
         };
         let w = SpendWitness {
-            inputs: vec![SpendInput { note: inp.clone(), position: pos, path, nk }],
+            inputs: vec![SpendInput { note: inp.clone(), position: pos, path, sk }],
             outputs: vec![out.clone()],
         };
 
@@ -648,7 +820,8 @@ mod tests {
         let pos = t.append(inp.commitment());
         let anchor = t.root();
         let path = t.path(pos).unwrap();
-        let nk = [3u8; 32];
+        let sk = [7u8; 32];
+        let nk = derive_nk(&sk);
 
         // Sanity: the honest position verifies.
         assert!(verify_path(&inp.commitment(), pos, &path, &anchor));
@@ -684,7 +857,7 @@ mod tests {
                 note: inp.clone(),
                 position: alias,
                 path: path.clone(),
-                nk,
+                sk,
             }],
             outputs: vec![out.clone()],
         };
@@ -698,7 +871,7 @@ mod tests {
             fee: 100,
         };
         let hw = SpendWitness {
-            inputs: vec![SpendInput { note: inp, position: pos, path, nk }],
+            inputs: vec![SpendInput { note: inp, position: pos, path, sk }],
             outputs: vec![out],
         };
         assert_eq!(check_spend(&honest, &hw), Ok(()));

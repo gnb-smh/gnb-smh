@@ -140,8 +140,8 @@ pub const DNS_SEED_DOMAIN: &str = "";
 /// No public seed infrastructure yet; peers are supplied with --peer.
 pub const DEFAULT_SEEDS: &[&str] = &[];
 
-pub const CHECKPOINT_DEPTH:      u64   = 1_000;      // finality: reorgs deeper than this rejected
-pub const PRUNING_DEPTH:         u64   = 10_000;     // block bodies pruned below tip - this
+pub const CHECKPOINT_DEPTH:      u64   = 1_000;      // node-local ingress window + deep-reorg alert depth; NOT a reorg-depth limit, no finality (audit DAG-6)
+pub const PRUNING_DEPTH:         u64   = 10_000;     // block bodies pruned below tip - this; undo records are kept, so reorgs of any depth still work
 
 // Hybrid ML-DSA-65 ‖ Falcon-1024 sizes, including the 4-byte crypto-agility
 // suite header. SIG_SIZE is an upper bound (Falcon is variable length) used
@@ -1085,14 +1085,14 @@ impl Block {
         let ok = gnb_smh::verify(&self.header.pow_preimage(), self.header.nonce, &target);
         if ok {
             if let Ok(mut cache) = pow_cache().lock() {
-                if cache.set.insert(id) {
-                    cache.order.push_back(id);
-                    if cache.order.len() > POW_CACHE_CAPACITY {
-                        if let Some(old) = cache.order.pop_front() {
-                            cache.set.remove(&old);
-                        }
-                    }
-                }
+                // Insert with FIFO eviction: `PowCache::insert`, defined at
+                // the end of this file so that the code the browser wallet
+                // core compiles keeps its line numbers (panic locations are
+                // part of the reproducible WASM, audit WAL-5; this comment
+                // fills the lines the inlined insert took). It is a function
+                // of its own so that its eviction bound can be tested
+                // (docs/testing/MUTATION.md).
+                cache.insert(id);
             }
         }
         ok
@@ -1310,7 +1310,7 @@ mod structure_split_tests {
     fn cheap_half_accepts_well_formed_block_regardless_of_pow() {
         // Hard target, arbitrary nonce: the PoW fails, the cheap half passes.
         let mut b = block_with(GENESIS_BITS, 0);
-        while b.validate_pow() { b.header.nonce += 1; } // find a FAILING nonce
+        assert!((0..16).any(|n| { b.header.nonce = n; !b.validate_pow() }), "no FAILING nonce in 16 (each passes w.p. ~1/4,500; bounded: a broken proof check or cache must fail, not hang)");
         assert_eq!(b.validate_structure_without_pow(), Ok(()));
         assert_eq!(b.validate_structure(), Err("invalid PoW"),
             "validate_structure must still verify the proof of work");
@@ -1402,8 +1402,8 @@ mod validate_coinbase_value_tests {
 // blue work replaces the current selected chain, UTXOs mutated by the
 // losing branch must be reverted. We persist an UndoData record per block
 // so the eventual rollback_block() primitive (Sprint U.2) can replay the
-// mutations in reverse. Kept in storage only while the block is within the
-// finality window; records below finalized_height are pruned in Sprint U.3.
+// mutations in reverse. Kept for every connected block (never pruned): there
+// is no reorg-depth limit (audit DAG-6).
 
 /// A single input consumed by a block that must be restored on rollback.
 /// Captures the full pre-spend output so we can re-insert it verbatim.
@@ -1926,6 +1926,51 @@ mod hardening_core_tests {
         let _g = activation::scoped_override(6);
         // Below the activation the pow-limit target is allowed: almost any
         // nonce passes (one or two evaluations).
-        while !b.validate_pow() { b.header.nonce += 1; }
+        // Bounded: a broken proof check must fail the test, not hang it.
+        assert!((0..32).any(|n| { b.header.nonce = n; b.validate_pow() }), "no valid nonce in 32");
     }
 }
+
+// Test-only fixture support, kept at the END of the file: the code the
+// browser wallet core compiles keeps its line numbers (panic locations are
+// part of the reproducible WASM, audit WAL-5).
+#[cfg(feature = "test-pow-limit")]
+impl Block {
+    /// TEST FIXTURES ONLY — compiled only with the `test-pow-limit` feature,
+    /// which the node binary refuses to run with. Records this block's id in
+    /// the proof-of-work cache WITHOUT evaluating GnB-SMH, so integration
+    /// tests can build thousand-block chains (one evaluation takes most of a
+    /// second in a dev build). `validate_pow` still decodes `bits` and
+    /// enforces the pow limit before it consults the cache, and every check
+    /// after the proof (height, expected bits, timestamp, transactions,
+    /// GhostDAG, connect) runs unchanged.
+    pub fn test_only_assume_pow_valid(&self) {
+        let id = self.block_hash();
+        if let Ok(mut cache) = pow_cache().lock() {
+            cache.insert(id);
+        }
+    }
+}
+
+// Added after the browser wallet core was pinned, so kept at the END of the
+// file for the same reason as the fixture above (audit WAL-5).
+impl PowCache {
+    /// Record a verified block id; the oldest entry is evicted once more than
+    /// `POW_CACHE_CAPACITY` ids are held (FIFO). Re-inserting a held id is a
+    /// no-op.
+    fn insert(&mut self, id: [u8; 32]) {
+        if self.set.insert(id) {
+            self.order.push_back(id);
+            if self.order.len() > POW_CACHE_CAPACITY {
+                if let Some(old) = self.order.pop_front() {
+                    self.set.remove(&old);
+                }
+            }
+        }
+    }
+}
+
+/// Boundary and encoding tests of this module's consensus functions
+/// (mutation-tested: docs/testing/MUTATION.md).
+#[cfg(test)]
+mod consensus_tests;

@@ -10,12 +10,13 @@ members = [
     "crates/coherence-core",  # shielded-pool primitives used by the block format
     "crates/gnb-wallet-wasm", # browser wallet core (WebAssembly), served at /wallet
     "node",                   # the `gnb` full node, `gnb-cli`, `gnb-wallet`
-    # Vendored forks, patched in through [patch.crates-io] below. Members so
-    # their own guard tests run in place (`cargo test -p pqcrypto-internals`,
-    # `cargo test -p libp2p-yamux`: tests/vendor_pin.rs, tests/lockfile_guard.rs)
-    # and in `cargo test --workspace` (audit finding AUD-2).
+    # Vendored fork, patched in through [patch.crates-io] below. A member so
+    # its guard test runs in place (`cargo test -p pqcrypto-internals`:
+    # tests/vendor_pin.rs) and in `cargo test --workspace` (audit AUD-2).
+    # (The libp2p-yamux fork was retired with libp2p 0.57: upstream
+    # libp2p-yamux 0.48 has a single yamux 0.14 backend. The yamux lockfile
+    # guard moved to node/tests/supply_chain_lockfile_guard.rs, audit OPS-2.)
     "crates/pqcrypto-internals",
-    "crates/libp2p-yamux",
 ]
 # Standalone reference crate (GnB-SMH v1 + ledger v1) with its own Cargo.lock,
 # and the cargo-fuzz crate (nightly + sanitizer flags, its own workspace).
@@ -48,6 +49,3 @@ overflow-checks = true
 # Vendored fork of pqcrypto-internals 0.2.11 adding scoped seeded-RNG support
 # for deterministic ML-DSA-65 / Falcon key generation (Wallet::from_seed).
 pqcrypto-internals = { path = "crates/pqcrypto-internals" }
-# Vendored libp2p-yamux with the vulnerable yamux 0.12 backend removed
-# (GHSA-vxx9-2994-q338). Drop when upstream libp2p sheds yamux 0.12.
-libp2p-yamux = { path = "crates/libp2p-yamux" }

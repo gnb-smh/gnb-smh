@@ -1,5 +1,6 @@
 //! Live (real `NetworkNode` swarms on loopback) regression tests for the
-//! network fixes NET-2, NET-4, NET-5, NET-6 and NET-11. Each test is the
+//! network fixes NET-2, NET-4, NET-5, NET-6 and NET-11, and for the deferred
+//! (processor-decided) relay of gossip transactions. Each test is the
 //! inverse of the live proof of concept written during the 2026-10-14 audit.
 //!
 //! Blocks here are a harness payload (`SimPayload`), not real PoW blocks: the
@@ -26,6 +27,8 @@ struct Harness {
     dag: Arc<RwLock<GhostDAG>>,
     outbound_tx: mpsc::Sender<NetworkMessage>,
     peer_state: Arc<PeerStateTable>,
+    /// Txids of the gossip transactions delivered to this node's processor.
+    txs: Arc<parking_lot::Mutex<std::collections::HashSet<[u8; 32]>>>,
     _dir: tempfile::TempDir,
 }
 
@@ -96,22 +99,31 @@ async fn spawn_node(bootstrap_peers: Vec<String>) -> Harness {
             let _ = node.run(block_tx, outbound_rx, dag, ps, store, Some(addr_tx)).await;
         });
     }
+    let txs = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
     {
-        let dag = dag.clone();
+        let (dag, txs) = (dag.clone(), txs.clone());
         tokio::spawn(async move {
             while let Some(msg) = block_rx.recv().await {
-                if let NetworkMessage::NewBlock { block_data, .. } = msg {
-                    apply(&dag, &block_data);
+                match msg {
+                    NetworkMessage::NewBlock { block_data, .. } => {
+                        apply(&dag, &block_data);
+                    }
+                    NetworkMessage::NewTransaction { txid, .. } => {
+                        txs.lock().insert(txid);
+                    }
+                    _ => {}
                 }
             }
         });
     }
     let addr = learn_addr(addr_rx).await;
-    Harness { peer_id, addr, dag, outbound_tx, peer_state, _dir: dir }
+    Harness { peer_id, addr, dag, outbound_tx, peer_state, txs, _dir: dir }
 }
 
 /// A node on the production `run_validated()` path whose "processor" Accepts
-/// blocks with `work > 0` and Rejects blocks with `work == 0` (invalid).
+/// blocks with `work > 0` and Rejects blocks with `work == 0` (invalid), and
+/// stands in for the mempool on transactions: Accept (admitted) iff the
+/// payload starts with 0x01, else Ignore (refused).
 async fn spawn_validating_node(bootstrap_peers: Vec<String>) -> Harness {
     let dir = tempfile::tempdir().expect("tempdir");
     let node = NetworkNode::new(config(&dir, bootstrap_peers)).expect("NetworkNode::new");
@@ -130,27 +142,38 @@ async fn spawn_validating_node(bootstrap_peers: Vec<String>) -> Harness {
             let _ = node.run_validated(inbound_tx, verdict_rx, outbound_rx, dag, ps, store, Some(addr_tx)).await;
         });
     }
+    let txs = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
     {
-        let dag = dag.clone();
+        let (dag, txs) = (dag.clone(), txs.clone());
         tokio::spawn(async move {
             while let Some(Inbound { msg, origin }) = inbound_rx.recv().await {
-                if let NetworkMessage::NewBlock { block_data, .. } = msg {
-                    let verdict = match bincode::serde::decode_from_slice::<SimPayload, _>(&block_data, bincode::config::standard()) {
-                        Ok((p, _)) if p.work > 0 => {
-                            apply(&dag, &block_data);
-                            GossipVerdict::Accept
+                let verdict = match msg {
+                    NetworkMessage::NewBlock { block_data, .. } => {
+                        match bincode::serde::decode_from_slice::<SimPayload, _>(&block_data, bincode::config::standard()) {
+                            Ok((p, _)) if p.work > 0 => {
+                                apply(&dag, &block_data);
+                                GossipVerdict::Accept
+                            }
+                            _ => GossipVerdict::Reject,
                         }
-                        _ => GossipVerdict::Reject,
-                    };
-                    if let Some((message_id, propagation_source)) = origin.pending_verdict() {
-                        let _ = verdict_tx.send(GossipValidation { message_id, propagation_source, verdict }).await;
                     }
+                    NetworkMessage::NewTransaction { txid, tx_data } => {
+                        txs.lock().insert(txid);
+                        // Stand-in for `mempool::relay::TxRelay` (driven with
+                        // real transactions in `fix_mempool_live`): admitted
+                        // frames are Accepted, refused ones Ignored.
+                        if tx_data.first() == Some(&1) { GossipVerdict::Accept } else { GossipVerdict::Ignore }
+                    }
+                    _ => continue,
+                };
+                if let Some((message_id, propagation_source)) = origin.pending_verdict() {
+                    let _ = verdict_tx.send(GossipValidation { message_id, propagation_source, verdict }).await;
                 }
             }
         });
     }
     let addr = learn_addr(addr_rx).await;
-    Harness { peer_id, addr, dag, outbound_tx, peer_state, _dir: dir }
+    Harness { peer_id, addr, dag, outbound_tx, peer_state, txs, _dir: dir }
 }
 
 async fn publish_block(h: &Harness, hash: [u8; 32], parent: [u8; 32], ts: u64, work: u128) {
@@ -340,4 +363,38 @@ async fn live_unsolicited_pex_triggers_no_dials() {
     // Longer than two PEX dial ticks (10 s each).
     let dialed = tokio::time::timeout(Duration::from_secs(25), victim.accept()).await;
     assert!(dialed.is_err(), "the victim address must never be dialed");
+}
+
+/// Gossip transactions are relayed only after the mempool admitted them (the
+/// verdict is deferred to the processor, as for blocks; in production
+/// `mempool::relay::TxRelay` answers it). Topology A — B — C;
+/// B runs `run_validated`. A's refused transaction is delivered to B's
+/// processor but never relayed to C; A's admitted transaction is. Before, a
+/// transaction was relayed on decode, so junk frames filled every node's
+/// gossip window for free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_relay_forwards_only_admitted_transactions() {
+    init_log();
+    let b = spawn_validating_node(vec![]).await;
+    let c = spawn_node(vec![full_addr(&b)]).await;
+    let a = spawn_node(vec![full_addr(&b)]).await;
+    tokio::time::sleep(Duration::from_secs(12)).await;
+
+    let junk = [0x0Eu8; 32];
+    let good = [0x6Fu8; 32];
+    a.outbound_tx.send(NetworkMessage::NewTransaction { txid: junk, tx_data: vec![0, 1, 2] }).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    a.outbound_tx.send(NetworkMessage::NewTransaction { txid: good, tx_data: vec![1, 2, 3] }).await.unwrap();
+
+    let has = |h: &Harness, id: [u8; 32]| h.txs.lock().contains(&id);
+    let arrived = tokio::time::timeout(Duration::from_secs(30), async {
+        while !has(&c, good) {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await;
+    assert!(arrived.is_ok(), "the admitted transaction is relayed by B to C");
+    assert!(has(&b, junk), "B's processor judged the refused transaction");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(!has(&c, junk), "the refused transaction is never relayed to C");
 }

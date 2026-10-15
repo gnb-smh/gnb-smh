@@ -6,7 +6,8 @@
 //!   gettransaction, getbalance, getutxos,
 //!   sendrawtransaction,
 //!   validateaddress, estimatefee, getrawmempool,
-//!   decoderawtransaction, getdaginfo, listtransactions, getpeerinfo
+//!   decoderawtransaction, getdaginfo, listtransactions, getpeerinfo,
+//!   invalidateblock, reconsiderblock (admin: audit DAG-6)
 //!
 //! Mempool policy (audit MEM-6, `docs/MEMPOOL.md`): `sendrawtransaction`
 //! accepts children of unconfirmed transactions (≤ 25 ancestors and
@@ -99,6 +100,22 @@ pub struct NodeState {
 /// a "not wired" error instead of silently accepting.
 pub type SubmitBlockFn = dyn Fn(crate::core::Block) -> Result<String, String> + Send + Sync;
 
+/// Operator chain overrides (audit DAG-6), Bitcoin Core's `invalidateblock`
+/// and `reconsiderblock`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainAdminOp {
+    /// Disqualify a block and its selected-chain descendants, persistently.
+    Invalidate,
+    /// Remove such disqualifications (the block, its selected-chain ancestors
+    /// and descendants) and let the node re-evaluate them.
+    Reconsider,
+}
+
+/// Hook that performs a [`ChainAdminOp`] on a block through the acceptance
+/// pipeline (`accept::invalidate_block` / `accept::reconsider_block`), wired by
+/// main.rs. Returns a JSON summary. `None` makes the methods report "not wired".
+pub type ChainAdminFn = dyn Fn(ChainAdminOp, [u8; 32]) -> Result<Value, String> + Send + Sync;
+
 #[derive(Clone, Debug)]
 pub struct RpcConfig {
     pub bind_address:              String,
@@ -184,6 +201,8 @@ struct AppState {
     // NET-12: cancellation flag of THIS request (a fresh flag per request,
     // set when the dispatch timeout fires); long loops check it.
     cancel:                  Arc<std::sync::atomic::AtomicBool>,
+    // Audit DAG-6: invalidateblock / reconsiderblock hook.
+    chain_admin:             Option<Arc<ChainAdminFn>>,
 }
 
 // ─── R3-audit H-R3-5 / L-8: bound the expensive analytics + template RPCs ───
@@ -237,7 +256,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getdagwindow", "getaddresshistory", "getrichlist", "gethashrate", "getdifficultyhistory",
     "getblocktimepercentiles", "gettxstatus", "getaddressinfo", "estimatefeeadvanced",
     "getmempoolstats", "validateaddressverbose", "gettxsbyblock", "getaddressbalance_at_height",
-    "getattestation",
+    "getattestation", "invalidateblock", "reconsiderblock",
 ];
 
 /// Longest method-name prefix written to a log line (NET-13).
@@ -374,6 +393,7 @@ fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_rpc_server(
     config:      RpcConfig,
     state:       Arc<RwLock<NodeState>>,
@@ -383,6 +403,8 @@ pub async fn start_rpc_server(
     outbound_tx: mpsc::Sender<NetworkMessage>,
     // B5f pool seam — see `SubmitBlockFn`.
     submit_block: Option<Arc<SubmitBlockFn>>,
+    // Audit DAG-6 — see `ChainAdminFn`.
+    chain_admin: Option<Arc<ChainAdminFn>>,
 ) {
     // NET-14: `format!("{host}:{port}")` could not express IPv6 hosts such as
     // `::1`; resolve explicitly and report a bad address clearly. main.rs
@@ -452,6 +474,7 @@ pub async fn start_rpc_server(
         heavy_gate:              Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
         submit_block,
         cancel:                  Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        chain_admin,
     };
 
     // P0 RPC hardening (roadmap §1.6 / §4.3): body-size cap, global
@@ -846,6 +869,22 @@ async fn handle_rpc(
                 })),
             )
         }
+    }
+}
+
+/// `invalidateblock` / `reconsiderblock`: params `[block_hash_hex]`.
+fn chain_admin_call(op: ChainAdminOp, params: Option<&Value>, state: &AppState) -> Value {
+    let hex_str = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+    let hash: [u8; 32] = match hex::decode(hex_str).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) {
+        Some(h) => h,
+        None => return json!({ "error": "expected one parameter: a 64-hex-character block hash" }),
+    };
+    match &state.chain_admin {
+        None => json!({ "error": "invalidateblock/reconsiderblock not wired on this node" }),
+        Some(hook) => match hook(op, hash) {
+            Ok(v) => v,
+            Err(e) => json!({ "error": e }),
+        },
     }
 }
 
@@ -1430,6 +1469,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 },
             }
         }
+
+        // Audit DAG-6: operator recovery (Bitcoin Core's invalidateblock /
+        // reconsiderblock). Admin methods: never anonymous (auth::ADMIN_METHODS).
+        "invalidateblock" => chain_admin_call(ChainAdminOp::Invalidate, params, state),
+        "reconsiderblock" => chain_admin_call(ChainAdminOp::Reconsider, params, state),
 
         "getdaginfo" => {
             let dag = state.dag.read();
@@ -2423,6 +2467,7 @@ mod audit_2026_10_rpc_tests {
             heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
             submit_block: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            chain_admin: None,
         };
         (tmp, state)
     }
@@ -2477,7 +2522,7 @@ mod audit_2026_10_rpc_tests {
         let config = RpcConfig { port: busy.local_addr().unwrap().port(), ..RpcConfig::default() };
         tokio::time::timeout(std::time::Duration::from_secs(10), start_rpc_server(
             config, state.node_state.clone(), state.store.clone(), state.mempool.clone(),
-            state.dag.clone(), state.outbound_tx.clone(), None,
+            state.dag.clone(), state.outbound_tx.clone(), None, None,
         )).await.expect("a failed bind must end the RPC task");
     }
 
@@ -2511,6 +2556,36 @@ mod audit_2026_10_rpc_tests {
             assert_eq!(e["fee"], fee.to_string());
             assert_eq!(e["data"], hex::encode(t.to_wire_bytes(true)));
         }
+    }
+
+    /// Audit DAG-6: `invalidateblock` / `reconsiderblock` parse one block
+    /// hash and reach the chain-admin hook with the right operation; a bad
+    /// parameter never reaches it; an unwired node says so.
+    #[tokio::test]
+    async fn chain_admin_methods_reach_the_hook() {
+        let (_tmp, mut state) = state_with_chain(1);
+        let r = dispatch("invalidateblock", Some(&json!([hex::encode([7u8; 32])])), &state).await;
+        assert!(r["error"].as_str().unwrap().contains("not wired"), "{r}");
+
+        type Calls = parking_lot::Mutex<Vec<(ChainAdminOp, [u8; 32])>>;
+        let calls: Arc<Calls> = Arc::default();
+        let seen = calls.clone();
+        state.chain_admin = Some(Arc::new(move |op, h| {
+            seen.lock().push((op, h));
+            Ok(json!({ "tip": hex::encode(h) }))
+        }));
+        let r = dispatch("invalidateblock", Some(&json!([hex::encode([7u8; 32])])), &state).await;
+        assert_eq!(r["tip"], json!(hex::encode([7u8; 32])));
+        let r = dispatch("reconsiderblock", Some(&json!([hex::encode([8u8; 32])])), &state).await;
+        assert_eq!(r["tip"], json!(hex::encode([8u8; 32])));
+        for bad in [json!([]), json!(["zz"]), json!([hex::encode([1u8; 31])])] {
+            let r = dispatch("invalidateblock", Some(&bad), &state).await;
+            assert!(r["error"].as_str().unwrap().contains("block hash"), "{r}");
+        }
+        assert_eq!(*calls.lock(), vec![
+            (ChainAdminOp::Invalidate, [7u8; 32]),
+            (ChainAdminOp::Reconsider, [8u8; 32]),
+        ]);
     }
 
     /// WAL-1: `getrawtransaction` returns bytes that hash to the txid.
@@ -2760,6 +2835,7 @@ mod block_rules_template_tests {
             heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
             submit_block: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            chain_admin: None,
         };
         (tmp, state)
     }

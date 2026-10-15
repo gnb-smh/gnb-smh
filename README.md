@@ -28,9 +28,9 @@ Status: pre-release. Not audited.
 | `site/`, `worker/` | gnb-smh.com: site, explorer (`/explorer`) and web wallet (`/wallet`), served by a Cloudflare Worker that also proxies the read-only explorer API |
 | `deploy/` | Node and explorer-API systemd units and install scripts |
 | `genesis/` | The Bloch Genesis-3 terminal snapshot the genesis ledger is built from |
-| `crates/pqcrypto-internals`, `crates/libp2p-yamux` | Vendored forks (patched in through `[patch.crates-io]`), workspace members so their guard tests run |
+| `crates/pqcrypto-internals` | Vendored fork (patched in through `[patch.crates-io]`), a workspace member so its guard test runs. (The `libp2p-yamux` fork was retired with libp2p 0.57; `node/tests/supply_chain_lockfile_guard.rs` keeps a single yamux >= 0.13.10 and hickory >= 0.26.1 in `Cargo.lock`.) |
 | `node/fuzz` | cargo-fuzz targets (own workspace, nightly): wire decoders, difficulty, PoW and signature verify, Merkle paths, mempool |
-| `docs/` | Protocol notes: [consensus](docs/CONSENSUS.md), [monetary policy and carryover](docs/MONETARY-POLICY.md), [running a node](docs/RUNNING.md), [ledger v1](docs/LEDGER.md) |
+| `docs/` | Protocol notes: [consensus](docs/CONSENSUS.md), [monetary policy and carryover](docs/MONETARY-POLICY.md), [running a node](docs/RUNNING.md), [ledger v1](docs/LEDGER.md); testing: [sanitizers, Miri, 32-bit](docs/testing/SANITIZERS.md) |
 | `reference/`, `rust/`, `analysis/` | Standalone GnB-SMH v1 reference implementation and GnB ledger v1 (see below) |
 
 ## Build and test
@@ -48,8 +48,11 @@ cargo deny check && cargo audit
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of these, the Python references, the
-standalone `rust/` crate, the vendored-crate and Falcon guards, and nightly the
-fuzz targets.
+standalone `rust/` crate, the vendored-crate and Falcon guards, the sanitizer,
+Miri and 32-bit jobs ([docs/testing/SANITIZERS.md](docs/testing/SANITIZERS.md)),
+and nightly the fuzz targets. Mutation testing of the consensus code
+(`.github/workflows/mutants.yml`, [docs/testing/MUTATION.md](docs/testing/MUTATION.md))
+runs weekly and, on the lines a pull request changes, on every pull request.
 
 The toolchain is pinned in `rust-toolchain.toml`.
 
@@ -102,7 +105,7 @@ Research prototype, not yet wired into the node.
 | Path | What it is |
 | --- | --- |
 | `reference/gnb_smh.py` | GnB-SMH normative definition (Python standard library only) |
-| `reference/check_vectors.py`, `test_vectors.json` | 7 PoW vectors and the checker of both vector files |
+| `reference/check_vectors.py`, `test_vectors.json` | 17 PoW vectors (log2_n = 1, 2, 10, 19) and the checker of both vector files |
 | `reference/gnb_difficulty.py` | Difficulty normative definition: compact bits, chain work, ASERT, GnB's difficulty input |
 | `reference/gen_difficulty_vectors.py`, `difficulty_vectors.json` | Compact, chain-work, ASERT and multi-parent expected-bits vectors, checked by `crates/gnb-smh` and `crates/gnb-crypto` |
 | `reference/gnb_sighash.py`, `sighash_vectors.json` | Transaction signature digests (sighash v2 byte by byte, sighash v3, v3 component messages) and their vectors (`python3 reference/gnb_sighash.py` regenerates them), checked by `crates/gnb-crypto/tests/sighash_vectors.rs` |

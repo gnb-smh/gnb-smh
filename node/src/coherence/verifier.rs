@@ -24,8 +24,44 @@
 //!
 //! The binding/pinning decision logic is feature-independent pure code below so
 //! the default (no-SP1) build unit-tests it.
+//!
+//! AUTHORITY GUARD (audit COH-1): an accepting verifier is only meaningful if
+//! the statement it verifies proves spending authority. Spend statement v1
+//! did not (one note, unlimited nullifiers). [`accepting_verifier_allowed`]
+//! refuses any statement version for which
+//! `coherence_core::statement_binds_authority` is false; it is enforced at
+//! compile time below (the build fails if the crate's statement version stops
+//! binding authority), when an accepting backend is constructed
+//! ([`ShieldedVerifier::from_env`]), and on every use ([`ShieldedVerifier::verify`],
+//! [`ShieldedVerifier::is_active`]). The statement version is also part of
+//! the committed public values ([`expected_public_bytes`]), so a proof from a
+//! guest built for another statement version never binds. `RejectAll` remains
+//! the only verifier compiled into the node.
 
-use coherence_core::SpendPublic;
+use coherence_core::{statement_binds_authority, SpendPublic, SPEND_STATEMENT_VERSION};
+
+/// Compile-time guard (COH-1): no node build exists whose spend statement does
+/// not bind spending authority.
+const _: () = assert!(
+    statement_binds_authority(SPEND_STATEMENT_VERSION),
+    "coherence-core's spend statement does not bind spending authority; \
+     no shielded verifier may be built against it (audit COH-1)"
+);
+
+/// `Ok` iff an ACCEPTING shielded verifier may be enabled for spend statement
+/// `statement_version`: the statement must prove spending authority (the
+/// nullifier key derives from the key that derives the note's `pk_d`).
+pub fn accepting_verifier_allowed(statement_version: u32) -> Result<(), String> {
+    if statement_binds_authority(statement_version) {
+        Ok(())
+    } else {
+        Err(format!(
+            "spend statement v{statement_version} does not bind spending authority \
+             (one note would yield unlimited nullifiers); refusing to enable a shielded \
+             verifier (audit COH-1)"
+        ))
+    }
+}
 
 /// Pinned SP1 verifying-key hash of the Coherence spend guest program
 /// (`vk.bytes32()` from `sp1_sdk`, i.e. `0x` + 64 hex chars).
@@ -39,12 +75,15 @@ use coherence_core::SpendPublic;
 /// vkey file. Do NOT make this env-overridable — that would defeat the pin.
 pub const SHIELDED_SPEND_VKEY_HASH: &str = "";
 
-/// Canonical byte serialization of `SpendPublic` — exactly what the SP1 guest
-/// commits via `sp1_zkvm::io::commit(&public)` (bincode v1 wire format;
-/// bincode 2's `legacy()` config reproduces it). `None` only on a serializer
-/// error, which the caller must treat as "reject".
+/// Canonical committed public values of a spend proof: the bincode v1 wire
+/// format (bincode 2's `legacy()` config) of the pair
+/// `(SPEND_STATEMENT_VERSION: u32, public: SpendPublic)` — exactly what a
+/// guest for statement v2 must commit (`sp1_zkvm::io::commit(&(2u32, public))`).
+/// Binding the version means a proof from a guest built for another statement
+/// (in particular v1, which committed `SpendPublic` alone) never validates.
+/// `None` only on a serializer error, which the caller must treat as "reject".
 pub fn expected_public_bytes(public: &SpendPublic) -> Option<Vec<u8>> {
-    bincode::serde::encode_to_vec(public, bincode::config::legacy()).ok()
+    bincode::serde::encode_to_vec((SPEND_STATEMENT_VERSION, public), bincode::config::legacy()).ok()
 }
 
 /// TRUE iff the proof's committed public values are byte-for-byte the canonical
@@ -90,9 +129,13 @@ pub enum ShieldedVerifier {
 
 impl ShieldedVerifier {
     /// Verify `proof` against the public inputs. `false` rejects the tx.
+    /// Always `false` when the statement does not bind spending authority.
     pub fn verify(&self, public: &SpendPublic, proof: &[u8]) -> bool {
         #[cfg(not(feature = "sp1-verify"))]
         let _ = (public, proof); // only the SP1 arm consumes them
+        if accepting_verifier_allowed(SPEND_STATEMENT_VERSION).is_err() {
+            return false;
+        }
         match self {
             ShieldedVerifier::RejectAll => false,
             #[cfg(feature = "sp1-verify")]
@@ -107,16 +150,27 @@ impl ShieldedVerifier {
     /// Fail-closed: selecting `sp1` with a missing/mismatched vkey pin or with
     /// `SP1_PROVER=mock` in the environment PANICS at startup rather than
     /// running a verifier that could accept (or silently reject) everything.
+    ///
+    /// Start-up guard (COH-1): selecting an accepting backend panics unless
+    /// the statement version binds spending authority.
     pub fn from_env() -> Self {
         match std::env::var("GNB_SHIELDED_VERIFY").ok().as_deref() {
             #[cfg(feature = "sp1-verify")]
-            Some("sp1") => ShieldedVerifier::Sp1(sp1_backend::Sp1Verifier::from_env()),
+            Some("sp1") => {
+                if let Err(e) = accepting_verifier_allowed(SPEND_STATEMENT_VERSION) {
+                    panic!("{e}");
+                }
+                ShieldedVerifier::Sp1(sp1_backend::Sp1Verifier::from_env())
+            }
             _ => ShieldedVerifier::RejectAll,
         }
     }
 
+    /// True iff this verifier can accept a proof: a non-`RejectAll` backend
+    /// AND a statement that binds spending authority.
     pub fn is_active(&self) -> bool {
         !matches!(self, ShieldedVerifier::RejectAll)
+            && accepting_verifier_allowed(SPEND_STATEMENT_VERSION).is_ok()
     }
 }
 
@@ -275,6 +329,42 @@ mod tests {
     fn from_env_without_sp1_selected_is_reject_all() {
         // GNB_SHIELDED_VERIFY unset in the test env ⇒ safe default.
         assert!(!ShieldedVerifier::from_env().is_active());
+    }
+
+    // ── authority guard (audit COH-1) ────────────────────────────────────────
+
+    #[test]
+    fn accepting_verifier_requires_a_statement_that_binds_authority() {
+        let err = accepting_verifier_allowed(1).unwrap_err();
+        assert!(err.contains("does not bind spending authority"), "{err}");
+        assert!(accepting_verifier_allowed(0).is_err());
+        assert_eq!(accepting_verifier_allowed(2), Ok(()));
+        assert_eq!(accepting_verifier_allowed(SPEND_STATEMENT_VERSION), Ok(()));
+    }
+
+    /// The statement version is part of the committed public values: bytes a
+    /// v1 guest committed (the bare `SpendPublic`), or a pair naming another
+    /// version, never bind.
+    #[test]
+    fn statement_version_is_bound_into_public_values() {
+        let p = pub_();
+        let bare = bincode::serde::encode_to_vec(&p, bincode::config::legacy()).unwrap();
+        assert!(!public_values_bind(&bare, &p), "v1-style commitment bound");
+        let v1 = bincode::serde::encode_to_vec((1u32, &p), bincode::config::legacy()).unwrap();
+        assert!(!public_values_bind(&v1, &p), "a v1-version commitment bound");
+        let v2 = bincode::serde::encode_to_vec((2u32, &p), bincode::config::legacy()).unwrap();
+        assert!(public_values_bind(&v2, &p));
+        assert_eq!(&v2[..4], &2u32.to_le_bytes(), "version leads the committed bytes");
+
+        // Byte-exact layout documented in docs/CONSENSUS.md.
+        let mut manual = 2u32.to_le_bytes().to_vec();
+        manual.extend_from_slice(&p.anchor);
+        manual.extend_from_slice(&(p.nullifiers.len() as u64).to_le_bytes());
+        p.nullifiers.iter().for_each(|n| manual.extend_from_slice(n));
+        manual.extend_from_slice(&(p.out_commitments.len() as u64).to_le_bytes());
+        p.out_commitments.iter().for_each(|c| manual.extend_from_slice(c));
+        manual.extend_from_slice(&p.fee.to_le_bytes());
+        assert_eq!(expected_public_bytes(&p).unwrap(), manual);
     }
 
     // ── public-values binding (audit P123 P-1) ────────────────────────────────
