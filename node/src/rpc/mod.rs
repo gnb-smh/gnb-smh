@@ -196,6 +196,9 @@ struct AppState {
     allowed_hosts:           Arc<Vec<String>>,
     trust_loopback:          bool,
     heavy_gate:              Arc<HeavyGate>,
+    /// L-8: `getblocktemplate`'s own cache and build permit
+    /// (`gated_dispatch`), so an analytics scan never answers a miner "busy".
+    template_gate:           Arc<HeavyGate>,
     // B5f pool seam: submitblock hook (None = method returns "not wired").
     submit_block:            Option<Arc<SubmitBlockFn>>,
     // NET-12: cancellation flag of THIS request (a fresh flag per request,
@@ -234,12 +237,10 @@ const HEAVY_READ_METHODS: &[&str] = &[
     // block body, and additionally share the single-flight TTL cache.
     "getdifficultyhistory",
     "getblocktimepercentiles",
-    // L-8 (audit): `getblocktemplate` is expensive and stateful: it is
-    // privileged (see
-    // `auth::WRITE_METHODS`) and now shares the same short-TTL/single-flight
-    // discipline as the analytics methods above, closing the "poll it in a
-    // loop and force a fresh mempool drain + ancestry walk every time" cost.
-    "getblocktemplate",
+    // L-8 (audit): `getblocktemplate` is bounded the same way (cache +
+    // single flight) but through its OWN gate (`AppState::template_gate`,
+    // `gated_dispatch`): sharing this one's single scan permit answered a
+    // miner "busy" whenever a public analytics scan was in flight.
 ];
 
 /// NET-13: every method name `dispatch` implements. Metrics label anything
@@ -297,12 +298,35 @@ pub fn resolve_bind_address(host: &str, port: u16) -> Result<std::net::SocketAdd
 
 /// TTL for cached heavy-read results. Analytics freshness of ~1 block is fine.
 const HEAVY_READ_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// L-8: how long a `getblocktemplate` result is served while its parents and
+/// height are unchanged. A new tip misses the cache at once (`template_cache_key`); a
+/// mempool change shows in the template within this time, which bounds the
+/// rebuilds a polling miner causes on a busy pool to one per this interval
+/// (Bitcoin Core rebuilds on a new tip, and on a mempool change at most every
+/// 5 s).
+const TEMPLATE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Cap on distinct cached keys (parameterised methods could otherwise grow
 /// the map unboundedly — the exact DoS shape this gate exists to close).
 const HEAVY_READ_CACHE_MAX_KEYS: usize = 64;
+/// Cap on cached templates (`HeavyGate::for_templates`). The template key
+/// changes with every new block, so all but the newest entries are dead:
+/// with the analytics cap of 64, a node kept up to 63 expired templates of
+/// up to about 2 MB each (as JSON) for good. Expired entries are also dropped
+/// on every insert; the few left cover two miners asking with different
+/// params, or a parent set an invalidation brings back within the TTL.
+const TEMPLATE_CACHE_MAX_KEYS: usize = 4;
+/// The answer of the analytics gate while its single scan is in flight.
+const HEAVY_BUSY: &str = "busy: another heavy analytics scan is in flight; retry shortly";
+/// The answer of the template gate while another template is being built.
+const TEMPLATE_BUSY: &str = "busy: another getblocktemplate build is in flight; retry shortly";
 
 pub struct HeavyGate {
     ttl:   std::time::Duration,
+    /// Most entries kept; expired ones are dropped on every insert, and the
+    /// oldest when the map is still full.
+    max_keys: usize,
+    /// The error text for a caller that finds the permit taken.
+    busy:  &'static str,
     cache: parking_lot::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>,
     /// Held for the duration of a scan; `try_lock` makes concurrency-1 a hard
     /// bound with no queueing (queueing would just move the pile-up).
@@ -310,9 +334,24 @@ pub struct HeavyGate {
 }
 
 impl HeavyGate {
+    /// The analytics gate (`HEAVY_READ_METHODS`): `ttl`, at most
+    /// `HEAVY_READ_CACHE_MAX_KEYS` results.
     pub fn new(ttl: std::time::Duration) -> Self {
+        Self::with_limits(ttl, HEAVY_READ_CACHE_MAX_KEYS, HEAVY_BUSY)
+    }
+
+    /// `getblocktemplate`'s own gate (L-8): `TEMPLATE_CACHE_TTL`, at most
+    /// `TEMPLATE_CACHE_MAX_KEYS` templates, and a "busy" answer that names
+    /// the template build, not an analytics scan.
+    pub fn for_templates() -> Self {
+        Self::with_limits(TEMPLATE_CACHE_TTL, TEMPLATE_CACHE_MAX_KEYS, TEMPLATE_BUSY)
+    }
+
+    fn with_limits(ttl: std::time::Duration, max_keys: usize, busy: &'static str) -> Self {
         Self {
             ttl,
+            max_keys: max_keys.max(1),
+            busy,
             cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             scan:  parking_lot::Mutex::new(()),
         }
@@ -326,6 +365,22 @@ impl HeavyGate {
     /// scan permit. A caller that can neither hit the cache nor take the
     /// permit gets an error Value immediately (bounded, non-queueing).
     pub fn run<F: FnOnce() -> Value>(&self, key: String, f: F) -> Value {
+        let store_key = key.clone();
+        self.run_keyed(key, f, move |_| Some(store_key))
+    }
+
+    /// [`Self::run`], but a computed result is stored under
+    /// `store_key(&result)` (`None`: not stored) instead of under `key`: the
+    /// key of what the result was actually computed from, when that can
+    /// differ from what `key` was read from (`getblocktemplate`: a block
+    /// accepted between reading `key` and the build changes the parents the
+    /// template is built on). A hit on a key then only ever returns a result
+    /// computed from what the key names.
+    pub fn run_keyed<F, K>(&self, key: String, f: F, store_key: K) -> Value
+    where
+        F: FnOnce() -> Value,
+        K: FnOnce(&Value) -> Option<String>,
+    {
         let now = std::time::Instant::now();
         if let Some((at, v)) = self.cache.lock().get(&key) {
             if now.duration_since(*at) < self.ttl {
@@ -340,21 +395,23 @@ impl HeavyGate {
                 if v.get("error").is_some() {
                     return v;
                 }
+                let Some(store_key) = store_key(&v) else { return v };
+                let now = std::time::Instant::now();
                 let mut cache = self.cache.lock();
-                if cache.len() >= HEAVY_READ_CACHE_MAX_KEYS {
-                    // Evict stale entries first; if still full, drop the map —
-                    // correctness is unaffected (it is a cache).
-                    cache.retain(|_, (at, _)| now.duration_since(*at) < self.ttl);
-                    if cache.len() >= HEAVY_READ_CACHE_MAX_KEYS {
-                        cache.clear();
+                // Expired entries are dead (never served again): drop them on
+                // every insert, then the oldest while the map is still full.
+                cache.retain(|_, (at, _)| now.duration_since(*at) < self.ttl);
+                if !cache.contains_key(&store_key) {
+                    while cache.len() >= self.max_keys {
+                        let Some(oldest) = cache.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone())
+                            else { break };
+                        cache.remove(&oldest);
                     }
                 }
-                cache.insert(key, (std::time::Instant::now(), v.clone()));
+                cache.insert(store_key, (now, v.clone()));
                 v
             }
-            None => json!({
-                "error": "busy: another heavy analytics scan is in flight; retry shortly",
-            }),
+            None => json!({ "error": self.busy }),
         }
     }
 }
@@ -472,6 +529,7 @@ pub async fn start_rpc_server(
         allowed_hosts:           Arc::new(config.allowed_hosts.clone()),
         trust_loopback:          config.trust_loopback,
         heavy_gate:              Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
+        template_gate:           Arc::new(HeavyGate::for_templates()),
         submit_block,
         cancel:                  Arc::new(std::sync::atomic::AtomicBool::new(false)),
         chain_admin,
@@ -651,6 +709,84 @@ fn selected_tip_height(state: &AppState) -> u64 {
         .unwrap_or(0)
 }
 
+/// Cache key of a `getblocktemplate` call: its params, and the parents and
+/// header height the template would be built on
+/// (`template::template_parents_and_height`, the template builder's own
+/// choice), so anything that changes them misses the cache at once: a new
+/// block, an `invalidateblock` / `reconsiderblock` (DAG-6: the tip SET is
+/// unchanged, only which tips are valid), a parent's body arriving (a
+/// header-only tip is not an eligible parent). The template's bits, blue
+/// score, subsidy and UTXO view are functions of the parents and height.
+/// Keyed by params alone, a template was served for up to 30 s after a new
+/// block: parents a block behind, so an external miner kept building forks of
+/// the tip (test/functional/mining_getblocktemplate_submitblock.py). Mempool
+/// changes are not in the key: they show in the template within
+/// `TEMPLATE_CACHE_TTL` (a pool-digest key missed on every admission, so a
+/// miner polling a busy pool rebuilt the template on every call, and
+/// computing the digest copied every pool txid).
+///
+/// This is the LOOKUP key, read under `dag.read()` only, before the build.
+/// The builder takes the acceptance lock and chooses the parents again, so a
+/// block accepted in between gives a template on other parents. A template
+/// is therefore stored under the key of the parents and height it carries
+/// ([`template_result_key`]), which equals this one only when nothing
+/// changed in between.
+fn template_cache_key(params: Option<&Value>, state: &AppState) -> String {
+    let (parents, height) = {
+        let dag = state.dag.read();
+        crate::template::template_parents_and_height(&dag, &state.store)
+    };
+    template_cache_key_for(params, parents.iter().map(|p| p.as_slice()), height)
+}
+
+/// The template cache key of `params` and a template on `parents` (in
+/// template order) at header `height`.
+fn template_cache_key_for<'a>(params: Option<&Value>, parents: impl IntoIterator<Item = &'a [u8]>, height: u64) -> String {
+    use sha3::{Digest as _, Sha3_256};
+    // Order kept: the first parent is the template's selected parent.
+    let mut h = Sha3_256::new();
+    for p in parents {
+        h.update(p);
+    }
+    format!("getblocktemplate|{}|parents={}|height={}",
+        params.map(|p| p.to_string()).unwrap_or_default(), hex::encode(h.finalize()), height)
+}
+
+/// The key a built template is stored under: the `parents` and `height` it
+/// was built on (its own fields), so a cache hit on a key only ever returns
+/// a template on the parents that key names. Keyed by the lookup key, a
+/// template built on a block X accepted during the build was stored under
+/// the key of the parents before X, and after an `invalidateblock X` brought
+/// those parents back, the next call within `TEMPLATE_CACHE_TTL` was served
+/// a template on the invalidated X. `None` (not stored) for anything that is
+/// not a template.
+fn template_result_key(params: Option<&Value>, template: &Value) -> Option<String> {
+    let parents = template.get("parents")?.as_array()?.iter()
+        .map(|p| p.as_str().and_then(|h| hex::decode(h).ok()))
+        .collect::<Option<Vec<Vec<u8>>>>()?;
+    let height = template.get("height")?.as_u64()?;
+    Some(template_cache_key_for(params, parents.iter().map(Vec::as_slice), height))
+}
+
+/// Run one dispatch `f` behind the bound its method needs (L-8 / H-R3-5):
+/// `getblocktemplate` through its own gate (looked up by `template_cache_key`,
+/// stored by `template_result_key`, `TEMPLATE_CACHE_TTL`,
+/// `TEMPLATE_CACHE_MAX_KEYS`), the heavy analytics reads through the HeavyGate
+/// (method|params key, `HEAVY_READ_CACHE_TTL`), everything else directly.
+/// Separate gates: a public analytics scan holding the HeavyGate's single
+/// permit must not answer a miner's template request "busy".
+fn gated_dispatch<F: FnOnce() -> Value>(method: &str, params: Option<&Value>, state: &AppState, f: F) -> Value {
+    if method == "getblocktemplate" {
+        state.template_gate.run_keyed(template_cache_key(params, state), f,
+            |template| template_result_key(params, template))
+    } else if HeavyGate::is_heavy(method) {
+        let key = format!("{}|{}", method, params.map(|p| p.to_string()).unwrap_or_default());
+        state.heavy_gate.run(key, f)
+    } else {
+        f()
+    }
+}
+
 async fn handle_rpc(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -763,20 +899,12 @@ async fn handle_rpc(
             let d_params = params.cloned();
             let d_handle = tokio::runtime::Handle::current();
             let join_handle = tokio::task::spawn_blocking(move || {
-                // R3-audit H-R3-5: heavy O(chain) analytics reads go through
-                // the HeavyGate — TTL cache + at most one scan in flight.
-                if HeavyGate::is_heavy(&d_method) {
-                    let key = format!(
-                        "{}|{}",
-                        d_method,
-                        d_params.as_ref().map(|p| p.to_string()).unwrap_or_default(),
-                    );
-                    d_state.heavy_gate.clone().run(key, || {
-                        d_handle.block_on(dispatch(&d_method, d_params.as_ref(), &d_state))
-                    })
-                } else {
+                // R3-audit H-R3-5 / L-8: heavy O(chain) analytics reads and
+                // getblocktemplate go through their gates — TTL cache + at
+                // most one computation in flight per gate.
+                gated_dispatch(&d_method, d_params.as_ref(), &d_state, || {
                     d_handle.block_on(dispatch(&d_method, d_params.as_ref(), &d_state))
-                }
+                })
             });
             // L-9 (audit): the outer `TimeoutLayer` (tower-http) previously
             // was the ONLY thing standing between a stuck dispatch and a
@@ -894,7 +1022,13 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let s = state.node_state.read();
             let pruned_h = state.store.pruned_height();
             json!({
-                "network":         "mainnet",
+                // The chain this node runs (`--testnet`), as set once at
+                // start-up. Was the literal "mainnet" on every node
+                // (test/functional/feature_test_build_guard.py).
+                "network":         match crate::core::node_chain_id() {
+                    crate::core::ChainId::Testnet => "testnet",
+                    crate::core::ChainId::Mainnet => "mainnet",
+                },
                 "version":         s.version,
                 "protocol":        PROTOCOL_VERSION,
                 "net_protocol":    crate::network::PROTOCOL_VERSION,
@@ -1164,7 +1298,9 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // walk stops early `truncated` is true and `utxo_count` /
             // `satoshis` cover the returned UTXOs only; `getbalance` gives
             // the address totals.
-            const GETUTXOS_MAX: usize = 10_000;
+            // The wallets' send flow widens a truncated window to this cap
+            // (`gnb_crypto::wallet::send::GETUTXOS_MAX_ROWS`, the same value).
+            const GETUTXOS_MAX: usize = gnb_crypto::wallet::send::GETUTXOS_MAX_ROWS as usize;
             let limit = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64())
                 .map(|n| usize::try_from(n).unwrap_or(usize::MAX).min(GETUTXOS_MAX))
                 .unwrap_or(GETUTXOS_MAX);
@@ -1174,10 +1310,24 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     Ok((utxos, truncated)) => {
                         let total: u64 = utxos.iter().map(|(_, _, o)| o.value).fold(0u64, u64::saturating_add);
                         // R3: `value` is a satoshi amount → decimal string.
-                        let list: Vec<Value> = utxos.iter().map(|(txid, idx, out)| json!({
-                            "txid": hex::encode(txid), "index": idx,
-                            "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
-                        })).collect();
+                        // An output of a coinbase also carries the coinbase's
+                        // height: it is spendable only from height
+                        // coinbase_height + COINBASE_MATURITY, and a wallet
+                        // that cannot tell selected immature coinbase outputs
+                        // and built transactions the node refuses
+                        // (test/functional/wallet_coinbase_maturity.py).
+                        let list: Vec<Value> = utxos.iter().map(|(txid, idx, out)| {
+                            let mut row = json!({
+                                "txid": hex::encode(txid), "index": idx,
+                                "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
+                            });
+                            let coinbase_height = <[u8; 32]>::try_from(txid.as_slice()).ok()
+                                .and_then(|t| state.store.get_coinbase_height(&t).ok().flatten());
+                            if let Some(h) = coinbase_height {
+                                row["coinbase_height"] = json!(h);
+                            }
+                            row
+                        }).collect();
                         json!({
                             "address":    addr,
                             "utxo_count": list.len(),
@@ -2465,6 +2615,7 @@ mod audit_2026_10_rpc_tests {
             allowed_hosts: Arc::new(Vec::new()),
             trust_loopback: false,
             heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
+            template_gate: Arc::new(HeavyGate::for_templates()),
             submit_block: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             chain_admin: None,
@@ -2502,6 +2653,116 @@ mod audit_2026_10_rpc_tests {
         }
         let known: std::collections::BTreeSet<String> = KNOWN_RPC_METHODS.iter().map(|s| s.to_string()).collect();
         assert_eq!(arms, known);
+    }
+
+    /// A cached `getblocktemplate` never outlives the chain it was built on:
+    /// its key changes with a new block. A pool transaction does not change
+    /// it (the template catches up within TEMPLATE_CACHE_TTL), so a miner
+    /// polling a busy pool does not rebuild on every call. Functional
+    /// counterpart: test/functional/mining_getblocktemplate_submitblock.py.
+    /// (Invalidation and body arrival: the test below.)
+    #[test]
+    fn template_cache_key_follows_new_blocks_not_the_pool() {
+        let (_tmp, state) = state_with_chain(3);
+        let k0 = template_cache_key(None, &state);
+        assert_eq!(k0, template_cache_key(None, &state), "stable while nothing changes");
+
+        let tx = crate::core::Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [7; 32], prev_index: 0, script_sig: vec![1; 8], sequence: 0 }],
+            outputs: vec![TxOutput { value: 10_000, script_pubkey: vec![2; 20] }],
+            locktime: 0,
+        };
+        state.mempool.add(tx, 1_000_000).expect("pool accepts the fixture");
+        assert_eq!(template_cache_key(None, &state), k0, "a pool change alone keeps the key");
+
+        state.dag.write().add_block([9; 32], vec![[3; 32]], 2_000, 1).unwrap();
+        assert_ne!(template_cache_key(None, &state), k0, "a new tip must miss the cached template");
+        assert_ne!(template_cache_key(Some(&json!([{"x": 1}])), &state), template_cache_key(None, &state));
+    }
+
+    /// What a template build returns, as far as the cache reads it: the
+    /// parents and height `template_parents_and_height` gives on the DAG at
+    /// build time (the fields the builder copies from the template it built),
+    /// and `n` to tell builds apart.
+    fn fake_template(state: &AppState, n: u32) -> Value {
+        let (parents, height) = {
+            let dag = state.dag.read();
+            crate::template::template_parents_and_height(&dag, &state.store)
+        };
+        json!({"template": n, "parents": parents.iter().map(hex::encode).collect::<Vec<_>>(), "height": height})
+    }
+
+    /// getblocktemplate has its own gate: while a public analytics scan
+    /// holds the HeavyGate's permit, a template is still built (it used to
+    /// be answered "busy"), and analytics are still refused; a second
+    /// template call with the same tips is served from the template cache,
+    /// a new tip rebuilds at once.
+    #[test]
+    fn template_requests_are_not_blocked_by_an_analytics_scan() {
+        let (_tmp, state) = state_with_chain(3);
+        let builds = std::cell::Cell::new(0u32);
+        let build = || { builds.set(builds.get() + 1); fake_template(&state, builds.get()) };
+        let scan = state.heavy_gate.scan.lock(); // an analytics scan in flight
+        assert_eq!(gated_dispatch("getblocktemplate", None, &state, build)["template"], 1);
+        let refused = gated_dispatch("getrichlist", None, &state, || json!({"should": "not run"}));
+        assert!(refused["error"].as_str().unwrap_or("").contains("busy"), "{refused}");
+        drop(scan);
+        assert_eq!(gated_dispatch("getblocktemplate", None, &state, build)["template"], 1,
+            "same tips: served from the template cache");
+        state.dag.write().add_block([9; 32], vec![[3; 32]], 2_000, 1).unwrap();
+        assert_eq!(gated_dispatch("getblocktemplate", None, &state, build)["template"], 2,
+            "a new tip rebuilds at once");
+        assert_eq!(builds.get(), 2);
+        assert_eq!(gated_dispatch("getblockcount", None, &state, || json!(7)), json!(7));
+        assert!(TEMPLATE_CACHE_TTL <= std::time::Duration::from_secs(5));
+    }
+
+    /// A template call that finds another template build in flight is told
+    /// so, not that "another heavy analytics scan" is (the template gate
+    /// answered with the analytics gate's text); analytics keep theirs.
+    #[test]
+    fn a_busy_template_gate_names_the_template_build() {
+        let (_tmp, state) = state_with_chain(3);
+        let build = state.template_gate.scan.lock(); // a template build in flight
+        let busy = gated_dispatch("getblocktemplate", None, &state, || json!({"should": "not run"}));
+        let text = busy["error"].as_str().unwrap_or("");
+        assert!(text.starts_with("busy:") && text.contains("getblocktemplate"), "{busy}");
+        assert!(!text.contains("analytics"), "{busy}");
+        drop(build);
+        let scan = state.heavy_gate.scan.lock();
+        let busy = gated_dispatch("getrichlist", None, &state, || json!({"should": "not run"}));
+        assert!(busy["error"].as_str().unwrap_or("").contains("analytics scan"), "{busy}");
+        drop(scan);
+    }
+
+    /// The template key changes with every block, so the template gate keeps
+    /// only fresh templates, and few: an expired one is dropped when the next
+    /// is stored, and at most TEMPLATE_CACHE_MAX_KEYS are kept, the newest.
+    /// With the analytics gate's eviction (only once 64 keys were reached), a
+    /// node kept up to 63 dead templates of up to about 2 MB each for good.
+    #[test]
+    fn the_template_gate_keeps_only_a_few_fresh_templates() {
+        let gate = HeavyGate::with_limits(std::time::Duration::from_millis(30), TEMPLATE_CACHE_MAX_KEYS, TEMPLATE_BUSY);
+        gate.run("parents=a".into(), || json!(1));
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        gate.run("parents=b".into(), || json!(2));
+        assert_eq!(gate.cache.lock().keys().cloned().collect::<Vec<_>>(), vec!["parents=b".to_string()],
+            "the expired template must be dropped when the next one is stored");
+
+        let gate = HeavyGate::for_templates();
+        const { assert!(TEMPLATE_CACHE_MAX_KEYS < HEAVY_READ_CACHE_MAX_KEYS) };
+        for i in 0..(HEAVY_READ_CACHE_MAX_KEYS * 2) {
+            gate.run(format!("parents={i}"), || json!(i));
+        }
+        let last = HEAVY_READ_CACHE_MAX_KEYS * 2 - 1;
+        {
+            let cache = gate.cache.lock();
+            assert_eq!(cache.len(), TEMPLATE_CACHE_MAX_KEYS);
+            assert!(cache.contains_key(&format!("parents={last}")), "the newest template is kept");
+        }
+        // ... and served while fresh.
+        assert_eq!(gate.run(format!("parents={last}"), || json!("rebuilt")), json!(last));
     }
 
     #[test]
@@ -2646,6 +2907,16 @@ mod audit_2026_10_rpc_tests {
         let r = dispatch("getutxos", Some(&json!([address.to_string()])), &state).await;
         assert_eq!(r["returned"], 5);
         assert_eq!(r["truncated"], false);
+
+        // An output of a coinbase carries its coinbase's height (wallets skip
+        // immature ones); any other output carries no such field.
+        state.store.put_coinbase_info(&[3; 32], 77).unwrap();
+        let r = dispatch("getutxos", Some(&json!([address.to_string()])), &state).await;
+        let rows = r["utxos"].as_array().unwrap();
+        for row in rows {
+            let expected = if row["txid"] == hex::encode([3u8; 32]) { json!(77) } else { Value::Null };
+            assert_eq!(row["coinbase_height"], expected, "{row}");
+        }
     }
 
     /// NET-12: the chain-walking statistics read only the requested window.
@@ -2833,6 +3104,7 @@ mod block_rules_template_tests {
             allowed_hosts: Arc::new(Vec::new()),
             trust_loopback: false,
             heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
+            template_gate: Arc::new(HeavyGate::for_templates()),
             submit_block: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             chain_admin: None,
@@ -2873,6 +3145,124 @@ mod block_rules_template_tests {
             height: t["height"].as_u64().unwrap(),
             shielded_transactions: vec![],
         }
+    }
+
+    /// The getblocktemplate cache key follows the template's PARENTS, not
+    /// the DAG's tip set: `invalidateblock` / `reconsiderblock` (DAG-6) leave
+    /// the tip set and block count unchanged but change which tips are
+    /// parents, and a header-only tip becomes a parent only when its body
+    /// arrives. Each of these misses the cache at once (keyed on the tips, a
+    /// miner kept the invalidated parent for up to TEMPLATE_CACHE_TTL).
+    /// A height-1 block on genesis `gh` (timestamp `gts`), told apart by `tag`.
+    fn genesis_child(gh: [u8; 32], gts: u64, tag: u8) -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1, parents: vec![gh], merkle_root: MerkleRoot::default(),
+                timestamp: gts + 60, bits: core::POW_LIMIT_BITS, nonce: tag as u64,
+            },
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: vec![TxInput { prev_txid: [0; 32], prev_index: u32::MAX, script_sig: vec![tag; 8], sequence: u32::MAX }],
+                outputs: vec![TxOutput { value: 1, script_pubkey: vec![0x44; 20] }],
+                locktime: 0,
+            }],
+            blue_score: 1,
+            height: 1,
+            shielded_transactions: vec![],
+        }
+    }
+
+    #[test]
+    fn template_cache_key_follows_invalidation_and_body_arrival() {
+        let (_tmp, state) = state_with_genesis();
+        let gh = state.dag.read().tips()[0];
+        let gts = state.dag.read().get_block_data(&gh).map(|d| d.timestamp).unwrap_or(0);
+        let child = |tag: u8| genesis_child(gh, gts, tag);
+        let (a, b) = (child(1), child(2));
+        let (ah, bh) = (a.block_hash(), b.block_hash());
+        let parents_of = |state: &AppState| {
+            let dag = state.dag.read();
+            crate::template::template_parents_and_height(&dag, &state.store).0
+        };
+
+        // A bodied, B header-only: B is no parent, so its header changes
+        // nothing; its body arriving does.
+        state.store.put_block(&a).unwrap();
+        state.dag.write().add_block(ah, vec![gh], gts + 60, 1).unwrap();
+        let k_a = template_cache_key(None, &state);
+        state.dag.write().add_block(bh, vec![gh], gts + 60, 1).unwrap();
+        assert_eq!(parents_of(&state), vec![ah]);
+        assert_eq!(template_cache_key(None, &state), k_a, "a header-only tip is no parent");
+        state.store.put_block(&b).unwrap();
+        let both = parents_of(&state);
+        assert_eq!(both.len(), 2);
+        let k_ab = template_cache_key(None, &state);
+        assert_ne!(k_ab, k_a, "a parent's body arriving must miss the cached template");
+
+        // invalidateblock A: same tips, same block count, other parents.
+        let tips_before = state.dag.read().tips();
+        state.dag.write().mark_invalid(ah);
+        assert_eq!(state.dag.read().tips(), tips_before);
+        assert_eq!(parents_of(&state), vec![bh]);
+        let k_inv = template_cache_key(None, &state);
+        assert_ne!(k_inv, k_ab, "an invalidated parent must miss the cached template");
+        // reconsiderblock A: back to the first key.
+        state.dag.write().reset_invalid_sets(std::iter::empty(), std::iter::empty());
+        assert_eq!(parents_of(&state), both);
+        assert_eq!(template_cache_key(None, &state), k_ab);
+    }
+
+    /// A template is cached under the parents it was BUILT on, not under the
+    /// key read before the build. The race: a miner's call reads the key on
+    /// [A]; block B is accepted while the build waits for the acceptance
+    /// lock, so the template is built on [A, B]. Stored under the [A] key, an
+    /// `invalidateblock B` (parents [A] again) within TEMPLATE_CACHE_TTL had
+    /// the next call served the template on the invalidated B, which the node
+    /// itself refuses. Now that call misses and builds on [A], and the
+    /// template on [A, B] is served again only once B is reconsidered.
+    #[test]
+    fn a_template_is_cached_under_the_parents_it_was_built_on() {
+        let (_tmp, state) = state_with_genesis();
+        let gh = state.dag.read().tips()[0];
+        let gts = state.dag.read().get_block_data(&gh).map(|d| d.timestamp).unwrap_or(0);
+        let (a, b) = (genesis_child(gh, gts, 1), genesis_child(gh, gts, 2));
+        let (ah, bh) = (a.block_hash(), b.block_hash());
+        state.store.put_block(&a).unwrap();
+        state.dag.write().add_block(ah, vec![gh], gts + 60, 1).unwrap();
+
+        // What the builder returns: the parents and height it chose under the
+        // acceptance lock (`build_block_template_with`), here read the same way.
+        let built_on_current_parents = |n: u32| {
+            let (parents, height) = {
+                let dag = state.dag.read();
+                crate::template::template_parents_and_height(&dag, &state.store)
+            };
+            json!({"build": n, "parents": parents.iter().map(hex::encode).collect::<Vec<_>>(), "height": height})
+        };
+        let parents_in = |t: &Value| hashes(&t["parents"]);
+
+        let t1 = gated_dispatch("getblocktemplate", None, &state, || {
+            // B is accepted between the key lookup and the build.
+            state.store.put_block(&b).unwrap();
+            state.dag.write().add_block(bh, vec![gh], gts + 60, 1).unwrap();
+            built_on_current_parents(1)
+        });
+        assert_eq!(parents_in(&t1).len(), 2, "{t1}");
+        assert!(parents_in(&t1).contains(&bh));
+
+        // invalidateblock B: the parents are [A] again.
+        state.dag.write().mark_invalid(bh);
+        let t2 = gated_dispatch("getblocktemplate", None, &state, || built_on_current_parents(2));
+        assert_eq!(t2["build"], 2, "the template on the invalidated B was served from [A]'s key: {t2}");
+        assert_eq!(parents_in(&t2), vec![ah]);
+
+        // reconsiderblock B: the template on [A, B] is that key's again.
+        state.dag.write().reset_invalid_sets(std::iter::empty(), std::iter::empty());
+        let t3 = gated_dispatch("getblocktemplate", None, &state, || built_on_current_parents(3));
+        assert_eq!(t3["build"], 1, "{t3}");
+        // And [A] again serves the template built on [A].
+        state.dag.write().mark_invalid(bh);
+        assert_eq!(gated_dispatch("getblocktemplate", None, &state, || built_on_current_parents(4))["build"], 2);
     }
 
     #[tokio::test]

@@ -106,10 +106,24 @@ impl WalletClient {
         parse_balance(&bal_response, &addr_info)
     }
 
-    /// Get spendable UTXOs for an address.
+    /// Every unspent output the node reports for an address, coinbase
+    /// outputs included whether mature or not. To pay, use
+    /// [`Self::spendable_utxos`].
     pub async fn utxos(&self, address: &Address) -> Result<Vec<Utxo>, WalletError> {
         let response = self.call("getutxos", json!([address.to_string()])).await?;
         parse_utxos(&response, address)
+    }
+
+    /// The unspent outputs of `address` spendable in the block at
+    /// `next_block_height`, and how many coinbase outputs were left out as
+    /// not yet mature there (`send::utxo_row_spendable_at`, the rule
+    /// `gnb-cli send` applies too). A payment that selected an immature
+    /// coinbase output was refused by every node.
+    pub async fn spendable_utxos(&self, address: &Address, next_block_height: u64)
+        -> Result<(Vec<Utxo>, usize), WalletError>
+    {
+        let response = self.call("getutxos", json!([address.to_string()])).await?;
+        parse_spendable_utxos(&response, address, next_block_height)
     }
 
     /// Get estimated fee rates.
@@ -222,8 +236,13 @@ impl WalletClient {
         fee_policy: &FeePolicy,
     ) -> Result<([u8; 32], BuiltPayment), WalletError> {
         let fee = fee_rate_preference.fee_choice();
-        let utxos = self.utxos(wallet.address()).await?;
         let next_block_height = self.next_block_height().await?;
+        // Coinbase outputs not yet mature at the next block are never selected.
+        let (utxos, immature) = self.spendable_utxos(wallet.address(), next_block_height).await?;
+        if utxos.is_empty() && immature > 0 {
+            return Err(WalletError::Payment(super::send::all_immature_message(
+                &wallet.address().to_string(), immature, next_block_height)));
+        }
         let chain_id = crate::core::ChainId::for_network(wallet.network());
         let prevs = if payment::amounts_committed_at(next_block_height, chain_id) {
             PrevTxs::new()
@@ -336,6 +355,26 @@ fn parse_balance(balance: &Value, pending: &Value) -> Result<Balance, WalletErro
     let pending_out = pending.get("pending_outgoing").and_then(super::sat_u64).unwrap_or(0);
     Ok(Balance { confirmed, pending_incoming: pending_in, pending_outgoing: pending_out,
         total: confirmed.checked_add(pending_in).ok_or(WalletError::Overflow)? })
+}
+
+/// [`parse_utxos`] without the rows not spendable at `next_block_height`
+/// (`send::utxo_row_spendable_at`), and how many were left out.
+fn parse_spendable_utxos(response: &Value, address: &Address, next_block_height: u64)
+    -> Result<(Vec<Utxo>, usize), WalletError>
+{
+    let utxos = parse_utxos(response, address)?;
+    let rows = response.get("utxos").and_then(|v| v.as_array())
+        .ok_or_else(|| WalletError::BadResponse("missing utxos array".into()))?;
+    let mut spendable = Vec::with_capacity(utxos.len());
+    let mut immature = 0;
+    for (utxo, row) in utxos.into_iter().zip(rows) {
+        if super::send::utxo_row_spendable_at(row, next_block_height).map_err(WalletError::BadResponse)? {
+            spendable.push(utxo);
+        } else {
+            immature += 1;
+        }
+    }
+    Ok((spendable, immature))
 }
 
 fn parse_utxos(response: &Value, address: &Address) -> Result<Vec<Utxo>, WalletError> {
@@ -618,10 +657,21 @@ mod audit_2026_10_send_tests {
     fn serve(responses: std::collections::HashMap<&'static str, Value>)
         -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>)
     {
+        let (url, seen, _params) = serve_recording(responses);
+        (url, seen)
+    }
+
+    /// [`serve`], also recording the params of every call.
+    #[allow(clippy::type_complexity)]
+    fn serve_recording(responses: std::collections::HashMap<&'static str, Value>)
+        -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>, std::sync::Arc<std::sync::Mutex<Vec<Value>>>)
+    {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = seen.clone();
+        let params = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let params_log = params.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
@@ -642,13 +692,69 @@ mod audit_2026_10_send_tests {
                 let req: Value = serde_json::from_slice(&body).unwrap();
                 let method = req["method"].as_str().unwrap().to_string();
                 log.lock().unwrap().push(method.clone());
+                params_log.lock().unwrap().push(req["params"].clone());
                 let result = responses.get(method.as_str()).cloned().unwrap_or(json!({"error": "unknown"}));
                 let doc = json!({"jsonrpc": "2.0", "id": req["id"], "result": result}).to_string();
                 let _ = stream.write_all(format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{doc}", doc.len()).as_bytes());
             }
         });
-        (format!("http://{address}"), seen)
+        (format!("http://{address}"), seen, params)
+    }
+
+    /// The library client never selects a coinbase output that is not mature
+    /// at the next block (the same defect `gnb-cli send` had: every node
+    /// refused the broadcast "coinbase maturity"), even when it alone covers
+    /// the payment, and refuses before signing when only immature coins are
+    /// left.
+    #[tokio::test]
+    async fn send_payment_skips_immature_coinbase_outputs() {
+        use crate::core::COINBASE_MATURITY as M;
+        let (wallet, _) = crate::wallet::Wallet::generate(Network::Testnet).unwrap();
+        let tip = 1_000u64;
+        let row = |txid: u8, value: &str, cb: Option<u64>| {
+            let mut r = json!({"txid": hex::encode([txid; 32]), "index": 0, "value": value});
+            if let Some(h) = cb { r["coinbase_height"] = json!(h); }
+            r
+        };
+        let rows = json!({"utxos": [
+            row(1, "10000000000", Some(tip)),         // 100 GNB, 1 confirmation: immature
+            row(2, "200000000", Some(tip + 1 - M)),   // 2 GNB, exactly mature at tip + 1
+            row(3, "200000000", None),                // 2 GNB, not a coinbase output
+        ]});
+        let responses = std::collections::HashMap::from([
+            ("getdaginfo", json!({"tip_height": tip, "next_block_height": tip + 1})),
+            ("getutxos", rows),
+            ("sendrawtransaction", json!({"txid": "00"})),
+        ]);
+        let (url, seen, params) = serve_recording(responses);
+        let client = WalletClient::new(url);
+        let to = Address::from_hash([7; 20], Network::Testnet);
+        let (spendable, immature) = client.spendable_utxos(wallet.address(), tip + 1).await.unwrap();
+        assert_eq!((spendable.len(), immature), (2, 1));
+        assert_eq!(client.utxos(wallet.address()).await.unwrap().len(), 3, "utxos() still lists every output");
+        // The mock echoes a wrong txid: `send` fails AFTER broadcasting.
+        let err = client.send(&wallet, &to, 300_000_000, FeePreference::Slow).await.unwrap_err();
+        assert!(matches!(err, WalletError::BadResponse(_)), "{err}");
+        let sent = {
+            let seen = seen.lock().unwrap();
+            let i = seen.iter().position(|m| m == "sendrawtransaction").expect("broadcast");
+            params.lock().unwrap()[i][0].as_str().unwrap().to_string()
+        };
+        let tx = Transaction::from_wire_bytes(&hex::decode(sent).unwrap()).unwrap();
+        let spent: Vec<[u8; 32]> = tx.inputs.iter().map(|i| i.prev_txid).collect();
+        assert_eq!(spent.len(), 2);
+        assert!(!spent.contains(&[1u8; 32]), "the immature 100 GNB coinbase output was selected");
+
+        let responses = std::collections::HashMap::from([
+            ("getdaginfo", json!({"tip_height": tip})),
+            ("getutxos", json!({"utxos": [row(1, "10000000000", Some(tip))]})),
+            ("sendrawtransaction", json!({"txid": "00"})),
+        ]);
+        let (url, seen) = serve(responses);
+        let err = WalletClient::new(url).send(&wallet, &to, 100_000_000, FeePreference::Slow).await.unwrap_err();
+        assert!(matches!(&err, WalletError::Payment(m) if m.contains("immature")), "{err}");
+        assert!(!seen.lock().unwrap().iter().any(|m| m == "sendrawtransaction"), "nothing is broadcast");
     }
 
     /// WAL-1 regression (version-1 payments, below the activation): a node

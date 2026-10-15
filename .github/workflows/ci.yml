@@ -4,7 +4,7 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: "17 3 * * *"   # nightly: fuzz-target build and smoke run
+    - cron: "17 3 * * *"   # nightly: every job (fuzz: 60 s per target; the weekly 10-minute campaign is fuzz.yml)
   workflow_dispatch:
 
 permissions:
@@ -86,6 +86,33 @@ jobs:
           key: workspace-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - name: Build
         run: cargo build --workspace --locked
+      # The functional-test feature `test-pow-limit` (node feature forwarding
+      # gnb-crypto's dev feature; every target is the pow limit) must never be
+      # part of an artifact build: not enabled by the default feature graph of
+      # the build above, not a default feature of the node, and the binary just
+      # built must not be a test build (a test build refuses mainnet with exit
+      # code 2; a production build gets past that guard and stops at the
+      # missing carryover snapshot with exit code 1).
+      - name: Artifact builds never enable test-pow-limit
+        run: |
+          tree=$(cargo tree --workspace --locked -e features,normal,build -i gnb-crypto)
+          echo "$tree"
+          if echo "$tree" | grep -q 'test-pow-limit'; then
+            echo "::error::test-pow-limit is enabled in the artifact build graph"; exit 1
+          fi
+          cargo metadata --locked --no-deps --format-version 1 | python3 -c '
+          import json, sys
+          gnb = next(p for p in json.load(sys.stdin)["packages"] if p["name"] == "gnb")
+          default = gnb["features"].get("default", [])
+          assert "test-pow-limit" not in default, f"test-pow-limit is a default feature: {default}"
+          print("gnb default features:", default)'
+          set +e
+          out=$(./target/debug/gnb --data-dir "$RUNNER_TEMP/artifact-probe" 2>&1); code=$?
+          set -e
+          echo "$out" | tail -3
+          if [ "$code" -eq 2 ] || echo "$out" | grep -q "test-pow-limit"; then
+            echo "::error::target/debug/gnb is a test-pow-limit build"; exit 1
+          fi
       - name: Test
         run: cargo test --workspace --locked
 
@@ -124,6 +151,41 @@ jobs:
         run: |
           cargo test -p gnb-smh --locked --release --lib integer_overflow_panics_in_this_profile 2>&1 \
             | tee /dev/stderr | grep -q "test result: ok. 1 passed; 0 failed; 0 ignored"
+
+  # Functional tests (test/functional, docs/testing/FUNCTIONAL.md): real gnb
+  # node processes on loopback, driven over JSON-RPC and gnb-cli. Needs the
+  # TEST-ONLY build (node feature test-pow-limit, debug profile); that binary
+  # refuses mainnet and is never published.
+  functional:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies (librocksdb-sys needs clang/libclang)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: functional-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Build the test-only binaries (gnb, gnb-cli; feature test-pow-limit)
+        run: cargo build -p gnb --features test-pow-limit --bin gnb --bin gnb-cli --locked
+      - name: Functional tests
+        run: >
+          python3 test/functional/test_runner.py --no-build --jobs 2 --timeout 300
+          --tmpdir "$RUNNER_TEMP/functional" --cachedir "$RUNNER_TEMP/functional-cache" --keep-failed
+      - name: Node logs of failed tests
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: functional-logs
+          path: ${{ runner.temp }}/functional
+          retention-days: 7
 
   # Vendored fork: PQClean source pin (VENDOR.toml), and the Falcon
   # clean-variant guard. (The libp2p-yamux fork was retired with libp2p 0.57,
@@ -179,6 +241,21 @@ jobs:
           test "$rebuilt" = "$pinned"
           # The script re-pins and refreshes the SRI hashes: nothing may change.
           git diff --exit-code -- site/
+
+  # The site's JavaScript tests (site/tests, Node's built-in runner, no npm
+  # dependencies): the committed wallet core loaded as the page loads it
+  # (pinned-hash refusal, phrase-backed create/restore, verified plan/pay,
+  # coinbase maturity), the SRI attributes, the explorer's HTML escaping and
+  # the Worker's security headers and origins.
+  site-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: node --test site/tests
+        run: node --test site/tests/*.test.mjs
 
   clippy:
     runs-on: ubuntu-latest
@@ -250,6 +327,11 @@ jobs:
         run: sh scripts/sanitizers.sh ubsan
       - name: UBSan on a CPU without AVX2 (clean ML-DSA C code; ML-DSA, wallet signing and ACVP tests)
         run: sh scripts/sanitizers.sh ubsan-noavx2
+      # The whole gnb-crypto suite on that CPU: about 10 minutes of emulation
+      # (the keystore KDFs), so nightly and on demand only.
+      - name: UBSan on a CPU without AVX2, every gnb-crypto test (nightly)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: sh scripts/sanitizers.sh ubsan-noavx2-full
 
   # Miri: undefined behaviour in the pure-Rust consensus arithmetic (gnb-smh
   # difficulty/compact/ASERT/work, gnb-crypto core::limits, tokenomics,
@@ -257,10 +339,12 @@ jobs:
   # pqcrypto-internals; then gnb-smh (with the Python PoW vectors) on a
   # 32-bit and a big-endian target, and the wasm wallet's C ABI on i686.
   # Miri-incompatible tests carry #[cfg_attr(miri, ignore = "<why>")]; the
-  # script fails a step whose passed-test count drops below its minimum.
+  # script fails a step whose passed-test count drops below its minimum, and
+  # bounds each Miri command at 30 minutes (SANITIZER_MIRI_TIMEOUT): a test
+  # Miri cannot finish would otherwise hold the job until its timeout.
   miri:
     runs-on: ubuntu-latest
-    timeout-minutes: 120   # local reference: about 15 minutes in total
+    timeout-minutes: 75   # about 15 minutes in total, locally and on GitHub
     steps:
       - uses: actions/checkout@v4
       - name: Nightly toolchain with Miri (pinned)
@@ -275,6 +359,25 @@ jobs:
         run: sh scripts/sanitizers.sh miri
       - name: Miri (gnb-smh on i686 and s390x, gnb-wallet-wasm C ABI on i686)
         run: sh scripts/sanitizers.sh miri-cross
+
+  # The node itself (gnb: RocksDB, libp2p, every unit and integration test) on
+  # i686. Its untrusted-input decoders must give a 32-bit build the verdicts
+  # a 64-bit one gives: bincode truncates declared lengths there (found by
+  # this run; node/src/network/mod.rs). About 25 minutes of building and
+  # testing, so nightly and on demand only.
+  i686-node:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: 32-bit target, multilib gcc and g++, libclang (RocksDB, PQClean C)
+        run: |
+          sudo apt-get update && sudo apt-get install -y g++-multilib clang libclang-dev
+          cargo --version   # installs the rust-toolchain.toml toolchain
+          rustup target add i686-unknown-linux-gnu
+      - name: gnb (lib, bins, integration tests) on i686
+        run: sh scripts/sanitizers.sh i686-node
 
   # 32-bit build and tests (usize = 32 bits: the CRY-8 overflow class) of the
   # consensus crates and the wasm wallet core on i686-unknown-linux-gnu,
@@ -291,29 +394,13 @@ jobs:
       - name: gnb-smh, gnb-crypto, coherence-core, pqcrypto-internals, gnb-wallet-wasm on i686
         run: sh scripts/sanitizers.sh i686
 
-  # Builds every cargo-fuzz target (node/fuzz, nightly + libFuzzer) and runs
-  # each briefly over its committed seed corpus.
+  # Builds every cargo-fuzz target (node/fuzz, nightly + libFuzzer + ASan) and
+  # runs each for 60 s over its committed seed corpus, on pull requests and
+  # the nightly run; crash reproducers are uploaded as the `fuzz-artifacts`
+  # artifact. Defined in fuzz.yml, which also runs the weekly 10-minute
+  # campaign (docs/testing/FUZZING.md).
   fuzz:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: System dependencies (librocksdb-sys needs clang/libclang)
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-      - name: Nightly toolchain
-        run: rustup toolchain install nightly --profile minimal
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-fuzz
-      - name: Start from the audited lockfile
-        run: cp Cargo.lock node/fuzz/Cargo.lock
-      - name: Build all fuzz targets
-        working-directory: node/fuzz
-        run: cargo +nightly fuzz build
-      - name: Smoke-run each target over its seed corpus
-        working-directory: node/fuzz
-        run: |
-          for t in $(cargo +nightly fuzz list); do
-            mkdir -p "corpus/$t"
-            cargo +nightly fuzz run "$t" "corpus/$t" -- -max_total_time=30 -rss_limit_mb=4096
-          done
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/fuzz.yml
+    with:
+      seconds: 60

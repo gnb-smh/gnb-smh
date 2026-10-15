@@ -11,6 +11,9 @@
 #   sh scripts/sanitizers.sh ubsan-noavx2
 #                                        the UBSan ML-DSA tests on an emulated CPU without AVX2
 #                                        (qemu-user), so the CLEAN ML-DSA C code runs
+#   sh scripts/sanitizers.sh ubsan-noavx2-full
+#                                        every gnb-crypto lib and integration test on that CPU
+#                                        (about 10 minutes; CI runs it nightly)
 #   sh scripts/sanitizers.sh miri        Miri: consensus arithmetic (gnb-smh, gnb-crypto core),
 #                                        the unsafe code of pqcrypto-internals (nightly + miri)
 #   sh scripts/sanitizers.sh miri-cross  Miri: gnb-smh on a 32-bit (i686) and a big-endian (s390x)
@@ -18,6 +21,10 @@
 #   sh scripts/sanitizers.sh i686        the consensus crates' and the wasm wallet core's full test
 #                                        suites on i686-unknown-linux-gnu (pinned toolchain,
 #                                        gcc-multilib)
+#   sh scripts/sanitizers.sh i686-node   the node's (gnb) unit and integration tests on
+#                                        i686-unknown-linux-gnu: RocksDB and the other C/C++
+#                                        dependencies built for 32 bits (g++-multilib, libclang;
+#                                        about 25 minutes, CI runs it nightly)
 #
 # Each mode builds into its own directory, $SANITIZER_TARGET_DIR/<mode>
 # (default target/sanitizers/<mode>), so sanitizer flags never reach the
@@ -63,18 +70,41 @@ expect_passed() { # <min passed> <command...>
   min=$1
   shift
   mkdir -p "$root"
-  log="$root/expect-passed.log"
+  # One log per script run: two modes run at once over the same
+  # $SANITIZER_TARGET_DIR must not truncate each other's log (that lost
+  # `test result:` lines and failed a passing run).
+  log="$root/expect-passed.$$.log"
   { rc=0; "$@" 2>&1 || rc=$?; echo "$rc" >"$log.rc"; } | tee "$log"
   rc=$(cat "$log.rc")
   if [ "$rc" -ne 0 ]; then
     exit "$rc"
   fi
   passed=$(sed -n 's/.*test result:.* \([0-9][0-9]*\) passed;.*/\1/p' "$log" | awk '{ n += $1 } END { print n + 0 }')
+  rm -f "$log" "$log.rc"
   if [ "$passed" -lt "$min" ]; then
     echo "sanitizers: $passed tests passed, expected at least $min: $*" >&2
     exit 1
   fi
   echo "sanitizers: $passed tests passed (at least $min expected): $*"
+}
+
+# A test that Miri cannot finish in reasonable time (an input of 10^5 or more
+# elements, thousands of hash compressions) does not fail under Miri: it
+# runs until the CI job times out (the miri jobs of the merge commit 299a718
+# were still in their host step after 115 minutes). Each Miri
+# command therefore gets a wall-clock bound of SANITIZER_MIRI_TIMEOUT seconds
+# (default 1800, about six times the slowest command, the gnb-crypto
+# selection) and fails with the remedy. timeout(1) signals its whole process
+# group, so the interpreted test process stops too.
+miri_timeout=${SANITIZER_MIRI_TIMEOUT:-1800}
+with_miri_timeout() { # <command...>
+  rc=0
+  timeout --kill-after=30 "$miri_timeout" "$@" || rc=$?
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    echo "sanitizers: no result after $miri_timeout s under Miri: $*" >&2
+    echo "sanitizers: a test Miri cannot finish (large inputs, heavy hashing) needs #[cfg_attr(miri, ignore = \"<why>\")]; PQClean C fails instead (unsupported foreign call) and needs the same" >&2
+  fi
+  return "$rc"
 }
 
 asan() {
@@ -143,16 +173,50 @@ ubsan_noavx2() {
   expect_passed 3 qemu-x86_64 -cpu Nehalem "$acvp"
 }
 
+# Runs each test binary to completion on the Nehalem CPU; stops at the first
+# failure.
+nehalem_each() { # <test binary>...
+  for b in "$@"; do
+    echo "sanitizers: qemu-x86_64 -cpu Nehalem $b"
+    qemu-x86_64 -cpu Nehalem "$b" || return $?
+  done
+}
+
+# The whole gnb-crypto suite (every lib and integration test, the keystore
+# KDFs included) on the Nehalem CPU, under UBSan: about 10 minutes of
+# emulation, so CI runs it on the nightly schedule only.
+ubsan_noavx2_full() {
+  ubsan_env
+  bins=$(cargo test --locked --target "$host" -p gnb-crypto --lib --tests --no-run --message-format=json \
+    | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p')
+  n=0
+  for b in $bins; do
+    [ -x "$b" ] || { echo "sanitizers: missing UBSan test binary '$b'" >&2; exit 1; }
+    n=$((n + 1))
+  done
+  if [ "$n" -lt 2 ]; then
+    echo "sanitizers: expected the gnb-crypto lib and integration test binaries, found $n" >&2
+    exit 1
+  fi
+  cd crates/gnb-crypto # where cargo runs this crate's tests
+  # shellcheck disable=SC2086 # one word per binary path
+  expect_passed 363 nehalem_each $bins
+}
+
 miri() {
   export CARGO_TARGET_DIR="$root/miri"
   export MIRIFLAGS="${MIRIFLAGS:--Zmiri-strict-provenance}"
-  # Tests that cannot run under Miri carry #[cfg_attr(miri, ignore = "<why>")].
-  expect_passed 30 cargo +"$nightly" miri test --locked -p gnb-smh
-  expect_passed 42 cargo +"$nightly" miri test --locked -p gnb-crypto --lib -- \
+  # Tests that cannot run under Miri carry #[cfg_attr(miri, ignore = "<why>")]:
+  # the PQClean C code (Miri cannot call it: the test fails) and inputs too
+  # large to interpret (the test never ends: with_miri_timeout). A new test
+  # in gnb-smh or in the gnb-crypto modules selected below needs one if it
+  # does either.
+  expect_passed 30 with_miri_timeout cargo +"$nightly" miri test --locked -p gnb-smh
+  expect_passed 42 with_miri_timeout cargo +"$nightly" miri test --locked -p gnb-crypto --lib -- \
     core::limits:: core::tokenomics:: core::block_rules:: core::sighash:: core::activation::
   # Library tests only: tests/vendor_pin.rs reads files (Miri isolation) and
   # has no unsafe code.
-  expect_passed 15 cargo +"$nightly" miri test --locked -p pqcrypto-internals --lib
+  expect_passed 15 with_miri_timeout cargo +"$nightly" miri test --locked -p pqcrypto-internals --lib
 }
 
 miri_cross() {
@@ -161,7 +225,7 @@ miri_cross() {
   # gnb-smh has no C code, so Miri can interpret it for any target. Its Python
   # PoW vectors (log2_n <= 2) check every byte-order site on s390x.
   for t in i686-unknown-linux-gnu s390x-unknown-linux-gnu; do
-    expect_passed 30 cargo +"$nightly" miri test --locked -p gnb-smh --target "$t"
+    expect_passed 30 with_miri_timeout cargo +"$nightly" miri test --locked -p gnb-smh --target "$t"
   done
   # The wasm wallet's C ABI (gnb_alloc / gnb_call / gnb_free) packs a 32-bit
   # pointer into a u64, so its round trip runs on a 32-bit target. Its
@@ -169,7 +233,7 @@ miri_cross() {
   # Miri never runs it (the signing test is ignored under Miri). Pointers
   # cross the ABI as integers (as from JavaScript): permissive provenance.
   export MIRIFLAGS=-Zmiri-permissive-provenance
-  expect_passed 3 cargo +"$nightly" miri test --locked -p gnb-wallet-wasm --target i686-unknown-linux-gnu --lib
+  expect_passed 3 with_miri_timeout cargo +"$nightly" miri test --locked -p gnb-wallet-wasm --target i686-unknown-linux-gnu --lib
 }
 
 i686() {
@@ -181,15 +245,26 @@ i686() {
   done
 }
 
+# The node on a 32-bit target: every test target of gnb (lib, bins,
+# integration tests). Its untrusted-input decoders must give a 32-bit build
+# the verdicts a 64-bit one gives (bincode truncated declared lengths there,
+# see node/src/network/mod.rs).
+i686_node() {
+  export CARGO_TARGET_DIR="$root/i686-node"
+  cargo test --locked --target i686-unknown-linux-gnu -p gnb --no-fail-fast
+}
+
 case "$mode" in
   asan) asan ;;
   ubsan) ubsan ;;
   ubsan-noavx2) ubsan_noavx2 ;;
+  ubsan-noavx2-full) ubsan_noavx2_full ;;
   miri) miri ;;
   miri-cross) miri_cross ;;
   i686) i686 ;;
+  i686-node) i686_node ;;
   *)
-    echo "usage: sh scripts/sanitizers.sh asan|ubsan|ubsan-noavx2|miri|miri-cross|i686" >&2
+    echo "usage: sh scripts/sanitizers.sh asan|ubsan|ubsan-noavx2|ubsan-noavx2-full|miri|miri-cross|i686|i686-node" >&2
     exit 2
     ;;
 esac

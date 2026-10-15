@@ -120,16 +120,21 @@ class Reader:
         return struct.unpack("<Q", self.take(8))[0]
 
     def varint(self) -> int:
-        """Bitcoin varint; a non-minimal encoding is accepted here and caught
-        by the canonical re-encoding check."""
+        """Bitcoin CompactSize. Only the minimal encoding of a value is
+        accepted, as by the node's decoder (`read_varint` in gnb-crypto
+        core): FD needs a value >= 0xFD, FE >= 0x10000, FF >= 0x100000000."""
         tag = self.take(1)[0]
         if tag == 0xFF:
-            return self.u64()
-        if tag == 0xFE:
-            return self.u32()
-        if tag == 0xFD:
-            return struct.unpack("<H", self.take(2))[0]
-        return tag
+            v, least = self.u64(), 0x1_0000_0000
+        elif tag == 0xFE:
+            v, least = self.u32(), 0x1_0000
+        elif tag == 0xFD:
+            v, least = struct.unpack("<H", self.take(2))[0], 0xFD
+        else:
+            return tag
+        if v < least:
+            raise DecodeError("non-canonical varint")
+        return v
 
 
 def read_tx(r: Reader) -> mk.Tx:
@@ -209,26 +214,20 @@ def decode_block(b: bytes) -> Block:
     parents = [r.take(32) for _ in range(n)]
     merkle_root = r.take(32)
     timestamp, bits, nonce, blue, height = r.u64(), r.u32(), r.u64(), r.u64(), r.u64()
-    body = b[r.pos:]
-    rb = Reader(body)
-    count = rb.varint()
+    count = r.varint()
     if count > MAX_BLOCK_TXS:
         raise DecodeError("implausible tx count")
-    offset = rb.pos
-    txs = []
-    for _ in range(count):
-        tx = read_tx(Reader(body[offset:]))
-        # The Rust decoder advances by the CANONICAL length of each
-        # transaction (a non-minimal varint inside one misaligns the rest).
-        offset += len(tx.wire(True))
-        txs.append(tx)
-    rs = Reader(body[offset:])
-    n_shielded = rs.varint()
+    # Each transaction starts where the previous one ENDED (the bytes its
+    # decoder consumed). With minimal varints that is also its canonical
+    # length, so an accepted block is exactly the encoding of what it decodes
+    # to (the node's `Transaction::read_wire_bytes` framing).
+    txs = [read_tx(r) for _ in range(count)]
+    n_shielded = r.varint()
     if n_shielded > MAX_SHIELDED_TXS:
         raise DecodeError("implausible shielded count")
     if n_shielded:
         raise NotImplementedError("shielded transactions are not modelled by this reference")
-    if offset + rs.pos != len(body):
+    if r.pos != len(b):
         raise DecodeError("trailing bytes in block body")
     return Block(Header(version, parents, merkle_root, timestamp, bits, nonce), txs, blue, height)
 

@@ -39,7 +39,7 @@ What the vectors do NOT pin:
 | What | Where |
 | --- | --- |
 | Transaction vectors (187 cases) | `reference/tx_vectors.json` |
-| Block vectors (100 cases) | `reference/block_vectors.json` |
+| Block vectors (102 cases) | `reference/block_vectors.json` |
 | Generator (deterministic Rust, seeded keys and signatures) | `crates/gnb-crypto/tests/gen_consensus_vectors.rs` |
 | Runner through gnb-crypto (real pow limit, explicit chain ids) | `crates/gnb-crypto/tests/consensus_vectors.rs` |
 | Runner through the node (connect path, mempool admission, testnet) | `node/tests/consensus_vectors.rs` |
@@ -407,13 +407,14 @@ Transactions (187: 98 pre-activation, 89 post-activation; 66 valid; 182 on mainn
 | `tx64/` | 8 | 63 / 64 / 65-byte txid preimages in both regimes; the mainnet boundary |
 | `bip30/` | 2 | an output on an unspent coin's outpoint (valid pre, invalid post) |
 
-Blocks (100: 41 pre-activation, 59 post-activation; 34 valid):
+Blocks (102: 42 pre-activation, 60 post-activation; 34 valid):
 
 | Area | Cases | What |
 | --- | --- | --- |
 | `basic/`, `order/` | 10 | coinbase only, coinbase and spend, a spend of an earlier transaction in the block, the reverse order, two transactions spending one coin |
 | `merkle/`, `dup/` | 10 | the other regime's root, a zero root, a three-transaction block and its CVE-2012-2459 mutation (duplicate-tx pre, bad root post), a duplicated transaction |
 | `coinbase/` | 23 | not first, two coinbases, no transactions, two / zero outputs, subsidy + 1, subsidy + fees (exact and + 1), paying zero, above `MAX_SUPPLY_SAT`, the halving at 4,204,800 |
+| `decode/` | 2 | a valid block's bytes with one varint in the non-minimal 3-byte form (the transaction count post; a coinbase script_sig length pre, with a coinbase locktime ending `FD 00` so that the decoder before the rule, which framed each transaction at its re-encoded length, accepted the bytes as the same block): the decoder accepts only minimal varints, at every height (docs/CONSENSUS.md, "Wire encoding"). The decoder before the rule (the Python reference before H-fuzz too) accepts both byte strings |
 | `commitment/`, `structure/` | 17 | two parents; script_sig of 79 bytes; bad tag; height + 1 and big-endian; parents reordered and dropped; witness root zero, over txids, and with the coinbase's own wtxid; 10,000-byte script_sig (valid) and one byte more (decode); a wrong commitment ignored pre; the mainnet boundary; 256 parents (valid) and 257 (decode) |
 | `same-block-coinbase/` | 3 | valid pre; `connect` scope post; `full` scope post (the commitment cannot match) |
 | `pow/` | 13 | the GnB-SMH proof at the genesis target: a mined nonce (valid) and a failing nonce (`bad-pow`), post; 0x2100ffff evaluated pre (limit only), refused post; the genesis target exactly and one unit above, in both regimes; the mainnet boundary; four malformed bits |

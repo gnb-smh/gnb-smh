@@ -1,0 +1,124 @@
+name: fuzz
+
+# Builds every cargo-fuzz target of node/fuzz (nightly, libFuzzer, ASan) and
+# runs each one over its committed seed corpus for a fixed time.
+#
+# * pull requests and the nightly CI run call this workflow from ci.yml with
+#   60 s per target;
+# * the weekly schedule below runs the 10-minute-per-target campaign;
+# * a manual run takes the time per target as input.
+#
+# Any crash, leak, timeout or out-of-memory input fails the run; every
+# reproducer libFuzzer wrote (node/fuzz/artifacts/<target>/) is uploaded as
+# the `fuzz-artifacts` artifact. Reproduce one locally with
+#   cargo +nightly fuzz run <target> <artifact file>
+# (docs/testing/FUZZING.md). A `cargo fuzz list` that fails or does not list
+# every [[bin]] of node/fuzz/Cargo.toml, or a target without a committed
+# seed corpus, also fails the run.
+
+on:
+  workflow_call:
+    inputs:
+      seconds:
+        description: Seconds of fuzzing per target
+        type: number
+        default: 60
+  schedule:
+    - cron: "23 6 * * 0" # weekly (Sunday): 10 minutes per target; not mutants.yml's minute (41 4)
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds of fuzzing per target
+        default: "600"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned nightly (cargo-fuzz needs nightly for the sanitizer flags). Bump
+  # it deliberately: a moving nightly makes runs non-reproducible.
+  FUZZ_TOOLCHAIN: nightly-2026-10-14
+  # Explicit target: cargo-fuzz defaults to the triple it was built for, and
+  # the prebuilt binary that install-action fetches is a musl build, whose
+  # statically linked libc ASan cannot instrument.
+  FUZZ_TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      FUZZ_SECONDS: ${{ inputs.seconds || 600 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies (librocksdb-sys needs clang/libclang)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: Nightly toolchain (pinned)
+        run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # Downloaded sources only. The ASan target directory (about 5 GB of
+      # dependencies plus about 0.4 GB per target binary) is not cached: it
+      # would take most of the repository's 10 GB cache budget from the
+      # other jobs, and every change to the node's code rebuilds the targets
+      # anyway. The key names the toolchain so a cache entry can never
+      # outlive the toolchain it was made with.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: fuzz-${{ runner.os }}-${{ env.FUZZ_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', 'node/fuzz/Cargo.toml') }}
+      - name: Start from the audited lockfile
+        run: cp Cargo.lock node/fuzz/Cargo.lock
+      - name: Build all fuzz targets (ASan)
+        working-directory: node/fuzz
+        run: cargo +"$FUZZ_TOOLCHAIN" fuzz build --target "$FUZZ_TARGET"
+      - name: Run each target over its seed corpus
+        working-directory: node/fuzz
+        run: |
+          # The target list must be the [[bin]] list of Cargo.toml: a failing
+          # or empty `cargo fuzz list` must fail the job, never run nothing
+          # (a failure inside `for t in $(...)` would not stop the step).
+          targets=$(cargo +"$FUZZ_TOOLCHAIN" fuzz list)
+          expected=$(grep -c '^\[\[bin\]\]' Cargo.toml || true)
+          count=$(printf '%s\n' "$targets" | grep -c . || true)
+          if [ "$expected" -lt 1 ] || [ "$count" -ne "$expected" ]; then
+            echo "::error::cargo fuzz list printed $count targets; Cargo.toml declares $expected"
+            exit 1
+          fi
+          echo "$count targets: $(echo $targets)"
+          failed=""
+          for t in $targets; do
+            # Every target starts from a committed seed corpus.
+            if [ -z "$(ls -A "corpus/$t" 2>/dev/null)" ]; then
+              echo "::error::$t has no committed seed corpus (corpus/$t)"
+              failed="$failed $t"
+              continue
+            fi
+            mkdir -p "artifacts/$t"
+            echo "::group::$t ($FUZZ_SECONDS s)"
+            # The committed corpus is the input; new coverage goes to a
+            # scratch directory so the run never edits the checkout.
+            mkdir -p "/tmp/fuzz-new/$t"
+            if ! cargo +"$FUZZ_TOOLCHAIN" fuzz run --target "$FUZZ_TARGET" "$t" "/tmp/fuzz-new/$t" "corpus/$t" -- \
+                -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048 -timeout=120 \
+                -print_final_stats=1; then
+              failed="$failed $t"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::fuzz targets failed:$failed"
+            exit 1
+          fi
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: node/fuzz/artifacts
+          if-no-files-found: ignore

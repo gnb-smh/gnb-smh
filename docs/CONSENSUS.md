@@ -122,6 +122,110 @@ Structural checks (size, merkle root, coinbase shape, duplicates, dust, and
 at/after the activation the 64-byte rule and the coinbase commitment) run
 before `accept_block` on every ingress path.
 
+## Wire encoding (all heights)
+
+Blocks are relayed (gossip `NewBlock`, `/gnb/sync/1` block responses,
+`submitblock`) and stored in the encoding of `Block::to_wire_bytes`; a
+transaction alone (gossip, `sendrawtransaction`) in that of
+`Transaction::to_wire_bytes(true)`:
+
+```text
+block      = header ‖ varint(n_tx) ‖ tx* ‖ varint(n_shielded) ‖ shielded_tx*
+header     = version u32le ‖ varint(n_parents) ‖ parent* (32 bytes) ‖ merkle_root
+             ‖ timestamp u64le ‖ bits u32le ‖ nonce u64le ‖ blue_score u64le ‖ height u64le
+tx         = version u32le ‖ varint(n_in) ‖ input* ‖ varint(n_out) ‖ output* ‖ locktime u32le
+input      = prev_txid (32 bytes) ‖ prev_index u32le ‖ varint(len) ‖ script_sig ‖ sequence u32le
+output     = value u64le ‖ varint(len) ‖ script_pubkey
+varint(v)  = v (one byte)            if v < 0xFD
+           = 0xFD ‖ u16le(v)         if 0xFD <= v <= 0xFFFF
+           = 0xFE ‖ u32le(v)         if 0x10000 <= v <= 0xFFFFFFFF
+           = 0xFF ‖ u64le(v)         otherwise
+```
+
+(`shielded_tx` uses the same varint for its counts and lengths; no shielded
+transaction is valid today.) The decoders (`Block::from_wire_bytes`,
+`BlockHeader::from_wire_bytes`, `Transaction::from_wire_bytes`) accept exactly
+this encoding, as Bitcoin Core's `ReadCompactSize` does:
+
+1. a varint in a longer form than its value needs is refused (`FD 05 00` for
+   5, an `FE` form below 0x10000, an `FF` form below 2^32;
+   `non-canonical varint`);
+2. each transaction of a block starts where the previous one ended, at the
+   bytes its decoder consumed (`Transaction::read_wire_bytes`);
+3. no byte may follow the block, and the gossip / RPC transaction decoder
+   (`admission::decode_tx_strict`) refuses bytes after a transaction.
+
+So a byte string that decodes is exactly `to_wire_bytes` of what it decodes
+to: every block and transaction has one encoding. This is a decoding rule,
+not a validity rule, and it applies at every height (no activation). It does
+not change which blocks are valid. The block id commits to `pow_preimage`
+(fixed-width fields, the parent count as u32le) and the nonce, and txids,
+wtxids, the Merkle roots, the coinbase commitment and the block size are all
+computed from the canonical encodings of the decoded transactions, so the
+id and validity of a block never depended on how its varints were written.
+Every block has its minimal encoding, which the decoders read as before (with
+minimal varints the bytes a transaction consumes are its canonical length).
+Every encoder in the code base (`write_varint`, used by the node, its miner
+and templates, the wallets and the WASM wallet core) writes only minimal
+varints (`core::wire_canonical_tests::varint_minimality_boundaries`), and the
+node stores blocks as `to_wire_bytes()` and serves those bytes to sync
+requests and gossip. An external miner that assembles a block from
+`getblocktemplate` must write the transaction count and the coinbase's
+varints minimally, as Bitcoin's CompactSize writers do: `submitblock` refuses
+other bytes (`deserialise failed: ... non-canonical varint`).
+
+What changed (H-fuzz, found by the fuzz target `wire_roundtrip`) is which
+byte strings are accepted for an already valid block id. A widened varint
+used to be accepted, so one block had many encodings. A widened varint
+inside a transaction also made the block decoder frame the next transaction,
+or the shielded count, at the re-encoded length, which is fewer bytes than
+the decoder consumed, so the body decoded from inside the previous
+transaction. Such bytes are now refused before the block id is computed:
+nothing is recorded about the id (no invalid mark, no orphan entry), the copy
+is dropped, and the block is accepted from its canonical encoding, for
+example from another relay or when a descendant's missing parent is fetched
+by directed sync. Vectors: `decode/non-minimal-tx-count/post` and
+`decode/non-minimal-script-sig-length/pre` (blocks; the decoder before the
+rule accepts both byte strings, the second only through its framing at the
+re-encoded length), `decode/non-minimal-varint` (transactions);
+`core::wire_canonical_tests`; `node/tests/fuzz_regressions.rs`.
+
+Mixed versions. A release without this rule (origin/main before H-fuzz)
+accepts a widened encoding of a valid block, answers `Accept`, and gossipsub
+forwards the bytes it received. Anyone can widen a varint of a fresh block
+and hand that copy to such nodes first, so an honest older node can deliver
+widened bytes to an upgraded one. The upgraded node therefore answers a
+`NewBlock` whose `block_data` fails with the minimal-varint error
+(`core::is_non_minimal_varint_error`) with `Ignore`: not relayed, no gossipsub
+invalid-delivery (P4) penalty, nothing recorded
+(`ingress::verdict_for_block_decode_error`). Every other malformed body is
+still `Reject` (P4 penalty on the delivering peer). With `Reject`, three such
+frames from one older peer within a couple of minutes (block topic: weight
+0.5, -100 per invalid delivery squared, decay 0.5 per minute) would pass the
+graylist threshold (-400) and the upgraded node would ignore all of that
+peer's gossip. The classification covers every older relay: the two
+decoders read the same fields with the same checks and differ only in the
+varint rule and in where the next transaction starts after a widened varint,
+so every byte string the older decoder accepts and this one refuses fails on
+a non-minimal varint
+(`core::wire_canonical_tests::pre_fix_acceptances_fail_on_a_non_minimal_varint`,
+`node/tests/fix_net_ingress.rs::widened_block_varints_are_ignored_and_other_malformed_bodies_rejected`).
+A party sending such bytes directly is not penalized either; it costs the
+receiver one decode. The same holds for the gossip envelope: a non-canonical
+bincode frame (`WireDecodeError::NonCanonical`) of a `NewBlock` or
+`NewTransaction`, the messages that nodes relay after validating them, is
+dropped without penalty (an older release relays it), while a non-canonical
+frame of any other message, which no honest node relays, is a penalized
+protocol violation (`network::tests::non_canonical_relayable_frames_are_dropped_without_penalty`).
+The transaction bytes inside a `NewTransaction` need no such rule: the older
+gossip decoder (`admission::decode_tx_strict`) already refused a transaction
+that is not its canonical length, so older nodes never relay a widened
+transaction. Once no
+release without the rule can be a peer, `Reject` can be restored for both
+classes; that needs a peer protocol version that older releases cannot
+advertise (they follow the hardening activation block, so the activation
+height cannot serve as the cut-off).
+
 ## GhostDAG
 
 k = 10. Blocks below the hardening activation height use the interval-index
@@ -1040,7 +1144,11 @@ roughly every 9 minutes. At the activation height itself the target steps
 back to at most the genesis target if the chain was running easier.
 `expected_bits_at(parent_time, height, activation)` is the real ASERT rule
 for any activation height. The dev-only `test-pow-limit` feature pins every
-target to `POW_LIMIT_BITS` and is rejected by the node binary.
+target to `POW_LIMIT_BITS`. A node binary built with it refuses mainnet, and
+an optimised (release-profile) one refuses every network
+(`test_pow_limit_guard` in `node/src/main.rs`; the node's own feature does
+not compile in a release build); only a debug test build runs, on
+`--testnet`, for the functional tests (`docs/testing/FUNCTIONAL.md`).
 
 ### Blocks stored before the upgrade (node-local)
 

@@ -428,6 +428,17 @@ pub struct SyncEntry {
 // String headers before the bounds check rejects it. That is bounded and
 // short-lived (not the multi-GB pre-allocation this fixes), but tightening it
 // to zero would need a custom `Deserialize` impl — not done here.
+//
+// 32-bit targets (i686, wasm32, 32-bit ARM; the audit's CRY-8 class): bincode
+// 2.0.1's serde bridge reads every sequence and map length with
+// `usize::decode`, which casts the declared u64 with `as usize`. There a
+// declared length of 2^32 + n decodes as n, so a frame every 64-bit node
+// rejects (it announces more bytes than it has) decoded on a 32-bit node into
+// a different message (found by running the node's tests on i686:
+// `wire_decode_rejects_multi_gb_declared_vec`, docs/testing/SANITIZERS.md).
+// The one-encoding rule (`WireDecodeError::NonCanonical`) refuses it on every
+// target: the decoded message re-encodes with a 1- to 5-byte length, not the
+// 9 bytes the frame used.
 
 /// Hard ceiling on any single gossip frame. Must match gossipsub's
 /// `max_transmit_size` configured in `run()`.
@@ -486,16 +497,37 @@ pub enum WireDecodeError {
     /// let an attacker make any request byte-unique (fresh gossip message id)
     /// and so bypass gossipsub's de-duplication.
     TrailingBytes(usize),
+    /// The frame decoded but is not the encoding of what it decoded to:
+    /// bincode accepts non-minimal varints (`FB 05 00` for 5), so without
+    /// this check one message had many byte encodings, each a fresh gossip
+    /// message id — the NET-7 de-duplication bypass without trailing bytes
+    /// (fuzz target `netmsg_decode`, docs/testing/FUZZING.md). A compliant
+    /// encoder never produces them.
+    ///
+    /// `relayable`: the message is one that nodes relay after validating it
+    /// (`NewBlock`, `NewTransaction`; see [`gossip_disposition`]). Releases
+    /// before this rule (origin/main) decode such a frame, accept the
+    /// message and gossipsub forwards the bytes they received, so it can be
+    /// delivered by an honest older relay: it is refused but not a protocol
+    /// violation ([`Self::is_protocol_violation`]), so it is dropped
+    /// without penalty. Any other message type is never relayed by an
+    /// honest node, so its non-canonical frame comes from its author.
+    NonCanonical { relayable: bool },
 }
 
 impl WireDecodeError {
-    /// Oversized and bounds-violating frames are deliberate protocol
-    /// violations — a compliant node cannot produce them. Malformed frames
-    /// may just be a newer/older protocol version.
+    /// Oversized, bounds-violating, padded and non-canonical frames are
+    /// deliberate protocol violations — a compliant node cannot produce them
+    /// — except a non-canonical frame of a relayable message, which an
+    /// honest older release relays (see [`WireDecodeError::NonCanonical`]).
+    /// Malformed frames may just be a newer/older protocol version.
     pub fn is_protocol_violation(&self) -> bool {
         matches!(
             self,
-            WireDecodeError::Oversized(_) | WireDecodeError::Bounds(_) | WireDecodeError::TrailingBytes(_)
+            WireDecodeError::Oversized(_)
+                | WireDecodeError::Bounds(_)
+                | WireDecodeError::TrailingBytes(_)
+                | WireDecodeError::NonCanonical { relayable: false }
         )
     }
 }
@@ -526,7 +558,13 @@ pub fn decode_wire_message(data: &[u8]) -> Result<NetworkMessage, WireDecodeErro
         Err(e) => return Err(WireDecodeError::Malformed(e.to_string())),
     };
     validate_wire_bounds(&msg)?;
-    Ok(msg)
+    // One encoding per message: the frame must be what the encoder writes.
+    match bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {
+        Ok(canonical) if canonical == data => Ok(msg),
+        _ => Err(WireDecodeError::NonCanonical {
+            relayable: matches!(msg, NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. }),
+        }),
+    }
 }
 
 /// Explicit bounds on every variable-length field of NetworkMessage.
@@ -617,7 +655,9 @@ pub enum WireReaction {
     /// `gossipsub.set_application_score`. With app_specific_weight 1.0 and
     /// graylist_threshold -400, the fourth violation graylists the peer.
     Penalize { error: WireDecodeError, score: f64 },
-    /// Malformed bincode — possibly benign version skew. Log-only, no penalty.
+    /// Malformed bincode — possibly benign version skew — or a non-canonical
+    /// frame of a relayable message (`WireDecodeError::NonCanonical`, which
+    /// an older release relays). Log-only, no penalty.
     IgnoreMalformed(String),
 }
 
@@ -652,10 +692,13 @@ impl WirePenaltyTracker {
     /// exact logic previously inline in `run()`:
     ///   - decodes via [`decode_wire_message`] (4 MiB frame/read limit +
     ///     post-decode bounds + no trailing bytes);
-    ///   - protocol violations (Oversized/Bounds/TrailingBytes) accumulate
+    ///   - protocol violations (Oversized/Bounds/TrailingBytes, and
+    ///     NonCanonical of a message that is never relayed) accumulate
     ///     [`WIRE_VIOLATION_PENALTY`] per offense, floored at
     ///     [`WIRE_PENALTY_FLOOR`];
-    ///   - plain-malformed frames are ignored (may be version skew).
+    ///   - plain-malformed frames and non-canonical frames of a relayable
+    ///     message (`NewBlock`, `NewTransaction`) are ignored (version skew:
+    ///     an older release accepts and relays the latter).
     pub fn classify(&mut self, peer: PeerId, data: &[u8]) -> WireReaction {
         match decode_wire_message(data) {
             Ok(msg) => WireReaction::Accept(msg),
@@ -1347,7 +1390,7 @@ impl NetworkNode {
         let mut recent_block_publishes: std::collections::HashMap<[u8; 32], std::time::Instant> =
             std::collections::HashMap::new();
         const REGOSSIP_SUPPRESS_TTL: Duration = Duration::from_secs(30);
-        let mut heartbeat   = tokio::time::interval(Duration::from_secs(30));
+        let mut heartbeat   = new_heartbeat();
         let mut save_peers  = tokio::time::interval(Duration::from_secs(60));
         // Sprint CC: periodic tip announce (every 60s).
         let mut tip_announce = tokio::time::interval(Duration::from_secs(60));
@@ -1412,6 +1455,21 @@ impl NetworkNode {
                                     recent_block_publishes.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
                                     recent_block_publishes.insert(*block_hash, now);
                                 }
+                                // Receipt trace of a gossiped transaction, off by
+                                // default (`GOSSIP_RX_TX_LOG_TARGET`): the
+                                // functional tests check with it that an invalid
+                                // transaction never reaches a peer. The decode
+                                // runs only when the trace is enabled.
+                                NetworkMessage::NewTransaction { tx_data, .. }
+                                    if log::log_enabled!(target: GOSSIP_RX_TX_LOG_TARGET, log::Level::Debug) =>
+                                {
+                                    match crate::core::Transaction::from_wire_bytes(tx_data) {
+                                        Ok(tx) => debug!(target: GOSSIP_RX_TX_LOG_TARGET, "← tx {} from {}",
+                                            hex::encode(&tx.txid()[..8]), propagation_source),
+                                        Err(_) => debug!(target: GOSSIP_RX_TX_LOG_TARGET, "← tx (undecodable, {} bytes) from {}",
+                                            tx_data.len(), propagation_source),
+                                    }
+                                }
                                 NetworkMessage::PeerTip { blue_score, height, .. }
                                 | NetworkMessage::Version { blue_score, height, .. } => {
                                     // NET-6: claims are attributed to their signed AUTHOR
@@ -1427,6 +1485,21 @@ impl NetworkNode {
                                             let ht = clamp_announced_blue_score(*height, our_count);
                                             peer_state.observe_claim(a, bs, ht, now);
                                             claim_ok = true;
+                                            // A claim ahead of us: pull the frontier
+                                            // from its AUTHOR, the peer known to have
+                                            // it. The processor's own pulls for this
+                                            // claim go to the selector's choice
+                                            // (rotation, NET-9), often a peer without
+                                            // the blocks. Tips answers are
+                                            // deduplicated by the frontier tracker, so
+                                            // the extra pull fetches nothing twice
+                                            // (Headers answers are not: header pulls
+                                            // stay with the processor). Bounded by
+                                            // the per-author claim limiter above.
+                                            if claim_warrants_directed_pull(bs, our_score) {
+                                                send_directed_pull(&mut swarm, &mut selector, &mut inflight_pull, a,
+                                                    NetworkMessage::GetTips, now);
+                                            }
                                         }
                                     }
                                     if let NetworkMessage::Version { version, user_agent, .. } = &msg {
@@ -1465,13 +1538,22 @@ impl NetworkNode {
                                 }
                             }
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                             info!("✓ connected: {}", peer_id);
                             // DO NOT call gossipsub.add_explicit_peer() here: explicit
                             // peers are excluded from the mesh (libp2p-gossipsub
                             // behaviour.rs), which once made the mesh unbuildable.
-                            peer_count = peer_count.saturating_add(1);
-                            crate::metrics::set_peer_count(peer_count as i64);
+                            let first_connection = num_established.get() == 1;
+                            // The count is of distinct peers, not connections, and the
+                            // processor (RPC `peers`, the miner's has-peers check) sees
+                            // it at once, not at the next 30 s heartbeat.
+                            if let Some(count) = peer_count_after_connect(peer_count, num_established.get()) {
+                                peer_count = count;
+                                crate::metrics::set_peer_count(peer_count as i64);
+                                sink.deliver(NetworkMessage::PeerCount {
+                                    count: peer_count, addresses: known_peers.iter().cloned().collect(),
+                                }, InboundOrigin::Local, "connect");
+                            }
                             peer_state.on_connect(peer_id, Instant::now());
                             selector.on_connect(peer_id);
                             // PROPAGAÇÃO-CHURN fix: persist only the canonical form of
@@ -1531,6 +1613,18 @@ impl NetworkNode {
                                 attempts: MAX_PULL_ATTEMPTS,
                                 tried: vec![peer_id],
                             }, peer_id));
+                            // Directed frontier exchange with the new peer: its tips,
+                            // asked of IT. The gossip announcements above reach a
+                            // second peer connecting within the same second as
+                            // byte-identical frames, which gossipsub drops as
+                            // duplicates, so a healed partition used to wait for
+                            // the 30 s nudge / 60 s announce (about 60 s;
+                            // test/functional/feature_partition_heal.py). Both ends
+                            // do this, so each learns the other's frontier now.
+                            if first_connection {
+                                send_directed_pull(&mut swarm, &mut selector, &mut inflight_pull, peer_id,
+                                    NetworkMessage::GetTips, now);
+                            }
                             drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, now);
                         }
                         // Mesh fix (fresh-joiner IBD): THIS event is the moment the
@@ -1567,9 +1661,12 @@ impl NetworkNode {
                         }
                         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                             info!("✗ disconnected: {}", peer_id);
-                            peer_count = peer_count.saturating_sub(1);
-                            crate::metrics::set_peer_count(peer_count as i64);
-                            if num_established == 0 {
+                            if let Some(count) = peer_count_after_disconnect(peer_count, num_established) {
+                                peer_count = count;
+                                crate::metrics::set_peer_count(peer_count as i64);
+                                sink.deliver(NetworkMessage::PeerCount {
+                                    count: peer_count, addresses: known_peers.iter().cloned().collect(),
+                                }, InboundOrigin::Local, "disconnect");
                                 peer_state.on_disconnect(&peer_id);
                                 selector.on_disconnect(&peer_id);
                                 if let Some(tx) = &self.peer_events {
@@ -1658,15 +1755,12 @@ impl NetworkNode {
                                 libp2p::request_response::Message::Response { request_id, response } => {
                                     let now = Instant::now();
                                     let entry = inflight_pull.remove(&request_id);
-                                    if matches!(response, sync_rr::SyncResponse::Busy) {
-                                        // NET-5: back-pressure, not an offence. Back
-                                        // off from this peer and retry elsewhere.
-                                        selector.on_busy(&peer, now);
-                                        if let Some((p, _)) = entry {
-                                            requeue_pull(&mut pending_pulls, p, peer);
-                                        }
-                                    } else {
-                                        selector.on_success(&peer);
+                                    // NET-5 / NET-9: selector bookkeeping, and Busy /
+                                    // BlockNotFound send the pull to another peer
+                                    // (`on_pull_response`); the processor still sees
+                                    // a NotFound below (NET-9 count).
+                                    on_pull_response(entry, &response, peer, &mut selector, &mut pending_pulls, now);
+                                    if !matches!(response, sync_rr::SyncResponse::Busy) {
                                         match response {
                                             sync_rr::SyncResponse::Peers { peers } => {
                                                 // NET-11: solicited addresses go to the
@@ -1971,6 +2065,97 @@ fn requeue_pull(pending: &mut std::collections::VecDeque<PendingPull>, mut p: Pe
     }
     if pending.len() < MAX_PENDING_PULLS {
         pending.push_back(p);
+    }
+}
+
+/// Log target of the debug-level receipt trace of gossiped transactions
+/// (`RUST_LOG=info,gnb_gossip_rx_tx=debug`). Every gossiped block is logged
+/// at info (`← block h=… <hash>`); transactions only with this target.
+pub const GOSSIP_RX_TX_LOG_TARGET: &str = "gnb_gossip_rx_tx";
+
+/// Period of the network heartbeat (peer count, housekeeping, re-subscribe,
+/// bootstrap re-dial with no peers).
+const HEARTBEAT_PERIOD: Duration = Duration::from_secs(30);
+
+/// The network heartbeat timer. Its first tick comes after one period, not
+/// at once: at start-up no connection is established yet, so an immediate
+/// tick saw 0 peers and re-dialed every bootstrap peer the swarm loop had
+/// just dialed (two connections per peer).
+fn new_heartbeat() -> tokio::time::Interval {
+    tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT_PERIOD, HEARTBEAT_PERIOD)
+}
+
+/// The distinct-peer count after a connection to a peer is established
+/// (`num_established`: that peer's connections, this one included), or
+/// `None` when it is unchanged: only a peer's first connection counts. The
+/// count (RPC `peers`, the miner's has-peers check) used to count
+/// connections, so a peer dialed twice counted twice.
+fn peer_count_after_connect(count: usize, num_established: u32) -> Option<usize> {
+    (num_established == 1).then(|| count.saturating_add(1))
+}
+
+/// The distinct-peer count after a connection to a peer is closed
+/// (`num_established`: that peer's connections still open), or `None` when
+/// it is unchanged: only a peer's last connection closing counts.
+fn peer_count_after_disconnect(count: usize, num_established: u32) -> Option<usize> {
+    (num_established == 0).then(|| count.saturating_sub(1))
+}
+
+/// Whether a tip claim, clamped to `claimed` (blue score), is worth a directed
+/// pull from its author: only a claim ahead of our own selected tip.
+fn claim_warrants_directed_pull(claimed: u64, our_score: u64) -> bool {
+    claimed > our_score
+}
+
+/// Send the pull `msg` (GetTips / GetHeaders / GetBlock / PeerRequest) to
+/// `peer` itself, bypassing the selector's choice: a request about THAT
+/// peer's state (its frontier on connect; the headers and frontier it claims
+/// to have). Never retried on another peer (`attempts` = MAX_PULL_ATTEMPTS);
+/// the answer flows through the same `on_pull_response` / processor path as
+/// any other pull.
+fn send_directed_pull(
+    swarm:    &mut libp2p::Swarm<BlochBehaviour>,
+    selector: &mut sync_rr::PullPeerSelector,
+    inflight: &mut std::collections::HashMap<libp2p::request_response::OutboundRequestId, (PendingPull, PeerId)>,
+    peer:     PeerId,
+    msg:      NetworkMessage,
+    now:      std::time::Instant,
+) {
+    let Some(req) = sync_rr::as_pull_request(&msg) else { return };
+    let id = swarm.behaviour_mut().sync_rr.send_request(&peer, req.clone());
+    debug!("→ directed pull [{}] to {} (its own state)", msg.kind_name(), peer);
+    selector.on_sent(peer, now);
+    inflight.insert(id, (PendingPull { msg, req, attempts: MAX_PULL_ATTEMPTS, tried: vec![peer] }, peer));
+}
+
+/// The answer `response` from `peer` to a directed pull (`entry`: the pull
+/// and the peer it was sent to, `None` for an unknown request id). Updates the
+/// selector (`Busy`: a short back-off; any other answer: a success) and puts
+/// the pull back in `pending` for ANOTHER peer when the answer does not
+/// complete it (`sync_rr::retry_pull_elsewhere`: `Busy`, and `BlockNotFound`,
+/// a peer that does not have the body; bounded by `MAX_PULL_ATTEMPTS`). Every
+/// other answer completes the pull. The swarm loop calls this for every
+/// response, so the retry decision is unit-tested where it is made:
+/// a `BlockNotFound` that completed the pull left a healing partition
+/// waiting for the 30-60 s sweeps (test/functional/feature_partition_heal.py).
+fn on_pull_response(
+    entry:    Option<(PendingPull, PeerId)>,
+    response: &sync_rr::SyncResponse,
+    peer:     PeerId,
+    selector: &mut sync_rr::PullPeerSelector,
+    pending:  &mut std::collections::VecDeque<PendingPull>,
+    now:      std::time::Instant,
+) {
+    if matches!(response, sync_rr::SyncResponse::Busy) {
+        // NET-5: back-pressure, not an offence.
+        selector.on_busy(&peer, now);
+    } else {
+        selector.on_success(&peer);
+    }
+    if sync_rr::retry_pull_elsewhere(response) {
+        if let Some((p, _)) = entry {
+            requeue_pull(pending, p, peer);
+        }
     }
 }
 
@@ -3095,6 +3280,137 @@ mod tests {
         }
     }
 
+    /// The frame must be the canonical encoding of the message it decodes to.
+    ///
+    /// (a) NET-7 on every target: a non-minimal varint (the enum tag, an
+    ///     integer field, a length) is a byte-distinct frame of the same
+    ///     message, so a fresh gossip message id. Each decoded before the
+    ///     check, on x86_64 too.
+    /// (b) CRY-8 on 32-bit targets: a `block_data` length of 2^32 + 3 written
+    ///     as a 9-byte varint, then 3 bytes. A 64-bit node rejects it (read
+    ///     limit); on i686 bincode truncated the length to 3 and the frame
+    ///     decoded as a 3-byte `block_data`. Now rejected on every target.
+    #[test]
+    fn wire_decode_requires_the_canonical_encoding() {
+        let msg = NetworkMessage::NewBlock {
+            block_hash: [0u8; 32],
+            blue_score: 5,
+            height:     9,
+            block_data: vec![7u8; 3],
+        };
+        let cfg = bincode::config::standard();
+        let enc = bincode::serde::encode_to_vec(&msg, cfg).unwrap();
+        assert!(decode_wire_message(&enc).is_ok(), "the canonical frame decodes");
+        // Layout guard: tag, 32 hash bytes, blue_score 5, height 9, len 3, data.
+        assert!(enc[0] < 0xFB, "single-byte enum tag");
+        assert_eq!(&enc[33..35], &[5, 9], "bincode encoding layout changed; update this test");
+        assert!(enc.ends_with(&[3, 7, 7, 7]), "bincode encoding layout changed; update this test");
+        let head = &enc[..enc.len() - 4];
+
+        let splice = |at: usize, len: usize, with: &[u8]| -> Vec<u8> {
+            let mut f = enc[..at].to_vec();
+            f.extend_from_slice(with);
+            f.extend_from_slice(&enc[at + len..]);
+            f
+        };
+        let mut non_minimal = vec![
+            ("enum tag as u16", splice(0, 1, &[0xFB, enc[0], 0])),
+            ("blue_score as u16", splice(33, 1, &[0xFB, 5, 0])),
+            ("height as u64", splice(34, 1, &[0xFD, 9, 0, 0, 0, 0, 0, 0, 0])),
+            ("length as u16", splice(head.len(), 1, &[0xFB, 3, 0])),
+            ("length as u32", splice(head.len(), 1, &[0xFC, 3, 0, 0, 0])),
+            ("length as u64", splice(head.len(), 1, &[0xFD, 3, 0, 0, 0, 0, 0, 0, 0])),
+        ];
+        let mut truncated = head.to_vec();
+        truncated.push(0xFD);
+        truncated.extend_from_slice(&((1u64 << 32) + 3).to_le_bytes());
+        truncated.extend_from_slice(&[7, 7, 7]);
+        non_minimal.push(("length 2^32 + 3", truncated));
+
+        for (what, frame) in &non_minimal {
+            // Every non-minimal frame still carries the same logical message:
+            // bincode itself accepts it (on 64-bit targets except the length
+            // of 2^32 + 3, which only 32-bit targets accept).
+            if *what != "length 2^32 + 3" || cfg!(target_pointer_width = "32") {
+                let (m, used): (NetworkMessage, usize) =
+                    bincode::serde::decode_from_slice(frame, cfg).expect(what);
+                assert_eq!(used, frame.len(), "{what}");
+                assert_eq!(
+                    bincode::serde::encode_to_vec(&m, cfg).unwrap(),
+                    enc,
+                    "{what}: the same message as the canonical frame"
+                );
+            }
+            match decode_wire_message(frame) {
+                // 64-bit targets: the 9-byte length announces 2^32 + 3 bytes
+                // and the frame ends after 3 (Malformed, as before).
+                Err(e) if *what == "length 2^32 + 3" && cfg!(target_pointer_width = "64") => {
+                    assert!(matches!(e, WireDecodeError::Malformed(_)), "{what}: {e:?}");
+                }
+                // A block announcement: refused, but an older release
+                // relays it, so not a protocol violation (no penalty).
+                Err(e) => {
+                    assert!(matches!(e, WireDecodeError::NonCanonical { relayable: true }), "{what}: {e:?}");
+                    assert!(!e.is_protocol_violation(), "{what}: {e:?}");
+                }
+                Ok(m) => panic!("{what}: a non-canonical frame must not decode, got {}", m.kind_name()),
+            }
+        }
+    }
+
+    /// Mixed-version rollout: releases before the one-encoding rule accept a
+    /// non-canonical `NewBlock` / `NewTransaction` frame and gossipsub relays
+    /// the bytes they received, so an upgraded node drops such a frame
+    /// WITHOUT penalty (four penalized frames would graylist an honest older
+    /// relay). A message that no honest node relays (here `GetHeaders`,
+    /// `PeerTip`) in a non-canonical frame comes from its author and is still
+    /// a penalized protocol violation.
+    #[test]
+    fn non_canonical_relayable_frames_are_dropped_without_penalty() {
+        let cfg = bincode::config::standard();
+        // Widen the varint at `at` (a value < 251) to bincode's 3-byte form.
+        let widen = |enc: &[u8], at: usize| -> Vec<u8> {
+            assert!(enc[at] < 0xFB);
+            let mut f = enc[..at].to_vec();
+            f.extend_from_slice(&[0xFB, enc[at], 0]);
+            f.extend_from_slice(&enc[at + 1..]);
+            f
+        };
+        let relayed = [
+            NetworkMessage::NewBlock { block_hash: [1; 32], blue_score: 5, height: 9, block_data: vec![7; 3] },
+            NetworkMessage::NewTransaction { txid: [2; 32], tx_data: vec![8; 4] },
+        ];
+        let authored = [
+            NetworkMessage::GetHeaders { from_blue_score: 5, limit: 9, nonce: 3 },
+            NetworkMessage::PeerTip { peer_id: "p".into(), blue_score: 5, height: 9 },
+        ];
+        let mut t = WirePenaltyTracker::new();
+        let peer = PeerId::random();
+        for (m, relayable) in relayed.iter().map(|m| (m, true)).chain(authored.iter().map(|m| (m, false))) {
+            let enc = bincode::serde::encode_to_vec(m, cfg).unwrap();
+            // The enum tag (index < 251) is the first byte of every frame.
+            let wide = widen(&enc, 0);
+            let (back, _): (NetworkMessage, usize) = bincode::serde::decode_from_slice(&wide, cfg).unwrap();
+            assert_eq!(bincode::serde::encode_to_vec(&back, cfg).unwrap(), enc, "{}: same message", m.kind_name());
+            match decode_wire_message(&wide) {
+                Err(e @ WireDecodeError::NonCanonical { .. }) => {
+                    assert!(matches!(e, WireDecodeError::NonCanonical { relayable: r } if r == relayable), "{e:?}");
+                    assert_eq!(e.is_protocol_violation(), !relayable, "{}", m.kind_name());
+                }
+                other => panic!("{}: {other:?}", m.kind_name()),
+            }
+            let before = t.score_of(&peer);
+            match t.classify(peer, &wide) {
+                WireReaction::IgnoreMalformed(_) if relayable => assert_eq!(t.score_of(&peer), before),
+                WireReaction::Penalize { error: WireDecodeError::NonCanonical { relayable: false }, score } if !relayable => {
+                    assert_eq!(score, before.unwrap_or(0.0) + WIRE_VIOLATION_PENALTY);
+                }
+                other => panic!("{}: {other:?}", m.kind_name()),
+            }
+        }
+        assert_eq!(t.score_of(&peer), Some(2.0 * WIRE_VIOLATION_PENALTY), "only the two authored frames were penalized");
+    }
+
     /// Gossip pulls and gossip responses are neither delivered nor relayed;
     /// blocks are deferred to the validating processor; local-only frames
     /// from peers are dropped.
@@ -3222,5 +3538,150 @@ mod tests {
             ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, &peers, false, &me, &HashSet::new());
         }
         assert!(book.len() <= pex_validator::PEX_MAX_PER_WINDOW);
+    }
+
+    // ── Directed-pull answers (`on_pull_response`) ──────────────────────────
+
+    use std::time::Instant;
+
+    fn get_block_pull(attempts: u8, tried: Vec<PeerId>) -> PendingPull {
+        let msg = NetworkMessage::GetBlock { block_hash: [5u8; 32], nonce: 1 };
+        let req = sync_rr::as_pull_request(&msg).expect("GetBlock is a directed pull");
+        PendingPull { msg, req, attempts, tried }
+    }
+
+    /// A selector with `peers` connected and one pull in flight to `sent_to`.
+    fn selector_with(peers: &[PeerId], sent_to: PeerId, now: Instant) -> sync_rr::PullPeerSelector {
+        let mut sel = sync_rr::PullPeerSelector::new(HashSet::new());
+        for p in peers {
+            sel.on_connect(*p);
+        }
+        sel.on_sent(sent_to, now);
+        sel
+    }
+
+    /// THE regression for the BlockNotFound retry (feature_partition_heal.py
+    /// waited 80 s to more than 120 s): a peer that does not have the body
+    /// answers NotFound, and the pull goes back in the queue, one attempt
+    /// used, that peer recorded as tried, so the next drain sends it to the
+    /// OTHER peer. The answer counts as a success for the answering peer (no
+    /// back-off). Deleting the requeue fails this test.
+    #[test]
+    fn block_not_found_requeues_the_pull_for_another_peer() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let now = Instant::now();
+        let mut sel = selector_with(&[a, b], a, now);
+        let mut pending = std::collections::VecDeque::new();
+        let not_found = sync_rr::SyncResponse::BlockNotFound { block_hash: [5u8; 32] };
+        on_pull_response(Some((get_block_pull(0, vec![]), a)), &not_found, a, &mut sel, &mut pending, now);
+
+        assert_eq!(pending.len(), 1, "the pull must be retried, not completed");
+        let p = &pending[0];
+        assert_eq!((p.attempts, p.tried.clone()), (1, vec![a]));
+        assert!(matches!(p.req, sync_rr::SyncRequest::GetBlock { block_hash } if block_hash == [5u8; 32]));
+        assert_eq!(sel.in_flight(&a), 0);
+        assert!(!sel.is_cooling_down(&a, now), "NotFound is an answer, not back-pressure");
+        assert_eq!(sel.select(now, &p.tried), Some(b), "the retry goes to the peer not tried yet");
+
+        // B does not have it either: the third attempt would exceed
+        // MAX_PULL_ATTEMPTS, so the pull is dropped (the processor's sweeps
+        // re-issue anything still needed).
+        let p = pending.pop_front().unwrap();
+        sel.on_sent(b, now);
+        on_pull_response(Some((p, b)), &not_found, b, &mut sel, &mut pending, now);
+        assert_eq!((pending.len(), pending[0].attempts, pending[0].tried.clone()), (1, 2, vec![a, b]));
+        let p = pending.pop_front().unwrap();
+        sel.on_sent(a, now);
+        on_pull_response(Some((p, a)), &not_found, a, &mut sel, &mut pending, now);
+        assert!(pending.is_empty(), "dropped after MAX_PULL_ATTEMPTS ({MAX_PULL_ATTEMPTS})");
+    }
+
+    /// Busy (NET-5): back-pressure. The peer backs off and the pull is
+    /// retried elsewhere.
+    #[test]
+    fn busy_backs_the_peer_off_and_requeues_the_pull() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let now = Instant::now();
+        let mut sel = selector_with(&[a, b], a, now);
+        let mut pending = std::collections::VecDeque::new();
+        on_pull_response(Some((get_block_pull(0, vec![]), a)), &sync_rr::SyncResponse::Busy, a,
+            &mut sel, &mut pending, now);
+        assert!(sel.is_cooling_down(&a, now));
+        assert_eq!(sel.in_flight(&a), 0);
+        assert_eq!((pending.len(), pending[0].attempts, pending[0].tried.clone()), (1, 1, vec![a]));
+        assert_eq!(sel.select(now, &[]), Some(b));
+    }
+
+    /// Every other answer completes the pull: nothing is requeued, and an
+    /// answer to an unknown request id requeues nothing either.
+    #[test]
+    fn answers_that_complete_a_pull_do_not_requeue_it() {
+        let entry = || SyncEntry { hash: [1u8; 32], blue_score: 1, height: 1 };
+        for resp in [
+            sync_rr::SyncResponse::Block { block_hash: [5u8; 32], blue_score: 1, height: 1, block_data: vec![1] },
+            sync_rr::SyncResponse::Headers { entries: vec![entry()] },
+            sync_rr::SyncResponse::Headers { entries: vec![] },
+            sync_rr::SyncResponse::Tips { tips: vec![entry()], locator: vec![] },
+            sync_rr::SyncResponse::Peers { peers: vec![] },
+        ] {
+            let a = PeerId::random();
+            let now = Instant::now();
+            let mut sel = selector_with(&[a], a, now);
+            let mut pending = std::collections::VecDeque::new();
+            on_pull_response(Some((get_block_pull(0, vec![]), a)), &resp, a, &mut sel, &mut pending, now);
+            assert!(pending.is_empty(), "{resp:?} completes the pull");
+            assert_eq!(sel.in_flight(&a), 0, "{resp:?}");
+            assert!(!sel.is_cooling_down(&a, now), "{resp:?}");
+        }
+        let a = PeerId::random();
+        let now = Instant::now();
+        let mut sel = selector_with(&[a], a, now);
+        let mut pending = std::collections::VecDeque::new();
+        on_pull_response(None, &sync_rr::SyncResponse::BlockNotFound { block_hash: [5u8; 32] }, a,
+            &mut sel, &mut pending, now);
+        assert!(pending.is_empty());
+        assert_eq!(sel.in_flight(&a), 0);
+    }
+
+    // ── Peer count and heartbeat ────────────────────────────────────────────
+
+    /// The peer count is of distinct peers: a second connection to a peer
+    /// (both ends dialing, a re-dial) does not count, closing one of two
+    /// connections does not uncount, closing the last one does. Counting
+    /// connections reported a peer dialed twice as two peers.
+    #[test]
+    fn peer_count_counts_distinct_peers_not_connections() {
+        // Peer P connects twice, Q once: 2 peers.
+        let mut count = 0usize;
+        for n in [1u32, 2, 1] {
+            if let Some(c) = peer_count_after_connect(count, n) {
+                count = c;
+            }
+        }
+        assert_eq!(count, 2);
+        assert_eq!(peer_count_after_connect(count, 2), None, "a second connection to a peer");
+        // One of P's two connections closes: P is still connected.
+        assert_eq!(peer_count_after_disconnect(count, 1), None);
+        // P's last connection closes, then Q's.
+        count = peer_count_after_disconnect(count, 0).unwrap();
+        assert_eq!(count, 1);
+        count = peer_count_after_disconnect(count, 0).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(peer_count_after_disconnect(0, 0), Some(0), "never below zero");
+    }
+
+    /// The heartbeat's first tick comes one period after start-up, not at
+    /// once: an immediate tick saw 0 peers (no connection established yet)
+    /// and re-dialed every bootstrap peer, giving two connections per peer.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_first_tick_is_one_period_after_start() {
+        let mut hb = new_heartbeat();
+        let start = tokio::time::Instant::now();
+        assert!(tokio::time::timeout(HEARTBEAT_PERIOD - Duration::from_millis(1), hb.tick()).await.is_err(),
+            "the heartbeat ticked at start-up");
+        hb.tick().await;
+        assert_eq!(start.elapsed(), HEARTBEAT_PERIOD);
+        hb.tick().await;
+        assert_eq!(start.elapsed(), 2 * HEARTBEAT_PERIOD);
     }
 }

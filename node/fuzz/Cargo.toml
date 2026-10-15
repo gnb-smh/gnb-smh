@@ -9,7 +9,9 @@
 #   cargo +nightly fuzz run tx_parse        # seeds: corpus/tx_parse/
 #
 # Targets and the seed corpus each starts from (corpus/<target>/; the seeds are
-# generated and replayed on stable by node/tests/parser_corpus_floor.rs):
+# generated and replayed on stable by node/tests/parser_corpus_floor.rs for
+# the first nine targets except header_parse, and by
+# node/tests/fuzz_seed_corpus.rs for header_parse and the others):
 #
 #   tx_parse          Transaction::from_wire_bytes (+ decode/encode idempotence)
 #   block_parse       Block::from_wire_bytes (+ idempotence)
@@ -20,9 +22,24 @@
 #   pow_verify        GnB-SMH output vs target (small scratchpad), hybrid signature verify
 #   merkle_path       coherence_core::verify_path
 #   mempool_ops       Mempool op stream with the txs/spent/rate-index invariant
+#   block_rules       hardening block rules vs independent references (Merkle, commitment, 64-byte)
+#   sighash           sighash v2 / v3 vs independent references; single-field sensitivity
+#   witness_parse     script_sig framing (lenient / exact / canonical witness)
+#   wire_roundtrip    Transaction / BlockHeader / Block encode-decode round trips, strictness
+#   undo_decode       UndoData stored encoding (legacy and extended)
+#   keystore_decode   keyfile v1/v2 and keystore v2/v3 JSON parse + decrypt (fast KDF)
+#   address_parse     Address::parse / parse_for_network vs a reference parser
+#   sync_rr_codec     /gnb/sync/1 frames and the libp2p codec (bounds, canonicality, read cap)
+#   accept_dag        accept_block on small DAGs: arrival-order independence
+#
+# docs/testing/FUZZING.md describes every target, the campaign results and
+# how to reproduce them.
 #
 # `cargo check` on stable type-checks the targets (libfuzzer-sys builds there
-# too); actually fuzzing needs nightly + cargo-fuzz.
+# too); actually fuzzing needs nightly + cargo-fuzz. Copy the root lockfile
+# first in every case (node/fuzz/Cargo.lock is not committed): without it
+# cargo resolves this workspace afresh to the newest semver-compatible
+# versions on crates.io, not the audited ones.
 
 [package]
 name = "gnb-fuzz"
@@ -37,11 +54,36 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 gnb = { path = ".." }
-gnb-crypto = { path = "../../crates/gnb-crypto" }
+# `test-pow-limit` (tests only; a gnb binary with it refuses mainnet, and an
+# optimised one every network: `test_pow_limit_guard` in node/src/main.rs) pins every
+# expected target to the pow limit: one GnB-SMH evaluation seals a block, which
+# is what lets `accept_dag` drive the real pipeline. No other target reads the
+# expected bits or the pow limit.
+gnb-crypto = { path = "../../crates/gnb-crypto", features = ["test-pow-limit"] }
 gnb-smh = { path = "../../crates/gnb-smh" }
 coherence-core = { path = "../../crates/coherence-core" }
 bincode = { version = "2", features = ["serde"] }
 primitive-types = "0.13"
+# Independent reference implementations and fixtures (all already in the
+# workspace lockfile).
+sha2 = "0.10"
+sha3 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+base64 = "0.22"
+aes-gcm = "0.10"
+argon2 = "0.5"
+tempfile = "3"
+parking_lot = "0.12"
+pqcrypto-internals = "0.2"
+# sync_rr_codec drives the node's libp2p request-response codec
+# (`BlochSyncCodec`) over an in-memory stream with a `futures` executor and
+# `futures::io::Cursor` (same 0.3 requirement as the node, so one crate
+# instance). The `Codec` trait comes from the node's own libp2p, re-exported
+# as `gnb::libp2p`: this crate does not name libp2p, so it cannot resolve to
+# a libp2p other than the node's (the libp2p upgrade needs no edit here).
+futures = "0.3"
 
 [workspace]
 members = ["."]
@@ -113,6 +155,69 @@ bench = false
 [[bin]]
 name = "mempool_ops"
 path = "fuzz_targets/mempool_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_rules"
+path = "fuzz_targets/block_rules.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sighash"
+path = "fuzz_targets/sighash.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "witness_parse"
+path = "fuzz_targets/witness_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_roundtrip"
+path = "fuzz_targets/wire_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "undo_decode"
+path = "fuzz_targets/undo_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keystore_decode"
+path = "fuzz_targets/keystore_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "address_parse"
+path = "fuzz_targets/address_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_rr_codec"
+path = "fuzz_targets/sync_rr_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "accept_dag"
+path = "fuzz_targets/accept_dag.rs"
 test = false
 doc = false
 bench = false

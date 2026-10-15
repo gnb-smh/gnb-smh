@@ -11,9 +11,11 @@ that command.
 | `asan` | AddressSanitizer + LeakSanitizer over the test suites of `gnb-smh`, `gnb-crypto` (alone) and `pqcrypto-internals`, with the Rust code and the PQClean C code instrumented | `sanitizers` | pass; one leak report (in two tests, F1), fixed |
 | `ubsan` | UndefinedBehaviorSanitizer over the PQClean C code, under the `gnb-crypto` and `pqcrypto-internals` test suites | `sanitizers` | pass; no report |
 | `ubsan-noavx2` | the UBSan ML-DSA, wallet-signing and ACVP tests on qemu's Nehalem CPU (no AVX2), so the clean ML-DSA C code runs | `sanitizers` | pass; no report |
+| `ubsan-noavx2-full` | every `gnb-crypto` lib and integration test, under UBSan, on qemu's Nehalem CPU | `sanitizers` (nightly schedule and manual dispatch only) | pass; no report (363 tests) |
 | `miri` | Miri over the pure-Rust consensus arithmetic and the unsafe RNG override | `miri` | pass; no undefined behaviour |
 | `miri-cross` | Miri over `gnb-smh` (including the Python PoW vectors) on `i686` (32-bit) and `s390x` (big-endian), and over the wasm wallet's C ABI on `i686` | `miri` | pass |
 | `i686` | the full test suites of `gnb-smh`, `gnb-crypto`, `coherence-core`, `pqcrypto-internals` and `gnb-wallet-wasm` on `i686-unknown-linux-gnu` | `i686` | pass; one failure (a 64-bit assumption in a test, F2), fixed; a concurrent run exposed a temp-file race between test processes (F3), fixed; the wallet's `minfee` truncated sizes on 32-bit targets (F4), fixed |
+| `i686-node` | every test target of the node (`gnb`: lib, bins, integration tests) on `i686-unknown-linux-gnu`, RocksDB and the other C/C++ dependencies built for 32 bits | `i686-node` (nightly schedule and manual dispatch only) | pass after fix F5 (1230 tests); `cargo test` there also rewrote the committed fuzz corpus, fixed |
 | (default) | node lib tests with debug assertions and overflow checks | `workspace-test` | pass (288 tests; 324 on the merged PR branch); now guarded by a test |
 | (local only) | parking_lot deadlock detection over the node's lock-using tests | none (needs new dependencies, see [Deadlock detection](#deadlock-detection)) | no deadlock in 288 lib and 58 integration tests; positive control detected |
 
@@ -34,6 +36,16 @@ ran nothing (`0 passed` exits 0). Each of those commands therefore runs
 through `expect_passed <minimum>`, which sums the `N passed` of every `test
 result:` line and fails below the minimum; the minimums are the current
 counts (below).
+
+A test that Miri cannot finish does not fail: it runs until the CI job's
+timeout (the `miri` jobs of merge commit `299a718`, whose two `core::limits`
+cap tests build 10^5 to 10^6 elements, were still in their host step after
+115 minutes). Every Miri command therefore also runs under `timeout(1)`
+(`with_miri_timeout`, `SANITIZER_MIRI_TIMEOUT` seconds, default 1800, about
+six times the slowest command), which stops the whole process group and
+names the remedy, `cfg_attr(miri, ignore = "<why>")`. A test that calls the
+PQClean C code needs the same attribute; it fails at once under Miri
+(unsupported foreign call) rather than hanging.
 
 Each mode builds into its own directory, `$SANITIZER_TARGET_DIR/<mode>`
 (default `target/sanitizers/<mode>`), so sanitizer flags never reach the
@@ -149,7 +161,26 @@ nodes run and the code compiled into the wasm32 wallet. Selection (from
 `acvp_mldsa` integration test (the official ACVP ML-DSA-65 vectors; 3
 passed; minimum 3). About 35 s locally; the whole lib suite took 575 s under
 emulation (280 passed, no report; mostly keystore KDFs with no ML-DSA in
-them), so it is not in CI.
+them), so it is not in the per-push job; the whole suite is its own mode,
+`ubsan-noavx2-full`, which CI runs nightly (next section).
+
+### The whole `gnb-crypto` suite without AVX2 (`ubsan-noavx2-full`)
+
+```sh
+sh scripts/sanitizers.sh ubsan-noavx2-full   # builds the UBSan test binaries if needed
+```
+
+Every `gnb-crypto` lib and integration test binary (the `ubsan` mode's
+binaries, listed by `cargo test --no-run`) runs to completion under `qemu-x86_64
+-cpu Nehalem`, from `crates/gnb-crypto`; `expect_passed` sums all of them
+(minimum 363). CI: a step of the `sanitizers` job that runs only on the
+nightly schedule and on manual dispatch (`if: github.event_name ==
+'schedule' || github.event_name == 'workflow_dispatch'`), so pushes do not
+pay the emulation time.
+
+Result (local, merged PR branch): pass, no UBSan report: 338 lib tests (1
+ignored) and the 25 integration tests (1 ignored) of the eight integration
+binaries; the lib binary takes 319 s under emulation, the rest about 30 s.
 
 Positive control (on a scratch copy, `[patch.crates-io]` to a copy of
 `pqcrypto-mldsa` 0.1.2): a signed overflow added to
@@ -178,7 +209,7 @@ JavaScript); isolation stays on (no file system or clock access). What runs
 | Crate | Tests | Notes |
 | --- | --- | --- |
 | `gnb-smh` | every unit test (compact bits, chain work, ASERT including the AUD-1 wide multiply and shift, the lane-level Keccak step, the scratchpad), `tests/difficulty_vectors.rs` and `tests/vectors.rs` (the Python PoW vectors with log2_n = 1 and 2) [30] | the log2_n = 10 and 19 PoW vectors skipped, `canonical_entry_points_match_the_reference_vector` ignored (below) |
-| `gnb-crypto` | `core::limits`, `core::tokenomics`, `core::block_rules` (Merkle roots, coinbase branch, coinbase commitment, witness root), `core::sighash`, `core::activation` [42] | five tests ignored (below) |
+| `gnb-crypto` | `core::limits`, `core::tokenomics`, `core::block_rules` (Merkle roots, coinbase branch, coinbase commitment, witness root), `core::sighash`, `core::activation` [42] | six tests ignored (below) |
 | `pqcrypto-internals` | the library tests: the `unsafe extern "C"` RNG entry point and the thread-local seeded-RNG stack, including guard drops after TLS destruction [15] | the two re-exec tests ignored |
 | `gnb-smh` on `i686-unknown-linux-gnu` and `s390x-unknown-linux-gnu` | the same `gnb-smh` tests on a 32-bit and a big-endian target, including the whole PoW pipeline against the Python reference [30 each] | `miri-cross`; std for the target is built by `cargo miri setup` |
 | `gnb-wallet-wasm` on `i686-unknown-linux-gnu` | the lib tests, among them `c_abi_roundtrip_on_32_bit`: `gnb_alloc` / `gnb_call` / `gnb_free` as `site/wallet/core.js` calls them, plus `minfee` on 32 bits [3] | `miri-cross`; `create_export_open_roundtrip_and_pay` ignored (PQClean C) |
@@ -212,6 +243,7 @@ ignored with the reason in the attribute:
 | `gnb-crypto` `core::sighash` `v3_scripts_verify_and_every_fault_is_rejected`, `v2_scripts_verify_below_the_activation` | ignored | hybrid key generation and signing through the PQClean C code, which Miri cannot execute |
 | `gnb-crypto` `core::limits` `block_count_caps_are_inclusive` | ignored | blocks of 1,000,000 transactions and 100,000 shielded transactions: still running after 17 minutes under Miri; `check_block_canonical_limits` runs under Miri in the other cap tests |
 | `gnb-crypto` `core::limits` `transaction_count_caps_are_inclusive` | ignored | 100,000 inputs and 100,000 outputs, cloned: still running after 9 minutes under Miri; `check_tx_canonical_limits` runs under Miri in the other tests of the module |
+| `gnb-crypto` `core::limits` `count_and_size_caps_match_the_wire_parser` (fuzzing merge) | ignored | builds, encodes and parses a block of 1,000,000 transactions (`block_count_caps_are_inclusive` only builds and checks it and was still running after 17 minutes under Miri), transactions of 100,000 inputs and outputs and an 8 MB proof; the parser and `check_*_canonical_limits` run under Miri in `limits_match_the_wire_parser` and the other tests of the module |
 | `pqcrypto-internals` `os_rng_failure_aborts_instead_of_failing_open`, `null_buffer_aborts_instead_of_failing_open` | ignored | they re-execute the test binary (`std::process::Command`), which Miri does not support |
 | `pqcrypto-internals` `tests/vendor_pin.rs` | not run (`--lib`) | reads files (isolation); no unsafe code |
 
@@ -274,8 +306,32 @@ and 64-bit targets. On a 32-bit target `gnb-wallet-wasm` also compiles
 `gnb_free` exactly as `site/wallet/core.js` does (the `(ptr << 32) | len`
 packing holds only for 32-bit pointers).
 
-Result: all pass after fixes F2 and F4. The node itself was not built for
-i686 (RocksDB would need a 32-bit C++ toolchain; not attempted).
+Result: all pass after fixes F2 and F4. The node is the `i686-node` mode
+(next section).
+
+### The node on i686 (`i686-node`)
+
+```sh
+sudo apt-get install g++-multilib clang libclang-dev   # RocksDB (C++) and its bindgen, for 32 bits
+rustup target add i686-unknown-linux-gnu
+sh scripts/sanitizers.sh i686-node
+```
+
+Every test target of `gnb` (the lib, the binaries, every integration test;
+the crate has no doctests) on `i686-unknown-linux-gnu`, with RocksDB,
+zstd, lz4, bzip2, zlib and the PQClean C compiled for 32 bits. Above all,
+the node's decoders of untrusted input must give a 32-bit build the verdicts
+a 64-bit build gives. CI: job
+`i686-node`, on the nightly schedule and on manual dispatch only
+(locally about 10 minutes to build the lib and binary tests, RocksDB
+included, and 11 more to build and run the integration tests).
+
+Result: one failure (F5, a 32-bit decoding difference in the gossip and
+sync codecs), fixed; then all pass: the lib (326 tests), the `gnb` binary
+(350), `gnb-cli` (3) and the 69 integration targets (551 passed, 8 ignored),
+1230 tests in all, with the committed fuzz seed corpus unchanged after the
+run (`parser_corpus_floor` regenerates it; on i686 it used to write a
+different one, see the follow-ups below).
 
 ## Debug assertions and overflow checks
 
@@ -360,10 +416,12 @@ is not ruled out.
 | F2 | i686 | `min_fee_has_a_floor_and_scales_with_size` failed: it expected `min_tx_fee_sat(usize::MAX)` to saturate at `u64::MAX / 1000` | The test assumed a 64-bit `usize`; with 32 bits the u64 product does not saturate and the function correctly returns the exact fee. The function computes in u64 on every target, so fees agree on 32- and 64-bit platforms | The test asserts the exact fee of the largest 32-bit size on every target and the saturating value only on 64-bit targets |
 | F3 | concurrent runs | `wallet::legacy_keystore_tests::save_load_roundtrip_still_works` failed with "No such file or directory" in the i686 run while the UBSan suite ran the same test in another process | Seven keystore tests (`wallet::legacy_keystore_tests` x4, `hd_wallet::tests` x3) write a fixed file name in the shared temp directory and delete it at start and end, so two test processes delete each other's file. Reproduced by running one test binary twice at once, 15 times: 15 of 30 runs failed for one test, 1 of 30 for another | The names carry the process id (as the neighbouring tests already do); 0 of 30 concurrent runs fail for each of the seven. Matters for parallel sanitizer runs and for `cargo mutants -j N` |
 | F4 | review (code reading), confirmed on `i686` | The wasm wallet's `minfee` request quoted the floor fee for a size of 2^32 bytes or more on 32-bit targets: 2^32 + 100 was priced as 100 bytes (10,000 instead of 8,589,934,792) | CRY-8: `size as usize` wraps modulo 2^32 where `usize` has 32 bits (wasm32, i686); `gnb-wallet-wasm` was in none of the 32-bit runs | `usize::try_from(size)`, error "`size` too large". `minfee_does_not_truncate_sizes_on_32_bit_targets` and `c_abi_roundtrip_on_32_bit` fail on i686 with the old cast (fee "10000") and pass after; on x86_64 the old cast passes. Low impact: such sizes are absurd |
+| F5 | `i686-node` | `network::tests::wire_decode_rejects_multi_gb_declared_vec` failed on i686: a gossip frame whose `block_data` declares 8 GiB (a 9-byte varint, then nothing) decoded as a `NewBlock` with an empty `block_data` | bincode 2.0.1's serde bridge reads every sequence and map length with `usize::decode` (`varint_decode_usize`: `u64 as usize`), so on a 32-bit target a declared length of 2^32 * k + n decodes as n. A frame that every 64-bit node refuses (it announces more bytes than it carries) decoded on a 32-bit node into a different message; the `/gnb/sync/1` codec decodes the same way. P2P framing only: no consensus encoding is decoded with bincode from untrusted input | The gossip and sync decoders require the canonical encoding: the decoded message must re-encode to the frame (`WireDecodeError::NonCanonical`, a penalized protocol violation, except for `NewBlock` and `NewTransaction` frames, which releases without the rule relay, so they are dropped without penalty: docs/CONSENSUS.md, "Wire encoding"; `InvalidData` on the sync path). The same rule refuses non-minimal varints on every target (byte-distinct frames of one message, each a fresh gossip message id: the NET-7 de-duplication bypass without trailing bytes), which the fuzzing package (merged after this one, docs/testing/FUZZING.md) found independently; its code (commit `f471e83`) is used verbatim so that its merge is clean. `wire_decode_requires_the_canonical_encoding` and `non_canonical_frames_are_rejected` fail on x86_64 without the check (non-minimal tag, integer and length forms decode) and pass with it; `wire_decode_rejects_multi_gb_declared_vec` fails on i686 without it and passes with it |
 
 No memory error, no C undefined behaviour and no Rust undefined behaviour
-was found in the code under test. F4 is the one defect in shipped code (low
-impact).
+was found in the code under test. F4 and F5 are the defects in shipped code
+(F4 low impact; F5 affects only 32-bit builds of the node, which accepted
+some frames that 64-bit nodes refuse).
 
 ## Review follow-ups (2026-10-15)
 
@@ -385,9 +443,11 @@ A review of this work found five gaps; each is closed above:
 
 ## On the merged PR branch
 
-This work was written on `b6a2976` and merged into the PR branch after the
-mempool/relay, networking/storage and block-ingress packages and the
-mutation, fuzzing, consensus-vector and functional-test packages. Every mode
+This work was written on `b6a2976` and merged into the PR branch (`299a718`)
+after the node-local mempool and RPC policy package (P4), the shielded pool,
+ledger, wallet transport and libp2p 0.57 package (P5), the node-local chain
+selection package (P3), and the mutation-testing and consensus-vector
+packages (the fuzzing package was merged after it). Every mode
 was re-run on the merged tree (same environment, `nightly-2026-10-14`, own
 target directories):
 
@@ -407,7 +467,9 @@ What the merge changed:
   GnB-SMH entry-point test, the two end-to-end sighash script tests (PQClean
   C) and the two `core::limits` cap tests that build 10^5 to 10^6 elements.
   The two cap tests were still running after 17 and 9 minutes when stopped;
-  with them the `miri` job would have outgrown its timeout.
+  with them the `miri` job would have outgrown its timeout. A sixth,
+  `core::limits::count_and_size_caps_match_the_wire_parser`, came with the
+  fuzzing merge (see [After the fuzzing merge](#after-the-fuzzing-merge)).
 - The minimums are the merged counts: `gnb-smh` 30 (host, i686, s390x; was
   24), the `gnb-crypto` selection 42 (was 29).
 - F4 changes the browser wallet core, which the PR branch rebuilds
@@ -417,3 +479,71 @@ What the merge changed:
   Through `site/wallet/core.js`, the previously shipped core priced
   `minFee(2^32 + 100)` at 10000; the rebuilt one refuses it ("`size` too
   large").
+
+### After the merge: CI on GitHub and the open issues
+
+The PR branch was pushed after the merge, so the new jobs have run on
+GitHub (results read from the Actions API; the job logs themselves were not
+reachable from the local environment):
+
+| Commit | `sanitizers` | `miri` | `i686` | `wasm-reproducible` | `consensus-crates` (with the release overflow step) |
+| --- | --- | --- | --- | --- | --- |
+| `299a718` (the merge), push and pull-request runs | pass (about 5 minutes) | no result: the host step was still running after 115 minutes when last checked (the two `core::limits` cap tests, see above), under the job timeout of then 120 minutes | pass | pass | pass |
+| `48a2d42` (Miri selection and minimums), push and pull-request runs | pass | pass: host step 6.1 and 4.6 minutes, cross step 5.7 and 4.3 minutes; the steps run `expect_passed` with the minimums 30 / 42 / 15 and 30 / 30 / 3 | pass | pass | pass |
+
+`wasm-reproducible` rebuilt the wallet core on fresh runners (no cache step,
+wasi-sdk 25 downloaded and checked) and matched the committed binary and
+`WASM_SHA256` on both commits: the local re-pin did not depend on the local
+wasi-sdk copy or on a warm target directory.
+
+Local re-runs through the script with the new minimums: `miri` passed (30,
+42 and 15 passed; 471 s with a cold target directory, and 364 s again with
+the final script, time bound included), `miri-cross` passed with the time
+bound (30 on i686, 30 on s390x, 3 for the wallet; 400 s). Positive control
+of the time bound: `SANITIZER_MIRI_TIMEOUT=20 sh scripts/sanitizers.sh miri`
+stops the `gnb-smh` command after 20 s with exit status 124 and the remedy
+message, and no Miri process is left running.
+
+Follow-ups made here:
+
+- The Miri time bound (`with_miri_timeout`, above) and a `miri` job timeout
+  of 75 minutes (was 120): a test Miri cannot finish now fails its step after
+  30 minutes with the remedy, instead of holding the job.
+- `ubsan-noavx2-full` (every `gnb-crypto` test without AVX2) and
+  `i686-node` (the node on 32 bits) run nightly and on manual dispatch; both
+  passed locally through the script (above), neither has run on GitHub yet.
+  `i686-node` found F5, and that `cargo test` on i686 rewrote the committed
+  fuzz seed corpus (`node/tests/parser_corpus_floor.rs` reduced its random
+  numbers with `as usize`); the generator now reduces in `u64` and writes
+  the same corpus on both widths.
+- `expect_passed` logs to a file per script run: two modes run at once over
+  one `SANITIZER_TARGET_DIR` truncated each other's shared log, which lost
+  `test result:` lines and failed a passing run (seen locally: 338 counted
+  of 363 passed).
+
+Still open, by decision: `parking_lot` deadlock detection is not in CI. It
+needs eight new lockfile packages and a `deny.toml` exception (see
+[Deadlock detection](#deadlock-detection)); that is a dependency decision for
+the maintainers.
+
+### After the fuzzing merge
+
+- The fuzzing package (merge `f312057`) added
+  `core::limits::count_and_size_caps_match_the_wire_parser`, which is in the
+  `miri` selection (`core::limits::`) and builds, encodes and parses a block
+  of 1,000,000 transactions. It carries `cfg_attr(miri, ignore = "<why>")`
+  (`91f5477`) like the other cap tests: the selection now has six ignored
+  tests (Miri table above).
+- `miri` re-run locally through the script on the tree after that merge and
+  its review fixes (`nightly-2026-10-14`, own target directory): pass, no
+  undefined behaviour; `gnb-smh` 25 unit (1 ignored), 4 and 1; the
+  `gnb-crypto` selection 42 passed, 6 ignored; `pqcrypto-internals` 15 (3
+  ignored); 417 s, the `gnb-crypto` selection 291 s. The minimums (30 / 42 /
+  15) are unchanged.
+- The node on i686, for the targets the fuzzing merge added or changed
+  (`cargo test --target i686-unknown-linux-gnu -p gnb --lib --test
+  fuzz_seed_corpus --test fuzz_regressions --test parser_corpus_floor --test
+  wire_decoder_fuzz --test fix_net_ingress`, not the whole `i686-node`
+  mode): pass, 327 unit tests, 5, 3, 6, 3 and 14; the committed seed corpus
+  is reproduced unchanged on 32 bits (`fuzz_seed_corpus` regenerates it and
+  compares).

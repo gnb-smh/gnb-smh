@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use gnb::core::{self, Block, BlockHeader, Transaction, TxInput, TxOutput};
 use gnb::ingress::{
     backfill_decision, bits_meet_floor, derived_blue_score, ease_target, orphan_is_sync_evidence,
-    unsolicited_height_too_far_ahead, verdict_for_accept_error, BackfillDecision, ClaimPolicy,
+    unsolicited_height_too_far_ahead, verdict_for_accept_error, verdict_for_block_decode_error, BackfillDecision, ClaimPolicy,
     DeepBackfillBudget, OrphanInsert, OrphanLimits, OrphanPool, SupervisorBackoff,
     DEEP_BACKFILL_BURST, ORPHAN_WORK_FLOOR_SHIFT, SUPERVISOR_HEALTHY_RESET,
 };
@@ -255,6 +255,63 @@ fn only_context_free_failures_are_rejected() {
     assert_eq!(verdict_for_accept_error("timestamp rejected: timestamp too far in the future"), GossipVerdict::Ignore);
     assert_eq!(verdict_for_accept_error("U.4: execute_reorg failed: reorg depth exceeds maximum"), GossipVerdict::Ignore);
     assert_eq!(verdict_for_accept_error("tx double-spend: outpoint already spent"), GossipVerdict::Ignore);
+}
+
+/// Mixed-version rollout of the minimal-varint rule (H-fuzz, docs/CONSENSUS.md
+/// "Wire encoding"): a `NewBlock` whose `block_data` is a valid block with a
+/// widened varint (accepted and relayed verbatim by releases before the rule)
+/// is answered `Ignore`, never `Reject`, so the gossipsub P4 penalty cannot be
+/// steered onto honest older relays (three such frames within a couple of
+/// minutes graylisted one). Every other malformed body stays `Reject`.
+#[test]
+fn widened_block_varints_are_ignored_and_other_malformed_bodies_rejected() {
+    // The coinbase's locktime ends `FD 00`: with its script_sig length widened
+    // the pre-fix decoder (framing at the re-encoded length) read the
+    // shielded count as `FD 00 00` and accepted the bytes as this block.
+    let mut blk = block_with(vec![[0x33; 32]], core::GENESIS_BITS, 7, 7, 0);
+    blk.transactions[0].locktime = u32::from_le_bytes([0x11, 0x22, 0xFD, 0x00]);
+    blk.header.merkle_root = blk.body_merkle_root();
+    let w = blk.to_wire_bytes();
+    assert!(Block::from_wire_bytes(&w).is_ok());
+    let hdr = blk.header.to_wire_bytes(blk.blue_score, blk.height).len();
+    let widen = |at: usize, form: &[u8]| -> Vec<u8> {
+        assert!(w[at] < 0xFD, "a one-byte varint at {at}");
+        let mut v = w[..at].to_vec();
+        v.extend_from_slice(form);
+        v[at + 1] = w[at];
+        v.extend_from_slice(&w[at + 1..]);
+        v
+    };
+    let ss_len_at = hdr + 1 + 4 + 1 + 36; // tx count, version, input count, outpoint
+    assert_eq!(usize::from(w[ss_len_at]), blk.transactions[0].inputs[0].script_sig.len());
+    let widened = [
+        ("parent count", widen(4, &[0xFD, 0, 0])),
+        ("tx count", widen(hdr, &[0xFD, 0, 0])),
+        ("tx count, 9-byte form", widen(hdr, &[0xFF, 0, 0, 0, 0, 0, 0, 0, 0])),
+        ("script_sig length", widen(ss_len_at, &[0xFD, 0, 0])),
+        ("shielded count", widen(w.len() - 1, &[0xFE, 0, 0, 0, 0])),
+    ];
+    for (what, bytes) in &widened {
+        let e = Block::from_wire_bytes(bytes).expect_err(what);
+        assert!(core::is_non_minimal_varint_error(&e), "{what}: {e}");
+        assert_eq!(verdict_for_block_decode_error(&e), GossipVerdict::Ignore, "{what}: {e}");
+        // The frame itself is canonical bincode: it reaches the block decoder.
+        let frame = enc(&NetworkMessage::NewBlock { block_hash: blk.block_hash(), blue_score: 1, height: 1, block_data: bytes.clone() });
+        assert!(decode_wire_message(&frame).is_ok(), "{what}");
+    }
+    let mut trailing = w.clone();
+    trailing.push(0);
+    let mut truncated = w.clone();
+    truncated.pop();
+    let mut cut_tx = w[..hdr + 1].to_vec(); // header and a tx count of 1, no transaction
+    cut_tx.push(0);
+    let mut too_many = w.clone();
+    too_many[hdr] = 2; // two transactions announced, one present
+    for (what, bytes) in [("trailing byte", trailing), ("truncated", truncated), ("missing tx", cut_tx), ("tx count 2", too_many), ("empty", vec![])] {
+        let e = Block::from_wire_bytes(&bytes).expect_err(what);
+        assert!(!core::is_non_minimal_varint_error(&e), "{what}: {e}");
+        assert_eq!(verdict_for_block_decode_error(&e), GossipVerdict::Reject, "{what}: {e}");
+    }
 }
 
 // ── NET-6 ────────────────────────────────────────────────────────────────────

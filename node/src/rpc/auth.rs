@@ -80,9 +80,9 @@ fn rate_limit_key(ip: IpAddr) -> IpAddr {
 /// listed here anyway: it is EXPENSIVE (dual DAG reads, an ancestry walk for
 /// `bits`, draining + serialising up to 2000 mempool transactions) and was
 /// previously unauthenticated at the loose read bucket, letting a poll loop
-/// force that cost repeatedly for free. `rpc::mod::HEAVY_READ_METHODS` adds
-/// the matching short-TTL/single-flight cache on top of the stricter auth +
-/// rate limit this listing gives it.
+/// force that cost repeatedly for free. Its own short-TTL/single-flight gate
+/// (`rpc::mod::gated_dispatch`, `AppState::template_gate`) adds a cache on top
+/// of the stricter auth + rate limit this listing gives it.
 pub const WRITE_METHODS: &[&str] = &[
     "sendrawtransaction",
     "submitblock",

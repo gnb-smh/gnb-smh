@@ -44,8 +44,11 @@ https-rpc = ["dep:rustls", "dep:webpki-roots"]
 # the guard bites only when a mainnet artifact is cut:
 #   cargo test -p gnb-crypto --features mainnet canonical_k_activation_height_is_set_for_mainnet
 mainnet = []
-# TESTS ONLY: every expected target is the pow limit. Consensus-breaking; the
-# node binary refuses to start with it. Enabled through node dev-dependencies.
+# TESTS ONLY: every expected target is the pow limit. Consensus-breaking; a
+# node binary with it refuses mainnet, and an optimised one every network
+# (node/src/main.rs `test_pow_limit_guard`). Enabled through node
+# dev-dependencies and the node's own `test-pow-limit` feature (functional
+# tests, docs/testing/FUNCTIONAL.md).
 test-pow-limit = []
 # `auxpow-rehearsal` is an EMPTY marker feature (no deps). It ONLY lowers
 # AUXPOW_ACTIVATION_HEIGHT to 0 (core/mod.rs) so a LOCAL, off-mainnet build

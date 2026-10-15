@@ -80,3 +80,41 @@ export async function loadCore(url, sha256Hex) {
     wipe: () => call({ op: "wipe" }),
   };
 }
+
+// ── Which coins a payment can spend ──────────────────────────────────────────
+// Coinbase outputs are spendable COINBASE_MATURITY blocks after the block that
+// created them (gnb_crypto::core::COINBASE_MATURITY; site/tests pins the two).
+export const COINBASE_MATURITY = 100;
+
+/** Split getutxos rows into those spendable in the block at `nextHeight` and
+ *  the immature coinbase outputs: a row carrying `coinbase_height` only from
+ *  coinbase_height + COINBASE_MATURITY on, a row without it always (the rule
+ *  of gnb_crypto::wallet::send::utxo_row_spendable_at, which the core and
+ *  gnb-cli apply). A malformed coinbase_height counts as immature. */
+export function splitByMaturity(rows, nextHeight) {
+  const spendable = [], immature = [];
+  for (const row of rows) {
+    const cb = row.coinbase_height;
+    const mature = cb === undefined || cb === null
+      || (Number.isSafeInteger(cb) && cb >= 0 && nextHeight - cb >= COINBASE_MATURITY);
+    (mature ? spendable : immature).push(row);
+  }
+  return { spendable, immature };
+}
+
+/** The coins one payment may spend in the block at `nextHeight`: the first
+ *  `window` spendable rows the node lists, and the immature coinbase outputs
+ *  seen. `fetchRows(limit)` resolves to { rows, truncated } from getutxos
+ *  (the node lists an address's outputs in index order and sets `truncated`
+ *  when it stops at the limit). When immature coinbase outputs took part of a
+ *  truncated window, a `wide` one is asked for, so mature coins listed after
+ *  them are found; `truncated` then says whether even that was cut short. */
+export async function spendableWindow(fetchRows, nextHeight, window = 50, wide = 1000) {
+  let { rows, truncated } = await fetchRows(window);
+  let { spendable, immature } = splitByMaturity(rows, nextHeight);
+  if (truncated && immature.length > 0 && wide > window) {
+    ({ rows, truncated } = await fetchRows(wide));
+    ({ spendable, immature } = splitByMaturity(rows, nextHeight));
+  }
+  return { spendable: spendable.slice(0, window), immature, truncated: truncated === true, listed: rows.length };
+}
