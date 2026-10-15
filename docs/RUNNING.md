@@ -55,10 +55,11 @@ written by an older node gets them built once at start-up (log line
 undo records); until then those methods answer with an error instead of
 scanning. Every start-up also checks that the stored aggregates describe the
 connected chain on disk (block count and a fingerprint of the connected
-blocks against the undo records), so a data directory that an older release
-moved forward after a downgrade is rebuilt too instead of serving stale
-statistics. `hashrate_hs` counts every DAG block (the selected-chain blocks
-and the blue and red blocks they merge, `avg_dag_block_interval_secs`);
+blocks against the undo records) and rebuilds them when they do not, instead
+of serving stale statistics. (An older release can no longer move the chain
+of an upgraded data directory forward: see "Upgrading and downgrading".)
+`hashrate_hs` counts every DAG block (the selected-chain blocks and the blue
+and red blocks they merge, `avg_dag_block_interval_secs`);
 `avg_block_time_secs` is the interval between selected-chain blocks. A
 storage failure behind any of these methods is answered with the generic
 `STORAGE_ERROR` response; the detail only goes to the node's log.
@@ -76,6 +77,17 @@ to loopback addresses. Each call has one 30-second deadline covering name
 resolution, connect, the TLS handshake, the request and the response; every
 socket read and write gets only the time left, so a server that stalls or
 drips its answer cannot hold the wallet longer than that.
+
+## Upgrading and downgrading
+
+The upgrade to a release that keeps the shielded-pool state on disk (audit
+COH-2) is one-way. From its first start the data directory holds the
+RocksDB column family `shielded`. Every earlier release opens its database
+read-write with a fixed list of column families that does not name it, and
+RocksDB refuses that open (`Invalid argument: Column families not opened:
+shielded`), so the earlier release stops at start-up. To downgrade, restore a
+copy of the data directory taken before the upgrade (with the node stopped)
+or resynchronize from a new data directory.
 
 ## Wallet keystores (audit CRY-7)
 

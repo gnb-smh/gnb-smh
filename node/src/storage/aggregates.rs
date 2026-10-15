@@ -27,13 +27,19 @@
 //! that the incremental values equal a full recomputation.
 //!
 //! The version marker alone does not prove the aggregates current: a binary
-//! that does not know them (an older release run during a downgrade) moves
-//! the chain without touching `agg/*`, and the marker survives. At start-up
-//! [`Storage::ensure_aggregates`] therefore also compares the stored block
-//! count and connected-set fingerprint (`agg/chain`, `agg/conn`) with one
-//! pass over the undo-record keys, and rebuilds on any mismatch (review
-//! finding: a downgrade and re-upgrade served a stale rich list, tiers and
-//! chain totals indefinitely).
+//! that does not know them moves the chain without touching `agg/*`, and the
+//! marker survives. At start-up [`Storage::ensure_aggregates`] therefore also
+//! compares the stored block count and connected-set fingerprint
+//! (`agg/chain`, `agg/conn`) with one pass over the undo-record keys, and
+//! rebuilds on any mismatch (review finding: a downgrade and re-upgrade
+//! served a stale rich list, tiers and chain totals indefinitely). RocksDB
+//! refuses the read-write open of every release that predates the `shielded`
+//! column family (audit COH-2) on a data directory that has it
+//! (docs/RUNNING.md, "Upgrading and downgrading"), so once this release has
+//! opened a data directory no downgrade can move its chain. The check still
+//! covers a data directory an older release moved before this upgrade (a
+//! downgrade from a NET-12 build that predates COH-2), one edited outside the
+//! node and one restored in part.
 //!
 //! These are node-local indexes: no consensus rule reads them.
 
@@ -279,7 +285,7 @@ impl Storage {
                 return Ok(false);
             }
             log::warn!("NET-12: the explorer aggregates do not describe the connected chain on disk \
-                        (written before a downgrade?); rebuilding them");
+                        (moved by another binary, or restored in part?); rebuilding them");
             self.agg_ready.store(false, Ordering::Release);
         }
         self.rebuild_aggregates(&AtomicBool::new(false))?;

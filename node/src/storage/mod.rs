@@ -1819,6 +1819,25 @@ mod shielded_cf_tests {
         let rw = Storage::open(tmp.path()).unwrap();
         assert_eq!(rw.get_shielded(b"T").unwrap(), None);
     }
+
+    /// The upgrade is one-way (docs/RUNNING.md, "Upgrading and
+    /// downgrading"): once this release has opened a data-dir, the open an
+    /// earlier release performs (read-write, a fixed descriptor list without
+    /// `shielded`) is refused by RocksDB, so a downgrade needs a pre-upgrade
+    /// copy of the data directory or a resync.
+    #[test]
+    fn upgraded_data_dir_is_refused_by_the_open_of_an_earlier_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(Storage::open(tmp.path()).unwrap());
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let old: Vec<ColumnFamilyDescriptor> =
+            Storage::cf_descriptors().into_iter().filter(|d| d.name() != CF_SHIELDED).collect();
+        let err = DB::open_cf_descriptors(&opts, tmp.path(), old).expect_err("an earlier release cannot open it");
+        assert!(err.to_string().contains("Column families not opened: shielded"), "{err}");
+        drop(Storage::open(tmp.path()).expect("this release still opens it"));
+    }
 }
 
 // ── Bloch Genesis-3 carryover ingestion ─────────────────────────────────────

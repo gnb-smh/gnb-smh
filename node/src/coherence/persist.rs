@@ -158,6 +158,14 @@ impl ShieldedPool {
     /// transaction was ever accepted) loads as the empty genesis state at the
     /// UTXO tip. A state whose tip differs from the UTXO tip is refused unless
     /// it is empty (then it is consistent with any chain position).
+    ///
+    /// No node build reaches that mismatch any more: every write of the UTXO
+    /// tip after genesis carries the shielded tip in the same batch, and a
+    /// release from before this column family cannot open a data dir that has
+    /// it (RocksDB refuses the read-write open, see docs/RUNNING.md,
+    /// "Upgrading and downgrading"), so it cannot move the UTXO tip alone
+    /// after a downgrade. The adopt branch below only covers a data dir that
+    /// was edited outside the node or restored in part.
     pub fn load(store: &Storage) -> Result<ShieldedPool, String> {
         let utxo_tip = store.get_meta("tip_hash").map_err(|e| e.to_string())?
             .map(|v| hash32(&v, "meta tip_hash")).transpose()?;
