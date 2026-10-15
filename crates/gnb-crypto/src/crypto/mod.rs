@@ -1858,9 +1858,13 @@ mod kat {
         assert!(!verify(&pk, GOLDEN_MSG, &sig[..sig.len() - 1]), "truncated sig must fail");
         assert!(!verify(&pk, GOLDEN_MSG, &sig[..MLDSA_SIG_LEN]), "falcon-less sig must fail");
 
-        // Oversized signature (trailing garbage) → false.
+        // Oversized signature (trailing garbage) → false. The garbage byte is
+        // non-zero: signing is randomized, and a 1,279-byte compact Falcon half
+        // plus one 0x00 is the 1,280-byte zero-padded encoding, which this
+        // lenient verifier accepts by design (see
+        // `canonical_verifier_rejects_the_legacy_zero_padded_variant`).
         let mut over = sig.clone();
-        over.push(0x00);
+        over.push(0x01);
         assert!(!verify(&pk, GOLDEN_MSG, &over), "oversized sig must fail");
 
         // Tampered public key: ML-DSA body byte (pk[4]) and Falcon body byte
