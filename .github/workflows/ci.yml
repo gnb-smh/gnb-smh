@@ -4,7 +4,7 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: "17 3 * * *"   # nightly: fuzz-target build and smoke run
+    - cron: "17 3 * * *"   # nightly: every job (fuzz: 60 s per target; the weekly 10-minute campaign is fuzz.yml)
   workflow_dispatch:
 
 permissions:
@@ -317,29 +317,13 @@ jobs:
       - name: gnb-smh, gnb-crypto, coherence-core, pqcrypto-internals, gnb-wallet-wasm on i686
         run: sh scripts/sanitizers.sh i686
 
-  # Builds every cargo-fuzz target (node/fuzz, nightly + libFuzzer) and runs
-  # each briefly over its committed seed corpus.
+  # Builds every cargo-fuzz target (node/fuzz, nightly + libFuzzer + ASan) and
+  # runs each for 60 s over its committed seed corpus, on pull requests and
+  # the nightly run; crash reproducers are uploaded as the `fuzz-artifacts`
+  # artifact. Defined in fuzz.yml, which also runs the weekly 10-minute
+  # campaign (docs/testing/FUZZING.md).
   fuzz:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: System dependencies (librocksdb-sys needs clang/libclang)
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-      - name: Nightly toolchain
-        run: rustup toolchain install nightly --profile minimal
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-fuzz
-      - name: Start from the audited lockfile
-        run: cp Cargo.lock node/fuzz/Cargo.lock
-      - name: Build all fuzz targets
-        working-directory: node/fuzz
-        run: cargo +nightly fuzz build
-      - name: Smoke-run each target over its seed corpus
-        working-directory: node/fuzz
-        run: |
-          for t in $(cargo +nightly fuzz list); do
-            mkdir -p "corpus/$t"
-            cargo +nightly fuzz run "$t" "corpus/$t" -- -max_total_time=30 -rss_limit_mb=4096
-          done
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/fuzz.yml
+    with:
+      seconds: 60

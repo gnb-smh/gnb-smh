@@ -15,7 +15,7 @@ import { html, raw, isAddress, isHex64, num, sats } from "/assets/safe.js";
 
 // SHA-256 of /wallet/gnb_wallet.wasm. Written by scripts/build-wallet-wasm.sh
 // and checked by `node --test site/tests/`; loadCore refuses any other binary.
-const WASM_SHA256 = "95aca43a6dc1f0ed1b09959f35386e2040e0239b6402d354ff943ad1cd88897a";
+const WASM_SHA256 = "3639ff5883e841af2d91cb3df0dc239345f5ad21aad6a94b5e5e73ce8eb259c4";
 
 const SAT = 100000000n;
 const IDLE_LOCK_MS = 10 * 60 * 1000;
