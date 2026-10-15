@@ -51,6 +51,10 @@ class TestNode:
         self.args_used: list[str] = []
         self._log_handle = None
         self.log_offset = 0
+        # Unexpected exits seen by stop(): a node that had already exited (a
+        # crash), or that did not stop cleanly on SIGTERM. The framework
+        # fails the test with them (GnbTestFramework.shutdown).
+        self.problems: list[str] = []
         self.url = f"http://127.0.0.1:{rpc_port}/"
         self.rpc = AuthServiceProxy(self.url, api_key, timeout=60)
 
@@ -129,16 +133,30 @@ class TestNode:
     def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
 
-    def stop(self, timeout: float = 30) -> None:
+    def stop(self, timeout: float = 30, *, expect_exited: bool = False) -> None:
         """SIGTERM (the node has no stop RPC; RocksDB keeps every committed
-        write across process termination), then SIGKILL after `timeout`."""
+        write across process termination), then SIGKILL after `timeout`.
+
+        A node that had already exited (unless `expect_exited`: a start-up
+        refusal the test waited for), that exits on SIGTERM with a code other
+        than the signal's, or that needs SIGKILL, is recorded in `problems`;
+        the framework fails the test with it, like Bitcoin Core's framework
+        does for an unexpected exit code."""
         if self.process is None:
             return
-        if self.process.poll() is None:
+        rc = self.process.poll()
+        if rc is not None:
+            if not expect_exited:
+                self.problems.append(f"node{self.index} had exited before it was stopped "
+                                     f"(exit code {rc}): it crashed or stopped on its own")
+        else:
             self.process.send_signal(signal.SIGTERM)
             try:
-                self.process.wait(timeout=timeout)
+                rc = self.process.wait(timeout=timeout)
+                if rc not in (0, -signal.SIGTERM):
+                    self.problems.append(f"node{self.index} exited with code {rc} on SIGTERM")
             except subprocess.TimeoutExpired:
+                self.problems.append(f"node{self.index} did not stop within {timeout}s of SIGTERM; killed")
                 self.process.kill()
                 self.process.wait(timeout=30)
         self.process = None
@@ -147,6 +165,7 @@ class TestNode:
             self._log_handle = None
 
     def kill(self) -> None:
+        """SIGKILL, deliberately (a crash the test simulates; not a problem)."""
         if self.process is not None and self.process.poll() is None:
             self.process.kill()
             self.process.wait(timeout=30)
@@ -182,7 +201,7 @@ class TestNode:
             self.kill()
             raise AssertionFailure(f"node{self.index} did not exit (expected failure {expected!r})")
         rc = self.process.returncode
-        self.stop()
+        self.stop(expect_exited=True)
         out = tail(self.stdout_path, 40)
         if expected not in out:
             raise AssertionFailure(f"expected {expected!r} in node output; got:\n{out}")
@@ -204,6 +223,17 @@ class TestNode:
         with open(self.stdout_path, "rb") as f:
             f.seek(self.log_offset)
             return f.read()
+
+    def panics(self) -> list:
+        """Panic messages anywhere in this node's log (every run). A panic in
+        a spawned task (network, miner, RPC worker, the supervised message
+        processor) does not end the process, so only the log shows it."""
+        try:
+            with open(self.stdout_path, "rb") as f:
+                text = f.read().decode("utf-8", "replace")
+        except FileNotFoundError:
+            return []
+        return [line.strip() for line in text.splitlines() if "panicked at" in line]
 
     def peer_id(self) -> str:
         m = re.findall(rb"P2P identity: (12D3Koo\w+)", self.log_since_start())
@@ -270,25 +300,6 @@ class TestNode:
             if pool <= {t["txid"] for t in tmpl["transactions"]} or time.monotonic() >= deadline:
                 return tmpl
             time.sleep(0.25)
-
-    def submit_block(self, block: Block, *, max_nonces: int = 32) -> str:
-        """Submit `block`, searching nonces from block.nonce upward while the
-        node answers "invalid PoW". Under test-pow-limit the target is about
-        (1 - 2^-16) * 2^256, so the first nonce is almost always valid; the
-        node computes GnB-SMH, the test never has to. Returns the block hash.
-        Any other rejection raises JSONRPCException."""
-        for _ in range(max_nonces):
-            try:
-                res = self.rpc.submitblock(block.serialize().hex())
-            except JSONRPCException as e:
-                if "invalid PoW" in e.message or "proof of work" in e.message:
-                    block.nonce += 1
-                    continue
-                raise
-            if res.get("hash") != block.hash_hex():
-                raise AssertionFailure(f"submitblock hash {res.get('hash')} != {block.hash_hex()}")
-            return res["hash"]
-        raise AssertionFailure(f"no valid nonce in {max_nonces} tries (is this a test-pow-limit build?)")
 
     def submit_block(self, block: Block, *, max_nonces: int = 32) -> str:
         """Submit `block`, searching nonces from block.nonce upward while the

@@ -12,9 +12,11 @@ A test subclasses GnbTestFramework, sets `num_nodes` (and optionally
      dir;
   3. starts the nodes on loopback with separate data dirs, ports and API keys,
      and connects them (`setup_network`; default: node i dials nodes 0..i-1);
-  4. runs the test; on failure prints the tail of every node's log;
-  5. always stops every node process and removes the temp dir (kept with
-     --nocleanup, or with --keep-failed when the test failed).
+  4. runs the test;
+  5. always stops every node process; the test fails if a node had exited
+     on its own (crash), did not stop cleanly on SIGTERM, or logged a panic;
+  6. on failure prints the tail of every node's log; removes the temp dir
+     (kept with --nocleanup, or with --keep-failed when the test failed).
 
 Exit codes: 0 passed, 1 failed, 77 skipped (as Bitcoin Core).
 """
@@ -142,9 +144,14 @@ class GnbTestFramework:
         except BaseException:  # noqa: BLE001 - every failure is reported
             self.log.error("test failed:\n%s", traceback.format_exc())
         finally:
+            problems = self.shutdown()
+            if problems:
+                self.log.error("node problems (the test fails with them%s):\n  %s",
+                               "; run_test itself passed" if status != TEST_EXIT_FAILED else "",
+                               "\n  ".join(problems))
+                status = TEST_EXIT_FAILED
             if status == TEST_EXIT_FAILED:
                 self.dump_logs()
-            self.shutdown()
             if self.options.nocleanup or (self.options.keep_failed and status == TEST_EXIT_FAILED):
                 self.log.info("not cleaning up %s", self.tmpdir)
             else:
@@ -175,13 +182,22 @@ class GnbTestFramework:
             copy_datadir(start_dir, node.datadir)
             self.nodes.append(node)
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> list:
+        """Stop every node; return what went wrong with them: an unexpected
+        exit (a node that crashed, or did not stop cleanly) and any panic in a
+        node's log. Any of these fails the test, also when run_test passed:
+        a panic in a spawned task does not end the node process, and a node
+        that died after the test's last RPC is otherwise invisible."""
+        problems = []
         for node in self.nodes:
             try:
                 node.stop(timeout=15)
             except Exception as e:  # noqa: BLE001
-                self.log.error("stopping node%d: %r", node.index, e)
+                problems.append(f"stopping node{node.index}: {e!r}")
                 node.kill()
+            problems += node.problems
+            problems += [f"node{node.index} log: {p}" for p in node.panics()]
+        return problems
 
     def dump_logs(self, lines: int = 80) -> None:
         """Tail of every node's log, without the per-request RPC trace lines
