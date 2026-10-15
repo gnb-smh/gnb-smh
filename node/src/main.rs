@@ -333,6 +333,18 @@ mod test_pow_limit_guard_tests {
         }
     }
 
+    /// docs/CONSENSUS.md describes the guard as it is. It said the node
+    /// binary rejects the feature, which stopped being true when debug test
+    /// builds began to run on testnet for the functional tests.
+    #[test]
+    fn the_consensus_spec_describes_the_guard() {
+        let spec = include_str!("../../docs/CONSENSUS.md").split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(!spec.contains("is rejected by the node binary"));
+        for says in ["refuses mainnet", "refuses every network", "`test_pow_limit_guard`", "`--testnet`"] {
+            assert!(spec.contains(says), "docs/CONSENSUS.md must say {says:?} about test-pow-limit");
+        }
+    }
+
     #[test]
     fn production_build_runs_on_both_networks_in_every_profile() {
         for debug_assertions in [false, true] {

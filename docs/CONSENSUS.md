@@ -1144,7 +1144,11 @@ roughly every 9 minutes. At the activation height itself the target steps
 back to at most the genesis target if the chain was running easier.
 `expected_bits_at(parent_time, height, activation)` is the real ASERT rule
 for any activation height. The dev-only `test-pow-limit` feature pins every
-target to `POW_LIMIT_BITS` and is rejected by the node binary.
+target to `POW_LIMIT_BITS`. A node binary built with it refuses mainnet, and
+an optimised (release-profile) one refuses every network
+(`test_pow_limit_guard` in `node/src/main.rs`; the node's own feature does
+not compile in a release build); only a debug test build runs, on
+`--testnet`, for the functional tests (`docs/testing/FUNCTIONAL.md`).
 
 ### Blocks stored before the upgrade (node-local)
 
