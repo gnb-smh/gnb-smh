@@ -2958,7 +2958,7 @@
   },
   {
    "id": "decode/non-minimal-script-sig-length/pre",
-   "description": "A coinbase-only block below the activation with the coinbase's script_sig length written in the 3-byte form (same block id and contents): the decoder refuses the bytes at every height. Decoders before the fix accepted it and framed the next field at the re-encoded length, two bytes early.",
+   "description": "A coinbase-only block below the activation with the coinbase's script_sig length written in the 3-byte form (same block id and contents) and a coinbase locktime whose last two bytes are FD 00: the decoder refuses the bytes at every height. Decoders before the fix accepted them as this block: they framed the shielded count at the coinbase's re-encoded length, two bytes early, and read it as FD 00 00 (0).",
    "network": "mainnet",
    "activation_height": "1000",
    "activation_source": "explicit",
@@ -2967,7 +2967,7 @@
    "scope": "full",
    "pow": "skip",
    "prevouts": [],
-   "block": "01000000013a4fcd317475f0734a21a5bb2b56ed0857ef5fccdb212a77ef51627abc8885fe04d107eea2a2ecb3cbcef3e623e403a7c3b8698684e2503ae732b62a7e9cc1f0f67ec76a00000000ffff00210000000000000000e703000000000000e7030000000000000101000000010000000000000000000000000000000000000000000000000000000000000000fffffffffd2300676e622d626c6f636b2d766563746f72732f626c6f636b2f6465636f64652f7072652fffffffff01030161060000000014d7e8d5e9b4ff0cd2636f30a510bbc55cd289ff9f0000000000",
+   "block": "01000000013a4fcd317475f0734a21a5bb2b56ed0857ef5fccdb212a77ef51627abc8885feb08bea1215456d6836091038c6e118e40e6525ecaa73144366cf6fd72d84e210f67ec76a00000000ffff00210000000000000000e703000000000000e7030000000000000101000000010000000000000000000000000000000000000000000000000000000000000000fffffffffd2300676e622d626c6f636b2d766563746f72732f626c6f636b2f6465636f64652f7072652fffffffff01030161060000000014d7e8d5e9b4ff0cd2636f30a510bbc55cd289ff9f1122fd0000",
    "expected": {
     "verdict": "invalid",
     "error_class": "decode"

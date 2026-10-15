@@ -1976,15 +1976,25 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
             "The two-parent commitment base block with its transaction count written as FD 02 00 (same block id and contents): not the minimal encoding of 2, the decoder refuses the bytes.",
             ACT, base.clone(), vec![], Some("decode"), "full", Pow::Skip);
         c.cases.last_mut().unwrap().raw = Some(widen(&w, hdr));
-        let mut pre = raw_block(Pre.height(), ACT, one_parent(), vec![coinbase(subsidy(Pre.height()), "block/decode/pre", b"")]);
+        // The coinbase's locktime ends `FD 00` (locktime is not a consensus
+        // rule): a decoder with lenient varints that frames each transaction at
+        // its re-encoded length (the decoder before the fix) stops two bytes
+        // early, reads the shielded count as `FD 00 00` (0) from those two
+        // locktime bytes and the real count byte, and accepts the bytes as
+        // this (valid) block. A lenient decoder that frames by the bytes
+        // consumed accepts them too; only the minimal-varint rule refuses them.
+        let mut cb = coinbase(subsidy(Pre.height()), "block/decode/pre", b"");
+        cb.locktime = u32::from_le_bytes([0x11, 0x22, 0xFD, 0x00]);
+        let mut pre = raw_block(Pre.height(), ACT, one_parent(), vec![cb]);
         reroot(&mut pre, ACT);
         let w = pre.to_wire_bytes();
+        assert!(w.ends_with(&[0x11, 0x22, 0xFD, 0x00, 0x00]), "locktime, then a shielded count of 0");
         let hdr = pre.header.to_wire_bytes(pre.blue_score, pre.height).len();
         // Transaction count, version, input count, outpoint, script_sig length.
         let ss_len_at = hdr + 1 + 4 + 1 + 36;
         assert_eq!(w[ss_len_at] as usize, pre.transactions[0].inputs[0].script_sig.len());
         c.push_full("decode/non-minimal-script-sig-length/pre".into(),
-            "A coinbase-only block below the activation with the coinbase's script_sig length written in the 3-byte form (same block id and contents): the decoder refuses the bytes at every height. Decoders before the fix accepted it and framed the next field at the re-encoded length, two bytes early.",
+            "A coinbase-only block below the activation with the coinbase's script_sig length written in the 3-byte form (same block id and contents) and a coinbase locktime whose last two bytes are FD 00: the decoder refuses the bytes at every height. Decoders before the fix accepted them as this block: they framed the shielded count at the coinbase's re-encoded length, two bytes early, and read it as FD 00 00 (0).",
             ACT, pre, vec![], Some("decode"), "full", Pow::Skip);
         c.cases.last_mut().unwrap().raw = Some(widen(&w, ss_len_at));
     }
