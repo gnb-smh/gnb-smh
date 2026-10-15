@@ -303,12 +303,23 @@ pub fn decode_frame<M: for<'de> Deserialize<'de>>(buf: &[u8]) -> io::Result<M> {
     Ok(msg)
 }
 
+/// [`decode_frame`] plus the one-encoding rule of the gossip path
+/// (`network::WireDecodeError::NonCanonical`): bincode accepts non-minimal
+/// varints, so the frame must equal the re-encoding of what it decoded to.
+fn decode_canonical<M: Serialize + for<'de> Deserialize<'de>>(buf: &[u8]) -> io::Result<M> {
+    let msg: M = decode_frame(buf)?;
+    if encode_frame(&msg)? != buf {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "non-canonical sync frame (non-minimal varint)"));
+    }
+    Ok(msg)
+}
+
 /// Decode + bounds-validate an inbound [`SyncRequest`]. The directed-sync
 /// analogue of `network/mod.rs::decode_wire_message` for the gossip path:
 /// same read-limit discipline, same per-field bounds, so a peer cannot use
 /// the directed protocol to bypass limits enforced on the gossip one.
 pub fn decode_request(buf: &[u8]) -> io::Result<SyncRequest> {
-    let req: SyncRequest = decode_frame(buf)?;
+    let req: SyncRequest = decode_canonical(buf)?;
     validate_sync_request_bounds(&req)?;
     Ok(req)
 }
@@ -319,7 +330,7 @@ pub fn decode_request(buf: &[u8]) -> io::Result<SyncRequest> {
 /// (2000) the gossip path enforces, and the processor would then walk the
 /// whole thing and issue a `GetBlock` per unknown entry.
 pub fn decode_response(buf: &[u8]) -> io::Result<SyncResponse> {
-    let resp: SyncResponse = decode_frame(buf)?;
+    let resp: SyncResponse = decode_canonical(buf)?;
     validate_sync_response_bounds(&resp)?;
     Ok(resp)
 }

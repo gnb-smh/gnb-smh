@@ -441,16 +441,26 @@ pub enum WireDecodeError {
     /// let an attacker make any request byte-unique (fresh gossip message id)
     /// and so bypass gossipsub's de-duplication.
     TrailingBytes(usize),
+    /// The frame decoded but is not the encoding of what it decoded to:
+    /// bincode accepts non-minimal varints (`FB 05 00` for 5), so without
+    /// this check one message had many byte encodings, each a fresh gossip
+    /// message id — the NET-7 de-duplication bypass without trailing bytes
+    /// (fuzz target `netmsg_decode`, docs/testing/FUZZING.md). A compliant
+    /// encoder never produces them.
+    NonCanonical,
 }
 
 impl WireDecodeError {
-    /// Oversized and bounds-violating frames are deliberate protocol
-    /// violations — a compliant node cannot produce them. Malformed frames
-    /// may just be a newer/older protocol version.
+    /// Oversized, bounds-violating, padded and non-canonical frames are
+    /// deliberate protocol violations — a compliant node cannot produce them.
+    /// Malformed frames may just be a newer/older protocol version.
     pub fn is_protocol_violation(&self) -> bool {
         matches!(
             self,
-            WireDecodeError::Oversized(_) | WireDecodeError::Bounds(_) | WireDecodeError::TrailingBytes(_)
+            WireDecodeError::Oversized(_)
+                | WireDecodeError::Bounds(_)
+                | WireDecodeError::TrailingBytes(_)
+                | WireDecodeError::NonCanonical
         )
     }
 }
@@ -481,7 +491,11 @@ pub fn decode_wire_message(data: &[u8]) -> Result<NetworkMessage, WireDecodeErro
         Err(e) => return Err(WireDecodeError::Malformed(e.to_string())),
     };
     validate_wire_bounds(&msg)?;
-    Ok(msg)
+    // One encoding per message: the frame must be what the encoder writes.
+    match bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {
+        Ok(canonical) if canonical == data => Ok(msg),
+        _ => Err(WireDecodeError::NonCanonical),
+    }
 }
 
 /// Explicit bounds on every variable-length field of NetworkMessage.
