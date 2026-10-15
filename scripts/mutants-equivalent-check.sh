@@ -12,6 +12,8 @@
 # block between the "BEGIN/END equivalent mutants" markers, and compares the
 # mutants the block removes (names without ":line:column", repeats counted)
 # with .cargo/mutants-equivalent.txt. Any difference fails (exit 1).
+# Colors are forced off: CI sets CARGO_TERM_COLOR=always, which cargo-mutants
+# honours, and ANSI escapes in the names would never match the plain list.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -29,8 +31,8 @@ fi
 names() { sed -E 's/^([^:]+):[0-9]+:[0-9]+:/\1:/' | LC_ALL=C sort; }
 : > "$tmp/excluded"
 for pkg in gnb-smh gnb-crypto; do
-    cargo mutants -p "$pkg" --list --config "$tmp/no-equivalent.toml" | names > "$tmp/$pkg.all"
-    cargo mutants -p "$pkg" --list | names > "$tmp/$pkg.kept"
+    cargo mutants -p "$pkg" --list --colors never --config "$tmp/no-equivalent.toml" | names > "$tmp/$pkg.all"
+    cargo mutants -p "$pkg" --list --colors never | names > "$tmp/$pkg.kept"
     LC_ALL=C comm -23 "$tmp/$pkg.all" "$tmp/$pkg.kept" >> "$tmp/excluded"
 done
 LC_ALL=C sort -o "$tmp/excluded" "$tmp/excluded"
