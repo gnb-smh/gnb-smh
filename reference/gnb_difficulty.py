@@ -35,6 +35,11 @@ anchor's parent time and `height_diff + 1`; the schedules are the same.
 GnB's consensus inputs (docs/CONSENSUS.md): the anchor is the genesis block;
 `parent_time` is the latest timestamp over ALL parents of the block (not the
 GhostDAG selected parent's), and `height` is max(parent heights) + 1.
+
+Pow limit (audit POW-3): for a block at header height `height` the clamp is
+`pow_limit_bits_at(height, activation_height)`: the genesis target
+(GENESIS_BITS) when 1 <= height and height >= activation_height (the
+hardening activation, mainnet 110,000), POW_LIMIT_BITS before.
 """
 
 from __future__ import annotations
@@ -43,6 +48,8 @@ from __future__ import annotations
 TARGET_SPACING = 30              # seconds
 HALFLIFE = 2 * 60 * 60           # seconds (240 blocks)
 POW_LIMIT_BITS = 0x2100FFFF
+HARDENED_POW_LIMIT_BITS = 0x1F0E9036   # = GENESIS_BITS (POW-3)
+MAINNET_HARDENING_ACTIVATION_HEIGHT = 110_000
 GENESIS_BITS = 0x1F0E9036
 GENESIS_TIMESTAMP = 1791429092
 GENESIS_HEIGHT = 0
@@ -224,10 +231,22 @@ def difficulty_input(parents: list[tuple[int, int]]) -> tuple[int, int]:
     return max(t for _, t in parents), max(h for h, _ in parents) + 1
 
 
-def expected_bits(parents: list[tuple[int, int]]) -> int:
-    """`bits` a GnB block with these parents must carry. A parent timestamp
+def pow_limit_bits_at(height: int, activation_height: int) -> int:
+    """Pow limit of a block at header height `height` (POW-3): the genesis
+    target at/after the hardening activation (never for the genesis itself),
+    POW_LIMIT_BITS before."""
+    if height >= 1 and height >= activation_height:
+        return HARDENED_POW_LIMIT_BITS
+    return POW_LIMIT_BITS
+
+
+def expected_bits(parents: list[tuple[int, int]],
+                  activation_height: int = MAINNET_HARDENING_ACTIVATION_HEIGHT) -> int:
+    """`bits` a GnB block with these parents must carry under the given
+    hardening activation height (mainnet by default). A parent timestamp
     above i64::MAX is an error (the Rust code converts u64 -> i64)."""
     parent_time, height = difficulty_input(parents)
     if parent_time > I64_MAX:
         raise ValueError("parent timestamp out of range")
-    return asert_next_bits(parent_time, height)
+    return asert_next_bits(parent_time, height,
+                           pow_limit_bits=pow_limit_bits_at(height, activation_height))

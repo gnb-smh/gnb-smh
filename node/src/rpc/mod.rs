@@ -1253,8 +1253,40 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_secs();
+            // Hardening block rules (docs/CONSENSUS.md, "Block rules at the
+            // hardening activation"): at/after the activation the coinbase
+            // script_sig MUST start with `coinbase_script_sig_prefix` (80
+            // bytes: tag, height, parents commitment, witness root of exactly
+            // the listed transactions in this order), followed by at most
+            // `max_coinbase_extra_bytes` miner bytes; the header Merkle root
+            // uses the tagged tree; the size limit is measured on the wire
+            // encoding. Below it, all three are as before.
+            //
+            // The WHOLE coinbase, measured with `size_rule`, must fit in
+            // `coinbase_reserve`: the listed transactions may fill the rest of
+            // the block. `max_coinbase_extra_bytes` already includes that
+            // bound for a coinbase with one output whose script_pubkey is at
+            // most `max_coinbase_script_pubkey_bytes` bytes (and the consensus
+            // script_sig cap), so a miner that stays within both fields can
+            // never produce a block over `max_block_size`.
+            let commitment = tmpl.coinbase_commitment();
+            let max_extra = crate::template::external_coinbase_max_extra(
+                commitment.map(|c| c.len()).unwrap_or(0),
+                tmpl.hardened,
+                crate::template::EXTERNAL_COINBASE_RESERVE,
+            );
 
             json!({
+                "hardening_active":     tmpl.hardened,
+                "hardening_activation_height": tmpl.activation_height,
+                "merkle_rule":          if tmpl.hardened { "gnb-tagged-v1" } else { "sha256d-duplicate-last" },
+                "size_rule":            if tmpl.hardened { "wire" } else { "bincode" },
+                "coinbase_script_sig_prefix": commitment.map(hex::encode).unwrap_or_default(),
+                "max_coinbase_extra_bytes": max_extra,
+                "max_coinbase_script_pubkey_bytes": crate::template::EXTERNAL_COINBASE_MAX_SPK,
+                // Siblings from the coinbase leaf to the header root (fold the
+                // coinbase txid through them with the `merkle_rule`).
+                "coinbase_merkle_branch": tmpl.coinbase_merkle_branch().iter().map(hex::encode).collect::<Vec<_>>(),
                 "parents":              tmpl.parents.iter().map(hex::encode).collect::<Vec<_>>(),
                 "height":               tmpl.height,
                 "blue_score":           tmpl.blue_score,
@@ -1269,9 +1301,12 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // MAX_FUTURE_SECS ahead of the validator's clock.
                 "min_time":             tmpl.parent_timestamp,
                 // Size accounting: the whole block, measured as the consensus
-                // rule measures it (bincode `Block::size_bytes`), must stay
-                // <= max_block_size; the listed transactions leave
-                // coinbase_reserve bytes for the coinbase.
+                // rule measures it at this height (`size_rule`: bincode
+                // `Block::size_bytes` before the activation, the wire encoding
+                // `Block::to_wire_bytes` from it), must stay <= max_block_size;
+                // the listed transactions leave coinbase_reserve bytes for the
+                // WHOLE coinbase (in the same measure), which is what
+                // max_coinbase_extra_bytes is derived from.
                 "max_block_size":       crate::core::MAX_BLOCK_SIZE,
                 "coinbase_reserve":     crate::template::EXTERNAL_COINBASE_RESERVE,
                 "max_parents":          crate::core::MAX_PARENTS,
@@ -2415,5 +2450,133 @@ mod audit_2026_10_rpc_tests {
         let r = dispatch("getdaginfo", None, &state).await;
         assert_eq!(r["tip_height"], 5);
         assert_eq!(r["next_block_height"], 9, "the pool's next height, not tip_height + 1");
+    }
+}
+
+// ── Hardening block rules: getblocktemplate gives external miners the coinbase
+//    layout and the Merkle rule of the template's height (package P1) ────────
+#[cfg(test)]
+mod block_rules_template_tests {
+    use super::*;
+    use crate::core::{self, activation, block_rules, Block, BlockHeader, MerkleRoot, TxInput, TxOutput};
+    use tempfile::TempDir;
+
+    /// An AppState whose DAG holds one bodied genesis (built under the
+    /// calling thread's activation height).
+    fn state_with_genesis() -> (TempDir, AppState) {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(Storage::open(&tmp.path().join("db")).expect("storage"));
+        let mut genesis = core::genesis_block();
+        genesis.header.timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 1_000;
+        let gh = genesis.block_hash();
+        store.put_block(&genesis).unwrap();
+        let mut dag = GhostDAG::with_default_k();
+        dag.add_genesis(gh, genesis.header.timestamp);
+        let (outbound_tx, _rx) = mpsc::channel(1);
+        let state = AppState {
+            node_state: Arc::new(RwLock::new(NodeState::default())),
+            store,
+            mempool: Arc::new(Mempool::new()),
+            dag: Arc::new(RwLock::new(dag)),
+            outbound_tx,
+            api_key: None,
+            require_auth_for_writes: false,
+            require_auth_for_reads: false,
+            rate_limiter: Arc::new(auth::RateLimiterSet::new(60, 5)),
+            trust_private_ranges: false,
+            allowed_origins: Arc::new(Vec::new()),
+            allowed_hosts: Arc::new(Vec::new()),
+            trust_loopback: false,
+            heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
+            submit_block: None,
+        };
+        (tmp, state)
+    }
+
+    fn hashes(v: &Value) -> Vec<[u8; 32]> {
+        v.as_array().unwrap().iter()
+            .map(|h| hex::decode(h.as_str().unwrap()).unwrap().try_into().unwrap())
+            .collect()
+    }
+
+    /// Assemble a block the way an external miner does from the RPC fields
+    /// alone: coinbase script_sig = prefix || own bytes, header root folded
+    /// from the coinbase txid through `coinbase_merkle_branch`.
+    fn external_block(t: &Value, extra: &[u8]) -> Block {
+        let mut script_sig = hex::decode(t["coinbase_script_sig_prefix"].as_str().unwrap()).unwrap();
+        script_sig.extend_from_slice(extra);
+        let value: u64 = t["subsidy_sat"].as_str().unwrap().parse().unwrap();
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [0; 32], prev_index: u32::MAX, script_sig, sequence: u32::MAX }],
+            outputs: vec![TxOutput { value, script_pubkey: vec![0x44; 20] }],
+            locktime: 0,
+        };
+        let hardened = t["merkle_rule"] == "gnb-tagged-v1";
+        let root = block_rules::merkle_root_from_coinbase_branch(
+            &coinbase.txid(), &hashes(&t["coinbase_merkle_branch"]), hardened);
+        Block {
+            header: BlockHeader {
+                version: 1, parents: hashes(&t["parents"]), merkle_root: root,
+                timestamp: t["min_time"].as_u64().unwrap() + 1,
+                bits: t["bits"].as_u64().unwrap() as u32, nonce: 0,
+            },
+            transactions: vec![coinbase],
+            blue_score: t["blue_score"].as_u64().unwrap(),
+            height: t["height"].as_u64().unwrap(),
+            shielded_transactions: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn getblocktemplate_returns_the_coinbase_layout_of_the_templates_height() {
+        // From the activation: the 80-byte prefix, tagged root, wire size.
+        {
+            let _guard = activation::scoped_override(1);
+            let (_tmp, state) = state_with_genesis();
+            let t = dispatch("getblocktemplate", None, &state).await;
+            assert_eq!(t["height"], 1, "{t}");
+            assert_eq!(t["hardening_active"], true);
+            assert_eq!(t["merkle_rule"], "gnb-tagged-v1");
+            assert_eq!(t["size_rule"], "wire");
+            let prefix = hex::decode(t["coinbase_script_sig_prefix"].as_str().unwrap()).unwrap();
+            assert_eq!(prefix.len(), block_rules::COINBASE_COMMITMENT_LEN);
+            assert_eq!(&prefix[..8], b"GNB-CB01");
+            // The whole coinbase must fit the reserve: far below the
+            // script_sig cap (9,920), which a full template has no room for.
+            let max_extra = t["max_coinbase_extra_bytes"].as_u64().unwrap() as usize;
+            assert_eq!(max_extra, crate::template::external_coinbase_max_extra(80, true, 1_000));
+            assert!(max_extra > 700 && max_extra < 1_000 - 80, "{max_extra}");
+            assert_eq!(t["max_coinbase_script_pubkey_bytes"], crate::template::EXTERNAL_COINBASE_MAX_SPK);
+            let block = external_block(&t, &vec![0xE5; max_extra]);
+            assert!(block.transactions[0].wire_size(true) <= t["coinbase_reserve"].as_u64().unwrap() as usize);
+            assert_eq!(block_rules::check_block_hardened_at(&block, 1), Ok(()));
+            assert_eq!(block.validate_structure_without_pow_at(1), Ok(()));
+            let block = external_block(&t, b"pool-extranonce");
+            assert_eq!(block_rules::check_block_hardened_at(&block, 1), Ok(()));
+            assert_eq!(block.validate_structure_without_pow_at(1), Ok(()));
+            assert_eq!(block.body_merkle_root(), block.header.merkle_root);
+        }
+        // Below it: no prefix, the legacy root and bincode size, as before.
+        {
+            let _guard = activation::scoped_override(activation::NEVER);
+            let (_tmp, state) = state_with_genesis();
+            let t = dispatch("getblocktemplate", None, &state).await;
+            assert_eq!(t["hardening_active"], false, "{t}");
+            assert_eq!(t["merkle_rule"], "sha256d-duplicate-last");
+            assert_eq!(t["size_rule"], "bincode");
+            assert_eq!(t["coinbase_script_sig_prefix"], "");
+            let max_extra = t["max_coinbase_extra_bytes"].as_u64().unwrap() as usize;
+            assert_eq!(max_extra, crate::template::external_coinbase_max_extra(0, false, 1_000));
+            assert!(max_extra > 800 && max_extra < 1_000, "{max_extra}");
+            let block = external_block(&t, &vec![0xE5; max_extra]);
+            assert!(block.transactions[0].actual_size() <= t["coinbase_reserve"].as_u64().unwrap() as usize);
+            assert_eq!(block.validate_structure_without_pow_at(activation::NEVER), Ok(()));
+            let block = external_block(&t, b"height:1 pool");
+            assert_eq!(block.validate_structure_without_pow_at(activation::NEVER), Ok(()));
+            assert_eq!(block.header.merkle_root, core::Transaction::merkle_root(&block.transactions));
+            assert_ne!(block.header.merkle_root, MerkleRoot::ZERO);
+        }
     }
 }

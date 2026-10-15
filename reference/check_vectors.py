@@ -10,6 +10,7 @@ import pathlib
 import sys
 
 import gen_difficulty_vectors
+import gen_merkle_vectors
 import gnb_smh as ref
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -35,7 +36,7 @@ def main() -> int:
     # Difficulty: compact bits, chain work, ASERT, GnB's expected bits.
     stored = json.loads((HERE / "difficulty_vectors.json").read_text())
     fresh = gen_difficulty_vectors.build()
-    for section in ("compact", "targets", "asert", "gnb_expected_bits"):
+    for section in ("compact", "targets", "asert", "gnb_expected_bits", "hardening_pow_limit"):
         bad = sum(a != b for a, b in zip(stored[section], fresh[section]))
         bad += abs(len(stored[section]) - len(fresh[section]))
         failures += bad
@@ -44,6 +45,13 @@ def main() -> int:
     if stored.get("gnb") != fresh["gnb"]:
         print("FAIL difficulty constants")
         failures += 1
+
+    # Hardening block rules: Merkle trees, ids, the coinbase commitment.
+    stored = json.loads((HERE / "merkle_vectors.json").read_text())
+    fresh = gen_merkle_vectors.build()
+    bad = int(stored != fresh)
+    failures += bad
+    print(f"{'ok  ' if not bad else 'FAIL'} merkle / block-rule vectors")
     return 1 if failures else 0
 
 

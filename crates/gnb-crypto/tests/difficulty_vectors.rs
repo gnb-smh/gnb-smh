@@ -84,6 +84,47 @@ fn multi_parent_expected_bits_match_reference() {
     }
 }
 
+/// POW-3: the pow limit around the hardening activation height, on the real
+/// ASERT path (`expected_bits_at` is never pinned by `test-pow-limit`).
+#[test]
+fn hardening_pow_limit_matches_reference() {
+    let d = doc();
+    let g = &d["gnb"];
+    assert_eq!(
+        g["hardened_pow_limit_bits"].as_u64().unwrap(),
+        u64::from(core::block_rules::HARDENED_POW_LIMIT_BITS)
+    );
+    assert_eq!(core::block_rules::HARDENED_POW_LIMIT_BITS, core::GENESIS_BITS);
+    assert_eq!(
+        g["mainnet_hardening_activation_height"].as_u64().unwrap(),
+        core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT
+    );
+    let cases = d["hardening_pow_limit"].as_array().unwrap();
+    assert!(cases.len() >= 24);
+    let pow_limit_bits = core::target_to_bits(&core::bits_to_target(core::POW_LIMIT_BITS));
+    let mut clamped_below = 0;
+    let mut clamped_at = 0;
+    for v in cases {
+        let act = v["activation_height"].as_u64().unwrap();
+        let height = v["height"].as_u64().unwrap();
+        let parent_time = v["parent_time"].as_u64().unwrap();
+        let limit = u32::try_from(v["pow_limit_bits"].as_u64().unwrap()).unwrap();
+        let want = u32::try_from(v["bits"].as_u64().unwrap()).unwrap();
+        assert_eq!(core::block_rules::pow_limit_bits_at(height, act), limit, "{v}");
+        assert_eq!(core::expected_bits_at(parent_time, height, act).unwrap(), want, "{v}");
+        let target = core::bits_to_target(want);
+        assert!(core::Block::target_within_pow_limit_at(&target, height, act), "{v}");
+        if want == pow_limit_bits {
+            clamped_below += 1;
+            assert!(height < act, "{v}");
+        }
+        if limit == core::GENESIS_BITS && want == core::GENESIS_BITS && v["note"] != "on schedule" {
+            clamped_at += 1;
+        }
+    }
+    assert!(clamped_below > 0 && clamped_at > 0, "both sides of the boundary are exercised");
+}
+
 #[test]
 fn chain_work_matches_reference() {
     let d = doc();

@@ -25,10 +25,12 @@
 //!     zero-value output (policy: UTXO-set bloat, VAL-11 note), canonical
 //!     witnesses at EVERY height and the hybrid signature suite only
 //!     ([`check_standard_witnesses`], CRY-1/CRY-2 policy);
-//!  5. version: valid AND standard for the next block's height
+//!  5. next-block rules ([`check_tx_for_next_block`]): the version valid AND
+//!     standard for the next block's height
 //!     (`core::sighash::check_tx_version_standard`: version 3 from the
 //!     hardening activation height; below it version >= 3 is non-standard
-//!     although consensus-valid with sighash v2);
+//!     although consensus-valid with sighash v2) and, at/after the
+//!     activation, no 64-byte txid preimage (VAL-10);
 //!  6. conflicts: an input already spent by a pooled tx (first-seen wins —
 //!     the explicit replacement rule is "no replacement", MEM-6);
 //!  7. duplicate inputs within the tx (C-R3-2);
@@ -275,9 +277,20 @@ fn activation_height() -> u64 {
 /// regime, the activation state at `block_height` and the prevouts (see
 /// [`sig_cache_key`]); only successes are cached. Relay policy (version >= 3
 /// non-standard below the activation) is NOT part of this rule: see
-/// [`check_version_for_next_block`].
+/// [`check_version_for_next_block`]. Uses the process-wide activation height.
 pub fn verify_input_scripts(tx: &Transaction, prevouts: &[TxOutput], block_height: u64) -> Result<(), String> {
-    let act = activation_height();
+    verify_input_scripts_at(tx, prevouts, block_height, activation_height())
+}
+
+/// [`verify_input_scripts`] for an explicit hardening activation height (the
+/// node's `accept::validate_block_in_view_at` evaluates every rule of a block
+/// under one activation height).
+pub fn verify_input_scripts_at(
+    tx: &Transaction,
+    prevouts: &[TxOutput],
+    block_height: u64,
+    act: u64,
+) -> Result<(), String> {
     let version = core::sighash::check_tx_version(tx.version, block_height, act)?;
     let witnesses = core::sighash::check_input_witnesses(tx, prevouts, version)?;
     let key = sig_cache_key(tx, version, core::activation::is_active_at(block_height, act), prevouts);
@@ -394,6 +407,24 @@ pub fn check_version_for_next_block(tx: &Transaction, next_block_height: u64) ->
     core::sighash::check_tx_version_standard(tx.version, next_block_height, activation_height()).map(|_| ())
 }
 
+/// Step 5: every signature-free rule a transaction must satisfy for the block
+/// at `next_block_height` that is a function of that height alone (no chain
+/// state): the version rule and policy ([`check_version_for_next_block`],
+/// CRY-3) and, at/after the hardening activation, no 64-byte txid preimage
+/// (`core::block_rules::check_tx_not_64_bytes`, VAL-10). THE height check
+/// admission, the re-check under the acceptance lock in [`admit`],
+/// post-connect eviction (`accept::evict_version_invalid`),
+/// `accept::revalidate_mempool` and the template self-check share, so a pool
+/// whose next height crosses the activation drops (or a template at another
+/// height skips) every transaction that block could not contain.
+pub fn check_tx_for_next_block(tx: &Transaction, next_block_height: u64) -> Result<(), String> {
+    check_version_for_next_block(tx, next_block_height)?;
+    if core::block_rules::rules_active_at(next_block_height, activation_height()) {
+        core::block_rules::check_tx_not_64_bytes(tx).map_err(str::to_string)?;
+    }
+    Ok(())
+}
+
 /// Run every admission check (steps 1–11) WITHOUT inserting. Returns the fee.
 /// `mempool = None` skips the pool-relative checks (known/conflict/rolling
 /// fee), which is what block-independent callers such as
@@ -428,7 +459,11 @@ pub fn check_transaction(
         // consensus), relayed ones must be standard.
         check_standard_witnesses(tx).map_err(AdmissionError::Rejected)?;
     }
-    check_version_for_next_block(tx, policy.next_block_height).map_err(AdmissionError::Rejected)?;
+    // Version rule / policy (CRY-3) and the 64-byte rule (VAL-10), judged at
+    // the height of the block the transaction would be mined in: neither a
+    // version-1 transaction nor a 64-byte txid preimage can be mined at/after
+    // the activation, so neither is pooled there.
+    check_tx_for_next_block(tx, policy.next_block_height).map_err(AdmissionError::Rejected)?;
 
     // Conflicts with the pool and duplicate inputs (cheap, no I/O).
     let mut seen: HashSet<([u8; 32], u32)> = HashSet::with_capacity(tx.inputs.len());
@@ -505,11 +540,12 @@ pub fn check_transaction(
 /// that every input is still unspent, so it cannot race a block connect that
 /// spends an input and sweeps conflicts (MEM-3) between the check and the
 /// insert. Under the same lock the height-dependent rules (version rule and
-/// policy, coinbase maturity) are re-checked against the pool's CURRENT next
-/// height (`Mempool::next_height`) when it differs from the height the checks
-/// ran at: a block connected meanwhile (whose post-connect eviction ran
-/// before this insert) cannot let in a transaction invalid for the new next
-/// block. Signatures need no re-check: a version that passes the policy at
+/// policy, the 64-byte rule, coinbase maturity: [`check_tx_for_next_block`]
+/// and `core::check_coinbase_maturity`) are re-checked against the pool's
+/// CURRENT next height (`Mempool::next_height`) when it differs from the
+/// height the checks ran at: a block connected meanwhile (whose post-connect
+/// eviction ran before this insert) cannot let in a transaction invalid for
+/// the new next block. Signatures need no re-check: a version that passes the policy at
 /// both heights selects the same digest at both.
 pub fn admit(
     store: &Storage,
@@ -536,7 +572,7 @@ pub fn admit(
     }
     let current = mempool.next_height();
     if current != 0 && current != policy.next_block_height {
-        check_version_for_next_block(&tx, current).map_err(|e| AdmissionError::Rejected(format!(
+        check_tx_for_next_block(&tx, current).map_err(|e| AdmissionError::Rejected(format!(
             "{e} (the next block moved to height {current} while the transaction was being checked)")))?;
         core::check_coinbase_maturity(&tx, current, |t| store.get_coinbase_height(t).ok().flatten())
             .map_err(AdmissionError::Immature)?;
