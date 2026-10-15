@@ -1,0 +1,22 @@
+# The mutants that the equivalent-mutant block of .cargo/mutants.toml
+# (between "BEGIN equivalent mutants" and "END equivalent mutants") must
+# exclude: exactly these, each as many times as listed. Names are
+# cargo-mutants' mutant names with the ":line:column" removed.
+# scripts/mutants-equivalent-check.sh (CI) fails when the block excludes any
+# other mutant or misses one of these. Each is justified in the
+# equivalent-mutant table of docs/testing/MUTATION.md (E1-E5).
+#
+# E1 (lane16: three `|`)
+crates/gnb-smh/src/lib.rs: replace | with ^ in lane16
+crates/gnb-smh/src/lib.rs: replace | with ^ in lane16
+crates/gnb-smh/src/lib.rs: replace | with ^ in lane16
+# E2 (target_to_bits: three `|`)
+crates/gnb-smh/src/difficulty.rs: replace | with ^ in target_to_bits
+crates/gnb-smh/src/difficulty.rs: replace | with ^ in target_to_bits
+crates/gnb-smh/src/difficulty.rs: replace | with ^ in target_to_bits
+# E3 (work: one `|`)
+crates/gnb-smh/src/difficulty.rs: replace | with ^ in work
+# E4 (asert_next_target: the pow-limit clamp, one `>`)
+crates/gnb-smh/src/difficulty.rs: replace > with >= in asert_next_target
+# E5 (min_tx_fee_sat: one `>`)
+crates/gnb-crypto/src/core/tokenomics.rs: replace > with >= in min_tx_fee_sat

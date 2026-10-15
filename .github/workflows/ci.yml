@@ -190,8 +190,11 @@ jobs:
   # results: docs/testing/MUTATION.md. Weekly and on demand, every mutant of
   # the scope; each crate in its own invocation (the node's test-pow-limit
   # feature is never unified into gnb-crypto), gnb-crypto in shards. Fails on
-  # any missed (surviving) mutant, on a baseline failure and on any other
-  # cargo-mutants error (scripts/mutants-gate.sh).
+  # any missed (surviving) mutant, on any timeout that is not a known hang
+  # (.cargo/mutants-timeouts.txt), on a baseline failure and on any other
+  # cargo-mutants error (scripts/mutants-gate.sh); and when the
+  # equivalent-mutant exclusions no longer match the documented list
+  # (scripts/mutants-equivalent-check.sh).
   mutants:
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '41 4 * * 0'
     runs-on: ubuntu-latest
@@ -210,6 +213,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants@27.1.0
+      - name: Equivalent-mutant exclusions match the documented list
+        if: matrix.package == 'gnb-smh'
+        run: scripts/mutants-equivalent-check.sh
       - name: cargo mutants -p ${{ matrix.package }} --shard ${{ matrix.shard }}
         run: >
           scripts/mutants-gate.sh "$RUNNER_TEMP/mutants"
@@ -233,9 +239,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants@27.1.0
+      - name: Equivalent-mutant exclusions match the documented list
+        run: scripts/mutants-equivalent-check.sh
       - name: Diff against the base branch
+        if: success() || failure()
         run: git diff "origin/${{ github.base_ref }}...HEAD" > "$RUNNER_TEMP/pr.diff"
       - name: gnb-smh mutants in the diff
+        if: success() || failure()
         run: >
           scripts/mutants-gate.sh "$RUNNER_TEMP/mutants-gnb-smh"
           -p gnb-smh --in-diff "$RUNNER_TEMP/pr.diff" --test-tool cargo -j 2 --no-shuffle

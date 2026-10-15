@@ -31,14 +31,18 @@ transaction end to end; the node crate's tests are outside this measurement).
 | `crates/gnb-crypto/src/core/activation.rs` | all | — |
 | `crates/gnb-crypto/src/core/tokenomics.rs` | all | — |
 | `crates/gnb-crypto/src/core/carryover.rs` | all | — |
-| `crates/gnb-crypto/src/core/mod.rs` | every consensus function: chain id, size constants, difficulty wrappers and `expected_bits*`, ASERT parameters, `validate_pow` and the pow-limit checks, the proof cache, coinbase format/value, Merkle roots, txid/wtxid, wire encodings and parsers, size measures (`wire_size`, `size_bytes`), `parse_script_sig*`, `check_coinbase_maturity`, `check_min_fee`, the structural checks, `UndoData` encoding | the wallet's pre-signing fee estimators and statistics (`Transaction::estimate_size`, `calc_fee`, `estimate_fee`, `actual_size`, `total_output`, `unique_output_addresses`: never called by validation), the human-facing difficulty float (`difficulty_from_bits`, `difficulty_to_target`, `u256_to_f64`: RPC/explorer display), `Debug`/`Display` of `MerkleRoot` |
+| `crates/gnb-crypto/src/core/mod.rs` | every consensus function: chain id, size constants, difficulty wrappers and `expected_bits*`, ASERT parameters, `validate_pow` and the pow-limit checks, the proof cache, coinbase format/value, Merkle roots, txid/wtxid, wire encodings and parsers, size measures (`wire_size`, `size_bytes`), `parse_script_sig*`, `check_coinbase_maturity`, `check_min_fee`, the structural checks, `UndoData` encoding, `Transaction::actual_size` (the pre-activation size of one transaction: the node's mempool admission and the miner's coinbase reserve use it) | the pre-signing fee estimators and output statistics (`Transaction::estimate_size`, `calc_fee`, `estimate_fee`, `total_output`, `unique_output_addresses`: used by the wallet and the advisory `estimatefee` RPC, never by validation, mempool admission or the block template), the human-facing difficulty float (`difficulty_from_bits`, `difficulty_to_target`, `u256_to_f64`: RPC/explorer display), `Debug`/`Display` of `MerkleRoot` |
 
 The scope, the exclusions and the equivalent mutants are encoded once, in
 `.cargo/mutants.toml` (`examine_globs`, `exclude_re`), which every run below
 and CI use. In-scope mutants: 280 in gnb-smh (272 after excluding the
-equivalent ones), 717 in gnb-crypto at `b6a2976` (718 at
-the head of this branch, extracting `PowCache::insert` added one; 717 after
-excluding the equivalent one).
+equivalent ones), 719 in gnb-crypto at `b6a2976` (720 at the head of this
+branch, extracting `PowCache::insert` added one; 719 after excluding the
+equivalent one). `Transaction::actual_size` (2 mutants) was first excluded
+as a wallet helper and put back in scope after review, when it turned out
+to be the size measure the node's mempool admission and coinbase reserve
+use; the full runs below were made without it (717 and 718 mutants), and its
+two mutants were run separately at `b6a2976` and at the head.
 
 ## Method
 
@@ -61,7 +65,7 @@ excluding the equivalent one).
   for a type without `Default`), *timeout* (the test run did not finish within
   the timeout: the mutant hangs a test, e.g. it turns a loop into an endless
   one; the tests did not pass, so the mutant is detected — every timeout is
-  listed and explained below).
+  listed and explained below, and the gate fails on any other).
 - Every survivor was either killed by a new test that checks a specific
   behaviour (an exact boundary, an exact byte layout, an independent
   reference value, a real signature that must or must not verify) or shown
@@ -84,7 +88,18 @@ scripts/mutants-gate.sh out-pr -p gnb-crypto --in-diff pr.diff --test-tool cargo
 
 # List the scope without running anything:
 cargo mutants -p gnb-crypto --list
+
+# Check that the equivalent-mutant exclusions still exclude exactly E1-E5:
+scripts/mutants-equivalent-check.sh
 ```
+
+Parallel runs (`-j 2` and more) need a separate target directory for each
+build copy, which is cargo-mutants' default (`<copy>/target`). With
+`CARGO_TARGET_DIR` set, every copy builds into the one shared directory and a
+job can run the test binary built from another job's mutant, so a mutant can
+be recorded as caught by the wrong binary. `scripts/mutants-gate.sh` unsets
+the variable; when calling `cargo mutants` directly, unset it too (or use
+`-j 1`).
 
 The runs recorded here were made on a shared 4-CPU machine under
 `nice -n 15` with `RUST_TEST_THREADS=2`, `CARGO_BUILD_JOBS=2`,
@@ -139,7 +154,13 @@ Counts are caught / missed / unviable / timeout.
 
 After the new tests, 5 mutants time out. Each one makes a loop endless, and
 each log shows the test binary started (for three of them, tests had already
-failed) before the run hung, so they are detected, not survivors:
+failed) before the run hung, so they are detected, not survivors. They are
+the only timeouts the gate accepts: `.cargo/mutants-timeouts.txt` lists them
+(by name without line and column, each at most once), and
+`scripts/mutants-gate.sh` fails on any other timed-out mutant. A mutant that
+only makes the tests slower (a disabled proof cache, a quadratic Merkle path)
+or that a new unbounded test loop turns into a hang is not evidence that a
+test detects it, so it must not pass as one:
 
 | mutant | why the tests hang |
 | --- | --- |
@@ -226,7 +247,15 @@ at epoch edges, carryover totals and `verify_and_convert`'s five checks).
 ## Equivalent mutants
 
 No input distinguishes these mutants from the original code; they are
-excluded in `.cargo/mutants.toml`.
+excluded in `.cargo/mutants.toml`, between the `BEGIN/END equivalent mutants`
+markers. The patterns match by file, function and operator (E4 also by
+column), so they would also exclude a new mutant that a later edit adds to one
+of these functions. `scripts/mutants-equivalent-check.sh` (CI) therefore lists
+the scope with and without that block (`cargo mutants --list`, nothing is
+built) and checks that the block removes exactly the nine mutants of
+`.cargo/mutants-equivalent.txt` (names without line and column, repeats
+counted); any new mutant inside a pattern, or a documented one that a pattern
+no longer matches, fails it.
 
 | id | mutant(s) | why it is equivalent |
 | --- | --- | --- |
@@ -243,21 +272,33 @@ excluded in `.cargo/mutants.toml`.
 - **`mutants`** (weekly, Sunday 04:41 UTC, and on `workflow_dispatch`): the
   whole scope, gnb-smh in one job and gnb-crypto in four shards
   (`--shard k/4`), each through `scripts/mutants-gate.sh`. The job fails on
-  any missed mutant, on a baseline failure and on any other cargo-mutants
-  error; timeouts are reported as warnings (the tests did not pass). The
-  `mutants.out` directory (per-mutant logs and diffs) is uploaded as an
-  artifact.
+  any missed mutant, on any timeout not in `.cargo/mutants-timeouts.txt`, on
+  a baseline failure and on any other cargo-mutants error; the known hangs
+  are reported as warnings. The gnb-smh job also runs
+  `scripts/mutants-equivalent-check.sh`. The `mutants.out` directory
+  (per-mutant logs and diffs) is uploaded as an artifact.
 - **`mutants-diff`** (every pull request): only the mutants on lines the PR
   changes, `git diff origin/<base>...HEAD` passed to `--in-diff`, for each
-  crate. A PR that changes no in-scope line tests no mutant and passes in
-  seconds; one that changes consensus code must come with tests that catch
-  its mutants.
+  crate, with the same gate (missed mutants and unknown timeouts fail), after
+  `scripts/mutants-equivalent-check.sh`. A PR that changes no in-scope line
+  tests no mutant and passes in seconds; one that changes consensus code must
+  come with tests that catch its mutants.
 
 The gate was checked locally both ways: with the exclusions it passes on the
 mutants of `lane16` and `target_to_bits` (27 caught, the 6 equivalent ones
 not run) and of `min_tx_fee_sat` (3 caught, E5 not run); on the `b6a2976`
 export it fails (exit 1) on the surviving `pubkey_hash_matches` mutant. A
 diff that touches no in-scope Rust line exits 0 without building anything.
+The timeout allow-list was checked the same way: the five known hangs plus
+the two `actual_size` mutants pass the gate (exit 0: 5 timeouts, the rest
+caught), and the `issued_through_sat` hang alone, with its line removed from
+a copy of `.cargo/mutants-timeouts.txt`, fails it (exit 1, the mutant named).
+That run was started with `CARGO_TARGET_DIR` set to a shared directory; the
+logs show each build copy running its own `<copy>/target/debug/deps` test
+binary. `scripts/mutants-equivalent-check.sh` passes on this tree and fails
+(exit 1, the drifted mutant named) on two simulated edits: a new `|` in
+`work` (a tenth mutant inside the E3 pattern) and the E4 clamp moved into a
+block (the documented mutant no longer matched at column 12).
 
 cargo-mutants is pinned (`cargo-mutants@27.1.0`) so that a new release's new
 mutation operators do not fail an unrelated run; bumping it is a deliberate
@@ -271,5 +312,11 @@ change that re-checks the scope.
    value) and confirm it fails against the mutant:
    `cargo mutants -p <crate> --re '^<mutant name>$'`.
 3. Only if no input can distinguish it, add a row to the equivalent-mutant
-   table above with the argument, and an `exclude_re` entry to
-   `.cargo/mutants.toml` that matches that mutant and nothing else.
+   table above with the argument, an `exclude_re` entry inside the
+   equivalent-mutant block of `.cargo/mutants.toml` that matches that mutant
+   and as little else as possible, and the mutant's name (without line and
+   column) to `.cargo/mutants-equivalent.txt`.
+4. A timeout that is not a known hang fails the gate too. If the mutant
+   really makes a loop endless, explain it in the Timeouts table and add it to
+   `.cargo/mutants-timeouts.txt`; if it only slows the tests down, add a test
+   that fails against it instead.

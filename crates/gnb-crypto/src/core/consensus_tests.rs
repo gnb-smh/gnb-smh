@@ -347,6 +347,22 @@ fn size_bytes_is_the_bincode_length() {
 }
 
 #[test]
+fn actual_size_is_the_bincode_length_that_size_bytes_sums() {
+    // `Transaction::actual_size` is one transaction's share of the
+    // pre-activation block-size measure (`Block::size_bytes`): the node's
+    // mempool admission (MAX_TX_SIZE, fee rates) and the miner's coinbase
+    // reserve rely on it.
+    let tx = spend_tx(7, &[1_000, 2_000]);
+    let len = bincode::serde::encode_to_vec(&tx, bincode::config::standard()).unwrap().len();
+    assert_eq!(tx.actual_size(), len);
+    assert!(len > 100);
+    let without = valid_block(3, vec![[1; 32]], 20, vec![spend_tx(1, &[1_000])], activation::NEVER);
+    let mut with = without.clone();
+    with.transactions.push(tx.clone());
+    assert_eq!(with.size_bytes(), without.size_bytes() + tx.actual_size());
+}
+
+#[test]
 fn merkle_validation_compares_with_the_header() {
     let g = genesis_block();
     assert!(g.validate_merkle());
