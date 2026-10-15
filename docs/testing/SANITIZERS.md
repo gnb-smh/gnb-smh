@@ -209,7 +209,7 @@ JavaScript); isolation stays on (no file system or clock access). What runs
 | Crate | Tests | Notes |
 | --- | --- | --- |
 | `gnb-smh` | every unit test (compact bits, chain work, ASERT including the AUD-1 wide multiply and shift, the lane-level Keccak step, the scratchpad), `tests/difficulty_vectors.rs` and `tests/vectors.rs` (the Python PoW vectors with log2_n = 1 and 2) [30] | the log2_n = 10 and 19 PoW vectors skipped, `canonical_entry_points_match_the_reference_vector` ignored (below) |
-| `gnb-crypto` | `core::limits`, `core::tokenomics`, `core::block_rules` (Merkle roots, coinbase branch, coinbase commitment, witness root), `core::sighash`, `core::activation` [42] | five tests ignored (below) |
+| `gnb-crypto` | `core::limits`, `core::tokenomics`, `core::block_rules` (Merkle roots, coinbase branch, coinbase commitment, witness root), `core::sighash`, `core::activation` [42] | six tests ignored (below) |
 | `pqcrypto-internals` | the library tests: the `unsafe extern "C"` RNG entry point and the thread-local seeded-RNG stack, including guard drops after TLS destruction [15] | the two re-exec tests ignored |
 | `gnb-smh` on `i686-unknown-linux-gnu` and `s390x-unknown-linux-gnu` | the same `gnb-smh` tests on a 32-bit and a big-endian target, including the whole PoW pipeline against the Python reference [30 each] | `miri-cross`; std for the target is built by `cargo miri setup` |
 | `gnb-wallet-wasm` on `i686-unknown-linux-gnu` | the lib tests, among them `c_abi_roundtrip_on_32_bit`: `gnb_alloc` / `gnb_call` / `gnb_free` as `site/wallet/core.js` calls them, plus `minfee` on 32 bits [3] | `miri-cross`; `create_export_open_roundtrip_and_pay` ignored (PQClean C) |
@@ -243,6 +243,7 @@ ignored with the reason in the attribute:
 | `gnb-crypto` `core::sighash` `v3_scripts_verify_and_every_fault_is_rejected`, `v2_scripts_verify_below_the_activation` | ignored | hybrid key generation and signing through the PQClean C code, which Miri cannot execute |
 | `gnb-crypto` `core::limits` `block_count_caps_are_inclusive` | ignored | blocks of 1,000,000 transactions and 100,000 shielded transactions: still running after 17 minutes under Miri; `check_block_canonical_limits` runs under Miri in the other cap tests |
 | `gnb-crypto` `core::limits` `transaction_count_caps_are_inclusive` | ignored | 100,000 inputs and 100,000 outputs, cloned: still running after 9 minutes under Miri; `check_tx_canonical_limits` runs under Miri in the other tests of the module |
+| `gnb-crypto` `core::limits` `count_and_size_caps_match_the_wire_parser` (fuzzing merge) | ignored | builds, encodes and parses a block of 1,000,000 transactions (`block_count_caps_are_inclusive` only builds and checks it and was still running after 17 minutes under Miri), transactions of 100,000 inputs and outputs and an 8 MB proof; the parser and `check_*_canonical_limits` run under Miri in `limits_match_the_wire_parser` and the other tests of the module |
 | `pqcrypto-internals` `os_rng_failure_aborts_instead_of_failing_open`, `null_buffer_aborts_instead_of_failing_open` | ignored | they re-execute the test binary (`std::process::Command`), which Miri does not support |
 | `pqcrypto-internals` `tests/vendor_pin.rs` | not run (`--lib`) | reads files (isolation); no unsafe code |
 
@@ -442,10 +443,11 @@ A review of this work found five gaps; each is closed above:
 
 ## On the merged PR branch
 
-This work was written on `b6a2976` and merged into the PR branch after the
-mempool/relay, networking/storage and block-ingress packages and the
-mutation, consensus-vector and functional-test packages (the fuzzing package
-was merged after it). Every mode
+This work was written on `b6a2976` and merged into the PR branch (`299a718`)
+after the node-local mempool and RPC policy package (P4), the shielded pool,
+ledger, wallet transport and libp2p 0.57 package (P5), the node-local chain
+selection package (P3), and the mutation-testing and consensus-vector
+packages (the fuzzing package was merged after it). Every mode
 was re-run on the merged tree (same environment, `nightly-2026-10-14`, own
 target directories):
 
@@ -465,7 +467,9 @@ What the merge changed:
   GnB-SMH entry-point test, the two end-to-end sighash script tests (PQClean
   C) and the two `core::limits` cap tests that build 10^5 to 10^6 elements.
   The two cap tests were still running after 17 and 9 minutes when stopped;
-  with them the `miri` job would have outgrown its timeout.
+  with them the `miri` job would have outgrown its timeout. A sixth,
+  `core::limits::count_and_size_caps_match_the_wire_parser`, came with the
+  fuzzing merge (see [After the fuzzing merge](#after-the-fuzzing-merge)).
 - The minimums are the merged counts: `gnb-smh` 30 (host, i686, s390x; was
   24), the `gnb-crypto` selection 42 (was 29).
 - F4 changes the browser wallet core, which the PR branch rebuilds
@@ -521,3 +525,25 @@ Still open, by decision: `parking_lot` deadlock detection is not in CI. It
 needs eight new lockfile packages and a `deny.toml` exception (see
 [Deadlock detection](#deadlock-detection)); that is a dependency decision for
 the maintainers.
+
+### After the fuzzing merge
+
+- The fuzzing package (merge `f312057`) added
+  `core::limits::count_and_size_caps_match_the_wire_parser`, which is in the
+  `miri` selection (`core::limits::`) and builds, encodes and parses a block
+  of 1,000,000 transactions. It carries `cfg_attr(miri, ignore = "<why>")`
+  (`91f5477`) like the other cap tests: the selection now has six ignored
+  tests (Miri table above).
+- `miri` re-run locally through the script on the tree after that merge and
+  its review fixes (`nightly-2026-10-14`, own target directory): pass, no
+  undefined behaviour; `gnb-smh` 25 unit (1 ignored), 4 and 1; the
+  `gnb-crypto` selection 42 passed, 6 ignored; `pqcrypto-internals` 15 (3
+  ignored); 417 s, the `gnb-crypto` selection 291 s. The minimums (30 / 42 /
+  15) are unchanged.
+- The node on i686, for the targets the fuzzing merge added or changed
+  (`cargo test --target i686-unknown-linux-gnu -p gnb --lib --test
+  fuzz_seed_corpus --test fuzz_regressions --test parser_corpus_floor --test
+  wire_decoder_fuzz --test fix_net_ingress`, not the whole `i686-node`
+  mode): pass, 327 unit tests, 5, 3, 6, 3 and 14; the committed seed corpus
+  is reproduced unchanged on 32 bits (`fuzz_seed_corpus` regenerates it and
+  compares).
