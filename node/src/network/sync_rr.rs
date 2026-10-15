@@ -802,15 +802,19 @@ mod tests {
 
     /// Only Busy and BlockNotFound send a pull to another peer; every other
     /// answer completes it (a BlockNotFound that completed the pull left a
-    /// healing partition waiting for the 30-60 s sweeps).
+    /// healing partition waiting for the 30-60 s sweeps). The swarm loop's
+    /// use of it is tested in network/mod.rs (`on_pull_response`).
     #[test]
     fn not_found_and_busy_retry_on_another_peer() {
-        for resp in sample_responses() {
-            let expected = matches!(resp, SyncResponse::Busy | SyncResponse::BlockNotFound { .. });
-            assert_eq!(retry_pull_elsewhere(&resp), expected, "{resp:?}");
+        // sample_responses(): Block, BlockNotFound, Headers, Tips, Peers, Busy.
+        let expected = [false, true, false, false, false, true];
+        let responses = sample_responses();
+        assert_eq!(responses.len(), expected.len());
+        for (resp, want) in responses.iter().zip(expected) {
+            assert_eq!(retry_pull_elsewhere(resp), want, "{resp:?}");
         }
-        assert!(retry_pull_elsewhere(&SyncResponse::BlockNotFound { block_hash: [0; 32] }));
         assert!(!retry_pull_elsewhere(&SyncResponse::Tips { tips: vec![], locator: vec![] }));
+        assert!(!retry_pull_elsewhere(&SyncResponse::Headers { entries: vec![] }));
     }
 
     // 1. Pure bincode frame round-trip for every request/response variant.

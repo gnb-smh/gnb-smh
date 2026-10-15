@@ -1540,24 +1540,12 @@ impl NetworkNode {
                                 libp2p::request_response::Message::Response { request_id, response } => {
                                     let now = Instant::now();
                                     let entry = inflight_pull.remove(&request_id);
-                                    if matches!(response, sync_rr::SyncResponse::Busy) {
-                                        // NET-5: back-pressure, not an offence. Back
-                                        // off from this peer and retry elsewhere.
-                                        selector.on_busy(&peer, now);
-                                        if let Some((p, _)) = entry {
-                                            requeue_pull(&mut pending_pulls, p, peer);
-                                        }
-                                    } else {
-                                        selector.on_success(&peer);
-                                        // A peer without the block answered
-                                        // NotFound: ask another one (bounded by
-                                        // MAX_PULL_ATTEMPTS); the processor still
-                                        // sees the NotFound below (NET-9 count).
-                                        if sync_rr::retry_pull_elsewhere(&response) {
-                                            if let Some((p, _)) = entry {
-                                                requeue_pull(&mut pending_pulls, p, peer);
-                                            }
-                                        }
+                                    // NET-5 / NET-9: selector bookkeeping, and Busy /
+                                    // BlockNotFound send the pull to another peer
+                                    // (`on_pull_response`); the processor still sees
+                                    // a NotFound below (NET-9 count).
+                                    on_pull_response(entry, &response, peer, &mut selector, &mut pending_pulls, now);
+                                    if !matches!(response, sync_rr::SyncResponse::Busy) {
                                         match response {
                                             sync_rr::SyncResponse::Peers { peers } => {
                                                 // NET-11: solicited addresses go to the
@@ -1845,6 +1833,37 @@ fn requeue_pull(pending: &mut std::collections::VecDeque<PendingPull>, mut p: Pe
     }
     if pending.len() < MAX_PENDING_PULLS {
         pending.push_back(p);
+    }
+}
+
+/// The answer `response` from `peer` to a directed pull (`entry`: the pull
+/// and the peer it was sent to, `None` for an unknown request id). Updates the
+/// selector (`Busy`: a short back-off; any other answer: a success) and puts
+/// the pull back in `pending` for ANOTHER peer when the answer does not
+/// complete it (`sync_rr::retry_pull_elsewhere`: `Busy`, and `BlockNotFound`,
+/// a peer that does not have the body; bounded by `MAX_PULL_ATTEMPTS`). Every
+/// other answer completes the pull. The swarm loop calls this for every
+/// response, so the retry decision is unit-tested where it is made:
+/// a `BlockNotFound` that completed the pull left a healing partition
+/// waiting for the 30-60 s sweeps (test/functional/feature_partition_heal.py).
+fn on_pull_response(
+    entry:    Option<(PendingPull, PeerId)>,
+    response: &sync_rr::SyncResponse,
+    peer:     PeerId,
+    selector: &mut sync_rr::PullPeerSelector,
+    pending:  &mut std::collections::VecDeque<PendingPull>,
+    now:      std::time::Instant,
+) {
+    if matches!(response, sync_rr::SyncResponse::Busy) {
+        // NET-5: back-pressure, not an offence.
+        selector.on_busy(&peer, now);
+    } else {
+        selector.on_success(&peer);
+    }
+    if sync_rr::retry_pull_elsewhere(response) {
+        if let Some((p, _)) = entry {
+            requeue_pull(pending, p, peer);
+        }
     }
 }
 
@@ -3040,5 +3059,108 @@ mod tests {
             ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, &peers, false, &me, &HashSet::new());
         }
         assert!(book.len() <= pex_validator::PEX_MAX_PER_WINDOW);
+    }
+
+    // ── Directed-pull answers (`on_pull_response`) ──────────────────────────
+
+    use std::time::Instant;
+
+    fn get_block_pull(attempts: u8, tried: Vec<PeerId>) -> PendingPull {
+        let msg = NetworkMessage::GetBlock { block_hash: [5u8; 32], nonce: 1 };
+        let req = sync_rr::as_pull_request(&msg).expect("GetBlock is a directed pull");
+        PendingPull { msg, req, attempts, tried }
+    }
+
+    /// A selector with `peers` connected and one pull in flight to `sent_to`.
+    fn selector_with(peers: &[PeerId], sent_to: PeerId, now: Instant) -> sync_rr::PullPeerSelector {
+        let mut sel = sync_rr::PullPeerSelector::new(HashSet::new());
+        for p in peers {
+            sel.on_connect(*p);
+        }
+        sel.on_sent(sent_to, now);
+        sel
+    }
+
+    /// THE regression for the BlockNotFound retry (feature_partition_heal.py
+    /// waited 80 s to more than 120 s): a peer that does not have the body
+    /// answers NotFound, and the pull goes back in the queue, one attempt
+    /// used, that peer recorded as tried, so the next drain sends it to the
+    /// OTHER peer. The answer counts as a success for the answering peer (no
+    /// back-off). Deleting the requeue fails this test.
+    #[test]
+    fn block_not_found_requeues_the_pull_for_another_peer() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let now = Instant::now();
+        let mut sel = selector_with(&[a, b], a, now);
+        let mut pending = std::collections::VecDeque::new();
+        let not_found = sync_rr::SyncResponse::BlockNotFound { block_hash: [5u8; 32] };
+        on_pull_response(Some((get_block_pull(0, vec![]), a)), &not_found, a, &mut sel, &mut pending, now);
+
+        assert_eq!(pending.len(), 1, "the pull must be retried, not completed");
+        let p = &pending[0];
+        assert_eq!((p.attempts, p.tried.clone()), (1, vec![a]));
+        assert!(matches!(p.req, sync_rr::SyncRequest::GetBlock { block_hash } if block_hash == [5u8; 32]));
+        assert_eq!(sel.in_flight(&a), 0);
+        assert!(!sel.is_cooling_down(&a, now), "NotFound is an answer, not back-pressure");
+        assert_eq!(sel.select(now, &p.tried), Some(b), "the retry goes to the peer not tried yet");
+
+        // B does not have it either: the third attempt would exceed
+        // MAX_PULL_ATTEMPTS, so the pull is dropped (the processor's sweeps
+        // re-issue anything still needed).
+        let p = pending.pop_front().unwrap();
+        sel.on_sent(b, now);
+        on_pull_response(Some((p, b)), &not_found, b, &mut sel, &mut pending, now);
+        assert_eq!((pending.len(), pending[0].attempts, pending[0].tried.clone()), (1, 2, vec![a, b]));
+        let p = pending.pop_front().unwrap();
+        sel.on_sent(a, now);
+        on_pull_response(Some((p, a)), &not_found, a, &mut sel, &mut pending, now);
+        assert!(pending.is_empty(), "dropped after MAX_PULL_ATTEMPTS ({MAX_PULL_ATTEMPTS})");
+    }
+
+    /// Busy (NET-5): back-pressure. The peer backs off and the pull is
+    /// retried elsewhere.
+    #[test]
+    fn busy_backs_the_peer_off_and_requeues_the_pull() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let now = Instant::now();
+        let mut sel = selector_with(&[a, b], a, now);
+        let mut pending = std::collections::VecDeque::new();
+        on_pull_response(Some((get_block_pull(0, vec![]), a)), &sync_rr::SyncResponse::Busy, a,
+            &mut sel, &mut pending, now);
+        assert!(sel.is_cooling_down(&a, now));
+        assert_eq!(sel.in_flight(&a), 0);
+        assert_eq!((pending.len(), pending[0].attempts, pending[0].tried.clone()), (1, 1, vec![a]));
+        assert_eq!(sel.select(now, &[]), Some(b));
+    }
+
+    /// Every other answer completes the pull: nothing is requeued, and an
+    /// answer to an unknown request id requeues nothing either.
+    #[test]
+    fn answers_that_complete_a_pull_do_not_requeue_it() {
+        let entry = || SyncEntry { hash: [1u8; 32], blue_score: 1, height: 1 };
+        for resp in [
+            sync_rr::SyncResponse::Block { block_hash: [5u8; 32], blue_score: 1, height: 1, block_data: vec![1] },
+            sync_rr::SyncResponse::Headers { entries: vec![entry()] },
+            sync_rr::SyncResponse::Headers { entries: vec![] },
+            sync_rr::SyncResponse::Tips { tips: vec![entry()], locator: vec![] },
+            sync_rr::SyncResponse::Peers { peers: vec![] },
+        ] {
+            let a = PeerId::random();
+            let now = Instant::now();
+            let mut sel = selector_with(&[a], a, now);
+            let mut pending = std::collections::VecDeque::new();
+            on_pull_response(Some((get_block_pull(0, vec![]), a)), &resp, a, &mut sel, &mut pending, now);
+            assert!(pending.is_empty(), "{resp:?} completes the pull");
+            assert_eq!(sel.in_flight(&a), 0, "{resp:?}");
+            assert!(!sel.is_cooling_down(&a, now), "{resp:?}");
+        }
+        let a = PeerId::random();
+        let now = Instant::now();
+        let mut sel = selector_with(&[a], a, now);
+        let mut pending = std::collections::VecDeque::new();
+        on_pull_response(None, &sync_rr::SyncResponse::BlockNotFound { block_hash: [5u8; 32] }, a,
+            &mut sel, &mut pending, now);
+        assert!(pending.is_empty());
+        assert_eq!(sel.in_flight(&a), 0);
     }
 }
