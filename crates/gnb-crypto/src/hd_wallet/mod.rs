@@ -1472,7 +1472,7 @@ mod tests {
     /// re-derivation that would point at an empty address.
     #[test]
     fn loads_legacy_random_key_wallet() {
-        let tmp = std::env::temp_dir().join("bloch-hd-legacy-test.json");
+        let tmp = std::env::temp_dir().join(format!("bloch-hd-legacy-test-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
 
         // Build a wallet whose key is OS-random, exactly like a pre-v3 file.
@@ -1518,7 +1518,7 @@ mod tests {
     /// write turns this red again.
     #[test]
     fn v1_file_survives_load_new_address_save_load_roundtrip() {
-        let tmp = std::env::temp_dir().join("bloch-hd-v1-roundtrip-test.json");
+        let tmp = std::env::temp_dir().join(format!("bloch-hd-v1-roundtrip-test-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
 
         let password = "test-password-12345!";
@@ -1550,7 +1550,7 @@ mod tests {
     /// flags) — the version-persistence fix must not be special-cased to v1.
     #[test]
     fn v2_file_survives_load_new_address_save_load_roundtrip() {
-        let tmp = std::env::temp_dir().join("bloch-hd-v2-roundtrip-test.json");
+        let tmp = std::env::temp_dir().join(format!("bloch-hd-v2-roundtrip-test-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
 
         let password = "test-password-12345!";
