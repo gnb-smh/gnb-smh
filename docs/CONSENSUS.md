@@ -170,15 +170,24 @@ past. Reorgs deeper than 1,000 selected-chain blocks are logged and counted
 connected block and a pruned body leaves a rollback record, so a reorg of any
 depth also works on a pruned node. A pruned node that reorganized away from
 blocks whose bodies it had pruned and needs them again (the old chain became
-the heaviest once more) re-fetches exactly those bodies from its peers before
-it connects them; nothing is written in between.
+the heaviest once more, or an operator override below moves to it) re-fetches
+exactly those bodies from its peers before it connects them; nothing is
+written in between. It accepts a body of a block already in its DAG only if
+it requested that body (at most 16,384 outstanding, 15 minutes each), only as
+the answer to its own directed pull, and only for a block that is not applied
+(an applied block is rolled back from its undo record); any other copy is
+ignored before decoding. A restored body must carry the height the DAG
+verified when the block was accepted (neither `height` nor `blue_score` is
+committed by the block id), and it is stored exactly as on acceptance.
 
 An operator can override the choice, node-locally and persistently, with the
 RPCs `invalidateblock <hash>` (disqualify the block and every block whose
 selected chain passes through it, and move to the best remaining chain) and
 `reconsiderblock <hash>` (remove those marks for the block, its
 selected-chain ancestors and descendants, and re-evaluate); see
-`docs/RUNNING.md`. These are not consensus rules.
+`docs/RUNNING.md`. These are not consensus rules. On a pruned node, an
+override whose new chain needs pruned bodies changes nothing, requests the
+next (at most 4,096) of those bodies and asks to be retried.
 
 ### Blue work
 
@@ -291,6 +300,41 @@ it. Measured in `node/tests/fix_ghostdag_dag7_perf.rs` (80 such blocks,
 dev profile): 747 ms of insertions at 12,000 blocks become 0.5 ms of
 refusals.
 
+Why a peer cannot reach the pre-activation coloring walk without passing the
+work rule:
+
+- The walk (`candidate_anticone_blues`) runs only inside
+  `GhostDAG::add_block`, and blocks from the network reach `add_block` only
+  through `accept::accept_block`. Genesis and the start-up load insert stored
+  `GhostdagData` and color nothing; restoring a pruned body (DAG-6) inserts
+  nothing.
+- `accept_block` is called by the ingress core for a block whose parents are
+  all known, after the work rule admitted it; by the orphan drain, for a
+  buffered orphan whose last missing parent was just inserted (the orphan
+  passed the bits floor and its proof of work to be buffered, and it becomes
+  connectable only after that parent passed the work rule); by the RPC
+  `submitblock` (a write method, served on loopback by default: the
+  operator's own pool, which, like Bitcoin Core's `submitblock`, bypasses the
+  anti-DoS rule); and by the built-in miner. Every call checks the header
+  height, the exact ASERT bits, the timestamp and the proof of work before
+  insertion.
+
+What the rule still admits is bounded by work. For a candidate c merged by a
+new block B, the walk visits B's selected chain downward, skipping chain
+blocks that merged no blue, and stops at the first chain block in c's past
+or after k + 1 blues in c's anticone. A visited chain block that adds no blue
+merged only blues of c's past (none can be in c's future), so beyond k + 1
+steps each step is a distinct block of c's past that the selected chain
+merged as blue without that chain block being in c's past. All of these
+blocks, and c, entered the DAG through the work rule: within the 360-block
+window (a chain keeping pace with ours), merge-backed (each needs a buffered,
+proof-of-work-verified orphan whose blue-work bound reaches the threshold,
+and more than 1,000 blocks below the tip at most 4, then one per 30 s, from
+one shared budget), or chain-backed (announced orphans covering the fork's
+whole depth below the window). A walk therefore lengthens by at most one
+step per such paid admission. After activation, the mergeset limit and the
+merge depth bound every block's coloring outright.
+
 ### Anti-DoS work rule (node-local policy, not consensus)
 
 Audit POW-3. Blocks on deep forks can be nearly free (absolute-schedule ASERT).
@@ -301,17 +345,34 @@ shorter chain) and `lb(B)` = the largest parent blue work + `work(B)`, a lower
 bound of B's blue work:
 
 1. `lb(B) ≥ T`; or
-2. `lb(B)` + the work of an orphan chain announced on top of B reaches `T`
-   (the orphans are buffered or were evicted from the bounded orphan pool;
-   each passed the orphan bits floor and its proof of work); or
+2. `lb(B)` + the work announced on top of B reaches `T`. The announced work
+   is the summed header work of the distinct orphans that wait on B directly
+   or through one another, each counted once, whatever the shape of the fork
+   (a DAG-shaped fork is summed, not measured along one path: after
+   activation `T` includes merged blues, and a fork of parallel blocks must be
+   credited the same way). The orphans are buffered, or were evicted from the
+   bounded orphan pool and are kept without their bodies (at most 50,000,
+   by block id, so a re-sent orphan never counts twice); if larger, the work
+   of the heaviest single path of buffered orphans plus the work remembered
+   along an evicted path is used instead (it chains through any number of
+   evictions, so a linear fork deeper than every store still proves its work).
+   Each orphan passed the orphan bits floor and its proof of work. Both
+   remembered stores are keyed only by an evicted orphan's missing parents
+   (at most 8), charged to the peer that delivered it (at most a quarter of
+   each store per peer) and, when full, give way only to an entry of greater
+   work, so orphans at the floor cannot flush them; or
 3. a buffered orphan whose own lower bound reaches `T` needs B as a parent;
    such blocks more than 1,000 blocks below the tip are rationed (4, then one
    per 30 s).
 
-Otherwise B is ignored without penalty. A chain that carries the work is
-always accepted (this is Bitcoin's anti-DoS work threshold, with the orphan
-pool as the header buffer), so for honest data the final chain is the same
-with or without the rule.
+Otherwise B is ignored without penalty (a refused block is not re-evaluated
+until the orphan pool, the DAG or the selected tip changes). A chain that
+carries the work is accepted (this is Bitcoin's anti-DoS work threshold, with
+the orphan pool as the header buffer), so for honest data the final chain is
+the same with or without the rule. The one bound is memory: a DAG-shaped fork
+with more blocks above its first block than the pool and the 50,000 kept
+evicted orphans hold is credited the summed work of the part they hold, or
+its heaviest path if larger.
 
 ## Mining
 

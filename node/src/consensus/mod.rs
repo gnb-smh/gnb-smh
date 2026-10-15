@@ -1666,6 +1666,13 @@ impl GhostDAG {
     ///   a skipped block is an ancestor of the candidate, the next merging block
     ///   below it is one too (ancestry is transitive), so the walk still stops
     ///   before processing anything the original walk would not have processed.
+    ///
+    /// Residual cost (package P3): beyond k + 1 steps, each step is a distinct
+    /// block of the candidate's past that the selected chain merged as blue.
+    /// Every block reaches this walk only through `accept::accept_block`
+    /// after the node's anti-DoS work rule (`ingress::BlockIngress`), so a
+    /// long walk costs the attacker one work-rule admission per step; see
+    /// docs/CONSENSUS.md, "Per-block cost".
     fn candidate_anticone_blues(
         &self,
         selected_parent: &BlockHash,
