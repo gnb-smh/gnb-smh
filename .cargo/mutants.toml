@@ -70,8 +70,9 @@ additional_cargo_args = ["--locked"]
 # per run). The gate therefore requires the consensus code's own tests to
 # catch every mutant. The wallet tests do reach the consensus scope: some of
 # them sign transactions and verify them with `sighash::verify_tx_scripts`,
-# and at b6a2976 they caught sighash.rs mutants that this configuration
-# reports as missed (docs/testing/MUTATION.md, "Before": both measurements).
+# and at b6a2976 they caught 12 mutants (10 in sighash.rs, 2 in
+# activation.rs) that this configuration reports as missed
+# (docs/testing/MUTATION.md gives the "before" numbers both ways).
 # Skipping tests never turns a missed mutant into a caught one.
 additional_cargo_test_args = ["--tests", "--", "--skip", "wallet::"]
 # Per-mutant test timeout: 5x the baseline test time, at least 60 s.

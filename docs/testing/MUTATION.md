@@ -10,13 +10,25 @@ tests that now kill every non-equivalent survivor, and the mutants that are
 provably equivalent to the original code.
 
 Target: **0 non-equivalent surviving mutants** in the scope below.
-Result: **0 non-equivalent survivors.** Of the 180 mutants that survived at
-`b6a2976` (31 in gnb-smh, 149 in gnb-crypto), 171 are now killed by new tests
-and 9 are equivalent (E1-E5 below; they are the only mutants still missed).
-The largest gap found: at `b6a2976` no gnb-crypto test failed if
-`verify_input_signatures` accepted every signature or `pubkey_hash_matches`
-accepted every public key (the crate's own tests never verified a signed
-transaction end to end; the node crate's tests are outside this measurement).
+Result: **0 non-equivalent survivors.** Measured the way the gate runs
+(each crate's own tests, minus gnb-crypto's wallet and keystore tests; see
+Method), 182 mutants survived at `b6a2976`: 31 in gnb-smh and 151 in
+gnb-crypto (149 in the original scope plus the 2 of `Transaction::actual_size`,
+added to the scope after review). 173 are now killed by new tests and 9 are
+equivalent (E1-E5 below; they are the only mutants still missed).
+
+That "before" count is the suite minus the wallet tests, not the whole
+suite. Re-run with the wallet tests, 12 of the 151 gnb-crypto survivors were
+already caught at `b6a2976`. Ten of them are in `sighash.rs`, because wallet
+tests sign transactions and check them with `sighash::verify_tx_scripts`;
+the other two are in `activation.rs`. So the whole suite left 170 survivors
+(31 + 139), 161 of them non-equivalent.
+
+The largest gap found: at `b6a2976` no gnb-crypto test, the wallet tests
+included, failed if `pubkey_hash_matches` accepted every public key for
+every script (`-> true`). No test checked that a script refuses a valid
+signature made with a key it does not commit to. The node crate's tests are
+outside this measurement.
 
 ## Scope
 
@@ -53,11 +65,18 @@ two mutants were run separately at `b6a2976` and at the head.
   invocation. gnb-crypto is never tested together with the node crate `gnb`,
   whose dev-dependency feature `test-pow-limit` would pin every expected
   target and hide the real ASERT path.
-- Tests run: unit and integration tests (`cargo test --tests`, no doctests).
-  The gnb-crypto wallet/keystore tests (`wallet::`, `hd_wallet::`: Argon2 and
-  HD derivation, ~30 s per run) are skipped (`-- --skip wallet::`); skipping
-  tests can only turn a caught mutant into a missed one, never the reverse,
-  so the numbers below are conservative.
+- Tests run: unit and integration tests (`cargo test --tests`, no doctests),
+  minus gnb-crypto's wallet and keystore tests (`wallet::`, `hd_wallet::`:
+  Argon2 and HD derivation, ~30 s per run; `-- --skip wallet::`). This is
+  the gate's configuration. It requires the consensus modules' own tests to
+  catch every mutant, but it is not the whole suite: some wallet tests sign
+  transactions and verify them with `sighash::verify_tx_scripts`, so they do
+  reach the consensus scope. The "before" numbers under this configuration
+  therefore overstate what the whole suite missed at `b6a2976`, so the
+  "before" survivors were re-run with the wallet tests as well (both rows are
+  below). Skipping tests never turns a missed mutant into a caught one, so
+  the "after" result (no non-equivalent survivor) holds for the whole suite
+  too. gnb-smh has no wallet tests, so its numbers are the same either way.
 - Per-mutant test timeout: 5x the measured baseline test time, at least 60 s
   (`timeout_multiplier`, `minimum_test_timeout` in `.cargo/mutants.toml`).
 - Outcomes: *caught* (a test failed), *missed* (all tests passed: a
@@ -112,6 +131,15 @@ target directory (`TMPDIR`, cargo-mutants' own build copies):
   `2/3`). The `1/3` slice was interrupted by a machine restart after 192 of
   its 239 mutants; the remaining 47 and the one mutant whose test run the
   restart killed were run afterwards by exact name (`--re '^<name>$'`).
+- **before, whole suite**: the 149 gnb-crypto survivors of that run, re-run
+  by exact name on the same export with the wallet tests included
+  (`additional_cargo_test_args = ["--tests"]`, everything else unchanged). The
+  other 568 mutants were not re-run: adding tests cannot make a failing run
+  pass. Only the survivors can change.
+- **`Transaction::actual_size`** (2 mutants, added to the scope after
+  review): run separately at `b6a2976` (both missed; nothing in gnb-crypto
+  calls `actual_size` there, so no test of the crate can reach it, with or
+  without the wallet tests) and at the head of this branch (both caught).
 - **after**: gnb-smh at `5b4731e` (its last change) without the exclusions,
   so the equivalent mutants show up as missed; gnb-crypto on a snapshot of
   commit `3b95f40` (the gnb-crypto tests; the gnb-crypto code is that of
@@ -126,29 +154,39 @@ target directory (`TMPDIR`, cargo-mutants' own build copies):
 | --- | ---: | ---: | ---: | ---: | ---: |
 | gnb-smh, before (`b6a2976`) | 280 | 240 | 31 | 9 | 0 |
 | gnb-smh, after | 280 | 263 | 8 (all equivalent) | 9 | 0 |
-| gnb-crypto, before (`b6a2976`) | 717 | 499 | 149 | 47 | 22 |
-| gnb-crypto, after | 718 | 665 | 1 (E5, equivalent) | 47 | 5 |
+| gnb-crypto, before (`b6a2976`), gate configuration (no wallet tests) | 719 | 499 | 151 | 47 | 22 |
+| gnb-crypto, before (`b6a2976`), whole suite | 719 | 511 | 139 | 47 | 22 |
+| gnb-crypto, after | 720 | 667 | 1 (E5, equivalent) | 47 | 5 |
+
+The gnb-crypto rows include the two `actual_size` mutants (run separately,
+see Method). The whole-suite row re-ran only the survivors. The 12 that the
+wallet tests catch are `pubkey_hash_matches -> false` and its `==` -> `!=`,
+the four `check_input_witnesses` mutants, the four `verify_input_signatures`
+mutants (among them `-> Ok(())`, no signature checked), and
+`hardening_activation_height_for_signer -> 0` and `-> 1`.
 
 ### Per file
 
-Counts are caught / missed / unviable / timeout.
+Counts are caught / missed / unviable / timeout. "Before" is the gate
+configuration (no wallet tests); "missed, whole suite" is how many of those
+survivors the whole suite, wallet tests included, also missed at `b6a2976`.
 
-| file | mutants | before | after |
-| --- | ---: | --- | --- |
-| `gnb-smh/src/lib.rs` | 64 | 45 / 16 / 3 / 0 | 58 / 3 (E1) / 3 / 0 |
-| `gnb-smh/src/difficulty.rs` | 216 | 195 / 15 / 6 / 0 | 205 / 5 (E2-E4) / 6 / 0 |
-| `gnb-crypto/src/core/mod.rs` | 406 / 407 | 272 / 98 / 26 / 10 | 381 / 0 / 26 / 0 |
-| `gnb-crypto/src/core/block_rules.rs` | 80 | 64 / 7 / 1 / 8 | 75 / 0 / 1 / 4 |
-| `gnb-crypto/src/core/sighash.rs` | 46 | 29 / 12 / 5 / 0 | 41 / 0 / 5 / 0 |
-| `gnb-crypto/src/core/limits.rs` | 50 | 26 / 24 / 0 / 0 | 50 / 0 / 0 / 0 |
-| `gnb-crypto/src/core/activation.rs` | 16 | 8 / 3 / 2 / 3 | 14 / 0 / 2 / 0 |
-| `gnb-crypto/src/core/tokenomics.rs` | 56 | 43 / 1 / 11 / 1 | 43 / 1 (E5) / 11 / 1 |
-| `gnb-crypto/src/core/carryover.rs` | 63 | 57 / 4 / 2 / 0 | 61 / 0 / 2 / 0 |
-| **total** | 997 / 998 | 739 / 180 / 56 / 22 | 928 / 9 (E1-E5) / 56 / 5 |
+| file | mutants | before | missed, whole suite | after |
+| --- | ---: | --- | ---: | --- |
+| `gnb-smh/src/lib.rs` | 64 | 45 / 16 / 3 / 0 | 16 | 58 / 3 (E1) / 3 / 0 |
+| `gnb-smh/src/difficulty.rs` | 216 | 195 / 15 / 6 / 0 | 15 | 205 / 5 (E2-E4) / 6 / 0 |
+| `gnb-crypto/src/core/mod.rs` | 408 / 409 | 272 / 100 / 26 / 10 | 100 | 383 / 0 / 26 / 0 |
+| `gnb-crypto/src/core/block_rules.rs` | 80 | 64 / 7 / 1 / 8 | 7 | 75 / 0 / 1 / 4 |
+| `gnb-crypto/src/core/sighash.rs` | 46 | 29 / 12 / 5 / 0 | 2 | 41 / 0 / 5 / 0 |
+| `gnb-crypto/src/core/limits.rs` | 50 | 26 / 24 / 0 / 0 | 24 | 50 / 0 / 0 / 0 |
+| `gnb-crypto/src/core/activation.rs` | 16 | 8 / 3 / 2 / 3 | 1 | 14 / 0 / 2 / 0 |
+| `gnb-crypto/src/core/tokenomics.rs` | 56 | 43 / 1 / 11 / 1 | 1 | 43 / 1 (E5) / 11 / 1 |
+| `gnb-crypto/src/core/carryover.rs` | 63 | 57 / 4 / 2 / 0 | 4 | 61 / 0 / 2 / 0 |
+| **total** | 999 / 1000 | 739 / 182 / 56 / 22 | 170 | 930 / 9 (E1-E5) / 56 / 5 |
 
-`core/mod.rs` has one mutant more after the change: `PowCache::insert ->
-()` (the eviction comparison moved from `Block::validate_pow` into
-`PowCache::insert` with its three mutants).
+`core/mod.rs` includes the two `actual_size` mutants, and has one more
+after the change: `PowCache::insert -> ()` (the eviction comparison moved
+from `Block::validate_pow` into `PowCache::insert` with its three mutants).
 
 ### Timeouts
 
@@ -202,7 +240,11 @@ the node chain id is irreversible.
 | `asert_next_target`: `out > pow_limit` -> `out == pow_limit` | 1 | `asert_clamps_a_representable_target_above_the_limit` (a target one half-life behind an anchor at the limit: representable, above the limit, clamped) |
 | `lane16`, `target_to_bits`, `work`, `asert_next_target` (`>` -> `>=`) | 8 | equivalent: E1-E4 |
 
-### gnb-crypto (149 survivors)
+### gnb-crypto (151 survivors)
+
+Survivors of the gate configuration (no wallet tests). Where the wallet tests
+already caught a mutant at `b6a2976`, the row says so: the new tests make the
+consensus module's own tests catch it.
 
 | code | surviving mutants | killed by |
 | --- | --- | --- |
@@ -223,9 +265,10 @@ the node chain id is irreversible.
 | `Block::validate_no_duplicate_txs -> Ok(())` | 1 | `duplicate_transactions_are_rejected` |
 | `Block::validate_structure_without_pow_at`: `MAX_PARENTS`, `MAX_BLOCK_SIZE` | 3 | `parent_count_limit_is_inclusive`, `block_size_limit_is_inclusive_under_both_measures` (a block of exactly 1,000,000 bytes under each regime's measure passes, one byte more fails) |
 | `Block::size_bytes` | 2 | `size_bytes_is_the_bincode_length` |
+| `Transaction::actual_size -> 0`, `-> 1` (in scope since review) | 2 | `actual_size_is_the_bincode_length_that_size_bytes_sums` (the bincode length, and a block's `size_bytes` grows by exactly a transaction's `actual_size`) |
 | `UndoOverwrites::is_empty`, `UndoData::mutation_count`, `UndoData::from_bytes` | 2 + 8 + 3 | `undo_extension_is_written_for_each_single_overwrite`, `undo_mutation_count_sums_the_four_lists`, `undo_trailing_bytes_are_classified` |
 | `hash_meets_target` | 2 | `difficulty_wrappers` |
-| `sighash.rs` `pubkey_hash_matches` (3), `check_input_witnesses` (4), `verify_input_signatures` (4), among them `verify_input_signatures -> Ok(())` (no signature checked), `pubkey_hash_matches -> true` (any key accepted for any script) and the prevout/witness count checks | 11 | `v3_scripts_verify_and_every_fault_is_rejected`, `v2_scripts_verify_below_the_activation`: real hybrid (ML-DSA-65 + Falcon-1024) signatures over a two-input transaction verify, and each single fault (other chain id, v3 signature checked as v2, legacy version at the activation, changed spent amount, signature of the other input, foreign key, missing prevout, trailing framing byte, missing suite envelope) is rejected with its own error |
+| `sighash.rs` `pubkey_hash_matches` (3), `check_input_witnesses` (4), `verify_input_signatures` (4), among them `verify_input_signatures -> Ok(())` (no signature checked), `pubkey_hash_matches -> true` (any key accepted for any script) and the prevout/witness count checks. With the wallet tests, 10 of the 11 were already caught at `b6a2976` (`wallet::payment::tests::v3_signature_commits_to_the_spent_amount_and_script`, `wallet::send::tests::cli_send_signs_version_3_from_the_activation_height`, `wallet::sighash_v3_signers::*`); `pubkey_hash_matches -> true` survived them too | 11 | `v3_scripts_verify_and_every_fault_is_rejected`, `v2_scripts_verify_below_the_activation`: real hybrid (ML-DSA-65 + Falcon-1024) signatures over a two-input transaction verify, and each single fault (other chain id, v3 signature checked as v2, legacy version at the activation, changed spent amount, signature of the other input, foreign key, missing prevout, trailing framing byte, missing suite envelope) is rejected with its own error |
 | `Display for SighashError` | 1 | `sighash_error_messages` |
 | `block_rules.rs` `rules_active -> true/false` | 2 | `process_wide_predicate_follows_the_override` |
 | `check_coinbase_commitment`: `len < 80` -> `<= 80` | 1 | `commitment_check_boundaries` (exactly the 80-byte commitment is valid) |
@@ -233,7 +276,7 @@ the node chain id is irreversible.
 | `limits.rs` `check_block_money_range` (shielded fee) | 1 | `shielded_fee_is_in_the_money_range` |
 | `check_tx_canonical_limits` input/output counts | 4 | `transaction_count_caps_are_inclusive` |
 | `check_block_canonical_limits`: transaction and shielded counts, the four per-shielded-transaction caps and the `\|\|` between them | 19 | `block_count_caps_are_inclusive`, `shielded_field_caps_are_inclusive` (each field at its cap passes, one over fails, one field at a time) |
-| `activation.rs` `hardening_activation_height_for_signer -> 0/1` | 2 | `signer_height_follows_the_signer_chain_and_the_override` |
+| `activation.rs` `hardening_activation_height_for_signer -> 0/1` (with the wallet tests, already caught at `b6a2976`: the wallet's signing-version tests) | 2 | `signer_height_follows_the_signer_chain_and_the_override` |
 | `hardening_active_at -> true` | 1 | `process_wide_predicate_uses_the_process_wide_height` |
 | `carryover.rs` `parse_and_convert`: `bad += 1` -> `*=` (malformed and duplicate rows), the summary threshold `bad > 5` -> `>=`, `==` | 4 | `failure_report_names_five_lines_then_summarises` |
 | `tokenomics.rs` `min_tx_fee_sat`: `>` -> `>=` | 1 | equivalent: E5 |
