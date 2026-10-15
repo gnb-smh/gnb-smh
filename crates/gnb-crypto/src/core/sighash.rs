@@ -620,4 +620,145 @@ mod tests {
         assert_eq!(Transaction::parse_script_sig_exact(&w[..w.len() - 1]), None);
         assert!(canonical_witness(&w).is_err(), "a non-enveloped signature is not canonical");
     }
+
+    // ── End-to-end input-script rule with real hybrid signatures ────────────
+
+    struct Signer {
+        pk: Vec<u8>,
+        sk: Vec<u8>,
+        spk: Vec<u8>,
+    }
+
+    fn signer(seed: u8) -> Signer {
+        let (pk, sk) = crypto::generate_keypair_from_seed(&[seed; 32]).unwrap();
+        let spk = Sha3_256::digest(&pk)[..20].to_vec();
+        Signer { pk, sk, spk }
+    }
+
+    /// A two-input transaction spending two outputs of `s`, every input
+    /// signed under `digest` (version 3 for v3, version 1 for v2).
+    fn signed_tx(s: &Signer, digest: SighashVersion, chain: ChainId) -> (Transaction, Vec<TxOutput>) {
+        let mut tx = Transaction {
+            version: if digest == SighashVersion::V3 { TX_VERSION_V3 } else { TX_VERSION_LEGACY },
+            inputs: (0..2u8).map(|i| TxInput {
+                prev_txid: [0x30 + i; 32],
+                prev_index: i as u32,
+                script_sig: vec![],
+                sequence: u32::MAX,
+            }).collect(),
+            outputs: vec![TxOutput { value: 40_000, script_pubkey: vec![0x77; 20] }],
+            locktime: 0,
+        };
+        let prevouts: Vec<TxOutput> =
+            (0..2u64).map(|i| TxOutput { value: 25_000 + i, script_pubkey: s.spk.clone() }).collect();
+        let sigs: Vec<Vec<u8>> = match digest {
+            SighashVersion::V2 => (0..2).map(|i| crypto::sign(&s.sk, &tx.sighash(i, chain)).unwrap()).collect(),
+            SighashVersion::V3 => {
+                let pre = SighashV3Precomputed::new(&tx, &prevouts).unwrap();
+                (0..2)
+                    .map(|i| {
+                        let d = pre.digest(i, crypto::SUITE_MLDSA65_FALCON1024, chain).unwrap();
+                        crypto::sign_bound(&s.sk, &d).unwrap()
+                    })
+                    .collect()
+            }
+        };
+        for (inp, sig) in tx.inputs.iter_mut().zip(sigs) {
+            inp.script_sig = Transaction::build_script_sig(&sig, &s.pk);
+        }
+        (tx, prevouts)
+    }
+
+    /// At/after the activation: a correctly signed version-3 transaction
+    /// verifies, and every single fault is rejected with its own error.
+    #[test]
+    fn v3_scripts_verify_and_every_fault_is_rejected() {
+        use SighashVersion::V3;
+        let (h, main) = (100, ChainId::Mainnet);
+        let s = signer(7);
+        let (tx, prev) = signed_tx(&s, V3, main);
+        assert_eq!(verify_tx_scripts(&tx, &prev, main, h, h), Ok(V3));
+
+        let w = check_input_witnesses(&tx, &prev, V3).unwrap();
+        assert_eq!(w.len(), 2);
+        for (i, (sig, pk)) in w.iter().enumerate() {
+            assert_eq!(Transaction::parse_script_sig_exact(&tx.inputs[i].script_sig), Some((*sig, *pk)));
+        }
+        assert_eq!(verify_input_signatures(&tx, &prev, &w, V3, main), Ok(()));
+
+        // Replay on another chain id, and a v3 signature checked as v2.
+        assert_eq!(verify_tx_scripts(&tx, &prev, ChainId::Testnet, h, h), Err("invalid signature at input 0".into()));
+        assert_eq!(verify_input_signatures(&tx, &prev, &w, SighashVersion::V2, main),
+            Err("invalid signature at input 0".into()));
+        // Only version 3 is valid at/after the activation.
+        let mut t = tx.clone();
+        t.version = TX_VERSION_LEGACY;
+        assert!(verify_tx_scripts(&t, &prev, main, h, h).unwrap_err().starts_with("bad-txns-version"));
+        // v3 commits every spent amount: changing input 1's breaks input 0.
+        let mut p = prev.clone();
+        p[1].value += 1;
+        assert_eq!(verify_tx_scripts(&tx, &p, main, h, h), Err("invalid signature at input 0".into()));
+        // Input 0 valid, input 1 carries input 0's signature (other index).
+        let mut t = tx.clone();
+        t.inputs[1].script_sig = t.inputs[0].script_sig.clone();
+        assert_eq!(verify_tx_scripts(&t, &prev, main, h, h), Err("invalid signature at input 1".into()));
+        // The public key must hash to the spent script.
+        let mut p = prev.clone();
+        p[1].script_pubkey[0] ^= 1;
+        assert_eq!(verify_tx_scripts(&tx, &p, main, h, h), Err("pubkey mismatch at input 1".into()));
+        // One prevout per input.
+        assert_eq!(verify_tx_scripts(&tx, &prev[..1], main, h, h), Err("1 prevouts for 2 inputs".into()));
+        // Canonical framing: a trailing byte is invalid at/after the activation.
+        let mut t = tx.clone();
+        t.inputs[1].script_sig.push(0);
+        assert!(verify_tx_scripts(&t, &prev, main, h, h).unwrap_err()
+            .starts_with("input 1: non-canonical script_sig framing"));
+
+        // verify_input_signatures' own guards.
+        assert_eq!(verify_input_signatures(&tx, &prev, &w[..1], V3, main), Err("1 witnesses for 2 inputs".into()));
+        let unenveloped = [(&b"no suite envelope"[..], w[0].1), w[1]];
+        assert_eq!(verify_input_signatures(&tx, &prev, &unenveloped, V3, main),
+            Err("input 0: signature has no suite envelope".into()));
+        assert_eq!(verify_input_signatures(&tx, &prev[..1], &w, V3, main),
+            Err("sighash v3 needs one spent output per input (1 for 2 inputs)".into()));
+    }
+
+    /// Below the activation: the historical v2 rule, lenient framing included.
+    #[test]
+    fn v2_scripts_verify_below_the_activation() {
+        use SighashVersion::V2;
+        let (h, main) = (100, ChainId::Mainnet);
+        let s = signer(8);
+        let (tx, prev) = signed_tx(&s, V2, main);
+        assert_eq!(verify_tx_scripts(&tx, &prev, main, h - 1, h), Ok(V2));
+        assert_eq!(tx.sighash_v2_checked(1, main), Ok(tx.sighash(1, main)));
+        assert_ne!(tx.sighash(1, main), tx.sighash(0, main));
+
+        // A trailing byte after the public key is ignored below the activation.
+        let mut t = tx.clone();
+        t.inputs[1].script_sig.push(0);
+        assert_eq!(verify_tx_scripts(&t, &prev, main, h - 1, h), Ok(V2));
+        // The same transaction is invalid at the activation (version 1).
+        assert!(verify_tx_scripts(&tx, &prev, main, h, h).unwrap_err().starts_with("bad-txns-version"));
+
+        assert_eq!(verify_tx_scripts(&tx, &prev, ChainId::Testnet, h - 1, h), Err("invalid signature at input 0".into()));
+        let mut t = tx.clone();
+        t.inputs[1].script_sig = t.inputs[0].script_sig.clone();
+        assert_eq!(verify_tx_scripts(&t, &prev, main, h - 1, h), Err("invalid signature at input 1".into()));
+        let mut t = tx.clone();
+        t.inputs[0].script_sig.truncate(7);
+        assert_eq!(verify_tx_scripts(&t, &prev, main, h - 1, h), Err("malformed script_sig at input 0".into()));
+        let mut p = prev.clone();
+        p[0].script_pubkey[19] ^= 0x80;
+        assert_eq!(verify_tx_scripts(&tx, &p, main, h - 1, h), Err("pubkey mismatch at input 0".into()));
+    }
+
+    #[test]
+    fn sighash_error_messages() {
+        assert_eq!(SighashError::InputIndexOutOfRange { index: 2, inputs: 2 }.to_string(),
+            "sighash input index 2 out of range (2 inputs)");
+        assert_eq!(SighashError::SpentOutputCount { spent: 1, inputs: 3 }.to_string(),
+            "sighash v3 needs one spent output per input (1 for 3 inputs)");
+        assert_eq!(SighashError::TooLarge("input count").to_string(), "sighash: input count does not fit in u32");
+    }
 }

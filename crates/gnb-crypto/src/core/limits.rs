@@ -260,6 +260,83 @@ mod tests {
         assert!(check_block_money_range(&ok).is_ok());
     }
 
+    fn shielded(fee: u64) -> coherence_core::ShieldedTx {
+        coherence_core::ShieldedTx {
+            anchor: [0; 32], nullifiers: vec![], outputs: vec![], fee, proof: vec![], binding_sig: vec![],
+        }
+    }
+
+    #[test]
+    fn shielded_fee_is_in_the_money_range() {
+        let cap = tokenomics::MAX_SUPPLY_SAT;
+        let mut b = block_with(vec![tx(1, 20, 1_000)]);
+        b.shielded_transactions = vec![shielded(5), shielded(cap)];
+        assert_eq!(check_block_money_range(&b), Ok(()));
+        b.shielded_transactions.push(shielded(cap + 1));
+        assert_eq!(check_block_money_range(&b), Err("shielded[2] fee exceeds MAX_SUPPLY_SAT".into()));
+    }
+
+    /// Input and output counts: the cap is allowed, one more is not.
+    #[test]
+    fn transaction_count_caps_are_inclusive() {
+        let mut t = tx(1, 20, 1);
+        t.inputs = vec![t.inputs[0].clone(); MAX_TX_INPUTS];
+        t.outputs = vec![t.outputs[0].clone(); MAX_TX_OUTPUTS];
+        assert_eq!(check_tx_canonical_limits(&t), Ok(()));
+        let mut more_in = t.clone();
+        more_in.inputs.push(more_in.inputs[0].clone());
+        assert_eq!(check_tx_canonical_limits(&more_in), Err("100001 inputs exceed the 100000 cap".into()));
+        let mut more_out = t;
+        more_out.outputs.push(more_out.outputs[0].clone());
+        assert_eq!(check_tx_canonical_limits(&more_out), Err("100001 outputs exceed the 100000 cap".into()));
+    }
+
+    #[test]
+    fn block_count_caps_are_inclusive() {
+        let empty_tx = Transaction { version: 1, inputs: vec![], outputs: vec![], locktime: 0 };
+        let mut b = block_with(vec![empty_tx; MAX_BLOCK_TXS]);
+        assert_eq!(check_block_canonical_limits(&b), Ok(()));
+        b.transactions.push(b.transactions[0].clone());
+        assert_eq!(check_block_canonical_limits(&b), Err("1000001 transactions exceed the 1000000 cap".into()));
+
+        let mut b = block_with(vec![tx(1, 20, 1)]);
+        b.shielded_transactions = vec![shielded(0); MAX_BLOCK_SHIELDED_TXS];
+        assert_eq!(check_block_canonical_limits(&b), Ok(()));
+        b.shielded_transactions.push(shielded(0));
+        assert_eq!(check_block_canonical_limits(&b), Err("100001 shielded transactions exceed the 100000 cap".into()));
+    }
+
+    /// Every per-shielded-transaction field: at the cap passes, one over fails.
+    #[test]
+    fn shielded_field_caps_are_inclusive() {
+        type Set = fn(&mut coherence_core::ShieldedTx, usize);
+        let fields: [(Set, usize); 4] = [
+            (|s, n| s.nullifiers = vec![[1; 32]; n], MAX_SHIELDED_NULLIFIERS),
+            (|s, n| s.outputs = vec![[2; 32]; n], MAX_SHIELDED_OUTPUTS),
+            (|s, n| s.proof = vec![3; n], MAX_SHIELDED_PROOF_SIZE),
+            (|s, n| s.binding_sig = vec![4; n], MAX_SHIELDED_BINDING_SIG_SIZE),
+        ];
+        for (k, (set, cap)) in fields.into_iter().enumerate() {
+            let mut b = block_with(vec![tx(1, 20, 1)]);
+            let mut s = shielded(0);
+            set(&mut s, cap);
+            b.shielded_transactions = vec![shielded(0), s];
+            assert_eq!(check_block_canonical_limits(&b), Ok(()), "field {k} at the cap");
+            set(&mut b.shielded_transactions[1], cap + 1);
+            assert_eq!(check_block_canonical_limits(&b), Err("shielded[1] exceeds a wire-format cap".into()), "field {k}");
+        }
+    }
+
+    #[test]
+    fn context_free_check_runs_both_rules() {
+        let mut b = block_with(vec![tx(1, 20, tokenomics::MAX_SUPPLY_SAT + 1)]);
+        assert_eq!(check_block_context_free(&b), Err("tx[0]: output 0 value 1000000000000001 exceeds MAX_SUPPLY_SAT".into()));
+        b.transactions[0].outputs[0].value = 1;
+        assert_eq!(check_block_context_free(&b), Ok(()));
+        b.header.parents = vec![[1; 32]; MAX_PARENTS + 1];
+        assert_eq!(check_block_context_free(&b), Err("257 parents exceed the 256 cap".into()));
+    }
+
     /// Supply invariant: the whole mining schedule plus the carryover is in
     /// range, so MoneyRange can never reject an honestly issued amount.
     #[test]

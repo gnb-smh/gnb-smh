@@ -27,6 +27,11 @@ pub mod block_rules;
 /// MoneyRange and canonical-encoding size helpers (audit VAL-11 / VAL-12).
 pub mod limits;
 
+/// Boundary and encoding tests of this module's consensus functions
+/// (mutation-tested: docs/testing/MUTATION.md).
+#[cfg(test)]
+mod consensus_tests;
+
 // ── Network identity ─────────────────────────────────────────────────────────
 
 pub const MAINNET_PREFIX:        &str  = "gnb1q";
@@ -918,6 +923,22 @@ struct PowCache {
 
 const POW_CACHE_CAPACITY: usize = 16_384;
 
+impl PowCache {
+    /// Record a verified block id; the oldest entry is evicted once more than
+    /// `POW_CACHE_CAPACITY` ids are held (FIFO). Re-inserting a held id is a
+    /// no-op.
+    fn insert(&mut self, id: [u8; 32]) {
+        if self.set.insert(id) {
+            self.order.push_back(id);
+            if self.order.len() > POW_CACHE_CAPACITY {
+                if let Some(old) = self.order.pop_front() {
+                    self.set.remove(&old);
+                }
+            }
+        }
+    }
+}
+
 fn pow_cache() -> &'static std::sync::Mutex<PowCache> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<PowCache>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| {
@@ -1085,14 +1106,7 @@ impl Block {
         let ok = gnb_smh::verify(&self.header.pow_preimage(), self.header.nonce, &target);
         if ok {
             if let Ok(mut cache) = pow_cache().lock() {
-                if cache.set.insert(id) {
-                    cache.order.push_back(id);
-                    if cache.order.len() > POW_CACHE_CAPACITY {
-                        if let Some(old) = cache.order.pop_front() {
-                            cache.set.remove(&old);
-                        }
-                    }
-                }
+                cache.insert(id);
             }
         }
         ok
@@ -1310,7 +1324,9 @@ mod structure_split_tests {
     fn cheap_half_accepts_well_formed_block_regardless_of_pow() {
         // Hard target, arbitrary nonce: the PoW fails, the cheap half passes.
         let mut b = block_with(GENESIS_BITS, 0);
-        while b.validate_pow() { b.header.nonce += 1; } // find a FAILING nonce
+        // Find a FAILING nonce (each passes with probability ~1/4,500).
+        // Bounded: a broken proof check or cache must fail, not hang.
+        assert!((0..16).any(|n| { b.header.nonce = n; !b.validate_pow() }), "no failing nonce in 16");
         assert_eq!(b.validate_structure_without_pow(), Ok(()));
         assert_eq!(b.validate_structure(), Err("invalid PoW"),
             "validate_structure must still verify the proof of work");
@@ -1926,6 +1942,7 @@ mod hardening_core_tests {
         let _g = activation::scoped_override(6);
         // Below the activation the pow-limit target is allowed: almost any
         // nonce passes (one or two evaluations).
-        while !b.validate_pow() { b.header.nonce += 1; }
+        // Bounded: a broken proof check must fail the test, not hang it.
+        assert!((0..32).any(|n| { b.header.nonce = n; b.validate_pow() }), "no valid nonce in 32");
     }
 }
