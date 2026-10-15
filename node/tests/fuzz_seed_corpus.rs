@@ -1,7 +1,8 @@
 //! Seed corpora of the cargo-fuzz targets added by the 2026-10 hardening
 //! (`fuzz/fuzz_targets/{block_rules, sighash, witness_parse, wire_roundtrip,
-//! undo_decode, keystore_decode, address_parse, sync_rr_codec, accept_dag}`),
-//! and their stable-Rust floor.
+//! undo_decode, keystore_decode, address_parse, sync_rr_codec, accept_dag}`)
+//! and of `header_parse` (an original target `parser_corpus_floor.rs` does
+//! not seed), and their stable-Rust floor.
 //!
 //! * `GNB_WRITE_FUZZ_SEEDS=1 cargo test -p gnb --test fuzz_seed_corpus`
 //!   (re)writes the generated seeds `fuzz/corpus/<target>/seed_*`.
@@ -259,6 +260,36 @@ fn seeds() -> BTreeMap<&'static str, Vec<Vec<u8>>> {
     wr.push(with(&[3, 0, 0], &nonmin));
     m.insert("wire_roundtrip", wr);
 
+    // header_parse (an original target that had no corpus): raw header wire
+    // bytes, parent counts 0 / 1 / 2 / 256 (the cap) / 257, near misses.
+    let hdr = |parents: usize, r: &mut Rng| {
+        let h = BlockHeader {
+            version: 1,
+            parents: (0..parents).map(|i| [i as u8; 32]).collect(),
+            merkle_root: MerkleRoot(r.arr32()),
+            timestamp: r.next(),
+            bits: 0x2100_FFFF,
+            nonce: r.next(),
+        };
+        h.to_wire_bytes(r.next() % 1000, r.next() % 1000)
+    };
+    // Its own stream, so the seeds of the other targets do not move.
+    let mut rh = Rng(0x4EAD_E2_5EED);
+    let h2 = hdr(2, &mut rh);
+    let mut hp = vec![
+        hard.header.to_wire_bytes(hard.blue_score, hard.height),
+        legacy.header.to_wire_bytes(legacy.blue_score, legacy.height),
+        hdr(0, &mut rh),
+        h2.clone(),
+        hdr(256, &mut rh),
+        hdr(257, &mut rh),
+        h2[..h2.len() - 1].to_vec(),
+    ];
+    let mut trailing = h2.clone();
+    trailing.push(0);
+    hp.push(trailing);
+    m.insert("header_parse", hp);
+
     // undo_decode: [0 | stored bytes] (legacy and extended), [1 | generator].
     let mut u = UndoData::new(r.arr32(), 42);
     u.spent_utxos.push(UndoEntry { prev_txid: r.arr32(), prev_index: 1, output: TxOutput { value: 9, script_pubkey: r.bytes(20) } });
@@ -396,7 +427,7 @@ fn rest(d: &[u8], skip: usize) -> &[u8] {
 
 #[test]
 fn corpus_floor_wire_decoders() {
-    for (target, skip) in [("wire_roundtrip", 3), ("block_rules", 9)] {
+    for (target, skip) in [("wire_roundtrip", 3), ("block_rules", 9), ("header_parse", 0)] {
         floor(target, |d| {
             let b = rest(d, skip);
             if let Ok(block) = Block::from_wire_bytes(b) {
