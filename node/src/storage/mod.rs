@@ -1,6 +1,8 @@
 //! Bloch-SIS Protocol — Storage (RocksDB)
 
 pub mod indexer;
+/// Audit NET-12: explorer aggregates maintained in the UTXO write batches.
+pub mod aggregates;
 
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, IteratorMode};
 use std::path::Path;
@@ -99,9 +101,58 @@ pub struct Storage {
     /// and every chain-state mutation goes through. Reentrant so a nested
     /// call on the same thread cannot self-deadlock.
     accept_lock: parking_lot::ReentrantMutex<()>,
+    /// Memo of pure verdicts on stored block bodies ([`Storage::body_verdict`]).
+    body_verdicts: parking_lot::Mutex<BodyVerdicts>,
+    /// NET-12: serialises every read-modify-write of the explorer
+    /// aggregates (`aggregates.rs`). Never held while taking `accept_lock`.
+    agg_lock: parking_lot::Mutex<()>,
+    /// NET-12: the aggregates are complete (cached `agg/version`).
+    agg_ready: std::sync::atomic::AtomicBool,
+    /// NET-12: number of storage reads served (diagnostics; lets tests prove
+    /// that an RPC's cost does not grow with the chain).
+    reads: std::sync::atomic::AtomicU64,
+}
+
+/// Upper bound on the entries of the body-verdict memo. Reaching it clears
+/// the memo (the verdicts are recomputable; only the cost changes).
+pub const BODY_VERDICT_MEMO_CAP: usize = 16_384;
+
+/// The body-verdict memo ([`Storage::body_verdict`]).
+#[derive(Default)]
+struct BodyVerdicts {
+    /// Block hash → (caller key, verdict on the body stored under that hash).
+    map: std::collections::HashMap<[u8; 32], (u64, bool)>,
+    /// Bumped by every body write or delete through this type, so a verdict
+    /// computed while a body changed is not recorded.
+    epoch: u64,
+    /// Verdicts computed (memo misses), for tests and diagnostics.
+    computed: u64,
 }
 
 impl Storage {
+    fn with_db(db: DB) -> Self {
+        Self {
+            db,
+            accept_lock: parking_lot::ReentrantMutex::new(()),
+            body_verdicts: Default::default(),
+            agg_lock: parking_lot::Mutex::new(()),
+            agg_ready: std::sync::atomic::AtomicBool::new(false),
+            reads: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn note_reads(&self, n: u64) {
+        self.reads.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// NET-12: total storage reads served by this handle so far (point
+    /// reads plus iterator steps of the instrumented accessors).
+    #[allow(dead_code)] // library API (tests, diagnostics)
+    pub fn storage_reads(&self) -> u64 {
+        self.reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Build the full column-family descriptor list. Shared by the read-write
     /// [`open`] and the read-only [`open_read_only`] paths so both agree on the
     /// exact schema (CF names + per-CF options) — the read-only replay harness
@@ -177,7 +228,9 @@ impl Storage {
         opts.set_write_buffer_size(64 * 1024 * 1024);
         let db = DB::open_cf_descriptors(&opts, path, Self::cf_descriptors())
             .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
-        Ok(Self { db, accept_lock: parking_lot::ReentrantMutex::new(()) })
+        let store = Self::with_db(db);
+        store.init_aggregates_marker()?;
+        Ok(store)
     }
 
     /// Open an existing snapshot **read-only**. RocksDB is opened with
@@ -196,7 +249,12 @@ impl Storage {
         // mutates the primary.
         let db = DB::open_cf_descriptors_read_only(&opts, path, Self::cf_descriptors(), false)
             .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
-        Ok(Self { db, accept_lock: parking_lot::ReentrantMutex::new(()) })
+        let store = Self::with_db(db);
+        // Read-only: report the marker, never write it.
+        let ready = store.get_meta("agg/version").ok().flatten()
+            .is_some_and(|v| v.as_slice() == aggregates::AGG_VERSION.to_le_bytes());
+        store.agg_ready.store(ready, std::sync::atomic::Ordering::Release);
+        Ok(store)
     }
 
     /// Take the acceptance mutex (audit DAG-10). See the field documentation.
@@ -256,6 +314,7 @@ impl Storage {
         }
 
         self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        self.forget_body_verdict(&hash);
         Ok(())
     }
 
@@ -272,8 +331,10 @@ impl Storage {
     pub fn put_block_body(&self, block: &Block) -> Result<(), StorageError> {
         let hash = block.block_hash();
         let cf_b = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
-        self.db.put_cf(&cf_b, &hash, &block.to_wire_bytes())
-            .map_err(|e| StorageError::WriteFailed(e.to_string()))
+        let written = self.db.put_cf(&cf_b, &hash, &block.to_wire_bytes())
+            .map_err(|e| StorageError::WriteFailed(e.to_string()));
+        self.forget_body_verdict(&hash);
+        written
     }
 
     /// Delete a block body (CF_BLOCKS only). Used to drop the body of a block
@@ -281,10 +342,84 @@ impl Storage {
     /// unreferenced is left behind.
     pub fn delete_block_body(&self, hash: &[u8; 32]) -> Result<(), StorageError> {
         let cf_b = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
-        self.db.delete_cf(&cf_b, hash).map_err(|e| StorageError::WriteFailed(e.to_string()))
+        let deleted = self.db.delete_cf(&cf_b, hash).map_err(|e| StorageError::WriteFailed(e.to_string()));
+        self.forget_body_verdict(hash);
+        deleted
+    }
+
+    /// A verdict `verdict(body)` on the body stored under `hash`, memoized per
+    /// hash and `key`: `Ok(None)` when no body is stored (checked on every
+    /// call, so a pruned or deleted body is never reported), otherwise the
+    /// memoized verdict for `(hash, key)` or, on a miss, `verdict` applied to
+    /// the decoded body and recorded. `verdict` MUST be a pure function of the
+    /// body and `key` (one memo slot per hash: another `key` replaces it).
+    /// Every body write or delete through this type (`put_block`,
+    /// `put_block_body`, `delete_block_body`, `prune_blocks_below`) drops the
+    /// hash's memo, and a verdict computed while a body changed is not
+    /// recorded; a raw write through [`Storage::db`] bypasses the memo.
+    /// A body that cannot be read or decoded is an error and is not memoized.
+    ///
+    /// Used by the block template's parent predicate
+    /// (`template::template_parents_and_height_at`), which runs on every
+    /// valid tip at every block acceptance: without the memo every call
+    /// decoded and re-hashed (Merkle and witness roots) every tip body.
+    pub fn body_verdict<F: FnOnce(&Block) -> bool>(
+        &self,
+        hash: &[u8; 32],
+        key: u64,
+        verdict: F,
+    ) -> Result<Option<bool>, StorageError> {
+        if !self.has_block_body(hash)? {
+            return Ok(None);
+        }
+        let epoch = {
+            let memo = self.body_verdicts.lock();
+            if let Some(&(k, v)) = memo.map.get(hash) {
+                if k == key {
+                    return Ok(Some(v));
+                }
+            }
+            memo.epoch
+        };
+        let Some(block) = self.get_block(hash)? else { return Ok(None) };
+        let v = verdict(&block);
+        let mut memo = self.body_verdicts.lock();
+        memo.computed = memo.computed.wrapping_add(1);
+        if memo.epoch == epoch {
+            if memo.map.len() >= BODY_VERDICT_MEMO_CAP && !memo.map.contains_key(hash) {
+                memo.map.clear();
+            }
+            memo.map.insert(*hash, (key, v));
+        }
+        Ok(Some(v))
+    }
+
+    /// Number of verdicts [`Storage::body_verdict`] computed (memo misses)
+    /// since the store was opened. Diagnostics and tests (the `gnb` binary
+    /// does not call it).
+    #[allow(dead_code)]
+    pub fn body_verdicts_computed(&self) -> u64 {
+        self.body_verdicts.lock().computed
+    }
+
+    /// Drop the memoized body verdict of `hash` (its body was written or
+    /// deleted).
+    fn forget_body_verdict(&self, hash: &[u8; 32]) {
+        let mut memo = self.body_verdicts.lock();
+        memo.map.remove(hash);
+        memo.epoch = memo.epoch.wrapping_add(1);
+    }
+
+    /// Whether a body is stored for `hash` (no decoding).
+    pub fn has_block_body(&self, hash: &[u8; 32]) -> Result<bool, StorageError> {
+        let cf = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
+        Ok(self.db.get_pinned_cf(&cf, hash)
+            .map_err(|e| StorageError::ReadFailed(e.to_string()))?
+            .is_some())
     }
 
     pub fn get_block(&self, hash: &[u8; 32]) -> Result<Option<Block>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
         match self.db.get_cf(&cf, hash).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) => Ok(Some(
@@ -296,6 +431,7 @@ impl Storage {
     }
 
     pub fn get_block_hash_at_height(&self, height: u64) -> Result<Option<[u8; 32]>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
         match self.db.get_cf(&cf, &height.to_be_bytes()).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) if d.len() == 32 => { let mut h = [0u8;32]; h.copy_from_slice(&d); Ok(Some(h)) }
@@ -304,6 +440,7 @@ impl Storage {
     }
 
     pub fn get_timestamp_at_height(&self, height: u64) -> Result<Option<u64>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_TIMESTAMPS).ok_or(StorageError::CfNotFound(CF_TIMESTAMPS.into()))?;
         match self.db.get_cf(&cf, &height.to_be_bytes()).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) if d.len() == 8 => Ok(Some(u64::from_le_bytes(d[..8].try_into().unwrap()))),
@@ -311,23 +448,32 @@ impl Storage {
         }
     }
 
+    /// Create (or overwrite) one UTXO with its address-index row. NET-12:
+    /// the explorer aggregates change in the SAME write batch.
     pub fn put_utxo(&self, txid: &[u8], index: u32, output: &TxOutput) -> Result<(), StorageError> {
         let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
         let key = utxo_key(txid, index);
-        self.db.put_cf(&cf, &key, &encode(output)?)
-            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        let _agg = self.agg_lock();
+        let mut deltas = aggregates::HolderDeltas::default();
+        if let Some(prev) = self.get_utxo(txid, index)? {
+            deltas.remove(&prev);
+        }
+        deltas.add(output);
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&cf, &key, &encode(output)?);
 
         // Address index: key = [20B address][32B txid][4B index], value = empty
         if output.script_pubkey.len() >= 20 {
             let cf_ai = self.db.cf_handle(CF_ADDR_UTXO).ok_or(StorageError::CfNotFound(CF_ADDR_UTXO.into()))?;
             let ai_key = addr_utxo_key(&output.script_pubkey, txid, index);
-            self.db.put_cf(&cf_ai, &ai_key, &[])
-                .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+            batch.put_cf(&cf_ai, &ai_key, []);
         }
-        Ok(())
+        self.stage_holder_deltas(&mut batch, &deltas)?;
+        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
     pub fn get_utxo(&self, txid: &[u8], index: u32) -> Result<Option<TxOutput>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
         match self.db.get_cf(&cf, &utxo_key(txid, index)).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) => Ok(Some(decode(&d)?)),
@@ -340,6 +486,7 @@ impl Storage {
         if let Some(cf) = self.db.cf_handle(CF_BLOCKS) {
             let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
             for item in iter {
+                self.note_reads(1);
                 if let Ok((key, val)) = item {
                     if key.len() == 32 {
                         let mut hash = [0u8; 32];
@@ -377,6 +524,7 @@ impl Storage {
         let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
         let mut out: Vec<(Vec<u8>, u32, u64, Vec<u8>)> = Vec::new();
         for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            self.note_reads(1);
             let (key, val) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
             // Fail the whole export on corruption; a partial ledger cannot
             // be advertised as a complete carryover set. Preserve historical
@@ -391,29 +539,45 @@ impl Storage {
 
     pub fn clear_utxos(&self) -> Result<(), StorageError> {
         let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
+        let _agg = self.agg_lock();
+        let mut deltas = aggregates::HolderDeltas::default();
         let mut batch = rocksdb::WriteBatch::default();
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         for item in iter {
-            if let Ok((key, _)) = item { batch.delete_cf(&cf, &key); }
+            if let Ok((key, val)) = item {
+                if let Ok(out) = decode::<TxOutput>(&val) {
+                    deltas.remove(&out);
+                }
+                batch.delete_cf(&cf, &key);
+            }
         }
+        self.stage_holder_deltas(&mut batch, &deltas)?;
         self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         Ok(())
     }
 
+    /// Delete one UTXO with its address-index row. NET-12: the explorer
+    /// aggregates change in the SAME write batch.
     pub fn delete_utxo(&self, txid: &[u8], index: u32) -> Result<(), StorageError> {
         // Fetch the UTXO first to get the address for index cleanup
         let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
+        let _agg = self.agg_lock();
+        let mut deltas = aggregates::HolderDeltas::default();
+        let mut batch = rocksdb::WriteBatch::default();
         if let Some(data) = self.db.get_cf(&cf, &utxo_key(txid, index))
             .map_err(|e| StorageError::ReadFailed(e.to_string()))?
         {
             if let Ok(output) = decode::<TxOutput>(&data) {
                 if output.script_pubkey.len() >= 20 {
                     let cf_ai = self.db.cf_handle(CF_ADDR_UTXO).ok_or(StorageError::CfNotFound(CF_ADDR_UTXO.into()))?;
-                    let _ = self.db.delete_cf(&cf_ai, &addr_utxo_key(&output.script_pubkey, txid, index));
+                    batch.delete_cf(&cf_ai, addr_utxo_key(&output.script_pubkey, txid, index));
                 }
+                deltas.remove(&output);
             }
         }
-        self.db.delete_cf(&cf, &utxo_key(txid, index)).map_err(|e| StorageError::WriteFailed(e.to_string()))
+        batch.delete_cf(&cf, utxo_key(txid, index));
+        self.stage_holder_deltas(&mut batch, &deltas)?;
+        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
     /// O(k) balance query via address index (was O(n) full UTXO scan)
@@ -428,6 +592,7 @@ impl Storage {
         let (mut total, mut count) = (0u64, 0usize);
         let iter = self.db.prefix_iterator_cf(&cf_ai, &prefix);
         for item in iter {
+            self.note_reads(2);
             if let Ok((k, _)) = item {
                 // Stop when prefix no longer matches
                 if k.len() < address_bytes.len() || &k[..address_bytes.len()] != address_bytes { break; }
@@ -460,6 +625,7 @@ impl Storage {
         let mut set = std::collections::HashSet::<[u8; 20]>::new();
         let mut utxos = 0usize;
         for item in self.db.iterator_cf(&cf_ai, IteratorMode::Start) {
+            self.note_reads(1);
             if let Ok((k, _)) = item {
                 if k.len() >= 20 {
                     let mut addr = [0u8; 20];
@@ -484,6 +650,7 @@ impl Storage {
         let mut result = Vec::new();
         let iter = self.db.prefix_iterator_cf(&cf_ai, &prefix);
         for item in iter {
+            self.note_reads(2);
             if let Ok((k, _)) = item {
                 let alen = address_bytes.len();
                 if k.len() < alen || &k[..alen] != address_bytes { break; }
@@ -522,6 +689,7 @@ impl Storage {
         let expected = alen + 36;
         let mut result = Vec::new();
         for (k, _) in self.db.prefix_iterator_cf(&cf_ai, address_bytes).flatten() {
+            self.note_reads(2);
             if k.len() < alen || &k[..alen] != address_bytes { break; }
             if k.len() != expected { continue; }
             let Some(v) = self.db.get_cf(&cf_utxo, &k[alen..expected])
@@ -548,6 +716,7 @@ impl Storage {
 
     /// Load GhostDAG data for a single block
     pub fn get_dag_data(&self, hash: &BlockHash) -> Result<Option<GhostdagData>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_DAG).ok_or(StorageError::CfNotFound(CF_DAG.into()))?;
         match self.db.get_cf(&cf, hash).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) => Ok(Some(decode(&d)?)),
@@ -896,18 +1065,23 @@ impl Storage {
 
     /// Every persisted chain-disqualified block hash.
     pub fn load_invalid_blocks(&self) -> Result<Vec<BlockHash>, StorageError> {
+        Ok(self.load_invalid_blocks_with_reasons()?.into_iter().map(|(h, _)| h).collect())
+    }
+
+    /// Every persisted chain-disqualified block hash with its recorded reason.
+    pub fn load_invalid_blocks_with_reasons(&self) -> Result<Vec<(BlockHash, String)>, StorageError> {
         let cf = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
         let mut out = Vec::new();
         let iter = self.db.iterator_cf(&cf, IteratorMode::From(Self::INVALID_PREFIX, rocksdb::Direction::Forward));
         for item in iter {
-            let (k, _) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            let (k, v) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
             if !k.starts_with(Self::INVALID_PREFIX) {
                 break;
             }
             if k.len() == Self::INVALID_PREFIX.len() + 32 {
                 let mut h = [0u8; 32];
                 h.copy_from_slice(&k[Self::INVALID_PREFIX.len()..]);
-                out.push(h);
+                out.push((h, String::from_utf8_lossy(&v).into_owned()));
             }
         }
         Ok(out)
@@ -991,6 +1165,7 @@ impl Storage {
     /// Get the height at which a coinbase transaction was created.
     /// Returns None if the txid is not a coinbase.
     pub fn get_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_COINBASE).ok_or(StorageError::CfNotFound(CF_COINBASE.into()))?;
         match self.db.get_cf(&cf, txid).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) if d.len() == 8 => Ok(Some(u64::from_le_bytes(d[..8].try_into().unwrap()))),
@@ -1019,6 +1194,7 @@ impl Storage {
 
     /// Lookup transaction location: returns (block_hash, block_height)
     pub fn get_tx_location(&self, txid: &[u8; 32]) -> Result<Option<([u8; 32], u64)>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_TX_INDEX).ok_or(StorageError::CfNotFound(CF_TX_INDEX.into()))?;
         match self.db.get_cf(&cf, txid).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) if d.len() == 40 => {
@@ -1044,6 +1220,7 @@ impl Storage {
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
         self.db.get_cf(&cf, key.as_bytes()).map_err(|e| StorageError::ReadFailed(e.to_string()))
     }
@@ -1060,7 +1237,10 @@ impl Storage {
         -> Result<(), StorageError>
     {
         let cf = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
-        self.db.put_cf(&cf, block_hash, &encode(data)?)
+        // `UndoData::to_bytes`: the legacy encoding, plus the overwritten-rows
+        // extension only when the block replaced something (audit VAL-2).
+        let bytes = data.to_bytes().map_err(StorageError::SerializeFailed)?;
+        self.db.put_cf(&cf, block_hash, &bytes)
             .map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 
@@ -1069,9 +1249,11 @@ impl Storage {
     pub fn get_undo_data(&self, block_hash: &[u8; 32])
         -> Result<Option<crate::core::UndoData>, StorageError>
     {
+        self.note_reads(1);
         let cf = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
         match self.db.get_cf(&cf, block_hash).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
-            Some(d) => Ok(Some(decode(&d)?)),
+            // Records written before the VAL-2 extension decode unchanged.
+            Some(d) => Ok(Some(crate::core::UndoData::from_bytes(&d).map_err(StorageError::DeserializeFailed)?)),
             None    => Ok(None),
         }
     }
@@ -1203,12 +1385,20 @@ impl Storage {
         for (txid, idx) in &undo.created_utxo_keys {
             let _ = self.delete_utxo(txid, *idx);
         }
+        //    VAL-2: restore the coins those outputs overwrote (same outpoint),
+        //    so the UTXO set equals that of a node that never applied the block.
+        for entry in &undo.overwritten.utxos {
+            let _ = self.put_utxo(&entry.prev_txid, entry.prev_index, &entry.output);
+        }
 
         // 7. Delete coinbase-info entries for any coinbase txs this block
         //    introduced. A reverted coinbase must not be treated as mature
         //    by downstream validation.
         for txid in &undo.coinbase_txids {
             let _ = self.delete_coinbase_info(txid);
+        }
+        for (txid, height) in &undo.overwritten.coinbase_heights {
+            let _ = self.put_coinbase_info(txid, *height);
         }
 
         // 8. Delete tx_index entries. After rollback the txid is no longer
@@ -1218,11 +1408,18 @@ impl Storage {
         for txid in &undo.tx_index_keys {
             let _ = self.delete_tx_index(txid);
         }
+        for (txid, block, height) in &undo.overwritten.tx_index {
+            let _ = self.put_tx_index(txid, block, *height);
+        }
 
         // 9. Finally, delete the undo record itself. Must be last: if any
         //    earlier step erred after we deleted this first, the caller
         //    would have no way to retry or to introspect the record.
         self.delete_undo_data(block_hash)?;
+
+        // NET-12: the block left the connected chain (holder aggregates
+        // already followed the put/delete calls above).
+        self.note_block_disconnected(block_hash, undo.tx_index_keys.len() as u64)?;
 
         Ok(undo)
     }
@@ -1249,6 +1446,9 @@ impl Storage {
                 {
                     self.db.delete_cf(&cf_blocks, &hash_bytes)
                         .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+                    if let Ok(hash) = <[u8; 32]>::try_from(hash_bytes.as_slice()) {
+                        self.forget_body_verdict(&hash);
+                    }
                     pruned += 1;
                 }
             }
@@ -1550,11 +1750,19 @@ impl Storage {
             .ok_or(StorageError::CfNotFound(CF_ADDR_UTXO.into()))?;
         let cf_meta = self.db.cf_handle(CF_META)
             .ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        let _agg = self.agg_lock();
+        let mut deltas = aggregates::HolderDeltas::default();
         let mut batch = rocksdb::WriteBatch::default();
         for u in &snap.utxos {
+            if let Some(prev) = self.get_utxo(&u.txid, u.vout)? {
+                deltas.remove(&prev);
+            }
             batch.put_cf(&cf_utxo, utxo_key(&u.txid, u.vout), encode(&u.output)?);
             batch.put_cf(&cf_ai, addr_utxo_key(&u.output.script_pubkey, &u.txid, u.vout), [0u8; 0]);
+            deltas.add(&u.output);
         }
+        // NET-12: holder aggregates in the same batch.
+        self.stage_holder_deltas(&mut batch, &deltas)?;
         batch.put_cf(&cf_meta, b"carryover_sha3", snap.sha3);
         self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         Ok(snap.utxos.len() as u64)

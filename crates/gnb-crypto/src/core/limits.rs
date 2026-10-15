@@ -26,12 +26,13 @@
 //! block that arrives over the network (it was parsed, so it already obeys
 //! the caps). `limits_match_the_wire_parser` keeps the two in sync.
 //!
-//! Block SIZE (`MAX_BLOCK_SIZE`) is deliberately NOT re-measured here: the
-//! consensus rule is `Block::size_bytes()` (bincode), checked by
-//! `Block::validate_structure`. Switching the measure to the wire encoding
-//! would change which blocks are valid; every producer (miner template,
-//! `getblocktemplate`) instead budgets with the exact same `size_bytes()`
-//! measure the rule uses.
+//! Block SIZE (`MAX_BLOCK_SIZE`) is not measured here. Below the hardening
+//! activation the consensus rule is `Block::size_bytes()` (bincode); at and
+//! after it the canonical wire encoding `Block::wire_size()`, the encoding
+//! fee rates use (`super::block_rules::block_size_for_rules`, audit VAL-12
+//! residual). Both are checked by `Block::validate_structure`, the wire
+//! measure also by `accept_block`, and every producer (miner template,
+//! `getblocktemplate`) budgets with the measure of the template's height.
 
 use super::{tokenomics, Block, Transaction, MAX_PARENTS};
 

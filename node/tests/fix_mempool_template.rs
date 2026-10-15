@@ -210,9 +210,12 @@ fn mem3_conflicting_pool_tx_is_swept_on_connect() {
     assert!(!n.mempool.contains(&a.txid()), "conflict swept on connect");
 }
 
-/// After a reorg the pool is re-validated against the new UTXO set: a pooled
-/// tx spending an output that only existed on the abandoned chain is dropped,
-/// while the abandoned chain's own (still valid) tx is re-admitted.
+/// After a reorg the pool is re-validated against the new UTXO set plus the
+/// pool: the abandoned chain's own (still valid) tx is re-admitted, and a
+/// pooled tx spending an output that only existed on the abandoned chain is
+/// kept only as an in-pool CHILD of that re-admitted tx (audit MEM-6 chains;
+/// before MEM-6 it was dropped). The variant where the parent cannot come
+/// back is `fix_mempool_policy::mem6_reorg_drops_child_whose_parent_cannot_return`.
 #[test]
 fn mem3_pool_is_revalidated_after_a_reorg() {
     let genesis = mk_genesis(unix_now() - 10_000);
@@ -234,8 +237,10 @@ fn mem3_pool_is_revalidated_after_a_reorg() {
     let f2 = empty_child(&n, f1.block_hash(), "f2");
     accept(&n, &f2).unwrap();
     assert_eq!(sel_tip(&n), Some(f2.block_hash()));
-    assert!(!n.mempool.contains(&p.txid()), "P's input only existed on the abandoned chain");
     assert!(n.mempool.contains(&tx1.txid()), "tx1 re-admitted through the shared admission path");
+    assert!(n.mempool.contains(&p.txid()), "P's input only exists in the pool now: P stays as tx1's child");
+    assert_eq!(n.mempool.get_entry(&p.txid()).unwrap().parents.into_iter().collect::<Vec<_>>(), vec![tx1.txid()]);
+    n.mempool.debug_check_invariants().unwrap();
 }
 
 struct TestClock(Arc<AtomicU64>);

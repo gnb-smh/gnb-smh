@@ -31,6 +31,10 @@ jobs:
         run: |
           python3 reference/gen_difficulty_vectors.py
           git diff --exit-code reference/difficulty_vectors.json
+      - name: Block-rule (Merkle, coinbase commitment) vectors are reproducible
+        run: |
+          python3 reference/gen_merkle_vectors.py
+          git diff --exit-code reference/merkle_vectors.json
       - name: Ledger reference tests
         run: python3 reference/test_ledger.py
       - name: Ledger vectors are reproducible

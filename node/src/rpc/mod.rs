@@ -7,6 +7,15 @@
 //!   sendrawtransaction,
 //!   validateaddress, estimatefee, getrawmempool,
 //!   decoderawtransaction, getdaginfo, listtransactions, getpeerinfo
+//!
+//! Mempool policy (audit MEM-6, `docs/MEMPOOL.md`): `sendrawtransaction`
+//! accepts children of unconfirmed transactions (≤ 25 ancestors and
+//! descendants, ≤ 500,000-byte packages) and applies FULL-RBF — a
+//! transaction double-spending pooled ones replaces them iff it adds no new
+//! unconfirmed input, pays a higher fee rate than each direct conflict, an
+//! absolute fee ≥ the fees of everything it evicts plus 1 sat/byte of its own
+//! size, and evicts ≤ 100 transactions (BIP125 rules 2–6, no signalling).
+//! `getmempoolinfo` reports these parameters under `policy`.
 
 pub mod auth;
 mod explorer;
@@ -172,13 +181,20 @@ struct AppState {
     heavy_gate:              Arc<HeavyGate>,
     // B5f pool seam: submitblock hook (None = method returns "not wired").
     submit_block:            Option<Arc<SubmitBlockFn>>,
+    // NET-12: cancellation flag of THIS request (a fresh flag per request,
+    // set when the dispatch timeout fires); long loops check it.
+    cancel:                  Arc<std::sync::atomic::AtomicBool>,
 }
 
 // ─── R3-audit H-R3-5 / L-8: bound the expensive analytics + template RPCs ───
 //
-// These methods do expensive per-call work — `supply_distribution` and
-// `chain_stats` iterate EVERY block (twice, for the former), the per-address
-// history walks grow with the chain, and `getblocktemplate` (L-8) reads the
+// These methods did expensive per-call work. NET-12 (audit): the chain
+// statistics, rich list, supply distribution and address count are now
+// served from incremental aggregates (`storage::aggregates`) with bounded,
+// cancellable work (`analytics::*_bounded`); they stay classed heavy (TTL
+// cache + single flight) as defence in depth. Still genuinely heavy: the
+// per-address history walk (`getaddressbalance_at_height`, streamed and
+// cancellable), and `getblocktemplate` (L-8), which reads the
 // DAG twice, walks parent ancestry to derive `bits`, and drains + serialises
 // up to 2000 mempool transactions — on a port that, for the analytics
 // methods, has no auth and, for loopback/private callers, no rate limit
@@ -300,6 +316,11 @@ impl HeavyGate {
         match self.scan.try_lock() {
             Some(_permit) => {
                 let v = f();
+                // NET-12: never cache a failure (a cancelled or not-ready
+                // computation must not answer the next caller for 30 s).
+                if v.get("error").is_some() {
+                    return v;
+                }
                 let mut cache = self.cache.lock();
                 if cache.len() >= HEAVY_READ_CACHE_MAX_KEYS {
                     // Evict stale entries first; if still full, drop the map —
@@ -430,6 +451,7 @@ pub async fn start_rpc_server(
         trust_loopback:          config.trust_loopback,
         heavy_gate:              Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
         submit_block,
+        cancel:                  Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     // P0 RPC hardening (roadmap §1.6 / §4.3): body-size cap, global
@@ -519,9 +541,65 @@ fn cap_echoed_id(id: Value) -> Value {
     }
 }
 
+/// Current Unix time in seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// MEM-6: the node's transaction relay policy, as reported by
+/// `getmempoolinfo` (normative text: docs/MEMPOOL.md).
+fn mempool_policy_json() -> Value {
+    use crate::mempool as m;
+    json!({
+        "replacement": "full-rbf: a conflicting transaction replaces pooled ones iff it adds no new unconfirmed input, \
+                        pays a higher fee rate than each direct conflict, an absolute fee >= the sum of every evicted \
+                        transaction's fee plus the incremental relay fee on its own size, and evicts at most \
+                        max_replacement_evictions transactions (BIP125 rules 2-6, no signalling)",
+        "max_replacement_evictions": m::MAX_REPLACEMENT_EVICTIONS,
+        "incremental_relay_fee_sat_per_byte": m::INCREMENTAL_RELAY_FEE_RATE,
+        "min_relay_fee_sat_per_byte": m::MIN_RELAY_FEE_RATE,
+        "unconfirmed_chains": true,
+        "max_ancestors": m::MAX_ANCESTORS,
+        "max_descendants": m::MAX_DESCENDANTS,
+        "max_package_bytes": m::MAX_PACKAGE_BYTES,
+        "block_template_selection": "ancestor-package fee rate (child pays for parent)",
+        "orphan_pool": {
+            "max_transactions": m::orphanage::MAX_ORPHAN_TXS,
+            "max_bytes": m::orphanage::MAX_ORPHAN_BYTES,
+            "max_per_peer": m::orphanage::MAX_ORPHANS_PER_PEER,
+            "max_bytes_per_peer": m::orphanage::MAX_ORPHAN_BYTES_PER_PEER,
+            "expiry_secs": m::orphanage::ORPHAN_EXPIRY_SECS,
+            "max_inputs": m::orphanage::MAX_ORPHAN_INPUTS,
+            "keyed_by": "wtxid; quotas per delivering connection",
+        },
+        "signature_budget": {
+            "keyed_by": "delivering connection (gossip propagation_source)",
+            "burst_input_signatures": m::relay::SIG_BUDGET_BURST,
+            "refill_per_sec": m::relay::SIG_BUDGET_REFILL_PER_SEC,
+            "refunded_on_admission": true,
+        },
+        "expiry_secs": m::MEMPOOL_EXPIRY_SECS,
+        "max_tx_bytes": m::MAX_TX_SIZE,
+    })
+}
+
 fn storage_err_response(e: &StorageError) -> Value {
     log::warn!("rpc: storage error (detail withheld from caller): {}", e);
     json!({ "error": "internal storage error", "code": "STORAGE_ERROR" })
+}
+
+/// The response for a failed explorer statistic: a storage failure gets the
+/// sanitised L-5 response (its detail only reaches the log); cancellation,
+/// not-ready and no-tip keep their plain message (HeavyGate never caches
+/// any of them).
+fn stats_err_response(e: &crate::analytics::StatsError) -> Value {
+    match e {
+        crate::analytics::StatsError::Storage(se) => storage_err_response(se),
+        other => json!({ "error": other.to_string() }),
+    }
 }
 
 /// Height of the selected tip — the number a confirmation count is relative to.
@@ -652,7 +730,12 @@ async fn handle_rpc(
             // Hand the whole dispatch to the blocking pool so worker threads
             // stay free to accept and poll. `block_on` is legal here precisely
             // because a spawn_blocking thread is not a runtime worker.
-            let d_state  = state.clone();
+            // NET-12: a cancellation flag per request; the inner timeout
+            // below sets it, and every long loop of a heavy method checks
+            // it, so a timed-out scan stops instead of running on.
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut d_state = state.clone();
+            d_state.cancel = cancel.clone();
             let d_method = method.to_string();
             let d_params = params.cloned();
             let d_handle = tokio::runtime::Handle::current();
@@ -717,6 +800,7 @@ async fn handle_rpc(
                 }
                 _ = tokio::time::sleep(DISPATCH_INNER_TIMEOUT) => {
                     abort_handle.abort();
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                     log::warn!(
                         "rpc dispatch timed out for method={} ip={} after {:?}; aborted \
                          (queued work is cancelled; already-running work finishes in the \
@@ -794,7 +878,13 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             })
         }
         "getblockcount"  => json!(state.node_state.read().block_count),
-        "getmempoolinfo" => json!({ "size": state.node_state.read().mempool_size }),
+        // MEM-6: the size plus the relay policy in force (docs/MEMPOOL.md).
+        "getmempoolinfo" => json!({
+            "size":                 state.node_state.read().mempool_size,
+            "bytes":                state.mempool.size_bytes(),
+            "rolling_min_fee_rate_sat_per_byte": state.mempool.rolling_min_fee_rate(),
+            "policy":               mempool_policy_json(),
+        }),
 
         "getblockhash" => {
             let height = params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1009,13 +1099,15 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
         // ── Chain: distinct on-chain wallets (addresses with a balance) ──
         "getaddresscount" => {
-            match state.store.count_addresses_with_balance() {
+            // NET-12: one read of the incremental aggregates (was a scan of
+            // the whole address index on every call).
+            match crate::analytics::address_count_bounded(&state.store) {
                 Ok((addrs, utxos)) => json!({
                     "addresses_with_balance": addrs,
                     "utxo_entries":           utxos,
-                    "note": "distinct addresses currently holding >=1 UTXO (on-chain wallets with a non-zero balance); addresses that spent to zero or never held a UTXO are not counted",
+                    "note": "distinct 20-byte addresses currently holding >=1 UTXO (on-chain wallets with a non-zero balance) and their UTXOs; addresses that spent to zero or never held a UTXO are not counted",
                 }),
-                Err(e) => storage_err_response(&e),
+                Err(e) => stats_err_response(&e),
             }
         }
 
@@ -1229,11 +1321,18 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // Shared template builder (audit MEM-2 / DAG-2): parents = at most
             // MAX_PARENTS bodied, non-disqualified tips by blue work; height =
             // max parent height + 1 (accept_block's VULN-02 rule); expected
-            // bits exactly as accept_block validates them; transactions by fee
-            // rate under a byte budget measured like the consensus size rule,
+            // bits exactly as accept_block validates them; transactions as
+            // whole ANCESTOR PACKAGES by package fee rate, parents before
+            // children (MEM-6 child-pays-for-parent), under a byte budget
+            // measured like the consensus size rule of the template's height,
             // reserving EXTERNAL_COINBASE_RESERVE bytes for the caller's
-            // coinbase; every tx re-validated against the UTXO set (offenders
-            // evicted). Fees are recomputed from the UTXO set.
+            // coinbase; every tx re-validated at the template's height against
+            // the UTXO set plus the outputs of the transactions placed before
+            // it (offenders evicted with their descendants). Fees are
+            // recomputed. Each entry's `depends` lists its in-template parents
+            // (BIP22: 1-based positions in `transactions`): a block built from
+            // a subset of the entries must keep every dependency of every
+            // entry it keeps.
             let tmpl = match crate::template::build_block_template(
                 &state.dag, &state.store, &state.mempool,
                 crate::template::EXTERNAL_COINBASE_RESERVE,
@@ -1241,20 +1340,45 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 Ok(t) => t,
                 Err(e) => return json!({ "error": e }),
             };
-            let tx_entries: Vec<Value> = tmpl.transactions.iter().map(|(tx, fee)| {
-                json!({
-                    "txid": hex::encode(tx.txid()),
-                    // R3: satoshi amount → decimal string.
-                    "fee":  fee.to_string(),
-                    "data": hex::encode(tx.to_wire_bytes(true)),
-                })
-            }).collect();
+            let tx_entries = template_tx_entries(&tmpl);
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_secs();
+            // Hardening block rules (docs/CONSENSUS.md, "Block rules at the
+            // hardening activation"): at/after the activation the coinbase
+            // script_sig MUST start with `coinbase_script_sig_prefix` (80
+            // bytes: tag, height, parents commitment, witness root of exactly
+            // the listed transactions in this order), followed by at most
+            // `max_coinbase_extra_bytes` miner bytes; the header Merkle root
+            // uses the tagged tree; the size limit is measured on the wire
+            // encoding. Below it, all three are as before.
+            //
+            // The WHOLE coinbase, measured with `size_rule`, must fit in
+            // `coinbase_reserve`: the listed transactions may fill the rest of
+            // the block. `max_coinbase_extra_bytes` already includes that
+            // bound for a coinbase with one output whose script_pubkey is at
+            // most `max_coinbase_script_pubkey_bytes` bytes (and the consensus
+            // script_sig cap), so a miner that stays within both fields can
+            // never produce a block over `max_block_size`.
+            let commitment = tmpl.coinbase_commitment();
+            let max_extra = crate::template::external_coinbase_max_extra(
+                commitment.map(|c| c.len()).unwrap_or(0),
+                tmpl.hardened,
+                crate::template::EXTERNAL_COINBASE_RESERVE,
+            );
 
             json!({
+                "hardening_active":     tmpl.hardened,
+                "hardening_activation_height": tmpl.activation_height,
+                "merkle_rule":          if tmpl.hardened { "gnb-tagged-v1" } else { "sha256d-duplicate-last" },
+                "size_rule":            if tmpl.hardened { "wire" } else { "bincode" },
+                "coinbase_script_sig_prefix": commitment.map(hex::encode).unwrap_or_default(),
+                "max_coinbase_extra_bytes": max_extra,
+                "max_coinbase_script_pubkey_bytes": crate::template::EXTERNAL_COINBASE_MAX_SPK,
+                // Siblings from the coinbase leaf to the header root (fold the
+                // coinbase txid through them with the `merkle_rule`).
+                "coinbase_merkle_branch": tmpl.coinbase_merkle_branch().iter().map(hex::encode).collect::<Vec<_>>(),
                 "parents":              tmpl.parents.iter().map(hex::encode).collect::<Vec<_>>(),
                 "height":               tmpl.height,
                 "blue_score":           tmpl.blue_score,
@@ -1269,9 +1393,12 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // MAX_FUTURE_SECS ahead of the validator's clock.
                 "min_time":             tmpl.parent_timestamp,
                 // Size accounting: the whole block, measured as the consensus
-                // rule measures it (bincode `Block::size_bytes`), must stay
-                // <= max_block_size; the listed transactions leave
-                // coinbase_reserve bytes for the coinbase.
+                // rule measures it at this height (`size_rule`: bincode
+                // `Block::size_bytes` before the activation, the wire encoding
+                // `Block::to_wire_bytes` from it), must stay <= max_block_size;
+                // the listed transactions leave coinbase_reserve bytes for the
+                // WHOLE coinbase (in the same measure), which is what
+                // max_coinbase_extra_bytes is derived from.
                 "max_block_size":       crate::core::MAX_BLOCK_SIZE,
                 "coinbase_reserve":     crate::template::EXTERNAL_COINBASE_RESERVE,
                 "max_parents":          crate::core::MAX_PARENTS,
@@ -1452,20 +1579,27 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
         // ── Sprint B: Chain analytics ──────────────────────────────────────
 
+        // NET-12: bounded — incremental aggregates plus an in-memory walk of
+        // at most `analytics::STATS_WINDOW_MAX_BLOCKS` selected-chain blocks
+        // (cancellable); was a decode of every stored block body per call.
         "getchainstats" => {
-            match crate::analytics::chain_stats(&state.store, &state.mempool) {
+            match crate::analytics::chain_stats_bounded(&state.store, &state.dag, unix_now(), &state.cancel) {
                 Ok(s) => json!({
                     "total_blocks":         s.total_blocks,
+                    "chain_blocks":         s.chain_blocks,
                     "total_txs":            s.total_txs,
                     "avg_txs_per_block":    s.avg_txs_per_block,
                     "blocks_last_24h":      s.blocks_last_24h,
                     "txs_last_24h":         s.txs_last_24h,
+                    "window_capped":        s.window_capped,
                     "avg_block_time_secs":  s.avg_block_time,
+                    "avg_dag_block_interval_secs": s.avg_dag_block_interval,
                     "current_difficulty":   s.current_difficulty,
                     "hashrate_hs":          s.hashrate_estimate,
                     "hashrate_human":       format_hashrate(s.hashrate_estimate),
+                    "note": "total_blocks: blocks in the DAG; chain_blocks/total_txs/*_last_24h: the applied selected chain (the ledger); avg_block_time_secs: interval between selected-chain blocks; hashrate_hs: from the interval between ALL DAG blocks (chain blocks and the blue and red blocks they merged, avg_dag_block_interval_secs) over the last 50 chain blocks",
                 }),
-                Err(e) => json!({ "error": e }),
+                Err(e) => stats_err_response(&e),
             }
         }
 
@@ -1477,14 +1611,16 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         "getaddresshistory"     => explorer::get_address_history(params, state),
         "getrichlist"           => explorer::get_rich_list(params, state),
         "gethashrate" => {
-            match crate::analytics::chain_stats(&state.store, &state.mempool) {
+            match crate::analytics::chain_stats_bounded(&state.store, &state.dag, unix_now(), &state.cancel) {
                 Ok(s) => json!({
                     "hashrate_hs":          s.hashrate_estimate,
                     "hashrate_human":       format_hashrate(s.hashrate_estimate),
                     "avg_block_time_secs":  s.avg_block_time,
+                    "avg_dag_block_interval_secs": s.avg_dag_block_interval,
                     "current_difficulty":   s.current_difficulty,
+                    "note": "hashrate_hs counts every DAG block (chain blocks and the blue and red blocks they merged): hashes per block / avg_dag_block_interval_secs over the last 50 chain blocks",
                 }),
-                Err(e) => json!({ "error": e }),
+                Err(e) => stats_err_response(&e),
             }
         }
 
@@ -1704,8 +1840,9 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     } else {
                         return json!({ "error": "invalid address" });
                     }
-                    match state.store.balance_at_height(&addr_hash, height) {
-                        Ok(balance) => {
+                    // NET-12: streamed and cancellable (heavy method).
+                    match state.store.balance_at_height_cancellable(&addr_hash, height, &state.cancel) {
+                        Ok((balance, _)) => {
                             let tx_count = state.store.count_address_history(&addr_hash, 0, height).unwrap_or(0);
                             json!({
                                 "address":               addr,
@@ -1753,6 +1890,23 @@ fn parse_address(addr: &str) -> Option<Vec<u8>> {
 }
 
 /// Format a transaction for JSON output
+/// The `transactions` entries of `getblocktemplate`: `txid`, `fee` (decimal
+/// string, R3), `data` (wire hex) and `depends` — the 1-based positions of
+/// the entry's in-template parents (`BlockTemplate::depends`, BIP22
+/// semantics). A subset of the entries is mineable only if it is closed
+/// under `depends` and keeps the listed order.
+fn template_tx_entries(tmpl: &crate::template::BlockTemplate) -> Vec<Value> {
+    tmpl.transactions.iter().zip(tmpl.depends()).map(|((tx, fee), depends)| {
+        json!({
+            "txid":    hex::encode(tx.txid()),
+            // R3: satoshi amount → decimal string.
+            "fee":     fee.to_string(),
+            "data":    hex::encode(tx.to_wire_bytes(true)),
+            "depends": depends,
+        })
+    }).collect()
+}
+
 fn format_tx(tx: &Transaction) -> Value {
     json!({
         "txid":     hex::encode(tx.txid()),
@@ -1910,6 +2064,29 @@ mod l5_storage_error_sanitization_tests {
             "column-family internal name leaked into the RPC response: {}",
             rendered
         );
+    }
+
+    /// Review finding (NET-12 regression of L-5): the explorer statistics
+    /// (`getrichlist`, `getsupplydistribution`, `getaddresscount`,
+    /// `getchainstats`, `gethashrate`) return a typed `StatsError`; a
+    /// storage failure is answered with the sanitised response and its
+    /// detail never reaches the caller. (`StatsError` is not `Serialize`
+    /// and its `Display` of a storage failure carries no detail, so no
+    /// handler can echo it.) Pre-fix they returned `e.to_string()` of the
+    /// `StorageError` — e.g. a RocksDB message with the data-dir path.
+    #[test]
+    fn stats_storage_errors_are_sanitised() {
+        use crate::analytics::StatsError;
+        let sensitive = StatsError::Storage(StorageError::ReadFailed(
+            "IO error: /var/lib/gnb/db/000123.sst: No such file or directory".into(),
+        ));
+        let r = stats_err_response(&sensitive);
+        assert_eq!(r, json!({ "error": "internal storage error", "code": "STORAGE_ERROR" }));
+        assert!(!r.to_string().contains("/var/lib"), "{r}");
+        assert!(!sensitive.to_string().contains("/var/lib"), "Display carries no detail either");
+        assert_eq!(stats_err_response(&StatsError::Cancelled), json!({ "error": "cancelled" }));
+        assert!(stats_err_response(&StatsError::NotReady)["error"].as_str().unwrap().contains("not built"));
+        assert!(stats_err_response(&StatsError::NoTip).get("code").is_none());
     }
 
     /// Every `StorageError` variant must produce the SAME stable response —
@@ -2245,6 +2422,7 @@ mod audit_2026_10_rpc_tests {
             trust_loopback: false,
             heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
             submit_block: None,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         (tmp, state)
     }
@@ -2301,6 +2479,38 @@ mod audit_2026_10_rpc_tests {
             config, state.node_state.clone(), state.store.clone(), state.mempool.clone(),
             state.dag.clone(), state.outbound_tx.clone(), None,
         )).await.expect("a failed bind must end the RPC task");
+    }
+
+    /// Review finding (getblocktemplate x MEM-6 CPFP): every transaction
+    /// entry carries `depends`, the 1-based positions of its in-template
+    /// parents (BIP22), so an external miner that keeps a subset of the
+    /// entries can keep it closed under dependencies.
+    #[test]
+    fn getblocktemplate_entries_list_in_template_dependencies() {
+        let tx = |ins: &[([u8; 32], u32)], tag: u8| Transaction {
+            version: 1,
+            inputs: ins.iter().map(|(t, i)| TxInput { prev_txid: *t, prev_index: *i, script_sig: vec![tag; 8], sequence: u32::MAX }).collect(),
+            outputs: vec![TxOutput { value: 1_000, script_pubkey: vec![tag; 20] }, TxOutput { value: 1_000, script_pubkey: vec![tag; 20] }],
+            locktime: 0,
+        };
+        let a = tx(&[([0xA0; 32], 0)], 1);
+        let b = tx(&[(a.txid(), 0)], 2);
+        let c = tx(&[([0xA1; 32], 0)], 3);
+        let d = tx(&[(b.txid(), 1), (a.txid(), 1), (b.txid(), 0), ([0xA2; 32], 0)], 4);
+        let tmpl = crate::template::BlockTemplate {
+            parents: vec![[0; 32]], height: 1, blue_score: 1, bits: 0x2100_FFFF, parent_timestamp: 0,
+            transactions: vec![(a.clone(), 10), (b.clone(), 20), (c.clone(), 30), (d.clone(), 40)],
+            total_fees: 100, subsidy: 0, evicted: 0, tx_byte_budget: 0,
+            activation_height: u64::MAX, hardened: false,
+        };
+        let entries = template_tx_entries(&tmpl);
+        let depends: Vec<Value> = entries.iter().map(|e| e["depends"].clone()).collect();
+        assert_eq!(depends, vec![json!([]), json!([1]), json!([]), json!([1, 2])]);
+        for (e, (t, fee)) in entries.iter().zip(&tmpl.transactions) {
+            assert_eq!(e["txid"], hex::encode(t.txid()));
+            assert_eq!(e["fee"], fee.to_string());
+            assert_eq!(e["data"], hex::encode(t.to_wire_bytes(true)));
+        }
     }
 
     /// WAL-1: `getrawtransaction` returns bytes that hash to the txid.
@@ -2380,6 +2590,100 @@ mod audit_2026_10_rpc_tests {
         assert_eq!(r["count"], 0);
     }
 
+    /// NET-12: the explorer statistics read a bounded number of storage
+    /// entries (counted by the store) whatever the number of holders; the
+    /// answers match the UTXO set. Pre-fix `getrichlist` /
+    /// `getsupplydistribution` / `getaddresscount` scanned the whole UTXO
+    /// set and `getchainstats` / `gethashrate` decoded every block body.
+    #[tokio::test]
+    async fn net12_explorer_methods_read_bounded_entries() {
+        let (_tmp, state) = state_with_chain(60);
+        assert!(state.store.aggregates_ready());
+        for i in 0..300u32 {
+            let mut spk = vec![0u8; 20];
+            spk[..4].copy_from_slice(&i.to_le_bytes());
+            state.store.put_utxo(&[(i % 251) as u8; 32], i, &TxOutput { value: 1_000 + i as u64, script_pubkey: spk }).unwrap();
+        }
+        for (method, params, bound) in [
+            ("getrichlist", json!([100, 0]), 102u64),
+            ("getrichlist", json!([100, 200]), 302),
+            ("getsupplydistribution", json!([]), 1),
+            ("getaddresscount", json!([]), 1),
+            ("getchainstats", json!([]), 5),
+            ("gethashrate", json!([]), 5),
+        ] {
+            let r0 = state.store.storage_reads();
+            let r = dispatch(method, Some(&params), &state).await;
+            let reads = state.store.storage_reads() - r0;
+            assert!(r.get("error").is_none(), "{method}: {r}");
+            assert!(reads <= bound, "{method} {params}: {reads} reads > {bound}");
+        }
+        let r = dispatch("getrichlist", Some(&json!([100, 0])), &state).await;
+        assert_eq!(r["holders"], 300);
+        assert_eq!(r["items"].as_array().unwrap().len(), 100);
+        assert_eq!(r["items"][0]["balance"], "1299");
+        assert_eq!(r["items"][0]["rank"], 1);
+        let r = dispatch("getrichlist", Some(&json!([10, 1_000_000_000u64])), &state).await;
+        assert_eq!(r["offset"], crate::analytics::MAX_RICHLIST_OFFSET, "offset clamped");
+        let r = dispatch("getaddresscount", None, &state).await;
+        assert_eq!((r["addresses_with_balance"].as_u64(), r["utxo_entries"].as_u64()), (Some(300), Some(300)));
+        let r = dispatch("getchainstats", None, &state).await;
+        assert_eq!(r["total_blocks"], 61);
+        // A cancelled request stops (and HeavyGate never caches the error).
+        let mut cancelled = state.clone();
+        cancelled.cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let r = dispatch("getchainstats", None, &cancelled).await;
+        assert_eq!(r["error"], "cancelled");
+        let gate = HeavyGate::new(HEAVY_READ_CACHE_TTL);
+        assert_eq!(gate.run("k".into(), || json!({ "error": "cancelled" }))["error"], "cancelled");
+        assert_eq!(gate.run("k".into(), || json!(7)), json!(7), "the failure was not cached");
+    }
+
+    /// Review finding (chain_tail): a cancelled request is an ERROR for the
+    /// two selected-chain walks, also when the flag was set while the
+    /// request waited for the DAG lock, and HeavyGate never caches it — the
+    /// next uncancelled call computes real values. Pre-fix `chain_tail`
+    /// stopped silently and returned an empty tail: `{sample_size: 0,
+    /// p50_secs: 0, ...}` and `{count: 0, points: []}` as successes, cached
+    /// for 30 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn net12_cancelled_chain_walks_are_errors_and_never_cached() {
+        let (_tmp, state) = state_with_chain(60);
+        let mut cancelled = state.clone();
+        cancelled.cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        for m in ["getblocktimepercentiles", "getdifficultyhistory"] {
+            let r = dispatch(m, Some(&json!([10])), &cancelled).await;
+            assert_eq!(r["error"], "cancelled", "{m}: {r}");
+        }
+        // Exactly as the server runs a heavy method: HeavyGate around a
+        // blocking dispatch, both states sharing one gate.
+        let run = |st: AppState| {
+            let h = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                st.heavy_gate.clone().run("getblocktimepercentiles|[10]".into(), || {
+                    h.block_on(dispatch("getblocktimepercentiles", Some(&json!([10])), &st))
+                })
+            })
+        };
+        let r = run(cancelled).await.unwrap();
+        assert_eq!(r["error"], "cancelled");
+        let r = run(state).await.unwrap();
+        assert!(r.get("error").is_none(), "{r}");
+        assert_eq!(r["sample_size"], 10, "computed, not served from a cached failure: {r}");
+        assert_eq!(r["p50_secs"], 60);
+    }
+
+    /// MEM-6: `getmempoolinfo` reports the relay policy in force.
+    #[tokio::test]
+    async fn mem6_getmempoolinfo_reports_the_policy() {
+        let (_tmp, state) = state_with_chain(1);
+        let r = dispatch("getmempoolinfo", None, &state).await;
+        assert_eq!(r["policy"]["max_replacement_evictions"], crate::mempool::MAX_REPLACEMENT_EVICTIONS);
+        assert_eq!(r["policy"]["max_ancestors"], crate::mempool::MAX_ANCESTORS);
+        assert_eq!(r["policy"]["unconfirmed_chains"], true);
+        assert!(r["policy"]["replacement"].as_str().unwrap().starts_with("full-rbf"));
+    }
+
     /// NET-15: explorer reads still work with storage access moved out of
     /// the DAG lock (and do not deadlock against a concurrent writer).
     #[tokio::test]
@@ -2415,5 +2719,134 @@ mod audit_2026_10_rpc_tests {
         let r = dispatch("getdaginfo", None, &state).await;
         assert_eq!(r["tip_height"], 5);
         assert_eq!(r["next_block_height"], 9, "the pool's next height, not tip_height + 1");
+    }
+}
+
+// ── Hardening block rules: getblocktemplate gives external miners the coinbase
+//    layout and the Merkle rule of the template's height (package P1) ────────
+#[cfg(test)]
+mod block_rules_template_tests {
+    use super::*;
+    use crate::core::{self, activation, block_rules, Block, BlockHeader, MerkleRoot, TxInput, TxOutput};
+    use tempfile::TempDir;
+
+    /// An AppState whose DAG holds one bodied genesis (built under the
+    /// calling thread's activation height).
+    fn state_with_genesis() -> (TempDir, AppState) {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(Storage::open(&tmp.path().join("db")).expect("storage"));
+        let mut genesis = core::genesis_block();
+        genesis.header.timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 1_000;
+        let gh = genesis.block_hash();
+        store.put_block(&genesis).unwrap();
+        let mut dag = GhostDAG::with_default_k();
+        dag.add_genesis(gh, genesis.header.timestamp);
+        let (outbound_tx, _rx) = mpsc::channel(1);
+        let state = AppState {
+            node_state: Arc::new(RwLock::new(NodeState::default())),
+            store,
+            mempool: Arc::new(Mempool::new()),
+            dag: Arc::new(RwLock::new(dag)),
+            outbound_tx,
+            api_key: None,
+            require_auth_for_writes: false,
+            require_auth_for_reads: false,
+            rate_limiter: Arc::new(auth::RateLimiterSet::new(60, 5)),
+            trust_private_ranges: false,
+            allowed_origins: Arc::new(Vec::new()),
+            allowed_hosts: Arc::new(Vec::new()),
+            trust_loopback: false,
+            heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
+            submit_block: None,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        (tmp, state)
+    }
+
+    fn hashes(v: &Value) -> Vec<[u8; 32]> {
+        v.as_array().unwrap().iter()
+            .map(|h| hex::decode(h.as_str().unwrap()).unwrap().try_into().unwrap())
+            .collect()
+    }
+
+    /// Assemble a block the way an external miner does from the RPC fields
+    /// alone: coinbase script_sig = prefix || own bytes, header root folded
+    /// from the coinbase txid through `coinbase_merkle_branch`.
+    fn external_block(t: &Value, extra: &[u8]) -> Block {
+        let mut script_sig = hex::decode(t["coinbase_script_sig_prefix"].as_str().unwrap()).unwrap();
+        script_sig.extend_from_slice(extra);
+        let value: u64 = t["subsidy_sat"].as_str().unwrap().parse().unwrap();
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [0; 32], prev_index: u32::MAX, script_sig, sequence: u32::MAX }],
+            outputs: vec![TxOutput { value, script_pubkey: vec![0x44; 20] }],
+            locktime: 0,
+        };
+        let hardened = t["merkle_rule"] == "gnb-tagged-v1";
+        let root = block_rules::merkle_root_from_coinbase_branch(
+            &coinbase.txid(), &hashes(&t["coinbase_merkle_branch"]), hardened);
+        Block {
+            header: BlockHeader {
+                version: 1, parents: hashes(&t["parents"]), merkle_root: root,
+                timestamp: t["min_time"].as_u64().unwrap() + 1,
+                bits: t["bits"].as_u64().unwrap() as u32, nonce: 0,
+            },
+            transactions: vec![coinbase],
+            blue_score: t["blue_score"].as_u64().unwrap(),
+            height: t["height"].as_u64().unwrap(),
+            shielded_transactions: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn getblocktemplate_returns_the_coinbase_layout_of_the_templates_height() {
+        // From the activation: the 80-byte prefix, tagged root, wire size.
+        {
+            let _guard = activation::scoped_override(1);
+            let (_tmp, state) = state_with_genesis();
+            let t = dispatch("getblocktemplate", None, &state).await;
+            assert_eq!(t["height"], 1, "{t}");
+            assert_eq!(t["hardening_active"], true);
+            assert_eq!(t["merkle_rule"], "gnb-tagged-v1");
+            assert_eq!(t["size_rule"], "wire");
+            let prefix = hex::decode(t["coinbase_script_sig_prefix"].as_str().unwrap()).unwrap();
+            assert_eq!(prefix.len(), block_rules::COINBASE_COMMITMENT_LEN);
+            assert_eq!(&prefix[..8], b"GNB-CB01");
+            // The whole coinbase must fit the reserve: far below the
+            // script_sig cap (9,920), which a full template has no room for.
+            let max_extra = t["max_coinbase_extra_bytes"].as_u64().unwrap() as usize;
+            assert_eq!(max_extra, crate::template::external_coinbase_max_extra(80, true, 1_000));
+            assert!(max_extra > 700 && max_extra < 1_000 - 80, "{max_extra}");
+            assert_eq!(t["max_coinbase_script_pubkey_bytes"], crate::template::EXTERNAL_COINBASE_MAX_SPK);
+            let block = external_block(&t, &vec![0xE5; max_extra]);
+            assert!(block.transactions[0].wire_size(true) <= t["coinbase_reserve"].as_u64().unwrap() as usize);
+            assert_eq!(block_rules::check_block_hardened_at(&block, 1), Ok(()));
+            assert_eq!(block.validate_structure_without_pow_at(1), Ok(()));
+            let block = external_block(&t, b"pool-extranonce");
+            assert_eq!(block_rules::check_block_hardened_at(&block, 1), Ok(()));
+            assert_eq!(block.validate_structure_without_pow_at(1), Ok(()));
+            assert_eq!(block.body_merkle_root(), block.header.merkle_root);
+        }
+        // Below it: no prefix, the legacy root and bincode size, as before.
+        {
+            let _guard = activation::scoped_override(activation::NEVER);
+            let (_tmp, state) = state_with_genesis();
+            let t = dispatch("getblocktemplate", None, &state).await;
+            assert_eq!(t["hardening_active"], false, "{t}");
+            assert_eq!(t["merkle_rule"], "sha256d-duplicate-last");
+            assert_eq!(t["size_rule"], "bincode");
+            assert_eq!(t["coinbase_script_sig_prefix"], "");
+            let max_extra = t["max_coinbase_extra_bytes"].as_u64().unwrap() as usize;
+            assert_eq!(max_extra, crate::template::external_coinbase_max_extra(0, false, 1_000));
+            assert!(max_extra > 800 && max_extra < 1_000, "{max_extra}");
+            let block = external_block(&t, &vec![0xE5; max_extra]);
+            assert!(block.transactions[0].actual_size() <= t["coinbase_reserve"].as_u64().unwrap() as usize);
+            assert_eq!(block.validate_structure_without_pow_at(activation::NEVER), Ok(()));
+            let block = external_block(&t, b"height:1 pool");
+            assert_eq!(block.validate_structure_without_pow_at(activation::NEVER), Ok(()));
+            assert_eq!(block.header.merkle_root, core::Transaction::merkle_root(&block.transactions));
+            assert_ne!(block.header.merkle_root, MerkleRoot::ZERO);
+        }
     }
 }

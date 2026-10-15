@@ -181,6 +181,37 @@ def expected_bits_vectors():
     return out
 
 
+def hardening_vectors():
+    """POW-3: the pow limit around the hardening activation height.
+
+    Each case gives a block's difficulty input and an activation height; the
+    expected bits clamp to POW_LIMIT_BITS below the activation and to the
+    genesis target at/after it."""
+    t0 = d.GENESIS_TIMESTAMP
+    out = []
+    for act in (d.MAINNET_HARDENING_ACTIVATION_HEIGHT, 1, 1000):
+        for height in sorted({max(act - 1, 1), act, act + 1}):
+            on = t0 + 30 * (height - 1)
+            for note, parent_time in (
+                ("far behind schedule (one year late)", on + 365 * 86_400),
+                ("eight half-lives late", on + 57_600),
+                ("on schedule", on),
+                ("ahead of schedule", on - 7_200),
+            ):
+                parents = [(height - 1, parent_time)]
+                out.append({
+                    "note": note,
+                    "activation_height": act,
+                    "parent_time": parent_time,
+                    "height": height,
+                    "pow_limit_bits": d.pow_limit_bits_at(height, act),
+                    "bits": d.expected_bits(parents, act),
+                })
+    # The genesis-level boundary of the limit itself.
+    assert d.pow_limit_bits_at(0, 0) == d.POW_LIMIT_BITS
+    return out
+
+
 def build() -> dict:
     return {
         "description": "GnB difficulty vectors from reference/gnb_difficulty.py: compact bits, "
@@ -188,11 +219,14 @@ def build() -> dict:
                        "work is a decimal string (u128).",
         "gnb": {"target_spacing": d.TARGET_SPACING, "halflife": d.HALFLIFE,
                 "pow_limit_bits": d.POW_LIMIT_BITS, "genesis_bits": d.GENESIS_BITS,
-                "genesis_timestamp": d.GENESIS_TIMESTAMP, "genesis_height": d.GENESIS_HEIGHT},
+                "genesis_timestamp": d.GENESIS_TIMESTAMP, "genesis_height": d.GENESIS_HEIGHT,
+                "hardened_pow_limit_bits": d.HARDENED_POW_LIMIT_BITS,
+                "mainnet_hardening_activation_height": d.MAINNET_HARDENING_ACTIVATION_HEIGHT},
         "compact": compact_vectors(),
         "targets": target_vectors(),
         "asert": asert_vectors(),
         "gnb_expected_bits": expected_bits_vectors(),
+        "hardening_pow_limit": hardening_vectors(),
     }
 
 
@@ -204,7 +238,8 @@ def main():
     doc = build()
     (HERE / "difficulty_vectors.json").write_text(render(doc))
     print(f"{len(doc['compact'])} compact, {len(doc['targets'])} target, "
-          f"{len(doc['asert'])} ASERT, {len(doc['gnb_expected_bits'])} expected-bits vectors")
+          f"{len(doc['asert'])} ASERT, {len(doc['gnb_expected_bits'])} expected-bits, "
+          f"{len(doc['hardening_pow_limit'])} pow-limit vectors")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,6 @@ use std::collections::{HashMap, HashSet};
 
 const MAX_PAGE: usize = 100;
 const MAX_DAG_WINDOW: usize = 300;
-const RICHLIST_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Selected chain from genesis (index 0) to the selected tip.
 struct ChainCache {
@@ -248,17 +247,30 @@ pub(super) fn get_block_dag(params: Option<&Value>, state: &AppState) -> Value {
 /// Selected-chain blocks from the tip backwards, at most `n`, as
 /// `(hash, height, timestamp)`. An O(n) walk of selected parents under a
 /// short DAG read lock; no storage access (NET-12/NET-15).
-fn chain_tail(state: &AppState, n: usize) -> Vec<([u8; 32], u64, u64)> {
+///
+/// `None` = the request was cancelled (also while it waited for the lock) —
+/// never a partial tail: callers answer `{"error": "cancelled"}`, which
+/// HeavyGate never caches. Returning a truncated tail as a success let a
+/// cancelled request cache zero block-time percentiles and an empty
+/// difficulty history for 30 s (review finding).
+fn chain_tail(state: &AppState, n: usize) -> Option<Vec<([u8; 32], u64, u64)>> {
+    use std::sync::atomic::Ordering::Relaxed;
     let dag = state.dag.read();
+    if state.cancel.load(Relaxed) {
+        return None;
+    }
     let mut out = Vec::with_capacity(n.min(4096));
     let mut cur = dag.selected_tip();
     while let Some(h) = cur {
         if out.len() >= n { break; }
+        if state.cancel.load(Relaxed) {
+            return None;
+        }
         let Some(d) = dag.get_block_data(&h) else { break };
         out.push((h, d.height, d.timestamp));
         cur = d.selected_parent;
     }
-    out
+    Some(out)
 }
 
 /// Upper bound on blocks read by `getdifficultyhistory`, per point asked.
@@ -271,10 +283,15 @@ const DIFFICULTY_SCAN_PER_POINT: usize = 4;
 /// body, decoded and sorted on every call).
 pub(super) fn get_difficulty_history(params: Option<&Value>, state: &AppState) -> Value {
     let limit = (params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(20) as usize).clamp(1, 100);
-    let tail = chain_tail(state, limit * DIFFICULTY_SCAN_PER_POINT);
+    let Some(tail) = chain_tail(state, limit * DIFFICULTY_SCAN_PER_POINT) else {
+        return json!({ "error": "cancelled" });
+    };
     let mut items: Vec<Value> = Vec::new();
     let mut last_bits: Option<u32> = None;
     for (hash, height, timestamp) in tail {
+        if state.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return json!({ "error": "cancelled" });
+        }
         let Ok(Some(block)) = state.store.get_block(&hash) else { continue };
         let bits = block.header.bits;
         if last_bits != Some(bits) {
@@ -299,7 +316,9 @@ pub(super) fn get_difficulty_history(params: Option<&Value>, state: &AppState) -
 /// body, decoded and sorted on every call).
 pub(super) fn get_block_time_percentiles(params: Option<&Value>, state: &AppState) -> Value {
     let window = (params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(100) as usize).clamp(10, 1000);
-    let tail = chain_tail(state, window + 1);
+    let Some(tail) = chain_tail(state, window + 1) else {
+        return json!({ "error": "cancelled" });
+    };
     let mut deltas: Vec<u64> = tail.windows(2).map(|w| w[0].2.saturating_sub(w[1].2)).collect();
     deltas.sort_unstable();
     let n = deltas.len();
@@ -418,90 +437,52 @@ pub(super) fn get_address_history(params: Option<&Value>, state: &AppState) -> V
     })
 }
 
-/// Holders from one pass over the UTXO set: address → (value, utxo count).
-fn holders(state: &AppState) -> Result<Vec<([u8; 20], u64, u64)>, StorageError> {
-    let mut map: HashMap<[u8; 20], (u64, u64)> = HashMap::new();
-    for (_txid, _vout, value, spk) in state.store.iter_utxos_sorted()? {
-        if let Ok(h) = <[u8; 20]>::try_from(spk.as_slice()) {
-            let e = map.entry(h).or_default();
-            e.0 = e.0.saturating_add(value);
-            e.1 += 1;
-        }
-    }
-    let mut v: Vec<([u8; 20], u64, u64)> = map.into_iter().map(|(h, (b, n))| (h, b, n)).collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    Ok(v)
-}
-
-struct RichCache { at: std::time::Instant, list: Vec<([u8; 20], u64, u64)>, total: u64 }
-
-fn rich_cache() -> &'static parking_lot::Mutex<Option<RichCache>> {
-    static C: std::sync::OnceLock<parking_lot::Mutex<Option<RichCache>>> = std::sync::OnceLock::new();
-    C.get_or_init(|| parking_lot::Mutex::new(None))
-}
-
-fn with_holders<R>(state: &AppState, f: impl FnOnce(&RichCache) -> R) -> Result<R, StorageError> {
-    let mut g = rich_cache().lock();
-    if g.as_ref().is_none_or(|c| c.at.elapsed() > RICHLIST_TTL) {
-        let list = holders(state)?;
-        let total = list.iter().map(|x| x.1).sum();
-        *g = Some(RichCache { at: std::time::Instant::now(), list, total });
-    }
-    Ok(f(g.as_ref().expect("filled above")))
-}
-
-/// `getrichlist [limit=50, offset=0]` — holders by balance (cached ~2 min).
+/// `getrichlist [limit=50, offset=0]` — holders by balance.
+///
+/// NET-12: served from the incremental holder index (`storage::aggregates`,
+/// updated in the same batch as every UTXO change): one read of the tier
+/// totals plus at most `offset + limit` index entries, `offset` capped at
+/// `analytics::MAX_RICHLIST_OFFSET`. Was a scan of the whole UTXO set.
 pub(super) fn get_rich_list(params: Option<&Value>, state: &AppState) -> Value {
     let limit = (params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(50) as usize).clamp(1, MAX_PAGE);
-    let offset = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let offset = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).unwrap_or(0)
+        .min(crate::analytics::MAX_RICHLIST_OFFSET as u64) as usize;
     let testnet = crate::core::node_chain_id() == crate::core::ChainId::Testnet;
-    match with_holders(state, |c| json!({
-        "holders":      c.list.len(),
-        "total_supply": c.total.to_string(),
-        "offset":       offset,
-        "items":        c.list.iter().enumerate().skip(offset).take(limit).map(|(i, (h, b, n))| json!({
-            "rank":    i + 1,
-            "address": crate::crypto::address_from_hash(h, testnet),
-            "balance": b.to_string(),
-            "utxos":   n,
-            "share":   if c.total > 0 { *b as f64 / c.total as f64 } else { 0.0 },
-        })).collect::<Vec<_>>(),
-    })) {
-        Ok(v) => v,
-        Err(e) => storage_err_response(&e),
+    match crate::analytics::rich_list_bounded(&state.store, offset, limit, &state.cancel) {
+        Ok(page) => json!({
+            "holders":      page.holders,
+            "total_supply": page.total_supply.to_string(),
+            "offset":       page.offset,
+            "max_offset":   crate::analytics::MAX_RICHLIST_OFFSET,
+            "items":        page.items.iter().enumerate().map(|(i, (h, e))| json!({
+                "rank":    page.offset + i + 1,
+                "address": crate::crypto::address_from_hash(h, testnet),
+                "balance": e.balance.to_string(),
+                "utxos":   e.utxos,
+                "share":   if page.total_supply > 0 { e.balance as f64 / page.total_supply as f64 } else { 0.0 },
+            })).collect::<Vec<_>>(),
+        }),
+        Err(e) => super::stats_err_response(&e),
     }
 }
 
-const TIERS: &[(u64, &str)] = &[
-    (100_000_000, "< 1 GNB"),
-    (1_000_000_000, "1 – 10 GNB"),
-    (10_000_000_000, "10 – 100 GNB"),
-    (100_000_000_000, "100 – 1k GNB"),
-    (1_000_000_000_000, "1k – 10k GNB"),
-    (10_000_000_000_000, "10k – 100k GNB"),
-    (u64::MAX, "≥ 100k GNB"),
-];
-
 /// `getsupplydistribution` — holders bucketed by balance, from the UTXO set
-/// (carryover included).
+/// (carryover included). NET-12: one read of the incremental tier totals.
 pub(super) fn get_supply_distribution(state: &AppState) -> Value {
-    match with_holders(state, |c| {
-        let mut buckets = vec![(0u64, 0u64); TIERS.len()];
-        for (_, b, _) in &c.list {
-            let i = TIERS.iter().position(|(cap, _)| b < cap).unwrap_or(TIERS.len() - 1);
-            buckets[i].0 += 1;
-            buckets[i].1 += b;
+    use crate::storage::aggregates::TIERS;
+    match crate::analytics::supply_distribution_bounded(&state.store) {
+        Ok(tiers) => {
+            let total: u64 = tiers.iter().fold(0u64, |a, t| a.saturating_add(t.sats));
+            let holders: u64 = tiers.iter().map(|t| t.holders).sum();
+            json!({
+                "total_supply": total.to_string(),
+                "holders": holders,
+                "tiers": TIERS.iter().zip(tiers.iter()).map(|((_, label), t)| json!({
+                    "label": label, "address_count": t.holders, "total_sats": t.sats.to_string(),
+                    "pct_of_supply": if total > 0 { t.sats as f64 * 100.0 / total as f64 } else { 0.0 },
+                })).collect::<Vec<_>>(),
+            })
         }
-        json!({
-            "total_supply": c.total.to_string(),
-            "holders": c.list.len(),
-            "tiers": TIERS.iter().zip(buckets).map(|((_, label), (n, s))| json!({
-                "label": label, "address_count": n, "total_sats": s.to_string(),
-                "pct_of_supply": if c.total > 0 { s as f64 * 100.0 / c.total as f64 } else { 0.0 },
-            })).collect::<Vec<_>>(),
-        })
-    }) {
-        Ok(v) => v,
-        Err(e) => storage_err_response(&e),
+        Err(e) => super::stats_err_response(&e),
     }
 }

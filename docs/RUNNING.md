@@ -42,3 +42,23 @@ new chain.
 JSON-RPC on 127.0.0.1:17210. Useful methods: `getblockcount`, `getdaginfo`,
 `getblocktemplate`, `submitblock`, `getsupplyinfo`, `getbalance`,
 `sendrawtransaction`. See `node/src/rpc/mod.rs`.
+
+Transaction relay and mempool policy (unconfirmed chains, child-pays-for-parent
+templates, full-RBF, orphan transactions): `docs/MEMPOOL.md`;
+`getmempoolinfo` reports the parameters in force.
+
+The explorer statistics (`getchainstats`, `gethashrate`, `getrichlist`,
+`getsupplydistribution`, `getaddresscount`) are served from aggregates the
+node keeps in the same write batches as its UTXO set. A data directory
+written by an older node gets them built once at start-up (log line
+"NET-12: explorer aggregates rebuilt …", one pass over the UTXO set and the
+undo records); until then those methods answer with an error instead of
+scanning. Every start-up also checks that the stored aggregates describe the
+connected chain on disk (block count and a fingerprint of the connected
+blocks against the undo records), so a data directory that an older release
+moved forward after a downgrade is rebuilt too instead of serving stale
+statistics. `hashrate_hs` counts every DAG block (the selected-chain blocks
+and the blue and red blocks they merge, `avg_dag_block_interval_secs`);
+`avg_block_time_secs` is the interval between selected-chain blocks. A
+storage failure behind any of these methods is answered with the generic
+`STORAGE_ERROR` response; the detail only goes to the node's log.

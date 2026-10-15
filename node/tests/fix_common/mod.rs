@@ -82,6 +82,42 @@ pub fn signed_spend(k: &Key, inputs: &[([u8; 32], u32)], outputs: Vec<TxOutput>)
     tx
 }
 
+/// A signed spend for a block at header height `height`, under the rules of
+/// that height (process-wide activation height, i.e. the calling thread's
+/// `scoped_override`): below the hardening activation exactly
+/// [`signed_spend`] (version 1, sighash v2); at/after it version 3 with
+/// sighash v3 and bound signatures (`core::sighash`), which commit to
+/// `spent` (the outputs the inputs spend, in input order).
+pub fn signed_spend_at(
+    k: &Key,
+    inputs: &[([u8; 32], u32)],
+    spent: &[TxOutput],
+    outputs: Vec<TxOutput>,
+    height: u64,
+) -> Transaction {
+    let act = core::activation::hardening_activation_height();
+    let version = core::sighash::tx_version_for_height(height, act);
+    if version != core::sighash::TX_VERSION_V3 {
+        return signed_spend(k, inputs, outputs);
+    }
+    let mut tx = Transaction {
+        version,
+        inputs: inputs.iter().map(|(t, i)| TxInput {
+            prev_txid: *t, prev_index: *i, script_sig: vec![], sequence: u32::MAX,
+        }).collect(),
+        outputs,
+        locktime: 0,
+    };
+    let suite = crypto::public_key_suite(&k.pk).expect("enveloped public key");
+    let pre = core::sighash::SighashV3Precomputed::new(&tx, spent).expect("one spent output per input");
+    for i in 0..tx.inputs.len() {
+        let digest = pre.digest(i, suite, core::node_chain_id()).expect("input index in range");
+        let sig = crypto::sign_bound(&k.sk, &digest).expect("sign");
+        tx.inputs[i].script_sig = Transaction::build_script_sig(&sig, &k.pk);
+    }
+    tx
+}
+
 pub fn out(value: u64, spk: &[u8]) -> TxOutput {
     TxOutput { value, script_pubkey: spk.to_vec() }
 }
@@ -139,8 +175,26 @@ pub fn accept(n: &Node, b: &Block) -> Result<BlockHash, String> {
     )
 }
 
+/// Write the coinbase commitment and the header Merkle root `b` needs under
+/// the rules of its header height (`core::block_rules`, process-wide
+/// activation height, i.e. the calling thread's `scoped_override`): at/after
+/// the hardening activation the coinbase `script_sig` becomes
+/// `commitment || <its current bytes>` and the root is the tagged tree; below
+/// it nothing but the legacy root changes.
+pub fn commit_block(b: &mut Block) {
+    if core::block_rules::rules_active(b.height) {
+        let c = core::block_rules::expected_coinbase_commitment(b);
+        if let Some(input) = b.transactions.first_mut().and_then(|cb| cb.inputs.first_mut()) {
+            let extra = std::mem::take(&mut input.script_sig);
+            input.script_sig = core::block_rules::coinbase_script_sig(&c, &extra);
+        }
+    }
+    b.header.merkle_root = b.body_merkle_root();
+}
+
 /// Build a block on `parents` (known to `dag_of`) carrying `txs`, with the
-/// header height / bits the consensus rules require, and seal it. `pred`
+/// header height / bits the consensus rules require, the coinbase commitment
+/// and Merkle root of that height (`commit_block`), and seal it. `pred`
 /// constrains the block hash (tie-break control).
 pub fn mk_block_where(
     dag_of: &Node,
@@ -169,6 +223,7 @@ pub fn mk_block_where(
         height,
         shielded_transactions: Vec::new(),
     };
+    commit_block(&mut b);
     loop {
         if pred(&b.block_hash()) && b.validate_pow() {
             return b;

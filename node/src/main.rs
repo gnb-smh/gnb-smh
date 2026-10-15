@@ -27,6 +27,9 @@ mod rpc;
 mod metrics;
 mod pow;         // GnB-SMH PoW adapter
 mod transport;
+// The binary uses part of the mempool's library API (the rest serves RPC
+// consumers, tools and tests through the `gnb` library crate).
+#[allow(dead_code)]
 mod mempool;
 mod analytics;
 mod reorg;
@@ -725,7 +728,7 @@ async fn main() {
         enable_mdns:     cli.enable_mdns,
         archive:         cli.archive,
     };
-    let node = match network::NetworkNode::new(net_cfg) {
+    let mut node = match network::NetworkNode::new(net_cfg) {
         Ok(n)  => { info!("P2P: {}", n.peer_id); n }
         Err(e) => { error!("network: {}", e); std::process::exit(1); }
     };
@@ -746,6 +749,13 @@ async fn main() {
     // back to the network loop, which relays only Accepted frames.
     let (block_tx, mut block_rx) = mpsc::channel::<network::Inbound>(1000);
     let (vtx2, validation_rx) = mpsc::channel::<network::GossipValidation>(4096);
+    // MEM-5 / MEM-6: processor → network penalties (an invalid orphan whose
+    // frame left gossipsub's cache) and network → processor disconnect
+    // notices (the tx relay drops per-connection budgets and orphans).
+    let (net_ctl_tx, net_ctl_rx) = mpsc::channel::<network::NetworkControl>(1024);
+    let (peer_ev_tx, mut peer_ev_rx) = mpsc::channel::<network::PeerEvent>(1024);
+    node.attach_control(net_ctl_rx);
+    node.attach_peer_events(peer_ev_tx);
     let (outbound_tx, outbound_rx) = mpsc::channel::<network::NetworkMessage>(1000);
 
     // ── Sprint 2.c: Tip-change broadcast channel ─────────────────────────────
@@ -850,12 +860,29 @@ async fn main() {
             // DAG-7 / POW-3: ration deep (below-finality) insertions that the
             // "awaited orphan parent" exemption may grant.
             let mut deep_budget = ingress::DeepBackfillBudget::new();
+            // MEM-5 / MEM-6: validated transaction relay — per-connection
+            // signature budgets and the bounded orphan-transaction pool.
+            // Shared with the blocking pool, where admission runs.
+            let tx_relay = Arc::new(parking_lot::Mutex::new(mempool::relay::TxRelay::new()));
+            // MEM-6: verdicts withheld for orphan frames, keyed by the frame's
+            // wtxid and timed from its arrival (settled from the relay's
+            // OrphanEvents: Accept / Reject / Ignore) and re-announcements.
+            let mut deferred: mempool::relay::DeferredVerdicts<network::InboundOrigin> =
+                mempool::relay::DeferredVerdicts::new();
 
             loop {
             // Orphan-deadlock fix: select between the inbound channel and the
             // ~30s orphan sweep.
             let inbound = tokio::select! {
                 m = block_rx.recv() => match m { Some(m) => m, None => break },
+                // MEM-5 / MEM-6: a connection closed — forget its signature
+                // budget and the orphans it delivered.
+                Some(ev) = peer_ev_rx.recv() => {
+                    let network::PeerEvent::Disconnected(peer) = ev;
+                    let events = tx_relay.lock().on_peer_disconnected(peer);
+                    settle_orphan_events(&mut deferred, &vtx2, &net_ctl_tx, &events);
+                    continue;
+                }
                 _ = orphan_sweep.tick() => {
                     let ready = sweep_orphan_parents(
                         &mut orphans, &mut parent_fetch, &dag2, &otx2,
@@ -863,15 +890,52 @@ async fn main() {
                     // Defensive liveness: a waited-on parent that is ALREADY in
                     // the DAG (its accept raced the waiting_for insert) would
                     // otherwise strand its orphans forever — drain them now.
+                    let mut chain = accept::ChainMove::default();
                     for p in ready {
                         process_orphans(
                             p, &mut orphans,
                             &dag2, &store2, &mem2, &state2,
-                            Some(&tip_tx2), &shielded2,
+                            Some(&tip_tx2), &shielded2, &mut chain,
                         );
                     }
                     frontier2.lock().set_orphan_evidence(orphans.max_evidence_height());
                     maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
+                    // MEM-6: expire orphan transactions and re-try those
+                    // whose parents arrived through any path (miner, RPC) —
+                    // a bounded, round-robin scan. At the pool's next
+                    // height, as every admission. First the orphan
+                    // bookkeeping of the applied-chain move the drained
+                    // blocks caused, if any.
+                    let next_height = mempool::admission::pool_next_height(&dag2.read(), &store2, &mem2);
+                    let (store_v, mem_v, relay_v) = (store2.clone(), mem2.clone(), tx_relay.clone());
+                    if let Ok(events) = tokio::task::spawn_blocking(move || {
+                        let mut relay = relay_v.lock();
+                        let now = std::time::Instant::now();
+                        let mut events = if chain.is_empty() {
+                            mempool::relay::OrphanEvents::default()
+                        } else {
+                            relay.on_chain_moved(&store_v, &mem_v, next_height,
+                                &chain.connected_txs(), &chain.disconnected_txs(), now, unix_now_secs())
+                        };
+                        let swept = relay.retry_orphans(&store_v, &mem_v, next_height, now, unix_now_secs());
+                        events.admitted.extend(swept.admitted);
+                        events.rejected.extend(swept.rejected);
+                        events.dropped.extend(swept.dropped);
+                        events
+                    }).await {
+                        settle_orphan_events(&mut deferred, &vtx2, &net_ctl_tx, &events);
+                    }
+                    let now = std::time::Instant::now();
+                    let stale = {
+                        let relay = tx_relay.lock();
+                        deferred.prune(|w| relay.orphans().contains(w), now)
+                    };
+                    for origin in stale {
+                        report_verdict(&vtx2, &origin, network::GossipVerdict::Ignore);
+                    }
+                    let due: Vec<core::Transaction> = deferred.due_reannouncements(now).iter()
+                        .filter_map(|t| mem2.get_tx(t)).collect();
+                    announce_txs(&otx2, &due);
                     continue;
                 }
             };
@@ -947,7 +1011,7 @@ async fn main() {
                         let d = dag2.read();
                         frontier2.lock().to_request_capped(
                             &advertised,
-                            |h| d.has_block(h) || orphans.contains(h),
+                            |h| accept::is_known_block_in(&d, &store2, h) || orphans.contains(h),
                             now,
                             sync::frontier::MAX_NEW_TIPS_PER_RESPONSE,
                         )
@@ -970,7 +1034,7 @@ async fn main() {
                     let missing: Vec<[u8; 32]> = {
                         let d = dag2.read();
                         entries.iter()
-                            .filter(|e| !d.has_block(&e.hash) && !orphans.contains(&e.hash))
+                            .filter(|e| !accept::is_known_block_in(&d, &store2, &e.hash) && !orphans.contains(&e.hash))
                             .map(|e| e.hash).collect()
                     };
                     if !missing.is_empty() {
@@ -1018,8 +1082,19 @@ async fn main() {
                 // dropped without penalty.
                 network::NetworkMessage::NewBlock { block_data, block_hash, height, .. } => {
                     let now = std::time::Instant::now();
+                    // MEM-6: what this block (and the orphan blocks it
+                    // unblocked) did to the APPLIED chain, for the
+                    // orphan-transaction bookkeeping that runs AFTER the
+                    // block's verdict (never on its relay path). Empty for a
+                    // fork-loser or merge candidate, which applies none of
+                    // its transactions (selected-chain-only ledger).
+                    let mut chain = accept::ChainMove::default();
                     let verdict: network::GossipVerdict = 'blk: {
-                        if dag2.read().has_block(&block_hash) || orphans.contains(&block_hash) {
+                        // A block in the DAG that waits for a body (its stored
+                        // body failed a witness-dependent rule below the
+                        // hardening activation) is NOT known: this copy may be
+                        // the honest one (`accept::awaits_body`).
+                        if accept::is_known_block(&dag2, &store2, &block_hash) || orphans.contains(&block_hash) {
                             break 'blk network::GossipVerdict::Ignore;
                         }
                         let tip_h = selected_tip_height(&dag2);
@@ -1172,10 +1247,10 @@ async fn main() {
                         // accept_block checks height, expected bits and timestamp
                         // BEFORE the proof of work (NET-2), then everything else.
                         let t_validate = std::time::Instant::now();
-                        match accept_block(
+                        match accept::accept_block_tracking(
                             &block, block_hash, height,
                             &dag2, &store2, &mem2, &state2,
-                            Some(&tip_tx2), &shielded2,
+                            Some(&tip_tx2), &shielded2, &mut chain,
                         ) {
                             Err(e) => {
                                 crate::metrics::observe_block_validation(t_validate.elapsed().as_secs_f64());
@@ -1192,8 +1267,11 @@ async fn main() {
                                     accepted_hash,
                                     &mut orphans,
                                     &dag2, &store2, &mem2, &state2,
-                                    Some(&tip_tx2), &shielded2,
+                                    Some(&tip_tx2), &shielded2, &mut chain,
                                 );
+                                // MEM-6: orphan-transaction bookkeeping runs after
+                                // the verdict below (review finding: it used to
+                                // delay the block's relay).
                                 {
                                     let mut fr = frontier2.lock();
                                     fr.note_received(&block_hash);
@@ -1205,6 +1283,32 @@ async fn main() {
                         }
                     };
                     report_verdict(&vtx2, &origin, verdict);
+                    // A body rejected for a witness-dependent reason (or found
+                    // missing) during this acceptance: ask peers for another
+                    // copy now; the orphan sweep retries with backoff.
+                    request_awaited_bodies(&dag2, &mut parent_fetch, &otx2).await;
+                    // MEM-6: orphan transactions the applied chain now
+                    // confirms or conflicts with are dropped; those waiting
+                    // on a transaction it gained (or lost back to the pool)
+                    // are re-tried (and announced). Exactly the blocks the
+                    // mempool treated as connected / disconnected
+                    // (`ChainMove`): nothing for a fork-loser (review
+                    // finding). Off the block's relay path: the verdict
+                    // above is already out. Judged at the pool's next height
+                    // (the node's next template height, `pool_next_height`),
+                    // as every admission.
+                    if !chain.is_empty() {
+                        let next_height = mempool::admission::pool_next_height(&dag2.read(), &store2, &mem2);
+                        let (connected_txs, disconnected_txs) = (chain.connected_txs(), chain.disconnected_txs());
+                        let (store_v, mem_v, relay_v) = (store2.clone(), mem2.clone(), tx_relay.clone());
+                        if let Ok(events) = tokio::task::spawn_blocking(move || {
+                            relay_v.lock().on_chain_moved(
+                                &store_v, &mem_v, next_height, &connected_txs, &disconnected_txs,
+                                std::time::Instant::now(), unix_now_secs())
+                        }).await {
+                            settle_orphan_events(&mut deferred, &vtx2, &net_ctl_tx, &events);
+                        }
+                    }
                 }
 
                 // Local heartbeat only: a PeerCount from a peer would let it set
@@ -1217,37 +1321,82 @@ async fn main() {
                     }
                 }
 
-                // Add validated tx to mempool
-                network::NetworkMessage::NewTransaction { tx_data, .. } => {
-                    // Sprint 1.d: Bitcoin-format tx wire. MEM-5: strict decode —
-                    // trailing bytes are refused, so one tx has exactly one
-                    // encoding (no gossipsub-dedup bypass by byte mutation).
-                    match mempool::admission::decode_tx_strict(&tx_data) {
-                        Ok(tx) => {
-                            // MEM-1/4/5: the shared admission function (same rules
-                            // as sendrawtransaction and reorg re-injection): size,
-                            // standardness incl. dust, known/recent-reject, UTXO,
-                            // version and maturity at the NEXT block height (the
-                            // node's next template height, `pool_next_height` —
-                            // never dag.block_count()), fees, and signatures
-                            // last. P0: it runs on the blocking pool so PQ
-                            // signature work cannot stall this task's reactor.
-                            let next_height = mempool::admission::pool_next_height(&dag2.read(), &store2, &mem2);
-                            let store_v = store2.clone();
-                            let mem_v = mem2.clone();
-                            let admitted = tokio::task::spawn_blocking(move || {
-                                let policy = mempool::admission::AdmissionPolicy::relay(next_height);
-                                mempool::admission::admit(&store_v, &mem_v, tx, &policy)
-                            }).await;
-                            match admitted {
-                                Ok(Ok(_))  => {}
-                                Ok(Err(e)) => debug!("mempool reject: {}", e),
-                                Err(e)     => warn!("tx verify task failed: {}", e),
+                // Validated transaction relay (MEM-5 / NET-2 / NET-4).
+                //
+                // The network loop no longer relays a gossiped transaction on
+                // decode: it waits for the verdict computed here. The shared
+                // admission function (same rules as sendrawtransaction and
+                // reorg re-injection — strict decode, size, standardness incl.
+                // dust, witness and version policy, known/recent-reject,
+                // inputs from the UTXO set or the pool, version rule and
+                // maturity at the NEXT block height — the node's next
+                // template height, `pool_next_height`, never
+                // dag.block_count() — fees, replacement and chain limits)
+                // runs cheapest first; the signature step
+                // runs LAST and is charged to the DELIVERING CONNECTION's
+                // budget (never the self-chosen gossip author), refunded on
+                // admission.
+                // Accept → relayed; Reject (malformed or consensus-invalid,
+                // once the chain contains the hardening activation block:
+                // `TxRelay::penalties_in_force`) → not relayed and the
+                // delivering peer — its author, as no peer on the chain
+                // forwards it unvalidated any more — takes gossipsub's
+                // invalid-message penalty; before that block an older
+                // release that forwards every frame unvalidated may be the
+                // honest deliverer, so the same frame is answered Ignore;
+                // Ignore → dropped without penalty (policy, duplicates,
+                // recent rejects, rate limit). MEM-6: an orphan's verdict is
+                // WITHHELD (keyed by the frame's wtxid, timed from its
+                // arrival) and settled from the relay's OrphanEvents: Accept
+                // when exactly those bytes enter the pool, Reject when their
+                // re-try proves them invalid while penalties are in force
+                // (or a penalty on the delivering connection once the frame
+                // left gossipsub's cache), Ignore when the orphan is
+                // dropped.
+                // P0: it runs on the blocking pool so PQ signature work
+                // cannot stall this task's reactor.
+                network::NetworkMessage::NewTransaction { txid, tx_data } => {
+                    // The connection that delivered the frame (gossip
+                    // propagation_source): the key of the signature budget
+                    // and the orphan quotas. The signed gossip author is
+                    // chosen by the sender and bounds nothing.
+                    let peer = origin.peer();
+                    // The signed gossip author: for logs only.
+                    let author = match &origin {
+                        network::InboundOrigin::Gossip { author, .. } => *author,
+                        _ => None,
+                    };
+                    let received_at = origin.received_at().unwrap_or_else(std::time::Instant::now);
+                    let next_height = mempool::admission::pool_next_height(&dag2.read(), &store2, &mem2);
+                    let (store_v, mem_v, relay_v) = (store2.clone(), mem2.clone(), tx_relay.clone());
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        relay_v.lock().on_gossip_tx(
+                            &store_v, &mem_v, next_height, &txid, &tx_data, peer,
+                            std::time::Instant::now(), unix_now_secs())
+                    }).await;
+                    match outcome {
+                        Ok(o) => {
+                            if o.invalid {
+                                warn!("tx {} from {:?} (author {:?}) INVALID ({:?}): {}",
+                                    hex::encode(&txid[..8]), peer, author, o.verdict, o.detail);
+                            } else {
+                                debug!("tx {} verdict {:?}: {}", hex::encode(&txid[..8]), o.verdict, o.detail);
                             }
-                            state2.write().mempool_size = mem2.size();
+                            if o.orphaned {
+                                if let Some(back) = deferred.defer(o.wtxid, origin, received_at, std::time::Instant::now()) {
+                                    report_verdict(&vtx2, &back, network::GossipVerdict::Ignore);
+                                }
+                            } else {
+                                report_verdict(&vtx2, &origin, o.verdict);
+                            }
+                            settle_orphan_events(&mut deferred, &vtx2, &net_ctl_tx, &o.orphans);
                         }
-                        Err(e) => debug!("tx decode rejected: {}", e),
+                        Err(e) => {
+                            warn!("tx verify task failed: {}", e);
+                            report_verdict(&vtx2, &origin, network::GossipVerdict::Ignore);
+                        }
                     }
+                    state2.write().mempool_size = mem2.size();
                 }
 
                 // NET-6: same claim handling as PeerTip (rate-limited directed
@@ -1558,14 +1707,20 @@ async fn main() {
                 // at most MAX_PARENTS bodied, non-disqualified tips by blue work
                 // (header-only tips are unmineable, see GhostDAG::bodied_tips);
                 // expected ASERT bits for exactly those parents (fail closed if
-                // underivable — never mine on a guessed target); transactions by
-                // fee rate under a byte budget measured exactly like the
-                // consensus size rule, each re-validated against the UTXO set
-                // (offenders are evicted from the mempool); coinbase fees
-                // recomputed from the UTXO set (N-7 duplicate-outpoint safe).
-                // Coinbase reserve: our own coinbase at its widest encoding.
-                let cb_reserve = template::miner_coinbase(u64::MAX, u64::MAX, miner_spk.clone())
-                    .actual_size();
+                // underivable — never mine on a guessed target); transactions as
+                // whole ancestor packages by package fee rate, parents before
+                // children (MEM-6 CPFP), under a byte budget measured exactly
+                // like the consensus size rule of the template's height, each
+                // re-validated at that height against the UTXO set plus the
+                // outputs of the transactions placed before it (offenders are
+                // evicted from the mempool with their descendants); coinbase
+                // fees recomputed (N-7 duplicate-outpoint safe).
+                // Coinbase reserve: our own coinbase at its widest encoding,
+                // including the 80-byte hardening commitment, in the larger
+                // of the two size measures (valid on both sides of the
+                // activation). `assemble_block` writes the commitment and the
+                // tagged Merkle root when the template's height requires them.
+                let cb_reserve = template::miner_coinbase_reserve(&miner_spk);
                 let tmpl = match template::build_block_template(&dag_m, &store_m, &mem_m, cb_reserve) {
                     Ok(t) => t,
                     Err(e) => {
@@ -1834,7 +1989,9 @@ fn make_rpc_submit_block_cb(
 ) -> Arc<rpc::SubmitBlockFn> {
     Arc::new(move |block: core::Block| -> Result<String, String> {
         let block_hash = block.block_hash();
-        if dag.read().has_block(&block_hash) {
+        // A block waiting for a body (witness-dependent failure of its
+        // previous body) is not a duplicate: this copy is re-evaluated.
+        if accept::is_known_block(&dag, &store, &block_hash) {
             // DAG-1: a disqualified block stays in the DAG; tell the
             // submitter it is invalid rather than merely a duplicate.
             if dag.read().is_invalid(&block_hash) {
@@ -1972,6 +2129,50 @@ fn maybe_release_ibd(
     }
 }
 
+/// Current Unix time in seconds.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// MEM-6: settle the withheld gossip verdicts of orphans from what the relay
+/// reported: Accept for the frames of admitted orphans (gossipsub relays the
+/// original bytes; every admitted orphan is also scheduled for
+/// re-announcement), Reject for consensus-invalid ones still in gossipsub's
+/// cache (the delivering peer takes the P4 penalty) — else an
+/// application-score penalty on the connection that delivered it — and
+/// Ignore for dropped ones.
+fn settle_orphan_events(
+    deferred: &mut mempool::relay::DeferredVerdicts<network::InboundOrigin>,
+    vtx: &mpsc::Sender<network::GossipValidation>,
+    net_ctl: &mpsc::Sender<network::NetworkControl>,
+    events: &mempool::relay::OrphanEvents,
+) {
+    if events.is_empty() {
+        return;
+    }
+    let s = deferred.settle(events, std::time::Instant::now());
+    for (origin, verdict) in s.verdicts {
+        report_verdict(vtx, &origin, verdict);
+    }
+    for peer in s.penalize {
+        let _ = net_ctl.try_send(network::NetworkControl::PenalizePeer(peer));
+    }
+}
+
+/// MEM-6: announce transactions that entered the pool without their own
+/// gossip frame being relayed (orphans admitted after that frame expired).
+fn announce_txs(otx: &mpsc::Sender<network::NetworkMessage>, txs: &[core::Transaction]) {
+    for tx in txs {
+        let _ = otx.try_send(network::NetworkMessage::NewTransaction {
+            txid: tx.txid(),
+            tx_data: tx.to_wire_bytes(true),
+        });
+    }
+}
+
 /// NET-2: report the processor's verdict for a deferred gossip frame. No-op
 /// for frames that owe none (directed answers, local frames, or gossip whose
 /// verdict the network loop already reported).
@@ -2024,6 +2225,9 @@ fn process_orphans(
     // Sprint 2.c: propagate tip broadcast through orphan resurrection.
     tip_tx:        Option<&broadcast::Sender<tip::TipChanged>>,
     shielded:      &Arc<RwLock<crate::coherence::ShieldedPool>>,
+    // MEM-6: accumulates what the drained orphans did to the applied chain
+    // (for the orphan-transaction bookkeeping).
+    chain:         &mut accept::ChainMove,
 ) {
     let mut queue: std::collections::VecDeque<[u8; 32]> = std::collections::VecDeque::new();
     queue.push_back(accepted_hash);
@@ -2043,7 +2247,7 @@ fn process_orphans(
                 let height = entry.height;
                 let mut block = entry.block;
                 normalize_wire_metadata(&mut block, dag);
-                match accept_block(&block, orphan_hash, height, dag, store, mempool, node_state, tip_tx, shielded) {
+                match accept::accept_block_tracking(&block, orphan_hash, height, dag, store, mempool, node_state, tip_tx, shielded, chain) {
                     Ok(hash) => {
                         info!("✓ orphan h={} accepted (pool={})", height, orphans.len());
                         queue.push_back(hash);
@@ -2087,6 +2291,14 @@ async fn sweep_orphan_parents(
                 chased.push(p);
             }
         }
+        // Blocks in the DAG waiting for a body (a witness-dependent failure
+        // below the hardening activation dropped theirs): fetched like a
+        // missing parent until a body arrives.
+        for h in d.body_pending_blocks() {
+            if !chased.contains(&h) {
+                chased.push(h);
+            }
+        }
         (ready, chased)
     };
     let (retry, give_up) = parent_fetch.sweep(&chased, now);
@@ -2114,6 +2326,30 @@ async fn sweep_orphan_parents(
 /// becomes fetchable, it re-enters the pool.
 fn drop_orphan_subtree(root_parent: [u8; 32], orphans: &mut ingress::OrphanPool) -> usize {
     orphans.drop_subtree(&root_parent)
+}
+
+/// Ask peers for the body of every block that waits for one (its stored body
+/// failed a rule that depends on witness bytes the block id does not commit
+/// to, or is missing — `GhostDAG::mark_body_pending`) and is not already
+/// being fetched. Reuses the missing-parent machinery: the request is tracked
+/// by `parent_fetch`, so the periodic sweep retries it with backoff (from
+/// another peer, `PullPeerSelector`) and the backfill guard admits the
+/// solicited answer even when it is deep below the tip. NOT consensus.
+async fn request_awaited_bodies(
+    dag:          &Arc<RwLock<consensus::GhostDAG>>,
+    parent_fetch: &mut sync::parent_fetch::ParentFetchTracker,
+    otx:          &tokio::sync::mpsc::Sender<network::NetworkMessage>,
+) {
+    let wanted: Vec<[u8; 32]> = dag.read().body_pending_blocks().into_iter()
+        .filter(|h| !parent_fetch.is_awaited(h))
+        .collect();
+    let now = std::time::Instant::now();
+    for h in wanted {
+        info!("requesting another body of block {} (its previous body was rejected or is missing)",
+            hex::encode(&h[..8]));
+        parent_fetch.note_requested(h, now);
+        let _ = otx.send(network::NetworkMessage::GetBlock { block_hash: h, nonce: getblock_nonce() }).await;
+    }
 }
 
 #[cfg(test)]
@@ -2237,8 +2473,15 @@ mod ingress_processor_tests {
         normalize_wire_metadata(&mut b1n, &f.dag);
         let h1 = accept_block(&b1n, b1.block_hash(), 1, &f.dag, &f.store, &f.mempool, &f.node_state, None, &f.shielded)
             .expect("b1 accepted");
-        process_orphans(h1, &mut pool, &f.dag, &f.store, &f.mempool, &f.node_state, None, &f.shielded);
+        let mut chain = accept::ChainMove::default();
+        process_orphans(h1, &mut pool, &f.dag, &f.store, &f.mempool, &f.node_state, None, &f.shielded,
+            &mut chain);
         assert!(pool.is_empty(), "the whole orphan chain was drained");
+        // MEM-6 review finding: the drained blocks' move of the applied chain
+        // is reported for the orphan-transaction bookkeeping.
+        assert_eq!(chain.connected.iter().map(|b| b.block_hash()).collect::<Vec<_>>(),
+            vec![b2.block_hash(), b3.block_hash()]);
+        assert!(chain.disconnected.is_empty());
         assert!(f.dag.read().has_block(&b3.block_hash()));
         let stored = f.store.get_block(&b3.block_hash()).unwrap().unwrap();
         assert_eq!(stored.blue_score, 3, "derived from parents, not the forged u64::MAX");
@@ -2258,6 +2501,47 @@ mod ingress_processor_tests {
             Arc::new(parking_lot::Mutex::new(sync::frontier::FrontierState::new())),
             Arc::new(RwLock::new(rpc::NodeState::default())),
         )
+    }
+
+    /// A block whose body was rejected for a witness-dependent reason (below
+    /// the hardening activation) waits for another body: the processor asks
+    /// peers for it at once through the missing-parent tracker (so the
+    /// backfill guard admits the solicited answer), does not ask twice, and
+    /// the periodic sweep chases it like a missing parent.
+    #[tokio::test]
+    async fn blocks_waiting_for_a_body_are_requested_and_swept() {
+        let (dag, _, _, _) = release_fixture();
+        let waiting = [0xB0u8; 32];
+        dag.write().add_block(waiting, vec![[0xAA; 32]], 1_001, 1).expect("child of genesis");
+        dag.write().mark_body_pending(waiting, Some([0x11; 32]));
+        let (otx, mut orx) = tokio::sync::mpsc::channel::<network::NetworkMessage>(8);
+
+        let mut tracker = sync::parent_fetch::ParentFetchTracker::new();
+        request_awaited_bodies(&dag, &mut tracker, &otx).await;
+        match orx.try_recv() {
+            Ok(network::NetworkMessage::GetBlock { block_hash, .. }) => assert_eq!(block_hash, waiting),
+            other => panic!("expected a GetBlock, got {:?}", other.map(|_| "another message")),
+        }
+        assert!(tracker.is_awaited(&waiting), "tracked: the backfill guard admits the answer");
+        request_awaited_bodies(&dag, &mut tracker, &otx).await;
+        assert!(orx.try_recv().is_err(), "already being fetched: no duplicate request");
+
+        // The sweep (a fresh tracker, e.g. after the record was given up on)
+        // re-requests it although no orphan waits for it.
+        let mut fresh = sync::parent_fetch::ParentFetchTracker::new();
+        let mut orphans = ingress::OrphanPool::default();
+        sweep_orphan_parents(&mut orphans, &mut fresh, &dag, &otx).await;
+        match orx.try_recv() {
+            Ok(network::NetworkMessage::GetBlock { block_hash, .. }) => assert_eq!(block_hash, waiting),
+            other => panic!("expected a GetBlock from the sweep, got {:?}", other.map(|_| "another message")),
+        }
+
+        // Once a body is accepted the block no longer waits: nothing to chase.
+        dag.write().clear_body_pending(&waiting);
+        let mut fresh = sync::parent_fetch::ParentFetchTracker::new();
+        sweep_orphan_parents(&mut orphans, &mut fresh, &dag, &otx).await;
+        request_awaited_bodies(&dag, &mut fresh, &otx).await;
+        assert!(orx.try_recv().is_err());
     }
 
     /// NET-6: an inflated tip claim (even u64::MAX from a connected peer) can
