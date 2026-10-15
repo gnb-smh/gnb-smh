@@ -224,6 +224,13 @@ mod tests {
     /// the script and parent caps only: the count caps need megabytes.)
     /// Peak memory about 150 MB (a block of 1,000,001 empty transactions).
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "builds, encodes and parses a block of 1,000,000 transactions (block_count_caps_are_inclusive \
+                  only builds and checks it and was still running after 17 minutes under Miri), transactions \
+                  of 100,000 inputs and outputs and an 8 MB proof; the parser and check_*_canonical_limits run \
+                  under Miri in limits_match_the_wire_parser and the other tests of this module"
+    )]
     fn count_and_size_caps_match_the_wire_parser() {
         use coherence_core::ShieldedTx;
 

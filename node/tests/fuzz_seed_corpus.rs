@@ -274,7 +274,7 @@ fn seeds() -> BTreeMap<&'static str, Vec<Vec<u8>>> {
         h.to_wire_bytes(r.next() % 1000, r.next() % 1000)
     };
     // Its own stream, so the seeds of the other targets do not move.
-    let mut rh = Rng(0x4EAD_E2_5EED);
+    let mut rh = Rng(0x004E_ADE2_5EED);
     let h2 = hdr(2, &mut rh);
     let mut hp = vec![
         hard.header.to_wire_bytes(hard.blue_score, hard.height),
