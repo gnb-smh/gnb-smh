@@ -31,12 +31,12 @@ assertion failure, which libFuzzer reports as a crash like any panic.
 | `block_rules` | `core::block_rules` (VAL-2, VAL-10, VAL-12, CRY-1) | tagged Merkle root equals an RFC 6962-style recursive reference; legacy root equals Bitcoin's in-place `ComputeMerkleRoot`; coinbase branch folds back to the root and ignores position 0; a duplicated last id changes the tagged root; on blocks decoded from untrusted bytes: wire encoding and `wire_size`, txid, wtxid, header roots, witness root, parents commitment and the 80-byte coinbase commitment equal the references; the 64-byte rule fires exactly on 64-byte txid preimages; the commitment verdict (which field fails) equals a reference parser; a block repaired to the specification is accepted, and altering any committed field (commitment byte, height, parent list, a witness, a truncated commitment, an extra transaction) is rejected while the miner's extra bytes are free |
 | `sighash` | `Transaction::sighash`, `sighash_v2_checked`, `sighash_v3`, `SighashV3Precomputed` | no panic for any transaction, index or spent-output count; v2 equals an independent hand-written bincode encoding of the stripped transaction (and the bincode crate); v3 equals an independent 195-byte preimage; v3 errors exactly on a spent-output count mismatch or an out-of-range index; changing any single committed field (version, locktime, chain, suite, index, prevout, sequence, spent amount, spent script, output value or script) changes the v3 digest; no `script_sig` changes either digest |
 | `witness_parse` | `parse_script_sig{,_borrowed,_exact}`, `build_script_sig`, `sighash::canonical_witness`, `check_input_witnesses` | the parsers equal a reference parser (lenient and exact); exact round trip of `build_script_sig`; trailing bytes refused by the exact parser only; the canonical-witness and per-regime witness rules agree with the framing and `is_canonical_signature_encoding`; genuine canonical hybrid signatures altered by the input exercise the envelope and Falcon compact-encoding checks |
-| `wire_roundtrip` | `Transaction` / `BlockHeader` / `Block` wire encoding, `admission::decode_tx_strict` | generated values: the encoding equals an independent encoder, `wire_size` its length, `decode(encode(x)) == x` exactly when `x` is within the parser caps (values at and one past each cap are generated), every proper prefix and one extra byte are refused; untrusted bytes: the strict decoders are the exact inverse of the encoder (`decode(b) = x` implies `encode(x) == b`) |
+| `wire_roundtrip` | `Transaction` / `BlockHeader` / `Block` wire encoding, `admission::decode_tx_strict` | generated values: the encoding equals an independent encoder, `wire_size` its length, `decode(encode(x)) == x` exactly when `x` is within the parser caps (values at and one past the script-length and parent caps are generated; the count and size caps need 100 KB to 10 MB values and are checked at and one past each cap by the unit test `core::limits::tests::count_and_size_caps_match_the_wire_parser` instead), every proper prefix and one extra byte are refused; untrusted bytes: the strict decoders are the exact inverse of the encoder (`decode(b) = x` implies `encode(x) == b`) |
 | `undo_decode` | `UndoData::{from_bytes, to_bytes}` | no panic; decode/encode fixed point; a record without overwrites is byte-identical to the legacy six-field record; the legacy prefix decodes alone; an empty extension is normalised away; trailing garbage and a truncated extension are refused |
 | `keystore_decode` | keyfile v1/v2 (`EncryptedKeyfile`, `Wallet::from_encrypted_bytes`), keystore v2/v3 (`Keypair::from_encrypted_bytes`) | arbitrary JSON: no panic, decrypt driven to completion with cheap Argon2 parameters, parameters over the bounds refused before any KDF; library-written keyfiles (fast parameters) round-trip and refuse a wrong password and any altered AEAD-bound field; a keystore v3 written by an independent implementation of the format loads to the same key pair and refuses an altered network, address, version, ciphertext or KDF output length |
 | `address_parse` | `Address::parse`, `parse_for_network`, `FromStr`, `Display` | verdict (value or error kind) equals a reference parser; the canonical form round-trips and differs only by hex case and the Bloch alias; `parse_for_network` accepts the own network only; a one-digit change is `BadChecksum`; a prefix swap keeps the hash (documented residual) |
 | `sync_rr_codec` | `/gnb/sync/1` frames: `decode_request`, `decode_response`, `encode_frame`, `check_nonempty_frame`, and the libp2p codec `BlochSyncCodec` (`read_request` / `read_response` / `write_request` / `write_response`) over an in-memory stream | no panic; every refusal is `InvalidData` (penalized) and an empty frame `UnexpectedEof` (not penalized); accepted frames obey every bound and are canonical; both transports enforce the same bounds (a response accepted here passes the gossip decoder, a gossip pull accepted there is accepted here); generated messages round-trip exactly when within bounds; reading a stream through the codec is exactly `check_nonempty_frame` + the decoder on its first 4 MiB, writing is `encode_frame` and reads back, and a stream over the 4 MiB read cap (a valid frame followed by padding) is a penalized refusal |
-| `accept_dag` | `accept::accept_block` (behind `validate_structure`) on a RocksDB `Storage` in a temporary directory with a real `GhostDAG` | small arbitrary DAGs (up to 6 sealed blocks, PoW-cheap through the crate's `test-pow-limit` feature) with signed spends of funded outputs, conflicting spends, spend chains, version 1 and 3 transactions, broken signatures, missing inputs and deliberate faults (coinbase over-claim, wrong height, wrong bits, timestamp before a parent, duplicated transaction), under the hardening activation never / from genesis / inside the DAG; no panic, and two different arrival orders of the same block set (orphans retried) end with the same selected tip, applied tip, UTXO set digest and DAG block set; optionally a reload from storage (`reconcile_on_startup`) keeps that state |
+| `accept_dag` | `accept::accept_block` (behind `validate_structure`) on a RocksDB `Storage` in a temporary directory with a real `GhostDAG` | small arbitrary DAGs (up to 6 sealed blocks, PoW-cheap through the crate's `test-pow-limit` feature) with signed spends of funded outputs, conflicting spends, spend chains, version 1 and 3 transactions, broken signatures, missing inputs and deliberate faults (coinbase over-claim, wrong height, wrong difficulty bits sealed at their own easy target so that the difficulty rule is what refuses them, timestamp before a parent, duplicated transaction), under the hardening activation never / from genesis / inside the DAG; no panic, and two different arrival orders of the same block set (orphans retried) end with the same selected tip, applied tip, UTXO set digest and DAG block set; a block with a wrong height, a timestamp before a parent, wrong bits or a duplicated transaction is in neither node's DAG; optionally a reload from storage (`reconcile_on_startup`) keeps that state |
 
 The seed corpora of eight of the nine original targets are generated (and
 replayed on stable Rust) by `node/tests/parser_corpus_floor.rs`; those of
@@ -96,16 +96,22 @@ it empty); `fuzz_seed_corpus.rs` now generates one.
 
 Every target ran under ASan (`cargo +nightly fuzz build`: release, debug
 assertions and overflow checks, LeakSanitizer on) for 600 s, `accept_dag` for
-1,800 s, starting from its committed corpus, with `nice -n 15 -jobs=1
+1,800 s, starting from its committed corpus (all of it; see below for the
+first `accept_dag` run), with `nice -n 15 -jobs=1
 -workers=1 -rss_limit_mb=2048 -timeout=120`, two targets at a time on a shared
 4-core machine that was also running other builds and mutation tests (the
-exec rates are lower bounds). Built with nightly `cargo 1.101.0-nightly
-(2026-10-07)` and cargo-fuzz 0.13.2. The binaries were built from the tree
+exec rates are lower bounds). Built with `nightly-2026-10-14` (rustc
+1.101.0-nightly 822182db4 2026-10-13, cargo 2026-10-07; the toolchain CI
+pins) and cargo-fuzz 0.13.2. The binaries were built from the tree
 with both fixes above in place; the later runs (`header_parse`,
 `undo_decode`, `address_parse`, `sync_rr_codec`) were rebuilt from the
 committed tree (the library code did not change in between, only `#[cfg(test)]`
-code). `cov` / `ft` are libFuzzer's covered edges and features at the end of
-the run (whole binary), `corpus` the corpus it ended with.
+code). `accept_dag` was re-run on the final tree (below). After the other
+runs the library gained only the `gnb::libp2p` re-export and a unit test;
+all 18 targets were then rebuilt from the final tree and replayed their
+committed corpora with exit status 0. `cov` / `ft` are libFuzzer's covered
+edges and features at the end of the run (whole binary), `corpus` the
+corpus it ended with.
 
 | Target | Seconds | Executions | exec/s | cov | ft | Corpus (units) | Peak RSS (MB) | Findings |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
@@ -126,29 +132,54 @@ the run (whole binary), `corpus` the corpus it ended with.
 | `keystore_decode` | 600 | 1,437,930 | 2,392 | 5,482 | 14,025 | 2,332 | 476 | none |
 | `address_parse` | 600 | 4,318,981 | 7,186 | 626 | 1,151 | 88 | 555 | none |
 | `sync_rr_codec` | 600 | 119,432 | 198 | 2,325 | 5,852 | 558 | 558 | none |
-| `accept_dag` | 1,800 | 703 | 0.4 | 8,080 | 27,021 | 264 | 535 | none (one 10 s slow-unit report, not a timeout) |
+| `accept_dag` | 1,800 | 1,287 | 0.7 | 8,000 | 26,649 | 323 | 540 | none (no slow unit) |
 
 No crash, leak, timeout or out-of-memory input after the two fixes.
 `sync_rr_codec` also ran 600 s before it drove the libp2p codec (527,601
 executions, 877 exec/s, cov 2,033, no finding); the codec checks raised its
 coverage to 2,325 edges and lowered the rate (every frame is also read
-through the codec, and the read-cap check builds 4 MiB streams).
+through the codec, and the read-cap check builds 4 MiB streams). Rebuilt
+with the codec trait taken from `gnb::libp2p`, it ran another 120 s (27,278
+executions, cov 2,304, no finding).
 
 `accept_dag` is slow by construction: every block it has not built before
 costs one GnB-SMH evaluation (a 64 MiB scratchpad) to seal, which dominates
 under ASan and coverage instrumentation (13 of 15 stack samples of a running
 campaign were in `gnb_smh::hash_with`, the other two in RocksDB opening its
-temporary databases). An input of up to six blocks took 2.6 s on average and
-up to 10 s; libFuzzer reports a unit of 10 s or more as `slow-unit` (the
-per-input timeout is 120 s). Replaying a sample of 42 inputs of its final
-corpus (158 blocks; activation never, from genesis, inside the DAG and at the
-mainnet height) shows the pipeline both accepting and rejecting, for many
-different reasons: of 145 deliveries in the first arrival order, 71 were
-accepted; the others were rejected for a missing UTXO (17), an invalid
-selected parent (17), a duplicated transaction (11), a wrong height (10), a
-timestamp before a parent (9), a coinbase over-claim (4), an invalid
-signature (body rejected without poisoning the block id, 3), an invalid proof
-of work (2) and a transaction version not allowed at the height (1).
+temporary databases). An input of up to six blocks took 1.4 s on average in
+the run above (2.6 s, and up to 10 s, in the first run on a busier machine);
+libFuzzer reports a unit of 10 s or more as `slow-unit` (the per-input
+timeout is 120 s).
+
+The row above is the second `accept_dag` campaign, a re-run of the target
+after two corrections, from the whole committed corpus (12 seeds: the 6
+original programs, the 4 DAG-1 scenarios and 2 wrong-bits programs). The first 1,800 s
+run (703 executions, cov 8,080, no finding) is not a valid result for the
+current target: it started from the 6 original seeds only (the 4 DAG-1
+scenario seeds were committed nine minutes after it started, and were only
+replayed, never fuzzed from), and its wrong-bits fault never reached the
+difficulty rule. That fault gave the block the genesis bits (a target of
+about 2^-12) and left it unsealed, so `validate_structure` refused it as an
+invalid proof of work every time; the fault now uses a wrong target within
+the pow limit that seals in one or two evaluations (`0x2100FFFE` or
+`0x21008000`), and the target also asserts that a block with a wrong
+height, a timestamp before a parent, wrong bits or a duplicated transaction
+is never accepted.
+
+Replaying the whole final corpus of the run above (318 inputs: the 12 seeds
+and the 306 it added; activation never, from genesis, inside the DAG and at
+the mainnet height) with `ACCEPT_DAG_LOG=1` shows the pipeline both
+accepting and rejecting, for many different reasons: of 1,173 deliveries in
+the first arrival order, 563 were accepted; the others were rejected in
+their chain context for a missing UTXO (197), an invalid selected parent
+(120), a coinbase over-claim (25), a double spend (6), descent from an
+invalid block (3), BIP30 (an output that would overwrite an unspent coin,
+2), a transaction version not allowed at the height (2) or an invalid
+signature (2, and 1 body rejected without poisoning the block id); and
+outside it for a duplicated transaction (94), a timestamp before a parent
+(71), wrong difficulty bits (44: `invalid difficulty: block bits 0x2100fffe`
+26 times, `0x21008000` 18 times) and a wrong height (43). No block was
+refused as an invalid proof of work.
 
 ### Do the targets detect what they are meant to detect?
 
@@ -171,15 +202,29 @@ assertion within seconds:
 | `address_parse` | reference checks 3 of the 4 checksum bytes | < 1 s | `parse differs from the reference` |
 | `sync_rr_codec` | expected read result without `check_nonempty_frame` | 1 s | `read_request: error kinds differ` |
 | `accept_dag` | arrival order B never retries a block whose parent is unknown | 9 s | `arrival order changed the outcome` |
+| `accept_dag` | the wrong-bits fault silently builds a valid block (the expected bits) | 20 s | `b0 with wrong difficulty bits was accepted` |
 
 ## Known limits
 
 * CI starts every run from the committed seeds: the corpus a run grows is
   not kept (only crash reproducers are uploaded), so the weekly campaign does
   not accumulate coverage from week to week.
-* `accept_dag` executes one input every 2.6 s on average (above): the
-  60-second pull-request run sees about twenty DAGs, the weekly 10-minute
+* `accept_dag` executes one input every 1.4 to 2.6 s on average (above):
+  the 60-second pull-request run sees a few dozen DAGs, the weekly 10-minute
   run a few hundred.
+* `accept_dag` runs with gnb-crypto's `test-pow-limit` feature (one
+  evaluation seals a block): the expected bits are always the
+  pre-activation pow limit and `validate_pow` enforces that limit at every
+  height. Neither the ASERT schedule nor the hardened pow limit of audit
+  POW-3 (the genesis target from the activation on) is exercised by it, in
+  any of its activation regimes. Both are covered only by gnb-crypto's own
+  tests, run without the feature (`expected_bits_at`, `pow_limit_bits_at`,
+  `validate_pow` at the hardened limit; CI job `consensus-crates`), and the
+  ASERT arithmetic by `pow_decode` (with the pre-activation pow limit).
+* `wire_roundtrip` reaches the script-length and parent caps only; the count
+  and size caps (inputs, outputs, block and shielded transactions,
+  nullifiers, shielded outputs, proof, binding signature) are checked by a
+  unit test, not fuzzed.
 * The async read of the sync codec is driven over an in-memory stream; the
   libp2p substream and muxer underneath are not fuzzed.
 * `keystore_decode` drives the decryption to completion only for Argon2
@@ -205,6 +250,9 @@ cargo +nightly fuzz run sighash /tmp/new corpus/sighash -- \
 # Replay one input (a CI artifact, or a corpus file):
 cargo +nightly fuzz run wire_roundtrip corpus/wire_roundtrip/regress_nonminimal_parent_count
 
+# accept_dag: print the verdict of every delivery (first arrival order):
+ACCEPT_DAG_LOG=1 cargo +nightly fuzz run accept_dag corpus/accept_dag/seed_0010_38
+
 # Minimize a crash, or the corpus:
 cargo +nightly fuzz tmin <target> <crash file>
 cargo +nightly fuzz cmin <target>
@@ -224,10 +272,20 @@ cargo test -p gnb --test parser_corpus_floor generate_seed_corpus  # original ta
 
 ## Continuous integration
 
-`.github/workflows/fuzz.yml` builds every target on nightly with ASan and runs
-each one over its committed corpus. `ci.yml` calls it on every pull request
-and in the nightly run with 60 seconds per target; its own weekly schedule
-(Sunday) runs 10 minutes per target, and a manual run takes the time as an
-input. A crash, leak, timeout (120 s per input) or out-of-memory input (2 GB)
-fails the job, and every reproducer libFuzzer wrote is uploaded as the
-`fuzz-artifacts` artifact.
+`.github/workflows/fuzz.yml` builds every target with ASan on a pinned
+nightly (`FUZZ_TOOLCHAIN`, `nightly-2026-10-14`, the toolchain of the
+campaign above; bump it deliberately) and runs each one over its committed
+corpus. `ci.yml` calls it on every pull request and in the nightly run with
+60 seconds per target; its own weekly schedule (Sunday) runs 10 minutes per
+target, and a manual run takes the time as an input. A crash, leak, timeout
+(120 s per input) or out-of-memory input (2 GB) fails the job, and every
+reproducer libFuzzer wrote is uploaded as the `fuzz-artifacts` artifact. The
+job also fails when `cargo fuzz list` fails or does not list every `[[bin]]`
+of `node/fuzz/Cargo.toml` (it can never pass having fuzzed nothing), and when
+a target has no committed seed corpus.
+
+Only the downloaded crate sources are cached (key: toolchain and
+lockfiles). The ASan target directory (measured locally: about 5 GB of
+dependencies plus about 0.4 GB per target binary) is rebuilt on every run:
+caching it would take most of the repository's 10 GB cache budget from the
+other jobs, and any change to the node's code rebuilds the targets anyway.
