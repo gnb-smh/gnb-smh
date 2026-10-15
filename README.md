@@ -30,7 +30,8 @@ Status: pre-release. Not audited.
 | `genesis/` | The Bloch Genesis-3 terminal snapshot the genesis ledger is built from |
 | `crates/pqcrypto-internals`, `crates/libp2p-yamux` | Vendored forks (patched in through `[patch.crates-io]`), workspace members so their guard tests run |
 | `node/fuzz` | cargo-fuzz targets (own workspace, nightly): wire decoders, difficulty, PoW and signature verify, Merkle paths, mempool |
-| `docs/` | Protocol notes: [consensus](docs/CONSENSUS.md), [monetary policy and carryover](docs/MONETARY-POLICY.md), [running a node](docs/RUNNING.md), [ledger v1](docs/LEDGER.md) |
+| `docs/` | Protocol notes: [consensus](docs/CONSENSUS.md), [monetary policy and carryover](docs/MONETARY-POLICY.md), [running a node](docs/RUNNING.md), [ledger v1](docs/LEDGER.md), [functional tests](docs/testing/FUNCTIONAL.md) |
+| `test/functional` | Multi-node functional tests and their framework (Python, stdlib only) |
 | `reference/`, `rust/`, `analysis/` | Standalone GnB-SMH v1 reference implementation and GnB ledger v1 (see below) |
 
 ## Build and test
@@ -45,6 +46,9 @@ cargo test -p gnb-smh --locked
 cargo test -p gnb-crypto --locked
 cargo clippy --workspace --all-targets --locked
 cargo deny check && cargo audit
+# Functional tests: real gnb / gnb-cli processes on loopback, built with the
+# test-only `test-pow-limit` feature (docs/testing/FUNCTIONAL.md)
+python3 test/functional/test_runner.py
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of these, the Python references, the
