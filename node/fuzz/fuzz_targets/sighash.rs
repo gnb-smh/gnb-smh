@@ -161,7 +161,7 @@ fuzz_target!(|data: &[u8]| {
     let pick = inp.u16() as usize;
     let delta = inp.u8() | 1;
     // Spent outputs: usually one per input, sometimes not.
-    let mismatch = inp.u8() % 8 == 0;
+    let mismatch = inp.u8().is_multiple_of(8);
     let tx = gen_tx(&mut inp, 8, 6, 48);
     let n_spent = if mismatch { inp.below(9) } else { tx.inputs.len() };
     let spent: Vec<TxOutput> =

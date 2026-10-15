@@ -45,7 +45,7 @@ fn check_id_list(inp: &mut Input) {
     for i in 0..n {
         // Repeated ids are allowed and frequent: duplicates are the
         // interesting shape for Merkle malleability.
-        if i > 0 && inp.u8() % 4 == 0 {
+        if i > 0 && inp.u8().is_multiple_of(4) {
             let j = inp.below(i);
             ids.push(ids[j]);
         } else {

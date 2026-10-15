@@ -163,8 +163,8 @@ fn keyfile_round_trip(inp: &mut Input, v2: bool) {
         assert_eq!((w.public_key(), w.network()), (&public[..], network));
         assert!(back.decrypt_v2(PASSWORD).is_err(), "a v1 keyfile opened as v2");
     }
-    assert!(matches!(back.decrypt("wrong-password-but-long"), Err(_)));
-    assert!(matches!(back.decrypt_v2("wrong-password-but-long"), Err(_)));
+    assert!(back.decrypt("wrong-password-but-long").is_err());
+    assert!(back.decrypt_v2("wrong-password-but-long").is_err());
 
     let mut v: Value = serde_json::from_slice(&json_bytes).unwrap();
     if !tamper_keyfile(&mut v, inp) {

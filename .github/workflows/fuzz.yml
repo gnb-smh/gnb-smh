@@ -24,7 +24,7 @@ on:
         type: number
         default: 60
   schedule:
-    - cron: "41 4 * * 0" # weekly (Sunday): 10 minutes per target
+    - cron: "23 6 * * 0" # weekly (Sunday): 10 minutes per target; not mutants.yml's minute (41 4)
   workflow_dispatch:
     inputs:
       seconds:

@@ -232,7 +232,7 @@ fn gen_response(inp: &mut Input) -> SyncResponse {
                 1 => MAX_WIRE_ADDRS + 1,
                 _ => inp.below(4),
             };
-            let long = inp.u8() % 8 == 0;
+            let long = inp.u8().is_multiple_of(8);
             let peers = (0..n)
                 .map(|i| if long && i == 0 { "x".repeat(MAX_WIRE_ADDR_LEN + (inp.u8() & 1) as usize) } else { format!("/ip4/10.0.0.{}/tcp/1", i % 250) })
                 .collect();

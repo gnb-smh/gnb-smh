@@ -365,8 +365,8 @@ cargo test -p gnb --test parser_corpus_floor generate_seed_corpus  # original ta
 nightly (`FUZZ_TOOLCHAIN`, `nightly-2026-10-14`, the toolchain of the
 campaign above; bump it deliberately) and runs each one over its committed
 corpus. `ci.yml` calls it on every pull request and in the nightly run with
-60 seconds per target; its own weekly schedule (Sunday) runs 10 minutes per
-target, and a manual run takes the time as an input. A crash, leak, timeout
+60 seconds per target; its own weekly schedule (Sunday 06:23 UTC, not the
+minute of mutants.yml's weekly run) runs 10 minutes per target, and a manual run takes the time as an input. A crash, leak, timeout
 (120 s per input) or out-of-memory input (2 GB) fails the job, and every
 reproducer libFuzzer wrote is uploaded as the `fuzz-artifacts` artifact. The
 job also fails when `cargo fuzz list` fails or does not list every `[[bin]]`

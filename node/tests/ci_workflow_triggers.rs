@@ -234,6 +234,24 @@ fn fuzz_workflow_runs_weekly_and_from_ci() {
     assert!(ci.text.contains("seconds: 60"), "ci.yml fuzz job: 60 s per target");
 }
 
+/// Two weekly campaigns (mutants.yml and fuzz.yml) started on the same
+/// minute (`41 4 * * 0`, integration review of H-fuzz). They run on separate
+/// runners, so this is about runner concurrency, not correctness: every
+/// scheduled workflow gets a cron of its own.
+#[test]
+fn no_two_workflows_share_a_cron() {
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for w in all_workflows() {
+        for c in &w.crons {
+            if let Some((other, _)) = seen.iter().find(|(_, s)| s == c) {
+                panic!("{} and {} are both scheduled at {c:?}", other, w.file);
+            }
+            seen.push((w.file.clone(), c.clone()));
+        }
+    }
+    assert!(seen.len() >= 3, "expected the ci, mutants and fuzz schedules, got {seen:?}");
+}
+
 /// A filter on `github.event.schedule` must name a cron of its own workflow;
 /// a stale value silently stops the job from ever running on the schedule.
 #[test]

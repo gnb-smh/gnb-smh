@@ -497,7 +497,7 @@ fuzz_target!(|data: &[u8]| {
         2 => 1 + inp.below(3) as u64,
         _ => activation::MAINNET_HARDENING_ACTIVATION_HEIGHT,
     };
-    let do_restart = inp.u8() % 4 == 0;
+    let do_restart = inp.u8().is_multiple_of(4);
     let _act = activation::scoped_override(act);
     let g = genesis();
     let blocks = build(&mut inp, &g);
