@@ -273,6 +273,16 @@ mod tests {
         let _ = Scratchpad::new(MAX_LOG2_N + 1);
     }
 
+    /// Every profile must trap integer overflow (root Cargo.toml: release sets
+    /// `overflow-checks = true`, dev/test inherit it from debug assertions).
+    /// Checks the profile this binary was built with, so CI also runs it as
+    /// `cargo test --release -p gnb-smh --lib integer_overflow`.
+    #[test]
+    fn integer_overflow_panics_in_this_profile() {
+        let r = std::panic::catch_unwind(|| std::hint::black_box(u32::MAX) + std::hint::black_box(1u32));
+        assert!(r.is_err(), "overflow-checks are off in this build profile");
+    }
+
     #[test]
     #[should_panic]
     fn verify_rejects_non_canonical_scratchpad() {

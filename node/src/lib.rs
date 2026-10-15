@@ -89,3 +89,17 @@ pub mod prelude {
     #[cfg(feature = "node")]
     pub use crate::mempool::{Mempool, MempoolEntry, MempoolError, AddressTxInfo};
 }
+
+#[cfg(test)]
+mod build_profile_tests {
+    /// The node's lib tests run with debug assertions and overflow checks:
+    /// both are on by default in the dev/test profile (the root Cargo.toml
+    /// overrides only opt-level per package), and this test fails if a
+    /// profile change ever turns them off (docs/testing/SANITIZERS.md).
+    #[test]
+    fn test_build_traps_integer_overflow_and_debug_assertions() {
+        assert!(cfg!(debug_assertions), "lib tests must run with debug assertions");
+        let r = std::panic::catch_unwind(|| std::hint::black_box(u64::MAX) + std::hint::black_box(1u64));
+        assert!(r.is_err(), "integer overflow did not panic: overflow-checks are off for the node lib");
+    }
+}

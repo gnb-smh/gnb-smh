@@ -100,6 +100,10 @@ jobs:
         run: |
           cargo test -p gnb-crypto --locked --lib expected_bits_at_schedule_is_genesis_bits 2>&1 \
             | tee /dev/stderr | grep -q "test result: ok. 1 passed; 0 failed; 0 ignored"
+      - name: The release profile traps integer overflow (overflow-checks = true)
+        run: |
+          cargo test -p gnb-smh --locked --release --lib integer_overflow_panics_in_this_profile 2>&1 \
+            | tee /dev/stderr | grep -q "test result: ok. 1 passed; 0 failed; 0 ignored"
 
   # Vendored forks: PQClean source pin (VENDOR.toml), the yamux lockfile guard
   # (GHSA-vxx9-2994-q338), and the Falcon clean-variant guard.
