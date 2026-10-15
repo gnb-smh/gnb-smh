@@ -322,6 +322,25 @@ fn seeds() -> BTreeMap<&'static str, Vec<Vec<u8>>> {
     let mut d: Vec<Vec<u8>> = (0..4).map(|i| with(&[i, 0], &r.bytes(40 + 30 * i as usize))).collect();
     d.push(vec![1, 0, 5, 0, 0, 0, 0x80, 7, 0, 0, 0, 0, 0x80, 1, 0x21, 0, 0, 1, 0, 0, 0x80, 2, 0x33]);
     d.push(vec![2, 4, 1, 0, 3, 0, 0, 0, 0x80, 7, 0x10, 0, 1, 0, 0, 0x80, 4, 0x51, 1, 0, 0, 0, 0, 0x05, 9]);
+    // Historical scenarios, as accept_dag programs (layout: activation,
+    // restart, u16 block count - 1, then per block: u16 parents - 1, u16
+    // parent index per parent, flags, u16 timestamp step, u16 tx count, one
+    // slot byte per tx, coinbase tag; then the permutation draws).
+    // DAG-1: sibling blocks on the genesis carrying the same spend, delivered
+    // in both orders (legacy rules, then the hardening rules from genesis).
+    let siblings = |act: u8| vec![act, 1, 1, 0, 0, 0, 0, 0, 0x80, 0, 0, 1, 0, 0x00, 0xA1, 0, 0, 0, 0, 0x80, 0, 0, 1, 0, 0x00, 0xB2, 0, 0];
+    d.push(siblings(0));
+    d.push(siblings(1));
+    // A fork that spends an output created earlier on itself (slot 0 then its
+    // child spend, slot 3), against a coinbase-only sibling chain, with a
+    // reload from storage.
+    d.push(vec![0, 0, 3, 0, 0, 0, 0, 0, 0x80, 0, 0, 1, 0, 0x00, 0x01, 0, 0, 1, 0, 0x80, 0, 0, 1, 0, 0x03, 0x02,
+        0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0x03, 0, 0, 3, 0, 0x80, 0, 0, 0, 0, 0x04, 3, 0, 1, 0, 0, 0]);
+    // An over-claiming coinbase (flags 5, invalid at connect time), an
+    // honest sibling, and a block merging both (DAG-1: a disqualified block
+    // stays in the DAG so that a merger is accepted in every order).
+    d.push(vec![0, 1, 2, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0x11, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0x12,
+        1, 0, 2, 0, 1, 0, 0x80, 0, 0, 0, 0, 0x13, 2, 0, 1, 0]);
     m.insert("accept_dag", d);
     m
 }
