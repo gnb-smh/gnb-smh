@@ -81,9 +81,12 @@ fn forward_to_processor<T>(block_tx: &mpsc::Sender<T>, item: T, kind: &'static s
 // `report_message_validation_result`. `Accept` forwards it; `Reject` drops it
 // AND applies gossipsub's invalid-delivery (P4) penalty to the peer that
 // delivered it; `Ignore` drops it without penalty. Because every honest node
-// now validates before forwarding, an invalid frame is only ever delivered by
-// its originator, so penalties land on the author instead of on honest relays
-// (NET-4).
+// running this validation forwards only frames it accepted, an invalid frame
+// is then delivered only by its originator, so penalties land on the author
+// instead of on honest relays (NET-4). Earlier releases forward
+// `NewTransaction` frames without validating them, so the transaction relay
+// answers `Reject` only once no such release can be a peer on the chain
+// (`mempool::relay::TxRelay::penalties_in_force`).
 
 /// The application's verdict on one gossip frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

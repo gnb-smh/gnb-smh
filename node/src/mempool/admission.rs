@@ -24,7 +24,9 @@
 //!     no dust output (the consensus `Block::validate_dust` rule), no
 //!     zero-value output (policy: UTXO-set bloat, VAL-11 note), canonical
 //!     witnesses at EVERY height and the hybrid signature suite only
-//!     ([`check_standard_witnesses`], CRY-1/CRY-2 policy);
+//!     ([`check_standard_witnesses`], CRY-1/CRY-2 policy; a non-canonical
+//!     witness is consensus-invalid for version 3 at/after the activation:
+//!     [`check_witnesses_for_next_block`]);
 //!  5. next-block rules ([`check_tx_for_next_block`]): the version valid AND
 //!     standard for the next block's height
 //!     (`core::sighash::check_tx_version_standard`: version 3 from the
@@ -53,21 +55,30 @@
 //!     verified-signature cache shared with block validation. A caller may
 //!     put a gate in front of this step (`admit_gated`): the gossip relay
 //!     charges the delivering connection's signature budget there (MEM-5),
-//!     only on a cache miss ([`signatures_cached`], same key as the cache).
+//!     only on a cache miss ([`verify_input_scripts_gated_at`]: one
+//!     cache-key computation for the lookup and the insertion; the version
+//!     and witness checks run before the gate, so they cost it nothing).
 //!
 //! Every error says whether the transaction is consensus-INVALID
-//! ([`AdmissionError::Rejected`]: no honest node relays it, so the gossip
-//! relay penalises its author) or merely refused by local policy (every
-//! other variant). Relay policy (the version policy, canonical witnesses,
-//! suite 0x0002, zero-value outputs, size) and every rule whose verdict
-//! depends on the next block's height (the version rule, the 64-byte rule,
-//! coinbase maturity) are policy refusals ([`AdmissionError::NonStandard`] /
-//! [`AdmissionError::Immature`]): a peer running older software, or one
-//! block behind across the activation, relays such a transaction honestly.
-//! Rejections other than "missing inputs", duplicates and rate limiting are
-//! remembered in the mempool's bounded recent-rejects filter until the
+//! ([`AdmissionError::Rejected`]: no upgraded node relays it; the gossip
+//! relay penalises the delivering peer once no older release can be a peer
+//! on the chain, see `relay::TxRelay`) or merely refused by local policy
+//! (every other variant). Relay policy (the version policy, canonical
+//! witnesses below the activation or for a version other than 3, suite
+//! 0x0002, zero-value outputs, size) and every rule whose verdict depends on
+//! the next block's height (the version rule, the 64-byte rule, coinbase
+//! maturity) are policy refusals ([`AdmissionError::NonStandard`] /
+//! [`AdmissionError::Immature`]): a peer one block behind across the
+//! activation relays such a transaction honestly. A non-canonical witness on
+//! a version-3 transaction for a block at/after the activation is
+//! `Rejected`: there the canonical witness is the consensus rule (CRY-1) and
+//! a peer one block behind refuses version 3 as non-standard
+//! ([`check_witnesses_for_next_block`]). Rejections other than "missing
+//! inputs", duplicates and rate limiting are remembered in the mempool's
+//! bounded recent-rejects filter until the next block's height or the
 //! selected tip changes, so a peer replaying the same invalid transaction
-//! costs a hash lookup (MEM-5).
+//! costs a hash lookup (MEM-5); a verdict computed before such a change is
+//! never remembered after it (`Mempool::note_rejected_in_epoch`).
 //!
 //! # Which height
 //!
@@ -129,15 +140,18 @@ pub enum AdmissionError {
     /// Consensus-INVALID for this exact transaction: it can never be mined
     /// in any block (bad signature, inputs < outputs, below the consensus
     /// minimum fee, dust, MoneyRange, canonical limits, duplicate inputs, no
-    /// inputs, a coinbase outside a block). The gossip relay reports
-    /// `Reject` and the author is penalised.
+    /// inputs, a coinbase outside a block), or, for a version-3 transaction
+    /// whose next block is at/after the hardening activation, a
+    /// non-canonical witness. The gossip relay reports `Reject` and the
+    /// delivering peer is penalised once no older release can be a peer on
+    /// the chain (`relay::TxRelay`; `Ignore` before that).
     Rejected(String),
     /// Refused by local relay policy only (size above `MAX_TX_SIZE`, no
-    /// outputs, a zero-value output, a non-canonical witness or a
-    /// single-algorithm suite, the version policy) or by a rule whose
-    /// verdict depends on this node's next block height (the version rule,
-    /// the 64-byte rule: [`check_tx_for_next_block`]). The relay reports
-    /// `Ignore`.
+    /// outputs, a zero-value output, a non-canonical witness where it is not
+    /// a consensus rule, a single-algorithm suite, the version policy) or by
+    /// a rule whose verdict depends on this node's next block height (the
+    /// version rule, the 64-byte rule: [`check_tx_for_next_block`]). The
+    /// relay reports `Ignore`.
     NonStandard(String),
     /// An input is neither in the UTXO set nor an output of a pooled
     /// transaction (unknown parent, or already spent by a confirmed
@@ -296,6 +310,8 @@ fn sig_cache() -> &'static parking_lot::Mutex<(HashSet<[u8; 32]>, std::collectio
 ///   regime-specific reasoning above.
 fn sig_cache_key(tx: &Transaction, version: SighashVersion, active: bool, prevouts: &[TxOutput]) -> [u8; 32] {
     use sha3::{Digest, Sha3_256};
+    #[cfg(test)]
+    tests::SIG_KEYS_COMPUTED.with(|c| c.set(c.get() + 1));
     let mut h = Sha3_256::new();
     h.update(b"gnb-sigcache-v4");
     h.update(core::node_chain_id().to_le_bytes());
@@ -376,13 +392,32 @@ pub fn verify_input_scripts_at(
     block_height: u64,
     act: u64,
 ) -> Result<(), String> {
-    let version = core::sighash::check_tx_version(tx.version, block_height, act)?;
-    let witnesses = core::sighash::check_input_witnesses(tx, prevouts, version)?;
+    verify_input_scripts_gated_at(tx, prevouts, block_height, act, &mut |_| Ok(())).map_err(|e| e.to_string())
+}
+
+/// [`verify_input_scripts_at`] with a [`SignatureGate`] called once, right
+/// before the signature math, only on a verified-signature cache MISS (after
+/// the version and witness checks, so a transaction that fails those costs
+/// the gate nothing). The cache key is computed once: admission used to hash
+/// the transaction for [`signatures_cached`] and again here (integration
+/// open issue). A script failure is [`AdmissionError::Rejected`]; a gate
+/// refusal is returned as the gate gave it.
+pub fn verify_input_scripts_gated_at(
+    tx: &Transaction,
+    prevouts: &[TxOutput],
+    block_height: u64,
+    act: u64,
+    gate: &mut SignatureGate<'_>,
+) -> Result<(), AdmissionError> {
+    let version = core::sighash::check_tx_version(tx.version, block_height, act).map_err(AdmissionError::Rejected)?;
+    let witnesses = core::sighash::check_input_witnesses(tx, prevouts, version).map_err(AdmissionError::Rejected)?;
     let key = sig_cache_key(tx, version, core::activation::is_active_at(block_height, act), prevouts);
     if sig_cache().lock().0.contains(&key) {
         return Ok(());
     }
-    core::sighash::verify_input_signatures(tx, prevouts, &witnesses, version, core::node_chain_id())?;
+    gate(tx)?;
+    core::sighash::verify_input_signatures(tx, prevouts, &witnesses, version, core::node_chain_id())
+        .map_err(AdmissionError::Rejected)?;
     let mut g = sig_cache().lock();
     let (set, order) = &mut *g;
     if set.insert(key) {
@@ -468,17 +503,73 @@ fn check_policy(tx: &Transaction) -> Result<(), AdmissionError> {
 ///   consensus-valid (outputs that may already be locked to such keys are not
 ///   frozen) but is non-standard: no new 0x0002 spend enters the pool.
 pub fn check_standard_witnesses(tx: &Transaction) -> Result<(), String> {
+    check_standard_witnesses_classified(tx).map_err(|(_, m)| m)
+}
+
+/// Why [`check_standard_witnesses`] refused a transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WitnessRefusal {
+    /// Some input's `script_sig` is not the canonical witness
+    /// (`core::sighash::canonical_witness`: framing or signature encoding).
+    /// Consensus requires exactly this for a version-3 transaction at/after
+    /// the hardening activation (CRY-1); policy everywhere else.
+    Framing,
+    /// Every witness is canonical, but some public key is not hybrid (suite
+    /// 0x0002 or an unknown key): policy at every height (CRY-2).
+    Suite,
+}
+
+/// [`check_standard_witnesses`] with the kind of refusal. The framing of
+/// EVERY input is checked before any suite, so a transaction that fails both
+/// (on different inputs) is reported as [`WitnessRefusal::Framing`], the
+/// failure that can be a consensus rule.
+pub fn check_standard_witnesses_classified(tx: &Transaction) -> Result<(), (WitnessRefusal, String)> {
+    let mut keys = Vec::with_capacity(tx.inputs.len());
     for (i, inp) in tx.inputs.iter().enumerate() {
         let (_sig, pk) = core::sighash::canonical_witness(&inp.script_sig)
-            .map_err(|e| format!("input {i}: {e} (non-standard)"))?;
+            .map_err(|e| (WitnessRefusal::Framing, format!("input {i}: {e} (non-standard)")))?;
+        keys.push(pk);
+    }
+    for (i, pk) in keys.into_iter().enumerate() {
         if !crate::crypto::is_hybrid_public_key(pk) {
-            return Err(format!(
+            return Err((WitnessRefusal::Suite, format!(
                 "input {i}: single-algorithm signature suite (non-standard; only the hybrid \
                  ML-DSA-65 + Falcon-1024 suite 0x0001 is relayed)"
-            ));
+            )));
         }
     }
     Ok(())
+}
+
+/// Step 4's witness check as an admission verdict for the block at
+/// `next_block_height` (process-wide activation height). Every refusal is
+/// [`AdmissionError::NonStandard`] (relay policy, no penalty) EXCEPT a
+/// non-canonical witness when the canonical witness is the consensus rule
+/// there: the transaction is version 3 and the next block is at/after the
+/// hardening activation (`core::sighash::check_tx_version` selects sighash
+/// v3, whose witness rule is exactly `core::sighash::canonical_witness`,
+/// CRY-1). Such a transaction can never be mined at that height and no
+/// upgraded node relays it (below the activation version 3 is non-standard),
+/// so it is [`AdmissionError::Rejected`]. A suite-0x0002 key stays
+/// `NonStandard` at every height (consensus-valid, CRY-2).
+pub fn check_witnesses_for_next_block(tx: &Transaction, next_block_height: u64) -> Result<(), AdmissionError> {
+    check_witnesses_for_next_block_at(tx, next_block_height, activation_height())
+}
+
+/// [`check_witnesses_for_next_block`] for an explicit activation height.
+pub fn check_witnesses_for_next_block_at(tx: &Transaction, next_block_height: u64, act: u64) -> Result<(), AdmissionError> {
+    match check_standard_witnesses_classified(tx) {
+        Ok(()) => Ok(()),
+        Err((WitnessRefusal::Framing, m))
+            if matches!(core::sighash::check_tx_version(tx.version, next_block_height, act), Ok(SighashVersion::V3)) =>
+        {
+            Err(AdmissionError::Rejected(format!(
+                "{m}: bad-witness: the canonical witness is a consensus rule for version 3 at height \
+                 {next_block_height} (hardening activation {act})"
+            )))
+        }
+        Err((_, m)) => Err(AdmissionError::NonStandard(m)),
+    }
 }
 
 /// Step 5: the version rule AND policy at the next block's height
@@ -576,8 +667,11 @@ pub fn check_transaction_gated(
         // consensus), relayed ones must be standard.
         // Policy, not invalidity (MEM-5 verdicts): a non-canonical witness
         // or a suite-0x0002 key is consensus-valid below the activation, so
-        // the sender is not penalised.
-        check_standard_witnesses(tx).map_err(AdmissionError::NonStandard)?;
+        // the sender is not penalised. The one exception is consensus: a
+        // version-3 transaction for a block at/after the activation must
+        // carry canonical witnesses (CRY-1), so a framing failure there is
+        // `Rejected` (`check_witnesses_for_next_block`).
+        check_witnesses_for_next_block(tx, policy.next_block_height)?;
     }
     // Version rule / policy (CRY-3) and the 64-byte rule (VAL-10), judged at
     // the height of the block the transaction would be mined in: neither a
@@ -657,11 +751,9 @@ pub fn check_transaction_gated(
         && core::activation::is_active_at(policy.next_block_height, activation_height());
     if policy.check_signatures || regime_may_have_changed {
         // Behind the caller's gate (MEM-5: the relay's per-connection
-        // budget), charged only when the work is not already cached.
-        if !signatures_cached(tx, &prevouts, policy.next_block_height) {
-            gate(tx)?;
-        }
-        verify_input_scripts(tx, &prevouts, policy.next_block_height).map_err(AdmissionError::Rejected)?;
+        // budget), charged only when the work is not already cached; one
+        // cache-key computation for the lookup and the insertion.
+        verify_input_scripts_gated_at(tx, &prevouts, policy.next_block_height, activation_height(), gate)?;
     }
     Ok(fee)
 }
@@ -700,11 +792,16 @@ pub fn admit_gated(
     policy: &AdmissionPolicy,
     gate: &mut SignatureGate<'_>,
 ) -> Result<AddOutcome, AdmissionError> {
+    // The filter's epoch BEFORE any state is read: a verdict computed against
+    // a next height or a tip that changed meanwhile (the change clears the
+    // filter and starts a new epoch) is not remembered, so it can never be
+    // replayed at the new height (review finding).
+    let epoch = mempool.recent_rejects_epoch();
     let fee = match check_transaction_gated(store, Some(mempool), &tx, policy, gate) {
         Ok(fee) => fee,
         Err(e) => {
             if policy.use_reject_filter && e.is_cacheable() {
-                mempool.note_rejected(wtxid(&tx));
+                mempool.note_rejected_in_epoch(wtxid(&tx), epoch);
             }
             return Err(e);
         }
@@ -754,4 +851,104 @@ pub fn has_missing_input(store: &Storage, mempool: &Mempool, tx: &Transaction) -
 /// sweep (a parent that is neither cannot have made its child admissible).
 pub fn parent_available(store: &Storage, mempool: &Mempool, txid: &[u8; 32]) -> bool {
     mempool.contains(txid) || matches!(store.get_tx_location(txid), Ok(Some(_)))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::core::TxInput;
+    use sha3::{Digest, Sha3_256};
+
+    thread_local! {
+        /// Signature-cache keys computed on this thread ([`sig_cache_key`]).
+        pub(crate) static SIG_KEYS_COMPUTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    fn keys_computed() -> u64 {
+        SIG_KEYS_COMPUTED.with(|c| c.get())
+    }
+
+    fn signed(sk: &[u8], pk: &[u8], prev: [u8; 32]) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: prev, prev_index: 0, script_sig: vec![], sequence: u32::MAX }],
+            outputs: vec![TxOutput { value: 900_000, script_pubkey: vec![0x01; 20] }],
+            locktime: 0,
+        };
+        let sig = crate::crypto::sign(sk, &tx.sighash(0, core::node_chain_id())).expect("sign");
+        tx.inputs[0].script_sig = Transaction::build_script_sig(&sig, pk);
+        tx
+    }
+
+    /// Integration open issue: admission hashed the whole transaction twice
+    /// for the verified-signature cache on a miss (`signatures_cached`, then
+    /// `verify_input_scripts`). Now one key per admission, hit or miss; the
+    /// gate (the relay's signature budget) is called only on a miss, and
+    /// never for a transaction whose witnesses already fail (pubkey not
+    /// matching the spent script): those cost the budget nothing.
+    #[test]
+    fn admission_computes_the_signature_cache_key_once_and_gates_only_signature_math() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = Storage::open(&tmp.path().join("db")).expect("storage");
+        let (pk, sk) = crate::crypto::generate_keypair();
+        let spk = Sha3_256::digest(&pk)[..20].to_vec();
+        store.put_utxo(&[0x11; 32], 0, &TxOutput { value: 1_000_000, script_pubkey: spk }).unwrap();
+        store.put_utxo(&[0x12; 32], 0, &TxOutput { value: 1_000_000, script_pubkey: vec![0x77; 20] }).unwrap();
+        let policy = AdmissionPolicy::relay(1);
+        let mut gate_calls = 0u32;
+
+        let tx = signed(&sk, &pk, [0x11; 32]);
+        let before = keys_computed();
+        check_transaction_gated(&store, None, &tx, &policy, &mut |_| { gate_calls += 1; Ok(()) }).expect("valid");
+        assert_eq!(keys_computed() - before, 1, "one key for the lookup AND the insertion");
+        assert_eq!(gate_calls, 1, "a miss is gated");
+
+        let before = keys_computed();
+        check_transaction_gated(&store, None, &tx, &policy, &mut |_| { gate_calls += 1; Ok(()) }).expect("valid");
+        assert_eq!(keys_computed() - before, 1);
+        assert_eq!(gate_calls, 1, "a cache hit is not gated");
+
+        // A spend of an output locked to another key: refused by the witness
+        // check, before any key or gate.
+        let wrong = signed(&sk, &pk, [0x12; 32]);
+        let before = keys_computed();
+        let err = check_transaction_gated(&store, None, &wrong, &policy, &mut |_| { gate_calls += 1; Ok(()) }).unwrap_err();
+        assert!(matches!(&err, AdmissionError::Rejected(m) if m.contains("pubkey mismatch")), "{err}");
+        assert_eq!(keys_computed() - before, 0);
+        assert_eq!(gate_calls, 1, "the budget is not charged for a witness failure");
+
+        // A refusing gate aborts before the signature math, with its error.
+        let mut fresh = signed(&sk, &pk, [0x11; 32]);
+        fresh.outputs[0].value -= 1; // another txid: a cache miss
+        let sig = crate::crypto::sign(&sk, &fresh.sighash(0, core::node_chain_id())).unwrap();
+        fresh.inputs[0].script_sig = Transaction::build_script_sig(&sig, &pk);
+        let err = check_transaction_gated(&store, None, &fresh, &policy,
+            &mut |_| Err(AdmissionError::RateLimited("budget".into()))).unwrap_err();
+        assert_eq!(err, AdmissionError::RateLimited("budget".into()));
+        assert!(!signatures_cached(&fresh, &[store.get_utxo(&[0x11; 32], 0).unwrap().unwrap()], 1));
+    }
+
+    /// Review finding (P4 merge): the witness verdict depends on whether the
+    /// canonical witness is the consensus rule at the next block's height.
+    #[test]
+    fn non_canonical_witness_is_rejected_only_where_consensus_requires_it() {
+        let (pk, sk) = crate::crypto::generate_keypair();
+        let mut v3 = signed(&sk, &pk, [0x13; 32]);
+        v3.version = core::sighash::TX_VERSION_V3;
+        v3.inputs[0].script_sig.push(0); // trailing byte: non-canonical framing
+        let mut v1 = v3.clone();
+        v1.version = 1;
+        const ACT: u64 = 10;
+        // At/after the activation, version 3: consensus-invalid.
+        for h in [ACT, ACT + 1] {
+            let err = check_witnesses_for_next_block_at(&v3, h, ACT).unwrap_err();
+            assert!(matches!(&err, AdmissionError::Rejected(m) if m.contains("bad-witness")), "{err}");
+        }
+        // Below it (version 3 is v2 there), or another version: policy.
+        let err = check_witnesses_for_next_block_at(&v3, ACT - 1, ACT).unwrap_err();
+        assert!(matches!(err, AdmissionError::NonStandard(_)), "{err}");
+        let err = check_witnesses_for_next_block_at(&v1, ACT, ACT).unwrap_err();
+        assert!(matches!(err, AdmissionError::NonStandard(_)), "{err}");
+        assert_eq!(check_witnesses_for_next_block_at(&signed(&sk, &pk, [0x13; 32]), ACT, ACT), Ok(()));
+    }
 }

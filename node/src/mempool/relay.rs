@@ -26,12 +26,22 @@
 //!   out of budget is answered `Ignore` without any signature work; its
 //!   bucket and its orphans are dropped when it disconnects;
 //! * the verdict is `Accept` (relayed by gossipsub) only for a transaction
-//!   that entered the pool; `Reject` (not relayed, the delivering peer takes
-//!   gossipsub's invalid-message penalty — the author, since honest relays no
-//!   longer forward invalid frames) for a malformed frame or a
-//!   consensus-invalid transaction; `Ignore` (not relayed, not penalised) for
-//!   policy refusals, duplicates, recently rejected ids, missing inputs and
-//!   rate limiting;
+//!   that entered the pool; `Ignore` (not relayed, not penalised) for policy
+//!   refusals, duplicates, recently rejected ids, missing inputs and rate
+//!   limiting; for a malformed frame or a consensus-invalid transaction it is
+//!   `Reject` (not relayed, the delivering peer takes gossipsub's
+//!   invalid-message penalty) ONLY once no older release can be an honest
+//!   peer on the node's chain ([`TxRelay::penalties_in_force`]): every
+//!   release before this one forwards every `NewTransaction` frame on the
+//!   same topic without validating it, so until the chain contains the
+//!   hardening activation block (which those releases reject, see
+//!   docs/CONSENSUS.md, "Relay policy") an invalid frame can come from an
+//!   honest relay, and `Reject` would let an attacker get it graylisted by
+//!   every upgraded peer (review finding). Such a frame is answered `Ignore`
+//!   there (still not relayed, still cached in the recent-rejects filter);
+//!   from the block after the activation every peer that follows the chain
+//!   validates before forwarding, so an invalid frame comes from its author
+//!   and `Reject` lands on it;
 //! * a transaction with missing inputs is kept in the bounded orphanage
 //!   ([`super::orphanage`], keyed by wtxid) and re-tried when a parent
 //!   enters the pool or a block confirms one (only the children of those
@@ -40,10 +50,14 @@
 //!   ([`DeferredVerdicts`], keyed by the frame's WTXID, timed from the
 //!   frame's arrival) and settles it from the [`OrphanEvents`] the relay
 //!   returns: `Accept` when exactly those bytes are admitted, `Reject` when
-//!   their re-try proves them consensus-invalid (or, once the frame left
-//!   gossipsub's cache, an application-score penalty on the connection that
-//!   delivered them), `Ignore` when the orphan is evicted, expires or is
-//!   erased. Every admitted orphan is also re-announced by the node after
+//!   their re-try proves them consensus-invalid while penalties are in force
+//!   (or, once the frame left gossipsub's cache, an application-score
+//!   penalty on the connection that delivered them), `Ignore` when the
+//!   orphan is evicted, expires, is erased, or proves invalid before
+//!   penalties are in force. Orphans are erased and re-tried after a block
+//!   only for the transactions the APPLIED chain gained or lost
+//!   ([`TxRelay::on_chain_moved`]; a fork-loser applies none, as for the
+//!   mempool). Every admitted orphan is also re-announced by the node after
 //!   [`REANNOUNCE_DELAY`], so one admitted after its frame left gossipsub's
 //!   cache still propagates.
 
@@ -93,13 +107,22 @@ pub const REANNOUNCE_DELAY: Duration = Duration::from_secs(35);
 /// Bound on deferred verdicts and scheduled re-announcements.
 pub const MAX_DEFERRED: usize = 1024;
 
-/// Gossip verdict for an admission error: `Reject` only for
-/// consensus-invalid transactions (no honest node can relay them, so the
-/// penalty lands on the author), `Ignore` for everything that is local
-/// policy or state (duplicates, recent rejects, missing inputs, fees,
-/// replacement and chain limits, rate limits, a full pool).
+/// Gossip verdict for an admission error once penalties are in force
+/// ([`TxRelay::penalties_in_force`]): `Reject` only for consensus-invalid
+/// transactions (no upgraded node relays them, so the penalty lands on the
+/// author), `Ignore` for everything that is local policy or state
+/// (duplicates, recent rejects, missing inputs, fees, replacement and chain
+/// limits, rate limits, a full pool). Before that,
+/// [`verdict_for_admission_error_at`] answers `Ignore` for every error.
 pub fn verdict_for_admission_error(e: &AdmissionError) -> GossipVerdict {
-    if e.is_consensus_invalid() {
+    verdict_for_admission_error_at(e, true)
+}
+
+/// [`verdict_for_admission_error`] with the penalty gate: `penalise =
+/// false` (an older, non-validating release may still be an honest peer on
+/// the chain) turns `Reject` into `Ignore`.
+pub fn verdict_for_admission_error_at(e: &AdmissionError, penalise: bool) -> GossipVerdict {
+    if e.is_consensus_invalid() && penalise {
         GossipVerdict::Reject
     } else {
         GossipVerdict::Ignore
@@ -123,7 +146,9 @@ pub struct RejectedOrphan {
 pub struct OrphanEvents {
     /// Orphans that entered the pool, parents first (announce them).
     pub admitted: Vec<Transaction>,
-    /// Orphans whose re-try proved them consensus-invalid.
+    /// Orphans whose re-try proved them consensus-invalid while penalties
+    /// are in force ([`TxRelay::penalties_in_force`]; before that such an
+    /// orphan is reported in `dropped`).
     pub rejected: Vec<RejectedOrphan>,
     /// Wtxids of orphans that left the orphanage without a verdict
     /// (evicted, expired, erased by a block or a disconnect, another
@@ -148,6 +173,10 @@ impl OrphanEvents {
 pub struct GossipTxOutcome {
     /// The verdict to report for the gossip frame.
     pub verdict: GossipVerdict,
+    /// The frame was malformed or its transaction consensus-invalid,
+    /// whatever the verdict (`Reject` once penalties are in force, `Ignore`
+    /// before).
+    pub invalid: bool,
     /// Human-readable reason (logs).
     pub detail: String,
     /// The frame's transaction was buffered as an orphan: the caller should
@@ -164,7 +193,21 @@ pub struct GossipTxOutcome {
 
 impl GossipTxOutcome {
     fn verdict(verdict: GossipVerdict, detail: impl Into<String>) -> Self {
-        Self { verdict, detail: detail.into(), orphaned: false, wtxid: [0u8; 32], orphans: OrphanEvents::default() }
+        Self { verdict, invalid: false, detail: detail.into(), orphaned: false, wtxid: [0u8; 32], orphans: OrphanEvents::default() }
+    }
+
+    /// A malformed frame or a consensus-invalid transaction: `Reject` when
+    /// `penalise`, else `Ignore` (see [`TxRelay::penalties_in_force`]).
+    fn invalid(penalise: bool, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        let (verdict, detail) = if penalise {
+            (GossipVerdict::Reject, detail)
+        } else {
+            (GossipVerdict::Ignore, format!(
+                "{detail} (not penalised: an older release that forwards transaction frames unvalidated \
+                 can still be an honest peer on this chain)"))
+        };
+        Self { invalid: true, ..Self::verdict(verdict, detail) }
     }
 }
 
@@ -322,6 +365,14 @@ impl<O> DeferredVerdicts<O> {
     }
 }
 
+/// The default [`TxRelay::penalty_height`] for a hardening activation at
+/// `activation_height`: the block AFTER the activation block, the first next
+/// block whose parent chain no older release accepts. Saturating, so
+/// `activation::NEVER` never penalises.
+pub fn default_penalty_height(activation_height: u64) -> u64 {
+    activation_height.saturating_add(1)
+}
+
 /// Per-node transaction-relay state: per-connection signature budgets and
 /// the orphanage. Owned by the message processor.
 pub struct TxRelay {
@@ -330,6 +381,9 @@ pub struct TxRelay {
     /// Round-robin position of the periodic sweep (an orphan sequence
     /// number).
     sweep_cursor: u64,
+    /// The smallest next-block height at which invalid transaction frames
+    /// are penalised ([`Self::penalties_in_force`]).
+    penalty_height: u64,
 }
 
 impl Default for TxRelay {
@@ -349,7 +403,48 @@ impl TxRelay {
             budget: TokenBuckets::new(burst, refill_per_sec, SIG_BUDGET_TRACK_CAP),
             orphans: TxOrphanage::new(orphan_limits),
             sweep_cursor: 0,
+            penalty_height: default_penalty_height(crate::core::activation::hardening_activation_height()),
         }
+    }
+
+    /// Penalise invalid frames from next-block height `height` on instead of
+    /// the default ([`default_penalty_height`] of the process-wide hardening
+    /// activation, read at construction). `0` penalises at every height:
+    /// tests of the post-rollout verdicts on chains below the activation.
+    pub fn with_penalty_height(mut self, height: u64) -> Self {
+        self.penalty_height = height;
+        self
+    }
+
+    /// The smallest next-block height at which invalid frames are penalised.
+    pub fn penalty_height(&self) -> u64 {
+        self.penalty_height
+    }
+
+    /// True iff a malformed frame or a consensus-invalid transaction judged
+    /// for the block at `next_block_height` is answered `Reject` (and an
+    /// invalid orphan penalised): iff the node's chain already contains the
+    /// hardening activation block, i.e. `next_block_height > activation`.
+    ///
+    /// Why (review finding): every release before this one forwards every
+    /// `NewTransaction` frame without validating it, on the same topic
+    /// (`gnb/txs/1`). `Reject` charges gossipsub's invalid-message penalty to
+    /// the delivering peer and to every peer that delivered a duplicate;
+    /// with the transaction topic's weights about six invalid frames within
+    /// a minute or two push a peer below the graylist threshold, after which
+    /// all its gossip, blocks included, is ignored. While such a release can
+    /// be an honest peer on the chain, an attacker could have every upgraded
+    /// node graylist every non-upgraded one by sending it a few garbage
+    /// frames, splitting the network during the rollout. Those releases
+    /// cannot accept the activation block (tagged Merkle root, sighash v3,
+    /// docs/CONSENSUS.md), so from the block after it every peer on the
+    /// chain validates transaction frames before forwarding them and an
+    /// invalid frame is delivered only by its author. Before that the frame
+    /// is answered `Ignore`: still never forwarded, still remembered in the
+    /// recent-rejects filter, and still charged to the delivering
+    /// connection's signature budget.
+    pub fn penalties_in_force(&self, next_block_height: u64) -> bool {
+        next_block_height >= self.penalty_height
     }
 
     /// The orphanage (read-only).
@@ -390,13 +485,14 @@ impl TxRelay {
             return done(GossipTxOutcome::verdict(GossipVerdict::Ignore,
                 format!("transaction of {} bytes exceeds the relay limit {}", tx_data.len(), MAX_TX_SIZE)), events);
         }
+        let penalise = self.penalties_in_force(next_block_height);
         let tx = match admission::decode_tx_strict(tx_data) {
             Ok(t) => t,
-            Err(e) => return done(GossipTxOutcome::verdict(GossipVerdict::Reject, format!("malformed transaction: {}", e)), events),
+            Err(e) => return done(GossipTxOutcome::invalid(penalise, format!("malformed transaction: {}", e)), events),
         };
         let txid = tx.txid();
         if txid != *claimed_txid {
-            return done(GossipTxOutcome::verdict(GossipVerdict::Reject,
+            return done(GossipTxOutcome::invalid(penalise,
                 format!("frame claims txid {} but the transaction hashes to {}",
                     hex::encode(&claimed_txid[..8]), hex::encode(&txid[..8]))), events);
         }
@@ -436,19 +532,16 @@ impl TxRelay {
                 o.orphaned = orphaned;
                 o
             }
-            Err(e) => GossipTxOutcome::verdict(verdict_for_admission_error(&e), e.to_string()),
+            Err(e) if e.is_consensus_invalid() => GossipTxOutcome::invalid(penalise, e.to_string()),
+            Err(e) => GossipTxOutcome::verdict(verdict_for_admission_error_at(&e, penalise), e.to_string()),
         };
         out.wtxid = wtxid;
         done(out, events)
     }
 
-    /// After a block connected: drop orphans it confirmed (in any encoding)
-    /// or conflicts with, expire stale ones, then re-try ONLY the orphans
-    /// waiting on a transaction of the block (Bitcoin Core's work set; the
-    /// review found the previous full scan of the orphanage — one storage
-    /// read per orphan input — on every block's relay path). Orphans whose
-    /// parent arrived through another path are found by the periodic
-    /// [`Self::retry_orphans`] sweep.
+    /// After ONE block was connected to the applied chain (no reorg):
+    /// [`Self::on_chain_moved`] with `block_txs` connected and nothing
+    /// disconnected.
     #[allow(clippy::too_many_arguments)]
     pub fn on_block_connected(
         &mut self,
@@ -459,8 +552,41 @@ impl TxRelay {
         now: Instant,
         now_unix: u64,
     ) -> OrphanEvents {
-        let confirmed: Vec<[u8; 32]> = block_txs.iter().map(|t| t.txid()).collect();
-        let spent: Vec<([u8; 32], u32)> = block_txs.iter()
+        self.on_chain_moved(store, mempool, next_block_height, block_txs, &[], now, now_unix)
+    }
+
+    /// After the APPLIED chain moved (`accept::ChainMove`): `connected_txs`
+    /// are the transactions of the blocks it gained, `disconnected_txs` the
+    /// non-coinbase transactions of the blocks it lost (re-injected into the
+    /// pool by the acceptance pipeline). Drops orphans the connected blocks
+    /// confirmed (in any encoding) or conflict with, expires stale ones, then
+    /// re-tries ONLY the orphans waiting on one of those transactions
+    /// (Bitcoin Core's work set; the review found the previous full scan of
+    /// the orphanage — one storage read per orphan input — on every block's
+    /// relay path): a confirmed parent, or a disconnected one now back in
+    /// the pool. Orphans whose parent arrived through another path are found
+    /// by the periodic [`Self::retry_orphans`] sweep.
+    ///
+    /// Review finding: the caller passed the ARRIVING block's transactions
+    /// for every accepted block, fork-losers and merge candidates included,
+    /// and ignored the other blocks of a reorg. Under the selected-chain-only
+    /// ledger such a block applies nothing, so a valid orphan whose input a
+    /// side block spent (or that a side block contained) was erased while
+    /// its input was still unspent; only the applied chain's movement counts
+    /// now, exactly as for the mempool (`accept::update_mempool_after_connect`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_chain_moved(
+        &mut self,
+        store: &Storage,
+        mempool: &Mempool,
+        next_block_height: u64,
+        connected_txs: &[Transaction],
+        disconnected_txs: &[Transaction],
+        now: Instant,
+        now_unix: u64,
+    ) -> OrphanEvents {
+        let confirmed: Vec<[u8; 32]> = connected_txs.iter().map(|t| t.txid()).collect();
+        let spent: Vec<([u8; 32], u32)> = connected_txs.iter()
             .filter(|t| !t.is_coinbase())
             .flat_map(|t| t.inputs.iter().map(|i| (i.prev_txid, i.prev_index)))
             .collect();
@@ -468,7 +594,9 @@ impl TxRelay {
         events.dropped.extend(self.orphans.expire(now_unix));
         let policy = AdmissionPolicy::relay(next_block_height);
         let mut budget = MAX_ORPHAN_RETRY_INPUTS_PER_EVENT;
-        let resolved = self.resolve_orphans(store, mempool, &policy, confirmed, now, &mut budget);
+        let mut roots = confirmed;
+        roots.extend(disconnected_txs.iter().map(|t| t.txid()));
+        let resolved = self.resolve_orphans(store, mempool, &policy, roots, now, &mut budget);
         events.absorb(resolved);
         events
     }
@@ -607,8 +735,16 @@ impl TxRelay {
                 None
             }
             Err(e) if e.is_consensus_invalid() => {
-                log::debug!("orphan {} invalid on re-try: {}", hex::encode(&wtxid[..8]), e);
-                events.rejected.push(RejectedOrphan { txid: o.txid, wtxid: *wtxid, peer: o.peer, reason: e.to_string() });
+                if self.penalties_in_force(policy.next_block_height) {
+                    log::debug!("orphan {} invalid on re-try: {}", hex::encode(&wtxid[..8]), e);
+                    events.rejected.push(RejectedOrphan { txid: o.txid, wtxid: *wtxid, peer: o.peer, reason: e.to_string() });
+                } else {
+                    // Its frame is answered Ignore and its connection is not
+                    // penalised: see `penalties_in_force`.
+                    log::debug!("orphan {} invalid on re-try (not penalised before the activation block): {}",
+                        hex::encode(&wtxid[..8]), e);
+                    events.dropped.push(*wtxid);
+                }
                 None
             }
             Err(e) => {

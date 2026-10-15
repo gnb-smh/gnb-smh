@@ -108,6 +108,11 @@ impl Rng {
 /// and consensus-invalid transactions (bad signature, inputs < outputs, dust);
 /// Ignore for policy refusals, duplicates, recently rejected ids and missing
 /// inputs. Pre-fix every decodable frame was relayed (`Deliver(Accept)`).
+///
+/// These are the verdicts once penalties are in force (the relay built with
+/// `with_penalty_height(0)`); on a chain without the hardening activation
+/// block the same malformed / invalid frames are answered `Ignore`
+/// (`relay_penalties_start_with_the_block_after_the_activation`).
 #[test]
 fn mem5_gossip_tx_verdicts_follow_admission() {
     let genesis = mk_genesis(unix_now() - 10_000);
@@ -115,7 +120,7 @@ fn mem5_gossip_tx_verdicts_follow_admission() {
     let funds: Vec<_> = (0..6u8).map(|i| ([0x50 + i; 32], 0u32, out(1_000_000, &k.spk))).collect();
     let n = node_with(&genesis, &funds);
     let next = admission::next_block_height(&n.dag.read());
-    let mut relay = TxRelay::new();
+    let mut relay = TxRelay::new().with_penalty_height(0);
     let author = Some(PeerId::random());
     let t0 = Instant::now();
     let mut go = |claim: &[u8; 32], bytes: &[u8]| relay.on_gossip_tx(&n.store, &n.mempool, next, claim, bytes, author, t0, unix_now());
@@ -192,7 +197,8 @@ fn mem5_signature_work_is_last_and_budgeted_per_connection() {
     let funds: Vec<_> = (0..10u8).map(|i| ([0x70 + i; 32], 0u32, out(1_000_000, &k.spk))).collect();
     let n = node_with(&genesis, &funds);
     let next = admission::next_block_height(&n.dag.read());
-    let mut relay = TxRelay::with_limits(3, 0.0, OrphanLimits::default());
+    // Penalties in force (see mem5_gossip_tx_verdicts_follow_admission).
+    let mut relay = TxRelay::with_limits(3, 0.0, OrphanLimits::default()).with_penalty_height(0);
     let (a, b) = (Some(PeerId::random()), Some(PeerId::random()));
     let t0 = Instant::now();
     let go = |relay: &mut TxRelay, tx: &Transaction, p: Option<PeerId>| {
@@ -428,7 +434,8 @@ fn mem5_orphan_quotas_and_budget_follow_the_connection_not_the_author() {
     // (b) The re-try signature work: five 3-input orphans with bad scripts,
     // under five fresh authors, all waiting on one cheap parent. A bucket
     // of 10 verifies three of them (9 tokens); the other two wait.
-    let mut relay = TxRelay::with_limits(10, 0.0, OrphanLimits::default());
+    // Penalties in force: invalid re-tries are reported as `rejected`.
+    let mut relay = TxRelay::with_limits(10, 0.0, OrphanLimits::default()).with_penalty_height(0);
     let p = signed_spend(&k, &[(fund.0, 0)], (0..15).map(|_| out(600_000, &k.spk)).collect());
     for j in 0..5u32 {
         let t = junk_signed(&w, &[(p.txid(), 3 * j), (p.txid(), 3 * j + 1), (p.txid(), 3 * j + 2)], &[1_700_000], 0x60 + j as u8);
@@ -465,7 +472,10 @@ fn mem6_invalid_orphan_on_retry_is_rejected_or_penalised() {
     let fund = ([0x6Au8; 32], 0u32, out(10_000_000, &k.spk));
     let n = node_with(&genesis, std::slice::from_ref(&fund));
     let next = admission::next_block_height(&n.dag.read());
-    let mut relay = TxRelay::new();
+    // Penalties in force; before the activation block the invalid orphan is
+    // dropped (frame Ignore, no penalty):
+    // relay_penalties_start_with_the_block_after_the_activation.
+    let mut relay = TxRelay::new().with_penalty_height(0);
     let (x, y) = (PeerId::random(), PeerId::random());
     let t0 = Instant::now();
     let parent = signed_spend(&k, &[(fund.0, 0)], vec![out(4_000_000, &k.spk), out(4_000_000, &k.spk)]);
@@ -519,7 +529,8 @@ fn mem6_junk_signature_copy_neither_shadows_nor_releases_the_genuine_child() {
     let n = node_with(&genesis, &funds);
     let next = admission::next_block_height(&n.dag.read());
     let limits = OrphanLimits { max_entries_per_peer: 3, ..OrphanLimits::default() };
-    let mut relay = TxRelay::with_limits(400, 20.0, limits);
+    // Penalties in force (the junk copy's frame is answered Reject in (3)).
+    let mut relay = TxRelay::with_limits(400, 20.0, limits).with_penalty_height(0);
     let (attacker, honest) = (PeerId::random(), PeerId::random());
     let t0 = Instant::now();
     let w = junk_witness(&k);
@@ -686,7 +697,8 @@ fn mem6_orphan_retry_work_per_event_is_bounded_by_inputs() {
     let fund = ([0x9Eu8; 32], 0u32, out(20_000_000, &k.spk));
     let n = node_with(&genesis, std::slice::from_ref(&fund));
     let next = admission::next_block_height(&n.dag.read());
-    let mut relay = TxRelay::new();
+    // Penalties in force: the invalid re-tries are counted as `rejected`.
+    let mut relay = TxRelay::new().with_penalty_height(0);
     let t0 = Instant::now();
     let w = junk_witness(&k);
     let p = signed_spend(&k, &[(fund.0, 0)], (0..450).map(|_| out(30_000, &k.spk)).collect());
@@ -1112,9 +1124,13 @@ fn mem6_full_rbf_through_admission_and_relay() {
 /// refusals — the version policy, non-canonical witnesses — and the rules
 /// whose verdict depends on this node's next block height (a version-1
 /// transaction once the next block is at the activation) are `Ignore`: a
-/// peer running an older release, or one block behind across the
-/// activation, relays such a transaction honestly, so it is never penalised.
-/// An invalid sighash-v3 signature is consensus-invalid: `Reject`.
+/// peer one block behind across the activation relays such a transaction
+/// honestly, so it is never penalised. An invalid sighash-v3 signature is
+/// consensus-invalid: `Reject` — from the block after the activation block
+/// on. While the next block IS the activation block an older release that
+/// forwards every frame unvalidated can still be an honest peer on the
+/// chain, so the same frame is answered `Ignore` (review finding on the P4
+/// merge: no penalty for honest relays of an older release).
 #[test]
 fn merge_p2_policy_refusals_are_ignored_and_invalid_v3_signatures_rejected() {
     let k = key();
@@ -1147,24 +1163,37 @@ fn merge_p2_policy_refusals_are_ignored_and_invalid_v3_signatures_rejected() {
     // At the activation: the next block is 1, the activation 1.
     {
         let _g = core::activation::scoped_override(1);
-        let n = node_with(&mk_genesis(unix_now() - 10_000), &funds);
+        let genesis = mk_genesis(unix_now() - 10_000);
+        let n = node_with(&genesis, &funds);
         let next = admission::pool_next_height(&n.dag.read(), &n.store, &n.mempool);
         assert_eq!(next, 1);
         let mut relay = TxRelay::new();
+        assert_eq!(relay.penalty_height(), 2, "the block after the activation block");
         let t0 = Instant::now();
-        let mut go = |tx: &Transaction| {
+        let go = |relay: &mut TxRelay, next: u64, tx: &Transaction| {
             relay.on_gossip_tx(&n.store, &n.mempool, next, &tx.txid(), &wire(tx), Some(PeerId::random()), t0, unix_now())
         };
         let v1 = signed_spend(&k, &[(funds[0].0, 0)], pay(0xC7));
-        let o = go(&v1);
+        let o = go(&mut relay, next, &v1);
         assert_eq!(o.verdict, GossipVerdict::Ignore, "a height rule is not grounds for a penalty: {}", o.detail);
-        assert!(o.detail.contains("bad-txns-version"), "{}", o.detail);
+        assert!(!o.invalid && o.detail.contains("bad-txns-version"), "{}", o.detail);
         let other = signed_spend_at(&k, &[(funds[2].0, 0)], std::slice::from_ref(&funds[2].2), pay(0xC8), 1);
         let mut bad = signed_spend_at(&k, &[(funds[1].0, 0)], std::slice::from_ref(&funds[1].2), pay(0xC9), 1);
         bad.inputs[0].script_sig = other.inputs[0].script_sig.clone(); // canonical, but for another tx
-        let o = go(&bad);
+        let o = go(&mut relay, next, &bad);
+        assert!(o.invalid, "consensus-invalid: {}", o.detail);
+        assert_eq!(o.verdict, GossipVerdict::Ignore, "the activation block is not in the chain yet: {}", o.detail);
+        assert!(!n.mempool.contains(&bad.txid()));
+
+        // The activation block: from the next block on, invalid frames are
+        // penalised.
+        accept(&n, &empty_child(&n, genesis.block_hash(), "activation-block")).unwrap();
+        let next = admission::pool_next_height(&n.dag.read(), &n.store, &n.mempool);
+        assert_eq!(next, 2);
+        let o = go(&mut relay, next, &bad);
+        assert!(o.invalid);
         assert_eq!(o.verdict, GossipVerdict::Reject, "{}", o.detail);
-        assert_eq!(go(&other).verdict, GossipVerdict::Accept);
+        assert_eq!(go(&mut relay, next, &other).verdict, GossipVerdict::Accept);
     }
 }
 
@@ -1173,7 +1202,10 @@ fn merge_p2_policy_refusals_are_ignored_and_invalid_v3_signatures_rejected() {
 /// spending a POOLED parent those are the parent's output. The child that
 /// overtakes its parent is buffered as an orphan (its witness is standard)
 /// and admitted when the parent arrives; a child signed over a wrong amount
-/// is consensus-invalid (`Reject`). The template at the activation height
+/// is consensus-invalid (answered `Ignore` here: the next block is the
+/// activation block, so an older release can still be an honest relay; see
+/// `merge_p2_policy_refusals_are_ignored_and_invalid_v3_signatures_rejected`
+/// for `Reject` after it). The template at the activation height
 /// mines the package parent first (the self-check verifies the child against
 /// the in-template parent's output), with the hardening coinbase commitment,
 /// and the block is valid.
@@ -1206,7 +1238,8 @@ fn merge_v3_chain_in_the_pool_is_verified_against_the_parent_outputs() {
     assert!(admission::signatures_cached(&child, std::slice::from_ref(&parent.outputs[0]), next),
         "verified against the pooled parent's output");
     let o = go(&bad_child);
-    assert_eq!(o.verdict, GossipVerdict::Reject, "{}", o.detail);
+    assert!(o.invalid, "{}", o.detail);
+    assert_eq!(o.verdict, GossipVerdict::Ignore, "next block = the activation block: not penalised yet: {}", o.detail);
     assert!(!n.mempool.contains(&bad_child.txid()));
     n.mempool.debug_check_invariants().unwrap();
 
@@ -1265,6 +1298,220 @@ fn merge_reorg_reinjects_a_v3_chain_oldest_first_and_reverifies_it() {
     let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
     assert_eq!(tmpl.transactions.iter().map(|(t, _)| t.txid()).collect::<Vec<_>>(), vec![tx1.txid(), p.txid()]);
     assert_eq!(tmpl.evicted, 0);
+}
+
+// ── Review of the P4 merge ───────────────────────────────────────────────────
+
+/// Review finding (relay penalties during the rollout): every release before
+/// this one forwards every `NewTransaction` frame unvalidated on the same
+/// topic, so while such a release can be an honest peer on the chain (until
+/// the chain contains the hardening activation block, which it rejects) a
+/// malformed or consensus-invalid frame is answered `Ignore` — never
+/// forwarded, still cached in the recent-rejects filter, but no gossipsub
+/// penalty that an attacker could aim at an honest old relay (about six
+/// invalid frames graylist a peer). From the block after the activation
+/// block on, `Reject` (the default relay's penalty height is the activation
+/// height + 1). Pre-fix: `Reject` at every height.
+#[test]
+fn relay_penalties_start_with_the_block_after_the_activation() {
+    use gnb::mempool::relay::{DeferredVerdicts, default_penalty_height};
+    assert_eq!(default_penalty_height(core::activation::NEVER), u64::MAX, "never activated: never penalised");
+    assert_eq!(default_penalty_height(0), 1);
+
+    // Mainnet schedule (no chain id in tests): next block 1, far below it.
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let k = key();
+    let funds: Vec<_> = (0..3u8).map(|i| ([0x2A + i; 32], 0u32, out(1_000_000, &k.spk))).collect();
+    let n = node_with(&genesis, &funds);
+    let next = admission::pool_next_height(&n.dag.read(), &n.store, &n.mempool);
+    assert_eq!(next, 1);
+    let mut relay = TxRelay::new();
+    assert_eq!(relay.penalty_height(), core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT + 1);
+    assert!(!relay.penalties_in_force(next));
+    let t0 = Instant::now();
+    let go = |relay: &mut TxRelay, claim: &[u8; 32], bytes: &[u8]| {
+        relay.on_gossip_tx(&n.store, &n.mempool, next, claim, bytes, Some(PeerId::random()), t0, unix_now())
+    };
+    let good = signed_spend(&k, &[(funds[0].0, 0)], vec![out(900_000, &[0x01; 20])]);
+    let mut padded = wire(&good);
+    padded.push(0);
+    let mut bad_sig = signed_spend(&k, &[(funds[1].0, 0)], vec![out(900_000, &[0x02; 20])]);
+    bad_sig.inputs[0].script_sig[10] ^= 0xFF;
+    let frames: Vec<([u8; 32], Vec<u8>, &str)> = vec![
+        ([7u8; 32], vec![0xFF; 64], "undecodable"),
+        (good.txid(), padded, "trailing bytes"),
+        ([9u8; 32], wire(&good), "claimed txid mismatch"),
+        (bad_sig.txid(), wire(&bad_sig), "bad signature"),
+    ];
+    for (claim, bytes, what) in &frames {
+        let o = go(&mut relay, claim, bytes);
+        assert!(o.invalid, "{what}: {}", o.detail);
+        assert_eq!(o.verdict, GossipVerdict::Ignore, "{what}: an old release may have relayed it honestly: {}", o.detail);
+    }
+    let o = go(&mut relay, &bad_sig.txid(), &wire(&bad_sig));
+    assert!(!o.invalid && o.detail.contains("recently rejected"), "still cached: {}", o.detail);
+    assert!(!n.mempool.contains(&bad_sig.txid()));
+
+    // An orphan proved invalid on re-try: dropped (its frame Ignore), no
+    // connection to penalise.
+    let parent = signed_spend(&k, &[(funds[2].0, 0)], vec![out(900_000, &k.spk)]);
+    let mut child = signed_spend(&k, &[(parent.txid(), 0)], vec![out(800_000, &[0x03; 20])]);
+    child.inputs[0].script_sig[10] ^= 0xFF;
+    let mut d: DeferredVerdicts<&'static str> = DeferredVerdicts::new();
+    let o = go(&mut relay, &child.txid(), &wire(&child));
+    assert!(o.orphaned, "{}", o.detail);
+    assert!(d.defer(o.wtxid, "child-frame", t0, t0).is_none());
+    let o = go(&mut relay, &parent.txid(), &wire(&parent));
+    assert_eq!(o.verdict, GossipVerdict::Accept, "{}", o.detail);
+    assert!(o.orphans.rejected.is_empty());
+    assert_eq!(o.orphans.dropped, vec![admission::wtxid(&child)]);
+    let s = d.settle(&o.orphans, t0);
+    assert_eq!(s.verdicts, vec![("child-frame", GossipVerdict::Ignore)]);
+    assert!(s.penalize.is_empty());
+
+    // The same relay penalises once the next block is above the activation.
+    let mut after = TxRelay::new().with_penalty_height(next);
+    for (claim, bytes, what) in &frames[..3] {
+        assert_eq!(go(&mut after, claim, bytes).verdict, GossipVerdict::Reject, "{what}");
+    }
+    // A chain whose activation is at genesis: penalties from block 1.
+    let _g = core::activation::scoped_override(0);
+    assert!(TxRelay::new().penalties_in_force(1));
+}
+
+/// Review finding (orphan bookkeeping vs. the selected-chain-only ledger):
+/// main.rs erased and re-tried orphans for the ARRIVING block's
+/// transactions whenever `accept_block` returned `Ok`, fork-losers included,
+/// and ignored the other blocks of a reorg. A fork-loser applies none of its
+/// transactions, so an orphan it "confirmed" (or conflicted with) was erased
+/// while its input was still unspent on the applied chain. Now the
+/// acceptance pipeline reports the applied chain's move
+/// (`accept::accept_block_tracking` → `ChainMove`, the same
+/// `ConnectOutcome` the mempool uses) and the relay erases / re-tries only
+/// for it (`TxRelay::on_chain_moved`).
+#[test]
+fn orphan_bookkeeping_follows_the_applied_chain_only() {
+    use gnb::accept::{accept_block_tracking, ChainMove};
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0x3Au8; 32], 0u32, out(5_000_000, &k.spk));
+    let n = node_with(&genesis, std::slice::from_ref(&fund));
+    let track = |b: &Block, m: &mut ChainMove| {
+        b.validate_structure().unwrap();
+        accept_block_tracking(b, b.block_hash(), b.height, &n.dag, &n.store, &n.mempool, &n.node_state,
+            Some(&n.tip_tx), &n.shielded, m)
+    };
+    let hashes = |v: &[Block]| v.iter().map(|b| b.block_hash()).collect::<Vec<_>>();
+
+    // The applied chain G -> A1 -> A2; an extension is reported as such.
+    let a1 = empty_child(&n, gh, "a1");
+    let mut m = ChainMove::default();
+    track(&a1, &mut m).unwrap();
+    assert_eq!((hashes(&m.connected), m.disconnected.len()), (vec![a1.block_hash()], 0));
+    let a2 = empty_child(&n, a1.block_hash(), "a2");
+    track(&a2, &mut ChainMove::default()).unwrap();
+
+    // C (child of the unknown P) is buffered as an orphan.
+    let p = signed_spend(&k, &[(fund.0, 0)], vec![out(4_900_000, &k.spk)]);
+    let c = signed_spend(&k, &[(p.txid(), 0)], vec![out(4_800_000, &[0x3B; 20])]);
+    let next = admission::pool_next_height(&n.dag.read(), &n.store, &n.mempool);
+    let mut relay = TxRelay::new();
+    let t0 = Instant::now();
+    let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &c.txid(), &wire(&c), Some(PeerId::random()), t0, unix_now());
+    assert!(o.orphaned, "{}", o.detail);
+
+    // A side block F1 on G carrying P and C: a fork-loser (A2 is heavier),
+    // stored without UTXO validation, applying nothing.
+    let subsidy = core::tokenomics::block_subsidy_sat;
+    let f1 = mk_block(&n, vec![gh], vec![coinbase("f1", subsidy(1) + 200_000, vec![0xF1; 20]), p.clone(), c.clone()]);
+    let mut m = ChainMove::default();
+    track(&f1, &mut m).expect("accepted into the DAG");
+    assert_eq!(applied_tip(&n), Some(a2.block_hash()));
+    assert!(m.is_empty(), "a fork-loser applies none of its transactions");
+    let ev = relay.on_chain_moved(&n.store, &n.mempool, next, &m.connected_txs(), &m.disconnected_txs(), t0, unix_now());
+    assert!(ev.is_empty(), "{ev:?}");
+    assert!(relay.orphans().contains(&admission::wtxid(&c)), "C is still valid: P's input is unspent");
+    // (The pre-fix call, the arriving block's transactions, erased it.)
+    let mut pre_fix = TxRelay::new();
+    pre_fix.on_gossip_tx(&n.store, &n.mempool, next, &c.txid(), &wire(&c), Some(PeerId::random()), t0, unix_now());
+    let ev = pre_fix.on_block_connected(&n.store, &n.mempool, next, &f1.transactions, t0, unix_now());
+    assert_eq!(ev.dropped, vec![admission::wtxid(&c)]);
+
+    // P arrives: C is admitted.
+    let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &p.txid(), &wire(&p), Some(PeerId::random()), t0, unix_now());
+    assert_eq!(o.verdict, GossipVerdict::Accept, "{}", o.detail);
+    assert_eq!(o.orphans.admitted.iter().map(|t| t.txid()).collect::<Vec<_>>(), vec![c.txid()]);
+
+    // The fork overtakes: the net move over both acceptances is F1, F2, F3
+    // connected and A2, A1 disconnected (tip first) — what the mempool saw.
+    let mut m = ChainMove::default();
+    let f2 = empty_child(&n, f1.block_hash(), "f2");
+    track(&f2, &mut m).unwrap();
+    let f3 = empty_child(&n, f2.block_hash(), "f3");
+    track(&f3, &mut m).unwrap();
+    assert_eq!(applied_tip(&n), Some(f3.block_hash()));
+    assert_eq!(hashes(&m.connected), vec![f1.block_hash(), f2.block_hash(), f3.block_hash()]);
+    assert_eq!(hashes(&m.disconnected), vec![a2.block_hash(), a1.block_hash()]);
+    assert_eq!(m.connected_txs().iter().filter(|t| !t.is_coinbase()).map(|t| t.txid()).collect::<Vec<_>>(),
+        vec![p.txid(), c.txid()]);
+    assert_eq!(n.mempool.size(), 0, "P and C confirmed by F1");
+
+    // A plan undone by a later one cancels out.
+    let mut m = ChainMove::default();
+    m.record(reorg::ConnectOutcome { disconnected: vec![], connected: vec![a1.clone(), a2.clone()] });
+    m.record(reorg::ConnectOutcome { disconnected: vec![a2.clone()], connected: vec![f2.clone()] });
+    assert_eq!(hashes(&m.connected), vec![a1.block_hash(), f2.block_hash()]);
+    assert!(m.disconnected.is_empty());
+}
+
+/// Review finding (getblocktemplate x CPFP): since ancestor-package
+/// selection a template carries in-pool chains, and its entries listed only
+/// txid / fee / data. An external miner that keeps a subset of the entries
+/// (below the activation nothing fixes the list) could drop a parent and
+/// keep its child: the block is invalid (input not found) after the proof
+/// of work. Each entry now lists its in-template parents (`depends`, BIP22:
+/// 1-based positions); a subset closed under them is valid, one that is not
+/// is refused.
+#[test]
+fn mem6_template_lists_in_template_dependencies() {
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let k = key();
+    let fp = ([0x4Au8; 32], 0u32, out(1_000_000, &k.spk));
+    let fx = ([0x4Bu8; 32], 0u32, out(1_000_000, &k.spk));
+    let n = node_with(&genesis, &[fp.clone(), fx.clone()]);
+    let policy = AdmissionPolicy::relay(admission::next_block_height(&n.dag.read()));
+    let parent = signed_spend(&k, &[(fp.0, 0)], vec![out(487_500, &k.spk), out(487_500, &k.spk)]); // fee 25,000
+    let child = signed_spend(&k, &[(parent.txid(), 0)], vec![out(287_500, &k.spk)]); // fee 200,000
+    let grandchild = signed_spend(&k, &[(parent.txid(), 1), (child.txid(), 0)], vec![out(575_000, &[0x4D; 20])]); // 200,000
+    let indep = signed_spend(&k, &[(fx.0, 0)], vec![out(940_000, &[0x4E; 20])]); // fee 60,000
+    for t in [&parent, &indep, &child, &grandchild] {
+        admission::admit(&n.store, &n.mempool, t.clone(), &policy).expect("admitted");
+    }
+    let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
+    let ids: Vec<_> = tmpl.transactions.iter().map(|(t, _)| t.txid()).collect();
+    assert_eq!(ids, vec![parent.txid(), child.txid(), grandchild.txid(), indep.txid()]);
+    assert_eq!(tmpl.depends(), vec![vec![], vec![1], vec![1, 2], vec![]]);
+
+    // A miner's block from a subset of the entries, in the listed order.
+    let block_of = |keep: &[usize]| -> Block {
+        let mut sub = tmpl.clone();
+        sub.transactions = keep.iter().map(|i| tmpl.transactions[*i].clone()).collect();
+        sub.total_fees = sub.transactions.iter().map(|(_, f)| *f).sum();
+        let cb = template::miner_coinbase(sub.height, sub.subsidy + sub.total_fees, vec![0xCB; 20]);
+        let mut b = template::assemble_block(&sub, cb, unix_now()).expect("structurally valid");
+        while !b.validate_pow() { b.header.nonce += 1; }
+        b
+    };
+    // Not closed under `depends`: the child's input does not exist.
+    for keep in [&[1usize, 2, 3][..], &[0, 2, 3]] {
+        let err = accept(&n, &block_of(keep)).unwrap_err();
+        assert!(err.contains("not found"), "{keep:?}: {err}");
+    }
+    assert_eq!(applied_tip(&n), Some(genesis.block_hash()));
+    // Closed: valid.
+    accept(&n, &block_of(&[0, 1, 3])).expect("parent + child + independent");
+    assert_eq!(n.mempool.size(), 1, "only the grandchild is left");
 }
 
 // ── NET-12: incremental aggregates ───────────────────────────────────────────

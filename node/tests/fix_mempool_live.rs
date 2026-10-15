@@ -107,6 +107,18 @@ async fn spawn_publisher(bootstrap_peers: Vec<String>) -> Peer {
 /// A validating node: production `run_validated`, real store holding
 /// `genesis` + `funds`, the library transaction relay as processor.
 async fn spawn_validator(bootstrap_peers: Vec<String>, genesis: &Block, funds: &[([u8; 32], u32, gnb::core::TxOutput)]) -> Peer {
+    spawn_validator_with(bootstrap_peers, genesis, funds, None).await
+}
+
+/// [`spawn_validator`] whose relay penalises invalid frames from next-block
+/// height `penalty_height` (`None`: the production default, the block after
+/// the hardening activation block).
+async fn spawn_validator_with(
+    bootstrap_peers: Vec<String>,
+    genesis: &Block,
+    funds: &[([u8; 32], u32, gnb::core::TxOutput)],
+    penalty_height: Option<u64>,
+) -> Peer {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut node = NetworkNode::new(config(&dir, bootstrap_peers)).expect("NetworkNode::new");
     let peer_id = node.peer_id;
@@ -128,7 +140,10 @@ async fn spawn_validator(bootstrap_peers: Vec<String>, genesis: &Block, funds: &
     {
         let (dag, store, mempool, seen) = (n.dag.clone(), n.store.clone(), n.mempool.clone(), seen.clone());
         tokio::spawn(async move {
-            let mut relay = TxRelay::new();
+            let mut relay = match penalty_height {
+                Some(h) => TxRelay::new().with_penalty_height(h),
+                None => TxRelay::new(),
+            };
             let mut deferred: DeferredVerdicts<InboundOrigin> = DeferredVerdicts::new();
             let report = |origin: &InboundOrigin, verdict: GossipVerdict| {
                 if let Some((message_id, propagation_source)) = origin.pending_verdict() {
@@ -200,11 +215,14 @@ fn init_log() {
 
 /// MEM-5 / NET-2 / NET-4 (live). Topology A — B — C and D — B; B and C
 /// validate. Attacker A publishes eight consensus-invalid transactions (bad
-/// hybrid signatures): honest relay B rejects them (A, their author, takes
-/// gossipsub's invalid-message penalty and is graylisted by B) and never
-/// forwards them, so C never sees one and never has a reason to penalise B.
-/// A valid transaction from honest D still reaches C through B (B was not
-/// cut off) and enters C's pool.
+/// hybrid signatures): honest relay B refuses them and never forwards them,
+/// so C never sees one and never has a reason to penalise B. (On this chain,
+/// far below the hardening activation, B answers them `Ignore`: an older
+/// release may relay such frames honestly, see
+/// `live_old_release_relay_is_not_graylisted_for_forwarding_invalid_frames`;
+/// from the block after the activation block A would take gossipsub's
+/// invalid-message penalty.) A valid transaction from honest D still reaches
+/// C through B (B was not cut off) and enters C's pool.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_invalid_tx_is_not_relayed_and_relay_is_not_penalised() {
     init_log();
@@ -271,4 +289,50 @@ async fn live_child_before_parent_propagates_through_the_orphan_pool() {
     let e = c.mempool.as_ref().unwrap().get_entry(&child.txid()).unwrap();
     assert!(e.parents.contains(&parent.txid()), "C holds the chain as parent and child");
     let _ = &a;
+}
+
+/// Review finding on the P4 merge (live). Every release before the
+/// validating relay forwards `NewTransaction` frames without validating
+/// them (modelled by the legacy `run()` path: `Deliver(Accept)`), on the
+/// same topic. Old relay O delivers garbage transaction frames to upgraded
+/// validator B — exactly what it does after an attacker sends them to it;
+/// for B the delivering peer is O either way. B's chain does not contain the
+/// hardening activation block, so B answers them `Ignore`: O keeps its
+/// standing and the valid transaction O delivers next enters B's pool.
+/// Control, the pre-fix behaviour (penalties at every height): B answers
+/// `Reject`, gossipsub charges O the invalid-message penalty, O falls below
+/// the graylist threshold and B ignores everything O sends afterwards
+/// (blocks included) — the valid transaction never arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_old_release_relay_is_not_graylisted_for_forwarding_invalid_frames() {
+    init_log();
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let k = key();
+    let funds = vec![([0xF5u8; 32], 0u32, out(1_000_000, &k.spk))];
+    let b_fixed = spawn_validator_with(vec![], &genesis, &funds, None).await;
+    let b_prefix = spawn_validator_with(vec![], &genesis, &funds, Some(0)).await;
+    let o_fixed = spawn_publisher(vec![full_addr(&b_fixed)]).await;
+    let o_prefix = spawn_publisher(vec![full_addr(&b_prefix)]).await;
+    tokio::time::sleep(Duration::from_secs(12)).await;
+
+    // 20 malformed frames (one decay of the penalty counter, x0.5 per
+    // minute, still leaves the control far below the graylist threshold).
+    for i in 0..20u8 {
+        for o in [&o_fixed, &o_prefix] {
+            o.outbound_tx
+                .send(NetworkMessage::NewTransaction { txid: [i; 32], tx_data: vec![0xFF, i, 0xEE, 0x01] })
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!b_fixed.seen.lock().is_empty() && !b_prefix.seen.lock().is_empty(), "the frames reached both validators");
+
+    let valid = signed_spend(&k, &[(funds[0].0, 0)], vec![out(950_000, &[0x5A; 20])]);
+    publish(&o_fixed, &valid).await;
+    publish(&o_prefix, &valid).await;
+    assert!(pooled(&b_fixed, valid.txid(), 30).await, "O kept its standing at B: its valid transaction is admitted");
+    assert!(!pooled(&b_prefix, valid.txid(), 15).await, "control: with penalties in force B graylisted the old relay");
+    assert!(!b_prefix.seen.lock().contains(&valid.txid()));
 }

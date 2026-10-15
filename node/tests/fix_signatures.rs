@@ -30,7 +30,10 @@ use gnb::core::sighash::{SighashV3Precomputed, SighashVersion, SIGHASH_V3_PREIMA
 use gnb::core::{self, activation, Block, ChainId, Transaction, TxInput, TxOutput};
 use gnb::crypto;
 use gnb::mempool::admission::{self, AdmissionError, AdmissionPolicy};
+use gnb::mempool::relay::TxRelay;
+use gnb::network::GossipVerdict;
 use gnb::template;
+use libp2p::PeerId;
 use gnb::wallet::payment::{FeeChoice, FeePolicy};
 use gnb::wallet::send;
 use serde_json::{json, Value};
@@ -503,13 +506,75 @@ fn non_canonical_witnesses_policy_at_all_heights_consensus_from_activation() {
         .collect();
     for (m, t) in MUTATIONS.iter().zip(&canonical) {
         let bad = mutate(t, *m);
-        assert!(admit(&n, &bad).is_err(), "{m:?} refused by admission");
+        // Consensus-invalid for version 3 from the activation: `Rejected`,
+        // not a policy refusal (review finding on the P4 merge).
+        let err = admit(&n, &bad).unwrap_err();
+        assert!(matches!(&err, AdmissionError::Rejected(e) if e.contains("bad-witness")), "{m:?}: {err}");
         let err = extend(&n, vec![bad]).unwrap_err();
         assert!(err.contains("non-canonical"), "{m:?}: {err}");
         assert_eq!(tip_height(&n), H - 1);
     }
     extend(&n, canonical).expect("canonical v3 witnesses are valid");
     assert!(post.iter().all(|f| spent(&n, f)));
+}
+
+/// Review finding on the P4 merge (integration open issue 1): a version-3
+/// transaction whose witness is not canonical, for a block at/after the
+/// activation, is consensus-INVALID (CRY-1) and no upgraded node relays it
+/// (one block behind, version 3 is non-standard). Admission now answers
+/// `Rejected` and the gossip relay `Reject` once penalties are in force,
+/// i.e. from the block after the activation block; while the next block IS
+/// the activation block, an older release (which forwards every frame
+/// unvalidated) can still be an honest peer, so the frame is `Ignore` there.
+/// Pre-fix the witness standardness step (which runs before the version
+/// rule) mapped every failure to `NonStandard`: `Ignore` at every height, so
+/// breaking the witness framing made any invalid transaction penalty-free. A
+/// suite-0x0002 key stays `NonStandard` (consensus-valid, CRY-2).
+#[test]
+fn non_canonical_v3_witness_is_rejected_and_penalised_after_the_activation() {
+    let _g = activation::scoped_override(H);
+    let k = key();
+    let k2 = mldsa_only_key(&key());
+    let f: Vec<_> = (0..4u8).map(|i| fund(0x60 + i, 2 * SAT, &k.spk)).collect();
+    let f2 = fund(0x68, 2 * SAT, &k2.spk);
+    let n = node_with(&mk_genesis(unix_now() - 10_000), &[f.clone(), vec![f2.clone()]].concat());
+    advance_to(&n, H - 1);
+    assert_eq!(next_height(&n), H);
+    let pay = |i: usize| vec![out(2 * SAT - FEE, &[0x6A + i as u8; 20])];
+    let mut relay = TxRelay::new();
+    assert_eq!(relay.penalty_height(), H + 1);
+    let gossip = |relay: &mut TxRelay, tx: &Transaction| {
+        relay.on_gossip_tx(&n.store, &n.mempool, next_height(&n), &tx.txid(), &tx.to_wire_bytes(true),
+            Some(PeerId::random()), std::time::Instant::now(), unix_now())
+    };
+
+    // Next block = the activation block H.
+    let bad: Vec<Transaction> = MUTATIONS.iter().enumerate()
+        .map(|(i, m)| mutate(&v3_spend(&k, &[(f[i].0, 0)], std::slice::from_ref(&f[i].2), pay(i)), *m))
+        .collect();
+    for (m, t) in MUTATIONS.iter().zip(&bad) {
+        let err = admission::check_transaction(&n.store, Some(&n.mempool), t, &AdmissionPolicy::relay(H)).unwrap_err();
+        assert!(matches!(&err, AdmissionError::Rejected(e) if e.contains("bad-witness")), "{m:?}: {err}");
+        let o = gossip(&mut relay, t);
+        assert!(o.invalid, "{m:?}: {}", o.detail);
+        assert_eq!(o.verdict, GossipVerdict::Ignore, "{m:?}: the activation block is not in the chain yet: {}", o.detail);
+    }
+    let t2 = v3_spend(&k2, &[(f2.0, 0)], std::slice::from_ref(&f2.2), pay(9));
+    let o = gossip(&mut relay, &t2);
+    assert!(!o.invalid && o.verdict == GossipVerdict::Ignore && o.detail.contains("single-algorithm"), "{:?}", o);
+
+    // The activation block: from here on the same frames are penalised.
+    extend(&n, vec![]).unwrap();
+    assert_eq!(next_height(&n), H + 1);
+    for (m, t) in MUTATIONS.iter().zip(&bad) {
+        let o = gossip(&mut relay, t);
+        assert!(o.invalid, "{m:?}: {}", o.detail);
+        assert_eq!(o.verdict, GossipVerdict::Reject, "{m:?}: {}", o.detail);
+    }
+    let o = gossip(&mut relay, &t2);
+    assert_eq!(o.verdict, GossipVerdict::Ignore, "suite 0x0002 is policy at every height: {}", o.detail);
+    let good = v3_spend(&k, &[(f[3].0, 0)], std::slice::from_ref(&f[3].2), pay(3));
+    assert_eq!(gossip(&mut relay, &good).verdict, GossipVerdict::Accept);
 }
 
 /// Genesis carry-over outputs (address = hash of the RAW public key) stay
@@ -1048,6 +1113,63 @@ fn template_skips_a_version_only_failure_at_another_height() {
     let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
     assert_eq!(tmpl.evicted, 1, "invalid for the block the pool targets: evicted");
     assert!(!n.mempool.contains(&p.txid()));
+}
+
+// ── Review (P4 merge): the recent-rejects filter follows the next height ─────
+
+/// Review finding: a refusal that depends on the next block's height (here
+/// the version policy: version 3 below the activation) was remembered in the
+/// recent-rejects filter, which only a TIP change cleared. A DAG change that
+/// moves the template height without moving the applied tip (a lighter tip
+/// with a greater DAG height, stored as a fork-loser:
+/// `accept::sync_mempool_next_height`) left the stale verdict in place, so
+/// a wallet's version-3 payment for the new height ACT was refused as
+/// "recently rejected" (RPC and gossip) until the next tip change. Now the
+/// filter is cleared whenever the next height moves, and a verdict computed
+/// before such a change is never remembered after it (epoch check).
+#[test]
+fn recent_rejects_are_forgotten_when_the_next_height_moves_without_a_tip_change() {
+    const ACT: u64 = 8;
+    let _g = activation::scoped_override(ACT);
+    let k = key();
+    let f = fund(0xE6, 2 * SAT, &k.spk);
+    let n = node_with_dag8_shapes(std::slice::from_ref(&f));
+    advance_to(&n, ACT - 4);
+    // S merges three siblings of A (the most blue work); X1 -> X2 is a
+    // lighter side chain from A.
+    let a = sel_tip(&n).unwrap();
+    let bs: Vec<BlockHash> = (0..3).map(|_| accept(&n, &child_where(&n, a, vec![], |_| true)).unwrap()).collect();
+    let s = accept(&n, &block_on_where(&n, bs, vec![], |_| true)).unwrap();
+    let x1 = accept(&n, &child_where(&n, a, vec![], |_| true)).unwrap();
+    let x2 = accept(&n, &child_where(&n, x1, vec![], |_| true)).unwrap();
+    assert_eq!(applied_tip(&n), Some(s));
+    assert_eq!(next_height(&n), ACT - 1);
+
+    // A version-3 payment signed for ACT is refused for ACT-1 (policy) and
+    // remembered.
+    let pay = v3_spend(&k, &[(f.0, 0)], std::slice::from_ref(&f.2), vec![out(2 * SAT - FEE, &[0xE7; 20])]);
+    let err = admit(&n, &pay).unwrap_err();
+    assert!(matches!(&err, AdmissionError::NonStandard(m) if m.contains("non-standard-version")), "{err}");
+    assert!(n.mempool.is_recently_rejected(&admission::wtxid(&pay)));
+
+    // X (DAG height ACT-1) is stored as a fork-loser: the applied tip stays
+    // S, the template merges X, the next height moves to ACT.
+    let x = accept(&n, &child_where(&n, x2, vec![], |_| true)).unwrap();
+    assert_eq!(applied_tip(&n), Some(s), "no tip change");
+    assert_eq!(dag_height(&n, &x), ACT - 1);
+    assert_eq!(next_height(&n), ACT);
+    assert!(!n.mempool.is_recently_rejected(&admission::wtxid(&pay)), "the verdict for ACT-1 is forgotten");
+    admit(&n, &pay).expect("valid and standard for ACT");
+
+    // The epoch: a verdict computed before the next height moved (the filter
+    // cleared) is not remembered after it.
+    let w = [0x5E; 32];
+    let epoch = n.mempool.recent_rejects_epoch();
+    n.mempool.clear_recent_rejects();
+    assert!(!n.mempool.note_rejected_in_epoch(w, epoch));
+    assert!(!n.mempool.is_recently_rejected(&w));
+    assert!(n.mempool.note_rejected_in_epoch(w, n.mempool.recent_rejects_epoch()));
+    assert!(n.mempool.is_recently_rejected(&w));
 }
 
 // ── Review: admission re-checks the next height under the acceptance lock ───

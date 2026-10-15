@@ -481,6 +481,11 @@ pub struct Mempool {
     rolling_min: Mutex<(u128, u64)>,
     /// MEM-5: recent-rejects filter (wtxid set + FIFO order).
     recent_rejects: Mutex<(HashSet<[u8; 32]>, VecDeque<[u8; 32]>)>,
+    /// Generation of the recent-rejects filter: bumped (under the filter's
+    /// lock) by every [`Self::clear_recent_rejects`], i.e. whenever the
+    /// selected tip or the next block's height changes. A verdict computed in
+    /// an older epoch is not remembered ([`Self::note_rejected_in_epoch`]).
+    recent_rejects_epoch: AtomicU64,
     /// Header height of the next block the pool targets: the height of the
     /// node's own next template (`template::next_template_height`), the ONE
     /// height admission, post-connect eviction, re-injection, templates and
@@ -504,6 +509,7 @@ impl Mempool {
             clock,
             rolling_min: Mutex::new((0, 0)),
             recent_rejects: Mutex::new((HashSet::new(), VecDeque::new())),
+            recent_rejects_epoch: AtomicU64::new(0),
             next_height: AtomicU64::new(0),
         }
     }
@@ -909,7 +915,7 @@ impl Mempool {
     // ── MEM-5: recent-rejects filter ─────────────────────────────────────
 
     /// True iff a transaction with this wtxid was rejected since the last
-    /// tip change.
+    /// change of the selected tip or of the next block's height.
     pub fn is_recently_rejected(&self, wtxid: &[u8; 32]) -> bool {
         self.recent_rejects.lock().0.contains(wtxid)
     }
@@ -917,7 +923,11 @@ impl Mempool {
     /// Remember a rejected wtxid (bounded, FIFO).
     pub fn note_rejected(&self, wtxid: [u8; 32]) {
         let mut g = self.recent_rejects.lock();
-        let (set, order) = &mut *g;
+        Self::insert_reject(&mut g, wtxid);
+    }
+
+    fn insert_reject(g: &mut (HashSet<[u8; 32]>, VecDeque<[u8; 32]>), wtxid: [u8; 32]) {
+        let (set, order) = g;
         if set.insert(wtxid) {
             order.push_back(wtxid);
             while order.len() > MAX_RECENT_REJECTS {
@@ -928,12 +938,38 @@ impl Mempool {
         }
     }
 
-    /// Forget every remembered rejection (called when the selected tip
-    /// changes: a tx rejected against the old tip may be valid now).
+    /// The recent-rejects filter's current epoch (see
+    /// [`Self::note_rejected_in_epoch`]). Read it BEFORE reading any state a
+    /// verdict depends on.
+    pub fn recent_rejects_epoch(&self) -> u64 {
+        self.recent_rejects_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Remember a rejected wtxid only if the filter was not cleared since
+    /// `epoch` was read ([`Self::recent_rejects_epoch`]): a verdict computed
+    /// against the previous tip or next height must not outlive the change
+    /// (it would be replayed at the new height). Returns whether it was
+    /// remembered.
+    pub fn note_rejected_in_epoch(&self, wtxid: [u8; 32], epoch: u64) -> bool {
+        let mut g = self.recent_rejects.lock();
+        if self.recent_rejects_epoch.load(Ordering::SeqCst) != epoch {
+            return false;
+        }
+        Self::insert_reject(&mut g, wtxid);
+        true
+    }
+
+    /// Forget every remembered rejection and start a new epoch. Called when
+    /// the selected tip changes (a tx rejected against the old tip may be
+    /// valid now) and when the next block's height changes without a tip
+    /// change (`accept::sync_mempool_next_height`: a version, 64-byte or
+    /// maturity verdict computed for the old height says nothing about the
+    /// new one).
     pub fn clear_recent_rejects(&self) {
         let mut g = self.recent_rejects.lock();
         g.0.clear();
         g.1.clear();
+        self.recent_rejects_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Number of remembered rejections.

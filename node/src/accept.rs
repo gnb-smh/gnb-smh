@@ -580,9 +580,10 @@ pub fn revalidate_mempool(store: &storage::Storage, mempool: &mempool::Mempool, 
 /// a DAG change that connected nothing (a fork-loser or merge candidate
 /// stored, a block disqualified): a new tip with a greater DAG height, or a
 /// disqualified one, moves the template height without moving the applied
-/// tip. When the height moved, drop the transactions whose version is invalid
-/// or non-standard at the new height and, when it went down, the ones no
-/// longer mature (`revalidate_mempool`). Call under the acceptance lock (or
+/// tip. When the height moved, clear the recent-rejects filter (its verdicts
+/// were computed for the old height), drop the transactions whose version is
+/// invalid or non-standard at the new height and, when it went down, the ones
+/// no longer mature (`revalidate_mempool`). Call under the acceptance lock (or
 /// at start-up before any concurrent acceptance). Returns the height.
 pub fn sync_mempool_next_height(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
@@ -591,6 +592,14 @@ pub fn sync_mempool_next_height(
 ) -> u64 {
     let next = crate::template::next_template_height(&dag.read(), store);
     let previous = mempool.set_next_height(next);
+    if previous != next {
+        // Review finding: the recent-rejects filter holds verdicts computed
+        // for the previous next height (the version rule and policy, the
+        // 64-byte rule, coinbase maturity). Without a tip change nothing else
+        // clears it, so a transaction refused for H-1 stayed "recently
+        // rejected" at H (RPC and gossip) until the next tip change.
+        mempool.clear_recent_rejects();
+    }
     if previous != 0 && previous != next {
         let dropped = if next < previous {
             revalidate_mempool(store, mempool, next)
@@ -868,6 +877,67 @@ fn persist_unchanged(
     store.write_batch(batch).map_err(|e| e.to_string())
 }
 
+/// What one or more acceptance calls did to the applied (selected) chain:
+/// the NET effect of every committed plan, accumulated in order (a block
+/// connected by one call and disconnected by a later one appears in neither
+/// list). Under the selected-chain-only ledger (docs/CONSENSUS.md) these are
+/// the only blocks whose transactions were applied or un-applied; a block
+/// stored as a fork-loser or merge candidate applies nothing. Consumers: the
+/// orphan-transaction bookkeeping (`mempool::relay::TxRelay::on_chain_moved`),
+/// which must treat exactly the transactions the mempool treats as confirmed
+/// (`update_mempool_after_connect` reads the same `ConnectOutcome`).
+#[derive(Debug, Default, Clone)]
+pub struct ChainMove {
+    /// Blocks added to the applied chain and still on it, in connect order.
+    pub connected: Vec<core::Block>,
+    /// Blocks removed from the applied chain that were on it before the first
+    /// recorded plan, in disconnect order (tip first).
+    pub disconnected: Vec<core::Block>,
+}
+
+impl ChainMove {
+    /// Fold one committed plan's outcome in.
+    pub fn record(&mut self, outcome: ConnectOutcome) {
+        for b in outcome.disconnected {
+            let h = b.block_hash();
+            match self.connected.iter().position(|c| c.block_hash() == h) {
+                Some(i) => {
+                    self.connected.remove(i);
+                }
+                None => self.disconnected.push(b),
+            }
+        }
+        for b in outcome.connected {
+            let h = b.block_hash();
+            match self.disconnected.iter().position(|d| d.block_hash() == h) {
+                Some(i) => {
+                    self.disconnected.remove(i);
+                }
+                None => self.connected.push(b),
+            }
+        }
+    }
+
+    /// True iff the applied chain did not move.
+    pub fn is_empty(&self) -> bool {
+        self.connected.is_empty() && self.disconnected.is_empty()
+    }
+
+    /// Every transaction of the connected blocks (coinbases included), in
+    /// connect order.
+    pub fn connected_txs(&self) -> Vec<core::Transaction> {
+        self.connected.iter().flat_map(|b| b.transactions.iter().cloned()).collect()
+    }
+
+    /// The non-coinbase transactions of the disconnected blocks, oldest
+    /// disconnected block first (the order reorg re-injection uses).
+    pub fn disconnected_txs(&self) -> Vec<core::Transaction> {
+        self.disconnected.iter().rev()
+            .flat_map(|b| b.transactions.iter().filter(|t| !t.is_coinbase()).cloned())
+            .collect()
+    }
+}
+
 /// Accept a block: acceptance checks, DAG insertion, then connect the best
 /// valid chain atomically (see the module documentation for the semantics).
 /// Returns `Ok(block_hash)` when the block was accepted into the DAG and is
@@ -890,6 +960,29 @@ pub fn accept_block(
     // Coherence C2: the node's shielded-pool engine. Applied only for blocks
     // that join the selected chain (COH-2).
     shielded:   &Arc<RwLock<ShieldedPool>>,
+) -> Result<[u8; 32], String> {
+    let mut ignored = ChainMove::default();
+    accept_block_tracking(block, block_hash, height, dag, store, mempool, node_state, tip_tx, shielded, &mut ignored)
+}
+
+/// [`accept_block`] that also records into `chain` what the call did to the
+/// applied chain ([`ChainMove`]): nothing for a fork-loser / merge candidate
+/// (the block is accepted but applies no transaction), the connected and
+/// disconnected blocks of a committed extension or reorg — also when the
+/// arriving block itself is reported invalid while another chain was
+/// connected.
+#[allow(clippy::too_many_arguments)]
+pub fn accept_block_tracking(
+    block:      &core::Block,
+    block_hash: [u8; 32],
+    height:     u64,
+    dag:        &Arc<RwLock<consensus::GhostDAG>>,
+    store:      &Arc<storage::Storage>,
+    mempool:    &Arc<mempool::Mempool>,
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+    tip_tx:     Option<&broadcast::Sender<tip::TipChanged>>,
+    shielded:   &Arc<RwLock<ShieldedPool>>,
+    chain:      &mut ChainMove,
 ) -> Result<[u8; 32], String> {
     // DAG-10: one acceptance at a time, across every ingress path.
     let _accept_guard = store.acceptance_lock();
@@ -1093,7 +1186,7 @@ pub fn accept_block(
         }
     };
 
-    let connected = match &resolution {
+    let connected = match resolution {
         Resolution::Unchanged => {
             let record = if replacing { None } else { Some(block_hash) };
             if let Err(e) = persist_unchanged(dag, store, record, &log.invalid) {
@@ -1121,7 +1214,8 @@ pub fn accept_block(
             // The next height on the DAG after the move: the template
             // height (never the new tip's header height + 1, DAG-8).
             let next_height = crate::template::next_template_height(&dag.read(), store);
-            update_mempool_after_connect(store, mempool, outcome, next_height);
+            update_mempool_after_connect(store, mempool, &outcome, next_height);
+            chain.record(outcome);
             true
         }
     };

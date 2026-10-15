@@ -21,11 +21,18 @@ transaction that passed everything else:
 2. size: canonical wire size and bincode size at most `MAX_TX_SIZE`
    (409,600 bytes);
 3. known: already pooled, already confirmed, or in the recent-rejects filter
-   (50,000 wtxids, cleared whenever the selected tip changes);
+   (50,000 wtxids, cleared whenever the selected tip or the next block's
+   height changes — a fork-loser with a greater DAG height or a
+   disqualification can move the height without moving the tip; a verdict
+   computed before such a change is never remembered after it);
 4. standardness: canonical-encoding limits, MoneyRange, no dust output
    (< 546 sat), no zero-value output, the canonical witness of every input
    and a hybrid (suite 0x0001) public key (`CONSENSUS.md`, "Relay policy
-   (all heights)"; skipped for re-injection);
+   (all heights)"; skipped for re-injection). Every witness's framing is
+   checked before any key's suite. A non-canonical witness is policy, except
+   on a version-3 transaction whose next block is at/after the hardening
+   activation: there it breaks the consensus witness rule (CRY-1) and the
+   transaction is consensus-invalid;
 5. next-block rules: the version valid **and standard** for the height of
    the next block, and from the hardening activation no 64-byte txid
    preimage (`admission::check_tx_for_next_block`; `CONSENSUS.md`, "Which
@@ -43,7 +50,10 @@ transaction that passed everything else:
     which commits to every spent amount and script — for an input spending a
     pooled parent, that parent's output), last, through a bounded
     verified-signature cache shared with block validation (keyed by the
-    digest regime, the activation state, the wtxid and the spent outputs).
+    digest regime, the activation state, the wtxid and the spent outputs;
+    the key is computed once per admission). The witnesses and public-key
+    hashes are checked before the cache lookup; only a cache miss reaches
+    the signature budget (§2) and the signature math.
 
 "The next block" is the node's own next template
 (`template::next_template_height`, cached in `Mempool::next_height`), the
@@ -61,12 +71,27 @@ processor, exactly as for blocks):
 | verdict | when | effect |
 |---|---|---|
 | Accept | the transaction entered the pool | forwarded to the mesh |
-| Reject | malformed frame (non-canonical bytes, wrong claimed txid) or a consensus-invalid transaction (check 1 coinbase / no inputs, 4 canonical limits / MoneyRange / dust, 6, 9 consensus parts, 11) | not forwarded; the delivering peer takes gossipsub's invalid-message penalty on the transaction topic |
-| Ignore | anything else: policy refusals (size, no outputs, zero-value output, non-canonical witness, suite 0x0002, the version policy, fee below the relay or rolling minimum, replacement and chain limits, pool full), the rules whose verdict depends on this node's next block height (step 5 and an immature coinbase spend: a peer one block behind across the activation, or running an older release, relays such a transaction honestly), duplicates, recently rejected ids, missing inputs, signature budget exhausted | not forwarded, no penalty |
+| Reject | penalties in force (below) AND a malformed frame (non-canonical bytes, wrong claimed txid) or a consensus-invalid transaction (check 1 coinbase / no inputs, 4 canonical limits / MoneyRange / dust / the canonical witness of a version-3 transaction at/after the activation, 6, 9 consensus parts, 11) | not forwarded; the delivering peer takes gossipsub's invalid-message penalty on the transaction topic |
+| Ignore | a malformed frame or a consensus-invalid transaction while penalties are not in force (still remembered in the recent-rejects filter and charged to the signature budget); policy refusals (size, no outputs, zero-value output, a non-canonical witness where it is not the consensus rule, suite 0x0002, the version policy, fee below the relay or rolling minimum, replacement and chain limits, pool full); the rules whose verdict depends on this node's next block height (step 5 and an immature coinbase spend: a peer one block behind across the activation relays such a transaction honestly); duplicates, recently rejected ids, missing inputs, signature budget exhausted | not forwarded, no penalty |
 
-Because every honest node validates before forwarding, an invalid frame is
-only ever delivered by its author, so the penalty lands on the author and
-never on an honest relay.
+**Penalties and older releases.** Every release before the validating relay
+forwards every `NewTransaction` frame without validating it, on the same
+topic (`gnb/txs/1`). Gossipsub charges a `Reject` to the delivering peer and
+to every peer that delivered a duplicate; with the transaction topic's
+weights (−50 per invalid delivery, squared, topic weight 0.3, decay ×0.5 per
+minute, graylist threshold −400) about six invalid frames within a minute or
+two graylist a peer, after which all its gossip, blocks included, is ignored.
+So while such a release can be an honest peer on the chain, a `Reject` would
+let an attacker have every upgraded node graylist every non-upgraded one by
+sending it a few garbage frames. Those releases reject the hardening
+activation block (`CONSENSUS.md`, "Block rules at the hardening
+activation"), so **penalties are in force once the node's next block height
+is above the activation height** (the chain contains the activation block;
+`TxRelay::penalties_in_force`; mainnet from height 110,001, testnet and
+regtest from block 1). From then on every peer that follows the chain
+validates before forwarding, an invalid frame is delivered only by its
+author, and the penalty lands on the author and never on an honest relay.
+Before that, the node still never forwards an invalid frame.
 
 **Signature budget.** Step 11 is charged to the **connection that delivered
 the frame** (the gossipsub `propagation_source`), never to the signed gossip
@@ -98,14 +123,20 @@ is kept in the orphan pool instead of being dropped:
   bound is reached, the oldest orphan of the connection holding the most is
   evicted; the orphans of a connection that closes are dropped;
 * an orphan expires after 20 minutes;
-* when a transaction enters the pool or a connected block confirms it, the
-  orphans waiting on it are re-tried (breadth-first through their own
-  children, at most 25 orphans and 400 inputs per event); there is no scan of
-  the whole orphan pool per block. A 30 s sweep finds orphans whose parents
-  arrived by another path (RPC, the miner, a reorg): one lookup per recorded
-  missing parent, stopping at the first one still missing, at most 1,000
-  lookups per sweep, round-robin. Orphans confirmed by a block (in any
-  encoding) or spending an outpoint the block spent are erased;
+* when a transaction enters the pool, or a block connected to the APPLIED
+  (selected) chain confirms it, or a reorg disconnects the block that
+  confirmed it (it returns to the pool), the orphans waiting on it are
+  re-tried (breadth-first through their own children, at most 25 orphans
+  and 400 inputs per event); there is no scan of the whole orphan pool per
+  block. A 30 s sweep finds orphans whose parents arrived by another path
+  (RPC, the miner, a block accepted outside the gossip path): one lookup
+  per recorded missing parent, stopping at the first one still missing, at
+  most 1,000 lookups per sweep, round-robin. Orphans confirmed by a block
+  connected to the applied chain (in any encoding) or spending an outpoint
+  such a block spent are erased. A block stored as a fork-loser or merge
+  candidate applies none of its transactions (`CONSENSUS.md`, "Ledger
+  semantics: selected-chain-only") and changes nothing here, exactly as for
+  the mempool (§6);
 * a re-tried orphan's signatures are charged to the connection that
   delivered it.
 
@@ -117,8 +148,8 @@ the network loop (gossipsub keeps an unvalidated frame for 12 heartbeats of
 | outcome | verdict of the withheld frame |
 |---|---|
 | exactly these bytes entered the pool, within the window | Accept (gossipsub forwards the original frame) |
-| the re-try proved these bytes consensus-invalid | Reject within the window (the delivering connection takes the P4 penalty); after it, an application-score penalty on that connection |
-| evicted, expired, erased, another encoding admitted, refused by policy | Ignore |
+| the re-try proved these bytes consensus-invalid, penalties in force (§2) | Reject within the window (the delivering connection takes the P4 penalty); after it, an application-score penalty on that connection |
+| evicted, expired, erased, another encoding admitted, refused by policy, or proved consensus-invalid while penalties are not in force | Ignore |
 
 Every admitted orphan is also re-announced by the node 35 s later (after
 gossipsub's 30 s duplicate window), so one admitted after its frame left the
@@ -158,6 +189,16 @@ included (all or nothing). A member that fails only the version / 64-byte
 rules at the template's height but passes them at the pool's next height is
 skipped instead (kept pooled; its descendants are not selected either).
 Without in-pool chains this is plain highest-fee-rate-first selection.
+
+A template can therefore contain a child whose input exists only as the
+output of an earlier listed parent. `getblocktemplate` lists, for every
+transaction entry, `depends`: the 1-based positions in `transactions` of its
+in-template parents (BIP22 semantics, `BlockTemplate::depends`). A block
+built from a subset of the entries is valid only if the subset is closed
+under `depends` (transitively) and keeps the listed order; dropping a parent
+but keeping its child makes the block invalid ("UTXO … not found"). Below
+the hardening activation nothing else fixes the list; at/after it the
+coinbase commitment covers exactly the listed transactions in that order.
 
 ## 6. Removal, eviction, expiry
 

@@ -1321,11 +1321,18 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // Shared template builder (audit MEM-2 / DAG-2): parents = at most
             // MAX_PARENTS bodied, non-disqualified tips by blue work; height =
             // max parent height + 1 (accept_block's VULN-02 rule); expected
-            // bits exactly as accept_block validates them; transactions by fee
-            // rate under a byte budget measured like the consensus size rule,
+            // bits exactly as accept_block validates them; transactions as
+            // whole ANCESTOR PACKAGES by package fee rate, parents before
+            // children (MEM-6 child-pays-for-parent), under a byte budget
+            // measured like the consensus size rule of the template's height,
             // reserving EXTERNAL_COINBASE_RESERVE bytes for the caller's
-            // coinbase; every tx re-validated against the UTXO set (offenders
-            // evicted). Fees are recomputed from the UTXO set.
+            // coinbase; every tx re-validated at the template's height against
+            // the UTXO set plus the outputs of the transactions placed before
+            // it (offenders evicted with their descendants). Fees are
+            // recomputed. Each entry's `depends` lists its in-template parents
+            // (BIP22: 1-based positions in `transactions`): a block built from
+            // a subset of the entries must keep every dependency of every
+            // entry it keeps.
             let tmpl = match crate::template::build_block_template(
                 &state.dag, &state.store, &state.mempool,
                 crate::template::EXTERNAL_COINBASE_RESERVE,
@@ -1333,14 +1340,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 Ok(t) => t,
                 Err(e) => return json!({ "error": e }),
             };
-            let tx_entries: Vec<Value> = tmpl.transactions.iter().map(|(tx, fee)| {
-                json!({
-                    "txid": hex::encode(tx.txid()),
-                    // R3: satoshi amount → decimal string.
-                    "fee":  fee.to_string(),
-                    "data": hex::encode(tx.to_wire_bytes(true)),
-                })
-            }).collect();
+            let tx_entries = template_tx_entries(&tmpl);
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1890,6 +1890,23 @@ fn parse_address(addr: &str) -> Option<Vec<u8>> {
 }
 
 /// Format a transaction for JSON output
+/// The `transactions` entries of `getblocktemplate`: `txid`, `fee` (decimal
+/// string, R3), `data` (wire hex) and `depends` — the 1-based positions of
+/// the entry's in-template parents (`BlockTemplate::depends`, BIP22
+/// semantics). A subset of the entries is mineable only if it is closed
+/// under `depends` and keeps the listed order.
+fn template_tx_entries(tmpl: &crate::template::BlockTemplate) -> Vec<Value> {
+    tmpl.transactions.iter().zip(tmpl.depends()).map(|((tx, fee), depends)| {
+        json!({
+            "txid":    hex::encode(tx.txid()),
+            // R3: satoshi amount → decimal string.
+            "fee":     fee.to_string(),
+            "data":    hex::encode(tx.to_wire_bytes(true)),
+            "depends": depends,
+        })
+    }).collect()
+}
+
 fn format_tx(tx: &Transaction) -> Value {
     json!({
         "txid":     hex::encode(tx.txid()),
@@ -2462,6 +2479,38 @@ mod audit_2026_10_rpc_tests {
             config, state.node_state.clone(), state.store.clone(), state.mempool.clone(),
             state.dag.clone(), state.outbound_tx.clone(), None,
         )).await.expect("a failed bind must end the RPC task");
+    }
+
+    /// Review finding (getblocktemplate x MEM-6 CPFP): every transaction
+    /// entry carries `depends`, the 1-based positions of its in-template
+    /// parents (BIP22), so an external miner that keeps a subset of the
+    /// entries can keep it closed under dependencies.
+    #[test]
+    fn getblocktemplate_entries_list_in_template_dependencies() {
+        let tx = |ins: &[([u8; 32], u32)], tag: u8| Transaction {
+            version: 1,
+            inputs: ins.iter().map(|(t, i)| TxInput { prev_txid: *t, prev_index: *i, script_sig: vec![tag; 8], sequence: u32::MAX }).collect(),
+            outputs: vec![TxOutput { value: 1_000, script_pubkey: vec![tag; 20] }, TxOutput { value: 1_000, script_pubkey: vec![tag; 20] }],
+            locktime: 0,
+        };
+        let a = tx(&[([0xA0; 32], 0)], 1);
+        let b = tx(&[(a.txid(), 0)], 2);
+        let c = tx(&[([0xA1; 32], 0)], 3);
+        let d = tx(&[(b.txid(), 1), (a.txid(), 1), (b.txid(), 0), ([0xA2; 32], 0)], 4);
+        let tmpl = crate::template::BlockTemplate {
+            parents: vec![[0; 32]], height: 1, blue_score: 1, bits: 0x2100_FFFF, parent_timestamp: 0,
+            transactions: vec![(a.clone(), 10), (b.clone(), 20), (c.clone(), 30), (d.clone(), 40)],
+            total_fees: 100, subsidy: 0, evicted: 0, tx_byte_budget: 0,
+            activation_height: u64::MAX, hardened: false,
+        };
+        let entries = template_tx_entries(&tmpl);
+        let depends: Vec<Value> = entries.iter().map(|e| e["depends"].clone()).collect();
+        assert_eq!(depends, vec![json!([]), json!([1]), json!([]), json!([1, 2])]);
+        for (e, (t, fee)) in entries.iter().zip(&tmpl.transactions) {
+            assert_eq!(e["txid"], hex::encode(t.txid()));
+            assert_eq!(e["fee"], fee.to_string());
+            assert_eq!(e["data"], hex::encode(t.to_wire_bytes(true)));
+        }
     }
 
     /// WAL-1: `getrawtransaction` returns bytes that hash to the txid.

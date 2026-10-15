@@ -185,6 +185,34 @@ impl BlockTemplate {
             .collect();
         core::block_rules::coinbase_merkle_branch(&ids, self.hardened)
     }
+
+    /// In-template dependencies (BIP22 `depends`): for each listed
+    /// transaction, in template order, the 1-based positions in
+    /// [`Self::transactions`] of the EARLIER listed transactions whose
+    /// outputs it spends (its direct in-template parents, ascending). Since
+    /// ancestor-package selection (MEM-6) a template can carry a chain whose
+    /// child's input exists only as its in-template parent's output, so a
+    /// block built from a SUBSET of the listed transactions is valid only if
+    /// the subset is closed under these dependencies (transitively) and keeps
+    /// the listed order: dropping a parent but keeping its child makes the
+    /// block invalid (input not found). Below the hardening activation no
+    /// coinbase commitment fixes the list, so an external miner may drop
+    /// transactions; at/after it `coinbase_commitment` covers exactly the
+    /// listed transactions in this order.
+    pub fn depends(&self) -> Vec<Vec<usize>> {
+        let mut position: HashMap<[u8; 32], usize> = HashMap::with_capacity(self.transactions.len());
+        let mut out = Vec::with_capacity(self.transactions.len());
+        for (i, (tx, _)) in self.transactions.iter().enumerate() {
+            let mut deps: Vec<usize> = tx.inputs.iter()
+                .filter_map(|inp| position.get(&inp.prev_txid).copied())
+                .collect();
+            deps.sort_unstable();
+            deps.dedup();
+            out.push(deps);
+            position.insert(tx.txid(), i + 1);
+        }
+        out
+    }
 }
 
 /// Upper bound of the size of a block with these parents and NO

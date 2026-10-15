@@ -529,8 +529,18 @@ non-standard transaction (version ≥ 3 signed over sighash v2, a non-canonical
 witness, a suite 0x0002 key) is valid. Nor is it a verdict on the peer that
 relayed it: the gossip relay answers these refusals, and the next-height
 rules above, `Ignore` without a penalty (`docs/MEMPOOL.md`, §2), since a peer
-running an older release or one block behind across the activation relays
-such a transaction honestly.
+one block behind across the activation relays such a transaction honestly.
+A non-canonical witness on a version-3 transaction for a block at/after the
+activation is not policy but the consensus witness rule ("Witnesses"): no
+upgraded node relays such a transaction (one block behind, version 3 is
+non-standard), so admission treats it as consensus-invalid, like a bad
+signature. Releases before the validating relay forward every transaction
+frame without validating it, so the relay answers malformed or
+consensus-invalid transaction frames with a penalty (`Reject`) only once the
+node's next block height is above the activation height, i.e. once its chain
+contains the activation block, which those releases reject; before that it
+answers them `Ignore` (never forwarded). From then on every peer that follows
+the chain validates transaction frames before forwarding them.
 
 ### Signers
 
@@ -569,7 +579,11 @@ height: `hardening_active`, `merkle_rule` (`sha256d-duplicate-last` or
 listed transactions in that order, empty before the activation),
 `max_coinbase_extra_bytes`, `max_coinbase_script_pubkey_bytes`, and
 `coinbase_merkle_branch` (the siblings from the coinbase leaf to the header
-root under `merkle_rule`).
+root under `merkle_rule`). Each transaction entry carries `txid`, `fee`,
+`data` and `depends`: the 1-based positions of the earlier entries whose
+outputs it spends (BIP22). The template mines unconfirmed chains parent
+first (`docs/MEMPOOL.md`, §5), so a block built from a subset of the entries
+must keep every dependency of every entry it keeps, in the listed order.
 
 The listed transactions may fill the block up to `max_block_size` minus a
 framing bound minus `coinbase_reserve` (1,000 bytes), so the WHOLE coinbase,
