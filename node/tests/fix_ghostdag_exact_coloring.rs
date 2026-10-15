@@ -109,8 +109,10 @@ fn stored_blue_set(dag: &GhostDAG, b: &BlockHash, memo: &mut HashMap<BlockHash, 
 
 // ── reference GHOSTDAG (definition, brute force) ─────────────────────────────
 
-/// Same tie-broken Kahn order as `consensus::topological_sort` (ancestors
-/// first, hash order among ready blocks): the deterministic candidate order.
+/// Same order as `consensus::topological_sort` (audit B2-T9): Kahn with a
+/// FIFO queue, the initial ready blocks and each step's newly ready blocks in
+/// ascending id order, appended at the back. The independent check of this
+/// order is the Python reference (`node/tests/ghostdag_vectors.rs`).
 fn topo(parents_of: &HashMap<BlockHash, Vec<BlockHash>>, blocks: &HashSet<BlockHash>) -> Vec<BlockHash> {
     let mut indeg: HashMap<BlockHash, usize> = HashMap::new();
     let mut rev: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();

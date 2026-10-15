@@ -40,6 +40,13 @@ jobs:
         run: |
           python3 reference/gen_merkle_vectors.py
           git diff --exit-code reference/merkle_vectors.json
+      # docs/CONSENSUS.md "Coloring" / "Parent list" (audit B2-T9, B2-T10):
+      # the GhostDAG candidate order and parent-list shapes; the node checks
+      # them in node/tests/ghostdag_vectors.rs.
+      - name: GhostDAG vectors are reproducible
+        run: |
+          python3 reference/gen_ghostdag_vectors.py
+          git diff --exit-code reference/ghostdag_vectors.json
       - name: Ledger reference tests
         run: python3 reference/test_ledger.py
       - name: Ledger vectors are reproducible

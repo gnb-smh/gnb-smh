@@ -16,7 +16,12 @@ What the vectors do NOT pin:
 - **Header-chain context.** `accept_block`'s checks against the DAG (parents
   known, height = max parent height + 1, the expected ASERT bits,
   timestamps) are not evaluated; `reference/difficulty_vectors.json` pins
-  ASERT, the node's own tests pin the rest.
+  ASERT, `reference/ghostdag_vectors.json` (from `reference/gnb_ghostdag.py`,
+  checked by `node/tests/ghostdag_vectors.rs`) pins the GhostDAG data of
+  small DAGs at/after the activation (selected parent, DAG and header
+  heights, the candidate order and coloring, blue score and work; audit
+  B2-T9) and the parent-list shapes (repeated and redundant parents, B2-T10),
+  the node's own tests pin the rest.
 - **The production composition of the stages.** The runners call the
   stage functions in the node's order (the node runner: the ingress
   structure check `Block::validate_structure_without_pow`,

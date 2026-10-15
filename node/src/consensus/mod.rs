@@ -477,7 +477,15 @@ fn compute_mergeset(
     topological_sort(store, mergeset_set.into_iter().collect())
 }
 
-/// Topological sort: ancestors first, descendants last
+/// The coloring order of a mergeset (consensus, audit B2-T9; specified in
+/// docs/CONSENSUS.md, "Coloring", executable in reference/gnb_ghostdag.py):
+/// Kahn's algorithm with a FIFO queue. The in-degree of a block counts its
+/// parents inside `blocks`; the queue starts with the blocks of in-degree 0
+/// in ascending byte order of their ids; each block taken from the FRONT
+/// appends the blocks it makes ready at the BACK, in ascending id order. It
+/// is NOT "the lowest id among the blocks ready now": a block that becomes
+/// ready later comes after every block already queued, whatever its id
+/// (`node/tests/ghostdag_vectors.rs`, case `order/fifo-not-lowest-id`).
 fn topological_sort(store: &DagStore, blocks: Vec<BlockHash>) -> Vec<BlockHash> {
     // Build in-degree map within this set
     let set: HashSet<BlockHash> = blocks.iter().cloned().collect();
@@ -1860,9 +1868,10 @@ impl GhostDAG {
     /// Exact GHOSTDAG coloring (PHANTOM paper, Kaspa's algorithm) for blocks at
     /// or above the hardening activation (audit DAG-4).
     ///
-    /// Candidates are taken in the deterministic mergeset order (ancestors
-    /// first, hash tie-break). With `blue` = blue(selected_parent) ∪
-    /// {selected_parent} ∪ the candidates already coloured blue, a candidate
+    /// Candidates are taken in the mergeset order of [`topological_sort`]
+    /// (FIFO Kahn, ids ascending among the blocks each step makes ready).
+    /// With `blue` = blue(selected_parent) ∪ {selected_parent} ∪ the
+    /// candidates already coloured blue, a candidate
     /// `c` is blue iff
     ///   (a) |anticone(c) ∩ blue| ≤ k, and
     ///   (b) every `x ∈ anticone(c) ∩ blue` has |anticone(x) ∩ blue| + 1 ≤ k.

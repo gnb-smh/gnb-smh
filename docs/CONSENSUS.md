@@ -443,10 +443,33 @@ boundary.
 
 ### Coloring
 
-`mergeset(B) = past(B) \ past(sp) \ {sp}`. Candidates are processed in a fixed
-topological order: ancestors first, and among blocks that are ready at the
-same time, lower hash first. With `blue` = blue(sp) ∪ {sp} ∪ the candidates
-already colored blue, candidate c is blue iff:
+`mergeset(B) = past(B) \ past(sp) \ {sp}`. The coloring is greedy, so the
+order in which the candidates are processed decides which of them become
+blue; it is part of consensus (audit B2-T9) and is, at every height (the
+pre-activation coloring uses the same order):
+
+1. the in-degree of a candidate is the number of its distinct parents that
+   are themselves in the mergeset;
+2. a FIFO queue starts with the candidates of in-degree 0, in ascending byte
+   order of their 32-byte block ids;
+3. repeatedly the candidate at the FRONT of the queue is taken; the
+   candidates whose in-degree drops to 0 by its removal are appended at the
+   BACK of the queue, in ascending byte order of their ids.
+
+This is Kahn's algorithm with a FIFO queue. It is NOT "always the lowest id
+among the candidates ready at that point": a candidate that becomes ready
+later is processed after every candidate already queued, whatever its id.
+The two readings color differently (`reference/ghostdag_vectors.json`, case
+`order/fifo-not-lowest-id`: a mergeset of eleven siblings T1..T11 of the
+selected parent and U, a child of T1 with the lowest id; FIFO colors
+T1..T10 blue, the other reading T1, U, T2..T9). `reference/gnb_ghostdag.py`
+is the executable definition of the order and of the coloring below, and
+`node/tests/ghostdag_vectors.rs` checks the node against its vectors. (Kaspa
+orders the mergeset by blue work, then hash; GnB keeps its own order, which
+every GnB release since genesis has used.)
+
+With `blue` = blue(sp) ∪ {sp} ∪ the candidates already colored blue,
+candidate c is blue iff:
 
 1. |anticone(c) ∩ blue| ≤ k, and
 2. every x in anticone(c) ∩ blue has |anticone(x) ∩ blue| + 1 ≤ k.
