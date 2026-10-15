@@ -39,6 +39,10 @@ env:
   # Pinned nightly (cargo-fuzz needs nightly for the sanitizer flags). Bump
   # it deliberately: a moving nightly makes runs non-reproducible.
   FUZZ_TOOLCHAIN: nightly-2026-10-14
+  # Explicit target: cargo-fuzz defaults to the triple it was built for, and
+  # the prebuilt binary that install-action fetches is a musl build, whose
+  # statically linked libc ASan cannot instrument.
+  FUZZ_TARGET: x86_64-unknown-linux-gnu
 
 jobs:
   fuzz:
@@ -72,7 +76,7 @@ jobs:
         run: cp Cargo.lock node/fuzz/Cargo.lock
       - name: Build all fuzz targets (ASan)
         working-directory: node/fuzz
-        run: cargo +"$FUZZ_TOOLCHAIN" fuzz build
+        run: cargo +"$FUZZ_TOOLCHAIN" fuzz build --target "$FUZZ_TARGET"
       - name: Run each target over its seed corpus
         working-directory: node/fuzz
         run: |
@@ -100,7 +104,7 @@ jobs:
             # The committed corpus is the input; new coverage goes to a
             # scratch directory so the run never edits the checkout.
             mkdir -p "/tmp/fuzz-new/$t"
-            if ! cargo +"$FUZZ_TOOLCHAIN" fuzz run "$t" "/tmp/fuzz-new/$t" "corpus/$t" -- \
+            if ! cargo +"$FUZZ_TOOLCHAIN" fuzz run --target "$FUZZ_TARGET" "$t" "/tmp/fuzz-new/$t" "corpus/$t" -- \
                 -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048 -timeout=120 \
                 -print_final_stats=1; then
               failed="$failed $t"
