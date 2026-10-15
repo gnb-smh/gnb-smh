@@ -151,6 +151,16 @@ mod tests {
         assert_eq!(min_tx_fee_sat(5_000), MIN_TX_FEE_SAT);
         assert_eq!(min_tx_fee_sat(8_600), 17_200);
         assert_eq!(min_tx_fee_sat(8_601), 17_202);
+        // The product is computed in u64 on every target, so a size that fits
+        // in 32 bits gets the same, exact fee on 32- and 64-bit platforms.
+        assert_eq!(min_tx_fee_sat(u32::MAX as usize), 2 * u32::MAX as u64);
+        // The largest size: on 64-bit targets the product saturates at
+        // u64::MAX; with a 32-bit usize (i686, wasm32 wallets) it cannot
+        // overflow and stays exact. (Before the i686 CI job this test asserted
+        // the 64-bit value unconditionally and failed on 32-bit targets.)
+        #[cfg(target_pointer_width = "64")]
         assert_eq!(min_tx_fee_sat(usize::MAX), u64::MAX.div_ceil(1000));
+        #[cfg(not(target_pointer_width = "64"))]
+        assert_eq!(min_tx_fee_sat(usize::MAX), 2 * usize::MAX as u64);
     }
 }
