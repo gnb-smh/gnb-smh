@@ -1390,12 +1390,7 @@ impl NetworkNode {
         let mut recent_block_publishes: std::collections::HashMap<[u8; 32], std::time::Instant> =
             std::collections::HashMap::new();
         const REGOSSIP_SUPPRESS_TTL: Duration = Duration::from_secs(30);
-        // First tick after one period, not at once: at start-up no connection
-        // is established yet, so an immediate tick saw 0 peers and re-dialed
-        // every bootstrap peer the loop above had just dialed (two
-        // connections per peer).
-        let mut heartbeat   = tokio::time::interval_at(
-            tokio::time::Instant::now() + HEARTBEAT_PERIOD, HEARTBEAT_PERIOD);
+        let mut heartbeat   = new_heartbeat();
         let mut save_peers  = tokio::time::interval(Duration::from_secs(60));
         // Sprint CC: periodic tip announce (every 60s).
         let mut tip_announce = tokio::time::interval(Duration::from_secs(60));
@@ -1552,8 +1547,8 @@ impl NetworkNode {
                             // The count is of distinct peers, not connections, and the
                             // processor (RPC `peers`, the miner's has-peers check) sees
                             // it at once, not at the next 30 s heartbeat.
-                            if first_connection {
-                                peer_count = peer_count.saturating_add(1);
+                            if let Some(count) = peer_count_after_connect(peer_count, num_established.get()) {
+                                peer_count = count;
                                 crate::metrics::set_peer_count(peer_count as i64);
                                 sink.deliver(NetworkMessage::PeerCount {
                                     count: peer_count, addresses: known_peers.iter().cloned().collect(),
@@ -1666,8 +1661,8 @@ impl NetworkNode {
                         }
                         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                             info!("✗ disconnected: {}", peer_id);
-                            if num_established == 0 {
-                                peer_count = peer_count.saturating_sub(1);
+                            if let Some(count) = peer_count_after_disconnect(peer_count, num_established) {
+                                peer_count = count;
                                 crate::metrics::set_peer_count(peer_count as i64);
                                 sink.deliver(NetworkMessage::PeerCount {
                                     count: peer_count, addresses: known_peers.iter().cloned().collect(),
@@ -2081,6 +2076,30 @@ pub const GOSSIP_RX_TX_LOG_TARGET: &str = "gnb_gossip_rx_tx";
 /// Period of the network heartbeat (peer count, housekeeping, re-subscribe,
 /// bootstrap re-dial with no peers).
 const HEARTBEAT_PERIOD: Duration = Duration::from_secs(30);
+
+/// The network heartbeat timer. Its first tick comes after one period, not
+/// at once: at start-up no connection is established yet, so an immediate
+/// tick saw 0 peers and re-dialed every bootstrap peer the swarm loop had
+/// just dialed (two connections per peer).
+fn new_heartbeat() -> tokio::time::Interval {
+    tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT_PERIOD, HEARTBEAT_PERIOD)
+}
+
+/// The distinct-peer count after a connection to a peer is established
+/// (`num_established`: that peer's connections, this one included), or
+/// `None` when it is unchanged: only a peer's first connection counts. The
+/// count (RPC `peers`, the miner's has-peers check) used to count
+/// connections, so a peer dialed twice counted twice.
+fn peer_count_after_connect(count: usize, num_established: u32) -> Option<usize> {
+    (num_established == 1).then(|| count.saturating_add(1))
+}
+
+/// The distinct-peer count after a connection to a peer is closed
+/// (`num_established`: that peer's connections still open), or `None` when
+/// it is unchanged: only a peer's last connection closing counts.
+fn peer_count_after_disconnect(count: usize, num_established: u32) -> Option<usize> {
+    (num_established == 0).then(|| count.saturating_sub(1))
+}
 
 /// Whether a tip claim, clamped to `claimed` (blue score), is worth a directed
 /// pull from its author: only a claim ahead of our own selected tip.
@@ -3622,5 +3641,47 @@ mod tests {
             &mut sel, &mut pending, now);
         assert!(pending.is_empty());
         assert_eq!(sel.in_flight(&a), 0);
+    }
+
+    // ── Peer count and heartbeat ────────────────────────────────────────────
+
+    /// The peer count is of distinct peers: a second connection to a peer
+    /// (both ends dialing, a re-dial) does not count, closing one of two
+    /// connections does not uncount, closing the last one does. Counting
+    /// connections reported a peer dialed twice as two peers.
+    #[test]
+    fn peer_count_counts_distinct_peers_not_connections() {
+        // Peer P connects twice, Q once: 2 peers.
+        let mut count = 0usize;
+        for n in [1u32, 2, 1] {
+            if let Some(c) = peer_count_after_connect(count, n) {
+                count = c;
+            }
+        }
+        assert_eq!(count, 2);
+        assert_eq!(peer_count_after_connect(count, 2), None, "a second connection to a peer");
+        // One of P's two connections closes: P is still connected.
+        assert_eq!(peer_count_after_disconnect(count, 1), None);
+        // P's last connection closes, then Q's.
+        count = peer_count_after_disconnect(count, 0).unwrap();
+        assert_eq!(count, 1);
+        count = peer_count_after_disconnect(count, 0).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(peer_count_after_disconnect(0, 0), Some(0), "never below zero");
+    }
+
+    /// The heartbeat's first tick comes one period after start-up, not at
+    /// once: an immediate tick saw 0 peers (no connection established yet)
+    /// and re-dialed every bootstrap peer, giving two connections per peer.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_first_tick_is_one_period_after_start() {
+        let mut hb = new_heartbeat();
+        let start = tokio::time::Instant::now();
+        assert!(tokio::time::timeout(HEARTBEAT_PERIOD - Duration::from_millis(1), hb.tick()).await.is_err(),
+            "the heartbeat ticked at start-up");
+        hb.tick().await;
+        assert_eq!(start.elapsed(), HEARTBEAT_PERIOD);
+        hb.tick().await;
+        assert_eq!(start.elapsed(), 2 * HEARTBEAT_PERIOD);
     }
 }

@@ -242,8 +242,9 @@ class TestNode:
         return m[-1].decode()
 
     def sees_peer(self, peer_id: str) -> bool:
-        """`peer_id` connected in this run (the RPC peer count only refreshes
-        on the 30 s network heartbeat; the log line is immediate)."""
+        """`peer_id` connected in this run, from the log line the node writes
+        on the connection (the RPC peer count says how many distinct peers
+        are connected, not which)."""
         return f"✓ connected: {peer_id}".encode() in self.log_since_start()
 
     def tip(self) -> str:

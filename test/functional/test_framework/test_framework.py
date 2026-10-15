@@ -218,9 +218,10 @@ class GnbTestFramework:
 
     def wait_for_peers(self, nodes=None, pairs=None, timeout: float = 60) -> None:
         """Wait until every pair (default: all pairs of `nodes`) is connected
-        both ways, from the nodes' logs (the RPC peer count lags by up to the
-        30 s network heartbeat), then give gossipsub two of its 1 s heartbeats
-        to exchange subscriptions and graft the mesh."""
+        both ways, from the nodes' logs (which name the peer; the RPC peer
+        count, updated on every connect and disconnect, only counts them),
+        then give gossipsub two of its 1 s heartbeats to exchange
+        subscriptions and graft the mesh."""
         nodes = nodes or self.nodes
         if pairs is None:
             pairs = [(a, b) for i, a in enumerate(nodes) for b in nodes[i + 1:]]

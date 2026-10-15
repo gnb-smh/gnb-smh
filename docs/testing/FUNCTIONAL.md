@@ -199,7 +199,11 @@ of failed tests.
 ## Behaviour the tests rely on (and document)
 
 - The RPC peer count, and the miner's "has peers" check, count distinct
-  peers and change on every connect and disconnect.
+  peers and change on every connect and disconnect
+  (`peer_count_counts_distinct_peers_not_connections`). The network
+  heartbeat's first tick comes 30 s after start-up, so start-up does not
+  re-dial the bootstrap peers it has just dialed
+  (`heartbeat_first_tick_is_one_period_after_start`).
 - A disqualified block stays in the DAG and in `getdaginfo.tips` (DAG-1), but
   is never selected, never offered as a parent and never relayed.
 - The mempool is not persisted across restarts.
@@ -210,7 +214,11 @@ of failed tests.
   back up, the 2 s connection settle included): on connect each node asks
   the new peer for its
   frontier directly (a directed `GetTips`), and a tip claim ahead of ours
-  makes the node ask the claiming peer for its frontier. A pulled block a
+  makes the node ask the claiming peer for its frontier. (The header pulls a
+  claim triggers still go to the pull selector's choice: a `Headers` answer
+  is not deduplicated against block requests already in flight, so asking
+  the claimant too would download blocks twice; the frontier pulled from the
+  claimant is what the heal needs.) A pulled block a
   peer does not have (`BlockNotFound`) is retried on another peer at once.
   Before these, the on-connect gossip announcements to a second peer within
   the same second were dropped as gossipsub duplicates and the claim-
