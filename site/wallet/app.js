@@ -9,8 +9,10 @@
 // it the claimed values of the UTXOs a payment spends are verified against
 // their previous transactions inside the core; the review shows the ACTUAL
 // fee and any input that could not be verified (WAL-1, WAL-6); new wallets
-// are backed by a 24-word recovery phrase (WAL-7).
-import { loadCore } from "/wallet/core.js";
+// are backed by a 24-word recovery phrase (WAL-7). Only coins spendable in the
+// next block reach the core: an immature coinbase output is neither counted as
+// spendable nor offered to the core (core.js splitByMaturity).
+import { loadCore, spendableWindow, splitByMaturity, COINBASE_MATURITY } from "/wallet/core.js";
 import { html, raw, isAddress, isHex64, num, sats } from "/assets/safe.js";
 
 // SHA-256 of /wallet/gnb_wallet.wasm. Written by scripts/build-wallet-wasm.sh
@@ -18,11 +20,15 @@ import { html, raw, isAddress, isHex64, num, sats } from "/assets/safe.js";
 const WASM_SHA256 = "3639ff5883e841af2d91cb3df0dc239345f5ad21aad6a94b5e5e73ce8eb259c4";
 
 const SAT = 100000000n;
+// One payment spends at most this many outputs (each input carries an
+// ~8.5 kB post-quantum signature); getutxos is asked for this many, and for
+// UTXO_WIDE_WINDOW when immature coinbase outputs took part of a cut-short list.
+const UTXO_WINDOW = 50, UTXO_WIDE_WINDOW = 1000;
 const IDLE_LOCK_MS = 10 * 60 * 1000;
 const app = document.getElementById("app");
 const lockBtn = document.getElementById("lock");
 let core = null;
-let state = { mode: "locked", address: null, tab: "send", balance: null, utxos: [], pending: null };
+let state = { mode: "locked", address: null, tab: "send", balance: null, utxos: [], immature: [], pending: null };
 let idleTimer = null, pollTimer = null;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -57,8 +63,10 @@ async function broadcast(hex) {
 /** Only well-formed UTXO rows reach the core (WAL-3). */
 function cleanUtxos(rows) {
   return (Array.isArray(rows) ? rows : []).filter((u) => u && isHex64(u.txid) && Number.isInteger(u.index)
-    && u.index >= 0 && sats(u.value) !== null && typeof u.script_pubkey === "string" && /^[0-9a-f]{40}$/.test(u.script_pubkey));
+    && u.index >= 0 && sats(u.value) !== null && typeof u.script_pubkey === "string" && /^[0-9a-f]{40}$/.test(u.script_pubkey)
+    && (u.coinbase_height === undefined || u.coinbase_height === null || (Number.isSafeInteger(u.coinbase_height) && u.coinbase_height >= 0)));
 }
+const total = (rows) => rows.reduce((s, u) => s + sats(u.value), 0n);
 function download(name, text) {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([text], { type: "application/json" }));
@@ -84,7 +92,7 @@ function armIdleLock() {
 function lock(message) {
   try { core?.wipe(); } catch {}
   clearTimeout(idleTimer); clearInterval(pollTimer);
-  state = { mode: "locked", address: null, tab: "send", balance: null, utxos: [], pending: null };
+  state = { mode: "locked", address: null, tab: "send", balance: null, utxos: [], immature: [], pending: null };
   lockBtn.hidden = true;
   renderGate(message);
 }
@@ -200,7 +208,7 @@ function showPhrase(created, keystore) {
 // ── the vault (unlocked or watching) ─────────────────────────────────────────
 function enter(mode, address, notice) {
   if (!isAddress(address)) throw new Error("invalid address");
-  state = { mode, address, tab: mode === "keys" ? "send" : "receive", balance: null, utxos: [], pending: null, notice };
+  state = { mode, address, tab: mode === "keys" ? "send" : "receive", balance: null, utxos: [], immature: [], pending: null, notice };
   lockBtn.hidden = false; lockBtn.textContent = mode === "keys" ? "Lock" : "Close";
   armIdleLock(); renderVault(); refresh();
   clearInterval(pollTimer); pollTimer = setInterval(refresh, 20000);
@@ -209,11 +217,21 @@ function enter(mode, address, notice) {
 async function refresh() {
   if (state.mode === "locked") return;
   try {
-    const [bal, utxos] = await Promise.all([api("getbalance", [state.address]), api("getutxos", [state.address, 50])]);
+    const address = state.address;
+    const fetchRows = async (limit) => {
+      const r = await api("getutxos", [address, limit]);
+      return { rows: cleanUtxos(r.utxos), truncated: r.truncated === true };
+    };
+    const [bal, next] = await Promise.all([api("getbalance", [address]), nextBlockHeight()]);
+    const coins = await spendableWindow(fetchRows, next, UTXO_WINDOW, UTXO_WIDE_WINDOW);
+    if (state.address !== address) return;
     state.balance = sats(bal.satoshis ?? bal.balance) ?? 0n;
-    state.utxos = cleanUtxos(utxos.utxos);
-    state.utxoTotal = state.utxos.reduce((s, u) => s + sats(u.value), 0n);
-    state.utxoCount = count(bal.utxo_count ?? state.utxos.length);
+    state.utxos = coins.spendable;
+    state.utxoTotal = total(coins.spendable);
+    state.immature = coins.immature;
+    state.immatureTotal = total(coins.immature);
+    state.utxosTruncated = coins.truncated;
+    state.utxoCount = count(bal.utxo_count ?? coins.listed);
     paintSlab();
     if (state.tab === "activity") paintActivity();
   } catch (e) { const el = document.getElementById("slab-err"); if (el) showError(el, e); }
@@ -237,8 +255,8 @@ function paintSlab() {
    <div class="row">${keys ? raw(`<span class="chip on">● Unlocked</span>`) : raw(`<span class="chip watch">◌ Watching</span>`)}<a class="chip" href="/explorer#/address/${state.address}" target="_blank" rel="noopener">Explorer ↗</a></div>
    <span class="k">Address</span><div class="addr" id="addr">${state.address}</div>
    <div class="row"><button class="chip" id="copy">Copy address</button><button class="chip" id="refresh">Refresh</button></div>
-   <div class="facts"><div><b>${state.utxoCount ?? "—"}</b><span>Unspent outputs</span></div><div><b>${state.utxos.length ? fmt(state.utxoTotal, 4) : "—"}</b><span>Spendable now*</span></div></div>
-   <p class="note">* One payment can spend up to 50 outputs (each input carries an ~8.5 kB post-quantum signature).</p><div id="slab-err"></div>`);
+   <div class="facts"><div><b>${state.utxoCount ?? "—"}</b><span>Unspent outputs</span></div><div><b>${state.utxos.length ? fmt(state.utxoTotal, 4) : "—"}</b><span>Spendable now*</span></div>${state.immature.length ? html`<div><b>${fmt(state.immatureTotal, 4)}</b><span>Immature (mining rewards)</span></div>` : ""}</div>
+   <p class="note">* One payment can spend up to ${UTXO_WINDOW} outputs (each input carries an ~8.5 kB post-quantum signature).${state.immature.length ? ` Mining rewards (coinbase outputs) become spendable ${COINBASE_MATURITY} blocks after their block; ${state.immature.length} are not yet and are not counted.` : ""}${state.utxosTruncated ? " The node listed only part of this address's outputs; more may be spendable." : ""}</p><div id="slab-err"></div>`);
   document.getElementById("copy").addEventListener("click", (e) => navigator.clipboard?.writeText(state.address).then(() => { e.target.textContent = "Copied"; setTimeout(() => (e.target.textContent = "Copy address"), 1200); }));
   document.getElementById("refresh").addEventListener("click", refresh);
 }
@@ -286,8 +304,9 @@ function paintSend(pane = document.getElementById("pane")) {
    <button class="btn" id="review">Review payment</button><div id="send-out"></div>`);
   document.getElementById("max").addEventListener("click", () => {
     // Leave room for the fee of up to 50 inputs (~430 kB at 2,000 sat/kB).
-    const reserve = 900000n, total = state.utxoTotal || 0n;
-    document.getElementById("amt").value = total > reserve ? fmt(total - reserve) : "0";
+    // utxoTotal counts only the coins spendable in the next block.
+    const reserve = 900000n, spendable = state.utxoTotal || 0n;
+    document.getElementById("amt").value = spendable > reserve ? fmt(spendable - reserve) : "0";
   });
   document.getElementById("review").addEventListener("click", async (ev) => {
     const btn = ev.currentTarget, out = document.getElementById("send-out"); out.innerHTML = "";
@@ -295,12 +314,19 @@ function paintSend(pane = document.getElementById("pane")) {
       const to = core.normalize(document.getElementById("to").value);
       const amount = parseGnb(document.getElementById("amt").value);
       if (amount <= 0n) throw new Error("Enter an amount above zero.");
-      if (!state.utxos.length) throw new Error("No spendable outputs found for this address yet.");
+      if (!state.utxos.length) {
+        throw new Error(state.immature.length
+          ? `No spendable outputs yet: ${state.immature.length} mining reward(s) become spendable ${COINBASE_MATURITY} blocks after their block.`
+          : "No spendable outputs found for this address yet.");
+      }
       busy(btn, "Verifying inputs and signing…"); await nextFrame();
       const next = await nextBlockHeight();
-      const plan = core.plan(state.utxos, to, amount.toString(), "0", next);
+      // The rows of the last refresh, checked again at this height.
+      const coins = splitByMaturity(state.utxos, next).spendable;
+      if (!coins.length) throw new Error("No spendable outputs at the next block; refresh and try again.");
+      const plan = core.plan(coins, to, amount.toString(), "0", next);
       const prevtxs = await fetchPrevTxs(plan.prev_txids || []);
-      const tx = core.pay(state.utxos, to, amount.toString(), "0", next, prevtxs);
+      const tx = core.pay(coins, to, amount.toString(), "0", next, prevtxs);
       state.pending = { ...tx, to };
       unbusy(btn);
       const unverified = num(tx.unverified_inputs) || 0;
