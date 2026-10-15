@@ -1298,7 +1298,9 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // walk stops early `truncated` is true and `utxo_count` /
             // `satoshis` cover the returned UTXOs only; `getbalance` gives
             // the address totals.
-            const GETUTXOS_MAX: usize = 10_000;
+            // The wallets' send flow widens a truncated window to this cap
+            // (`gnb_crypto::wallet::send::GETUTXOS_MAX_ROWS`, the same value).
+            const GETUTXOS_MAX: usize = gnb_crypto::wallet::send::GETUTXOS_MAX_ROWS as usize;
             let limit = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64())
                 .map(|n| usize::try_from(n).unwrap_or(usize::MAX).min(GETUTXOS_MAX))
                 .unwrap_or(GETUTXOS_MAX);

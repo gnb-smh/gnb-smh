@@ -2,10 +2,12 @@
 //! (WAL-1, WAL-6, WAL-7). Transport-agnostic: the caller passes a JSON-RPC
 //! closure, so the flow is unit-tested without a node.
 //!
-//! 1. `getutxos` (bounded by a limit) and `getdaginfo` (the next block's
-//!    height = `next_block_height`, or `tip_height` + 1 from an older node;
-//!    it selects the transaction version: 3 with sighash v3 at/after the
-//!    hardening activation, 1 below it);
+//! 1. `getutxos` (bounded by a limit; a truncated window that cannot pay is
+//!    asked again with the node's whole window, `GETUTXOS_MAX_ROWS`) and
+//!    `getdaginfo` (the next block's height = `next_block_height`, or
+//!    `tip_height` + 1 from an older node; it selects the transaction
+//!    version: 3 with sighash v3 at/after the hardening activation, 1 below
+//!    it);
 //! 2. coin selection on the claimed values, among the outputs spendable in
 //!    the next block (a coinbase output, `coinbase_height` in its row, only
 //!    from `COINBASE_MATURITY` blocks after its coinbase);
@@ -171,21 +173,71 @@ pub fn next_block_height_from_daginfo(result: &Value) -> Result<u64, String> {
     }
 }
 
+/// The most `getutxos` rows the node returns in one call (its `GETUTXOS_MAX`
+/// in node/src/rpc/mod.rs; a larger limit is capped to it).
+pub const GETUTXOS_MAX_ROWS: u64 = 10_000;
+
+/// Whether a `getutxos` result says the node stopped listing at the limit.
+fn utxos_truncated(result: &Value) -> bool {
+    result.get("truncated").and_then(Value::as_bool).unwrap_or(false)
+}
+
 /// Steps 1–4: fetch, select, verify, build and sign. Nothing is broadcast.
+///
+/// The node lists an address's unspent outputs in index order up to
+/// `req.utxo_limit` (`truncated` when it stopped there), so the window can
+/// miss the coins a payment needs: immature coinbase outputs, which are
+/// never selected, can fill most or all of it, or what it holds is too
+/// little. When a truncated window fails, the flow asks once more for the
+/// node's whole window ([`GETUTXOS_MAX_ROWS`], what `WalletClient` asks for);
+/// an error from a window that is still truncated says so, instead of
+/// claiming that the address has no spendable coins.
 pub fn prepare_send(rpc: &RpcFn<'_>, req: &SendRequest<'_>) -> Result<PreparedSend, String> {
-    let result = rpc("getutxos", &json!([req.keypair.address, req.utxo_limit]))?;
+    let result = fetch_utxos(rpc, req, req.utxo_limit)?;
+    let next_block_height = next_block_height_from_daginfo(&rpc("getdaginfo", &json!([]))?)?;
+    match prepare_from_rows(rpc, req, &result, next_block_height) {
+        Err(_) if utxos_truncated(&result) && req.utxo_limit < GETUTXOS_MAX_ROWS => {
+            let wide = fetch_utxos(rpc, req, GETUTXOS_MAX_ROWS)?;
+            prepare_from_rows(rpc, req, &wide, next_block_height)
+                .map_err(|e| with_truncation_note(e, &wide, &req.keypair.address))
+        }
+        Err(e) => Err(with_truncation_note(e, &result, &req.keypair.address)),
+        ok => ok,
+    }
+}
+
+/// Step 1: `getutxos` of the sender's address, at most `limit` rows.
+fn fetch_utxos(rpc: &RpcFn<'_>, req: &SendRequest<'_>, limit: u64) -> Result<Value, String> {
+    let result = rpc("getutxos", &json!([req.keypair.address, limit]))?;
     if let Some(e) = result_error(&result) {
         return Err(format!("getutxos: {e}"));
     }
-    let all = parse_utxo_rows(&result)?;
+    Ok(result)
+}
+
+/// `error`, and when `result` (a `getutxos` answer) was truncated, that the
+/// node listed only part of `address`'s unspent outputs.
+fn with_truncation_note(error: String, result: &Value, address: &str) -> String {
+    if !utxos_truncated(result) {
+        return error;
+    }
+    let listed = result.get("utxos").and_then(Value::as_array).map_or(0, Vec::len);
+    format!("{error} (the node listed only the first {listed} unspent outputs of {address}: \
+        getutxos truncated; spendable coins may exist beyond them)")
+}
+
+/// Steps 2–4 on one `getutxos` result.
+fn prepare_from_rows(rpc: &RpcFn<'_>, req: &SendRequest<'_>, result: &Value, next_block_height: u64)
+    -> Result<PreparedSend, String>
+{
+    let all = parse_utxo_rows(result)?;
     if all.is_empty() {
         return Err(format!("no UTXOs found for {}", req.keypair.address));
     }
     let value_seen = all.iter().try_fold(0u64, |t, u| t.checked_add(u.output.value))
         .ok_or("UTXO value total exceeds u64")?;
-    let next_block_height = next_block_height_from_daginfo(&rpc("getdaginfo", &json!([]))?)?;
     // Coinbase outputs not yet mature at the next block are never selected.
-    let (utxos, immature) = spendable_utxo_rows(&result, next_block_height)?;
+    let (utxos, immature) = spendable_utxo_rows(result, next_block_height)?;
     if utxos.is_empty() {
         return Err(all_immature_message(&req.keypair.address, immature, next_block_height));
     }
@@ -458,6 +510,99 @@ mod tests {
         };
         let err = prepare_send(&rpc, &request(&kp, &to)).err().unwrap();
         assert!(err.contains("immature"), "{err}");
+    }
+
+    /// The txid of the `i`-th coin of [`window_mock`]: `i` + 1, big-endian.
+    fn window_txid(i: usize) -> [u8; 32] {
+        let mut t = [0u8; 32];
+        t[..4].copy_from_slice(&(i as u32 + 1).to_be_bytes());
+        t
+    }
+
+    /// A `getutxos` mock of a node listing `coins` (value, coinbase_height)
+    /// in order up to the requested limit, `truncated` when it stops there,
+    /// as the node does; records each call's method and limit.
+    fn window_mock<'a>(kp: &'a Keypair, coins: &'a [(u64, Option<u64>)], tip: u64,
+        calls: &'a RefCell<Vec<(String, Option<u64>)>>)
+        -> impl Fn(&str, &Value) -> Result<Value, String> + 'a
+    {
+        move |method, params| {
+            let limit = params.get(1).and_then(Value::as_u64);
+            calls.borrow_mut().push((method.to_string(), limit));
+            Ok(match method {
+                "getdaginfo" => json!({"tip_height": tip, "next_block_height": tip + 1}),
+                "getutxos" => {
+                    let limit = limit.unwrap_or(GETUTXOS_MAX_ROWS).min(GETUTXOS_MAX_ROWS) as usize;
+                    let list: Vec<Value> = coins.iter().take(limit).enumerate().map(|(i, (value, cb))| {
+                        let mut row = json!({"txid": hex::encode(window_txid(i)), "index": 0,
+                            "value": value.to_string(), "script_pubkey": hex::encode(kp.address_bytes())});
+                        if let Some(h) = cb { row["coinbase_height"] = json!(h); }
+                        row
+                    }).collect();
+                    json!({"utxos": list, "truncated": coins.len() > limit})
+                }
+                _ => json!({"error": "unknown method"}),
+            })
+        }
+    }
+
+    /// `gnb-cli send` asks for a 50-row window. When immature coinbase
+    /// outputs fill it (a miner's address) and the mature coins come after
+    /// them in the node's order, the send used to fail with "no spendable
+    /// UTXOs ... still immature" although the address could pay; it now
+    /// asks again for the node's whole window and pays from the mature
+    /// coins. A window that could pay is not asked again, and a failure on a
+    /// window that is still truncated says the list was truncated.
+    #[test]
+    fn a_truncated_window_of_immature_coinbase_outputs_is_widened() {
+        let kp = super::super::generate_keypair(false);
+        let to = Address::from_hash([7; 20], Network::Mainnet);
+        let tip = 1_000u64;
+        let mut coins: Vec<(u64, Option<u64>)> = vec![(10 * SAT, Some(tip)); 55];
+        coins.extend([(2 * SAT, None); 5]);
+        let calls = RefCell::new(Vec::new());
+        let rpc = window_mock(&kp, &coins, tip, &calls);
+        let req = SendRequest { amount: 3 * SAT, ..request(&kp, &to) };
+        let prepared = prepare_send(&rpc, &req).unwrap();
+        let spent: Vec<[u8; 32]> = prepared.payment.tx.inputs.iter().map(|i| i.prev_txid).collect();
+        assert_eq!(spent.len(), 2);
+        assert!(spent.iter().all(|t| (55..60).any(|i| *t == window_txid(i))),
+            "an immature coinbase output was selected: {spent:?}");
+        let windows: Vec<Option<u64>> = calls.borrow().iter()
+            .filter(|(m, _)| m == "getutxos").map(|(_, l)| *l).collect();
+        assert_eq!(windows, vec![Some(50), Some(GETUTXOS_MAX_ROWS)]);
+        assert_eq!(prepared.utxos_seen, 60);
+
+        // Mature coins inside the first window: one call, as before.
+        let mut coins: Vec<(u64, Option<u64>)> = vec![(2 * SAT, None); 5];
+        coins.extend(vec![(10 * SAT, Some(tip)); 55]);
+        let calls = RefCell::new(Vec::new());
+        let rpc = window_mock(&kp, &coins, tip, &calls);
+        prepare_send(&rpc, &req).unwrap();
+        assert_eq!(calls.borrow().iter().filter(|(m, _)| m == "getutxos").count(), 1);
+
+        // Still truncated at the node's cap: the error says so.
+        let coins: Vec<(u64, Option<u64>)> = vec![(10 * SAT, Some(tip)); GETUTXOS_MAX_ROWS as usize + 1];
+        let calls = RefCell::new(Vec::new());
+        let rpc = window_mock(&kp, &coins, tip, &calls);
+        let err = prepare_send(&rpc, &req).err().unwrap();
+        assert!(err.contains("immature") && err.contains("truncated"), "{err}");
+        assert!(err.contains(&format!("first {GETUTXOS_MAX_ROWS} unspent outputs")), "{err}");
+        // A caller already asking for the whole window: asked once, same note.
+        let calls = RefCell::new(Vec::new());
+        let rpc = window_mock(&kp, &coins, tip, &calls);
+        let whole = SendRequest { utxo_limit: GETUTXOS_MAX_ROWS, ..req };
+        let err = prepare_send(&rpc, &whole).err().unwrap();
+        assert!(err.contains("immature") && err.contains("truncated"), "{err}");
+        assert_eq!(calls.borrow().iter().filter(|(m, _)| m == "getutxos").count(), 1);
+
+        // Not truncated: the plain message, one call.
+        let coins = vec![(10 * SAT, Some(tip)); 3];
+        let calls = RefCell::new(Vec::new());
+        let rpc = window_mock(&kp, &coins, tip, &calls);
+        let err = prepare_send(&rpc, &req).err().unwrap();
+        assert!(err.contains("immature") && !err.contains("truncated"), "{err}");
+        assert_eq!(calls.borrow().iter().filter(|(m, _)| m == "getutxos").count(), 1);
     }
 
     #[test]
