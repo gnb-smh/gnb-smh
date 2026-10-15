@@ -113,27 +113,42 @@ pub fn parse_utxo_rows(result: &Value) -> Result<Vec<Utxo>, String> {
     }).collect()
 }
 
-/// `getutxos` rows spendable in the block at `next_block_height`, and how
-/// many were left out: a row carrying `coinbase_height` (an output of a
-/// coinbase) is spendable only from `coinbase_height + COINBASE_MATURITY`
-/// (`core::check_coinbase_maturity`). Selecting one earlier produced a
+/// Whether the `getutxos` row `row` is spendable in the block at
+/// `next_block_height`: a row carrying `coinbase_height` (an output of a
+/// coinbase) only from `coinbase_height + COINBASE_MATURITY` on
+/// (`core::check_coinbase_maturity`); a row without the field (an older node,
+/// or not a coinbase) is. A malformed field is refused. The one rule every
+/// wallet path selects coins by: `gnb-cli` / `gnb-wallet` (`prepare_send`),
+/// `WalletClient::send_payment` and the browser wallet core
+/// (crates/gnb-wallet-wasm). Selecting an immature output produced a
 /// transaction every node refuses (test/functional/wallet_coinbase_maturity.py).
-/// A row without the field (an older node, or not a coinbase) is kept; a
-/// malformed one is refused, like every other malformed row.
+pub fn utxo_row_spendable_at(row: &Value, next_block_height: u64) -> Result<bool, String> {
+    match row.get("coinbase_height") {
+        None | Some(Value::Null) => Ok(true),
+        Some(v) => {
+            let h = v.as_u64().ok_or("UTXO coinbase_height must be an integer")?;
+            Ok(next_block_height.saturating_sub(h) >= crate::core::COINBASE_MATURITY)
+        }
+    }
+}
+
+/// Why a payment cannot be built when every coin of `address` is an immature
+/// coinbase output (`immature` of them) at `next_block_height`.
+pub fn all_immature_message(address: &str, immature: usize, next_block_height: u64) -> String {
+    format!("no spendable UTXOs for {address}: {immature} coinbase output(s) still immature at height \
+        {next_block_height} (coinbase outputs mature after {} blocks)", crate::core::COINBASE_MATURITY)
+}
+
+/// `getutxos` rows spendable in the block at `next_block_height`
+/// ([`utxo_row_spendable_at`]), and how many were left out. A malformed row
+/// is refused, like every other malformed row.
 pub fn spendable_utxo_rows(result: &Value, next_block_height: u64) -> Result<(Vec<Utxo>, usize), String> {
     let utxos = parse_utxo_rows(result)?;
     let rows = result.get("utxos").and_then(Value::as_array).ok_or("RPC response missing UTXO array")?;
     let mut spendable = Vec::with_capacity(utxos.len());
     let mut immature = 0;
     for (utxo, row) in utxos.into_iter().zip(rows) {
-        let mature = match row.get("coinbase_height") {
-            None | Some(Value::Null) => true,
-            Some(v) => {
-                let h = v.as_u64().ok_or("UTXO coinbase_height must be an integer")?;
-                next_block_height.saturating_sub(h) >= crate::core::COINBASE_MATURITY
-            }
-        };
-        if mature { spendable.push(utxo) } else { immature += 1 }
+        if utxo_row_spendable_at(row, next_block_height)? { spendable.push(utxo) } else { immature += 1 }
     }
     Ok((spendable, immature))
 }
@@ -172,9 +187,7 @@ pub fn prepare_send(rpc: &RpcFn<'_>, req: &SendRequest<'_>) -> Result<PreparedSe
     // Coinbase outputs not yet mature at the next block are never selected.
     let (utxos, immature) = spendable_utxo_rows(&result, next_block_height)?;
     if utxos.is_empty() {
-        return Err(format!("no spendable UTXOs for {}: {} coinbase output(s) still immature at height {} \
-            (coinbase outputs mature after {} blocks)",
-            req.keypair.address, immature, next_block_height, crate::core::COINBASE_MATURITY));
+        return Err(all_immature_message(&req.keypair.address, immature, next_block_height));
     }
     let chain_id = ChainId::for_network(req.keypair.network()?);
 
