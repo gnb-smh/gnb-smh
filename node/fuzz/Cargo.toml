@@ -36,7 +36,10 @@
 # how to reproduce them.
 #
 # `cargo check` on stable type-checks the targets (libfuzzer-sys builds there
-# too); actually fuzzing needs nightly + cargo-fuzz.
+# too); actually fuzzing needs nightly + cargo-fuzz. Copy the root lockfile
+# first in every case (node/fuzz/Cargo.lock is not committed): without it
+# cargo resolves this workspace afresh to the newest semver-compatible
+# versions on crates.io, not the audited ones.
 
 [package]
 name = "gnb-fuzz"
@@ -74,10 +77,12 @@ tempfile = "3"
 parking_lot = "0.12"
 pqcrypto-internals = "0.2"
 # sync_rr_codec drives the node's libp2p request-response codec
-# (`BlochSyncCodec`) over an in-memory stream: the `Codec` trait and an
-# executor. Any version: the one the node resolves to (same crate instance).
+# (`BlochSyncCodec`) over an in-memory stream with a `futures` executor and
+# `futures::io::Cursor` (same 0.3 requirement as the node, so one crate
+# instance). The `Codec` trait comes from the node's own libp2p, re-exported
+# as `gnb::libp2p`: this crate does not name libp2p, so it cannot resolve to
+# a libp2p other than the node's (the libp2p upgrade needs no edit here).
 futures = "0.3"
-libp2p = { version = "*", default-features = false, features = ["request-response"] }
 
 [workspace]
 members = ["."]

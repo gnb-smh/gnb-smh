@@ -32,6 +32,8 @@ use std::io;
 use common::*;
 use futures::executor::block_on;
 use futures::io::Cursor;
+// The node's own libp2p (re-exported): the trait BlochSyncCodec implements.
+use gnb::libp2p::request_response::Codec as _;
 use gnb::network::sync_rr::{
     as_pull_request, check_nonempty_frame, decode_request, decode_response, encode_frame, is_sync_protocol_violation,
     response_to_message, BlochSyncCodec, SyncRequest, SyncResponse, SYNC_PROTOCOL,
@@ -41,7 +43,6 @@ use gnb::network::{
     MAX_WIRE_GETHEADERS_LIMIT, MAX_WIRE_LOCATOR, MAX_WIRE_SYNC_ENTRIES, MAX_WIRE_TIPS,
 };
 use libfuzzer_sys::fuzz_target;
-use libp2p::request_response::Codec as _;
 
 /// The read cap of the codec (`take(MAX_FRAME)`), restated.
 const MAX_FRAME: usize = 4 * 1024 * 1024;

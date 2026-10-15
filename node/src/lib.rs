@@ -62,6 +62,16 @@ pub mod accept;
 #[cfg(feature = "node")]
 pub mod template;
 
+// The libp2p crate the node is built with, for code that drives the node's
+// protocol implementations through libp2p traits and must name the SAME crate
+// instance (the fuzz target `sync_rr_codec` calls `BlochSyncCodec` through
+// `request_response::Codec`). Naming libp2p in such a crate with its own
+// version requirement could resolve to another 0.x minor, whose traits
+// `BlochSyncCodec` does not implement.
+#[cfg(feature = "node")]
+#[doc(hidden)]
+pub use libp2p;
+
 /// Convenience re-exports for consumers of the library (wallet UIs,
 /// block explorers, etc.). Import with `use gnb::prelude::*`.
 pub mod prelude {
