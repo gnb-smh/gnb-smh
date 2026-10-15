@@ -4,20 +4,45 @@
 and block validity in both regimes of the hardening activation, the way
 Bitcoin Core's `src/test/data/tx_valid.json`, `tx_invalid.json` and
 `script_tests.json` pin Bitcoin's rules. Each case is data: bytes, the UTXO
-state they are evaluated against, a height, an explicit activation height,
-and the expected verdict with the class of the rule that rejects it. A
-change to a consensus rule changes a verdict and fails the runners, whatever
-code path the change went through.
+state they are evaluated against, a height, an activation height, the
+expected verdict with the class of the rule that rejects it, and (for a
+transaction) the mempool verdict with the class of the admission rule that
+refuses it. A change to a rule the vectors exercise changes a verdict, or the
+stage that reaches it, and fails a runner (see "Effectiveness" for the
+mutations checked).
+
+What the vectors do NOT pin:
+
+- **Header-chain context.** `accept_block`'s checks against the DAG (parents
+  known, height = max parent height + 1, the expected ASERT bits,
+  timestamps) are not evaluated; `reference/difficulty_vectors.json` pins
+  ASERT, the node's own tests pin the rest.
+- **The production composition of the stages.** The runners call the
+  stage functions in the node's order (the node runner: the ingress
+  structure check `Block::validate_structure_without_pow`,
+  `check_block_hardened_at`, the pow limit, `Block::validate_pow`,
+  `limits::check_block_context_free`, `accept::validate_block_in_view_classified`,
+  `admission::check_transaction`), but neither runner calls `accept_block`
+  or the gossip/RPC pipeline around them, and a tx case reaches the block
+  rules through the test helper `tx_context_free` (the per-transaction
+  subset of `Block::validate_structure_without_pow_at`).
+- **The proof of work beyond three blocks.** Two `pow: full` cases evaluate
+  the GnB-SMH proof at the genesis target (a mined nonce and a failing one);
+  the third, at 0x2100ffff, pins the limit only (nearly every output meets
+  that target). Every other case skips the proof or checks the limit alone.
+- **Shielded transactions, the 400 KiB mempool size limit, pool-relative
+  admission** (conflicts, the rolling fee, the reject filter) and the
+  mempool's own data structure.
 
 | What | Where |
 | --- | --- |
 | Transaction vectors (185 cases) | `reference/tx_vectors.json` |
-| Block vectors (96 cases) | `reference/block_vectors.json` |
+| Block vectors (100 cases) | `reference/block_vectors.json` |
 | Generator (deterministic Rust, seeded keys and signatures) | `crates/gnb-crypto/tests/gen_consensus_vectors.rs` |
 | Runner through gnb-crypto (real pow limit, explicit chain ids) | `crates/gnb-crypto/tests/consensus_vectors.rs` |
 | Runner through the node (connect path, mempool admission, testnet) | `node/tests/consensus_vectors.rs` |
-| Shared loader and error-class mapping | `crates/gnb-crypto/tests/consensus_vectors_common/mod.rs` |
-| Independent Python check (no Rust) | `reference/check_consensus_vectors.py` over `reference/gnb_validity.py`, `gnb_merkle.py`, `gnb_sighash.py`, `gnb_difficulty.py` |
+| Shared loader, stage expectations (`context_free_expectation`) and error-class mapping | `crates/gnb-crypto/tests/consensus_vectors_common/mod.rs` |
+| Independent Python check (no Rust) | `reference/check_consensus_vectors.py` over `reference/gnb_validity.py`, `gnb_merkle.py`, `gnb_sighash.py`, `gnb_difficulty.py`, `gnb_smh.py` |
 | CI | `python-reference` (Python check), `consensus-crates` (gnb-crypto runner; regenerate and `git diff --exit-code`), `workspace-test` (node runner) |
 
 ```text
@@ -31,26 +56,35 @@ GNB_WRITE_VECTORS=1 cargo test -p gnb-crypto --test gen_consensus_vectors -- --i
 ## Three independent judges
 
 1. **The generator writes the expected verdicts by hand.** Next to every
-   construction (`c.valid(..)`, `c.invalid(.., "min-fee")`) the expected
-   verdict, class and mempool verdict are literals. The generator never calls
-   a validation function to decide a verdict, and boundary values (dust 546,
+   construction (`c.valid(..)`, `c.invalid(.., "min-fee")`,
+   `c.invalid_refused(.., "min-fee", "non-standard-no-inputs")`) the
+   expected verdict, class, mempool verdict and refusal class are literals.
+   The generator never calls a validation function to decide a verdict, and
+   boundary values (dust 546,
    maturity 100, minimum fee `max(10,000, ceil(size x 2,000 / 1,000))`, the
    subsidy schedule, `MAX_SUPPLY_SAT`, the 1,000,000-byte limit, the
    10,000-byte script cap) come from the generator's own constants, not from
    the code under test. Regenerating after a rule change therefore does not
-   move a vector; the runners fail instead. The one exception is mining: the
-   `pow: full` case finds its nonce with `Block::validate_pow`.
+   move a vector; the runners fail instead. Mining does not use a validation
+   function either: the `pow: full` nonces come from the GnB-SMH hash with
+   the generator's own target decoding and comparison (`proof_holds`,
+   `mine_from`; the search for the genesis-target case starts at a recorded
+   hint, so regeneration costs one evaluation instead of about 4,500).
 2. **The Rust runners** check every verdict through the functions the node
-   runs (see "Evaluation" below), and every recorded derived value (txid,
-   wtxid, sighash digests, roots, sizes) against the current code.
+   runs (see "Evaluation" below), stage by stage (the context-free stages
+   must reject exactly the context-free classes), and every recorded
+   derived value (txid, wtxid, sighash digests, roots, sizes) against the
+   current code.
 3. **The Python check** re-derives every derived value and every
    non-signature verdict from the specification (`docs/CONSENSUS.md`), with
    its own decoder, Merkle trees, commitment, both sighash digests, bincode
    size model, Falcon compact-encoding parser and validity rules
-   (`reference/gnb_validity.py`). It cannot verify ML-DSA-65 / Falcon-1024
-   signatures, so a case whose class is `bad-signature` must pass every other
-   rule in Python, and every other class must be exactly the first rule
-   Python sees fail. It also re-derives every mempool verdict.
+   (`reference/gnb_validity.py`), and evaluates the GnB-SMH proof of the
+   `pow: full` blocks with `reference/gnb_smh.py` (about 2 s each). It cannot
+   verify ML-DSA-65 / Falcon-1024 signatures, so a case whose class is
+   `bad-signature` must pass every other rule in Python, and every other
+   class must be exactly the first rule Python sees fail. It re-derives every
+   mempool verdict and refusal class the same way.
 
 Deliberately corrupting a vector (an expected class, a digest, a size, a
 policy verdict) makes the Python check fail; so does a rule flipped in the
@@ -78,9 +112,25 @@ Every case carries `activation_height` and `height` (decimal strings). The
 regime is `pre-activation` iff `height < activation_height` (the block rules
 additionally never apply at height 0; no case uses it). Most cases use
 activation height 1,000 with heights 999 (pre) and 1,000 (post: the boundary
-itself). Further cases use the mainnet schedule (109,999 / 110,000), the
-testnet schedule (activation 0, height 1), "never" (`18446744073709551615`)
-and heights around the halving at 4,204,800.
+itself). Further cases use activation 0 on mainnet, "never"
+(`18446744073709551615`) and heights around the halving at 4,204,800.
+
+`activation_source` says where a runner takes the activation height from:
+
+- `explicit`: the recorded height, installed for the case
+  (`activation::scoped_override` in the node runner, the `_at` functions'
+  argument in the gnb-crypto runner);
+- `schedule`: the case's network's own activation schedule (mainnet 110,000,
+  testnet 0; docs/CONSENSUS.md, "Activation"), which the runners do NOT
+  install: the gnb-crypto runner evaluates the case under
+  `activation::hardening_activation_height_for_chain(chain)` (and
+  `validate_pow` under the process-wide height), the node runner under the
+  process-wide height of its chain id (mainnet in the main process, testnet
+  in the testnet child). These cases (mainnet 109,999 / 110,000 for the
+  version rule, the 64-byte rule, the coinbase commitment and the pow limit;
+  testnet activation 0 at height 1) therefore pin the schedule constants and
+  the chain-id-to-schedule mapping; the Python check verifies that the
+  recorded height is the documented schedule.
 
 `network` is `mainnet` or `testnet` (the chain id signatures commit to). The
 node's chain id is process-wide, so the node runner evaluates the testnet
@@ -97,6 +147,7 @@ cases in a child process of its own test binary.
     "description":        what the case is and why the verdict holds,
     "network":            "mainnet" | "testnet",
     "activation_height":  "1000",
+    "activation_source":  "explicit" | "schedule",
     "height":             "999",                 header height of the evaluation block
     "regime":             "pre-activation" | "post-activation",
     "prevouts": [ {                              the UTXO view, exactly
@@ -105,7 +156,7 @@ cases in a child process of its own test binary.
        "source": "utxo" | "block-coinbase" } ],
     "tx":                 wire hex (Transaction::to_wire_bytes(true)),
     "expected": { "verdict": "valid" | "invalid", "error_class": null | class },
-    "policy":   { "verdict": "accept" | "reject", "error_class": null | class },
+    "policy":   { "verdict": "accept" | "reject", "error_class": null (accept) | class (reject) },
     "derived":  null (undecodable) | { "txid", "wtxid", "wire_size", "txid_preimage_size",
                  "digests": [ { "input", "sighash_v2", "sighash_v3_suite", "sighash_v3" | null } ] }
   } ]
@@ -126,8 +177,10 @@ in the node's order:
    (`Block::validate_coinbase_format`), at/after the activation not 64 bytes
    (`block_rules::check_tx_not_64_bytes`), no dust (`Block::validate_dust`),
    encoding caps and MoneyRange (`limits::check_block_context_free`);
-2. connection, `accept::validate_block_in_view_classified_at` (the function
-   behind block extension, reorg and re-validation) on a RocksDB store holding
+2. connection, `accept::validate_block_in_view_classified` (the function
+   the acceptance pipeline calls for an extension and for every block of a
+   reorg; the case's activation height installed, or the schedule's) on a
+   RocksDB store holding
    exactly the `utxo` prevouts: at/after the activation BIP30 and no spend of
    the block's own coinbase; coinbase maturity; double spends; missing
    inputs; input MoneyRange; the version rule; witnesses; public-key hashes;
@@ -140,15 +193,42 @@ block vectors' subject.
 `expected` is the consensus verdict and the class of the FIRST rule that
 fails. Invalid cases are built to violate one rule where the rules allow it
 (otherwise the class is the first in the order above, which the Python check
-reproduces).
+reproduces). The runners compare stage by stage: step 1 must reject exactly
+the cases whose class is a step-1 class (`coinbase-format`, `tx-64-bytes`,
+`dust`, the encoding caps, and `value-out-of-range` when an output, an
+output total or the block total is above `MAX_SUPPLY_SAT`, which the runner
+computes from the data); every other case must pass step 1 and get its
+verdict from step 2. A step-1 rule that is dropped therefore fails the
+runners even where a step-2 rule would reject the case with the same class
+(the output MoneyRange is checked in both).
+
+The gnb-crypto runner evaluates step 2 through gnb-crypto's own functions in
+the node's order (`core::check_coinbase_maturity`, the input sum with
+`limits::money_add`, `core::sighash::verify_tx_scripts`,
+`limits::check_tx_money_range`, inputs >= outputs, `core::check_min_fee`).
+BIP30, the same-block coinbase rule, duplicate inputs and missing inputs are
+implemented in `node/src/accept.rs`, so for the 7 cases of those classes it
+checks every earlier rule and lists the case as deferred to the node runner
+(`TX_DEFERRED_TO_NODE`; the test asserts that every case is either decided or
+deferred, and prints the deferred ones).
 
 `policy` is mempool admission (`admission::check_transaction`, relay policy,
 signatures on) for a block at `height`, on the same store, in which every
 `utxo` prevout's txid is also indexed as a confirmed transaction (a node
-applies every coin together with its creating transaction). A
-consensus-invalid case is always refused (`error_class` null: the reason is
-not pinned); a consensus-valid case is accepted or refused for the named
-policy class.
+applies every coin together with its creating transaction): `accept`, or
+`reject` with the class of the FIRST admission rule that refuses it. A
+consensus-invalid case is always refused. Admission runs its relay-policy
+rules before its copies of the consensus rules (structure, already
+confirmed, MoneyRange / dust / zero value, witness standardness and the
+hybrid suite, the version rule and policy, the 64-byte rule, duplicate
+inputs, presence, maturity, value, the minimum fee, the relay fee,
+signatures), so 37 of the 120 invalid cases are refused for a policy reason
+(`non-standard-witness` for every non-canonical witness, `non-standard-suite`
+for a 0x0002 key, `non-standard-version`, `non-standard-no-inputs`,
+`missing-input` for the block's own coinbase, `already-confirmed` for the
+BIP30 case); the other 83 are refused by the admission's own copy of the
+violated rule, with the consensus class. The node runner fails on a
+different class, and on a storage or pool error.
 
 `derived.digests` are the sighash v2 digest of every input under the
 network's chain id and the sighash v3 digest (spent outputs from `prevouts`;
@@ -177,27 +257,43 @@ input's coin is not in `prevouts`). The Python check recomputes them with
 ```
 
 **Evaluation** (scope `full`): `Block::from_wire_bytes`;
-`Block::validate_structure_without_pow_at` (parent count, size measure of the
+`Block::validate_structure_without_pow` / `_at` (parent count, size measure of the
 regime, header Merkle root of the regime, coinbase format, at/after the
 activation the 64-byte rule and the coinbase commitment, duplicate
 transactions, dust); `block_rules::check_block_hardened_at`; the pow limit
 (`pow: limit`: the bits decode and the target is within the pow limit of the
 height, `pow_limit_bits_at`; `pow: full`: also the GnB-SMH proof,
 `Block::validate_pow`); `limits::check_block_context_free`; then
-`accept::validate_block_in_view_classified_at` against a store holding the
-prevouts. Scope `connect` decodes and runs the last step only: it pins VAL-3
+`accept::validate_block_in_view_classified` against a store holding the
+prevouts. As for transactions, the stages up to `check_block_context_free`
+must reject exactly the context-free classes (the output-side
+`value-out-of-range` included), and every other case must reach the connect
+step. Scope `connect` decodes and runs the last step only: it pins VAL-3
 (no spend of the block's own coinbase) at/after the activation, which a
 complete block cannot reach because its coinbase commitment would have to
 commit to itself (the matching `full` case shows the commitment rejecting
 it).
 
-Not part of the block vectors: the header-chain context `accept_block`
-checks against the DAG (parents known, height = max parent height + 1,
-expected ASERT bits, timestamps; `reference/difficulty_vectors.json` pins
-ASERT) and the GnB-SMH proof except in the one mined case. The node's test
-build pins `validate_pow`'s limit (`test-pow-limit`), so the gnb-crypto
-runner, built without it, evaluates `validate_pow` with the real limit for
-every pow-limit case.
+The node runner calls the ingress check `Block::validate_structure_without_pow`
+(process-wide activation height: the case's installed height, or the
+schedule) and `accept::validate_block_in_view_classified`, the variant the
+acceptance pipeline calls; the gnb-crypto runner calls the `_at` variants.
+
+The GnB-SMH proof (`pow: full`) is evaluated for three blocks:
+`pow/genesis-bits-mined/post` (bits 0x1f0e9036, the genesis target and the
+pow limit from the activation, with a mined nonce: about one output in 4,500
+meets this target, so a changed preimage, nonce, hash or comparison fails
+it), `pow/genesis-bits-proof-fails/post` (the same block with a nonce whose
+output misses the target: `bad-pow`, so a skipped or inverted proof check
+fails it) and `pow/pow-limit-bits-below-the-activation` (0x2100ffff, where
+nearly every output meets the target: it pins the limit, not the proof).
+The node's test build pins `validate_pow`'s limit to 0x2100ffff
+(`test-pow-limit`); all three are within it, so the node runner evaluates
+them too, and the gnb-crypto runner, built without the feature, also
+evaluates `validate_pow` with the real limit for every pow-limit case (it
+must refuse them without an evaluation). Not part of the block vectors: the
+header-chain context `accept_block` checks against the DAG (see the top of
+this page).
 
 ## Error classes
 
@@ -231,22 +327,25 @@ from in `consensus_vectors_common::classify`):
 | `coinbase-value` | the coinbase claims more than subsidy + fees | `miner coinbase output exceeds allowed amount` |
 | `pow-limit` | the target is above the pow limit of the height (POW-3) | runner (`pow_limit_bits_at`) |
 | `bad-bits` | the compact bits do not decode | runner (`try_bits_to_target`) |
+| `bad-pow` | the GnB-SMH output is not below the target of the bits | `Block::validate_pow` false |
 
-Policy classes (`policy.error_class`, consensus-valid cases only):
-`non-standard-witness` (a non-canonical witness below the activation),
-`non-standard-version` (version >= 3 below the activation),
-`non-standard-suite` (a suite-0x0002 key), `non-standard-zero-value`,
-`non-standard-no-outputs`, `missing-input` (an unconfirmed coin: the block's
+Policy classes (`policy.error_class` of a refused case): any consensus class
+above that admission's own copy of the rule decides (`decode` for bytes
+`admission::decode_tx_strict` refuses), plus `non-standard-witness` (a
+non-canonical witness, at every height), `non-standard-version` (version >= 3
+below the activation), `non-standard-suite` (a suite-0x0002 key),
+`non-standard-zero-value`, `non-standard-no-outputs`,
+`non-standard-no-inputs`, `missing-input` (an unconfirmed coin: the block's
 own coinbase), `already-confirmed` (the txid is already in the transaction
 index).
 
 ## Coverage
 
-Transactions (185: 97 pre-activation, 88 post-activation; 65 valid):
+Transactions (185: 97 pre-activation, 88 post-activation; 65 valid; 180 on mainnet, 5 on testnet):
 
 | Area | Cases | What |
 | --- | --- | --- |
-| `basic/` | 10 | honest signers of both regimes; 1-3 inputs; the mainnet (109,999 / 110,000), testnet (0) and never schedules |
+| `basic/` | 10 | honest signers of both regimes; 1-3 inputs; the mainnet schedule (109,999 / 110,000, `activation_source: schedule`), activation 0 on mainnet, never activated |
 | `struct/` | 15 | no outputs (valid, non-standard), no inputs, coinbase-shaped transaction, missing input, null outpoint in a 2-input transaction, duplicate inputs, two vouts of one txid, lock time and sequence not enforced |
 | `decode/` | 8 | truncated, trailing byte, non-minimal varint, empty, input / output count above the cap, 10,001-byte script_sig and script_pubkey |
 | `size/` | 6 | a 10,000-byte script_sig (lenient padding: valid pre, non-canonical post), a 10,000-byte output script, 300 outputs |
@@ -254,14 +353,14 @@ Transactions (185: 97 pre-activation, 88 post-activation; 65 valid):
 | `maturity/` | 12 | depth 100 / 99 / 0 (a parallel block's coinbase) / negative, a second immature input, a carry-over coin at height 1, the block's own coinbase (valid pre, `same-block-coinbase` post) |
 | `version/` | 18 | versions 0, 1, 2, 3, 4, 2^32-1 in both regimes; version 3 over the wrong digest in each regime; the mainnet boundary; never-activated |
 | `sig/` | 26 | wrong amount and wrong script (v2 does not commit: valid; v3 does: invalid), another input's amount, wrong input index, the v2 out-of-range marker quirk, testnet signature on mainnet, components swapped between inputs, component ids swapped, legacy binding over a v3 digest and bound binding over a v2 digest, a digest with another suite id, tampered ML-DSA and Falcon nonce bytes, another key's signature, a key that does not hash to the coin, a bad second input |
-| `net/` | 5 | testnet-signed on testnet (both regimes), mainnet-signed on testnet, the testnet schedule |
+| `net/` | 5 | testnet-signed on testnet (both regimes), mainnet-signed on testnet, the testnet schedule (activation 0, `schedule`) |
 | `suite/` | 16 | split-and-relabel of a hybrid signature to 0x0002 (valid pre: the CRY-2 weakness kept below the activation; invalid post), genuine 0x0002 spends (valid, non-standard), cross-suite key/signature pairs, relabelled to reserved 0x0000 / 0xffff and unknown 0x0003, a 3,310-byte 0x0002 body |
 | `raw/` | 8 | raw carry-over public keys with enveloped and raw signatures, and the address committing to the exact key encoding |
 | `witness/` | 22 | trailing bytes, signature without envelope, Falcon in the 1,280-byte zero-padded form (valid pre, non-canonical post), an extra non-zero Falcon byte, truncated Falcon, empty signature, sig_len beyond the script, empty and 7-byte script_sigs, pk_len one short |
 | `tx64/` | 8 | 63 / 64 / 65-byte txid preimages in both regimes; the mainnet boundary |
 | `bip30/` | 2 | an output on an unspent coin's outpoint (valid pre, invalid post) |
 
-Blocks (96: 40 pre-activation, 56 post-activation; 33 valid):
+Blocks (100: 41 pre-activation, 59 post-activation; 34 valid):
 
 | Area | Cases | What |
 | --- | --- | --- |
@@ -270,19 +369,23 @@ Blocks (96: 40 pre-activation, 56 post-activation; 33 valid):
 | `coinbase/` | 23 | not first, two coinbases, no transactions, two / zero outputs, subsidy + 1, subsidy + fees (exact and + 1), paying zero, above `MAX_SUPPLY_SAT`, the halving at 4,204,800 |
 | `commitment/`, `structure/` | 17 | two parents; script_sig of 79 bytes; bad tag; height + 1 and big-endian; parents reordered and dropped; witness root zero, over txids, and with the coinbase's own wtxid; 10,000-byte script_sig (valid) and one byte more (decode); a wrong commitment ignored pre; the mainnet boundary; 256 parents (valid) and 257 (decode) |
 | `same-block-coinbase/` | 3 | valid pre; `connect` scope post; `full` scope post (the commitment cannot match) |
-| `pow/` | 11 | 0x2100ffff mined and evaluated pre, refused post; the genesis target exactly and one unit above, in both regimes; the mainnet boundary; four malformed bits |
+| `pow/` | 13 | the GnB-SMH proof at the genesis target: a mined nonce (valid) and a failing nonce (`bad-pow`), post; 0x2100ffff evaluated pre (limit only), refused post; the genesis target exactly and one unit above, in both regimes; the mainnet boundary; four malformed bits |
 | `size/` | 6 | 1 MB blocks: wire 1,000,001 with bincode below (valid pre, invalid post), wire exactly 1,000,000 (valid post), bincode 1,000,001 with wire below (invalid pre, valid post), bincode exactly 1,000,000 (valid pre) |
-| `value/`, `maturity/`, `sig/`, `tx64/`, `bip30/`, `version/`, `witness/` | 16 | the transaction rules inside a block: dust, an immature spend, a bad signature, a 64-byte transaction, BIP30 on a spend's and on the coinbase's output, the version rule, a padded witness under the same block id (valid pre, witness commitment post) |
+| `value/`, `maturity/`, `sig/`, `tx64/`, `bip30/`, `version/`, `witness/` | 18 | the transaction rules inside a block: dust, the block-wide output total above `MAX_SUPPLY_SAT` with every transaction in range (VAL-11), an immature spend, a bad signature, a 64-byte transaction, BIP30 on a spend's and on the coinbase's output, the version rule, a padded witness under the same block id (valid pre, witness commitment post) |
 
 `crates/gnb-crypto/tests/consensus_vectors.rs::vector_coverage` fails if a
-class, a policy class, a network x regime pair, a version x regime pair, a
-raw key or a 0x0002 key disappears from the files.
+class, a policy class, a network x regime pair, a network's schedule case, a
+version x regime pair, a raw key, a 0x0002 key, the mined and the failing
+proof at the genesis target or the block-total MoneyRange case disappears
+from the files.
 
 ## Adding a case
 
 Add it to the generator, next to its neighbours, with the verdict, class and
-mempool verdict you expect as literals; keep it to one violated rule when the
-rules allow it. Regenerate with `GNB_WRITE_VECTORS=1`, run the three judges,
+mempool verdict (and refusal class) you expect as literals: `c.invalid(..)`
+when admission refuses it for the same rule, `c.invalid_refused(.., class,
+policy_class)` when an earlier admission rule does; keep it to one violated
+rule when the rules allow it. Regenerate with `GNB_WRITE_VECTORS=1`, run the three judges,
 and review the JSON diff (an existing case must not change unless the change
 is the point). A new rejection string must be classified in
 `consensus_vectors_common::classify` (the runners panic on an unknown one)
@@ -292,11 +395,13 @@ and, for Python, produced by `reference/gnb_validity.py`.
 
 Each rule below was flipped in the code, one at a time (anchored source
 edits); both Rust runners were rebuilt and run, then the code was restored
-and the tree checked clean. All 16 mutations made at least one runner fail,
-naming the cases (2026-10-15 run; the baseline passed in the same build).
-The Python check does not read the Rust code, so it is unaffected by these
-and is exercised instead by corrupting the files (13 corruptions, each
-reported).
+and the tree checked clean. The Python check does not read the Rust code, so
+it is unaffected by these and is exercised instead by corrupting the files
+(13 corruptions in the first round, 5 in the second, each reported).
+
+**First round** (the runners as first committed; 16 mutations, each made at
+least one runner fail, naming the cases; the baseline passed in the same
+build):
 
 | Mutation | Runner | Cases that fail |
 | --- | --- | --- |
@@ -315,7 +420,38 @@ reported).
 | hardened pow limit = the old pow limit | both | `pow/pow-limit-bits-from-the-activation`, `pow/genesis-target-plus-one-from-the-activation`, `pow/mainnet-110000-pow-limit-bits` |
 | commitment height also accepted big-endian | both | `commitment/height-big-endian/post` |
 | lenient witness framing made exact below the activation | both | `witness/one-trailing-byte/pre`, `witness/1000-trailing-bytes/pre`, `size/script-sig-10000-bytes/pre`, `fee/witness-padding-raises-the-minimum/pre`, `witness/padded-witness-same-block-id/pre` |
-| MoneyRange allows `MAX_SUPPLY_SAT + 1` | node | `value/output-above-max-supply/*`, `value/prevout-above-max-supply/*`, `coinbase/above-max-supply/*` (the gnb-crypto runner leaves the input-side MoneyRange to the node runner and does not see this one) |
+| MoneyRange allows `MAX_SUPPLY_SAT + 1` | node | `value/output-above-max-supply/*`, `value/prevout-above-max-supply/*`, `coinbase/above-max-supply/*` (the gnb-crypto runner of that round compared no `value-out-of-range` verdict at all, on either side; fixed in the second round) |
+
+**Second round** (after review, 2026-10-15). A review found mutations the
+first-round runners did not see: they compared a context-free class only when
+the context-free stage failed, let every other case fall through silently,
+recorded no refusal class for consensus-invalid transactions, evaluated no
+GnB-SMH proof that can fail, and installed the activation height of the
+schedule cases instead of reading the schedule. The runners now compare each
+stage against `context_free_expectation`, decide or explicitly defer every
+case, compare every refusal class, run `schedule` cases on the schedule, and
+the files gained the genesis-target proof pair and the block-total MoneyRange
+case. Each mutation below was run against the first-round runners and files
+(column "before") and the current ones ("now"), in a scratch copy of the tree
+with its own target dir; the baselines passed in both.
+
+| Mutation | Before | Now: cases that fail |
+| --- | --- | --- |
+| `check_block_context_free` without its MoneyRange (`check_block_money_range`) | gnb-crypto runner passed; node runner failed only `coinbase/above-max-supply/*` (the connect path's own output MoneyRange rejected the tx cases with the same class) | both runners: `value/output-above-max-supply/*`, `value/outputs-sum-above-max-supply/*`, `value/output-u64-max/*` (context-free stage), `coinbase/above-max-supply/*`, `value/block-output-total-above-max-supply/*` |
+| block-wide output total not summed | (no vector) | both runners: `value/block-output-total-above-max-supply/*` |
+| `validate_pow` skips the GnB-SMH evaluation (limit kept) | both runners passed | both runners: `pow/genesis-bits-proof-fails/post` |
+| `validate_pow` evaluates the proof for `nonce ^ 1` | (not run: the only proof, at 0x2100ffff, holds for nearly any nonce) | both runners: `pow/genesis-bits-mined/post`, `pow/genesis-bits-proof-fails/post` |
+| admission without its "no inputs" rule (still refused, as zero-value) | node runner passed | node runner: `struct/no-inputs/*` (refusal class) |
+| `core::check_min_fee` accepts one unit below the minimum | gnb-crypto runner passed | gnb-crypto runner: `fee/minimum-minus-one/*` |
+| `core::check_coinbase_maturity` accepts depth 99 | gnb-crypto runner passed | gnb-crypto runner: `maturity/depth-99/*` |
+| `MAINNET_HARDENING_ACTIVATION_HEIGHT` = 110,001 | both runners passed | both runners: `basic/mainnet-schedule/110000`, `version/mainnet-boundary/v1-at-110000`, `tx64/mainnet-boundary/110000`, `commitment/no-commitment-at-mainnet-height-110000`, `pow/mainnet-110000-pow-limit-bits` (node: also their mempool verdicts) |
+| `TESTNET_HARDENING_ACTIVATION_HEIGHT` = 2 | node runner passed | both runners: `net/testnet-schedule/height-1` (node: the testnet child, consensus and mempool) |
+
+Python corruptions of the second round, each reported: the mined nonce + 1
+(`bad-pow` and a stale block id), the failing proof relabelled valid, the
+refusal class of `witness/one-trailing-byte/post` set to its consensus class,
+that of `struct/no-inputs/pre` set to `min-fee`, and `basic/activation-zero/height-1`
+labelled `schedule`.
 
 ## Findings while building the vectors
 
