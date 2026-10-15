@@ -157,6 +157,15 @@ fn lib_commitment_kind(r: Result<(), &'static str>) -> Result<(), &'static str> 
     })
 }
 
+/// The activation predicate as specified (`activation::is_active_at`, and
+/// never at the genesis height): `height >= activation`. `NEVER` is u64::MAX,
+/// so the rules are active under it at the one height u64::MAX: no block can
+/// reach that height (its parents would be at u64::MAX - 1), but a decoded
+/// block can claim it.
+fn ref_active(height: u64, activation: u64) -> bool {
+    height >= 1 && height >= activation
+}
+
 fn check_block(b: &Block) {
     // Encodings and sizes.
     let wire = b.to_wire_bytes();
@@ -176,8 +185,12 @@ fn check_block(b: &Block) {
     }
 
     // Roots and commitments.
-    assert_eq!(b.body_merkle_root_at(0).0, ref_body_root(b, b.height >= 1), "hardened body root");
-    assert_eq!(b.body_merkle_root_at(activation::NEVER).0, ref_body_root(b, false), "legacy body root");
+    assert_eq!(b.body_merkle_root_at(0).0, ref_body_root(b, ref_active(b.height, 0)), "hardened body root");
+    assert_eq!(
+        b.body_merkle_root_at(activation::NEVER).0,
+        ref_body_root(b, ref_active(b.height, activation::NEVER)),
+        "legacy body root"
+    );
     assert_eq!(br::witness_root(&b.transactions).0, ref_witness_root(&b.transactions), "witness root");
     assert_eq!(br::parents_commitment(&b.header.parents), ref_parents_commitment(&b.header.parents));
     assert_eq!(
@@ -193,7 +206,9 @@ fn check_block(b: &Block) {
     let _ = br::check_hardened_body(b);
     let _ = b.validate_structure_without_pow_at(0);
     let _ = b.validate_structure_without_pow_at(activation::NEVER);
-    assert_eq!(br::check_block_hardened_at(b, activation::NEVER), Ok(()));
+    if !ref_active(b.height, activation::NEVER) {
+        assert_eq!(br::check_block_hardened_at(b, activation::NEVER), Ok(()));
+    }
     if b.height == 0 {
         assert_eq!(br::check_block_hardened_at(b, 0), Ok(()));
     }
