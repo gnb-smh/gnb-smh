@@ -19,10 +19,17 @@ fn main() {
     // Parse --rpc-url flag (default: 127.0.0.1:17210)
     let mut rpc_host = "127.0.0.1".to_string();
     let mut rpc_port = 17210u16;
+    // WAL-7: `--rpc-url https://node.example` (certificate-verified), with
+    // `--rpc-ca <PEM/DER file>` for a private CA or self-signed certificate.
+    let mut rpc_url: Option<String> = None;
+    let mut rpc_ca: Option<String> = None;
     let mut allow_large_hd_wallet = false;
     // WAL-7: the network of a new wallet is an explicit choice recorded in
     // the file (keystore v3 authenticates it), never inferred from its name.
     let mut testnet = false;
+    // CRY-7: `send` unlocks a v2 keystore only for an explicitly stated
+    // network (--mainnet / --testnet), then rewrites it as v3.
+    let mut mainnet = false;
     let mut cmd_args: Vec<&str> = Vec::new();
 
     let mut i = 1;
@@ -30,12 +37,24 @@ fn main() {
         match args[i].as_str() {
             "--rpc-host" => { i += 1; if i < args.len() { rpc_host = args[i].clone(); } }
             "--rpc-port" => { i += 1; if i < args.len() { rpc_port = args[i].parse().unwrap_or(17210); } }
+            "--rpc-url" => { i += 1; if i < args.len() { rpc_url = Some(args[i].clone()); } }
+            "--rpc-ca" => { i += 1; if i < args.len() { rpc_ca = Some(args[i].clone()); } }
             "--allow-large-hd-wallet" => { allow_large_hd_wallet = true; }
             "--testnet" => { testnet = true; }
+            "--mainnet" => { mainnet = true; }
             _ => { cmd_args.push(&args[i]); }
         }
         i += 1;
     }
+    if testnet && mainnet {
+        die("--mainnet and --testnet are mutually exclusive");
+    }
+    let stated_network = match (testnet, mainnet) {
+        (true, _) => Some(gnb::address::Network::Testnet),
+        (false, true) => Some(gnb::address::Network::Mainnet),
+        (false, false) => None,
+    };
+    let rpc_target = RpcTarget::new(rpc_url, &rpc_host, rpc_port, rpc_ca.as_deref());
 
     if cmd_args.is_empty() {
         print_usage();
@@ -136,7 +155,7 @@ fn main() {
         // ── Wallet: send (builds + signs + broadcasts) ─────────────
         "send" => {
             require_params(params, 3, "send <wallet.json> <to_address> <amount_gnb> [--fee auto|GNB] [--max-fee GNB] [--yes] [--allow-unverified-inputs]");
-            do_send(params, &rpc_host, rpc_port);
+            do_send(params, &rpc_target, stated_network);
             return;
         }
 
@@ -271,7 +290,7 @@ fn main() {
     };
 
     // Make RPC call
-    match rpc_call(&rpc_host, rpc_port, rpc_method, &rpc_params) {
+    match rpc_call(&rpc_target, rpc_method, &rpc_params) {
         Ok(result) => {
             let pretty = serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
             println!("{}", pretty);
@@ -285,18 +304,43 @@ fn main() {
 
 // ── RPC client ──────────────────────────────────────────────────────────────
 
-/// Plain-HTTP JSON-RPC. WAL-7/NET-16: the transport refuses to send
-/// `GNB_RPC_API_KEY` to anything but a loopback address; reach a remote node
-/// through an SSH tunnel (`ssh -L 17210:127.0.0.1:17210 host`).
-fn rpc_call(host: &str, port: u16, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let authority = if host.contains(':') && !host.starts_with('[') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
+/// Where gnb-cli sends its RPCs (WAL-7).
+struct RpcTarget {
+    /// `host:port` (plain HTTP), `http://…` or `https://…`.
+    endpoint: String,
+    /// HTTPS trust anchors: the webpki roots, or `--rpc-ca`.
+    trust: gnb::wallet::http_rpc::TlsTrust,
+}
+
+impl RpcTarget {
+    fn new(rpc_url: Option<String>, host: &str, port: u16, ca: Option<&str>) -> RpcTarget {
+        let endpoint = match rpc_url {
+            Some(url) => url,
+            None if host.contains("://") => host.to_string(),
+            None if host.contains(':') && !host.starts_with('[') => format!("[{host}]:{port}"),
+            None => format!("{host}:{port}"),
+        };
+        let trust = match ca {
+            Some(path) => gnb::wallet::http_rpc::TlsTrust::from_cert_file(std::path::Path::new(path))
+                .unwrap_or_else(|e| die(&e)),
+            None => gnb::wallet::http_rpc::TlsTrust::WebPkiRoots,
+        };
+        RpcTarget { endpoint, trust }
+    }
+}
+
+/// JSON-RPC over HTTP or HTTPS. WAL-7/NET-16: `GNB_RPC_API_KEY` is sent over
+/// HTTPS (certificate-verified) to any host, over plain HTTP only to a
+/// loopback address (remote nodes: https:// or an SSH tunnel).
+fn rpc_call(target: &RpcTarget, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
     let api_key = std::env::var("GNB_RPC_API_KEY").ok().map(zeroize::Zeroizing::new);
-    gnb::wallet::http_rpc::call(&authority, method, params, api_key.as_deref().map(String::as_str))
+    gnb::wallet::http_rpc::call_with_trust(&target.endpoint, method, params,
+        api_key.as_deref().map(String::as_str), &target.trust)
 }
 
 // ── Send command ────────────────────────────────────────────────────────────
 
-fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
+fn do_send(params: &[&str], target: &RpcTarget, stated_network: Option<gnb::address::Network>) {
     let wallet_path = params[0];
     let to_address = params[1];
     let amount_str = params[2];
@@ -328,10 +372,26 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     let path = std::path::Path::new(wallet_path);
     // Keystore v3/v2 first (address field; bloch1q… accepted for v2), then
     // the v1 keyfile format (address derived from the public key).
-    let keypair = match gnb::wallet::Keypair::load_encrypted(path, &password) {
-        Ok(kp) => kp,
+    // CRY-7: a v2 keystore needs the network stated (--mainnet/--testnet);
+    // it is checked against the stored address and rewritten as v3 — but only
+    // once the send is confirmed, keeping the original as <file>.v2.bak.
+    let (keypair, pending_migration) = match gnb::wallet::Keypair::unlock_for_spending(path, &password, stated_network) {
+        Ok((kp, pending)) => {
+            if pending.is_some() {
+                eprintln!("Keystore {} is v2: it is rewritten as v3 (network and address authenticated) \
+                           once the send is confirmed; the original is kept as a .v2.bak copy for Bloch \
+                           wallets and GnB releases before v3, which read only version 2.", path.display());
+            }
+            (kp, pending)
+        }
+        Err(e2) if is_keystore_v2_or_v3(path) => die(&format!("Failed to load wallet: {e2}")),
         Err(e2) => match gnb::wallet::Wallet::load_encrypted(path, &password) {
-            Ok(w) => w.into_keypair(),
+            Ok(w) => {
+                if stated_network.is_some_and(|n| n != w.network()) {
+                    die("the wallet's network does not match --mainnet/--testnet");
+                }
+                (w.into_keypair(), None)
+            }
             Err(e1) => {
                 eprintln!("Failed to load wallet: {} (keystore v2/v3) / {} (keyfile v1)", e2, e1);
                 process::exit(1);
@@ -345,7 +405,7 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
 
     // Fetch UTXOs (bounded), verify the selected ones against their
     // transactions (WAL-1), build and sign under the fee guard.
-    let rpc = |method: &str, p: &serde_json::Value| rpc_call(rpc_host, rpc_port, method, p);
+    let rpc = |method: &str, p: &serde_json::Value| rpc_call(target, method, p);
     let request = gnb::wallet::send::SendRequest {
         keypair: &keypair,
         to: &to,
@@ -366,6 +426,14 @@ fn do_send(params: &[&str], rpc_host: &str, rpc_port: u16) {
     }
     if !yes && !gnb::wallet::send::confirm("Broadcast this transaction?") {
         die("not broadcast");
+    }
+    // CRY-7: the send passed every check and was confirmed.
+    if let Some(pending) = pending_migration {
+        match pending.commit() {
+            Ok(backup) => eprintln!("Keystore {} rewritten as v3; the v2 original is kept at {} \
+                                     (keep it for Bloch or older GnB releases).", path.display(), backup.display()),
+            Err(e) => eprintln!("Keystore not migrated: {e}"),
+        }
     }
 
     match gnb::wallet::send::broadcast(&rpc, &prepared) {
@@ -711,6 +779,20 @@ fn die(msg: &str) -> ! {
     process::exit(1);
 }
 
+/// True when `path` holds a keystore v2/v3 JSON (a top-level `"version"` of 2
+/// or 3), so a failure to unlock it is reported as is instead of falling back
+/// to the v1 keyfile parser.
+fn is_keystore_v2_or_v3(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if meta.len() > gnb::util::DEFAULT_WALLET_FILE_LIMIT as u64 {
+        return false;
+    }
+    std::fs::read(path).ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("version").and_then(serde_json::Value::as_u64))
+        .is_some_and(|v| v == 2 || v == 3)
+}
+
 fn print_usage() {
     println!(r#"
   gnb-cli — Bloch-SIS Protocol RPC client
@@ -779,11 +861,20 @@ fn print_usage() {
   OPTIONS
     --rpc-host <host>                      RPC host (default: 127.0.0.1)
     --rpc-port <port>                      RPC port (default: 17210)
+    --rpc-url <url>                        RPC endpoint URL instead of host/port:
+                                           http://host:port or https://host[:port]
+                                           (certificate and host name verified)
+    --rpc-ca <file>                        PEM/DER trust anchor(s) for https (a
+                                           private CA or self-signed certificate)
     --allow-large-hd-wallet                Trusted-backup recovery (up to 512 MiB)
     --testnet                              New wallets are testnet (newwallet,
-                                           restorewallet, newseed)
-    GNB_RPC_API_KEY=<key>                  Sent only to loopback hosts (use an
-                                           SSH tunnel for remote nodes)
+                                           restorewallet, newseed); for send: the
+                                           keystore must be a testnet key
+    --mainnet                              For send: the keystore must be a mainnet
+                                           key. A v2 keystore needs --mainnet or
+                                           --testnet and is rewritten as v3 (CRY-7)
+    GNB_RPC_API_KEY=<key>                  Sent over https to any host; over plain
+                                           http only to loopback (or SSH tunnel)
     --help                                 This message
 "#);
 }

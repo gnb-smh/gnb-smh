@@ -34,6 +34,9 @@ mod mempool;
 mod analytics;
 mod reorg;
 mod attestation;  // L3 attestation (referenced by rpc)
+// The binary uses the pipeline subset of the shielded-pool API; the rest
+// (in-memory journal, mempool, snapshots) serves the library and its tests.
+#[allow(dead_code)]
 mod coherence;    // Coherence C2 shielded pool
 mod dandelion;    // Coherence P3 Dandelion++ tx-relay privacy
 mod tip;
@@ -771,8 +774,15 @@ async fn main() {
     // all senders `let _ = ...` it. Safe no-op.
     let (tip_tx, _) = broadcast::channel::<tip::TipChanged>(64);
 
-    // Coherence C2: the node's shielded-pool engine (in-memory).
-    let shielded = Arc::new(RwLock::new(crate::coherence::ShieldedPool::new()));
+    // Coherence C2: the node's shielded pool, reloaded from RocksDB (audit
+    // COH-2: persisted with the UTXO set in every connect batch).
+    let shielded = match crate::coherence::ShieldedPool::load(&store) {
+        Ok(pool) => Arc::new(RwLock::new(pool)),
+        Err(e) => {
+            error!("cannot load the persisted shielded-pool state: {}. Refusing to start.", e);
+            std::process::exit(1);
+        }
+    };
 
     // DAG-1 / DAG-11: load the persisted invalid-block set and reconcile any
     // state a pre-fix non-atomic commit left behind, before any block is accepted.

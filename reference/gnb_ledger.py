@@ -64,6 +64,12 @@ MAX_TXS = 65_536               # per block
 MAX_BLOCK_KEYS = 16_384        # per block: inputs + outputs of all transactions = witnesses to check
 MAX_BLOCK_TX_BYTES = 4_000_000 # per block: sum of transaction wire sizes
 MAX_COINBASE_EXTRA = 100
+# Per block: the committed witness bundle (consensus cap, audit LED-1). A bundle
+# above it is refused before it is hashed, so no attempt costs more hashing than
+# this; a block whose committed bundle is larger can never be validated. One
+# maximal transaction (1,024 inputs and 1,024 outputs, every proof at full depth,
+# about 17 MB) plus a maximal coinbase always fit.
+MAX_WITNESS_BYTES = 32 * 1024 * 1024
 COINBASE_MATURITY = 100
 
 TX_REGULAR = 0
@@ -109,10 +115,12 @@ class InvalidBlock(Exception):
     Permanent codes prove the committed block is invalid; the witness bundle is
     committed too, so a malformed, forged or stale committed bundle is permanent.
     Transient codes mean the body or witness received does not hash to the header's
-    commitments (tx_root, witness_root): the block may still be valid."""
+    commitments (tx_root, witness_root), or the witness received is larger than any
+    committed bundle may be (witness-size: it is refused before it is hashed, so it
+    cannot be attributed to the header): the block may still be valid."""
 
     CODES = (
-        "header", "target", "pow", "tx-root", "witness-commitment", "isolation",
+        "header", "target", "pow", "tx-root", "witness-size", "witness-commitment", "isolation",
         "witness-format", "noncanonical-proof", "witness-mismatch", "accept-invalid",
         "reject-invalid", "coinbase", "state-commitment",
     )
@@ -517,11 +525,21 @@ def check_block_txs(txs: Sequence[Tx], ctx: Context) -> None:
         raise InvalidBlock("isolation", "coinbase parents root")
 
 
-def apply_block_txs(state: State, txs: Sequence[Tx], witness: bytes, ctx: Context
-                    ) -> tuple[State, list[bool]]:
+def apply_block_txs(state: State, txs: Sequence[Tx], witness: bytes, ctx: Context, *,
+                    merged: bool = False) -> tuple[State, list[bool]]:
     """Stateless transition. Regular transactions are processed in order, then the
     coinbase (txs[0]) last, so it can claim the fees accepted in the same block.
-    Every proof is checked against the root left by the previous operation."""
+    Every proof is checked against the root left by the previous operation.
+
+    merged=True applies a block of a chain block's MERGESET (not its selected
+    parent chain) under the mergeset coinbase-collision rule (audit LED-1): a
+    merged block whose coinbase output already exists -- an identical coinbase at
+    the same height on the same parents, i.e. a twin of a block applied before
+    it -- forfeits its coinbase. Its coinbase entry is then REJECT_OUTPUT_EXISTS
+    proving that one of its output keys holds exactly the record this coinbase
+    would create; no coinbase output is created, its other outcomes stand, and
+    the merging block stays valid. Without merged the same entry makes the block
+    invalid (coinbase), as before."""
     check_block_txs(txs, ctx)
     r = _Reader(witness, "witness-format")
     if r.u32() != len(txs):
@@ -584,7 +602,11 @@ def apply_block_txs(state: State, txs: Sequence[Tx], witness: bytes, ctx: Contex
     if tag not in (ACCEPT, REJECT_OUTPUT_EXISTS):
         raise InvalidBlock("witness-format", "coinbase entry must be ACCEPT or a collision proof")
     # Every regular outcome above is proven, so `fees` is forced: an overclaim is the block's fault.
-    if sum(o.amount for o in cb.outputs) > ctx.subsidy + fees:
+    # The one exception is a merged twin forfeiting its coinbase (checked below): it mints nothing,
+    # and its identical coinbase claimed the twin's fees when the twin was applied -- the same fees
+    # that make this block's own transactions fail now, so its `fees` here can be 0.
+    if (sum(o.amount for o in cb.outputs) > ctx.subsidy + fees
+            and not (merged and tag == REJECT_OUTPUT_EXISTS)):
         raise InvalidBlock("coinbase", "claims more than subsidy plus fees")
     cid = txid(cb)
     if tag == REJECT_OUTPUT_EXISTS:
@@ -597,7 +619,18 @@ def apply_block_txs(state: State, txs: Sequence[Tx], witness: bytes, ctx: Contex
         key = outpoint_key(cid, o)
         if root_from(key, leaf_hash(key, value), r.proof()) != root:
             raise InvalidBlock("witness-mismatch", "claimed-existing coinbase output is absent")
-        raise InvalidBlock("coinbase", "coinbase output already exists")
+        if not merged:
+            raise InvalidBlock("coinbase", "coinbase output already exists")
+        # Mergeset rule: the twin of an applied block forfeits its coinbase. The
+        # existing output must be exactly what this coinbase would create. A
+        # forfeit is exempt from the claim check above: nothing is minted, and
+        # the identical coinbase holding the output passed it when applied.
+        out = cb.outputs[o]
+        if value != utxo_value(UtxoRecord(out.amount, out.owner, ctx.height, True)):
+            raise InvalidBlock("coinbase", "colliding output is not an identical coinbase output")
+        if not r.done():
+            raise InvalidBlock("witness-format", "trailing bytes")
+        return State(root, state.nullifier_root), accepted
     for o, out in enumerate(cb.outputs):
         root = _create(root, cid, o, UtxoRecord(out.amount, out.owner, ctx.height, True), r.proof())
     accepted[0] = True
@@ -688,9 +721,13 @@ def validate_body(parent: State, hdr: Header, tx_wires: Sequence[bytes], witness
     body or bundle for this header), while a committed body or bundle that breaks a
     rule is permanent. So a bad bundle costs one hash per attempt, and the proof checks
     of a block id run to completion at most once. Peers' oversized bodies should be
-    cut at the network layer; hashing here is linear in what was received."""
+    cut at the network layer; hashing here is linear in what was received, and a
+    witness above MAX_WITNESS_BYTES is refused before it is hashed (transient: it
+    cannot be the committed bundle of a valid block)."""
     if tx_root([wtxid(w) for w in tx_wires]) != hdr.tx_root:
         raise InvalidBlock("tx-root")
+    if len(witness) > MAX_WITNESS_BYTES:
+        raise InvalidBlock("witness-size", "bundle exceeds MAX_WITNESS_BYTES")
     if witness_commitment(witness) != hdr.witness_root:
         raise InvalidBlock("witness-commitment")
     if sum(len(w) for w in tx_wires) > MAX_BLOCK_TX_BYTES:
@@ -728,7 +765,8 @@ class FullNode:
         self.tree.set(key, utxo_leaf(key, record))
         self.utxos[key] = record
 
-    def build(self, txs: Sequence[Tx], ctx: Context) -> tuple[bytes, list[bool], int]:
+    def build(self, txs: Sequence[Tx], ctx: Context, *, merged: bool = False
+              ) -> tuple[bytes, list[bool], int]:
         """Decide every outcome exactly as the validator will, apply it, and return
         (witness bundle, accepted flags, fees of the accepted transactions)."""
         check_block_txs(txs, ctx)
@@ -769,18 +807,31 @@ class FullNode:
             fees += fee
             accepted[idx] = True
         cb = txs[0]
-        if sum(o.amount for o in cb.outputs) > ctx.subsidy + fees:
-            raise InvalidBlock("coinbase", "claims more than subsidy plus fees")
+        overclaim = sum(o.amount for o in cb.outputs) > ctx.subsidy + fees
         cid = txid(cb)
-        parts.append(bytes([ACCEPT]))
-        for o, out in enumerate(cb.outputs):
-            k = outpoint_key(cid, o)
-            if k in self.utxos:
+        out_keys = [outpoint_key(cid, o) for o in range(len(cb.outputs))]
+        taken = next((o for o, k in enumerate(out_keys) if k in self.utxos), None)
+        # A merged twin forfeiting its coinbase is exempt from the claim check
+        # (see apply_block_txs); every other coinbase is held to it.
+        if overclaim and not (merged and taken is not None):
+            raise InvalidBlock("coinbase", "claims more than subsidy plus fees")
+        if taken is not None:
+            if not merged:
                 raise InvalidBlock("coinbase", "coinbase output already exists")
-            parts.append(self.tree.proof(k))
-            self.insert(k, UtxoRecord(out.amount, out.owner, ctx.height, True))
-        accepted[0] = True
-        return b"".join(parts), accepted, fees
+            # Mergeset rule: a twin of an applied block forfeits its coinbase.
+            k = out_keys[taken]
+            parts += [bytes([REJECT_OUTPUT_EXISTS]), struct.pack("<I", taken),
+                      utxo_value(self.utxos[k]), self.tree.proof(k)]
+        else:
+            parts.append(bytes([ACCEPT]))
+            for k, out in zip(out_keys, cb.outputs):
+                parts.append(self.tree.proof(k))
+                self.insert(k, UtxoRecord(out.amount, out.owner, ctx.height, True))
+            accepted[0] = True
+        bundle = b"".join(parts)
+        if len(bundle) > MAX_WITNESS_BYTES:
+            raise InvalidBlock("witness-size", "bundle exceeds MAX_WITNESS_BYTES: include fewer transactions")
+        return bundle, accepted, fees
 
 
 if __name__ == "__main__":

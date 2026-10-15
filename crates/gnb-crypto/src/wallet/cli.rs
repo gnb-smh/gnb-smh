@@ -66,8 +66,16 @@ fn label(k: &str, v: &str) {
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
-    #[arg(long, global = true)]
+    /// New wallets are testnet; for `send` and `sign`, the network the
+    /// keystore must belong to (a v2 keystore needs it stated, CRY-7).
+    #[arg(long, global = true, conflicts_with = "mainnet")]
     testnet: bool,
+    /// For `send` and `sign`: the keystore must be a mainnet key (required
+    /// to unlock, and migrate to v3, a v2 keystore; CRY-7).
+    #[arg(long, global = true)]
+    mainnet: bool,
+    /// Node RPC endpoint: http://host:port, or https://host[:port] (TLS,
+    /// certificate verified; GNB_RPC_CA=<PEM/DER file> for a private CA).
     #[arg(long, global = true, default_value = "http://127.0.0.1:17210")]
     rpc: String,
 }
@@ -266,7 +274,7 @@ pub fn main() {
         }
 
         Cmd::Send { keystore, to, amount, fee, max_fee, yes, allow_unverified_inputs } => {
-            let kp          = load_kp(&keystore);
+            let (kp, pending_migration) = load_kp_for_spending(&keystore, stated_network(cli.testnet, cli.mainnet));
             let amount_sats = checked_cli_satoshis(&amount, false).unwrap_or_else(|message| err(message));
             let fee_choice  = crate::wallet::send::parse_fee_arg(&fee).unwrap_or_else(|message| err(message));
             let fee_policy  = crate::wallet::send::parse_max_fee_arg(max_fee.as_deref())
@@ -302,6 +310,8 @@ pub fn main() {
             if !yes && !crate::wallet::send::confirm("  Broadcast this transaction?") {
                 err("Not broadcast.");
             }
+            // CRY-7: the spend passed every check and was confirmed.
+            finish_keystore_migration(pending_migration);
 
             print!("  {}broadcasting via sendrawtransaction...{}\r", MUTED, RESET);
             match crate::wallet::send::broadcast(&rpc, &prepared) {
@@ -417,7 +427,7 @@ pub fn main() {
         }
 
         Cmd::Sign { keystore, message } => {
-            let kp = load_kp(&keystore);
+            let (kp, pending_migration) = load_kp_for_spending(&keystore, stated_network(cli.testnet, cli.mainnet));
             // A4-M-4 FIX: sign a DOMAIN-SEPARATED digest of the message's raw
             // bytes — NEVER hex-decode user-supplied text first. The old
             // code's `hex::decode(&message).unwrap_or_else(|_| message.into_bytes())`
@@ -434,6 +444,7 @@ pub fn main() {
                     let h = hex::encode(&sig);
                     println!("  {}", muted(&h[..64]));
                     println!("  {}...{}", DIM, RESET);
+                    finish_keystore_migration(pending_migration);
                 }
                 Err(e) => err(&format!("Sign failed: {}", e)),
             }
@@ -555,6 +566,55 @@ fn read_disclosure_bundle_with_limit(
     serde_json::from_slice(&bytes).map_err(|error| format!("Bundle parse failed: {}", error))
 }
 
+/// The network the caller stated with `--mainnet` / `--testnet` (CRY-7).
+fn stated_network(testnet: bool, mainnet: bool) -> Option<crate::address::Network> {
+    match (testnet, mainnet) {
+        (true, _) => Some(crate::address::Network::Testnet),
+        (false, true) => Some(crate::address::Network::Mainnet),
+        (false, false) => None,
+    }
+}
+
+/// Unlock a keystore for spending or signing (CRY-7): a v2 keystore needs
+/// the network stated. Its rewrite as v3 is returned pending: the caller
+/// commits it with [`finish_keystore_migration`] only once the spend or
+/// signature went ahead, so an aborted command leaves the v2 file untouched.
+fn load_kp_for_spending(path: &std::path::Path, network: Option<crate::address::Network>)
+    -> (crate::wallet::Keypair, Option<crate::wallet::PendingKeystoreMigration>)
+{
+    let pw = prompt_password(&format!("  {}password:{} ", MUTED, RESET));
+    let loaded = crate::wallet::Keypair::unlock_for_spending(path, &pw, network);
+    drop(pw);
+    match loaded {
+        Ok((kp, pending)) => {
+            ok("keystore decrypted");
+            if pending.is_some() {
+                println!("  {}keystore v2: it is rewritten as v3 (network and address authenticated) once{}", MUTED, RESET);
+                println!("  {}this command completes; the original is kept as <file>.v2.bak for Bloch{}", MUTED, RESET);
+                println!("  {}wallets and GnB releases before v3, which read only version 2.{}", MUTED, RESET);
+            }
+            println!();
+            (kp, pending)
+        }
+        Err(e) => err(&format!("Load failed: {e} (pass --mainnet or --testnet for a v2 keystore)")),
+    }
+}
+
+/// Commit a pending v2 -> v3 keystore migration (CRY-7) and report where the
+/// original went. A failure is reported but does not undo the command: the
+/// v2 file is then simply left as it was.
+fn finish_keystore_migration(pending: Option<crate::wallet::PendingKeystoreMigration>) {
+    let Some(pending) = pending else { return };
+    match pending.commit() {
+        Ok(backup) => {
+            ok("keystore v2 rewritten as v3: its network and address are now authenticated");
+            label("v2 original", &backup.display().to_string());
+            println!("  {}keep it if you use this key with Bloch or an older GnB release{}", MUTED, RESET);
+        }
+        Err(e) => println!("  {} keystore not migrated: {e}", red("!")),
+    }
+}
+
 fn load_kp(path: &PathBuf) -> crate::wallet::Keypair {
     let pw = prompt_password(&format!("  {}password:{} ", MUTED, RESET));
     let loaded = crate::wallet::Keypair::load_encrypted(path, &pw);
@@ -614,20 +674,24 @@ fn rpc_call(endpoint: &str, method: &str, params: serde_json::Value) -> serde_js
     rpc_result(endpoint, method, params).unwrap_or_else(|error| serde_json::json!({"error":error}))
 }
 
-/// The plaintext client cannot speak TLS: refuse `https://` instead of
-/// silently downgrading it (WAL-7). Remote nodes are reached through an
-/// SSH tunnel to a loopback port.
-fn rpc_authority(endpoint: &str) -> Result<&str, String> {
-    if endpoint.starts_with("https://") {
-        return Err("https:// RPC endpoints are not supported by this client; use an SSH tunnel \
-                    (ssh -L 17210:127.0.0.1:17210 host) and --rpc http://127.0.0.1:17210".into());
+/// WAL-7: `http://host:port` (plain) or `https://host[:port]` (rustls,
+/// certificate and host name verified against the webpki roots, or against
+/// the `GNB_RPC_CA` PEM/DER file for a private CA). An https endpoint is never
+/// downgraded to plain HTTP.
+fn rpc_endpoint(endpoint: &str) -> Result<crate::wallet::http_rpc::Endpoint, String> {
+    crate::wallet::http_rpc::Endpoint::parse(endpoint)
+}
+
+fn rpc_trust() -> Result<crate::wallet::http_rpc::TlsTrust, String> {
+    match std::env::var_os("GNB_RPC_CA") {
+        Some(path) => crate::wallet::http_rpc::TlsTrust::from_cert_file(std::path::Path::new(&path)),
+        None => Ok(crate::wallet::http_rpc::TlsTrust::WebPkiRoots),
     }
-    Ok(endpoint.strip_prefix("http://").unwrap_or(endpoint).trim_end_matches('/'))
 }
 
 fn rpc_result(endpoint: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
-    let authority = rpc_authority(endpoint)?;
-    crate::wallet::http_rpc::call(authority, method, &params, None)
+    rpc_endpoint(endpoint)?;
+    crate::wallet::http_rpc::call_with_trust(endpoint, method, &params, None, &rpc_trust()?)
 }
 
 // Parse once from the original CLI token: no float may choose the spend amount.
@@ -994,12 +1058,19 @@ mod audit_cli_input_tests {
 mod audit_2026_10_cli_tests {
     use super::*;
 
-    /// WAL-7: an https endpoint is refused instead of silently downgraded.
+    /// WAL-7 (residual): https endpoints are spoken over TLS, never
+    /// downgraded to plain HTTP; plain endpoints keep working. (Before
+    /// HTTPS support this test asserted that https was refused.)
     #[test]
-    fn https_endpoints_are_refused_not_downgraded() {
-        assert!(rpc_authority("https://node.example:17210").is_err());
-        assert_eq!(rpc_authority("http://127.0.0.1:17210/").unwrap(), "127.0.0.1:17210");
-        assert!(rpc_call("https://node.example", "getblockcount", serde_json::json!([]))["error"].is_string());
+    fn https_endpoints_use_tls_and_plain_endpoints_stay_plain() {
+        let e = rpc_endpoint("https://node.example:17210").unwrap();
+        assert!(e.tls && e.host == "node.example" && e.port == 17210);
+        assert_eq!(rpc_endpoint("https://node.example/").unwrap().port, 443);
+        let e = rpc_endpoint("http://127.0.0.1:17210/").unwrap();
+        assert!(!e.tls && e.authority() == "127.0.0.1:17210");
+        assert!(rpc_endpoint("https://user@node.example").is_err());
+        // Nothing listens on port 1: an error, not a plain-HTTP fallback.
+        assert!(rpc_call("https://127.0.0.1:1", "getblockcount", serde_json::json!([]))["error"].is_string());
     }
 
     /// WAL-1/WAL-6/WAL-7: send defaults to the size-aware fee and asks for
@@ -1017,6 +1088,19 @@ mod audit_2026_10_cli_tests {
         let cli = Cli::try_parse_from(["gnb-wallet", "send", "w.json", "to", "1", "--max-fee", "0.5",
             "--yes", "--allow-unverified-inputs"]).unwrap();
         assert!(matches!(cli.cmd, Cmd::Send { yes: true, allow_unverified_inputs: true, .. }));
+    }
+
+    /// CRY-7: `send` / `sign` take the stated network from --mainnet /
+    /// --testnet (none stated: only a v3 keystore unlocks); both is an error.
+    #[test]
+    fn spending_network_is_stated_explicitly() {
+        let cli = Cli::try_parse_from(["gnb-wallet", "--mainnet", "send", "w.json", "to", "1"]).unwrap();
+        assert_eq!(stated_network(cli.testnet, cli.mainnet), Some(crate::address::Network::Mainnet));
+        let cli = Cli::try_parse_from(["gnb-wallet", "sign", "w.json", "msg", "--testnet"]).unwrap();
+        assert_eq!(stated_network(cli.testnet, cli.mainnet), Some(crate::address::Network::Testnet));
+        let cli = Cli::try_parse_from(["gnb-wallet", "sign", "w.json", "msg"]).unwrap();
+        assert_eq!(stated_network(cli.testnet, cli.mainnet), None);
+        assert!(Cli::try_parse_from(["gnb-wallet", "--mainnet", "--testnet", "sign", "w.json", "m"]).is_err());
     }
 
     /// WAL-7: `new` is phrase-backed unless --random-key is given.

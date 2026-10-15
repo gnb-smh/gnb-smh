@@ -905,3 +905,109 @@ same function that gives the node's next block height
 the template keep agreeing on that height.
 `stored_blocks_failing_the_hardening_rules_are_disqualified_at_startup`
 covers the scenario.
+
+## Shielded pool (inactive)
+
+No shielded transaction is valid today. The node compiles exactly one proof
+verifier, `RejectAll`, and `accept_block` rejects every block that carries a
+shielded transaction before it reaches the DAG. The rules below therefore
+change no block's validity and need no activation height. Enabling a
+verifier would be a separate consensus change with its own activation, and
+it is guarded in code (see "Verifier guard").
+
+### Spend statement v2 (audit COH-1)
+
+Version 1 of the statement took the nullifier key `nk` as a free witness.
+Anyone who knew a note's opening could spend it, and one note produced a
+fresh nullifier for every `nk` (the audit spent one 1,000-value note 8 times).
+Version 2 (`coherence_core::SPEND_STATEMENT_VERSION = 2`) binds spending
+authority. `H(x)` is SHAKE-256 squeezed to 32 bytes, `‖` is concatenation,
+the domain tags are ASCII without a terminator, and integers are unsigned
+little-endian:
+
+```text
+sk   : 32-byte spending key (private witness)
+ak   = H("gnb:coherence:ak:v2"  ‖ sk)
+nk   = H("gnb:coherence:nk:v2"  ‖ sk)
+pk_d = H("gnb:coherence:pkd:v2" ‖ ak ‖ nk)
+cm   = H("gnb:coherence:cm:v1"  ‖ v as u64 ‖ pk_d ‖ rho ‖ psi)     (unchanged)
+nf   = H("gnb:coherence:nf:v2"  ‖ nk ‖ cm ‖ position as u64)
+```
+
+The commitment tree is unchanged: depth 32, `parent = H("gnb:coherence:mt:v1"
+‖ left ‖ right)`, the empty leaf is `H("gnb:coherence:mt:v1" ‖ "empty-leaf")`,
+and a missing right child at height `d` is the empty subtree of height `d`.
+
+`check_spend(public, witness)` accepts iff all of the following hold:
+
+1. `|public.out_commitments| = |witness.outputs|` and
+   `|public.nullifiers| = |witness.inputs|`.
+2. No two inputs have the same position.
+3. For each input `i`:
+   - `position < 2^32`;
+   - `cm_i` is a member under `public.anchor` with the witness path;
+   - `pk_d(sk_i) = note_i.pk_d` (spending authority, otherwise `Unauthorized(i)`);
+   - `public.nullifiers[i] = nf(nk(sk_i), cm_i, position_i)`.
+4. `public.out_commitments[j] = cm(outputs[j])` for each output `j`.
+5. `Σ inputs.v = Σ outputs.v + public.fee`, computed in u128 with no
+   overflow.
+
+SHAKE-256 is collision resistant, so a note's `pk_d` fixes `(ak, nk)`. Each
+(note, position) therefore has exactly one nullifier, and only the holder of
+`sk` can produce it. `(ak, nk)` is a viewing key: it recognises `pk_d` and
+computes nullifiers, but the statement takes `sk`, so it cannot spend.
+
+Golden vectors, pinned by `crates/coherence-core/tests/statement_v2.rs` and
+reproduced independently with Python's `hashlib.shake_256`. The inputs are
+`sk = 00 01 02 … 1f`, `v = 1000`, `rho = 0x11 × 32`, `psi = 0x22 × 32`,
+`position = 5`:
+
+| value | hex |
+| --- | --- |
+| `ak` | `1d64f855d802d8d73b185b6c3c8666fce5ed176d3d2e1b480fa5f8620d981223` |
+| `nk` | `0004a2dfbb1a21b7ef2584349aa057e6980430a6bac9a0124159aa2f6ffa738d` |
+| `pk_d` | `d9a13fe370b6169dd975132432296e614e31902be55d0c542b606c3aaa20b551` |
+| `cm` | `ca6218f92e0f20ffb2e285a05af2e33efcc5f576e48989dd6cec2dd707a70a6f` |
+| `nf` | `f7c0d16ea5c3034bbf561e57da5a31da7080309bb1a922072106af8a6abc51ce` |
+| empty tree root | `91225423fd45e8d61ce70c068f075176eacdcebf5d0df94fdb80a1b4aa5d251a` |
+
+### Verifier guard and committed public values
+
+`node/src/coherence/verifier.rs` refuses any accepting verifier unless
+`statement_binds_authority(SPEND_STATEMENT_VERSION)` holds, which is true for
+version ≥ 2. A `const` assertion fails the build, `ShieldedVerifier::from_env`
+panics at start-up when an accepting backend is selected, and `verify` and
+`is_active` re-check the condition on every call. A proof's committed public
+values must equal the bincode-v1 (`legacy`, fixed-width little-endian)
+encoding of the pair `(SPEND_STATEMENT_VERSION, public)`:
+
+```text
+u32 version (= 2) ‖ anchor (32) ‖ u64 n ‖ nullifiers (32·n)
+                  ‖ u64 m ‖ out_commitments (32·m) ‖ u64 fee
+```
+
+A proof from a guest built for another version, including a v1 guest that
+committed only `SpendPublic`, never binds. No guest prover lives in this
+repository.
+
+### State (audit COH-2)
+
+The shielded state is the commitment tree, the spent-nullifier set and the
+window of the last 100 distinct tree roots that are accepted as anchors.
+Applying a transaction validates it against the accumulated state (known
+anchor, unseen nullifiers, no duplicate within the transaction, valid proof),
+marks its nullifiers spent, appends its output commitments, and records the
+new root as an anchor. A block is applied atomically: if any of its
+transactions fails, the block is invalid in its own context.
+
+Like the UTXO set, the state follows the applied selected chain only. A
+block is applied when it joins the selected chain and disconnected when a
+reorg removes it, in the same atomic RocksDB batch as its UTXO changes.
+`ShieldedPool::stage_plan` moves the state and `StagedShielded::stage_into`
+writes it. The batch carries the leaves, nullifiers, anchor window, a
+per-block undo record (tree length, spent nullifiers and anchor window
+before the block) and the shielded tip, laid out in column family `shielded`
+(`node/src/coherence/persist.rs`). At start-up the node reloads the state
+and refuses to run if a non-empty state's tip differs from the UTXO tip.
+Applying a block costs O(outputs × 32 + nullifiers): the tree is incremental,
+and nothing is cloned.

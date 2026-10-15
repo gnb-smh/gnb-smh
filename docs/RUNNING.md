@@ -62,3 +62,45 @@ and the blue and red blocks they merge, `avg_dag_block_interval_secs`);
 `avg_block_time_secs` is the interval between selected-chain blocks. A
 storage failure behind any of these methods is answered with the generic
 `STORAGE_ERROR` response; the detail only goes to the node's log.
+
+The node serves plain HTTP. To reach a remote node, put a TLS reverse proxy in
+front of its RPC port or use an SSH tunnel
+(`ssh -L 17210:127.0.0.1:17210 host`). Both CLI wallets speak HTTPS (audit
+WAL-7): `gnb-cli --rpc-url https://node.example …` or
+`gnb-wallet --rpc https://node.example …`. They verify the certificate chain
+against the Mozilla roots (`webpki-roots`) and check the host name. For a
+private CA or a self-signed certificate, pass the trust anchor with
+`gnb-cli --rpc-ca ca.pem` or set `GNB_RPC_CA=ca.pem` for `gnb-wallet`.
+`GNB_RPC_API_KEY` is sent over HTTPS to any host, but over plain HTTP only
+to loopback addresses. Each call has one 30-second deadline covering name
+resolution, connect, the TLS handshake, the request and the response; every
+socket read and write gets only the time left, so a server that stalls or
+drips its answer cannot hold the wallet longer than that.
+
+## Wallet keystores (audit CRY-7)
+
+Every front end writes keystore **v3**, which authenticates the network and
+the address in the AES-GCM associated data. Older **v2** files, from Bloch
+or from GnB before the fix, authenticate neither: editing `gnb1q…` to
+`gnb1t…` in a v2 file still loads the key for the other network. The CLIs
+therefore unlock a v2 keystore for spending (`gnb-cli send`) or signing
+(`gnb-wallet send` / `sign`) only when the network is stated with `--mainnet`
+or `--testnet`. The stored address must be a valid address of that network
+and match the decrypted key, and the file's `network` field must not name the
+other network. The file is then rewritten as v3 under the same password,
+but only once the command went ahead: after the send was checked and
+confirmed (`send`) or the message was signed (`sign`); an aborted command
+leaves the v2 file as it was. Before the rewrite the original v2 file is
+copied byte for byte to a new `<file>.v2.bak` (`<file>.v2.bak.1`, `.2`, …
+if that name is taken; an existing backup is never overwritten), mode 0600
+and fsynced; if the copy cannot be written, nothing is rewritten. Keep that
+copy if you use the key elsewhere: **Bloch wallets and GnB releases before
+keystore v3 read only version-2 keystores** and cannot open the v3 file.
+The rewrite itself is atomic (temp file, fsync, rename), mode 0600, and the
+new bytes are decrypted and checked before they replace the old file. A v3
+keystore needs no flag, but a stated network must match it. The library
+calls are `Keypair::unlock_for_spending` (verify in memory, then
+`PendingKeystoreMigration::commit`), `Keypair::load_for_spending` (both at
+once) and, for front ends without a filesystem,
+`Keypair::unlock_for_spending_bytes` (a front end that stores the v3 JSON
+must also keep, or offer for download, the original v2 bytes).

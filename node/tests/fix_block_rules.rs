@@ -1332,6 +1332,10 @@ fn stored_blocks_failing_the_hardening_rules_are_disqualified_at_startup() {
     assert_eq!(n.store.get_meta(pipeline::HARDENING_RECHECK_META).unwrap(), Some(A.to_le_bytes().to_vec()));
     assert_eq!(sel_tip(&n), Some(m2.block_hash()));
     assert_eq!(applied_tip(&n), Some(m2.block_hash()), "the applied chain left the legacy branch");
+    // COH-2: the rollback-only plan moved the shielded state with the chain,
+    // in memory and in the same committed batch.
+    assert_eq!(n.shielded.read().tip(), Some(m2.block_hash()));
+    assert_eq!(gnb::coherence::ShieldedPool::load(&n.store).unwrap().tip(), Some(m2.block_hash()));
     assert!(n.store.get_utxo(&p.transactions[0].txid(), 0).unwrap().is_none());
     assert!(n.store.get_utxo(&m2.transactions[0].txid(), 0).unwrap().is_some());
 

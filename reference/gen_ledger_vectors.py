@@ -359,6 +359,69 @@ def main() -> None:
             "witness_hex": w.hex(), "pre": state_json(pre5),
         })
 
+    # ------------------------------------------------------------- mergeset coinbase rule (LED-1)
+    # Two blocks on the same parents at height 5 with identical coinbases. The selected
+    # chain applies A; a chain block merging the twin B applies it with merged=True and
+    # B forfeits its coinbase. Applied directly (no header): apply_block_txs(..., merged).
+    mergeset = []
+    m_node = copy.deepcopy(node)
+    m_parents = L._h(L._prefix(b"vector-parents"), b"A and B")
+    twin_cb = coinbase(5, [("dave", SUBSIDY), ("alice", 0)], b"twin", parents_root=m_parents)
+    m_ctx = ctx(5, m_parents)
+    wa, _, _ = m_node.build([twin_cb], m_ctx)
+    pre_b = m_node.state()
+    t8 = spend([(t1id, 1)], ["alice"], [("carol", 28_000)])
+    txs_b = [twin_cb, t8]
+    pre_b_node = copy.deepcopy(m_node)
+    wb, accepted_b, _ = m_node.build(txs_b, m_ctx, merged=True)
+    assert accepted_b == [False, True]
+    post_b, flags_b = L.apply_block_txs(pre_b, txs_b, wb, m_ctx, merged=True)
+    assert post_b == m_node.state() and flags_b == accepted_b
+
+    def merged_case(name: str, pre: L.State, txs: list[L.Tx], witness: bytes, merged: bool) -> dict:
+        v = {"name": name, "merged": merged, "height": 5, "subsidy": SUBSIDY, "coinbase_maturity": MATURITY,
+             "parents_root": m_parents.hex(), "txs_hex": [w.hex() for w in wires(txs)],
+             "witness_hex": witness.hex(), "pre": state_json(pre)}
+        try:
+            post, flags = L.apply_block_txs(pre, txs, witness, m_ctx, merged=merged)
+        except L.InvalidBlock as e:
+            v.update({"expected_error": e.code, "permanent": e.permanent})
+        else:
+            v.update({"post": state_json(post), "accepted": flags})
+        return v
+
+    mergeset.append(merged_case("twin-coinbase-forfeited", pre_b, txs_b, wb, True))
+    mergeset.append(merged_case("twin-coinbase-outside-mergeset", pre_b, txs_b, wb, False))
+    entries_b = parse_witness(txs_b, wb)        # [t8, coinbase]
+    bad_b = copy.deepcopy(entries_b)
+    bad_b[1]["proof"] = flip_first_sibling(bad_b[1]["proof"])
+    mergeset.append(merged_case("twin-proof-sibling-flipped", pre_b, txs_b, encode_witness(bad_b), True))
+    # A collision with an output that is NOT what this coinbase would create.
+    odd = copy.deepcopy(pre_b_node)
+    odd_key = L.outpoint_key(L.txid(twin_cb), 0)
+    odd.insert(odd_key, L.UtxoRecord(SUBSIDY, OWNER["dave"], 4, True))
+    w_odd = (struct.pack("<I", 1) + bytes([L.REJECT_OUTPUT_EXISTS]) + struct.pack("<I", 0)
+             + L.utxo_value(odd.utxos[odd_key]) + odd.tree.proof(odd_key))
+    mergeset.append(merged_case("collision-not-identical-coinbase", odd.state(), [twin_cb], w_odd, True))
+    # Review follow-up: twins share their template, so the merged twin carries the transactions
+    # the first one already spent. Its fees are 0 while its identical coinbase claims SUBSIDY plus
+    # the first one's fees; the forfeit is exempt from the claim check.
+    f_node = copy.deepcopy(node)
+    fee_cb = coinbase(5, [("dave", SUBSIDY + 1_000)], b"fee-twin", parents_root=m_parents)
+    txs_f = [fee_cb, t8]                         # t8 pays a fee of 1_000
+    _, accepted_fa, fees_fa = f_node.build(txs_f, m_ctx)
+    assert accepted_fa == [True, True] and fees_fa == 1_000
+    pre_f = f_node.state()
+    wf, accepted_f, fees_f = f_node.build(txs_f, m_ctx, merged=True)
+    assert accepted_f == [False, False] and fees_f == 0 and f_node.state() == pre_f
+    mergeset.append(merged_case("fee-paying-twin-forfeited", pre_f, txs_f, wf, True))
+    mergeset.append(merged_case("fee-paying-twin-outside-mergeset", pre_f, txs_f, wf, False))
+    assert [("expected_error" in v) for v in mergeset] == [False, True, True, True, False, True]
+    assert [v.get("expected_error") for v in mergeset[1:]] == ["coinbase", "witness-mismatch", "coinbase",
+                                                               None, "coinbase"]
+    assert mergeset[4]["post"] == state_json(pre_f) and mergeset[4]["accepted"] == [False, False]
+    _ = wa
+
     # ------------------------------------------------------------- sparse Merkle tree vectors
     t = L.SparseMerkleTree()
     keys = [L._h(L._prefix(b"vector-key"), bytes([i])) for i in range(6)]
@@ -388,15 +451,18 @@ def main() -> None:
                 "validated with GnB-SMH at log2_n = 4; each invalid case has exactly one fault. "
                 "permanent = the block itself is invalid (the header commits to the transactions "
                 "and the witness bundle); otherwise the body or witness received does not hash "
-                "to the header's commitments.",
+                "to the header's commitments. mergeset cases are applied directly with "
+                "apply_block_txs(pre, txs, witness, ctx, merged) (the LED-1 coinbase-collision rule).",
         "params": {"log2_n": LOG2_N, "coinbase_maturity": MATURITY, "subsidy": SUBSIDY},
         "smt": smt,
         "chain": chain,
         "synthetic": synthetic,
         "invalid": invalid,
+        "mergeset": mergeset,
     }
     (HERE / "ledger_vectors.json").write_text(json.dumps(doc, indent=1) + "\n")
-    print(f"{len(chain)} chain blocks, {len(synthetic)} synthetic, {len(invalid)} invalid cases", file=sys.stderr)
+    print(f"{len(chain)} chain blocks, {len(synthetic)} synthetic, {len(invalid)} invalid cases, "
+          f"{len(mergeset)} mergeset cases", file=sys.stderr)
     for b in chain + synthetic:
         print(f"  {b['name']}: {len(b['txs_hex'])} txs, witness {b['witness_bytes']} B, "
               f"accepted {b['accepted']}", file=sys.stderr)
