@@ -4,51 +4,135 @@
 //! pow limit: the node's dev feature `test-pow-limit` is off here).
 //!
 //! What this runner checks (the node runner, `node/tests/consensus_vectors.rs`,
-//! adds the connect-time rules and mempool admission):
+//! runs the node's own connect path and mempool admission):
 //!
 //! * every recorded derived value (txid, wtxid, sizes, sighash v2/v3 digests,
 //!   Merkle and witness roots, parent commitment, subsidy, block id) is what
 //!   the code computes;
-//! * transactions: strict decoding, the context-free per-transaction rules of
-//!   a block, and the input-script rule `core::sighash::verify_tx_scripts`
-//!   with the case's chain id (testnet cases included) wherever the expected
-//!   verdict depends on it;
+//! * transactions: strict decoding; the context-free per-transaction rules of
+//!   a block, which must reject exactly the cases whose class is context-free
+//!   (`context_free_expectation`, the output-side MoneyRange included); then
+//!   the connect-time rules in the node's order through gnb-crypto's own
+//!   functions: `core::check_coinbase_maturity`, the input sum
+//!   (`limits::money_add`), `core::sighash::verify_tx_scripts` with the
+//!   case's chain id, `limits::check_tx_money_range`, inputs >= outputs and
+//!   `core::check_min_fee`. The rules implemented in the node crate (BIP30,
+//!   the same-block coinbase rule, duplicate and missing inputs:
+//!   [`TX_DEFERRED_TO_NODE`]) are left to the node runner, explicitly: every
+//!   case is either decided here or listed as deferred;
 //! * blocks: decoding, `Block::validate_structure_without_pow_at`,
-//!   `block_rules::check_block_hardened_at`, the pow limit (with
-//!   `Block::validate_pow` under the case's activation height where it fails
-//!   fast or the case is mined) and `limits::check_block_context_free`.
+//!   `block_rules::check_block_hardened_at`, the pow limit, the GnB-SMH proof
+//!   (`Block::validate_pow` under the case's activation height wherever the
+//!   limit refuses the bits or the case is `pow: full`) and
+//!   `limits::check_block_context_free`, which together must give exactly
+//!   the context-free class (or pass, for a connect-time class or a valid
+//!   block, whose final verdict is the node runner's).
+//!
+//! A case whose `activation_source` is `schedule` is evaluated under
+//! `activation::hardening_activation_height_for_chain(chain)` (and
+//! `validate_pow` under the process-wide height, the mainnet schedule here),
+//! never under its recorded height.
 
 #[path = "consensus_vectors_common/mod.rs"]
 mod common;
 
 use common::*;
 use gnb_crypto::core::sighash::SighashV3Precomputed;
-use gnb_crypto::core::{self, activation, block_rules, limits, Block, Transaction, TxOutput};
+use gnb_crypto::core::{self, activation, block_rules, limits, Block, ChainId, Transaction, TxOutput};
 use gnb_crypto::crypto;
 
 fn hexs(b: &[u8]) -> String {
     hex::encode(b)
 }
 
-/// Classes decided before the input scripts in the node's order.
-const BEFORE_SCRIPTS: &[&str] = &[
-    "decode", "coinbase-format", "tx-64-bytes", "dust", "value-out-of-range", "canonical-limit", "bip30",
-    "same-block-coinbase", "immature-coinbase", "double-spend", "missing-input",
-];
+/// Transaction classes whose rule is implemented in the node crate
+/// (`node/src/accept.rs`: BIP30, the same-block coinbase rule of VAL-3,
+/// duplicate and missing inputs), not in gnb-crypto. This runner checks
+/// every rule before them and leaves the verdict to the node runner.
+const TX_DEFERRED_TO_NODE: &[&str] = &["bip30", "same-block-coinbase", "double-spend", "missing-input"];
+
+enum Connect {
+    /// The verdict of the connect-time rules this runner can evaluate.
+    Decided(Result<(), String>),
+    /// The case's class belongs to a rule of the node crate.
+    Deferred,
+}
+
+/// The connect-time rules for the one transaction of a wrapper block, in the
+/// node's order (`accept::validate_tx_in_view`, then
+/// `validate_tx_inputs_classified`), through gnb-crypto's functions.
+fn connect_core(c: &TxVector, tx: &Transaction, chain: ChainId, act: u64, expected: &str) -> Connect {
+    let fail = |e: String| Connect::Decided(Err(classify(&e).to_string()));
+    // BIP30 (checked for the whole block first) and VAL-3: accept.rs.
+    if matches!(expected, "bip30" | "same-block-coinbase") {
+        return Connect::Deferred;
+    }
+    // Coinbase maturity at the block height; the view's coinbase heights.
+    let maturity = core::check_coinbase_maturity(tx, c.height, |txid| {
+        c.prevouts.iter().find(|p| !p.block_coinbase && p.txid == *txid).and_then(|p| p.coinbase_height)
+    });
+    if let Err(e) = maturity {
+        return fail(e);
+    }
+    // Per input: duplicate outpoints and presence (accept.rs), then the
+    // input sum's MoneyRange (`limits::money_add`).
+    if matches!(expected, "double-spend" | "missing-input") {
+        return Connect::Deferred;
+    }
+    // Below the activation the block's own coinbase outputs are spendable
+    // in the block (at/after it VAL-3 rejected the spend above).
+    let hardened = block_rules::rules_active_at(c.height, act);
+    let mut spent = Vec::with_capacity(tx.inputs.len());
+    let mut total_in = 0u64;
+    for inp in &tx.inputs {
+        let coin = c.prevouts.iter().find(|p| {
+            p.txid == inp.prev_txid && p.vout == inp.prev_index && !(p.block_coinbase && hardened)
+        });
+        let Some(coin) = coin else {
+            return Connect::Decided(Err("missing-input".into()));
+        };
+        total_in = match limits::money_add(total_in, coin.amount) {
+            Ok(t) => t,
+            Err(e) => return fail(e),
+        };
+        spent.push(coin.out());
+    }
+    // Version rule, witnesses, public-key hashes, signatures.
+    if let Err(e) = core::sighash::verify_tx_scripts(tx, &spent, chain, c.height, act) {
+        return fail(e);
+    }
+    let total_out = match limits::check_tx_money_range(tx) {
+        Ok(t) => t,
+        Err(e) => return fail(e),
+    };
+    if total_in < total_out {
+        return Connect::Decided(Err("inputs-below-outputs".into()));
+    }
+    match core::check_min_fee(tx, total_in - total_out) {
+        Ok(()) => Connect::Decided(Ok(())),
+        Err(e) => fail(e),
+    }
+}
 
 #[test]
 fn tx_vectors_core() {
     let v = load_tx_vectors();
     assert!(v.cases.len() >= 150, "{} tx cases", v.cases.len());
     assert_eq!(v.constants["wrapper_coinbase_script_sig"], hexs(WRAPPER_COINBASE_SCRIPT_SIG));
+    let max_supply = max_supply_sat(&v.constants);
     let mut rep = Report::default();
     let mut ids = std::collections::HashSet::new();
+    let mut decided = 0usize;
+    let mut deferred: Vec<(String, String)> = Vec::new();
     for c in &v.cases {
         assert!(ids.insert(c.id.clone()), "duplicate id {}", c.id);
         let chain = chain_of(&c.network);
+        let act = if c.schedule { activation::hardening_activation_height_for_chain(chain) } else { c.activation };
+        let expected = want(&c.error);
         let Some(tx) = decode_tx(&c.bytes) else {
-            rep.expect(&c.id, "strict decode", &want(&c.error), "decode");
+            rep.expect(&c.id, "strict decode", &expected, "decode");
             assert!(c.derived.is_null(), "{}: no derived values for undecodable bytes", c.id);
+            decided += 1;
             continue;
         };
         // Derived values.
@@ -72,42 +156,53 @@ fn tx_vectors_core() {
             rep.expect(&c.id, &format!("sighash_v3[{i}]"), dg["sighash_v3"].as_str().unwrap_or("null"), &got);
         }
 
-        // Context-free per-transaction rules.
+        // The context-free per-transaction rules must reject exactly the
+        // context-free classes.
         let block = wrapper_block(&tx, c.height, &c.prevouts);
-        let cf = tx_context_free(&block, c.activation).map_err(|e| classify(&e).to_string());
-        let expected = want(&c.error);
-        match &cf {
-            Err(_) => rep.expect(&c.id, "context-free rules", &expected, &verdict(&cf)),
-            Ok(()) => {
-                if CONTEXT_FREE_CLASSES.contains(&expected.as_str()) {
-                    rep.expect(&c.id, "context-free rules", &expected, "valid");
-                }
-            }
+        let cf = tx_context_free(&block, act).map_err(|e| classify(&e).to_string());
+        let expected_cf = context_free_expectation(&expected, &block, max_supply);
+        rep.expect(&c.id, "context-free rules", &expected_cf, &verdict(&cf));
+        if cf.is_err() || expected_cf != "valid" {
+            decided += 1;
+            continue;
         }
 
-        // The input-script rule, wherever the expected verdict depends on it.
-        if cf.is_ok() && !BEFORE_SCRIPTS.contains(&expected.as_str()) {
-            let spent = spent.clone().expect("every input resolves when the scripts decide");
-            let got = core::sighash::verify_tx_scripts(&tx, &spent, chain, c.height, c.activation)
-                .map(|_| ())
-                .map_err(|e| classify(&e).to_string());
-            let want_scripts = if SCRIPT_CLASSES.contains(&expected.as_str()) { expected.clone() } else { "valid".into() };
-            rep.expect(&c.id, "verify_tx_scripts", &want_scripts, &verdict(&got));
+        // The connect-time rules gnb-crypto implements.
+        match connect_core(c, &tx, chain, act, &expected) {
+            Connect::Decided(got) => {
+                decided += 1;
+                rep.expect(&c.id, "connect-time rules (gnb-crypto)", &expected, &verdict(&got));
+            }
+            Connect::Deferred => {
+                assert!(TX_DEFERRED_TO_NODE.contains(&expected.as_str()), "{}: deferred class {expected}", c.id);
+                deferred.push((c.id.clone(), expected.clone()));
+            }
         }
     }
+    assert_eq!(decided + deferred.len(), v.cases.len(), "every case is decided here or deferred to the node runner");
+    eprintln!(
+        "tx vectors (gnb-crypto): {decided} cases decided here, {} deferred to the node runner ({})",
+        deferred.len(),
+        deferred.iter().map(|(id, class)| format!("{id}: {class}")).collect::<Vec<_>>().join(", ")
+    );
     rep.finish("tx vectors (gnb-crypto)");
 }
 
 #[test]
 fn block_vectors_core() {
-    let cases = load_block_vectors();
-    assert!(cases.len() >= 60, "{} block cases", cases.len());
+    let b = load_block_vectors();
+    let max_supply = max_supply_sat(&b.constants);
+    assert!(b.cases.len() >= 60, "{} block cases", b.cases.len());
     let mut rep = Report::default();
-    for c in &cases {
+    let (mut decided, mut connect_deferred) = (0usize, 0usize);
+    for c in &b.cases {
+        let act = if c.schedule { activation::hardening_activation_height_for_chain(ChainId::Mainnet) } else { c.activation };
+        let expected = want(&c.error);
         let block = match Block::from_wire_bytes(&c.bytes) {
             Ok(b) => b,
             Err(_) => {
-                rep.expect(&c.id, "decode", &want(&c.error), "decode");
+                rep.expect(&c.id, "decode", &expected, "decode");
+                decided += 1;
                 continue;
             }
         };
@@ -127,25 +222,27 @@ fn block_vectors_core() {
         rep.expect(&c.id, "bincode_size", &d["bincode_size"].to_string(), &block.size_bytes().to_string());
 
         if c.scope == "connect" {
-            continue; // connect-time rules only: node runner
+            connect_deferred += 1; // connect-time rules only: node runner
+            continue;
         }
-        let expected = want(&c.error);
         let got = (|| -> Result<(), String> {
-            block.validate_structure_without_pow_at(c.activation).map_err(|e| classify(e).to_string())?;
-            block_rules::check_block_hardened_at(&block, c.activation).map_err(|e| classify(e).to_string())?;
+            block.validate_structure_without_pow_at(act).map_err(|e| classify(e).to_string())?;
+            block_rules::check_block_hardened_at(&block, act).map_err(|e| classify(e).to_string())?;
             if c.pow != "skip" {
-                let limit = pow_limit(&block, c.activation);
-                // `validate_pow` under the case's activation height: it must
-                // agree, without an evaluation, wherever the limit fails. A
-                // workspace-wide build unifies the node's dev feature
-                // `test-pow-limit`, which pins `validate_pow`'s limit to
-                // 0x2100ffff: there only the mined case is evaluated.
+                let limit = pow_limit(&block, act);
+                // `validate_pow` under the case's activation height (the
+                // process-wide schedule for a `schedule` case): it must agree,
+                // without an evaluation, wherever the limit fails, and decide
+                // the proof of a `pow: full` case. A workspace-wide build
+                // unifies the node's dev feature `test-pow-limit`, which pins
+                // `validate_pow`'s limit to 0x2100ffff: there only the
+                // `pow: full` cases are evaluated.
                 if core::TEST_POW_LIMIT {
-                    if c.pow == "full" && !block.validate_pow() {
+                    if c.pow == "full" && limit.is_ok() && !block.validate_pow() {
                         return Err("bad-pow".into());
                     }
                 } else if limit.is_err() || c.pow == "full" {
-                    let _g = activation::scoped_override(c.activation);
+                    let _g = (!c.schedule).then(|| activation::scoped_override(c.activation));
                     let t = std::time::Instant::now();
                     let ok = block.validate_pow();
                     if limit.is_err() {
@@ -159,15 +256,16 @@ fn block_vectors_core() {
             }
             limits::check_block_context_free(&block).map_err(|e| classify(&e).to_string())
         })();
-        match &got {
-            Err(_) => rep.expect(&c.id, "context-free block rules", &expected, &verdict(&got)),
-            Ok(()) => {
-                if CONTEXT_FREE_CLASSES.contains(&expected.as_str()) {
-                    rep.expect(&c.id, "context-free block rules", &expected, "valid");
-                }
-            }
+        let expected_cf = context_free_expectation(&expected, &block, max_supply);
+        rep.expect(&c.id, "context-free block rules", &expected_cf, &verdict(&got));
+        if expected_cf == "valid" {
+            connect_deferred += 1; // the final verdict is the connect-time rules': node runner
+        } else {
+            decided += 1;
         }
     }
+    assert_eq!(decided + connect_deferred, b.cases.len());
+    eprintln!("block vectors (gnb-crypto): {decided} verdicts decided by the context-free stages here, {connect_deferred} decided at connect time (node runner)");
     rep.finish("block vectors (gnb-crypto)");
 }
 
@@ -184,13 +282,21 @@ fn vector_coverage() {
     ] {
         assert!(has(&|c| c.error.as_deref() == Some(class)), "tx class {class} not covered");
     }
-    for policy in ["non-standard-witness", "non-standard-version", "non-standard-suite", "non-standard-zero-value", "non-standard-no-outputs"] {
+    for policy in [
+        "non-standard-witness", "non-standard-version", "non-standard-suite", "non-standard-zero-value",
+        "non-standard-no-outputs", "non-standard-no-inputs", "already-confirmed", "missing-input",
+    ] {
         assert!(has(&|c| c.policy_class.as_deref() == Some(policy)), "policy {policy} not covered");
     }
+    // Consensus-invalid cases refused by an earlier relay-policy rule, and
+    // ones refused by the admission's own copy of the consensus rule.
+    assert!(has(&|c| c.error.is_some() && c.policy_class.as_deref() != c.error.as_deref()));
+    assert!(has(&|c| c.error.is_some() && c.policy_class.as_deref() == c.error.as_deref()));
     for net in ["mainnet", "testnet"] {
         for post in [false, true] {
             assert!(has(&|c| c.network == net && (c.height >= c.activation) == post), "{net} post={post}");
         }
+        assert!(has(&|c| c.network == net && c.schedule), "{net}: no case under the network's own schedule");
     }
     for version in [0u32, 1, 2, 3, 4, u32::MAX] {
         for post in [false, true] {
@@ -204,15 +310,22 @@ fn vector_coverage() {
     assert!(has(&|c| c.error.is_none() && pk_len(c) == Some(crypto::MLDSA_PUBKEY_LEN + crypto::falcon::pubkey_len())));
     assert!(has(&|c| c.error.is_none() && pk_len(c) == Some(4 + crypto::MLDSA_PUBKEY_LEN)));
 
-    let b = load_block_vectors();
+    let b = load_block_vectors().cases;
     for class in [
         "decode", "bad-merkle-root", "coinbase-format", "tx-64-bytes", "cb-commitment-missing", "cb-commitment-tag",
         "cb-height", "cb-parents", "witness-commitment", "duplicate-tx", "block-size", "pow-limit", "bad-bits",
-        "bip30", "coinbase-value", "coinbase-output-count", "same-block-coinbase",
+        "bad-pow", "value-out-of-range", "bip30", "coinbase-value", "coinbase-output-count", "same-block-coinbase",
     ] {
         assert!(b.iter().any(|c| c.error.as_deref() == Some(class)), "block class {class} not covered");
     }
     for post in [false, true] {
         assert!(b.iter().filter(|c| (c.height >= c.activation) == post && c.error.is_none()).count() >= 10);
     }
+    // A mined proof at a target most outputs miss (bits at or below the
+    // genesis target 0x1f0e9036: about 1 output in 4,500 meets it).
+    let hard = |c: &&BlockVector| c.pow == "full" && Block::from_wire_bytes(&c.bytes).is_ok_and(|blk| blk.header.bits <= 0x1F0E_9036);
+    assert!(b.iter().filter(hard).any(|c| c.error.is_none()), "no valid mined proof at the genesis target");
+    assert!(b.iter().filter(hard).any(|c| c.error.as_deref() == Some("bad-pow")), "no failing proof at the genesis target");
+    // The block-wide output total of VAL-11 with every transaction in range.
+    assert!(b.iter().any(|c| c.error.as_deref() == Some("value-out-of-range") && c.id.starts_with("value/block-output-total")));
 }

@@ -6,20 +6,27 @@
 //! (`admission::decode_tx_strict`), put in its wrapper block
 //! `[coinbase, tx]` at the case height, checked with the per-transaction
 //! context-free block rules (`Block::validate_coinbase_format`, the 64-byte
-//! rule, `Block::validate_dust`, `limits::check_block_context_free`) and then
-//! connected with `accept::validate_block_in_view_classified_at`, the
-//! function behind block extension, reorg and re-validation, against a
-//! RocksDB store holding exactly the case's prevouts. Mempool admission
-//! (`admission::check_transaction`, relay policy, signatures on) runs on the
-//! same store at the case height: a consensus-invalid case must be refused,
-//! a consensus-valid one accepted or refused for the recorded policy reason.
+//! rule, `Block::validate_dust`, `limits::check_block_context_free`), which
+//! must reject exactly the context-free classes (`context_free_expectation`),
+//! and then connected with `accept::validate_block_in_view_classified`, the
+//! function the acceptance pipeline calls for an extension and every block
+//! of a reorg, against a RocksDB store holding exactly the case's prevouts.
+//! Mempool admission (`admission::check_transaction`, relay policy,
+//! signatures on) runs on the same store at the case height and must accept,
+//! or refuse with the recorded class of the first admission rule that
+//! refuses (a storage or pool error fails the case).
 //!
-//! Blocks: `Block::from_wire_bytes`, `validate_structure_without_pow_at`,
-//! `block_rules::check_block_hardened_at`, the pow limit,
-//! `limits::check_block_context_free`, then
-//! `accept::validate_block_in_view_classified_at` on a store holding the
-//! case's prevouts (scope `connect`: decode and the last step only).
+//! Blocks: `Block::from_wire_bytes`, the ingress structure check
+//! `Block::validate_structure_without_pow`, `block_rules::check_block_hardened_at`,
+//! the pow limit, `Block::validate_pow` for `pow: full`,
+//! `limits::check_block_context_free` (together: exactly the context-free
+//! class), then `accept::validate_block_in_view_classified` on a store holding
+//! the case's prevouts (scope `connect`: decode and the last step only).
 //!
+//! Activation: an `explicit` case installs its height with
+//! `activation::scoped_override`; a `schedule` case installs nothing, so every
+//! rule runs under the process-wide height of the node's chain id (mainnet
+//! 110,000 here, testnet 0 in the testnet child), which the case thereby pins.
 //! The node's chain id is process-wide (`core::set_node_chain_id`, a
 //! `OnceLock`), so the testnet cases run in a child process of this test
 //! binary (`tx_vectors_testnet`).
@@ -51,13 +58,23 @@ fn store_with(prevouts: &[Prevout]) -> (tempfile::TempDir, Storage) {
     (tmp, store)
 }
 
+/// The activation height the case's rules run under: its own (installed for
+/// the returned guard's lifetime) or, for a `schedule` case, the node's
+/// process-wide schedule.
+fn activation_for(schedule: bool, recorded: u64) -> (Option<activation::OverrideGuard>, u64) {
+    let guard = (!schedule).then(|| activation::scoped_override(recorded));
+    (guard, activation::hardening_activation_height())
+}
+
 fn policy_class(e: &AdmissionError) -> String {
     match e {
         AdmissionError::MissingInputs(_) => "missing-input".into(),
         AdmissionError::Immature(_) => "immature-coinbase".into(),
         AdmissionError::LowFee(_) => "low-relay-fee".into(),
         AdmissionError::Duplicate(m) if m == "transaction already confirmed" => "already-confirmed".into(),
-        AdmissionError::Duplicate(m) | AdmissionError::Conflict(m) | AdmissionError::Pool(m) => format!("pool: {m}"),
+        AdmissionError::Duplicate(m) | AdmissionError::Conflict(m) => format!("pool: {m}"),
+        // Never a recorded class: a storage or pool failure is not a verdict.
+        AdmissionError::Pool(m) => format!("storage/pool error: {m}"),
         AdmissionError::Rejected(m) => {
             if m.starts_with("non-standard-version") {
                 "non-standard-version".into()
@@ -85,43 +102,39 @@ fn policy_class(e: &AdmissionError) -> String {
 fn run_tx_vectors(network: &str) -> usize {
     assert_eq!(core::node_chain_id(), chain_of(network), "the process chain id must be the cases' network");
     let v = load_tx_vectors();
+    let max_supply = max_supply_sat(&v.constants);
     let mut rep = Report::default();
     let mut n = 0;
     for c in v.cases.iter().filter(|c| c.network == network) {
         n += 1;
-        let _g = activation::scoped_override(c.activation);
+        let (_g, act) = activation_for(c.schedule, c.activation);
         let (_tmp, store) = store_with(&c.prevouts);
         let tx = match admission::decode_tx_strict(&c.bytes) {
             Ok(tx) => tx,
             Err(_) => {
                 rep.expect(&c.id, "consensus", &want(&c.error), "decode");
-                rep.expect(&c.id, "policy", &c.policy, "reject");
+                rep.expect(&c.id, "policy class", c.policy_class.as_deref().unwrap_or("accept"), "decode");
                 continue;
             }
         };
 
-        // Consensus: the context-free per-transaction rules, then connect.
+        // Consensus: the context-free per-transaction rules (exactly the
+        // context-free classes), then connect.
+        let expected = want(&c.error);
         let block = wrapper_block(&tx, c.height, &c.prevouts);
-        let got = tx_context_free(&block, c.activation)
-            .map_err(|e| classify(&e).to_string())
-            .and_then(|()| {
-                accept::validate_block_in_view_classified_at(&store, &block, c.activation)
-                    .map_err(|e| classify(&e.reason).to_string())
-            });
-        rep.expect(&c.id, "consensus", &want(&c.error), &verdict(&got));
+        let cf = tx_context_free(&block, act).map_err(|e| classify(&e).to_string());
+        rep.expect(&c.id, "context-free rules", &context_free_expectation(&expected, &block, max_supply), &verdict(&cf));
+        let got = cf.and_then(|()| {
+            accept::validate_block_in_view_classified(&store, &block).map_err(|e| classify(&e.reason).to_string())
+        });
+        rep.expect(&c.id, "consensus", &expected, &verdict(&got));
 
         // Mempool admission for a block at the case height.
         let adm = admission::check_transaction(&store, None, &tx, &AdmissionPolicy::relay(c.height));
-        match (&adm, c.policy.as_str()) {
-            (Ok(_), _) => rep.expect(&c.id, "policy", &c.policy, "accept"),
-            (Err(e), "reject") => {
-                let class = policy_class(e);
-                match &c.policy_class {
-                    Some(want_class) => rep.expect(&c.id, "policy class", want_class, &class),
-                    None => rep.expect(&c.id, "policy", "reject", "reject"),
-                }
-            }
-            (Err(e), _) => rep.expect(&c.id, "policy", &c.policy, &format!("reject ({})", policy_class(e))),
+        match &adm {
+            Ok(_) => rep.expect(&c.id, "policy", &c.policy, "accept"),
+            Err(AdmissionError::Pool(m)) => rep.expect(&c.id, "admission", "a verdict", &format!("storage/pool error: {m}")),
+            Err(e) => rep.expect(&c.id, "policy class", c.policy_class.as_deref().unwrap_or("accept"), &policy_class(e)),
         }
     }
     rep.finish(&format!("tx vectors on {network} (node)"));
@@ -164,35 +177,48 @@ fn tx_vectors_testnet_child() {
 
 #[test]
 fn block_vectors() {
-    let cases = load_block_vectors();
-    assert!(cases.len() >= 60);
+    let b = load_block_vectors();
+    let max_supply = max_supply_sat(&b.constants);
+    assert!(b.cases.len() >= 60);
     let mut rep = Report::default();
-    for c in &cases {
-        let _g = activation::scoped_override(c.activation);
-        let got = (|| -> Result<(), String> {
-            let block = Block::from_wire_bytes(&c.bytes).map_err(|_| "decode".to_string())?;
-            if c.scope == "full" {
-                block.validate_structure_without_pow_at(c.activation).map_err(|e| classify(e).to_string())?;
-                block_rules::check_block_hardened_at(&block, c.activation).map_err(|e| classify(e).to_string())?;
+    for c in &b.cases {
+        let (_g, act) = activation_for(c.schedule, c.activation);
+        let expected = want(&c.error);
+        let block = match Block::from_wire_bytes(&c.bytes) {
+            Ok(b) => b,
+            Err(_) => {
+                rep.expect(&c.id, "block", &expected, "decode");
+                continue;
+            }
+        };
+        if c.scope == "full" {
+            let cf = (|| -> Result<(), String> {
+                block.validate_structure_without_pow().map_err(|e| classify(e).to_string())?;
+                block_rules::check_block_hardened_at(&block, act).map_err(|e| classify(e).to_string())?;
                 if c.pow != "skip" {
-                    pow_limit(&block, c.activation).map_err(str::to_string)?;
+                    pow_limit(&block, act).map_err(str::to_string)?;
                     // `validate_pow` itself: the dev feature `test-pow-limit`
                     // pins this build's limit to 0x2100ffff, so only the
-                    // mined (below-activation) case is evaluated here; the
-                    // gnb-crypto runner evaluates it with the real limit.
+                    // `pow: full` cases (all within it) are evaluated here; the
+                    // gnb-crypto runner evaluates the pow-limit cases with
+                    // the real limit.
                     if c.pow == "full" && !block.validate_pow() {
                         return Err("bad-pow".into());
                     }
                 }
-                limits::check_block_context_free(&block).map_err(|e| classify(&e).to_string())?;
-            } else {
-                assert_eq!(c.scope, "connect", "{}", c.id);
+                limits::check_block_context_free(&block).map_err(|e| classify(&e).to_string())
+            })();
+            rep.expect(&c.id, "context-free block rules", &context_free_expectation(&expected, &block, max_supply), &verdict(&cf));
+            if let Err(class) = cf {
+                rep.expect(&c.id, "block", &expected, &class);
+                continue;
             }
-            let (_tmp, store) = store_with(&c.prevouts);
-            accept::validate_block_in_view_classified_at(&store, &block, c.activation)
-                .map_err(|e| classify(&e.reason).to_string())
-        })();
-        rep.expect(&c.id, "block", &want(&c.error), &verdict(&got));
+        } else {
+            assert_eq!(c.scope, "connect", "{}", c.id);
+        }
+        let (_tmp, store) = store_with(&c.prevouts);
+        let got = accept::validate_block_in_view_classified(&store, &block).map_err(|e| classify(&e.reason).to_string());
+        rep.expect(&c.id, "block", &expected, &verdict(&got));
     }
     rep.finish("block vectors (node)");
 }

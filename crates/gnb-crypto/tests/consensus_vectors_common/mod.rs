@@ -3,8 +3,9 @@
 //! `node/tests/consensus_vectors.rs`): loading `reference/tx_vectors.json` /
 //! `reference/block_vectors.json`, the wrapper block of a tx vector, the
 //! context-free per-transaction checks a block applies, the pow-limit check,
-//! and the mapping from the node's error strings to the vectors' error
-//! classes (docs/testing/VECTORS.md).
+//! which stage must reject a case (`context_free_expectation`), and the
+//! mapping from the node's error strings to the vectors' error classes
+//! (docs/testing/VECTORS.md).
 #![allow(dead_code)]
 
 use gnb_crypto::core::{block_rules, limits, Block, BlockHeader, ChainId, MerkleRoot, Transaction, TxInput, TxOutput};
@@ -38,6 +39,17 @@ pub fn bytes_of(v: &Value) -> Vec<u8> {
 
 pub fn h32(v: &Value) -> [u8; 32] {
     bytes_of(v).try_into().expect("32 bytes")
+}
+
+/// `activation_source`: `true` for `"schedule"` (the activation height is the
+/// network's own schedule; the runners take it from the schedule instead of
+/// installing it), `false` for `"explicit"`.
+fn schedule_of(v: &Value) -> bool {
+    match v.as_str().expect("activation_source") {
+        "schedule" => true,
+        "explicit" => false,
+        other => panic!("unknown activation_source {other}"),
+    }
 }
 
 pub fn chain_of(network: &str) -> ChainId {
@@ -100,6 +112,8 @@ pub struct TxVector {
     pub id: String,
     pub network: String,
     pub activation: u64,
+    /// The activation height is the network's schedule (`activation_source`).
+    pub schedule: bool,
     pub height: u64,
     pub prevouts: Vec<Prevout>,
     pub bytes: Vec<u8>,
@@ -107,6 +121,7 @@ pub struct TxVector {
     pub error: Option<String>,
     /// `"accept"` or `"reject"`.
     pub policy: String,
+    /// The class of the first admission rule that refuses it (`None` iff accepted).
     pub policy_class: Option<String>,
     pub derived: Value,
 }
@@ -123,6 +138,7 @@ pub fn load_tx_vectors() -> TxVectors {
         id: c["id"].as_str().unwrap().to_string(),
         network: c["network"].as_str().unwrap().to_string(),
         activation: u64_of(&c["activation_height"]),
+        schedule: schedule_of(&c["activation_source"]),
         height: u64_of(&c["height"]),
         prevouts: prevouts_of(&c["prevouts"]),
         bytes: bytes_of(&c["tx"]),
@@ -136,6 +152,11 @@ pub fn load_tx_vectors() -> TxVectors {
         let raw = d["cases"].as_array().unwrap().iter().find(|x| x["id"] == c.id.as_str()).unwrap();
         assert_eq!(raw["regime"], regime, "{}: regime label", c.id);
         assert!(c.error.is_none() || c.policy == "reject", "{}: an invalid case is never admitted", c.id);
+        match c.policy.as_str() {
+            "accept" => assert!(c.policy_class.is_none(), "{}: an admitted case names no class", c.id),
+            "reject" => assert!(c.policy_class.is_some(), "{}: a refusal names the class of the refusing rule", c.id),
+            other => panic!("{}: unknown policy verdict {other}", c.id),
+        }
     }
     TxVectors { constants: d["constants"].clone(), cases }
 }
@@ -143,6 +164,8 @@ pub fn load_tx_vectors() -> TxVectors {
 pub struct BlockVector {
     pub id: String,
     pub activation: u64,
+    /// The activation height is the (mainnet) schedule (`activation_source`).
+    pub schedule: bool,
     pub height: u64,
     pub scope: String,
     pub pow: String,
@@ -152,10 +175,15 @@ pub struct BlockVector {
     pub derived: Value,
 }
 
-pub fn load_block_vectors() -> Vec<BlockVector> {
+pub struct BlockVectors {
+    pub constants: Value,
+    pub cases: Vec<BlockVector>,
+}
+
+pub fn load_block_vectors() -> BlockVectors {
     let d = load("block_vectors.json");
     assert_eq!(d["format"], "gnb-consensus-block-vectors/1");
-    d["cases"].as_array().unwrap().iter().map(|c| {
+    let cases = d["cases"].as_array().unwrap().iter().map(|c| {
         let bytes = if c["block"].is_string() {
             bytes_of(&c["block"])
         } else {
@@ -172,6 +200,7 @@ pub fn load_block_vectors() -> Vec<BlockVector> {
         BlockVector {
             id: c["id"].as_str().unwrap().to_string(),
             activation: u64_of(&c["activation_height"]),
+            schedule: schedule_of(&c["activation_source"]),
             height: u64_of(&c["height"]),
             scope: c["scope"].as_str().unwrap().to_string(),
             pow: c["pow"].as_str().unwrap().to_string(),
@@ -180,7 +209,13 @@ pub fn load_block_vectors() -> Vec<BlockVector> {
             error: expected_of(&c["expected"]),
             derived: c["derived"].clone(),
         }
-    }).collect()
+    }).collect();
+    BlockVectors { constants: d["constants"].clone(), cases }
+}
+
+/// `constants.max_supply_sat` of a vector file.
+pub fn max_supply_sat(constants: &Value) -> u64 {
+    u64_of(&constants["max_supply_sat"])
 }
 
 // ── The wrapper block of a tx vector ────────────────────────────────────────
@@ -256,13 +291,60 @@ pub fn pow_limit(block: &Block, activation: u64) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Error classes produced by the context-free stages (anything else is a
-/// connect-time class).
+/// Error classes produced only by the context-free stages (structure, the
+/// hardening block rules, the pow limit and proof, the encoding caps).
+/// `value-out-of-range` is context-free on the output side only
+/// ([`outputs_out_of_range`]); every other class is connect-time.
 pub const CONTEXT_FREE_CLASSES: &[&str] = &[
     "decode", "too-many-parents", "block-size", "bad-merkle-root", "coinbase-format", "tx-64-bytes",
     "cb-commitment-missing", "cb-commitment-tag", "cb-height", "cb-parents", "witness-commitment",
     "duplicate-tx", "dust", "pow-limit", "bad-bits", "bad-pow", "canonical-limit",
 ];
+
+/// Error classes decided by the connect-time rules
+/// (`accept::validate_block_in_view_classified_at`), the input side of
+/// `value-out-of-range` included.
+pub const CONNECT_CLASSES: &[&str] = &[
+    "bip30", "same-block-coinbase", "immature-coinbase", "double-spend", "missing-input", "value-out-of-range",
+    "bad-version", "witness-malformed", "witness-non-canonical", "pubkey-mismatch", "bad-signature",
+    "inputs-below-outputs", "min-fee", "coinbase-output-count", "coinbase-value",
+];
+
+/// Whether an output, a transaction's output total or the block's output
+/// total exceeds `max_supply` (u128 arithmetic on the data alone, not the
+/// code under test). Such a block fails the context-free MoneyRange of
+/// `limits::check_block_context_free` (VAL-11); an input-side MoneyRange
+/// failure is connect-time.
+pub fn outputs_out_of_range(block: &Block, max_supply: u64) -> bool {
+    let max = u128::from(max_supply);
+    let mut block_total = 0u128;
+    for tx in &block.transactions {
+        let tx_total: u128 = tx.outputs.iter().map(|o| u128::from(o.value)).sum();
+        if tx.outputs.iter().any(|o| u128::from(o.value) > max) || tx_total > max {
+            return true;
+        }
+        block_total += tx_total;
+    }
+    block_total > max
+}
+
+/// The verdict the context-free stages must give for a case whose expected
+/// verdict is `expected` (`"valid"` or a class): the class itself where it is
+/// a context-free class (or the output-side MoneyRange), `"valid"` where the
+/// case must get past them to the connect-time rules. Comparing each stage
+/// against this, instead of only the final verdict, fails a runner when a
+/// context-free rule is dropped and a later rule happens to reject the case
+/// with the same class.
+pub fn context_free_expectation(expected: &str, block: &Block, max_supply: u64) -> String {
+    let context_free = CONTEXT_FREE_CLASSES.contains(&expected)
+        || (expected == "value-out-of-range" && outputs_out_of_range(block, max_supply));
+    if context_free {
+        expected.to_string()
+    } else {
+        assert!(expected == "valid" || CONNECT_CLASSES.contains(&expected), "unknown error class {expected}");
+        "valid".to_string()
+    }
+}
 
 /// Input-script classes (`core::sighash::verify_tx_scripts`).
 pub const SCRIPT_CLASSES: &[&str] = &["bad-version", "witness-malformed", "witness-non-canonical", "pubkey-mismatch", "bad-signature"];
