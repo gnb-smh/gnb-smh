@@ -137,9 +137,11 @@ tests running in parallel share it. Only `db/` is copied into a node (its
   GnB-SMH; on "invalid PoW" (probability 2^-16 at the pow limit) the next
   nonce is tried. Deterministic: no background miner.
 - The node caches `getblocktemplate` while the template's parents and height
-  are unchanged (`template_cache_key`): a new block, an `invalidateblock` /
-  `reconsiderblock` or a parent's body arriving misses the cache at once, a
-  mempool change shows within 5 s (`TEMPLATE_CACHE_TTL`, as Bitcoin Core). `generate` uses
+  are unchanged (`template_cache_key`; a template is stored under the parents
+  it was built on, `template_result_key`, and at most four are kept): a new
+  block, an `invalidateblock` / `reconsiderblock` or a parent's body arriving
+  misses the cache at once, a mempool change shows within 5 s
+  (`TEMPLATE_CACHE_TTL`, as Bitcoin Core). `generate` uses
   `node.fresh_template()`, which waits until the template offers every
   mempool transaction (at most one cache period).
 - `node.start(mine=True, miner_address=...)`: the node's own miner (`--mine`,

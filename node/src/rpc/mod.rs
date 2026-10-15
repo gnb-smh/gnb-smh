@@ -308,9 +308,25 @@ const TEMPLATE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5
 /// Cap on distinct cached keys (parameterised methods could otherwise grow
 /// the map unboundedly — the exact DoS shape this gate exists to close).
 const HEAVY_READ_CACHE_MAX_KEYS: usize = 64;
+/// Cap on cached templates (`HeavyGate::for_templates`). The template key
+/// changes with every new block, so all but the newest entries are dead:
+/// with the analytics cap of 64, a node kept up to 63 expired templates of
+/// up to about 2 MB each (as JSON) for good. Expired entries are also dropped
+/// on every insert; the few left cover two miners asking with different
+/// params, or a parent set an invalidation brings back within the TTL.
+const TEMPLATE_CACHE_MAX_KEYS: usize = 4;
+/// The answer of the analytics gate while its single scan is in flight.
+const HEAVY_BUSY: &str = "busy: another heavy analytics scan is in flight; retry shortly";
+/// The answer of the template gate while another template is being built.
+const TEMPLATE_BUSY: &str = "busy: another getblocktemplate build is in flight; retry shortly";
 
 pub struct HeavyGate {
     ttl:   std::time::Duration,
+    /// Most entries kept; expired ones are dropped on every insert, and the
+    /// oldest when the map is still full.
+    max_keys: usize,
+    /// The error text for a caller that finds the permit taken.
+    busy:  &'static str,
     cache: parking_lot::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>,
     /// Held for the duration of a scan; `try_lock` makes concurrency-1 a hard
     /// bound with no queueing (queueing would just move the pile-up).
@@ -318,9 +334,24 @@ pub struct HeavyGate {
 }
 
 impl HeavyGate {
+    /// The analytics gate (`HEAVY_READ_METHODS`): `ttl`, at most
+    /// `HEAVY_READ_CACHE_MAX_KEYS` results.
     pub fn new(ttl: std::time::Duration) -> Self {
+        Self::with_limits(ttl, HEAVY_READ_CACHE_MAX_KEYS, HEAVY_BUSY)
+    }
+
+    /// `getblocktemplate`'s own gate (L-8): `TEMPLATE_CACHE_TTL`, at most
+    /// `TEMPLATE_CACHE_MAX_KEYS` templates, and a "busy" answer that names
+    /// the template build, not an analytics scan.
+    pub fn for_templates() -> Self {
+        Self::with_limits(TEMPLATE_CACHE_TTL, TEMPLATE_CACHE_MAX_KEYS, TEMPLATE_BUSY)
+    }
+
+    fn with_limits(ttl: std::time::Duration, max_keys: usize, busy: &'static str) -> Self {
         Self {
             ttl,
+            max_keys: max_keys.max(1),
+            busy,
             cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             scan:  parking_lot::Mutex::new(()),
         }
@@ -334,6 +365,22 @@ impl HeavyGate {
     /// scan permit. A caller that can neither hit the cache nor take the
     /// permit gets an error Value immediately (bounded, non-queueing).
     pub fn run<F: FnOnce() -> Value>(&self, key: String, f: F) -> Value {
+        let store_key = key.clone();
+        self.run_keyed(key, f, move |_| Some(store_key))
+    }
+
+    /// [`Self::run`], but a computed result is stored under
+    /// `store_key(&result)` (`None`: not stored) instead of under `key`: the
+    /// key of what the result was actually computed from, when that can
+    /// differ from what `key` was read from (`getblocktemplate`: a block
+    /// accepted between reading `key` and the build changes the parents the
+    /// template is built on). A hit on a key then only ever returns a result
+    /// computed from what the key names.
+    pub fn run_keyed<F, K>(&self, key: String, f: F, store_key: K) -> Value
+    where
+        F: FnOnce() -> Value,
+        K: FnOnce(&Value) -> Option<String>,
+    {
         let now = std::time::Instant::now();
         if let Some((at, v)) = self.cache.lock().get(&key) {
             if now.duration_since(*at) < self.ttl {
@@ -348,21 +395,23 @@ impl HeavyGate {
                 if v.get("error").is_some() {
                     return v;
                 }
+                let Some(store_key) = store_key(&v) else { return v };
+                let now = std::time::Instant::now();
                 let mut cache = self.cache.lock();
-                if cache.len() >= HEAVY_READ_CACHE_MAX_KEYS {
-                    // Evict stale entries first; if still full, drop the map —
-                    // correctness is unaffected (it is a cache).
-                    cache.retain(|_, (at, _)| now.duration_since(*at) < self.ttl);
-                    if cache.len() >= HEAVY_READ_CACHE_MAX_KEYS {
-                        cache.clear();
+                // Expired entries are dead (never served again): drop them on
+                // every insert, then the oldest while the map is still full.
+                cache.retain(|_, (at, _)| now.duration_since(*at) < self.ttl);
+                if !cache.contains_key(&store_key) {
+                    while cache.len() >= self.max_keys {
+                        let Some(oldest) = cache.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone())
+                            else { break };
+                        cache.remove(&oldest);
                     }
                 }
-                cache.insert(key, (std::time::Instant::now(), v.clone()));
+                cache.insert(store_key, (now, v.clone()));
                 v
             }
-            None => json!({
-                "error": "busy: another heavy analytics scan is in flight; retry shortly",
-            }),
+            None => json!({ "error": self.busy }),
         }
     }
 }
@@ -480,7 +529,7 @@ pub async fn start_rpc_server(
         allowed_hosts:           Arc::new(config.allowed_hosts.clone()),
         trust_loopback:          config.trust_loopback,
         heavy_gate:              Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
-        template_gate:           Arc::new(HeavyGate::new(TEMPLATE_CACHE_TTL)),
+        template_gate:           Arc::new(HeavyGate::for_templates()),
         submit_block,
         cancel:                  Arc::new(std::sync::atomic::AtomicBool::new(false)),
         chain_admin,
@@ -675,30 +724,61 @@ fn selected_tip_height(state: &AppState) -> u64 {
 /// `TEMPLATE_CACHE_TTL` (a pool-digest key missed on every admission, so a
 /// miner polling a busy pool rebuilt the template on every call, and
 /// computing the digest copied every pool txid).
+///
+/// This is the LOOKUP key, read under `dag.read()` only, before the build.
+/// The builder takes the acceptance lock and chooses the parents again, so a
+/// block accepted in between gives a template on other parents. A template
+/// is therefore stored under the key of the parents and height it carries
+/// ([`template_result_key`]), which equals this one only when nothing
+/// changed in between.
 fn template_cache_key(params: Option<&Value>, state: &AppState) -> String {
-    use sha3::{Digest as _, Sha3_256};
     let (parents, height) = {
         let dag = state.dag.read();
         crate::template::template_parents_and_height(&dag, &state.store)
     };
+    template_cache_key_for(params, parents.iter().map(|p| p.as_slice()), height)
+}
+
+/// The template cache key of `params` and a template on `parents` (in
+/// template order) at header `height`.
+fn template_cache_key_for<'a>(params: Option<&Value>, parents: impl IntoIterator<Item = &'a [u8]>, height: u64) -> String {
+    use sha3::{Digest as _, Sha3_256};
     // Order kept: the first parent is the template's selected parent.
     let mut h = Sha3_256::new();
-    for p in &parents {
+    for p in parents {
         h.update(p);
     }
     format!("getblocktemplate|{}|parents={}|height={}",
         params.map(|p| p.to_string()).unwrap_or_default(), hex::encode(h.finalize()), height)
 }
 
+/// The key a built template is stored under: the `parents` and `height` it
+/// was built on (its own fields), so a cache hit on a key only ever returns
+/// a template on the parents that key names. Keyed by the lookup key, a
+/// template built on a block X accepted during the build was stored under
+/// the key of the parents before X, and after an `invalidateblock X` brought
+/// those parents back, the next call within `TEMPLATE_CACHE_TTL` was served
+/// a template on the invalidated X. `None` (not stored) for anything that is
+/// not a template.
+fn template_result_key(params: Option<&Value>, template: &Value) -> Option<String> {
+    let parents = template.get("parents")?.as_array()?.iter()
+        .map(|p| p.as_str().and_then(|h| hex::decode(h).ok()))
+        .collect::<Option<Vec<Vec<u8>>>>()?;
+    let height = template.get("height")?.as_u64()?;
+    Some(template_cache_key_for(params, parents.iter().map(Vec::as_slice), height))
+}
+
 /// Run one dispatch `f` behind the bound its method needs (L-8 / H-R3-5):
-/// `getblocktemplate` through its own gate (`template_cache_key`,
-/// `TEMPLATE_CACHE_TTL`), the heavy analytics reads through the HeavyGate
+/// `getblocktemplate` through its own gate (looked up by `template_cache_key`,
+/// stored by `template_result_key`, `TEMPLATE_CACHE_TTL`,
+/// `TEMPLATE_CACHE_MAX_KEYS`), the heavy analytics reads through the HeavyGate
 /// (method|params key, `HEAVY_READ_CACHE_TTL`), everything else directly.
 /// Separate gates: a public analytics scan holding the HeavyGate's single
 /// permit must not answer a miner's template request "busy".
 fn gated_dispatch<F: FnOnce() -> Value>(method: &str, params: Option<&Value>, state: &AppState, f: F) -> Value {
     if method == "getblocktemplate" {
-        state.template_gate.run(template_cache_key(params, state), f)
+        state.template_gate.run_keyed(template_cache_key(params, state), f,
+            |template| template_result_key(params, template))
     } else if HeavyGate::is_heavy(method) {
         let key = format!("{}|{}", method, params.map(|p| p.to_string()).unwrap_or_default());
         state.heavy_gate.run(key, f)
@@ -2533,7 +2613,7 @@ mod audit_2026_10_rpc_tests {
             allowed_hosts: Arc::new(Vec::new()),
             trust_loopback: false,
             heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
-            template_gate: Arc::new(HeavyGate::new(TEMPLATE_CACHE_TTL)),
+            template_gate: Arc::new(HeavyGate::for_templates()),
             submit_block: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             chain_admin: None,
@@ -2599,6 +2679,18 @@ mod audit_2026_10_rpc_tests {
         assert_ne!(template_cache_key(Some(&json!([{"x": 1}])), &state), template_cache_key(None, &state));
     }
 
+    /// What a template build returns, as far as the cache reads it: the
+    /// parents and height `template_parents_and_height` gives on the DAG at
+    /// build time (the fields the builder copies from the template it built),
+    /// and `n` to tell builds apart.
+    fn fake_template(state: &AppState, n: u32) -> Value {
+        let (parents, height) = {
+            let dag = state.dag.read();
+            crate::template::template_parents_and_height(&dag, &state.store)
+        };
+        json!({"template": n, "parents": parents.iter().map(hex::encode).collect::<Vec<_>>(), "height": height})
+    }
+
     /// getblocktemplate has its own gate: while a public analytics scan
     /// holds the HeavyGate's permit, a template is still built (it used to
     /// be answered "busy"), and analytics are still refused; a second
@@ -2608,20 +2700,67 @@ mod audit_2026_10_rpc_tests {
     fn template_requests_are_not_blocked_by_an_analytics_scan() {
         let (_tmp, state) = state_with_chain(3);
         let builds = std::cell::Cell::new(0u32);
-        let build = || { builds.set(builds.get() + 1); json!({"template": builds.get()}) };
+        let build = || { builds.set(builds.get() + 1); fake_template(&state, builds.get()) };
         let scan = state.heavy_gate.scan.lock(); // an analytics scan in flight
-        assert_eq!(gated_dispatch("getblocktemplate", None, &state, build), json!({"template": 1}));
+        assert_eq!(gated_dispatch("getblocktemplate", None, &state, build)["template"], 1);
         let refused = gated_dispatch("getrichlist", None, &state, || json!({"should": "not run"}));
         assert!(refused["error"].as_str().unwrap_or("").contains("busy"), "{refused}");
         drop(scan);
-        assert_eq!(gated_dispatch("getblocktemplate", None, &state, build), json!({"template": 1}),
+        assert_eq!(gated_dispatch("getblocktemplate", None, &state, build)["template"], 1,
             "same tips: served from the template cache");
         state.dag.write().add_block([9; 32], vec![[3; 32]], 2_000, 1).unwrap();
-        assert_eq!(gated_dispatch("getblocktemplate", None, &state, build), json!({"template": 2}),
+        assert_eq!(gated_dispatch("getblocktemplate", None, &state, build)["template"], 2,
             "a new tip rebuilds at once");
         assert_eq!(builds.get(), 2);
         assert_eq!(gated_dispatch("getblockcount", None, &state, || json!(7)), json!(7));
         assert!(TEMPLATE_CACHE_TTL <= std::time::Duration::from_secs(5));
+    }
+
+    /// A template call that finds another template build in flight is told
+    /// so, not that "another heavy analytics scan" is (the template gate
+    /// answered with the analytics gate's text); analytics keep theirs.
+    #[test]
+    fn a_busy_template_gate_names_the_template_build() {
+        let (_tmp, state) = state_with_chain(3);
+        let build = state.template_gate.scan.lock(); // a template build in flight
+        let busy = gated_dispatch("getblocktemplate", None, &state, || json!({"should": "not run"}));
+        let text = busy["error"].as_str().unwrap_or("");
+        assert!(text.starts_with("busy:") && text.contains("getblocktemplate"), "{busy}");
+        assert!(!text.contains("analytics"), "{busy}");
+        drop(build);
+        let scan = state.heavy_gate.scan.lock();
+        let busy = gated_dispatch("getrichlist", None, &state, || json!({"should": "not run"}));
+        assert!(busy["error"].as_str().unwrap_or("").contains("analytics scan"), "{busy}");
+        drop(scan);
+    }
+
+    /// The template key changes with every block, so the template gate keeps
+    /// only fresh templates, and few: an expired one is dropped when the next
+    /// is stored, and at most TEMPLATE_CACHE_MAX_KEYS are kept, the newest.
+    /// With the analytics gate's eviction (only once 64 keys were reached), a
+    /// node kept up to 63 dead templates of up to about 2 MB each for good.
+    #[test]
+    fn the_template_gate_keeps_only_a_few_fresh_templates() {
+        let gate = HeavyGate::with_limits(std::time::Duration::from_millis(30), TEMPLATE_CACHE_MAX_KEYS, TEMPLATE_BUSY);
+        gate.run("parents=a".into(), || json!(1));
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        gate.run("parents=b".into(), || json!(2));
+        assert_eq!(gate.cache.lock().keys().cloned().collect::<Vec<_>>(), vec!["parents=b".to_string()],
+            "the expired template must be dropped when the next one is stored");
+
+        let gate = HeavyGate::for_templates();
+        const { assert!(TEMPLATE_CACHE_MAX_KEYS < HEAVY_READ_CACHE_MAX_KEYS) };
+        for i in 0..(HEAVY_READ_CACHE_MAX_KEYS * 2) {
+            gate.run(format!("parents={i}"), || json!(i));
+        }
+        let last = HEAVY_READ_CACHE_MAX_KEYS * 2 - 1;
+        {
+            let cache = gate.cache.lock();
+            assert_eq!(cache.len(), TEMPLATE_CACHE_MAX_KEYS);
+            assert!(cache.contains_key(&format!("parents={last}")), "the newest template is kept");
+        }
+        // ... and served while fresh.
+        assert_eq!(gate.run(format!("parents={last}"), || json!("rebuilt")), json!(last));
     }
 
     #[test]
@@ -2963,7 +3102,7 @@ mod block_rules_template_tests {
             allowed_hosts: Arc::new(Vec::new()),
             trust_loopback: false,
             heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
-            template_gate: Arc::new(HeavyGate::new(TEMPLATE_CACHE_TTL)),
+            template_gate: Arc::new(HeavyGate::for_templates()),
             submit_block: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             chain_admin: None,
@@ -3012,12 +3151,9 @@ mod block_rules_template_tests {
     /// parents, and a header-only tip becomes a parent only when its body
     /// arrives. Each of these misses the cache at once (keyed on the tips, a
     /// miner kept the invalidated parent for up to TEMPLATE_CACHE_TTL).
-    #[test]
-    fn template_cache_key_follows_invalidation_and_body_arrival() {
-        let (_tmp, state) = state_with_genesis();
-        let gh = state.dag.read().tips()[0];
-        let gts = state.dag.read().get_block_data(&gh).map(|d| d.timestamp).unwrap_or(0);
-        let child = |tag: u8| Block {
+    /// A height-1 block on genesis `gh` (timestamp `gts`), told apart by `tag`.
+    fn genesis_child(gh: [u8; 32], gts: u64, tag: u8) -> Block {
+        Block {
             header: BlockHeader {
                 version: 1, parents: vec![gh], merkle_root: MerkleRoot::default(),
                 timestamp: gts + 60, bits: core::POW_LIMIT_BITS, nonce: tag as u64,
@@ -3031,7 +3167,15 @@ mod block_rules_template_tests {
             blue_score: 1,
             height: 1,
             shielded_transactions: vec![],
-        };
+        }
+    }
+
+    #[test]
+    fn template_cache_key_follows_invalidation_and_body_arrival() {
+        let (_tmp, state) = state_with_genesis();
+        let gh = state.dag.read().tips()[0];
+        let gts = state.dag.read().get_block_data(&gh).map(|d| d.timestamp).unwrap_or(0);
+        let child = |tag: u8| genesis_child(gh, gts, tag);
         let (a, b) = (child(1), child(2));
         let (ah, bh) = (a.block_hash(), b.block_hash());
         let parents_of = |state: &AppState| {
@@ -3064,6 +3208,59 @@ mod block_rules_template_tests {
         state.dag.write().reset_invalid_sets(std::iter::empty(), std::iter::empty());
         assert_eq!(parents_of(&state), both);
         assert_eq!(template_cache_key(None, &state), k_ab);
+    }
+
+    /// A template is cached under the parents it was BUILT on, not under the
+    /// key read before the build. The race: a miner's call reads the key on
+    /// [A]; block B is accepted while the build waits for the acceptance
+    /// lock, so the template is built on [A, B]. Stored under the [A] key, an
+    /// `invalidateblock B` (parents [A] again) within TEMPLATE_CACHE_TTL had
+    /// the next call served the template on the invalidated B, which the node
+    /// itself refuses. Now that call misses and builds on [A], and the
+    /// template on [A, B] is served again only once B is reconsidered.
+    #[test]
+    fn a_template_is_cached_under_the_parents_it_was_built_on() {
+        let (_tmp, state) = state_with_genesis();
+        let gh = state.dag.read().tips()[0];
+        let gts = state.dag.read().get_block_data(&gh).map(|d| d.timestamp).unwrap_or(0);
+        let (a, b) = (genesis_child(gh, gts, 1), genesis_child(gh, gts, 2));
+        let (ah, bh) = (a.block_hash(), b.block_hash());
+        state.store.put_block(&a).unwrap();
+        state.dag.write().add_block(ah, vec![gh], gts + 60, 1).unwrap();
+
+        // What the builder returns: the parents and height it chose under the
+        // acceptance lock (`build_block_template_with`), here read the same way.
+        let built_on_current_parents = |n: u32| {
+            let (parents, height) = {
+                let dag = state.dag.read();
+                crate::template::template_parents_and_height(&dag, &state.store)
+            };
+            json!({"build": n, "parents": parents.iter().map(hex::encode).collect::<Vec<_>>(), "height": height})
+        };
+        let parents_in = |t: &Value| hashes(&t["parents"]);
+
+        let t1 = gated_dispatch("getblocktemplate", None, &state, || {
+            // B is accepted between the key lookup and the build.
+            state.store.put_block(&b).unwrap();
+            state.dag.write().add_block(bh, vec![gh], gts + 60, 1).unwrap();
+            built_on_current_parents(1)
+        });
+        assert_eq!(parents_in(&t1).len(), 2, "{t1}");
+        assert!(parents_in(&t1).contains(&bh));
+
+        // invalidateblock B: the parents are [A] again.
+        state.dag.write().mark_invalid(bh);
+        let t2 = gated_dispatch("getblocktemplate", None, &state, || built_on_current_parents(2));
+        assert_eq!(t2["build"], 2, "the template on the invalidated B was served from [A]'s key: {t2}");
+        assert_eq!(parents_in(&t2), vec![ah]);
+
+        // reconsiderblock B: the template on [A, B] is that key's again.
+        state.dag.write().reset_invalid_sets(std::iter::empty(), std::iter::empty());
+        let t3 = gated_dispatch("getblocktemplate", None, &state, || built_on_current_parents(3));
+        assert_eq!(t3["build"], 1, "{t3}");
+        // And [A] again serves the template built on [A].
+        state.dag.write().mark_invalid(bh);
+        assert_eq!(gated_dispatch("getblocktemplate", None, &state, || built_on_current_parents(4))["build"], 2);
     }
 
     #[tokio::test]
