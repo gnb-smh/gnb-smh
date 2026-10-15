@@ -65,6 +65,16 @@ audit WAL-5). The gnb-crypto integration tests now also include the consensus
 vector runner `tests/consensus_vectors.rs` (docs/testing/VECTORS.md), which
 the gate runs too: more tests can only catch more mutants.
 
+Re-run on the merged tree (`065c5e0`, an export of the commit; the gate
+configuration through `scripts/mutants-gate.sh`, `-j 2 --no-shuffle`, on the
+4-CPU machine of the runs below under `nice -n 10` with `RUST_TEST_THREADS=2`,
+`CARGO_BUILD_JOBS=2` and a private `TMPDIR`): **gnb-smh** 272 mutants, 263
+caught, 0 missed, 9 unviable, 0 timeouts (15 min); **gnb-crypto** 719 mutants,
+667 caught, 0 missed, 47 unviable, 5 timeouts, all five the known hangs of
+`.cargo/mutants-timeouts.txt` (1 h 46 min). Both gates exit 0. The mutants of
+the moved code are among the caught ones: `PowCache::insert -> ()` and its
+three `>` mutants, and those of `Block::validate_pow`.
+
 ## Method
 
 - Tool: cargo-mutants 27.1.0, `--test-tool cargo`, two jobs (`-j 2`),
@@ -342,9 +352,14 @@ job filters of mutants.yml below.
   tests no mutant and passes in seconds; one that changes consensus code must
   come with tests that catch its mutants. The job runs both crates in one
   runner with a 120-minute timeout: a PR whose diff covers most of the scope
-  has about as many mutants as the full run (gnb-crypto alone took about 2 h
+  has about as many mutants as the full run (gnb-crypto alone took 1 h 46 min
   with `-j 2` on a 4-CPU machine) and can time out; for such a PR, run the
-  sharded `mutants` workflow on its branch (`workflow_dispatch`).
+  sharded `mutants` workflow on its branch (`workflow_dispatch`). Its first
+  runs on GitHub (then still a job of ci.yml): at `065c5e0` the diff held 6
+  gnb-crypto mutants (none in gnb-smh) and the gate step passed, the job
+  failing only on the equivalent-mutant check, whose `--list` output carried
+  the ANSI colours of `CARGO_TERM_COLOR=always` (fixed in `7df48b4`); at
+  `7df48b4` the job passed.
 
 The gate was checked locally both ways: with the exclusions it passes on the
 mutants of `lane16` and `target_to_bits` (27 caught, the 6 equivalent ones
