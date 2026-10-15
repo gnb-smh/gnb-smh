@@ -928,14 +928,22 @@ descendants and is persisted (`invalid_block/<id>`), as before. A
 witness-dependent failure does not: the stored body is deleted (so it is no
 longer served to peers), nothing is persisted, and the block, with its
 selected-chain descendants, waits in memory for another body
-(`GhostDAG::mark_body_pending`); the next-best chain is used meanwhile. Every
-ingress path (gossip, directed pulls, header sync, `submitblock`) treats such
-a block as not yet known (`accept::is_known_block`), the message processor
-requests its body from peers through the missing-parent fetch tracker (retried
-by the periodic sweep), and `accept_block` takes a copy of the same id whose
-witness root differs from every body already rejected for it: the copy passes
-the same acceptance checks as a new block, replaces the body, and the chain is
-re-evaluated. A block in the DAG whose body is missing (for example after a
+(`GhostDAG::mark_body_pending`); the next-best chain is used meanwhile. Header
+sync and `submitblock` treat such a block as not yet known
+(`accept::is_known_block`). The message processor requests its body from a
+peer at once through the missing-parent fetch tracker (a directed pull,
+retried with backoff by the periodic sweep), and over block relay it takes
+only the answer to such a pull: an unsolicited gossip copy of a block already
+in the DAG is ignored before decoding and not relayed, also while a body of
+it is wanted, because every copy taken re-validates the chain through the
+block and a relay could otherwise make the node do that endlessly with
+re-malleated bodies (see "Selected parent and fork choice"). Recovery
+therefore depends on the directed pulls: a peer that answers with the same
+rejected body again is refused cheaply (rejected-witness-root memo below) and
+the pull is retried at the sweep's backoff. `accept_block` takes a copy of the
+same id whose witness root differs from every body already rejected for it:
+the copy passes the same acceptance checks as a new block, replaces the body,
+and the chain is re-evaluated. A block in the DAG whose body is missing (for example after a
 restart) is treated the same way. At/after the activation the witness
 commitment fixes every byte of a stored body, so every connect-time failure is
 id-committed and is persisted as before. `node/tests/fix_block_rules.rs`

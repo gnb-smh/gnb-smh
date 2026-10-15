@@ -117,12 +117,16 @@ first block of a fork the node followed in a reorg deeper than the pruning
 depth, or `reconsiderblock` after an `invalidateblock` that rolled the node
 back through pruned blocks. The call then changes nothing and returns an error
 saying how many block bodies it is re-fetching from the peers (at most 4,096
-per call, nearest the new tip first). Repeat the same call once they have
+per call, nearest the new tip first; the node keeps at most 1,024 body
+requests in flight and sends the next ones as bodies arrive, so the transfer
+never crowds out its other block requests). Repeat the same call once they have
 arrived (a few seconds to minutes, depending on the count); each retry
 requests the next missing bodies, until the call succeeds. Ordinary block
 acceptance needs no retry: when a heavier chain needs pruned bodies, the node
 accepts its blocks, fetches the bodies and moves to it once they are back.
-A body of a block the node already holds is accepted only while the node waits
+The transactions of blocks rolled back from pruned bodies cannot be put back
+into the mempool (docs/MEMPOOL.md, section 6); their senders must rebroadcast
+them. A body of a block the node already holds is accepted only while the node waits
 for it (it requested it, or the body it had was rejected) and only as the
 answer to its own request; it is checked like a new block (height implied by
 its parents, difficulty, timestamp, proof of work, the witness commitment
@@ -145,7 +149,10 @@ carryover snapshot:
 
 Without `--carryover-snapshot`, or on a pruned node whose old block bodies are
 gone, it refuses to start and says why; resync from a fresh `--data-dir` (or
-from an archival node's data dir). Data dirs written by this release cannot
+from an archival node's data dir). This includes a data dir last written by a
+release from before blocks carried undo records: its applied blocks cannot be
+rolled back, so the state is rebuilt (an archival node) or resynced (a pruned
+node). Data dirs written by this release cannot
 produce the footprint: every chain move is committed in one atomic batch.
 
 ## Upgrading and downgrading

@@ -48,9 +48,13 @@
 //! witness_dependent`) is a property of THIS BODY, not of the block: the body
 //! is deleted, nothing is persisted, and the block (with its selected-chain
 //! descendants) waits in memory for another body
-//! (`GhostDAG::mark_body_pending`). The ingress paths do not treat it as
-//! known (`is_known_block`), the processor re-requests it from peers, and a
-//! copy with a different witness root replaces the body and is re-evaluated.
+//! (`GhostDAG::mark_body_pending`). Header sync and `submitblock` do not
+//! treat it as known (`is_known_block`); the processor re-requests it from
+//! peers, and over block relay only the answer to that directed pull is taken
+//! (`ingress::BlockIngress::handle_block`: an unsolicited gossip copy is
+//! ignored, so nobody can make the node re-validate the chain through the
+//! block with an endless supply of re-malleated bodies). A copy with a
+//! different witness root replaces the body and is re-evaluated.
 //! A block whose body is missing waits the same way — also one whose body was
 //! PRUNED while it was on the selected chain and that a reorg left unapplied
 //! (audit DAG-6: without a reorg-depth limit the chain through it can become
@@ -205,8 +209,11 @@ pub fn awaits_body_in(d: &consensus::GhostDAG, store: &storage::Storage, hash: &
 }
 
 /// True iff `hash` needs no further copy: it is in the DAG and does not
-/// [`awaits_body`]. The dedup every ingress path (gossip, pulls, IBD,
-/// `submitblock`) applies before `accept_block`.
+/// [`awaits_body`]. The dedup header sync, directed pulls and `submitblock`
+/// apply before `accept_block`. Gossip is stricter: an unsolicited copy of a
+/// DAG block is ignored even while a body of it is wanted (only the answer to
+/// the node's own directed pull is taken, `ingress::BlockIngress::
+/// handle_block`; docs/CONSENSUS.md, "Ledger semantics").
 pub fn is_known_block(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
@@ -469,7 +476,9 @@ pub fn validate_block_in_view_classified_at(
 /// Bring the mempool in line with a committed chain move: drop confirmed txs
 /// and every tx conflicting with an outpoint the connected blocks spent;
 /// after a reorg re-admit the disconnected txs through the shared admission
-/// function and re-validate the whole pool against the new UTXO set; clear
+/// function (only those of blocks whose body is stored: a block rolled back
+/// from its undo record alone, body pruned, has none to re-admit) and
+/// re-validate the whole pool against the new UTXO set; clear
 /// the recent-rejects filter (the tip changed) and expire stale entries.
 ///
 /// `next_height` is the node's next template height on the DAG AFTER the
@@ -531,6 +540,12 @@ pub fn update_mempool_after_connect(
         let (re, dropped) = reorg::reinject_disconnected(store, mempool, candidates, next_height);
         let stale = revalidate_mempool(store, mempool, next_height);
         info!("reorg: mempool reinjected={} discarded={} invalidated={}", re, dropped, stale);
+        if !outcome.disconnected_pruned.is_empty() {
+            // Rolled back from their undo records alone (docs/MEMPOOL.md §6).
+            warn!("reorg: {} disconnected block(s) had pruned bodies; their transactions cannot be \
+                   re-admitted to the mempool and must be rebroadcast by their senders",
+                outcome.disconnected_pruned.len());
+        }
     }
     mempool.clear_recent_rejects();
     let expired = mempool.expire_older_than(mempool::MEMPOOL_EXPIRY_SECS);
@@ -867,8 +882,10 @@ fn resolve_best_chain(
 /// [`disqualify`], nothing is persisted and the block id is not poisoned:
 /// the body is deleted (so it is never served to peers again) and the block,
 /// with its selected-chain descendants, waits in memory for a different body
-/// (`GhostDAG::mark_body_pending`), which every ingress path accepts
-/// (`awaits_body`) and the message processor re-requests from peers.
+/// (`GhostDAG::mark_body_pending`): the message processor re-requests it
+/// from peers and takes the answer to that pull (`awaits_body`; header sync
+/// and `submitblock` take a copy too, unsolicited gossip copies are
+/// ignored).
 fn drop_body_and_wait(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
@@ -1988,12 +2005,14 @@ pub fn rebuild_chain_state(
 // (`GhostDAG::mark_body_pending`, in memory) — set by `resolve_best_chain`
 // for every block of the best chain it cannot connect, or by
 // [`request_bodies`] for the bodies an operator override needs —, and
-// [`awaits_body`] is the one predicate every ingress path consults. The
+// [`awaits_body`] is the one predicate every ingress path consults (gossip
+// additionally takes only the answer to the node's own directed pull). The
 // message processor requests those bodies through its missing-parent tracker
-// (`ingress::awaited_bodies_to_request`), and a copy that arrives goes
-// through `accept_block`'s body-replacement path: bound to the header height
-// the DAG parents imply, the expected bits, the timestamp, the hardening
-// block rules (witness commitment), the proof of work and the
+// (`ingress::awaited_bodies_to_request`, at most
+// `ingress::MAX_BODY_PULLS_IN_FLIGHT` being fetched at once), and a copy that
+// arrives goes through `accept_block`'s body-replacement path: bound to the
+// header height the DAG parents imply, the expected bits, the timestamp, the
+// hardening block rules (witness commitment), the proof of work and the
 // rejected-witness-root memo, then stored with the metadata acceptance
 // derives.
 
