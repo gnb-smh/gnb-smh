@@ -2573,13 +2573,14 @@ mod audit_2026_10_rpc_tests {
         assert_eq!(arms, known);
     }
 
-    /// A cached `getblocktemplate` never outlives the tips it was built on:
+    /// A cached `getblocktemplate` never outlives the chain it was built on:
     /// its key changes with a new block. A pool transaction does not change
     /// it (the template catches up within TEMPLATE_CACHE_TTL), so a miner
     /// polling a busy pool does not rebuild on every call. Functional
     /// counterpart: test/functional/mining_getblocktemplate_submitblock.py.
+    /// (Invalidation and body arrival: the test below.)
     #[test]
-    fn template_cache_key_follows_the_tips_not_the_pool() {
+    fn template_cache_key_follows_new_blocks_not_the_pool() {
         let (_tmp, state) = state_with_chain(3);
         let k0 = template_cache_key(None, &state);
         assert_eq!(k0, template_cache_key(None, &state), "stable while nothing changes");

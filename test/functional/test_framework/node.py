@@ -279,9 +279,9 @@ class TestNode:
 
     # ── Mining through getblocktemplate / submitblock ────────────────────
 
-    # The node serves a cached getblocktemplate while its DAG tips are
-    # unchanged and rebuilds it for a mempool change at most this often
-    # (node/src/rpc/mod.rs TEMPLATE_CACHE_TTL, as Bitcoin Core's 5 s).
+    # The node serves a cached getblocktemplate while the template's parents
+    # and height are unchanged and rebuilds it for a mempool change at most
+    # this often (node/src/rpc/mod.rs TEMPLATE_CACHE_TTL, as Bitcoin Core's 5 s).
     TEMPLATE_CACHE_TTL = 5
 
     def get_template(self) -> dict:
