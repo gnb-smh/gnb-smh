@@ -45,9 +45,11 @@ jobs:
         run: |
           python3 reference/gnb_sighash.py
           git diff --exit-code reference/sighash_vectors.json
-      # docs/testing/VECTORS.md: every derived value and every non-signature
-      # verdict of the tx/block consensus vectors, re-derived by the Python
-      # references (gnb_validity, gnb_merkle, gnb_sighash, gnb_difficulty).
+      # docs/testing/VECTORS.md: every derived value, every non-signature
+      # verdict and every mempool refusal class of the tx/block consensus
+      # vectors, re-derived by the Python references (gnb_validity,
+      # gnb_merkle, gnb_sighash, gnb_difficulty; gnb_smh evaluates the three
+      # `pow: full` proofs, ~2 s each).
       - name: Consensus tx/block vectors against the Python references
         run: python3 reference/check_consensus_vectors.py
 

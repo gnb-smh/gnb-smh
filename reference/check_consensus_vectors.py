@@ -12,12 +12,15 @@ against the Python references instead, with no Rust in the loop:
   subsidy, block id, wire and bincode sizes) is recomputed from the bytes
   (gnb_merkle, gnb_sighash, gnb_validity);
 * every expected verdict is re-derived by gnb_validity, which implements every
-  rule except the signature mathematics. A case whose expected class is
+  rule except the signature mathematics (the GnB-SMH proof of the `pow: full`
+  blocks included, with reference/gnb_smh.py). A case whose expected class is
   `bad-signature` (or that is valid) must pass every other rule here; any
   other class must be exactly the first rule gnb_validity sees fail;
-* every mempool verdict of a consensus-valid case is re-derived by
-  gnb_validity.admission, and every consensus-invalid case is refused by it
-  (or fails only its signatures).
+* every mempool verdict is re-derived by gnb_validity.admission the same way:
+  accepted, or refused with exactly the recorded class of the first refusing
+  admission rule (`bad-signature`: every other admission rule passes);
+* a case whose `activation_source` is `schedule` records its network's
+  activation height from docs/CONSENSUS.md.
 
 Exit status 0 iff every check passes. Format: docs/testing/VECTORS.md.
 """
@@ -83,6 +86,13 @@ def judge(chk: Checker, case: str, what: str, expected: str, got: str) -> None:
         chk.eq(case, what, expected, got)
 
 
+def check_activation_source(chk: Checker, cid: str, network: str, act: int, source: str) -> None:
+    """`schedule`: the recorded height is the network's own schedule (the
+    runners take it from the schedule); `explicit`: anything else."""
+    schedule = gv.HARDENING_ACTIVATION_HEIGHT[network]
+    chk.eq(cid, "activation_source", "schedule" if act == schedule else "explicit", source)
+
+
 def check_constants(chk: Checker, c: dict) -> None:
     chk.eq("constants", "mainnet chain id", sh.CHAIN_MAINNET, c["chain_id_mainnet"])
     chk.eq("constants", "testnet chain id", sh.CHAIN_TESTNET, c["chain_id_testnet"])
@@ -120,17 +130,19 @@ def check_tx_vectors(chk: Checker) -> int:
         ids.add(cid)
         height, act = int(case["height"]), int(case["activation_height"])
         chk.eq(cid, "regime", "post-activation" if height >= act else "pre-activation", case["regime"])
+        check_activation_source(chk, cid, case["network"], act, case["activation_source"])
         chain = CHAINS[case["network"]]
         expected = case["expected"]["error_class"] or "valid"
         chk.eq(cid, "verdict/class", case["expected"]["verdict"] == "valid", expected == "valid")
         policy, policy_class = case["policy"]["verdict"], case["policy"]["error_class"]
+        chk.eq(cid, "policy verdict/class", policy == "accept", policy_class is None)
         raw = bytes.fromhex(case["tx"])
         try:
             tx = gv.decode_tx_strict(raw)
         except gv.DecodeError:
             chk.eq(cid, "consensus", expected, "decode")
             chk.eq(cid, "derived", None, case["derived"])
-            chk.eq(cid, "policy", "reject", policy)
+            chk.eq(cid, "policy class", "decode", policy_class)
             continue
 
         # Derived values.
@@ -170,17 +182,12 @@ def check_tx_vectors(chk: Checker) -> int:
             chk.eq(cid, "signatures required", [(i, rule) for i in range(len(tx.inputs))],
                    [(i, r) for (t, i, r, _) in out.signatures if t is tx])
 
-        # Mempool admission.
+        # Mempool admission: accepted, or refused with exactly the recorded
+        # class (a consensus-invalid case is always refused).
         adm, _ = verdict_of(lambda out: gv.admission(tx, view, height, act, out))
-        if expected == "valid":
-            if policy == "accept":
-                chk.eq(cid, "policy", "valid", adm)
-            else:
-                chk.eq(cid, "policy class", policy_class, adm)
-        else:
+        if expected != "valid":
             chk.eq(cid, "policy", "reject", policy)
-            if adm == "valid":
-                chk.eq(cid, "admission refuses an invalid case (only its signatures fail)", "bad-signature", expected)
+        judge(chk, cid, "policy class", policy_class or "valid", adm)
     return len(doc["cases"])
 
 
@@ -198,6 +205,7 @@ def check_block_vectors(chk: Checker) -> int:
         cid = case["id"]
         height, act = int(case["height"]), int(case["activation_height"])
         chk.eq(cid, "regime", "post-activation" if height >= act else "pre-activation", case["regime"])
+        check_activation_source(chk, cid, case["network"], act, case["activation_source"])
         expected = case["expected"]["error_class"] or "valid"
         raw = block_bytes(case)
         try:
