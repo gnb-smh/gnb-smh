@@ -1214,13 +1214,16 @@ pub fn accept_block(
 
     // ── Sprint 2.c: emit TipChanged if the selected tip moved ────────
     if let Some(tip_tx) = tip_tx {
-        let has_body = |h: &[u8; 32]| store.get_block(h).ok().flatten().is_some();
+        // Presence only (no decode): this runs at every acceptance.
+        let has_body = |h: &[u8; 32]| store.has_block_body(h).unwrap_or(false);
         let new_tip = { dag.read().best_bodied_tip(has_body) };
         if new_tip != old_tip {
             if let Some(tip_hash) = new_tip {
                 let d = dag.read();
                 if let Some(data) = d.get_block_data(&tip_hash).cloned() {
-                    let tips_parents: Vec<[u8; 32]> = d.template_parents(core::MAX_PARENTS, has_body);
+                    // The template's own parents (memoized parent predicate,
+                    // `template::eligible_parent`), not a second predicate.
+                    let tips_parents: Vec<[u8; 32]> = crate::template::template_parents_and_height(&d, store).0;
                     drop(d);
                     let bits = store.get_meta("current_bits").ok().flatten()
                         .and_then(|b| b.as_slice().try_into().ok().map(u32::from_le_bytes))

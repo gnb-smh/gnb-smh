@@ -99,6 +99,24 @@ pub struct Storage {
     /// and every chain-state mutation goes through. Reentrant so a nested
     /// call on the same thread cannot self-deadlock.
     accept_lock: parking_lot::ReentrantMutex<()>,
+    /// Memo of pure verdicts on stored block bodies ([`Storage::body_verdict`]).
+    body_verdicts: parking_lot::Mutex<BodyVerdicts>,
+}
+
+/// Upper bound on the entries of the body-verdict memo. Reaching it clears
+/// the memo (the verdicts are recomputable; only the cost changes).
+pub const BODY_VERDICT_MEMO_CAP: usize = 16_384;
+
+/// The body-verdict memo ([`Storage::body_verdict`]).
+#[derive(Default)]
+struct BodyVerdicts {
+    /// Block hash → (caller key, verdict on the body stored under that hash).
+    map: std::collections::HashMap<[u8; 32], (u64, bool)>,
+    /// Bumped by every body write or delete through this type, so a verdict
+    /// computed while a body changed is not recorded.
+    epoch: u64,
+    /// Verdicts computed (memo misses), for tests and diagnostics.
+    computed: u64,
 }
 
 impl Storage {
@@ -177,7 +195,7 @@ impl Storage {
         opts.set_write_buffer_size(64 * 1024 * 1024);
         let db = DB::open_cf_descriptors(&opts, path, Self::cf_descriptors())
             .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
-        Ok(Self { db, accept_lock: parking_lot::ReentrantMutex::new(()) })
+        Ok(Self { db, accept_lock: parking_lot::ReentrantMutex::new(()), body_verdicts: Default::default() })
     }
 
     /// Open an existing snapshot **read-only**. RocksDB is opened with
@@ -196,7 +214,7 @@ impl Storage {
         // mutates the primary.
         let db = DB::open_cf_descriptors_read_only(&opts, path, Self::cf_descriptors(), false)
             .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
-        Ok(Self { db, accept_lock: parking_lot::ReentrantMutex::new(()) })
+        Ok(Self { db, accept_lock: parking_lot::ReentrantMutex::new(()), body_verdicts: Default::default() })
     }
 
     /// Take the acceptance mutex (audit DAG-10). See the field documentation.
@@ -256,6 +274,7 @@ impl Storage {
         }
 
         self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        self.forget_body_verdict(&hash);
         Ok(())
     }
 
@@ -272,8 +291,10 @@ impl Storage {
     pub fn put_block_body(&self, block: &Block) -> Result<(), StorageError> {
         let hash = block.block_hash();
         let cf_b = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
-        self.db.put_cf(&cf_b, &hash, &block.to_wire_bytes())
-            .map_err(|e| StorageError::WriteFailed(e.to_string()))
+        let written = self.db.put_cf(&cf_b, &hash, &block.to_wire_bytes())
+            .map_err(|e| StorageError::WriteFailed(e.to_string()));
+        self.forget_body_verdict(&hash);
+        written
     }
 
     /// Delete a block body (CF_BLOCKS only). Used to drop the body of a block
@@ -281,7 +302,72 @@ impl Storage {
     /// unreferenced is left behind.
     pub fn delete_block_body(&self, hash: &[u8; 32]) -> Result<(), StorageError> {
         let cf_b = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
-        self.db.delete_cf(&cf_b, hash).map_err(|e| StorageError::WriteFailed(e.to_string()))
+        let deleted = self.db.delete_cf(&cf_b, hash).map_err(|e| StorageError::WriteFailed(e.to_string()));
+        self.forget_body_verdict(hash);
+        deleted
+    }
+
+    /// A verdict `verdict(body)` on the body stored under `hash`, memoized per
+    /// hash and `key`: `Ok(None)` when no body is stored (checked on every
+    /// call, so a pruned or deleted body is never reported), otherwise the
+    /// memoized verdict for `(hash, key)` or, on a miss, `verdict` applied to
+    /// the decoded body and recorded. `verdict` MUST be a pure function of the
+    /// body and `key` (one memo slot per hash: another `key` replaces it).
+    /// Every body write or delete through this type (`put_block`,
+    /// `put_block_body`, `delete_block_body`, `prune_blocks_below`) drops the
+    /// hash's memo, and a verdict computed while a body changed is not
+    /// recorded; a raw write through [`Storage::db`] bypasses the memo.
+    /// A body that cannot be read or decoded is an error and is not memoized.
+    ///
+    /// Used by the block template's parent predicate
+    /// (`template::template_parents_and_height_at`), which runs on every
+    /// valid tip at every block acceptance: without the memo every call
+    /// decoded and re-hashed (Merkle and witness roots) every tip body.
+    pub fn body_verdict<F: FnOnce(&Block) -> bool>(
+        &self,
+        hash: &[u8; 32],
+        key: u64,
+        verdict: F,
+    ) -> Result<Option<bool>, StorageError> {
+        if !self.has_block_body(hash)? {
+            return Ok(None);
+        }
+        let epoch = {
+            let memo = self.body_verdicts.lock();
+            if let Some(&(k, v)) = memo.map.get(hash) {
+                if k == key {
+                    return Ok(Some(v));
+                }
+            }
+            memo.epoch
+        };
+        let Some(block) = self.get_block(hash)? else { return Ok(None) };
+        let v = verdict(&block);
+        let mut memo = self.body_verdicts.lock();
+        memo.computed = memo.computed.wrapping_add(1);
+        if memo.epoch == epoch {
+            if memo.map.len() >= BODY_VERDICT_MEMO_CAP && !memo.map.contains_key(hash) {
+                memo.map.clear();
+            }
+            memo.map.insert(*hash, (key, v));
+        }
+        Ok(Some(v))
+    }
+
+    /// Number of verdicts [`Storage::body_verdict`] computed (memo misses)
+    /// since the store was opened. Diagnostics and tests (the `gnb` binary
+    /// does not call it).
+    #[allow(dead_code)]
+    pub fn body_verdicts_computed(&self) -> u64 {
+        self.body_verdicts.lock().computed
+    }
+
+    /// Drop the memoized body verdict of `hash` (its body was written or
+    /// deleted).
+    fn forget_body_verdict(&self, hash: &[u8; 32]) {
+        let mut memo = self.body_verdicts.lock();
+        memo.map.remove(hash);
+        memo.epoch = memo.epoch.wrapping_add(1);
     }
 
     /// Whether a body is stored for `hash` (no decoding).
@@ -1277,6 +1363,9 @@ impl Storage {
                 {
                     self.db.delete_cf(&cf_blocks, &hash_bytes)
                         .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+                    if let Ok(hash) = <[u8; 32]>::try_from(hash_bytes.as_slice()) {
+                        self.forget_body_verdict(&hash);
+                    }
                     pruned += 1;
                 }
             }

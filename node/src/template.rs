@@ -2,7 +2,8 @@
 //! `getblocktemplate` RPC (audit MEM-2, DAG-2, MEM-1/MEM-3 template side).
 //!
 //! * Parents: at most `core::MAX_PARENTS` bodied, non-disqualified tips
-//!   whose body passes the hardening block rules of its height,
+//!   whose body passes the hardening block rules of its height (verdict
+//!   memoized per block hash, [`eligible_parent`]),
 //!   highest blue work first (`GhostDAG::template_parents`,
 //!   [`template_parents_and_height`]) — the stock code
 //!   used EVERY tip, so more than 256 tips made every template invalid
@@ -253,19 +254,9 @@ pub fn template_parents_and_height(d: &GhostDAG, store: &Storage) -> (Vec<BlockH
 /// an upgraded peer, and neither can a block that references it. The SAME
 /// predicate decides the template's parents and the node's next height
 /// ([`next_template_height`]), so the mempool and the template never
-/// disagree about which tips count.
+/// disagree about which tips count ([`eligible_parent`]).
 pub fn template_parents_and_height_at(d: &GhostDAG, store: &Storage, activation_height: u64) -> (Vec<BlockHash>, u64) {
-    let parents = d.template_parents(core::MAX_PARENTS, |h| match store.get_block(h) {
-        Ok(Some(b)) => match core::block_rules::check_block_hardened_at(&b, activation_height) {
-            Ok(()) => true,
-            Err(e) => {
-                log::error!("template: parent candidate {} fails the hardening block rules ({}); skipped",
-                    hex::encode(&h[..8]), e);
-                false
-            }
-        },
-        _ => false,
-    });
+    let parents = d.template_parents(core::MAX_PARENTS, |h| eligible_parent(store, h, activation_height));
     if parents.is_empty() {
         return (parents, admission::next_block_height(d));
     }
@@ -276,6 +267,31 @@ pub fn template_parents_and_height_at(d: &GhostDAG, store: &Storage, activation_
         .unwrap_or(0)
         .saturating_add(1);
     (parents, height)
+}
+
+/// The template's parent predicate: a body is stored for `h` and it passes
+/// `core::block_rules::check_block_hardened_at(body, activation_height)`.
+///
+/// It runs on every valid tip (and, with no eligible tip, along the
+/// selected chain) at every block acceptance, through
+/// [`next_template_height`]. The verdict on a stored body is a pure function
+/// of the body and the activation height, so it is memoized per block hash
+/// (`Storage::body_verdict`; a body write or delete drops the hash's entry):
+/// each body is decoded and hashed (wire size, tagged Merkle root, witness
+/// root) once, not once per acceptance, and a failing body is logged once,
+/// when its verdict is computed.
+pub fn eligible_parent(store: &Storage, h: &BlockHash, activation_height: u64) -> bool {
+    let verdict = store.body_verdict(h, activation_height, |b| {
+        match core::block_rules::check_block_hardened_at(b, activation_height) {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!("template: parent candidate {} fails the hardening block rules ({}); skipped",
+                    hex::encode(&h[..8]), e);
+                false
+            }
+        }
+    });
+    matches!(verdict, Ok(Some(true)))
 }
 
 /// Header height of the node's next template (see

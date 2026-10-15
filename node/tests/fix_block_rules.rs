@@ -1496,3 +1496,107 @@ fn block_and_transaction_rule_predicates_agree_at_every_next_block_height() {
     let e = pipeline::validate_tx_standalone(&tx64_v3, &n.store, 0).unwrap_err();
     assert!(e.contains("64-byte"), "{e}");
 }
+
+/// Review finding: the template's parent predicate (stored body passes
+/// `check_block_hardened_at`) runs on every valid tip at every acceptance
+/// (`next_template_height`). Its verdict is memoized per block hash: repeated
+/// calls decode and hash no body, a body rewrite (the body-pending
+/// replacement) is re-judged once, and a deleted body is never eligible.
+#[test]
+fn template_parent_predicate_judges_each_stored_body_once() {
+    const A: u64 = 1;
+    let _g = activation::scoped_override(A);
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0x95u8; 32], 0u32, out(5_000_000, &k.spk));
+    let n = node_with(&genesis, std::slice::from_ref(&fund));
+    let tx = signed_spend_at(&k, &[(fund.0, 0)], std::slice::from_ref(&fund.2), vec![out(4_900_000, &[0x9C; 20])], 1);
+    let t0 = build(&n, vec![gh], vec![coinbase("memo-0", subsidy(1) + 100_000, vec![0xD0; 20]), tx]);
+    let t1 = build(&n, vec![gh], vec![coinbase("memo-1", subsidy(1), vec![0xD1; 20])]);
+    let t2 = build(&n, vec![gh], vec![coinbase("memo-2", subsidy(1), vec![0xD2; 20])]);
+    for t in [&t0, &t1, &t2] {
+        accept(&n, t).unwrap();
+    }
+    let ids = |v: &[&Block]| {
+        let mut v: Vec<BlockHash> = v.iter().map(|b| b.block_hash()).collect();
+        v.sort();
+        v
+    };
+    let parents = || {
+        let mut p = template::template_parents_and_height(&n.dag.read(), &n.store).0;
+        p.sort();
+        p
+    };
+    assert_eq!(parents(), ids(&[&t0, &t1, &t2]));
+    let computed = n.store.body_verdicts_computed();
+    for _ in 0..20 {
+        assert_eq!(parents(), ids(&[&t0, &t1, &t2]));
+        assert_eq!(template::next_template_height(&n.dag.read(), &n.store), 2);
+    }
+    assert_eq!(n.store.body_verdicts_computed(), computed, "no tip body is decoded or hashed again");
+
+    // A witness-mutated body under the same id (what a body-pending
+    // replacement writes) is re-judged once, fails, and stays excluded
+    // without being judged (or logged) again.
+    let mut mutated = t0.clone();
+    mutated.transactions[1].inputs[0].script_sig[100] ^= 1;
+    assert_eq!(mutated.block_hash(), t0.block_hash());
+    assert!(block_rules::check_block_hardened_at(&mutated, A).is_err());
+    n.store.put_block_body(&mutated).unwrap();
+    assert_eq!(parents(), ids(&[&t1, &t2]));
+    assert_eq!(n.store.body_verdicts_computed(), computed + 1);
+    for _ in 0..5 {
+        assert_eq!(parents(), ids(&[&t1, &t2]));
+    }
+    assert_eq!(n.store.body_verdicts_computed(), computed + 1);
+    // The honest body back: eligible again.
+    n.store.put_block_body(&t0).unwrap();
+    assert_eq!(parents(), ids(&[&t0, &t1, &t2]));
+    assert_eq!(n.store.body_verdicts_computed(), computed + 2);
+
+    // A deleted body is never eligible, whatever the memo held.
+    n.store.delete_block_body(&t1.block_hash()).unwrap();
+    assert_eq!(parents(), ids(&[&t0, &t2]));
+    // Another activation height is judged afresh (one memo slot per hash).
+    assert!(template::template_parents_and_height_at(&n.dag.read(), &n.store, activation::NEVER).0.len() == 2);
+}
+
+/// `Storage::body_verdict`: memoized per (hash, key), re-judged after every
+/// body write, `None` for a deleted or pruned body.
+#[test]
+fn storage_body_verdict_memo_follows_every_body_write() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Storage::open(&tmp.path().join("db")).unwrap();
+    let k = key();
+    let spend = signed_spend(&k, &[([0x96; 32], 0)], vec![out(1_000, &[0x0A; 20])]);
+    let b = unsealed_block_at(3, &spend, 0);
+    let h = b.block_hash();
+    let honest = b.transactions[1].inputs[0].script_sig[100];
+    let calls = std::cell::Cell::new(0u32);
+    // The verdict "byte 100 of the spend's witness is the honest one".
+    let judge = |key: u64| store.body_verdict(&h, key, |body| {
+        calls.set(calls.get() + 1);
+        body.transactions[1].inputs[0].script_sig[100] == honest
+    }).unwrap();
+    assert_eq!(judge(7), None, "no body stored");
+    store.put_block_body(&b).unwrap();
+    assert_eq!(judge(7), Some(true));
+    assert_eq!(judge(7), Some(true));
+    assert_eq!(calls.get(), 1, "memoized");
+    assert_eq!(judge(8), Some(true));
+    assert_eq!(calls.get(), 2, "another key is judged afresh");
+    let mut other = b.clone();
+    other.transactions[1].inputs[0].script_sig[100] ^= 1;
+    assert_eq!(other.block_hash(), h);
+    store.put_block_body(&other).unwrap();
+    assert_eq!(judge(8), Some(false), "a rewritten body is judged afresh");
+    assert_eq!(calls.get(), 3);
+    store.delete_block_body(&h).unwrap();
+    assert_eq!(judge(8), None);
+    store.put_block(&b).unwrap();
+    assert_eq!(judge(8), Some(true));
+    assert_eq!(calls.get(), 4);
+    assert_eq!(store.prune_blocks_below(4).unwrap(), 1);
+    assert_eq!(judge(8), None, "a pruned body is never reported");
+}
