@@ -14,7 +14,7 @@ that command.
 | `miri` | Miri over the pure-Rust consensus arithmetic and the unsafe RNG override | `miri` | pass; no undefined behaviour |
 | `miri-cross` | Miri over `gnb-smh` (including the Python PoW vectors) on `i686` (32-bit) and `s390x` (big-endian), and over the wasm wallet's C ABI on `i686` | `miri` | pass |
 | `i686` | the full test suites of `gnb-smh`, `gnb-crypto`, `coherence-core`, `pqcrypto-internals` and `gnb-wallet-wasm` on `i686-unknown-linux-gnu` | `i686` | pass; one failure (a 64-bit assumption in a test, F2), fixed; a concurrent run exposed a temp-file race between test processes (F3), fixed; the wallet's `minfee` truncated sizes on 32-bit targets (F4), fixed |
-| (default) | node lib tests with debug assertions and overflow checks | `workspace-test` | pass (288 tests); now guarded by a test |
+| (default) | node lib tests with debug assertions and overflow checks | `workspace-test` | pass (288 tests; 324 on the merged PR branch); now guarded by a test |
 | (local only) | parking_lot deadlock detection over the node's lock-using tests | none (needs new dependencies, see [Deadlock detection](#deadlock-detection)) | no deadlock in 288 lib and 58 integration tests; positive control detected |
 
 Local environment of the results below: Ubuntu 24.04, x86_64 with AVX2;
@@ -75,7 +75,10 @@ submission vectors).
 Result: all suites pass with no ASan or LSan report after fix F1
 (`gnb-smh`: 19 unit, 5 integration; `gnb-crypto`: 280 unit (1 ignored), 21
 integration, doctests; `pqcrypto-internals`: 17 unit (1 ignored helper), 2
-integration, 2 doctests).
+integration, 2 doctests). On the merged PR branch: `gnb-smh` 26 unit, 5
+integration; `gnb-crypto` 338 unit (1 ignored), 25 integration (1 ignored),
+doctests; `pqcrypto-internals` unchanged; no report (see
+[On the merged PR branch](#on-the-merged-pr-branch)).
 
 Positive controls (each mutation was reverted after the run):
 
@@ -119,8 +122,8 @@ every PQClean archive references `__ubsan_handle_*`.
 Rust code has no UBSan: Rust's own overflow checks (on in every test profile,
 see below) and Miri cover the Rust side.
 
-Result: `gnb-crypto` (280 unit, 21 integration, doctests) and
-`pqcrypto-internals` pass with no report.
+Result: `gnb-crypto` (280 unit, 21 integration, doctests; 338 and 25 on the
+merged PR branch) and `pqcrypto-internals` pass with no report.
 
 Positive control: changing the shift in `keccak_inc_absorb` to
 `8 * ((s_inc[25] + i) & 0x0F)` is reported as `cfiles/fips202.c:459:55:
@@ -174,10 +177,10 @@ JavaScript); isolation stays on (no file system or clock access). What runs
 
 | Crate | Tests | Notes |
 | --- | --- | --- |
-| `gnb-smh` | every unit test (compact bits, chain work, ASERT including the AUD-1 wide multiply and shift, the lane-level Keccak step, the scratchpad), `tests/difficulty_vectors.rs` and `tests/vectors.rs` (the Python PoW vectors with log2_n = 1 and 2) [24] | the log2_n = 10 and 19 PoW vectors skipped (below) |
-| `gnb-crypto` | `core::limits`, `core::tokenomics`, `core::block_rules` (Merkle roots, coinbase branch, coinbase commitment, witness root), `core::sighash`, `core::activation` [29] | `v3_cost_is_linear_in_the_input_count` ignored |
+| `gnb-smh` | every unit test (compact bits, chain work, ASERT including the AUD-1 wide multiply and shift, the lane-level Keccak step, the scratchpad), `tests/difficulty_vectors.rs` and `tests/vectors.rs` (the Python PoW vectors with log2_n = 1 and 2) [30] | the log2_n = 10 and 19 PoW vectors skipped, `canonical_entry_points_match_the_reference_vector` ignored (below) |
+| `gnb-crypto` | `core::limits`, `core::tokenomics`, `core::block_rules` (Merkle roots, coinbase branch, coinbase commitment, witness root), `core::sighash`, `core::activation` [42] | five tests ignored (below) |
 | `pqcrypto-internals` | the library tests: the `unsafe extern "C"` RNG entry point and the thread-local seeded-RNG stack, including guard drops after TLS destruction [15] | the two re-exec tests ignored |
-| `gnb-smh` on `i686-unknown-linux-gnu` and `s390x-unknown-linux-gnu` | the same `gnb-smh` tests on a 32-bit and a big-endian target, including the whole PoW pipeline against the Python reference [24 each] | `miri-cross`; std for the target is built by `cargo miri setup` |
+| `gnb-smh` on `i686-unknown-linux-gnu` and `s390x-unknown-linux-gnu` | the same `gnb-smh` tests on a 32-bit and a big-endian target, including the whole PoW pipeline against the Python reference [30 each] | `miri-cross`; std for the target is built by `cargo miri setup` |
 | `gnb-wallet-wasm` on `i686-unknown-linux-gnu` | the lib tests, among them `c_abi_roundtrip_on_32_bit`: `gnb_alloc` / `gnb_call` / `gnb_free` as `site/wallet/core.js` calls them, plus `minfee` on 32 bits [3] | `miri-cross`; `create_export_open_roundtrip_and_pay` ignored (PQClean C) |
 
 Result: no undefined behaviour (`gnb-smh` 19 unit, 4 difficulty-vector
@@ -185,7 +188,9 @@ tests and the PoW vector test, `gnb-crypto` 29 tests, `pqcrypto-internals` 15
 tests). The `miri` mode takes about 6 minutes locally (363 s with the
 dependencies already built; Miri's own timings: `gnb-smh` unit tests 80 s,
 difficulty vectors 60 s, PoW vectors 41 s, the `gnb-crypto` selection 185 s,
-`pqcrypto-internals` 11 s).
+`pqcrypto-internals` 11 s). On the merged PR branch: `gnb-smh` 25 unit (1
+ignored), 4 and 1; `gnb-crypto` 42 (5 ignored); `pqcrypto-internals` 15; no
+undefined behaviour; 393 s (the `gnb-crypto` selection 291 s).
 
 Hashing is what limits Miri: one Keccak-f[1600] permutation takes about
 0.4 s and one SHA-256 compression about 0.2 s (measured: the full
@@ -203,6 +208,10 @@ ignored with the reason in the attribute:
 | `gnb-crypto` Merkle tests (`legacy_root_is_bit_identical_...`, `duplicate_last_mutation_...`, `coinbase_branch_reproduces_the_root`) | trees up to 5 leaves (17 natively) | SHA-256 cost; empty, single, odd and even levels and a carried-up node are still covered |
 | `gnb-smh` `matches_python_reference` | the 10 vectors with log2_n = 1 and 2 (all 17 natively); fails if fewer than 10 ran | log2_n = 10 and 19 cost 2^11 and 2^20 Keccak permutations per vector; log2_n <= 2 is at most 8 inner permutations and still runs seed, fill, data-dependent mix and final digest |
 | `gnb-crypto` `v3_cost_is_linear_in_the_input_count` | ignored | ~300 Keccak permutations of byte counting; its arithmetic also runs in `v3_commits_to_every_field` |
+| `gnb-smh` `canonical_entry_points_match_the_reference_vector` | ignored | five canonical evaluations (log2_n = 19, 64 MiB, ~2^20 Keccak permutations each); the log2_n <= 2 Python vectors run the same pipeline under Miri |
+| `gnb-crypto` `core::sighash` `v3_scripts_verify_and_every_fault_is_rejected`, `v2_scripts_verify_below_the_activation` | ignored | hybrid key generation and signing through the PQClean C code, which Miri cannot execute |
+| `gnb-crypto` `core::limits` `block_count_caps_are_inclusive` | ignored | blocks of 1,000,000 transactions and 100,000 shielded transactions: still running after 17 minutes under Miri; `check_block_canonical_limits` runs under Miri in the other cap tests |
+| `gnb-crypto` `core::limits` `transaction_count_caps_are_inclusive` | ignored | 100,000 inputs and 100,000 outputs, cloned: still running after 9 minutes under Miri; `check_tx_canonical_limits` runs under Miri in the other tests of the module |
 | `pqcrypto-internals` `os_rng_failure_aborts_instead_of_failing_open`, `null_buffer_aborts_instead_of_failing_open` | ignored | they re-execute the test binary (`std::process::Command`), which Miri does not support |
 | `pqcrypto-internals` `tests/vendor_pin.rs` | not run (`--lib`) | reads files (isolation); no unsafe code |
 
@@ -212,7 +221,9 @@ and anything that opens RocksDB (the node).
 `miri-cross` takes about 5 to 6 minutes locally (308 s and 331 s in two
 runs with the target sysroots cached); on each of i686 and s390x the 19 unit, 4 difficulty-vector
 tests and the PoW vector test (10 vectors) pass, and `gnb-wallet-wasm` passes
-3 tests on i686 (1 ignored). No undefined behaviour.
+3 tests on i686 (1 ignored). No undefined behaviour. On the merged PR branch:
+25 unit (1 ignored), 4 and 1 on each target, the wallet's 3; 408 s including
+the two target sysroots.
 
 Positive controls:
 
@@ -272,7 +283,7 @@ The node's lib tests already run with debug assertions and overflow checks:
 the dev/test profile enables debug assertions, `overflow-checks` follows
 them, and the root `Cargo.toml` overrides only `opt-level` per package. The
 release profile sets `overflow-checks = true` explicitly. `cargo test -p gnb
---lib` passes (288 tests). Two tests now keep it that way:
+--lib` passes (288 tests; 324 on the merged PR branch). Two tests now keep it that way:
 
 - `node/src/lib.rs` `build_profile_tests::test_build_traps_integer_overflow_and_debug_assertions`;
 - `gnb-smh` `tests::integer_overflow_panics_in_this_profile`, which CI also
@@ -371,3 +382,38 @@ A review of this work found five gaps; each is closed above:
 5. `gnb-wallet-wasm` (the 32-bit consumer, with the only other first-party
    `unsafe`) was in no run: now in `i686` and, for its C ABI, in
    `miri-cross`; F4 fixed.
+
+## On the merged PR branch
+
+This work was written on `b6a2976` and merged into the PR branch after the
+mempool/relay, networking/storage and block-ingress packages and the
+mutation, fuzzing, consensus-vector and functional-test packages. Every mode
+was re-run on the merged tree (same environment, `nightly-2026-10-14`, own
+target directories):
+
+| Mode | Result on the merged tree |
+| --- | --- |
+| `asan` | pass, no ASan or LSan report: `gnb-smh` 26 unit, 5 integration; `gnb-crypto` 338 unit (1 ignored), 25 integration (1 ignored), doctests; `pqcrypto-internals` 17, 2, 2; all 12 PQClean archives instrumented (180 s with the build) |
+| `ubsan` | pass, no report: `gnb-crypto` 338 unit, 25 integration, doctests; `pqcrypto-internals`; all 12 archives instrumented |
+| `ubsan-noavx2` | pass: 63 (1 ignored) and 3 |
+| `miri` | pass, no undefined behaviour: 30, 42 and 15 (393 s) |
+| `miri-cross` | pass: 30 on i686 and 30 on s390x, `gnb-wallet-wasm` 3 (408 s) |
+| `i686` | pass: `gnb-smh` 26 + 5; `gnb-crypto` 338 unit + 25 integration; `coherence-core` 12 unit + 17 integration; `pqcrypto-internals` 17 + 2 + 2; `gnb-wallet-wasm` 4 |
+
+What the merge changed:
+
+- Five of the PR branch's newer tests cannot run under Miri and now carry
+  `cfg_attr(miri, ignore = "<why>")` (Miri table above): the canonical
+  GnB-SMH entry-point test, the two end-to-end sighash script tests (PQClean
+  C) and the two `core::limits` cap tests that build 10^5 to 10^6 elements.
+  The two cap tests were still running after 17 and 9 minutes when stopped;
+  with them the `miri` job would have outgrown its timeout.
+- The minimums are the merged counts: `gnb-smh` 30 (host, i686, s390x; was
+  24), the `gnb-crypto` selection 42 (was 29).
+- F4 changes the browser wallet core, which the PR branch rebuilds
+  reproducibly and pins (CI job `wasm-reproducible`, audit WAL-5):
+  `site/wallet/gnb_wallet.wasm` was rebuilt with `scripts/build-wallet-wasm.sh`
+  (1.94.1, wasi-sdk 25) and `WASM_SHA256` and the SRI hashes were updated.
+  Through `site/wallet/core.js`, the previously shipped core priced
+  `minFee(2^32 + 100)` at 10000; the rebuilt one refuses it ("`size` too
+  large").

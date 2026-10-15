@@ -147,8 +147,8 @@ miri() {
   export CARGO_TARGET_DIR="$root/miri"
   export MIRIFLAGS="${MIRIFLAGS:--Zmiri-strict-provenance}"
   # Tests that cannot run under Miri carry #[cfg_attr(miri, ignore = "<why>")].
-  expect_passed 24 cargo +"$nightly" miri test --locked -p gnb-smh
-  expect_passed 29 cargo +"$nightly" miri test --locked -p gnb-crypto --lib -- \
+  expect_passed 30 cargo +"$nightly" miri test --locked -p gnb-smh
+  expect_passed 42 cargo +"$nightly" miri test --locked -p gnb-crypto --lib -- \
     core::limits:: core::tokenomics:: core::block_rules:: core::sighash:: core::activation::
   # Library tests only: tests/vendor_pin.rs reads files (Miri isolation) and
   # has no unsafe code.
@@ -161,7 +161,7 @@ miri_cross() {
   # gnb-smh has no C code, so Miri can interpret it for any target. Its Python
   # PoW vectors (log2_n <= 2) check every byte-order site on s390x.
   for t in i686-unknown-linux-gnu s390x-unknown-linux-gnu; do
-    expect_passed 24 cargo +"$nightly" miri test --locked -p gnb-smh --target "$t"
+    expect_passed 30 cargo +"$nightly" miri test --locked -p gnb-smh --target "$t"
   done
   # The wasm wallet's C ABI (gnb_alloc / gnb_call / gnb_free) packs a 32-bit
   # pointer into a u64, so its round trip runs on a 32-bit target. Its

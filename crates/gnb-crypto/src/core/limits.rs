@@ -278,6 +278,12 @@ mod tests {
 
     /// Input and output counts: the cap is allowed, one more is not.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "builds a transaction of 100,000 inputs and 100,000 outputs and clones it (one heap \
+                  allocation per input and output): still running after 9 minutes under Miri; \
+                  check_tx_canonical_limits runs under Miri in the other tests of this module"
+    )]
     fn transaction_count_caps_are_inclusive() {
         let mut t = tx(1, 20, 1);
         t.inputs = vec![t.inputs[0].clone(); MAX_TX_INPUTS];
@@ -292,6 +298,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "builds blocks of 1,000,000 transactions and 100,000 shielded transactions (one clone, one \
+                  check and one drop per element): still running after 17 minutes under Miri; \
+                  check_block_canonical_limits runs under Miri in the other cap tests of this module"
+    )]
     fn block_count_caps_are_inclusive() {
         let empty_tx = Transaction { version: 1, inputs: vec![], outputs: vec![], locktime: 0 };
         let mut b = block_with(vec![empty_tx; MAX_BLOCK_TXS]);
