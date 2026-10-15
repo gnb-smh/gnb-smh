@@ -242,6 +242,21 @@ jobs:
           # The script re-pins and refreshes the SRI hashes: nothing may change.
           git diff --exit-code -- site/
 
+  # The site's JavaScript tests (site/tests, Node's built-in runner, no npm
+  # dependencies): the committed wallet core loaded as the page loads it
+  # (pinned-hash refusal, phrase-backed create/restore, verified plan/pay,
+  # coinbase maturity), the SRI attributes, the explorer's HTML escaping and
+  # the Worker's security headers and origins.
+  site-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: node --test site/tests
+        run: node --test site/tests/*.test.mjs
+
   clippy:
     runs-on: ubuntu-latest
     steps:
