@@ -1081,10 +1081,24 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     Ok((utxos, truncated)) => {
                         let total: u64 = utxos.iter().map(|(_, _, o)| o.value).fold(0u64, u64::saturating_add);
                         // R3: `value` is a satoshi amount → decimal string.
-                        let list: Vec<Value> = utxos.iter().map(|(txid, idx, out)| json!({
-                            "txid": hex::encode(txid), "index": idx,
-                            "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
-                        })).collect();
+                        // An output of a coinbase also carries the coinbase's
+                        // height: it is spendable only from height
+                        // coinbase_height + COINBASE_MATURITY, and a wallet
+                        // that cannot tell selected immature coinbase outputs
+                        // and built transactions the node refuses
+                        // (test/functional/wallet_coinbase_maturity.py).
+                        let list: Vec<Value> = utxos.iter().map(|(txid, idx, out)| {
+                            let mut row = json!({
+                                "txid": hex::encode(txid), "index": idx,
+                                "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
+                            });
+                            let coinbase_height = <[u8; 32]>::try_from(txid.as_slice()).ok()
+                                .and_then(|t| state.store.get_coinbase_height(&t).ok().flatten());
+                            if let Some(h) = coinbase_height {
+                                row["coinbase_height"] = json!(h);
+                            }
+                            row
+                        }).collect();
                         json!({
                             "address":    addr,
                             "utxo_count": list.len(),
@@ -2462,6 +2476,16 @@ mod audit_2026_10_rpc_tests {
         let r = dispatch("getutxos", Some(&json!([address.to_string()])), &state).await;
         assert_eq!(r["returned"], 5);
         assert_eq!(r["truncated"], false);
+
+        // An output of a coinbase carries its coinbase's height (wallets skip
+        // immature ones); any other output carries no such field.
+        state.store.put_coinbase_info(&[3; 32], 77).unwrap();
+        let r = dispatch("getutxos", Some(&json!([address.to_string()])), &state).await;
+        let rows = r["utxos"].as_array().unwrap();
+        for row in rows {
+            let expected = if row["txid"] == hex::encode([3u8; 32]) { json!(77) } else { Value::Null };
+            assert_eq!(row["coinbase_height"], expected, "{row}");
+        }
     }
 
     /// NET-12: the chain-walking statistics read only the requested window.
