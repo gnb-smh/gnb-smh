@@ -1356,3 +1356,105 @@ fn classify_stored_block_separates_id_committed_from_body_only_failures() {
     wrong_height.header.merkle_root = wrong_height.body_merkle_root_at(1);
     assert!(matches!(pipeline::classify_stored_block(&wrong_height, 1), pipeline::StoredBlockCheck::IdCommitted(_)));
 }
+
+// ── Merge review (P1 x P2) ───────────────────────────────────────────────────
+
+/// A block at `height` carrying a coinbase and `spend` (header unchecked: the
+/// in-block helpers and the connect rule read only the body and the height).
+fn unsealed_block_at(height: u64, spend: &Transaction, fee: u64) -> Block {
+    Block {
+        header: BlockHeader {
+            version: 1, parents: vec![], merkle_root: MerkleRoot::ZERO,
+            timestamp: 0, bits: core::GENESIS_BITS, nonce: 0,
+        },
+        transactions: vec![coinbase("in-block", subsidy(height) + fee, vec![0xC1; 20]), spend.clone()],
+        blue_score: height,
+        height,
+        shielded_transactions: Vec::new(),
+    }
+}
+
+/// Review finding: `validate_tx_in_block_with_maturity` gated VAL-3 on
+/// `block.height` but evaluated the transaction rules (version, sighash
+/// regime) at its `current_height` argument, which `validate_tx_in_block`
+/// passes as 0. With the mainnet activation, a valid version-3 / sighash-v3
+/// spend in a block at 110,001 was rejected ("invalid signature") and an
+/// invalid version-1 spend accepted. Every rule is now evaluated at
+/// `block.height` (`current_height` only drives coinbase maturity), so both
+/// helpers and the connect rule (`validate_block_in_view_at`) give the same
+/// verdict on both sides of the activation.
+#[test]
+fn in_block_helpers_evaluate_transaction_rules_at_the_block_height() {
+    const A: u64 = core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
+    let _g = activation::scoped_override(A);
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let k = key();
+    let fund = ([0x91u8; 32], 0u32, out(2_000_000, &k.spk));
+    let n = node_with(&genesis, std::slice::from_ref(&fund));
+    let spend_for = |h: u64| {
+        signed_spend_at(&k, &[(fund.0, fund.1)], std::slice::from_ref(&fund.2), vec![out(1_900_000, &[0x07; 20])], h)
+    };
+    let v1 = spend_for(A - 1);
+    let v3 = spend_for(A + 1);
+    assert_eq!((v1.version, v3.version), (1, 3));
+    let cases = [
+        (A + 1, &v3, None),
+        (A + 1, &v1, Some("bad-txns-version")),
+        (A, &v3, None),
+        (A, &v1, Some("bad-txns-version")),
+        (A - 1, &v1, None),
+        (A - 1, &v3, Some("")), // a v3-digest signature checked under sighash v2
+    ];
+    for (height, tx, want_err) in cases {
+        let b = unsealed_block_at(height, tx, 100_000);
+        let helper = pipeline::validate_tx_in_block(&b, tx, &n.store, &mut std::collections::HashSet::new());
+        let with_maturity = pipeline::validate_tx_in_block_with_maturity(
+            &b, tx, &n.store, &mut std::collections::HashSet::new(), height,
+        );
+        let connect = pipeline::validate_block_in_view_at(&*n.store, &b, A);
+        match want_err {
+            None => {
+                helper.unwrap_or_else(|e| panic!("h={height} v{}: {e}", tx.version));
+                assert_eq!(with_maturity, Ok(100_000), "h={height} v{}", tx.version);
+                connect.unwrap_or_else(|e| panic!("connect h={height} v{}: {e}", tx.version));
+            }
+            Some(what) => {
+                let errs: Vec<String> = [("helper", helper), ("with_maturity", with_maturity.map(|_| ())), ("connect", connect)]
+                    .into_iter()
+                    .map(|(path, r)| r.expect_err(&format!("{path}: h={height} v{} must be rejected", tx.version)))
+                    .collect();
+                assert!(errs[0].contains(what), "h={height} v{}: {}", tx.version, errs[0]);
+                assert!(errs.iter().all(|e| e == &errs[0]), "one rule, one reason: {errs:?}");
+            }
+        }
+    }
+}
+
+/// Review finding: the in-block helper applied VAL-3 but not BIP30 (VAL-2)
+/// for the transaction it validates. From the activation, a transaction whose
+/// output would overwrite an unspent coin is rejected by the helper exactly as
+/// by the connect rule (one function, `check_no_unspent_overwrite`); below it
+/// both accept, as before.
+#[test]
+fn in_block_helper_applies_bip30_to_its_transaction() {
+    for hardened in [false, true] {
+        let act = if hardened { 1 } else { activation::NEVER };
+        let _g = activation::scoped_override(act);
+        let genesis = mk_genesis(unix_now() - 10_000);
+        let k = key();
+        let fund = ([0x92u8; 32], 0u32, out(2_000_000, &k.spk));
+        let n = node_with(&genesis, std::slice::from_ref(&fund));
+        let tx = signed_spend_at(&k, &[(fund.0, 0)], std::slice::from_ref(&fund.2), vec![out(1_900_000, &[0x08; 20])], 5);
+        n.store.put_utxo(&tx.txid(), 0, &out(1_000, &[0x09; 20])).unwrap();
+        let b = unsealed_block_at(5, &tx, 100_000);
+        let helper = pipeline::validate_tx_in_block(&b, &tx, &n.store, &mut std::collections::HashSet::new());
+        let connect = pipeline::validate_block_in_view_at(&*n.store, &b, act);
+        if hardened {
+            assert!(helper.unwrap_err().contains("BIP30"));
+            assert!(connect.unwrap_err().contains("BIP30"));
+        } else {
+            helper.expect("old rules: no BIP30");
+            connect.expect("old rules: no BIP30");
+        }
+    }
+}

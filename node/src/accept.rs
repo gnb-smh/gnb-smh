@@ -269,18 +269,22 @@ impl From<String> for TxFailure {
     }
 }
 
-/// Validate `tx` (the transaction at index `idx` of `block`) against `view`
-/// plus the outputs of the transactions STRICTLY BEFORE it in the block
-/// (`earlier`). Coinbase maturity and the transaction rules (version,
-/// witness, digest) use the block's header height under `activation_height`.
-/// When `same_block_coinbase` is `Some` (hardening rules, audit VAL-3) an
-/// input spending that coinbase's outputs is rejected. Returns the fee.
+/// Validate `tx` (a non-coinbase transaction of a block at header height
+/// `block_height`) against `view` plus the outputs of the transactions
+/// STRICTLY BEFORE it in the block (`earlier`). The transaction rules
+/// (version, witness, digest) are evaluated at `block_height` under
+/// `activation_height`; coinbase maturity at `maturity_height` (the block
+/// path passes `block_height`; `0` skips the maturity check). When
+/// `same_block_coinbase` is `Some` (hardening rules, audit VAL-3) an input
+/// spending that coinbase's outputs is rejected. Returns the fee.
+#[allow(clippy::too_many_arguments)]
 fn validate_tx_in_view(
     tx: &core::Transaction,
     view: &dyn UtxoView,
     earlier: &HashMap<([u8; 32], u32), core::TxOutput>,
     spent_in_block: &mut HashSet<([u8; 32], u32)>,
-    current_height: u64,
+    block_height: u64,
+    maturity_height: u64,
     same_block_coinbase: Option<&[u8; 32]>,
     activation_height: u64,
 ) -> Result<u64, TxFailure> {
@@ -292,7 +296,7 @@ fn validate_tx_in_view(
             ).into());
         }
     }
-    core::check_coinbase_maturity(tx, current_height, |txid| {
+    core::check_coinbase_maturity(tx, maturity_height, |txid| {
         view.view_coinbase_height(txid).ok().flatten()
     })?;
     let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
@@ -301,7 +305,25 @@ fn validate_tx_in_view(
         }
         view.view_utxo(txid, idx)
     };
-    validate_tx_inputs_classified(tx, &lookup, Some(spent_in_block), current_height, activation_height)
+    validate_tx_inputs_classified(tx, &lookup, Some(spent_in_block), block_height, activation_height)
+}
+
+/// BIP30 (audit VAL-2) for one transaction of a block subject to the
+/// hardening rules: none of `tx`'s outputs may have the outpoint of a coin
+/// that is unspent in `view` (the parent's state). The block path checks every
+/// transaction of the block, the coinbase included, before validating any;
+/// [`validate_tx_in_block_with_maturity`] checks the transaction it validates.
+fn check_no_unspent_overwrite(view: &dyn UtxoView, tx: &core::Transaction) -> Result<(), String> {
+    let txid = tx.txid();
+    for j in 0..tx.outputs.len() as u32 {
+        if view.view_utxo(&txid, j)?.is_some() {
+            return Err(format!(
+                "BIP30: output {}:{} would overwrite an unspent coin",
+                hex::encode(&txid[..8]), j
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Full in-context validation of a block's transactions against `view` (the
@@ -314,7 +336,12 @@ fn validate_tx_in_view(
 /// THE shared connect-time rule: the acceptance pipeline calls it for an
 /// extension and for every block of a reorg (`reorg::connect_plan`), under
 /// the process-wide hardening activation height (see
-/// [`validate_block_in_view_at`] for the rules that change there).
+/// [`validate_block_in_view_at`] for the rules that change there). The
+/// pipeline itself calls the classified variant
+/// ([`validate_block_in_view_classified`], same verdict); this unclassified
+/// form is library API (tests), unused by the `gnb` binary, which compiles
+/// this file as its own module.
+#[allow(dead_code)]
 pub fn validate_block_in_view(view: &dyn UtxoView, block: &core::Block) -> Result<(), String> {
     validate_block_in_view_at(view, block, core::activation::hardening_activation_height())
 }
@@ -331,8 +358,11 @@ pub fn validate_block_in_view(view: &dyn UtxoView, block: &core::Block) -> Resul
 ///
 /// Below the activation both rules are absent, exactly as before. The
 /// transaction rules of the same activation (version 3 / sighash v3 /
-/// canonical witnesses, `core::sighash`) are evaluated under the same
-/// `activation_height` (`admission::verify_input_scripts_at`).
+/// canonical witnesses, `core::sighash`) are evaluated at the same height
+/// (`block.height`, also the coinbase-maturity height) under the same
+/// `activation_height` (`admission::verify_input_scripts_at`). Library API
+/// like [`validate_block_in_view`] (unused by the `gnb` binary).
+#[allow(dead_code)]
 pub fn validate_block_in_view_at(
     view: &dyn UtxoView,
     block: &core::Block,
@@ -360,15 +390,7 @@ pub fn validate_block_in_view_classified_at(
     let hardened = core::block_rules::rules_active_at(height, activation_height);
     if hardened {
         for tx in &block.transactions {
-            let txid = tx.txid();
-            for j in 0..tx.outputs.len() as u32 {
-                if view.view_utxo(&txid, j).map_err(committed)?.is_some() {
-                    return Err(committed(format!(
-                        "BIP30: output {}:{} would overwrite an unspent coin",
-                        hex::encode(&txid[..8]), j
-                    )));
-                }
-            }
+            check_no_unspent_overwrite(view, tx).map_err(committed)?;
         }
     }
     let same_block_coinbase = if hardened {
@@ -382,7 +404,7 @@ pub fn validate_block_in_view_classified_at(
     for (i, tx) in block.transactions.iter().enumerate() {
         if i > 0 {
             let fee = validate_tx_in_view(
-                tx, view, &earlier, &mut spent_in_block, height, same_block_coinbase.as_ref(),
+                tx, view, &earlier, &mut spent_in_block, height, height, same_block_coinbase.as_ref(),
                 activation_height,
             ).map_err(|f| BlockInvalidity {
                 reason: f.reason,
@@ -1608,7 +1630,9 @@ pub fn miner_template_total_fees(
 }
 
 /// Validate a transaction within a block context.
-/// Uses both in-block outputs and persistent UTXO set, with double-spend tracking.
+/// Uses both in-block outputs and persistent UTXO set, with double-spend
+/// tracking. No coinbase-maturity check (see
+/// [`validate_tx_in_block_with_maturity`]).
 #[allow(dead_code)]
 pub fn validate_tx_in_block(
     block:          &core::Block,
@@ -1620,14 +1644,23 @@ pub fn validate_tx_in_block(
     Ok(())
 }
 
-/// FIX VULN-03: Validate TX within a block against the COMMITTED store,
-/// including coinbase maturity. Returns the fee.
+/// FIX VULN-03: Validate the non-coinbase transaction `tx` of `block` against
+/// the COMMITTED store, including coinbase maturity. Returns the fee.
 ///
 /// SECURITY (Legacy C-2): the in-block prevout map holds ONLY the
 /// transactions STRICTLY BEFORE `tx` in `block.transactions` (identified by
-/// txid), so a transaction can never spend a later transaction's output. The
-/// acceptance pipeline uses the equivalent `validate_block_in_view`, which
-/// checks a block against its own context through a staging overlay.
+/// txid), so a transaction can never spend a later transaction's output.
+///
+/// Heights: every consensus rule is evaluated at the block's header height
+/// `block.height` under the process-wide hardening activation, exactly as
+/// the connect path (`validate_block_in_view`) evaluates it for this
+/// transaction: the transaction rules (version 3 / sighash v3 / canonical
+/// witnesses, `core::sighash`), BIP30 for `tx`'s outputs (audit VAL-2) and
+/// no spend of the block's own coinbase (audit VAL-3). `current_height` is
+/// used ONLY for coinbase maturity (`0` skips it; the connect path uses
+/// `block.height`). Unlike the connect path this checks one transaction, so
+/// the block-level rules (BIP30 of the other transactions, the coinbase
+/// value) are the caller's.
 pub fn validate_tx_in_block_with_maturity(
     block:          &core::Block,
     tx:             &core::Transaction,
@@ -1639,9 +1672,13 @@ pub fn validate_tx_in_block_with_maturity(
     let cutoff = block.transactions.iter()
         .position(|t| t.txid() == tx_txid)
         .unwrap_or(block.transactions.len());
-    // Same gate as `validate_block_in_view` (audit VAL-3).
+    // Same gate and height as `validate_block_in_view_classified_at`.
     let activation_height = core::activation::hardening_activation_height();
     let hardened = core::block_rules::rules_active_at(block.height, activation_height);
+    let view: &storage::Storage = store;
+    if hardened {
+        check_no_unspent_overwrite(view, tx)?;
+    }
     let same_block_coinbase = if hardened { block.transactions.first().map(|cb| cb.txid()) } else { None };
     let earlier: HashMap<([u8; 32], u32), core::TxOutput> = block.transactions[..cutoff]
         .iter()
@@ -1651,9 +1688,9 @@ pub fn validate_tx_in_block_with_maturity(
             t.outputs.iter().enumerate().map(move |(i, o)| ((txid, i as u32), o.clone()))
         })
         .collect();
-    let view: &storage::Storage = store;
     validate_tx_in_view(
-        tx, view, &earlier, spent_in_block, current_height, same_block_coinbase.as_ref(), activation_height,
+        tx, view, &earlier, spent_in_block, block.height, current_height, same_block_coinbase.as_ref(),
+        activation_height,
     )
     .map_err(|f| f.reason)
 }
