@@ -211,6 +211,29 @@ fn mutation_workflow_runs_weekly_on_demand_and_on_pull_requests() {
     assert!(m.text.contains("tool: cargo-mutants@27.1.0"), "cargo-mutants pin (docs/testing/MUTATION.md)");
 }
 
+/// fuzz.yml (H-fuzz, docs/testing/FUZZING.md): the weekly 10-minute campaign
+/// on a cron of its own, and a reusable workflow that ci.yml's `fuzz` job
+/// calls with 60 s per target on pull requests, the nightly run and manual
+/// runs, never on a plain push.
+#[test]
+fn fuzz_workflow_runs_weekly_and_from_ci() {
+    let f = load("fuzz.yml");
+    assert_eq!(f.triggers, ["workflow_call", "schedule", "workflow_dispatch"], "fuzz.yml triggers");
+    assert_eq!(f.crons.len(), 1, "fuzz.yml: one cron");
+    assert!(f.crons[0].ends_with(" * * 0"), "fuzz.yml: a weekly (Sunday) cron, got {:?}", f.crons);
+    let ids: Vec<&str> = f.jobs.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["fuzz"], "fuzz.yml jobs");
+
+    let ci = load("ci.yml");
+    let cond = job_if(&ci, "fuzz").expect("ci.yml: the fuzz job has an event filter");
+    for event in ["pull_request", "schedule", "workflow_dispatch"] {
+        assert!(cond.contains(&format!("'{event}'")), "ci.yml fuzz job does not run on {event}: {cond}");
+    }
+    assert!(!cond.contains("'push'"), "ci.yml fuzz job runs on push: {cond}");
+    assert!(ci.text.contains("uses: ./.github/workflows/fuzz.yml"), "ci.yml fuzz job does not call fuzz.yml");
+    assert!(ci.text.contains("seconds: 60"), "ci.yml fuzz job: 60 s per target");
+}
+
 /// A filter on `github.event.schedule` must name a cron of its own workflow;
 /// a stale value silently stops the job from ever running on the schedule.
 #[test]
