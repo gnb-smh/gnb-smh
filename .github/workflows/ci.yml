@@ -45,6 +45,13 @@ jobs:
         run: |
           python3 reference/gnb_sighash.py
           git diff --exit-code reference/sighash_vectors.json
+      # docs/testing/VECTORS.md: every derived value, every non-signature
+      # verdict and every mempool refusal class of the tx/block consensus
+      # vectors, re-derived by the Python references (gnb_validity,
+      # gnb_merkle, gnb_sighash, gnb_difficulty; gnb_smh evaluates the three
+      # `pow: full` proofs, ~2 s each).
+      - name: Consensus tx/block vectors against the Python references
+        run: python3 reference/check_consensus_vectors.py
 
   rust:
     runs-on: ubuntu-latest
@@ -100,6 +107,14 @@ jobs:
         run: |
           cargo test -p gnb-crypto --locked --lib expected_bits_at_schedule_is_genesis_bits 2>&1 \
             | tee /dev/stderr | grep -q "test result: ok. 1 passed; 0 failed; 0 ignored"
+      # docs/testing/VECTORS.md: the deterministic Rust generator (seeded keys
+      # and signatures) must reproduce the frozen tx/block consensus vectors
+      # byte for byte. Their runners are tests/consensus_vectors.rs (above,
+      # real pow limit) and node/tests/consensus_vectors.rs (workspace-test).
+      - name: Consensus tx/block vectors are reproducible
+        run: |
+          GNB_WRITE_VECTORS=1 cargo test -p gnb-crypto --locked --test gen_consensus_vectors -- --ignored
+          git diff --exit-code reference/tx_vectors.json reference/block_vectors.json
 
   # Vendored fork: PQClean source pin (VENDOR.toml), and the Falcon
   # clean-variant guard. (The libp2p-yamux fork was retired with libp2p 0.57,
