@@ -319,22 +319,32 @@ no longer matches, fails it.
 
 ## CI
 
-`.github/workflows/ci.yml`:
+`.github/workflows/mutants.yml`, a workflow of its own. A cron starts every
+job of its workflow that has no event filter, so the weekly cron in ci.yml
+would re-run all of CI (workspace build and test, the WASM rebuild, clippy,
+...) every Sunday on the commit the nightly run had just checked; ci.yml keeps
+only the nightly cron. `node/tests/ci_workflow_triggers.rs` checks this: at
+most one cron per workflow, no mutation job in ci.yml, and the triggers and
+job filters of mutants.yml below.
 
-- **`mutants`** (weekly, Sunday 04:41 UTC, and on `workflow_dispatch`): the
-  whole scope, gnb-smh in one job and gnb-crypto in four shards
-  (`--shard k/4`), each through `scripts/mutants-gate.sh`. The job fails on
-  any missed mutant, on any timeout not in `.cargo/mutants-timeouts.txt`, on
-  a baseline failure and on any other cargo-mutants error; the known hangs
-  are reported as warnings. The gnb-smh job also runs
-  `scripts/mutants-equivalent-check.sh`. The `mutants.out` directory
-  (per-mutant logs and diffs) is uploaded as an artifact.
+- **`mutants`** (weekly, Sunday 04:41 UTC, and on `workflow_dispatch` of the
+  `mutants` workflow): the whole scope, gnb-smh in one job and gnb-crypto in
+  four shards (`--shard k/4`), each through `scripts/mutants-gate.sh`. The job
+  fails on any missed mutant, on any timeout not in
+  `.cargo/mutants-timeouts.txt`, on a baseline failure and on any other
+  cargo-mutants error; the known hangs are reported as warnings. The gnb-smh
+  job also runs `scripts/mutants-equivalent-check.sh`. The `mutants.out`
+  directory (per-mutant logs and diffs) is uploaded as an artifact.
 - **`mutants-diff`** (every pull request): only the mutants on lines the PR
   changes, `git diff origin/<base>...HEAD` passed to `--in-diff`, for each
   crate, with the same gate (missed mutants and unknown timeouts fail), after
   `scripts/mutants-equivalent-check.sh`. A PR that changes no in-scope line
   tests no mutant and passes in seconds; one that changes consensus code must
-  come with tests that catch its mutants.
+  come with tests that catch its mutants. The job runs both crates in one
+  runner with a 120-minute timeout: a PR whose diff covers most of the scope
+  has about as many mutants as the full run (gnb-crypto alone took about 2 h
+  with `-j 2` on a 4-CPU machine) and can time out; for such a PR, run the
+  sharded `mutants` workflow on its branch (`workflow_dispatch`).
 
 The gate was checked locally both ways: with the exclusions it passes on the
 mutants of `lane16` and `target_to_bits` (27 caught, the 6 equivalent ones

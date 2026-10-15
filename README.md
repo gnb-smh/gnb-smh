@@ -49,7 +49,9 @@ cargo deny check && cargo audit
 
 CI (`.github/workflows/ci.yml`) runs all of these, the Python references, the
 standalone `rust/` crate, the vendored-crate and Falcon guards, and nightly the
-fuzz targets.
+fuzz targets. Mutation testing of the consensus code
+(`.github/workflows/mutants.yml`, [docs/testing/MUTATION.md](docs/testing/MUTATION.md))
+runs weekly and, on the lines a pull request changes, on every pull request.
 
 The toolchain is pinned in `rust-toolchain.toml`.
 

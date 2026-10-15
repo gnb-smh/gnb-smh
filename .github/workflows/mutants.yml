@@ -1,0 +1,103 @@
+name: mutants
+
+# Mutation testing of the consensus code (cargo-mutants). Scope, exclusions
+# and the documented equivalent mutants: .cargo/mutants.toml; method and
+# results: docs/testing/MUTATION.md.
+#
+# A workflow of its own so that the weekly schedule starts only these jobs. A
+# schedule starts every job of its workflow that has no event filter: as a
+# second cron in ci.yml it re-ran the whole of CI (workspace build and test,
+# the WASM rebuild, clippy, ...) every Sunday on the commit the nightly run had
+# just checked. node/tests/ci_workflow_triggers.rs keeps it that way.
+on:
+  pull_request:
+  schedule:
+    - cron: "41 4 * * 0"   # weekly (Sunday): every mutant of the scope
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # As in ci.yml: test binaries without debug info (the runner's disk is
+  # small); incremental builds are useless on a fresh runner.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # Weekly and on demand, every mutant of the scope; each crate in its own
+  # invocation (the node's test-pow-limit feature is never unified into
+  # gnb-crypto), gnb-crypto in shards. Fails on any missed (surviving)
+  # mutant, on any timeout that is not a known hang
+  # (.cargo/mutants-timeouts.txt), on a baseline failure and on any other
+  # cargo-mutants error (scripts/mutants-gate.sh); and when the
+  # equivalent-mutant exclusions no longer match the documented list
+  # (scripts/mutants-equivalent-check.sh).
+  mutants:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { package: gnb-smh, shard: "0/1" }
+          - { package: gnb-crypto, shard: "0/4" }
+          - { package: gnb-crypto, shard: "1/4" }
+          - { package: gnb-crypto, shard: "2/4" }
+          - { package: gnb-crypto, shard: "3/4" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@27.1.0
+      - name: Equivalent-mutant exclusions match the documented list
+        if: matrix.package == 'gnb-smh'
+        run: scripts/mutants-equivalent-check.sh
+      - name: cargo mutants -p ${{ matrix.package }} --shard ${{ matrix.shard }}
+        run: >
+          scripts/mutants-gate.sh "$RUNNER_TEMP/mutants"
+          -p ${{ matrix.package }} --shard ${{ matrix.shard }} --test-tool cargo -j 2 --no-shuffle
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-${{ matrix.package }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/mutants/mutants.out
+
+  # Pull requests: only the mutants on lines the PR changes (--in-diff against
+  # the base branch). A PR that touches no in-scope line tests no mutant.
+  mutants-diff:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@27.1.0
+      - name: Equivalent-mutant exclusions match the documented list
+        run: scripts/mutants-equivalent-check.sh
+      - name: Diff against the base branch
+        if: success() || failure()
+        run: git diff "origin/${{ github.base_ref }}...HEAD" > "$RUNNER_TEMP/pr.diff"
+      - name: gnb-smh mutants in the diff
+        if: success() || failure()
+        run: >
+          scripts/mutants-gate.sh "$RUNNER_TEMP/mutants-gnb-smh"
+          -p gnb-smh --in-diff "$RUNNER_TEMP/pr.diff" --test-tool cargo -j 2 --no-shuffle
+      - name: gnb-crypto mutants in the diff
+        if: success() || failure()
+        run: >
+          scripts/mutants-gate.sh "$RUNNER_TEMP/mutants-gnb-crypto"
+          -p gnb-crypto --in-diff "$RUNNER_TEMP/pr.diff" --test-tool cargo -j 2 --no-shuffle
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-diff
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/mutants-gnb-smh/mutants.out
+            ${{ runner.temp }}/mutants-gnb-crypto/mutants.out
