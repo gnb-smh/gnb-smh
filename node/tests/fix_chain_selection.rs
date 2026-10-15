@@ -657,7 +657,6 @@ fn reconsider(n: &Node, h: BlockHash) -> Result<accept::ChainOverride, accept::O
     accept::reconsider_block(h, &n.dag, &n.store, &n.mempool, &n.node_state, Some(&n.tip_tx), &n.shielded)
 }
 
-
 /// `invalidateblock` makes the node leave the heaviest chain for the best
 /// chain that does not contain the block (rolling back past it), persists
 /// across a restart, and `reconsiderblock` returns to the heaviest chain —
@@ -1092,15 +1091,32 @@ fn pow3_low_work_flood_is_refused_before_pow_storage_or_insertion() {
 }
 
 /// Simulated network: deliver `want_tip` (the fork tip, as a frontier tip),
-/// answer every parent request at once, and re-announce the tip whenever the
-/// pipeline stalls, until `n` selects `want_tip`. Returns the admissions of
-/// processed blocks, the drops and the number of announcements.
+/// answer every parent request in the order the requests were sent (they are
+/// all in flight at once, so a DAG-shaped fork arrives level by level), and
+/// whenever the pipeline stalls do what the node's 30 s nudge and orphan
+/// sweep do — re-request the missing parents buffered orphans still wait for
+/// and re-announce the tip — until `n` selects `want_tip`. Returns the
+/// admissions of processed blocks, the drops and the number of
+/// announcements.
 #[allow(clippy::type_complexity)]
 fn sync_tip_first(
     core: &mut BlockIngress,
     n: &Node,
     by_hash: &HashMap<BlockHash, Block>,
     want_tip: BlockHash,
+) -> (Vec<(BlockHash, WorkAdmission)>, Vec<(BlockHash, DropReason)>, usize) {
+    sync_tip_first_with(core, n, by_hash, want_tip, &mut |_| {})
+}
+
+/// [`sync_tip_first`], running `between` after every delivery (adversarial
+/// traffic interleaved with the honest fetches).
+#[allow(clippy::type_complexity)]
+fn sync_tip_first_with(
+    core: &mut BlockIngress,
+    n: &Node,
+    by_hash: &HashMap<BlockHash, Block>,
+    want_tip: BlockHash,
+    between: &mut dyn FnMut(&mut BlockIngress),
 ) -> (Vec<(BlockHash, WorkAdmission)>, Vec<(BlockHash, DropReason)>, usize) {
     let mut admissions = Vec::new();
     let mut drops = Vec::new();
@@ -1111,6 +1127,16 @@ fn sync_tip_first(
         let Some(h) = queue.pop_front() else {
             rounds += 1;
             assert!(rounds <= 50, "the fork must be followed in a bounded number of re-announcements");
+            {
+                // The orphan sweep: re-request awaited parents that are
+                // neither in the DAG nor buffered (peers serve the fork's).
+                let d = n.dag.read();
+                let mut chased: Vec<BlockHash> = core.orphans.waiting_parents().into_iter()
+                    .filter(|p| by_hash.contains_key(p) && !d.has_block(p) && !core.orphans.contains(p))
+                    .collect();
+                chased.sort();
+                queue.extend(chased);
+            }
             queue.push_back(want_tip);
             continue;
         };
@@ -1119,9 +1145,7 @@ fn sync_tip_first(
         let blk = &by_hash[&h];
         match feed(core, n, blk) {
             BlockOutcome::Buffered { request, .. } => {
-                for p in request.into_iter().rev() {
-                    queue.push_front(p);
-                }
+                queue.extend(request);
             }
             BlockOutcome::Processed { admission, result, .. } => {
                 result.expect("fork block accepted");
@@ -1131,6 +1155,7 @@ fn sync_tip_first(
             BlockOutcome::Known | BlockOutcome::PoolRefused | BlockOutcome::BodyRestored => {}
             BlockOutcome::Invalid(e) => panic!("invalid: {e}"),
         }
+        between(core);
     }
     (admissions, drops, rounds)
 }
@@ -1222,3 +1247,152 @@ fn pow3_merge_backed_deep_blocks_are_rationed() {
     assert_eq!(admitted, ingress::DEEP_BACKFILL_BURST as usize);
     assert_eq!(tip_meta(&x), tip);
 }
+
+/// Audit POW-3 follow-up (review): under the hardened rules (testnet and
+/// regtest from genesis, mainnet from 110,000) blue work counts merged blues,
+/// so the threshold is real blue work — but the work rule credited an
+/// announced fork with the work of ONE path of orphans. A heavier DAG-shaped
+/// fork (here two blocks per level, each merging both blocks of the level
+/// below) was refused for good: its first block's single-path credit
+/// (51 + 500 blocks of work) never reached the threshold (640), while the fork
+/// (1,051 blocks of blue work) beats the 1,000-block chain. The credit is now
+/// the summed work of the distinct orphans announced above a block, buffered
+/// or evicted, each counted once; the node follows the fork tip first through
+/// a pool much smaller than the fork and ends with the UTXO set of a node fed
+/// in order.
+#[test]
+fn pow3_heavier_dag_shaped_fork_is_followed_under_the_hardened_rules() {
+    let _hardened = gnb::core::activation::scoped_override(0);
+    let genesis = mk_genesis(unix_now() - 50_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let honest = b.chain(gh, 1_000, "dh");
+    let mut fork: Vec<Block> = Vec::new();
+    let mut level = vec![honest[49].block_hash()]; // the fork branches at height 50
+    for i in 0..500 {
+        let l0 = b.empty(level.clone(), &format!("dl{i}a"));
+        let l1 = b.empty(level.clone(), &format!("dl{i}b"));
+        level = vec![l0.block_hash(), l1.block_hash()];
+        fork.push(l0);
+        fork.push(l1);
+    }
+    let top = b.empty(level, "dtop");
+    fork.push(top.clone());
+    let by_hash: HashMap<BlockHash, Block> = fork.iter().map(|x| (x.block_hash(), x.clone())).collect();
+
+    // The fork is heavier under the hardened rules: a node fed everything in
+    // order ends on it.
+    let w = node_with(&genesis, &[]);
+    assert!(w.dag.read().is_hardened_at(1), "hardened rules from genesis");
+    deliver(&w, &honest);
+    deliver(&w, &fork);
+    assert_eq!(sel_tip(&w), Some(top.block_hash()));
+    let unit = core::bits_to_work(core::POW_LIMIT_BITS);
+
+    let x = node_with(&genesis, &[]);
+    for blk in &honest {
+        accept(&x, blk).unwrap();
+    }
+    assert_eq!(ingress::anti_dos_work_threshold(&x.dag.read()), 640 * unit);
+    let mut core = BlockIngress::with_limits(OrphanLimits {
+        max_entries: 300, max_bytes: 64 << 20, max_entries_per_peer: 300, max_bytes_per_peer: 64 << 20,
+    });
+    let (admissions, drops, rounds) = sync_tip_first(&mut core, &x, &by_hash, top.block_hash());
+    println!("POW-3 DAG-shaped fork: followed after {rounds} announcement(s); {} admissions", admissions.len());
+    assert!(drops.is_empty(), "no fork block was refused: {drops:?}");
+    let first = admissions.iter().find(|(h, _)| *h == fork[0].block_hash()).expect("first fork block");
+    assert_eq!(first.1, WorkAdmission::ChainBacked);
+    assert_eq!(tip_meta(&x), top.block_hash());
+    assert_eq!(digest(&x), digest(&w));
+}
+
+/// A junk orphan for the flood below: 256 random missing parents, pow-limit
+/// bits (they meet the anti-DoS floor under `test-pow-limit`), proof marked
+/// verified.
+fn junk_orphan(j: u64, height: u64) -> Block {
+    let mut rng = Rng(0x5EED_F100_D000_0000 ^ j);
+    let parents: Vec<BlockHash> = (0..256)
+        .map(|_| {
+            let mut h = [0u8; 32];
+            for c in h.chunks_mut(8) {
+                c.copy_from_slice(&rng.next().to_le_bytes());
+            }
+            h
+        })
+        .collect();
+    let mut blk = Block {
+        header: BlockHeader {
+            version: 1,
+            parents,
+            merkle_root: MerkleRoot::ZERO,
+            timestamp: unix_now(),
+            bits: core::POW_LIMIT_BITS,
+            nonce: j,
+        },
+        transactions: vec![coinbase(&format!("junk{j}"), 0, vec![0xEE; 20])],
+        blue_score: height,
+        height,
+        shielded_transactions: Vec::new(),
+    };
+    blk.header.merkle_root = blk.body_merkle_root();
+    blk.test_only_assume_pow_valid();
+    blk
+}
+
+/// Audit POW-3 follow-up (review): the remembered-work map could be flushed.
+/// Every evicted orphan remembered work under each of its (up to 256,
+/// sender-chosen) parents in one FIFO, and a re-sent evicted orphan was
+/// evicted again for free — 212 orphans of 256 parents, cycled, pushed every
+/// honest entry out of the 50,000-entry map between two parent fetches, so a
+/// fork deeper than the window plus the pool lost its proven work and was
+/// refused. Scaled down here: the remembered stores hold 1,024 entries and
+/// one gossiping peer cycles 12 orphans of 256 random parents, each charged
+/// 2 MB so its 16 MiB quota holds 8 (every re-send evicts one: 12 x 256 =
+/// 3,072 keys per cycle, three times the store, as 212 x 256 exceeds 50,000),
+/// after EVERY honest delivery until the fork's first block is admitted. The
+/// fork is 550 blocks deep and fetched through a 100-orphan pool (its first
+/// block needs 190 blocks of announced work, so the evicted part must be
+/// remembered). The first block is still chain-backed and the node ends on
+/// the fork tip.
+#[test]
+fn pow3_remembered_work_survives_a_parent_key_flood() {
+    let genesis = mk_genesis(unix_now() - 50_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let honest = b.chain(gh, 600, "kf");
+    let fork = b.chain(honest[49].block_hash(), 600, "kg"); // tip at height 650
+    let fork_tip = fork.last().unwrap().block_hash();
+    let by_hash: HashMap<BlockHash, Block> = fork.iter().map(|x| (x.block_hash(), x.clone())).collect();
+    let x = node_with(&genesis, &[]);
+    for blk in &honest {
+        accept(&x, blk).unwrap();
+    }
+    let mut core = BlockIngress::with_limits(OrphanLimits {
+        max_entries: 10_000, max_bytes: 64 << 20, max_entries_per_peer: 100, max_bytes_per_peer: 16 << 20,
+    });
+    core.orphans.set_remembered_capacity(1_024);
+    let attacker = Some(libp2p::PeerId::random());
+    let flood: Vec<Block> = (0..12).map(|j| junk_orphan(j, 600)).collect();
+    let f1 = fork[0].block_hash();
+    let mut buffered = 0usize;
+    let mut between = |core: &mut BlockIngress| {
+        if x.dag.read().has_block(&f1) {
+            return;
+        }
+        for o in &flood {
+            if matches!(feed_as(core, &x, o, attacker, false, 2_000_000), BlockOutcome::Buffered { .. }) {
+                buffered += 1;
+            }
+        }
+    };
+    let (admissions, drops, rounds) = sync_tip_first_with(&mut core, &x, &by_hash, fork_tip, &mut between);
+    println!("POW-3 flood: fork followed after {rounds} announcement(s); {buffered} flood orphans (re)buffered");
+    assert!(buffered > 12 * 500, "the flood cycled through the pool after every delivery: {buffered}");
+    assert!(drops.is_empty(), "no fork block was refused: {drops:?}");
+    let first = admissions.iter().find(|(h, _)| *h == fork[0].block_hash()).expect("first fork block");
+    assert_eq!(first.1, WorkAdmission::ChainBacked);
+    assert_eq!(tip_meta(&x), fork_tip);
+    let (skeletons, paths) = core.orphans.remembered_len();
+    assert!(skeletons <= 1_024 && paths <= 1_024);
+}
+

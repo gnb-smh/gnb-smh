@@ -2114,8 +2114,9 @@ async fn sweep_orphan_parents(
         }).await;
     }
     if !retry.is_empty() {
-        info!("orphan sweep: re-requested {} missing parent(s) (orphans={} bytes={})",
-            retry.len(), orphans.len(), orphans.total_bytes());
+        let (skeletons, paths) = orphans.remembered_len();
+        info!("orphan sweep: re-requested {} missing parent(s) (orphans={} bytes={}, remembered evicted={} paths={})",
+            retry.len(), orphans.len(), orphans.total_bytes(), skeletons, paths);
     }
     for (h, attempts) in give_up {
         let dropped = drop_orphan_subtree(h, orphans);

@@ -24,9 +24,10 @@
 //! * POW-3 (node-local anti-DoS half): a block whose parents we hold is only
 //!   stored and processed if its chain can come within
 //!   [`ANTI_DOS_WINDOW_BLOCKS`] selected-chain blocks of work of our tip, or
-//!   if a proof-of-work-verified orphan chain announced on top of it does
-//!   (see [`work_admission`]). A chain that carries the work is always
-//!   accepted, so the final outcome for honest data is unchanged;
+//!   if the proof-of-work-verified orphans announced on top of it (summed,
+//!   each once, buffered or evicted) bring it there (see [`work_admission`]).
+//!   A chain that carries the work is accepted, so the final outcome for
+//!   honest data is unchanged;
 //! * DAG-6, pruned nodes: a body of a block already in the DAG is restored
 //!   only if this node requested it, from a directed answer, and bound to
 //!   the DAG's verified height (see [`WantedBodies`]).
@@ -346,7 +347,36 @@ pub struct OrphanEntry {
     pub peer:   Option<PeerId>,
     /// Counted as IBD evidence (see [`orphan_is_sync_evidence`]).
     pub evidence: bool,
+    /// The parents that were missing (not in the DAG) when it was buffered:
+    /// the only keys its eviction remembers work under (POW-3). A parent
+    /// already in the DAG is never looked up by the work rule.
+    pub missing: Vec<[u8; 32]>,
     seq:        u64,
+}
+
+/// POW-3: an evicted orphan kept WITHOUT its body: its work and the missing
+/// parents it waited on. The work rule sums the work of the distinct blocks
+/// buffered or kept as skeletons above a block (see
+/// [`OrphanPool::announced_work_above`]). Being keyed by the block id, a
+/// re-sent orphan never adds its work twice.
+#[derive(Clone, Debug)]
+struct Skeleton {
+    work:    u128,
+    /// At most [`REMEMBERED_KEYS_PER_ORPHAN`] of its missing parents.
+    parents: Vec<[u8; 32]>,
+    owner:   Option<PeerId>,
+    seq:     u64,
+}
+
+/// POW-3: the greatest work of a single path of evicted orphans announced on
+/// top of a missing parent (cumulative along the path, so it chains through
+/// any number of evictions: it lets a linear fork longer than every bounded
+/// store prove its work).
+#[derive(Clone, Copy, Debug)]
+struct RememberedPath {
+    work:  u128,
+    owner: Option<PeerId>,
+    seq:   u64,
 }
 
 /// Result of [`OrphanPool::insert`].
@@ -383,17 +413,51 @@ pub struct OrphanPool {
     evidence:    BTreeMap<u64, usize>,
     total_bytes: usize,
     next_seq:    u64,
-    /// POW-3: announced work remembered across evictions. For a missing
-    /// parent `p`, the greatest proof-of-work-verified work of an orphan chain
-    /// built on `p` that was evicted (see [`OrphanPool::announced_work_above`]).
-    /// Lets a chain longer than the pool still prove its work when its bottom
-    /// finally connects. Bounded by [`REMEMBERED_WORK_MAX`], oldest first.
-    remembered:       HashMap<[u8; 32], u128>,
-    remembered_order: VecDeque<[u8; 32]>,
+    // ── POW-3: work announced by evicted orphans ──────────────────────────
+    //
+    // Two bounded stores, both filled when an orphan is evicted, both keyed
+    // only by the orphan's MISSING parents (at most
+    // REMEMBERED_KEYS_PER_ORPHAN of them) and both charged to the peer that
+    // delivered it: a peer owns at most 1/REMEMBERED_PEER_SHARE of each. A
+    // full store gives way to an entry of greater work (the lowest-work entry
+    // goes; skeletons: else the delivering peer's own oldest), so orphans at
+    // the anti-DoS floor can neither flush a remembered honest chain nor
+    // re-add work by being re-sent.
+    remembered_cap: usize,
+    /// Evicted orphans by id (exact set semantics: summed once each).
+    skeletons:      HashMap<[u8; 32], Skeleton>,
+    /// Reverse index: missing parent -> skeletons that waited on it.
+    skel_children:  HashMap<[u8; 32], HashSet<[u8; 32]>>,
+    skel_by_work:   BTreeSet<WorkKey>,
+    skel_by_owner:  HashMap<Option<PeerId>, BTreeSet<(u64, [u8; 32])>>,
+    /// Missing parent -> greatest single-path work remembered above it.
+    paths:          HashMap<[u8; 32], RememberedPath>,
+    path_by_work:   BTreeSet<WorkKey>,
+    path_by_owner:  HashMap<Option<PeerId>, BTreeSet<WorkKey>>,
+    rem_seq:        u64,
+    /// Bumped whenever the backing of some block can have grown (an orphan
+    /// was buffered, or a remembered path grew). Lets the ingress core cache
+    /// a LowWork verdict until then.
+    generation:     u64,
 }
 
-/// Bound of the remembered announced-work map (POW-3). 48 bytes per entry.
+/// `(work, insertion sequence, id)`: orders remembered entries lowest work
+/// first, oldest first among equals.
+type WorkKey = (u128, u64, [u8; 32]);
+
+/// Bound of each POW-3 remembered-work store: evicted-orphan skeletons
+/// (about 200 bytes each with one parent) and remembered paths (about 100).
+/// Tests may lower it ([`OrphanPool::set_remembered_capacity`]).
 pub const REMEMBERED_WORK_MAX: usize = 50_000;
+
+/// At most this many missing parents of one evicted orphan are remembered.
+/// Honest fork blocks miss a handful; a crafted orphan's 256 random parents
+/// no longer turn one eviction into 256 entries.
+pub const REMEMBERED_KEYS_PER_ORPHAN: usize = 8;
+
+/// One delivering peer owns at most `1 / REMEMBERED_PEER_SHARE` of each
+/// remembered store (it then pays with its own entries).
+pub const REMEMBERED_PEER_SHARE: usize = 4;
 
 /// Proof-of-work work a block's header claims (its bits; checked against the
 /// proof before an orphan is buffered).
@@ -418,9 +482,35 @@ impl OrphanPool {
             evidence: BTreeMap::new(),
             total_bytes: 0,
             next_seq: 0,
-            remembered: HashMap::new(),
-            remembered_order: VecDeque::new(),
+            remembered_cap: REMEMBERED_WORK_MAX,
+            skeletons: HashMap::new(),
+            skel_children: HashMap::new(),
+            skel_by_work: BTreeSet::new(),
+            skel_by_owner: HashMap::new(),
+            paths: HashMap::new(),
+            path_by_work: BTreeSet::new(),
+            path_by_owner: HashMap::new(),
+            rem_seq: 0,
+            generation: 0,
         }
+    }
+
+    /// Change the bound of each remembered-work store (tests use small ones
+    /// to exercise eviction). Existing entries above the bound are kept
+    /// until they are replaced.
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn set_remembered_capacity(&mut self, cap: usize) {
+        self.remembered_cap = cap;
+    }
+
+    /// See the `generation` field.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Number of evicted orphans kept as skeletons / remembered paths.
+    pub fn remembered_len(&self) -> (usize, usize) {
+        (self.skeletons.len(), self.paths.len())
     }
 
     pub fn len(&self) -> usize {
@@ -524,59 +614,229 @@ impl OrphanPool {
         usage.seqs.insert(seq);
         self.total_bytes = self.total_bytes.saturating_add(bytes);
         self.order.insert(seq, hash);
-        self.entries.insert(hash, OrphanEntry { block, height, bytes, peer, evidence, seq });
+        // A re-buffered evicted orphan replaces its skeleton (its work is
+        // counted once). Any insertion can raise a block's backing (a new id,
+        // or a buffered orphan that may merge-back its parents again).
+        self.drop_skeleton(&hash);
+        self.generation = self.generation.wrapping_add(1);
+        self.entries.insert(hash, OrphanEntry {
+            block, height, bytes, peer, evidence, missing: missing_parents.to_vec(), seq,
+        });
         OrphanInsert::Inserted { evicted }
     }
 
-    /// Evict one orphan to make room, first remembering the work its chain
-    /// announces for each of its parents (POW-3), then removing it.
+    /// Evict one orphan to make room. Its work is remembered first (POW-3):
+    /// as a skeleton (the orphan without its body), and, under each of its
+    /// missing parents, as the work of the heaviest single path of orphans it
+    /// tops. Then it is removed.
     fn evict(&mut self, h: &[u8; 32]) {
         if let Some(e) = self.entries.get(h) {
-            let above = header_work(&e.block).saturating_add(self.announced_work_above(h));
-            let parents = e.block.header.parents.clone();
-            for p in parents {
-                self.remember(p, above);
+            let work = header_work(&e.block);
+            let keys: Vec<[u8; 32]> = e.missing.iter().take(REMEMBERED_KEYS_PER_ORPHAN).copied().collect();
+            let owner = e.peer;
+            let path = work.saturating_add(self.path_work_above(h));
+            for p in &keys {
+                self.remember_path(*p, path, owner);
             }
+            self.add_skeleton(*h, work, keys, owner);
         }
         self.remove(h);
     }
 
-    fn remember(&mut self, parent: [u8; 32], work: u128) {
-        match self.remembered.get_mut(&parent) {
-            Some(w) => *w = (*w).max(work),
-            None => {
-                if self.remembered_order.len() >= REMEMBERED_WORK_MAX {
-                    if let Some(old) = self.remembered_order.pop_front() {
-                        self.remembered.remove(&old);
-                    }
+    /// Keep an evicted orphan as a skeleton, within the store's bounds.
+    fn add_skeleton(&mut self, hash: [u8; 32], work: u128, parents: Vec<[u8; 32]>, owner: Option<PeerId>) {
+        if self.remembered_cap == 0 || self.skeletons.contains_key(&hash) {
+            return;
+        }
+        let per_owner = (self.remembered_cap / REMEMBERED_PEER_SHARE).max(1);
+        let own_oldest = |pool: &Self| pool.skel_by_owner.get(&owner).and_then(|s| s.iter().next().map(|(_, h)| *h));
+        if self.skel_by_owner.get(&owner).map_or(0, |s| s.len()) >= per_owner {
+            // The delivering peer pays with its own oldest skeleton.
+            if let Some(o) = own_oldest(self) {
+                self.drop_skeleton(&o);
+            }
+        } else if self.skeletons.len() >= self.remembered_cap {
+            // Full: an entry of greater work replaces the lowest-work one;
+            // otherwise the delivering peer pays with its own oldest.
+            match self.skel_by_work.iter().next().copied() {
+                Some((lowest, _, l)) if work > lowest => {
+                    self.drop_skeleton(&l);
                 }
-                self.remembered.insert(parent, work);
-                self.remembered_order.push_back(parent);
+                _ => match own_oldest(self) {
+                    Some(o) => {
+                        self.drop_skeleton(&o);
+                    }
+                    None => return,
+                },
+            }
+        }
+        let seq = self.rem_seq;
+        self.rem_seq = self.rem_seq.wrapping_add(1);
+        for p in &parents {
+            self.skel_children.entry(*p).or_default().insert(hash);
+        }
+        self.skel_by_work.insert((work, seq, hash));
+        self.skel_by_owner.entry(owner).or_default().insert((seq, hash));
+        self.skeletons.insert(hash, Skeleton { work, parents, owner, seq });
+    }
+
+    fn drop_skeleton(&mut self, h: &[u8; 32]) -> Option<Skeleton> {
+        let s = self.skeletons.remove(h)?;
+        self.skel_by_work.remove(&(s.work, s.seq, *h));
+        if let Some(set) = self.skel_by_owner.get_mut(&s.owner) {
+            set.remove(&(s.seq, *h));
+            if set.is_empty() {
+                self.skel_by_owner.remove(&s.owner);
+            }
+        }
+        for p in &s.parents {
+            if let Some(c) = self.skel_children.get_mut(p) {
+                c.remove(h);
+                if c.is_empty() {
+                    self.skel_children.remove(p);
+                }
+            }
+        }
+        Some(s)
+    }
+
+    /// Remember `work` (a single path of evicted orphans) above `parent`,
+    /// combined with what is remembered there by `max` (idempotent: a re-sent
+    /// orphan never adds its work twice). Bounded: a peer at its share
+    /// replaces its own lowest entry, a full store its globally lowest one,
+    /// and only by an entry of greater work. Along an honest chain fetched
+    /// tip first, the newest link carries the greatest cumulative work, so
+    /// what gives way is the obsolete links above it.
+    fn remember_path(&mut self, parent: [u8; 32], work: u128, owner: Option<PeerId>) {
+        if self.remembered_cap == 0 || work == 0 {
+            return;
+        }
+        let old = self.paths.get(&parent).copied();
+        if old.is_some_and(|o| o.work >= work) {
+            return;
+        }
+        // Upgrading a key frees its own slot first.
+        if old.is_some() {
+            self.forget_path(&parent);
+        }
+        let per_owner = (self.remembered_cap / REMEMBERED_PEER_SHARE).max(1);
+        let owner_full = self.path_by_owner.get(&owner).map_or(0, |s| s.len()) >= per_owner;
+        let store_full = self.paths.len() >= self.remembered_cap;
+        if owner_full || store_full {
+            let victim = if owner_full {
+                self.path_by_owner.get(&owner).and_then(|s| s.iter().next().copied())
+            } else {
+                self.path_by_work.iter().next().copied()
+            };
+            match victim {
+                Some((lowest, _, v)) if work > lowest => self.forget_path(&v),
+                _ => {
+                    // Refused: what was remembered here stays.
+                    if let Some(o) = old {
+                        self.insert_path(parent, o);
+                    }
+                    return;
+                }
+            }
+        }
+        let seq = self.rem_seq;
+        self.rem_seq = self.rem_seq.wrapping_add(1);
+        self.insert_path(parent, RememberedPath { work, owner, seq });
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn insert_path(&mut self, parent: [u8; 32], r: RememberedPath) {
+        self.path_by_work.insert((r.work, r.seq, parent));
+        self.path_by_owner.entry(r.owner).or_default().insert((r.work, r.seq, parent));
+        self.paths.insert(parent, r);
+    }
+
+    fn forget_path(&mut self, h: &[u8; 32]) {
+        if let Some(r) = self.paths.remove(h) {
+            self.path_by_work.remove(&(r.work, r.seq, *h));
+            if let Some(set) = self.path_by_owner.get_mut(&r.owner) {
+                set.remove(&(r.work, r.seq, *h));
+                if set.is_empty() {
+                    self.path_by_owner.remove(&r.owner);
+                }
             }
         }
     }
 
     /// True iff evicted orphans announced work above `h` (it was a missing
-    /// parent of a chain we had buffered).
+    /// parent of an orphan we had buffered).
     pub fn remembers(&self, h: &[u8; 32]) -> bool {
-        self.remembered.contains_key(h)
+        self.paths.contains_key(h) || self.skel_children.contains_key(h)
     }
 
-    /// Drop the remembered work for `h` (the block is in the DAG now).
+    /// `h` is in the DAG now: drop what is remembered under it and its own
+    /// skeleton. Skeletons that waited on it stay (they may wait on other
+    /// parents, and they still announce work above blocks below `h`).
     pub fn forget(&mut self, h: &[u8; 32]) {
-        if self.remembered.remove(h).is_some() {
-            self.remembered_order.retain(|x| x != h);
-        }
+        self.forget_path(h);
+        self.drop_skeleton(h);
     }
 
-    /// POW-3: the greatest work of an orphan chain announced ABOVE `root`
-    /// (excluding `root` itself): the maximum, over the buffered orphans that
-    /// wait on `root` directly or through other buffered orphans, of the
-    /// summed header work along the waiting path, combined with the work
-    /// remembered from evicted orphans. Every orphan's proof was verified
-    /// against its bits before it was buffered, so this is work an announcer
+    /// POW-3: the work announced ABOVE `root` (excluding `root` itself) by
+    /// proof-of-work-verified orphans: the summed header work of the DISTINCT
+    /// orphans, buffered or kept as skeletons, that wait on `root` directly
+    /// or through one another, each counted once whatever the shape (a
+    /// diamond or a DAG-shaped fork is summed, never counted per path); or,
+    /// if greater, the work of the heaviest single path of buffered orphans
+    /// plus a remembered path (which lets a linear fork deeper than the
+    /// stores still prove its work). Never more than the work the announcers
     /// really spent. O(orphans above `root`).
+    #[allow(dead_code)] // the work rule uses the capped form; tests use this one
     pub fn announced_work_above(&self, root: &[u8; 32]) -> u128 {
+        self.announced_work_capped(root, u128::MAX)
+    }
+
+    /// [`Self::announced_work_above`], cut short once it reaches `need` (the
+    /// result is `>= need` iff the full value is).
+    pub fn announced_work_capped(&self, root: &[u8; 32], need: u128) -> u128 {
+        let sum = self.closure_work_above(root, need);
+        if sum >= need || self.paths.is_empty() {
+            return sum;
+        }
+        sum.max(self.path_work_above(root))
+    }
+
+    /// The summed work of the distinct buffered or skeleton orphans
+    /// transitively waiting on `root`; stops once it reaches `need`.
+    fn closure_work_above(&self, root: &[u8; 32], need: u128) -> u128 {
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        seen.insert(*root);
+        let mut queue: VecDeque<[u8; 32]> = VecDeque::new();
+        queue.push_back(*root);
+        let mut sum = 0u128;
+        while let Some(h) = queue.pop_front() {
+            let buffered = self.waiting_for.get(&h).into_iter().flatten();
+            let evicted = self.skel_children.get(&h).into_iter().flatten();
+            for c in buffered.chain(evicted) {
+                if !seen.insert(*c) {
+                    continue;
+                }
+                let w = match self.entries.get(c) {
+                    Some(e) => header_work(&e.block),
+                    None => match self.skeletons.get(c) {
+                        Some(sk) => sk.work,
+                        None => continue,
+                    },
+                };
+                sum = sum.saturating_add(w);
+                if sum >= need {
+                    return sum;
+                }
+                queue.push_back(*c);
+            }
+        }
+        sum
+    }
+
+    /// The greatest work of a single path of buffered orphans above `root`,
+    /// extended by the remembered path work at its end. O(buffered orphans
+    /// above `root`).
+    fn path_work_above(&self, root: &[u8; 32]) -> u128 {
         // Depth-first, a node is computed once all its buffered waiters are;
         // `in_progress` guards against (impossible) cycles.
         let mut memo: HashMap<[u8; 32], u128> = HashMap::new();
@@ -595,7 +855,7 @@ impl OrphanPool {
                     .collect())
                 .unwrap_or_default();
             if pending.is_empty() || !in_progress.insert(h) {
-                let mut best = self.remembered.get(&h).copied().unwrap_or(0);
+                let mut best = self.paths.get(&h).map_or(0, |r| r.work);
                 if let Some(ws) = waiters {
                     for w in ws {
                         if let Some(e) = self.entries.get(w) {
@@ -777,10 +1037,12 @@ pub enum WorkAdmission {
     /// Its own work bound reaches the threshold (every honest block near the
     /// tip, fork-losers within the window).
     NearTip,
-    /// A proof-of-work-verified orphan chain announced on top of it (buffered,
-    /// or remembered after eviction) brings the chain through it to the
-    /// threshold: a chain that carries the work, however deep it branches
-    /// (Bitcoin: headers with enough work make the blocks requested).
+    /// The proof-of-work-verified orphans announced on top of it (buffered,
+    /// or remembered after eviction; their work summed, each counted once —
+    /// see [`OrphanPool::announced_work_above`]) bring the chain through it
+    /// to the threshold: a chain that carries the work, however deep it
+    /// branches and whatever its shape (Bitcoin: headers with enough work
+    /// make the blocks requested).
     ChainBacked,
     /// A buffered orphan whose own bound reaches the threshold needs it as a
     /// parent (it merges a lower-work block); deep ones consume the
@@ -1040,9 +1302,20 @@ pub struct BlockIngress {
     /// `(selected tip, anti_dos_work_threshold)` of the last work check: the
     /// threshold only changes when the selected tip does.
     threshold_cache:  Option<(BlockHash, u128)>,
+    /// POW-3: blocks refused as `LowWork`, with the state they were refused
+    /// in (orphan-pool generation, DAG size, selected tip). The verdict can
+    /// only change with that state, so a re-sent refused block costs a map
+    /// lookup, not another walk over the orphans above it. Bounded, FIFO.
+    low_work_seen:    HashMap<[u8; 32], LowWorkState>,
+    low_work_order:   VecDeque<[u8; 32]>,
     /// DAG-6: bodies this node asked for (shared with the operator calls).
     wanted:           SharedWantedBodies,
 }
+
+type LowWorkState = (u64, usize, Option<BlockHash>);
+
+/// Bound of the LowWork verdict cache of [`BlockIngress`].
+pub const LOW_WORK_CACHE_MAX: usize = 4_096;
 
 impl Default for BlockIngress {
     fn default() -> Self {
@@ -1067,6 +1340,8 @@ impl BlockIngress {
             parent_fetch: ParentFetchTracker::new(),
             deep_budget: DeepBackfillBudget::new(),
             threshold_cache: None,
+            low_work_seen: HashMap::new(),
+            low_work_order: VecDeque::new(),
             wanted,
         }
     }
@@ -1091,6 +1366,17 @@ impl BlockIngress {
         self.orphans.is_waited_on(hash) || self.parent_fetch.is_awaited(hash) || self.orphans.remembers(hash)
     }
 
+    fn note_low_work(&mut self, hash: [u8; 32], state: LowWorkState) {
+        if self.low_work_seen.insert(hash, state).is_none() {
+            self.low_work_order.push_back(hash);
+            while self.low_work_order.len() > LOW_WORK_CACHE_MAX {
+                if let Some(old) = self.low_work_order.pop_front() {
+                    self.low_work_seen.remove(&old);
+                }
+            }
+        }
+    }
+
     /// The POW-3 work rule for a block whose parents are all known (cheap:
     /// DAG lookups and the orphan pool, no proof of work).
     pub fn work_check(
@@ -1101,6 +1387,10 @@ impl BlockIngress {
         now: Instant,
         dag: &GhostDAG,
     ) -> Result<WorkAdmission, DropReason> {
+        let state: LowWorkState = (self.orphans.generation(), dag.block_count(), dag.selected_tip());
+        if self.low_work_seen.get(hash) == Some(&state) {
+            return Err(DropReason::LowWork);
+        }
         let threshold = match (dag.selected_tip(), self.threshold_cache) {
             (Some(tip), Some((cached_tip, t))) if tip == cached_tip => t,
             (tip, _) => {
@@ -1113,10 +1403,18 @@ impl BlockIngress {
         let (chain_above, merge_lb) = if lb >= threshold {
             (0, 0)
         } else {
-            (self.orphans.announced_work_above(hash), self.orphans.best_waiter_lb(hash, lb, dag))
+            let chain_above = self.orphans.announced_work_capped(hash, threshold - lb);
+            if lb.saturating_add(chain_above) >= threshold {
+                (chain_above, 0) // ChainBacked: the merge bound is not needed
+            } else {
+                (chain_above, self.orphans.best_waiter_lb(hash, lb, dag))
+            }
         };
         match work_admission(lb, threshold, chain_above, merge_lb) {
-            WorkAdmission::LowWork => Err(DropReason::LowWork),
+            WorkAdmission::LowWork => {
+                self.note_low_work(*hash, state);
+                Err(DropReason::LowWork)
+            }
             WorkAdmission::MergeBacked => {
                 if backfill_decision(block.height, tip_h, true) == BackfillDecision::AwaitedDeep
                     && !self.deep_budget.allow_at(now)
@@ -1485,11 +1783,105 @@ mod tests {
         }
         assert_eq!(pool.len(), 3, "o6, o5, o4 were evicted");
         assert!(pool.remembers(&o(3)), "o4's eviction remembered the work above o3");
+        assert_eq!(pool.remembered_len(), (3, 3), "three skeletons, three remembered path links");
         assert_eq!(pool.announced_work_above(&x), 6 * w, "the whole announced chain, buffered + remembered");
         assert_eq!(pool.announced_work_above(&o(2)), 4 * w);
-        pool.forget(&o(3));
-        assert!(!pool.remembers(&o(3)));
-        assert_eq!(pool.announced_work_above(&x), 3 * w, "only the buffered o1..o3 are left");
+        // o1..o3 connect (removed from the pool, forgotten): the evicted part
+        // above o3 is still announced, by its skeletons.
+        for i in 1..=3 {
+            pool.remove(&o(i));
+            pool.forget(&o(i));
+        }
+        assert_eq!(pool.announced_work_above(&o(3)), 3 * w);
+        // Re-sending the evicted orphans (they are re-buffered, evicting one
+        // another) never adds their work twice.
+        for _round in 0..3 {
+            for i in (4..=6u64).rev() {
+                pool.insert(o(i), blk(vec![o(i - 1)], i), i, 1, None, false, &[o(i - 1)]);
+                assert_eq!(pool.announced_work_above(&o(3)), 3 * w);
+            }
+        }
+    }
+
+    #[test]
+    fn announced_work_sums_a_dag_shaped_chain_once() {
+        // Width-2 lattice of 40 levels above the missing root x: each level's
+        // two blocks have both blocks of the level below as parents. Its
+        // summed work is 80 blocks; any single path carries 40.
+        let w = core::bits_to_work(core::POW_LIMIT_BITS);
+        let x = h(9_000);
+        let node = |level: u64, side: u64| if level == 0 { x } else { h(10_000 + 2 * level + side) };
+        let build = |pool: &mut OrphanPool| {
+            for level in (1..=40u64).rev() {
+                for side in 0..2u64 {
+                    let parents = if level == 1 { vec![x] } else { vec![node(level - 1, 0), node(level - 1, 1)] };
+                    pool.insert(node(level, side), blk(parents.clone(), 2 * level + side), level, 1, None, false, &parents);
+                }
+            }
+        };
+        let mut big = OrphanPool::default();
+        build(&mut big);
+        assert_eq!(big.announced_work_above(&x), 80 * w, "every block once");
+        assert_eq!(big.path_work_above(&x), 40 * w, "the heaviest single path (the pre-fix measure)");
+        // Fetched tip first through a pool of 10: 70 of them evicted, still
+        // counted once each.
+        let mut small = OrphanPool::new(OrphanLimits {
+            max_entries: 10, max_bytes: 1 << 20, max_entries_per_peer: 10, max_bytes_per_peer: 1 << 20,
+        });
+        build(&mut small);
+        assert_eq!(small.len(), 10);
+        assert_eq!(small.announced_work_above(&x), 80 * w);
+        assert_eq!(small.announced_work_capped(&x, 5 * w), 5 * w, "stops once the need is met");
+        // A width-k diamond flood: k orphans on x and one merging them all.
+        let mut d = OrphanPool::default();
+        let k = 50u64;
+        let fan: Vec<[u8; 32]> = (0..k).map(|i| h(20_000 + i)).collect();
+        for (i, f) in fan.iter().enumerate() {
+            d.insert(*f, blk(vec![x], 30_000 + i as u64), 1, 1, None, false, &[x]);
+        }
+        d.insert(h(21_000), blk(fan.clone(), 31_000), 2, 1, None, false, &fan);
+        assert_eq!(d.announced_work_above(&x), (k + 1) as u128 * w, "no more than its summed proof of work");
+    }
+
+    #[test]
+    fn remembered_work_resists_a_parent_key_flood() {
+        // An honest chain of 30 orphans above x, fetched tip first from peer
+        // None through a pool of 10 (default remembered-store bounds).
+        let w = core::bits_to_work(core::POW_LIMIT_BITS);
+        let x = h(40_000);
+        let o = |i: u64| h(41_000 + i);
+        let mut pool = OrphanPool::new(OrphanLimits {
+            max_entries: 1_000, max_bytes: 1 << 30, max_entries_per_peer: 10, max_bytes_per_peer: 1 << 30,
+        });
+        let attacker = Some(PeerId::random());
+        // The audit's flood: 212 distinct attacker orphans, each with 256
+        // random missing parents (212 x 256 > REMEMBERED_WORK_MAX keys per
+        // cycle), cycled between every honest delivery.
+        let flood: Vec<core::Block> = (0..212u64)
+            .map(|j| blk((0..256u64).map(|p| h(1_000_000 + j * 1_000 + p)).collect(), 50_000 + j))
+            .collect();
+        let send_flood = |pool: &mut OrphanPool| {
+            for b in &flood {
+                let parents = b.header.parents.clone();
+                pool.insert(b.block_hash(), b.clone(), 1, 1, attacker, false, &parents);
+            }
+        };
+        for i in (1..=30u64).rev() {
+            let parent = if i == 1 { x } else { o(i - 1) };
+            pool.insert(o(i), blk(vec![parent], 60_000 + i), i, 1, None, false, &[parent]);
+            // Between every honest delivery the attacker cycles its flood
+            // (re-sent orphans are re-buffered and evicted again).
+            send_flood(&mut pool);
+        }
+        // Pre-fix: each attacker eviction pushed 256 keys into a 50,000-entry
+        // FIFO, flushing every honest link. Now an eviction remembers at most
+        // 8 keys, re-sends never create entries, a peer owns at most a
+        // quarter of each store and only greater work displaces another
+        // peer's entries.
+        assert_eq!(pool.announced_work_above(&x), 30 * w, "the honest chain's work is still announced above x");
+        let (skel, paths) = pool.remembered_len();
+        assert!(skel <= 20 + 212, "one skeleton per distinct evicted orphan: {skel}");
+        assert!(paths <= 20 + 212 * REMEMBERED_KEYS_PER_ORPHAN, "at most 8 keys per evicted orphan: {paths}");
     }
 
     #[test]
@@ -1522,7 +1914,7 @@ mod tests {
         pool.insert(h(1001), blk(vec![x], 1), 1, 1, None, false, &[x]);
         pool.insert(h(1002), blk(vec![x], 2), 1, 1, None, false, &[x]);
         pool.insert(h(1003), blk(vec![h(1001), h(1002), chain[50]], 3), 2, 1, None, false, &[h(1001), h(1002)]);
-        assert_eq!(pool.announced_work_above(&x), 2 * w, "longest waiting path x <- a <- c");
+        assert_eq!(pool.announced_work_above(&x), 3 * w, "a, b and c, each once (not the longest path)");
         // Merge-backed: c's bound comes from the known chain[50] (500).
         assert_eq!(pool.best_waiter_lb(&x, 7, &dag), 500 + w);
         // With x's own bound high, the path through x dominates.
