@@ -1549,6 +1549,15 @@ impl NetworkNode {
                                         }
                                     } else {
                                         selector.on_success(&peer);
+                                        // A peer without the block answered
+                                        // NotFound: ask another one (bounded by
+                                        // MAX_PULL_ATTEMPTS); the processor still
+                                        // sees the NotFound below (NET-9 count).
+                                        if sync_rr::retry_pull_elsewhere(&response) {
+                                            if let Some((p, _)) = entry {
+                                                requeue_pull(&mut pending_pulls, p, peer);
+                                            }
+                                        }
                                         match response {
                                             sync_rr::SyncResponse::Peers { peers } => {
                                                 // NET-11: solicited addresses go to the
