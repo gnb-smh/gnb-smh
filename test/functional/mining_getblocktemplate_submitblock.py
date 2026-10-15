@@ -5,14 +5,19 @@
   independent Python encoding of the consensus rules (messages.py).
 * A block assembled from the template is accepted, gets the id Python
   computes, becomes the tip and is relayed to the peer.
-* The next template builds on it immediately (no stale cached template).
+* The next template builds on it immediately (no stale cached template:
+  the template cache is keyed on the DAG tips).
 * A resubmission is refused as a duplicate.
-* A mempool transaction is offered with its fee; a coinbase that claims one
+* A mempool transaction is offered with its fee once the template cache
+  turns over (within TEMPLATE_CACHE_TTL, 5 s, of the pool change, as
+  Bitcoin Core); a coinbase that claims one
   satoshi more than subsidy + fees is refused and not relayed; the exact
   claim is accepted and confirms the transaction on both nodes.
 * Two blocks on the same template (a DAG fork) are both accepted, and the
   next template merges them.
 """
+
+import time
 
 from test_framework.authproxy import JSONRPCException
 from test_framework.messages import (
@@ -53,17 +58,18 @@ class GetBlockTemplateTest(GnbTestFramework):
         assert_equal(tmpl["coinbase_script_sig_prefix"],
                      coinbase_commitment(block.height, block.parents, block.txs).hex())
 
-        self.log.info("a block built from the template is accepted, becomes the tip and is relayed")
+        self.log.info("a block built from the template is accepted, becomes the tip; the next template builds on it at once")
+        assert_equal(n0.getblocktemplate()["parents"], tmpl["parents"])  # cached, keyed on the current tips
         h1 = n0.submit_block(block)
-        assert_equal(h1, block.hash_hex())
-        assert_equal(n0.tip(), h1)
-        self.sync_blocks()
-        assert_equal(n1.getblock(h1)["height"], start_height + 1)
-
-        self.log.info("the next template builds on the submitted block at once")
-        tmpl2 = n0.getblocktemplate()
+        tmpl2 = n0.getblocktemplate()  # well inside the cache TTL: only the new tip can miss it
         assert_equal(tmpl2["parents"], [h1], "template must not be served stale after a new tip")
         assert_equal(tmpl2["height"], start_height + 2)
+        assert_equal(h1, block.hash_hex())
+        assert_equal(n0.tip(), h1)
+
+        self.log.info("the block is relayed")
+        self.sync_blocks()
+        assert_equal(n1.getblock(h1)["height"], start_height + 1)
 
         self.log.info("resubmitting the same block is refused as a duplicate")
         assert_raises_rpc_error("duplicate block", n0.submitblock, block.serialize().hex())
@@ -80,6 +86,10 @@ class GetBlockTemplateTest(GnbTestFramework):
         txid = n1.cli_send(wallet, RECIPIENT, "1.5")
         self.sync_mempools()
         assert_equal(n0.mempool(), [txid])
+        offered = time.monotonic()
+        wait_until(lambda: [t["txid"] for t in n0.getblocktemplate()["transactions"]] == [txid], timeout=15,
+                   desc="the template offers the pool transaction")
+        assert_true(time.monotonic() - offered < 5 + 3, "a pool change shows in the template within the 5 s TTL")
         tmpl3 = n0.getblocktemplate()
         assert_equal([t["txid"] for t in tmpl3["transactions"]], [txid])
         fee = int(tmpl3["transactions"][0]["fee"])

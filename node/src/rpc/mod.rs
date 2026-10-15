@@ -170,6 +170,9 @@ struct AppState {
     allowed_hosts:           Arc<Vec<String>>,
     trust_loopback:          bool,
     heavy_gate:              Arc<HeavyGate>,
+    /// L-8: `getblocktemplate`'s own cache and build permit
+    /// (`gated_dispatch`), so an analytics scan never answers a miner "busy".
+    template_gate:           Arc<HeavyGate>,
     // B5f pool seam: submitblock hook (None = method returns "not wired").
     submit_block:            Option<Arc<SubmitBlockFn>>,
 }
@@ -199,12 +202,10 @@ const HEAVY_READ_METHODS: &[&str] = &[
     // block body, and additionally share the single-flight TTL cache.
     "getdifficultyhistory",
     "getblocktimepercentiles",
-    // L-8 (audit): `getblocktemplate` is expensive and stateful: it is
-    // privileged (see
-    // `auth::WRITE_METHODS`) and now shares the same short-TTL/single-flight
-    // discipline as the analytics methods above, closing the "poll it in a
-    // loop and force a fresh mempool drain + ancestry walk every time" cost.
-    "getblocktemplate",
+    // L-8 (audit): `getblocktemplate` is bounded the same way (cache +
+    // single flight) but through its OWN gate (`AppState::template_gate`,
+    // `gated_dispatch`): sharing this one's single scan permit answered a
+    // miner "busy" whenever a public analytics scan was in flight.
 ];
 
 /// NET-13: every method name `dispatch` implements. Metrics label anything
@@ -262,6 +263,13 @@ pub fn resolve_bind_address(host: &str, port: u16) -> Result<std::net::SocketAdd
 
 /// TTL for cached heavy-read results. Analytics freshness of ~1 block is fine.
 const HEAVY_READ_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// L-8: how long a `getblocktemplate` result is served while the DAG tips are
+/// unchanged. A new tip misses the cache at once (`template_cache_key`); a
+/// mempool change shows in the template within this time, which bounds the
+/// rebuilds a polling miner causes on a busy pool to one per this interval
+/// (Bitcoin Core rebuilds on a new tip, and on a mempool change at most every
+/// 5 s).
+const TEMPLATE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Cap on distinct cached keys (parameterised methods could otherwise grow
 /// the map unboundedly — the exact DoS shape this gate exists to close).
 const HEAVY_READ_CACHE_MAX_KEYS: usize = 64;
@@ -429,6 +437,7 @@ pub async fn start_rpc_server(
         allowed_hosts:           Arc::new(config.allowed_hosts.clone()),
         trust_loopback:          config.trust_loopback,
         heavy_gate:              Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
+        template_gate:           Arc::new(HeavyGate::new(TEMPLATE_CACHE_TTL)),
         submit_block,
     };
 
@@ -550,40 +559,46 @@ fn selected_tip_height(state: &AppState) -> u64 {
         .unwrap_or(0)
 }
 
-/// HeavyGate cache key of a heavy method call: the method and its params,
-/// and for `getblocktemplate` also the state the template is a function of
-/// (the DAG's tips and block count, the mempool's transaction set). Keyed by
-/// method and params alone, a template was served for up to
-/// HEAVY_READ_CACHE_TTL after a new block or transaction arrived: parents a
-/// block behind and transactions already confirmed, so an external miner kept
-/// building forks of the tip (test/functional/mining_getblocktemplate_submitblock.py).
-/// Bitcoin Core likewise rebuilds its template whenever the tip changes. The
-/// single-flight bound of the gate is unchanged, and the method is
-/// auth-gated (`auth::WRITE_METHODS`).
-fn heavy_cache_key(method: &str, params: Option<&Value>, state: &AppState) -> String {
-    let mut key = format!("{}|{}", method, params.map(|p| p.to_string()).unwrap_or_default());
-    if method == "getblocktemplate" {
-        use sha3::{Digest as _, Sha3_256};
-        let (mut tips, blocks) = {
-            let dag = state.dag.read();
-            (dag.tips(), dag.block_count())
-        };
-        tips.sort_unstable();
-        let mut h = Sha3_256::new();
-        for t in &tips {
-            h.update(t);
-        }
-        // Order-independent digest of the pool's transaction set.
-        let mut pool = [0u8; 32];
-        for txid in state.mempool.txids() {
-            for (a, b) in pool.iter_mut().zip(txid) {
-                *a ^= b;
-            }
-        }
-        key.push_str(&format!("|tips={}|blocks={}|pool={}:{}",
-            hex::encode(h.finalize()), blocks, state.mempool.size(), hex::encode(pool)));
+/// Cache key of a `getblocktemplate` call: its params and the state the
+/// template's parents and height are a function of, the DAG's tips and block
+/// count, so a new block misses the cache at once. Keyed by params alone, a
+/// template was served for up to 30 s after a new block: parents a block
+/// behind, so an external miner kept building forks of the tip
+/// (test/functional/mining_getblocktemplate_submitblock.py). Mempool changes
+/// are not in the key: they show in the template within
+/// `TEMPLATE_CACHE_TTL` (a pool-digest key missed on every admission, so a
+/// miner polling a busy pool rebuilt the template on every call, and
+/// computing the digest copied every pool txid). O(tips).
+fn template_cache_key(params: Option<&Value>, state: &AppState) -> String {
+    use sha3::{Digest as _, Sha3_256};
+    let (mut tips, blocks) = {
+        let dag = state.dag.read();
+        (dag.tips(), dag.block_count())
+    };
+    tips.sort_unstable();
+    let mut h = Sha3_256::new();
+    for t in &tips {
+        h.update(t);
     }
-    key
+    format!("getblocktemplate|{}|tips={}|blocks={}",
+        params.map(|p| p.to_string()).unwrap_or_default(), hex::encode(h.finalize()), blocks)
+}
+
+/// Run one dispatch `f` behind the bound its method needs (L-8 / H-R3-5):
+/// `getblocktemplate` through its own gate (`template_cache_key`,
+/// `TEMPLATE_CACHE_TTL`), the heavy analytics reads through the HeavyGate
+/// (method|params key, `HEAVY_READ_CACHE_TTL`), everything else directly.
+/// Separate gates: a public analytics scan holding the HeavyGate's single
+/// permit must not answer a miner's template request "busy".
+fn gated_dispatch<F: FnOnce() -> Value>(method: &str, params: Option<&Value>, state: &AppState, f: F) -> Value {
+    if method == "getblocktemplate" {
+        state.template_gate.run(template_cache_key(params, state), f)
+    } else if HeavyGate::is_heavy(method) {
+        let key = format!("{}|{}", method, params.map(|p| p.to_string()).unwrap_or_default());
+        state.heavy_gate.run(key, f)
+    } else {
+        f()
+    }
 }
 
 async fn handle_rpc(
@@ -693,16 +708,12 @@ async fn handle_rpc(
             let d_params = params.cloned();
             let d_handle = tokio::runtime::Handle::current();
             let join_handle = tokio::task::spawn_blocking(move || {
-                // R3-audit H-R3-5: heavy O(chain) analytics reads go through
-                // the HeavyGate — TTL cache + at most one scan in flight.
-                if HeavyGate::is_heavy(&d_method) {
-                    let key = heavy_cache_key(&d_method, d_params.as_ref(), &d_state);
-                    d_state.heavy_gate.clone().run(key, || {
-                        d_handle.block_on(dispatch(&d_method, d_params.as_ref(), &d_state))
-                    })
-                } else {
+                // R3-audit H-R3-5 / L-8: heavy O(chain) analytics reads and
+                // getblocktemplate go through their gates — TTL cache + at
+                // most one computation in flight per gate.
+                gated_dispatch(&d_method, d_params.as_ref(), &d_state, || {
                     d_handle.block_on(dispatch(&d_method, d_params.as_ref(), &d_state))
-                }
+                })
             });
             // L-9 (audit): the outer `TimeoutLayer` (tower-http) previously
             // was the ONLY thing standing between a stuck dispatch and a
@@ -2331,6 +2342,7 @@ mod audit_2026_10_rpc_tests {
             allowed_hosts: Arc::new(Vec::new()),
             trust_loopback: false,
             heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
+            template_gate: Arc::new(HeavyGate::new(TEMPLATE_CACHE_TTL)),
             submit_block: None,
         };
         (tmp, state)
@@ -2368,21 +2380,16 @@ mod audit_2026_10_rpc_tests {
         assert_eq!(arms, known);
     }
 
-    /// A cached `getblocktemplate` never outlives the tips or the mempool it
-    /// was built from: its HeavyGate key changes with a new block and with a
-    /// new pool transaction, while other heavy methods keep the plain
-    /// method|params key. Functional counterpart:
-    /// test/functional/mining_getblocktemplate_submitblock.py.
+    /// A cached `getblocktemplate` never outlives the tips it was built on:
+    /// its key changes with a new block. A pool transaction does not change
+    /// it (the template catches up within TEMPLATE_CACHE_TTL), so a miner
+    /// polling a busy pool does not rebuild on every call. Functional
+    /// counterpart: test/functional/mining_getblocktemplate_submitblock.py.
     #[test]
-    fn template_cache_key_follows_tips_and_mempool() {
+    fn template_cache_key_follows_the_tips_not_the_pool() {
         let (_tmp, state) = state_with_chain(3);
-        let k0 = heavy_cache_key("getblocktemplate", None, &state);
-        assert_eq!(k0, heavy_cache_key("getblocktemplate", None, &state), "stable while nothing changes");
-        assert_eq!(heavy_cache_key("getchainstats", None, &state), "getchainstats|");
-
-        state.dag.write().add_block([9; 32], vec![[3; 32]], 2_000, 1).unwrap();
-        let k1 = heavy_cache_key("getblocktemplate", None, &state);
-        assert_ne!(k1, k0, "a new tip must miss the cached template");
+        let k0 = template_cache_key(None, &state);
+        assert_eq!(k0, template_cache_key(None, &state), "stable while nothing changes");
 
         let tx = crate::core::Transaction {
             version: 1,
@@ -2391,9 +2398,36 @@ mod audit_2026_10_rpc_tests {
             locktime: 0,
         };
         state.mempool.add(tx, 1_000_000).expect("pool accepts the fixture");
-        let k2 = heavy_cache_key("getblocktemplate", None, &state);
-        assert_ne!(k2, k1, "a new pool transaction must miss the cached template");
-        assert_eq!(heavy_cache_key("getchainstats", None, &state), "getchainstats|");
+        assert_eq!(template_cache_key(None, &state), k0, "a pool change alone keeps the key");
+
+        state.dag.write().add_block([9; 32], vec![[3; 32]], 2_000, 1).unwrap();
+        assert_ne!(template_cache_key(None, &state), k0, "a new tip must miss the cached template");
+        assert_ne!(template_cache_key(Some(&json!([{"x": 1}])), &state), template_cache_key(None, &state));
+    }
+
+    /// getblocktemplate has its own gate: while a public analytics scan
+    /// holds the HeavyGate's permit, a template is still built (it used to
+    /// be answered "busy"), and analytics are still refused; a second
+    /// template call with the same tips is served from the template cache,
+    /// a new tip rebuilds at once.
+    #[test]
+    fn template_requests_are_not_blocked_by_an_analytics_scan() {
+        let (_tmp, state) = state_with_chain(3);
+        let builds = std::cell::Cell::new(0u32);
+        let build = || { builds.set(builds.get() + 1); json!({"template": builds.get()}) };
+        let scan = state.heavy_gate.scan.lock(); // an analytics scan in flight
+        assert_eq!(gated_dispatch("getblocktemplate", None, &state, build), json!({"template": 1}));
+        let refused = gated_dispatch("getrichlist", None, &state, || json!({"should": "not run"}));
+        assert!(refused["error"].as_str().unwrap_or("").contains("busy"), "{refused}");
+        drop(scan);
+        assert_eq!(gated_dispatch("getblocktemplate", None, &state, build), json!({"template": 1}),
+            "same tips: served from the template cache");
+        state.dag.write().add_block([9; 32], vec![[3; 32]], 2_000, 1).unwrap();
+        assert_eq!(gated_dispatch("getblocktemplate", None, &state, build), json!({"template": 2}),
+            "a new tip rebuilds at once");
+        assert_eq!(builds.get(), 2);
+        assert_eq!(gated_dispatch("getblockcount", None, &state, || json!(7)), json!(7));
+        assert!(TEMPLATE_CACHE_TTL <= std::time::Duration::from_secs(5));
     }
 
     #[test]
@@ -2579,6 +2613,7 @@ mod block_rules_template_tests {
             allowed_hosts: Arc::new(Vec::new()),
             trust_loopback: false,
             heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
+            template_gate: Arc::new(HeavyGate::new(TEMPLATE_CACHE_TTL)),
             submit_block: None,
         };
         (tmp, state)

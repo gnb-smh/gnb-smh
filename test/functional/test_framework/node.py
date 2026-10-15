@@ -249,8 +249,46 @@ class TestNode:
 
     # ── Mining through getblocktemplate / submitblock ────────────────────
 
+    # The node serves a cached getblocktemplate while its DAG tips are
+    # unchanged and rebuilds it for a mempool change at most this often
+    # (node/src/rpc/mod.rs TEMPLATE_CACHE_TTL, as Bitcoin Core's 5 s).
+    TEMPLATE_CACHE_TTL = 5
+
     def get_template(self) -> dict:
         return self.rpc.getblocktemplate()
+
+    def fresh_template(self) -> dict:
+        """A template that offers every transaction now in the mempool, as
+        a block mined "now" would. Right after a transaction arrives the
+        cached template can lack it for up to TEMPLATE_CACHE_TTL; poll until
+        it is offered, or until the cache has turned over once (then the
+        node's template is the answer, whatever it leaves out)."""
+        deadline = time.monotonic() + self.TEMPLATE_CACHE_TTL + 1
+        while True:
+            pool = set(self.mempool())
+            tmpl = self.get_template()
+            if pool <= {t["txid"] for t in tmpl["transactions"]} or time.monotonic() >= deadline:
+                return tmpl
+            time.sleep(0.25)
+
+    def submit_block(self, block: Block, *, max_nonces: int = 32) -> str:
+        """Submit `block`, searching nonces from block.nonce upward while the
+        node answers "invalid PoW". Under test-pow-limit the target is about
+        (1 - 2^-16) * 2^256, so the first nonce is almost always valid; the
+        node computes GnB-SMH, the test never has to. Returns the block hash.
+        Any other rejection raises JSONRPCException."""
+        for _ in range(max_nonces):
+            try:
+                res = self.rpc.submitblock(block.serialize().hex())
+            except JSONRPCException as e:
+                if "invalid PoW" in e.message or "proof of work" in e.message:
+                    block.nonce += 1
+                    continue
+                raise
+            if res.get("hash") != block.hash_hex():
+                raise AssertionFailure(f"submitblock hash {res.get('hash')} != {block.hash_hex()}")
+            return res["hash"]
+        raise AssertionFailure(f"no valid nonce in {max_nonces} tries (is this a test-pow-limit build?)")
 
     def submit_block(self, block: Block, *, max_nonces: int = 32) -> str:
         """Submit `block`, searching nonces from block.nonce upward while the
@@ -274,11 +312,12 @@ class TestNode:
     def generate(self, n: int, address: str, *, extra: bytes = b"") -> list:
         """Mine `n` blocks paying `address`, one getblocktemplate + submitblock
         each, waiting for every block to become the selected tip (no
-        background miner involved: deterministic)."""
+        background miner involved: deterministic). Each block includes the
+        mempool as it is when the block is mined (`fresh_template`)."""
         spk = address_to_script_pubkey(address)
         hashes = []
         for _ in range(n):
-            tmpl = self.get_template()
+            tmpl = self.fresh_template()
             block = block_from_template(tmpl, spk, extra=extra)
             h = self.submit_block(block)
             hashes.append(h)

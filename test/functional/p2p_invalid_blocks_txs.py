@@ -67,7 +67,7 @@ class InvalidBlocksTxsTest(GnbTestFramework):
         self.rejected.append(block.hash_hex())
 
     def template(self):
-        return self.nodes[0].getblocktemplate()
+        return self.nodes[0].fresh_template()  # offers T once it is in the pool
 
     # ── test ─────────────────────────────────────────────────────────────
 
