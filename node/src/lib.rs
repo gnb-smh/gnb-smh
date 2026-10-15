@@ -98,8 +98,9 @@ mod build_profile_tests {
     /// profile change ever turns them off (docs/testing/SANITIZERS.md).
     #[test]
     fn test_build_traps_integer_overflow_and_debug_assertions() {
-        assert!(cfg!(debug_assertions), "lib tests must run with debug assertions");
-        let r = std::panic::catch_unwind(|| std::hint::black_box(u64::MAX) + std::hint::black_box(1u64));
+        let d = std::panic::catch_unwind(|| debug_assert!(std::hint::black_box(false)));
+        assert!(d.is_err(), "debug_assert! did not fire: lib tests must run with debug assertions");
+        let r =std::panic::catch_unwind(|| std::hint::black_box(u64::MAX) + std::hint::black_box(1u64));
         assert!(r.is_err(), "integer overflow did not panic: overflow-checks are off for the node lib");
     }
 }

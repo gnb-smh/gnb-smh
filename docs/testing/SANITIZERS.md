@@ -220,8 +220,9 @@ release profile sets `overflow-checks = true` explicitly. `cargo test -p gnb
 - `gnb-smh` `tests::integer_overflow_panics_in_this_profile`, which CI also
   runs with `--release` (job `consensus-crates`).
 
-Mutation checks: `[profile.dev.package.gnb] overflow-checks = false` fails
-the node test; `CARGO_PROFILE_DEV_OVERFLOW_CHECKS=false` and, with
+Mutation checks: `[profile.dev.package.gnb] overflow-checks = false` and,
+separately, `debug-assertions = false` (a `debug_assert!` that must fire)
+fail the node test; `CARGO_PROFILE_DEV_OVERFLOW_CHECKS=false` and, with
 `--release`, `CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=false` fail the gnb-smh
 test.
 
