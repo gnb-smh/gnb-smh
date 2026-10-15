@@ -16,6 +16,11 @@ env:
   # runner's disk is small. Incremental builds are useless on a fresh runner.
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_INCREMENTAL: "0"
+  # The nightly of the sanitizers and miri jobs (scripts/sanitizers.sh reads
+  # it, and defaults to the same date). Pinned: a nightly without Miri, or a
+  # rustc change to -Zsanitizer, must not change their result with no change
+  # here. Bump it on purpose, together with the script's default.
+  SANITIZER_NIGHTLY: nightly-2026-10-14
 
 jobs:
   python-reference:
@@ -166,15 +171,18 @@ jobs:
   # the Rust code (nightly -Zsanitizer=address) AND the PQClean C code that
   # the pqcrypto build scripts compile (clang -fsanitize=address); then
   # UndefinedBehaviorSanitizer instruments that C code (gcc, no recovery).
-  # Each mode checks that every PQClean archive really is instrumented.
+  # Each mode checks that every PQClean archive really is instrumented. The
+  # runner has AVX2, so ML-DSA runs its AVX2 code there; the last step runs
+  # the UBSan ML-DSA tests on qemu's Nehalem CPU (no AVX2) so the clean ML-DSA
+  # C code (non-AVX2 nodes, the wasm32 wallet) runs under UBSan too.
   sanitizers:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Nightly toolchain
-        run: rustup toolchain install nightly --profile minimal
-      - name: clang and the UBSan runtime
-        run: sudo apt-get update && sudo apt-get install -y clang libubsan1
+      - name: Nightly toolchain (pinned)
+        run: rustup toolchain install "$SANITIZER_NIGHTLY" --profile minimal
+      - name: clang, the UBSan runtime and qemu-user
+        run: sudo apt-get update && sudo apt-get install -y clang libubsan1 qemu-user
       # Older ASan runtimes crash under the runner kernel's 32-bit mmap ASLR
       # entropy; 28 bits is what they support. Harmless for current ones.
       - name: ASLR entropy compatible with the ASan shadow layout
@@ -183,28 +191,37 @@ jobs:
         run: sh scripts/sanitizers.sh asan
       - name: UndefinedBehaviorSanitizer (PQClean C under gnb-crypto and pqcrypto-internals)
         run: sh scripts/sanitizers.sh ubsan
+      - name: UBSan on a CPU without AVX2 (clean ML-DSA C code; ML-DSA, wallet signing and ACVP tests)
+        run: sh scripts/sanitizers.sh ubsan-noavx2
 
   # Miri: undefined behaviour in the pure-Rust consensus arithmetic (gnb-smh
   # difficulty/compact/ASERT/work, gnb-crypto core::limits, tokenomics,
   # block_rules, sighash, activation) and in the unsafe RNG override of
-  # pqcrypto-internals; then gnb-smh on a 32-bit and a big-endian target.
-  # Miri-incompatible tests carry #[cfg_attr(miri, ignore = "<why>")].
+  # pqcrypto-internals; then gnb-smh (with the Python PoW vectors) on a
+  # 32-bit and a big-endian target, and the wasm wallet's C ABI on i686.
+  # Miri-incompatible tests carry #[cfg_attr(miri, ignore = "<why>")]; the
+  # script fails a step whose passed-test count drops below its minimum.
   miri:
     runs-on: ubuntu-latest
     timeout-minutes: 120   # local reference: about 15 minutes in total
     steps:
       - uses: actions/checkout@v4
-      - name: Nightly toolchain with Miri
+      - name: Nightly toolchain with Miri (pinned)
         run: |
-          rustup toolchain install nightly --profile minimal --component miri,rust-src
-          cargo +nightly miri setup
+          rustup toolchain install "$SANITIZER_NIGHTLY" --profile minimal --component miri,rust-src
+          cargo +"$SANITIZER_NIGHTLY" miri setup
+      # gnb-wallet-wasm's dependencies compile the PQClean C for i686 in their
+      # build scripts (Miri never executes it).
+      - name: multilib gcc
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
       - name: Miri (host)
         run: sh scripts/sanitizers.sh miri
-      - name: Miri (gnb-smh on i686 and s390x)
+      - name: Miri (gnb-smh on i686 and s390x, gnb-wallet-wasm C ABI on i686)
         run: sh scripts/sanitizers.sh miri-cross
 
   # 32-bit build and tests (usize = 32 bits: the CRY-8 overflow class) of the
-  # consensus crates on i686-unknown-linux-gnu, pinned toolchain.
+  # consensus crates and the wasm wallet core on i686-unknown-linux-gnu,
+  # pinned toolchain.
   i686:
     runs-on: ubuntu-latest
     steps:
@@ -214,7 +231,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y gcc-multilib
           cargo --version   # installs the rust-toolchain.toml toolchain
           rustup target add i686-unknown-linux-gnu
-      - name: gnb-smh, gnb-crypto, coherence-core, pqcrypto-internals on i686
+      - name: gnb-smh, gnb-crypto, coherence-core, pqcrypto-internals, gnb-wallet-wasm on i686
         run: sh scripts/sanitizers.sh i686
 
   # Builds every cargo-fuzz target (node/fuzz, nightly + libFuzzer) and runs

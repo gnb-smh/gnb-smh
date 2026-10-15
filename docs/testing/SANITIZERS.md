@@ -10,16 +10,30 @@ that command.
 | --- | --- | --- | --- |
 | `asan` | AddressSanitizer + LeakSanitizer over the test suites of `gnb-smh`, `gnb-crypto` (alone) and `pqcrypto-internals`, with the Rust code and the PQClean C code instrumented | `sanitizers` | pass; one leak report (in two tests, F1), fixed |
 | `ubsan` | UndefinedBehaviorSanitizer over the PQClean C code, under the `gnb-crypto` and `pqcrypto-internals` test suites | `sanitizers` | pass; no report |
+| `ubsan-noavx2` | the UBSan ML-DSA, wallet-signing and ACVP tests on qemu's Nehalem CPU (no AVX2), so the clean ML-DSA C code runs | `sanitizers` | pass; no report |
 | `miri` | Miri over the pure-Rust consensus arithmetic and the unsafe RNG override | `miri` | pass; no undefined behaviour |
-| `miri-cross` | Miri over `gnb-smh` on `i686` (32-bit) and `s390x` (big-endian) | `miri` | pass |
-| `i686` | the full test suites of `gnb-smh`, `gnb-crypto`, `coherence-core`, `pqcrypto-internals` on `i686-unknown-linux-gnu` | `i686` | pass; one failure (a 64-bit assumption in a test, F2), fixed; a concurrent run exposed a temp-file race between test processes (F3), fixed |
+| `miri-cross` | Miri over `gnb-smh` (including the Python PoW vectors) on `i686` (32-bit) and `s390x` (big-endian), and over the wasm wallet's C ABI on `i686` | `miri` | pass |
+| `i686` | the full test suites of `gnb-smh`, `gnb-crypto`, `coherence-core`, `pqcrypto-internals` and `gnb-wallet-wasm` on `i686-unknown-linux-gnu` | `i686` | pass; one failure (a 64-bit assumption in a test, F2), fixed; a concurrent run exposed a temp-file race between test processes (F3), fixed; the wallet's `minfee` truncated sizes on 32-bit targets (F4), fixed |
 | (default) | node lib tests with debug assertions and overflow checks | `workspace-test` | pass (288 tests); now guarded by a test |
 | (local only) | parking_lot deadlock detection over the node's lock-using tests | none (needs new dependencies, see [Deadlock detection](#deadlock-detection)) | no deadlock in 288 lib and 58 integration tests; positive control detected |
 
 Local environment of the results below: Ubuntu 24.04, x86_64 with AVX2;
-pinned toolchain 1.94.1; nightly `rustc 1.101.0-nightly (822182db4
-2026-10-13)` with the matching Miri; clang 18.1.3; gcc 13.3.0 with
-`gcc-multilib`.
+pinned toolchain 1.94.1; nightly `nightly-2026-10-14` (`rustc
+1.101.0-nightly (822182db4 2026-10-13)`) with the matching Miri; clang
+18.1.3; gcc 13.3.0 with `gcc-multilib`; qemu-user 8.2.
+
+The nightly is pinned: the script defaults to `nightly-2026-10-14` and CI
+sets the same `SANITIZER_NIGHTLY`, so a nightly without Miri, or a rustc
+change to `-Zsanitizer`, cannot change a result without a change in the
+repository. Bump both on purpose (`SANITIZER_NIGHTLY=nightly-<date> sh
+scripts/sanitizers.sh <mode>` tries a newer one locally).
+
+The Miri modes and `ubsan-noavx2` select tests by name filter or by
+`cfg_attr(miri, ignore)`, so a renamed module could leave a green step that
+ran nothing (`0 passed` exits 0). Each of those commands therefore runs
+through `expect_passed <minimum>`, which sums the `N passed` of every `test
+result:` line and fails below the minimum; the minimums are the current
+counts (below).
 
 Each mode builds into its own directory, `$SANITIZER_TARGET_DIR/<mode>`
 (default `target/sanitizers/<mode>`), so sanitizer flags never reach the
@@ -30,7 +44,7 @@ the real ASERT path runs.
 ## AddressSanitizer and LeakSanitizer (`asan`)
 
 ```sh
-rustup toolchain install nightly --profile minimal
+rustup toolchain install nightly-2026-10-14 --profile minimal
 sh scripts/sanitizers.sh asan
 ```
 
@@ -82,8 +96,8 @@ Limits:
 - On an AVX2 machine `pqcrypto-mldsa` dispatches ML-DSA to its AVX2 code at
   run time, so the clean ML-DSA code is linked and instrumented but not
   executed by this job. It runs natively in the `i686` job (no AVX2 build) and
-  was run under UBSan on an emulated CPU without AVX2 (next section). Falcon
-  is always the clean variant (`scripts/falcon-clean-guard.sh`).
+  under UBSan on an emulated CPU without AVX2 (`ubsan-noavx2`, next section).
+  Falcon is always the clean variant (`scripts/falcon-clean-guard.sh`).
 
 ## UndefinedBehaviorSanitizer for the C code (`ubsan`)
 
@@ -108,47 +122,70 @@ see below) and Miri cover the Rust side.
 Result: `gnb-crypto` (280 unit, 21 integration, doctests) and
 `pqcrypto-internals` pass with no report.
 
-No-AVX2 run: the same UBSan-instrumented `gnb-crypto` unit-test binary was
-run under `qemu-x86_64 -cpu Nehalem` (qemu-user 8.2), where
-`is_x86_feature_detected!("avx2")` is false, so ML-DSA-65 takes the clean
-code path. Result: 280 passed (1 ignored), no UBSan report, in 575 s under
-emulation. This run is local only (not in CI):
-
-```sh
-sudo apt-get install qemu-user
-cd crates/gnb-crypto   # where cargo runs this crate's tests
-UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 qemu-x86_64 -cpu Nehalem \
-  ../../target/sanitizers/ubsan/x86_64-unknown-linux-gnu/debug/deps/gnb_crypto-<hash>
-```
-
 Positive control: changing the shift in `keccak_inc_absorb` to
 `8 * ((s_inc[25] + i) & 0x0F)` is reported as `cfiles/fips202.c:459:55:
 runtime error: shift exponent 64 is too large for 64-bit type 'long unsigned
 int'` and fails the test run.
 
+### The clean ML-DSA code without AVX2 (`ubsan-noavx2`)
+
+```sh
+sudo apt-get install qemu-user
+sh scripts/sanitizers.sh ubsan      # builds the UBSan test binaries
+sh scripts/sanitizers.sh ubsan-noavx2
+```
+
+The `ubsan` binaries run under `qemu-x86_64 -cpu Nehalem`, a CPU model
+without AVX/AVX2, where `is_x86_feature_detected!("avx2")` is false and
+`pqcrypto-mldsa` takes the clean ML-DSA C code: the code non-AVX2 x86_64
+nodes run and the code compiled into the wasm32 wallet. Selection (from
+`crates/gnb-crypto`, where cargo runs its tests): the `gnb-crypto` lib tests
+`crypto::` (hybrid key generation, signing, verification, KATs),
+`wallet::payment::`, `wallet::legacy_sign_tests::`,
+`wallet::sighash_v3_signers::` (63 passed, 1 ignored; minimum 63) and the
+`acvp_mldsa` integration test (the official ACVP ML-DSA-65 vectors; 3
+passed; minimum 3). About 35 s locally; the whole lib suite took 575 s under
+emulation (280 passed, no report; mostly keystore KDFs with no ML-DSA in
+them), so it is not in CI.
+
+Positive control (on a scratch copy, `[patch.crates-io]` to a copy of
+`pqcrypto-mldsa` 0.1.2): a signed overflow added to
+`PQCLEAN_MLDSA65_CLEAN_ntt` (`volatile int32_t p = 0x7fffffff; p = p +
+(a[0] != 0x7fffffff);`, no effect on the results) is reported by
+`ubsan-noavx2` as `ml-dsa-65/clean/ntt.c:54:67: runtime error: signed
+integer overflow: 1 + 2147483647 cannot be represented in type 'int'` in
+`PQCLEAN_MLDSA65_CLEAN_ntt` <- `PQCLEAN_MLDSA65_CLEAN_poly_ntt`, by both the
+lib and the ACVP binary, while the same UBSan binaries run natively (AVX2,
+what the `ubsan` step does) pass, 63 and 3 tests.
+
 ## Miri (`miri`, `miri-cross`)
 
 ```sh
-rustup toolchain install nightly --profile minimal --component miri,rust-src
+rustup toolchain install nightly-2026-10-14 --profile minimal --component miri,rust-src
 sh scripts/sanitizers.sh miri
+sudo apt-get install gcc-multilib   # miri-cross: gnb-wallet-wasm's build scripts compile C for i686
 sh scripts/sanitizers.sh miri-cross
 ```
 
-`MIRIFLAGS=-Zmiri-strict-provenance`; isolation stays on (no file system or
-clock access). What runs:
+`MIRIFLAGS=-Zmiri-strict-provenance` (`-Zmiri-permissive-provenance` for
+the wasm wallet's ABI, whose pointers cross as integers, as they do from
+JavaScript); isolation stays on (no file system or clock access). What runs
+(minimum passed-test count of each command in brackets):
 
 | Crate | Tests | Notes |
 | --- | --- | --- |
-| `gnb-smh` | every unit test (compact bits, chain work, ASERT including the AUD-1 wide multiply and shift, the lane-level Keccak step, the scratchpad), `tests/difficulty_vectors.rs` and `tests/vectors.rs` (the Python PoW vectors with log2_n = 1 and 2) | the log2_n = 10 and 19 PoW vectors skipped (below) |
-| `gnb-crypto` | `core::limits`, `core::tokenomics`, `core::block_rules` (Merkle roots, coinbase branch, coinbase commitment, witness root), `core::sighash`, `core::activation` (29 tests) | `v3_cost_is_linear_in_the_input_count` ignored |
-| `pqcrypto-internals` | the library tests: the `unsafe extern "C"` RNG entry point and the thread-local seeded-RNG stack, including guard drops after TLS destruction | the two re-exec tests ignored |
-| `gnb-smh` on `i686-unknown-linux-gnu` and `s390x-unknown-linux-gnu` | the same `gnb-smh` tests on a 32-bit and a big-endian target, including the whole PoW pipeline against the Python reference | `miri-cross`; std for the target is built by `cargo miri setup` |
+| `gnb-smh` | every unit test (compact bits, chain work, ASERT including the AUD-1 wide multiply and shift, the lane-level Keccak step, the scratchpad), `tests/difficulty_vectors.rs` and `tests/vectors.rs` (the Python PoW vectors with log2_n = 1 and 2) [24] | the log2_n = 10 and 19 PoW vectors skipped (below) |
+| `gnb-crypto` | `core::limits`, `core::tokenomics`, `core::block_rules` (Merkle roots, coinbase branch, coinbase commitment, witness root), `core::sighash`, `core::activation` [29] | `v3_cost_is_linear_in_the_input_count` ignored |
+| `pqcrypto-internals` | the library tests: the `unsafe extern "C"` RNG entry point and the thread-local seeded-RNG stack, including guard drops after TLS destruction [15] | the two re-exec tests ignored |
+| `gnb-smh` on `i686-unknown-linux-gnu` and `s390x-unknown-linux-gnu` | the same `gnb-smh` tests on a 32-bit and a big-endian target, including the whole PoW pipeline against the Python reference [24 each] | `miri-cross`; std for the target is built by `cargo miri setup` |
+| `gnb-wallet-wasm` on `i686-unknown-linux-gnu` | the lib tests, among them `c_abi_roundtrip_on_32_bit`: `gnb_alloc` / `gnb_call` / `gnb_free` as `site/wallet/core.js` calls them, plus `minfee` on 32 bits [3] | `miri-cross`; `create_export_open_roundtrip_and_pay` ignored (PQClean C) |
 
-Result: no undefined behaviour (`gnb-smh` 19 unit and 4 vector tests,
-`gnb-crypto` 29 tests, `pqcrypto-internals` 15 tests). The `miri` mode takes
-about 5 minutes locally, compilation included (Miri's own timings:
-`gnb-smh` unit tests 80 s, difficulty vectors 60 s, the `gnb-crypto`
-selection 185 s, `pqcrypto-internals` 9 s).
+Result: no undefined behaviour (`gnb-smh` 19 unit, 4 difficulty-vector
+tests and the PoW vector test, `gnb-crypto` 29 tests, `pqcrypto-internals` 15
+tests). The `miri` mode takes about 6 minutes locally (363 s with the
+dependencies already built; Miri's own timings: `gnb-smh` unit tests 80 s,
+difficulty vectors 60 s, PoW vectors 41 s, the `gnb-crypto` selection 185 s,
+`pqcrypto-internals` 11 s).
 
 Hashing is what limits Miri: one Keccak-f[1600] permutation takes about
 0.4 s and one SHA-256 compression about 0.2 s (measured: the full
@@ -172,9 +209,10 @@ ignored with the reason in the attribute:
 Not selected at all: FFI signing and verification (Miri cannot execute C),
 and anything that opens RocksDB (the node).
 
-`miri-cross` (gnb-smh on i686 and s390x) takes about 6 minutes locally,
-including building the two target sysroots; 19 unit and 4 vector tests pass
-on each target.
+`miri-cross` takes about 5 to 6 minutes locally (308 s and 331 s in two
+runs with the target sysroots cached); on each of i686 and s390x the 19 unit, 4 difficulty-vector
+tests and the PoW vector test (10 vectors) pass, and `gnb-wallet-wasm` passes
+3 tests on i686 (1 ignored). No undefined behaviour.
 
 Positive controls:
 
@@ -183,6 +221,13 @@ Positive controls:
   constructing invalid value of type &mut [u8]: encountered a dangling
   reference (going beyond the bounds of its allocation)` at the
   `slice::from_raw_parts_mut` call, the case ASan misses.
+- Wasm wallet ABI (each reverted): leaking `gnb_call`'s output as an
+  unshrunk `Vec` (capacity larger than the length later passed to
+  `gnb_free`) passes natively on i686 and is reported by Miri as
+  `incorrect layout on deallocation: ... has size 32 and alignment 1, but
+  gave size 22`; `gnb_free` with capacity `len + 1`, and `gnb_alloc` without
+  `.max(1)` (a dangling pointer for an empty request), are reported by Miri
+  as dangling references (natively they crash).
 - Endianness: each of four byte-order slips in `gnb-smh` passes every
   native test on x86_64, the Python reference vectors included
   (little-endian hides them), and fails `matches_python_reference` under Miri
@@ -208,14 +253,18 @@ sh scripts/sanitizers.sh i686
 The audit's CRY-8 class is arithmetic that is safe with a 64-bit `usize` and
 overflows or truncates with a 32-bit one (i686, and the wasm32 browser
 wallet, which uses `gnb-crypto`). The job runs the complete test suites of
-`gnb-smh`, `gnb-crypto`, `coherence-core` and `pqcrypto-internals` on
+`gnb-smh`, `gnb-crypto`, `coherence-core`, `pqcrypto-internals` and
+`gnb-wallet-wasm` (the wasm32 wallet core itself) on
 `i686-unknown-linux-gnu`, PQClean C included (`gcc -m32`). The difficulty,
 Merkle and sighash vector suites pass there, so compact bits, ASERT, chain
 work, both Merkle trees and both sighash versions are bit-identical on 32-
-and 64-bit targets.
+and 64-bit targets. On a 32-bit target `gnb-wallet-wasm` also compiles
+`c_abi_roundtrip_on_32_bit`, which drives `gnb_alloc` / `gnb_call` /
+`gnb_free` exactly as `site/wallet/core.js` does (the `(ptr << 32) | len`
+packing holds only for 32-bit pointers).
 
-Result: all pass after fix F2. The node itself was not built for i686
-(RocksDB would need a 32-bit C++ toolchain; not attempted).
+Result: all pass after fixes F2 and F4. The node itself was not built for
+i686 (RocksDB would need a 32-bit C++ toolchain; not attempted).
 
 ## Debug assertions and overflow checks
 
@@ -300,5 +349,26 @@ is not ruled out.
 | F2 | i686 | `min_fee_has_a_floor_and_scales_with_size` failed: it expected `min_tx_fee_sat(usize::MAX)` to saturate at `u64::MAX / 1000` | The test assumed a 64-bit `usize`; with 32 bits the u64 product does not saturate and the function correctly returns the exact fee. The function computes in u64 on every target, so fees agree on 32- and 64-bit platforms | The test asserts the exact fee of the largest 32-bit size on every target and the saturating value only on 64-bit targets |
 | F3 | concurrent runs | `wallet::legacy_keystore_tests::save_load_roundtrip_still_works` failed with "No such file or directory" in the i686 run while the UBSan suite ran the same test in another process | Seven keystore tests (`wallet::legacy_keystore_tests` x4, `hd_wallet::tests` x3) write a fixed file name in the shared temp directory and delete it at start and end, so two test processes delete each other's file. Reproduced by running one test binary twice at once, 15 times: 15 of 30 runs failed for one test, 1 of 30 for another | The names carry the process id (as the neighbouring tests already do); 0 of 30 concurrent runs fail for each of the seven. Matters for parallel sanitizer runs and for `cargo mutants -j N` |
 
+| F4 | review (code reading), confirmed on `i686` | The wasm wallet's `minfee` request quoted the floor fee for a size of 2^32 bytes or more on 32-bit targets: 2^32 + 100 was priced as 100 bytes (10,000 instead of 8,589,934,792) | CRY-8: `size as usize` wraps modulo 2^32 where `usize` has 32 bits (wasm32, i686); `gnb-wallet-wasm` was in none of the 32-bit runs | `usize::try_from(size)`, error "`size` too large". `minfee_does_not_truncate_sizes_on_32_bit_targets` and `c_abi_roundtrip_on_32_bit` fail on i686 with the old cast (fee "10000") and pass after; on x86_64 the old cast passes. Low impact: such sizes are absurd |
+
 No memory error, no C undefined behaviour and no Rust undefined behaviour
-was found in the code under test.
+was found in the code under test. F4 is the one defect in shipped code (low
+impact).
+
+## Review follow-ups (2026-10-15)
+
+A review of this work found five gaps; each is closed above:
+
+1. The big-endian claim of `miri-cross` covered only `lanes_to_bytes`: the
+   PoW vectors were ignored under Miri. Now the log2_n = 1 and 2 Python
+   vectors run under Miri on s390x and i686 (Miri section, positive
+   controls).
+2. The F1 late-drop check could not fail (it ran over an empty stack). It
+   now runs over a live sentinel override (F1 row).
+3. The clean ML-DSA C code never ran under a sanitizer in CI: new mode
+   `ubsan-noavx2` and CI step.
+4. Miri steps could pass with zero tests, and the nightly was not pinned:
+   `expect_passed` minimums, `nightly-2026-10-14`.
+5. `gnb-wallet-wasm` (the 32-bit consumer, with the only other first-party
+   `unsafe`) was in no run: now in `i686` and, for its C ABI, in
+   `miri-cross`; F4 fixed.
