@@ -15,22 +15,28 @@
 //!
 //! # SAFETY / consensus status
 //!
-//! This index is **NOT wired into the live consensus hot path.** It is used
-//! only by `GhostDAG` when its `ColoringMode` is set to `Fast`, which is an
-//! opt-in mode exercised by the differential test (`tests/ghostdag_differential.rs`).
+//! On GnB this index IS on the live consensus path, for every block from
+//! genesis (audit DAG-12: this paragraph used to say the opposite, which was
+//! Bloch's state before its flag day). `CORRECTED_COLORING_ACTIVATION_HEIGHT`
+//! is `0`, so `GhostDAG::maintains_reachability_index()` is always true:
+//! `add_block` registers every block here, the mergeset walk
+//! (`compute_mergeset_bounded`) and both colorings (the pre-activation
+//! `classify_mergeset_fast` and the exact post-activation
+//! `classify_mergeset_exact`) answer every ancestry query from it, and its
+//! records are committed in the same RocksDB batch as the block's CF_DAG
+//! record (CF_REACHABILITY). It is never consensus STATE: nothing it holds is
+//! hashed into `GhostdagData` or the integrity chain, and it can be rebuilt
+//! from CF_DAG at any time by replaying insertions in topological order
+//! (the boot path does so when the stored index is missing, partial, of
+//! another schema version, or fails its sampled self-check against
+//! [`brute_force_is_ancestor`]).
 //!
-//! The reason is spelled out in the implementation plan: replacing the bounded
-//! `is_ancestor` with a *correct* unbounded one is only a pure-performance,
-//! result-identical change **if** the bound never actually bit on the real
-//! chain. The bounded path can, in principle, produce a different (bug-compatible)
-//! blue set / blue_score than the correct path on pathological deep+wide DAGs.
-//! Adopting the correct answer where they differ would be a **consensus rule
-//! change / fork** and must go behind an activation-height gate with network
-//! coordination — never baked silently into the hot path.
-//!
-//! The differential test is what proves, per DAG shape, whether legacy and
-//! fast agree byte-for-byte. On the real ≥397k mainnet history that proof must
-//! be run against a snapshot before this index can be promoted to the default.
+//! What a wrong answer would cost: a mis-labeled interval or a stale future
+//! covering set colors blocks differently from every other node, which is a
+//! consensus split. Hence the oracle harness below and the boot-time sample.
+//! The bounded legacy `is_ancestor` it replaced is kept only for the `Legacy`
+//! coloring, which the gate never selects on GnB
+//! (`tests/ghostdag_differential.rs` compares the two).
 //!
 //! # Correctness harness
 //!

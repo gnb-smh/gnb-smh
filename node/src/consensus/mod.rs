@@ -13,8 +13,11 @@
 //!   - Both candidate and existing blue blocks satisfy the K constraint
 //!
 //! Performance:
-//!   - is_ancestor: O(height_diff) with blue_score/height shortcuts (vs O(DAG) naive)
-//!   - past_blue_set: bounded to K*100 depth on selected chain (audit H-5)
+//!   - ancestry: the interval reachability index (`reachability`), live for
+//!     every block (`CORRECTED_COLORING_ACTIVATION_HEIGHT = 0`), O(log) per
+//!     query; the bounded legacy `is_ancestor` (blue_work shortcut, DAG-8)
+//!     and the k*100-bounded `past_blue_set` serve only the Legacy coloring,
+//!     which the activation gate never selects on GnB
 //!   - blue_work: cumulative work; see the hardening activation note below
 //!
 //! Hardening activation (audit 2026-10-14, DAG-3 / DAG-4 / DAG-7):
@@ -433,34 +436,6 @@ fn compute_past(store: &DagStore, b: &BlockHash) -> HashSet<BlockHash> {
         }
     }
     past
-}
-
-/// Compute the blue set of block B (all blue blocks in past(B))
-#[allow(dead_code)]
-fn compute_blue_set(store: &DagStore, b: &BlockHash) -> HashSet<BlockHash> {
-    let past = compute_past(store, b);
-    let mut blue_set = HashSet::new();
-    for h in &past {
-        if let Some(_data) = store.get(h) {
-            // A block is in the blue set if it appears in any ancestor's mergeset_blues
-            // or is the genesis
-            blue_set.insert(*h); // simplified: walk selected parent chain
-        }
-    }
-    // More precisely: walk selected parent chain + collect mergeset_blues
-    let mut blue = HashSet::new();
-    let mut cur = Some(*b);
-    while let Some(h) = cur {
-        if let Some(data) = store.get(&h) {
-            for mb in &data.mergeset_blues {
-                blue.insert(*mb);
-            }
-            cur = data.selected_parent;
-        } else {
-            break;
-        }
-    }
-    blue
 }
 
 // ── Mergeset computation ──────────────────────────────────────────────────────
@@ -2822,31 +2797,43 @@ impl GhostDAG {
         chain
     }
 
-    /// Is `hash` in the blue set of the current DAG?
-    /// Bounded check: walks selected chain up to 2*K depth.
+    /// Is `hash` in the blue set of the selected tip, i.e. in
+    /// `blue(tip) ∪ {tip}`: the selected chain from the tip down to genesis
+    /// and every mergeset blue of a block on it? Exact at any depth (audit
+    /// DAG-12: it used the legacy `past_blue_set` walk, bounded to k * 100
+    /// chain blocks, and missed the selected chain itself).
+    ///
+    /// The walk down the selected chain stops at the first chain block whose
+    /// `blue_work` is below `hash`'s: `blue_work` never decreases along a
+    /// parent edge (a block's is at least its selected parent's, the
+    /// heaviest of its parents), so neither that block nor anything below it
+    /// has `hash` in its past or mergeset. Diagnostics and tests only; no
+    /// consensus or relay decision calls it.
     pub fn is_blue(&self, hash: &BlockHash) -> bool {
-        if let Some(tip) = self.selected_tip() {
-            let blue = self.past_blue_set(&tip);
-            return blue.contains(hash);
+        let (Some(tip), Some(target)) = (self.selected_tip(), self.store.get(hash)) else {
+            return false;
+        };
+        let mut cur = Some(tip);
+        while let Some(h) = cur {
+            if h == *hash {
+                return true;
+            }
+            let Some(d) = self.store.get(&h) else { return false };
+            if d.mergeset_blues.contains(hash) {
+                return true;
+            }
+            if d.blue_work < target.blue_work {
+                return false;
+            }
+            cur = d.selected_parent;
         }
         false
     }
 
-    /// Informational confirmation depth: true when `hash`'s blue_score is more
-    /// than `CHECKPOINT_DEPTH` below the current tip.
-    ///
-    /// Audit DAG-6: this is NOT finality. The node has no finality checkpoint
-    /// and no reorg-depth limit; a heavier valid chain is followed at any
-    /// depth, so a "final" block can still be reorganized out by a chain with
-    /// more work (as in Bitcoin). Kept for diagnostics only.
-    pub fn is_final(&self, hash: &BlockHash) -> bool {
-        let tip_score = self.tip_blue_score();
-        if let Some(data) = self.store.get(hash) {
-            tip_score.saturating_sub(data.blue_score) > crate::core::CHECKPOINT_DEPTH
-        } else {
-            false
-        }
-    }
+    // (Audit DAG-12: `is_final`, a diagnostic that compared a blue-score gap
+    // with the header-height constant `CHECKPOINT_DEPTH` and that nothing
+    // called, was removed. There is no finality: docs/CONSENSUS.md, "Selected
+    // parent and fork choice".)
 
     /// Ordered block hashes from blue_score `from` for IBD sync.
     ///
