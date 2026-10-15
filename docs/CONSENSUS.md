@@ -551,6 +551,11 @@ transactions, plus `version_rule` vectors: the consensus verdict
 activations 0, 100 and `NEVER`. `crates/gnb-crypto/tests/sighash_vectors.rs`
 pins them, and CI regenerates the file and diffs it.
 
+Whole-transaction and whole-block verdicts in both regimes (signatures,
+witnesses, suites, versions, values, maturity, the block rules below) are
+pinned by the data-driven vectors `reference/tx_vectors.json` and
+`reference/block_vectors.json`; see `docs/testing/VECTORS.md`.
+
 ## Mining
 
 The built-in miner (`gnb --mine --miner-address gnb1q…`) uses one 64 MiB
