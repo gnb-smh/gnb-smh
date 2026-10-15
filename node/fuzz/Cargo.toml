@@ -28,7 +28,7 @@
 #   undo_decode       UndoData stored encoding (legacy and extended)
 #   keystore_decode   keyfile v1/v2 and keystore v2/v3 JSON parse + decrypt (fast KDF)
 #   address_parse     Address::parse / parse_for_network vs a reference parser
-#   sync_rr_codec     /gnb/sync/1 request/response frames (bounds, canonicality)
+#   sync_rr_codec     /gnb/sync/1 frames and the libp2p codec (bounds, canonicality, read cap)
 #   accept_dag        accept_block on small DAGs: arrival-order independence
 #
 # docs/testing/FUZZING.md describes every target, the campaign results and
@@ -72,6 +72,11 @@ argon2 = "0.5"
 tempfile = "3"
 parking_lot = "0.12"
 pqcrypto-internals = "0.2"
+# sync_rr_codec drives the node's libp2p request-response codec
+# (`BlochSyncCodec`) over an in-memory stream: the `Codec` trait and an
+# executor. Any version: the one the node resolves to (same crate instance).
+futures = "0.3"
+libp2p = { version = "*", default-features = false, features = ["request-response"] }
 
 [workspace]
 members = ["."]
