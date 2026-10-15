@@ -33,10 +33,10 @@ assertion failure, which libFuzzer reports as a crash like any panic.
 | `witness_parse` | `parse_script_sig{,_borrowed,_exact}`, `build_script_sig`, `sighash::canonical_witness`, `check_input_witnesses` | the parsers equal a reference parser (lenient and exact); exact round trip of `build_script_sig`; trailing bytes refused by the exact parser only; the canonical-witness and per-regime witness rules agree with the framing and `is_canonical_signature_encoding`; genuine canonical hybrid signatures altered by the input exercise the envelope and Falcon compact-encoding checks |
 | `wire_roundtrip` | `Transaction` / `BlockHeader` / `Block` wire encoding, `admission::decode_tx_strict` | generated values: the encoding equals an independent encoder, `wire_size` its length, `decode(encode(x)) == x` exactly when `x` is within the parser caps (values at and one past the script-length and parent caps are generated; the count and size caps need 100 KB to 10 MB values and are checked at and one past each cap by the unit test `core::limits::tests::count_and_size_caps_match_the_wire_parser` instead), every proper prefix and one extra byte are refused; untrusted bytes: the strict decoders are the exact inverse of the encoder (`decode(b) = x` implies `encode(x) == b`) |
 | `undo_decode` | `UndoData::{from_bytes, to_bytes}` | no panic; decode/encode fixed point; a record without overwrites is byte-identical to the legacy six-field record; the legacy prefix decodes alone; an empty extension is normalised away; trailing garbage and a truncated extension are refused |
-| `keystore_decode` | keyfile v1/v2 (`EncryptedKeyfile`, `Wallet::from_encrypted_bytes`), keystore v2/v3 (`Keypair::from_encrypted_bytes`) | arbitrary JSON: no panic, decrypt driven to completion with cheap Argon2 parameters, parameters over the bounds refused before any KDF; library-written keyfiles (fast parameters) round-trip and refuse a wrong password and any altered AEAD-bound field; a keystore v3 written by an independent implementation of the format loads to the same key pair and refuses an altered network, address, version, ciphertext or KDF output length |
+| `keystore_decode` | keyfile v1/v2 (`EncryptedKeyfile`, `Wallet::from_encrypted_bytes`), keystore v2/v3 (`Keypair::from_encrypted_bytes`), the spending unlock `Keypair::unlock_for_spending_bytes` (entry point of the keystore v2 -> v3 migration) | arbitrary JSON: no panic, decrypt driven to completion with cheap Argon2 parameters, parameters over the bounds refused before any KDF; the spending unlock never unlocks what the plain load refuses, never migrates without a stated network, and unlocks a keystore v3 only for its own network; library-written keyfiles (fast parameters) round-trip and refuse a wrong password and any altered AEAD-bound field; a keystore v3 written by an independent implementation of the format loads to the same key pair, unlocks for spending with no migration on its own network (or none stated) and not on the other, and refuses an altered network, address, version, ciphertext or KDF output length |
 | `address_parse` | `Address::parse`, `parse_for_network`, `FromStr`, `Display` | verdict (value or error kind) equals a reference parser; the canonical form round-trips and differs only by hex case and the Bloch alias; `parse_for_network` accepts the own network only; a one-digit change is `BadChecksum`; a prefix swap keeps the hash (documented residual) |
-| `sync_rr_codec` | `/gnb/sync/1` frames: `decode_request`, `decode_response`, `encode_frame`, `check_nonempty_frame`, and the libp2p codec `BlochSyncCodec` (`read_request` / `read_response` / `write_request` / `write_response`) over an in-memory stream | no panic; every refusal is `InvalidData` (penalized) and an empty frame `UnexpectedEof` (not penalized); accepted frames obey every bound and are canonical; both transports enforce the same bounds (a response accepted here passes the gossip decoder, a gossip pull accepted there is accepted here); generated messages round-trip exactly when within bounds; reading a stream through the codec is exactly `check_nonempty_frame` + the decoder on its first 4 MiB, writing is `encode_frame` and reads back, and a stream over the 4 MiB read cap (a valid frame followed by padding) is a penalized refusal |
-| `accept_dag` | `accept::accept_block` (behind `validate_structure`) on a RocksDB `Storage` in a temporary directory with a real `GhostDAG` | small arbitrary DAGs (up to 6 sealed blocks, PoW-cheap through the crate's `test-pow-limit` feature) with signed spends of funded outputs, conflicting spends, spend chains, version 1 and 3 transactions, broken signatures, missing inputs and deliberate faults (coinbase over-claim, wrong height, wrong difficulty bits sealed at their own easy target so that the difficulty rule is what refuses them, timestamp before a parent, duplicated transaction), under the hardening activation never / from genesis / inside the DAG; no panic, and two different arrival orders of the same block set (orphans retried) end with the same selected tip, applied tip, UTXO set digest and DAG block set; a block with a wrong height, a timestamp before a parent, wrong bits or a duplicated transaction is in neither node's DAG; optionally a reload from storage (`reconcile_on_startup`) keeps that state |
+| `sync_rr_codec` | `/gnb/sync/1` frames: `decode_request`, `decode_response`, `encode_frame`, `check_nonempty_frame`, and the libp2p codec `BlochSyncCodec` (`read_request` / `read_response` / `write_request` / `write_response`) over an in-memory stream | no panic; every refusal is `InvalidData` (penalized) and an empty frame `UnexpectedEof` (not penalized); accepted frames obey every bound and are canonical; both transports enforce the same bounds (a response accepted here passes the gossip decoder, a gossip pull accepted there is accepted here); generated messages round-trip exactly when within bounds; reading a response stream through the codec is exactly `check_nonempty_frame` + the decoder on its first 4 MiB; a request stream is read up to 64 bytes (`MAX_REQUEST_FRAME`) and one that reaches 64 bytes is a penalized refusal, a shorter one is `check_nonempty_frame` + `decode_request`; every generated request encodes below 64 bytes; writing is `encode_frame` and reads back; a stream past the read cap (a valid frame followed by padding: 64 bytes for a request, 4 MiB for a response) is a penalized refusal |
+| `accept_dag` | the message processor's path for a gossiped block: `Block::from_wire_bytes`, then `ingress::BlockIngress::handle_block` (structure without proof of work, the orphan pool with its floor and proof check, the POW-3 work rule, `normalize_wire_metadata`, `accept::accept_block_tracking`, the drain of waiting orphans) and the periodic orphan sweep, on a RocksDB `Storage` in a temporary directory with a real `GhostDAG` | small arbitrary DAGs (up to 6 sealed blocks, PoW-cheap through the crate's `test-pow-limit` feature) with signed spends of funded outputs, conflicting spends, spend chains, version 1 and 3 transactions, broken signatures, missing inputs and deliberate faults (coinbase over-claim, wrong height, wrong difficulty bits sealed at their own easy target so that the difficulty rule is what refuses them, timestamp before a parent, duplicated transaction), under the hardening activation never / from genesis / inside the DAG; no panic, and two different arrival orders of the same block set (orphans buffered in the core's pool and drained when a parent is accepted or by the sweep) end with the same selected tip, applied tip, UTXO set digest and DAG block set; a block with a wrong height, a timestamp before a parent, wrong bits or a duplicated transaction is in neither node's DAG; optionally a reload from storage (`reconcile_on_startup`) keeps that state |
 
 The seed corpora of eight of the nine original targets are generated (and
 replayed on stable Rust) by `node/tests/parser_corpus_floor.rs`; those of
@@ -68,6 +68,12 @@ input committed to the target's corpus (`regress_*`).
    the bytes consumed (`Transaction::read_wire_bytes`). The encoders always
    wrote minimal varints, so nothing produced or stored changes; block ids,
    txids and roots commit to decoded values, so this is not a validity rule.
+   It changes which bytes are accepted for a valid block id; the rule, its
+   reasoning and the mixed-version consequence are specified in
+   docs/CONSENSUS.md ("Wire encoding"), and the consensus vectors
+   `decode/non-minimal-tx-count/post` and
+   `decode/non-minimal-script-sig-length/pre` pin it for the Rust runners and
+   the Python reference.
    The reproducer came from a seed written to probe the property (a header
    with a `FD 01 00` parent count); a 200-second run without that seed did not
    rediscover it. Tests: `core::wire_canonical_tests`,
@@ -83,7 +89,12 @@ input committed to the target's corpus (`regress_*`).
    refuses a frame that is not the re-encoding of its message:
    `WireDecodeError::NonCanonical`, a penalized protocol violation) and
    `network/sync_rr.rs` (`decode_request` / `decode_response`, `InvalidData`).
-   Tests: `node/tests/fuzz_regressions.rs`.
+   Tests: `node/tests/fuzz_regressions.rs`. On the integration branch the
+   same check arrived first with the sanitizers package (commit `6492ebc`,
+   the same hunks), which found it necessary on i686 as well: bincode reads
+   declared lengths as `usize`, so a 32-bit node decoded a frame declaring
+   2^32 + n bytes as one of n bytes (docs/testing/SANITIZERS.md, F5); there
+   it sits next to the libp2p 0.57 codec and its 64-byte request cap.
 
 Each fix was checked by mutation: disabling it makes its regression tests
 fail.
@@ -181,6 +192,67 @@ outside it for a duplicated transaction (94), a timestamp before a parent
 26 times, `0x21008000` 18 times) and a wrong height (43). No block was
 refused as an invalid proof of work.
 
+### After the merge into the integration branch
+
+The package was written on `b6a2976` and merged after the mempool/relay
+(P4), networking/storage (P5), block-ingress (P3), mutation-testing,
+consensus-vector and sanitizer packages. Three targets were adapted to the
+APIs those packages changed:
+
+* `accept_dag` delivered blocks to `accept::accept_block` behind
+  `validate_structure`, retrying orphans itself. P3 replaced the processor's
+  `NewBlock` handling with `ingress::BlockIngress`, so the target now
+  decodes each block from its wire bytes and hands it to
+  `BlockIngress::handle_block` (structure without proof of work, the orphan
+  pool, the POW-3 work rule, `normalize_wire_metadata`,
+  `accept_block_tracking`, the orphan drain), then runs the processor's
+  orphan sweep. The sweep matters: an orphan whose parent is stored but
+  disqualified (an over-claiming coinbase) is not drained by that parent's
+  own acceptance, only by the sweep. With the sweep removed from the harness
+  the target stopped in 14 s with `arrival order changed the outcome`.
+* `sync_rr_codec` modelled a 4 MiB read for requests too; P5's codec reads
+  at most 64 bytes of a request stream (`MAX_REQUEST_FRAME`) and refuses one
+  that reaches 64 bytes. The model now follows that, every generated request
+  must encode below 64 bytes, and a request padded to the cap must be a
+  penalized refusal.
+* `keystore_decode` also drives P5's `Keypair::unlock_for_spending_bytes`
+  (see the targets table).
+
+Every target was rebuilt from the merged tree with `nightly-2026-10-14` and
+cargo-fuzz 0.13.2, without a sanitizer (`-s none`; release, debug
+assertions; disk space), and every committed corpus replayed with exit
+status 0. Then each target except `pow_decode`, `pow_verify` and
+`merkle_path` (library code unchanged; replayed only) ran from its committed
+corpus, three at a time at `nice -n 10` on the shared 4-core machine:
+
+| Target | Seconds | Executions | Findings |
+| --- | ---: | ---: | --- |
+| `accept_dag` | 900 | 1,186 | none |
+| `sync_rr_codec` | 300 | 220,440 | none |
+| `keystore_decode` | 300 | 8,738,026 | none |
+| `wire_roundtrip` | 300 | 3,209,623 | none |
+| `block_rules` | 120, then 300 | 456,781, then 7,103,962 | one harness defect (below), none after its fix |
+| `sighash` | 120 | 3,482,523 | none |
+| `netmsg_decode` | 120 | 40,152,150 | none |
+| `witness_parse`, `undo_decode`, `address_parse`, `mempool_ops`, `block_parse`, `header_parse`, `tx_parse` | 60 each | 775,763; 3,143,813; 1,918,612; 312,448; 13,710,017; 39,930,910; 10,142,540 | none |
+| `handshake_decode` | 30 | 23,366,454 | none |
+
+The `block_rules` finding was in the target, not the library: its reference
+treated activation `NEVER` as "legacy rules at every height", but
+`activation::is_active_at` is `height >= activation` and `NEVER` is
+u64::MAX, so a decoded block claiming height u64::MAX is under the hardening
+rules even with `NEVER` (no block can reach that height: its parents would
+be at u64::MAX - 1). The library has behaved this way since before the
+package; the reference now uses the same predicate, and the input is in the
+corpus as `regress_height_u64_max_under_never`.
+
+Replaying the 12 `accept_dag` seeds with `ACCEPT_DAG_LOG=1` through the
+ingress core: of the deliveries in the first arrival order, 16 were
+accepted, 4 buffered as orphans (children of refused blocks), and the rest
+refused for a missing UTXO (6), a timestamp before a parent (2), wrong
+difficulty bits (2), an invalid selected parent (2), a coinbase over-claim
+(2), a wrong height (1) and a duplicated transaction (1).
+
 ### Do the targets detect what they are meant to detect?
 
 Besides the two real defects (whose fixes were each checked by disabling
@@ -201,7 +273,7 @@ assertion within seconds:
 | `keystore_decode` | independent v3 writer omits the network byte of the associated data | 1 s | `library refuses a keystore v3 written to the specification` |
 | `address_parse` | reference checks 3 of the 4 checksum bytes | < 1 s | `parse differs from the reference` |
 | `sync_rr_codec` | expected read result without `check_nonempty_frame` | 1 s | `read_request: error kinds differ` |
-| `accept_dag` | arrival order B never retries a block whose parent is unknown | 9 s | `arrival order changed the outcome` |
+| `accept_dag` | arrival order B never retries a block whose parent is unknown (the harness before the merge, which retried orphans itself) | 9 s | `arrival order changed the outcome` |
 | `accept_dag` | the wrong-bits fault silently builds a valid block (the expected bits) | 20 s | `b0 with wrong difficulty bits was accepted` |
 
 ## Known limits
@@ -225,6 +297,15 @@ assertion within seconds:
   and size caps (inputs, outputs, block and shielded transactions,
   nullifiers, shielded outputs, proof, binding signature) are checked by a
   unit test, not fuzzed.
+* `accept_dag` drives the processor's ingress core, but on DAGs of at most
+  six blocks its anti-DoS rules admit every block: the POW-3 work threshold
+  is 0 below `ANTI_DOS_WINDOW_BLOCKS` (360) selected-chain blocks, no block
+  is deep below the tip, and under `test-pow-limit` the orphan floor is the
+  pow limit. `LowWork`, `OrphanBelowFloor`, the deep-backfill budget and
+  orphan-pool eviction are covered by the node's tests
+  (`node/tests/fix_chain_selection.rs`, `ingress` unit tests), not here. The
+  orphan sweep runs once after the last delivery (in the node it runs every
+  30 s), and blocks arrive unsolicited from no peer.
 * The async read of the sync codec is driven over an in-memory stream; the
   libp2p substream and muxer underneath are not fuzzed.
 * `keystore_decode` drives the decryption to completion only for Argon2

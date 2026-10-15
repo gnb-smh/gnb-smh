@@ -1,8 +1,15 @@
-//! The real block-acceptance pipeline (`gnb::accept::accept_block`, behind the
-//! structural gate every ingress path runs, `Block::validate_structure`) on a
-//! RocksDB `Storage` in a temporary directory with a real `GhostDAG`, driven
-//! by small arbitrary DAGs of sealed, PoW-cheap blocks (`test-pow-limit` is on
-//! in this crate: one GnB-SMH evaluation per block, cached by block id).
+//! The real block-acceptance pipeline as the node's message processor runs it
+//! for a gossiped block: the wire decoder (`Block::from_wire_bytes`), then the
+//! processor's ingress core `gnb::ingress::BlockIngress::handle_block` (the
+//! structure check without proof of work, the orphan pool with its anti-DoS
+//! floor and proof check, the POW-3 work rule, `normalize_wire_metadata`,
+//! `accept::accept_block_tracking`, the drain of the orphans waiting on an
+//! accepted block), and after the last delivery the processor's periodic
+//! orphan sweep (every waited-on parent already in the DAG is drained). It
+//! runs on a RocksDB `Storage` in a temporary directory with a real
+//! `GhostDAG`, driven by small arbitrary DAGs of sealed, PoW-cheap blocks
+//! (`test-pow-limit` is on in this crate: one GnB-SMH evaluation per block,
+//! cached by block id).
 //!
 //! The input chooses the hardening activation height (never, from genesis, or
 //! inside the DAG), up to `MAX_BLOCKS` blocks, each block's parents (any
@@ -12,7 +19,8 @@
 //! deliberate faults (coinbase over-claim, wrong height, wrong bits,
 //! timestamp before a parent, a duplicated transaction). The wrong-bits
 //! block is sealed at its own (wrong but easy) target, so it is refused by
-//! `accept_block`'s difficulty rule, not by the proof-of-work check.
+//! `accept_block`'s difficulty rule, not by the proof-of-work check (an
+//! orphan's proof is checked when it is buffered).
 //!
 //! Not covered here: with `test-pow-limit` the expected bits are always the
 //! pre-activation pow limit and `validate_pow` enforces that limit at every
@@ -25,7 +33,10 @@
 //!
 //! The same block set is delivered to two fresh nodes in two different
 //! arrival orders (the build order and an input-chosen permutation; a block
-//! whose parent is unknown waits and is retried, as the orphan pool does).
+//! whose parent is unknown waits in the core's orphan pool). On these small
+//! DAGs the anti-DoS rules of the core admit every block: the POW-3 work
+//! threshold is 0 below `ANTI_DOS_WINDOW_BLOCKS` (360) selected-chain blocks,
+//! nothing is deep below the tip, and the orphan floor is the pow limit.
 //! Asserted (audit DAG-1, "arrival-order independence"):
 //! * no panic anywhere in the pipeline;
 //! * both nodes end with the same selected tip, the same applied tip, the
@@ -41,6 +52,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use common::*;
 use gnb::accept;
@@ -48,6 +60,7 @@ use gnb::coherence::ShieldedPool;
 use gnb::consensus::GhostDAG;
 use gnb::core::{self, activation, block_rules, sighash, Block, BlockHeader, MerkleRoot, Transaction, TxInput, TxOutput};
 use gnb::crypto;
+use gnb::ingress::{AcceptCtx, BlockIngress, BlockOutcome};
 use gnb::mempool::Mempool;
 use gnb::pow;
 use gnb::rpc::NodeState;
@@ -60,6 +73,9 @@ const GENESIS_TS: u64 = 1_750_000_000;
 const FUND_VALUE: u64 = 100_000_000;
 const STEP_FEE: u64 = 100_000;
 const N_FUNDS: u8 = 4;
+/// The processor's "now" for the orphan floor, fixed for reproducible runs
+/// (with `test-pow-limit` the floor is the pow limit whatever the time).
+const NOW_UNIX: u64 = GENESIS_TS + 3_600;
 
 struct Key {
     pk: Vec<u8>,
@@ -310,6 +326,8 @@ struct Node {
     mempool: Arc<Mempool>,
     node_state: Arc<RwLock<NodeState>>,
     shielded: Arc<RwLock<ShieldedPool>>,
+    /// The message processor's per-block core (orphan pool, work rule).
+    core: BlockIngress,
 }
 
 fn new_node(genesis: &Block) -> Node {
@@ -336,14 +354,73 @@ fn new_node(genesis: &Block) -> Node {
         mempool: Arc::new(Mempool::new()),
         node_state: Arc::new(RwLock::new(NodeState::default())),
         shielded: Arc::new(RwLock::new(ShieldedPool::new())),
+        core: BlockIngress::new(),
     }
 }
 
-fn deliver(n: &Node, b: &Built) -> Result<[u8; 32], String> {
-    b.block.validate_structure().map_err(|e| format!("structural validation: {e}"))?;
-    accept::accept_block(
-        &b.block, b.hash, b.block.height, &n.dag, &n.store, &n.mempool, &n.node_state, None, &n.shielded,
-    )
+/// The index of `hash` among the built blocks, for the log.
+fn name(blocks: &[Built], hash: &[u8; 32]) -> String {
+    blocks.iter().position(|b| b.hash == *hash).map(|i| format!("b{i}")).unwrap_or_else(|| "?".into())
+}
+
+/// One gossiped block: its wire bytes decoded as the processor decodes a
+/// `NewBlock`, then the ingress core (unsolicited, no peer). Returns the log
+/// lines: the block's own outcome, then the orphans it drained.
+fn deliver(n: &mut Node, blocks: &[Built], i: usize) -> Vec<String> {
+    let b = &blocks[i];
+    let wire = b.block.to_wire_bytes();
+    let block = Block::from_wire_bytes(&wire).expect("a built block decodes from its own encoding");
+    assert_eq!(block.block_hash(), b.hash, "the decoded block has another id");
+    let ctx = AcceptCtx {
+        dag: &n.dag,
+        store: &n.store,
+        mempool: &n.mempool,
+        node_state: &n.node_state,
+        tip_tx: None,
+        shielded: &n.shielded,
+    };
+    let outcome = n.core.handle_block(block, b.hash, wire.len(), None, false, Instant::now(), NOW_UNIX, &ctx);
+    match outcome {
+        BlockOutcome::Processed { result, drained, .. } => {
+            let mut log = vec![format!("b{i}: {}", result.map(|_| "ok".to_string()).unwrap_or_else(|e| e))];
+            log.extend(drained.iter().map(|h| format!("{} (orphan, drained by b{i}): ok", name(blocks, h))));
+            log
+        }
+        BlockOutcome::Buffered { .. } => vec![format!("b{i}: orphan, buffered")],
+        BlockOutcome::Invalid(e) => vec![format!("b{i}: {e}")],
+        other => vec![format!("b{i}: {other:?}")],
+    }
+}
+
+/// The processor's periodic orphan sweep (`main.rs`, `sweep_orphan_parents`
+/// then `drain_orphans`): every waited-on parent that is in the DAG — also
+/// one stored but disqualified, whose own acceptance drained nothing — has
+/// its waiting orphans processed.
+fn sweep(n: &mut Node, blocks: &[Built]) -> Vec<String> {
+    let mut log = Vec::new();
+    for _ in 0..=MAX_BLOCKS {
+        let ready: Vec<[u8; 32]> = {
+            let d = n.dag.read();
+            n.core.orphans.waiting_parents().into_iter().filter(|p| d.has_block(p)).collect()
+        };
+        if ready.is_empty() {
+            break;
+        }
+        let ctx = AcceptCtx {
+            dag: &n.dag,
+            store: &n.store,
+            mempool: &n.mempool,
+            node_state: &n.node_state,
+            tip_tx: None,
+            shielded: &n.shielded,
+        };
+        for p in ready {
+            for h in n.core.drain_orphans(p, &ctx) {
+                log.push(format!("{} (orphan, drained by the sweep): ok", name(blocks, &h)));
+            }
+        }
+    }
+    log
 }
 
 /// `ACCEPT_DAG_LOG=1` prints every delivery verdict of the first arrival
@@ -354,28 +431,14 @@ fn verbose() -> bool {
     *V.get_or_init(|| std::env::var_os("ACCEPT_DAG_LOG").is_some())
 }
 
-/// Deliver `blocks` in `order`; a block with an unknown parent waits and is
-/// retried after every round that accepted something (the orphan pool).
-fn run(n: &Node, blocks: &[Built], order: &[usize]) -> Vec<String> {
+/// Deliver `blocks` in `order` (a block with an unknown parent waits in the
+/// orphan pool), then run the orphan sweep once.
+fn run(n: &mut Node, blocks: &[Built], order: &[usize]) -> Vec<String> {
     let mut log = Vec::new();
-    let mut pending: Vec<usize> = order.to_vec();
-    loop {
-        let mut waiting = Vec::new();
-        let mut progress = false;
-        for &i in &pending {
-            match deliver(n, &blocks[i]) {
-                Err(e) if e.contains("unknown parent") => waiting.push(i),
-                r => {
-                    progress = true;
-                    log.push(format!("b{i}: {}", r.map(|_| "ok".to_string()).unwrap_or_else(|e| e)));
-                }
-            }
-        }
-        if waiting.is_empty() || !progress {
-            break;
-        }
-        pending = waiting;
+    for &i in order {
+        log.extend(deliver(n, blocks, i));
     }
+    log.extend(sweep(n, blocks));
     log
 }
 
@@ -450,15 +513,15 @@ fuzz_target!(|data: &[u8]| {
         perm.reverse();
     }
 
-    let a = new_node(&g);
-    let log_a = run(&a, &blocks, &natural);
+    let mut a = new_node(&g);
+    let log_a = run(&mut a, &blocks, &natural);
     if verbose() {
         for l in &log_a {
             eprintln!("accept_dag A {l}");
         }
     }
     let mut b = new_node(&g);
-    let log_b = run(&b, &blocks, &perm);
+    let log_b = run(&mut b, &blocks, &perm);
     let (sa, sb) = (state(&a, &blocks), state(&b, &blocks));
     assert_eq!(
         sa, sb,

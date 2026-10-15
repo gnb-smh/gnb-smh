@@ -18,6 +18,14 @@
 //!   (Argon2id, AES-256-GCM, the documented associated data): the library
 //!   loads exactly the written key pair, and altering the network, the
 //!   address, the version or the ciphertext makes it fail.
+//! * The spending unlock (`Keypair::unlock_for_spending_bytes`, the entry
+//!   point of the keystore v2 -> v3 migration): on arbitrary bytes it never
+//!   panics, never unlocks what the plain load refuses, and never migrates
+//!   without a stated network; a keystore v3 unlocks with no migration for
+//!   its own network or none stated, and is refused for the other network.
+//!   (The migration itself re-encrypts with the production KDF cost, seconds
+//!   per execution, so it is not driven: a v2 keystore is only unlocked with
+//!   no network stated, which refuses before any re-encryption.)
 #![no_main]
 
 mod common;
@@ -28,7 +36,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use common::*;
 use gnb_crypto::address::Network;
 use gnb_crypto::wallet::encryption::{EncryptedKeyfile, KdfParams, NetworkStr};
-use gnb_crypto::wallet::{EncryptedKeystore, Keypair, Wallet, WalletError};
+use gnb_crypto::wallet::{EncryptedKeystore, Keypair, Wallet, WalletError, KEYSTORE_VERSION_V3};
 use libfuzzer_sys::fuzz_target;
 use serde_json::{json, Value};
 
@@ -61,8 +69,26 @@ fn raw_json(bytes: &[u8]) {
         let k = &ks.crypto.kdf_params;
         if over_bounds(k.memory_cost, k.time_cost, k.parallelism) {
             assert!(Keypair::from_encrypted_bytes(bytes, PASSWORD).is_err());
+            assert!(Keypair::unlock_for_spending_bytes(bytes, PASSWORD, None).is_err());
         } else if cheap(k.memory_cost, k.time_cost, k.parallelism) {
-            let _ = Keypair::from_encrypted_bytes(bytes, PASSWORD);
+            let loaded = Keypair::from_encrypted_bytes(bytes, PASSWORD);
+            match (&loaded, Keypair::unlock_for_spending_bytes(bytes, PASSWORD, None)) {
+                (Err(e), Ok(_)) => panic!("unlocked for spending a keystore the plain load refuses ({e})"),
+                (Ok(k), Ok((u, migrated))) => {
+                    assert!(migrated.is_none(), "migrated with no network stated");
+                    assert_eq!((&u.private_key, &u.public_key), (&k.private_key, &k.public_key));
+                }
+                _ => {}
+            }
+            // A stated network only for v3 (no migration, no production KDF).
+            if ks.version == KEYSTORE_VERSION_V3 {
+                for n in [Network::Mainnet, Network::Testnet] {
+                    if let Ok((u, migrated)) = Keypair::unlock_for_spending_bytes(bytes, PASSWORD, Some(n)) {
+                        assert!(migrated.is_none(), "a keystore v3 was migrated");
+                        assert_eq!(u.network().ok(), Some(n), "a keystore v3 unlocked for another network");
+                    }
+                }
+            }
         }
     }
 }
@@ -214,6 +240,16 @@ fn keystore_v3(inp: &mut Input) {
     assert_eq!((kp.private_key.as_slice(), kp.public_key.as_slice()), (&private_key[..], &public_key[..]));
     assert_eq!(kp.address, v["address"].as_str().unwrap());
     assert!(Keypair::from_encrypted_bytes(&bytes, "wrong-password-but-long").is_err());
+    for stated in [None, Some(net(testnet))] {
+        let (u, migrated) = Keypair::unlock_for_spending_bytes(&bytes, PASSWORD, stated)
+            .expect("a keystore v3 does not unlock for spending on its own network");
+        assert!(migrated.is_none(), "a keystore v3 was migrated");
+        assert_eq!((u.private_key.as_slice(), u.public_key.as_slice()), (&private_key[..], &public_key[..]));
+    }
+    assert!(
+        Keypair::unlock_for_spending_bytes(&bytes, PASSWORD, Some(net(!testnet))).is_err(),
+        "a keystore v3 unlocked for spending on the other network"
+    );
 
     let mut t = v.clone();
     match inp.u8() % 5 {

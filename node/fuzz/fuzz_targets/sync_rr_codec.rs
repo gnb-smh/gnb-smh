@@ -17,11 +17,16 @@
 //! * The framing itself: the libp2p codec `BlochSyncCodec` (`read_request` /
 //!   `read_response` / `write_*`, the code the request-response behaviour
 //!   runs on every substream) is driven over an in-memory stream. Reading a
-//!   stream is exactly `check_nonempty_frame` + the decoder applied to its
-//!   first 4 MiB (`MAX_FRAME`, restated here), writing is `encode_frame`, a
-//!   written message reads back exactly when it is within the bounds, and a
-//!   stream longer than 4 MiB (a valid frame followed by padding) is a
-//!   penalized refusal, never a decode of its first frame.
+//!   response stream is exactly `check_nonempty_frame` + the decoder applied
+//!   to its first 4 MiB (`MAX_FRAME`, restated here). A request stream is
+//!   read up to 64 bytes only (`MAX_REQUEST_FRAME`, restated; the largest
+//!   request encodes to 33): one that reaches 64 bytes is a penalized
+//!   refusal, a shorter one is `check_nonempty_frame` + `decode_request`.
+//!   Writing is `encode_frame`, every generated request encodes below the
+//!   request cap, a written message reads back exactly when it is within the
+//!   bounds, and a stream past the cap (a valid frame followed by padding:
+//!   64 bytes for a request, 4 MiB for a response) is a penalized refusal,
+//!   never a decode of its first frame.
 #![no_main]
 
 mod common;
@@ -44,8 +49,11 @@ use gnb::network::{
 };
 use libfuzzer_sys::fuzz_target;
 
-/// The read cap of the codec (`take(MAX_FRAME)`), restated.
+/// The read cap of the codec for responses (`take(MAX_FRAME)`), restated.
 const MAX_FRAME: usize = 4 * 1024 * 1024;
+/// The read cap for requests (`take(MAX_REQUEST_FRAME)`), restated: a request
+/// stream that fills it is refused, since no valid request is that long.
+const MAX_REQUEST_FRAME: usize = 64;
 
 /// Same value, or errors of the same kind.
 fn assert_same_io<T: PartialEq + Debug>(got: &io::Result<T>, want: &io::Result<T>, what: &str) {
@@ -64,11 +72,22 @@ fn codec_read(stream: &[u8]) -> (io::Result<SyncRequest>, io::Result<SyncRespons
     (req, resp)
 }
 
-/// The codec on `stream` equals the frame functions on its first 4 MiB.
+/// The codec on `stream` equals the frame functions: on the whole stream
+/// for a request shorter than the request cap (a longer one is a violation),
+/// on the first 4 MiB for a response.
 fn check_codec_read(stream: &[u8]) {
     let (req, resp) = codec_read(stream);
+    let want_req = if stream.len() >= MAX_REQUEST_FRAME {
+        Err(io::Error::new(io::ErrorKind::InvalidData, "request stream reached the request cap"))
+    } else {
+        check_nonempty_frame(stream.to_vec()).and_then(|f| decode_request(&f))
+    };
+    if let Err(e) = &req {
+        if stream.len() >= MAX_REQUEST_FRAME {
+            assert!(is_sync_protocol_violation(e), "a request stream at the cap refused without a penalty: {e}");
+        }
+    }
     let frame = &stream[..stream.len().min(MAX_FRAME)];
-    let want_req = check_nonempty_frame(frame.to_vec()).and_then(|f| decode_request(&f));
     let want_resp = check_nonempty_frame(frame.to_vec()).and_then(|f| decode_response(&f));
     assert_same_io(&req, &want_req, "read_request");
     assert_same_io(&resp, &want_resp, "read_response");
@@ -91,6 +110,17 @@ fn check_codec_write_response(resp: &SyncResponse) {
     assert_eq!(written, encode_frame(resp).unwrap(), "write_response is not encode_frame");
     let (_, back) = codec_read(&written);
     assert_eq!(back.ok(), response_in_bounds(resp).then(|| resp.clone()), "codec response round trip");
+}
+
+/// A request stream padded to the request cap (a valid request followed by
+/// zeros) is refused as a protocol violation, never decoded from its first
+/// frame. Cheap (64 bytes), so it runs for every generated request.
+fn check_request_cap(enc: &[u8], extra: usize) {
+    let mut padded = enc.to_vec();
+    padded.resize(MAX_REQUEST_FRAME + extra, 0);
+    let (req, _) = codec_read(&padded);
+    let e = req.expect_err("a request stream at the 64-byte cap was accepted");
+    assert!(is_sync_protocol_violation(&e), "request stream at the cap refused without a penalty: {e}");
 }
 
 /// A stream past the 4 MiB read cap (a valid frame followed by padding) is
@@ -235,12 +265,14 @@ fuzz_target!(|data: &[u8]| {
         1 => {
             let req = gen_request(&mut inp);
             let enc = encode_frame(&req).unwrap();
+            assert!(enc.len() < MAX_REQUEST_FRAME, "{req:?} encodes to {} bytes, not below the request cap", enc.len());
             assert_eq!(decode_request(&enc).ok(), request_in_bounds(&req).then(|| req.clone()), "request round trip");
             let mut longer = enc.clone();
             longer.push(inp.u8());
             assert!(decode_request(&longer).is_err(), "a trailing byte was accepted");
             check_frame(&enc);
             check_codec_write_request(&req);
+            check_request_cap(&enc, inp.below(4));
         }
         _ => {
             let resp = gen_response(&mut inp);
