@@ -5,6 +5,12 @@ use gnb_smh::{trace_with, Scratchpad};
 const VECTORS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/reference/test_vectors.json"));
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "64 MiB scratchpads (log2_n = 19) and >= 2^11 Keccak-f[1600] permutations per vector; \
+              one permutation takes ~0.4 s under Miri. Safe code (#![forbid(unsafe_code)]); the \
+              scratchpad logic runs under Miri at log2_n = 1 in the unit tests"
+)]
 fn matches_python_reference() {
     let doc: serde_json::Value = serde_json::from_str(VECTORS).unwrap();
     let vectors = doc["vectors"].as_array().unwrap();

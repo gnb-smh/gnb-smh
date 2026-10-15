@@ -13,8 +13,11 @@ use serde_json::Value;
 const VECTORS: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../reference/difficulty_vectors.json"));
 
-fn doc() -> Value {
-    serde_json::from_str(VECTORS).unwrap()
+/// Parsed once per test binary: parsing the vector file dominates the run
+/// time under Miri (about 35 s per parse).
+fn doc() -> &'static Value {
+    static DOC: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    DOC.get_or_init(|| serde_json::from_str(VECTORS).unwrap())
 }
 
 fn u32_of(v: &Value) -> u32 {

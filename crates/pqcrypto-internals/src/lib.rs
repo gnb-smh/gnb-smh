@@ -561,6 +561,7 @@ mod tests {
 
     /// Audit K-H1 REGRESSION: an OS RNG failure must abort, not return `-1`.
     #[test]
+    #[cfg_attr(miri, ignore = "re-executes the test binary as a child process (std::process::Command), which Miri does not support")]
     fn os_rng_failure_aborts_instead_of_failing_open() {
         assert_failed_closed(&run_abort_case("os_rng_failure"), "os_rng_failure");
     }
@@ -568,6 +569,7 @@ mod tests {
     /// Audit K-H1 REGRESSION: a NULL buffer with `len > 0` must abort too —
     /// there is no way to return randomness, and an error code is discarded.
     #[test]
+    #[cfg_attr(miri, ignore = "re-executes the test binary as a child process (std::process::Command), which Miri does not support")]
     fn null_buffer_aborts_instead_of_failing_open() {
         assert_failed_closed(&run_abort_case("null_buffer"), "null_buffer");
     }

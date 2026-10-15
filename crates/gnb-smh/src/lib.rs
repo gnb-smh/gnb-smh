@@ -213,11 +213,16 @@ pub fn verify(header: &[u8], nonce: u64, target: &difficulty::Target) -> bool {
 mod tests {
     use super::*;
 
+    /// One Keccak-f[1600] permutation takes about 0.4 s under Miri (measured,
+    /// docs/testing/SANITIZERS.md), so the hashing tests below run a few
+    /// iterations there and the full count natively.
+    const HASH_TRIALS: u64 = if cfg!(miri) { 3 } else { 200 };
+
     /// The lane-level step must equal FIPS 202 SHAKE256(x || u32le(i) || tag, 128).
     #[test]
     fn step_matches_shake256() {
         let mut x = [0u64; LANES];
-        for trial in 0u64..200 {
+        for trial in 0u64..HASH_TRIALS {
             for (k, lane) in x.iter_mut().enumerate() {
                 *lane = trial
                     .wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -254,7 +259,8 @@ mod tests {
 
     #[test]
     fn nonce_and_header_change_output() {
-        let mut sp = Scratchpad::new(8);
+        // 2^8 blocks natively; 2 blocks (still both phases, both tags) under Miri.
+        let mut sp = Scratchpad::new(if cfg!(miri) { MIN_LOG2_N } else { 8 });
         let a = hash_with(&mut sp, b"gnb", 0);
         assert_ne!(a, hash_with(&mut sp, b"gnb", 1));
         assert_ne!(a, hash_with(&mut sp, b"gnc", 0));

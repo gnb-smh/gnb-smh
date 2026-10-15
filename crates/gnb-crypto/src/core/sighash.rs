@@ -581,6 +581,11 @@ mod tests {
     /// O(size) bytes; the v2 digest hashes O(size) bytes PER input. Counted,
     /// not timed, so the test is deterministic.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "absorbs ~40 KB into SHA3-256 (~300 Keccak-f[1600] permutations, ~0.4 s each under \
+                  Miri); a byte-counting cost test, its arithmetic also runs in v3_commits_to_every_field"
+    )]
     fn v3_cost_is_linear_in_the_input_count() {
         let cost_v3 = |n: usize| {
             let (tx, spent) = tx_with(n, 2, 3);
