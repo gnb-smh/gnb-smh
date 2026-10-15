@@ -593,6 +593,41 @@ mod tests {
         assert_eq!(t, Target(one));
     }
 
+    /// The pow-limit clamp also applies when the computed target is below
+    /// 2^256 (the exact-shift path), not only when the shift overflows.
+    #[test]
+    fn asert_clamps_a_representable_target_above_the_limit() {
+        let a = anchor();
+        let p = AsertParams { pow_limit: bits_to_target(a.bits), ..params() };
+        // One half-life behind schedule: the target doubles, above the limit.
+        let t = asert_next_target(&p, &a, a.timestamp + 7_200, 1).unwrap();
+        assert_eq!(t, p.pow_limit);
+        // Exactly on schedule the anchor target IS the limit and is kept.
+        assert_eq!(asert_next_target(&p, &a, a.timestamp, 1).unwrap(), p.pow_limit);
+        // One half-life ahead: half the limit, untouched by the clamp.
+        let mut half = p.pow_limit.0;
+        shr1(&mut half);
+        assert_eq!(asert_next_target(&p, &a, a.timestamp - 7_200, 1).unwrap(), Target(half));
+    }
+
+    #[test]
+    fn meets_target_is_strict_big_endian() {
+        let t = Target::from_be_bytes({
+            let mut b = [0u8; 32];
+            b[0] = 0x01;
+            b
+        });
+        let mut below = [0xFFu8; 32];
+        below[0] = 0x00;
+        assert!(meets_target(&below, &t), "2^248 - 1 < 2^248");
+        assert!(!meets_target(&t.0, &t), "equal is not below");
+        let mut above = t.0;
+        above[31] = 1;
+        assert!(!meets_target(&above, &t));
+        assert!(!meets_target(&[0u8; 32], &Target::ZERO), "nothing meets the zero target");
+        assert!(meets_target(&[0u8; 32], &Target::MAX));
+    }
+
     #[test]
     fn asert_rejects_bad_inputs() {
         let p = params();
@@ -673,6 +708,38 @@ mod tests {
         let mut e = [0u8; 32];
         e[24] = 0xC0; // 2^63 + 2^62
         assert_eq!(shift_to_u256(&v, -1), Some(e));
+    }
+
+    #[test]
+    fn target_accessors_round_trip() {
+        let mut b = [0u8; 32];
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = i as u8;
+        }
+        let t = Target::from_be_bytes(b);
+        assert_eq!(t, Target(b));
+        assert_eq!(t.as_bytes(), &b);
+        assert_eq!(Target::MAX.as_bytes(), &[0xFF; 32]);
+        assert_eq!(Target::ZERO.as_bytes(), &[0x00; 32]);
+    }
+
+    /// Error texts reach node logs and RPC rejections; pin them.
+    #[test]
+    fn error_messages() {
+        assert_eq!(BitsError::NegativeFlag.to_string(), "compact bits has the negative flag set");
+        assert_eq!(BitsError::ZeroMantissa.to_string(), "compact bits has a zero mantissa");
+        assert_eq!(
+            BitsError::ExponentOutOfRange { exponent: 0xFF }.to_string(),
+            "compact bits exponent 255 is out of the 256-bit range"
+        );
+        assert_eq!(BitsError::MantissaOverflow.to_string(), "compact bits mantissa overflows 256 bits");
+        assert_eq!(BitsError::ZeroTarget.to_string(), "compact bits encodes the zero target");
+        assert_eq!(AsertError::HeightNotAboveAnchor.to_string(), "ASERT height is not above the anchor");
+        assert_eq!(
+            AsertError::InvalidAnchor(BitsError::ZeroMantissa).to_string(),
+            "invalid ASERT anchor bits: compact bits has a zero mantissa"
+        );
+        assert_eq!(AsertError::ArithmeticOverflow.to_string(), "ASERT arithmetic overflow");
     }
 
     #[test]
