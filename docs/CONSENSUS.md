@@ -234,8 +234,8 @@ dropped because it failed a rule that depends on witness bytes the block id
 does not commit to (below the hardening activation, see "Ledger semantics")
 waits the same way: both are one state, "a body of this DAG block is wanted",
 decided in one place, fetched through one request path (the node's directed
-pulls of missing parents, retried with backoff) and accepted through one
-path. The node accepts a copy of a block already in its DAG only while a body
+pulls of missing parents, retried with backoff, at most 1,024 bodies being
+fetched at once) and accepted through one path. The node accepts a copy of a block already in its DAG only while a body
 of it is wanted, only as the answer to its own directed pull, and only for a
 block that is not applied (an applied block is rolled back from its undo
 record); any other copy is ignored before decoding. A copy is checked exactly

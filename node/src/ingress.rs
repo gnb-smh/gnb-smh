@@ -1184,29 +1184,77 @@ pub enum DropReason {
     DeepBudgetExhausted,
 }
 
-/// At most this many waiting bodies are requested at once
-/// ([`awaited_bodies_to_request`]), and at most this many are named by an
-/// operator override that needs pruned bodies (`accept::missing_bodies_below`);
-/// the periodic sweep and a retry ask for the next ones.
+/// At most this many pruned bodies are named by an operator override that
+/// needs them (`accept::missing_bodies_below`); a retry names the next ones.
 pub const MAX_BODY_REFETCH: usize = 4_096;
+
+/// At most this many blocks that wait for a body are being fetched at once
+/// (tracked in `parent_fetch`: requested through [`awaited_bodies_to_request`]
+/// or re-requested by the orphan sweep through [`awaited_bodies_to_chase`]).
+/// A quarter of the network's directed-pull queue
+/// (`network::MAX_PENDING_PULLS`): a pruned node that waits for thousands of
+/// bodies at once (a fork deeper than the pruning depth, audit DAG-6) must
+/// not fill that queue with body pulls, which would make it drop the
+/// orphan-parent and IBD pulls issued meanwhile (review of the P3 merge).
+/// The other bodies are requested as these arrive or are given up on.
+pub const MAX_BODY_PULLS_IN_FLIGHT: usize = crate::network::MAX_PENDING_PULLS / 4;
 
 /// The blocks in the DAG that wait for a body (`GhostDAG::body_pending_blocks`
 /// — the one record of wanted bodies, see `accept::awaits_body`) and are not
-/// already being fetched through `parent_fetch`, at most `limit`. The ONE
-/// request path for wanted bodies, whatever made them wanted (a
+/// already being fetched through `parent_fetch`, as many as keep the bodies
+/// being fetched at once within `limit` (those already tracked count). The
+/// ONE request path for wanted bodies, whatever made them wanted (a
 /// witness-dependent rejection, a connect or an operator override that needs
 /// a missing or pruned body): the processor sends a directed GetBlock for
 /// each and records it in `parent_fetch`, so the periodic sweep retries it
-/// with backoff. Pure selection: nothing is recorded here.
+/// with backoff. Sorted; when the room is smaller than the candidates, a
+/// random window of them ([`take_rotated`]). Pure selection: nothing is
+/// recorded here.
 pub fn awaited_bodies_to_request(
     dag: &GhostDAG,
     parent_fetch: &ParentFetchTracker,
     limit: usize,
 ) -> Vec<BlockHash> {
-    dag.body_pending_blocks().into_iter()
-        .filter(|h| !parent_fetch.is_awaited(h))
-        .take(limit)
-        .collect()
+    let (in_flight, fresh): (Vec<BlockHash>, Vec<BlockHash>) = dag.body_pending_blocks().into_iter()
+        .partition(|h| parent_fetch.is_awaited(h));
+    take_rotated(fresh, limit.saturating_sub(in_flight.len()))
+}
+
+/// The blocks waiting for a body that the periodic orphan sweep chases
+/// (`ParentFetchTracker::sweep` retries each with backoff and forgets every
+/// tracked hash NOT in its chased list): those already being fetched — at
+/// most `limit`, so they keep their retry schedule — then not-yet-tracked
+/// ones up to `limit` in total, which the sweep requests now. The bound keeps
+/// the sweep's GetBlock bursts within [`MAX_BODY_PULLS_IN_FLIGHT`] however
+/// many blocks wait (it used to chase every one, every period).
+pub fn awaited_bodies_to_chase(
+    dag: &GhostDAG,
+    parent_fetch: &ParentFetchTracker,
+    limit: usize,
+) -> Vec<BlockHash> {
+    let (mut in_flight, fresh): (Vec<BlockHash>, Vec<BlockHash>) = dag.body_pending_blocks().into_iter()
+        .partition(|h| parent_fetch.is_awaited(h));
+    in_flight.truncate(limit);
+    let room = limit - in_flight.len();
+    in_flight.extend(take_rotated(fresh, room));
+    in_flight
+}
+
+/// Up to `n` of the sorted `candidates`: all of them if they fit, otherwise
+/// a window of `n` starting at a random offset (wrapping), sorted. A fixed
+/// window would starve the blocks after it whenever the first ones cannot be
+/// fetched (no peer serves them: the sweep gives up and chases them again).
+fn take_rotated(candidates: Vec<BlockHash>, n: usize) -> Vec<BlockHash> {
+    if candidates.len() <= n {
+        return candidates;
+    }
+    if n == 0 {
+        return Vec::new();
+    }
+    let start = rand::random_range(0..candidates.len());
+    let mut out: Vec<BlockHash> = candidates.iter().cycle().skip(start).take(n).copied().collect();
+    out.sort_unstable();
+    out
 }
 
 /// What [`BlockIngress::handle_block`] did with one block.
@@ -1475,7 +1523,7 @@ impl BlockIngress {
             // missing — pruned ones included (audit DAG-6) — or rejected for a
             // witness-dependent reason now wait for one; the caller requests
             // them (`awaited_bodies_to_request`, the one request path).
-            let missing_bodies = awaited_bodies_to_request(&ctx.dag.read(), &self.parent_fetch, MAX_BODY_REFETCH);
+            let missing_bodies = awaited_bodies_to_request(&ctx.dag.read(), &self.parent_fetch, MAX_BODY_PULLS_IN_FLIGHT);
             BlockOutcome::Processed { admission, result, drained, missing_bodies }
         }
     }
@@ -1847,8 +1895,61 @@ mod tests {
         pf.note_requested(chain[2], Instant::now());
         assert_eq!(awaited_bodies_to_request(&dag, &pf, MAX_BODY_REFETCH), vec![chain[4]],
             "a body already being fetched is not requested twice");
+        assert!(awaited_bodies_to_request(&dag, &pf, 1).is_empty(),
+            "the bound counts the bodies already being fetched");
         dag.clear_body_pending(&chain[4]);
         assert!(awaited_bodies_to_request(&dag, &pf, MAX_BODY_REFETCH).is_empty());
+    }
+
+    /// Review of the P3 merge: the orphan sweep chased EVERY block waiting
+    /// for a body each period (thousands on a pruned node following a fork
+    /// deeper than the pruning depth), filling the shared directed-pull
+    /// queue. Now the bodies being fetched at once stay within the bound —
+    /// requested or re-chased — the tracked ones keep their place, and a
+    /// capped selection does not always pick the same window.
+    #[test]
+    fn awaited_bodies_in_flight_stay_bounded() {
+        let (mut dag, chain) = chain_dag(40, 10);
+        for h in &chain[1..] {
+            dag.mark_body_pending(*h, None);
+        }
+        let waiting = dag.body_pending_blocks();
+        assert_eq!(waiting.len(), 40);
+        let mut pf = ParentFetchTracker::new();
+        let now = Instant::now();
+        // Requests: at most the bound in flight.
+        let first = awaited_bodies_to_request(&dag, &pf, 10);
+        assert_eq!(first.len(), 10);
+        assert!(first.windows(2).all(|w| w[0] < w[1]), "sorted, distinct");
+        for h in &first {
+            pf.note_requested(*h, now);
+        }
+        assert!(awaited_bodies_to_request(&dag, &pf, 10).is_empty(), "the bound is reached");
+        assert_eq!(awaited_bodies_to_request(&dag, &pf, 15).len(), 5);
+        // The sweep keeps the tracked ones and adds none while full ...
+        let chased = awaited_bodies_to_chase(&dag, &pf, 10);
+        assert_eq!(chased, first);
+        let (retry, give_up) = pf.sweep(&chased, now);
+        assert!(retry.is_empty() && give_up.is_empty(), "within their backoff");
+        assert_eq!(pf.len(), 10, "nothing tracked was forgotten");
+        // ... and fills the room once some arrived.
+        for h in &first[..4] {
+            dag.clear_body_pending(h);
+        }
+        let chased = awaited_bodies_to_chase(&dag, &pf, 10);
+        assert_eq!(chased.len(), 10);
+        assert!(first[4..].iter().all(|h| chased.contains(h)), "tracked first");
+        let (retry, _) = pf.sweep(&chased, now);
+        assert_eq!(retry.len(), 4, "only the new ones are requested now");
+        // A capped selection is not a fixed window: over a few draws more
+        // than `n` distinct blocks come up.
+        let fresh = ParentFetchTracker::new();
+        let mut seen: HashSet<BlockHash> = HashSet::new();
+        for _ in 0..64 {
+            seen.extend(awaited_bodies_to_request(&dag, &fresh, 5));
+        }
+        assert!(seen.len() > 5, "rotating window: {} distinct", seen.len());
+        assert!(awaited_bodies_to_chase(&dag, &fresh, 0).is_empty());
     }
 
     #[test]

@@ -2298,18 +2298,22 @@ async fn sweep_orphan_parents(
         let d = dag.read();
         let mut ready = Vec::new();
         let mut chased = Vec::new();
+        let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         for p in orphans.waiting_parents() {
             if d.has_block(&p) {
                 ready.push(p);
-            } else if !orphans.contains(&p) {
+            } else if !orphans.contains(&p) && seen.insert(p) {
                 chased.push(p);
             }
         }
         // Blocks in the DAG waiting for a body (a witness-dependent failure
-        // below the hardening activation dropped theirs): fetched like a
-        // missing parent until a body arrives.
-        for h in d.body_pending_blocks() {
-            if !chased.contains(&h) {
+        // below the hardening activation dropped theirs, or a connect needs a
+        // missing or pruned one, audit DAG-6): fetched like a missing parent
+        // until a body arrives — at most `MAX_BODY_PULLS_IN_FLIGHT` at once
+        // (the ones being fetched keep their retry schedule), however many
+        // wait, so they never fill the directed-pull queue.
+        for h in ingress::awaited_bodies_to_chase(&d, parent_fetch, ingress::MAX_BODY_PULLS_IN_FLIGHT) {
+            if seen.insert(h) {
                 chased.push(h);
             }
         }
@@ -2347,8 +2351,9 @@ fn drop_orphan_subtree(root_parent: [u8; 32], orphans: &mut ingress::OrphanPool)
 /// failed a rule that depends on witness bytes the block id does not commit
 /// to, or is missing — pruned and needed again by a connect or an operator
 /// override, audit DAG-6 — `GhostDAG::mark_body_pending`) and is not already
-/// being fetched (`ingress::awaited_bodies_to_request`, at most
-/// `ingress::MAX_BODY_REFETCH` at once). The one request path for wanted
+/// being fetched (`ingress::awaited_bodies_to_request`: at most
+/// `ingress::MAX_BODY_PULLS_IN_FLIGHT` bodies are being fetched at once, the
+/// others are requested as these arrive). The one request path for wanted
 /// bodies; it reuses the missing-parent machinery: the request is tracked by
 /// `parent_fetch`, so the periodic sweep retries it with backoff (from another
 /// peer, `PullPeerSelector`), and the answer — a directed pull — is what the
@@ -2359,7 +2364,7 @@ async fn request_awaited_bodies(
     parent_fetch: &mut sync::parent_fetch::ParentFetchTracker,
     otx:          &tokio::sync::mpsc::Sender<network::NetworkMessage>,
 ) {
-    let wanted = ingress::awaited_bodies_to_request(&dag.read(), parent_fetch, ingress::MAX_BODY_REFETCH);
+    let wanted = ingress::awaited_bodies_to_request(&dag.read(), parent_fetch, ingress::MAX_BODY_PULLS_IN_FLIGHT);
     if wanted.len() > 1 {
         info!("requesting the bodies of {} block(s) waiting for one", wanted.len());
     }
@@ -2563,6 +2568,58 @@ mod ingress_processor_tests {
         sweep_orphan_parents(&mut orphans, &mut fresh, &dag, &otx).await;
         request_awaited_bodies(&dag, &mut fresh, &otx).await;
         assert!(orx.try_recv().is_err());
+    }
+
+    /// Review of the P3 merge: a pruned node following a fork deeper than the
+    /// pruning depth can wait for thousands of bodies at once. The periodic
+    /// sweep used to re-send a GetBlock for every one of them each period
+    /// (filling the 4,096-entry directed-pull queue, so orphan-parent and IBD
+    /// pulls were dropped); now at most `MAX_BODY_PULLS_IN_FLIGHT` bodies are
+    /// being fetched at once, through the sweep and the request path alike.
+    #[tokio::test]
+    async fn the_sweep_fetches_a_bounded_number_of_waiting_bodies() {
+        let (dag, _, _, _) = release_fixture();
+        let cap = ingress::MAX_BODY_PULLS_IN_FLIGHT;
+        let n = cap + 100;
+        {
+            let mut d = dag.write();
+            for i in 0..n as u64 {
+                let mut h = [0xC0u8; 32];
+                h[..8].copy_from_slice(&i.to_le_bytes());
+                d.add_block(h, vec![[0xAA; 32]], 1_001, 1).expect("child of genesis");
+                d.mark_body_pending(h, None);
+            }
+        }
+        let (otx, mut orx) = tokio::sync::mpsc::channel::<network::NetworkMessage>(4 * n);
+        let drain = |orx: &mut tokio::sync::mpsc::Receiver<network::NetworkMessage>| {
+            let mut k = 0usize;
+            while let Ok(m) = orx.try_recv() {
+                assert!(matches!(m, network::NetworkMessage::GetBlock { .. }));
+                k += 1;
+            }
+            k
+        };
+        let mut tracker = sync::parent_fetch::ParentFetchTracker::new();
+        let mut orphans = ingress::OrphanPool::default();
+        sweep_orphan_parents(&mut orphans, &mut tracker, &dag, &otx).await;
+        assert_eq!(drain(&mut orx), cap, "one bounded burst, not one GetBlock per waiting block");
+        assert_eq!(tracker.len(), cap);
+        // The request path adds nothing while the bound is reached ...
+        request_awaited_bodies(&dag, &mut tracker, &otx).await;
+        assert_eq!(drain(&mut orx), 0);
+        // ... and the next sweep within the backoff re-sends nothing and
+        // keeps every tracked body.
+        sweep_orphan_parents(&mut orphans, &mut tracker, &dag, &otx).await;
+        assert_eq!(drain(&mut orx), 0);
+        assert_eq!(tracker.len(), cap);
+        // Bodies that arrive make room for the next ones.
+        let arrived: Vec<[u8; 32]> = dag.read().body_pending_blocks().into_iter()
+            .filter(|h| tracker.is_awaited(h)).take(30).collect();
+        for h in &arrived {
+            dag.write().clear_body_pending(h);
+        }
+        request_awaited_bodies(&dag, &mut tracker, &otx).await;
+        assert_eq!(drain(&mut orx), 30);
     }
 
     /// NET-6: an inflated tip claim (even u64::MAX from a connected peer) can
