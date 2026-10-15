@@ -19,7 +19,9 @@ the second transaction conflicts with A:
 
 from test_framework.messages import Tx, hash_to_address
 from test_framework.test_framework import GnbTestFramework
-from test_framework.util import AssertionFailure, assert_equal, assert_in, assert_true, wait_until
+from test_framework.util import (
+    AssertionFailure, assert_equal, assert_in, assert_raises_rpc_error, assert_true, wait_until,
+)
 
 PAYEE_A = hash_to_address(bytes(range(220, 240)))
 PAYEE_B = hash_to_address(bytes(range(1, 21)))
@@ -49,6 +51,10 @@ class MempoolReplacementTest(GnbTestFramework):
         for n in self.nodes:
             assert_equal(n.mempool(), [a])
         fee_a = int(n0.getrawmempool(True)["transactions"][0]["fee"])
+        # A's inputs, read now: once B is relayed, every node replaces A
+        # within milliseconds and no longer finds it (not pooled, not
+        # confirmed), so A is never queried after B is sent.
+        a_inputs = self.outpoints(n0, a)
 
         self.log.info("a conflicting payment at A's fee is refused; A stays")
         try:
@@ -66,10 +72,13 @@ class MempoolReplacementTest(GnbTestFramework):
         self.log.info("a conflicting payment with a higher fee replaces A on every node")
         fee_b = fee_a + 100_000
         b = n1.cli_send(wallet, PAYEE_B, "2", "--fee", gnb_amount(fee_b), "--max-fee", gnb_amount(2 * fee_b))
-        assert_true(self.outpoints(n1, b) & self.outpoints(n0, a), "B spends A's coins")
+        assert_true(self.outpoints(n1, b) & a_inputs, "B spends A's coins")
         self.sync_mempools()
         for n in self.nodes:
             wait_until(lambda n=n: n.mempool() == [b], timeout=30, desc=f"node{n.index} holds B only")
+            # Replaced A is gone: neither pooled nor confirmed, so no node
+            # serves it (why A's inputs were read before B was sent).
+            assert_raises_rpc_error("transaction not found", n.getrawtransaction, a)
         assert_equal(int(n2.getrawmempool(True)["transactions"][0]["fee"]), fee_b)
 
         self.log.info("a block mined at node2 confirms B everywhere; A is gone")
