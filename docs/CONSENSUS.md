@@ -435,9 +435,12 @@ bound of B's blue work:
    along an evicted path is used instead (it chains through any number of
    evictions, so a linear fork deeper than every store still proves its work).
    Each orphan passed the orphan bits floor (the target a child of the
-   selected tip would carry now, eased 16-fold, never easier than the pow
-   limit of that child's height: the genesis target at/after the hardening
-   activation, see "Pow limit (POW-3)") and its proof of work. Both
+   selected tip would carry now, eased 16-fold and capped at the pow limit of
+   the height the orphan claims — the limit its own proof of work is checked
+   against: the genesis target at/after the hardening activation, the legacy
+   limit below it, see "Pow limit (POW-3)" — so the pre-activation blocks of
+   a fork that branches below the activation stay admissible after the tip
+   passed it) and its proof of work. Both
    remembered stores are keyed only by an evicted orphan's missing parents
    (at most 8), charged to the peer that delivered it (at most a quarter of
    each store per peer) and, when full, give way only to an entry of greater

@@ -170,8 +170,13 @@ pub fn reference_target(tip_h: u64, now_unix: u64) -> [u8; 32] {
 /// (`core::Block::pow_limit_target_for_height`, i.e. `core::block_rules::
 /// pow_limit_bits_at` under the process-wide activation height).
 pub fn ease_target(target: &[u8; 32], shift: u32, height: u64) -> [u8; 32] {
+    ease_target_to(target, shift, &core::Block::pow_limit_target_for_height(height))
+}
+
+/// `target × 2^shift`, saturating at the target `limit`.
+pub fn ease_target_to(target: &[u8; 32], shift: u32, limit: &[u8; 32]) -> [u8; 32] {
     use primitive_types::U256;
-    let limit = U256::from_big_endian(&core::Block::pow_limit_target_for_height(height));
+    let limit = U256::from_big_endian(limit);
     let t = U256::from_big_endian(target);
     if t.is_zero() {
         return limit.to_big_endian();
@@ -180,10 +185,20 @@ pub fn ease_target(target: &[u8; 32], shift: u32, height: u64) -> [u8; 32] {
     eased.to_big_endian()
 }
 
-/// The admission floor for orphans: [`reference_target`] eased by
-/// [`ORPHAN_WORK_FLOOR_SHIFT`], capped at the pow limit of height `tip_h + 1`.
-pub fn orphan_admission_floor(tip_h: u64, now_unix: u64) -> [u8; 32] {
-    ease_target(&reference_target(tip_h, now_unix), ORPHAN_WORK_FLOOR_SHIFT, tip_h.saturating_add(1))
+/// The admission floor for an orphan that claims header height
+/// `orphan_height`: [`reference_target`] eased by [`ORPHAN_WORK_FLOOR_SHIFT`],
+/// capped at the pow limit of `orphan_height` — the limit `validate_pow`
+/// checks the orphan's own proof against. The cap is evaluated at the
+/// orphan's OWN claimed height, never at the tip's next height: after the
+/// tip passed the hardening activation, a heavier fork that branched below it
+/// delivers orphans at pre-activation heights whose legal bits can be easier
+/// than the genesis target (the legacy pow limit applies there); capping
+/// their floor at the genesis target would drop them, break the fork's orphan
+/// chain and keep the node on the lighter chain (review of the P3 merge).
+/// The 16-fold easing of the reference still bounds how cheap any orphan can
+/// be.
+pub fn orphan_admission_floor(tip_h: u64, now_unix: u64, orphan_height: u64) -> [u8; 32] {
+    ease_target(&reference_target(tip_h, now_unix), ORPHAN_WORK_FLOOR_SHIFT, orphan_height)
 }
 
 /// `target(bits) <= floor`. Malformed bits never meet any floor. Cheap: no
@@ -1469,7 +1484,9 @@ impl BlockIngress {
             }
             // NET-2 / POW-4: bits no easier than the anti-DoS floor BEFORE
             // the proof is evaluated.
-            let floor = orphan_admission_floor(tip_h, now_unix);
+            // The cap is the pow limit of the height the orphan claims (the
+            // one its proof is checked against), not the tip's next height.
+            let floor = orphan_admission_floor(tip_h, now_unix, block.height);
             if !bits_meet_floor(block.header.bits, &floor) {
                 return BlockOutcome::Dropped(DropReason::OrphanBelowFloor);
             }
@@ -1650,12 +1667,19 @@ mod tests {
     #[test]
     fn ease_target_saturates_at_pow_limit() {
         // The cap is the pow limit of the height (POW-3: the genesis target
-        // at/after the hardening activation; under the test-only pow limit
-        // every height's limit is `POW_LIMIT_BITS`).
+        // at/after the hardening activation). Explicit schedules: the
+        // test-only pow limit the node's tests build with pins every
+        // height's limit to `POW_LIMIT_BITS`.
+        let legacy = core::bits_to_target(core::POW_LIMIT_BITS);
+        let genesis = core::bits_to_target(core::GENESIS_BITS);
+        assert!(genesis < legacy);
+        for limit in [legacy, genesis] {
+            assert_eq!(ease_target_to(&legacy, 4, &limit), limit);
+            assert_eq!(ease_target_to(&[0u8; 32], 4, &limit), limit, "a zero target falls back to the limit");
+        }
+        assert_eq!(ease_target(&legacy, 4, 1), core::Block::pow_limit_target_for_height(1));
         for h in [1u64, 110_000, u64::MAX] {
-            let cap = core::Block::pow_limit_target_for_height(h);
-            assert_eq!(ease_target(&core::bits_to_target(core::POW_LIMIT_BITS), 4, h), cap);
-            assert!(reference_target(h.saturating_sub(1), 0) <= cap);
+            assert!(reference_target(h.saturating_sub(1), 0) <= core::Block::pow_limit_target_for_height(h));
         }
         let limit = core::bits_to_target(core::POW_LIMIT_BITS);
         let g = core::bits_to_target(core::GENESIS_BITS);
@@ -1664,6 +1688,52 @@ mod tests {
         assert!(bits_meet_floor(core::GENESIS_BITS, &eased));
         assert!(!bits_meet_floor(core::POW_LIMIT_BITS, &eased), "pow-limit bits are easier than the floor");
         assert!(!bits_meet_floor(0x0480_0001, &limit), "malformed bits never meet a floor");
+    }
+
+    /// Review of the P3 merge: the orphan floor is capped at the pow limit of
+    /// the height the orphan CLAIMS (what `validate_pow` checks its proof
+    /// against), not of the tip's next height. Mainnet schedule (activation
+    /// 110,000), tip past the activation with the network at the genesis
+    /// target: an orphan of a heavier fork at a pre-activation height whose
+    /// legal bits are 4x easier than the genesis target is admitted (it was
+    /// dropped as `OrphanBelowFloor` when the cap was the genesis target of
+    /// height tip+1), while the same bits at a post-activation height still
+    /// fail (they fail `validate_pow` there anyway).
+    #[test]
+    fn orphan_floor_cap_follows_the_orphans_own_height() {
+        const ACT: u64 = 110_000;
+        let pow_limit_at = |h: u64| core::bits_to_target(core::block_rules::pow_limit_bits_at(h, ACT));
+        let genesis = core::bits_to_target(core::GENESIS_BITS);
+        // Network target near the genesis target after the activation: the
+        // reference a child of the tip at 110,500 would carry.
+        let reference = genesis;
+        let easier_4x = {
+            use primitive_types::U256;
+            (U256::from_big_endian(&genesis) << 2usize).to_big_endian()
+        };
+        let bits_4x = core::target_to_bits(&easier_4x);
+        assert!(core::bits_to_target(bits_4x) > genesis, "easier than the genesis target");
+        assert!(core::bits_to_target(bits_4x) <= pow_limit_at(ACT - 1), "legal below the activation");
+
+        // `orphan_admission_floor` under this schedule: the reference eased
+        // 16-fold, capped at the pow limit of the orphan's claimed height.
+        let floor = |claimed: u64| ease_target_to(&reference, ORPHAN_WORK_FLOOR_SHIFT, &pow_limit_at(claimed));
+        let pre = floor(ACT - 1);
+        assert!(bits_meet_floor(bits_4x, &pre), "a pre-activation orphan with legal bits is admitted");
+        assert_eq!(pre, ease_target_to(&reference, ORPHAN_WORK_FLOOR_SHIFT, &pow_limit_at(0)),
+            "below the activation: the legacy cap, i.e. 16x the reference");
+        // The pre-merge cap (pow limit of tip_h + 1) dropped it.
+        let at_tip_next = floor(110_501);
+        assert_eq!(at_tip_next, genesis);
+        assert!(!bits_meet_floor(bits_4x, &at_tip_next));
+        // Never easier than 16x the reference, whatever height is claimed.
+        let eased_16x = ease_target_to(&reference, ORPHAN_WORK_FLOOR_SHIFT, &core::bits_to_target(core::POW_LIMIT_BITS));
+        assert!(pre <= eased_16x);
+        let too_easy = {
+            use primitive_types::U256;
+            core::target_to_bits(&(U256::from_big_endian(&genesis) << 5usize).to_big_endian())
+        };
+        assert!(!bits_meet_floor(too_easy, &pre), "32x easier than the reference: below the floor");
     }
 
     #[test]
