@@ -1,0 +1,92 @@
+name: fuzz
+
+# Builds every cargo-fuzz target of node/fuzz (nightly, libFuzzer, ASan) and
+# runs each one over its committed seed corpus for a fixed time.
+#
+# * pull requests and the nightly CI run call this workflow from ci.yml with
+#   60 s per target;
+# * the weekly schedule below runs the 10-minute-per-target campaign;
+# * a manual run takes the time per target as input.
+#
+# Any crash, leak, timeout or out-of-memory input fails the run; every
+# reproducer libFuzzer wrote (node/fuzz/artifacts/<target>/) is uploaded as
+# the `fuzz-artifacts` artifact. Reproduce one locally with
+#   cargo +nightly fuzz run <target> <artifact file>
+# (docs/testing/FUZZING.md).
+
+on:
+  workflow_call:
+    inputs:
+      seconds:
+        description: Seconds of fuzzing per target
+        type: number
+        default: 60
+  schedule:
+    - cron: "41 4 * * 0" # weekly (Sunday): 10 minutes per target
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds of fuzzing per target
+        default: "600"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      FUZZ_SECONDS: ${{ inputs.seconds || 600 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies (librocksdb-sys needs clang/libclang)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: Nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            node/fuzz/target
+          key: fuzz-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'node/fuzz/Cargo.toml') }}
+      - name: Start from the audited lockfile
+        run: cp Cargo.lock node/fuzz/Cargo.lock
+      - name: Build all fuzz targets (ASan)
+        working-directory: node/fuzz
+        run: cargo +nightly fuzz build
+      - name: Run each target over its seed corpus
+        working-directory: node/fuzz
+        run: |
+          failed=""
+          for t in $(cargo +nightly fuzz list); do
+            mkdir -p "corpus/$t" "artifacts/$t"
+            echo "::group::$t ($FUZZ_SECONDS s)"
+            # The committed corpus is the input; new coverage goes to a
+            # scratch directory so the run never edits the checkout.
+            mkdir -p "/tmp/fuzz-new/$t"
+            if ! cargo +nightly fuzz run "$t" "/tmp/fuzz-new/$t" "corpus/$t" -- \
+                -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048 -timeout=120 \
+                -print_final_stats=1; then
+              failed="$failed $t"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::fuzz targets failed:$failed"
+            exit 1
+          fi
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: node/fuzz/artifacts
+          if-no-files-found: ignore
