@@ -1,6 +1,6 @@
 {
  "format": "gnb-consensus-tx-vectors/1",
- "description": "Transaction validity in both activation regimes. Each case is ONE non-coinbase transaction evaluated in a block at `height` (header height) under the explicit `activation_height`, on `network`, against a UTXO view holding exactly `prevouts` (source `utxo`; a `block-coinbase` prevout is output 0 of the block's own coinbase). The block is [wrapper coinbase, tx]: the wrapper coinbase has one input (32 zero bytes, index 0xffffffff, script_sig `constants.wrapper_coinbase_script_sig`, sequence 0xffffffff), one output (the block-coinbase prevout's amount and script, or 0 to 20 zero bytes), version 1, locktime 0. `expected` is the consensus verdict and the class of the first rule that fails in the node's order; `policy` is mempool admission for a block at `height` on a store holding the `utxo` prevouts, each prevout's txid indexed as a confirmed transaction (a node applies every coin with its creating transaction); a consensus-invalid case is always rejected. `derived` holds values the code computes and the Python reference recomputes. Format: docs/testing/VECTORS.md.",
+ "description": "Transaction validity in both activation regimes. Each case is ONE non-coinbase transaction evaluated in a block at `height` (header height) under `activation_height` (`activation_source`: `explicit`, or `schedule` = the network's own activation schedule, which the runners take from the schedule instead of installing it), on `network`, against a UTXO view holding exactly `prevouts` (source `utxo`; a `block-coinbase` prevout is output 0 of the block's own coinbase). The block is [wrapper coinbase, tx]: the wrapper coinbase has one input (32 zero bytes, index 0xffffffff, script_sig `constants.wrapper_coinbase_script_sig`, sequence 0xffffffff), one output (the block-coinbase prevout's amount and script, or 0 to 20 zero bytes), version 1, locktime 0. `expected` is the consensus verdict and the class of the first rule that fails in the node's order; `policy` is mempool admission for a block at `height` on a store holding the `utxo` prevouts, each prevout's txid indexed as a confirmed transaction (a node applies every coin with its creating transaction): accept, or reject with the class of the first admission rule that refuses it (a consensus-invalid case is always rejected). `derived` holds values the code computes and the Python reference recomputes. Format: docs/testing/VECTORS.md.",
  "generator": "crates/gnb-crypto/tests/gen_consensus_vectors.rs",
  "constants": {
   "chain_id_mainnet": 1196294145,
@@ -61,6 +61,7 @@
    "description": "The honest signer of the regime: version 1 + sighash v2 below the activation, version 3 + sighash v3 + bound signatures from it.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -103,6 +104,7 @@
    "description": "Two inputs locked to two different keys, two outputs.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -160,6 +162,7 @@
    "description": "Three inputs locked to one key; each signature commits to its own input index.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -232,6 +235,7 @@
    "description": "The honest signer of the regime: version 1 + sighash v2 below the activation, version 3 + sighash v3 + bound signatures from it.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -274,6 +278,7 @@
    "description": "Two inputs locked to two different keys, two outputs.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -331,6 +336,7 @@
    "description": "Three inputs locked to one key; each signature commits to its own input index.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -403,6 +409,7 @@
    "description": "The mainnet activation height 110,000: the last pre-activation height.",
    "network": "mainnet",
    "activation_height": "110000",
+   "activation_source": "schedule",
    "height": "109999",
    "regime": "pre-activation",
    "prevouts": [
@@ -445,6 +452,7 @@
    "description": "The mainnet activation height 110,000: the first post-activation height.",
    "network": "mainnet",
    "activation_height": "110000",
+   "activation_source": "schedule",
    "height": "110000",
    "regime": "post-activation",
    "prevouts": [
@@ -487,6 +495,7 @@
    "description": "Activation height 0 (testnet/regtest schedule): the rules apply from height 1.",
    "network": "mainnet",
    "activation_height": "0",
+   "activation_source": "explicit",
    "height": "1",
    "regime": "post-activation",
    "prevouts": [
@@ -529,6 +538,7 @@
    "description": "Activation height u64::MAX (never): the old rules at any height.",
    "network": "mainnet",
    "activation_height": "18446744073709551615",
+   "activation_source": "explicit",
    "height": "4000000",
    "regime": "pre-activation",
    "prevouts": [
@@ -571,6 +581,7 @@
    "description": "No outputs: the whole input value is the fee. Consensus-valid (there is no output-count rule); relay policy refuses it.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -610,9 +621,10 @@
   },
   {
    "id": "struct/no-inputs/pre",
-   "description": "No inputs (one zero-value output): there is no input-count rule, but the fee is 0, below the consensus minimum.",
+   "description": "No inputs (one zero-value output): there is no input-count rule, but the fee is 0, below the consensus minimum. The mempool refuses it first as non-standard (no inputs).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [],
@@ -623,7 +635,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-no-inputs"
    },
    "derived": {
     "txid": "cd8d0ee0b140abe89729fca83123dcdb5e29074089c4f4655c38de2f2ff84f11",
@@ -638,6 +650,7 @@
    "description": "A coinbase-shaped transaction (one input spending the null outpoint) outside position 0 of its block.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [],
@@ -648,7 +661,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "coinbase-format"
    },
    "derived": {
     "txid": "6c4962e8c949d79fe037a30edadcc3481afb71959db290b06e6b3d8ee2b35d1c",
@@ -670,6 +683,7 @@
    "description": "The spent outpoint is not in the UTXO set (otherwise a correctly signed spend).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [],
@@ -680,7 +694,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "missing-input"
    },
    "derived": {
     "txid": "5b7e03b95c380c7acc46937ba340d1016b6974383af68fa691cefe67092471a0",
@@ -702,6 +716,7 @@
    "description": "The same outpoint spent twice by one transaction, both inputs correctly signed.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -722,7 +737,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "double-spend"
    },
    "derived": {
     "txid": "344809b25e7c091593dbc4190b10a27ed08029ebc50d6edaa028893a3bc0d8ab",
@@ -750,6 +765,7 @@
    "description": "Two outputs of one transaction spent together: distinct outpoints.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -807,6 +823,7 @@
    "description": "locktime = 2^32-1 and sequence = 0: GnB has no lock-time or relative-lock-time rule (the fields are only signed).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -849,6 +866,7 @@
    "description": "No outputs: the whole input value is the fee. Consensus-valid (there is no output-count rule); relay policy refuses it.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -888,9 +906,10 @@
   },
   {
    "id": "struct/no-inputs/post",
-   "description": "No inputs (one zero-value output): there is no input-count rule, but the fee is 0, below the consensus minimum.",
+   "description": "No inputs (one zero-value output): there is no input-count rule, but the fee is 0, below the consensus minimum. The mempool refuses it first as non-standard (no inputs).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [],
@@ -901,7 +920,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-no-inputs"
    },
    "derived": {
     "txid": "db0aae3317f7cca4442ecf5808f16e5ac1fd08bde1b7fa087de585bf8b59b7f1",
@@ -916,6 +935,7 @@
    "description": "A coinbase-shaped transaction (one input spending the null outpoint) outside position 0 of its block.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [],
@@ -926,7 +946,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "coinbase-format"
    },
    "derived": {
     "txid": "636bb781bba9a589ba15ec6e7c32492dce11bb93a3643a9c0752c08c901bc600",
@@ -948,6 +968,7 @@
    "description": "The spent outpoint is not in the UTXO set (otherwise a correctly signed spend).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [],
@@ -958,7 +979,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "missing-input"
    },
    "derived": {
     "txid": "edb6ebec514590052d7a29a645d84041a5bb6faa4102ed3f2902e62e51552d49",
@@ -980,6 +1001,7 @@
    "description": "The same outpoint spent twice by one transaction, both inputs correctly signed.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -1000,7 +1022,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "double-spend"
    },
    "derived": {
     "txid": "c0c7a8d5e4c346aec0e5ec14ae2156d159d081bd487345f2ee73d4ea6474b6c4",
@@ -1028,6 +1050,7 @@
    "description": "Two outputs of one transaction spent together: distinct outpoints.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -1085,6 +1108,7 @@
    "description": "locktime = 2^32-1 and sequence = 0: GnB has no lock-time or relative-lock-time rule (the fields are only signed).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -1127,6 +1151,7 @@
    "description": "A two-input transaction whose second input names the null outpoint: not a coinbase (two inputs), and no such coin exists.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1147,7 +1172,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "missing-input"
    },
    "derived": {
     "txid": "7215f4f9fb44fe29a4ae0138aadaad509e6e7ff3de00b552253f0e7b4da88d83",
@@ -1175,6 +1200,7 @@
    "description": "A correctly signed transaction with its last byte removed.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1195,7 +1221,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "decode"
    },
    "derived": null
   },
@@ -1204,6 +1230,7 @@
    "description": "A correctly signed transaction followed by one extra byte: not the canonical encoding.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1224,7 +1251,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "decode"
    },
    "derived": null
   },
@@ -1233,6 +1260,7 @@
    "description": "The input count written as FD 01 00: decodes, but re-encodes differently (non-canonical).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1253,7 +1281,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "decode"
    },
    "derived": null
   },
@@ -1262,6 +1290,7 @@
    "description": "Zero bytes.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1282,7 +1311,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "decode"
    },
    "derived": null
   },
@@ -1291,6 +1320,7 @@
    "description": "An input count of 100,001 (the decoder's cap is 100,000).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1311,7 +1341,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "decode"
    },
    "derived": null
   },
@@ -1320,6 +1350,7 @@
    "description": "No inputs and an output count of 100,001 (cap 100,000).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1340,7 +1371,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "decode"
    },
    "derived": null
   },
@@ -1349,6 +1380,7 @@
    "description": "A script_sig one byte above the 10,000-byte cap (the signature, then zero padding).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1369,7 +1401,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "decode"
    },
    "derived": null
   },
@@ -1378,6 +1410,7 @@
    "description": "An output script one byte above the 10,000-byte cap.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1398,7 +1431,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "decode"
    },
    "derived": null
   },
@@ -1407,6 +1440,7 @@
    "description": "A valid signature followed by zero padding up to exactly 10,000 script_sig bytes: the lenient framing ignores the padding below the activation; the canonical witness rule refuses it from the activation.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1449,6 +1483,7 @@
    "description": "An output script of exactly 10,000 bytes (the cap). The fee covers the size.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1491,6 +1526,7 @@
    "description": "300 outputs to 300 different scripts.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1533,6 +1569,7 @@
    "description": "A valid signature followed by zero padding up to exactly 10,000 script_sig bytes: the lenient framing ignores the padding below the activation; the canonical witness rule refuses it from the activation.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -1553,7 +1590,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "af505b424b5f72384ca1c4eeec1a6c29c741ee8b88f372d423636ea5c1a8a153",
@@ -1575,6 +1612,7 @@
    "description": "An output script of exactly 10,000 bytes (the cap). The fee covers the size.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -1617,6 +1655,7 @@
    "description": "300 outputs to 300 different scripts.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -1659,6 +1698,7 @@
    "description": "One output of MAX_SUPPLY_SAT + 1 (MoneyRange).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1679,7 +1719,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "value-out-of-range"
    },
    "derived": {
     "txid": "5c3024c295e6f1f0a5082febb384516f710c13e225bf125dfc5bfc44ccbfb7b0",
@@ -1701,6 +1741,7 @@
    "description": "Two outputs of MAX_SUPPLY_SAT each: each in range, the sum is not.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1721,7 +1762,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "value-out-of-range"
    },
    "derived": {
     "txid": "f43c4bde7882ab5fa701db4564bccf81823b5161ae0dbba50aa01d0212bb65e4",
@@ -1743,6 +1784,7 @@
    "description": "An output of 2^64 - 1 (and a second output that would overflow the sum).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1763,7 +1805,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "value-out-of-range"
    },
    "derived": {
     "txid": "10301200f131a2799046ab96fd43b9372a58e6611bd3f13fb32786f3ba2fdb65",
@@ -1785,6 +1827,7 @@
    "description": "Spending a coin of exactly MAX_SUPPLY_SAT (in range) to one output of MAX_SUPPLY_SAT - 100,000.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1827,6 +1870,7 @@
    "description": "The spent coin holds MAX_SUPPLY_SAT + 1 (unreachable on a real chain): the input sum fails MoneyRange.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1847,7 +1891,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "value-out-of-range"
    },
    "derived": {
     "txid": "58c9de93006837b45b93209ee07ca280d4ca11a07a4907c58207b18c0d133bcb",
@@ -1869,6 +1913,7 @@
    "description": "Two spent coins of MAX_SUPPLY_SAT and 1: the input sum leaves the money range.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1898,7 +1943,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "value-out-of-range"
    },
    "derived": {
     "txid": "ca7af108216aef0d72ceb48dfdf87f84572f6b25a0abd25acd106aabf8fe25a2",
@@ -1926,6 +1971,7 @@
    "description": "Outputs exceed the input by one base unit.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1946,7 +1992,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "inputs-below-outputs"
    },
    "derived": {
     "txid": "f6192e313b156f323c4e5e7d053b472c8b559ebea29789011aed657567995e97",
@@ -1968,6 +2014,7 @@
    "description": "Inputs equal outputs: fee 0.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -1988,7 +2035,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "min-fee"
    },
    "derived": {
     "txid": "c5916898407568a082ce96a3a975ef40f3fb163fa5f28f8d26ec0695f0d93bcb",
@@ -2010,6 +2057,7 @@
    "description": "Fee exactly the size-based minimum: max(10,000, ceil(8424 wire bytes x 2,000 / 1,000)) = 16848.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -2052,6 +2100,7 @@
    "description": "Fee one base unit below the size-based minimum: max(10,000, ceil(8425 wire bytes x 2,000 / 1,000)) = 16850.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -2072,7 +2121,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "min-fee"
    },
    "derived": {
     "txid": "27e6a6833779f5b2405dd90d9405dc3a833e616161dc504e3773f090a20f48f0",
@@ -2094,6 +2143,7 @@
    "description": "A second output of 545 base units (dust threshold 546: 0 < value < 546 is invalid).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -2114,7 +2164,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "dust"
    },
    "derived": {
     "txid": "d6c6253a878855c13c030b30fc4157759cc5fee9ca39c2d783000c8895b978c6",
@@ -2136,6 +2186,7 @@
    "description": "A second output of 546 base units (dust threshold 546: 0 < value < 546 is invalid).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -2178,6 +2229,7 @@
    "description": "A second output of 1 base units (dust threshold 546: 0 < value < 546 is invalid).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -2198,7 +2250,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "dust"
    },
    "derived": {
     "txid": "5e3687a0dd45e4c704be3309351dadcbca63c2c959d409453fad6e0c5dd04c20",
@@ -2220,6 +2272,7 @@
    "description": "A zero-value output: not dust by consensus (only 0 < value < 546 is), refused by relay policy.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -2262,6 +2315,7 @@
    "description": "One output of MAX_SUPPLY_SAT + 1 (MoneyRange).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -2282,7 +2336,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "value-out-of-range"
    },
    "derived": {
     "txid": "e0437e72866e5cb97833eae8f62da36a427a3098d2b58a0de68780675dae4314",
@@ -2304,6 +2358,7 @@
    "description": "Two outputs of MAX_SUPPLY_SAT each: each in range, the sum is not.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -2324,7 +2379,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "value-out-of-range"
    },
    "derived": {
     "txid": "0ad50ddd7a376ebd7d3751401cb3bfb7d3a0ab51d9959f14d6651a128dc8472e",
@@ -2346,6 +2401,7 @@
    "description": "An output of 2^64 - 1 (and a second output that would overflow the sum).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -2366,7 +2422,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "value-out-of-range"
    },
    "derived": {
     "txid": "a5ab7e394cff522ac754c59b2f78937dec1d911822c062ee65417f57c3d46b3e",
@@ -2388,6 +2444,7 @@
    "description": "Spending a coin of exactly MAX_SUPPLY_SAT (in range) to one output of MAX_SUPPLY_SAT - 100,000.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -2430,6 +2487,7 @@
    "description": "The spent coin holds MAX_SUPPLY_SAT + 1 (unreachable on a real chain): the input sum fails MoneyRange.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -2450,7 +2508,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "value-out-of-range"
    },
    "derived": {
     "txid": "b5e3a6fb539caa29878840b0f726b9994f9d19c5f83ef43b825ff568e79f600b",
@@ -2472,6 +2530,7 @@
    "description": "Two spent coins of MAX_SUPPLY_SAT and 1: the input sum leaves the money range.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -2501,7 +2560,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "value-out-of-range"
    },
    "derived": {
     "txid": "8697157472c9315c7ade1a26918a7b6f928f58adb5f5395165e9b99161988811",
@@ -2529,6 +2588,7 @@
    "description": "Outputs exceed the input by one base unit.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -2549,7 +2609,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "inputs-below-outputs"
    },
    "derived": {
     "txid": "fb639674fafe8b5a2f51330664f4436fb58a4c82a43d711050214dbaf0d33326",
@@ -2571,6 +2631,7 @@
    "description": "Inputs equal outputs: fee 0.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -2591,7 +2652,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "min-fee"
    },
    "derived": {
     "txid": "e7e199a7adda88300e6011ebb1c33cd6981f5c800384b4600f317f2848b92c40",
@@ -2613,6 +2674,7 @@
    "description": "Fee exactly the size-based minimum: max(10,000, ceil(8424 wire bytes x 2,000 / 1,000)) = 16848.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -2655,6 +2717,7 @@
    "description": "Fee one base unit below the size-based minimum: max(10,000, ceil(8422 wire bytes x 2,000 / 1,000)) = 16844.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -2675,7 +2738,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "min-fee"
    },
    "derived": {
     "txid": "2c519e6b2a0547a2c4d82907e82b86ff12f505076dcc3664d2fb9e442169a540",
@@ -2697,6 +2760,7 @@
    "description": "A second output of 545 base units (dust threshold 546: 0 < value < 546 is invalid).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -2717,7 +2781,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "dust"
    },
    "derived": {
     "txid": "1d9f97aca1321ad48b4bae4371de4ecf031142418e83931d081fd47ed5274113",
@@ -2739,6 +2803,7 @@
    "description": "A second output of 546 base units (dust threshold 546: 0 < value < 546 is invalid).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -2781,6 +2846,7 @@
    "description": "A second output of 1 base units (dust threshold 546: 0 < value < 546 is invalid).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -2801,7 +2867,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "dust"
    },
    "derived": {
     "txid": "4babb2d6e6034b504b3c35cd011c4959026a0388eb48ea8bf05a030bd3786aaa",
@@ -2823,6 +2889,7 @@
    "description": "A zero-value output: not dust by consensus (only 0 < value < 546 is), refused by relay policy.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -2862,9 +2929,10 @@
   },
   {
    "id": "fee/witness-padding-raises-the-minimum/pre",
-   "description": "Fee exactly the minimum of the unpadded transaction; 50 padding bytes after the public key raise the wire size, so the fee is below the minimum (the fee rule counts witness bytes).",
+   "description": "Fee exactly the minimum of the unpadded transaction; 50 padding bytes after the public key raise the wire size, so the fee is below the minimum (the fee rule counts witness bytes). The mempool refuses the padded witness first (non-standard).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -2885,7 +2953,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "0a34cd82559301994125d2576ea34c57e4224a217fede55ec705e63a0c00a421",
@@ -2907,6 +2975,7 @@
    "description": "Spends the coinbase of a block at height 899 from a block at height 999 (depth 100; 100 needed).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -2949,6 +3018,7 @@
    "description": "Spends the coinbase of a block at height 900 from a block at height 999 (depth 99; 100 needed).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -2969,7 +3039,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "immature-coinbase"
    },
    "derived": {
     "txid": "ce1e4fbc08ac795e5d75be84bc570c3d8482b4377620c42a91c627ad45f87f16",
@@ -2991,6 +3061,7 @@
    "description": "Spends the coinbase of a block at height 999 from a block at height 999 (depth 0; 100 needed).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -3011,7 +3082,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "immature-coinbase"
    },
    "derived": {
     "txid": "2959acf1504d2aeff322adb2b417a2529eb3a51cfeebff8995446815fca3e0c9",
@@ -3033,6 +3104,7 @@
    "description": "Spends the coinbase of a block at height 1004 from a block at height 999 (depth -5; 100 needed).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -3053,7 +3125,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "immature-coinbase"
    },
    "derived": {
     "txid": "e928eb619cbc88fc42acfa84b8bf9d6489ba2c8b6e36084b8caa036daf957861",
@@ -3075,6 +3147,7 @@
    "description": "Spends output 0 of the coinbase of its own block (the wrapper coinbase pays the prevout). Valid below the activation (historical: the in-block coinbase was never looked up for maturity); mempool admission cannot see an unconfirmed coinbase.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -3117,6 +3190,7 @@
    "description": "Spends the coinbase of a block at height 900 from a block at height 1000 (depth 100; 100 needed).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -3159,6 +3233,7 @@
    "description": "Spends the coinbase of a block at height 901 from a block at height 1000 (depth 99; 100 needed).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -3179,7 +3254,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "immature-coinbase"
    },
    "derived": {
     "txid": "465d7e14248a7bf66c5f5e3322f9bb2f9854d7c2b87159d1e32a8c7c82d9adac",
@@ -3201,6 +3276,7 @@
    "description": "Spends the coinbase of a block at height 1000 from a block at height 1000 (depth 0; 100 needed).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -3221,7 +3297,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "immature-coinbase"
    },
    "derived": {
     "txid": "f98ac345d14bb1464f7599ff375b47481e1d1a63918455cc6a1d785adc013238",
@@ -3243,6 +3319,7 @@
    "description": "Spends the coinbase of a block at height 1005 from a block at height 1000 (depth -5; 100 needed).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -3263,7 +3340,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "immature-coinbase"
    },
    "derived": {
     "txid": "b4ce3cd1690ab3c60decb56bfadffb80708882ba61459259c8ab5232a6774e3c",
@@ -3282,9 +3359,10 @@
   },
   {
    "id": "maturity/same-block-coinbase/post",
-   "description": "Spends output 0 of the coinbase of its own block: invalid from the activation (VAL-3).",
+   "description": "Spends output 0 of the coinbase of its own block: invalid from the activation (VAL-3). Mempool admission cannot see an unconfirmed coinbase (missing input).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -3305,7 +3383,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "missing-input"
    },
    "derived": {
     "txid": "b861423a4b267a7772552d1dc1704af1a811e4c93cfef073259ad9922908d3c1",
@@ -3327,6 +3405,7 @@
    "description": "The second input spends a coinbase 50 blocks deep.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -3356,7 +3435,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "immature-coinbase"
    },
    "derived": {
     "txid": "2ab33347eeeef1019012ab43e1f64e0f6c4693be46e7fcdc8a2bff530dc6e29b",
@@ -3384,6 +3463,7 @@
    "description": "A non-coinbase coin (a genesis carry-over output) spent at height 1: no maturity rule applies.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1",
    "regime": "pre-activation",
    "prevouts": [
@@ -3426,6 +3506,7 @@
    "description": "Version 0 signed over sighash v2 below the activation: every version is valid there with sighash v2 and the lenient witness.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -3468,6 +3549,7 @@
    "description": "Version 0 (signed over sighash v2, as a legacy wallet would) from the activation: only version 3 is valid.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -3488,7 +3570,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-version"
    },
    "derived": {
     "txid": "ee564a5095a0c9d274e1308bbd6007fd76325e5ef14dbe68ee8856ce60dbc663",
@@ -3510,6 +3592,7 @@
    "description": "Version 1 signed over sighash v2 below the activation: every version is valid there with sighash v2 and the lenient witness.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -3552,6 +3635,7 @@
    "description": "Version 1 (signed over sighash v2, as a legacy wallet would) from the activation: only version 3 is valid.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -3572,7 +3656,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-version"
    },
    "derived": {
     "txid": "9a3d34a1f10664d51aaf10f105447e60d0d1daa60d38ef9b0629790abbfe77c1",
@@ -3594,6 +3678,7 @@
    "description": "Version 2 signed over sighash v2 below the activation: every version is valid there with sighash v2 and the lenient witness.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -3636,6 +3721,7 @@
    "description": "Version 2 (signed over sighash v2, as a legacy wallet would) from the activation: only version 3 is valid.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -3656,7 +3742,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-version"
    },
    "derived": {
     "txid": "34f2acd246c9735f4b502172f8ad273c15395f43d9032dd6b6a0a004c18f0809",
@@ -3678,6 +3764,7 @@
    "description": "Version 3 signed over sighash v2 below the activation: every version is valid there with sighash v2 and the lenient witness; version >= 3 is non-standard (relay policy only).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -3720,6 +3807,7 @@
    "description": "Version 3 signed over sighash v3 from the activation: the only valid version.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -3762,6 +3850,7 @@
    "description": "Version 4 signed over sighash v2 below the activation: every version is valid there with sighash v2 and the lenient witness; version >= 3 is non-standard (relay policy only).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -3804,6 +3893,7 @@
    "description": "Version 4 (signed over sighash v2, as a legacy wallet would) from the activation: only version 3 is valid.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -3824,7 +3914,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-version"
    },
    "derived": {
     "txid": "fbebeb47a5b455e0dabcbbf8e10a3cde262c7900c272e82057c590185ed5db47",
@@ -3846,6 +3936,7 @@
    "description": "Version 4294967295 signed over sighash v2 below the activation: every version is valid there with sighash v2 and the lenient witness; version >= 3 is non-standard (relay policy only).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -3888,6 +3979,7 @@
    "description": "Version 4294967295 (signed over sighash v2, as a legacy wallet would) from the activation: only version 3 is valid.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -3908,7 +4000,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-version"
    },
    "derived": {
     "txid": "8b11847fb5a7ce50c9c4846139dcfdef473a6b3a1607b4307716171529f95015",
@@ -3927,9 +4019,10 @@
   },
   {
    "id": "version/v3-signed-sighash-v3/pre",
-   "description": "Version 3 signed over sighash v3 (bound) below the activation: there every version is verified against sighash v2, so the signature fails.",
+   "description": "Version 3 signed over sighash v3 (bound) below the activation: there every version is verified against sighash v2, so the signature fails. The mempool refuses version 3 below the activation first (non-standard).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -3950,7 +4043,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-version"
    },
    "derived": {
     "txid": "29030c522ee209cd51ddc6030353021b7816f643136d816f900fb17a5a468d99",
@@ -3972,6 +4065,7 @@
    "description": "Version 3 signed over sighash v2 (legacy binding) from the activation: verified against sighash v3, the signature fails. No transaction is valid in both regimes.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -3992,7 +4086,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "096b35f248582c95c8a88b66780479b3024827d96dc58bc5a083d8ae51cc3201",
@@ -4014,6 +4108,7 @@
    "description": "Version 1 at the mainnet activation height 110,000.",
    "network": "mainnet",
    "activation_height": "110000",
+   "activation_source": "schedule",
    "height": "110000",
    "regime": "post-activation",
    "prevouts": [
@@ -4034,7 +4129,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-version"
    },
    "derived": {
     "txid": "a6b07c4e61eaa8032b21254205d01b71ab43e985d6d6b31c9a56164afb3b9836",
@@ -4056,6 +4151,7 @@
    "description": "Version 3 over sighash v2 at height 109,999 under the mainnet schedule: consensus-valid, non-standard.",
    "network": "mainnet",
    "activation_height": "110000",
+   "activation_source": "schedule",
    "height": "109999",
    "regime": "pre-activation",
    "prevouts": [
@@ -4098,6 +4194,7 @@
    "description": "Never activated: version 3 over sighash v2 at height 4,000,000 is consensus-valid, non-standard.",
    "network": "mainnet",
    "activation_height": "18446744073709551615",
+   "activation_source": "explicit",
    "height": "4000000",
    "regime": "pre-activation",
    "prevouts": [
@@ -4140,6 +4237,7 @@
    "description": "Never activated: version 2 at height 4,000,000.",
    "network": "mainnet",
    "activation_height": "18446744073709551615",
+   "activation_source": "explicit",
    "height": "4000000",
    "regime": "pre-activation",
    "prevouts": [
@@ -4182,6 +4280,7 @@
    "description": "The signer was told the wrong spent amount. Sighash v2 does not commit to the spent amount, so the signature is valid (the audit's WAL-1 weakness, kept below the activation).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -4224,6 +4323,7 @@
    "description": "The signer was told the wrong spent amount. Sighash v3 commits to every spent amount: the signature fails.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -4244,7 +4344,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "10bd3e117e0867fc4ab372b4c216cd850bbc12bfeb28ca42a81b6ca6d875089e",
@@ -4266,6 +4366,7 @@
    "description": "The signer was told the wrong spent script. Sighash v2 does not commit to the spent script, so the signature is valid (the audit's WAL-1 weakness, kept below the activation).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -4308,6 +4409,7 @@
    "description": "The signer was told the wrong spent script. Sighash v3 commits to every spent script: the signature fails.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -4328,7 +4430,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "f9c9c36f5fff580e242eda07cf49954178de95c7b3779257422eec6633cbeef9",
@@ -4350,6 +4452,7 @@
    "description": "Input 0's signer was told a wrong amount for INPUT 1's coin: sighash v3 commits to every input's spent amount.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -4379,7 +4482,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "d69ad7762b1ea57be6e12c339b165c09da257b3acd3dc18d5625c0cae73d8c48",
@@ -4407,6 +4510,7 @@
    "description": "Input 0 carries a signature over input 1's digest (same key, same transaction).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -4436,7 +4540,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "5f8c3e33134419a0589517c451ac5d8cd87451afc1a9c948c116f8a10328270c",
@@ -4464,6 +4568,7 @@
    "description": "Signed for the testnet chain id, evaluated on mainnet (replay protection).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -4484,7 +4589,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "ea0104c1caf7ab34d0ef71863fe863e2c1742f7f38c9f20ea4c9bcb4c1b8cb3e",
@@ -4506,6 +4611,7 @@
    "description": "Input 0's signature is input 1's ML-DSA component followed by input 0's Falcon component (each a valid signature of the same key over another message).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -4535,7 +4641,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "6874bc80aeb5f8079a6076ad037e61538fa3e7b607e0ee09addd3e6b7ac687aa",
@@ -4563,6 +4669,7 @@
    "description": "One bit flipped inside the ML-DSA-65 component (the encoding stays canonical).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -4583,7 +4690,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "7bcce33077ca965c089d24dc50fa3cd088ea5e607da279dc472ec3c15e6f69cb",
@@ -4605,6 +4712,7 @@
    "description": "One bit flipped inside the Falcon-1024 nonce (the encoding stays canonical).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -4625,7 +4733,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "7bcce33077ca965c089d24dc50fa3cd088ea5e607da279dc472ec3c15e6f69cb",
@@ -4647,6 +4755,7 @@
    "description": "A valid signature by key B presented with key A's public key (A owns the coin).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -4667,7 +4776,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "43befb8c6fcb7296e7b1e4815ddbaef04c695e518b9a0e718befac407dad8e58",
@@ -4689,6 +4798,7 @@
    "description": "Key B's correct signature and public key spending a coin locked to key A.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -4709,7 +4819,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "pubkey-mismatch"
    },
    "derived": {
     "txid": "43befb8c6fcb7296e7b1e4815ddbaef04c695e518b9a0e718befac407dad8e58",
@@ -4731,6 +4841,7 @@
    "description": "Input 0 is correct; input 1's ML-DSA component has one flipped bit.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -4760,7 +4871,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "8943fdca874c27e60617fea076a5e3acfac77cf4f3495fd990518de769b5596c",
@@ -4788,6 +4899,7 @@
    "description": "Input 0 carries a signature over input 1's digest (same key, same transaction).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -4817,7 +4929,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "6f54c0bcea13c53db65ab72077b64e127b6a09091ef253beee59247ed6cd7c73",
@@ -4845,6 +4957,7 @@
    "description": "Signed for the testnet chain id, evaluated on mainnet (replay protection).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -4865,7 +4978,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "e721c1a019ec8ae95ad7593543a6ac647975d09b7de64973dd309b6dd800e65c",
@@ -4887,6 +5000,7 @@
    "description": "Input 0's signature is input 1's ML-DSA component followed by input 0's Falcon component (each a valid signature of the same key over another message).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -4916,7 +5030,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "000324b916a80d5302bff47b1c125c89f47b234f6304dda86de65864f325b171",
@@ -4944,6 +5058,7 @@
    "description": "One bit flipped inside the ML-DSA-65 component (the encoding stays canonical).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -4964,7 +5079,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "b619e0c8055b8d670fa709a71878f792ef3357e9c58a5647896236d68d5acd08",
@@ -4986,6 +5101,7 @@
    "description": "One bit flipped inside the Falcon-1024 nonce (the encoding stays canonical).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -5006,7 +5122,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "b619e0c8055b8d670fa709a71878f792ef3357e9c58a5647896236d68d5acd08",
@@ -5028,6 +5144,7 @@
    "description": "A valid signature by key B presented with key A's public key (A owns the coin).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -5048,7 +5165,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "b1f728d35a4c93dddd2bb9a3c5e93d07607b07d537020689d3be4f4699c624d8",
@@ -5070,6 +5187,7 @@
    "description": "Key B's correct signature and public key spending a coin locked to key A.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -5090,7 +5208,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "pubkey-mismatch"
    },
    "derived": {
     "txid": "b1f728d35a4c93dddd2bb9a3c5e93d07607b07d537020689d3be4f4699c624d8",
@@ -5112,6 +5230,7 @@
    "description": "Input 0 is correct; input 1's ML-DSA component has one flipped bit.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -5141,7 +5260,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "0251ed1c8f0660ab80a04736015367abce5f0334d7739d5bf1026281013d39ba",
@@ -5169,6 +5288,7 @@
    "description": "Signed over the v2 digest of input index 5 of a one-input transaction (no marker anywhere: the historical out-of-range quirk) instead of index 0.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -5189,7 +5309,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "5bf2f82d8a53942f201dfa742d491bdb29fae943061419d3196ebc0b7800b6f5",
@@ -5211,6 +5331,7 @@
    "description": "The correct sighash v3 digest signed with the LEGACY binding (each component signs the digest verbatim): from the activation each component must sign its bound message.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -5231,7 +5352,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "936a3e0046d9c1381d9c5fafb91348daab685ed9c65ba3344d73b7a3609369ef",
@@ -5253,6 +5374,7 @@
    "description": "The correct sighash v2 digest signed with the v3 BOUND binding: below the activation components sign the digest verbatim.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -5273,7 +5395,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "93526805c47f4b7a7ff4de976b30929959e4d9e8e7fadb989a4f61c2a7f4df1f",
@@ -5295,6 +5417,7 @@
    "description": "Each component signs the OTHER component's bound message (component ids swapped).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -5315,7 +5438,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "a4744cef7e81336d5f46f95c2fd404e697041ec257b27ae401365d350d1f13f5",
@@ -5337,6 +5460,7 @@
    "description": "A hybrid (suite 0x0001) signature over the sighash v3 digest computed with suite id 0x0002: the digest commits to the signature's own suite.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -5357,7 +5481,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "0998b8ce6d07bc29a5c8efab69a1fcd698cba78fed983f71048479bdaf115df2",
@@ -5379,6 +5503,7 @@
    "description": "Signed for testnet, evaluated by a testnet node.",
    "network": "testnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -5421,6 +5546,7 @@
    "description": "Signed for testnet, evaluated by a testnet node.",
    "network": "testnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -5463,6 +5589,7 @@
    "description": "Signed for mainnet, evaluated by a testnet node.",
    "network": "testnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -5483,7 +5610,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "3333bef28def3374a2bec70364f56cd9cb3cf10d052fccfad425d6b0b00e5d94",
@@ -5505,6 +5632,7 @@
    "description": "Signed for mainnet, evaluated by a testnet node.",
    "network": "testnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -5525,7 +5653,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "68974824b4b8174545cb6441710a3fa2686b430069eec798e9f33d1a14a6e8b1",
@@ -5547,6 +5675,7 @@
    "description": "The testnet schedule (activation 0): version 3 / sighash v3 with the testnet chain id at height 1.",
    "network": "testnet",
    "activation_height": "0",
+   "activation_source": "schedule",
    "height": "1",
    "regime": "post-activation",
    "prevouts": [
@@ -5589,6 +5718,7 @@
    "description": "Key A's hybrid signature with its Falcon half stripped and the envelope relabelled 0x0002, spending a coin locked to the 0x0002 key made of A's ML-DSA half. Below the activation the components sign the digest verbatim, so this verifies (the audit's CRY-2 weakness, kept below the activation); 0x0002 keys are non-standard.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -5631,6 +5761,7 @@
    "description": "A genuine suite-0x0002 (ML-DSA-65 only) key spends its coin: consensus-valid at every height (coins locked to 0x0002 keys are never frozen), non-standard.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -5673,6 +5804,7 @@
    "description": "A 0x0002-relabelled ML-DSA half presented with the hybrid public key: a key of one suite never verifies a signature of another.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -5693,7 +5825,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "17bb26b844e1715deb34dcc81698ab2f90d31d614c1f478d15b91fe38b64e62a",
@@ -5712,9 +5844,10 @@
   },
   {
    "id": "suite/hybrid-signature-with-0x0002-key/pre",
-   "description": "Key A's full hybrid signature presented with the 0x0002 public key (the coin is locked to the 0x0002 key).",
+   "description": "Key A's full hybrid signature presented with the 0x0002 public key (the coin is locked to the 0x0002 key). The mempool refuses the 0x0002 key first (non-standard suite).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -5735,7 +5868,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-suite"
    },
    "derived": {
     "txid": "6be5a54fbccd85afb3d26c663ae4358171447b74898749ba3b02daa07969c98c",
@@ -5757,6 +5890,7 @@
    "description": "A valid hybrid signature relabelled to suite 0x0000: the key's suite (0x0001) differs, so verification fails.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -5777,7 +5911,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "802281c6d2fa68150d95483efbfed88c76e2fb3ab19dde1ca357b50a4c33b7ed",
@@ -5799,6 +5933,7 @@
    "description": "A valid hybrid signature relabelled to suite 0xffff: the key's suite (0x0001) differs, so verification fails.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -5819,7 +5954,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "d9f54410f63fa4ef3a6943ef0b6b1c9d5a5ad15d5cf2773d786f853d0a8da53c",
@@ -5841,6 +5976,7 @@
    "description": "A valid hybrid signature relabelled to suite 0x0003: the key's suite (0x0001) differs, so verification fails.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -5861,7 +5997,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "6126846063c97d53a0943bc750aba192891751806d3ec154f0b3cde4ebb381c2",
@@ -5880,9 +6016,10 @@
   },
   {
    "id": "suite/hybrid-split-and-relabelled-0x0002/post",
-   "description": "The same split-and-relabel from the activation: the components sign suite-bound messages and the digest commits to the suite, so it fails.",
+   "description": "The same split-and-relabel from the activation: the components sign suite-bound messages and the digest commits to the suite, so it fails. The mempool refuses the 0x0002 key first (non-standard suite).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -5903,7 +6040,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-suite"
    },
    "derived": {
     "txid": "fa31bfe60c760e1714bd00849b361481b17e7a4e1216b02d4eb08b5609d1f4fe",
@@ -5925,6 +6062,7 @@
    "description": "A genuine suite-0x0002 (ML-DSA-65 only) key spends its coin: consensus-valid at every height (coins locked to 0x0002 keys are never frozen), non-standard.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -5967,6 +6105,7 @@
    "description": "A 0x0002-relabelled ML-DSA half presented with the hybrid public key: a key of one suite never verifies a signature of another.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -5987,7 +6126,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "bad-signature"
    },
    "derived": {
     "txid": "820d5d4583ce94250547f3f2d0d6fb2106855b6a6b05f956fc9b98aba14ea97e",
@@ -6006,9 +6145,10 @@
   },
   {
    "id": "suite/hybrid-signature-with-0x0002-key/post",
-   "description": "Key A's full hybrid signature presented with the 0x0002 public key (the coin is locked to the 0x0002 key).",
+   "description": "Key A's full hybrid signature presented with the 0x0002 public key (the coin is locked to the 0x0002 key). The mempool refuses the 0x0002 key first (non-standard suite).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -6029,7 +6169,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-suite"
    },
    "derived": {
     "txid": "1605aa07969fee5bc18ad4bb585bb50f6a1eefd6a010bbab27dcb36105852d1c",
@@ -6051,6 +6191,7 @@
    "description": "A valid hybrid signature relabelled to suite 0x0000: not a live suite, so not a canonical witness.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -6071,7 +6212,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "bbf0226eccf437cfccc21ac81e047ff147aa5211d90670c81d5c83682f5942dd",
@@ -6093,6 +6234,7 @@
    "description": "A valid hybrid signature relabelled to suite 0xffff: not a live suite, so not a canonical witness.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -6113,7 +6255,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "f0cbab9cc7949d8cfe12bd0d24ae9812be9b6ee087ad115f037f2c5934b706bf",
@@ -6135,6 +6277,7 @@
    "description": "A valid hybrid signature relabelled to suite 0x0003: not a live suite, so not a canonical witness.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -6155,7 +6298,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "3f47798755f732bad80703aac7d8a797a2422d713a3a45f5ac9211c3d7d9ac08",
@@ -6174,9 +6317,10 @@
   },
   {
    "id": "suite/mldsa-only-sig-3310-bytes/pre",
-   "description": "A 0x0002 signature with one extra byte (3,310-byte body): the 0x0002 verifier requires exactly 3,309 bytes; from the activation it is not canonical.",
+   "description": "A 0x0002 signature with one extra byte (3,310-byte body): the 0x0002 verifier requires exactly 3,309 bytes; from the activation it is not canonical. The mempool refuses the non-canonical signature first in both regimes.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6197,7 +6341,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "63f465e631c0e60054246839cd6893779f8db1fbaab1d700a0cce0d420abbc35",
@@ -6216,9 +6360,10 @@
   },
   {
    "id": "suite/mldsa-only-sig-3310-bytes/post",
-   "description": "A 0x0002 signature with one extra byte (3,310-byte body): the 0x0002 verifier requires exactly 3,309 bytes; from the activation it is not canonical.",
+   "description": "A 0x0002 signature with one extra byte (3,310-byte body): the 0x0002 verifier requires exactly 3,309 bytes; from the activation it is not canonical. The mempool refuses the non-canonical signature first in both regimes.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -6239,7 +6384,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "9ff7b24e47102992c734781f0617bd3da33992dbfaecad349fb070962cac3917",
@@ -6261,6 +6406,7 @@
    "description": "A genesis carry-over address commits to the RAW 3,745-byte hybrid public key; the enveloped signature verifies at every height (exact length decides the key's encoding).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6303,6 +6449,7 @@
    "description": "Raw public key and a raw (non-enveloped) signature: below the activation an envelope-less signature is read as hybrid and verifies; it is not a canonical witness, so relay policy refuses it.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6345,6 +6492,7 @@
    "description": "A coin locked to the RAW key's hash, spent with the ENVELOPED encoding of the same key: the address commits to the exact bytes.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6365,7 +6513,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "pubkey-mismatch"
    },
    "derived": {
     "txid": "e76923afa0fec403f06e12477a2936a5c9f74d96b65a8ecd7b53bbd625d7664f",
@@ -6387,6 +6535,7 @@
    "description": "A coin locked to the ENVELOPED key's hash, spent with the RAW encoding of the same key.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6407,7 +6556,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "pubkey-mismatch"
    },
    "derived": {
     "txid": "6c192bf6eabf0ff5bbfe45724a1e204ef6b6e39d3ff828179e35d3ffb0fbf391",
@@ -6429,6 +6578,7 @@
    "description": "A genesis carry-over address commits to the RAW 3,745-byte hybrid public key; the enveloped signature verifies at every height (exact length decides the key's encoding).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -6468,9 +6618,10 @@
   },
   {
    "id": "raw/raw-public-key-raw-signature/post",
-   "description": "Raw public key and a raw signature from the activation: the signature envelope is mandatory in the canonical witness.",
+   "description": "Raw public key and a raw signature from the activation: the signature envelope is mandatory in the canonical witness (the mempool's witness standardness refuses it first).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -6491,7 +6642,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "3b092b8ddd8068a2a14eda46efe05895d0ad6ad5b3078b3fb4ee80113bb297cf",
@@ -6513,6 +6664,7 @@
    "description": "A coin locked to the RAW key's hash, spent with the ENVELOPED encoding of the same key: the address commits to the exact bytes.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -6533,7 +6685,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "pubkey-mismatch"
    },
    "derived": {
     "txid": "1643778d69b7ef9a28249f856026e1110f47f28b749fd85f5986f70ec7172d66",
@@ -6555,6 +6707,7 @@
    "description": "A coin locked to the ENVELOPED key's hash, spent with the RAW encoding of the same key.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -6575,7 +6728,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "pubkey-mismatch"
    },
    "derived": {
     "txid": "d3614ffbe26b4f62ce2945b9c1a5a33712fc903b2047bf851b4661108e2758b9",
@@ -6597,6 +6750,7 @@
    "description": "One byte after the public key. Below the activation the lenient framing ignores it (consensus-valid, non-standard); from the activation the framing must be exact.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6639,6 +6793,7 @@
    "description": "1,000 bytes after the public key (the fee still covers the larger size).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6681,6 +6836,7 @@
    "description": "The signature without its 4-byte suite envelope: read as hybrid below the activation; the envelope is mandatory from it.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6723,6 +6879,7 @@
    "description": "The Falcon half in the alternate 1,280-byte zero-padded form (same signature): accepted by the historical verifier; only the compact form is canonical.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6765,6 +6922,7 @@
    "description": "A non-zero byte appended to the Falcon half (inside sig_len): neither compact nor the padded form.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6785,7 +6943,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "03ba89bf509a0228f3d3bb80233bef66fa33d7344827393ea08266a8f5cf1e1a",
@@ -6807,6 +6965,7 @@
    "description": "The Falcon half missing its last 10 bytes.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6827,7 +6986,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "9de49d62887161a947b538c5039b32b7a1b512e5dd29cea9d52ce6ee7109684e",
@@ -6849,6 +7008,7 @@
    "description": "sig_len = 0 followed by the correct public key.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6869,7 +7029,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "5c40cd0949f12aa5ef7090723d1fe1fbe483c16c1f3afd5ad38f3e9a938a116c",
@@ -6891,6 +7051,7 @@
    "description": "sig_len declares 100,000 more bytes than the script_sig holds.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6911,7 +7072,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "98444c193414a9abb1c8cd21a40823dc3ba02d670a38bc64a3d072894479d547",
@@ -6933,6 +7094,7 @@
    "description": "An empty script_sig.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6953,7 +7115,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "efdf9feb2bbd226b828af63f01bf4e909a265f5880609418095aadafcf4e66a4",
@@ -6975,6 +7137,7 @@
    "description": "A 7-byte script_sig (shorter than the two length fields).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -6995,7 +7158,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "c3d0e4fce155b1400311efd728d4d8ba568a699d2e78bb8cd23c235ebd2514f1",
@@ -7017,6 +7180,7 @@
    "description": "pk_len one byte short: the lenient framing reads a truncated key (whose hash does not match the coin) and ignores the last byte; the exact framing refuses the trailing byte first.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -7037,7 +7201,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "98df843694d39b09b93881c5e5c52c8a97b87a880371b37220e9a5cb5884ea1f",
@@ -7059,6 +7223,7 @@
    "description": "One byte after the public key. Below the activation the lenient framing ignores it (consensus-valid, non-standard); from the activation the framing must be exact.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7079,7 +7244,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "6291a2da2b60da22095c057f264ba5e5c034e5c9a483548127d4593ffa9e6bfb",
@@ -7101,6 +7266,7 @@
    "description": "1,000 bytes after the public key (the fee still covers the larger size).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7121,7 +7287,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "31e75c89690079cf80a680d7735bd2e3a2b4ef6140744c194d049356b07b0a49",
@@ -7143,6 +7309,7 @@
    "description": "The signature without its 4-byte suite envelope: read as hybrid below the activation; the envelope is mandatory from it.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7163,7 +7330,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "0ac1e028e0e70792c85b30ffded863a5b5ef7dbf4a724d80997d9d3a9cbb93e1",
@@ -7185,6 +7352,7 @@
    "description": "The Falcon half in the alternate 1,280-byte zero-padded form (same signature): accepted by the historical verifier; only the compact form is canonical.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7205,7 +7373,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "91ff030869b7e3b7a8e1a86374144b48cab0734cdb2158774b11162330cab929",
@@ -7227,6 +7395,7 @@
    "description": "A non-zero byte appended to the Falcon half (inside sig_len): neither compact nor the padded form.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7247,7 +7416,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "07513ba01e58c55e298e972e6f75a3bce119ab2ad3c21fdb3b59ea1a220229c9",
@@ -7269,6 +7438,7 @@
    "description": "The Falcon half missing its last 10 bytes.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7289,7 +7459,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "032b31bbe988ffe376e77ce94a787f84b46a3c59682746219636ceaaa58642c9",
@@ -7311,6 +7481,7 @@
    "description": "sig_len = 0 followed by the correct public key.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7331,7 +7502,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "3167d9ab0829669b5c45655cd8f73e95bf142700682830011f42d663ceb16a2e",
@@ -7353,6 +7524,7 @@
    "description": "sig_len declares 100,000 more bytes than the script_sig holds.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7373,7 +7545,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "6d82c41ca0ba71c85beb30dd433bf5d53ab704e483addb8007abfd65221d676d",
@@ -7395,6 +7567,7 @@
    "description": "An empty script_sig.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7415,7 +7588,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "c8d4ef4d17e60aca84e985faa738414de37925df76ee40be52ff0517298a354e",
@@ -7437,6 +7610,7 @@
    "description": "A 7-byte script_sig (shorter than the two length fields).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7457,7 +7631,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "f81b71090c73c44072597963d252789bab54d90a480ca6cabb9e55ca39e521e8",
@@ -7479,6 +7653,7 @@
    "description": "pk_len one byte short: the lenient framing reads a truncated key (whose hash does not match the coin) and ignores the last byte; the exact framing refuses the trailing byte first.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7499,7 +7674,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "non-standard-witness"
    },
    "derived": {
     "txid": "f2c9c42f178684358813f90bcbd3c6d70d59047ea6942158f343e581d2cfb962",
@@ -7521,6 +7696,7 @@
    "description": "One input, one output with a 5-byte script: the txid preimage (no script_sig) is 64 bytes.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -7563,6 +7739,7 @@
    "description": "One input, one output with a 4-byte script: the txid preimage (no script_sig) is 63 bytes.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -7605,6 +7782,7 @@
    "description": "One input, one output with a 6-byte script: the txid preimage (no script_sig) is 65 bytes.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -7647,6 +7825,7 @@
    "description": "One input, one output with a 5-byte script: the txid preimage (no script_sig) is 64 bytes. Invalid from the activation (VAL-10).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7667,7 +7846,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "tx-64-bytes"
    },
    "derived": {
     "txid": "ff9db8ceb7d76381345801002d23e91aa5ffdda7d296bccf36467019c46b24b0",
@@ -7689,6 +7868,7 @@
    "description": "One input, one output with a 4-byte script: the txid preimage (no script_sig) is 63 bytes.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7731,6 +7911,7 @@
    "description": "One input, one output with a 6-byte script: the txid preimage (no script_sig) is 65 bytes.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7773,6 +7954,7 @@
    "description": "A 64-byte transaction at height 109999 under the mainnet schedule.",
    "network": "mainnet",
    "activation_height": "110000",
+   "activation_source": "schedule",
    "height": "109999",
    "regime": "pre-activation",
    "prevouts": [
@@ -7815,6 +7997,7 @@
    "description": "A 64-byte transaction at height 110000 under the mainnet schedule.",
    "network": "mainnet",
    "activation_height": "110000",
+   "activation_source": "schedule",
    "height": "110000",
    "regime": "post-activation",
    "prevouts": [
@@ -7835,7 +8018,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "tx-64-bytes"
    },
    "derived": {
     "txid": "2dad12e8199cb81610a5e0ab5e7ab37306752c55616ed9d5dd1e83c0b4af4c4a",
@@ -7857,6 +8040,7 @@
    "description": "An unspent coin already sits at this transaction's output 0 (models a coin created before). Below the activation the output overwrites it (historical). The mempool refuses it: the coin's txid, this transaction's, is already confirmed.",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "999",
    "regime": "pre-activation",
    "prevouts": [
@@ -7905,9 +8089,10 @@
   },
   {
    "id": "bip30/output-overwrites-an-unspent-coin/post",
-   "description": "An unspent coin already sits at this transaction's output 0: invalid from the activation (VAL-2, BIP30).",
+   "description": "An unspent coin already sits at this transaction's output 0: invalid from the activation (VAL-2, BIP30). The mempool refuses it as already confirmed (the coin's txid is this transaction's).",
    "network": "mainnet",
    "activation_height": "1000",
+   "activation_source": "explicit",
    "height": "1000",
    "regime": "post-activation",
    "prevouts": [
@@ -7937,7 +8122,7 @@
    },
    "policy": {
     "verdict": "reject",
-    "error_class": null
+    "error_class": "already-confirmed"
    },
    "derived": {
     "txid": "ed2d4e69751e3f0dfa551c900548918cd9ff6430817acad17fb1c9a330e4c07f",
