@@ -152,6 +152,7 @@ jobs:
         run: cargo test -p gnb-crypto --locked
       - name: Address-v2 Rust versus independent Python reference
         run: |
+          cargo test -p gnb-crypto --locked --example address_v2_oracle
           cargo build -p gnb-crypto --locked --example address_v2_oracle
           python3 reference/address_v2_differential.py target/debug/examples/address_v2_oracle
       - name: The real-ASERT test ran and was not ignored

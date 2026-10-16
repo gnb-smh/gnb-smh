@@ -23,7 +23,8 @@ def main():
     original = path.read_bytes()
     marker = b"\n#[cfg(test)]"
     production, tests = original.split(marker, 1)
-    baseline = subprocess.check_output(["git", "show", f"4b32fb6:{relative}"], cwd=root)
+    # Integrated ancestor, byte-identical to the engineer's historical 4b32fb6.
+    baseline = subprocess.check_output(["git", "show", f"887bd0b:{relative}"], cwd=root)
     sha = lambda data: hashlib.sha256(data).hexdigest()
     env = os.environ.copy()
     env.update({"CARGO_PROFILE_DEV_CODEGEN_UNITS": "79", "CARGO_PROFILE_TEST_CODEGEN_UNITS": "79",
