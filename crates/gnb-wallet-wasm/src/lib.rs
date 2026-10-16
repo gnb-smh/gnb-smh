@@ -194,6 +194,18 @@ fn observe_wiped(req: Option<&Value>, out: &Value) {
 /// Dispatch one request. Pure Rust, testable on the host.
 pub fn handle(req: &Value) -> Result<Value, String> {
     match s(req, "op")? {
+        "pqpsbt" => gnb_crypto::wallet::pqpsbt::public_request(req),
+        "pqpsbt_sign" => {
+            use gnb_crypto::wallet::pqpsbt::{self, PqPsbt};
+            let context = pqpsbt::context_from_request(req)?;
+            let mut document = PqPsbt::from_bytes(&pqpsbt::decode_hex(s(req, "hex")?, pqpsbt::MAX_BYTES)?)?;
+            let review = document.review(&context)?;
+            let key_index = with_session(|kp| {
+                Address::parse_for_network(&kp.address, context.network).map_err(|e| e.to_string())?;
+                document.sign(&context, &kp.public_key, |digest, version| kp.sign_tx_digest(digest, version))
+            })?;
+            Ok(json!({"hex": hex::encode(document.to_bytes()?), "key_index": key_index, "review": review.to_json()}))
+        }
         "open" => {
             let kp = open_keypair(req)?;
             let out = json!({ "address": kp.address, "public_key": hex::encode(&kp.public_key) });
@@ -507,6 +519,12 @@ mod tests {
 
     /// The session is process-global: tests that change it take this lock.
     static SESSION_TESTS: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn pqpsbt_public_decode_reaches_the_format_parser() {
+        let err = handle(&json!({"op": "pqpsbt", "action": "decode", "hex": ""})).unwrap_err();
+        assert!(err.contains("PQ-PSBT magic"), "missing public decoder: {err}");
+    }
 
     // The session is process-global: keep every flow in one test.
     #[test]

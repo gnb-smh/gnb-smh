@@ -44,6 +44,7 @@ pub mod encryption;
 pub mod client;
 pub mod errors;
 pub mod policy_spend;   // multi-party spends from policy (multisig/timelock) addresses
+pub mod pqpsbt;         // bounded policy transaction interchange and signing preflight
 pub mod http_rpc;
 pub mod disclosure;
 pub mod payment;
