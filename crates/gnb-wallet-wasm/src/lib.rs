@@ -806,6 +806,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "bridgelock runs PQClean keygen and signing via unsupported C FFI")]
     fn bridgelock_signs_the_version_of_the_target_height() {
         let _session = SESSION_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let created = handle(&json!({"op": "create", "mnemonic": false})).unwrap();
