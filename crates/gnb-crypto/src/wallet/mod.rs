@@ -917,18 +917,38 @@ impl Keypair {
 
     /// Run `f` with the secret key in its enveloped form (wrapping a legacy
     /// raw key under the public key's suite in zeroizing storage).
+    ///
+    /// B2-T2: the encoding is decided from exact lengths, never from leading
+    /// bytes. The suite is the public key's (`crypto::public_key_suite`: the
+    /// exact raw hybrid length is suite 0x0001, otherwise its envelope);
+    /// a secret of exactly that suite's raw length is a raw key and is
+    /// wrapped; otherwise it must be a well-formed envelope of that same
+    /// suite with a body of exactly the raw length. Guessing from the first
+    /// two bytes misread 1 in 65,536 raw keys (an ML-DSA secret starts with
+    /// the uniformly random `rho`) as enveloped under a bogus suite, and such
+    /// a wallet could never sign. Bitcoin Core takes a key's type from its
+    /// size and metadata in the same way, never from its first bytes.
     fn with_enveloped_secret(
         &self,
         f: impl FnOnce(&[u8]) -> Result<Vec<u8>, crypto::CryptoError>,
     ) -> Result<Vec<u8>, String> {
-        if crypto::parse_envelope(&self.private_key).is_some() {
-            f(&self.private_key).map_err(|e| e.to_string())
-        } else {
-            let suite = crypto::parse_envelope(&self.public_key)
-                .map(|(s, _)| s)
-                .unwrap_or(crypto::SUITE_MLDSA65_FALCON1024);
-            let sk = Zeroizing::new(crypto::wrap_envelope(suite, &self.private_key));
-            f(&sk).map_err(|e| e.to_string())
+        let suite = crypto::public_key_suite(&self.public_key).ok_or_else(|| {
+            "public key is neither the raw hybrid encoding nor a supported suite envelope".to_string()
+        })?;
+        let raw_len = crypto::raw_secret_key_len(suite)
+            .ok_or_else(|| format!("public key suite {suite:#06x} has no secret-key encoding"))?;
+        let sk = &self.private_key;
+        if sk.len() == raw_len {
+            let wrapped = Zeroizing::new(crypto::wrap_envelope(suite, sk));
+            return f(&wrapped).map_err(|e| e.to_string());
+        }
+        match crypto::parse_envelope(sk) {
+            Some((s, body)) if s == suite && body.len() == raw_len => f(sk).map_err(|e| e.to_string()),
+            Some((s, _)) if s != suite => Err(format!(
+                "secret key envelope names suite {s:#06x}, the public key suite {suite:#06x}")),
+            _ => Err(format!(
+                "secret key ({} bytes) is neither the raw encoding ({raw_len} bytes) nor the envelope \
+                 of the public key's suite {suite:#06x}", sk.len())),
         }
     }
 
@@ -2348,6 +2368,91 @@ mod legacy_sign_tests {
         // And a wrong key must still be rejected (no weakening).
         let (other_env, _) = crypto::generate_keypair();
         assert!(!crypto::verify(&other_env[4..], sighash, &sig), "a different pubkey must NOT verify");
+    }
+
+    /// The raw (pre-envelope) keypair of seed 22561: its ML-DSA `rho`, the
+    /// first bytes of both the raw public and the raw secret key, starts with
+    /// the envelope magic `B1 0C` (probability 2^-16 for a random key).
+    fn raw_keypair_with_magic_prefix() -> (Vec<u8>, Vec<u8>) {
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&22561u64.to_le_bytes());
+        let (pk_env, sk_env) = crypto::generate_keypair_from_seed(&seed).unwrap();
+        let raw_pk = pk_env[crypto::SUITE_HEADER_LEN..].to_vec();
+        let raw_sk = sk_env[crypto::SUITE_HEADER_LEN..].to_vec();
+        assert_eq!(&raw_pk[..4], &[0xB1, 0x0C, 0x8B, 0x1E], "fixture: raw pk starts with the magic");
+        assert_eq!(&raw_sk[..4], &[0xB1, 0x0C, 0x8B, 0x1E], "fixture: raw sk starts with the magic");
+        (raw_pk, raw_sk)
+    }
+
+    /// B2-T2: the signer classified a secret key as enveloped from its first
+    /// two bytes, so a raw key whose `rho` starts with `B1 0C` was read as
+    /// enveloped under the bogus suite `0x1e8b` and could never sign (sign,
+    /// sign_bound, sign_message and every payment failed), although consensus
+    /// accepts its signatures. Exact lengths decide now, as they do in
+    /// consensus (`crypto::public_key_suite`).
+    #[test]
+    fn raw_key_starting_with_the_envelope_magic_signs_everything() {
+        let (raw_pk, raw_sk) = raw_keypair_with_magic_prefix();
+        let kp = Keypair {
+            private_key: raw_sk.clone(),
+            public_key: raw_pk.clone(),
+            address: crypto::address_from_pubkey(&raw_pk, false),
+        };
+        let sig = kp.sign(b"founder-message").expect("sign");
+        assert!(crypto::verify(&raw_pk, b"founder-message", &sig));
+        let digest = [0x5Au8; 32];
+        let sig = kp.sign_bound(&digest).expect("sign_bound");
+        assert!(crypto::verify_bound(&raw_pk, &digest, &sig));
+        let sig = kp.sign_message(b"I own this address").expect("sign_message");
+        assert!(Keypair::verify_message_on(Network::Mainnet, &raw_pk, b"I own this address", &sig));
+
+        // A payment at a version-1 height and at the hardening activation
+        // (version 3, sighash v3).
+        let spk: [u8; 20] = kp.address_bytes().try_into().unwrap();
+        let utxos = vec![Utxo {
+            txid: [0x31; 32], index: 0,
+            output: TxOutput { value: 5_000_000_000, script_pubkey: spk.to_vec() },
+        }];
+        let to = Address::from_hash([7u8; 20], Network::Mainnet);
+        for height in [10, crate::core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT] {
+            let opts = PaymentOptions { next_block_height: Some(height), ..PaymentOptions::default() };
+            let paid = TxBuilder::build_payment(&kp, &utxos, &to, 100_000_000, &opts)
+                .unwrap_or_else(|e| panic!("payment at height {height}: {e}"));
+            let spent = [utxos[0].output.clone()];
+            crate::core::sighash::verify_tx_scripts(&paid.tx, &spent, crate::core::ChainId::Mainnet,
+                height, crate::core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT)
+                .unwrap_or_else(|e| panic!("consensus refuses the payment at height {height}: {e:?}"));
+        }
+
+        // The same raw secret with the enveloped public key, and the
+        // enveloped secret with the raw public key, sign as well.
+        let env_pk = crypto::wrap_envelope(crypto::SUITE_MLDSA65_FALCON1024, &raw_pk);
+        let env_sk = crypto::wrap_envelope(crypto::SUITE_MLDSA65_FALCON1024, &raw_sk);
+        for (sk, pk) in [(raw_sk.clone(), env_pk.clone()), (env_sk.clone(), raw_pk.clone()), (env_sk, env_pk)] {
+            let kp = Keypair { private_key: sk, public_key: pk.clone(), address: crypto::address_from_pubkey(&pk, false) };
+            let sig = kp.sign(b"m").expect("mixed encodings sign");
+            assert!(crypto::verify(&pk, b"m", &sig));
+        }
+    }
+
+    /// B2-T2: a secret that is neither the exact raw hybrid encoding nor a
+    /// well-formed envelope of the public key's suite is refused before any
+    /// signing, instead of being guessed at.
+    #[test]
+    fn secret_key_encoding_is_classified_by_exact_lengths() {
+        let (raw_pk, raw_sk) = raw_keypair_with_magic_prefix();
+        let env_pk = crypto::wrap_envelope(crypto::SUITE_MLDSA65_FALCON1024, &raw_pk);
+        let refused = |sk: Vec<u8>, pk: &[u8]| {
+            let kp = Keypair { private_key: sk, public_key: pk.to_vec(), address: crypto::address_from_pubkey(pk, false) };
+            kp.sign(b"m").unwrap_err()
+        };
+        // One byte short of the raw length: neither encoding.
+        assert!(refused(raw_sk[..raw_sk.len() - 1].to_vec(), &raw_pk).contains("secret key"));
+        // An envelope naming another suite than the public key's.
+        let wrong_suite = crypto::wrap_envelope(crypto::SUITE_MLDSA65_ONLY, &raw_sk);
+        assert!(refused(wrong_suite, &env_pk).contains("suite"));
+        // A public key that names no suite at all.
+        assert!(refused(raw_sk.clone(), &raw_pk[..100]).contains("public key"));
     }
 }
 

@@ -373,6 +373,23 @@ fn legacy_hybrid_pubkey_len() -> usize {
     MLDSA_PUBKEY_LEN.saturating_add(falcon::pubkey_len())
 }
 
+/// Exact byte length of a raw (non-enveloped) SECRET key of `suite`:
+/// `mldsa_sk(4,032) ‖ falcon_sk(2,305)` = 6,337 for suite 0x0001 (the
+/// pre-envelope founder / Bloch v2 keystores store this), the bare ML-DSA-65
+/// secret (4,032) for suite 0x0002. An enveloped secret of the same suite is
+/// exactly `SUITE_HEADER_LEN` bytes longer, so the two never collide on
+/// length (B2-T2: the wallet signer classifies secrets by these lengths, as
+/// consensus classifies public keys, never by their leading bytes). `None`
+/// for any other suite.
+pub(crate) fn raw_secret_key_len(suite: u16) -> Option<usize> {
+    match suite {
+        SUITE_MLDSA65_FALCON1024 => Some(MLDSA_SECRET_LEN.saturating_add(
+            pqcrypto_falcon::falcon1024::secret_key_bytes())),
+        SUITE_MLDSA65_ONLY => Some(MLDSA_SECRET_LEN),
+        _ => None,
+    }
+}
+
 /// Public-key-specific version of [`parse_envelope_or_legacy`] (audit A4
 /// lows / legacy pubkey fallback).
 ///
