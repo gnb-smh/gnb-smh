@@ -442,6 +442,21 @@ async fn main() {
         eprintln!("   Any local process — including a web page in a browser on this");
         eprintln!("   machine — can then call write methods without the key.");
     }
+    // B2-T11: an --rpc-allow-host name means the RPC is reached through a
+    // reverse proxy or tunnel, which delivers every remote caller from
+    // loopback (docs/RUNNING.md, "Remote RPC through a proxy or tunnel").
+    if !cli.rpc_allow_hosts.is_empty() {
+        if api_key.is_none() || !cli.rpc_require_auth_for_writes {
+            eprintln!("⚠  --rpc-allow-host: a proxied or tunnelled RPC must require the API key");
+            eprintln!("   for writes (--rpc-api-key-file <PATH> --rpc-require-auth-for-writes);");
+            eprintln!("   without it any remote caller may submit blocks and transactions.");
+        }
+        if cli.rpc_trust_loopback {
+            eprintln!("⚠  --rpc-trust-loopback with --rpc-allow-host: a proxy that adds no");
+            eprintln!("   forwarding header makes every remote caller an administrator.");
+            eprintln!("   Do not combine them (docs/RUNNING.md).");
+        }
+    }
     if cli.rpc_allow_origins.iter().any(|o| o == "*") {
         eprintln!("⚠  --rpc-allow-origin '*': any web page may issue READ calls.");
         eprintln!("   Write methods still refuse wildcard origins.");
@@ -2096,9 +2111,10 @@ fn commit_self_mined_block(
     Ok(block_hash)
 }
 
-/// Build the RPC `submitblock` hook (B5f pool seam). Behavior is unchanged
-/// from the previous inline closure: `Block::block_hash()` identity, dedup,
-/// `validate_structure()`, then the shared `accept_block` pipeline + gossip.
+/// Build the RPC `submitblock` hook (B5f pool seam): `Block::block_hash()`
+/// identity, dedup, `validate_structure_without_pow()`, then the shared
+/// `accept_block` pipeline (known parents, height, bits, timestamp, then the
+/// proof of work: B2-T11) + gossip.
 fn make_rpc_submit_block_cb(
     dag:        Arc<RwLock<consensus::GhostDAG>>,
     store:      Arc<storage::Storage>,
@@ -2122,7 +2138,14 @@ fn make_rpc_submit_block_cb(
             }
             return Err("duplicate block".to_string());
         }
-        block.validate_structure()
+        // B2-T11 (NET-2 on the RPC path): the cheap, context-free half of
+        // the structure check only. `accept_block` then checks the known
+        // parents, the header height, the expected bits and the timestamp,
+        // and only then evaluates the 64 MiB proof of work (cached by block
+        // id) — the order gossip ingress uses. `validate_structure()` ran
+        // the proof first, so any block on random parents or with wrong bits
+        // cost a full GnB-SMH evaluation per call.
+        block.validate_structure_without_pow()
             .map_err(|e| format!("structural validation: {}", e))?;
 
         accept_block(
@@ -2939,6 +2962,46 @@ mod external_submission_tests {
         let err = (node.rpc_cb())(bad).unwrap_err();
         assert!(err.contains("structural validation"), "rpc: {}", err);
         assert_eq!(node.dag.read().block_count(), 1, "DAG must contain only genesis");
+    }
+
+    /// A height-1 block with a binding Merkle root on `parents`, at `bits`,
+    /// whose nonce FAILS the proof of work (searched with `validate_pow`, so
+    /// `bits` must be hard enough for most nonces to fail).
+    fn unmined_child(node: &TestNode, parents: Vec<[u8; 32]>, bits: u32) -> core::Block {
+        let parent_ts = node.store.get_timestamp_at_height(0).unwrap().unwrap();
+        let txs = vec![mk_coinbase(1, core::tokenomics::block_subsidy_sat(1))];
+        let mut block = core::Block {
+            header: core::BlockHeader {
+                version: 1, parents, merkle_root: core::Transaction::merkle_root(&txs),
+                timestamp: parent_ts + 30, bits, nonce: 0,
+            },
+            transactions: txs, blue_score: 1, height: 1, shielded_transactions: Vec::new(),
+        };
+        while block.validate_pow() {
+            block.header.nonce += 1;
+        }
+        assert_eq!(block.validate_structure_without_pow(), Ok(()), "fixture is structurally valid");
+        block
+    }
+
+    /// B2-T11 (NET-2 on the RPC path): `submitblock` runs the cheap checks —
+    /// structure without the proof, then `accept_block`'s known parents,
+    /// header height, expected bits and timestamp — BEFORE the 64 MiB
+    /// GnB-SMH evaluation, in the order gossip ingress uses. It called
+    /// `validate_structure()` (proof included) first, so a block on random
+    /// parents, or with the wrong bits, cost a full evaluation each and was
+    /// refused as "invalid PoW"; now it is refused for its cheap fault.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpc_submit_runs_cheap_checks_before_the_proof_of_work() {
+        let genesis = mk_genesis(unix_now());
+        let node = node_with_genesis(&genesis);
+        let orphan = unmined_child(&node, vec![[0x5A; 32]], core::GENESIS_BITS);
+        let err = (node.rpc_cb())(orphan).unwrap_err();
+        assert!(err.contains("unknown parent"), "the unknown parent must be found before the proof: {err}");
+        let wrong_bits = unmined_child(&node, vec![genesis.block_hash()], core::GENESIS_BITS);
+        let err = (node.rpc_cb())(wrong_bits).unwrap_err();
+        assert!(err.contains("invalid difficulty"), "the bits must be checked before the proof: {err}");
+        assert_eq!(node.dag.read().block_count(), 1, "nothing stored");
     }
 
     /// Positive control: a genuinely mined block (GnB-SMH proof, binding

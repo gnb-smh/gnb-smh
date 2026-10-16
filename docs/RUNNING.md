@@ -78,6 +78,57 @@ resolution, connect, the TLS handshake, the request and the response; every
 socket read and write gets only the time left, so a server that stalls or
 drips its answer cannot hold the wallet longer than that.
 
+### Remote RPC through a proxy or tunnel (audit B2-T11)
+
+A reverse proxy or a tunnel delivers every remote request from loopback, so
+the node cannot tell its operator from anyone the proxy serves by the
+connection alone. Any setup that exposes the RPC port this way MUST:
+
+1. set an API key (`--rpc-api-key-file <file>`) and require it for writes
+   (`--rpc-require-auth-for-writes`), so `sendrawtransaction`, `submitblock`
+   and the administrative methods need the key (Bitcoin Core never serves
+   RPC without credentials);
+2. NOT use `--rpc-trust-loopback`. The node never extends that trust to a
+   request that carries a forwarding header, but a proxy that adds none (a
+   raw TCP forward, an SSH tunnel from another user) would make every remote
+   caller an administrator;
+3. have the proxy set `X-Forwarded-For` (or `X-Real-IP` / `Forwarded`).
+
+A request carrying any forwarding header (`X-Forwarded-For`, `X-Real-IP`,
+`True-Client-IP`, `CF-Connecting-IP`, `Forwarded`, ... : `FORWARDING_HEADERS`
+in `node/src/rpc/auth.rs`) is treated as a remote request even when it
+arrives from loopback: it is rate-limited in the bucket of the client the
+nearest proxy names (the last `X-Forwarded-For` entry; a header the node
+cannot parse shares one "unknown" bucket) and it is never a trusted caller.
+Direct loopback callers without such a header (the operator's `gnb-cli`, a
+co-located pool) keep the loopback exemption. The header is never trusted for
+authorization: it can only take trust away.
+
+`submitblock` runs the cheap checks first (structure without the proof of
+work, known parents, height, expected bits, timestamp) and evaluates the
+64 MiB proof of work last, as gossip ingress does, so an invalid submission
+costs no proof evaluation unless it is otherwise a valid next block.
+
+### Request bodies (audit B1-T4)
+
+RPC request bodies are capped at 1 MiB, except `submitblock`, whose body
+carries the block as hex (twice its wire size): it may be up to 4 MiB, room
+for a full 1,000,000-byte block. At most four bodies above 1 MiB are read at
+a time (the rest are answered HTTP 503, JSON-RPC -32005, "busy"); a body
+that is not `submitblock` and exceeds 1 MiB is answered HTTP 413. Bitcoin Core
+accepts bodies up to 32 MiB.
+
+### Anonymous transaction submissions (audit B1-T10)
+
+`sendrawtransaction` from a caller that is not trusted (no API key, not a
+trusted direct caller) is charged to one node-wide budget by its size before
+its signatures are verified: 2,000,000 bytes, refilled at 50,000 bytes per
+second. An admitted transaction is refunded, so the budget only runs out
+under transactions the node refuses (a flood of forged signatures relayed
+by the explorer API, from any number of addresses). While it is exhausted,
+anonymous submissions are answered "busy: ..."; callers presenting the API
+key are never charged.
+
 ## Chain selection and operator recovery
 
 The node always follows the best valid chain of the blocks it holds, at any
