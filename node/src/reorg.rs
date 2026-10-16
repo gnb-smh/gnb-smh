@@ -441,6 +441,11 @@ pub trait UtxoView {
     /// The block that holds `txid` on the applied chain (the tx-index row,
     /// written by every connect together with the transaction's coins).
     fn view_tx_block(&self, txid: &[u8; 32]) -> Result<Option<BlockHash>, ViewError>;
+    /// The HEADER height of the block that holds `txid` on the applied chain
+    /// (the same tx-index row), for relative timelocks below the activation
+    /// (`blockval::check_policy_spends`, `accept::MaturityRule`). `Ok(None)`
+    /// when unknown.
+    fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError>;
     /// The persisted GhostDAG record of `block` (blocks are persisted when
     /// accepted, before any later block is connected on them).
     fn view_dag_data(&self, block: &BlockHash) -> Result<Option<GhostdagData>, ViewError>;
@@ -458,6 +463,9 @@ impl UtxoView for Storage {
     }
     fn view_dag_data(&self, block: &BlockHash) -> Result<Option<GhostdagData>, ViewError> {
         self.get_dag_data(block).map_err(|e| ViewError(e.to_string()))
+    }
+    fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
+        self.get_tx_location(txid).map(|o| o.map(|(_, h)| h)).map_err(|e| ViewError(e.to_string()))
     }
 }
 
@@ -479,6 +487,9 @@ impl<'a> UtxoView for ReorgBatch<'a> {
         // coinbases it spends, all accepted before it; no block spends its
         // own coinbase from the activation, VAL-3).
         self.store.get_dag_data(block).map_err(|e| ViewError(e.to_string()))
+    }
+    fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
+        self.get_tx_location(txid).map(|o| o.map(|(_, h)| h)).map_err(ViewError)
     }
 }
 
@@ -1374,6 +1385,7 @@ mod reorg_hardening_unit_tests {
             blue_score: height,
             height,
             shielded_transactions: Vec::new(),
+            powit: Default::default(),
         }
     }
 

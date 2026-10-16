@@ -35,6 +35,8 @@
 //! (os testes `live_` sobem NetworkNode::run REAL em loopback e esperam o
 //!  tick de save_peers de 60 s; contam ~3 min no total)
 
+mod common;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -254,9 +256,8 @@ async fn spawn_node(bootstrap_peers: Vec<String>, pre_seed_known_peers: Option<V
                     seen.fetch_add(1, Ordering::Relaxed);
                 }
                 if let NetworkMessage::NewBlock { block_data, .. } = msg {
-                    if let Ok((p, _)) = bincode::serde::decode_from_slice::<SimPayload, _>(
-                        &block_data,
-                        bincode::config::standard(),
+                    if let Some(Ok((p, _))) = common::sim_block::unwrap(&block_data).map(|raw|
+                        bincode::serde::decode_from_slice::<SimPayload, _>(&raw, bincode::config::standard())
                     ) {
                         let mut d = dag.write();
                         if !d.has_block(&p.hash) && p.parents.iter().all(|h| d.has_block(h)) {
@@ -359,7 +360,7 @@ async fn live_wire_violations_graylist_blackhole() {
     a.outbound_tx
         .send(NetworkMessage::NewBlock {
             block_hash: block1,
-            block_data: bincode::serde::encode_to_vec(&p1, bincode::config::standard()).unwrap(),
+            block_data: common::sim_block::wrap(&bincode::serde::encode_to_vec(&p1, bincode::config::standard()).unwrap()),
             height: 1,
             blue_score: 1,
         })
@@ -397,7 +398,7 @@ async fn live_wire_violations_graylist_blackhole() {
     a.outbound_tx
         .send(NetworkMessage::NewBlock {
             block_hash: block2,
-            block_data: bincode::serde::encode_to_vec(&p2, bincode::config::standard()).unwrap(),
+            block_data: common::sim_block::wrap(&bincode::serde::encode_to_vec(&p2, bincode::config::standard()).unwrap()),
             height: 2,
             blue_score: 2,
         })
@@ -456,7 +457,7 @@ async fn live_poisoned_known_peers_self_heals_and_blocks_flow() {
     // A publica um bloco novo; pré-fix B está com A em graylist e o ignora.
     let child = [0xCB; 32];
     let payload = SimPayload { hash: child, parents: vec![GENESIS], timestamp: 1, work: 1 };
-    let block_data = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
+    let block_data = common::sim_block::wrap(&bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap());
     a.outbound_tx
         .send(NetworkMessage::NewBlock {
             block_hash: child,

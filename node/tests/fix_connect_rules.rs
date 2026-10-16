@@ -20,8 +20,8 @@ use gnb::core::{self, activation, Transaction, TxOutput};
 use gnb::mempool::admission::{self, AdmissionPolicy};
 use gnb::template;
 
-/// 4,000,000 GNB: three hops of it sum above `MAX_SUPPLY_SAT` (10,000,000 GNB).
-const BIG: u64 = 4_000_000 * core::tokenomics::SAT_PER_GNB;
+/// 4,500,000 GNB: three hops of it sum above `MAX_SUPPLY_SAT` (12,500,000 GNB).
+const BIG: u64 = 4_500_000 * core::tokenomics::SAT_PER_GNB;
 const HOP_FEE: u64 = 100_000;
 
 /// A chain of `keys.len() - 1` signed spends: hop i moves the previous
@@ -40,8 +40,8 @@ fn hop_chain(keys: &[Key], fund: &([u8; 32], u32, TxOutput), height: u64) -> Vec
 }
 
 /// B1-T1: on both sides of the activation, a mempool chain of three hops of
-/// 4,000,000 GNB (each transaction in range, outputs summing to about
-/// 12,000,000 GNB) is admitted, templated, assembled (the template
+/// 4,500,000 GNB (each transaction in range, outputs summing to about
+/// 13,500,000 GNB) is admitted, templated, assembled (the template
 /// self-check) and accepted and connected by the real pipeline. Before the
 /// fix `assemble_block` refused it ("block output total ... exceeds
 /// MAX_SUPPLY_SAT") and so did `accept_block`: the miner retried the same
@@ -451,6 +451,7 @@ fn maturity_spend(k: &Key, f: &MaturityFixture) -> (core::Block, Transaction) {
         blue_score: h,
         height: h,
         shielded_transactions: vec![],
+        powit: Default::default(),
     };
     (block, spend)
 }
@@ -570,6 +571,7 @@ fn template_includes_a_spend_mature_by_selected_chain_depth_from_the_activation(
         blue_score: 100,
         height: 100,
         shielded_transactions: vec![],
+        powit: Default::default(),
     };
     commit_block(&mut tip);
     f.store.put_block_body(&tip).unwrap();
@@ -585,4 +587,213 @@ fn template_includes_a_spend_mature_by_selected_chain_depth_from_the_activation(
     assert!(tmpl.transactions.iter().any(|(t, _)| t.txid() == txid), "the template includes the spend");
     assert_eq!(tmpl.evicted, 0);
     assert!(mempool.get_tx(&txid).is_some(), "not evicted");
+}
+
+// ── This chain's rules (main's `blockval`) under B1-T12 / B1-T13 / B1-T14 ────
+
+/// A 1-of-1 spend policy of `k` with relative timelock `older`.
+fn older_policy(k: &Key, older: u32) -> core::policy::SpendPolicy {
+    core::policy::SpendPolicy::new(1, vec![k.pk.clone()], 0, older).unwrap()
+}
+
+/// A signed spend of the policy coin `coin` (locked by `policy`) paying
+/// 4,000,000 to a key hash (change back to the policy), for a block at
+/// header height `height` under the calling thread's activation height
+/// (version 1 / sighash v2 below it, version 3 / sighash v3 from it).
+fn policy_spend_of(
+    k: &Key,
+    policy: &core::policy::SpendPolicy,
+    coin: &([u8; 32], u32, TxOutput),
+    height: u64,
+) -> Transaction {
+    use gnb::core::sighash::SighashVersion;
+    let mut s = gnb::wallet::policy_spend::PolicySpend::new(
+        gnb::address::Network::Mainnet, policy.clone(), &[(coin.0, coin.1, coin.2.value)],
+        vec![0x9A; 20], 4_000_000, 0, 0,
+    ).unwrap();
+    s.target_height(height).unwrap();
+    s.sign_digest(&k.pk, |d, v| match v {
+        SighashVersion::V2 => gnb::crypto::sign(&k.sk, d),
+        SighashVersion::V3 => gnb::crypto::sign_bound(&k.sk, d),
+    }.map_err(|e| format!("{e:?}"))).unwrap();
+    s.finalize().unwrap()
+}
+
+/// B1-T13 with this chain's rules (main's `blockval`, enforced at every
+/// height): their failures are classified by curability like every other
+/// connect failure. Locktime finality and the output kinds read only data
+/// the txid commits to: id-committed (disqualified and persisted). The
+/// policy-spend rules (timelocks, branch, framing) read the policy the
+/// `script_sig` reveals, so below `WITNESS_COMMITMENT_HEIGHT` (and the
+/// activation) another witness may cure them: witness-dependent (the block
+/// waits for another body, nothing persisted). Main classified every one of
+/// them id-committed (`From<String>`), so a relay that altered a policy
+/// witness of an honest block below 5,000 disqualified its id for good. From
+/// `WITNESS_COMMITMENT_HEIGHT` the `|wc:` suffix commits every witness and
+/// all of them are id-committed.
+#[test]
+fn chain_rule_failures_are_classified_by_curability() {
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0xE1u8; 32], 0u32, out(5_000_000, &k.spk));
+    let policy = older_policy(&k, 60_000);
+    let pcoin = ([0xE2u8; 32], 0u32, out(5_000_000, &policy.script_pubkey()));
+    let funds = [fund.clone(), pcoin.clone()];
+    let mut non_final = signed_spend(&k, &[(fund.0, 0)], vec![out(4_900_000, &[0x9A; 20])]);
+    non_final.locktime = 1_000_000;
+    let bad_kind = signed_spend(&k, &[(fund.0, 0)], vec![out(4_900_000, &[0x55; 5])]);
+    let timelocked = policy_spend_of(&k, &policy, &pcoin, 1);
+    let mut malformed = timelocked.clone();
+    malformed.inputs[0].script_sig = vec![0x02, 0xFF];
+    let cases = [
+        ("locktime above the block height", non_final, "non-final", false),
+        ("an output of neither kind", bad_kind, "unsupported script_pubkey", false),
+        ("a relative timelock the revealed policy does not meet", timelocked, "relative timelock", true),
+        ("a malformed policy witness", malformed, "malformed policy witness", true),
+    ];
+    for (what, tx, fragment, curable) in cases {
+        let n = node_with(&genesis, &funds);
+        n.store.put_tx_index(&pcoin.0, &gh, 0).unwrap(); // the policy coin, confirmed at height 0
+        let b = block_with_txs(&n, gh, what, 0, vec![tx]);
+        let e = classify_below(&n, &b);
+        assert!(e.reason.contains(fragment), "{what}: {e:?}");
+        assert_eq!(e.witness_dependent, curable, "{what}: {e:?}");
+        accept(&n, &b).expect_err(what);
+        let id = b.block_hash();
+        if curable {
+            assert!(n.dag.read().is_body_pending(&id), "{what}: waits for another body");
+            assert!(n.store.invalid_block_reason(&id).unwrap().is_none(), "{what}: nothing persisted");
+        } else {
+            assert!(n.dag.read().is_invalid_persistently(&id), "{what}: disqualified");
+            assert!(n.store.invalid_block_reason(&id).unwrap().is_some(), "{what}: persisted");
+        }
+        // The same transaction in a block at WITNESS_COMMITMENT_HEIGHT (below
+        // the activation): the block id commits to the witnesses.
+        let h = core::WITNESS_COMMITMENT_HEIGHT;
+        let mut hb = b.clone();
+        hb.height = h;
+        hb.blue_score = h;
+        hb.transactions[0] = coinbase(what, subsidy(h), vec![0xC3; 20]);
+        let view: &gnb::storage::Storage = &n.store;
+        match gnb::accept::validate_block_in_view_classified_at(view, &hb, activation::NEVER) {
+            Err(gnb::accept::ConnectFailure::Invalid(e)) => {
+                assert!(e.reason.contains(fragment) && !e.witness_dependent, "{what} at {h}: {e:?}");
+            }
+            other => panic!("{what} at {h}: expected a verdict, got {other:?}"),
+        }
+    }
+}
+
+/// B1-T12 with main's relative timelocks: the confirmation height of a
+/// spent policy output is read from the tx index while the block is
+/// connected. A row that cannot be read (or a confirmed coin without one,
+/// an inconsistent index) is a storage failure: no verdict, nothing
+/// persisted, and the block is judged once the row reads (main mapped the
+/// `storage:` error through `From<String>` into an id-committed verdict).
+#[test]
+fn relative_timelock_confirmation_read_failure_is_not_a_verdict() {
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let policy = older_policy(&k, 60_000);
+    let pcoin = ([0xE3u8; 32], 0u32, out(5_000_000, &policy.script_pubkey()));
+    let n = node_with(&genesis, std::slice::from_ref(&pcoin));
+    let b = block_with_txs(&n, gh, "t12-older", 0, vec![policy_spend_of(&k, &policy, &pcoin, 1)]);
+    let id = b.block_hash();
+    let view: &gnb::storage::Storage = &n.store;
+    for (what, row) in [("no tx-index row", None), ("a tx-index row that does not decode", Some(vec![1u8, 2, 3]))] {
+        if let Some(bytes) = &row {
+            corrupt_row(&n, "tx_index", &pcoin.0, bytes);
+        }
+        match gnb::accept::validate_block_in_view_classified_at(view, &b, activation::NEVER) {
+            Err(gnb::accept::ConnectFailure::Storage(m)) => assert!(m.contains("storage") || m.contains("tx-index"), "{what}: {m}"),
+            other => panic!("{what}: expected a storage failure, got {other:?}"),
+        }
+        let err = accept(&n, &b).expect_err(what);
+        assert!(!err.contains("invalid in its own chain context"), "{what}: not a verdict: {err}");
+        assert_no_verdict(&n, &id, what);
+        assert!(!n.dag.read().is_body_pending(&id), "{what}: not waiting for another body either");
+    }
+    n.store.put_tx_index(&pcoin.0, &gh, 0).unwrap();
+    let e = classify_below(&n, &b);
+    assert!(e.reason.contains("relative timelock") && e.witness_dependent, "once readable, judged: {e:?}");
+}
+
+/// B1-T14 with main's relative timelocks (`older` of a spend policy): a
+/// relative timelock counts confirmations of the spent output, exactly what
+/// coinbase maturity counts, and had the same defect (header heights, which
+/// a block merging a long light side tip inflates). One measure decides
+/// both (`accept::MaturityRule`, `confirmations_in_view`): below the
+/// activation header heights (main's rule, kept exactly), from it the
+/// selected-chain depth: the spending block's DAG height minus the DAG
+/// height of the block that confirmed the output. Connect and mempool
+/// admission (the template self-check reads the same
+/// `admission::confirmations_for_next_block`) agree in both regimes.
+#[test]
+fn relative_timelocks_count_selected_chain_blocks_from_the_activation() {
+    use gnb::consensus::GhostdagData;
+    let k = key();
+    let policy = older_policy(&k, core::COINBASE_MATURITY as u32);
+    // (case, C header, C DAG, sel DAG, side DAG, valid below, valid from the activation)
+    let cases = [
+        ("merge: header age 100, 10 selected-chain blocks", 1, 1, 10, 100, true, false),
+        ("inflated confirming header: header age 51, 100 selected-chain blocks", 50, 1, 100, 5, false, true),
+        ("99 selected-chain blocks", 1, 1, 99, 5, false, false),
+    ];
+    for (what, c_header, c_dag, sel_dag, side_dag, below, from) in cases {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = gnb::storage::Storage::open(&tmp.path().join("db")).unwrap();
+        let record = |height: u64, blue_work: u128| {
+            let mut d = GhostdagData::genesis();
+            d.height = height;
+            d.blue_score = height;
+            d.blue_work = blue_work;
+            d
+        };
+        let (c, sel, side) = ([0xE4u8; 32], [0xE5u8; 32], [0xE6u8; 32]);
+        let coin = ([0xE7u8; 32], 0u32, out(5_000_000, &policy.script_pubkey()));
+        store.put_dag_data(&c, &record(c_dag, 10)).unwrap();
+        store.put_dag_data(&sel, &record(sel_dag, 1_000_000)).unwrap();
+        store.put_dag_data(&side, &record(side_dag, 1)).unwrap();
+        store.put_tx_index(&coin.0, &c, c_header).unwrap();
+        store.put_utxo(&coin.0, coin.1, &coin.2).unwrap();
+        store.put_meta("tip_hash", &sel).unwrap();
+        let h = sel_dag.max(side_dag) + 1;
+        let view: &gnb::storage::Storage = &store;
+        for (act, valid) in [(activation::NEVER, below), (1, from)] {
+            let _g = activation::scoped_override(act);
+            let spend = policy_spend_of(&k, &policy, &coin, h);
+            let b = core::Block {
+                header: core::BlockHeader {
+                    version: 1, parents: vec![sel, side], merkle_root: core::MerkleRoot::ZERO,
+                    timestamp: 0, bits: 0, nonce: 0,
+                },
+                transactions: vec![coinbase("older", subsidy(h), vec![0xC4; 20]), spend.clone()],
+                blue_score: h,
+                height: h,
+                shielded_transactions: vec![],
+                powit: Default::default(),
+            };
+            let want = if act == 1 { sel_dag + 1 - c_dag } else { h - c_header };
+            assert_eq!(admission::confirmations_for_next_block(&store, &coin.0, h).unwrap(), Some(want), "{what} (act {act})");
+            let connect = gnb::accept::validate_block_in_view_classified_at(view, &b, act);
+            match (&connect, valid) {
+                (Ok(()), true) => {}
+                (Err(gnb::accept::ConnectFailure::Invalid(e)), false) => {
+                    assert!(e.reason.contains("relative timelock"), "{what} (act {act}): {e:?}");
+                    // Curable below the witness commitment and the activation
+                    // (the policy is revealed by the witness); fixed from it.
+                    assert_eq!(e.witness_dependent, act == activation::NEVER, "{what} (act {act})");
+                }
+                _ => panic!("{what} (activation {act}): expected valid={valid}, got {connect:?}"),
+            }
+            let adm = admission::check_transaction(&store, None, &spend, &AdmissionPolicy::relay(h));
+            match (&adm, valid) {
+                (Ok(_), true) => {}
+                (Err(admission::AdmissionError::Rejected(m)), false) if m.contains("relative timelock") => {}
+                _ => panic!("{what} (activation {act}): admission expected valid={valid}, got {adm:?}"),
+            }
+        }
+    }
 }

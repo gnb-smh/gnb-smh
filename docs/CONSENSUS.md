@@ -116,9 +116,13 @@ obtain from a future timestamp to about 6%.
    block is stored;
 6. GnB-SMH proof (64 MiB, cached by block id);
 7. transactions (version rule, witnesses and signatures as specified in
-   "Transaction signatures" below, double spends, coinbase maturity at the
-   block's consensus height, consensus minimum fee, and at/after the
-   activation BIP30 and no same-block coinbase spend), coinbase value.
+   "Transaction signatures" below, double spends, coinbase maturity and
+   relative timelocks in the depth measure of the block's regime ("Coinbase
+   maturity"), this chain's locktime, output-kind, dust and policy-spend
+   rules (`node/src/blockval.rs`), consensus minimum fee, BIP30 and no
+   same-block coinbase spend, this chain's rules at every height),
+   coinbase value (the miner output and, from `powit_height()`, one
+   witness-share output per PoWit share).
 
 Structural checks (size, merkle root, coinbase shape, duplicates, dust, and
 at/after the activation the 64-byte rule and the coinbase commitment) also
@@ -134,13 +138,14 @@ id (POW-8; re-audit B1-T0).
 
 ## Value ranges (MoneyRange, all heights)
 
-`MAX_SUPPLY_SAT = 10,000,000 GNB = 10^15` base units. A block is invalid if
-any of these values leaves `0..=MAX_SUPPLY_SAT` (a sum that overflows u64 is
-out of range too):
+`MAX_SUPPLY_SAT = 12,500,000 GNB = 1.25 x 10^15` base units. A block is
+invalid if any of these values leaves `0..=MAX_SUPPLY_SAT` (a sum that
+overflows u64 is out of range too):
 
-- every output value of every transaction, the coinbase included
-  (context-free: `limits::check_block_context_free`, before the block is
-  stored; also mempool admission and the template self-check);
+- every output value of every transaction, the coinbase included (its
+  witness-share outputs from `powit_height()` too) (context-free:
+  `limits::check_block_context_free`, before the block is stored; also
+  mempool admission and the template self-check);
 - each transaction's output total (context-free, same check);
 - each shielded transaction's fee (context-free);
 - each non-coinbase transaction's input total (connect time);
@@ -152,16 +157,21 @@ and the fee in CheckTxInputs, `bad-txns-accumulated-fee-outofrange` in
 ConnectBlock). Each is a sum of distinct coins (a transaction's inputs are
 distinct outpoints, its outputs at most its inputs, fees are conserved along
 in-block chains), so a block whose amounts are conserved never violates
-them. The sum of ALL outputs of a block is not bounded: a chain of in-block
+them. The coinbase's own total is bounded by the coinbase value rule
+(subsidy plus fees: the miner output at most its share plus the fees, each
+witness-share output exactly `per_attester`, `Block::validate_coinbase_value`).
+The sum of ALL outputs of a block is not bounded: a chain of in-block
 spends moves the same coins once per hop, so the outputs of a valid block
-can sum above the supply (three hops of 4,000,000 GNB: 12,000,000 GNB).
-The VAL-11 remediation (commit e3e45df) had also bounded that sum; the rule
-rejected such valid blocks at every height and made the template
-self-check refuse every template carrying such a mempool chain, so it is
-removed (re-audit B1-T1): only a node running e3e45df rejects such a block.
-Vectors: `value/*`, among them
+can sum above the supply (three hops of 4,500,000 GNB: 13,500,000 GNB).
+The VAL-11 remediation (commit e3e45df, merged into this chain's line by
+28a619d) had also bounded that sum; the rule rejected such valid blocks at
+every height and made the template self-check refuse every template
+carrying such a mempool chain, so it is removed (re-audit B1-T1): only a
+node running 28a619d .. cb60040 rejects such a block, every release of this
+chain before them accepts it. Vectors: `value/*`, among them
 `value/chained-spends-output-total-above-max-supply/*` (valid in both
-regimes) and `value/block-output-total-above-max-supply/*` (valid).
+regimes) and `value/block-output-total-above-max-supply/*` (valid; the
+vectors of cb60040 pinned the removed rule there).
 
 ## Wire encoding (all heights)
 
@@ -309,7 +319,7 @@ activation height:
 | Coinbase commitment: header height (BIP34), parent list, witness root | VAL-2, CRY-1 | `B.height` | same |
 | No overwrite of an unspent coin (BIP30) | VAL-2 | `B.height` | same |
 | No spend of the same block's coinbase | VAL-3 | `B.height` | same |
-| Coinbase maturity counts selected-chain blocks (DAG heights) instead of header heights | re-audit B1-T14 | `B.height` (the regime); the depth itself compares `GhostdagData::height` | "Coinbase maturity" |
+| Coinbase maturity and relative timelocks (`older`) count selected-chain blocks (DAG heights) instead of header heights | re-audit B1-T14 | `B.height` (the regime); the depth itself compares `GhostdagData::height` | "Coinbase maturity" |
 | `MAX_BLOCK_SIZE` measured on the wire encoding | VAL-12 | `B.height` | same |
 | Pow limit = genesis target | POW-3 | `B.height` (the height `expected_bits` is computed for) | same |
 
@@ -348,14 +358,14 @@ own pre-activation behaviour in their sections). That pre-activation behaviour i
 bit-identical to the code that produced the existing chain by
 `node/tests/fix_ghostdag_preactivation_identity.rs`.
 
-One pre-activation rule changed at every height, because the old behaviour
-did not give one verdict per block id (nodes could disagree on the same
-block, a split): the bincode block-size measure writes the uncommitted
-`blue_score` as 0 (re-audit B1-T0 / B2-T8). It is the deterministic rule
-that keeps every block any release accepted valid ("Block size (VAL-12)").
-And the block-wide output total that the VAL-11 remediation (e3e45df)
-introduced at every height is removed, which restores the verdict every
-earlier release gives ("Value ranges").
+The block-wide output total that the VAL-11 remediation (e3e45df, merged
+here by 28a619d) introduced at every height is removed, which restores the
+verdict every earlier release of this chain gives ("Value ranges",
+re-audit B1-T1). The pre-activation block-size measure is this chain's own,
+the wire encoding (`Block::size_bytes`, the PoWit section included from
+`powit_height()`), unchanged: it does not read the uncommitted
+`blue_score`, which the audit's bincode measure did (re-audit B1-T0 /
+B2-T8, "Block size (VAL-12)").
 
 ### Selected parent and fork choice
 
@@ -888,7 +898,8 @@ round as soon as a new tip arrives. External miners use `getblocktemplate`
 (which returns the preimage fields, `bits`, `target` and `min_time`) and
 `submitblock`. `getblocktemplate` also returns the rules of the template's
 height: `hardening_active`, `merkle_rule` (`sha256d-duplicate-last` or
-`gnb-tagged-v1`), `size_rule` (`bincode` or `wire`),
+`gnb-tagged-v1`), `size_rule` (`bincode` or `wire`: the audit's regime;
+`chain_size_rule` is this chain's, `wire` at every height),
 `coinbase_script_sig_prefix` (the 80-byte coinbase commitment for exactly the
 listed transactions in that order, empty before the activation),
 `max_coinbase_extra_bytes`, `max_coinbase_script_pubkey_bytes`, and
@@ -901,15 +912,16 @@ must keep every dependency of every entry it keeps, in the listed order.
 
 The listed transactions may fill the block up to `max_block_size` minus a
 framing bound minus `coinbase_reserve` (1,000 bytes), so the WHOLE coinbase,
-measured with `size_rule`, must fit in `coinbase_reserve`.
+measured on the wire encoding (`chain_size_rule`), must fit in
+`coinbase_reserve`.
 `max_coinbase_extra_bytes` (the miner bytes allowed after the prefix) already
 includes that bound: it is the largest number of extra bytes for which a
 coinbase with one input and one output whose `script_pubkey` is at most
 `max_coinbase_script_pubkey_bytes` (64) bytes, with every other field at its
 widest encoding, fits in `coinbase_reserve`, capped by the 10,000-byte
 `script_sig` limit (`template::external_coinbase_max_extra`). That is 794
-bytes at/after the activation (wire measure, 80-byte prefix) and 869 bytes
-before it (bincode measure, no prefix). A coinbase within both fields never
+bytes at/after the activation (80-byte prefix) and 874 bytes before it (no
+prefix), both on the wire measure. A coinbase within both fields never
 pushes a block built from the template over `max_block_size`.
 
 ## Block rules at the hardening activation
@@ -1057,20 +1069,31 @@ encoding itself is made canonical by the version-3 rule of the same
 activation ("Transaction signatures", "Witnesses"): with both rules there is
 exactly one valid block body per block id.
 
-**Below the activation (node-local, all heights of the old rules).** The
-blocks below the activation (109,999 on mainnet) stay malleable forever, so a
-node must not let a mutated copy disqualify their ids. This is node policy,
-not a consensus rule: it changes no verdict, only what a node remembers. A
-connect-time failure of a block below the activation is classified by
-whether another body with the same id could cure it
-(`accept::BlockInvalidity::witness_dependent`; Bitcoin Core likewise caches
-every failure as `BLOCK_CONSENSUS` except a detected malleation):
+**Below the activation (node-local, all heights of the old rules).** On
+this chain the block id commits to every witness from
+`WITNESS_COMMITMENT_HEIGHT` (5,000) up to the activation too: the coinbase
+`script_sig` ends with the `|wc:` suffix and the witness root
+(`Block::validate_witness_commitment`, checked by `accept_block` before the
+block is stored), so a connect failure of a block at a height >= 5,000 is
+id-committed whatever rule failed (`accept::witnesses_fixed_at`). The
+blocks below 5,000 stay malleable forever, so a node must not let a
+mutated copy disqualify their ids. This is node policy, not a consensus
+rule: it changes no verdict, only what a node remembers. A connect-time
+failure of a block below both heights is classified by whether another body
+with the same id could cure it (`accept::BlockInvalidity::witness_dependent`;
+Bitcoin Core likewise caches every failure as `BLOCK_CONSENSUS` except a
+detected malleation):
 
 - witness-dependent (curable): a non-coinbase `script_sig` that does not
   parse, a public key that does not hash to the prevout's 20-byte
   `script_pubkey` (the key lives in the `script_sig`), a signature that does
   not verify (sighash v2: below the activation every transaction version is
-  verified with it, under the lenient witness framing), and the size-based
+  verified with it, under the lenient witness framing), a policy-spend rule
+  (`blockval::check_policy_spends`: the policy witness's framing, a
+  policy-tree branch before `powit_height()`, the revealed policy's
+  absolute or relative timelock; the policy, its branch and so its
+  timelocks are revealed by the `script_sig`, whose hash match with the
+  33-byte policy output is checked with the scripts), and the size-based
   consensus minimum fee (measured on the wire size, `script_sig` included)
   when the fee reaches the floor below. Size limits measured with witnesses
   are context-free and checked before a block is stored, so they never
@@ -1078,22 +1101,32 @@ every failure as `BLOCK_CONSENSUS` except a detected malleation):
 - id-committed: everything else — missing or double-spent inputs, coinbase
   maturity, values and MoneyRange, coinbase value, shielded state, the
   transaction version rule (the txid covers the version, and the rule can
-  fail only at/after the activation), at/after the activation BIP30 and the
-  same-block coinbase spend — and the failures no witness can cure
-  (re-audit B1-T13): a fee below `min_tx_fee_sat(s)` with `s` the size of
-  the transaction with every `script_sig` empty (one length byte each: the
-  smallest any body with this txid can have; at least `MIN_TX_FEE_SAT`, so
-  a transaction without inputs, whose fee is 0, is here too), and a spend
-  of a coin whose `script_pubkey` is not 20 bytes (no public key hashes to
-  it).
+  fail only at/after the activation), BIP30 and the same-block coinbase
+  spend, this chain's context-free transaction rules (locktime finality,
+  the two output kinds, dust: `blockval::check_tx_context_free`, of the
+  coinbase too) — and the failures no witness can cure (re-audit B1-T13): a
+  fee below `min_tx_fee_sat(s)` with `s` the size of the transaction with
+  every `script_sig` empty (one length byte each: the smallest any body
+  with this txid can have; at least `MIN_TX_FEE_SAT`, so a transaction
+  without inputs, whose fee is 0, is here too), and a spend of a coin whose
+  `script_pubkey` is neither output kind (neither a 20-byte key hash nor a
+  33-byte spend policy: no public key hashes to it and no policy witness
+  is accepted for it).
+
+The PoWit section (from `powit_height()`) is covered by the block id (the
+v2 body root) and checked in context before the block is stored
+(`powit::block_state`): a failure there is refused like a bad height, it
+never reaches this classification.
 
 The class is decided by the whole block: the connect validates in two passes
 (`accept::validate_block_in_view_classified_at`, and the reference
 `reference/gnb_validity.py` `connect_block`): first the id-committed checks
 of every transaction in block order (same-block coinbase spend and maturity,
-inputs, version rule, values, the fee floor, 20-byte prevout scripts), then
-the coinbase value; then the witness checks of every transaction in block
-order (scripts, then the size-based minimum fee). A block with a bad
+once every prevout is found this chain's context-free rules, inputs,
+version rule, values, the fee floor, prevout output kinds), then the
+coinbase value; then the witness checks of every transaction in block
+order (the policy-spend rules, the scripts, then the size-based minimum
+fee). A block with a bad
 signature in one transaction and an overspend in a later one is therefore
 id-committed. The verdict is the one of any order (every rule must hold);
 only the first failure reported, and so the error class of a block failing
@@ -1110,8 +1143,9 @@ block-validity rules and never reach this classification.
 
 A failure to READ the node's own UTXO view while a block is validated (an
 I/O error, a corrupted or undecodable row, a coin row without its index
-row) is neither: it is no verdict at all, at every height (re-audit
-B1-T12). The connect is abandoned before anything is written, nothing is
+row, a confirmed policy coin without its tx-index row when a relative
+timelock needs its confirmation) is neither: it is no verdict at all, at
+every height (re-audit B1-T12). The connect is abandoned before anything is written, nothing is
 marked or persisted, the triggering block is rolled back out of the DAG,
 and the block is validated again when it is next received or the node
 restarts. A coinbase-height row that cannot be read is never taken for "not
@@ -1152,7 +1186,10 @@ override needs it (`accept::request_bodies`, and a body dropped during the
 override's own move), until a body arrives. Once the honest chain is heavier
 than the waiting branch its bodies are neither fetched nor taken (a copy is
 known, like an unrequested block with less work than the tip in Bitcoin
-Core); they are wanted again if the branch becomes heavier. A block whose
+Core); they are wanted again if the branch becomes heavier. A branch whose
+selected chain misses the PoWit-finalized checkpoint
+(`GhostDAG::set_finalized`, `conflicts_with_finality`) can never be
+selected, so its bodies are never wanted, however heavy it is. A block whose
 body no witness can fix is disqualified outright (above), so it never
 waits. At/after the activation the witness
 commitment fixes every byte of a stored body, so every connect-time failure is
@@ -1176,6 +1213,10 @@ descendants, which is a hash cycle. BIP30 below is the rule that guarantees
 safety in any case.
 
 ### No overwrite of an unspent coin (VAL-2 BIP30)
+
+(On this chain BIP30 and the rule of the next section apply at every
+height, as they have since before the 2026-10-14 reset; the audit's text
+below describes them from its activation.)
 
 From the activation, a block is invalid if any output `(txid, i)` of any of
 its transactions, the coinbase included, is an UNSPENT coin in the state of
@@ -1211,9 +1252,12 @@ block is connected, and it is then immature.
 ### Coinbase maturity (re-audit B1-T14)
 
 An output of the coinbase of block C may be spent by a transaction of block B
-only if `depth(B, C) >= COINBASE_MATURITY` (100). C is always on B's selected
-chain: only selected-chain blocks are applied, and the coinbase-height row of
-a coinbase exists exactly while its block is applied.
+only if `depth(B, C) >= COINBASE_MATURITY` (100). Every output of the
+coinbase counts, the witness-share outputs of a PoWit coinbase (from
+`powit_height()`) as much as the miner's: the coinbase-height row is kept
+per txid. C is always on B's selected chain: only selected-chain blocks are
+applied, and the coinbase-height row of a coinbase exists exactly while its
+block is applied.
 
 - Below the activation (`B.height < activation`): `depth = B.height -
   C.height`, both HEADER heights (saturating at 0; the coinbase-height row
@@ -1242,11 +1286,32 @@ the applied tip's DAG height + 1 (the template's selected parent is the
 applied tip). A read failure of any of these rows is a storage error, never
 "not a coinbase" (re-audit B1-T12).
 
-Wallets: `getutxos` reports, for a coinbase output, a `coinbase_height` such
-that the wallets' unchanged comparison `next_block_height - coinbase_height >=
-COINBASE_MATURITY` (`next_block_height` from `getdaginfo`) applies the rule in
-force for the next block: below the activation the header height of C; from
-it `next_block_height - depth(next block, C)`
+**Timelocks.** A relative timelock (`older` of a spend policy,
+docs/MULTISIG.md; `blockval::check_policy_spends_with_confirmations`)
+counts the confirmations of the output it spends, the quantity maturity
+counts, and the same measure decides it (`accept::MaturityRule`,
+`accept::confirmations_in_view`): below the activation `B.height` minus the
+header height the transaction index records for the spent output's
+transaction (this chain's rule, kept exactly); from the activation
+`dag_height(B)` minus the DAG height of the block the transaction index
+names for it. An output created earlier in B itself has 0 confirmations in
+both regimes; an output of an unconfirmed transaction has none (a relative
+timelock on it is not met). The connect path, mempool admission and the
+template self-check use it (`admission::confirmations_for_next_block` for
+a block not yet built). Absolute heights are not depths: the locktime
+finality rule (`locktime <= B.height`) and a policy's absolute timelock
+(`after <= locktime`) compare with B's header height in both regimes, the
+height every other height-gated rule (subsidy, activations, PoWit) reads,
+and are unchanged. A coinbase output locked to a policy needs both its
+maturity and its policy's timelocks.
+
+Wallets: `getutxos` reports, for a coinbase output (witness-share outputs
+included), a `coinbase_height` such that the wallets' unchanged comparison
+`next_block_height - coinbase_height >= COINBASE_MATURITY`
+(`next_block_height` from `getdaginfo`; `wallet::send::utxo_row_spendable_at`,
+which the CLI and web wallets use to leave immature rows out) applies the
+rule in force for the next block: below the activation the header height of
+C; from it `next_block_height - depth(next block, C)`
 (`admission::coinbase_height_for_wallets`). The CLI wallet and the WASM wallet
 therefore need no change.
 
@@ -1260,71 +1325,58 @@ they equal `height` and `coinbase_height` (a linear chain).
 
 ### Block size (VAL-12)
 
-From the activation, `MAX_BLOCK_SIZE = 1,000,000` bytes is compared with the
-canonical wire encoding `Block::to_wire_bytes` (`Block::wire_size`). That is
-the encoding transaction fee rates and the minimum fee use, so witness bytes
-count as they do for fees. Every field of it is fixed-width or covered by
-the block id, except the fixed 8 bytes of `blue_score`.
-
-Before the activation it is compared with the bincode encoding of the
-node's `Block` struct (bincode 2, "standard" configuration) with the
-`blue_score` field written as 0, whatever value the block carries
-(`block_rules::legacy_block_size`; `reference/gnb_validity.py`,
-`legacy_block_size`):
+On this chain `MAX_BLOCK_SIZE = 1,000,000` bytes is compared with the
+canonical wire encoding `Block::to_wire_bytes` at every height: from the
+activation `Block::wire_size`, below it `block_rules::legacy_block_size`
+(`Block::size_bytes`, "the bytes that are relayed and stored"), the same
+length. That is the encoding transaction fee rates and the minimum fee use,
+so witness bytes count as they do for fees. From `powit_height()` (10,000 on
+mainnet) the encoding carries the PoWit section, and the section counts in
+both measures (`wire_size` since main's 45c9c97, `size_bytes` since PoWit
+itself). The audit's VAL-12 measured bincode below its activation; this
+chain never did.
 
 ```text
-legacy_size(B) = bv(version) + bv(n_parents) + 32*n_parents + 32            // header: parents, merkle_root
-               + bv(timestamp) + bv(bits) + bv(nonce)
-               + bv(n_tx) + Σ txb(tx)                                       // transactions, block order
-               + bv(0)                                                      // blue_score, ALWAYS written as 0
-               + bv(height)                                                 // the header height
-               + bv(n_shielded) + Σ shielded                                // none is valid today
-txb(tx)        = bv(version) + bv(n_in) + Σ [ 32 + bv(prev_index) + bv(len(script_sig)) + script_sig + bv(sequence) ]
-               + bv(n_out) + Σ [ bv(value) + bv(len(script_pubkey)) + script_pubkey ] + bv(locktime)
-bv(v)          = 1 byte v                if v <= 250
-               = 0xFB ‖ u16le(v)         if v <= 0xFFFF
-               = 0xFC ‖ u32le(v)         if v <= 0xFFFFFFFF
-               = 0xFD ‖ u64le(v)         otherwise
+size(B) = 4 + cs(n_parents) + 32*n_parents + 32 + 8 + 4 + 8      // version, parents, merkle_root, timestamp, bits, nonce
+        + 8 + 8                                                  // blue_score, height: fixed-width u64 LE
+        + cs(n_tx) + Σ tx.to_wire_bytes(true)                    // transactions, block order
+        + cs(n_shielded) + Σ shielded                            // none is valid today
+        + powit_section                                          // from powit_height(): PowitBody::write_wire
 ```
 
-That is `Block::size_bytes()` of the block with `blue_score = 0`, i.e. the
-plain bincode length minus 0, 2, 4 or 8 bytes. Why `blue_score` is not
-measured as carried (re-audit B1-T0 / B2-T8): the block id does not commit
-to it (POW-8), and the node replaces the received value with the one
-derived from the block's parents (`max(parent blue_score) + 1`) before it
-stores, serves or relays the body. The rule used to read the received
-value, so one block id could be within the limit in the copy gossip
-delivered and over it in the copy every upgraded node served: a block of
-exactly 1,000,000 bytes mined with `blue_score` 0 was accepted by the online
-network and refused ("block too large") by every node that synced it later
-once blue scores pass 250 (a 3-byte varint), a permanent split. Releases
-before this rule therefore did not give one verdict per block id. The rule
-chosen is the deterministic one that keeps every block any release accepted
-valid: such a copy had `size_bytes() <= 1,000,000` with some `blue_score`,
-and 0 has the shortest encoding, so its measure is no larger. The
-alternative (measuring the derived value, by normalizing before the
-structure check) would make upgraded nodes refuse a copy that older
-releases accepted. A release with the old measure still decides a block
-within 8 bytes of the limit by the copy it receives; honest producers never
-come that close (templates budget the framing with every varint at its
-widest encoding). Heights are measured as carried: `accept_block` requires
-`height = max(parent DAG heights) + 1`, so every accepted copy carries the
-same value.
+(`cs` the minimal CompactSize varint of "Wire encoding".) The measure does
+not depend on the `blue_score` a copy carries (re-audit B1-T0 / B2-T8): the
+block id does not commit to it (POW-8), and the node replaces the received
+value with the one derived from the block's parents (`max(parent
+blue_score) + 1`) before it stores, serves or relays the body. A measure
+that read the received value could put one block id within the limit in the
+copy gossip delivered and over it in the copy every upgraded node served (the
+audit's bincode measure: a block of exactly 1,000,000 bytes mined with
+`blue_score` 0 was accepted by the online network and refused by every node
+that synced it later once blue scores pass 250, a 3-byte varint; a
+permanent split). The wire header writes `blue_score` as a fixed-width u64,
+so every copy measures the same, the same as with `blue_score` written as 0:
+one verdict per block id. Main's nodes measure exactly this
+(`Block::size_bytes`, PoWit section included), so the rule changes no
+verdict of theirs: no block they accepted becomes invalid and none they
+refused becomes valid. Heights are measured as carried: `accept_block`
+requires `height = max(parent DAG heights) + 1`, so every accepted copy
+carries the same value and the same PoWit section presence.
 
 `accept_block` checks the size rule of the block's verified header height
 (`block_rules::check_block_size_at`, the one size check of both regimes,
 also called by `Block::validate_structure_without_pow_at`,
 `check_block_hardened_at` and the template self-check), and every ingress
 path checks it before (no proof of work is spent on a block that is too
-large). Templates budget with the measure of their own height.
-Vectors: `size/*` in `reference/block_vectors.json`, which records both the
-plain `bincode_size` and the measure (`legacy_size`) of every block; the
-`size/bincode-exactly-1000000-blue-score-*/pre` and
-`size/bincode-1000001-wire-below-blue-score-*/pre` cases are the same block
-ids as `size/bincode-exactly-1000000/pre` (valid) and
-`size/bincode-1000001-wire-below/pre` (`block-size`) carrying `blue_score` 0
-and `u64::MAX`, with the same verdicts
-(`node/tests/fix_wire_metadata.rs` replays the finding end to end).
+large). Templates budget with the measure of their own height, the PoWit
+section and the witness-share coinbase outputs on top of the transactions.
+Vectors: `size/*` in `reference/block_vectors.json` (`wire_size` recorded
+for every block); the `size/wire-exactly-1000000-blue-score-*/pre` and
+`size/wire-1000001-bincode-below-blue-score-*/pre` cases are the same block
+ids as `size/wire-exactly-1000000/pre` (valid) and
+`size/wire-1000001-bincode-below/pre` (`block-size`) carrying `blue_score` 0
+and `u64::MAX`, with the same verdicts (`node/tests/fix_wire_metadata.rs`
+replays the finding end to end).
 
 ### Pow limit (POW-3)
 

@@ -526,6 +526,12 @@ pub enum WitnessRefusal {
 pub fn check_standard_witnesses_classified(tx: &Transaction) -> Result<(), (WitnessRefusal, String)> {
     let mut keys = Vec::with_capacity(tx.inputs.len());
     for (i, inp) in tx.inputs.iter().enumerate() {
+        // A policy spend (multisig / timelocks) carries a strictly parsed
+        // policy witness, not the single-key framing; whether it matches the
+        // spent output is consensus (`core::sighash::check_input_witnesses`).
+        if core::policy::AnyPolicyWitness::decode(&inp.script_sig).is_ok() {
+            continue;
+        }
         let (_sig, pk) = core::sighash::canonical_witness(&inp.script_sig)
             .map_err(|e| (WitnessRefusal::Framing, format!("input {i}: {e} (non-standard)")))?;
         keys.push(pk);
@@ -717,6 +723,21 @@ pub fn check_transaction_gated(
         .map_err(|e| AdmissionError::Pool(format!("storage: {}", e)))?
         .map_err(AdmissionError::Immature)?;
 
+    // This chain's rules (`blockval`): finality at the next height, output
+    // kinds, dust, policy timelocks. An output of a pooled (unconfirmed)
+    // parent has no confirmation height yet: a relative timelock on it is
+    // not satisfied. Relative timelocks count confirmations in the connect
+    // path's measure for the next block (re-audit B1-T14).
+    let confirmations = |t: &[u8; 32]| -> Result<Option<u64>, String> {
+        confirmations_for_next_block(store, t, policy.next_block_height).map_err(|e| e.0)
+    };
+    crate::blockval::check_tx_chain_rules_with_confirmations(tx, &prevouts, policy.next_block_height, &confirmations)
+        .map_err(|e| if e.starts_with(crate::blockval::STORAGE_ERR) {
+            AdmissionError::Pool(e)
+        } else {
+            AdmissionError::Rejected(e)
+        })?;
+
     // Value + fees.
     let total_out = core::limits::check_tx_money_range(tx).map_err(AdmissionError::Rejected)?;
     if total_in < total_out {
@@ -785,6 +806,29 @@ pub fn coinbase_maturity_for_next_block(
     };
     check_coinbase_maturity_in_view(tx, store, rule)
         .map_err(|e| crate::storage::StorageError::ReadFailed(e.0))
+}
+
+/// The confirmations the outputs of the confirmed transaction `txid` have at
+/// the next block, at header height `next_block_height`, for relative
+/// timelocks (`blockval::check_policy_spends_with_confirmations`), under the
+/// connect path's own measure (`accept::confirmations_in_view`, the
+/// coinbase-maturity measure, re-audit B1-T14): below the activation header
+/// heights, from it selected-chain depth (the next block a child of the
+/// applied tip, as for [`coinbase_maturity_for_next_block`]). `Ok(None)`:
+/// `txid` is not confirmed. Shared by admission and the template self-check.
+pub fn confirmations_for_next_block(
+    store: &Storage,
+    txid: &[u8; 32],
+    next_block_height: u64,
+) -> Result<Option<u64>, crate::reorg::ViewError> {
+    use crate::accept::{confirmations_in_view, MaturityRule};
+    let next_dag_height = || next_block_dag_height(store);
+    let rule = if core::block_rules::rules_active_at(next_block_height, activation_height()) {
+        MaturityRule::SelectedChainDepth(&next_dag_height)
+    } else {
+        MaturityRule::HeaderHeights(next_block_height)
+    };
+    confirmations_in_view(store, rule, txid)
 }
 
 /// The DAG height of the next block: the applied tip's (`tip_hash`, its DAG

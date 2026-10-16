@@ -17,6 +17,78 @@
 #![forbid(unsafe_code)]
 
 pub mod difficulty;
+/// GnB-SMH v2 draft (SHA-256). Not consensus.
+pub mod v2;
+/// GnB-SMH v3 (Argon2d-style fill, 4 MiB): consensus from the PoWit activation height.
+pub mod v3;
+
+/// The proof-of-work function consensus selects for a height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Algo {
+    /// GnB-SMH v1: ROMix over 64 MiB.
+    V1,
+    /// GnB-SMH v3: Argon2d-style 2-pass fill over 4 MiB.
+    V3,
+}
+
+impl Algo {
+    pub fn name(self) -> &'static str {
+        match self {
+            Algo::V1 => "gnb-smh-v1",
+            Algo::V3 => "gnb-smh-v3",
+        }
+    }
+
+    /// Scratchpad bytes one evaluation holds.
+    pub fn memory_bytes(self) -> usize {
+        match self {
+            Algo::V1 => BLOCK << LOG2_N,
+            Algo::V3 => v3::BLOCK << v3::LOG2_N,
+        }
+    }
+}
+
+/// A canonical scratchpad for either algorithm (one per mining thread).
+pub enum AnyScratchpad {
+    V1(Scratchpad),
+    V3(v3::Scratchpad),
+}
+
+impl AnyScratchpad {
+    pub fn new(algo: Algo) -> Self {
+        match algo {
+            Algo::V1 => AnyScratchpad::V1(Scratchpad::new(LOG2_N)),
+            Algo::V3 => AnyScratchpad::V3(v3::Scratchpad::new(v3::LOG2_N)),
+        }
+    }
+
+    pub fn algo(&self) -> Algo {
+        match self {
+            AnyScratchpad::V1(_) => Algo::V1,
+            AnyScratchpad::V3(_) => Algo::V3,
+        }
+    }
+
+    pub fn hash(&mut self, header: &[u8], nonce: u64) -> [u8; 32] {
+        match self {
+            AnyScratchpad::V1(sp) => hash_with(sp, header, nonce),
+            AnyScratchpad::V3(sp) => v3::hash_with(sp, header, nonce),
+        }
+    }
+}
+
+/// Canonical output of `algo` with a per-thread scratchpad.
+pub fn hash_algo(algo: Algo, header: &[u8], nonce: u64) -> [u8; 32] {
+    match algo {
+        Algo::V1 => hash_thread_local(header, nonce),
+        Algo::V3 => v3::hash_thread_local(header, nonce),
+    }
+}
+
+/// Consensus check of one proof under `algo`. A zero target never validates.
+pub fn verify_algo(algo: Algo, header: &[u8], nonce: u64, target: &difficulty::Target) -> bool {
+    !target.is_zero() && difficulty::meets_target(&hash_algo(algo, header, nonce), target)
+}
 
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::Shake256;

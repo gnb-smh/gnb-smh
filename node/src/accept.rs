@@ -291,19 +291,26 @@ pub struct BlockInvalidity {
     pub reason: String,
     /// The failure depends on bytes the block id does not commit to, and a
     /// body with other such bytes could cure it: a non-coinbase `script_sig`
-    /// (script parse, public key against a 20-byte prevout script,
-    /// signature) or the size-based minimum fee above the floor a body with
-    /// minimal witnesses would still owe, of a block below the hardening
-    /// activation whose id-committed checks all passed. Another body with
-    /// the same id may be valid, so the id must not be disqualified. A
-    /// failure no body with this id can cure is id-committed (re-audit
-    /// B1-T13): a fee below `min_tx_fee_sat` of the size with every
-    /// `script_sig` empty (so below `MIN_TX_FEE_SAT` too), a transaction
-    /// without inputs, a spend of a coin whose script is not 20 bytes, and
-    /// any id-committed failure anywhere in the block (the id-committed
-    /// checks of every transaction run before any witness check). Always
-    /// `false` at/after the activation, where the witness commitment
-    /// (checked before the block is stored) fixes every byte of the body.
+    /// (script parse, public key against a 20-byte prevout script, a policy
+    /// witness: its framing, its hash against a policy output, its
+    /// timelocks and branch, `blockval::check_policy_spends`; signature) or
+    /// the size-based minimum fee above the floor a body with minimal
+    /// witnesses would still owe, of a block whose id does not commit to its
+    /// witnesses ([`witnesses_fixed_at`]: below both
+    /// `core::WITNESS_COMMITMENT_HEIGHT` and the hardening activation) and
+    /// whose id-committed checks all passed. Another body with the same id
+    /// may be valid, so the id must not be disqualified. A failure no body
+    /// with this id can cure is id-committed (re-audit B1-T13): a fee below
+    /// `min_tx_fee_sat` of the size with every `script_sig` empty (so below
+    /// `MIN_TX_FEE_SAT` too), a transaction without inputs, a spend of a
+    /// coin whose script is neither output kind, this chain's context-free
+    /// rules (locktime finality, output kinds, dust), and any id-committed
+    /// failure anywhere in the block (the id-committed checks of every
+    /// transaction run before any witness check). Always `false` where the
+    /// id commits to the witnesses (the `|wc:` suffix from
+    /// `WITNESS_COMMITMENT_HEIGHT`, the coinbase commitment from the
+    /// activation; both checked before the block is stored, so they fix
+    /// every byte of the body).
     pub witness_dependent: bool,
 }
 
@@ -368,13 +375,16 @@ impl TxFailure {
         TxFailure::Invalid { reason, witness: true }
     }
 
-    /// Classified at a block subject (`hardened`) or not to the hardening
-    /// rules: at/after the activation the witness commitment fixed the body,
-    /// so no failure is witness-dependent there.
-    fn into_connect(self, hardened: bool) -> ConnectFailure {
+    /// Classified at a block whose id commits (`witnesses_fixed`) or not to
+    /// every witness: from `core::WITNESS_COMMITMENT_HEIGHT` (the `|wc:`
+    /// suffix) and at/after the hardening activation (the audit's coinbase
+    /// commitment) the witness commitment, checked before the block is
+    /// stored, fixed the body, so no failure is witness-dependent there
+    /// ([`witnesses_fixed_at`]).
+    fn into_connect(self, witnesses_fixed: bool) -> ConnectFailure {
         match self {
             TxFailure::Invalid { reason, witness } => {
-                ConnectFailure::Invalid(BlockInvalidity { reason, witness_dependent: witness && !hardened })
+                ConnectFailure::Invalid(BlockInvalidity { reason, witness_dependent: witness && !witnesses_fixed })
             }
             TxFailure::Storage(e) => ConnectFailure::Storage(e.0),
         }
@@ -385,10 +395,25 @@ impl TxFailure {
     }
 }
 
+/// Whether the id of a block at header height `height` commits to every
+/// witness of its body: from `core::WITNESS_COMMITMENT_HEIGHT` (the `|wc:`
+/// suffix, `Block::validate_witness_commitment`) and at/after the hardening
+/// activation (`block_rules::check_coinbase_commitment`). Both are checked
+/// before a block is stored, so a stored body of such a block is the only
+/// body its id admits and no connect failure is witness-dependent.
+pub fn witnesses_fixed_at(height: u64, activation_height: u64) -> bool {
+    core::block_rules::rules_active_at(height, activation_height) || core::witnesses_committed(height)
+}
+
 /// Which heights the coinbase-maturity rule compares (re-audit B1-T14;
 /// docs/CONSENSUS.md, "Coinbase maturity"). A spend of an output of the
 /// coinbase of block C by a transaction of block B needs a depth of at least
-/// `core::COINBASE_MATURITY` (100):
+/// `core::COINBASE_MATURITY` (100). The same measure counts the
+/// confirmations a relative timelock (`older` of a spend policy,
+/// `blockval::check_policy_spends_with_confirmations`) requires of the
+/// output it spends, C being the block that confirmed that output
+/// ([`confirmations_in_view`]); absolute heights (`locktime`, a policy's
+/// `after`) are compared with B's header height in both regimes:
 #[derive(Clone, Copy)]
 pub enum MaturityRule<'a> {
     /// No maturity check (the single-transaction helpers' `0`).
@@ -492,6 +517,37 @@ pub fn check_coinbase_maturity_in_view(
     }
 }
 
+/// The confirmations the outputs of the CONFIRMED transaction `txid` have at
+/// the spending block B under `rule` (the coinbase-maturity measure, re-audit
+/// B1-T14), for relative timelocks (`older`): below the activation B's header
+/// height minus the header height of the block the tx index names
+/// (`blockval::check_policy_spends`, unchanged); from it B's DAG height minus
+/// that block's DAG height, the number of selected-chain blocks from its
+/// child to B. `Ok(None)` when `txid` has no tx-index row (an output of an
+/// unconfirmed transaction); a confirmed transaction whose block has no DAG
+/// record is an inconsistent index, an error (no verdict). An output created
+/// earlier in B itself has 0 confirmations: the caller answers that without
+/// asking the view. [`MaturityRule::Skip`] has no measure and is never
+/// passed here (reported as a read failure, so no verdict, if it were).
+pub fn confirmations_in_view(
+    view: &dyn UtxoView,
+    rule: MaturityRule<'_>,
+    txid: &[u8; 32],
+) -> Result<Option<u64>, ViewError> {
+    match rule {
+        MaturityRule::Skip => Err(ViewError("no confirmation measure (MaturityRule::Skip)".into())),
+        MaturityRule::HeaderHeights(height) => Ok(view.view_tx_height(txid)?.map(|c| height.saturating_sub(c))),
+        MaturityRule::SelectedChainDepth(spend_dag_height) => {
+            let Some(block) = view.view_tx_block(txid)? else {
+                return Ok(None);
+            };
+            let data = view.view_dag_data(&block)?.ok_or_else(|| ViewError(format!(
+                "block {} of transaction {} has no DAG record", hex::encode(&block[..8]), hex::encode(&txid[..8]))))?;
+            Ok(Some(spend_dag_height()?.saturating_sub(data.height)))
+        }
+    }
+}
+
 /// [`check_coinbase_maturity_in_view`] as a transaction-level failure.
 fn check_maturity_in_view(tx: &core::Transaction, view: &dyn UtxoView, rule: MaturityRule<'_>) -> Result<(), TxFailure> {
     check_coinbase_maturity_in_view(tx, view, rule)?.map_err(TxFailure::from)
@@ -499,12 +555,15 @@ fn check_maturity_in_view(tx: &core::Transaction, view: &dyn UtxoView, rule: Mat
 
 /// The id-committed checks of `tx` (a non-coinbase transaction of a block
 /// at header height `block_height`) against `view` plus the outputs of the
-/// transactions STRICTLY BEFORE it in the block (`earlier`): everything
-/// [`check_tx_inputs_committed`] checks, coinbase maturity under `maturity`
-/// (the block path passes the rule of its regime, [`MaturityRule`]) and,
-/// when `same_block_coinbase` is `Some` (hardening rules, audit VAL-3), no
-/// input spending that coinbase's outputs. Returns what the witness checks
-/// ([`check_tx_witnesses`]) need.
+/// transactions STRICTLY BEFORE it in the block (`earlier`): when
+/// `same_block_coinbase` is `Some`, no input spending that coinbase's
+/// outputs (this chain's rule at every height, audit VAL-3), coinbase
+/// maturity under `maturity` (the block path passes the rule of its regime,
+/// [`MaturityRule`]), this chain's context-free transaction rules once every
+/// prevout is found (`blockval::check_tx_context_free`: locktime finality,
+/// the two output kinds, dust; all over data the txid commits to), then
+/// everything [`check_tx_inputs_committed`] checks. Returns what the witness
+/// checks ([`check_tx_policy_spends`], [`check_tx_witnesses`]) need.
 #[allow(clippy::too_many_arguments)]
 fn check_tx_in_view_committed(
     tx: &core::Transaction,
@@ -531,11 +590,35 @@ fn check_tx_in_view_committed(
         }
         view.view_utxo(txid, idx)
     };
-    check_tx_inputs_committed(tx, &lookup, Some(spent_in_block), block_height, activation_height)
+    // This chain's context-free rules (`blockval`: finality, output kinds,
+    // dust), in this chain's order: once every prevout is found, before the
+    // input and value checks. Id-committed (locktime and outputs are in the
+    // txid). The policy-spend rules (timelocks) read the witness: they are
+    // witness checks ([`check_tx_policy_spends`], pass 2).
+    let mut found = 0usize;
+    for inp in &tx.inputs {
+        if lookup(&inp.prev_txid, inp.prev_index)?.is_some() {
+            found += 1;
+        }
+    }
+    if found == tx.inputs.len() {
+        crate::blockval::check_tx_context_free(tx, block_height)?;
+    }
+    let mut committed = check_tx_inputs_committed(tx, &lookup, Some(spent_in_block), block_height, activation_height)?;
+    // The prevouts created earlier in this block: confirmed in the block
+    // itself, so 0 confirmations for a relative timelock. (A txid created
+    // earlier in the block has no other unspent outputs: BIP30.)
+    committed.in_block = tx.inputs.iter()
+        .filter(|inp| earlier.contains_key(&(inp.prev_txid, inp.prev_index)))
+        .map(|inp| inp.prev_txid)
+        .collect();
+    Ok(committed)
 }
 
-/// [`check_tx_in_view_committed`] then [`check_tx_witnesses`]: one
-/// transaction in full (the single-transaction helpers). Returns the fee.
+/// [`check_tx_in_view_committed`], [`check_tx_policy_spends`] (relative
+/// timelocks measured under `maturity`'s regime, `timelocks`) then
+/// [`check_tx_witnesses`]: one transaction in full (the single-transaction
+/// helpers). Returns the fee.
 #[allow(clippy::too_many_arguments)]
 fn validate_tx_in_view(
     tx: &core::Transaction,
@@ -544,14 +627,59 @@ fn validate_tx_in_view(
     spent_in_block: &mut HashSet<([u8; 32], u32)>,
     block_height: u64,
     maturity: MaturityRule<'_>,
+    timelocks: MaturityRule<'_>,
     same_block_coinbase: Option<&[u8; 32]>,
     activation_height: u64,
 ) -> Result<u64, TxFailure> {
     let committed = check_tx_in_view_committed(
         tx, view, earlier, spent_in_block, block_height, maturity, same_block_coinbase, activation_height,
     )?;
+    check_tx_policy_spends(tx, &committed, block_height, view, timelocks)?;
     check_tx_witnesses(tx, &committed, block_height, activation_height)?;
     Ok(committed.fee)
+}
+
+/// The policy-spend rules of `tx` (`blockval::check_policy_spends_with_confirmations`:
+/// the revealed policy's timelocks, a policy-tree spend only from
+/// `core::powit_height()`) in a block at header height `block_height`, a
+/// relative timelock counting confirmations under `timelocks` (the
+/// coinbase-maturity measure of the block's regime, [`confirmations_in_view`];
+/// 0 for an output created earlier in the block). Witness-dependent: the
+/// policy and its branch are revealed by the `script_sig` (whose hash match
+/// is checked with the scripts), so another witness may satisfy what this
+/// one does not. A confirmation height that cannot be read, or a confirmed
+/// output without one, is a read failure (no verdict, re-audit B1-T12).
+fn check_tx_policy_spends(
+    tx: &core::Transaction,
+    committed: &CommittedTx,
+    block_height: u64,
+    view: &dyn UtxoView,
+    timelocks: MaturityRule<'_>,
+) -> Result<(), TxFailure> {
+    let read_error: std::cell::RefCell<Option<ViewError>> = std::cell::RefCell::new(None);
+    let confirmations = |t: &[u8; 32]| -> Result<Option<u64>, String> {
+        if committed.in_block.contains(t) {
+            return Ok(Some(0));
+        }
+        confirmations_in_view(view, timelocks, t).map_err(|e| {
+            let m = e.0.clone();
+            read_error.borrow_mut().get_or_insert(e);
+            m
+        })
+    };
+    let verdict = crate::blockval::check_policy_spends_with_confirmations(
+        tx, &committed.prevouts, block_height, &confirmations,
+    );
+    if let Some(e) = read_error.into_inner() {
+        return Err(TxFailure::Storage(e));
+    }
+    match verdict {
+        Ok(()) => Ok(()),
+        // An output found in the view without a confirmation: an
+        // inconsistent index, not a rule.
+        Err(e) if e.starts_with(crate::blockval::STORAGE_ERR) => Err(TxFailure::Storage(ViewError(e))),
+        Err(e) => Err(TxFailure::witness(e)),
+    }
 }
 
 /// BIP30 (audit VAL-2) for one transaction of a block subject to the
@@ -583,8 +711,8 @@ fn check_no_unspent_overwrite(view: &dyn UtxoView, tx: &core::Transaction) -> Re
 /// runs `CheckTxInputs` for every transaction and leaves the scripts to the
 /// check queue): first the checks that depend only on data the block id
 /// commits to, for EVERY transaction and then the coinbase value; then the
-/// witness checks (scripts, the size-based minimum fee) of every
-/// transaction. The verdict is the same in any order (every rule must
+/// witness checks (the policy-spend rules, the scripts, the size-based
+/// minimum fee) of every transaction. The verdict is the same in any order (every rule must
 /// pass); the order decides the reported failure and so its class: an
 /// id-committed failure anywhere in the block is reported as such, never
 /// hidden behind an earlier witness failure. It also runs no signature
@@ -603,22 +731,26 @@ pub fn validate_block_in_view(view: &dyn UtxoView, block: &core::Block) -> Resul
     validate_block_in_view_at(view, block, core::activation::hardening_activation_height())
 }
 
-/// [`validate_block_in_view`] for an explicit activation height. At/after
-/// the activation (`core::block_rules::rules_active_at(block.height, ..)`):
+/// [`validate_block_in_view`] for an explicit activation height. At every
+/// height (this chain's rules since before the 2026-10-14 reset; the
+/// audit's VAL-2 / VAL-3 at the activation):
 ///
-/// * **BIP30 (audit VAL-2)**: no output of the block may have the outpoint of
-///   a coin that is unspent in `view` (the parent's state), checked for every
+/// * **BIP30**: no output of the block may have the outpoint of a coin that
+///   is unspent in `view` (the parent's state), checked for every
 ///   transaction, the coinbase included, before any transaction is validated;
-/// * **no same-block coinbase spend (audit VAL-3)**: the coinbase's outputs
-///   are not in the in-block prevout map, and an input spending them is
-///   rejected as a coinbase-maturity violation.
+/// * **no same-block coinbase spend**: the coinbase's outputs are not in the
+///   in-block prevout map, and an input spending them is rejected as a
+///   coinbase-maturity violation;
+/// * this chain's transaction rules (`blockval`): locktime finality, the two
+///   output kinds and dust (the coinbase's too), the policy-spend timelocks.
 ///
-/// Below the activation both rules are absent, exactly as before. The
-/// transaction rules of the same activation (version 3 / sighash v3 /
-/// canonical witnesses, `core::sighash`) are evaluated at the same height
-/// (`block.height`, also the coinbase-maturity height) under the same
-/// `activation_height` (`admission::verify_input_scripts_at`). Library API
-/// like [`validate_block_in_view`] (unused by the `gnb` binary).
+/// What changes at the activation: the transaction rules (version 3 /
+/// sighash v3 / canonical witnesses, `core::sighash`), evaluated at the same
+/// height (`block.height`) under the same `activation_height`
+/// (`admission::verify_input_scripts_at`), and the depth measure of coinbase
+/// maturity and relative timelocks ([`MaturityRule`]: header heights below,
+/// selected-chain depth from it, re-audit B1-T14). Library API like
+/// [`validate_block_in_view`] (unused by the `gnb` binary).
 #[allow(dead_code)]
 pub fn validate_block_in_view_at(
     view: &dyn UtxoView,
@@ -647,16 +779,18 @@ pub fn validate_block_in_view_classified_at(
     let committed = |reason: String| ConnectFailure::Invalid(BlockInvalidity { reason, witness_dependent: false });
     let height = block.height;
     let hardened = core::block_rules::rules_active_at(height, activation_height);
-    if hardened {
-        for tx in &block.transactions {
-            check_no_unspent_overwrite(view, tx).map_err(|f| f.into_connect(hardened))?;
-        }
+    let witnesses_fixed = witnesses_fixed_at(height, activation_height);
+    // BIP30 and no spend of the block's own coinbase: this chain's rules from
+    // genesis (the audit's VAL-2 / VAL-3 at the activation), so at every
+    // height here. A read failure of the view is no verdict (B1-T12).
+    for tx in &block.transactions {
+        check_no_unspent_overwrite(view, tx).map_err(|f| f.into_connect(witnesses_fixed))?;
     }
-    let same_block_coinbase = if hardened {
-        block.transactions.first().map(|cb| cb.txid())
-    } else {
-        None
-    };
+    if let Some(cb) = block.transactions.first() {
+        crate::blockval::check_tx_context_free(cb, height)
+            .map_err(|e| committed(format!("coinbase rejected: {}", e)))?;
+    }
+    let same_block_coinbase = block.transactions.first().map(|cb| cb.txid());
     let mut spent_in_block: HashSet<([u8; 32], u32)> = HashSet::new();
     let mut earlier: HashMap<([u8; 32], u32), core::TxOutput> = HashMap::new();
     let mut total_fees: u64 = 0;
@@ -684,12 +818,12 @@ pub fn validate_block_in_view_classified_at(
             let c = check_tx_in_view_committed(
                 tx, view, &earlier, &mut spent_in_block, height, maturity, same_block_coinbase.as_ref(),
                 activation_height,
-            ).map_err(|f| f.into_connect(hardened))?;
+            ).map_err(|f| f.into_connect(witnesses_fixed))?;
             total_fees = core::limits::money_add(total_fees, c.fee)
                 .map_err(|e| committed(format!("block fee sum: {}", e)))?;
             checked.push((tx, c));
         }
-        if hardened && i == 0 {
+        if i == 0 {
             continue; // VAL-3: the coinbase's outputs are not spendable in its own block
         }
         let txid = tx.txid();
@@ -699,9 +833,12 @@ pub fn validate_block_in_view_classified_at(
     }
     block.validate_coinbase_value(total_fees)
         .map_err(|e| committed(format!("coinbase rejected: {}", e)))?;
-    // Pass 2: the witness checks, in block order.
+    // Pass 2: the witness checks, in block order: the policy spends (their
+    // relative timelocks counted under the block's maturity measure), then
+    // the scripts and the size-based minimum fee.
     for (tx, c) in &checked {
-        check_tx_witnesses(tx, c, height, activation_height).map_err(|f| f.into_connect(hardened))?;
+        check_tx_policy_spends(tx, c, height, view, maturity).map_err(|f| f.into_connect(witnesses_fixed))?;
+        check_tx_witnesses(tx, c, height, activation_height).map_err(|f| f.into_connect(witnesses_fixed))?;
     }
     Ok(())
 }
@@ -1405,9 +1542,9 @@ pub fn accept_block_tracking(
     //    parents, so every caller (gossip, directed sync, orphan drain, body
     //    restore, `submitblock`, the miner) stores and serves the same body
     //    for one id and no peer-chosen value is ever persisted. No consensus
-    //    rule reads it (the pre-activation size measure writes it as 0,
-    //    `core::block_rules::legacy_block_size`; the wire size has it at a
-    //    fixed width), so this changes no verdict.
+    //    rule reads it (the size measure of both regimes, the wire encoding,
+    //    `core::block_rules::legacy_block_size` / `Block::wire_size`, writes
+    //    it at a fixed width), so this changes no verdict.
     let derived_blue_score = {
         let d = dag.read();
         crate::ingress::derived_blue_score(
@@ -1460,12 +1597,23 @@ pub fn accept_block_tracking(
     core::block_rules::check_block_hardened_at(block, core::activation::hardening_activation_height())
         .map_err(|e| format!("consensus rejection: {}", e))?;
     // ── The block-size limit at the VERIFIED header height, in the measure
-    //    of the regime (`block_rules::check_block_size_at`: the wire size
-    //    from the activation; below it bincode with the uncommitted
-    //    blue_score written as 0, re-audit B1-T0). Every ingress path checked
-    //    it on the claimed height; checking it here too means no caller can
-    //    store a block over the limit.
+    //    of the regime (`block_rules::check_block_size_at`: the wire
+    //    encoding at every height on this chain, re-audit B1-T0: the
+    //    uncommitted blue_score has a fixed width there). Every ingress path
+    //    checked it on the claimed height; checking it here too means no
+    //    caller can store a block over the limit.
     core::block_rules::check_block_size_at(block, core::activation::hardening_activation_height())
+        .map_err(|e| format!("consensus rejection: {}", e))?;
+    // This chain's context-free rules that depend on the header height
+    // (re-checked now that the height is verified; every ingress path ran
+    // them in `validate_structure` on the claimed height): the `|wc:` witness
+    // commitment from WITNESS_COMMITMENT_HEIGHT, the PoWit section's shape
+    // from `powit_height()`, and dust.
+    block.validate_witness_commitment()
+        .map_err(|e| format!("consensus rejection: {}", e))?;
+    block.validate_powit_structure()
+        .map_err(|e| format!("consensus rejection: {}", e))?;
+    block.validate_dust()
         .map_err(|e| format!("consensus rejection: {}", e))?;
 
     // ── Proof of work (expensive: 64 MiB GnB-SMH, cached by block id) ─
@@ -1494,6 +1642,21 @@ pub fn accept_block_tracking(
         return Err("shielded consensus rejection: ProofInvalid (no shielded verifier active)".into());
     }
 
+    // ── PoWit section, in context (from powit_height) ────────────────
+    // Share proofs, attested blocks and share uniqueness against this
+    // block's own selected chain, then the witness-set state transition
+    // (attestations, equivocation proofs, justification, finality). A pure
+    // function of the block and its past (never of the UTXO set), so a
+    // failure is refused like a bad height or difficulty: the block is not
+    // stored. `storage:` errors are local and refuse only this attempt.
+    let powit_state = if replacing {
+        None // same id, same PoWit section: its state is already stored
+    } else {
+        let d = dag.read();
+        crate::powit::block_state(block, &block_hash, &d, store)
+            .map_err(|e| if e.starts_with("storage:") { e } else { format!("consensus rejection: {}", e) })?
+    };
+
     // ── Insert into GhostDAG and store the body ──────────────────────
     let applied_tip = match old_tip {
         Some(t) => t,
@@ -1507,12 +1670,23 @@ pub fn accept_block_tracking(
         info!("block {} h={}: new body stored for a block that waited for one; re-evaluating",
             hex::encode(&block_hash[..8]), block.height);
     } else {
-        let work = pow::work_from_bits(block.header.bits);
+        // Chain work normalised across the GnB-SMH v1 -> v3 switch
+        // (`core::block_work`).
+        let work = pow::block_work(block.header.bits, block.height);
         dag.write().add_block(block_hash, block.header.parents.clone(), block.header.timestamp, work)
             .map_err(|e| format!("consensus rejection: {}", e))?;
         if let Err(e) = store.put_block_body(block) {
             dag.write().remove_block(&block_hash);
             return Err(e.to_string());
+        }
+        // The block's PoWit state, keyed by its hash (deterministic; inert
+        // if the block never joins the selected chain).
+        if let Some(st) = &powit_state {
+            if let Err(e) = crate::powit::save_state(store, &block_hash, st) {
+                let _ = store.delete_block_body(&block_hash);
+                dag.write().remove_block(&block_hash);
+                return Err(e);
+            }
         }
     }
     // Informational only (RPC / tip notifications).
@@ -1662,9 +1836,12 @@ pub fn accept_block_tracking(
         info!("✓ block h={} accepted", height);
     }
 
-    // (No finality checkpoint any more — audit DAG-6. The pruning cursor
-    // below uses the selected tip's DAG height, never tip_blue_score(); see
-    // the DAG-8 note on `GhostdagData::height`.)
+    // No depth-based finality any more (audit DAG-6). PoWit finality: the
+    // checkpoint the applied chain's witness set finalized pins fork choice
+    // (`GhostDAG::set_finalized`). The pruning cursor below uses the
+    // selected tip's DAG height, never tip_blue_score(); see the DAG-8 note
+    // on `GhostdagData::height`.
+    crate::powit::update_finalized(dag, store);
     let tip_height = {
         let d = dag.read();
         d.selected_tip()
@@ -2863,6 +3040,9 @@ fn validate_tx_inputs_classified(
 struct CommittedTx {
     prevouts: Vec<core::TxOutput>,
     fee: u64,
+    /// The txids of the prevouts created earlier in the same block (0
+    /// confirmations for a relative timelock); empty off the block path.
+    in_block: HashSet<[u8; 32]>,
 }
 
 /// The checks of `tx` that depend only on data its txid commits to (never
@@ -2877,10 +3057,15 @@ struct CommittedTx {
 ///   body with this txid can have, so at least `MIN_TX_FEE_SAT`); the
 ///   size-based minimum of the actual body is checked by
 ///   [`check_tx_witnesses`];
-/// * every prevout's `script_pubkey` must be 20 bytes: a public key must
-///   hash to it (`sighash::check_input_witnesses`, 20 bytes of SHA3-256),
-///   which no key does for another length. Reported as the pubkey-hash
-///   failure the witness check would report.
+/// * every prevout's `script_pubkey` must be one of the two output kinds
+///   (`core::policy::output_kind`): a 20-byte key hash, which a public key
+///   must hash to (`sighash::check_input_witnesses`, 20 bytes of SHA3-256),
+///   or a 33-byte spend policy, which a revealed policy must hash to. No
+///   witness spends any other script (no key hashes to it and no policy
+///   witness is accepted for it). Reported as the pubkey-hash failure the
+///   witness check would report. (This chain has enforced the output kinds
+///   on every output since before the 2026-10-14 reset, so such a coin
+///   exists only in a hand-built state.)
 ///
 /// The verdict of a transaction is unchanged (every rule must pass); only
 /// which failure is reported first, and so its class, moved.
@@ -2939,10 +3124,12 @@ fn check_tx_inputs_committed(
              (whatever its script_sigs)"
         ).into());
     }
-    if let Some(i) = prevouts.iter().position(|p| p.script_pubkey.len() != 20) {
-        return Err(format!("pubkey mismatch at input {} (the coin's script is not a 20-byte key hash)", i).into());
+    if let Some(i) = prevouts.iter().position(|p| core::policy::output_kind(&p.script_pubkey).is_none()) {
+        return Err(format!(
+            "pubkey mismatch at input {} (the coin's script is neither a 20-byte key hash nor a spend policy)", i
+        ).into());
     }
-    Ok(CommittedTx { prevouts, fee })
+    Ok(CommittedTx { prevouts, fee, in_block: HashSet::new() })
 }
 
 /// The checks of `tx` that depend on its `script_sig`s, after
@@ -3047,15 +3234,15 @@ pub fn validate_tx_in_block_with_maturity(
         .unwrap_or(block.transactions.len());
     // Same gate and height as `validate_block_in_view_classified_at`.
     let activation_height = core::activation::hardening_activation_height();
-    let hardened = core::block_rules::rules_active_at(block.height, activation_height);
     let view: &storage::Storage = store;
-    if hardened {
-        check_no_unspent_overwrite(view, tx).map_err(TxFailure::into_message)?;
-    }
-    let same_block_coinbase = if hardened { block.transactions.first().map(|cb| cb.txid()) } else { None };
+    let hardened = core::block_rules::rules_active_at(block.height, activation_height);
+    // BIP30 / no own-coinbase spend: this chain's rules at every height
+    // (see `validate_block_in_view_classified_at`).
+    check_no_unspent_overwrite(view, tx).map_err(TxFailure::into_message)?;
+    let same_block_coinbase = block.transactions.first().map(|cb| cb.txid());
     let earlier: HashMap<([u8; 32], u32), core::TxOutput> = block.transactions[..cutoff]
         .iter()
-        .filter(|t| !(hardened && t.is_coinbase()))
+        .filter(|t| !t.is_coinbase())
         .flat_map(|t| {
             let txid = t.txid();
             t.outputs.iter().enumerate().map(move |(i, o)| ((txid, i as u32), o.clone()))
@@ -3071,8 +3258,15 @@ pub fn validate_tx_in_block_with_maturity(
         (_, true) => MaturityRule::SelectedChainDepth(&spend_dag_height),
         (h, false) => MaturityRule::HeaderHeights(h),
     };
+    // Relative timelocks: the block's own measure, as on the connect path
+    // (never skipped).
+    let timelocks = if hardened {
+        MaturityRule::SelectedChainDepth(&spend_dag_height)
+    } else {
+        MaturityRule::HeaderHeights(block.height)
+    };
     validate_tx_in_view(
-        tx, view, &earlier, spent_in_block, block.height, maturity, same_block_coinbase.as_ref(),
+        tx, view, &earlier, spent_in_block, block.height, maturity, timelocks, same_block_coinbase.as_ref(),
         activation_height,
     )
     .map_err(TxFailure::into_message)

@@ -2,8 +2,8 @@
 //!
 //! # VAL-11: MoneyRange
 //!
-//! The 10 M GNB cap follows from the subsidy schedule, the coinbase rule and
-//! value conservation; nothing compared amounts with
+//! The 12.5 M GNB cap follows from the genesis ledger, the subsidy schedule,
+//! the coinbase rule (witness-share outputs included) and value conservation; nothing compared amounts with
 //! [`tokenomics::MAX_SUPPLY_SAT`] at validation time. [`money_range`] and the
 //! `check_*_money_range` helpers below are the Bitcoin-Core-style defence in
 //! depth, on exactly the sums Bitcoin Core bounds: every output, each
@@ -35,21 +35,24 @@
 //! `count_and_size_caps_match_the_wire_parser` (every other cap) keep the two
 //! in sync, each cap at and one past its value.
 //!
-//! Block SIZE (`MAX_BLOCK_SIZE`) is not measured here. Below the hardening
-//! activation the consensus rule is bincode with the uncommitted
-//! `blue_score` written as 0 (`super::block_rules::legacy_block_size`,
-//! re-audit B1-T0); at and after it the canonical wire encoding
-//! `Block::wire_size()`, the encoding fee rates use
-//! (`super::block_rules::block_size_for_rules`, audit VAL-12 residual). Both
-//! are checked by `block_rules::check_block_size_at`, called by
-//! `Block::validate_structure` (which `accept_block` runs at the verified
-//! height), and every producer (miner template, `getblocktemplate`) budgets
-//! with the measure of the template's height.
+//! Block SIZE (`MAX_BLOCK_SIZE`) is not measured here. On this chain the
+//! consensus measure is the canonical wire encoding at every height (below
+//! the hardening activation `super::block_rules::legacy_block_size`,
+//! `Block::size_bytes`; at and after it `Block::wire_size()`, the same
+//! length, `super::block_rules::block_size_for_rules`, audit VAL-12
+//! residual), which writes the uncommitted `blue_score` at a fixed width
+//! (re-audit B1-T0). Both are checked by `block_rules::check_block_size_at`,
+//! called by `Block::validate_structure` and by `accept_block` at the
+//! verified height, and every producer (miner template, `getblocktemplate`)
+//! budgets with the measure of the template's height.
 
 use super::{tokenomics, Block, Transaction, MAX_PARENTS};
 
-/// Maximum `script_sig` length (wire parser cap).
-pub const MAX_SCRIPT_SIG_SIZE: usize = 10_000;
+/// Maximum `script_sig` length (wire parser cap, `core::MAX_SCRIPT_SIG_LEN`):
+/// the largest policy witness (7-of-7 multisig, `core::policy`), so every
+/// policy output stays spendable (a 10,000-byte cap made the 2-of-3 team
+/// vesting unspendable, review F1).
+pub const MAX_SCRIPT_SIG_SIZE: usize = super::MAX_SCRIPT_SIG_LEN;
 /// Maximum `script_pubkey` length (wire parser cap).
 pub const MAX_SCRIPT_PUBKEY_SIZE: usize = 10_000;
 /// Maximum inputs per transaction (wire parser cap).
@@ -97,14 +100,18 @@ pub fn check_tx_money_range(tx: &Transaction) -> Result<u64, String> {
     Ok(total)
 }
 
-/// MoneyRange over every transaction of a block (coinbase included): each
-/// output and each transaction's output total (`check_tx_money_range`), and
-/// each shielded fee.
+/// MoneyRange over every transaction of a block (coinbase included, its
+/// witness-share outputs from `powit_height()` too): each output and each
+/// transaction's output total (`check_tx_money_range`), and each shielded
+/// fee. The coinbase's total is further bounded by the subsidy plus the
+/// fees (`Block::validate_coinbase_value`: the miner output plus one
+/// `per_attester` output per witness share).
 ///
 /// There is NO block-wide output total (re-audit B1-T1). The value moving
 /// through a chain of in-block spends is counted once per hop, so the
 /// outputs of a valid block can sum far above the supply (three hops of
-/// 4,000,000 GNB sum to 12,000,000); the sum bounds nothing. The remaining
+/// 4,500,000 GNB sum to 13,500,000, above the 12,500,000 cap); the sum
+/// bounds nothing. The remaining
 /// bounds are Bitcoin Core's: `nValueOut` per transaction (CheckTransaction),
 /// the input total per transaction (CheckTxInputs, `accept.rs`) and the
 /// accumulated block fees (ConnectBlock, `bad-txns-accumulated-fee-
@@ -214,6 +221,7 @@ mod tests {
             },
             transactions: txs,
             blue_score: 1, height: 1, shielded_transactions: vec![],
+            powit: Default::default(),
         }
     }
 
@@ -344,12 +352,13 @@ mod tests {
         }
     }
 
-    /// VAL-12 regression: an in-process block with a 12.6 kB script_sig (the
-    /// audit PoC shape) is refused by the consensus helper; a block that passes
-    /// the helper always round-trips through its wire encoding.
+    /// VAL-12 regression: an in-process block with a script_sig one byte
+    /// over the parser cap (the audit PoC shape, scaled to this chain's
+    /// policy-witness cap) is refused by the consensus helper; a block that
+    /// passes the helper always round-trips through its wire encoding.
     #[test]
     fn oversized_script_block_is_refused_and_valid_block_round_trips() {
-        let bad = block_with(vec![tx(12_600, 20, 1_000)]);
+        let bad = block_with(vec![tx(MAX_SCRIPT_SIG_SIZE + 1, 20, 1_000)]);
         assert!(check_block_context_free(&bad).is_err());
         assert!(Block::from_wire_bytes(&bad.to_wire_bytes()).is_err(),
             "the parser refuses it too: such a block could never be read back");
@@ -392,16 +401,16 @@ mod tests {
         let ok = block_with(vec![tx(1, 20, 1_000), tx(2, 20, 2_000)]);
         assert!(check_block_money_range(&ok).is_ok());
         let bad = block_with(vec![tx(1, 20, 1_000), tx(2, 20, cap + 1)]);
-        assert_eq!(check_block_money_range(&bad), Err("tx[1]: output 0 value 1000000000000001 exceeds MAX_SUPPLY_SAT".into()));
+        assert_eq!(check_block_money_range(&bad), Err(format!("tx[1]: output 0 value {} exceeds MAX_SUPPLY_SAT", cap + 1)));
     }
 
     /// Re-audit B1-T1: a chain of in-block spends moves the same coins once
-    /// per hop. Three hops of 4,000,000 GNB (12,000,000 GNB of outputs, above
-    /// the 10,000,000 GNB supply) are within every MoneyRange rule; the
+    /// per hop. Three hops of 4,500,000 GNB (13,500,000 GNB of outputs, above
+    /// the 12,500,000 GNB supply) are within every MoneyRange rule; the
     /// block-wide output total the VAL-11 remediation added refused it.
     #[test]
     fn chained_spends_above_the_supply_in_total_are_in_range() {
-        let v = 4_000_000 * tokenomics::SAT_PER_GNB;
+        let v = 4_500_000 * tokenomics::SAT_PER_GNB;
         let mut txs = Vec::new();
         let mut prev = [0x31u8; 32];
         for hop in 0..3u64 {
@@ -499,7 +508,7 @@ mod tests {
     #[test]
     fn context_free_check_runs_both_rules() {
         let mut b = block_with(vec![tx(1, 20, tokenomics::MAX_SUPPLY_SAT + 1)]);
-        assert_eq!(check_block_context_free(&b), Err("tx[0]: output 0 value 1000000000000001 exceeds MAX_SUPPLY_SAT".into()));
+        assert_eq!(check_block_context_free(&b), Err(format!("tx[0]: output 0 value {} exceeds MAX_SUPPLY_SAT", tokenomics::MAX_SUPPLY_SAT + 1)));
         b.transactions[0].outputs[0].value = 1;
         assert_eq!(check_block_context_free(&b), Ok(()));
         b.header.parents = vec![[1; 32]; MAX_PARENTS + 1];

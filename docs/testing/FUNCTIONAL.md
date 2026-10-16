@@ -62,7 +62,15 @@ the real ASERT rule by `node/tests/fix_pow_real_asert.rs` (re-audit POW-5):
 the test-only seam `core::scoped_real_expected_bits()`, compiled only with
 this feature, makes `expected_bits` compute the real rule on the calling
 thread, and the tests reject bits computed for the wrong height or parent
-timestamp.
+timestamp. The GnB-SMH v3 switch (`core::adjust_bits_for_algo`: from
+`powit_height()`, 10,000 on mainnet, the ASERT target is 4x harder) is
+covered twice: at the mainnet height for the rule and the ingress reference
+(`expected_bits_switch_to_v3_at_the_mainnet_powit_height`), and at the call
+sites by `node/tests/fix_pow_real_asert_v3.rs`, a binary that moves the
+switch to height 3 (`core::set_powit_height_override`) so that
+`accept_block`, the template and `handle_block` judge the first v3 block
+(its unshifted v1 bits are refused, the template carries the shifted bits,
+an orphan at the v1 floor is dropped).
 
 The feature is consensus-breaking, so it is fenced in four ways:
 

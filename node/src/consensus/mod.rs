@@ -760,6 +760,11 @@ pub struct GhostDAG {
     /// returned by `selected_tip()` or offered as template parents. Persisted
     /// by the acceptance pipeline (`Storage::load_invalid_blocks`).
     invalid: HashSet<BlockHash>,
+    /// PoWit finality (`powit`): the latest checkpoint the applied chain's
+    /// witness set finalized, as (hash, DAG height). A block whose
+    /// selected-parent chain does not pass through it is never selected or
+    /// offered as a template parent: finalized history is never rolled back.
+    finalized: Option<(BlockHash, u64)>,
     /// Whether the persisted invalid set has been loaded into `invalid`
     /// (set by `load_invalid`). The acceptance pipeline loads it lazily on
     /// first use if start-up did not.
@@ -817,6 +822,7 @@ impl GhostDAG {
             block_work: HashMap::new(),
             merge_skip: HashMap::new(),
             invalid: HashSet::new(),
+            finalized: None,
             invalid_loaded: false,
             invalid_roots: HashSet::new(),
             invalid_all_edges_roots: HashSet::new(),
@@ -962,6 +968,12 @@ impl GhostDAG {
     /// index is being maintained.
     pub fn reach_take_delta(&mut self) -> (Vec<(BlockHash, Vec<u8>)>, Vec<BlockHash>) {
         self.reach.take_persist_delta()
+    }
+
+    /// Undo [`Self::reach_take_delta`] when its write failed (see
+    /// `ReachabilityIndex::restore_persist_delta`).
+    pub fn reach_restore_delta(&mut self, upserts: &[(BlockHash, Vec<u8>)], removals: &[BlockHash]) {
+        self.reach.restore_persist_delta(upserts, removals)
     }
 
     /// The current reachability root (genesis), for persisting the meta tag.
@@ -1377,16 +1389,18 @@ impl GhostDAG {
         let use_index = self.ancestry_index_ready(parents, &selected_parent);
 
         // 3. Compute mergeset (topologically sorted, ancestors first). The
-        //    index-based walk returns the same list as the O(past) one; the
-        //    size limit applies only at or above the activation.
-        let limit = if hardened { Some(MAX_MERGESET_SIZE - 1) } else { None };
+        //    index-based walk returns the same list as the O(past) one.
+        //    MERGESET_SIZE_LIMIT (64, this chain's rule at every height) is
+        //    tighter than the audit's hardened MAX_MERGESET_SIZE - 1, so it
+        //    is the limit on both sides of the activation.
+        let limit = Some(MERGESET_SIZE_LIMIT.min(MAX_MERGESET_SIZE - 1));
         let mergeset = if use_index {
             self.compute_mergeset_bounded(parents, &selected_parent, limit)?
         } else {
             let m = compute_mergeset(&self.store, parents, &selected_parent);
             if let Some(limit) = limit {
                 if m.len() > limit {
-                    return Err(ConsensusError::MergesetTooLarge { limit: MAX_MERGESET_SIZE });
+                    return Err(ConsensusError::MergesetTooLarge { limit: MERGESET_SIZE_LIMIT });
                 }
             }
             m
@@ -1517,6 +1531,15 @@ impl GhostDAG {
             }
         }
         true
+    }
+
+    /// The selected parent a block with `parents` WILL get when inserted —
+    /// the same rule `add_block` applies. Used to validate a block's
+    /// transactions against the right state before it is inserted.
+    /// `None` when `parents` is empty.
+    pub fn preview_selected_parent(&self, parents: &[BlockHash]) -> Option<BlockHash> {
+        if parents.is_empty() { return None; }
+        Some(self.select_parent(parents))
     }
 
     /// Select parent with highest blue_work (heaviest chain).
@@ -1876,7 +1899,7 @@ impl GhostDAG {
             set.insert(h);
             if let Some(limit) = limit {
                 if set.len() > limit {
-                    return Err(ConsensusError::MergesetTooLarge { limit: MAX_MERGESET_SIZE });
+                    return Err(ConsensusError::MergesetTooLarge { limit: MERGESET_SIZE_LIMIT });
                 }
             }
             if let Some(d) = self.store.get(&h) {
@@ -2221,14 +2244,13 @@ impl GhostDAG {
             return Vec::new();
         }
         let sp = cands[0];
-        let height = self.store.get(&sp).map(|d| d.height + 1).unwrap_or(1);
-        if !self.is_hardened_at(height) {
-            cands.truncate(max_parents);
-            return cands;
-        }
 
+        // MERGESET_SIZE_LIMIT is this chain's rule at every height (and is
+        // tighter than the hardened MAX_MERGESET_SIZE - 1), so the budgeted
+        // selection runs on both sides of the activation: a plain capped
+        // list made the node reject its own templates on a fast network.
         let use_index = self.ancestry_index_ready(&cands, &sp);
-        let budget = MAX_MERGESET_SIZE - 1;
+        let budget = MERGESET_SIZE_LIMIT.min(MAX_MERGESET_SIZE - 1);
         let mut chosen = vec![sp];
         let mut merged: HashSet<BlockHash> = HashSet::new();
         for c in cands.iter().skip(1) {
@@ -2499,7 +2521,11 @@ impl GhostDAG {
     /// through `hash` the best one — some block on whose selected chain
     /// `hash` lies, with no persistent disqualification root between them
     /// (`hash` included), orders above the selected tip under GhostDAG's tip
-    /// order (`order_key`). Bitcoin Core downloads only the blocks of chains
+    /// order (`order_key`) and could be selected at all (its selected chain
+    /// passes through the PoWit-finalized checkpoint,
+    /// [`conflicts_with_finality`](Self::conflicts_with_finality): a chain
+    /// that would roll finalized history back never wins, whatever its
+    /// work). Bitcoin Core downloads only the blocks of chains
     /// with more work than its tip and ignores an unrequested block with
     /// less work (`AcceptBlock`); here a body-pending block on a lighter
     /// branch is neither requested from peers nor processed when a copy
@@ -2559,10 +2585,43 @@ impl GhostDAG {
     /// walked toward genesis, stopping after a disqualification root (a
     /// chain through it is invalid whatever body the blocks below get), at a
     /// block already reached, or below `min_dag_height` (DAG heights strictly
-    /// decrease along it), so every block is visited at most once.
+    /// decrease along it), so every block is visited at most once. A seed
+    /// whose selected chain misses the PoWit-finalized checkpoint is dropped
+    /// (it can never be selected); that check is memoised along the shared
+    /// chains too.
     fn wanted_pending(&self, min_dag_height: u64) -> (HashSet<BlockHash>, usize) {
         let mut visits = 0usize;
         let mut reached: HashSet<BlockHash> = HashSet::new();
+        // `conflicts_with_finality`, memoised: true = the block's selected
+        // chain misses the finalized checkpoint.
+        let mut finality_memo: HashMap<BlockHash, bool> = HashMap::new();
+        let mut conflicts = |h: BlockHash, visits: &mut usize| -> bool {
+            let Some((fh, fheight)) = self.finalized else { return false };
+            let mut path = Vec::new();
+            let mut cur = h;
+            let verdict = loop {
+                if let Some(&v) = finality_memo.get(&cur) {
+                    break v;
+                }
+                if cur == fh {
+                    break false;
+                }
+                *visits += 1;
+                let Some(d) = self.store.get(&cur) else { break true };
+                if d.height <= fheight {
+                    break true;
+                }
+                path.push(cur);
+                match d.selected_parent {
+                    Some(sp) => cur = sp,
+                    None => break true,
+                }
+            };
+            for p in path {
+                finality_memo.insert(p, verdict);
+            }
+            verdict
+        };
         match self.selected_tip().map(|t| self.order_key(&t)) {
             // No selected tip: any chain can win.
             None => reached.extend(self.body_pending.keys().copied()),
@@ -2584,6 +2643,9 @@ impl GhostDAG {
                     }
                 }
                 for seed in seeds {
+                    if conflicts(seed, &mut visits) {
+                        continue;
+                    }
                     let mut x = seed;
                     while let Some(d) = self.store.get(&x) {
                         if d.height < min_dag_height || !reached.insert(x) {
@@ -2795,7 +2857,7 @@ impl GhostDAG {
     /// the tips of the valid sub-DAG. Equal to `tips()` when nothing is
     /// marked invalid. Unordered.
     pub fn valid_tips(&self) -> Vec<BlockHash> {
-        if self.invalid.is_empty() {
+        if self.invalid.is_empty() && self.finalized.is_none() {
             return self.tips();
         }
         let mut out = Vec::new();
@@ -2805,9 +2867,16 @@ impl GhostDAG {
             if !visited.insert(h) {
                 continue;
             }
-            if self.invalid.contains(&h) {
+            if !self.selectable(&h) {
                 if let Some(d) = self.store.get(&h) {
-                    stack.extend(d.parents.iter().copied());
+                    // Nothing at or below the finalized height is selectable
+                    // except the checkpoint's own chain, which is reached
+                    // through its descendants: stop there instead of walking
+                    // a stale branch down to genesis.
+                    let below_finality = self.finalized.is_some_and(|(_, fh)| d.height <= fh);
+                    if !below_finality {
+                        stack.extend(d.parents.iter().copied());
+                    }
                 }
                 continue;
             }
@@ -2815,7 +2884,7 @@ impl GhostDAG {
                 continue;
             }
             let all_children_invalid = self.store.children.get(&h)
-                .map_or(true, |c| c.iter().all(|x| self.invalid.contains(x)));
+                .map_or(true, |c| c.iter().all(|x| !self.selectable(x)));
             if all_children_invalid {
                 out.push(h);
             }
@@ -2831,8 +2900,47 @@ impl GhostDAG {
     /// the tips through disqualified blocks finds the best valid block: every
     /// descendant of the best valid block is disqualified (a valid descendant
     /// would carry more blue_work), so it is reached through them.
+    /// Record the PoWit-finalized checkpoint (hash, DAG height). Only ever
+    /// moves forward in height; see [`GhostDAG::finalized`].
+    pub fn set_finalized(&mut self, hash: BlockHash, height: u64) {
+        if self.finalized.is_none_or(|(_, h)| height > h) {
+            self.finalized = Some((hash, height));
+        }
+    }
+
+    /// The PoWit-finalized checkpoint, if any.
+    pub fn finalized(&self) -> Option<(BlockHash, u64)> {
+        self.finalized
+    }
+
+    /// Whether `h`'s selected-parent chain misses the finalized checkpoint
+    /// (it forks below it, or `h` is below it): such a block would roll
+    /// finalized history back.
+    pub fn conflicts_with_finality(&self, h: &BlockHash) -> bool {
+        let Some((fh, fheight)) = self.finalized else { return false };
+        let mut cur = *h;
+        loop {
+            if cur == fh {
+                return false;
+            }
+            let Some(d) = self.store.get(&cur) else { return true };
+            if d.height <= fheight {
+                return true;
+            }
+            match d.selected_parent {
+                Some(sp) => cur = sp,
+                None => return true,
+            }
+        }
+    }
+
+    /// Selectable: not disqualified and on the finalized chain.
+    fn selectable(&self, h: &BlockHash) -> bool {
+        !self.invalid.contains(h) && !self.conflicts_with_finality(h)
+    }
+
     pub fn selected_tip(&self) -> Option<BlockHash> {
-        if self.invalid.is_empty() {
+        if self.invalid.is_empty() && self.finalized.is_none() {
             return self.store.tips.iter()
                 .max_by(|a, b| self.order_key(a).cmp(&self.order_key(b)))
                 .cloned();
@@ -2846,7 +2954,7 @@ impl GhostDAG {
             }
         }
         while let Some((_, _, h)) = heap.pop() {
-            if !self.invalid.contains(&h) {
+            if self.selectable(&h) {
                 return Some(h);
             }
             if let Some(d) = self.store.get(&h) {
@@ -3100,7 +3208,7 @@ pub enum ConsensusError {
 
     /// Audit DAG-7 (at or above the hardening activation): the block's
     /// mergeset, selected parent included, has more than `limit` blocks.
-    #[error("mergeset exceeds {limit} blocks (selected parent included)")]
+    #[error("mergeset exceeds the limit of {limit} blocks")]
     MergesetTooLarge { limit: usize },
 
     /// Audit DAG-7 (at or above the hardening activation): the block merges a
@@ -3109,6 +3217,14 @@ pub enum ConsensusError {
     #[error("merges red block {} below the merge-depth root", hex::encode(.red))]
     MergeDepthViolation { red: BlockHash },
 }
+
+/// Largest mergeset a block may have (blocks merged besides its selected
+/// chain). With k = 10 and 30-second blocks an honest mergeset stays near k;
+/// the live chain's has never exceeded 2. Bounds coloring and validation work
+/// per block (Kaspa enforces the same kind of limit).
+/// Parents a template references at most (Kaspa uses 10).
+
+pub const MERGESET_SIZE_LIMIT: usize = 64;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -3120,6 +3236,35 @@ mod tests {
         let mut h = [0u8; 32];
         h[0] = n;
         h
+    }
+
+    /// A block may not merge more than MERGESET_SIZE_LIMIT blocks; refusing
+    /// it leaves the DAG unchanged.
+    #[test]
+    fn oversized_mergeset_is_refused_without_mutation() {
+        for coloring in [ColoringMode::Legacy, ColoringMode::Fast] {
+            let mut dag = GhostDAG::with_default_k();
+            dag.coloring = coloring;
+            let g = [0xEEu8; 32];
+            dag.add_genesis(g, 1_000);
+            // The mergeset excludes the selected parent: LIMIT + 2 parents
+            // merge LIMIT + 1 blocks.
+            let side: Vec<BlockHash> = (0..MERGESET_SIZE_LIMIT as u16 + 2)
+                .map(|i| { let mut h = [0u8; 32]; h[..2].copy_from_slice(&i.to_le_bytes()); h[2] = 0x5A; h })
+                .collect();
+            for h in &side {
+                dag.add_block(*h, vec![g], 1_030, 1).unwrap();
+            }
+            let count = dag.block_count();
+            let big = [0xB1u8; 32];
+            let res = dag.add_block(big, side.clone(), 1_060, 1);
+            assert!(matches!(res, Err(ConsensusError::MergesetTooLarge { .. })), "{:?}", res.map(|d| d.height));
+            assert_eq!(dag.block_count(), count, "nothing inserted");
+            assert!(dag.get_block_data(&big).is_none());
+            let ok = [0xB2u8; 32];
+            assert!(dag.add_block(ok, side[..MERGESET_SIZE_LIMIT + 1].to_vec(), 1_060, 1).is_ok(),
+                    "a mergeset at the limit is accepted");
+        }
     }
 
     /// WS-A: the corrected-coloring gate is armed to a FUTURE height. A Legacy
@@ -3270,6 +3415,72 @@ mod tests {
         assert_eq!(w, expect);
         assert!(cut.is_body_wanted(&a[10]) && cut.is_body_wanted(&a[100]));
         assert!(!cut.is_body_wanted(&a[101]) && !cut.is_body_wanted(&a[300]) && !cut.is_body_wanted(&a[301]));
+    }
+
+    /// Re-audit B1-T13 with main's PoWit finality (`set_finalized`): a body
+    /// is wanted only while a chain through it can be SELECTED, and a chain
+    /// whose selected-parent chain misses the finalized checkpoint never is
+    /// (`selectable`), however heavy. A heavier branch forking below the
+    /// checkpoint therefore stops wanting its pending bodies once the
+    /// checkpoint is finalized on the other branch; a checkpoint below the
+    /// fork changes nothing.
+    #[test]
+    fn wanted_bodies_never_include_a_branch_that_misses_the_finalized_checkpoint() {
+        let id = |tag: u8, i: u32| {
+            let mut x = [0u8; 32];
+            x[0] = tag;
+            x[1..5].copy_from_slice(&i.to_le_bytes());
+            x
+        };
+        // genesis - 5 common blocks - B (10) | A (15); A's first 5 blocks
+        // wait for bodies.
+        let fixture = || {
+            let mut dag = GhostDAG::with_k(3);
+            let g = id(0, 0);
+            dag.add_genesis(g, 1_000);
+            let mut ts = 1_000u64;
+            let mut chain = |dag: &mut GhostDAG, tag: u8, from: BlockHash, len: u32| -> Vec<BlockHash> {
+                let mut v = Vec::new();
+                let mut parent = from;
+                for i in 1..=len {
+                    ts += 1;
+                    let h = id(tag, i);
+                    dag.add_block(h, vec![parent], ts, 1_000).unwrap();
+                    v.push(h);
+                    parent = h;
+                }
+                v
+            };
+            let common = chain(&mut dag, 1, g, 5);
+            let fork = *common.last().unwrap();
+            let b = chain(&mut dag, 2, fork, 10);
+            let a = chain(&mut dag, 3, fork, 15);
+            for h in &a[..5] {
+                dag.mark_body_pending(*h, None);
+            }
+            (dag, common, a, b)
+        };
+        let (dag, _, a, b) = fixture();
+        assert_eq!(dag.selected_tip(), Some(*b.last().unwrap()));
+        let mut pending: Vec<BlockHash> = a[..5].to_vec();
+        pending.sort_unstable();
+        assert_eq!(dag.wanted_body_blocks(), pending, "the heavier branch can win: its bodies are wanted");
+
+        // Finalized on B, above the fork: A can never be selected.
+        let (mut dag, _, a, b) = fixture();
+        let fh = dag.store.get(&b[2]).unwrap().height;
+        dag.set_finalized(b[2], fh);
+        assert!(dag.conflicts_with_finality(a.last().unwrap()));
+        assert_eq!(dag.selected_tip(), Some(*b.last().unwrap()));
+        assert!(dag.wanted_body_blocks().is_empty(), "a branch that misses the checkpoint is never wanted");
+        assert!(a[..5].iter().all(|h| dag.is_body_pending(h) && !dag.is_body_wanted(h)));
+
+        // Finalized below the fork: both branches pass through it.
+        let (mut dag, common, a, _) = fixture();
+        let fh = dag.store.get(&common[2]).unwrap().height;
+        dag.set_finalized(common[2], fh);
+        assert!(!dag.conflicts_with_finality(a.last().unwrap()));
+        assert_eq!(dag.wanted_body_blocks(), pending);
     }
 
     #[test]

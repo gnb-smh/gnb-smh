@@ -12,11 +12,13 @@
 //!   before children (child-pays-for-parent, audit MEM-6 —
 //!   `mempool::select_packages`; without in-pool chains this is highest fee
 //!   rate first), under a BYTE budget measured exactly as the consensus rule
-//!   measures AT THE TEMPLATE'S HEIGHT (below the hardening activation the
-//!   bincode measure `block_rules::legacy_block_size`, which writes the
-//!   uncommitted `blue_score` as 0; the canonical wire encoding `Block::wire_size`
-//!   at/after it, audit VAL-12 — package sizes and fee rates use the same
-//!   measure): the budget is `MAX_BLOCK_SIZE` minus an upper bound of the
+//!   measures AT THE TEMPLATE'S HEIGHT (on this chain the wire encoding at
+//!   every height: `block_rules::legacy_block_size` below the hardening
+//!   activation, `Block::wire_size` at/after it, audit VAL-12, neither
+//!   reading the uncommitted `blue_score`, re-audit B1-T0 — package sizes
+//!   and fee rates use the same measure, the PoWit section and the
+//!   witness-share coinbase outputs are budgeted on top): the budget is
+//!   `MAX_BLOCK_SIZE` minus an upper bound of the
 //!   header and block framing (every varint at its maximum width) minus a
 //!   coinbase reserve. A count-only cap let ~116 ordinary transactions push
 //!   every template past `MAX_BLOCK_SIZE` (MEM-2).
@@ -99,7 +101,9 @@ fn widest_coinbase_size(script_sig_len: usize, spk_len: usize, hardened: bool) -
         outputs: vec![TxOutput { value: u64::MAX, script_pubkey: vec![0xFF; spk_len] }],
         locktime: u32::MAX,
     };
-    if hardened { cb.wire_size(true) } else { cb.actual_size() }
+    // This chain's size rule is the wire encoding at every height.
+    let _ = hardened;
+    cb.wire_size(true)
 }
 
 /// The number of miner bytes an external coinbase may append after its
@@ -159,9 +163,29 @@ pub struct BlockTemplate {
     pub activation_height: u64,
     /// Whether the hardening block rules apply at `height`.
     pub hardened: bool,
+    /// PoWit section (from `core::powit_height()`): witness shares,
+    /// attestations and equivocation proofs, valid in this template's
+    /// context (`powit::template_body`).
+    pub powit: core::powit::PowitBody,
 }
 
 impl BlockTemplate {
+    /// The coinbase outputs of a block built from this template paying the
+    /// miner at `script_pubkey`: the miner output (subsidy share + fees)
+    /// followed by one output per PoWit witness share
+    /// (`core::Block::coinbase_outputs`).
+    pub fn coinbase_outputs(&self, script_pubkey: Vec<u8>) -> Vec<TxOutput> {
+        Block::coinbase_outputs(self.height, script_pubkey, self.total_fees, &self.powit.shares)
+    }
+
+    /// The node's own coinbase for this template ([`miner_coinbase`] with
+    /// [`Self::coinbase_outputs`]).
+    pub fn miner_coinbase(&self, script_pubkey: Vec<u8>) -> Transaction {
+        let mut cb = miner_coinbase(self.height, 0, script_pubkey.clone());
+        cb.outputs = self.coinbase_outputs(script_pubkey);
+        cb
+    }
+
     /// The 80-byte coinbase commitment a block built from this template must
     /// carry at the start of its coinbase `script_sig` (`None` below the
     /// activation, where the `script_sig` is free-form).
@@ -238,10 +262,12 @@ fn framing_upper_bound(parents: &[BlockHash], hardened: bool) -> usize {
         blue_score: u64::MAX,
         height: u64::MAX,
         shielded_transactions: Vec::new(),
+        powit: Default::default(),
     };
-    // The rule's own measure (`legacy_block_size`: blue_score written as 0,
-    // re-audit B1-T0). + 9: the transaction-count varint grows from 1 byte
-    // (empty) to at most 9.
+    // The rule's own measure (`legacy_block_size`, the wire length, with
+    // the PoWit section of a height at/after `powit_height()`; blue_score
+    // fixed-width, re-audit B1-T0). + 9: the transaction-count varint grows
+    // from 1 byte (empty) to at most 9.
     core::block_rules::legacy_block_size(&empty).saturating_add(9)
 }
 
@@ -403,9 +429,25 @@ pub fn build_block_template_with(
     // will judge the block).
     let hardened = core::block_rules::rules_active_at(height, activation_height);
 
+    // PoWit section (from powit_height), valid in this template's context.
+    let powit_body = {
+        let d = dag.read();
+        crate::powit::template_body(crate::powit::pool(), &d, store, parents[0], height)
+    };
+    let powit_bytes = {
+        let mut v = Vec::new();
+        powit_body.write_wire(&mut v);
+        v.len()
+    };
+    // One coinbase output per witness share: value (8) + script length
+    // varint (1) + the share's payout script.
+    let share_outputs: usize = powit_body.shares.iter().map(|s| 9 + s.payout.len()).sum();
+
     let budget = core::MAX_BLOCK_SIZE
         .saturating_sub(framing_upper_bound(&parents, hardened))
-        .saturating_sub(coinbase_reserve);
+        .saturating_sub(coinbase_reserve)
+        .saturating_sub(powit_bytes)
+        .saturating_sub(share_outputs);
 
     // Ancestor packages by package fee rate (CPFP), byte budget, self-check
     // of every package member in block order, eviction.
@@ -424,9 +466,8 @@ pub fn build_block_template_with(
     // The pool records bincode sizes; the consensus measure at/after the
     // activation is the wire encoding (VAL-12): package sizes, package fee
     // rates and the budget all use the measure of the template's height.
-    let candidates = mempool.package_candidates_with(|tx, pool_size| {
-        if hardened { tx.wire_size(true) } else { pool_size }
-    });
+    // This chain's size rule is the wire encoding at every height.
+    let candidates = mempool.package_candidates_with(|tx, _pool_size| tx.wire_size(true));
     mempool::select_packages(&candidates, budget, usize::MAX, |package| {
         // Dry-run the whole package against the template state; commit only
         // if every member passes (all-or-nothing).
@@ -487,6 +528,7 @@ pub fn build_block_template_with(
         tx_byte_budget: budget,
         activation_height,
         hardened,
+        powit: powit_body,
     })
 }
 
@@ -558,6 +600,26 @@ fn self_check(
     admission::coinbase_maturity_for_next_block(store, tx, height)
         .map_err(|_| TemplateReject::Skip)?
         .map_err(TemplateReject::Evict)?;
+    // This chain's rules (`blockval`): finality at the template height,
+    // output kinds, dust, policy timelocks. An output created earlier in the
+    // template is confirmed in the template's block (0 confirmations); a
+    // confirmed one counts in the connect path's measure for the template's
+    // height (`admission::confirmations_for_next_block`, re-audit B1-T14).
+    let confirmations = |t: &[u8; 32]| -> Result<Option<u64>, String> {
+        // Every transaction has an output 0: its presence among the
+        // template's outputs means `t` was placed earlier in the template.
+        if created(&(*t, 0)).is_some() {
+            return Ok(Some(0));
+        }
+        admission::confirmations_for_next_block(store, t, height).map_err(|e| e.0)
+    };
+    match crate::blockval::check_tx_chain_rules_with_confirmations(tx, &prevouts, height, &confirmations) {
+        Ok(()) => {}
+        Err(e) if e.starts_with(crate::blockval::STORAGE_ERR) => return Err(TemplateReject::Skip),
+        // A timelock or locktime that is not yet satisfied may be later.
+        Err(e) if e.contains("timelock") || e.contains("non-final") => return Err(TemplateReject::Skip),
+        Err(e) => return Err(TemplateReject::Evict(e)),
+    }
     let total_out = core::limits::check_tx_money_range(tx).map_err(TemplateReject::Evict)?;
     if total_in < total_out {
         return Err(TemplateReject::Evict(format!("inputs {} < outputs {}", total_in, total_out)));
@@ -601,6 +663,7 @@ pub fn assemble_block(template: &BlockTemplate, coinbase: Transaction, timestamp
         blue_score: template.blue_score,
         height: template.height,
         shielded_transactions: Vec::new(),
+        powit: template.powit.clone(),
     };
     if template.hardened {
         let commitment = core::block_rules::expected_coinbase_commitment(&block);
@@ -617,6 +680,9 @@ pub fn assemble_block(template: &BlockTemplate, coinbase: Transaction, timestamp
         }
     }
     block.header.merkle_root = block.body_merkle_root_at(template.activation_height);
+    // From WITNESS_COMMITMENT_HEIGHT to the activation: the `|wc:` suffix
+    // (refreshes the Merkle root; a no-op elsewhere).
+    block.commit_witnesses();
     check_template_block_at(&block, template.total_fees, template.activation_height)?;
     Ok(block)
 }
@@ -653,7 +719,8 @@ mod external_coinbase_tests {
     /// byte does not), and the values pinned in docs/CONSENSUS.md ("Mining").
     #[test]
     fn external_coinbase_max_extra_is_tight_against_the_reserve() {
-        for (hardened, prefix, pinned) in [(true, 80usize, 794usize), (false, 0, 869)] {
+        // This chain measures both regimes on the wire encoding.
+        for (hardened, prefix, pinned) in [(true, 80usize, 794usize), (false, 0, 874)] {
             let e = external_coinbase_max_extra(prefix, hardened, EXTERNAL_COINBASE_RESERVE);
             assert!(widest_coinbase_size(prefix + e, EXTERNAL_COINBASE_MAX_SPK, hardened) <= EXTERNAL_COINBASE_RESERVE);
             assert!(widest_coinbase_size(prefix + e + 1, EXTERNAL_COINBASE_MAX_SPK, hardened) > EXTERNAL_COINBASE_RESERVE);
@@ -667,7 +734,7 @@ mod external_coinbase_tests {
                 outputs: vec![TxOutput { value: 50 * 100_000_000, script_pubkey: vec![1; EXTERNAL_COINBASE_MAX_SPK] }],
                 locktime: 0,
             };
-            let size = if hardened { cb.wire_size(true) } else { cb.actual_size() };
+            let size = cb.wire_size(true);
             assert!(size <= EXTERNAL_COINBASE_RESERVE, "{size}");
         }
         // Capped by the consensus script_sig limit when the reserve allows more.

@@ -44,6 +44,8 @@ mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer
 mod ingress;      // audit fixes: block-ingress / orphan / IBD-latch policy
 mod accept;       // Block acceptance pipeline (accept/connect split, DAG-1)
 mod template;     // Block templates for the miner + getblocktemplate (MEM-2, DAG-2)
+mod blockval;     // this chain's tx rules on top of the audit set (locktime, policy, BIP30)
+mod powit;        // PoW + PoWit: witness shares, attestations, finality (node side)
 
 // The acceptance pipeline lives in `accept.rs` (shared with the library so
 // integration tests drive the real path); same names and signatures as the
@@ -83,6 +85,11 @@ struct Cli {
     /// recovered. Run at least one archival node, or new nodes cannot join.
     /// Costs disk: the full chain instead of the last 10,000 blocks.
     #[arg(long)]                                         archive: bool,
+    /// Rebuild the address history index (what getaddresshistory serves) from
+    /// the selected chain, then continue normally. Needs --carryover-snapshot:
+    /// spends of genesis-ledger outputs are resolved from it. Fixes histories
+    /// that lost their spends to reorgs on older releases.
+    #[arg(long)]                                         reindex_addresses: bool,
     /// Path to the uncompressed Bloch Genesis-3 carryover snapshot
     /// (`gunzip -k genesis/bloch-g3-carryover.tsv.gz`). Required on first
     /// boot: the genesis ledger is that snapshot converted to 1,000,000 GNB.
@@ -90,6 +97,22 @@ struct Cli {
     /// totals) before anything is written; any mismatch refuses to start.
     #[arg(long)]                                         carryover_snapshot: Option<PathBuf>,
     #[arg(long)]                                         testnet: bool,
+    /// PoW + PoWit activation height (GnB-SMH v3, witness shares, witness-set
+    /// finality). TESTNET ONLY: refused without --testnet. Mainnet activation
+    /// is a consensus constant (core::POWIT_HEIGHT_MAINNET).
+    #[arg(long)]                                         powit_height: Option<u64>,
+    /// PoWit witness: a forward-secure KES key from `gnb-cli witnesskeygen`.
+    /// The node mines witness shares credited to it and, once it is in the
+    /// witness set, signs checkpoints with the leaf of each target's epoch.
+    /// Needs --witness-password-file and --witness-payout.
+    #[arg(long)]                                         witness_key: Option<PathBuf>,
+    /// File whose first line is the witness key password (keep it 0600).
+    #[arg(long)]                                         witness_password_file: Option<PathBuf>,
+    /// Address that receives this witness's share rewards (may be a cold wallet).
+    #[arg(long)]                                         witness_payout: Option<String>,
+    /// Threads mining witness shares (GnB-SMH v3, 4 MiB each). Default 2 when
+    /// a witness wallet is set.
+    #[arg(long)]                                         share_threads: Option<usize>,
     #[arg(long, default_value = "./gnb-data")]            data_dir: String,
     /// RPC bind address. SECURITY: defaults to 127.0.0.1 (local only).
     /// Use --rpc-public to bind 0.0.0.0, which exposes RPC to the internet.
@@ -387,6 +410,16 @@ async fn main() {
     core::set_node_chain_id(
         if cli.testnet { core::ChainId::Testnet } else { core::ChainId::Mainnet }
     ).expect("node chain-id must be settable exactly once at startup");
+    if let Some(h) = cli.powit_height {
+        if !cli.testnet {
+            eprintln!("--powit-height is testnet-only; mainnet activation is a consensus constant");
+            std::process::exit(2);
+        }
+        core::set_powit_height_override(h).expect("PoWit height must be settable once at startup");
+    }
+    info!("proof of work: {} (PoWit activation height {})",
+          core::pow_algo(0).name(),
+          match core::powit_height() { u64::MAX => "off".to_string(), h => h.to_string() });
 
     // FIX v0.5.1 BLK-3: apply --rpc-public escape hatch.
     let rpc_bind = if cli.rpc_public { "0.0.0.0".to_string() } else { cli.rpc_bind.clone() };
@@ -518,14 +551,24 @@ async fn main() {
             error!("cannot read {}: {e}", snap_path.display());
             std::process::exit(1);
         });
+        // Locked team and founder allocations (core::vesting): the keys must
+        // be configured and match the consensus hash before any ledger exists.
+        let locked = core::vesting::genesis_tranches().unwrap_or_else(|e| {
+            error!("locked allocations unavailable: {e}. Refusing to start.");
+            std::process::exit(1);
+        });
+        info!("locked allocations: {} tranches (team {} + founder {} sat), first unlock h={}, last h={}",
+              locked.len(), core::tokenomics::TEAM_ALLOCATION_SAT, core::tokenomics::FOUNDER_ALLOCATION_SAT,
+              core::tokenomics::vesting_unlock_height(1),
+              core::tokenomics::vesting_unlock_height(core::tokenomics::VESTING_TRANCHES));
         match core::carryover::verify_and_convert(&bytes) {
             Ok(snap) => {
                 info!("carryover VERIFIED: {} Bloch outputs ({} BLCH sat) -> {} UTXOs, {} GNB sat \
                        ({} zero-value dropped, {} vouts fixed)",
                       snap.source_rows, snap.source_total_sat, snap.utxos.len(),
                       snap.converted_total_sat, snap.dropped_zero, snap.fixed_vouts);
-                match store.ingest_carryover(&snap) {
-                    Ok(n) => info!("carryover ingested: {n} UTXOs written atomically"),
+                match store.ingest_carryover(&snap, &locked) {
+                    Ok(n) => info!("genesis ledger ingested: {n} UTXOs (carryover + locked) written atomically"),
                     Err(e) => {
                         error!("carryover ingestion failed: {e}. Nothing was written. Refusing to start.");
                         std::process::exit(1);
@@ -589,9 +632,10 @@ async fn main() {
             store.put_tx_index(&tx.txid(), &hash, 0).expect("tx_index");
         }
         info!("Genesis: {}", hex::encode(hash));
-        info!("Supply: hard cap {} GNB (carryover {} sat), initial subsidy {} sat/block, halving every {} blocks",
+        info!("Supply: hard cap {} GNB (carryover {} sat, locked team+founder {} sat), initial subsidy {} sat/block, halving every {} blocks",
               core::tokenomics::MAX_SUPPLY_SAT / core::tokenomics::SAT_PER_GNB,
               core::carryover::CARRYOVER_CONVERTED_TOTAL_SAT,
+              core::tokenomics::TEAM_ALLOCATION_SAT + core::tokenomics::FOUNDER_ALLOCATION_SAT,
               core::tokenomics::INITIAL_SUBSIDY_SAT,
               core::tokenomics::HALVING_INTERVAL);
     } else {
@@ -612,6 +656,14 @@ async fn main() {
             _ => {
                 error!("data-dir has no (or a different) carryover marker. Refusing to start; \
                         use a fresh --data-dir with --carryover-snapshot.");
+                std::process::exit(1);
+            }
+        }
+        match store.get_meta("vesting_sha3").ok().flatten() {
+            Some(r) if r.as_slice() == core::vesting::VESTING_SPEC_SHA3 => {}
+            _ => {
+                error!("data-dir has no (or a different) locked-allocation marker. Refusing to start; \
+                        use a fresh --data-dir.");
                 std::process::exit(1);
             }
         }
@@ -897,10 +949,14 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
+            let locked = core::vesting::genesis_tranches().unwrap_or_else(|e| {
+                error!("locked allocations unavailable for the rebuild: {e}. Refusing to start.");
+                std::process::exit(1);
+            });
             let genesis = core::genesis_block();
             let gh = genesis.block_hash();
             let seed = |st: &storage::Storage, batch: &mut rocksdb::WriteBatch| -> Result<(), String> {
-                st.stage_carryover(batch, &snap).map_err(|e| e.to_string())?;
+                st.stage_carryover(batch, &snap, &locked).map_err(|e| e.to_string())?;
                 // Exactly what first boot writes for the genesis block.
                 for tx in &genesis.transactions {
                     st.stage_tx_index(batch, &tx.txid(), &gh, 0).map_err(|e| e.to_string())?;
@@ -917,6 +973,37 @@ async fn main() {
             if let Err(e) = accept::reconcile_on_startup(&dag, &store, &shielded) {
                 error!("start-up chain-state reconciliation failed after the rebuild: {}", e);
             }
+        }
+    }
+    // PoWit finality: pin fork choice to the checkpoint the applied chain's
+    // witness set has finalized (kept current by accept_block from here on).
+    powit::update_finalized(&dag, &store);
+    if let Some((h, height)) = dag.read().finalized() {
+        info!("PoWit finalized checkpoint: {} (DAG height {})", hex::encode(&h[..8]), height);
+    }
+    if cli.reindex_addresses {
+        let Some(snap_path) = cli.carryover_snapshot.as_ref() else {
+            error!("--reindex-addresses needs --carryover-snapshot"); std::process::exit(2);
+        };
+        let bytes = std::fs::read(snap_path).unwrap_or_else(|e| {
+            error!("cannot read {}: {e}", snap_path.display()); std::process::exit(1);
+        });
+        let snap = core::carryover::verify_and_convert(&bytes).unwrap_or_else(|f| {
+            error!("carryover verification failed: {:?}", f); std::process::exit(1);
+        });
+        let locked = core::vesting::genesis_tranches().unwrap_or_else(|e| {
+            error!("locked allocations unavailable: {e}"); std::process::exit(1);
+        });
+        let mut genesis_outputs = std::collections::HashMap::with_capacity(snap.utxos.len() + locked.len());
+        for u in snap.utxos { genesis_outputs.insert((u.txid, u.vout), u.output); }
+        for t in locked { genesis_outputs.insert((t.txid, t.vout), t.output); }
+        let mut chain = dag.read().selected_chain();
+        chain.reverse();
+        info!("reindexing address history over {} selected-chain blocks…", chain.len());
+        match store.reindex_addresses(&chain, genesis_outputs) {
+            Ok((blocks, rows, unresolved)) => info!(
+                "address history rebuilt: {blocks} blocks, {rows} rows, {unresolved} unresolved inputs"),
+            Err(e) => { error!("address reindex failed: {e}"); std::process::exit(1); }
         }
     }
     // The ONE next-block height of mempool admission, eviction, templates
@@ -1522,6 +1609,28 @@ async fn main() {
                     state2.write().mempool_size = mem2.size();
                 }
 
+                // PoWit items (shares, attestations, equivocation proofs):
+                // validated off the reactor, relayed only on Accept. An item
+                // that fails validation may be stale or for a branch this
+                // node does not follow, so it is ignored, never penalized.
+                network::NetworkMessage::NewPowitItem { id: claimed, kind, data } => {
+                    let verdict = if powit::item_id(kind, &data) != claimed {
+                        network::GossipVerdict::Reject
+                    } else {
+                        let (dag_v, store_v) = (dag2.clone(), store2.clone());
+                        let r = tokio::task::spawn_blocking(move || {
+                            let d = dag_v.read();
+                            powit::admit_item(kind, &data, &d, &store_v)
+                        }).await;
+                        match r {
+                            Ok(Ok(())) => network::GossipVerdict::Accept,
+                            Ok(Err(e)) => { debug!("PoWit item rejected: {}", e); network::GossipVerdict::Ignore }
+                            Err(e) => { warn!("PoWit verify task failed: {}", e); network::GossipVerdict::Ignore }
+                        }
+                    };
+                    report_verdict(&vtx2, &origin, verdict);
+                }
+
                 // NET-6: same claim handling as PeerTip (rate-limited directed
                 // pull; never latches IBD). Version frames carry a fresh
                 // timestamp, so they are the dedup-proof tip announcement.
@@ -1667,6 +1776,108 @@ async fn main() {
 
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
+
+    // ── PoWit witness: share mining + checkpoint attestations ──────────────
+    if let Some(key) = cli.witness_key.clone() {
+        let Some(pw) = cli.witness_password_file.clone() else {
+            eprintln!("--witness-key needs --witness-password-file");
+            std::process::exit(2);
+        };
+        let payout = match cli.witness_payout.as_deref().map(address_to_script_pubkey) {
+            Some(Ok(spk)) => spk,
+            Some(Err(e)) => { eprintln!("--witness-payout: {:?}", e); std::process::exit(2); }
+            None => { eprintln!("--witness-key needs --witness-payout <address>"); std::process::exit(2); }
+        };
+        let duty = match powit::WitnessDuty::load(&key, &pw, payout, &data_path) {
+            Ok(d) => Arc::new(d),
+            Err(e) => { eprintln!("witness: {}", e); std::process::exit(2); }
+        };
+        info!("🛡  PoWit witness key {} (activation {})", hex::encode(duty.key_id),
+              match core::powit_height() { u64::MAX => "off".to_string(), h => h.to_string() });
+
+        // Duty loop: prune the pool, sign the newest checkpoint once, gossip
+        // equivocation proofs.
+        {
+            let (dag_w, store_w, otx_w, duty_w) = (dag.clone(), store.clone(), outbound_tx.clone(), duty.clone());
+            let mut tip_rx_w = tip_tx.subscribe();
+            tokio::spawn(async move {
+                let mut sent_evidence: HashSet<[u8; 20]> = HashSet::new();
+                loop {
+                    // Every new tip, or every 2 s.
+                    tokio::select! {
+                        _ = tip_rx_w.recv() => {}
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                    }
+                    let (dag_b, store_b, duty_b) = (dag_w.clone(), store_w.clone(), duty_w.clone());
+                    let out = tokio::task::spawn_blocking(move || {
+                        let d = dag_b.read();
+                        powit::pool().prune(&d, &store_b);
+                        let att = match duty_b.maybe_attest(&d, &store_b) {
+                            Ok(Some(a)) => {
+                                let _ = powit::pool().admit_attestation(a.clone(), &d, &store_b);
+                                Some(a)
+                            }
+                            Ok(None) => None,
+                            Err(e) => { warn!("witness: {}", e); None }
+                        };
+                        (att, powit::pool_evidence())
+                    }).await;
+                    let Ok((att, evidence)) = out else { continue };
+                    if let Some(a) = att {
+                        info!("🛡  attested checkpoint slot {} ({})", a.target.height, hex::encode(&a.target.hash[..8]));
+                        let (id, kind, data) = powit::attestation_item(&a);
+                        let _ = otx_w.try_send(network::NetworkMessage::NewPowitItem { id, kind, data });
+                    }
+                    for ev in evidence {
+                        if sent_evidence.insert(ev.a.key_id()) {
+                            warn!("🛡  equivocation by witness {} — proof gossiped", hex::encode(ev.a.key_id()));
+                            let (id, kind, data) = powit::evidence_item(&ev);
+                            let _ = otx_w.try_send(network::NetworkMessage::NewPowitItem { id, kind, data });
+                        }
+                    }
+                }
+            });
+        }
+
+        // Share miners: read the tip under a short lock, mine without it.
+        let threads = cli.share_threads.unwrap_or(2);
+        for t in 0..threads {
+            let (dag_s, store_s, otx_s, payout, witness) =
+                (dag.clone(), store.clone(), outbound_tx.clone(), duty.payout_script.clone(), duty.key_id);
+            std::thread::Builder::new().name(format!("share-miner-{t}")).spawn(move || {
+                let stop = std::sync::atomic::AtomicBool::new(false);
+                loop {
+                    let tip = {
+                        let d = dag_s.read();
+                        d.selected_tip().and_then(|h| d.get_block_data(&h).map(|bd| (h, bd.height)))
+                    };
+                    let Some((tip, tip_h)) = tip.filter(|(_, h)| core::powit_active(h + 1)) else {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        continue;
+                    };
+                    let Some(attested) = store_s.get_block(&tip).ok().flatten() else {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        continue;
+                    };
+                    if let Some(share) = powit::mine_share(&attested, tip, witness, &payout, rand::random(), 16, &stop) {
+                        let admitted = {
+                            let d = dag_s.read();
+                            powit::pool().admit_share(share.clone(), &d, &store_s)
+                        };
+                        match admitted {
+                            Ok(_) => {
+                                debug!("share found on h={}", tip_h);
+                                let (id, kind, data) = powit::share_item(&share);
+                                let _ = otx_s.try_send(network::NetworkMessage::NewPowitItem { id, kind, data });
+                            }
+                            Err(e) => debug!("own share not admitted: {}", e),
+                        }
+                    }
+                }
+            }).expect("spawn share miner");
+        }
+        info!("🛡  {} share-miner thread(s)", threads);
+    }
 
     // ── Continuous Mining Loop ────────────────────────────────────────────────
     if cli.mine {
@@ -1850,12 +2061,10 @@ async fn main() {
                         continue;
                     }
                 };
-                // Fair launch: 100% of subsidy + fees to the miner, one output.
-                let coinbase = template::miner_coinbase(
-                    tmpl.height,
-                    tmpl.subsidy.saturating_add(tmpl.total_fees),
-                    miner_spk.clone(),
-                );
+                // Below the PoWit activation 100% of subsidy + fees to the
+                // miner; from it, the miner's part plus one output per
+                // witness share of the template's PoWit section.
+                let coinbase = tmpl.miner_coinbase(miner_spk.clone());
                 let now_ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_secs();
@@ -1877,6 +2086,7 @@ async fn main() {
                 const MINE_ROUND_ATTEMPTS: u64 = 64;
                 let preimage = block.header.pow_preimage();
                 let bits = block.header.bits;
+                let block_height = block.height;
                 let start_nonce: u64 = rand::random();
                 let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let mut tip_rx = tip_tx_m.subscribe();
@@ -1888,8 +2098,8 @@ async fn main() {
                 });
                 let stop_m = stop.clone();
                 let mined = tokio::task::spawn_blocking(move || {
-                    pow::mine_parallel(&preimage, bits, start_nonce, MINE_ROUND_ATTEMPTS,
-                                       mine_threads, Some(&stop_m))
+                    pow::mine_parallel(&preimage, bits, block_height, start_nonce, MINE_ROUND_ATTEMPTS,
+                                       mine_threads, Some(&*stop_m))
                 }).await;
                 tip_watch.abort();
 
@@ -2534,8 +2744,9 @@ mod ingress_processor_tests {
             blue_score: 0,
             height,
             shielded_transactions: Vec::new(),
+            powit: Default::default(),
         };
-        let nonce = pow::mine_parallel(&b.header.pow_preimage(), bits, 0, 1 << 16, 2, None)
+        let nonce = pow::mine_parallel(&b.header.pow_preimage(), bits, b.height, 0, 1 << 16, 2, None)
             .expect("solve");
         b.header.nonce = nonce;
         assert!(b.validate_structure().is_ok());
@@ -2569,6 +2780,7 @@ mod ingress_processor_tests {
             blue_score: 0,
             height: 0,
             shielded_transactions: Vec::new(),
+            powit: Default::default(),
         };
         store.put_block(&genesis).expect("store genesis");
         dag.write().add_genesis(genesis.block_hash(), genesis.header.timestamp);
@@ -2861,6 +3073,7 @@ mod external_submission_tests {
             blue_score: 0,
             height: 0,
             shielded_transactions: Vec::new(),
+            powit: Default::default(),
         }
     }
 
@@ -2919,11 +3132,12 @@ mod external_submission_tests {
             blue_score: 1,
             height: 1,
             shielded_transactions: Vec::new(),
+            powit: Default::default(),
                 };
 
         if mine {
             let preimage = block.header.pow_preimage();
-            let nonce = pow::mine_parallel(&preimage, bits, 0, 1 << 16, 4, None)
+            let nonce = pow::mine_parallel(&preimage, bits, 1, 0, 1 << 16, 4, None)
                 .expect("GnB-SMH solve within attempt budget");
             block.header.nonce = nonce;
             assert!(
@@ -3031,9 +3245,10 @@ mod external_submission_tests {
             blue_score: 1,
             height: 1,
             shielded_transactions: Vec::new(),
+            powit: Default::default(),
         };
         let preimage = block.header.pow_preimage();
-        let nonce = pow::mine_parallel(&preimage, bits, 0, 1 << 16, 4, None)
+        let nonce = pow::mine_parallel(&preimage, bits, 1, 0, 1 << 16, 4, None)
                 .expect("GnB-SMH solve within attempt budget");
             block.header.nonce = nonce;
         assert!(
@@ -3198,6 +3413,7 @@ mod external_submission_tests {
             blue_score: height,
             height,
             shielded_transactions: Vec::new(),
+            powit: Default::default(),
         }
     }
 
@@ -3625,6 +3841,7 @@ mod out_of_order_spend_tests {
             transactions: vec![coinbase(), tx_early, tx_late],
             blue_score: 0, height: 1,
             shielded_transactions: Vec::new(),
+            powit: Default::default(),
         };
 
         let mut spent = HashSet::new();
@@ -3684,6 +3901,7 @@ mod out_of_order_spend_tests {
             transactions: vec![coinbase(), tx_funding, tx_spend],
             blue_score: 0, height: 1,
             shielded_transactions: Vec::new(),
+            powit: Default::default(),
         };
 
         let mut spent = HashSet::new();

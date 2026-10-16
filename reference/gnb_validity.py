@@ -36,16 +36,35 @@ import gnb_smh as smh
 # ── Consensus constants (docs/CONSENSUS.md, docs/MONETARY-POLICY.md) ─────────
 
 SAT_PER_GNB = 100_000_000
-MAX_SUPPLY_SAT = 10_000_000 * SAT_PER_GNB
+# 12,500,000 GNB: carry-over 1,000,000, locked team + founder 2,500,000,
+# mining 9,000,000 (docs/MONETARY-POLICY.md).
+MAX_SUPPLY_SAT = 12_500_000 * SAT_PER_GNB
+MINING_ALLOCATION_SAT = 9_000_000 * SAT_PER_GNB
 HALVING_INTERVAL = 4 * 365 * 2_880
-INITIAL_SUBSIDY_SAT = (MAX_SUPPLY_SAT - MAX_SUPPLY_SAT // 10) // (2 * HALVING_INTERVAL)
+INITIAL_SUBSIDY_SAT = MINING_ALLOCATION_SAT // (2 * HALVING_INTERVAL)
 COINBASE_MATURITY = 100
 DUST_THRESHOLD = 546
 MIN_TX_FEE_SAT = 10_000
 MIN_FEE_RATE_SAT_PER_KB = 2_000
 MAX_BLOCK_SIZE = 1_000_000
 MAX_PARENTS = 256
-MAX_SCRIPT_LEN = 10_000
+# script_sig cap: the largest policy witness (core::MAX_SCRIPT_SIG_LEN,
+# a 7-of-7 multisig branch spend); script_pubkey cap 10,000.
+MAX_SCRIPT_SIG_LEN = 114_834
+MAX_SCRIPT_PUBKEY_LEN = 10_000
+# PoW + PoWit from this height on mainnet (core::POWIT_HEIGHT_MAINNET): the
+# block encoding and body root carry the PoWit section and the coinbase pays
+# the miner's share of the subsidy (witness_share::split_subsidy).
+POWIT_HEIGHT = 10_000
+WITNESS_POOL_BPS = 2_000
+# From this height up to the hardening activation the coinbase script_sig
+# ends with `|wc:` and the legacy Merkle root of [0^32, wtxid(tx_1), ...]
+# (core::WITNESS_COMMITMENT_HEIGHT).
+WITNESS_COMMITMENT_HEIGHT = 5_000
+WC_TAG = b"|wc:"
+# Output kinds (core::policy::output_kind): a 20-byte key hash or a 33-byte
+# spend policy (tag byte 0x02 + 32-byte hash).
+POLICY_SPK_TAG = 0x02
 MAX_TX_INPUTS = 100_000
 MAX_TX_OUTPUTS = 100_000
 MAX_BLOCK_TXS = 1_000_000
@@ -81,6 +100,20 @@ def subsidy(height: int) -> int:
     if height == 0 or height // HALVING_INTERVAL >= 64:
         return 0
     return INITIAL_SUBSIDY_SAT >> (height // HALVING_INTERVAL)
+
+
+def miner_subsidy(height: int) -> int:
+    """The most a coinbase with no witness shares may pay the miner before
+    fees: the whole subsidy below POWIT_HEIGHT, the subsidy minus its witness
+    pool from it."""
+    s = subsidy(height)
+    if height < POWIT_HEIGHT:
+        return s
+    return s - s * WITNESS_POOL_BPS // 10_000
+
+
+def is_output_kind(spk: bytes) -> bool:
+    return len(spk) == 20 or (len(spk) == 33 and spk[0] == POLICY_SPK_TAG)
 
 
 def min_fee(wire_size: int) -> int:
@@ -149,7 +182,7 @@ def read_tx(r: Reader) -> mk.Tx:
         txid = r.take(32)
         index = r.u32()
         n = r.varint()
-        if n > MAX_SCRIPT_LEN:
+        if n > MAX_SCRIPT_SIG_LEN:
             raise DecodeError("implausible script_sig length")
         inputs.append(mk.TxIn(txid, index, r.take(n), r.u32()))
     n_out = r.varint()
@@ -159,7 +192,7 @@ def read_tx(r: Reader) -> mk.Tx:
     for _ in range(n_out):
         value = r.u64()
         n = r.varint()
-        if n > MAX_SCRIPT_LEN:
+        if n > MAX_SCRIPT_PUBKEY_LEN:
             raise DecodeError("implausible script_pubkey length")
         outputs.append(mk.TxOut(value, r.take(n)))
     return mk.Tx(version, inputs, outputs, r.u32())
@@ -200,7 +233,10 @@ class Block:
         out = struct.pack("<I", h.version) + mk.varint(len(h.parents)) + b"".join(h.parents) + h.merkle_root
         out += struct.pack("<QIQQQ", h.timestamp, h.bits, h.nonce, self.blue_score, self.height)
         out += mk.varint(len(self.txs)) + b"".join(t.wire(True) for t in self.txs)
-        return out + mk.varint(0)  # no shielded transactions
+        out += mk.varint(0)  # no shielded transactions
+        if self.height >= POWIT_HEIGHT:
+            out += mk.varint(0) * 3  # empty PoWit section (shares, attestations, evidence)
+        return out
 
     def block_hash(self) -> bytes:
         return hashlib.sha3_256(BLOCK_ID_DOMAIN + self.header.pow_preimage()
@@ -229,12 +265,15 @@ def decode_block(b: bytes) -> Block:
         raise DecodeError("implausible shielded count")
     if n_shielded:
         raise NotImplementedError("shielded transactions are not modelled by this reference")
+    if height >= POWIT_HEIGHT:
+        if (r.varint(), r.varint(), r.varint()) != (0, 0, 0):
+            raise NotImplementedError("PoWit items are not modelled by this reference")
     if r.pos != len(b):
         raise DecodeError("trailing bytes in block body")
     return Block(Header(version, parents, merkle_root, timestamp, bits, nonce), txs, blue, height)
 
 
-# ── bincode-2 "standard" sizes (the block-size measure below the activation) ─
+# ── bincode-2 "standard" sizes (relay policy only: no consensus measure) ─────
 
 def tx_bincode(tx: mk.Tx) -> bytes:
     v = sh.bincode_varint
@@ -247,32 +286,26 @@ def tx_bincode(tx: mk.Tx) -> bytes:
     return out + v(tx.locktime)
 
 
-def block_bincode_size(b: Block, blue_score: int | None = None) -> int:
-    """Length of the bincode-2 "standard" encoding of the node's `Block`
-    struct (`Block::size_bytes`), with `blue_score` written as the given
-    value (default: the value the block carries)."""
+def block_bincode_size(b: Block) -> int:
     v = sh.bincode_varint
     h = b.header
     n = len(v(h.version)) + len(v(len(h.parents))) + 32 * len(h.parents) + 32
     n += len(v(h.timestamp)) + len(v(h.bits)) + len(v(h.nonce))
     n += len(v(len(b.txs))) + sum(len(tx_bincode(t)) for t in b.txs)
-    bs = b.blue_score if blue_score is None else blue_score
-    return n + len(v(bs)) + len(v(b.height)) + len(v(0))
-
-
-# The value the pre-activation size measure writes for `blue_score`.
-LEGACY_SIZE_BLUE_SCORE = 0
+    return n + len(v(b.blue_score)) + len(v(b.height)) + len(v(0))
 
 
 def legacy_block_size(b: Block) -> int:
     """The MAX_BLOCK_SIZE measure below the hardening activation
-    (docs/CONSENSUS.md, "Block size (VAL-12)"): the bincode length with
-    `blue_score` written as 0, whatever the copy carries. The block id does
-    not commit to `blue_score` and the node stores and serves the value
-    derived from the parents, so the measure must not read it (re-audit
-    B1-T0 / B2-T8); 0 has the shortest encoding, so no block accepted under
-    the old measure (any carried value) is too large under this one."""
-    return block_bincode_size(b, LEGACY_SIZE_BLUE_SCORE)
+    (docs/CONSENSUS.md, "Block size (VAL-12)"; `block_rules::legacy_block_size`):
+    the length of the wire encoding, the PoWit section included from
+    POWIT_HEIGHT, as from the activation (this chain never measured bincode).
+    The wire header writes `blue_score` as a fixed-width u64, so the measure is
+    the same for every copy of a block id, whatever `blue_score` it carries
+    (the same as with 0 written): the block id does not commit to
+    `blue_score`, and the node stores and serves the value derived from the
+    parents (re-audit B1-T0 / B2-T8)."""
+    return len(b.wire())
 
 
 # ── Witnesses and signature encodings ───────────────────────────────────────
@@ -438,7 +471,10 @@ def check_input_scripts(tx: mk.Tx, prevouts: list, height: int, activation: int,
         raise Invalid("bad-version")
     for i, (inp, prev) in enumerate(zip(tx.inputs, prevouts)):
         if rule == "v2":
-            w = parse_witness_lenient(inp.script_sig)
+            # This chain's v2 framing is exact (no bytes after the key); the
+            # compact Falcon encoding is part of the signature check
+            # (`crypto::verify_canonical`, not modelled here).
+            w = parse_witness_exact(inp.script_sig)
             if w is None:
                 raise Invalid("witness-malformed")
         else:
@@ -473,6 +509,16 @@ def check_maturity(tx: mk.Tx, view: View, height: int, activation: int) -> None:
             raise Invalid("immature-coinbase")
 
 
+def chain_rules(tx: mk.Tx, height: int) -> None:
+    """This chain's context-free transaction rules (node/src/blockval.rs
+    `check_tx_context_free`): finality (locktime is a block height), the two
+    output kinds. The txid commits to both."""
+    if tx.locktime > height:
+        raise Invalid("non-final")
+    if any(not is_output_kind(o.script_pubkey) for o in tx.outputs):
+        raise Invalid("bad-output-script")
+
+
 def connect_tx_committed(tx: mk.Tx, view: View, earlier: dict, spent_in_block: set, height: int,
                          activation: int, same_block_coinbase) -> tuple:
     """`check_tx_in_view_committed`: the checks of one non-coinbase
@@ -481,6 +527,11 @@ def connect_tx_committed(tx: mk.Tx, view: View, earlier: dict, spent_in_block: s
     if same_block_coinbase is not None and any(i.prev_txid == same_block_coinbase for i in tx.inputs):
         raise Invalid("same-block-coinbase")
     check_maturity(tx, view, height, activation)
+    # This chain's rules (node/src/blockval.rs), once every prevout is found:
+    # finality (locktime is a block height), the two output kinds.
+    if all((earlier.get((i.prev_txid, i.prev_index)) or view.utxos.get((i.prev_txid, i.prev_index))) is not None
+           for i in tx.inputs):
+        chain_rules(tx, height)
     local = set()
     prevouts = []
     total_in = 0
@@ -505,8 +556,10 @@ def connect_tx_committed(tx: mk.Tx, view: View, earlier: dict, spent_in_block: s
     # empty (its one-byte length prefix only).
     if fee < min_fee(len(tx.wire(False)) + len(tx.inputs)):
         raise Invalid("min-fee")
-    # No public key hashes to a script that is not 20 bytes.
-    if any(len(p.script_pubkey) != 20 for p in prevouts):
+    # No witness spends a script of neither output kind (no public key
+    # hashes to a script that is not 20 bytes; a policy witness spends only a
+    # 33-byte policy script).
+    if any(not is_output_kind(p.script_pubkey) for p in prevouts):
         raise Invalid("pubkey-mismatch")
     return fee, prevouts
 
@@ -531,23 +584,25 @@ def connect_tx(tx: mk.Tx, view: View, earlier: dict, spent_in_block: set, height
 
 def connect_block(b: Block, view: View, activation: int, out: Outcome) -> None:
     """`validate_block_in_view_at`: BIP30 and the same-block coinbase rule
-    from the activation; pass 1, the id-committed checks of every
-    transaction, then the coinbase value; pass 2, the witness checks of every
-    transaction (re-audit B1-T13)."""
-    hardened = block_rules_active(b.height, activation)
-    if hardened:
-        for tx in b.txs:
-            txid = tx.txid()
-            if any((txid, j) in view.utxos for j in range(len(tx.outputs))):
-                raise Invalid("bip30")
-    same_cb = b.txs[0].txid() if hardened and b.txs else None
+    at every height; pass 1, the id-committed checks of every transaction,
+    then the coinbase value; pass 2, the witness checks of every transaction
+    (re-audit B1-T13)."""
+    # BIP30 and no spend of the block's own coinbase: this chain's rules at
+    # every height (the audit's VAL-2 / VAL-3 from the activation).
+    for tx in b.txs:
+        txid = tx.txid()
+        if any((txid, j) in view.utxos for j in range(len(tx.outputs))):
+            raise Invalid("bip30")
+    # The coinbase's own finality and output kinds.
+    chain_rules(b.txs[0], b.height)
+    same_cb = b.txs[0].txid() if b.txs else None
     earlier, spent, fees, checked = {}, set(), 0, []
     for i, tx in enumerate(b.txs):
         if i > 0:
             fee, prevouts = connect_tx_committed(tx, view, earlier, spent, b.height, activation, same_cb)
             fees = money_add(fees, fee)
             checked.append((tx, prevouts, fee))
-        if hardened and i == 0:
+        if i == 0:
             continue
         txid = tx.txid()
         for j, o in enumerate(tx.outputs):
@@ -555,7 +610,7 @@ def connect_block(b: Block, view: View, activation: int, out: Outcome) -> None:
     cb = b.txs[0]
     if len(cb.outputs) != 1:
         raise Invalid("coinbase-output-count")
-    allowed = subsidy(b.height) + fees
+    allowed = miner_subsidy(b.height) + fees
     if allowed >= 1 << 64 or cb.outputs[0].value > allowed:
         raise Invalid("coinbase-value")
     for tx, prevouts, fee in checked:
@@ -569,7 +624,12 @@ COMMITMENT_CLASSES = {"missing": "cb-commitment-missing", "tag": "cb-commitment-
 
 
 def merkle_root_at(b: Block, activation: int) -> bytes:
-    return mk.merkle_root([t.txid() for t in b.txs], block_rules_active(b.height, activation))
+    tx_root = mk.merkle_root([t.txid() for t in b.txs], block_rules_active(b.height, activation))
+    return mk.header_root(tx_root, b.height)
+
+
+def wc_suffix(b: Block) -> bytes:
+    return WC_TAG + mk.legacy_merkle_root([bytes(32)] + [t.wtxid() for t in b.txs[1:]])
 
 
 def check_structure(b: Block, activation: int) -> None:
@@ -578,6 +638,8 @@ def check_structure(b: Block, activation: int) -> None:
     hardened = block_rules_active(b.height, activation)
     if len(b.header.parents) > MAX_PARENTS:
         raise Invalid("too-many-parents")
+    # This chain measures the wire encoding at every height (re-audit B1-T0:
+    # never a measure of the uncommitted blue_score).
     size = len(b.wire()) if hardened else legacy_block_size(b)
     if size > MAX_BLOCK_SIZE:
         raise Invalid("block-size")
@@ -597,6 +659,9 @@ def check_structure(b: Block, activation: int) -> None:
     for t in b.txs[1:]:
         if any(0 < o.value < DUST_THRESHOLD for o in t.outputs):
             raise Invalid("dust")
+    if WITNESS_COMMITMENT_HEIGHT <= b.height and not hardened:
+        if not b.txs[0].inputs[0].script_sig.endswith(wc_suffix(b)):
+            raise Invalid("witness-commitment-suffix")
 
 
 def check_pow_limit(b: Block, activation: int) -> None:
@@ -706,6 +771,7 @@ def admission(tx: mk.Tx, view: View, height: int, activation: int, out: Outcome)
         total_in = money_add(total_in, coin.value)
         prevouts.append(coin)
     check_maturity(tx, view, height, activation)
+    chain_rules(tx, height)
     total_out = tx_money_range(tx)
     if total_in < total_out:
         raise Invalid("inputs-below-outputs")

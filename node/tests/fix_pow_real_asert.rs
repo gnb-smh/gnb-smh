@@ -177,3 +177,37 @@ fn ingress_orphan_floor_call_site_follows_the_real_asert_rule_of_the_tip() {
     let o = deliver(&mut core_, &orphan(at_floor, "pow5-orphan-floor"));
     assert!(matches!(o, ingress::BlockOutcome::Buffered { .. }), "{o:?}");
 }
+
+/// PoW v3 (main's 28a619d) switches at the mainnet PoWit height, 10,000:
+/// under the real rule the expected bits of height 10,000 are the ASERT bits
+/// shifted by `POW_V3_DIFFICULTY_SHIFT` (`core::adjust_bits_for_algo`, a 4x
+/// harder target), those of 9,999 are the plain ASERT bits; the ingress
+/// orphan-floor reference of a tip at 9,999 (its child at 10,000) is the
+/// shifted target, that of a tip at 9,998 the plain one. The call sites at
+/// the switch (`accept_block`, the template, the ingress floor through
+/// `handle_block`) are exercised in `fix_pow_real_asert_v3.rs`, which moves
+/// the switch to height 3.
+#[test]
+fn expected_bits_switch_to_v3_at_the_mainnet_powit_height() {
+    assert_eq!(core::POWIT_HEIGHT_MAINNET, 10_000);
+    assert_eq!(core::powit_height(), core::POWIT_HEIGHT_MAINNET, "this binary keeps the mainnet switch");
+    let _real = core::scoped_real_expected_bits();
+    // Ahead of the schedule (five half-lives), so no target is clamped.
+    let ts = G0 + 30 * 10_000 - 5 * core::ASERT_HALFLIFE_SECS as u64;
+    let asert = |h: u64| gnb_smh::difficulty::asert_next_bits(
+        &core::asert_params_at(h, activation::hardening_activation_height()),
+        &core::asert_anchor(), ts as i64, h,
+    ).unwrap();
+    let v3 = core::adjust_bits_for_algo(asert(10_000), gnb_smh::Algo::V3);
+    assert_ne!(v3, asert(10_000));
+    {
+        use primitive_types::U256;
+        let shifted = U256::from_big_endian(&core::bits_to_target(asert(10_000))) >> core::POW_V3_DIFFICULTY_SHIFT;
+        assert_eq!(core::bits_to_target(v3), core::bits_to_target(core::target_to_bits(&shifted.to_big_endian())));
+    }
+    assert_eq!(core::expected_bits(ts, 9_999).unwrap(), asert(9_999), "v1 below the switch");
+    assert_eq!(core::expected_bits(ts, 10_000).unwrap(), v3, "v3 from the switch");
+    assert_eq!(real_bits(ts, 10_000), v3);
+    assert_eq!(ingress::reference_target(9_999, ts), core::bits_to_target(v3));
+    assert_eq!(ingress::reference_target(9_998, ts), core::bits_to_target(asert(9_999)));
+}

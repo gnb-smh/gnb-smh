@@ -1509,184 +1509,184 @@
    "chain_id": 1196294145,
    "tx": "tx0",
    "input_index": 0,
-   "preimage_len": 101,
-   "sighash": "211c6d375f6e50a58e09c9f3b914a3ea1fa38698d524ecabc745492e0141babf"
+   "preimage_len": 112,
+   "sighash": "bc7e7612ff9dd597dbaa8afaf53a6b89d2bea306d74f79a6dfb15e37d4e06382"
   },
   {
    "name": "two inputs, two outputs",
    "chain_id": 1196294145,
    "tx": "tx2",
    "input_index": 0,
-   "preimage_len": 162,
-   "sighash": "521ad017ab1ee496eaaeb144baf96268963210a491a3360d95f943161448197a"
+   "preimage_len": 182,
+   "sighash": "9a4914b6aeb1d1fc326a7bdea1ddf4047cb04d541d05c03fee788c1c8ad1f809"
   },
   {
    "name": "two inputs, two outputs",
    "chain_id": 1196294145,
    "tx": "tx2",
    "input_index": 1,
-   "preimage_len": 162,
-   "sighash": "76fa3ca21820f70b7d5070ff9bd39bd0beffe5a032c87b5b3fdf7effc02fbfa9"
+   "preimage_len": 182,
+   "sighash": "20f7e7d013935f7d83717324f3e7eaa7a9d18c273e06c6f5c6940ed24e4ae61f"
   },
   {
    "name": "two inputs, testnet chain id",
    "chain_id": 1196294146,
    "tx": "tx2",
    "input_index": 1,
-   "preimage_len": 162,
-   "sighash": "9861067cd575299db06a15ee93c68bedcf2e4c8de2d544dc1c586ac7d3813657"
+   "preimage_len": 182,
+   "sighash": "9c52fd5e362a485f17406a0c17777a4fc547a747eb3a14f1375fd9e6e7baf766"
   },
   {
    "name": "empty scripts and zero values",
    "chain_id": 1196294145,
    "tx": "tx4",
    "input_index": 0,
-   "preimage_len": 73,
-   "sighash": "6ef0697e7c476d7541f9e57bceb50905009b9689447e5958f7dd253fd885f723"
+   "preimage_len": 92,
+   "sighash": "2fab15380e7885ac62ae2f841d9d6912e94373e502ac91f61504af13cc076522"
   },
   {
    "name": "maximum field values",
    "chain_id": 1196294145,
    "tx": "tx6",
    "input_index": 0,
-   "preimage_len": 117,
-   "sighash": "b72a693a5a180d41a42e728e312eaaafe735baa07e588e7a46b01f6e18356660"
+   "preimage_len": 112,
+   "sighash": "e098b2c13b2ef41f74dc576e4113aaf53c5f71cfa868882473f376a70dc26479"
   },
   {
    "name": "long scripts (10,000-byte output script)",
    "chain_id": 1196294145,
    "tx": "tx8",
    "input_index": 0,
-   "preimage_len": 10338,
-   "sighash": "fde3586d39e09ddccd9cee1dc525adba63d8f3b3dfbd2307ccccc0edf2559e45"
+   "preimage_len": 10354,
+   "sighash": "114864cb0aa526509ef5cd5020787752d37754da2b5c6774ef1e8b58641c30a4"
   },
   {
    "name": "300 inputs",
    "chain_id": 1196294145,
    "tx": "tx10",
    "input_index": 0,
-   "preimage_len": 11908,
-   "sighash": "1ce1ec67df69ab9009e9b92592f139c8d60eb820e2822795517aa797ebdfd64c"
+   "preimage_len": 12431,
+   "sighash": "6d479ad9c0106f13b0a303f6b3445cfc2b924b1d72012ce3ba0966c17bb4384c"
   },
   {
    "name": "300 inputs",
    "chain_id": 1196294145,
    "tx": "tx10",
    "input_index": 250,
-   "preimage_len": 11908,
-   "sighash": "a1485fba76b03dc495b76bcf067d41b2a6f8c9b747b0497adf5052ffb6666bf6"
+   "preimage_len": 12431,
+   "sighash": "71acfc8754639e9cad37736199e4e321aab0de901ccda8cabca3d3f48862e7b7"
   },
   {
    "name": "300 inputs",
    "chain_id": 1196294145,
    "tx": "tx10",
    "input_index": 299,
-   "preimage_len": 11908,
-   "sighash": "267cabc82397066c17e681b58989c89a84a55369dfe6c934a32b9b0689f1e99f"
+   "preimage_len": 12431,
+   "sighash": "667946c56660cfb0f79ce1e179dd4a311989733fc941b228de5690b4f6ee4a22"
   },
   {
    "name": "random #0",
    "chain_id": 1196294146,
    "tx": "tx12",
    "input_index": 0,
-   "preimage_len": 236,
-   "sighash": "f7f811817d612b939a9edee8bc3df8e00388f92ed76f44aba0d56a5a29bf70e7"
+   "preimage_len": 227,
+   "sighash": "11503912d784c610f3a2bd19d23db1dc66036d727f402b5f63aa4e6d50e4564d"
   },
   {
    "name": "random #1",
    "chain_id": 1196294146,
    "tx": "tx13",
    "input_index": 2,
-   "preimage_len": 380,
-   "sighash": "8031f7487a4eba5611e98481fc0bb6d9dc1c4fad625d32f1b75ae342e825d797"
+   "preimage_len": 364,
+   "sighash": "6bc08437777bfd5486f6c1837cbdc1646c7ac4b532e1a21e30367eff0793a245"
   },
   {
    "name": "random #2",
    "chain_id": 1196294146,
    "tx": "tx14",
    "input_index": 2,
-   "preimage_len": 315,
-   "sighash": "592d7066a4b63e3b14e399f8e127f486abb1ff676818138a48f4443a8766757b"
+   "preimage_len": 303,
+   "sighash": "05185dd93abe006080ee05994cbcc12491b0c376f9fd04d483bdb6fc90ee1be1"
   },
   {
    "name": "random #3",
    "chain_id": 1196294145,
    "tx": "tx15",
    "input_index": 0,
-   "preimage_len": 451,
-   "sighash": "edf72bb14e590ab3beefbd280fd3699121cfa1c57ba6006f733dd57911091612"
+   "preimage_len": 435,
+   "sighash": "1e739de47bc7d03df19b9d2afe631217c947ccca74c2771e8404d351b392e32f"
   },
   {
    "name": "random #4",
    "chain_id": 1196294145,
    "tx": "tx16",
    "input_index": 1,
-   "preimage_len": 274,
-   "sighash": "9b2d5b8bc1bf7830bd79be8b8fceccf5e9ac45aa59c7e1b594d032e539834e5c"
+   "preimage_len": 263,
+   "sighash": "10bddbcaefe145896193e5f5a611826b8cf56b4af66b824bc47353bdf0825f8f"
   },
   {
    "name": "random #5",
    "chain_id": 1196294146,
    "tx": "tx17",
    "input_index": 2,
-   "preimage_len": 355,
-   "sighash": "ac5f83e0ab815ca159be48cebb818c8d8b2a60809fc4e6c2bf7aa49c9304450e"
+   "preimage_len": 340,
+   "sighash": "a1ae50f0df093b9f121fba62c9903b2767f18e01c2556a3f7cb5db35372940ee"
   },
   {
    "name": "random #6",
    "chain_id": 1196294145,
    "tx": "tx18",
    "input_index": 1,
-   "preimage_len": 245,
-   "sighash": "a06794510d87622cc105b009c3887c3f1f3a8ddc9af35806f914090c16b9f1c5"
+   "preimage_len": 237,
+   "sighash": "09f81c05df0b7f839237ac2ee0714322c4823747a1938a33482b4c32897fea07"
   },
   {
    "name": "random #7",
    "chain_id": 1196294146,
    "tx": "tx19",
    "input_index": 3,
-   "preimage_len": 297,
-   "sighash": "0a275cb64e88a159d930d5fad3fde286b4fea237d712371132082930b7ecc18b"
+   "preimage_len": 284,
+   "sighash": "153c46f0bdabb970bcf2000892ed7ae516991cec5dcbc87327d23fd6c1bc39c9"
   },
   {
    "name": "random #8",
    "chain_id": 1196294146,
    "tx": "tx20",
    "input_index": 4,
-   "preimage_len": 332,
-   "sighash": "34449af9e39c26ad624233582c14e0e2c8eb01487c71c01880e8850c970f4773"
+   "preimage_len": 317,
+   "sighash": "17128752126b279114c913ebf2d98891d0445c84bc8181e47afaba67f21ba185"
   },
   {
    "name": "random #9",
    "chain_id": 1196294146,
    "tx": "tx21",
    "input_index": 0,
-   "preimage_len": 140,
-   "sighash": "0c2545b6ec1f8f4094db1626d57b5883c8e5bcf27e0c7f88984496284faa5254"
+   "preimage_len": 134,
+   "sighash": "0092107cdb9adbf713aaf32a5258cb1e47592f104c4ae5261ace6ba23c3721e0"
   },
   {
    "name": "random #10",
    "chain_id": 1196294145,
    "tx": "tx22",
    "input_index": 5,
-   "preimage_len": 408,
-   "sighash": "17324a36bc983fc25769714320c1ed1c72b6406a0e7170ace5f6628a94d674c5"
+   "preimage_len": 391,
+   "sighash": "d913c53fe5de7d8a98f215cbdc3983a9a94063ca32cb2edd8e90e1b4cd63a38b"
   },
   {
    "name": "random #11",
    "chain_id": 1196294146,
    "tx": "tx23",
    "input_index": 1,
-   "preimage_len": 214,
-   "sighash": "b786af9ee1b35859fe2630a65d985085c4b2e1eb08b7e7c78087f321741a56b3"
+   "preimage_len": 206,
+   "sighash": "8bc51a8ada6f52bc299c0b72329d31831e60fb65cb0bfa0eaec7874f42023378"
   },
   {
    "name": "out-of-range index (historical: no marker)",
    "chain_id": 1196294145,
    "tx": "tx2",
    "input_index": 2,
-   "preimage_len": 151,
-   "sighash": "01b9f9b3344f3e1f9315c5bdd234e3803ec4e79d0ddc8ab1d1543a7e7214be5b"
+   "preimage_len": 171,
+   "sighash": "99dc2fb367cfb6f8541c15d9eb50f5dda0a90ef3ed4708d9169d5bd599174017"
   }
  ],
  "v3": [

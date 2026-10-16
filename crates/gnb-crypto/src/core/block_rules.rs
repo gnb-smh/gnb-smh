@@ -25,11 +25,7 @@
 //!   block's wtxids). The block id commits to it through header ->
 //!   merkle_root -> coinbase txid (a coinbase txid covers its `script_sig`).
 //! * **Block size (VAL-12)**: `MAX_BLOCK_SIZE` is measured on the canonical
-//!   wire encoding (`Block::wire_size`), the encoding fee rates use. Below the
-//!   activation the measure is [`legacy_block_size`] (bincode with the
-//!   uncommitted `blue_score` written as 0, re-audit B1-T0 / B2-T8): that
-//!   pre-activation rule is defined here too, [`check_block_size_at`] being
-//!   the one size check of both regimes.
+//!   wire encoding in both regimes ([`check_block_size_at`], B1-T0 / B2-T8).
 //!
 //! In-context rules live in the node's `validate_block_in_view` (BIP30
 //! no-overwrite, no spend of the same block's coinbase) and the pow limit in
@@ -335,56 +331,30 @@ pub fn check_coinbase_commitment(block: &Block) -> Result<(), &'static str> {
 
 // ── Block size (VAL-12; re-audit B1-T0 / B2-T8) ─────────────────────────────
 
-/// The value of `Block::blue_score` the pre-activation size measure writes,
-/// whatever the block carries: 0, whose bincode varint (1 byte) is the
-/// shortest any value has.
-pub const LEGACY_SIZE_BLUE_SCORE: u64 = 0;
-
-/// The pre-activation `MAX_BLOCK_SIZE` measure: the length of the bincode-2
-/// "standard" encoding of the block (`Block::size_bytes`) with its
-/// `blue_score` field written as [`LEGACY_SIZE_BLUE_SCORE`] (0).
+/// The pre-activation `MAX_BLOCK_SIZE` measure: the length of the block's
+/// wire encoding, `Block::size_bytes()` (`to_wire_bytes().len()`, the PoWit
+/// section included from `powit_height()`): the measure this chain's nodes
+/// apply at every height, never a bincode encoding (the audit's VAL-12
+/// measured bincode below its activation; this chain never did).
 ///
-/// Why not the block's own `blue_score` (re-audit B1-T0 / B2-T8): the block
-/// id does not commit to it, its bincode varint takes 1, 3, 5 or 9 bytes, and
-/// the node replaces the received value with the one derived from the
-/// block's parents before it stores and serves the body (POW-8). Measuring
-/// the received value let one block id be within the limit in the copy that
-/// was gossiped and over it in the copy every upgraded node serves, so a
-/// block the online network accepted was rejected by every node that synced
-/// it later, permanently. Every copy any release ever accepted had
-/// `size_bytes() <= MAX_BLOCK_SIZE` with SOME `blue_score`, and this measure
-/// is never larger than that (0 has the shortest encoding), so no block any
-/// release accepted becomes invalid; and the verdict is now the same for
-/// every copy of a block id. `height` is measured as carried: `accept_block`
-/// requires it to equal `max(parent DAG heights) + 1`, so every accepted copy
-/// carries the same value. docs/CONSENSUS.md, "Block size (VAL-12)";
-/// `reference/gnb_validity.py` (`legacy_block_size`).
+/// It does not depend on the uncommitted `blue_score` (re-audit B1-T0 /
+/// B2-T8): the wire header writes it as a fixed-width u64, so every copy of
+/// a block id (the one gossiped with any value, the one a node stores and
+/// serves with the value derived from the parents, POW-8) measures the same,
+/// the same as with `blue_score` written as 0. `height` is measured as
+/// carried: `accept_block` requires it to equal `max(parent DAG heights) +
+/// 1`, so every accepted copy carries the same value (and the same PoWit
+/// section presence). docs/CONSENSUS.md, "Block size (VAL-12)";
+/// `reference/gnb_validity.py` (`check_structure`).
 pub fn legacy_block_size(block: &Block) -> usize {
-    // The field order and types of `Block`'s serde derive, with
-    // `blue_score` replaced: bincode writes a borrowed slice exactly like the
-    // `Vec` it borrows from.
-    #[derive(serde::Serialize)]
-    struct Measured<'a> {
-        header: &'a super::BlockHeader,
-        transactions: &'a [Transaction],
-        blue_score: u64,
-        height: u64,
-        shielded_transactions: &'a [coherence_core::ShieldedTx],
-    }
-    let m = Measured {
-        header: &block.header,
-        transactions: &block.transactions,
-        blue_score: LEGACY_SIZE_BLUE_SCORE,
-        height: block.height,
-        shielded_transactions: &block.shielded_transactions,
-    };
-    bincode::serde::encode_to_vec(&m, bincode::config::standard()).map(|v| v.len()).unwrap_or(usize::MAX)
+    block.size_bytes()
 }
 
 /// The size `MAX_BLOCK_SIZE` is compared with: the canonical wire encoding
-/// (`Block::wire_size`, every field fixed-width or committed) when
-/// `hardened`, [`legacy_block_size`] otherwise. Neither depends on the
-/// uncommitted `blue_score`.
+/// (`Block::wire_size`, every field fixed-width or committed, the PoWit
+/// section counted) when `hardened`, [`legacy_block_size`] otherwise. On
+/// this chain both are the length of `to_wire_bytes()`; neither depends on
+/// the uncommitted `blue_score`.
 pub fn block_size_for_rules(block: &Block, hardened: bool) -> usize {
     if hardened {
         block.wire_size()
@@ -493,6 +463,7 @@ mod tests {
             blue_score: height,
             height,
             shielded_transactions: vec![],
+            powit: Default::default(),
         };
         let c = expected_coinbase_commitment(&b);
         b.transactions[0].inputs[0].script_sig = coinbase_script_sig(&c, b"extranonce");

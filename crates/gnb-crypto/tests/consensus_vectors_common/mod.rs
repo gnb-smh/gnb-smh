@@ -269,6 +269,7 @@ pub fn wrapper_block(tx: &Transaction, height: u64, prevouts: &[Prevout]) -> Blo
         blue_score: height,
         height,
         shielded_transactions: vec![],
+        powit: Default::default(),
     }
 }
 
@@ -314,14 +315,15 @@ pub fn pow_limit(block: &Block, activation: u64) -> Result<(), &'static str> {
 pub const CONTEXT_FREE_CLASSES: &[&str] = &[
     "decode", "too-many-parents", "block-size", "bad-merkle-root", "coinbase-format", "tx-64-bytes",
     "cb-commitment-missing", "cb-commitment-tag", "cb-height", "cb-parents", "witness-commitment",
-    "duplicate-tx", "dust", "pow-limit", "bad-bits", "bad-pow", "canonical-limit",
+    "duplicate-tx", "dust", "witness-commitment-suffix", "pow-limit", "bad-bits", "bad-pow", "canonical-limit",
 ];
 
 /// Error classes decided by the connect-time rules
 /// (`accept::validate_block_in_view_classified_at`), the input side of
 /// `value-out-of-range` included.
 pub const CONNECT_CLASSES: &[&str] = &[
-    "bip30", "same-block-coinbase", "immature-coinbase", "double-spend", "missing-input", "value-out-of-range",
+    "bip30", "same-block-coinbase", "immature-coinbase", "non-final", "bad-output-script", "double-spend",
+    "missing-input", "value-out-of-range",
     "bad-version", "witness-malformed", "witness-non-canonical", "pubkey-mismatch", "bad-signature",
     "inputs-below-outputs", "min-fee", "coinbase-output-count", "coinbase-value",
 ];
@@ -389,8 +391,14 @@ pub fn classify(reason: &str) -> &'static str {
         "min-fee"
     } else if has("inputs ") && has(" < outputs ") {
         "inputs-below-outputs"
-    } else if has("coinbase must have 1 output") {
+    } else if has("coinbase must have 1 output") || has("coinbase must have 1 miner output") {
         "coinbase-output-count"
+    } else if has("non-final: locktime") {
+        "non-final"
+    } else if has("unsupported script_pubkey") {
+        "bad-output-script"
+    } else if has("coinbase does not commit to the block's witnesses") {
+        "witness-commitment-suffix"
     } else if has("miner coinbase output exceeds allowed amount") || has("coinbase reward computation overflowed") {
         "coinbase-value"
     } else if has("MAX_SUPPLY_SAT") || has("overflows u64") {

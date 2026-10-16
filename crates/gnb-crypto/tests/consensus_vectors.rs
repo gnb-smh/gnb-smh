@@ -16,8 +16,8 @@
 //!   functions: the id-committed ones (`core::check_coinbase_maturity`, the
 //!   input sum with `limits::money_add`, `core::sighash::check_tx_version`,
 //!   `limits::check_tx_money_range`, inputs >= outputs, the fee floor
-//!   `tokenomics::min_tx_fee_sat` of the size with empty script_sigs, 20-byte
-//!   prevout scripts), then the witness ones
+//!   `tokenomics::min_tx_fee_sat` of the size with empty script_sigs,
+//!   prevout scripts of the two output kinds), then the witness ones
 //!   (`core::sighash::verify_tx_scripts` with the case's chain id,
 //!   `core::check_min_fee`; re-audit B1-T13). The rules implemented in the node crate (BIP30,
 //!   the same-block coinbase rule, duplicate and missing inputs:
@@ -52,7 +52,9 @@ fn hexs(b: &[u8]) -> String {
 /// (`node/src/accept.rs`: BIP30, the same-block coinbase rule of VAL-3,
 /// duplicate and missing inputs), not in gnb-crypto. This runner checks
 /// every rule before them and leaves the verdict to the node runner.
-const TX_DEFERRED_TO_NODE: &[&str] = &["bip30", "same-block-coinbase", "double-spend", "missing-input"];
+const TX_DEFERRED_TO_NODE: &[&str] = &[
+    "bip30", "same-block-coinbase", "double-spend", "missing-input", "non-final", "bad-output-script",
+];
 
 enum Connect {
     /// The verdict of the connect-time rules this runner can evaluate.
@@ -68,6 +70,11 @@ fn connect_core(c: &TxVector, tx: &Transaction, chain: ChainId, act: u64, expect
     let fail = |e: String| Connect::Decided(Err(classify(&e).to_string()));
     // BIP30 (checked for the whole block first) and VAL-3: accept.rs.
     if matches!(expected, "bip30" | "same-block-coinbase") {
+        return Connect::Deferred;
+    }
+    // This chain's locktime and output-kind rules (node/src/blockval.rs),
+    // evaluated after maturity once every prevout is found.
+    if matches!(expected, "non-final" | "bad-output-script") {
         return Connect::Deferred;
     }
     // Coinbase maturity: below the activation the block's header height and
@@ -110,8 +117,9 @@ fn connect_core(c: &TxVector, tx: &Transaction, chain: ChainId, act: u64, expect
     }
     // The id-committed rest: the version rule, the values, the fee floor no
     // script_sig can lower (the size with every script_sig empty: one length
-    // byte each) and 20-byte prevout scripts (no public key hashes to another
-    // length).
+    // byte each) and prevout scripts of the two output kinds (no public key
+    // hashes to another 20-byte script length, no policy witness spends a
+    // non-policy script).
     if let Err(e) = core::sighash::check_tx_version(tx.version, c.height, act) {
         return fail(e);
     }
@@ -126,7 +134,7 @@ fn connect_core(c: &TxVector, tx: &Transaction, chain: ChainId, act: u64, expect
     if fee < core::tokenomics::min_tx_fee_sat(tx.wire_size(false) + tx.inputs.len()) {
         return Connect::Decided(Err("min-fee".into()));
     }
-    if spent.iter().any(|o| o.script_pubkey.len() != 20) {
+    if spent.iter().any(|o| core::policy::output_kind(&o.script_pubkey).is_none()) {
         return Connect::Decided(Err("pubkey-mismatch".into()));
     }
     // Then the witness rules: witnesses, public-key hashes, signatures, and
@@ -245,8 +253,9 @@ fn block_vectors_core() {
         rep.expect(&c.id, "parents_commitment", d["parents_commitment"].as_str().unwrap(), &hexs(&block_rules::parents_commitment(&block.header.parents)));
         rep.expect(&c.id, "subsidy", d["subsidy"].as_str().unwrap(), &core::tokenomics::block_subsidy_sat(block.height).to_string());
         rep.expect(&c.id, "wire_size", &d["wire_size"].to_string(), &block.wire_size().to_string());
-        rep.expect(&c.id, "bincode_size", &d["bincode_size"].to_string(), &block.size_bytes().to_string());
-        rep.expect(&c.id, "legacy_size", &d["legacy_size"].to_string(), &block_rules::legacy_block_size(&block).to_string());
+        rep.expect(&c.id, "wire_size is the encoding", &d["wire_size"].to_string(), &c.bytes.len().to_string());
+        // Re-audit B1-T0: the pre-activation measure is the wire length too.
+        rep.expect(&c.id, "legacy size is the wire size", &d["wire_size"].to_string(), &block_rules::legacy_block_size(&block).to_string());
 
         if c.scope == "connect" {
             connect_deferred += 1; // connect-time rules only: node runner
@@ -306,6 +315,7 @@ fn vector_coverage() {
         "decode", "coinbase-format", "tx-64-bytes", "dust", "value-out-of-range", "bip30", "same-block-coinbase",
         "immature-coinbase", "double-spend", "missing-input", "bad-version", "witness-malformed",
         "witness-non-canonical", "pubkey-mismatch", "bad-signature", "inputs-below-outputs", "min-fee",
+        "non-final", "bad-output-script",
     ] {
         assert!(has(&|c| c.error.as_deref() == Some(class)), "tx class {class} not covered");
     }
@@ -356,6 +366,7 @@ fn vector_coverage() {
         "decode", "bad-merkle-root", "coinbase-format", "tx-64-bytes", "cb-commitment-missing", "cb-commitment-tag",
         "cb-height", "cb-parents", "witness-commitment", "duplicate-tx", "block-size", "pow-limit", "bad-bits",
         "bad-pow", "value-out-of-range", "bip30", "coinbase-value", "coinbase-output-count", "same-block-coinbase",
+        "witness-commitment-suffix", "bad-output-script", "witness-malformed",
     ] {
         assert!(b.iter().any(|c| c.error.as_deref() == Some(class)), "block class {class} not covered");
     }
@@ -375,6 +386,18 @@ fn vector_coverage() {
             let full = format!("{id}/{r}");
             assert!(b.iter().any(|c| c.id == full && c.error.is_none()), "{full} must be a valid case");
         }
+    }
+    // Re-audit B1-T0 / B2-T8: one block id at the size limit, carried with
+    // two blue_score values, has the verdict of every other copy.
+    for (id, err) in [("size/wire-exactly-1000000", None), ("size/wire-1000001-bincode-below", Some("block-size"))] {
+        let ids: Vec<&BlockVector> = ["pre", "pre-blue-score-0", "pre-blue-score-max"].iter()
+            .map(|t| {
+                let full = match *t { "pre" => format!("{id}/pre"), t => format!("{id}-{}/pre", &t[4..]) };
+                b.iter().find(|c| c.id == full).unwrap_or_else(|| panic!("{full} missing"))
+            })
+            .collect();
+        let hash = |c: &BlockVector| Block::from_wire_bytes(&c.bytes).expect("decodes").block_hash();
+        assert!(ids.iter().all(|c| c.error.as_deref() == err && hash(c) == hash(ids[0])), "{id}: one id, one verdict");
     }
     // Re-audit B1-T13: the connect order (the rules the block id commits to
     // for every transaction before any witness rule) is pinned.
