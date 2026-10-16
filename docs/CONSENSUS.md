@@ -251,23 +251,42 @@ exactly, and their stored `GhostdagData` stays valid.
 | regtest | 0 (from genesis) |
 
 The mainnet height was moved on 2026-10-16 from 110,000 (about 30 days after
-the release) to about one day after that decision. It was derived from the
-ASERT schedule, not from a node: ASERT anchors the difficulty at the genesis
-block and keeps the chain height on the schedule `(time - genesis time) /
-30 s`. Genesis timestamp 1,791,429,092 (2026-10-08 03:11:32 UTC), 30 s target
-spacing: on 2026-10-16 02:00 UTC the schedule height is about 22,897; one day
-is 2,880 blocks, about 25,777, rounded to 25,800, whose scheduled time is
-1,791,429,092 + 25,800 × 30 = 1,792,203,092 (2026-10-17 02:11:32 UTC). Every
-mainnet block at the time of the decision is below 25,800, so no existing
-block changes regime. The real chain can run somewhat ahead of or behind the
-schedule; the rules switch at the height, whatever the time. Every node and
-miner must run a release with this height before the chain reaches it
-(`RUNNING.md`, "Hardening activation"); a node with the old height (or none)
-keeps the old rules there and splits from the upgraded nodes. Moving the
-height again is one constant (`crates/gnb-crypto/src/core/activation.rs`),
-its copies in the generator of the consensus vectors and the Python
-references, the regenerated vectors, and a rebuilt web-wallet core
-(`site/wallet/gnb_wallet.wasm` compiles the height in).
+the release) to about one day after that decision. No mainnet node was
+reachable, so it was derived from the ASERT schedule `(time - genesis time) /
+30 s`, not from an observed tip. Genesis timestamp 1,791,429,092 (2026-10-08
+03:11:32 UTC), 30 s target spacing: on 2026-10-16 02:00 UTC the schedule
+height is about 22,897; one day is 2,880 blocks, about 25,777, rounded to
+25,800, whose scheduled time is 1,791,429,092 + 25,800 × 30 = 1,792,203,092
+(2026-10-17 02:11:32 UTC).
+
+The schedule bounds the real height only loosely. ASERT is anchored at the
+genesis block with a 2 h half-life, so at a steady network hashrate `H` the
+chain runs `240 × log2(H / H0)` blocks ahead of the schedule (behind it when
+negative), where `H0` ≈ 150 evaluations/s is the hashrate at which the genesis
+target (about 4,500 evaluations per block) gives 30 s blocks. At 16 × `H0`
+the activation arrives about 8 h before the scheduled time, at 128 × `H0`
+about 14 h before; the chain would already have been past 25,800 at the
+decision only above about 4,400 × `H0`. Below `H0` the chain lags the
+schedule, and from the activation the hardened pow limit (the genesis target,
+"Pow limit (POW-3)") stretches block times to about 30 s × `H0 / H` until the
+hashrate rises. Before the release, the mainnet tip (`getdaginfo`
+`tip_height`, `next_block_height`) and the current `bits` must be read from a
+node: the tip must be well below 25,800, else the height must be moved again
+before the chain reaches it; the observed block rate gives the real time of
+the activation; `bits` easier than `0x1f0e9036` means the post-activation
+slowdown above (`RUNNING.md`, "Hardening activation"). The rules switch at
+the height, whatever the time.
+
+Every node and miner must run a release with this height before the chain
+reaches it (`RUNNING.md`, "Hardening activation"); a node with the old height
+(or none) keeps the old rules there and splits from the upgraded nodes.
+Moving the height again is one constant
+(`crates/gnb-crypto/src/core/activation.rs`), its copies in the generator of
+the consensus vectors (`MAINNET_ACT`) and the three Python references
+(`gnb_validity.py`, `gnb_merkle.py`, `gnb_difficulty.py`), the regenerated
+`reference/{tx,block,merkle,difficulty}_vectors.json`, a rebuilt and re-pinned
+web-wallet core (`site/wallet/gnb_wallet.wasm` compiles the height in;
+`scripts/build-wallet-wasm.sh`) and a new node package version.
 
 Every consensus change of the 2026-10-14 audit activates at this ONE height.
 The schedule is defined in `crates/gnb-crypto/src/core/activation.rs`, and the

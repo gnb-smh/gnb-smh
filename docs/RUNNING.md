@@ -3,8 +3,11 @@
 ## Hardening activation: upgrade before mainnet height 25,800
 
 > **Every mainnet node and miner must run this release before the chain
-> reaches height 25,800** (about **2026-10-17 02:11 UTC** on the ASERT
-> schedule: genesis time + 25,800 × 30 s).
+> reaches height 25,800.** The deadline is the height: watch `getdaginfo`
+> `next_block_height`. On the ASERT schedule (genesis time + 25,800 × 30 s)
+> that is **2026-10-17 02:11 UTC**, but the chain runs ahead of the schedule
+> by about 240 blocks (2 h) per doubling of the network hashrate above about
+> 150 evaluations/s (8 h early at 16 times that), so do not wait for the date.
 
 - From height 25,800 the consensus rules of the 2026-10-14 audit apply on
   mainnet (`docs/CONSENSUS.md`, "Activation"; testnet and regtest apply them
@@ -15,18 +18,51 @@
   splits from the upgraded network at the activation block and follows a
   separate chain. A build of this release made before 2026-10-16 activates
   at 110,000 and splits the same way: upgrade it too.
+- Check the upgrade on each node: `getnetworkinfo` reports `version` 0.1.1
+  and `hardening_activation_height` 25800, and `getdaginfo` the same height
+  and `hardening_active` for `next_block_height`. A node reporting version
+  0.1.0 or no `hardening_activation_height` there is a build from before the
+  move (`getblocktemplate` shows 110000 on such a build of this release, and
+  nothing on the pre-hardening release) and must be replaced. Peers see the
+  identify agent `gnb/0.1.1/...`; the RPC does not list peers' agents
+  (`getpeerinfo` reports only counts), so network-wide adoption cannot be
+  read from one node.
 - Miners: a template for the activation block and after must come from an
   upgraded node. `getblocktemplate` reports `hardening_activation_height`
-  (25800 on mainnet) and `hardening_active` for the template's height;
-  `getdaginfo` reports `next_block_height`.
+  (25800 on mainnet) and `hardening_active` for the template's height.
 - Wallets sign version-3 transactions from the activation height on; a
   wallet built before this release (including a web-wallet core compiled
   with the old height) signs version 1 there, which every upgraded node
-  refuses.
-- The height comes from the schedule, not from a fixed date: if the release
-  ships later than planned, or the chain is ahead of the schedule, the
-  height must be moved again before the chain reaches it (one constant plus
-  the regenerated vectors; see the constant's documentation).
+  refuses. The committed web-wallet core (`site/wallet/gnb_wallet.wasm`) is
+  built with 25,800; the site must be deployed from this release before the
+  activation.
+- Transactions signed before the activation (version 1) that are still
+  unconfirmed when `next_block_height` reaches 25,800 are dropped from every
+  upgraded node's mempool and refused from then on (no transaction is valid
+  under both regimes: `docs/CONSENSUS.md`, "Transaction signatures" and
+  "Which height"). Services holding pending or pre-signed payments must
+  sign them again, as version 3, after the activation.
+- Release check (before tagging, by whoever ships it): read the mainnet tip
+  (`getdaginfo` `tip_height`, `next_block_height`) and the current `bits`
+  (`getblocktemplate`) from a mainnet node. The height 25,800 was derived
+  from the schedule, not from an observed tip (`docs/CONSENSUS.md`,
+  "Activation"). The tip must be well below 25,800, and (25,800 -
+  `next_block_height`) × the observed block interval is the real time left.
+  If `bits` is easier than the genesis target `0x1f0e9036` (network hashrate
+  below about 150 evaluations/s), blocks after the activation slow to about
+  30 s × (genesis work / current work) until the hashrate rises (POW-3):
+  record the expected interval here, or reconsider the timing.
+- If the release ships later than planned, or the chain is too close to the
+  height, the height must be moved again before the chain reaches it: the
+  constant `MAINNET_HARDENING_ACTIVATION_HEIGHT`, its copies in
+  `crates/gnb-crypto/tests/gen_consensus_vectors.rs` (`MAINNET_ACT`),
+  `reference/gnb_validity.py` (`HARDENING_ACTIVATION_HEIGHT`),
+  `reference/gnb_merkle.py` and `reference/gnb_difficulty.py`
+  (`MAINNET_HARDENING_ACTIVATION_HEIGHT`), the regenerated
+  `reference/{tx,block,merkle,difficulty}_vectors.json` (with their
+  generators), a rebuilt and re-pinned web-wallet core
+  (`scripts/build-wallet-wasm.sh`, then deploy the site), a new node package
+  version, and these notes (see the module documentation of `activation.rs`).
 
 ## Requirements
 

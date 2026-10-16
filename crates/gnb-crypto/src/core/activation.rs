@@ -60,11 +60,13 @@
 //! `node_chain_id()` then reports Mainnet. [`hardening_activation_height`]
 //! follows the same rule and returns the **mainnet** height. Consequences:
 //!
-//! - every existing test, which builds DAGs far below the mainnet height
-//!   (25,800), keeps exercising the old rules and keeps passing unchanged; a
-//!   test that needs a mainnet-regime height above that, or a boundary
-//!   height, derives it from [`MAINNET_HARDENING_ACTIVATION_HEIGHT`] or pins
-//!   its own activation height, never a literal;
+//! - a test that builds its DAG far below the mainnet height (25,800), as
+//!   almost every test does, keeps exercising the old rules; a test that
+//!   needs a mainnet-regime height above that, or a boundary height, derives
+//!   it from [`MAINNET_HARDENING_ACTIVATION_HEIGHT`] or pins its own
+//!   activation height, never a literal (the two that replay old-rules history
+//!   past 25,800, `node/tests/backfill_flood_lab.rs` and
+//!   `node/tests/ghostdag_replay_snapshot.rs`, pin [`NEVER`]);
 //! - a binary that forgot to set its chain id behaves like a mainnet node, the
 //!   conservative choice (it never applies the new rules early);
 //! - tests of the new rules must opt in explicitly, with an activation-height
@@ -96,7 +98,11 @@
 //! regenerating `reference/{tx,block,merkle,difficulty}_vectors.json` with
 //! their generators. The pinned web-wallet core (`site/wallet/gnb_wallet.wasm`)
 //! compiles the height in (`hardening_activation_height_for_signer`) and must
-//! be rebuilt and re-pinned (`scripts/build-wallet-wasm.sh`).
+//! be rebuilt and re-pinned (`scripts/build-wallet-wasm.sh`, which also
+//! refreshes the site's SRI hashes) and the site redeployed. The node's
+//! package version (`node/Cargo.toml`) should change with it, so that
+//! `getnetworkinfo` `version` and the identify agent tell the builds apart
+//! (`getnetworkinfo` / `getdaginfo` also report the height itself).
 
 use std::cell::Cell;
 
@@ -106,17 +112,30 @@ use super::ChainId;
 /// decision of 2026-10-16 (it was 110,000, about 30 days after the release,
 /// before that decision).
 ///
-/// Derivation (no node was queried; the height comes from the ASERT
-/// schedule, which anchors the difficulty at the genesis block and keeps the
-/// chain height on `(time - genesis time) / 30 s`): genesis timestamp
-/// 1,791,429,092 (2026-10-08 03:11:32 UTC), 30 s target spacing. On
-/// 2026-10-16 02:00 UTC the schedule height is about 22,897; one day more is
-/// 86,400 / 30 = 2,880 blocks, about 25,777, rounded to 25,800, whose
-/// scheduled time is 1,791,429,092 + 25,800 * 30 = 1,792,203,092
-/// (2026-10-17 02:11:32 UTC). Every mainnet block at the time of the decision
-/// is below 25,800, so no existing block changes regime. If the release ships
-/// later than planned, this height must be moved again (before the chain
-/// reaches it), with the vectors regenerated (module docs).
+/// Derivation (no mainnet node was reachable, so the height comes from the
+/// ASERT schedule `(time - genesis time) / 30 s`, not from an observed tip):
+/// genesis timestamp 1,791,429,092 (2026-10-08 03:11:32 UTC), 30 s target
+/// spacing. On 2026-10-16 02:00 UTC the schedule height is about 22,897; one
+/// day more is 86,400 / 30 = 2,880 blocks, about 25,777, rounded to 25,800,
+/// whose scheduled time is 1,791,429,092 + 25,800 * 30 = 1,792,203,092
+/// (2026-10-17 02:11:32 UTC).
+///
+/// The schedule bounds the real height only loosely. ASERT is anchored at the
+/// genesis block with a 2 h half-life ([`super::ASERT_HALFLIFE_SECS`]): at a
+/// steady network hashrate `H` the chain runs `240 * log2(H / H0)` blocks
+/// ahead of the schedule (behind it when negative), where `H0`, about 150
+/// evaluations/s, is the hashrate at which the genesis target
+/// (`GENESIS_BITS`, about 4,500 evaluations per block) gives 30 s blocks. At
+/// 16 times `H0` the height arrives about 8 h before 2026-10-17 02:11 UTC,
+/// at 128 times about 14 h before; the chain would already have passed
+/// 25,800 at the decision only above about 4,400 times `H0`. Below `H0` the
+/// chain lags the schedule and the hardened pow limit (the genesis target,
+/// POW-3) stretches block times from the activation on (`docs/CONSENSUS.md`,
+/// "Pow limit (POW-3)"). So before the release the real tip and bits must be
+/// read from a mainnet node (`docs/RUNNING.md`, "Hardening activation"): the
+/// tip must be well below 25,800, or this height must be moved again (before
+/// the chain reaches it; module docs), and the deadline is the height, not
+/// the date.
 pub const MAINNET_HARDENING_ACTIVATION_HEIGHT: u64 = 25_800;
 
 /// Testnet activates the hardening rules from genesis.
