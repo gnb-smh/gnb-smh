@@ -15,7 +15,12 @@ use std::collections::BTreeMap;
 pub const MAGIC: &[u8; 8] = b"GNBPSBT\xff";
 pub const VERSION: u16 = 1;
 pub const MAX_BYTES: usize = 8 * 1024 * 1024;
-pub const MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
+// Every hex payload comes from the <= MAX_BYTES binary representation.
+// The non-hex metadata is bounded by 181,504 bytes: 256 + 64 *
+// (256 + 7 * (128 + 16 * 11) + 7 * 64). These conservative per-object
+// budgets cover field names, delimiters, 20-digit u64 and 10-digit u32.
+// The extra 256 KiB therefore preserves JSON transport for every binary.
+pub const MAX_JSON_BYTES: usize = 2 * MAX_BYTES + 256 * 1024;
 pub const MAX_INPUTS: usize = 64;
 pub const MAX_OUTPUTS: usize = 64;
 pub const MAX_TX_BYTES: usize = 1_000_000;
@@ -846,7 +851,11 @@ impl PqPsbt {
                     .collect(),
             ),
         };
-        serde_json::to_string(&document).map_err(|e| e.to_string())
+        let text = serde_json::to_string(&document).map_err(|e| e.to_string())?;
+        if text.len() > MAX_JSON_BYTES {
+            return Err("PQ-PSBT JSON exceeds limit".into());
+        }
+        Ok(text)
     }
 }
 
@@ -964,6 +973,19 @@ fn field<'a>(request: &'a serde_json::Value, name: &str) -> Result<&'a str, Stri
         .ok_or_else(|| format!("missing string field `{name}`"))
 }
 
+/// No private material or extension fields belong in these public-data roles.
+pub fn check_request_fields(request: &serde_json::Value, allowed: &[&str]) -> Result<(), String> {
+    let object = request
+        .as_object()
+        .ok_or("PQ-PSBT request must be an object")?;
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("unknown PQ-PSBT request field `{key}`"));
+        }
+    }
+    Ok(())
+}
+
 pub fn context_from_request(request: &serde_json::Value) -> Result<SignContext, String> {
     Ok(SignContext {
         network: parse_network(field(request, "network")?)?,
@@ -993,6 +1015,18 @@ pub fn public_request_with_limits(
         }
     }
     let action = field(request, "action")?;
+    let fields: &[&str] = match action {
+        "decode" => &["op", "action", "hex"],
+        "encode" => &["op", "action", "json"],
+        "create" => &["op", "action", "spend_json"],
+        "update" => &["op", "action", "hex", "index", "input_json"],
+        "combine" => &["op", "action", "hex", "other_hex"],
+        "review" | "finalize" | "extract" => {
+            &["op", "action", "hex", "network", "next_height", "max_fee"]
+        }
+        _ => return Err("unknown PQ-PSBT action".into()),
+    };
+    check_request_fields(request, fields)?;
     let mut p = match action {
         "encode" => PqPsbt::from_json(field(request, "json")?)?,
         "create" => PqPsbt::from_legacy_json(field(request, "spend_json")?)?,
@@ -1252,5 +1286,207 @@ mod tests {
         })
         .unwrap();
         assert!(v3.finalize(&ctx).is_ok());
+    }
+    #[test]
+    fn pqpsbt_transport_budget_precedes_all_actual_signature_verification() {
+        use crate::crypto::POLICY_VERIFICATION_CALLS;
+        let (keys, mut p, context) = fixture();
+        for key in [&keys[0], &keys[2]] {
+            p.sign(&context, &key.public_key, |d, v| key.sign_tx_digest(d, v))
+                .unwrap();
+        }
+        let request = serde_json::json!({"action":"extract","hex":hex::encode(p.to_bytes().unwrap()),
+            "network":"mainnet","next_height":"17499","max_fee":"5000000"});
+        for (inputs, signatures) in [(0, 16), (4, 1)] {
+            POLICY_VERIFICATION_CALLS.with(|n| n.set(0));
+            let result = public_request_with_limits(&request, inputs, signatures);
+            assert!(result.unwrap_err().contains("budget"));
+            assert_eq!(POLICY_VERIFICATION_CALLS.with(|n| n.get()), 0);
+        }
+        POLICY_VERIFICATION_CALLS.with(|n| n.set(0));
+        assert!(public_request_with_limits(&request, 4, 16).is_ok());
+        let calls = POLICY_VERIFICATION_CALLS.with(|n| n.get());
+        // All partials, selected witnesses, then existing consensus verifier.
+        assert_eq!(calls, 6);
+        eprintln!("PQ-PSBT verification calls: rejected=0; accepted 2 partials={calls}");
+    }
+
+    #[test]
+    fn pqpsbt_combine_conflicts_and_failed_signing_are_atomic() {
+        let (keys, mut p, context) = fixture();
+        let mut input = p.inputs[0].clone();
+        input.derivations.push(Derivation {
+            key_index: 0,
+            fingerprint: [1; 4],
+            path: vec![0x80000001],
+        });
+        p.update_input(0, input).unwrap();
+        let before = p.to_bytes().unwrap();
+        let mut other = p.clone();
+        other.inputs[0].derivations[0].fingerprint = [2; 4];
+        assert!(p.combine(&other).is_err());
+        assert_eq!(p.to_bytes().unwrap(), before);
+        let mut update = p.inputs[0].clone();
+        update.prevout.value += 1;
+        assert!(p.update_input(0, update).is_err());
+        assert_eq!(p.to_bytes().unwrap(), before);
+        assert!(p
+            .sign(&context, &keys[0].public_key, |_, _| Err(
+                "hardware signer refused".into()
+            ))
+            .is_err());
+        assert_eq!(p.to_bytes().unwrap(), before);
+        p.spend.signatures[0].insert(0, vec![1]);
+        other = p.clone();
+        other.spend.signatures[0].insert(0, vec![2]);
+        assert!(p.combine(&other).is_err());
+        other = p.clone();
+        other.spend.tx.outputs[0].value += 1;
+        assert!(p.combine(&other).is_err());
+    }
+
+    #[test]
+    fn pqpsbt_binary_limit_preserves_equivalent_bounded_json() {
+        let (_, mut p, _) = fixture();
+        let original = strict_tx(p.inputs[0].previous_tx.as_ref().unwrap()).unwrap();
+        p.inputs = vec![p.inputs[0].clone(); 9];
+        p.spend.amounts = vec![5_000_000; 9];
+        p.spend.signatures = vec![BTreeMap::new(); 9];
+        p.spend.tx.inputs = vec![p.spend.tx.inputs[0].clone(); 9];
+        for i in 0..9 {
+            let mut previous = original.clone();
+            previous.inputs = vec![previous.inputs[0].clone(); 100];
+            for (j, input) in previous.inputs.iter_mut().enumerate() {
+                input.prev_txid = [i as u8; 32];
+                input.prev_index = j as u32;
+                input.script_sig = vec![i as u8; 9000];
+            }
+            p.spend.tx.inputs[i].prev_txid = previous.txid();
+            p.inputs[i].previous_tx = Some(previous.to_wire_bytes(true));
+        }
+        let mut remaining = MAX_BYTES - 1 - p.to_bytes().unwrap().len();
+        for i in 0..9 {
+            let mut previous = strict_tx(p.inputs[i].previous_tx.as_ref().unwrap()).unwrap();
+            let add = remaining.min(MAX_TX_BYTES - previous.wire_size(true));
+            let mut extra = add;
+            for input in &mut previous.inputs {
+                let chunk = extra.min(10_000 - input.script_sig.len());
+                input.script_sig.extend(std::iter::repeat_n(i as u8, chunk));
+                extra -= chunk;
+            }
+            assert_eq!(extra, 0);
+            p.spend.tx.inputs[i].prev_txid = previous.txid();
+            p.inputs[i].previous_tx = Some(previous.to_wire_bytes(true));
+            remaining -= add;
+        }
+        assert_eq!(remaining, 0);
+        assert_eq!(p.to_bytes().unwrap().len(), MAX_BYTES - 1);
+        let text = p.to_json().unwrap();
+        assert!(
+            text.len() > 2 * MAX_BYTES,
+            "fixture must exercise the old insufficient JSON cap"
+        );
+        assert!(text.len() <= MAX_JSON_BYTES);
+        assert_eq!(
+            PqPsbt::from_json(&text).unwrap().to_bytes().unwrap(),
+            p.to_bytes().unwrap()
+        );
+        assert!(PqPsbt::from_json(&" ".repeat(MAX_JSON_BYTES + 1)).is_err());
+        eprintln!(
+            "maximum-size binary={} JSON={} cap={MAX_JSON_BYTES}",
+            MAX_BYTES - 1,
+            text.len()
+        );
+    }
+
+    #[test]
+    fn pqpsbt_public_request_rejects_unknown_and_secret_fields() {
+        let (_, p, _) = fixture();
+        let request =
+            serde_json::json!({"action":"decode","hex":hex::encode(p.to_bytes().unwrap())});
+        assert!(public_request(&request).is_ok());
+        for field in ["private_key", "password", "wallet", "unexpected"] {
+            let mut bad = request.clone();
+            bad[field] = "untrusted metadata".into();
+            assert!(
+                public_request(&bad).is_err(),
+                "unexpected field {field} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn pqpsbt_max_transport_budget_measures_48_verifications_and_zero_when_over() {
+        use crate::crypto::POLICY_VERIFICATION_CALLS;
+        let keys = (0..4).map(|_| generate_keypair(false)).collect::<Vec<_>>();
+        let policy =
+            SpendPolicy::new(4, keys.iter().map(|k| k.public_key.clone()).collect(), 0, 0).unwrap();
+        let inputs = (1..=4).map(|i| ([i; 32], 0, 5_000_000)).collect::<Vec<_>>();
+        let mut spend = PolicySpend::new(
+            Network::Mainnet,
+            policy,
+            &inputs,
+            vec![9; 20],
+            1_000_000,
+            0,
+            0,
+        )
+        .unwrap();
+        spend.target_height(17_500).unwrap();
+        let mut p = PqPsbt::from_policy_spend(spend).unwrap();
+        let context = SignContext {
+            network: Network::Mainnet,
+            next_height: 17_500,
+            max_fee: 20_000_000,
+        };
+        for key in keys {
+            p.sign(&context, &key.public_key, |d, v| key.sign_tx_digest(d, v))
+                .unwrap();
+        }
+        let request = serde_json::json!({"action":"finalize","hex":hex::encode(p.to_bytes().unwrap()),
+            "network":"mainnet","next_height":"17500","max_fee":"20000000"});
+        for (inputs, signatures) in [(3, 16), (4, 15)] {
+            POLICY_VERIFICATION_CALLS.with(|n| n.set(0));
+            assert!(public_request_with_limits(&request, inputs, signatures)
+                .unwrap_err()
+                .contains("budget"));
+            assert_eq!(POLICY_VERIFICATION_CALLS.with(|n| n.get()), 0);
+        }
+        POLICY_VERIFICATION_CALLS.with(|n| n.set(0));
+        assert!(public_request_with_limits(&request, 4, 16).is_ok());
+        assert_eq!(POLICY_VERIFICATION_CALLS.with(|n| n.get()), 48);
+        eprintln!("PQ-PSBT maximum transport: 4 inputs/16 partials, accepted=48 verifier calls, over-budget=0");
+    }
+
+    #[test]
+    fn pqpsbt_signer_does_not_commit_earlier_input_when_later_callback_fails() {
+        let (keys, mut p, _) = fixture();
+        p.spend.target_height(17_500).unwrap();
+        p.inputs[0].previous_tx = None;
+        p.inputs.push(p.inputs[0].clone());
+        p.spend.amounts.push(p.spend.amounts[0]);
+        p.spend.signatures.push(BTreeMap::new());
+        let mut input = p.spend.tx.inputs[0].clone();
+        input.prev_index = 1;
+        p.spend.tx.inputs.push(input);
+        let before = p.to_bytes().unwrap();
+        let calls = std::cell::Cell::new(0);
+        let context = SignContext {
+            network: Network::Mainnet,
+            next_height: 17_500,
+            max_fee: 10_000_000,
+        };
+        assert!(p
+            .sign(&context, &keys[0].public_key, |d, v| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    Err("signer refused second input".into())
+                } else {
+                    keys[0].sign_tx_digest(d, v)
+                }
+            })
+            .is_err());
+        assert_eq!(calls.get(), 2);
+        assert_eq!(p.to_bytes().unwrap(), before);
     }
 }

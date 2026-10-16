@@ -98,7 +98,7 @@ No trailing bytes, unknown versions, unknown networks, duplicate keys or
 unknown fields. This format does not retain unknown extension fields.
 
 Limits checked before variable binary-field allocation: complete binary
-8 MiB; JSON 16 MiB; transaction/previous transaction 1,000,000 bytes;
+8 MiB; JSON `2 * 8 MiB + 256 KiB` (17,039,360 bytes); transaction/previous transaction 1,000,000 bytes;
 policy 65,536 bytes; tree 262,144 bytes; locking script 10,000 bytes;
 64 inputs and 64 outputs in the unsigned transaction; 7 derivations and
 7 signatures per input; 16 child indices per derivation; signature 8,192
@@ -144,3 +144,53 @@ strict fee/network checks and the existing H-1/H version boundary. This is
 an intermediate integration commit: independent vectors, broader tests,
 production reversal, frontend integration, canonical WASM rebuild, independent
 review and CI are still delivery gates. No completed PF-2 or rating is claimed.
+
+## Additional validation and boundary correction
+
+The initial 16 MiB JSON cap was insufficient for equivalence at the binary
+limit. A valid 8,388,607-byte binary produces 16,777,697 bytes of canonical
+JSON. The first attempted fixture had one 900,000-byte script_sig and failed
+setup at the existing transaction decoder; it is not counted as reproduction.
+The corrected fixture uses nine previous transactions, each with 100 bounded
+script_sigs, and distinct outpoints. Its old-cap test failed at the asserted
+JSON property. Before publication, the owner approved increasing only the
+JSON cap to `2 * MAX_BYTES + 256 KiB`; binary admission remains 8 MiB.
+Hex payload contributes at most twice the binary size. A conservative bound
+on JSON names, punctuation and numeric metadata is
+`256 + 64 * (256 + 7 * (128 + 16 * 11) + 7 * 64) = 181,504` bytes,
+below the 262,144-byte margin. The independent Python construction measures
+121,337 bytes of maximum metadata. Both input and output guards remain.
+`pqpsbt_binary_limit_preserves_equivalent_bounded_json` proves the concrete
+boundary round trip and refusal above the new JSON cap.
+
+Unknown public-request fields were separately reproduced: a valid decode
+request with `private_key` metadata was accepted. A central per-action
+allowlist now rejects unknown/secret fields. Documents remain exact strings
+so duplicate document fields cannot be erased by an intermediate JSON map.
+
+Focused host execution: 10 core unit tests and two integration tests passed;
+WASM host suite: nine tests passed. Independent Python vectors (45 accepted,
+95 rejected binary, 64 rejected JSON) all match Rust verdicts, binary bytes,
+and literal compact JSON. Another 512 seeded binary mutations agree with the
+Python JSONL oracle; 95 are accepted controls. These 716 comparisons are a
+bounded wallet-format differential, not a full-consensus or 10^7-case claim.
+The reference and its expected vectors were authored independently in a
+separate package and were not modified to match Rust output.
+
+Actual strict signature-verifier calls are measured by a test-only,
+thread-local counter at the existing crypto entry points, including the
+final consensus witness check. Two partial signatures cause six calls.
+At the proposed RPC frontend limit, four inputs and 16 valid partials cause
+48 calls (all partials, selected witnesses, final witness verification).
+The same request exceeding either the input or signature budget causes zero
+calls. This measures signature-verifier invocations, not individual lattice
+primitive calls, request latency or the frontend's HTTP admission behavior.
+
+The format supports only one policy or one selected tree branch across all
+inputs. Offline review checks structure, supplied previous-transaction
+contents, explicit network/height, absolute locktime, activation and strict
+fee ceiling. It does not establish current unspentness, coinbase maturity or
+relative input age; the online frontend owns those node observations. The
+finalizer keeps the existing PolicySpend choice of the threshold lowest-index
+signers common to every input. RPC scheduling, node-backed policysign, browser
+wrappers and canonical WASM build/pins are separate integration packages.
