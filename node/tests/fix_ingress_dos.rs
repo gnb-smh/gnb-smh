@@ -6,8 +6,11 @@
 //! budgets), B1-T7 (who a refused frame is charged to) and B1-T19 (the
 //! transaction verification budget).
 //!
-//! Each test was seen failing on the unmodified code (or, for a new API, with
-//! the fix reverted); see the package report. Node test builds enable
+//! Revert checks (the production hunk reverted, the test run, the hunk
+//! restored) were run for the POW-3, NET-2, NET-4 and POW-4 tests and for
+//! the review-finding tests: each failed with its hunk reverted (see the
+//! package report for the table). The B1-T5, B1-T7 and B1-T19 tests that
+//! predate the review were not revert-checked. Node test builds enable
 //! gnb-crypto's `test-pow-limit` feature (every expected target is the pow
 //! limit); proofs are marked verified (`test_only_assume_pow_valid`) where a
 //! test needs many blocks, and left unevaluated (garbage nonce, nothing
@@ -157,8 +160,9 @@ fn tip_work(n: &Node) -> u128 {
 /// "now" (under the absolute-schedule ASERT every child of A then has the
 /// pow-limit target) and floods 50 children of A, then 50 orphans on top of
 /// them. Pre-fix every one of them was stored and inserted (the anti-DoS
-/// work rule's threshold is relative to the victim's own tip; reproduced on
-/// the unmodified code: "admitted 51 unrequested blocks; DAG grew by 51").
+/// work rule's threshold is relative to the victim's own tip). Revert
+/// check: with the unrequested-block rule removed from
+/// `handle_block_gated`, A is no longer dropped and this test fails.
 /// Now the node knows it is in initial block download (its tip is below the
 /// minimum chain work, Bitcoin Core's `nMinimumChainWork`) and stores no
 /// block it did not ask for: everything is dropped before structure, proof
@@ -305,7 +309,8 @@ fn pow3_submitblock_is_subject_to_the_minimum_chain_work_only() {
 /// POW-3 / POW-4: the orphan drain is iterative. A recursive drain (one
 /// frame per accepted orphan, as before the audit fix) overflows this
 /// thread's small stack on a 3,000-orphan chain; the iterative one does not.
-/// (Verified with the drain made recursive again: this test aborts with a
+/// (Revert check: with the queue replaced by a recursive call per accepted
+/// orphan, the test binary aborts with a
 /// stack overflow.)
 #[test]
 fn drain_of_a_deep_orphan_chain_runs_on_a_small_stack() {
@@ -343,7 +348,7 @@ fn drain_of_a_deep_orphan_chain_runs_on_a_small_stack() {
 /// orphan with parents [tip, Y]. Pre-fix Y was admitted `MergeBacked` and
 /// the drain stored all of Z without any work check, with a valid voucher
 /// and with one that can never be valid (stamped before its parents) —
-/// reproduced on the unmodified code: "60 of 60 Z blocks stored". `act` is
+/// the auditor's measurement; not re-run by revert here. `act` is
 /// the hardening activation height in force.
 fn b1t5_scenario(invalid_voucher: bool, act: u64) -> (usize, bool, BlockOutcome, Option<BlockOutcome>) {
     let _a = core::activation::scoped_override(act);
@@ -784,8 +789,10 @@ fn net2_floor_failure_penalises_gossip_authors_never_pull_answers() {
 /// `Reject`); never for a contextual fault (an older release relays orphans
 /// before it knows their parents) — and never before the activation (an
 /// older release relays every frame unvalidated). Pre-fix every `Reject`
-/// was charged to the delivering relay (reproduced live:
-/// `fix_net_live::live_legacy_relay_is_not_graylisted_for_forwarding_invalid_blocks`).
+/// was charged to the delivering relay (the re-audit reproduced that live;
+/// `fix_ingress_live::live_legacy_relay_is_not_graylisted_for_forwarding_invalid_blocks`
+/// checks the fixed behaviour with a stand-in validator that calls
+/// `block_penalty`, not the node's processor).
 #[test]
 fn b1t7_block_penalty_follows_the_author_and_the_rollout() {
     use BlockFault::*;
@@ -873,9 +880,9 @@ fn big_junk(n: usize) -> (Node, Vec<Transaction>) {
 /// B1-T19: a 1-input transaction carrying ~390 kB of outputs cost ONE token
 /// while every input's sighash v2 re-encodes and hashes the whole
 /// transaction (and the frame's decoding and three wtxid hashes ran free):
-/// a 400-token burst bought 400 such frames — reproduced on the unmodified
-/// code: "100 of 100 frames of 398782 bytes reached signature
-/// verification". The gate is now priced in signatures AND bytes hashed,
+/// a 400-token burst bought 400 such frames (the engineer's measurement
+/// on the unmodified code: "100 of 100 frames of 398782 bytes reached
+/// signature verification"; not revert-checked). The gate is now priced in signatures AND bytes hashed,
 /// and the frame's decoding is charged first: the same burst buys
 /// `400 / (frame + gate)` of them.
 #[test]

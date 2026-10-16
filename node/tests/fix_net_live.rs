@@ -254,7 +254,8 @@ async fn live_relay_forwards_only_validated_blocks() {
 /// force, as on a chain past the hardening activation — before it, B1-T7's
 /// gate would spare the relay anyway). With `validate_messages()` removed
 /// from the gossipsub configuration, B forwards all five, C graylists B and
-/// D's block never arrives (verified in the Phase-4 worktree).
+/// D's block never arrives: revert check run in the R2b worktree, the test
+/// fails at "honest C must still receive D's block through honest B".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_relayed_violations_do_not_cut_honest_relay() {
     init_log();
