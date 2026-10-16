@@ -2457,11 +2457,11 @@ mod powit_pow_tests {
     use super::*;
     use primitive_types::U256;
 
-    /// Activation used by the tests in this binary. Far above any height the
-    /// other tests touch, so it cannot change their outcome.
-    const TEST_ACTIVATION: u64 = 1 << 40;
+    /// Shared activation for this binary. Tests of the switch initialize it
+    /// explicitly; ordinary low-height fixtures remain below it.
+    pub(super) const TEST_ACTIVATION: u64 = 1 << 40;
 
-    fn activate() {
+    pub(super) fn activate() {
         set_powit_height_override(TEST_ACTIVATION).expect("one activation height per test binary");
     }
 

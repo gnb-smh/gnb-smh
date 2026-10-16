@@ -1007,6 +1007,13 @@ async fn handle_rpc(
     // the client the proxy names (when the peer is a proxy) and never fully
     // trusted.
     let forwarded = auth::forwarded_client(&headers, &state.proxy_client_header);
+    // B1-R2-9: the method is in the untrusted body and operator status
+    // requires hashing a key. Bound both before doing either operation.
+    if !auth::admit_before_auth(client_ip, forwarded, state.trust_private_ranges, &state.rate_limiter) {
+        crate::metrics::inc_rpc_request("unknown", "rate_limited");
+        return rpc_transport_error(StatusCode::TOO_MANY_REQUESTS, -32002,
+            "rate limit exceeded; retry after a minute");
+    }
     // B1-T4: the body limit depends on the method (`read_rpc_body`); the
     // operator's callers (known from the headers) have reserved permits.
     let operator = matches!((presented_key, state.api_key.as_deref()), (Some(p), Some(c)) if auth::keys_match(p, c))
@@ -1072,7 +1079,7 @@ async fn handle_rpc(
         );
     }
 
-    let decision = auth::authorize_request(
+    let decision = auth::authorize_admitted_request(
         client_ip,
         forwarded,
         method,
@@ -3710,6 +3717,10 @@ mod audit_2026_10_rpc_tests {
     /// One POST through the real router, from `peer`, with extra headers.
     /// Returns the status and the body (JSON when it parses, else a string).
     async fn post_raw(state: &AppState, peer: &str, headers: &[(&str, &str)], body: Vec<u8>) -> (StatusCode, Value) {
+        post_body(state, peer, headers, axum::body::Body::from(body)).await
+    }
+
+    async fn post_body(state: &AppState, peer: &str, headers: &[(&str, &str)], body: axum::body::Body) -> (StatusCode, Value) {
         use axum::http::Request;
         use tower::util::ServiceExt;
         let peer: std::net::SocketAddr = peer.parse().unwrap();
@@ -3721,7 +3732,7 @@ mod audit_2026_10_rpc_tests {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        let resp = router.oneshot(req.body(axum::body::Body::from(body)).unwrap()).await.unwrap();
+        let resp = router.oneshot(req.body(body).unwrap()).await.unwrap();
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into()));
@@ -3730,6 +3741,68 @@ mod audit_2026_10_rpc_tests {
 
     fn rpc_body(method: &str, params: Value) -> Vec<u8> {
         serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn r7_rpc_rejects_key_flood_before_body_and_hash_work() {
+        let (_tmp, mut state) = state_with_chain(1);
+        state.api_key = Some("k".repeat(32));
+        state.rate_limiter = Arc::new(auth::RateLimiterSet::new(2, 1));
+        auth::KEY_HASH_BYTES.with(|n| n.set(0));
+        let attack = "x".repeat(8192);
+        let mut refused = 0;
+        let body_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for i in 0..100 {
+            // Malformed JSON used to hash the key before rejecting the body,
+            // never reaching authorize_request or consuming any token.
+            let polls = body_polls.clone();
+            let body = axum::body::Body::from_stream(futures::stream::once(async move {
+                polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{"))
+            }));
+            let (status, _) = post_body(&state, "127.0.0.1:5000",
+                &[("x-forwarded-for", "198.51.100.7"), ("x-api-key", &attack)], body).await;
+            if i < 3 { assert_eq!(status, StatusCode::BAD_REQUEST, "admitted requests still reach the parser"); }
+            if i >= 3 && status == StatusCode::TOO_MANY_REQUESTS { refused += 1; }
+        }
+        let hashed = auth::KEY_HASH_BYTES.with(|n| n.get());
+        let polled = body_polls.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("r7 router cost: {hashed} key bytes hashed, {polled} body chunks polled");
+        assert_eq!(polled, 3, "rate-limited requests must not poll their body");
+        assert!(hashed <= 3 * (attack.len() + 32), "pre-auth budget exceeded: {hashed} hashed bytes");
+        assert_eq!(refused, 97, "must refuse before parsing the body");
+    }
+
+    #[tokio::test]
+    async fn r7_getaddressinfo_storage_work_is_independent_of_confirmed_utxos() {
+        let (_tmp, state) = state_with_chain(1);
+        state.store.ensure_aggregates().unwrap();
+        let address = [7u8; 20];
+        for i in 0..256 {
+            state.store.put_utxo(&[1u8; 32], i, &TxOutput { value: 1000, script_pubkey: address.to_vec() }).unwrap();
+        }
+        let start = state.store.storage_reads();
+        let response = dispatch("getaddressinfo", Some(&json!([crate::address::Address::from_hash(address, crate::address::Network::Mainnet).to_string()])), &state).await;
+        let reads = state.store.storage_reads() - start;
+        assert_eq!(response["balance_sats"], "256000", "{response}");
+        assert_eq!(response["utxo_count"], 256);
+        assert!(reads <= 1, "empty mempool must need at most one storage read, observed {reads}");
+    }
+
+    #[tokio::test]
+    async fn r7_getaddressinfo_does_not_scan_during_aggregate_rebuild() {
+        let (_tmp, state) = state_with_chain(1);
+        let address = [7u8; 20];
+        state.store.put_utxo(&[1u8; 32], 0, &TxOutput { value: 1000, script_pubkey: address.to_vec() }).unwrap();
+        let mut batch = rocksdb::WriteBatch::default();
+        state.store.stage_aggregates_incomplete(&mut batch).unwrap();
+        state.store.write_batch(batch).unwrap();
+        assert!(!state.store.aggregates_ready());
+        let start = state.store.storage_reads();
+        let response = dispatch("getaddressinfo", Some(&json!([crate::address::Address::from_hash(address, crate::address::Network::Mainnet).to_string()])), &state).await;
+        let reads = state.store.storage_reads() - start;
+        assert_eq!(reads, 0, "unavailable aggregates must not trigger a fallback UTXO scan");
+        assert!(response["error"].as_str().unwrap_or("").contains("aggregates"), "{response}");
     }
 
     /// B1-T4: `submitblock` carries a block as hex, about twice its wire
