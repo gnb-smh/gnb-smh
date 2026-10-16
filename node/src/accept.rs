@@ -21,9 +21,9 @@
 //! never stored. A block that passes is inserted into GhostDAG and
 //! its body is stored — fork-losers included — WITHOUT validating its
 //! transactions against the current tip's UTXO set. The stored body carries
-//! the `blue_score` derived from the block's parents (max parent blue score
-//! + 1), never the uncommitted wire value (POW-8, re-audit B1-T0), so every
-//! node stores and serves the same bytes for one block id.
+//! the `blue_score` derived from the block's parents (the max parent blue
+//! score plus one), never the uncommitted wire value (POW-8, re-audit B1-T0),
+//! so every node stores and serves the same bytes for one block id.
 //!
 //! **Connection**: the applied UTXO set always corresponds to the selected-
 //! parent chain of the best (highest blue_work, blue_score, hash) block that is
