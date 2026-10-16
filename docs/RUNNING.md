@@ -153,7 +153,13 @@ from an archival node's data dir). This includes a data dir last written by a
 release from before blocks carried undo records: its applied blocks cannot be
 rolled back, so the state is rebuilt (an archival node) or resynced (a pruned
 node). Data dirs written by this release cannot
-produce the footprint: every chain move is committed in one atomic batch.
+produce the footprint: every chain move is committed in atomic chunks of at
+most 16 blocks, each together with its undo records, the tip pointer and the
+shielded state (Bitcoin Core's `ActivateBestChain` steps through a reorg the
+same way), so the memory a reorg needs does not grow with its depth and a
+crash in the middle of a long reorg leaves a consistent intermediate chain
+state that the next start continues from. An interrupted rebuild likewise
+resumes from its last committed chunk.
 
 ## Upgrading and downgrading
 

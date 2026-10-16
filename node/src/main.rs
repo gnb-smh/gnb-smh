@@ -1063,7 +1063,7 @@ async fn main() {
                             mempool::relay::OrphanEvents::default()
                         } else {
                             relay.on_chain_moved(&store_v, &mem_v, next_height,
-                                &chain.connected_txs(), &chain.disconnected_txs(), now, unix_now_secs())
+                                &chain.connected_txs(&store_v), &chain.disconnected_txs(&store_v), now, unix_now_secs())
                         };
                         let swept = relay.retry_orphans(&store_v, &mem_v, next_height, now, unix_now_secs());
                         events.admitted.extend(swept.admitted);
@@ -1416,9 +1416,13 @@ async fn main() {
                     // as every admission.
                     if !chain.is_empty() {
                         let next_height = mempool::admission::pool_next_height(&dag2.read(), &store2, &mem2);
-                        let (connected_txs, disconnected_txs) = (chain.connected_txs(), chain.disconnected_txs());
                         let (store_v, mem_v, relay_v) = (store2.clone(), mem2.clone(), tx_relay.clone());
                         if let Ok(events) = tokio::task::spawn_blocking(move || {
+                            // R4 (B1-T20): the move lists block hashes; the
+                            // bodies are read here, off the processor loop,
+                            // within Core's 20 MB budget.
+                            let (connected_txs, disconnected_txs) =
+                                (chain.connected_txs(&store_v), chain.disconnected_txs(&store_v));
                             relay_v.lock().on_chain_moved(
                                 &store_v, &mem_v, next_height, &connected_txs, &disconnected_txs,
                                 std::time::Instant::now(), unix_now_secs())
@@ -2601,9 +2605,9 @@ mod ingress_processor_tests {
         assert!(pool.is_empty(), "the whole orphan chain was drained");
         // MEM-6 review finding: the drained blocks' move of the applied chain
         // is reported for the orphan-transaction bookkeeping.
-        assert_eq!(chain.connected.iter().map(|b| b.block_hash()).collect::<Vec<_>>(),
+        assert_eq!(chain.connected(),
             vec![b2.block_hash(), b3.block_hash()]);
-        assert!(chain.disconnected.is_empty());
+        assert!(chain.disconnected().is_empty());
         assert!(f.dag.read().has_block(&b3.block_hash()));
         let stored = f.store.get_block(&b3.block_hash()).unwrap().unwrap();
         assert_eq!(stored.blue_score, 3, "derived from parents, not the forged u64::MAX");

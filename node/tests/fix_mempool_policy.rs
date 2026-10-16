@@ -979,15 +979,22 @@ fn mem6_reorg_reinjects_a_cross_block_chain_parents_first() {
 /// order inside each block, coinbases skipped.
 #[test]
 fn mem6_disconnected_txs_are_ordered_oldest_block_first() {
-    let mk = |tag: &str, txs: Vec<Transaction>| Block {
-        header: BlockHeader { version: 1, parents: vec![[0; 32]], merkle_root: MerkleRoot::ZERO, timestamp: 0, bits: 0, nonce: 0 },
+    let mk = |tag: &str, nonce: u64, txs: Vec<Transaction>| Block {
+        header: BlockHeader { version: 1, parents: vec![[0; 32]], merkle_root: MerkleRoot::ZERO, timestamp: 0, bits: 0, nonce },
         transactions: std::iter::once(coinbase(tag, 1, vec![1; 20])).chain(txs).collect(),
         blue_score: 0, height: 0, shielded_transactions: vec![],
     };
     let (a, b, c, d) = (syn(&[(ext(1), 0)], &[9], 1, 4), syn(&[(ext(2), 0)], &[9], 2, 4), syn(&[(ext(3), 0)], &[9], 3, 4), syn(&[(ext(4), 0)], &[9], 4, 4));
-    // `disconnected` is tip-first: [B2 (c, d), B1 (a, b)].
-    let outcome = reorg::ConnectOutcome { disconnected: vec![mk("b2", vec![c.clone(), d.clone()]), mk("b1", vec![a.clone(), b.clone()])], ..Default::default() };
-    let ids: Vec<_> = outcome.disconnected_txs_oldest_first().iter().map(|t| t.txid()).collect();
+    // `disconnected` is tip-first: [B2 (c, d), B1 (a, b)]; the outcome lists
+    // hashes and the bodies are read back from storage (R4, B2-T0).
+    let (b2, b1) = (mk("b2", 2, vec![c.clone(), d.clone()]), mk("b1", 1, vec![a.clone(), b.clone()]));
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = gnb::storage::Storage::open(tmp.path()).unwrap();
+    store.put_block_body(&b2).unwrap();
+    store.put_block_body(&b1).unwrap();
+    let outcome = reorg::ConnectOutcome { disconnected: vec![b2.block_hash(), b1.block_hash()], ..Default::default() };
+    let ids: Vec<_> = outcome.reinjection_candidates(&store, reorg::MAX_DISCONNECTED_TX_POOL_BYTES)
+        .txs.iter().map(|t| t.txid()).collect();
     assert_eq!(ids, vec![a.txid(), b.txid(), c.txid(), d.txid()]);
 }
 
@@ -1408,7 +1415,7 @@ fn orphan_bookkeeping_follows_the_applied_chain_only() {
     let a1 = empty_child(&n, gh, "a1");
     let mut m = ChainMove::default();
     track(&a1, &mut m).unwrap();
-    assert_eq!((hashes(&m.connected), m.disconnected.len()), (vec![a1.block_hash()], 0));
+    assert_eq!((m.connected(), m.disconnected().len()), (vec![a1.block_hash()], 0));
     let a2 = empty_child(&n, a1.block_hash(), "a2");
     track(&a2, &mut ChainMove::default()).unwrap();
 
@@ -1429,7 +1436,7 @@ fn orphan_bookkeeping_follows_the_applied_chain_only() {
     track(&f1, &mut m).expect("accepted into the DAG");
     assert_eq!(applied_tip(&n), Some(a2.block_hash()));
     assert!(m.is_empty(), "a fork-loser applies none of its transactions");
-    let ev = relay.on_chain_moved(&n.store, &n.mempool, next, &m.connected_txs(), &m.disconnected_txs(), t0, unix_now());
+    let ev = relay.on_chain_moved(&n.store, &n.mempool, next, &m.connected_txs(&n.store), &m.disconnected_txs(&n.store), t0, unix_now());
     assert!(ev.is_empty(), "{ev:?}");
     assert!(relay.orphans().contains(&admission::wtxid(&c)), "C is still valid: P's input is unspent");
     // (The pre-fix call, the arriving block's transactions, erased it.)
@@ -1451,23 +1458,23 @@ fn orphan_bookkeeping_follows_the_applied_chain_only() {
     let f3 = empty_child(&n, f2.block_hash(), "f3");
     track(&f3, &mut m).unwrap();
     assert_eq!(applied_tip(&n), Some(f3.block_hash()));
-    assert_eq!(hashes(&m.connected), vec![f1.block_hash(), f2.block_hash(), f3.block_hash()]);
-    assert_eq!(hashes(&m.disconnected), vec![a2.block_hash(), a1.block_hash()]);
-    assert_eq!(m.connected_txs().iter().filter(|t| !t.is_coinbase()).map(|t| t.txid()).collect::<Vec<_>>(),
+    assert_eq!(m.connected(), vec![f1.block_hash(), f2.block_hash(), f3.block_hash()]);
+    assert_eq!(m.disconnected(), vec![a2.block_hash(), a1.block_hash()]);
+    assert_eq!(m.connected_txs(&n.store).iter().filter(|t| !t.is_coinbase()).map(|t| t.txid()).collect::<Vec<_>>(),
         vec![p.txid(), c.txid()]);
     assert_eq!(n.mempool.size(), 0, "P and C confirmed by F1");
 
     // A plan undone by a later one cancels out.
     let mut m = ChainMove::default();
-    m.record(reorg::ConnectOutcome { connected: vec![a1.clone(), a2.clone()], ..Default::default() });
-    m.record(reorg::ConnectOutcome { disconnected: vec![a2.clone()], connected: vec![f2.clone()], ..Default::default() });
-    assert_eq!(hashes(&m.connected), vec![a1.block_hash(), f2.block_hash()]);
-    assert!(m.disconnected.is_empty());
+    m.record(&reorg::ConnectOutcome { connected: hashes(&[a1.clone(), a2.clone()]), ..Default::default() });
+    m.record(&reorg::ConnectOutcome { disconnected: hashes(&[a2.clone()]), connected: hashes(&[f2.clone()]), ..Default::default() });
+    assert_eq!(m.connected(), vec![a1.block_hash(), f2.block_hash()]);
+    assert!(m.disconnected().is_empty());
     // DAG-6: a block rolled back from its undo record alone (body pruned)
     // has no transactions to report; it only cancels its earlier connect.
-    m.record(reorg::ConnectOutcome { disconnected_pruned: vec![f2.block_hash()], ..Default::default() });
-    assert_eq!(hashes(&m.connected), vec![a1.block_hash()]);
-    assert!(m.disconnected.is_empty());
+    m.record(&reorg::ConnectOutcome { disconnected_pruned: vec![f2.block_hash()], ..Default::default() });
+    assert_eq!(m.connected(), vec![a1.block_hash()]);
+    assert!(m.disconnected().is_empty());
 }
 
 /// Review finding (getblocktemplate x CPFP): since ancestor-package

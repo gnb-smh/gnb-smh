@@ -890,7 +890,7 @@ fn merge_witness_rejected_body_is_refetched_through_the_ingress_core() {
     assert!(!accept::awaits_body(&n.dag, &n.store, &id));
     assert!(n.store.get_utxo(&pay.txid(), 0).unwrap().is_some());
     let moved = core.take_chain_move();
-    assert_eq!(moved.connected.iter().map(|x| x.block_hash()).collect::<Vec<_>>(), vec![id]);
+    assert_eq!(moved.connected(), vec![id]);
     assert!(matches!(feed(&mut core, &n, &honest), BlockOutcome::Known), "once only");
 }
 
