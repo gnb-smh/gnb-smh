@@ -70,27 +70,36 @@ def assert_raises_rpc_error(message_substr: str | None, fun, *args, http_status:
     raise AssertionFailure(f"no RPC error raised (expected {message_substr!r})")
 
 
-def wait_until(predicate, *, timeout: float = 60, interval: float = 0.25, desc: str = "") -> None:
+def wait_until(predicate, *, timeout: float = 60, interval: float = 0.25, desc: str = "",
+               deadline: float | None = None) -> None:
     """Poll `predicate()` until it returns a truthy value or `timeout` seconds
     (scaled by TIMEOUT_FACTOR) elapse. Exceptions from the predicate count as
     "not yet" until the deadline, then the last one is re-raised in the
-    failure message."""
-    deadline = time.monotonic() + timeout * TIMEOUT_FACTOR
+    failure message. An optional absolute monotonic deadline caps the scaled
+    timeout and is never scaled again. A late predicate result cannot pass;
+    this synchronous helper cannot interrupt a predicate blocked in I/O."""
+    started = time.monotonic()
+    relative_deadline = started + timeout * TIMEOUT_FACTOR
+    deadline = relative_deadline if deadline is None else min(deadline, relative_deadline)
     last_exc = None
-    while True:
+    while time.monotonic() < deadline:
+        ready = False
         try:
-            if predicate():
-                return
+            ready = predicate()
             last_exc = None
         except AssertionError:
             raise
         except Exception as e:  # noqa: BLE001 - reported below
             last_exc = e
-        if time.monotonic() >= deadline:
-            what = desc or getattr(predicate, "__name__", "predicate")
-            extra = f"; last error: {last_exc!r}" if last_exc else ""
-            raise AssertionFailure(f"wait_until timed out after {timeout * TIMEOUT_FACTOR:.0f}s: {what}{extra}")
-        time.sleep(interval)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if ready:
+            return
+        time.sleep(min(interval, remaining))
+    what = desc or getattr(predicate, "__name__", "predicate")
+    extra = f"; last error: {last_exc!r}" if last_exc else ""
+    raise AssertionFailure(f"wait_until deadline reached after {time.monotonic() - started:.3f}s: {what}{extra}")
 
 
 # ── Ports ────────────────────────────────────────────────────────────────────
