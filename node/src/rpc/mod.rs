@@ -1030,6 +1030,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     crate::core::ChainId::Mainnet => "mainnet",
                 },
                 "version":         s.version,
+                // The hardening activation height this binary enforces on its
+                // chain (mainnet 25,800 since the 2026-10-16 decision; builds
+                // from before it do not report the field), so an operator can
+                // confirm the upgrade (docs/RUNNING.md).
+                "hardening_activation_height": crate::core::activation::hardening_activation_height(),
                 "protocol":        PROTOCOL_VERSION,
                 "net_protocol":    crate::network::PROTOCOL_VERSION,
                 "blue_score":      s.tip_blue_score,
@@ -1637,12 +1642,19 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // tip_height + 1: a template that merges a tip with a greater DAG
             // height sits higher (DAG-8).
             let next_block_height = crate::mempool::admission::pool_next_height(&dag, &state.store, &state.mempool);
+            // The activation height in force (the one block validation and
+            // the template builder read) and whether the hardening rules
+            // apply at next_block_height, as getblocktemplate reports them
+            // for its template's height.
+            let activation_height = crate::core::activation::hardening_activation_height();
             json!({
                 "tip":            tip.map(|h| hex::encode(h)),
                 "tip_blue_score": tip_data.as_ref().map(|d| d.blue_score).unwrap_or(0),
                 "tip_blue_work":  tip_data.as_ref().map(|d| d.blue_work.to_string()).unwrap_or_default(),
                 "tip_height":     tip_data.as_ref().map(|d| d.height).unwrap_or(0),
                 "next_block_height": next_block_height,
+                "hardening_activation_height": activation_height,
+                "hardening_active": crate::core::block_rules::rules_active_at(next_block_height, activation_height),
                 "block_count":    dag.block_count(),
                 "tip_count":      tips.len(),
                 "tips":           tips.iter().map(|h| hex::encode(h)).collect::<Vec<_>>(),
@@ -3065,6 +3077,31 @@ mod audit_2026_10_rpc_tests {
         let r = dispatch("getdaginfo", None, &state).await;
         assert_eq!(r["tip_height"], 5);
         assert_eq!(r["next_block_height"], 9, "the pool's next height, not tip_height + 1");
+    }
+
+    /// `getdaginfo` and `getnetworkinfo` report the hardening activation
+    /// height in force (with no chain id set, as in every test: the mainnet
+    /// height), and `getdaginfo` whether it applies at `next_block_height`,
+    /// so an operator can confirm the upgrade to the 25,800 build (builds from
+    /// before the 2026-10-16 decision do not report it; docs/RUNNING.md).
+    #[tokio::test]
+    async fn rpc_reports_the_hardening_activation_height() {
+        use crate::core::activation::{self, MAINNET_HARDENING_ACTIVATION_HEIGHT as MAINNET};
+        let (_tmp, state) = state_with_chain(5);
+        let r = dispatch("getnetworkinfo", None, &state).await;
+        assert_eq!(r["hardening_activation_height"], MAINNET);
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["hardening_activation_height"], MAINNET);
+        assert_eq!(r["hardening_active"], false, "next height 6 is below the mainnet activation");
+        state.mempool.set_next_height(MAINNET - 1);
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["hardening_active"], false);
+        state.mempool.set_next_height(MAINNET);
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["hardening_active"], true, "the activation height itself is hardened");
+        let _g = activation::scoped_override(0);
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["hardening_activation_height"], 0);
     }
 }
 

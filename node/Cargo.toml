@@ -1,6 +1,6 @@
 [package]
 name = "gnb"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["GnB developers"]
 description = "GnB (Gödel and Bell): post-quantum proof-of-work BlockDAG node — GnB-SMH sequential memory-hard PoW, hybrid Falcon-1024 + ML-DSA-65 signatures, GhostDAG"
