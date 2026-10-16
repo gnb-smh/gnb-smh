@@ -58,6 +58,25 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(first["script_pubkey"], expected.hex())
         self.assertNotEqual(first["script_pubkey"], create(expression=f"policy(2,17,9,{key(1)},{key()})")["script_pubkey"])
 
+    def test_tree_three_branch_padding_and_order(self):
+        # Build the binary commitment directly, independently of parser state.
+        encoded = []
+        for index in range(3):
+            raw = bytes.fromhex(key(index))
+            encoded.append(b"\x01\x01\x01" + len(raw).to_bytes(4, "little") + raw + index.to_bytes(4, "little") + b"\0" * 4)
+        sha = lambda raw: hashlib.sha3_256(raw).digest()
+        leaves = [sha(b"GNB-POLICY-v2/leaf" + raw) for raw in encoded]
+        leaves.append(sha(b"GNB-POLICY-v2/empty"))
+        left = sha(b"GNB-POLICY-v2/node" + leaves[0] + leaves[1])
+        right = sha(b"GNB-POLICY-v2/node" + leaves[2] + leaves[3])
+        root = sha(b"GNB-POLICY-v2/node" + left + right)
+        expected = b"\x02" + sha(b"GNB-POLICY-v1\x02\x03" + root)
+        branches = [f"policy(1,{i},0,{key(i)})" for i in range(3)]
+        info = create(expression="tree(" + ",".join(branches) + ")")
+        self.assertEqual(info["script_pubkey"], expected.hex())
+        swapped = create(expression="tree(" + ",".join(reversed(branches)) + ")")
+        self.assertNotEqual(info["script_pubkey"], swapped["script_pubkey"])
+
     def test_pool_roundtrip_canonical_order_and_network(self):
         entries = [create(), create(expression=f"policy(1,0,0,{key(1)})")]
         request = {"action": "export", "network": "mainnet", "descriptors": [e["descriptor"] for e in entries]}
@@ -84,6 +103,14 @@ class DescriptorTests(unittest.TestCase):
         for text in malformed:
             with self.subTest(case=text[:100]), self.assertRaises(ValueError):
                 d.public_request({"action": "import", "network": "mainnet", "bundle": text})
+
+    def test_pool_byte_limit_includes_whitespace(self):
+        original = d.public_request({"action": "pool", "network": "mainnet", "public_keys": [key()]})
+        exact = original["bundle"] + " " * (d.MAX_POOL_BYTES - len(original["bundle"].encode("utf-8")))
+        self.assertEqual(len(exact.encode("utf-8")), d.MAX_POOL_BYTES)
+        self.assertEqual(d.public_request({"action": "import", "network": "mainnet", "bundle": exact}), original)
+        with self.assertRaises(ValueError):
+            d.public_request({"action": "import", "network": "mainnet", "bundle": exact + " "})
 
     def test_grammar_and_key_boundaries(self):
         invalid = [body().upper(), body() + " ", body().replace("pkh(", "pkh( "), body(expression="pkh(00)"), body(expression=f"pkh(b10c0200{key()})"), body(expression=f"pkh({key()}/0)"), body(expression=f"pkh({key()}*)"), body(expression=f"policy(01,0,0,{key()})"), body(expression=f"policy(0,0,0,{key()})"), body(expression=f"policy(2,0,0,{key()})"), body(expression=f"policy(1,4294967296,0,{key()})"), body(expression=f"policy(1,0,0,{key()},{key()})"), body(expression=f"tree(policy(1,0,0,{key()}))"), "a" * d.MAX_DESCRIPTOR_BYTES]
