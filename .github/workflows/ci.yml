@@ -279,9 +279,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Audit OPS-2: exact tool releases (the ones the policy was last
+      # verified with), so a new cargo-deny/cargo-audit release cannot change
+      # what the job checks without a reviewed bump here. The advisory
+      # database itself is fetched fresh on every run.
+      # node/tests/supply_chain_lockfile_guard.rs checks these pins.
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-audit
+          tool: cargo-deny@0.20.2,cargo-audit@0.22.2
+      # deny.toml [graph] all-features = true: every feature's graph (e.g.
+      # the node's sev-snp) is held to the policy.
       - name: cargo deny (advisories, bans, licenses, sources; deny.toml)
         run: cargo deny check
       - name: cargo audit (exceptions in .cargo/audit.toml)

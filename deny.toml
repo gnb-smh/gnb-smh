@@ -10,6 +10,13 @@
 # REVIEW BY 2027-01-15, and after every dependency bump: cargo-deny reports
 # unmatched ignores, skips and license entries as warnings; delete them.
 
+# Audit OPS-2: every check runs over the graph with ALL features enabled, so
+# an optional dependency of a documented build (the node's `sev-snp` feature,
+# deploy/gnb-node.service) is held to the same policy as the default build.
+# The plain `cargo deny check` in CI therefore covers every feature.
+[graph]
+all-features = true
+
 [advisories]
 version = 2
 yanked = "deny"
@@ -56,6 +63,19 @@ ignore = [
 multiple-versions = "deny"
 wildcards = "warn"          # avoid `*` version reqs
 allow-wildcard-paths = true # path deps in the workspace are fine
+
+# Audit CRY-6: `blst` and `secp256k1` were declared by the node but used by
+# no source file, and their C/assembly was compiled into every build. They
+# were removed; these bans keep them (and their -sys crates) from coming back
+# silently, directly or through a new dependency. GnB signs with ML-DSA-65 +
+# Falcon-1024 only. (node/tests/supply_chain_lockfile_guard.rs checks the
+# same on Cargo.lock in `cargo test`.) The rust-bitcoin oracle of the audit
+# harness (audit/consistency) is a separate workspace and is not affected.
+deny = [
+    { crate = "blst", reason = "audit CRY-6: unused BLS12-381 C/assembly, removed" },
+    { crate = "secp256k1", reason = "audit CRY-6: unused, removed; GnB has no ECDSA" },
+    { crate = "secp256k1-sys", reason = "audit CRY-6: C library of secp256k1, removed" },
+]
 
 # Known-benign duplicate allowlist. Every entry pins the EXACT older version
 # present today, so a new duplicate (yamux deliberately is not listed, and
@@ -115,7 +135,9 @@ version = 2
 confidence-threshold = 0.9
 # Permissive licenses only. AGPL/GPL/LGPL are NOT allowed globally: the
 # first-party AGPL crates are named in the exceptions below, so any
-# third-party copyleft dependency still fails. Entries that cargo-deny reports
+# third-party copyleft dependency still fails (the one reviewed exception is
+# option-ext's file-level MPL-2.0, scoped to that crate and release, below;
+# with [graph] all-features the check covers every feature). Entries that cargo-deny reports
 # as never encountered are removed (add one back only for a reviewed
 # dependency that needs it).
 allow = [
@@ -155,6 +177,20 @@ allow = ["AGPL-3.0-or-later"]
 [[licenses.exceptions]]
 name = "webpki-roots"
 allow = ["CDLA-Permissive-2.0"]
+
+# ── Third-party file-level copyleft (audit OPS-2) ────────────────────────────
+# option-ext 0.2.0 (MPL-2.0) reaches the graph only through the optional
+# `sev-snp` feature: sev 8 -> dirs 6 -> dirs-sys 0.5 -> option-ext. MPL-2.0
+# is copyleft per FILE: modified copies of option-ext's own source files must
+# stay MPL-2.0 and be offered as source; it places no condition on the code
+# linking it (MPL-2.0 s3.3, "Larger Work"), and the crate carries no
+# "Incompatible With Secondary Licenses" notice, so it combines with the AGPL
+# node. GnB ships option-ext unmodified. Scoped to this crate and this exact
+# version: any other MPL dependency, or another option-ext release, fails the
+# check and needs its own review.
+[[licenses.exceptions]]
+crate = "option-ext@=0.2.0"
+allow = ["MPL-2.0"]
 
 [sources]
 unknown-registry = "deny"
