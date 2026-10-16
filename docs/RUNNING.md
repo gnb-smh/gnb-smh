@@ -180,6 +180,18 @@ per-network-group budgets of failed verifications; an item whose id or
 encoding is wrong, or whose share proof or witness signature is invalid,
 counts against its sender like an invalid block.
 
+The PoWit pool that holds them is bounded and follows the selected tip on
+every node (not only witnesses): each tip change forgets shares out of the
+window, attestations no next block can include and proofs against barred
+keys. An attestation is held only by a member of its target's witness set,
+for a checkpoint slot at most one interval above the tip and not expired,
+from the tip's justified checkpoint; a key holds at most two (its newest
+targets). An equivocation proof is held and relayed only against a key in a
+recent witness set (checked before its signatures; a refused proof keeps its
+sender's verification-budget charge, as a forged one is free to make), at
+most 256 of them, one per key, and templates take the heaviest witnesses'
+proofs first. Full pools evict their worst entry for a better one.
+
 ## Peers and connections
 
 Connection management follows Bitcoin Core's `CConnman` / `addrman` design

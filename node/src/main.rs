@@ -2052,6 +2052,27 @@ async fn main() {
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
 
+    // ── PoWit pool upkeep, on EVERY node (PoWit audit finding 7) ──────────
+    // Each new tip: forget what it made stale (shares out of the window,
+    // expired or superseded attestations, proofs against barred keys) and
+    // refresh the pool's witness sets. Off the acceptance lock; the DAG read
+    // lock is held only to read the tip. (Every pool admission also follows
+    // the tip first, so a lagging task never leaves a stale pool in use.)
+    {
+        let (dag_p, store_p) = (dag.clone(), store.clone());
+        let mut tip_rx_p = tip_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match tip_rx_p.recv().await {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+                let (dag_b, store_b) = (dag_p.clone(), store_p.clone());
+                let _ = tokio::task::spawn_blocking(move || powit::pool().follow_selected_tip(&dag_b, &store_b)).await;
+            }
+        });
+    }
+
     // ── PoWit witness: share mining + checkpoint attestations ──────────────
     if let Some(key) = cli.witness_key.clone() {
         let Some(pw) = cli.witness_password_file.clone() else {
@@ -2070,7 +2091,7 @@ async fn main() {
         info!("🛡  PoWit witness key {} (activation {})", hex::encode(duty.key_id),
               match core::powit_height() { u64::MAX => "off".to_string(), h => h.to_string() });
 
-        // Duty loop: prune the pool, sign the newest checkpoint once, gossip
+        // Duty loop: follow the tip, sign the newest checkpoint once, gossip
         // equivocation proofs.
         {
             let (dag_w, store_w, otx_w, duty_w) = (dag.clone(), store.clone(), outbound_tx.clone(), duty.clone());
