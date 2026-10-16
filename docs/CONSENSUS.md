@@ -207,6 +207,28 @@ at/after the activation distinct parents, the 64-byte rule and the coinbase
 commitment) run
 before `accept_block` on every ingress path.
 
+Node-local (not consensus; NET-2 residual, Phase 4): on the message
+processor, the GnB-SMH proof of a gossiped or pulled block is evaluated only
+after every check above that precedes it, and not on the processor itself.
+The ingress core (`ingress::BlockIngress::handle_block_gated`) runs the
+cheap checks — for a block whose parents are known the anti-DoS work rule
+and steps 2–5 (`ingress::passes_pre_pow_checks`; a block that fails one goes
+to `accept_block`, which refuses it before evaluating anything), for an
+orphan the floor — and then hands the block to a bounded proof-of-work
+scheduler (`pow::verifier`): at most half the logical CPUs (1 to 4)
+evaluations at a time on the blocking thread pool, a queue bounded
+globally, per delivering peer and per network group, and a budget of
+failed evaluations per peer and per network group (a valid proof is
+refunded). The evaluation is `Block::validate_pow`, whose algorithm follows
+the header height: GnB-SMH v1 (64 MiB) below the PoW + PoWit activation
+(`core::powit_height()`), v3 (4 MiB) from it — results are keyed by block id
+and height for that reason. The processor resumes the block when its result
+arrives (the proof is then in `validate_pow`'s cache, so `accept_block` does
+not evaluate it again). A gossip frame whose block waited in the queue longer
+than gossipsub keeps it is answered `Ignore` unevaluated; every queued
+frame gets exactly one verdict. See "Anti-DoS work rule" below for the
+budgets and for who is charged.
+
 ## Wire encoding (all heights)
 
 Blocks are relayed (gossip `NewBlock`, `/gnb/sync/1` block responses,
@@ -718,14 +740,15 @@ work rule:
   rejected for its witness bytes) inserts nothing.
 - `accept_block` is called by the ingress core for a block whose parents are
   all known, after the work rule admitted it; by the orphan drain, for a
-  buffered orphan whose last missing parent was just inserted (the orphan
-  passed the bits floor and its proof of work to be buffered, and it becomes
-  connectable only after that parent passed the work rule); by the RPC
-  `submitblock` (a write method, served on loopback by default: the
-  operator's own pool, which, like Bitcoin Core's `submitblock`, bypasses the
-  anti-DoS rule); and by the built-in miner. Every call checks the header
-  height, the exact ASERT bits, the timestamp and the proof of work before
-  insertion.
+  buffered orphan whose last missing parent was just inserted, after the
+  work rule admitted it again with its parents known (Phase 4, B1-T5: the
+  orphan passed only the bits floor and its proof of work to be buffered);
+  by the RPC `submitblock`, after the minimum chain work (Phase 4, POW-3;
+  not the tip-relative work threshold, like Bitcoin Core's `submitblock`, so
+  an operator can feed the node a heavier chain that forks deep below its
+  tip); and by the built-in miner. Every call checks the
+  header height, the exact ASERT bits, the timestamp and the proof of work
+  before insertion.
 
 What the rule still admits is bounded by work. For a candidate c merged by a
 new block B, the walk visits B's selected chain downward, skipping chain
@@ -736,10 +759,11 @@ steps each step is a distinct block of c's past that the selected chain
 merged as blue without that chain block being in c's past. All of these
 blocks, and c, entered the DAG through the work rule: within the 360-block
 window (a chain keeping pace with ours), merge-backed (each needs a buffered,
-proof-of-work-verified orphan whose blue-work bound reaches the threshold,
-and more than 1,000 blocks below the tip at most 4, then one per 30 s, from
-one shared budget), or chain-backed (announced orphans covering the fork's
-whole depth below the window). A walk therefore lengthens by at most one
+proof-of-work-verified orphan that passes its contextual checks and whose
+blue-work bound reaches the threshold — below the activation only — and
+every such admission is charged to one shared budget: 4, then one per
+30 s), or chain-backed (announced orphans covering the fork's whole depth
+below the window). A walk therefore lengthens by at most one
 step per such paid admission. After activation, the mergeset limit and the
 merge depth bound every block's coloring outright.
 
@@ -765,7 +789,10 @@ bound of B's blue work:
    along an evicted path is used instead (it chains through any number of
    evictions, so a linear fork deeper than every store still proves its work).
    Each orphan passed the orphan bits floor (the target a child of the
-   selected tip would carry now, eased 16-fold and capped at the pow limit of
+   selected tip would carry now — re-expressed in the orphan's own GnB-SMH
+   algorithm when the two heights straddle the v1 -> v3 switch, v3 targets
+   being 2^`POW_V3_DIFFICULTY_SHIFT` harder for equal work
+   (`ingress::reference_for_height`) — eased 16-fold and capped at the pow limit of
    the height the orphan claims — the limit its own proof of work is checked
    against: the genesis target at/after the hardening activation, the legacy
    limit below it, see "Pow limit (POW-3)" — so the pre-activation blocks of
@@ -775,9 +802,25 @@ bound of B's blue work:
    (at most 8), charged to the peer that delivered it (at most a quarter of
    each store per peer) and, when full, give way only to an entry of greater
    work, so orphans at the floor cannot flush them; or
-3. a buffered orphan whose own lower bound reaches `T` needs B as a parent;
-   such blocks more than 1,000 blocks below the tip are rationed (4, then one
-   per 30 s).
+3. a buffered orphan VOUCHES for B (it merges B, a lower-work block):
+   Phase 4 (B1-T5) — the orphan waits on B directly and every other parent
+   of it is in the DAG; its header passes, with B in hand, the contextual
+   checks `accept_block` will apply (header height = max parent height + 1,
+   bits = the expected ASERT bits of its parent set, timestamp at least the
+   latest parent's and at most 600 s ahead); its height is below the
+   hardening activation; and its own bound (largest parent blue work, `lb(B)`
+   for B, + its work) reaches `T`. Every such admission is charged to one
+   budget (4, then one per 30 s), once, when B is about to be stored with
+   its proof known valid (charged before the proof, a block whose proof the
+   PoW workers evaluated was charged twice, and junk-nonce candidates spent
+   it). Before Phase 4 the bound came from the
+   self-declared parents and bits of any orphan above B, directly or through
+   other orphans, unchecked: one orphan listing the tip and a low-work block
+   (even one stamped before its parents, so never valid) got that block
+   admitted, and only admissions more than 1,000 blocks deep were rationed.
+   From the activation no orphan vouches: B's own chain cannot come within
+   the 360-block window, so B is below the merge-depth root of every block
+   that builds on the tip and merging it is a `MergeDepthViolation`.
 
 Otherwise B is ignored without penalty (a refused block is not re-evaluated
 until the orphan pool, the DAG or the selected tip changes). A chain that
@@ -787,6 +830,180 @@ the same with or without the rule. The one bound is memory: a DAG-shaped fork
 with more blocks above its first block than the pool and the 50,000 kept
 evicted orphans hold is credited the summed work of the part they hold, or
 its heaviest path if larger.
+
+The rule applies again to every buffered orphan the drain connects once its
+last missing parent is in the DAG (Phase 4, B1-T5; it used to be stored
+without any work check, so the low-work fork above a merge-backed block was
+stored whole); one it refuses is not stored, and the orphans above it keep
+waiting (if more work is announced above it, the orphan sweep fetches it
+again). The gossip verdict of a buffered orphan's frame is withheld until
+the orphan connects (`Accept`, relayed then), is refused (`Ignore`, or the
+penalty below for an `accept_block` rejection), leaves the pool or outlives
+gossipsub's cache (`Ignore`): an orphan has passed only the floor and its
+proof, and relaying it at once let floor-meeting orphans travel the whole
+network, charged at every hop to the honest relay that forwarded them
+(`ingress::DeferredBlockVerdicts`).
+
+### Minimum chain work and unrequested blocks (node-local policy, not consensus)
+
+Audit POW-3 (Phase 4). The work rule's threshold is relative to the node's
+own tip, so it does not protect a node whose tip is far behind the network
+(initial sync, or a node that was offline): an attacker mines one block A on
+that tip stamped "now", and under the absolute-schedule ASERT every child of
+A has the pow-limit target — near-free blocks, all above the threshold.
+Bitcoin Core's defences, adapted (`ingress::unrequested_block_admission`):
+
+- **Minimum chain work** (Core's `nMinimumChainWork`), in blue work:
+  `ingress::MAINNET_MINIMUM_CHAIN_WORK` (testnet and regtest: 0), or
+  `--minimumchainwork <hex>`. While the selected tip's blue work is below it
+  the node is in initial block download: it latches the IBD state (the
+  miner stays paused) and processes no block it did not ask for, unless that
+  block's own bound reaches the minimum. Mainnet's value is
+  `core::MIN_CHAIN_WORK`, the one release constant that also turns finality,
+  the reorg depth cap and pruning on (`core::finality_active`), 0 today: the
+  newest chain data the repository carries is the reading of
+  docs/MAINNET-READINESS.md §1 (one node, 14 Oct 2026), whose proposed value
+  is a release decision not yet taken, and a value the real chain does not
+  reach would stop every new node from syncing; docs/RUNNING.md gives the
+  release step that raises it. Block work bounds (`lb`, the announced work
+  of orphans) count each block as `accept_block` adds it to the DAG,
+  `core::block_work`: normalised across the GnB-SMH v1 -> v3 switch.
+- **Unrequested blocks** (Core's `AcceptBlock`, `!fRequested`): a block that
+  is neither the answer to one of this node's directed pulls nor a block it
+  has an outstanding request for (whoever delivers it) is processed only if
+  `lb(B)` reaches the blue work of the selected-chain block
+  `UNREQUESTED_WINDOW_BLOCKS` = k + 1 = 11 below the tip (Core requires at
+  least the tip's work; GhostDAG's honest concurrency, and `lb` omitting the
+  merged blues after the activation, need the k + 1 margin). A deeper fork
+  block is processed only when requested (the parent of a buffered orphan,
+  a frontier tip, an IBD pull), where the 360-block rule above applies. An
+  unrequested orphan is buffered only outside initial block download; one
+  claiming a height more than 1,000 above the tip is dropped before decoding
+  (`ingress::unsolicited_height_too_far_ahead`).
+- **`submitblock`**: refused below the minimum chain work
+  (`ingress::submitted_block_admission`, before the proof of work). The
+  tip-relative threshold `T` is not applied, as Bitcoin Core's `submitblock`
+  (`ProcessNewBlock` with `force_processing`) skips its anti-DoS checks: the
+  RPC is how an operator replays the heavier chain to a node that sat on a
+  minority branch (a partition or an eclipse), and that chain's first blocks
+  above a deep fork point are, judged one at a time, below `T` (a review of
+  an earlier Phase-4 version, which applied `T`, found such a replay refused
+  block by block). A deep-fork block is cheap below the activation, so a
+  public RPC should run with `--rpc-require-auth-for-writes`.
+
+What remains: with the mainnet minimum at 0, a node that is behind but not
+below the minimum is protected only by the rules relative to its tip, so a
+block A as above and its cheap children (each costing one evaluation) are
+processed — at most at the rate the attacker evaluates proofs, and within
+the per-peer and per-network-group proof-of-work budgets below; raising the
+minimum at each release closes this for every node that has not reached it.
+Blocks this node requested (IBD pulls answered by an attacker's header list)
+are not checked against the minimum: that needs a header chain with proofs
+(Core's headers presync), which the sync protocol (`/gnb/sync/1`
+`Headers`: ids and claimed scores only) does not carry.
+
+### Gossip penalties and proof-of-work budgets (node-local policy, not consensus)
+
+Audit NET-2 residual, B1-T7, NET-4 residual (Phase 4).
+
+**Who is charged for a refused block frame** (`ingress::block_penalty`).
+Gossipsub's `Reject` charges its invalid-message penalty (P4) to the peer
+that delivered the frame and to every peer that delivered a duplicate.
+Releases older than the validated relay (NET-2) forward every frame
+unvalidated and follow the chain until the hardening activation block
+(which they reject); releases older than Phase 4 relay an orphan once its
+bits meet their own floor and its proof is valid, before its parents are
+known, at every height. Either can be an honest peer that delivers a frame
+this node refuses (Bitcoin Core: never punish for data that may be invalid
+only because of a rule change, `BLOCK_RECENT_CONSENSUS_CHANGE`; punish the
+peer that sent it). So:
+
+- a frame the delivering peer authored (gossipsub's signed source is the
+  propagation source), or sent as the answer to this node's pull, is charged
+  to it as a misbehaviour: the peer is disconnected and its address
+  discouraged (below), and gossipsub is told `Ignore` (no relay that
+  forwarded a duplicate is charged) unless the next rule applies;
+- a relayed frame is charged (`Reject`, and a misbehaviour) only for a
+  context-free fault — malformed body, id or height binding, structure,
+  proof of work: what every release on the chain checks before relaying —
+  and only once the selected chain contains the activation block
+  (`ingress::block_penalties_in_force`, the transaction relay's gate);
+- a relayed frame with a contextual fault (height, bits, timestamp,
+  coinbase) or below the orphan floor (a function of the node's own tip and
+  clock) is never charged to the relay; an orphan below the floor that
+  answers this node's own pull is dropped without any charge
+  (`ingress::orphan_floor_penalty`: the node asked for it, and an old block
+  of an era with far easier bits fails the floor honestly).
+
+Before the activation a frame signed by a throwaway author key and delivered
+by another connection is a relayed frame: an attacker that signs each
+invalid block with a fresh key is never disconnected or discouraged for it
+(an honest legacy relay cannot be told apart from it), and is limited only
+by the per-peer and per-network-group proof-of-work budgets below.
+Discouragement before the activation covers self-signed gossip and answers
+to this node's pulls.
+
+Wire violations (oversized, bounds-violating, padded or non-canonical
+frames, which releases older than NET-2 forward) follow the same rule
+(`network::wire_violation_penalty`): the application-score penalty is charged
+to an author that delivered its own frame, or once penalties are in force;
+`Reject` (P4 on duplicates too) only once they are in force. A peer the
+bounded wire-penalty tracker forgets has its application score reset (it
+used to keep its last score forever).
+
+**Address discouragement** (`network::discourage`, Bitcoin Core's
+`m_discouraged`): a misbehaving peer is disconnected and its address — the
+IPv4 address, or the IPv6 /64 — discouraged for 24 hours (at most 50,000
+addresses); a connection from a discouraged address is closed at once, so a
+fresh libp2p identity from the same address buys nothing. Local addresses
+(loopback) and operator-configured peers (`--peer`) are never discouraged.
+
+**Proof-of-work budgets** (`pow::verifier`, see "Acceptance order"): every
+gossip evaluation is charged to the delivering peer (4, refilled one per
+60 s) and to its network group (IPv4 /16, IPv6 /32: 8, one per 30 s) and
+refunded when the proof is valid, so only failed proofs — and gossip orphans
+whose bits fail the floor, which are charged one evaluation — consume them;
+a gossip block from a peer or group whose budget is spent, or when the queue
+is full (64 gossip blocks, 4 per peer, 8 per group), is answered `Ignore`
+unevaluated. Answers to this node's own pulls are not charged up front (sync
+keeps up to 16 pulls in flight per peer, answered faster than proofs are
+evaluated): they have their own queue bound of 1,024, go first, and are
+charged to the peer and its group only when the proof is invalid (the peer
+is then also disconnected and discouraged). Results are remembered by block
+id and header height (the pow limit a proof is judged against depends on the
+height, which the id does not commit). The audit measured about three
+zero-cost invalid blocks per libp2p identity, identities being free; now
+identities and addresses inside one /16 share eight evaluations, and an
+author that delivers one invalid block of its own is disconnected and its
+address discouraged.
+
+**PoWit gossip** (`NewPowitItem`: witness shares, attestations, equivocation
+proofs; `ingress::PowitIngress`). Merged from the mainnet line, where each
+item was verified with `powit::admit_item` awaited inline on the block
+processor, unbudgeted — a share's proof is a GnB-SMH v3 evaluation (4 MiB,
+~90 ms), an attestation a KES signature check, both free to fake — and an
+item whose claimed id did not match was `Reject`ed whoever delivered it.
+Now the items, which travel on the transaction topic, are delivered to the
+transaction relay task (`network::goes_to_tx_ingest`), never to the block
+processor. The claimed id and the item's encoding are checked first
+(`ingress::powit_item_precheck`); verification then runs on the blocking
+pool through a proof-of-work scheduler of its own
+(`pow::verifier::PowLimits::powit_items`: half the block pool's workers, at
+least one; a queue of 256, 32 per peer, 64 per network group; budgets of
+failed verifications of 16 per peer, one per 5 s, and 32 per group, one per
+2 s; a stale queued item is answered `Ignore` unverified). An admitted item
+is relayed and refunded. A context-free fault — wrong id, malformed item,
+invalid share proof (or bits, target or payout that the share's attested
+block contradicts), invalid witness signature, an equivocation proof that
+does not verify (`ingress::powit_admit_error_fault`): what no release that
+knows `NewPowitItem` relays, since they all admit an item before relaying
+it — keeps its charge and is penalised through `ingress::block_penalty`,
+the block gate above (its author when it delivered the item itself; a relay
+only once penalties are in force). A refusal that depends on this node's
+chain or state (a share for a block that is not on its selected chain or is
+outside the share window, an attestation from another justified checkpoint
+or by a key outside the witness set, a full pool) is refunded and answered
+`Ignore`, never penalised.
 
 ## Transaction signatures (sighash v2 and v3, hardening activation)
 

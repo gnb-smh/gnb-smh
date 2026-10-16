@@ -229,11 +229,41 @@ fn from_mempool_error(e: MempoolError) -> AdmissionError {
 /// encoding INCLUDING script_sigs. Two encodings of the same txid with
 /// different signatures get different wtxids (reject filter, sig cache).
 pub fn wtxid(tx: &Transaction) -> [u8; 32] {
+    wtxid_of_canonical_bytes(&tx.to_wire_bytes(true))
+}
+
+/// The wtxid of the transaction whose canonical wire encoding
+/// (`to_wire_bytes(true)`) is `bytes` — B1-T19: the gossip relay hashes the
+/// frame it received (checked canonical by [`decode_tx_canonical`]) once,
+/// instead of re-encoding the decoded transaction for every use.
+pub fn wtxid_of_canonical_bytes(bytes: &[u8]) -> [u8; 32] {
     use sha3::{Digest, Sha3_256};
     let mut h = Sha3_256::new();
     h.update(b"gnb-wtxid-v1");
-    h.update(tx.to_wire_bytes(true));
+    h.update(bytes);
     h.finalize().into()
+}
+
+/// [`decode_tx_strict`] that also proves `bytes` IS the canonical encoding
+/// byte for byte (not only of the canonical length), so
+/// [`wtxid_of_canonical_bytes`]`(bytes) == `[`wtxid`]`(&tx)`. One
+/// re-encoding, as `decode_tx_strict` already did.
+pub fn decode_tx_canonical(bytes: &[u8]) -> Result<Transaction, String> {
+    if bytes.len() > MAX_TX_SIZE {
+        return Err(format!("transaction of {} bytes exceeds MAX_TX_SIZE {}", bytes.len(), MAX_TX_SIZE));
+    }
+    let tx = Transaction::from_wire_bytes(bytes)?;
+    let canonical = tx.to_wire_bytes(true);
+    if canonical.len() != bytes.len() {
+        return Err(format!(
+            "non-canonical transaction encoding: {} trailing byte(s)",
+            bytes.len().saturating_sub(canonical.len())
+        ));
+    }
+    if canonical != bytes {
+        return Err("non-canonical transaction encoding".into());
+    }
+    Ok(tx)
 }
 
 /// Strict gossip/RPC decode (MEM-5): `Transaction::from_wire_bytes` ignores
@@ -313,6 +343,12 @@ fn sig_cache() -> &'static parking_lot::Mutex<(HashSet<[u8; 32]>, std::collectio
 ///   the spent script. Included for v2 too, so the key never depends on the
 ///   regime-specific reasoning above.
 fn sig_cache_key(tx: &Transaction, version: SighashVersion, active: bool, prevouts: &[TxOutput]) -> [u8; 32] {
+    sig_cache_key_for(&wtxid(tx), version, active, prevouts)
+}
+
+/// [`sig_cache_key`] from the transaction's wtxid (B1-T19: the gossip relay
+/// computes it once per frame, from the frame's canonical bytes).
+fn sig_cache_key_for(wtxid: &[u8; 32], version: SighashVersion, active: bool, prevouts: &[TxOutput]) -> [u8; 32] {
     use sha3::{Digest, Sha3_256};
     #[cfg(test)]
     tests::SIG_KEYS_COMPUTED.with(|c| c.set(c.get() + 1));
@@ -320,7 +356,7 @@ fn sig_cache_key(tx: &Transaction, version: SighashVersion, active: bool, prevou
     h.update(b"gnb-sigcache-v4");
     h.update(core::node_chain_id().to_le_bytes());
     h.update([match version { SighashVersion::V2 => 2u8, SighashVersion::V3 => 3u8 }, u8::from(active)]);
-    h.update(wtxid(tx));
+    h.update(wtxid);
     h.update((prevouts.len() as u64).to_le_bytes());
     for p in prevouts {
         h.update(p.value.to_le_bytes());
@@ -413,9 +449,22 @@ pub fn verify_input_scripts_gated_at(
     act: u64,
     gate: &mut SignatureGate<'_>,
 ) -> Result<(), AdmissionError> {
+    verify_input_scripts_gated_with_wtxid_at(tx, &wtxid(tx), prevouts, block_height, act, gate)
+}
+
+/// [`verify_input_scripts_gated_at`] with the transaction's wtxid already
+/// computed (`tx_wtxid` MUST be [`wtxid`]`(tx)`; B1-T19: once per frame).
+pub fn verify_input_scripts_gated_with_wtxid_at(
+    tx: &Transaction,
+    tx_wtxid: &[u8; 32],
+    prevouts: &[TxOutput],
+    block_height: u64,
+    act: u64,
+    gate: &mut SignatureGate<'_>,
+) -> Result<(), AdmissionError> {
     let version = core::sighash::check_tx_version(tx.version, block_height, act).map_err(AdmissionError::Rejected)?;
     let witnesses = core::sighash::check_input_witnesses(tx, prevouts, version).map_err(AdmissionError::Rejected)?;
-    let key = sig_cache_key(tx, version, core::activation::is_active_at(block_height, act), prevouts);
+    let key = sig_cache_key_for(tx_wtxid, version, core::activation::is_active_at(block_height, act), prevouts);
     if sig_cache().lock().0.contains(&key) {
         return Ok(());
     }
@@ -653,6 +702,20 @@ pub fn check_transaction_gated(
     policy: &AdmissionPolicy,
     gate: &mut SignatureGate<'_>,
 ) -> Result<u64, AdmissionError> {
+    check_transaction_gated_with_wtxid(store, mempool, tx, &wtxid(tx), policy, gate)
+}
+
+/// [`check_transaction_gated`] with the transaction's wtxid already
+/// computed (`tx_wtxid` MUST be [`wtxid`]`(tx)`; B1-T19: the gossip relay
+/// computes it once per frame).
+pub fn check_transaction_gated_with_wtxid(
+    store: &Storage,
+    mempool: Option<&Mempool>,
+    tx: &Transaction,
+    tx_wtxid: &[u8; 32],
+    policy: &AdmissionPolicy,
+    gate: &mut SignatureGate<'_>,
+) -> Result<u64, AdmissionError> {
     check_structure_and_size(tx)?;
 
     // Known: pooled, recently rejected (a replay costs one bounded hash), or
@@ -662,7 +725,7 @@ pub fn check_transaction_gated(
         if mp.contains(&txid) {
             return Err(AdmissionError::Duplicate("duplicate transaction".into()));
         }
-        if policy.use_reject_filter && mp.is_recently_rejected(&wtxid(tx)) {
+        if policy.use_reject_filter && mp.is_recently_rejected(tx_wtxid) {
             return Err(AdmissionError::Duplicate("recently rejected".into()));
         }
     }
@@ -786,7 +849,7 @@ pub fn check_transaction_gated(
         // Behind the caller's gate (MEM-5: the relay's per-connection
         // budget), charged only when the work is not already cached; one
         // cache-key computation for the lookup and the insertion.
-        verify_input_scripts_gated_at(tx, &prevouts, policy.next_block_height, activation_height(), gate)?;
+        verify_input_scripts_gated_with_wtxid_at(tx, tx_wtxid, &prevouts, policy.next_block_height, activation_height(), gate)?;
     }
     Ok(fee)
 }
@@ -825,16 +888,34 @@ pub fn admit_gated(
     policy: &AdmissionPolicy,
     gate: &mut SignatureGate<'_>,
 ) -> Result<AddOutcome, AdmissionError> {
+    let w = wtxid(&tx);
+    admit_gated_with_wtxid(store, mempool, tx, &w, policy, gate)
+}
+
+/// [`admit_gated`] with the transaction's wtxid already computed
+/// (`tx_wtxid` MUST be [`wtxid`]`(&tx)`). B1-T19: the gossip relay hashes
+/// each frame once ([`wtxid_of_canonical_bytes`]) instead of re-encoding and
+/// re-hashing the whole transaction for the reject filter, the signature
+/// cache key and the rejection record (three SHA3 passes over up to 400 kB
+/// per frame, budget-refused frames included).
+pub fn admit_gated_with_wtxid(
+    store: &Storage,
+    mempool: &Mempool,
+    tx: Transaction,
+    tx_wtxid: &[u8; 32],
+    policy: &AdmissionPolicy,
+    gate: &mut SignatureGate<'_>,
+) -> Result<AddOutcome, AdmissionError> {
     // The filter's epoch BEFORE any state is read: a verdict computed against
     // a next height or a tip that changed meanwhile (the change clears the
     // filter and starts a new epoch) is not remembered, so it can never be
     // replayed at the new height (review finding).
     let epoch = mempool.recent_rejects_epoch();
-    let fee = match check_transaction_gated(store, Some(mempool), &tx, policy, gate) {
+    let fee = match check_transaction_gated_with_wtxid(store, Some(mempool), &tx, tx_wtxid, policy, gate) {
         Ok(fee) => fee,
         Err(e) => {
             if policy.use_reject_filter && e.is_cacheable() {
-                mempool.note_rejected_in_epoch(wtxid(&tx), epoch);
+                mempool.note_rejected_in_epoch(*tx_wtxid, epoch);
             }
             return Err(e);
         }

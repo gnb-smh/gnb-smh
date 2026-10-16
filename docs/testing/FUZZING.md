@@ -309,11 +309,21 @@ assertion within seconds:
   six blocks its anti-DoS rules admit every block: the POW-3 work threshold
   is 0 below `ANTI_DOS_WINDOW_BLOCKS` (360) selected-chain blocks, no block
   is deep below the tip, and under `test-pow-limit` the orphan floor is the
-  pow limit. `LowWork`, `OrphanBelowFloor`, the deep-backfill budget and
-  orphan-pool eviction are covered by the node's tests
-  (`node/tests/fix_chain_selection.rs`, `ingress` unit tests), not here. The
-  orphan sweep runs once after the last delivery (in the node it runs every
-  30 s), and blocks arrive unsolicited from no peer.
+  pow limit. `LowWork`, the deep-backfill budget and orphan-pool eviction
+  are covered by the node's tests (`node/tests/fix_chain_selection.rs`,
+  `node/tests/fix_net_ingress.rs`, `ingress` unit tests), not here. The
+  orphan floor gate in `BlockIngress::handle_block` (`OrphanBelowFloor`)
+  was covered by no test before Phase 4: under `test-pow-limit` the floor
+  is the pow limit, so every test build admitted every decodable bits value
+  there, and the tests named here checked only the floor's helper
+  functions (re-audit, POW-4 residual). It is covered since Phase 4 by
+  `node/tests/fix_ingress_dos.rs::pow4_floor_gate_refuses_before_the_proof`,
+  which sets a stricter reference target through a test seam
+  (`BlockIngress::with_reference_target`); the global orphan bound's
+  arrival-order eviction by
+  `fix_ingress_dos::pow4_global_orphan_bound_evicts_by_arrival_not_height`.
+  Still not here: the orphan sweep runs once after the last delivery (in
+  the node it runs every 30 s), and blocks arrive unsolicited from no peer.
 * The async read of the sync codec is driven over an in-memory stream; the
   libp2p substream and muxer underneath are not fuzzed.
 * `keystore_decode` drives the decryption to completion only for Argon2

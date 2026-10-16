@@ -207,6 +207,14 @@ struct Cli {
     /// opt-in: the shipped DEFAULT_SEEDS stays empty, so nobody's seed is
     /// required and you can point at (or run) any seed you trust. Repeatable.
     #[arg(long)]                                         dns_seed: Vec<String>,
+    /// Minimum chain work (hexadecimal blue work, as Bitcoin Core's
+    /// `-minimumchainwork`): while the selected tip carries less, the node is
+    /// in initial block download — it stores no block it did not ask for
+    /// (unless that block's own chain reaches it), refuses `submitblock`
+    /// blocks below it and does not mine. Default: the network's value
+    /// (`ingress::MAINNET_MINIMUM_CHAIN_WORK`, raised at each release;
+    /// docs/RUNNING.md). Non-consensus — a node-local anti-DoS knob.
+    #[arg(long = "minimumchainwork")]                    minimum_chain_work: Option<String>,
 
 }
 
@@ -423,6 +431,25 @@ async fn main() {
     info!("proof of work: {} (PoWit activation height {})",
           core::pow_algo(0).name(),
           match core::powit_height() { u64::MAX => "off".to_string(), h => h.to_string() });
+
+    // POW-3 (Phase 4): the minimum chain work (Bitcoin Core's
+    // nMinimumChainWork), once, before any block is handled.
+    {
+        let net = if cli.testnet { core::ChainId::Testnet } else { core::ChainId::Mainnet };
+        let w = match cli.minimum_chain_work.as_deref() {
+            Some(s) => match ingress::parse_minimum_chain_work(s) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("❌ --minimumchainwork: {e}");
+                    std::process::exit(2);
+                }
+            },
+            None => ingress::default_minimum_chain_work(net.into()),
+        };
+        let _ = ingress::set_minimum_chain_work(w);
+        info!("minimum chain work: {:#x}{}", w,
+            if cli.minimum_chain_work.is_some() { " (--minimumchainwork)" } else { " (network default)" });
+    }
 
     // FIX v0.5.1 BLK-3: apply --rpc-public escape hatch.
     let rpc_bind = if cli.rpc_public { "0.0.0.0".to_string() } else { cli.rpc_bind.clone() };
@@ -868,6 +895,17 @@ async fn main() {
     let (peer_ev_tx, mut peer_ev_rx) = mpsc::channel::<network::PeerEvent>(1024);
     node.attach_control(net_ctl_rx);
     node.attach_peer_events(peer_ev_tx);
+    // B1-T19: gossip transactions have their own channel and their own task
+    // (the transaction relay below), so a transaction flood can neither fill
+    // the block channel nor queue block work behind transaction work.
+    let (tx_ingest_tx, mut tx_ingest_rx) = mpsc::channel::<network::Inbound>(1000);
+    node.attach_tx_ingest(tx_ingest_tx);
+    // The applied-chain moves of accepted blocks, block processor → tx relay
+    // (its orphan-transaction bookkeeping, MEM-6).
+    let (chain_move_tx, mut chain_move_rx) = mpsc::channel::<accept::ChainMove>(256);
+    // NET-2 residual: peers' remote addresses (their network group keys the
+    // proof-of-work budget).
+    let peer_addrs = node.peer_addrs();
     let (outbound_tx, outbound_rx) = mpsc::channel::<network::NetworkMessage>(1000);
 
     // ── Sprint 2.c: Tip-change broadcast channel ─────────────────────────────
@@ -1037,6 +1075,243 @@ async fn main() {
     let body_requests = Arc::new(tokio::sync::Notify::new());
     let body_requests2 = body_requests.clone();
 
+    // ── Transaction relay task (B1-T19) ───────────────────────────────────────
+    //
+    // Gossip transactions are judged here, on their own task fed by their own
+    // channel (`NetworkNode::attach_tx_ingest`), never on the block processor:
+    // admission (signatures last, budgeted per connection and node-wide, in
+    // signatures AND bytes hashed — `mempool::relay::signature_gate_cost`)
+    // used to be awaited inline on the one loop that also handles NewBlock,
+    // fed by one shared FIFO that drops frames when full, so a transaction
+    // flood delayed — and could drop — blocks. The applied-chain moves of
+    // accepted blocks arrive from the block processor (`chain_move_tx`).
+    //
+    // PoWit items (witness shares, attestations, equivocation proofs) travel
+    // on the transaction topic and are judged here too, never on the block
+    // processor: cheap checks first, then verification (a share's proof is a
+    // GnB-SMH v3 evaluation, an attestation a KES signature check) on the
+    // blocking pool through their own bounded, budgeted proof-of-work
+    // scheduler (`ingress::PowitIngress`), with the block gate's rollout-
+    // gated penalties; relayed only once admitted.
+    {
+        let (store_t, mem_t, dag_t, state_t, otx_t, vtx_t, ctl_t) = (
+            store.clone(), mempool.clone(), dag.clone(), node_state.clone(),
+            outbound_tx.clone(), vtx2.clone(), net_ctl_tx.clone(),
+        );
+        let peer_addrs_t = peer_addrs.clone();
+        let activation_t = core::activation::hardening_activation_height();
+        tokio::spawn(async move {
+            use futures::future::FutureExt;
+            let mut backoff = ingress::SupervisorBackoff::new(
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(30),
+            );
+            loop {
+                let run_started = std::time::Instant::now();
+                let relay_task = async {
+                    // MEM-5 / MEM-6: validated transaction relay — signature
+                    // budgets and the bounded orphan-transaction pool. Shared
+                    // with the blocking pool, where admission runs.
+                    let tx_relay = Arc::new(parking_lot::Mutex::new(mempool::relay::TxRelay::new()));
+                    // MEM-6: verdicts withheld for orphan frames, keyed by the
+                    // frame's wtxid and timed from its arrival (settled from
+                    // the relay's OrphanEvents: Accept / Reject / Ignore) and
+                    // re-announcements.
+                    let mut deferred: mempool::relay::DeferredVerdicts<network::InboundOrigin> =
+                        mempool::relay::DeferredVerdicts::new();
+                    let mut sweep = tokio::time::interval(sync::parent_fetch::SWEEP_PERIOD);
+                    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    sweep.reset();
+                    // PoWit gossip: the bounded verification queue and its
+                    // results (from the blocking pool).
+                    let mut powit_core = ingress::PowitIngress::default();
+                    let (powit_done_tx, mut powit_done_rx) =
+                        mpsc::unbounded_channel::<(ingress::PowitJob, Result<(), String>)>();
+                    loop {
+                        tokio::select! {
+                            // A PoWit item verified off this task.
+                            Some((job, result)) = powit_done_rx.recv() => {
+                                if let Err(e) = &result {
+                                    debug!("PoWit item {} refused: {}", hex::encode(&job.id[..8]), e);
+                                }
+                                let in_force = ingress::block_penalties_in_force(selected_tip_height(&dag_t), activation_t);
+                                let v = powit_core.complete(job, &result, in_force, std::time::Instant::now());
+                                report_powit_verdict(&vtx_t, &ctl_t, v);
+                                dispatch_powit(&mut powit_core, &powit_done_tx, &dag_t, &store_t, &vtx_t);
+                            }
+                            m = tx_ingest_rx.recv() => {
+                                let Some(network::Inbound { msg, origin }) = m else { break };
+                                if let network::NetworkMessage::NewPowitItem { id, kind, data } = msg {
+                                    let now = std::time::Instant::now();
+                                    let source = pow::verifier::PowSource {
+                                        peer:  origin.peer(),
+                                        group: origin.peer().and_then(|p| peer_addrs_t.group(&p)),
+                                    };
+                                    let in_force = ingress::block_penalties_in_force(selected_tip_height(&dag_t), activation_t);
+                                    if let Some(v) = powit_core.on_item(id, kind, data, origin, source, in_force, now) {
+                                        report_powit_verdict(&vtx_t, &ctl_t, v);
+                                    }
+                                    dispatch_powit(&mut powit_core, &powit_done_tx, &dag_t, &store_t, &vtx_t);
+                                    continue;
+                                }
+                                // Validated transaction relay (MEM-5 / NET-2 / NET-4).
+                                //
+                                // The network loop does not relay a gossiped
+                                // transaction on decode: it waits for the verdict
+                                // computed here. The shared admission function (same
+                                // rules as sendrawtransaction and reorg re-injection —
+                                // strict decode, size, standardness incl. dust, witness
+                                // and version policy, known/recent-reject, inputs from
+                                // the UTXO set or the pool, version rule and maturity at
+                                // the NEXT block height — `pool_next_height` — fees,
+                                // replacement and chain limits) runs cheapest first; the
+                                // frame's decoding and the signature step are charged to
+                                // the DELIVERING CONNECTION's and the node-wide budgets
+                                // (never the self-chosen gossip author), refunded on
+                                // admission. Accept → relayed; Reject (malformed or
+                                // consensus-invalid, once the chain contains the
+                                // hardening activation block: `penalties_in_force`) →
+                                // not relayed and the delivering peer takes gossipsub's
+                                // invalid-message penalty; before that block an older
+                                // release that forwards every frame unvalidated may be
+                                // the honest deliverer, so the same frame is answered
+                                // Ignore; Ignore → dropped without penalty (policy,
+                                // duplicates, recent rejects, budgets). MEM-6: an
+                                // orphan's verdict is WITHHELD (keyed by the frame's
+                                // wtxid, timed from its arrival) and settled from the
+                                // relay's OrphanEvents. P0: admission runs on the
+                                // blocking pool so PQ signature work cannot stall this
+                                // task's reactor.
+                                let network::NetworkMessage::NewTransaction { txid, tx_data } = msg else {
+                                    report_verdict(&vtx_t, &origin, network::GossipVerdict::Ignore);
+                                    continue;
+                                };
+                                // The connection that delivered the frame (gossip
+                                // propagation_source): the key of the budget and of
+                                // the orphan quotas. The signed gossip author is
+                                // chosen by the sender and bounds nothing.
+                                let peer = origin.peer();
+                                // The signed gossip author: for logs only.
+                                let author = match &origin {
+                                    network::InboundOrigin::Gossip { author, .. } => *author,
+                                    _ => None,
+                                };
+                                let received_at = origin.received_at().unwrap_or_else(std::time::Instant::now);
+                                let next_height = mempool::admission::pool_next_height(&dag_t.read(), &store_t, &mem_t);
+                                let (store_v, mem_v, relay_v) = (store_t.clone(), mem_t.clone(), tx_relay.clone());
+                                let outcome = tokio::task::spawn_blocking(move || {
+                                    relay_v.lock().on_gossip_tx(
+                                        &store_v, &mem_v, next_height, &txid, &tx_data, peer,
+                                        std::time::Instant::now(), unix_now_secs())
+                                }).await;
+                                match outcome {
+                                    Ok(o) => {
+                                        if o.invalid {
+                                            warn!("tx {} from {:?} (author {:?}) INVALID ({:?}): {}",
+                                                hex::encode(&txid[..8]), peer, author, o.verdict, o.detail);
+                                        } else {
+                                            debug!("tx {} verdict {:?}: {}", hex::encode(&txid[..8]), o.verdict, o.detail);
+                                        }
+                                        if o.orphaned {
+                                            if let Some(back) = deferred.defer(o.wtxid, origin, received_at, std::time::Instant::now()) {
+                                                report_verdict(&vtx_t, &back, network::GossipVerdict::Ignore);
+                                            }
+                                        } else {
+                                            report_verdict(&vtx_t, &origin, o.verdict);
+                                        }
+                                        settle_orphan_events(&mut deferred, &vtx_t, &ctl_t, &o.orphans);
+                                    }
+                                    Err(e) => {
+                                        warn!("tx verify task failed: {}", e);
+                                        report_verdict(&vtx_t, &origin, network::GossipVerdict::Ignore);
+                                    }
+                                }
+                                state_t.write().mempool_size = mem_t.size();
+                            }
+                            // MEM-5 / MEM-6: a connection closed — forget its
+                            // signature budget and the orphans it delivered.
+                            Some(ev) = peer_ev_rx.recv() => {
+                                let network::PeerEvent::Disconnected(peer) = ev;
+                                let events = tx_relay.lock().on_peer_disconnected(peer);
+                                settle_orphan_events(&mut deferred, &vtx_t, &ctl_t, &events);
+                            }
+                            // MEM-6: what an accepted block (and the orphan blocks
+                            // it unblocked) did to the APPLIED chain: orphan
+                            // transactions it confirms or conflicts with are
+                            // dropped; those waiting on a transaction it gained (or
+                            // lost back to the pool) are re-tried (and announced).
+                            // Nothing for a fork-loser or merge candidate. Judged at
+                            // the pool's next height, as every admission.
+                            Some(chain) = chain_move_rx.recv() => {
+                                if chain.is_empty() {
+                                    continue;
+                                }
+                                let next_height = mempool::admission::pool_next_height(&dag_t.read(), &store_t, &mem_t);
+                                let (store_v, mem_v, relay_v) = (store_t.clone(), mem_t.clone(), tx_relay.clone());
+                                if let Ok(events) = tokio::task::spawn_blocking(move || {
+                                    // R4 (B1-T20): the move lists block hashes; the
+                                    // bodies are read here, on the blocking pool,
+                                    // within Core's 20 MB budget.
+                                    let (connected_txs, disconnected_txs) =
+                                        (chain.connected_txs(&store_v), chain.disconnected_txs(&store_v));
+                                    relay_v.lock().on_chain_moved(
+                                        &store_v, &mem_v, next_height, &connected_txs, &disconnected_txs,
+                                        std::time::Instant::now(), unix_now_secs())
+                                }).await {
+                                    settle_orphan_events(&mut deferred, &vtx_t, &ctl_t, &events);
+                                }
+                            }
+                            // MEM-6: expire orphan transactions and re-try those
+                            // whose parents arrived through any path (miner, RPC)
+                            // — a bounded, round-robin scan — at the pool's next
+                            // height, as every admission.
+                            _ = sweep.tick() => {
+                                let next_height = mempool::admission::pool_next_height(&dag_t.read(), &store_t, &mem_t);
+                                let (store_v, mem_v, relay_v) = (store_t.clone(), mem_t.clone(), tx_relay.clone());
+                                if let Ok(events) = tokio::task::spawn_blocking(move || {
+                                    relay_v.lock().retry_orphans(&store_v, &mem_v, next_height,
+                                        std::time::Instant::now(), unix_now_secs())
+                                }).await {
+                                    settle_orphan_events(&mut deferred, &vtx_t, &ctl_t, &events);
+                                }
+                                let now = std::time::Instant::now();
+                                let stale = {
+                                    let relay = tx_relay.lock();
+                                    deferred.prune(|w| relay.orphans().contains(w), now)
+                                };
+                                for origin in stale {
+                                    report_verdict(&vtx_t, &origin, network::GossipVerdict::Ignore);
+                                }
+                                let due: Vec<core::Transaction> = deferred.due_reannouncements(now).iter()
+                                    .filter_map(|t| mem_t.get_tx(t)).collect();
+                                announce_txs(&otx_t, &due);
+                                // PoWit: answer stale queued items, keep the
+                                // budget maps bounded.
+                                dispatch_powit(&mut powit_core, &powit_done_tx, &dag_t, &store_t, &vtx_t);
+                                powit_core.gc_at(now);
+                            }
+                        }
+                    }
+                };
+                match std::panic::AssertUnwindSafe(relay_task).catch_unwind().await {
+                    Ok(()) => {
+                        info!("transaction relay: input channel closed; task exiting cleanly");
+                        break;
+                    }
+                    Err(panic) => {
+                        crate::metrics::inc_task_panic("transaction_relay");
+                        let detail = panic.downcast_ref::<&str>().map(|s| (*s).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                        let wait = backoff.on_panic(run_started.elapsed());
+                        error!("transaction relay PANICKED: {} — node stays up; restarting in {:?}", detail, wait);
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+            }
+        });
+    }
+
     tokio::spawn(async move {
         use futures::future::FutureExt;
         // ── P0 supervision (roadmap §2.5, top reliability risk #1) ───────────
@@ -1055,6 +1330,9 @@ async fn main() {
             std::time::Duration::from_millis(100),
             std::time::Duration::from_secs(30),
         );
+        // B1-T7: the activation whose block, once on the selected chain, puts
+        // penalties for relayed block frames in force.
+        let activation = core::activation::hardening_activation_height();
         loop {
           let run_started = std::time::Instant::now();
           let processor = async {
@@ -1065,9 +1343,9 @@ async fn main() {
             // waiting orphans; POW-3 announced work), the missing-parent
             // retry tracker (orphan-deadlock fix: the periodic sweep
             // re-requests lost parents with backoff and prunes hopeless ones),
-            // the deep-insertion budget (DAG-7 / POW-3) and the POW-3 anti-DoS
-            // work rule. Lives inside the restartable closure: a panic
-            // rebuilds it empty (peers resend).
+            // the merge-backed insertion budget (DAG-7 / POW-3 / B1-T5), the
+            // POW-3 anti-DoS work rule and the minimum chain work. Lives inside
+            // the restartable closure: a panic rebuilds it empty (peers resend).
             let mut ingress_core = ingress::BlockIngress::with_limits(ingress::OrphanLimits::default());
             let mut orphan_sweep = tokio::time::interval(sync::parent_fetch::SWEEP_PERIOD);
             orphan_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1076,36 +1354,41 @@ async fn main() {
             // NET-6: tip claims only trigger (rate-limited) directed pulls and
             // reciprocal announcements; they never latch IBD.
             let mut claims = ingress::ClaimPolicy::new();
-            // MEM-5 / MEM-6: validated transaction relay — per-connection
-            // signature budgets and the bounded orphan-transaction pool.
-            // Shared with the blocking pool, where admission runs.
-            let tx_relay = Arc::new(parking_lot::Mutex::new(mempool::relay::TxRelay::new()));
-            // MEM-6: verdicts withheld for orphan frames, keyed by the frame's
-            // wtxid and timed from its arrival (settled from the relay's
-            // OrphanEvents: Accept / Reject / Ignore) and re-announcements.
-            let mut deferred: mempool::relay::DeferredVerdicts<network::InboundOrigin> =
-                mempool::relay::DeferredVerdicts::new();
+            // NET-2 residual (Phase 4): proof-of-work evaluations run OFF this
+            // task, on the blocking pool, at most `PowLimits::workers` at a
+            // time, from a queue bounded globally, per peer and per network
+            // group, charged to the delivering peer's and its network group's
+            // budgets (refunded for a valid proof). A block whose proof is
+            // pending is held as its frame (`Inbound`) and resubmitted to the
+            // ingress core when the result arrives; its gossip verdict is
+            // reported then, or `Ignore` if it waited past gossipsub's cache.
+            let mut pow_sched: pow::verifier::PowScheduler<network::Inbound> =
+                pow::verifier::PowScheduler::new(pow::verifier::PowLimits::default());
+            let (pow_done_tx, mut pow_done_rx) = mpsc::unbounded_channel::<PowDone>();
+            // B1-T5: the verdicts of buffered orphan frames are withheld until
+            // the orphan connects (Accept), is refused, or leaves the pool.
+            let mut deferred_blocks: ingress::DeferredBlockVerdicts<network::InboundOrigin> =
+                ingress::DeferredBlockVerdicts::new();
             let ctx = ingress::AcceptCtx {
                 dag: &dag2, store: &store2, mempool: &mem2, node_state: &state2,
                 tip_tx: Some(&tip_tx2), shielded: &shielded2,
             };
 
             loop {
-            // Orphan-deadlock fix: select between the inbound channel and the
-            // ~30s orphan sweep.
+            // Orphan-deadlock fix: select between the inbound channel, the
+            // proof-of-work results and the ~30s orphan sweep.
             let inbound = tokio::select! {
                 m = block_rx.recv() => match m { Some(m) => m, None => break },
+                // NET-2 residual: a proof evaluated off this task. The block's
+                // frame is resubmitted below; the ingress core now knows its
+                // proof (`KnownPow`).
+                Some(done) = pow_done_rx.recv() => {
+                    pow_sched.complete(done.outcome, std::time::Instant::now());
+                    done.inbound
+                }
                 // DAG-6: an operator override made bodies wait for one.
                 _ = body_requests2.notified() => {
                     request_awaited_bodies(&dag2, &mut ingress_core.parent_fetch, &otx2).await;
-                    continue;
-                }
-                // MEM-5 / MEM-6: a connection closed — forget its signature
-                // budget and the orphans it delivered.
-                Some(ev) = peer_ev_rx.recv() => {
-                    let network::PeerEvent::Disconnected(peer) = ev;
-                    let events = tx_relay.lock().on_peer_disconnected(peer);
-                    settle_orphan_events(&mut deferred, &vtx2, &net_ctl_tx, &events);
                     continue;
                 }
                 _ = orphan_sweep.tick() => {
@@ -1118,46 +1401,16 @@ async fn main() {
                     for p in ready {
                         ingress_core.drain_orphans(p, &ctx);
                     }
-                    // MEM-6: what the drained blocks did to the applied chain.
+                    // MEM-6: what the drained blocks did to the applied chain,
+                    // for the transaction relay's orphan bookkeeping.
                     let chain = ingress_core.take_chain_move();
+                    if !chain.is_empty() && chain_move_tx.try_send(chain).is_err() {
+                        warn!("transaction relay busy: an applied-chain move was not passed on (its orphan sweep catches up)");
+                    }
+                    settle_block_verdicts(&mut ingress_core, &mut deferred_blocks, &vtx2, &net_ctl_tx, &dag2, activation);
                     frontier2.lock().set_orphan_evidence(ingress_core.orphans.max_evidence_height());
                     maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
-                    // MEM-6: expire orphan transactions and re-try those
-                    // whose parents arrived through any path (miner, RPC) —
-                    // a bounded, round-robin scan. At the pool's next
-                    // height, as every admission. First the orphan
-                    // bookkeeping of the applied-chain move the drained
-                    // blocks caused, if any.
-                    let next_height = mempool::admission::pool_next_height(&dag2.read(), &store2, &mem2);
-                    let (store_v, mem_v, relay_v) = (store2.clone(), mem2.clone(), tx_relay.clone());
-                    if let Ok(events) = tokio::task::spawn_blocking(move || {
-                        let mut relay = relay_v.lock();
-                        let now = std::time::Instant::now();
-                        let mut events = if chain.is_empty() {
-                            mempool::relay::OrphanEvents::default()
-                        } else {
-                            relay.on_chain_moved(&store_v, &mem_v, next_height,
-                                &chain.connected_txs(&store_v), &chain.disconnected_txs(&store_v), now, unix_now_secs())
-                        };
-                        let swept = relay.retry_orphans(&store_v, &mem_v, next_height, now, unix_now_secs());
-                        events.admitted.extend(swept.admitted);
-                        events.rejected.extend(swept.rejected);
-                        events.dropped.extend(swept.dropped);
-                        events
-                    }).await {
-                        settle_orphan_events(&mut deferred, &vtx2, &net_ctl_tx, &events);
-                    }
-                    let now = std::time::Instant::now();
-                    let stale = {
-                        let relay = tx_relay.lock();
-                        deferred.prune(|w| relay.orphans().contains(w), now)
-                    };
-                    for origin in stale {
-                        report_verdict(&vtx2, &origin, network::GossipVerdict::Ignore);
-                    }
-                    let due: Vec<core::Transaction> = deferred.due_reannouncements(now).iter()
-                        .filter_map(|t| mem2.get_tx(t)).collect();
-                    announce_txs(&otx2, &due);
+                    pow_sched.gc_at(std::time::Instant::now());
                     continue;
                 }
             };
@@ -1314,14 +1567,29 @@ async fn main() {
                 // Full validation before storing — with orphan pool support.
                 //
                 // NET-2 (audit): checks run CHEAPEST FIRST and the 64 MiB PoW
-                // only after every cheap check has passed; the gossip frame is
-                // relayed only after the verdict computed here is reported
-                // (`report_verdict`): Accept → forwarded, Reject → not forwarded
-                // and the delivering peer takes gossipsub's P4 penalty, Ignore →
-                // dropped without penalty.
-                network::NetworkMessage::NewBlock { block_data, block_hash, height, .. } => {
+                // only after every cheap check has passed — off this task
+                // (NET-2 residual, Phase 4: the PoW scheduler); the gossip
+                // frame is relayed only after the verdict computed here is
+                // reported (`report_verdict`): Accept → forwarded, Reject → not
+                // forwarded and the delivering peer takes gossipsub's P4
+                // penalty, Ignore → dropped without penalty. B1-T7: who is
+                // charged follows `ingress::block_penalty`.
+                network::NetworkMessage::NewBlock { block_data, block_hash, height, blue_score } => {
                     let now = std::time::Instant::now();
-                    let verdict: network::GossipVerdict = 'blk: {
+                    let tip_h = selected_tip_height(&dag2);
+                    // B1-T7: the delivering peer authored the frame (nobody
+                    // relayed it), or sent it as the answer to our own pull.
+                    let self_authored = origin.delivered_by_author();
+                    let in_force = ingress::block_penalties_in_force(tip_h, activation);
+                    let penalty = |base: network::GossipVerdict, fault: ingress::BlockFault| {
+                        ingress::block_penalty(base, fault, self_authored, in_force)
+                    };
+                    let plain = |v: network::GossipVerdict| ingress::BlockPenalty { gossip: v, misbehaving: false };
+                    let pow_source = pow::verifier::PowSource {
+                        peer:  origin.peer(),
+                        group: origin.peer().and_then(|p| peer_addrs.group(&p)),
+                    };
+                    let step: BlockStep = 'blk: {
                         // Known = buffered, or in the DAG — unless a body of
                         // it is wanted (`accept::awaits_body`: its body was
                         // rejected for a witness-dependent reason, or a
@@ -1334,16 +1602,15 @@ async fn main() {
                         let known_in_dag = dag2.read().has_block(&block_hash)
                             && (!origin.is_solicited() || accept::is_known_block(&dag2, &store2, &block_hash));
                         if known_in_dag || ingress_core.orphans.contains(&block_hash) {
-                            break 'blk network::GossipVerdict::Ignore;
+                            break 'blk BlockStep::Verdict(plain(network::GossipVerdict::Ignore));
                         }
-                        let tip_h = selected_tip_height(&dag2);
                         // POW-2: bound the peer-supplied height BEFORE any
                         // decoding or arithmetic (unsolicited frames only — an
                         // answer to our own pull may legitimately be far ahead).
                         if !origin.is_solicited() && ingress::unsolicited_height_too_far_ahead(height, tip_h) {
                             debug!("NewBlock {} claims h={} far above tip h={}; ignored (pull-based IBD fetches it)",
                                 hex::encode(&block_hash[..8]), height, tip_h);
-                            break 'blk network::GossipVerdict::Ignore;
+                            break 'blk BlockStep::Verdict(plain(network::GossipVerdict::Ignore));
                         }
                         // Sprint 1.c: Bitcoin-format wire. A widened varint
                         // (which releases before the minimal-varint rule
@@ -1361,7 +1628,7 @@ async fn main() {
                                 } else {
                                     warn!("block deserialise: {}", e);
                                 }
-                                break 'blk v;
+                                break 'blk BlockStep::Verdict(penalty(v, ingress::BlockFault::ContextFree));
                             }
                         };
                         // SECURITY (audit H2): bind the wire-supplied block_hash /
@@ -1370,16 +1637,18 @@ async fn main() {
                         if real_hash != block_hash {
                             warn!("block id mismatch: claimed {} but content hashes to {}; dropping",
                                 hex::encode(&block_hash[..8]), hex::encode(&real_hash[..8]));
-                            break 'blk network::GossipVerdict::Reject;
+                            break 'blk BlockStep::Verdict(penalty(network::GossipVerdict::Reject, ingress::BlockFault::ContextFree));
                         }
                         if height != block.height {
                             warn!("block {} height mismatch: claimed {} vs content {}; dropping",
                                 hex::encode(&block_hash[..8]), height, block.height);
-                            break 'blk network::GossipVerdict::Reject;
+                            break 'blk BlockStep::Verdict(penalty(network::GossipVerdict::Reject, ingress::BlockFault::ContextFree));
                         }
 
                         // Everything else is the ingress core (shared with the
                         // integration tests), cheapest checks first:
+                        //  * the unrequested-block and minimum-chain-work rules
+                        //    (POW-3, Phase 4: Bitcoin Core's AcceptBlock);
                         //  * structure without PoW;
                         //  * ORPHAN (a parent unknown): backfill-flood guard (an
                         //    unsolicited far-below-tip orphan is dropped — backfill
@@ -1388,45 +1657,69 @@ async fn main() {
                         //  * parents known: the POW-3 anti-DoS WORK rule — the
                         //    block's chain must come within ANTI_DOS_WINDOW_BLOCKS
                         //    of our tip's work, or be backed by a proof-of-work-
-                        //    verified orphan chain announced on top of it (deep
-                        //    merge-backed blocks are rationed, DAG-7) — BEFORE the
-                        //    proof, storage or DAG insertion; then POW-8 metadata
-                        //    normalization, `accept_block` (height, expected bits,
-                        //    timestamp before the proof, NET-2) and the iterative
-                        //    orphan drain (POW-3 / POW-4).
+                        //    verified orphan chain announced on top of it, or by a
+                        //    contextually checked voucher (rationed, B1-T5) — and
+                        //    the checks accept_block runs before its proof
+                        //    (height, expected bits, timestamp), BEFORE the proof,
+                        //    storage or DAG insertion; then POW-8 metadata
+                        //    normalization, `accept_block` and the iterative orphan
+                        //    drain, which applies the work rule to every drained
+                        //    orphan (B1-T5).
                         let now_unix = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs()).unwrap_or(0);
                         let t_validate = std::time::Instant::now();
-                        match ingress_core.handle_block(block, block_hash, block_data.len(), origin.peer(),
-                                                        origin.is_solicited(), now, now_unix, &ctx) {
+                        let gated = ingress_core.handle_block_gated(block, block_hash, block_data.len(), origin.peer(),
+                            origin.is_solicited(), now, now_unix, &ctx, &mut KnownPow(&pow_sched));
+                        let outcome = match gated {
+                            ingress::Gated::Done(o) => o,
+                            ingress::Gated::PowPending(_) => break 'blk BlockStep::Pow,
+                        };
+                        match outcome {
                             ingress::BlockOutcome::Known | ingress::BlockOutcome::PoolRefused => {
-                                network::GossipVerdict::Ignore
+                                BlockStep::Verdict(plain(network::GossipVerdict::Ignore))
                             }
                             ingress::BlockOutcome::BodyRestored => {
                                 info!("wanted body of block {} h={} stored (it waited for one: rejected \
                                        for a witness-dependent reason, or pruned and needed again)",
                                     hex::encode(&block_hash[..8]), height);
-                                network::GossipVerdict::Ignore
+                                BlockStep::Verdict(plain(network::GossipVerdict::Ignore))
+                            }
+                            ingress::BlockOutcome::Dropped(ingress::DropReason::OrphanBelowFloor) => {
+                                // NET-2 residual: no honest miner publishes an
+                                // orphan 16 times easier than a block at our
+                                // tip (`ingress::orphan_floor_penalty`: gossip
+                                // is charged to the deliverer's proof-of-work
+                                // budget, its author penalised if it delivered
+                                // it itself; an answer to our own pull is only
+                                // dropped).
+                                let (p, charge) = ingress::orphan_floor_penalty(origin.is_solicited(), self_authored, in_force);
+                                if charge {
+                                    let _ = pow_sched.charge(&pow_source, now);
+                                }
+                                debug!("orphan {} h={} below the anti-DoS floor (tip h={})",
+                                    hex::encode(&block_hash[..8]), height, tip_h);
+                                BlockStep::Verdict(p)
                             }
                             ingress::BlockOutcome::Dropped(reason) => {
                                 debug!("block {} h={} dropped before PoW: {:?} (tip h={})",
                                     hex::encode(&block_hash[..8]), height, reason, tip_h);
                                 crate::metrics::inc_block_backfill_dropped();
-                                network::GossipVerdict::Ignore
+                                BlockStep::Verdict(plain(network::GossipVerdict::Ignore))
                             }
                             ingress::BlockOutcome::Invalid(reason) => {
                                 warn!("block {} rejected ({})", hex::encode(&block_hash[..8]), reason);
-                                network::GossipVerdict::Reject
+                                BlockStep::Verdict(penalty(network::GossipVerdict::Reject, ingress::BlockFault::ContextFree))
                             }
                             ingress::BlockOutcome::BodyRefused(reason) => {
-                                // B1-T2 review: a Reject here penalizes the
-                                // peer that served the body
-                                // (`directed_block_penalty`): only for what
-                                // the block id commits to.
+                                // B1-T2 review: a Reject here sanctions the
+                                // peer that served the body (an answer to our
+                                // own pull: its author, `ingress::block_penalty`)
+                                // only for what the block id commits to.
                                 warn!("wanted body of block {} h={} not stored: {}",
                                     hex::encode(&block_hash[..8]), height, reason);
-                                ingress::verdict_for_accept_error(&reason)
+                                BlockStep::Verdict(penalty(ingress::verdict_for_accept_error(&reason),
+                                    ingress::accept_error_fault(&reason)))
                             }
                             ingress::BlockOutcome::Buffered { request, evidence, evicted } => {
                                 if evicted > 0 {
@@ -1455,7 +1748,8 @@ async fn main() {
                                     s.is_syncing = true;
                                 }
                                 maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
-                                network::GossipVerdict::Accept
+                                // B1-T5: not relayed before it connects.
+                                BlockStep::DeferOrphan
                             }
                             ingress::BlockOutcome::Processed { admission, result, drained, missing_bodies } => {
                                 crate::metrics::observe_block_validation(t_validate.elapsed().as_secs_f64());
@@ -1472,7 +1766,7 @@ async fn main() {
                                     Err(e) => {
                                         crate::metrics::inc_block_rejected();
                                         warn!("block {} h={} REJECTED: {}", hex::encode(&block_hash[..8]), height, e);
-                                        ingress::verdict_for_accept_error(&e)
+                                        BlockStep::Verdict(penalty(ingress::verdict_for_accept_error(&e), ingress::accept_error_fault(&e)))
                                     }
                                     Ok(_) => {
                                         crate::metrics::inc_block_accepted();
@@ -1486,54 +1780,67 @@ async fn main() {
                                             fr.set_orphan_evidence(ingress_core.orphans.max_evidence_height());
                                         }
                                         maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
-                                        network::GossipVerdict::Accept
+                                        BlockStep::Verdict(plain(network::GossipVerdict::Accept))
                                     }
                                 }
                             }
                         }
                     };
-                    report_verdict(&vtx2, &origin, verdict);
-                    // B1-T2: an invalid block sent as the ANSWER to one of our
-                    // pulls costs its sender a misbehaviour penalty.
-                    if let Some(peer) = directed_block_penalty(verdict, &origin) {
-                        let _ = net_ctl_tx.try_send(network::NetworkControl::PenalizePeer(peer));
+                    match step {
+                        BlockStep::Verdict(p) => {
+                            report_verdict(&vtx2, &origin, p.gossip);
+                            // NET-2 residual + B1-T2: the deliverer's sanction
+                            // (`block_sanction`).
+                            if let Some(c) = block_sanction(p, &origin) {
+                                let _ = net_ctl_tx.try_send(c);
+                            }
+                        }
+                        BlockStep::DeferOrphan => {
+                            // Only a gossip frame owes a verdict.
+                            if origin.pending_verdict().is_some() {
+                                let received_at = origin.received_at().unwrap_or(now);
+                                if let Some(back) = deferred_blocks.defer(block_hash, origin, received_at, now) {
+                                    report_verdict(&vtx2, &back, network::GossipVerdict::Ignore);
+                                }
+                            }
+                        }
+                        BlockStep::Pow => {
+                            // NET-2 residual: every cheap check passed; the proof
+                            // is evaluated off this task, charged to the
+                            // delivering peer and its network group.
+                            let job = pow::verifier::PowJob {
+                                id: block_hash,
+                                height,
+                                source: pow_source,
+                                solicited: origin.is_solicited(),
+                                received_at: origin.received_at().unwrap_or(now),
+                                payload: network::Inbound {
+                                    msg: network::NetworkMessage::NewBlock { block_hash, blue_score, height, block_data },
+                                    origin,
+                                },
+                            };
+                            if let Err((refusal, job)) = pow_sched.submit(job, now) {
+                                debug!("block {} not evaluated: proof-of-work queue refused it ({:?})",
+                                    hex::encode(&block_hash[..8]), refusal);
+                                report_verdict(&vtx2, &job.payload.origin, network::GossipVerdict::Ignore);
+                            }
+                        }
                     }
+                    // B1-T5: verdicts of orphans the drain connected, refused or
+                    // dropped; and of frames whose orphan left the pool.
+                    settle_block_verdicts(&mut ingress_core, &mut deferred_blocks, &vtx2, &net_ctl_tx, &dag2, activation);
+                    dispatch_pow(&mut pow_sched, &pow_done_tx, &vtx2);
                     // A body rejected for a witness-dependent reason, or found
                     // missing (pruned, DAG-6) during this acceptance: ask peers
                     // for it now; the orphan sweep retries with backoff.
                     request_awaited_bodies(&dag2, &mut ingress_core.parent_fetch, &otx2).await;
                     // MEM-6: what this block (and the orphan blocks it
                     // unblocked) did to the APPLIED chain, for the
-                    // orphan-transaction bookkeeping that runs AFTER the
-                    // block's verdict (never on its relay path). Empty for a
-                    // fork-loser or merge candidate, which applies none of
-                    // its transactions (selected-chain-only ledger).
+                    // orphan-transaction bookkeeping of the transaction relay
+                    // task — never on the block's relay path.
                     let chain = ingress_core.take_chain_move();
-                    // MEM-6: orphan transactions the applied chain now
-                    // confirms or conflicts with are dropped; those waiting
-                    // on a transaction it gained (or lost back to the pool)
-                    // are re-tried (and announced). Exactly the blocks the
-                    // mempool treated as connected / disconnected
-                    // (`ChainMove`): nothing for a fork-loser (review
-                    // finding). Off the block's relay path: the verdict
-                    // above is already out. Judged at the pool's next height
-                    // (the node's next template height, `pool_next_height`),
-                    // as every admission.
-                    if !chain.is_empty() {
-                        let next_height = mempool::admission::pool_next_height(&dag2.read(), &store2, &mem2);
-                        let (store_v, mem_v, relay_v) = (store2.clone(), mem2.clone(), tx_relay.clone());
-                        if let Ok(events) = tokio::task::spawn_blocking(move || {
-                            // R4 (B1-T20): the move lists block hashes; the
-                            // bodies are read here, off the processor loop,
-                            // within Core's 20 MB budget.
-                            let (connected_txs, disconnected_txs) =
-                                (chain.connected_txs(&store_v), chain.disconnected_txs(&store_v));
-                            relay_v.lock().on_chain_moved(
-                                &store_v, &mem_v, next_height, &connected_txs, &disconnected_txs,
-                                std::time::Instant::now(), unix_now_secs())
-                        }).await {
-                            settle_orphan_events(&mut deferred, &vtx2, &net_ctl_tx, &events);
-                        }
+                    if !chain.is_empty() && chain_move_tx.try_send(chain).is_err() {
+                        warn!("transaction relay busy: an applied-chain move was not passed on (its orphan sweep catches up)");
                     }
                 }
 
@@ -1547,104 +1854,20 @@ async fn main() {
                     }
                 }
 
-                // Validated transaction relay (MEM-5 / NET-2 / NET-4).
-                //
-                // The network loop no longer relays a gossiped transaction on
-                // decode: it waits for the verdict computed here. The shared
-                // admission function (same rules as sendrawtransaction and
-                // reorg re-injection — strict decode, size, standardness incl.
-                // dust, witness and version policy, known/recent-reject,
-                // inputs from the UTXO set or the pool, version rule and
-                // maturity at the NEXT block height — the node's next
-                // template height, `pool_next_height`, never
-                // dag.block_count() — fees, replacement and chain limits)
-                // runs cheapest first; the signature step
-                // runs LAST and is charged to the DELIVERING CONNECTION's
-                // budget (never the self-chosen gossip author), refunded on
-                // admission.
-                // Accept → relayed; Reject (malformed or consensus-invalid,
-                // once the chain contains the hardening activation block:
-                // `TxRelay::penalties_in_force`) → not relayed and the
-                // delivering peer — its author, as no peer on the chain
-                // forwards it unvalidated any more — takes gossipsub's
-                // invalid-message penalty; before that block an older
-                // release that forwards every frame unvalidated may be the
-                // honest deliverer, so the same frame is answered Ignore;
-                // Ignore → dropped without penalty (policy, duplicates,
-                // recent rejects, rate limit). MEM-6: an orphan's verdict is
-                // WITHHELD (keyed by the frame's wtxid, timed from its
-                // arrival) and settled from the relay's OrphanEvents: Accept
-                // when exactly those bytes enter the pool, Reject when their
-                // re-try proves them invalid while penalties are in force
-                // (or a penalty on the delivering connection once the frame
-                // left gossipsub's cache), Ignore when the orphan is
-                // dropped.
-                // P0: it runs on the blocking pool so PQ signature work
-                // cannot stall this task's reactor.
-                network::NetworkMessage::NewTransaction { txid, tx_data } => {
-                    // The connection that delivered the frame (gossip
-                    // propagation_source): the key of the signature budget
-                    // and the orphan quotas. The signed gossip author is
-                    // chosen by the sender and bounds nothing.
-                    let peer = origin.peer();
-                    // The signed gossip author: for logs only.
-                    let author = match &origin {
-                        network::InboundOrigin::Gossip { author, .. } => *author,
-                        _ => None,
-                    };
-                    let received_at = origin.received_at().unwrap_or_else(std::time::Instant::now);
-                    let next_height = mempool::admission::pool_next_height(&dag2.read(), &store2, &mem2);
-                    let (store_v, mem_v, relay_v) = (store2.clone(), mem2.clone(), tx_relay.clone());
-                    let outcome = tokio::task::spawn_blocking(move || {
-                        relay_v.lock().on_gossip_tx(
-                            &store_v, &mem_v, next_height, &txid, &tx_data, peer,
-                            std::time::Instant::now(), unix_now_secs())
-                    }).await;
-                    match outcome {
-                        Ok(o) => {
-                            if o.invalid {
-                                warn!("tx {} from {:?} (author {:?}) INVALID ({:?}): {}",
-                                    hex::encode(&txid[..8]), peer, author, o.verdict, o.detail);
-                            } else {
-                                debug!("tx {} verdict {:?}: {}", hex::encode(&txid[..8]), o.verdict, o.detail);
-                            }
-                            if o.orphaned {
-                                if let Some(back) = deferred.defer(o.wtxid, origin, received_at, std::time::Instant::now()) {
-                                    report_verdict(&vtx2, &back, network::GossipVerdict::Ignore);
-                                }
-                            } else {
-                                report_verdict(&vtx2, &origin, o.verdict);
-                            }
-                            settle_orphan_events(&mut deferred, &vtx2, &net_ctl_tx, &o.orphans);
-                        }
-                        Err(e) => {
-                            warn!("tx verify task failed: {}", e);
-                            report_verdict(&vtx2, &origin, network::GossipVerdict::Ignore);
-                        }
-                    }
-                    state2.write().mempool_size = mem2.size();
+                // B1-T19: gossip transactions are delivered to the transaction
+                // relay task (`NetworkNode::attach_tx_ingest`), never here.
+                network::NetworkMessage::NewTransaction { .. } => {
+                    report_verdict(&vtx2, &origin, network::GossipVerdict::Ignore);
                 }
 
-                // PoWit items (shares, attestations, equivocation proofs):
-                // validated off the reactor, relayed only on Accept. An item
-                // that fails validation may be stale or for a branch this
-                // node does not follow, so it is ignored, never penalized.
-                network::NetworkMessage::NewPowitItem { id: claimed, kind, data } => {
-                    let verdict = if powit::item_id(kind, &data) != claimed {
-                        network::GossipVerdict::Reject
-                    } else {
-                        let (dag_v, store_v) = (dag2.clone(), store2.clone());
-                        let r = tokio::task::spawn_blocking(move || {
-                            let d = dag_v.read();
-                            powit::admit_item(kind, &data, &d, &store_v)
-                        }).await;
-                        match r {
-                            Ok(Ok(())) => network::GossipVerdict::Accept,
-                            Ok(Err(e)) => { debug!("PoWit item rejected: {}", e); network::GossipVerdict::Ignore }
-                            Err(e) => { warn!("PoWit verify task failed: {}", e); network::GossipVerdict::Ignore }
-                        }
-                    };
-                    report_verdict(&vtx2, &origin, verdict);
+                // PoWit items (shares, attestations, equivocation proofs) are
+                // delivered to the transaction relay task with transactions
+                // (`network::goes_to_tx_ingest`), which verifies them off this
+                // loop under budgets (`ingress::PowitIngress`), never here: a
+                // share's proof is a GnB-SMH v3 evaluation, and awaiting it
+                // here stalled every block behind a flood of junk shares.
+                network::NetworkMessage::NewPowitItem { .. } => {
+                    report_verdict(&vtx2, &origin, network::GossipVerdict::Ignore);
                 }
 
                 // NET-6: same claim handling as PeerTip (rate-limited directed
@@ -2354,6 +2577,12 @@ fn make_rpc_submit_block_cb(
             }
             return Err("duplicate block".to_string());
         }
+        // POW-3 (Phase 4): the minimum chain work applies to submitted blocks
+        // too (`ingress::submitted_block_admission`, DAG lookups only, before
+        // the proof of work); the tip-relative anti-DoS work rule does not,
+        // so an operator can replay a heavier chain that forks deep below the
+        // tip (Bitcoin Core's `submitblock`).
+        ingress::submitted_block_admission(&dag.read(), &block, ingress::minimum_chain_work())?;
         block.validate_structure()
             .map_err(|e| format!("structural validation: {}", e))?;
 
@@ -2524,11 +2753,22 @@ fn maybe_release_ibd(
     let evidence_ahead = evidence.is_some_and(|h| h > our_height.saturating_add(sync::IBD_EXIT_LAG));
     let verified  = have_frontier && reconciled && !abandoned_gap && our_work >= servable;
     let caught_up = !evidence_ahead;
+    // POW-3 (Phase 4): below the minimum chain work the node is in initial
+    // block download whatever else it sees (Bitcoin Core's first
+    // IsInitialBlockDownload criterion): the latch is held and the miner
+    // stays paused.
+    let below_minimum_work = our_work < ingress::minimum_chain_work();
     {
         let mut s = node_state.write();
         // RPC honesty hint (fresh, author-attributed claims only).
         s.best_announced_blue_score = best_announced;
-        if (verified || caught_up) && s.is_syncing {
+        if below_minimum_work {
+            if !s.is_syncing {
+                info!("IBD latched: selected-tip work {:#x} is below the minimum chain work {:#x}",
+                    our_work, ingress::minimum_chain_work());
+            }
+            s.is_syncing = true;
+        } else if (verified || caught_up) && s.is_syncing {
             s.is_syncing = false;
             info!("IBD complete (verified={} caught_up={}; score {} height {} best_announced {}; work {} servable {}; abandoned_gap={}; orphan_evidence={:?})",
                 verified, caught_up, our_score, our_height, best_announced, our_work, servable, abandoned_gap, evidence);
@@ -2592,6 +2832,177 @@ fn directed_block_penalty(verdict: network::GossipVerdict, origin: &network::Inb
     match (verdict, origin) {
         (network::GossipVerdict::Reject, network::InboundOrigin::Directed { peer }) => Some(*peer),
         _ => None,
+    }
+}
+
+/// The one misbehaviour model, block frames (R2b's NET-2 residual with
+/// R2a's B1-T2): what the network loop is asked to do about the peer that
+/// delivered a block frame judged `p`. Data no honest node sends
+/// (`p.misbehaving`, `ingress::block_penalty`: a context-free fault, or one
+/// the deliverer authored, which every answer to our own pull is) gets
+/// `Misbehaving`: disconnect, identity and address discouraged at once. An
+/// invalid directed answer the penalty model would not sanction still costs
+/// its sender one offence of the shared decaying score
+/// ([`directed_block_penalty`], `PenalizePeer`; four within the decay
+/// disconnect it), so answering pulls with invalid blocks is never free.
+/// A relayed gossip frame is left to gossipsub's verdict.
+fn block_sanction(p: ingress::BlockPenalty, origin: &network::InboundOrigin) -> Option<network::NetworkControl> {
+    if p.misbehaving {
+        return origin.peer().map(network::NetworkControl::Misbehaving);
+    }
+    directed_block_penalty(p.gossip, origin).map(network::NetworkControl::PenalizePeer)
+}
+
+/// What the processor does with one block frame after the ingress core.
+enum BlockStep {
+    /// Report this verdict (and the misbehaviour, if any) now.
+    Verdict(ingress::BlockPenalty),
+    /// Buffered as an orphan: withhold the verdict until it connects (B1-T5).
+    DeferOrphan,
+    /// Every cheap check passed: evaluate the proof off the processor
+    /// (NET-2 residual).
+    Pow,
+}
+
+/// A proof of work evaluated on the blocking pool, back to the processor.
+struct PowDone {
+    /// The block's frame, resubmitted to the ingress core.
+    inbound: network::Inbound,
+    outcome: pow::verifier::PowOutcome,
+}
+
+/// NET-2 residual: the processor's proof-of-work gate — the result of an
+/// earlier evaluation on the PoW scheduler, else "deferred" (the processor
+/// then queues the evaluation and resubmits the block when it is done).
+struct KnownPow<'a>(&'a pow::verifier::PowScheduler<network::Inbound>);
+
+impl ingress::PowGate for KnownPow<'_> {
+    fn check(&mut self, block: &core::Block, hash: &[u8; 32]) -> ingress::PowCheck {
+        match self.0.known(hash, block.height) {
+            Some(true) => ingress::PowCheck::Valid,
+            Some(false) => ingress::PowCheck::Invalid,
+            None => ingress::PowCheck::Deferred,
+        }
+    }
+}
+
+/// NET-2 residual: start every queued proof-of-work evaluation a worker slot
+/// is free for, on the blocking pool; the result comes back on `done`. A
+/// gossip job that waited past gossipsub's cache is answered `Ignore`
+/// unevaluated.
+fn dispatch_pow(
+    sched: &mut pow::verifier::PowScheduler<network::Inbound>,
+    done:  &mpsc::UnboundedSender<PowDone>,
+    vtx:   &mpsc::Sender<network::GossipValidation>,
+) {
+    let now = std::time::Instant::now();
+    loop {
+        match sched.start_next(now) {
+            pow::verifier::StartNext::Idle => break,
+            pow::verifier::StartNext::Expired(job) => {
+                debug!("block {} not evaluated: its frame waited past the gossip cache in the PoW queue",
+                    hex::encode(&job.id[..8]));
+                report_verdict(vtx, &job.payload.origin, network::GossipVerdict::Ignore);
+            }
+            pow::verifier::StartNext::Start(job) => {
+                let done = done.clone();
+                tokio::task::spawn_blocking(move || {
+                    // GnB-SMH v1 or v3, as the header height says.
+                    let valid = match &job.payload.msg {
+                        network::NetworkMessage::NewBlock { block_data, .. } => pow::verifier::evaluate_block_frame(block_data),
+                        _ => false,
+                    };
+                    let outcome = job.outcome(valid);
+                    let _ = done.send(PowDone { inbound: job.payload, outcome });
+                });
+            }
+        }
+    }
+}
+
+/// PoWit gossip: start every queued PoWit verification a worker slot is
+/// free for (`powit::admit_item` on the blocking pool, under a DAG read
+/// lock); the result comes back on `done`. A frame that waited past
+/// gossipsub's cache is answered `Ignore` unverified.
+fn dispatch_powit(
+    core_p: &mut ingress::PowitIngress,
+    done:   &mpsc::UnboundedSender<(ingress::PowitJob, Result<(), String>)>,
+    dag:    &Arc<RwLock<consensus::GhostDAG>>,
+    store:  &Arc<storage::Storage>,
+    vtx:    &mpsc::Sender<network::GossipValidation>,
+) {
+    let now = std::time::Instant::now();
+    loop {
+        match core_p.start_next(now) {
+            pow::verifier::StartNext::Idle => break,
+            pow::verifier::StartNext::Expired(job) => {
+                debug!("PoWit item {} not verified: its frame waited past the gossip cache",
+                    hex::encode(&job.id[..8]));
+                report_verdict(vtx, &job.payload.origin, network::GossipVerdict::Ignore);
+            }
+            pow::verifier::StartNext::Start(job) => {
+                let (done, dag, store) = (done.clone(), dag.clone(), store.clone());
+                tokio::task::spawn_blocking(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let d = dag.read();
+                        powit::admit_item(job.payload.kind, &job.payload.data, &d, &store)
+                    }))
+                    .unwrap_or_else(|_| Err("storage: PoWit verification panicked".into()));
+                    let _ = done.send((job, result));
+                });
+            }
+        }
+    }
+}
+
+/// Report a PoWit frame's verdict and, for a misbehaving deliverer (a
+/// context-free fault it authored, or relayed once penalties are in force:
+/// `ingress::block_penalty`), disconnect it and discourage its address.
+fn report_powit_verdict(
+    vtx:     &mpsc::Sender<network::GossipValidation>,
+    net_ctl: &mpsc::Sender<network::NetworkControl>,
+    v:       ingress::PowitVerdict,
+) {
+    report_verdict(vtx, &v.origin, v.penalty.gossip);
+    if v.penalty.misbehaving {
+        if let Some(peer) = v.origin.peer() {
+            warn!("PoWit item from {} invalid regardless of chain state: peer misbehaved", peer);
+            let _ = net_ctl.try_send(network::NetworkControl::Misbehaving(peer));
+        }
+    }
+}
+
+/// B1-T5: report the withheld verdicts of buffered orphan frames — Accept
+/// for an orphan that connected, the (B1-T7-gated) penalty for one
+/// `accept_block` refused, Ignore for one the work rule refused or that left
+/// the pool, or whose frame expired.
+fn settle_block_verdicts(
+    core:       &mut ingress::BlockIngress,
+    deferred:   &mut ingress::DeferredBlockVerdicts<network::InboundOrigin>,
+    vtx:        &mpsc::Sender<network::GossipValidation>,
+    net_ctl:    &mpsc::Sender<network::NetworkControl>,
+    dag:        &Arc<RwLock<consensus::GhostDAG>>,
+    activation: u64,
+) {
+    let events = core.take_orphan_events();
+    if deferred.is_empty() {
+        return;
+    }
+    let in_force = ingress::block_penalties_in_force(selected_tip_height(dag), activation);
+    for (origin, fate) in deferred.settle(&events) {
+        let p = match fate {
+            ingress::OrphanFate::Accepted => ingress::BlockPenalty { gossip: network::GossipVerdict::Accept, misbehaving: false },
+            ingress::OrphanFate::Rejected(e) => ingress::block_penalty(
+                ingress::verdict_for_accept_error(&e), ingress::accept_error_fault(&e), origin.delivered_by_author(), in_force),
+            ingress::OrphanFate::Dropped => ingress::BlockPenalty { gossip: network::GossipVerdict::Ignore, misbehaving: false },
+        };
+        report_verdict(vtx, &origin, p.gossip);
+        if let Some(c) = block_sanction(p, &origin) {
+            let _ = net_ctl.try_send(c);
+        }
+    }
+    for origin in deferred.prune(|h| core.orphans.contains(h), std::time::Instant::now()) {
+        report_verdict(vtx, &origin, network::GossipVerdict::Ignore);
     }
 }
 
@@ -2751,6 +3162,42 @@ mod ingress_processor_tests {
         };
         assert_eq!(directed_block_penalty(GossipVerdict::Reject, &gossip), None);
         assert_eq!(directed_block_penalty(GossipVerdict::Reject, &InboundOrigin::Local), None);
+    }
+
+    /// R2a (B1-T2) with R2b (NET-2 residual, B1-T7): one sanction per block
+    /// frame. An invalid answer to our own pull is authored by the peer that
+    /// sent it, so the penalty model calls it misbehaving: `Misbehaving`
+    /// (disconnect, identity and address discouraged), never a second
+    /// `PenalizePeer` on top. A directed `Reject` the penalty model does not
+    /// sanction still costs one offence of the shared score; a relayed
+    /// gossip frame before penalties are in force costs nothing here (its
+    /// gossip verdict is `Ignore`), and an honest verdict nothing at all.
+    #[test]
+    fn block_frames_get_one_sanction_from_the_shared_model() {
+        use crate::ingress::{block_penalty, BlockFault, BlockPenalty};
+        use network::{GossipVerdict, InboundOrigin, NetworkControl};
+        let peer = libp2p::PeerId::random();
+        let directed = InboundOrigin::Directed { peer };
+        let relay = InboundOrigin::Gossip {
+            propagation_source: peer,
+            author: Some(libp2p::PeerId::random()),
+            pending: None,
+            received_at: std::time::Instant::now(),
+        };
+        for in_force in [false, true] {
+            for fault in [BlockFault::ContextFree, BlockFault::Context] {
+                let p = block_penalty(GossipVerdict::Reject, fault, directed.delivered_by_author(), in_force);
+                assert_eq!(block_sanction(p, &directed), Some(NetworkControl::Misbehaving(peer)),
+                    "an invalid answer to our pull ({fault:?}, in force {in_force})");
+            }
+        }
+        let relayed = block_penalty(GossipVerdict::Reject, BlockFault::Context, relay.delivered_by_author(), false);
+        assert_eq!(block_sanction(relayed, &relay), None, "a relayed frame before penalties are in force");
+        let unsanctioned = BlockPenalty { gossip: GossipVerdict::Reject, misbehaving: false };
+        assert_eq!(block_sanction(unsanctioned, &directed), Some(NetworkControl::PenalizePeer(peer)));
+        let honest = BlockPenalty { gossip: GossipVerdict::Accept, misbehaving: false };
+        assert_eq!(block_sanction(honest, &directed), None);
+        assert_eq!(block_sanction(honest, &InboundOrigin::Local), None);
     }
 
     fn unix_now() -> u64 {
