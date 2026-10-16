@@ -479,6 +479,16 @@ impl Storage {
         }
     }
 
+    /// The stored body of `hash` exactly as stored: the canonical
+    /// `Block::to_wire_bytes` encoding every write path uses, not decoded.
+    /// The `/gnb/sync/1` server sends these bytes as they are (audit B2-T6:
+    /// it used to decode the block and encode it again for every request).
+    pub fn get_block_wire_bytes(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, StorageError> {
+        self.note_reads(1);
+        let cf = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
+        self.db.get_cf(&cf, hash).map_err(|e| StorageError::ReadFailed(e.to_string()))
+    }
+
     pub fn get_block_hash_at_height(&self, height: u64) -> Result<Option<[u8; 32]>, StorageError> {
         self.note_reads(1);
         let cf = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;

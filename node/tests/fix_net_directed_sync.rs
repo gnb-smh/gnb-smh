@@ -1,0 +1,632 @@
+//! Phase 4 (package R2a) regressions for the directed-sync CLIENT
+//! (`/gnb/sync/1`): re-audit items B1-T2, B1-T6, NET-9 and NET-10.
+//!
+//! * Every answer is bound to the request it answers (variant, block hash,
+//!   header count and range); anything else is a protocol violation that is
+//!   neither delivered nor allowed to complete the pull.
+//! * Pull selection prefers the peer that announced a block, never sends a
+//!   pull back to a peer that already answered it, counts NotFound and wrong
+//!   answers against the peer, spaces retries, keeps cooldowns across
+//!   reconnects and does not let one peer's answers fill the shared queue.
+//! * A discrete-event model with network latency (the earlier tests had
+//!   none): a fast attacker (NotFound, wrong-variant answers, stalls,
+//!   several identities) against honest servers that rate-limit with the
+//!   node's own `SyncRequestLimiter` — every honest pull must complete.
+//! * The frontier tracker: one peer cannot fill the in-flight set, inbound
+//!   identities cannot abandon a tip, and abandoned tips expire at their TTL.
+
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+use gnb::network::pull::{Enqueued, FailureKind, PullScheduler, MAX_PENDING_PULLS};
+use gnb::network::sync_rr::{SyncRequest, SyncRequestLimiter, SyncResponse, MAX_INFLIGHT_PER_PEER, STALL_FAILURES};
+use gnb::network::SyncEntry;
+use gnb::sync::frontier::{FrontierState, ABANDONED_TTL, MAX_FRONTIER_IN_FLIGHT, MAX_NEW_TIPS_PER_RESPONSE};
+use libp2p::PeerId;
+
+fn h(i: u32) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[..4].copy_from_slice(&i.to_be_bytes());
+    b[31] = 0xB1;
+    b
+}
+
+fn get_block(i: u32) -> SyncRequest {
+    SyncRequest::GetBlock { block_hash: h(i) }
+}
+
+fn block(i: u32) -> SyncResponse {
+    SyncResponse::Block { block_hash: h(i), blue_score: 1, height: 1, block_data: vec![1] }
+}
+
+fn entry(i: u32) -> SyncEntry {
+    SyncEntry { hash: h(i), blue_score: 100 + u64::from(i), height: 1 }
+}
+
+/// A scheduler with `n` outbound peers connected at `t0`.
+fn scheduler(n: usize, t0: Instant) -> (PullScheduler<u64>, Vec<PeerId>) {
+    let mut s = PullScheduler::new(HashSet::new());
+    let peers: Vec<PeerId> = (0..n).map(|_| PeerId::random()).collect();
+    for p in &peers {
+        s.on_connect(*p, true, t0);
+    }
+    (s, peers)
+}
+
+/// Drain once; returns the (peer, request id) pairs sent.
+fn drain(s: &mut PullScheduler<u64>, now: Instant, next_id: &mut u64) -> Vec<(PeerId, u64, SyncRequest)> {
+    let mut sent = Vec::new();
+    s.drain(now, |p, req| {
+        *next_id += 1;
+        sent.push((p, *next_id, req.clone()));
+        *next_id
+    });
+    sent
+}
+
+// ── B1-T2 / NET-10: answers are bound to their request ─────────────────────
+
+/// Each request kind against every answer shape: only an answer an honest
+/// server can give to THAT request is accepted. A wrong answer is a
+/// violation, is not delivered, and does not complete the pull (it goes to
+/// another peer). Before, any well-formed answer completed any pull and was
+/// handed to the processor as solicited data: a GetPeers or GetTips answered
+/// with 2,000 made-up headers produced 2,000 GetBlocks.
+#[test]
+fn answers_are_bound_to_their_request() {
+    let headers = |n: u32| SyncResponse::Headers { entries: (0..n).map(entry).collect() };
+    let tips = SyncResponse::Tips { tips: vec![entry(1)], locator: vec![] };
+    let peers = SyncResponse::Peers { peers: vec![] };
+    let get_headers = SyncRequest::GetHeaders { from_blue_score: 100, limit: 500 };
+    let cases: Vec<(SyncRequest, SyncResponse, bool)> = vec![
+        (get_block(1), block(1), true),
+        (get_block(1), SyncResponse::BlockNotFound { block_hash: h(1) }, true),
+        (get_block(1), block(2), false),
+        (get_block(1), SyncResponse::BlockNotFound { block_hash: h(2) }, false),
+        (get_block(1), headers(0), false),
+        (get_block(1), headers(2_000), false),
+        (get_block(1), tips.clone(), false),
+        (get_block(1), peers.clone(), false),
+        (get_headers.clone(), headers(500), true),
+        (get_headers.clone(), headers(0), true),
+        (get_headers.clone(), headers(501), false),
+        (SyncRequest::GetHeaders { from_blue_score: 101, limit: 500 }, headers(10), false),
+        (get_headers.clone(), tips.clone(), false),
+        (get_headers.clone(), block(1), false),
+        (get_headers.clone(), peers.clone(), false),
+        (SyncRequest::GetTips, tips.clone(), true),
+        (SyncRequest::GetTips, headers(2_000), false),
+        (SyncRequest::GetTips, peers.clone(), false),
+        (SyncRequest::GetTips, block(1), false),
+        (SyncRequest::GetPeers, peers.clone(), true),
+        (SyncRequest::GetPeers, headers(2_000), false),
+        (SyncRequest::GetPeers, tips.clone(), false),
+        (SyncRequest::GetPeers, SyncResponse::BlockNotFound { block_hash: h(1) }, false),
+    ];
+    for (req, resp, valid) in cases {
+        let t0 = Instant::now();
+        let (mut s, _) = scheduler(2, t0);
+        let mut id = 0;
+        assert_eq!(s.enqueue(req.clone(), None, &[], t0), Enqueued::Queued);
+        let sent = drain(&mut s, t0, &mut id);
+        assert_eq!(sent.len(), 1);
+        let (peer, rid, _) = sent[0];
+        let act = s.on_response(rid, peer, &resp, t0);
+        if valid {
+            assert!(act.violation.is_none(), "{req:?} / {resp:?}: honest answer flagged");
+            assert!(act.deliver, "{req:?} / {resp:?}: honest answer not delivered");
+        } else {
+            assert!(act.violation.is_some(), "{req:?} / {resp:?}: wrong answer accepted");
+            assert!(!act.deliver, "{req:?} / {resp:?}: wrong answer delivered to the processor");
+            // The pull is not completed by it: it goes to the other peer.
+            let again = drain(&mut s, t0, &mut id);
+            assert_eq!(again.len(), 1, "{req:?} / {resp:?}: a wrong answer completed the pull");
+            assert_ne!(again[0].0, peer, "the retry went back to the offender");
+            assert_eq!(again[0].2, req);
+        }
+    }
+}
+
+/// Busy is a valid answer to every request: not delivered, not a violation.
+#[test]
+fn busy_is_back_pressure_for_every_request() {
+    for req in [get_block(1), SyncRequest::GetHeaders { from_blue_score: 0, limit: 500 }, SyncRequest::GetTips, SyncRequest::GetPeers] {
+        let t0 = Instant::now();
+        let (mut s, _) = scheduler(1, t0);
+        let mut id = 0;
+        s.enqueue(req.clone(), None, &[], t0);
+        let (peer, rid, _) = drain(&mut s, t0, &mut id)[0].clone();
+        let act = s.on_response(rid, peer, &SyncResponse::Busy, t0);
+        assert_eq!((act.deliver, act.violation), (false, None), "{req:?}");
+        assert!(s.selector().is_cooling_down(&peer, t0));
+    }
+}
+
+// ── B1-T6 / NET-9: pull selection ──────────────────────────────────────────
+
+/// A pull goes first to the peer that announced the block (its hint), even
+/// when another peer is less loaded.
+#[test]
+fn pulls_prefer_the_announcing_peer() {
+    let t0 = Instant::now();
+    let (mut s, p) = scheduler(3, t0);
+    let mut id = 0;
+    // p[1] already has a pull in flight: least-loaded selection avoids it.
+    s.send_pinned(p[1], SyncRequest::GetTips, t0, |_, _| {
+        id += 1;
+        id
+    });
+    assert_eq!(s.enqueue(get_block(1), None, &[p[1]], t0), Enqueued::Queued);
+    let sent = drain(&mut s, t0, &mut id);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, p[1], "the pull must go to the peer that announced the block");
+}
+
+/// A peer that answered a pull (here NotFound) never gets the same pull
+/// again, even when it is the only peer with a free slot: the pull waits for
+/// another peer. Before, the drain fell back to the same NotFound peer and
+/// spent the pull's attempts on it.
+#[test]
+fn a_pull_never_returns_to_a_peer_that_already_answered_it() {
+    let t0 = Instant::now();
+    let (mut s, p) = scheduler(2, t0);
+    let (a, b) = (p[0], p[1]);
+    let mut id = 0;
+    // b is saturated by pinned pulls.
+    for _ in 0..MAX_INFLIGHT_PER_PEER {
+        s.send_pinned(b, SyncRequest::GetTips, t0, |_, _| {
+            id += 1;
+            id
+        });
+    }
+    let saturated_until = id;
+    s.enqueue(get_block(7), None, &[], t0);
+    let sent = drain(&mut s, t0, &mut id);
+    assert_eq!(sent.iter().map(|x| x.0).collect::<Vec<_>>(), vec![a]);
+    s.on_response(sent[0].1, a, &SyncResponse::BlockNotFound { block_hash: h(7) }, t0);
+    for later in [t0, t0 + Duration::from_secs(1), t0 + Duration::from_secs(5)] {
+        let again = drain(&mut s, later, &mut id);
+        assert!(again.is_empty(), "the pull was sent back to the peer that said NotFound: {again:?}");
+    }
+    // A slot frees up on b: the pull goes there.
+    let t1 = t0 + Duration::from_secs(5);
+    s.on_response(saturated_until, b, &SyncResponse::Tips { tips: vec![], locator: vec![] }, t1);
+    let again = drain(&mut s, t1, &mut id);
+    assert_eq!(again.iter().map(|x| (x.0, x.2.clone())).collect::<Vec<_>>(), vec![(b, get_block(7))]);
+}
+
+/// A block only the fifth peer has is still fetched: a pull is not dropped
+/// after three NotFounds while untried peers remain.
+#[test]
+fn a_pull_outlives_more_than_three_not_found() {
+    let t0 = Instant::now();
+    let (mut s, p) = scheduler(5, t0);
+    let mut id = 0;
+    s.enqueue(get_block(9), None, &[], t0);
+    let mut now = t0;
+    let mut asked = Vec::new();
+    loop {
+        let sent = drain(&mut s, now, &mut id);
+        if let Some((peer, rid, _)) = sent.first().cloned() {
+            asked.push(peer);
+            if asked.len() == 5 {
+                let act = s.on_response(rid, peer, &block(9), now);
+                assert!(act.deliver);
+                break;
+            }
+            s.on_response(rid, peer, &SyncResponse::BlockNotFound { block_hash: h(9) }, now);
+        }
+        now += Duration::from_millis(250);
+        assert!(now < t0 + Duration::from_secs(60), "the pull was dropped after {} NotFound(s)", asked.len());
+    }
+    let distinct: HashSet<PeerId> = asked.iter().copied().collect();
+    assert_eq!(distinct.len(), 5, "every attempt went to a different peer");
+    assert_eq!(distinct, p.iter().copied().collect());
+}
+
+/// Retries are spaced in time: after two failed attempts the third is not
+/// sent before the back-off.
+#[test]
+fn retries_are_spaced_in_time() {
+    let t0 = Instant::now();
+    let (mut s, _) = scheduler(4, t0);
+    let mut id = 0;
+    s.enqueue(get_block(3), None, &[], t0);
+    for _ in 0..2 {
+        let (peer, rid, _) = drain(&mut s, t0, &mut id)[0].clone();
+        s.on_failure(rid, peer, FailureKind::Transport, t0);
+    }
+    assert!(drain(&mut s, t0, &mut id).is_empty(), "third attempt sent at once");
+    assert!(drain(&mut s, t0 + Duration::from_millis(100), &mut id).is_empty());
+    assert_eq!(drain(&mut s, t0 + Duration::from_secs(5), &mut id).len(), 1, "but it is sent after the back-off");
+}
+
+/// NotFound counts against the answering peer: a peer that keeps saying
+/// NotFound ranks below one that serves, even when it is less loaded (a fast
+/// liar always has the fewest pulls in flight).
+#[test]
+fn not_found_answers_rank_a_peer_down() {
+    let t0 = Instant::now();
+    let (mut s, p) = scheduler(2, t0);
+    let (liar, honest) = (p[0], p[1]);
+    let mut id = 0;
+    for i in 0..3 {
+        s.enqueue(get_block(100 + i), None, &[liar], t0);
+        let (peer, rid, _) = drain(&mut s, t0, &mut id)[0].clone();
+        assert_eq!(peer, liar);
+        s.on_response(rid, liar, &SyncResponse::BlockNotFound { block_hash: h(100 + i) }, t0);
+        let (peer, rid, _) = drain(&mut s, t0, &mut id)[0].clone();
+        assert_eq!(peer, honest);
+        s.on_response(rid, honest, &block(100 + i), t0);
+    }
+    // honest now carries one pinned pull; the liar has none.
+    s.send_pinned(honest, SyncRequest::GetTips, t0, |_, _| {
+        id += 1;
+        id
+    });
+    s.enqueue(get_block(200), None, &[], t0);
+    let sent = drain(&mut s, t0, &mut id);
+    assert_eq!(sent[0].0, honest, "the NotFound peer must rank below the serving one");
+}
+
+/// A stalled peer's cooldown survives a reconnect, and its rotation slot
+/// is not reset to "never selected".
+#[test]
+fn cooldown_survives_reconnect() {
+    let t0 = Instant::now();
+    let (mut s, p) = scheduler(2, t0);
+    let (staller, good) = (p[0], p[1]);
+    let mut id = 0;
+    for _ in 0..STALL_FAILURES {
+        s.send_pinned(staller, SyncRequest::GetTips, t0, |_, _| {
+            id += 1;
+            id
+        });
+        s.on_failure(id, staller, FailureKind::Transport, t0);
+    }
+    assert!(s.selector().is_cooling_down(&staller, t0));
+    s.on_disconnect(&staller, t0);
+    s.on_connect(staller, true, t0 + Duration::from_secs(1));
+    assert!(s.selector().is_cooling_down(&staller, t0 + Duration::from_secs(1)), "a reconnect cleared the cooldown");
+    s.enqueue(get_block(1), None, &[], t0 + Duration::from_secs(1));
+    let sent = drain(&mut s, t0 + Duration::from_secs(1), &mut id);
+    assert_eq!(sent[0].0, good);
+}
+
+/// A misbehaving peer (a violation found by the network loop) is not
+/// selected while it is on cooldown.
+#[test]
+fn misbehaving_peer_is_not_selected() {
+    let t0 = Instant::now();
+    let (mut s, p) = scheduler(2, t0);
+    let mut id = 0;
+    s.send_pinned(p[1], SyncRequest::GetTips, t0, |_, _| {
+        id += 1;
+        id
+    });
+    s.on_misbehaving(&p[0], t0);
+    s.enqueue(get_block(1), None, &[p[0]], t0);
+    let sent = drain(&mut s, t0, &mut id);
+    assert_eq!(sent[0].0, p[1]);
+}
+
+/// One peer's answers cannot fill the shared pull queue: pulls attributed to
+/// one source are capped, and the node's own pulls (orphan parents, nudges)
+/// are still admitted when the queue is full.
+#[test]
+fn one_source_cannot_fill_the_pull_queue() {
+    let t0 = Instant::now();
+    let (mut s, p) = scheduler(2, t0);
+    let attacker = p[0];
+    let admitted = (0..MAX_PENDING_PULLS as u32)
+        .filter(|i| s.enqueue(get_block(*i), Some(attacker), &[attacker], t0) == Enqueued::Queued)
+        .count();
+    assert!(admitted <= MAX_PENDING_PULLS / 4, "one source queued {admitted} pulls");
+    // Other sources and local pulls still get in, even with the queue full.
+    let others = (0..3u32)
+        .flat_map(|k| (0..MAX_PENDING_PULLS as u32).map(move |i| (k, i)))
+        .filter(|(k, i)| s.enqueue(get_block(100_000 * (k + 1) + i), Some(PeerId::random()), &[], t0) == Enqueued::Queued)
+        .count();
+    assert!(others > 0);
+    assert!(s.pending_len() <= MAX_PENDING_PULLS);
+    assert_eq!(s.enqueue(get_block(9_999_999), None, &[], t0), Enqueued::Queued, "a local pull was refused");
+}
+
+/// The same block is pulled once, however many answers announce it.
+#[test]
+fn duplicate_block_pulls_are_coalesced() {
+    let t0 = Instant::now();
+    let (mut s, p) = scheduler(2, t0);
+    assert_eq!(s.enqueue(get_block(5), Some(p[0]), &[p[0]], t0), Enqueued::Queued);
+    assert_eq!(s.enqueue(get_block(5), Some(p[1]), &[p[1]], t0), Enqueued::Duplicate);
+    assert_eq!(s.enqueue(get_block(5), None, &[], t0), Enqueued::Duplicate);
+    assert_eq!(s.pending_len(), 1);
+}
+
+/// NET-9 residual: a NotFound from a peer that connected to US (an identity
+/// that costs nothing) never counts toward abandoning a frontier tip; one
+/// from a peer we dialed does.
+#[test]
+fn not_found_from_inbound_identities_never_abandons_a_tip() {
+    let t0 = Instant::now();
+    let mut s: PullScheduler<u64> = PullScheduler::new(HashSet::new());
+    let (inbound, outbound) = (PeerId::random(), PeerId::random());
+    s.on_connect(inbound, false, t0);
+    s.on_connect(outbound, true, t0);
+    assert!(!s.counts_for_abandonment(&inbound));
+    assert!(s.counts_for_abandonment(&outbound));
+    // And so the network loop does not deliver an inbound peer's NotFound.
+    let mut id = 0;
+    s.enqueue(get_block(1), None, &[inbound], t0);
+    let (peer, rid, _) = drain(&mut s, t0, &mut id)[0].clone();
+    assert_eq!(peer, inbound);
+    let act = s.on_response(rid, inbound, &SyncResponse::BlockNotFound { block_hash: h(1) }, t0);
+    assert!(!act.deliver && act.violation.is_none());
+}
+
+// ── Discrete-event model: fast attackers vs honest, rate-limiting servers ──
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Role {
+    Honest,
+    /// Answers every GetBlock with BlockNotFound.
+    NotFoundLiar,
+    /// Answers every request with a Headers frame (a wrong variant).
+    WrongVariant,
+    /// Never answers (the request times out after 30 s).
+    Staller,
+}
+
+struct SimPeer {
+    id: PeerId,
+    role: Role,
+    latency: Duration,
+    limiter: SyncRequestLimiter,
+    connected: bool,
+    violations: u32,
+}
+
+enum Ev {
+    Answer { id: u64, peer: usize, resp: SyncResponse },
+    Timeout { id: u64, peer: usize },
+}
+
+#[derive(Debug)]
+struct Outcome {
+    completed: usize,
+    dropped: u64,
+    to_attackers: usize,
+    sent: usize,
+    finished_after: Duration,
+}
+
+/// `n` GetBlock pulls of blocks every honest server has, from a node
+/// connected (outbound) to `honest` honest servers (latency
+/// `honest_latency`, the node's own per-requester rate limit: 64 burst, then
+/// 8/s, answered Busy beyond it) and to `attackers`. With `hinted`, each pull
+/// names an honest server that announced it. A violator is disconnected at
+/// its 4th violation (the network loop's misbehaviour threshold). Runs until
+/// every pull completed, nothing is left, or `limit` simulated time.
+fn simulate(n: u32, honest: usize, honest_latency: Duration, attackers: &[(Role, Duration)], hinted: bool) -> Outcome {
+    let limit = Duration::from_secs(600);
+    let t0 = Instant::now();
+    let me = PeerId::random();
+    let mut peers: Vec<SimPeer> = (0..honest)
+        .map(|_| (Role::Honest, honest_latency))
+        .chain(attackers.iter().copied())
+        .map(|(role, latency)| SimPeer { id: PeerId::random(), role, latency, limiter: SyncRequestLimiter::new(), connected: true, violations: 0 })
+        .collect();
+    let index: HashMap<PeerId, usize> = peers.iter().enumerate().map(|(i, p)| (p.id, i)).collect();
+    let mut s: PullScheduler<u64> = PullScheduler::new(HashSet::new());
+    // Attackers connect first (the order of a node's connections is theirs to choose).
+    for p in peers.iter().rev() {
+        s.on_connect(p.id, true, t0);
+    }
+    let wanted: HashMap<[u8; 32], u32> = (0..n).map(|i| (h(i), i)).collect();
+    for i in 0..n {
+        let hints = if hinted { vec![peers[i as usize % honest].id] } else { vec![] };
+        assert_eq!(s.enqueue(get_block(i), None, &hints, t0), Enqueued::Queued);
+    }
+    let mut queue: BinaryHeap<Reverse<(Duration, u64)>> = BinaryHeap::new();
+    let mut events: HashMap<u64, Ev> = HashMap::new();
+    let mut inflight: HashMap<u64, usize> = HashMap::new();
+    let (mut seq, mut next_id) = (0u64, 0u64);
+    let mut completed: HashSet<u32> = HashSet::new();
+    let (mut to_attackers, mut sent) = (0usize, 0usize);
+    let mut at = Duration::ZERO;
+    let tick = Duration::from_millis(250);
+    loop {
+        let now = t0 + at;
+        s.drain(now, |peer, req| {
+            next_id += 1;
+            let pi = index[&peer];
+            let p = &mut peers[pi];
+            sent += 1;
+            if p.role != Role::Honest {
+                to_attackers += 1;
+            }
+            let hash = match req {
+                SyncRequest::GetBlock { block_hash } => *block_hash,
+                _ => [0u8; 32],
+            };
+            let (delay, ev) = match p.role {
+                Role::Honest => {
+                    let resp = if !p.limiter.allow_at(me, now) {
+                        SyncResponse::Busy
+                    } else {
+                        SyncResponse::Block { block_hash: hash, blue_score: 1, height: 1, block_data: vec![1] }
+                    };
+                    (p.latency, Ev::Answer { id: next_id, peer: pi, resp })
+                }
+                Role::NotFoundLiar => (p.latency, Ev::Answer { id: next_id, peer: pi, resp: SyncResponse::BlockNotFound { block_hash: hash } }),
+                Role::WrongVariant => (
+                    p.latency,
+                    Ev::Answer { id: next_id, peer: pi, resp: SyncResponse::Headers { entries: (0..50).map(|i| entry(1_000_000 + i)).collect() } },
+                ),
+                Role::Staller => (Duration::from_secs(30), Ev::Timeout { id: next_id, peer: pi }),
+            };
+            seq += 1;
+            queue.push(Reverse((at + delay, seq)));
+            events.insert(seq, ev);
+            inflight.insert(next_id, pi);
+            next_id
+        });
+        if completed.len() == n as usize {
+            break;
+        }
+        let next = match queue.peek() {
+            Some(Reverse((t, _))) if *t <= at + tick => *t,
+            _ if queue.is_empty() && s.pending_len() == 0 => break,
+            _ => at + tick,
+        };
+        if next > limit {
+            break;
+        }
+        at = next;
+        let now = t0 + at;
+        while let Some(Reverse((t, sq))) = queue.peek().copied() {
+            if t > at {
+                break;
+            }
+            queue.pop();
+            match events.remove(&sq).expect("event") {
+                Ev::Answer { id, peer: pi, resp } => {
+                    if inflight.remove(&id).is_none() {
+                        continue; // its connection was closed meanwhile
+                    }
+                    let pid = peers[pi].id;
+                    let act = s.on_response(id, pid, &resp, now);
+                    if act.violation.is_some() {
+                        // (The scheduler already put the peer on cooldown;
+                        // the network loop adds the shared misbehaviour
+                        // score, modelled here by the violation count.)
+                        peers[pi].violations += 1;
+                        if peers[pi].violations >= 4 && peers[pi].connected {
+                            peers[pi].connected = false;
+                            s.on_disconnect(&pid, now);
+                            let ids: Vec<u64> = inflight.iter().filter(|(_, p)| **p == pi).map(|(i, _)| *i).collect();
+                            for i in ids {
+                                inflight.remove(&i);
+                                s.on_failure(i, pid, FailureKind::Transport, now);
+                            }
+                        }
+                    }
+                    if let (true, SyncResponse::Block { block_hash, .. }) = (act.deliver, &resp) {
+                        if let Some(i) = wanted.get(block_hash) {
+                            completed.insert(*i);
+                        }
+                    }
+                }
+                Ev::Timeout { id, peer: pi } => {
+                    if inflight.remove(&id).is_some() {
+                        s.on_failure(id, peers[pi].id, FailureKind::Transport, now);
+                    }
+                }
+            }
+        }
+    }
+    Outcome { completed: completed.len(), dropped: s.dropped(), to_attackers, sent, finished_after: at }
+}
+
+fn assert_all_honest_pulls_complete(o: &Outcome, n: u32, attackers: usize) {
+    eprintln!("{o:?}");
+    assert_eq!(o.completed, n as usize, "honest pulls did not all complete: {o:?}");
+    assert_eq!(o.dropped, 0, "pulls were dropped: {o:?}");
+    assert!(o.to_attackers <= n as usize * attackers, "a pull was sent twice to the same attacker: {o:?}");
+    assert!(o.finished_after < Duration::from_secs(300), "too slow: {o:?}");
+}
+
+const FAST: Duration = Duration::from_millis(5);
+const HONEST: Duration = Duration::from_millis(200);
+
+/// Latency-aware (honest 200 ms, attacker 5 ms): one fast NotFound liar.
+/// The re-audit's model of the old selector dropped 1,488 of 2,000 pulls
+/// with 4 honest peers.
+#[test]
+fn fast_not_found_liar_cannot_drop_honest_pulls() {
+    let o = simulate(2_000, 4, HONEST, &[(Role::NotFoundLiar, FAST)], false);
+    assert_all_honest_pulls_complete(&o, 2_000, 1);
+}
+
+/// Three NotFound identities against four honest servers.
+#[test]
+fn not_found_sybils_cannot_drop_honest_pulls() {
+    let o = simulate(2_000, 4, HONEST, &[(Role::NotFoundLiar, FAST), (Role::NotFoundLiar, FAST), (Role::NotFoundLiar, FAST)], false);
+    assert_all_honest_pulls_complete(&o, 2_000, 3);
+}
+
+/// A fast peer answering with useless frames of the wrong variant (which
+/// used to complete the pull and reset its failure count, so it captured
+/// most pulls: 97 % with one honest peer, 81 % with eight) completes
+/// nothing and is disconnected.
+#[test]
+fn fast_wrong_variant_peer_cannot_complete_pulls() {
+    for honest in [1u32, 4] {
+        let n = 500 * honest;
+        let o = simulate(n, honest as usize, HONEST, &[(Role::WrongVariant, FAST)], false);
+        assert_all_honest_pulls_complete(&o, n, 1);
+        assert!(o.to_attackers <= 16, "the violator kept getting pulls: {o:?}");
+    }
+}
+
+/// A staller (never answers) and a NotFound liar together, one honest
+/// server, pulls hinted with the honest announcer.
+#[test]
+fn staller_and_liar_with_one_honest_server() {
+    let o = simulate(1_000, 1, HONEST, &[(Role::Staller, FAST), (Role::NotFoundLiar, FAST)], true);
+    assert_all_honest_pulls_complete(&o, 1_000, 2);
+}
+
+/// With hints, pulls go to the announcing honest servers: the fast liar
+/// sees almost none of them.
+#[test]
+fn hinted_pulls_bypass_the_fast_liar() {
+    let o = simulate(2_000, 4, HONEST, &[(Role::NotFoundLiar, FAST)], true);
+    assert_all_honest_pulls_complete(&o, 2_000, 1);
+    assert!(o.to_attackers * 10 < o.sent, "the liar received {} of {} requests", o.to_attackers, o.sent);
+}
+
+// ── NET-10 / NET-9 residuals: the frontier tracker ─────────────────────────
+
+/// One peer's Tips answers cannot fill the global in-flight set: another
+/// peer's tips are still fetched.
+#[test]
+fn one_peer_cannot_fill_the_frontier() {
+    let mut fr = FrontierState::new();
+    let now = Instant::now();
+    let (attacker, honest) = (PeerId::random(), PeerId::random());
+    let mut from_attacker = 0usize;
+    for frame in 0u32..100 {
+        let tips: Vec<[u8; 32]> = (0u32..256).map(|i| h(frame * 1_000 + i)).collect();
+        from_attacker += fr.request_from(attacker, &tips, |_| false, now, MAX_NEW_TIPS_PER_RESPONSE).len();
+    }
+    assert!(from_attacker <= MAX_FRONTIER_IN_FLIGHT / 4, "one peer has {from_attacker} tips in flight");
+    let honest_tips: Vec<[u8; 32]> = (0u32..4).map(|i| h(9_000_000 + i)).collect();
+    let got = fr.request_from(honest, &honest_tips, |_| false, now, MAX_NEW_TIPS_PER_RESPONSE);
+    assert_eq!(got, honest_tips, "an honest peer's frontier was crowded out");
+    // Its slots come back as its tips arrive.
+    for t in &honest_tips {
+        fr.note_received(t);
+    }
+    assert_eq!(fr.outstanding(), from_attacker);
+}
+
+/// An abandoned tip is forgotten at its TTL, whether or not anything else
+/// is abandoned later (pruning used to run only inside `abandon`).
+#[test]
+fn abandoned_tip_expires_at_its_ttl() {
+    let mut fr = FrontierState::new();
+    let t0 = Instant::now();
+    let tip = h(1);
+    fr.to_request(&[tip], |_| false, t0);
+    for p in [PeerId::random(), PeerId::random()] {
+        fr.note_not_found_from(&tip, p, t0);
+    }
+    assert!(fr.is_abandoned_at(&tip, t0));
+    assert!(fr.is_abandoned_at(&tip, t0 + ABANDONED_TTL - Duration::from_secs(1)));
+    assert!(!fr.is_abandoned_at(&tip, t0 + ABANDONED_TTL), "abandoned tip outlived its TTL");
+    // And it can be requested again once expired.
+    let again = fr.to_request(&[tip], |_| false, t0 + ABANDONED_TTL);
+    assert_eq!(again, vec![tip]);
+}
