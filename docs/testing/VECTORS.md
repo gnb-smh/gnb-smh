@@ -494,7 +494,7 @@ with its own target dir; the baselines passed in both.
 | admission without its "no inputs" rule (still refused, as zero-value) | node runner passed | node runner: `struct/no-inputs/*` (refusal class) |
 | `core::check_min_fee` accepts one unit below the minimum | gnb-crypto runner passed | gnb-crypto runner: `fee/minimum-minus-one/*` |
 | `core::check_coinbase_maturity` accepts depth 99 | gnb-crypto runner passed | gnb-crypto runner: `maturity/depth-99/*` |
-| `MAINNET_HARDENING_ACTIVATION_HEIGHT` + 1 (run as 110,001 when the height was 110,000, the cases then named `.../110000`; re-run as 25,801 on 2026-10-16 against the gnb-crypto runner, which failed exactly these five cases) | both runners passed | both runners: `basic/mainnet-schedule/25800`, `version/mainnet-boundary/v1-at-25800`, `tx64/mainnet-boundary/25800`, `commitment/no-commitment-at-mainnet-height-25800`, `pow/mainnet-25800-pow-limit-bits` (node: also their mempool verdicts) |
+| `MAINNET_HARDENING_ACTIVATION_HEIGHT` + 1 (run as 110,001 when the height was 110,000, the cases then named `.../110000`; re-run as 25,801 on 2026-10-16 against both runners, in the working tree with the shared target dir, and reverted: each failed exactly these five cases) | both runners passed | both runners: `basic/mainnet-schedule/25800`, `version/mainnet-boundary/v1-at-25800`, `tx64/mainnet-boundary/25800`, `commitment/no-commitment-at-mainnet-height-25800`, `pow/mainnet-25800-pow-limit-bits` (node: also the mempool verdicts of the three transaction cases) |
 | `TESTNET_HARDENING_ACTIVATION_HEIGHT` = 2 | node runner passed | both runners: `net/testnet-schedule/height-1` (node: the testnet child, consensus and mempool) |
 
 Python corruptions of the second round, each reported: the mined nonce + 1
