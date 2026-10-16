@@ -168,6 +168,34 @@ fn pulls_prefer_the_announcing_peer() {
     assert_eq!(sent[0].0, p[1], "the pull must go to the peer that announced the block");
 }
 
+/// A poor peer (useless answers) is not preferred because it announced a
+/// block: a peer in good standing is asked first. Ranking the hint above the
+/// standing let a free identity that announces blocks it then answers
+/// NotFound for keep taking the first attempt of every pull it announced
+/// (and with a poor best candidate the pull would only wait).
+#[test]
+fn a_poor_announcer_is_not_preferred() {
+    use gnb::network::sync_rr::POOR_PEER_PENALTY;
+    let t0 = Instant::now();
+    let (mut s, p) = scheduler(2, t0);
+    let (poor, good) = (p[0], p[1]);
+    let mut id = 0;
+    for i in 0..4 {
+        s.enqueue(get_block(300 + i), None, &[poor], t0);
+    }
+    for (peer, rid, req) in drain(&mut s, t0, &mut id) {
+        assert_eq!(peer, poor);
+        let SyncRequest::GetBlock { block_hash } = req else { unreachable!() };
+        s.on_response(rid, peer, &SyncResponse::BlockNotFound { block_hash }, t0);
+    }
+    assert!(s.selector().penalty(&poor, t0) >= POOR_PEER_PENALTY);
+    // Those four now wait on `good` (in flight, unanswered).
+    assert_eq!(drain(&mut s, t0, &mut id).len(), 4);
+    s.enqueue(get_block(400), Some(poor), &[poor], t0);
+    let sent = drain(&mut s, t0, &mut id);
+    assert_eq!(sent.iter().map(|x| x.0).collect::<Vec<_>>(), vec![good], "the poor announcer was preferred");
+}
+
 /// A peer that answered a pull (here NotFound) never gets the same pull
 /// again, even when it is the only peer with a free slot: the pull waits for
 /// another peer. Before, the drain fell back to the same NotFound peer and
