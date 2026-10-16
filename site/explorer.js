@@ -1,6 +1,6 @@
 // gnb-smh.com explorer: data fetching, routing and DOM wiring. All markup is
 // built by /assets/explorer-views.js (escaped `html` templates, WAL-3).
-import { html } from "/assets/safe.js";
+import { html, isAddress, canonicalAddress } from "/assets/safe.js";
 import * as V from "/assets/explorer-views.js";
 
 const app = document.getElementById("app");
@@ -99,6 +99,7 @@ async function viewTx(txid) {
 // B1-T11: older pages follow the cursor the previous page returned
 // (`next_cursor`); the node and the API refuse offsets above 10,000.
 async function viewAddress(addr, page = 0, cursor = null) {
+  addr = await canonicalAddress(addr, api);
   const per = 25;
   show(app, V.loading("Loading address"));
   const params = cursor ? [addr, per, 0, cursor] : [addr, per, page * per];
@@ -115,9 +116,11 @@ async function viewHolders() {
 // ── search & routing ─────────────────────────────────────────────────────────
 document.getElementById("search").addEventListener("submit", async (ev) => {
   ev.preventDefault();
-  const q = document.getElementById("q").value.trim().toLowerCase();
+  const input = document.getElementById("q").value.trim();
+  // Preserve legacy/hex search casing without normalizing mixed-case Bech32m.
+  const q = /^(?:[0-9a-f]{64}|(?:gnb|bloch)1[qt][0-9a-f]{48}|gnb1[mn][0-9a-f]{72})$/i.test(input) ? input.toLowerCase() : input;
   if (!q) return;
-  if (/^gnb1[qt][0-9a-f]{48}$/.test(q)) return go(`#/address/${q}`);
+  if (isAddress(q)) return go(`#/address/${q}`);
   if (/^bloch1q[0-9a-f]{48}$/.test(q)) return go(`#/address/gnb1q${q.slice(7)}`);
   if (/^\d{1,12}$/.test(q)) {
     try {
@@ -153,7 +156,7 @@ async function route() {
     else if (v === "holders") await viewHolders();
     else if (v === "block" && /^[0-9a-f]{64}$/.test(a)) await viewBlock(a);
     else if (v === "tx" && /^[0-9a-f]{64}$/.test(a)) await viewTx(a);
-    else if (v === "address" && /^gnb1[qt][0-9a-f]{48}$/.test(a)) await viewAddress(a, pageNo(b), /^[0-9a-f]{32}$/.test(c || "") ? c : null);
+    else if (v === "address" && isAddress(a)) await viewAddress(a, pageNo(b), /^[0-9a-f]{32}$/.test(c || "") ? c : null);
     else show(app, html`<div class="err">Page not found. <a href="#/">Back to the overview</a></div>`);
   } catch (e) { show(app, V.fail(e)); }
 }

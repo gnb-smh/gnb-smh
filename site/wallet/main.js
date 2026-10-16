@@ -1,6 +1,7 @@
 // GnB Wallet: the sidechain-of-Bloch wallet. Keys are decrypted and used only
 // inside the WebAssembly core (core.js + gnb_wallet.wasm); this file never sees
 // a private key. Chain data comes from the site's read-only /api.
+import { watchAddress } from "../assets/safe.js";
 import { loadCore } from "./core.js";
 import { api, broadcast, addressToScript, gnb, short, ago, esc } from "../shared/gnb.js";
 
@@ -530,8 +531,8 @@ function viewBackup() {
 // Shareable watch links: #watch/<address>
 (async function boot() {
   await pollNetwork();
-  const m = location.hash.match(/^#watch\/(gnb1[qt][0-9a-f]{48}|bloch1[qt][0-9a-f]{48})$/);
-  if (m) { try { const c = await getCore(); history.replaceState(null, "", location.pathname + location.search + "#/wallet"); return enter("watch", c.normalize(m[1])); } catch {} }
+  const address = watchAddress(location.hash);
+  if (address) { try { const c = await getCore(); history.replaceState(null, "", location.pathname + location.search + "#/wallet"); return enter("watch", c.normalize(address)); } catch {} }
   route();
   setInterval(() => { if (st.mode === "locked") pollNetwork(); }, 30000);
 })();
