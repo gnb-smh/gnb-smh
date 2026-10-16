@@ -272,6 +272,10 @@ fn main() {
             do_pqpsbt(params);
             return;
         }
+        "descriptor" => {
+            do_descriptor(params, stated_network);
+            return;
+        }
         "policysign" => {
             require_params(params, 2, POLICY_SIGN_USAGE);
             do_policy_sign(params, &rpc_target, stated_network);
@@ -1129,6 +1133,56 @@ fn do_pqpsbt(params: &[&str]) {
     println!("{}", serde_json::to_string_pretty(&response).unwrap());
 }
 
+const DESCRIPTOR_USAGE: &str = "descriptor create|inspect|import <input-file> --mainnet|--testnet; descriptor export|pool <input-file> <new-pool-file> --mainnet|--testnet";
+
+fn do_descriptor(params: &[&str], stated_network: Option<gnb::address::Network>) {
+    use gnb::wallet::descriptor::{public_request, MAX_DESCRIPTOR_BYTES, MAX_POOL_BYTES};
+    use serde_json::json;
+    use std::io::Write;
+
+    let network = match stated_network {
+        Some(gnb::address::Network::Mainnet) => "mainnet",
+        Some(gnb::address::Network::Testnet) => "testnet",
+        None => die("descriptor requires an explicit network: --mainnet or --testnet"),
+    };
+    let action = params.first().copied().unwrap_or_else(|| die(DESCRIPTOR_USAGE));
+    let writes_pool = match action {
+        "create" | "inspect" | "import" => false,
+        "export" | "pool" => true,
+        _ => die(DESCRIPTOR_USAGE),
+    };
+    if params.len() != if writes_pool { 3 } else { 2 } {
+        die(DESCRIPTOR_USAGE);
+    }
+    let limit = if matches!(action, "create" | "inspect") { MAX_DESCRIPTOR_BYTES } else { MAX_POOL_BYTES };
+    // Cap raw bytes before parsing; keep bundle JSON intact so the shared
+    // codec can reject duplicate fields. Array inputs contain strings only.
+    let text = read_public_document(params[1], limit).unwrap_or_else(|error| die(&error));
+    let request = match action {
+        "create" => json!({"action": action, "network": network, "body": text}),
+        "inspect" => json!({"action": action, "network": network, "descriptor": text}),
+        "import" => json!({"action": action, "network": network, "bundle": text}),
+        _ => {
+            let entries: Vec<String> = serde_json::from_str(&text)
+                .unwrap_or_else(|error| die(&format!("public string array: {error}")));
+            if action == "export" { json!({"action": action, "network": network, "descriptors": entries}) }
+            else { json!({"action": action, "network": network, "public_keys": entries}) }
+        }
+    };
+    let response = public_request(&request).unwrap_or_else(|error| die(&error));
+    if writes_pool {
+        let bundle = response.get("bundle").and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| die("descriptor response has no public bundle"));
+        // Atomic create-new refuses existing files and symlinks, including a
+        // key backup accidentally chosen as the public pool destination.
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(params[2])
+            .unwrap_or_else(|error| die(&format!("create new public pool {}: {error}", params[2])));
+        file.write_all(bundle.as_bytes()).and_then(|()| file.sync_all())
+            .unwrap_or_else(|error| die(&format!("write public pool {}: {error}", params[2])));
+    }
+    println!("{}", serde_json::to_string_pretty(&response).unwrap_or_else(|error| die(&error.to_string())));
+}
+
 fn public_rpc_result(
     rpc: &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>,
     method: &str,
@@ -1672,6 +1726,9 @@ fn print_usage() {
 
   POLICY SIGNING AND PUBLIC DOCUMENT ROLES
     gnb-cli pqpsbt <public-request.json>    Offline create/decode/update/combine/review/finalize/extract
+    gnb-cli descriptor create|inspect|import <input-file> --mainnet|--testnet
+    gnb-cli descriptor export|pool <input-file> <new-pool-file> --mainnet|--testnet
+                                           Offline public identities only; no key or balance restore
     gnb-cli policysign <document.json> <wallet.json> [--max-fee GNB] [--yes]
                                            Verify the configured node before key access
 

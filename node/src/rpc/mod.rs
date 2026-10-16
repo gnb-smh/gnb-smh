@@ -319,7 +319,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getblockbyheight", "getrecentblocks", "gettransaction", "getrawtransaction", "getbalance",
     "getaddresscount", "getutxos", "sendrawtransaction", "validateaddress", "estimatefee",
     "getrawmempool", "decoderawtransaction", "getblocktemplate", "submitblock", "getdaginfo",
-    "submitpowititem", "getpowitinfo", "pqpsbt",
+    "submitpowititem", "getpowitinfo", "pqpsbt", "getdescriptorinfo", "deriveaddresses",
     "listtransactions", "getpeerinfo", "getpeers", "getsupplyinfo", "getchainstats",
     "getsupplydistribution", "getselectedchain", "getblockdag", "gettransactionfull",
     "getdagwindow", "getaddresshistory", "getrichlist", "gethashrate", "getdifficultyhistory",
@@ -1580,6 +1580,19 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             }
         }
 
+        "getdescriptorinfo" => {
+            match inspect_rpc_descriptor(params) {
+                Ok(info) => info,
+                Err(error) => json!({"error": error}),
+            }
+        }
+        "deriveaddresses" => {
+            match inspect_rpc_descriptor(params) {
+                Ok(info) => json!([info["address"]]),
+                Err(error) => json!({"error": error}),
+            }
+        }
+
         "pqpsbt" => {
             if state.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return json!({"error":"request cancelled"});
@@ -2592,6 +2605,22 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Read-only static descriptor inspection; all syntax and script derivation
+/// use the same codec as offline CLI and WASM. The caller cannot choose a
+/// different network, import a pool, or mutate a wallet through these RPCs.
+fn inspect_rpc_descriptor(params: Option<&Value>) -> Result<Value, String> {
+    let args = params.and_then(Value::as_array).filter(|args| args.len() == 1)
+        .ok_or("expected exactly one checksummed descriptor in an array")?;
+    let descriptor = args[0].as_str().ok_or("descriptor must be a string")?;
+    let network = match crate::core::node_chain_id() {
+        crate::core::ChainId::Mainnet => "mainnet",
+        crate::core::ChainId::Testnet => "testnet",
+    };
+    gnb_crypto::wallet::descriptor::public_request(&json!({
+        "action": "inspect", "network": network, "descriptor": descriptor,
+    }))
+}
 
 fn rpc_address_network() -> crate::address::Network {
     match crate::core::node_chain_id() {
