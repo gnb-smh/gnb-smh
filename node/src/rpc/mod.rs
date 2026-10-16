@@ -241,6 +241,8 @@ struct AppState {
     /// L-8: `getblocktemplate`'s own cache and build permit
     /// (`gated_dispatch`), so an analytics scan never answers a miner "busy".
     template_gate:           Arc<HeavyGate>,
+    /// One public PQ-PSBT operation; the blocking worker owns its permit.
+    pqpsbt_gate:             Arc<tokio::sync::Semaphore>,
     // B5f pool seam: submitblock hook (None = method returns "not wired").
     submit_block:            Option<Arc<SubmitBlockFn>>,
     // NET-12: cancellation flag of THIS request (a fresh flag per request,
@@ -317,7 +319,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getblockbyheight", "getrecentblocks", "gettransaction", "getrawtransaction", "getbalance",
     "getaddresscount", "getutxos", "sendrawtransaction", "validateaddress", "estimatefee",
     "getrawmempool", "decoderawtransaction", "getblocktemplate", "submitblock", "getdaginfo",
-    "submitpowititem", "getpowitinfo",
+    "submitpowititem", "getpowitinfo", "pqpsbt",
     "listtransactions", "getpeerinfo", "getpeers", "getsupplyinfo", "getchainstats",
     "getsupplydistribution", "getselectedchain", "getblockdag", "gettransactionfull",
     "getdagwindow", "getaddresshistory", "getrichlist", "gethashrate", "getdifficultyhistory",
@@ -619,6 +621,7 @@ pub async fn start_rpc_server(
         trust_loopback:          config.trust_loopback,
         heavy_gate:              Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
         template_gate:           Arc::new(HeavyGate::for_templates()),
+            pqpsbt_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         submit_block,
         cancel:                  Arc::new(std::sync::atomic::AtomicBool::new(false)),
         chain_admin,
@@ -1086,9 +1089,9 @@ async fn handle_rpc(
         presented_key,
         state.api_key.as_deref(),
         state.require_auth_for_writes,
-        state.require_auth_for_reads,
-        state.trust_private_ranges,
-        state.trust_loopback,
+        state.require_auth_for_reads || method == "pqpsbt",
+        state.trust_private_ranges && method != "pqpsbt",
+        state.trust_loopback && method != "pqpsbt",
         &state.rate_limiter,
     );
 
@@ -1253,6 +1256,46 @@ fn chain_admin_call(op: ChainAdminOp, params: Option<&Value>, state: &AppState) 
             Err(e) => json!({ "error": e }),
         },
     }
+}
+
+/// Public PQ-PSBT work is limited independently of the core's offline limits.
+/// Three verification passes in finalization yield at most 48 partial-signature
+/// checks. The gate is held by the blocking worker until it actually finishes;
+/// a response timeout does not admit replacement work while it keeps running.
+const PQPSBT_RPC_MAX_INPUTS: usize = 4;
+const PQPSBT_RPC_MAX_SIGNATURES: usize = 16;
+const POLICY_SELECTED_INPUTS_MAX: usize = 64;
+
+fn selected_policy_outpoints(params: Option<&Value>)
+    -> Result<Option<std::collections::BTreeSet<([u8;32],u32)>>, String>
+{
+    let Some(value) = params.and_then(|p| p.get(2)) else { return Ok(None); };
+    let rows = value.as_array().ok_or("selected outpoints must be an array")?;
+    if rows.len() > POLICY_SELECTED_INPUTS_MAX { return Err("at most 64 selected outpoints are allowed".into()); }
+    let mut selected = std::collections::BTreeSet::new();
+    for row in rows {
+        let object = row.as_object().ok_or("selected outpoint must be an object")?;
+        if object.len() != 2 { return Err("selected outpoint needs exactly txid and index".into()); }
+        let txid = row.get("txid").and_then(Value::as_str).filter(|s| s.len() == 64)
+            .and_then(|s| hex::decode(s).ok()).and_then(|b| b.try_into().ok())
+            .ok_or("selected txid must be 32-byte hex")?;
+        let index = row.get("index").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok())
+            .ok_or("selected index must fit u32")?;
+        if !selected.insert((txid,index)) { return Err("duplicate selected outpoint".into()); }
+    }
+    Ok(Some(selected))
+}
+
+/// A short reference read, never held during signature checks or row reads.
+/// Admission's selected-depth helpers use the applied storage tip; require
+/// that it agrees with the DAG tip reported by getdaginfo before exposing it.
+fn policy_rpc_snapshot(state: &AppState) -> Result<(u64,[u8;32]), Value> {
+    let dag = state.dag.read();
+    let tip = dag.selected_tip().ok_or_else(|| json!({"error":"node has no selected tip"}))?;
+    let applied = state.store.get_meta("tip_hash").map_err(|e| storage_err_response(&e))?
+        .and_then(|b| <[u8;32]>::try_from(b).ok());
+    if applied != Some(tip) { return Err(json!({"error":"node applied and selected tips differ; retry preflight"})); }
+    Ok((crate::mempool::admission::pool_next_height(&dag,&state.store,&state.mempool),tip))
 }
 
 async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Value {
@@ -1537,8 +1580,36 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             }
         }
 
+        "pqpsbt" => {
+            if state.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return json!({"error":"request cancelled"});
+            }
+            let _permit = match state.pqpsbt_gate.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => return json!({"error":"PQ-PSBT worker busy; retry later"}),
+            };
+            match gnb_crypto::wallet::pqpsbt::public_request_with_limits(
+                params.unwrap_or(&Value::Null), PQPSBT_RPC_MAX_INPUTS, PQPSBT_RPC_MAX_SIGNATURES) {
+                Ok(result) => result,
+                Err(error) => json!({"error":error}),
+            }
+        }
+
         // ── Wallet: list UTXOs for address (needed by wallet CLI) ────
         "getutxos" => {
+            // Optional third parameter requests consensus/mempool metadata
+            // for at most 64 selected inputs. Refuse malformed selections
+            // before any storage work; the default endpoint is unchanged.
+            let selected = match selected_policy_outpoints(params) {
+                Ok(s) => s,
+                Err(error) => return json!({"error":error}),
+            };
+            let snapshot = if selected.is_some() {
+                match policy_rpc_snapshot(state) {
+                    Ok(s) => Some(s),
+                    Err(error) => return error,
+                }
+            } else { None };
             let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
             // Optional 2nd param: max UTXOs to return. A wallet with hundreds of
             // thousands of UTXOs (e.g. the carry-over founder set) otherwise serializes
@@ -1583,10 +1654,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         // `admission::coinbase_height_for_wallets`). A height
                         // that cannot be read fails the call (never "not a
                         // coinbase", re-audit B1-T12).
-                        let next_block_height = {
+                        let next_block_height = snapshot.map(|s| s.0).unwrap_or_else(|| {
                             let dag = state.dag.read();
                             crate::mempool::admission::pool_next_height(&dag, &state.store, &state.mempool)
-                        };
+                        });
                         let rows: Result<Vec<Value>, crate::storage::StorageError> = utxos.iter().map(|(txid, idx, out)| {
                             let mut row = json!({
                                 "txid": hex::encode(txid), "index": idx,
@@ -1598,6 +1669,13 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                                 if let Some(h) = h {
                                     row["coinbase_height"] = json!(h);
                                 }
+                                if selected.as_ref().is_some_and(|s| s.contains(&(t,*idx))) {
+                                    row["spent_in_mempool"] = json!(state.mempool.spends_outpoint(&(t,*idx)));
+                                    let confirmations = crate::mempool::admission::confirmations_for_next_block(
+                                        &state.store,&t,next_block_height)
+                                        .map_err(|e| crate::storage::StorageError::ReadFailed(e.0))?;
+                                    row["confirmations_at_next_block"] = json!(confirmations);
+                                }
                             }
                             Ok(row)
                         }).collect();
@@ -1605,7 +1683,14 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             Ok(l) => l,
                             Err(e) => return storage_err_response(&e),
                         };
-                        json!({
+                        if let Some(initial) = snapshot {
+                            match policy_rpc_snapshot(state) {
+                                Ok(current) if current == initial => {},
+                                Ok(_) => return json!({"error":"node snapshot changed during UTXO lookup; retry preflight"}),
+                                Err(error) => return error,
+                            }
+                        }
+                        let mut result = json!({
                             "address":    addr,
                             "utxo_count": list.len(),
                             "returned":   list.len(),
@@ -1613,7 +1698,12 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             "satoshis":   total.to_string(),
                             "gnb":       total as f64 / 1e8,
                             "utxos":      list,
-                        })
+                        });
+                        if let Some((height,tip)) = snapshot {
+                            result["next_block_height"] = json!(height);
+                            result["tip"] = json!(hex::encode(tip));
+                        }
+                        result
                     },
                     Err(e) => storage_err_response(&e),
                 },
@@ -3095,6 +3185,7 @@ mod h_r3_5_tests {
 // ── 2026-10 audit regressions: NET-12, NET-13, NET-14, NET-15, WAL-1 ───────
 #[cfg(test)]
 mod audit_2026_10_rpc_tests {
+    include!("../../tests/support/pqpsbt_rpc_unit.rs");
     use super::*;
     use crate::core::{Block, BlockHeader, MerkleRoot, TxInput, TxOutput};
     use tempfile::TempDir;
@@ -3128,6 +3219,7 @@ mod audit_2026_10_rpc_tests {
             trust_loopback: false,
             heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
             template_gate: Arc::new(HeavyGate::for_templates()),
+            pqpsbt_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             submit_block: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             chain_admin: None,
@@ -3440,6 +3532,42 @@ mod audit_2026_10_rpc_tests {
             let expected = if row["txid"] == hex::encode([3u8; 32]) { json!(77) } else { Value::Null };
             assert_eq!(row["coinbase_height"], expected, "{row}");
         }
+    }
+
+    #[tokio::test]
+    async fn pqpsbt_getutxos_selected_metadata_matches_the_node_snapshot() {
+        let (_tmp, state) = state_with_chain(5);
+        state.store.put_meta("tip_hash", &[5; 32]).unwrap();
+        let address = crate::address::Address::from_hash([41; 20], crate::address::Network::Mainnet);
+        state.store.put_utxo(&[42; 32], 0, &TxOutput { value: 1_000, script_pubkey: vec![41;20] }).unwrap();
+        state.store.put_tx_index(&[42;32], &[2;32], 2).unwrap();
+        // Independent positive control: the old endpoint really returns the
+        // requested output, without the optional metadata contract.
+        let plain = dispatch("getutxos",Some(&json!([address.to_string(),1])),&state).await;
+        assert_eq!(plain["utxos"][0]["value"],"1000");
+        assert!(plain.get("tip").is_none());
+        let snapshot = dispatch("getdaginfo",None,&state).await;
+        let selected = json!([{"txid":hex::encode([42;32]),"index":0}]);
+        let before = state.store.storage_reads();
+        let result = dispatch("getutxos",Some(&json!([address.to_string(),1,selected])),&state).await;
+        let reads = state.store.storage_reads()-before;
+        assert_eq!(result["utxos"][0]["spent_in_mempool"],false,
+            "selected inputs need an explicit mempool-spend verdict, got {result}");
+        assert_eq!(result["next_block_height"],snapshot["next_block_height"]);
+        assert_eq!(result["tip"],snapshot["tip"]);
+        assert_eq!(result["utxos"][0]["confirmations_at_next_block"],snapshot["next_block_height"].as_u64().unwrap()-2);
+        assert!(reads <= 24,"one selected input performed {reads} storage reads");
+    }
+
+    #[tokio::test]
+    async fn pqpsbt_getutxos_rejects_more_than_64_selected_inputs_before_storage() {
+        let (_tmp, state) = state_with_chain(1);
+        let address = crate::address::Address::from_hash([41;20],crate::address::Network::Mainnet);
+        let selected: Vec<_> = (0..65u32).map(|i| json!({"txid":hex::encode([42;32]),"index":i})).collect();
+        let before = state.store.storage_reads();
+        let result = dispatch("getutxos",Some(&json!([address.to_string(),1,selected])),&state).await;
+        assert!(result["error"].is_string(),"65 selected inputs must be refused: {result}");
+        assert_eq!(state.store.storage_reads()-before,0,"refusal precedes storage work");
     }
 
     /// NET-12: the chain-walking statistics read only the requested window.
@@ -4380,6 +4508,7 @@ mod block_rules_template_tests {
             trust_loopback: false,
             heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
             template_gate: Arc::new(HeavyGate::for_templates()),
+            pqpsbt_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             submit_block: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             chain_admin: None,
