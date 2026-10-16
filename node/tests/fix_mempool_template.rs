@@ -177,6 +177,12 @@ fn dag2_template_parents_are_capped_at_max_parents() {
         n.store.put_block_body(&b).unwrap();
     }
     assert_eq!(n.dag.read().tips().len(), 300);
+    // The fixture inserts the tips into the DAG only; point the applied tip at
+    // the selected tip as a connect would (a template is refused while the
+    // UTXO set sits on another block, R4 review of B2-T0). The tips are
+    // zero-value coinbase-only blocks and the pool is empty.
+    let best = n.dag.read().selected_tip().unwrap();
+    n.store.put_meta("tip_hash", &best).unwrap();
     let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
     assert_eq!(tmpl.parents.len(), core::MAX_PARENTS);
     assert_eq!(tmpl.parents[0], n.dag.read().selected_tip().unwrap(), "selected parent first");
