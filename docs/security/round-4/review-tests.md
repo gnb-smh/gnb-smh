@@ -198,3 +198,76 @@ The path review has also reported two medium findings in the secondary wallet
 separate correction package and are **not closed by this addendum**. Pin and
 address-codec checks do not establish both complete wallet journeys. The full
 integration/CI/canonical-WASM gates and broader limitations above still apply.
+
+## Secondary-wallet review and CI follow-up
+
+Reviewed package: test-first `f330d6e`, correction `8be30ee`, evidence
+`581be80`, based on `70ca8a2`. I imported those exact commits into the isolated
+review worktree and independently ran
+`node --test site/tests/wallet-secondary.test.mjs`: **16 passed, 0 failed,
+0 skipped**, using Node 22.23.3. Log
+`/private/tmp/gnb-r4-review-tests-wallet-secondary.log`, SHA-256
+`b8130f090201b78fe0930280c9bd303b4845251309a1e54e46a0c42c683dca64`.
+
+The new tests exercise actual registered review, creation and keystore-open
+callbacks extracted from the served secondary controller. Their small DOM
+adapter supplies element lookup, event registration and disabled/checked state;
+the API adapter supplies ordinary synthetic chain data. `plan`, `pay`, key
+creation, encrypted-keystore export/open and recovery invoke the real pinned
+WASM. The testnet identity therefore is not fabricated by a mock, and the
+payment version is obtained from the real core. The funding-transaction and
+mainnet recovery controls pass before the intended failing cases.
+
+The test has deliberately distinct `tip_height: 7` and H-1/H target heights.
+It asserts the actual height argument, resulting v1/v3 choice, pre-activation
+raw-transaction request, legacy/v2 destinations, input verification disclosure,
+opposite-network rejection, and maturity filtering with a mixed eligible/
+ineligible input fixture. The unverified-input test invokes the confirmation
+handler directly while acknowledgement is absent (`wallet-secondary.test.mjs:190`),
+so its check is not satisfied solely by the DOM adapter refusing disabled
+button clicks. It also checks acknowledgement/revocation toggles.
+
+For creation and opening, the actual create/download/open callback sequence
+round-trips the same testnet keystore identity. Default mainnet creation still
+produces recovery words, and explicit network/type mismatches are rejected.
+The current Rust testnet creation path has no recovery words; the test asserts
+that actual limitation rather than inventing mnemonic compatibility.
+
+I confirmed that `f330d6e` leaves `main.js`, `core.js` and the WASM binary
+byte-identical to `70ca8a2`; its initial log has 2 passing controls / 13 runtime
+failures. I checked the initial log and all four reversal logs by SHA-256,
+and matched final source/test hashes to `wallet-secondary-reversals.json`.
+With final tests unchanged, the recorded payment reversal gives **7 pass /
+9 fail**, create reversal **13 / 3**, open reversal **11 / 5**, and restoration
+**16 / 0**. These are runtime failures after successful WASM loading, not
+import or build failures. The final suite is stronger than the original
+15-test baseline; the additional typed-argument case and assertions are
+explicitly covered by the final production reversals.
+
+This evidence supports the bounded corrections for R4-PATH-1 and R4-PATH-2
+from the test-strength lens. It does not prove a live browser's layout, network
+authenticity, chain unspentness, node admission, broadcasting, or all primary
+wallet paths. The broadcast callback is a refusing stub; the tests stop at
+review and at rejecting unacknowledged confirmation. The separate primary
+wallet height fallback remains outside this package's demonstrated fixes.
+
+Two non-production evidence improvements were reported:
+
+- At `8be30ee`, `planned` / `paid` record only successful core returns
+  (`wallet-secondary.test.mjs:76`). Zero length proves no successful result,
+  not zero attempted WASM calls. Pre-call counters would directly prove the
+  intended absence of attempts for invalid heights and immature-only inputs.
+  This is a limitation of the measurement, not a newly reproduced signing bug.
+- The secondary replay writes fixed `/private/tmp` log names and a versioned
+  manifest. Repeating it on the same machine could overwrite the archived
+  evidence. A fresh `--output` directory with a nonempty-directory refusal
+  would preserve the prior run. I did not rerun that replayer or overwrite its
+  logs; the independent green run has its own filename.
+
+Both prior CI/replay delivery details are closed by **`92b6b52`**: the workflow
+now explicitly executes `cargo test -p gnb-crypto --locked --example
+address_v2_oracle` before building/running the differential, and the oracle
+replay uses reachable baseline `887bd0b`, already checked byte-identical to
+the historical baseline. This is verification of the committed job and replay
+configuration, not a claim that the final CI run has finished. Full integration,
+JS integrity repinning and canonical Linux WASM gates remain required.
