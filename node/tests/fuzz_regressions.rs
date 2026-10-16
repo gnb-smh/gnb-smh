@@ -109,3 +109,57 @@ fn header_with_a_non_minimal_parent_count_is_refused() {
     wide.extend_from_slice(&enc[5..]);
     assert!(Block::from_wire_bytes(&wide).is_err());
 }
+
+/// `sighash` (every committed seed failed once the target built again): the
+/// target's v2 reference hashed the BINCODE body of the stripped transaction
+/// with version byte 0x01, the v2 of releases before cc5c450. This chain's v2
+/// (`Transaction::sighash`, `reference/gnb_sighash.py` `v2_body`) signs the
+/// WIRE encoding of the stripped transaction (the marker on the signed input,
+/// every other `script_sig` empty) with version byte 0x02; the target's
+/// reference follows it now. Pinned here from hand-written bytes, for both
+/// chains, both inputs and an out-of-range index (no marker at all).
+#[test]
+fn sighash_v2_signs_the_wire_body_of_the_stripped_transaction() {
+    use gnb::core::ChainId;
+    use sha3::{Digest, Sha3_256};
+    let tx = Transaction {
+        version: 1,
+        inputs: vec![
+            TxInput { prev_txid: [0xA1; 32], prev_index: 3, script_sig: vec![0xEE; 5], sequence: 0xFFFF_FFFE },
+            TxInput { prev_txid: [0xB2; 32], prev_index: 300, script_sig: vec![0xDD; 300], sequence: 7 },
+        ],
+        outputs: vec![TxOutput { value: 1_000_000, script_pubkey: vec![0x5A; 20] }],
+        locktime: 99,
+    };
+    let body = |index: usize| -> Vec<u8> {
+        let mut b = 1u32.to_le_bytes().to_vec(); // version
+        b.push(2); // input count (CompactSize)
+        for (i, inp) in tx.inputs.iter().enumerate() {
+            b.extend_from_slice(&inp.prev_txid);
+            b.extend_from_slice(&inp.prev_index.to_le_bytes());
+            if i == index {
+                b.push(11);
+                b.extend_from_slice(b"GNB_SIGHASH");
+            } else {
+                b.push(0);
+            }
+            b.extend_from_slice(&inp.sequence.to_le_bytes());
+        }
+        b.push(1); // output count
+        b.extend_from_slice(&1_000_000u64.to_le_bytes());
+        b.push(20);
+        b.extend_from_slice(&[0x5A; 20]);
+        b.extend_from_slice(&99u32.to_le_bytes()); // locktime
+        b
+    };
+    for chain in [ChainId::Mainnet, ChainId::Testnet] {
+        for index in [0usize, 1, 2] {
+            let mut pre = b"GNB-SIGHASH-v1\0\0".to_vec();
+            pre.push(0x02);
+            pre.extend_from_slice(&chain.to_u32().to_le_bytes());
+            pre.extend_from_slice(&body(index));
+            let want: [u8; 32] = Sha3_256::digest(&pre).into();
+            assert_eq!(tx.sighash(index, chain), want, "{chain:?}, input {index}");
+        }
+    }
+}
