@@ -127,6 +127,24 @@ other executed checks had passed. The full mutation campaign and `i686-node`
 were event-filtered skips. No green-at-merge claim is supported. This final
 local evidence is carried forward in the following round's documentation.
 
+Subsequent read-only observation on 2026-10-16 confirmed successful merge
+runs [38919256180](https://github.com/gnb-smh/gnb-smh/actions/runs/38919256180)
+and [38919616610](https://github.com/gnb-smh/gnb-smh/actions/runs/38919616610),
+both at `f06b7f8dc05af107fd16f2cebdd89d62a360662a`. In the latter, `fuzz`
+and `i686-node` were skipped by event filters; all executed jobs passed.
+The actual Linux functional step in
+[job 117035844906](https://github.com/gnb-smh/gnb-smh/actions/runs/38919616610/job/117035844906)
+reports **14 passed, zero skipped, zero failed; 14/14 completed in 240 seconds**.
+The partition scenario passed in 22.4 seconds and full-template in 133.2
+seconds. This is the live functional step, not its preceding unit tests'
+simulated pass/fail output. The inspected log is retained locally at
+`/private/tmp/gnb-r2-ci-main-functional.log`.
+
+The PR-head workspace job subsequently completed successfully at 15:09:07
+UTC. Its fuzz job was still running when inspected. These later results do
+not imply green CI at merge, and the Linux passes do not close either local
+macOS finding or establish the cause of the full-template timeout.
+
 Do not infer passing tests from compilation, source definitions, workflow
 configuration or an earlier revision. Preserve failures and skipped counts.
 Green CI for the exact proposed head is required before the next merge.
