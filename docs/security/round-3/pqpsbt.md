@@ -242,3 +242,112 @@ cases. Native and real-WASM signing tests remain mandatory. The i686 Miri
 attempt stopped before test execution because `i686-linux-gnu-gcc` is absent
 on this macOS host; that is a setup limitation, not runtime reproduction or
 an i686 green claim.
+
+## Explicit open acceptance and relay limitations
+
+Independent review reported a further case in which mandatory repeated
+policy witnesses already exceed the final transaction size bound before any
+signature is added. The additional reproduction/implementation task was
+stopped after automatic approval review rejected that action for possible
+cybersecurity risk. This engineer did not write or run a new Cargo regression
+for that scenario and made no production change for it. Existing reviewer
+evidence is preserved; the finding and associated acceptance remain open.
+It must not be counted as resolved by the separate 8 MiB candidate-atomicity
+fix above.
+
+The node's default 400 KiB relay policy is separate from this format's
+1,000,000-byte transaction bound. Structural import and finalization do not
+guarantee local relay admission. No relay-policy rule was changed or added
+by this package. Final integration, canonical Linux WASM rebuild/pin,
+independent review and CI remain the coordinating round's delivery gates.
+
+## Production reversals and retained evidence
+
+All eleven production reversals were repeated against final source commit
+`8cdb075d4dabb4f478a2f7624eb2b5f316baadab`. Each changed only its production
+hunk, retained final test bodies/instrumentation, failed at runtime, and
+restored the exact original source hash. Cases: legacy signing shape,
+public WASM dispatch, explicit fee ceiling, pre-crypto transport budget,
+request field allowlist, sufficient JSON cap, session network binding,
+shared MoneyRange checks, absolute fee floor, exact final fee and validation
+of the signed candidate. The MoneyRange reversal separately trips the
+input, output, input-sum and output-sum regressions. The candidate reversal
+records callback count, successful/failed return, serializability and byte
+identity. The Miri-only test attribute also has a separate runtime reversal
+and restored native Miri green; it is test configuration, not production.
+
+Evidence is retained outside the repository at
+`/private/tmp/gnb-pqpsbt-evidence/`. The replayable production driver is
+`replay_reversals.py` (SHA256
+`27e6f9be2d2260223ead313146b5fc8e68c6a6175c9cbf247ecfd04c1879cb7e`).
+`source-and-reversal-manifest.json` (SHA256
+`05c13adbf26bcfd7a94158b5ad4581fe521b8dfcfad9865c81addfe51980376c`)
+records the baseline/source commit, individual source hashes, driver hashes,
+reversal manifest hashes and final reversal-log hashes. The authoritative
+production reversal manifest is `reversal-final-manifest.json`; the initial
+seven-case run is superseded by the final eleven-case rerun.
+
+Commands use normal Cargo with the environment at the top of this brief.
+The complete crypto command is `cargo test --locked -p gnb-crypto -- --nocapture`;
+the WASM host command is `cargo test --locked -p gnb-wallet-wasm -- --nocapture`.
+The crypto run uses `GNB_PQPSBT_REFERENCE_DIR` only to read the independently
+committed reference worktree before round integration. The committed test's
+default path is repository `reference/`; absence is an error, never a skip.
+Initial sandbox failures in three existing HTTP tests were `PermissionDenied`
+at `TcpListener`, then passed with loopback permission. No production code
+was changed to address the sandbox.
+
+## Final restored-source validation and durable replay
+
+After all reversals restored the source bytes recorded for `8cdb075`, the
+complete separate `gnb-crypto` invocation passed 437 unit tests, 30 integration
+tests and one doctest: 468 passed, zero failed and four pre-existing ignores
+(one unit, one vector generator and two doctests). This includes the 204
+independent vectors and 512 seeded differential cases, with exact binary and
+canonical JSON comparison, plus the pointer-width arithmetic regression.
+The complete WASM host suite passed nine tests with no ignores. Restored
+native Miri passed four tests with five explicit FFI ignores, including the
+new signing test described above; it does not establish i686 Miri coverage.
+These are local results, not a claim of green round CI or final WASM pinning.
+
+The repository retains the exact executed drivers and small manifests:
+
+- [Production replay driver](pqpsbt-replay-reversals.py), byte-identical to
+  `replay_reversals.py` and its SHA256 recorded above.
+- [Eleven production reversals](pqpsbt-reversals.json), including each
+  changed/restored source hash, command and observed runtime failure.
+- [Source and reversal evidence](pqpsbt-evidence.json), including the driver,
+  manifest and external reversal-log hashes.
+- [Miri configuration replay](pqpsbt-replay-miri.py) and its
+  [restoration manifest](pqpsbt-miri-reversal.json).
+- [Final test-log hashes](pqpsbt-test-log-hashes.json), identifying the full
+  restored-source runs and the later review-finding red/green logs.
+
+The production driver deliberately preserves the paths used in the measured
+run: source worktree `/Users/tiagobulhoes/worktrees/gnb-technology-pqpsbt`,
+output directory `/private/tmp/gnb-pqpsbt-evidence` (create it beforehand), and
+Cargo target `/private/tmp/gnb-technology-target-pqpsbt`. Prepare a disposable
+checkout of `8cdb075` there and compare its source hashes with the evidence
+manifest before execution; documentation-only additions do not affect those
+hashes. Use the repository toolchain with dependencies available. The driver
+sets CGU 53, debug information off, incremental compilation off and two build
+jobs. Run `python3 docs/security/round-3/pqpsbt-replay-reversals.py` for all
+eleven cases, or append `--case <name>` for one case from its manifest. It
+temporarily changes production hunks and restores them in `finally`; do not
+run concurrent edits or builds against that checkout. Test bodies and
+instrumentation remain unchanged. Retain historical logs before replay,
+because output names are reused. The script checks mutation anchors and
+restoration, but source-hash verification is a prerequisite, not a claim
+that the script automatically validates every baseline file.
+
+The separate Miri driver expects a disposable source checkout at
+`/private/tmp/gnb-pqpsbt-miri-source` with the recorded final sources, output
+directory above, and target `/private/tmp/gnb-technology-pqpsbt-miri-native`.
+It uses installed `nightly` with Miri/rust-src, native host execution,
+`-Zmiri-permissive-provenance`, CGU 53 and one build job. The measured checkout
+was based on `68f4a91` with the final `8cdb075` core and WASM files copied from
+Git; the production of the selected crate matches the recorded final hashes.
+It removes only the new test's Miri ignore attribute, observes the unsupported
+foreign-function error, restores the exact file and runs the full native
+Miri library suite. It neither tests nor replays the stopped witness-size
+finding. Neither driver includes its probe, binary snapshots or large logs.
