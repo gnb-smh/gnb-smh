@@ -36,6 +36,7 @@ impl Builder {
             header: BlockHeader { version: 1, parents: parents.clone(), merkle_root: MerkleRoot::ZERO,
                 timestamp: pts + 1, bits, nonce: 0 },
             transactions: txs, blue_score: height, height, shielded_transactions: Vec::new(),
+            powit: Default::default(),
         };
         commit_block(&mut b);
         b.test_only_assume_pow_valid();

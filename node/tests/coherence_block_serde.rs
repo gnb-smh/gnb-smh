@@ -28,7 +28,7 @@ fn block_with(shielded: Vec<ShieldedTx>) -> Block {
         transactions: vec![cb],
         blue_score: 0,
         height: 1,
-        shielded_transactions: shielded,
+        shielded_transactions: shielded, powit: Default::default(),
     }
 }
 

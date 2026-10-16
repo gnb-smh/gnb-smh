@@ -115,7 +115,9 @@ mod sprint_n_tests {
         let tx1_txid = tx1.txid();
         assert!(mp.add(tx1, 100).is_ok());
 
-        let res = mp.add(tx2, 200);
+        // 150 < 100 + size: not enough to replace by fee (mempool RBF rule),
+        // so first-seen still wins.
+        let res = mp.add(tx2, 150);
         match res {
             Err(MempoolError::Conflict { outpoint_txid, outpoint_idx, existing_spender }) => {
                 assert_eq!(outpoint_txid, prev);
@@ -140,7 +142,8 @@ mod sprint_n_tests {
         assert!(mp.add(tx1, 100_000).is_ok());
 
         let tx2 = make_multi_input_tx(vec![(b, 0), (a, 0)], 200);
-        let res = mp.add(tx2, 200_000);
+        // Same fee over more bytes: a lower fee rate, so no replace-by-fee.
+        let res = mp.add(tx2, 100_000);
         assert!(matches!(res, Err(MempoolError::Conflict { .. })));
         assert_eq!(mp.size(), 1);
     }
@@ -181,13 +184,14 @@ mod sprint_n_tests {
             outputs: vec![TxOutput { value: 500, script_pubkey: vec![9; 20] }],
             locktime: 0,
         };
-        assert!(matches!(mp.add(tx2.clone(), 200_000), Err(MempoolError::Conflict { .. })));
+        // Equal fee: not a strictly higher fee rate, so no replace-by-fee.
+        assert!(matches!(mp.add(tx2.clone(), 100_000), Err(MempoolError::Conflict { .. })));
 
         // Remove tx1
         assert!(mp.remove(&tx1_txid));
 
         // Now tx2 should succeed
-        assert!(mp.add(tx2, 200_000).is_ok());
+        assert!(mp.add(tx2, 100_000).is_ok());
         assert_eq!(mp.size(), 1);
     }
 

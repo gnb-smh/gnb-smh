@@ -983,6 +983,7 @@ fn mem6_disconnected_txs_are_ordered_oldest_block_first() {
         header: BlockHeader { version: 1, parents: vec![[0; 32]], merkle_root: MerkleRoot::ZERO, timestamp: 0, bits: 0, nonce },
         transactions: std::iter::once(coinbase(tag, 1, vec![1; 20])).chain(txs).collect(),
         blue_score: 0, height: 0, shielded_transactions: vec![],
+        powit: Default::default(),
     };
     let (a, b, c, d) = (syn(&[(ext(1), 0)], &[9], 1, 4), syn(&[(ext(2), 0)], &[9], 2, 4), syn(&[(ext(3), 0)], &[9], 3, 4), syn(&[(ext(4), 0)], &[9], 4, 4));
     // `disconnected` is tip-first: [B2 (c, d), B1 (a, b)]; the outcome lists
@@ -1665,6 +1666,7 @@ impl Sim {
             blue_score: height,
             height,
             shielded_transactions: vec![],
+            powit: Default::default(),
         };
         self.store.put_block_body(&block).unwrap();
         if is_dup {

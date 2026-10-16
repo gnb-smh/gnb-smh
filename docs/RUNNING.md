@@ -173,7 +173,8 @@ most 16 blocks, each together with its undo records, the tip pointer and the
 shielded state (Bitcoin Core's `ActivateBestChain` steps through a reorg the
 same way), so the memory a reorg needs does not grow with its depth and a
 crash in the middle of a long reorg leaves a consistent intermediate chain
-state that the next start continues from. An interrupted rebuild likewise
+state that the next start continues from (with the PoWit finality pin
+restored from it first). An interrupted rebuild likewise
 resumes from its last committed chunk.
 
 ## Upgrading and downgrading

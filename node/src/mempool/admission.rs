@@ -530,6 +530,12 @@ pub enum WitnessRefusal {
 pub fn check_standard_witnesses_classified(tx: &Transaction) -> Result<(), (WitnessRefusal, String)> {
     let mut keys = Vec::with_capacity(tx.inputs.len());
     for (i, inp) in tx.inputs.iter().enumerate() {
+        // A policy spend (multisig / timelocks) carries a strictly parsed
+        // policy witness, not the single-key framing; whether it matches the
+        // spent output is consensus (`core::sighash::check_input_witnesses`).
+        if core::policy::AnyPolicyWitness::decode(&inp.script_sig).is_ok() {
+            continue;
+        }
         let (_sig, pk) = core::sighash::canonical_witness(&inp.script_sig)
             .map_err(|e| (WitnessRefusal::Framing, format!("input {i}: {e} (non-standard)")))?;
         keys.push(pk);
@@ -720,6 +726,20 @@ pub fn check_transaction_gated(
     core::check_coinbase_maturity(tx, policy.next_block_height, |t| {
         store.get_coinbase_height(t).ok().flatten()
     }).map_err(AdmissionError::Immature)?;
+
+    // This chain's rules (`blockval`): finality at the next height, output
+    // kinds, dust, policy timelocks. An output of a pooled (unconfirmed)
+    // parent has no confirmation height yet: a relative timelock on it is
+    // not satisfied.
+    let confirm = |t: &[u8; 32]| -> Result<Option<u64>, String> {
+        store.get_tx_location(t).map(|o| o.map(|(_, h)| h)).map_err(|e| e.to_string())
+    };
+    crate::blockval::check_tx_chain_rules(tx, &prevouts, policy.next_block_height, &confirm)
+        .map_err(|e| if e.starts_with(crate::blockval::STORAGE_ERR) {
+            AdmissionError::Pool(e)
+        } else {
+            AdmissionError::Rejected(e)
+        })?;
 
     // Value + fees.
     let total_out = core::limits::check_tx_money_range(tx).map_err(AdmissionError::Rejected)?;

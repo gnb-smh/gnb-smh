@@ -11,7 +11,7 @@ genesis that carries the Bloch Genesis-3 ledger over at a fixed conversion.
 | Consensus | GhostDAG (k = 10), 30-second target spacing |
 | Difficulty | ASERT anchored at genesis, 2-hour half-life, computed per block from its parents |
 | Signatures | Hybrid ML-DSA-65 ‖ Falcon-1024 |
-| Supply | Hard cap 10,000,000 GNB: 10% Bloch carryover, 90% mining |
+| Supply | Hard cap 12,500,000 GNB: 8% Bloch carryover, 10% team and 10% founder (locked: 1-year cliff, then 36 monthly tranches), 72% mining |
 | Unit | 1 GNB = 10^8 base units; addresses `gnb1q…` (mainnet), `gnb1t…` (testnet) |
 
 Status: pre-release. Not audited.
@@ -30,7 +30,7 @@ Status: pre-release. Not audited.
 | `genesis/` | The Bloch Genesis-3 terminal snapshot the genesis ledger is built from |
 | `crates/pqcrypto-internals` | Vendored fork (patched in through `[patch.crates-io]`), a workspace member so its guard test runs. (The `libp2p-yamux` fork was retired with libp2p 0.57; `node/tests/supply_chain_lockfile_guard.rs` keeps a single yamux >= 0.13.10 and hickory >= 0.26.1 in `Cargo.lock`.) |
 | `node/fuzz` | cargo-fuzz targets (own workspace, nightly): wire decoders and round trips, difficulty, PoW and signature verify, Merkle paths, mempool, block rules, sighash, witnesses, undo records, keystores, addresses, the sync codec, block acceptance in any arrival order ([docs/testing/FUZZING.md](docs/testing/FUZZING.md)) |
-| `docs/` | Protocol notes: [consensus](docs/CONSENSUS.md), [monetary policy and carryover](docs/MONETARY-POLICY.md), [running a node](docs/RUNNING.md), [ledger v1](docs/LEDGER.md); testing: [sanitizers, Miri, 32-bit](docs/testing/SANITIZERS.md), [fuzzing](docs/testing/FUZZING.md), [functional tests](docs/testing/FUNCTIONAL.md) |
+| `docs/` | Protocol notes: [consensus](docs/CONSENSUS.md), [monetary policy and carryover](docs/MONETARY-POLICY.md), [running a node](docs/RUNNING.md), [ledger v1](docs/LEDGER.md), [P2P security](docs/P2P.md), [multisig and timelocks](docs/MULTISIG.md); testing: [sanitizers, Miri, 32-bit](docs/testing/SANITIZERS.md), [fuzzing](docs/testing/FUZZING.md), [functional tests](docs/testing/FUNCTIONAL.md) |
 | `test/functional` | Multi-node functional tests and their framework (Python, stdlib only) |
 | `reference/`, `rust/`, `analysis/` | Standalone GnB-SMH v1 reference implementation and GnB ledger v1 (see below) |
 

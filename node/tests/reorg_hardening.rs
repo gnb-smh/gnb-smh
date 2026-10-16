@@ -42,6 +42,30 @@ use gnb::reorg::{apply_block_utxo_mutations, compute_reorg_plan, execute_reorg};
 use gnb::storage::Storage;
 use tempfile::TempDir;
 
+/// Test signer: a real hybrid keypair, so fork blocks pass the FULL rule set
+/// (`blockval::validate_block_transactions`) that reorgs now enforce.
+fn test_key() -> &'static (Vec<u8>, Vec<u8>) {
+    static KEY: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+    KEY.get_or_init(gnb::crypto::generate_keypair)
+}
+
+/// `script_pubkey` paying `test_key()`.
+fn owner_script() -> Vec<u8> {
+    use sha3::{Digest as _, Sha3_256};
+    Sha3_256::digest(&test_key().0)[..20].to_vec()
+}
+
+/// Sign every input of `tx` with `test_key()`.
+fn signed(mut tx: Transaction) -> Transaction {
+    let (pk, sk) = test_key();
+    for i in 0..tx.inputs.len() {
+        let sighash = tx.sighash(i, gnb::core::node_chain_id());
+        let sig = gnb::crypto::sign(sk, &sighash).expect("sign");
+        tx.inputs[i].script_sig = Transaction::build_script_sig(&sig, pk);
+    }
+    tx
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures — mirror sprint_u3_reorg.rs / sprint_u4_reorg_e2e.rs.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84,7 +108,7 @@ fn mk_block_at(height: u64, nonce_tag: u64, txs: Vec<Transaction>) -> Block {
         transactions: txs,
         blue_score: height,
         height,
-        shielded_transactions: Vec::new(),
+        shielded_transactions: Vec::new(), powit: Default::default(),
     }
 }
 
@@ -167,42 +191,42 @@ fn build_two_fork_world() -> TwoForkWorld {
     dag.store.insert(g, mk_dag_data(None, 0));
 
     // ── Fork A (the current selected tip): G → A1 → A2, applied forward ──
-    let a1 = mk_block_at(1, 1001, vec![mk_coinbase(0xA1, 500_000_000, 1, 0x01)]);
+    let a1 = mk_block_at(1, 1001, vec![mk_coinbase(0xA1, 100_000_000, 1, 0x01)]);
     let a1h = a1.block_hash();
     dag.store.insert(a1h, mk_dag_data(Some(g), 1));
     store.put_block(&a1).unwrap();
     apply_block_utxo_mutations(&store, &a1).unwrap();
 
-    let a2 = mk_block_at(2, 1002, vec![mk_coinbase(0xA2, 500_000_000, 2, 0x02)]);
+    let a2 = mk_block_at(2, 1002, vec![mk_coinbase(0xA2, 100_000_000, 2, 0x02)]);
     let a2h = a2.block_hash();
     dag.store.insert(a2h, mk_dag_data(Some(a1h), 2));
     store.put_block(&a2).unwrap();
     apply_block_utxo_mutations(&store, &a2).unwrap();
 
     // ── Fork B (the challenger): G → B1 → B2 → B3, persisted but NOT applied ──
-    let b1 = mk_block_at(1, 2001, vec![mk_coinbase(0xB1, 500_000_000, 1, 0x11)]);
+    let b1 = mk_block_at(1, 2001, vec![mk_coinbase(0xB1, 100_000_000, 1, 0x11)]);
     let b1h = b1.block_hash();
     dag.store.insert(b1h, mk_dag_data(Some(g), 1));
     store.put_block(&b1).unwrap();
 
-    let b2 = mk_block_at(2, 2002, vec![mk_coinbase(0xB2, 500_000_000, 2, 0x12)]);
+    let b2 = mk_block_at(2, 2002, vec![mk_coinbase(0xB2, 100_000_000, 2, 0x12)]);
     let b2h = b2.block_hash();
     dag.store.insert(b2h, mk_dag_data(Some(b1h), 2));
     store.put_block(&b2).unwrap();
 
-    let b3 = mk_block_at(3, 2003, vec![mk_coinbase(0xB3, 500_000_000, 3, 0x13)]);
+    let b3 = mk_block_at(3, 2003, vec![mk_coinbase(0xB3, 100_000_000, 3, 0x13)]);
     let b3h = b3.block_hash();
     dag.store.insert(b3h, mk_dag_data(Some(b2h), 3));
     store.put_block(&b3).unwrap();
 
     let a_outpoints = vec![
-        (mk_coinbase(0xA1, 500_000_000, 1, 0x01).txid(), 0u32),
-        (mk_coinbase(0xA2, 500_000_000, 2, 0x02).txid(), 0u32),
+        (mk_coinbase(0xA1, 100_000_000, 1, 0x01).txid(), 0u32),
+        (mk_coinbase(0xA2, 100_000_000, 2, 0x02).txid(), 0u32),
     ];
     let b_outpoints = vec![
-        (mk_coinbase(0xB1, 500_000_000, 1, 0x11).txid(), 0u32),
-        (mk_coinbase(0xB2, 500_000_000, 2, 0x12).txid(), 0u32),
-        (mk_coinbase(0xB3, 500_000_000, 3, 0x13).txid(), 0u32),
+        (mk_coinbase(0xB1, 100_000_000, 1, 0x11).txid(), 0u32),
+        (mk_coinbase(0xB2, 100_000_000, 2, 0x12).txid(), 0u32),
+        (mk_coinbase(0xB3, 100_000_000, 3, 0x13).txid(), 0u32),
     ];
     let mut universe = a_outpoints.clone();
     universe.extend(b_outpoints.clone());
@@ -240,7 +264,7 @@ fn reorg_a_to_b_utxo_set_equals_fork_b() {
     // the universe snapshot has exactly the 3 B outpoints and nothing else.
     for op in &w.b_outpoints {
         let o = w.store.get_utxo(&op.0, op.1).unwrap().expect("B output must exist after reorg");
-        assert_eq!(o.value, 500_000_000);
+        assert_eq!(o.value, 100_000_000);
     }
     for op in &w.a_outpoints {
         assert!(w.store.get_utxo(&op.0, op.1).unwrap().is_none(), "A-only output must be gone after A→B");
@@ -307,7 +331,7 @@ fn reorg_reinjects_valid_and_discards_orphan() {
     store.put_utxo(&u_txid, 0, &mk_output(0xAA, 10_000_000)).unwrap();
 
     // ── Fork A: A1 = [coinbase, txA(spend U)],  A2 = [coinbase, txD(spend A1 cb)] ──
-    let cb_a1 = mk_coinbase(0xA1, 500_000_000, 1, 0x01);
+    let cb_a1 = mk_coinbase(0xA1, 100_000_000, 1, 0x01);
     let cb_a1_txid = cb_a1.txid();
     let tx_a = mk_spend_tx(u_txid, 0, 0xBB, 9_990_000, 0x01); // spends U → still valid under B
     let tx_a_txid = tx_a.txid();
@@ -318,8 +342,8 @@ fn reorg_reinjects_valid_and_discards_orphan() {
     apply_block_utxo_mutations(&store, &a1).unwrap();
 
     // txD spends A1's coinbase output — an output that ONLY fork A ever creates.
-    let cb_a2 = mk_coinbase(0xA2, 500_000_000, 2, 0x02);
-    let tx_d = mk_spend_tx(cb_a1_txid, 0, 0xCC, 490_000_000, 0x02);
+    let cb_a2 = mk_coinbase(0xA2, 100_000_000, 2, 0x02);
+    let tx_d = mk_spend_tx(cb_a1_txid, 0, 0xCC, 90_000_000, 0x02);
     let tx_d_txid = tx_d.txid();
     let a2 = mk_block_at(2, 1002, vec![cb_a2, tx_d]);
     let a2h = a2.block_hash();
@@ -328,7 +352,7 @@ fn reorg_reinjects_valid_and_discards_orphan() {
     apply_block_utxo_mutations(&store, &a2).unwrap();
 
     // ── Fork B: single coinbase-only block off the LCA (does not touch U). ──
-    let b1 = mk_block_at(1, 2001, vec![mk_coinbase(0xB1, 500_000_000, 1, 0x11)]);
+    let b1 = mk_block_at(1, 2001, vec![mk_coinbase(0xB1, 100_000_000, 1, 0x11)]);
     let b1h = b1.block_hash();
     dag.store.insert(b1h, mk_dag_data(Some(g), 1));
     store.put_block(&b1).unwrap();
@@ -366,11 +390,13 @@ fn reorg_aborts_and_restores_on_fork_double_spend() {
     dag.store.insert(g, mk_dag_data(None, 0));
 
     // A mature, non-coinbase output U present at the LCA (survives rollback of A).
+    // It pays the test key so the FIRST spend is fully valid and the rule
+    // under test (the second, double-spending tx) is what aborts the reorg.
     let u_txid = [0x77u8; 32];
-    store.put_utxo(&u_txid, 0, &mk_output(0xAA, 10_000_000)).unwrap();
+    store.put_utxo(&u_txid, 0, &TxOutput { value: 10_000_000, script_pubkey: owner_script() }).unwrap();
 
     // Fork A: one coinbase block (the current tip).
-    let a1 = mk_block_at(1, 1001, vec![mk_coinbase(0xA1, 500_000_000, 1, 0x01)]);
+    let a1 = mk_block_at(1, 1001, vec![mk_coinbase(0xA1, 100_000_000, 1, 0x01)]);
     let a1h = a1.block_hash();
     dag.store.insert(a1h, mk_dag_data(Some(g), 1));
     store.put_block(&a1).unwrap();
@@ -379,14 +405,14 @@ fn reorg_aborts_and_restores_on_fork_double_spend() {
     // Universe of outpoints for the byte-exact pre-attempt snapshot.
     let universe = vec![
         (u_txid, 0u32),
-        (mk_coinbase(0xA1, 500_000_000, 1, 0x01).txid(), 0u32),
-        (mk_coinbase(0xB1, 500_000_000, 1, 0x11).txid(), 0u32),
+        (mk_coinbase(0xA1, 100_000_000, 1, 0x01).txid(), 0u32),
+        (mk_coinbase(0xB1, 100_000_000, 1, 0x11).txid(), 0u32),
     ];
     let snap_before = utxo_snapshot(&store, &universe);
 
     // Fork B: coinbase + TWO txs that both spend U (intra-block double-spend).
-    let cb_b1 = mk_coinbase(0xB1, 500_000_000, 1, 0x11);
-    let spend1 = mk_spend_tx(u_txid, 0, 0xB2, 9_000_000, 0x01);
+    let cb_b1 = mk_coinbase(0xB1, 100_000_000, 1, 0x11);
+    let spend1 = signed(mk_spend_tx(u_txid, 0, 0xB2, 9_000_000, 0x01));
     let spend2 = mk_spend_tx(u_txid, 0, 0xB3, 9_000_000, 0x02); // double-spends U
     let b1 = mk_block_at(1, 2001, vec![cb_b1, spend1, spend2]);
     let b1h = b1.block_hash();
@@ -404,8 +430,8 @@ fn reorg_aborts_and_restores_on_fork_double_spend() {
     let snap_after = utxo_snapshot(&store, &universe);
     assert_eq!(snap_before, snap_after, "aborted reorg must restore the pre-attempt UTXO state");
     // Concretely: A1's coinbase is back, no B output leaked in.
-    assert!(store.get_utxo(&mk_coinbase(0xA1, 500_000_000, 1, 0x01).txid(), 0).unwrap().is_some());
-    assert!(store.get_utxo(&mk_coinbase(0xB1, 500_000_000, 1, 0x11).txid(), 0).unwrap().is_none());
+    assert!(store.get_utxo(&mk_coinbase(0xA1, 100_000_000, 1, 0x01).txid(), 0).unwrap().is_some());
+    assert!(store.get_utxo(&mk_coinbase(0xB1, 100_000_000, 1, 0x11).txid(), 0).unwrap().is_none());
     assert!(store.get_utxo(&u_txid, 0).unwrap().is_some(), "seeded U intact after abort");
 }
 
@@ -419,7 +445,7 @@ fn reorg_aborts_and_restores_when_fork_spends_orphaned_output() {
     dag.store.insert(g, mk_dag_data(None, 0));
 
     // Fork A: coinbase cb_A1 (the current tip). cb_A1 exists ONLY on chain A.
-    let cb_a1 = mk_coinbase(0xA1, 500_000_000, 1, 0x01);
+    let cb_a1 = mk_coinbase(0xA1, 100_000_000, 1, 0x01);
     let cb_a1_txid = cb_a1.txid();
     let a1 = mk_block_at(1, 1001, vec![cb_a1]);
     let a1h = a1.block_hash();
@@ -429,15 +455,15 @@ fn reorg_aborts_and_restores_when_fork_spends_orphaned_output() {
 
     let universe = vec![
         (cb_a1_txid, 0u32),
-        (mk_coinbase(0xB1, 500_000_000, 1, 0x11).txid(), 0u32),
+        (mk_coinbase(0xB1, 100_000_000, 1, 0x11).txid(), 0u32),
     ];
     let snap_before = utxo_snapshot(&store, &universe);
 
     // Fork B: coinbase + a tx spending cb_A1 — an output that is rolled back
     // (orphaned) the moment fork A is disconnected, so it is absent from the
     // reorged UTXO set when B is re-validated.
-    let cb_b1 = mk_coinbase(0xB1, 500_000_000, 1, 0x11);
-    let spend_a_only = mk_spend_tx(cb_a1_txid, 0, 0xB2, 400_000_000, 0x01);
+    let cb_b1 = mk_coinbase(0xB1, 100_000_000, 1, 0x11);
+    let spend_a_only = mk_spend_tx(cb_a1_txid, 0, 0xB2, 90_000_000, 0x01);
     let b1 = mk_block_at(1, 2001, vec![cb_b1, spend_a_only]);
     let b1h = b1.block_hash();
     dag.store.insert(b1h, mk_dag_data(Some(g), 1));
@@ -453,7 +479,7 @@ fn reorg_aborts_and_restores_when_fork_spends_orphaned_output() {
     let snap_after = utxo_snapshot(&store, &universe);
     assert_eq!(snap_before, snap_after, "aborted reorg must restore the pre-attempt UTXO state");
     assert!(store.get_utxo(&cb_a1_txid, 0).unwrap().is_some(), "cb_A1 restored after abort");
-    assert!(store.get_utxo(&mk_coinbase(0xB1, 500_000_000, 1, 0x11).txid(), 0).unwrap().is_none(),
+    assert!(store.get_utxo(&mk_coinbase(0xB1, 100_000_000, 1, 0x11).txid(), 0).unwrap().is_none(),
         "no B coins-from-nothing after abort");
 }
 

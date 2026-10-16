@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use gnb::consensus::{
-    canonical_encode, BlockHash, ConsensusError, GhostDAG, GhostdagData, MAX_MERGESET_SIZE, MERGE_DEPTH,
+    canonical_encode, BlockHash, ConsensusError, GhostDAG, GhostdagData, MERGESET_SIZE_LIMIT, MERGE_DEPTH,
 };
 use gnb::core::activation::NEVER;
 use gnb::core::{GHOSTDAG_K, MAX_PARENTS};
@@ -428,11 +428,15 @@ fn chain(dag: &mut GhostDAG, tag: u8, from: BlockHash, len: u64, work: u128) -> 
 
 #[test]
 fn mergeset_size_limit_after_activation() {
+    // This chain's limit: 64 merged blocks besides the selected parent, on
+    // both sides of the activation.
+    let lim = MERGESET_SIZE_LIMIT as u64;
     for (activation, side_len, ok) in [
-        (0, MAX_MERGESET_SIZE as u64 - 1, true),  // 179 + selected parent = 180
-        (0, MAX_MERGESET_SIZE as u64, false),     // 181
+        (0, lim, true),
+        (0, lim + 1, false),
         (0, 1_000, false),
-        (NEVER, 1_000, true),                     // no limit before activation
+        (NEVER, lim, true),
+        (NEVER, lim + 1, false),
     ] {
         let mut dag = GhostDAG::with_k_and_activation(GHOSTDAG_K, activation);
         let g = hx(0xEE, 0);
@@ -448,7 +452,7 @@ fn mergeset_size_limit_after_activation() {
             let d = res.expect("within the limit");
             assert_eq!(d.mergeset_blues.len() + d.mergeset_reds.len(), side_len as usize);
         } else {
-            assert_eq!(res.unwrap_err(), ConsensusError::MergesetTooLarge { limit: MAX_MERGESET_SIZE });
+            assert_eq!(res.unwrap_err(), ConsensusError::MergesetTooLarge { limit: MERGESET_SIZE_LIMIT });
             assert_eq!(dag.block_count(), count_before, "rejected block not inserted");
             assert_eq!(dag.tips().into_iter().collect::<HashSet<_>>(), tips_before);
             assert!(!dag.has_block(&merge));
@@ -507,7 +511,7 @@ fn dag7_large_side_chain_merge_rejected_after_activation() {
     let t = std::time::Instant::now();
     let err = dag.add_block(hx(6, 0), vec![main[2_000], side[1_000]], 0, 1).unwrap_err();
     println!("1,000-block mergeset rejected in {:.2?}", t.elapsed());
-    assert_eq!(err, ConsensusError::MergesetTooLarge { limit: MAX_MERGESET_SIZE });
+    assert_eq!(err, ConsensusError::MergesetTooLarge { limit: MERGESET_SIZE_LIMIT });
 }
 
 // ── template helper (DAG-2 consensus side) ───────────────────────────────────
@@ -531,10 +535,10 @@ fn template_parents_respect_mergeset_limit() {
     let parents = dag.select_parents_for_template(&tips, MAX_PARENTS);
     assert_eq!(parents[0], main[20], "selected parent first");
     assert!(parents.len() <= MAX_PARENTS);
-    assert!(parents.len() > 100, "the helper still merges what fits ({})", parents.len());
+    assert!(parents.len() > 50, "the helper still merges what fits ({})", parents.len());
     let d = dag.add_block(template_hash(1), parents.clone(), 200, 1_000).expect("template is valid");
     assert_eq!(d.selected_parent, Some(main[20]));
-    assert!(1 + d.mergeset_blues.len() + d.mergeset_reds.len() <= MAX_MERGESET_SIZE);
+    assert!(d.mergeset_blues.len() + d.mergeset_reds.len() <= MERGESET_SIZE_LIMIT);
     // Deterministic, and independent of the candidate order.
     let mut rev = tips.clone();
     rev.reverse();
@@ -569,7 +573,9 @@ fn template_parents_before_activation_are_heaviest_tips() {
     }
     let tips = dag.tips();
     let parents = dag.select_parents_for_template(&tips, MAX_PARENTS);
-    assert_eq!(parents.len(), MAX_PARENTS);
+    // Budgeted by this chain's mergeset limit below the activation too:
+    // the selected parent plus 64 merged tips.
+    assert_eq!(parents.len(), MERGESET_SIZE_LIMIT + 1);
     assert_eq!(parents[0], main[20]);
     let w = |h: &BlockHash| dag.get_block_data(h).unwrap().blue_work;
     assert!(parents.windows(2).all(|p| w(&p[0]) >= w(&p[1])), "ordered by blue work");

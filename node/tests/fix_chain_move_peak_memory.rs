@@ -92,6 +92,7 @@ impl Builder {
                 blue_score: height,
                 height,
                 shielded_transactions: Vec::new(),
+                powit: Default::default(),
             };
             commit_block(&mut b);
             b.test_only_assume_pow_valid();

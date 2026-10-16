@@ -317,7 +317,9 @@ own selected-chain context. Blocks that fail connect-time validation, and
 every block whose selected-parent chain passes through one, are disqualified
 and never selected.
 
-There is no reorg-depth limit and no finality checkpoint (audit DAG-6). The
+There is no reorg-depth limit and no depth-based finality checkpoint (audit
+DAG-6; PoWit finality, from its activation, is described at the end of this
+paragraph). The
 former 1,000-block `MAX_REORG_DEPTH` and the `finalized_height` gate compared
 a fork with the node's own history, so nodes that received the same blocks in
 different orders could end on different chains. As in Bitcoin Core (no depth
@@ -334,7 +336,16 @@ blocks, each with the tip pointer at its end (node-local; Bitcoin Core's
 every intermediate state is a consistent applied tip, and start-up continues
 an interrupted move. When a block of a later chunk turns out invalid the best
 valid chain is resolved again from where the applied chain stands, which can
-move back to the old branch; the end state is the same as with one batch. A pruned node that reorganized away from
+move back to the old branch; the end state is the same as with one batch.
+From the PoWit activation fork choice is restricted to the branches through
+the latest checkpoint the applied chain's witness set finalized
+(`GhostDAG::set_finalized`). Each committed chunk pins the checkpoint its
+applied tip finalized before the move goes on, and start-up restores the pin
+from the applied tip before it resumes a move, so neither a block of a later
+chunk that turns out invalid nor a crash between chunks takes the node back
+across finality its applied chain reached (it ends where a node that
+followed the branch block by block ends). A block's PoWit state is committed
+in the same batch as its DAG record. A pruned node that reorganized away from
 blocks whose bodies it had pruned and needs them again (the old chain became
 the heaviest once more, or an operator override below moves to it) re-fetches
 those bodies from its peers before it connects them; nothing is written in

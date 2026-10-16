@@ -6,6 +6,9 @@
 //!   rebuild) commit in bounded chunks, each one a consistent applied tip that
 //!   start-up resumes from; a move larger than the memory available to one
 //!   commit still completes.
+//! * B2-T0 × PoWit — each committed chunk pins the finality its applied tip
+//!   reached (`GhostDAG::set_finalized`), and start-up restores the pin from
+//!   the applied tip before it resumes a move.
 //! * B1-T20 — reorg re-injection is capped by Bitcoin Core's 20 MB
 //!   `DisconnectedBlockTransactions` budget; into a full pool, a candidate
 //!   that would only be trimmed again is skipped (`Mempool::would_only_trim`)
@@ -59,6 +62,7 @@ impl Builder {
             blue_score: height,
             height,
             shielded_transactions: Vec::new(),
+            powit: Default::default(),
         };
         commit_block(&mut b);
         b.test_only_assume_pow_valid();
@@ -419,6 +423,147 @@ fn b2_t0_chain_state_rebuild_is_chunked_and_resumes() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// B2-T0 × PoWit finality: every chunk respects (and advances) the pin
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// A PoWit state whose witness set has finalized `cp` (slot 6, beyond the
+/// activation checkpoint at slot 1, so it pins fork choice).
+fn state_finalizing(cp: BlockHash) -> core::powit::PowitState {
+    let mut st = core::powit::PowitState::genesis(1, cp);
+    st.finalized = core::powit::Checkpoint { height: 6, hash: cp };
+    st.justified = st.finalized;
+    st
+}
+
+/// The finality fixture: genesis; A = 45 blocks; B = 46 blocks (heavier),
+/// whose 36th block pays its miner one satoshi too much (invalid in its own
+/// context only: it is stored as a fork-loser like any other block) and
+/// whose blocks from the 21st on carry a PoWit state finalizing B's 6th
+/// block (synthetic states, saved in every node's store: below the PoWit
+/// activation acceptance computes none). The reference node followed B
+/// block by block: it pinned B's 6th block as soon as B's 21st was its tip,
+/// so it never leaves B, and ends on B's last valid block, B[34].
+struct FinalityFixture {
+    genesis: Block,
+    a: Vec<Block>,
+    fork: Vec<Block>,
+    finalized: BlockHash,
+    reference: Node,
+}
+
+fn finality_fixture() -> FinalityFixture {
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let a = b.chain(gh, 45, "a");
+    let mut fork = b.chain(gh, 35, "b");
+    let h = b.height(&fork[34].block_hash()) + 1;
+    let bad = b.block(vec![fork[34].block_hash()],
+        vec![coinbase("b-overpays", core::tokenomics::block_subsidy_sat(h) + 1, vec![0xC0; 20])]);
+    fork.push(bad.clone());
+    fork.extend(b.chain(bad.block_hash(), 10, "bx"));
+    assert_eq!(fork.len(), 46);
+    let finalized = fork[5].block_hash();
+
+    let reference = node_with(&genesis, &[]);
+    save_finality_states(&reference, &fork, finalized);
+    deliver_all(&reference, &fork[..35]);
+    assert_eq!(reference.dag.read().finalized(), Some((finalized, 6)));
+    for blk in fork[35..].iter().chain(&a) {
+        let _ = accept(&reference, blk);
+    }
+    assert_eq!(applied_tip(&reference), Some(fork[34].block_hash()));
+    FinalityFixture { genesis, a, fork, finalized, reference }
+}
+
+fn save_finality_states(n: &Node, fork: &[Block], finalized: BlockHash) {
+    for blk in &fork[20..] {
+        gnb::powit::save_state(&n.store, &blk.block_hash(), &state_finalizing(finalized)).unwrap();
+    }
+}
+
+/// Main's PoWit finality pins fork choice to the checkpoint the applied
+/// chain's witness set finalized (`GhostDAG::set_finalized`), refreshed after
+/// each acceptance. A chunked move makes intermediate states applied: here
+/// the reorg from A onto B commits B's first 32 blocks (whose witness set
+/// finalized B[5]) before the chunk holding the invalid B[35] fails. Without
+/// a pin per chunk the move was resolved again unpinned and went back to A,
+/// rolling back finalized history the applied chain had reached; the
+/// committed chunk now pins B[5], so the move ends on B[34] like the node
+/// that followed B block by block. A restart keeps it there: start-up
+/// restores the pin from the applied tip before it reconciles (main pinned
+/// only after reconciling, from the unpinned selected tip, which is A).
+#[test]
+fn b2_t0_finality_reached_by_a_committed_chunk_binds_the_rest_of_the_move() {
+    let _guard = NoFaults;
+    let fx = finality_fixture();
+    let mut n = node_with(&fx.genesis, &[]);
+    save_finality_states(&n, &fx.fork, fx.finalized);
+    deliver_all(&n, &fx.a);
+    deliver_all(&n, &fx.fork[..44]);
+    assert_eq!(applied_tip(&n), Some(fx.a.last().unwrap().block_hash()), "B is lighter than A so far");
+    assert_eq!(n.dag.read().finalized(), None);
+
+    // B[44] (equal to A: the tie-break decides) or B[45] makes B the best:
+    // 3 rollback chunks, then B[0..16], B[16..32] (pins B[5]), B[32..]
+    // (fails on B[35]), then B[32..35].
+    for blk in &fx.fork[44..] {
+        let _ = accept(&n, blk);
+    }
+    assert_eq!(n.dag.read().finalized(), Some((fx.finalized, 6)), "pinned by the committed chunk");
+    assert_eq!(applied_tip(&n), Some(fx.fork[34].block_hash()),
+        "the move stays on the finalized branch (A forks below B[5])");
+    let reason = n.store.invalid_block_reason(&fx.fork[35].block_hash()).unwrap().expect("B[35] disqualified");
+    assert_eq!(accept::mark_kind(&reason), accept::MarkKind::Consensus, "{reason}");
+    assert_eq!(digest(&n), digest(&fx.reference), "same UTXO set as the node that followed B");
+    assert!(accept::check_chain_state(&n.dag, &n.store).unwrap().is_empty());
+
+    restart(&mut n);
+    assert_eq!(n.dag.read().finalized(), Some((fx.finalized, 6)), "restored from the applied tip");
+    assert_eq!(applied_tip(&n), Some(fx.fork[34].block_hash()), "a restart does not leave finality");
+    assert_eq!(digest(&n), digest(&fx.reference));
+}
+
+/// A crash between two chunks of that move, right after the chunk that
+/// pinned B[5]: the pin lives in memory, so start-up restores it from the
+/// persisted applied tip's witness set BEFORE it picks the block to resume
+/// to. Unpinned, the resumed move went back to A (heavier than B's valid
+/// part); it now completes on B[34] with the reference UTXO set.
+#[test]
+fn b2_t0_crash_resume_restores_the_finality_pin() {
+    let _guard = NoFaults;
+    let fx = finality_fixture();
+    let mut n = node_with(&fx.genesis, &[]);
+    save_finality_states(&n, &fx.fork, fx.finalized);
+    deliver_all(&n, &fx.a);
+    deliver_all(&n, &fx.fork[..44]);
+    let a_tip = fx.a.last().unwrap().block_hash();
+
+    // Commits 1-3 roll A back, 4-5 apply B[0..32]; the next one "crashes".
+    reorg::fault_injection::fail_after_commits(Some(5));
+    for blk in &fx.fork[44..] {
+        if applied_tip(&n) != Some(a_tip) {
+            break;
+        }
+        let _ = accept(&n, blk);
+    }
+    reorg::fault_injection::fail_after_commits(None);
+    assert_eq!(applied_tip(&n), Some(fx.fork[31].block_hash()), "stopped after the pinning chunk");
+    assert!(accept::check_chain_state(&n.dag, &n.store).unwrap().is_empty());
+
+    // Crash: the in-memory pin is lost with the rest of the DAG state.
+    reload(&mut n);
+    assert_eq!(n.dag.read().finalized(), None);
+    accept::reconcile_on_startup(&n.dag, &n.store, &n.shielded).expect("reconcile resumes the move");
+    assert_eq!(n.dag.read().finalized(), Some((fx.finalized, 6)));
+    assert_eq!(applied_tip(&n), Some(fx.fork[34].block_hash()), "resumed on the finalized branch");
+    assert_eq!(digest(&n), digest(&fx.reference));
+    restart(&mut n);
+    assert_eq!(applied_tip(&n), Some(fx.fork[34].block_hash()));
+    assert_eq!(digest(&n), digest(&fx.reference));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // B1-T20: bounded re-injection
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -447,6 +592,7 @@ fn synthetic_block(height: u64, nonce: u64, txs: Vec<Transaction>) -> Block {
         blue_score: height,
         height,
         shielded_transactions: Vec::new(),
+        powit: Default::default(),
     }
 }
 

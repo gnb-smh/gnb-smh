@@ -336,6 +336,24 @@ fn validate_tx_in_view(
         }
         view.view_utxo(txid, idx)
     };
+    // This chain's rules (`blockval`: finality, output kinds, dust, policy
+    // timelocks). Outputs created earlier in this block are confirmed at its
+    // height.
+    let mut prevouts = Vec::with_capacity(tx.inputs.len());
+    for inp in &tx.inputs {
+        if let Some(out) = lookup(&inp.prev_txid, inp.prev_index)? {
+            prevouts.push(out);
+        }
+    }
+    if prevouts.len() == tx.inputs.len() {
+        let confirm = |t: &[u8; 32]| -> Result<Option<u64>, String> {
+            if earlier.keys().any(|(c, _)| c == t) {
+                return Ok(Some(block_height));
+            }
+            view.view_tx_height(t)
+        };
+        crate::blockval::check_tx_chain_rules(tx, &prevouts, block_height, &confirm)?;
+    }
     validate_tx_inputs_classified(tx, &lookup, Some(spent_in_block), block_height, activation_height)
 }
 
@@ -419,16 +437,17 @@ pub fn validate_block_in_view_classified_at(
     let committed = |reason: String| BlockInvalidity { reason, witness_dependent: false };
     let height = block.height;
     let hardened = core::block_rules::rules_active_at(height, activation_height);
-    if hardened {
-        for tx in &block.transactions {
-            check_no_unspent_overwrite(view, tx).map_err(committed)?;
-        }
+    // BIP30 and no spend of the block's own coinbase: this chain's rules from
+    // genesis (the audit's VAL-2 / VAL-3 at the activation), so at every
+    // height here.
+    for tx in &block.transactions {
+        check_no_unspent_overwrite(view, tx).map_err(committed)?;
     }
-    let same_block_coinbase = if hardened {
-        block.transactions.first().map(|cb| cb.txid())
-    } else {
-        None
-    };
+    if let Some(cb) = block.transactions.first() {
+        crate::blockval::check_tx_context_free(cb, height)
+            .map_err(|e| committed(format!("coinbase rejected: {}", e)))?;
+    }
+    let same_block_coinbase = block.transactions.first().map(|cb| cb.txid());
     let mut spent_in_block: HashSet<([u8; 32], u32)> = HashSet::new();
     let mut earlier: HashMap<([u8; 32], u32), core::TxOutput> = HashMap::new();
     let mut total_fees: u64 = 0;
@@ -439,13 +458,15 @@ pub fn validate_block_in_view_classified_at(
                 activation_height,
             ).map_err(|f| BlockInvalidity {
                 reason: f.reason,
-                // At/after the activation the witness commitment fixed the body.
-                witness_dependent: f.witness && !hardened,
+                // From WITNESS_COMMITMENT_HEIGHT (the `|wc:` suffix, then
+                // the audit's commitment at the activation) the block id
+                // commits to every witness, which fixes the body.
+                witness_dependent: f.witness && !hardened && !core::witnesses_committed(height),
             })?;
             total_fees = core::limits::money_add(total_fees, fee)
                 .map_err(|e| committed(format!("block fee sum: {}", e)))?;
         }
-        if hardened && i == 0 {
+        if i == 0 {
             continue; // VAL-3: the coinbase's outputs are not spendable in its own block
         }
         let txid = tx.txid();
@@ -718,6 +739,37 @@ struct MarkClears {
     if_applied: Vec<BlockHash>,
 }
 
+/// The block whose insertion prompted a resolution (a new block, not a body
+/// replacement). Its DAG record and, from the PoWit activation, the
+/// in-context PoWit state computed before it was stored
+/// (`powit::block_state`) go into the FIRST batch that commits: the first
+/// chunk of the chain move (`commit_chunk`), or `persist_unchanged` when the
+/// applied chain does not move. A block is never recorded without its PoWit
+/// state (its children's state builds on it, `powit::base_state`), and a
+/// block refused before that commit leaves neither behind.
+#[derive(Clone, Copy)]
+struct TriggerRecord<'a> {
+    hash: BlockHash,
+    powit: Option<&'a core::powit::PowitState>,
+}
+
+/// Stage `t`'s DAG record and PoWit state (if it is still in the DAG).
+fn stage_trigger_record(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    batch: &mut rocksdb::WriteBatch,
+    t: &TriggerRecord<'_>,
+) -> Result<(), String> {
+    if !dag.read().has_block(&t.hash) {
+        return Ok(());
+    }
+    stage_dag_record_for(dag, store, batch, &t.hash)?;
+    if let Some(st) = t.powit {
+        crate::powit::stage_state(store, batch, &t.hash, st)?;
+    }
+    Ok(())
+}
+
 /// Why one chunk of a chain move did not commit (nothing of it was written).
 enum ChunkFailure {
     /// A block of the chunk is invalid in its own context; `witness` = the
@@ -733,13 +785,14 @@ enum ChunkFailure {
 /// chain indexes (`reorg::connect_plan`), its shielded state (COH-2), the
 /// tip pointer at the chunk's end, the persisted marks of `log_invalid`, the
 /// removal of the marks of every block it applies, and — when given — the
-/// trigger's DAG record and the operator's `clears_always`.
+/// trigger's DAG record with its PoWit state ([`TriggerRecord`]) and the
+/// operator's `clears_always`.
 fn commit_chunk(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
     shielded: &Arc<RwLock<ShieldedPool>>,
     sub: &reorg::ReorgPlan,
-    trigger: Option<BlockHash>,
+    trigger: Option<TriggerRecord<'_>>,
     clears_always: &[BlockHash],
     log_invalid: &[(BlockHash, String)],
 ) -> Result<ConnectOutcome, ChunkFailure> {
@@ -768,10 +821,8 @@ fn commit_chunk(
     };
     let new_tip = sub.target();
     let stage_extra = |st: &storage::Storage, batch: &mut rocksdb::WriteBatch| -> Result<(), String> {
-        if let Some(t) = trigger {
-            if dag.read().has_block(&t) {
-                stage_dag_record_for(dag, st, batch, &t)?;
-            }
+        if let Some(t) = &trigger {
+            stage_trigger_record(dag, st, batch, t)?;
         }
         // Operator `reconsiderblock`: the marks it removes in any case.
         for h in clears_always {
@@ -824,9 +875,10 @@ fn commit_chunk(
 
 /// Move the applied chain to the best valid block, marking blocks invalid as
 /// they fail. `applied_tip` is the block the UTXO set sits on (meta
-/// `tip_hash`). `trigger` is the block whose insertion prompted the call; its
-/// DAG record is folded into the first commit batch when
-/// `stage_trigger_record` (a new insertion, not a body replacement). `log`
+/// `tip_hash`). `trigger` is the new block whose insertion prompted the call
+/// (`None` for a body replacement and for the callers that insert nothing);
+/// its DAG record and PoWit state are folded into the first commit batch
+/// ([`TriggerRecord`]). `log`
 /// accumulates the disqualified roots and the dropped bodies; `clears` lists
 /// persisted marks to delete in the first commit (operator
 /// `reconsiderblock`). Whatever the caller, a committed chunk also deletes
@@ -841,7 +893,8 @@ fn commit_chunk(
 /// meanwhile. Blocks of the plan without a stored body are handled as
 /// `missing` says ([`MissingBodies`]).
 ///
-/// There is no depth limit and no finality gate (audit DAG-6): the plan to the
+/// There is no depth limit and no depth-based finality gate (audit DAG-6; PoWit
+/// finality pins the candidate, see below): the plan to the
 /// best valid block is executed at any depth — in chunks (audit B2-T0, like
 /// Bitcoin Core's `ActivateBestChain`, which steps through at most 32 blocks
 /// at a time with a bounded coins cache): each chunk of at most
@@ -855,14 +908,23 @@ fn commit_chunk(
 /// is a storage / missing-data failure before anything was committed (the
 /// caller rolls its trigger back); after a commit the failure is reported as
 /// `Connected { stopped: Some(..) }`.
+///
+/// PoWit finality (`GhostDAG::set_finalized`): the candidate is always the
+/// best block whose selected chain passes through the pinned checkpoint, and
+/// each committed chunk that applies blocks pins the checkpoint ITS applied
+/// tip's witness set finalized (`powit::pin_finalized_of`) before the next
+/// chunk or the next resolution: a block of a later chunk that turns out
+/// invalid never sends the move back across finality the applied chain has
+/// already reached (as a node that had followed the branch block by block
+/// would not go back). That checkpoint is on the candidate's own selected
+/// chain, so the candidate stays the best selectable block.
 #[allow(clippy::too_many_arguments)]
 fn resolve_best_chain(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
     shielded: &Arc<RwLock<ShieldedPool>>,
     applied_tip: BlockHash,
-    trigger: Option<BlockHash>,
-    stage_trigger_record: bool,
+    trigger: Option<TriggerRecord<'_>>,
     log: &mut ResolveLog,
     clears: &MarkClears,
     missing: MissingBodies,
@@ -870,7 +932,7 @@ fn resolve_best_chain(
     let mut applied = applied_tip;
     let mut delta = reorg::ChainDelta::default();
     let mut committed_any = false;
-    let mut trigger_pending = stage_trigger_record;
+    let mut trigger_pending = trigger.is_some();
     let mut clears_pending = true;
     let mut first_lca: Option<BlockHash> = None;
 
@@ -973,6 +1035,12 @@ fn resolve_best_chain(
                     clears_pending = false;
                     // Marks were persisted in the batch.
                     log.invalid.clear();
+                    // The finality the applied chain reached binds the rest
+                    // of the move (a rollback chunk ends on an ancestor of a
+                    // tip already pinned: nothing to advance).
+                    if !sub.to_apply.is_empty() {
+                        crate::powit::pin_finalized_of(dag, store, &applied);
+                    }
                 }
                 Err(ChunkFailure::Invalid { block, reason, witness }) => {
                     if reorg_depth > 0 { crate::metrics::inc_reorg_failure(); }
@@ -1069,21 +1137,20 @@ fn stage_invalid_marks(
     Ok(())
 }
 
-/// Persist the trigger's DAG record (if it is still in the DAG), the removal
-/// of every `cleared` mark and every pending invalid mark in one batch — used
-/// when the applied chain did not move.
+/// Persist the trigger's DAG record and PoWit state (if it is still in the
+/// DAG, [`TriggerRecord`]), the removal of every `cleared` mark and every
+/// pending invalid mark in one batch — used when the applied chain did not
+/// move.
 fn persist_unchanged(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
-    trigger: Option<BlockHash>,
+    trigger: Option<TriggerRecord<'_>>,
     invalid_log: &[(BlockHash, String)],
     cleared: &[BlockHash],
 ) -> Result<(), String> {
     let mut batch = rocksdb::WriteBatch::default();
-    if let Some(t) = trigger {
-        if dag.read().has_block(&t) {
-            stage_dag_record_for(dag, store, &mut batch, &t)?;
-        }
+    if let Some(t) = &trigger {
+        stage_trigger_record(dag, store, &mut batch, t)?;
     }
     for h in cleared {
         store.stage_clear_invalid_block(&mut batch, h).map_err(|e| e.to_string())?;
@@ -1306,6 +1373,17 @@ pub fn accept_block_tracking(
     //    no-op below the activation.
     core::block_rules::check_block_hardened_at(block, core::activation::hardening_activation_height())
         .map_err(|e| format!("consensus rejection: {}", e))?;
+    // This chain's context-free rules that depend on the header height
+    // (re-checked now that the height is verified; every ingress path ran
+    // them in `validate_structure` on the claimed height): the `|wc:` witness
+    // commitment from WITNESS_COMMITMENT_HEIGHT, the PoWit section's shape
+    // from `powit_height()`, and dust.
+    block.validate_witness_commitment()
+        .map_err(|e| format!("consensus rejection: {}", e))?;
+    block.validate_powit_structure()
+        .map_err(|e| format!("consensus rejection: {}", e))?;
+    block.validate_dust()
+        .map_err(|e| format!("consensus rejection: {}", e))?;
 
     // ── Proof of work (expensive: 64 MiB GnB-SMH, cached by block id) ─
     if !block.validate_pow() {
@@ -1332,6 +1410,21 @@ pub fn accept_block_tracking(
     if !block.shielded_transactions.is_empty() && !shielded.read().verifier.is_active() {
         return Err("shielded consensus rejection: ProofInvalid (no shielded verifier active)".into());
     }
+
+    // ── PoWit section, in context (from powit_height) ────────────────
+    // Share proofs, attested blocks and share uniqueness against this
+    // block's own selected chain, then the witness-set state transition
+    // (attestations, equivocation proofs, justification, finality). A pure
+    // function of the block and its past (never of the UTXO set), so a
+    // failure is refused like a bad height or difficulty: the block is not
+    // stored. `storage:` errors are local and refuse only this attempt.
+    let powit_state = if replacing {
+        None // same id, same PoWit section: its state is already stored
+    } else {
+        let d = dag.read();
+        crate::powit::block_state(block, &block_hash, &d, store)
+            .map_err(|e| if e.starts_with("storage:") { e } else { format!("consensus rejection: {}", e) })?
+    };
 
     // ── Insert into GhostDAG and store the body ──────────────────────
     if old_tip.is_none() {
@@ -1366,7 +1459,9 @@ pub fn accept_block_tracking(
         info!("block {} h={}: new body stored for a block that waited for one; re-evaluating",
             hex::encode(&block_hash[..8]), block.height);
     } else {
-        let work = pow::work_from_bits(block.header.bits);
+        // Chain work normalised across the GnB-SMH v1 -> v3 switch
+        // (`core::block_work`).
+        let work = pow::block_work(block.header.bits, block.height);
         let data = dag.write().add_block(block_hash, block.header.parents.clone(), block.header.timestamp, work)
             .map_err(|e| format!("consensus rejection: {}", e))?;
         // B1-T17: every body is indexed for pruning at its DAG height,
@@ -1375,6 +1470,10 @@ pub fn accept_block_tracking(
             dag.write().remove_block(&block_hash);
             return Err(e.to_string());
         }
+        // The block's PoWit state, keyed by its hash (deterministic; inert
+        // if the block never joins the selected chain), is committed with
+        // its DAG record below (`TriggerRecord`): in the first chunk of the
+        // chain move it triggers, or with its fork-loser record.
     }
     // Informational only (RPC / tip notifications).
     let _ = store.put_meta("current_bits", &block.header.bits.to_le_bytes());
@@ -1411,8 +1510,9 @@ pub fn accept_block_tracking(
     }
 
     // ── Connect the best valid chain (any depth, audit DAG-6) ────────
+    let trigger = (!replacing).then_some(TriggerRecord { hash: block_hash, powit: powit_state.as_ref() });
     let resolution = resolve_best_chain(
-        dag, store, shielded, applied_tip, Some(block_hash), !replacing,
+        dag, store, shielded, applied_tip, trigger,
         &mut log, &MarkClears::default(), MissingBodies::Wait,
     );
 
@@ -1436,8 +1536,7 @@ pub fn accept_block_tracking(
 
     let connected = match resolution {
         Resolution::Unchanged => {
-            let record = if replacing { None } else { Some(block_hash) };
-            if let Err(e) = persist_unchanged(dag, store, record, &log.invalid, &[]) {
+            if let Err(e) = persist_unchanged(dag, store, trigger, &log.invalid, &[]) {
                 // The DAG record of a non-applied block failed to persist:
                 // undo the in-memory insertion so memory and disk agree.
                 error!("failed to persist DAG record of {}: {}", hex::encode(&block_hash[..8]), e);
@@ -1529,9 +1628,12 @@ pub fn accept_block_tracking(
         info!("✓ block h={} accepted", height);
     }
 
-    // (No finality checkpoint any more — audit DAG-6. The pruning cursor
-    // below uses the selected tip's DAG height, never tip_blue_score(); see
-    // the DAG-8 note on `GhostdagData::height`.)
+    // No depth-based finality any more (audit DAG-6). PoWit finality: the
+    // checkpoint the applied chain's witness set finalized pins fork choice
+    // (`GhostDAG::set_finalized`). The pruning cursor below uses the
+    // selected tip's DAG height, never tip_blue_score(); see the DAG-8 note
+    // on `GhostdagData::height`.
+    crate::powit::update_finalized(dag, store);
     let tip_height = {
         let d = dag.read();
         d.selected_tip()
@@ -1544,7 +1646,13 @@ pub fn accept_block_tracking(
     // rollback record is written for each pruned APPLIED body, so a reorg of
     // any depth still works on a pruned node (DAG-6). Every stored body below
     // the pruning height goes — merged, fork-loser and junk bodies too
-    // (B1-T17, `Storage::prune_blocks_below`).
+    // (B1-T17, `Storage::prune_blocks_below`). The PoWit checks read bodies
+    // only within `SHARE_WINDOW` blocks below the block they validate (the
+    // selected chain's recent shares and the attested blocks,
+    // `powit::block_state`), so a block that can still compete never needs
+    // a pruned body; a reorg back onto a pruned block fetches it again
+    // (`awaits_body`) and its rollback uses the pruned-body record.
+    const _: () = assert!(core::PRUNING_DEPTH > 4 * core::witness_share::SHARE_WINDOW);
     if ARCHIVE_MODE.load(std::sync::atomic::Ordering::Relaxed) {
         if tip_height % 10_000 == 0 {
             info!("archival mode: retaining ALL block bodies (h={}); pruning disabled", tip_height);
@@ -1920,13 +2028,21 @@ pub fn reconcile_on_startup(
     // Step 4: applied tip vs best valid block.
     let applied = store.get_meta("tip_hash").ok().flatten()
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
+    // PoWit finality first (B2-T0): the pin lives in memory, so after a
+    // crash between two chunks of a move it is restored from the applied
+    // tip's witness set (what the committed chunks had pinned) BEFORE the
+    // best block is chosen: the resumed move never leaves finality the
+    // applied chain reached. `main` pins the selected tip's afterwards.
+    if let Some(a) = applied.filter(|a| dag.read().has_block(a)) {
+        crate::powit::pin_finalized_of(dag, store, &a);
+    }
     let best = dag.read().selected_tip();
     if let (Some(applied), Some(best)) = (applied, best) {
         if applied != best && dag.read().has_block(&applied) {
             warn!("reconcile: applied tip {} != best valid block {}; reconnecting",
                 hex::encode(&applied[..8]), hex::encode(&best[..8]));
             let mut log = ResolveLog::default();
-            match resolve_best_chain(dag, store, shielded, applied, None, false, &mut log,
+            match resolve_best_chain(dag, store, shielded, applied, None, &mut log,
                                      &MarkClears::default(), MissingBodies::Wait) {
                 Ok(Resolution::Connected { stopped: Some(m), .. }) => {
                     // B2-T0: the committed chunks stand; the next start (or
@@ -2120,6 +2236,13 @@ pub fn rebuild_chain_state(
     let applied = store.get_meta("tip_hash").map_err(|e| e.to_string())?
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
         .filter(|t| dag.read().has_block(t));
+    // PoWit finality: the checkpoint the applied chain's witness set
+    // finalized pins the chain the rebuild (or its resumption) reconnects,
+    // as it pinned the node's fork choice before the restart (the PoWit
+    // state is per block, never part of the chain state cleared below).
+    if let Some(t) = applied {
+        crate::powit::pin_finalized_of(dag, store, &t);
+    }
     let resume_from = match applied {
         Some(tip) if check_chain_state(dag, store)? == vec![ChainStateFault::RebuildInterrupted] => Some(tip),
         _ => None,
@@ -2189,7 +2312,7 @@ pub fn rebuild_chain_state(
 
     // 3. Connect the best valid chain, chunk by chunk.
     let mut log = ResolveLog::default();
-    let connected_blocks = match resolve_best_chain(dag, store, shielded, start, None, false, &mut log,
+    let connected_blocks = match resolve_best_chain(dag, store, shielded, start, None, &mut log,
                                                     &MarkClears::default(), MissingBodies::Wait)? {
         Resolution::Connected { stopped: Some(m), .. } => {
             // The flag stays set: the next run resumes from the last
@@ -2440,7 +2563,7 @@ fn apply_operator_override(
         .ok_or("no applied tip pointer")?;
     let (mut rolled_back, mut connected) = (0usize, 0usize);
     let mut rlog = ResolveLog { invalid: log, body_rejected: Vec::new() };
-    let resolution = match resolve_best_chain(dag, store, shielded, applied, None, false, &mut rlog,
+    let resolution = match resolve_best_chain(dag, store, shielded, applied, None, &mut rlog,
                                               &clears, MissingBodies::Stop) {
         Ok(r) => r,
         Err(m) if m.contains(reorg::ERR_MISSING_BODIES) => {
@@ -2871,15 +2994,14 @@ pub fn validate_tx_in_block_with_maturity(
         .unwrap_or(block.transactions.len());
     // Same gate and height as `validate_block_in_view_classified_at`.
     let activation_height = core::activation::hardening_activation_height();
-    let hardened = core::block_rules::rules_active_at(block.height, activation_height);
     let view: &storage::Storage = store;
-    if hardened {
-        check_no_unspent_overwrite(view, tx)?;
-    }
-    let same_block_coinbase = if hardened { block.transactions.first().map(|cb| cb.txid()) } else { None };
+    // BIP30 / no own-coinbase spend: this chain's rules at every height
+    // (see `validate_block_in_view_classified_at`).
+    check_no_unspent_overwrite(view, tx)?;
+    let same_block_coinbase = block.transactions.first().map(|cb| cb.txid());
     let earlier: HashMap<([u8; 32], u32), core::TxOutput> = block.transactions[..cutoff]
         .iter()
-        .filter(|t| !(hardened && t.is_coinbase()))
+        .filter(|t| !t.is_coinbase())
         .flat_map(|t| {
             let txid = t.txid();
             t.outputs.iter().enumerate().map(move |(i, o)| ((txid, i as u32), o.clone()))
