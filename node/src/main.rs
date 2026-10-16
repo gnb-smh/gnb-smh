@@ -220,8 +220,10 @@ struct Cli {
     /// in initial block download — it stores no block it did not ask for
     /// (unless that block's own chain reaches it), refuses `submitblock`
     /// blocks below it and does not mine. Default: the network's value
-    /// (`ingress::MAINNET_MINIMUM_CHAIN_WORK`, raised at each release;
-    /// docs/RUNNING.md). Non-consensus — a node-local anti-DoS knob.
+    /// (mainnet `ingress::MAINNET_MINIMUM_CHAIN_WORK` = 0x6acfc0, raised at
+    /// each release; testnet 0; docs/RUNNING.md). `0` turns it off; a value
+    /// below the default is logged as a warning. Non-consensus — a
+    /// node-local anti-DoS knob.
     #[arg(long = "minimumchainwork")]                    minimum_chain_work: Option<String>,
 
 }
@@ -444,19 +446,19 @@ async fn main() {
     // nMinimumChainWork), once, before any block is handled.
     {
         let net = if cli.testnet { core::ChainId::Testnet } else { core::ChainId::Mainnet };
-        let w = match cli.minimum_chain_work.as_deref() {
-            Some(s) => match ingress::parse_minimum_chain_work(s) {
-                Ok(w) => w,
-                Err(e) => {
-                    eprintln!("❌ --minimumchainwork: {e}");
-                    std::process::exit(2);
-                }
-            },
-            None => ingress::default_minimum_chain_work(net.into()),
+        let setting = match ingress::MinimumChainWorkSetting::resolve(cli.minimum_chain_work.as_deref(), net.into()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("❌ --minimumchainwork: {e}");
+                std::process::exit(2);
+            }
         };
-        let _ = ingress::set_minimum_chain_work(w);
-        info!("minimum chain work: {:#x}{}", w,
-            if cli.minimum_chain_work.is_some() { " (--minimumchainwork)" } else { " (network default)" });
+        let _ = ingress::set_minimum_chain_work(setting.value);
+        info!("minimum chain work: {:#x} ({}){}", setting.value, setting.value,
+            if setting.overridden { " (--minimumchainwork)" } else { " (network default)" });
+        if let Some(w) = setting.below_default_warning() {
+            warn!("⚠ {w}");
+        }
     }
 
     // FIX v0.5.1 BLK-3: apply --rpc-public escape hatch.
@@ -897,7 +899,11 @@ async fn main() {
         archive:         cli.archive,
     };
     // Audit POW-9: the node speaks its own network's protocol identifiers.
-    let mut node = match network::NetworkNode::new(net_cfg).map(|n| n.with_chain(core::node_chain_id())) {
+    // POW-3: below the minimum chain work the node advertises no frontier or
+    // headers to peers (initial block download; `serve::serve_sync_request`).
+    let mut node = match network::NetworkNode::new(net_cfg)
+        .map(|n| n.with_chain(core::node_chain_id()).with_minimum_chain_work(ingress::minimum_chain_work()))
+    {
         Ok(n)  => { info!("P2P: {}", n.peer_id); n }
         Err(e) => { error!("network: {}", e); std::process::exit(1); }
     };
@@ -911,6 +917,9 @@ async fn main() {
         tip_blue_score: our_score,
         block_count:    our_count,
         version:        env!("CARGO_PKG_VERSION").into(),
+        // POW-3: in initial block download from the start when the stored
+        // chain is below the minimum chain work (the latch keeps it so).
+        is_syncing:     ingress::below_minimum_chain_work(&dag.read(), ingress::minimum_chain_work()),
         ..Default::default()
     }));
 
@@ -1049,6 +1058,20 @@ async fn main() {
     powit::update_finalized(&dag, &store);
     if let Some((h, height)) = dag.read().finalized() {
         info!("PoWit finalized checkpoint: {} (DAG height {})", hex::encode(&h[..8]), height);
+    }
+    // POW-3: say at start-up when the stored chain is below the minimum
+    // chain work (a fresh node, or one whose chain stopped short of it):
+    // the node is in initial block download until a chain with that much
+    // work arrives (Bitcoin Core's IsInitialBlockDownload). The IBD latch
+    // repeats it as a warning while it lasts (`maybe_release_ibd`).
+    {
+        let (tip_work, min) = (ingress::tip_blue_work(&dag.read()), ingress::minimum_chain_work());
+        if tip_work < min {
+            info!("initial block download: the selected tip's chain work {:#x} is below the minimum chain work {:#x} \
+                   ({}%); the miner stays paused and unrequested blocks are refused until the node syncs a chain \
+                   with at least that much work (--minimumchainwork lowers it)",
+                  tip_work, min, tip_work.saturating_mul(100) / min);
+        }
     }
     if cli.reindex_addresses {
         // One layout, one rebuild: the DAG-8 migration's (chain positions,
@@ -2007,6 +2030,11 @@ async fn main() {
                     // the liveness backstop against a fabricated high announced
                     // score freezing the node.
                     maybe_release_ibd(&dag_n, &peer_state_n, &frontier_n, &state_n);
+                } else {
+                    // POW-3: a node with no peer cannot sync to the minimum
+                    // chain work either; say so as the latch would.
+                    let tip_work = ingress::tip_blue_work(&dag_n.read());
+                    warn_if_long_below_minimum(&state_n, tip_work, ingress::minimum_chain_work(), std::time::Instant::now());
                 }
             }
         });
@@ -2108,6 +2136,14 @@ async fn main() {
                     let out = tokio::task::spawn_blocking(move || {
                         let d = dag_b.read();
                         powit::pool().prune(&d, &store_b);
+                        // POW-3: no vote on a checkpoint of a selected chain
+                        // below the minimum chain work (initial block
+                        // download; it may be an eclipsing peer's cheap
+                        // chain, and the persistent vote record would then
+                        // bar this key's vote on the real one).
+                        if ingress::below_minimum_chain_work(&d, ingress::minimum_chain_work()) {
+                            return (None, powit::pool_evidence());
+                        }
                         let att = match duty_b.maybe_attest(&d, &store_b) {
                             Ok(Some(a)) => {
                                 let _ = powit::pool().admit_attestation(a.clone(), &d, &store_b);
@@ -2143,9 +2179,16 @@ async fn main() {
             std::thread::Builder::new().name(format!("share-miner-{t}")).spawn(move || {
                 let stop = std::sync::atomic::AtomicBool::new(false);
                 loop {
+                    // POW-3: no share on a selected tip below the minimum
+                    // chain work (initial block download), as no block is
+                    // mined there.
                     let tip = {
                         let d = dag_s.read();
-                        d.selected_tip().and_then(|h| d.get_block_data(&h).map(|bd| (h, bd.height)))
+                        if ingress::below_minimum_chain_work(&d, ingress::minimum_chain_work()) {
+                            None
+                        } else {
+                            d.selected_tip().and_then(|h| d.get_block_data(&h).map(|bd| (h, bd.height)))
+                        }
                     };
                     let Some((tip, tip_h)) = tip.filter(|(_, h)| core::powit_active(h + 1)) else {
                         std::thread::sleep(std::time::Duration::from_secs(5));
@@ -2286,6 +2329,24 @@ async fn main() {
                 // limit, audit DAG-6 — a strictly heavier chain reorgs us at
                 // any depth once its blocks arrive. The old FINALITY_FROZEN
                 // flag is gone.)
+                // POW-3: never mine on a selected tip below the minimum chain
+                // work, stalled or not (Bitcoin Core's miners get no template
+                // in initial block download): it may be a cheap chain this
+                // node's own pulls fetched from an eclipsing peer, and the
+                // stall release below exists for an unreachable frontier,
+                // not for a chain the release does not trust.
+                let below_min_work = {
+                    let d = dag_m.read();
+                    ingress::ibd_template_refusal(&d, ingress::minimum_chain_work())
+                };
+                if let Some(why) = below_min_work {
+                    if !was_syncing_last_tick {
+                        info!("⛏  miner paused: {why}");
+                        was_syncing_last_tick = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
                 if syncing_now && !sync_stalled {
                     if !was_syncing_last_tick {
                         info!("⛏  IBD in progress — miner paused, will resume when sync completes");
@@ -2466,7 +2527,7 @@ async fn main() {
     // ── External block submission (RPC submitblock) ──────────────────────────
     let rpc_submit_block: Arc<rpc::SubmitBlockFn> = make_rpc_submit_block_cb(
         dag.clone(), store.clone(), mempool.clone(), node_state.clone(),
-        shielded.clone(), outbound_tx.clone(), tip_tx.clone(),
+        shielded.clone(), outbound_tx.clone(), tip_tx.clone(), ingress::minimum_chain_work(),
     );
     // Audit DAG-6: operator recovery (invalidateblock / reconsiderblock).
     let rpc_chain_admin: Arc<rpc::ChainAdminFn> = make_chain_admin_cb(
@@ -2633,7 +2694,9 @@ fn commit_self_mined_block(
 /// Build the RPC `submitblock` hook (B5f pool seam): `Block::block_hash()`
 /// identity, dedup, `validate_structure_without_pow()`, then the shared
 /// `accept_block` pipeline (known parents, height, bits, timestamp, then the
-/// proof of work: B2-T11) + gossip.
+/// proof of work: B2-T11) + gossip. `min_chain_work`: the node's minimum
+/// chain work (`ingress::minimum_chain_work`; a parameter so tests pass it).
+#[allow(clippy::too_many_arguments)]
 fn make_rpc_submit_block_cb(
     dag:        Arc<RwLock<consensus::GhostDAG>>,
     store:      Arc<storage::Storage>,
@@ -2642,6 +2705,7 @@ fn make_rpc_submit_block_cb(
     shielded:   Arc<RwLock<crate::coherence::ShieldedPool>>,
     otx:        mpsc::Sender<network::NetworkMessage>,
     tip_tx:     broadcast::Sender<tip::TipChanged>,
+    min_chain_work: u128,
 ) -> Arc<rpc::SubmitBlockFn> {
     Arc::new(move |mut block: core::Block| -> Result<String, String> {
         let block_hash = block.block_hash();
@@ -2673,7 +2737,7 @@ fn make_rpc_submit_block_cb(
         // proof of work (cached by block id) — the order gossip ingress uses.
         // `validate_structure()` ran the proof first, so any block on random
         // parents or with wrong bits cost a full GnB-SMH evaluation per call.
-        ingress::submitted_block_admission(&dag.read(), &block, ingress::minimum_chain_work())?;
+        ingress::submitted_block_admission(&dag.read(), &block, min_chain_work)?;
         block.validate_structure_without_pow()
             .map_err(|e| format!("structural validation: {}", e))?;
 
@@ -2817,6 +2881,34 @@ fn maybe_release_ibd(
     frontier:   &Arc<parking_lot::Mutex<sync::frontier::FrontierState>>,
     node_state: &Arc<RwLock<rpc::NodeState>>,
 ) {
+    maybe_release_ibd_with(dag, peer_state, frontier, node_state,
+        ingress::minimum_chain_work(), std::time::Instant::now());
+}
+
+/// POW-3: the long-IBD warning alone (`ingress::MinimumWorkWatch`), for the
+/// periodic nudge of a node with no peer, which does not run the latch.
+fn warn_if_long_below_minimum(
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+    tip_work:   u128,
+    min_chain_work: u128,
+    now:        std::time::Instant,
+) {
+    let mut s = node_state.write();
+    if let Some(w) = s.min_work_watch.observe(tip_work, min_chain_work, now) {
+        warn!("⚠ {w} (this node has no peer)");
+    }
+}
+
+/// [`maybe_release_ibd`] against an explicit minimum chain work and clock
+/// (testable: the process-wide value is the network default in tests).
+fn maybe_release_ibd_with(
+    dag:        &Arc<RwLock<consensus::GhostDAG>>,
+    peer_state: &Arc<sync::peer_state::PeerStateTable>,
+    frontier:   &Arc<parking_lot::Mutex<sync::frontier::FrontierState>>,
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+    min_chain_work: u128,
+    now:        std::time::Instant,
+) {
     let (our_work, our_score, our_height, servable, reconciled, have_frontier, abandoned_gap, evidence) = {
         let d = dag.read();
         let selected = d.selected_tip().and_then(|h| d.get_node(&h));
@@ -2847,16 +2939,20 @@ fn maybe_release_ibd(
     // POW-3 (Phase 4): below the minimum chain work the node is in initial
     // block download whatever else it sees (Bitcoin Core's first
     // IsInitialBlockDownload criterion): the latch is held and the miner
-    // stays paused.
-    let below_minimum_work = our_work < ingress::minimum_chain_work();
+    // stays paused. A node that stays there for long says so, with the way
+    // out (`ingress::MinimumWorkWatch`).
+    let below_minimum_work = our_work < min_chain_work;
     {
         let mut s = node_state.write();
         // RPC honesty hint (fresh, author-attributed claims only).
         s.best_announced_blue_score = best_announced;
+        if let Some(w) = s.min_work_watch.observe(our_work, min_chain_work, now) {
+            warn!("⚠ {w}{}", if s.peer_count == 0 { " (this node has no peer)" } else { "" });
+        }
         if below_minimum_work {
             if !s.is_syncing {
                 info!("IBD latched: selected-tip work {:#x} is below the minimum chain work {:#x}",
-                    our_work, ingress::minimum_chain_work());
+                    our_work, min_chain_work);
             }
             s.is_syncing = true;
         } else if (verified || caught_up) && s.is_syncing {
@@ -3530,6 +3626,19 @@ mod ingress_processor_tests {
         assert_eq!(drain(&mut orx), 30);
     }
 
+    /// The latch with the minimum chain work off: the NET-6 rules below are
+    /// tested on the fixture's genesis-only chain, which is below mainnet's
+    /// minimum (that alone holds the latch, see
+    /// `ibd_latch_holds_below_the_mainnet_minimum_chain_work`).
+    fn release_without_minimum(
+        dag: &Arc<RwLock<consensus::GhostDAG>>,
+        ps:  &Arc<sync::peer_state::PeerStateTable>,
+        fr:  &Arc<parking_lot::Mutex<sync::frontier::FrontierState>>,
+        st:  &Arc<RwLock<rpc::NodeState>>,
+    ) {
+        maybe_release_ibd_with(dag, ps, fr, st, 0, std::time::Instant::now());
+    }
+
     /// NET-6: an inflated tip claim (even u64::MAX from a connected peer) can
     /// no longer hold the IBD latch: without work-backed evidence it releases.
     #[test]
@@ -3539,7 +3648,7 @@ mod ingress_processor_tests {
         ps.on_connect(liar, std::time::Instant::now());
         ps.observe_claim(liar, u64::MAX, u64::MAX, std::time::Instant::now());
         st.write().is_syncing = true;
-        maybe_release_ibd(&dag, &ps, &fr, &st);
+        release_without_minimum(&dag, &ps, &fr, &st);
         assert!(!st.read().is_syncing, "a claim alone must not keep the node in IBD");
     }
 
@@ -3550,11 +3659,69 @@ mod ingress_processor_tests {
         let (dag, ps, fr, st) = release_fixture();
         fr.lock().set_orphan_evidence(Some(sync::IBD_EXIT_LAG + 100));
         st.write().is_syncing = true;
-        maybe_release_ibd(&dag, &ps, &fr, &st);
+        release_without_minimum(&dag, &ps, &fr, &st);
         assert!(st.read().is_syncing, "evidence of a chain far ahead keeps the latch");
         fr.lock().set_orphan_evidence(Some(sync::IBD_EXIT_LAG));
-        maybe_release_ibd(&dag, &ps, &fr, &st);
+        release_without_minimum(&dag, &ps, &fr, &st);
         assert!(!st.read().is_syncing, "within IBD_EXIT_LAG counts as caught up");
+    }
+
+    /// POW-3 with mainnet's minimum chain work (the process-wide value in
+    /// tests: no chain id, no `--minimumchainwork`): a chain below it holds
+    /// the IBD latch whatever else the node sees (no peer, no evidence: it
+    /// would be "caught up"); one that reaches it releases the latch. An
+    /// override at or below the chain's work releases it too. A node that
+    /// stays below warns once per `MIN_WORK_WARNING_INTERVAL` (the watch in
+    /// `NodeState`).
+    #[test]
+    fn ibd_latch_holds_below_the_mainnet_minimum_chain_work() {
+        let min = core::MIN_CHAIN_WORK;
+        assert_eq!(ingress::minimum_chain_work(), min, "the mainnet default is in force");
+        assert_eq!(min, 7_000_000);
+        let (dag, ps, fr, st) = release_fixture();
+        dag.write().add_block([0xB1; 32], vec![[0xAA; 32]], 1_030, min - 1).expect("child of genesis");
+        assert_eq!(ingress::tip_blue_work(&dag.read()), min - 1);
+
+        // The production entry point, with the process-wide minimum.
+        maybe_release_ibd(&dag, &ps, &fr, &st);
+        assert!(st.read().is_syncing, "one unit of work short of the minimum: in IBD");
+        // The NET-6 rules alone would release it (no evidence: caught up).
+        release_without_minimum(&dag, &ps, &fr, &st);
+        assert!(!st.read().is_syncing);
+        // `--minimumchainwork` at the chain's work releases it as well.
+        st.write().is_syncing = true;
+        let t0 = std::time::Instant::now();
+        maybe_release_ibd_with(&dag, &ps, &fr, &st, min - 1, t0);
+        assert!(!st.read().is_syncing, "an override the chain reaches");
+
+        // Back below mainnet's value: latched; the warning is issued once the
+        // tip has stayed below for the interval (the watch in NodeState
+        // then has nothing more to report within that interval).
+        let iv = ingress::MIN_WORK_WARNING_INTERVAL;
+        maybe_release_ibd_with(&dag, &ps, &fr, &st, min, t0);
+        assert!(st.read().is_syncing);
+        let mut probe = st.read().min_work_watch.clone();
+        assert!(probe.observe(min - 1, min, t0 + iv).is_some(), "not warned before the interval");
+        maybe_release_ibd_with(&dag, &ps, &fr, &st, min, t0 + iv);
+        let mut probe = st.read().min_work_watch.clone();
+        assert!(probe.observe(min - 1, min, t0 + iv + iv / 2).is_none(), "the latch issued this interval's warning");
+        assert!(st.read().is_syncing);
+
+        // A node with no peer (the nudge does not run the latch) still warns,
+        // on the same watch: nothing more is due within this interval.
+        warn_if_long_below_minimum(&st, min - 1, min, t0 + iv + iv / 2);
+        let mut probe = st.read().min_work_watch.clone();
+        assert!(probe.observe(min - 1, min, t0 + 2 * iv).is_some(), "the next interval's warning is still due");
+        warn_if_long_below_minimum(&st, min - 1, min, t0 + 2 * iv);
+        let mut probe = st.read().min_work_watch.clone();
+        assert!(probe.observe(min - 1, min, t0 + 2 * iv + iv / 2).is_none(), "issued by the peerless path");
+
+        // One more block reaches the minimum: IBD complete, watch reset.
+        dag.write().add_block([0xB2; 32], vec![[0xB1; 32]], 1_060, 1).expect("child");
+        maybe_release_ibd_with(&dag, &ps, &fr, &st, min, t0 + 3 * iv);
+        assert!(!st.read().is_syncing, "the tip reached the minimum chain work");
+        let mut probe = st.read().min_work_watch.clone();
+        assert!(probe.observe(min, min, t0 + 10 * iv).is_none());
     }
 }
 
@@ -3617,11 +3784,18 @@ mod external_submission_tests {
     }
 
     impl TestNode {
+        /// The `submitblock` hook with no minimum chain work: these fixture
+        /// chains (pow-limit blocks, work 1 each) sit far below mainnet's,
+        /// which `rpc_cb_with` tests.
         fn rpc_cb(&self) -> Arc<rpc::SubmitBlockFn> {
+            self.rpc_cb_with(0)
+        }
+
+        fn rpc_cb_with(&self, min_chain_work: u128) -> Arc<rpc::SubmitBlockFn> {
             make_rpc_submit_block_cb(
                 self.dag.clone(), self.store.clone(), self.mempool.clone(),
                 self.node_state.clone(), self.shielded.clone(),
-                self.otx.clone(), self.tip_tx.clone(),
+                self.otx.clone(), self.tip_tx.clone(), min_chain_work,
             )
         }
     }
@@ -3834,6 +4008,26 @@ mod external_submission_tests {
         let good = mk_child(&node, &genesis, true);
         let res = (node.rpc_cb())(good);
         assert!(res.is_ok(), "rpc submitblock must accept a valid block: {:?}", res);
+        assert_eq!(node.dag.read().block_count(), 2);
+    }
+
+    /// POW-3: the hook applies the node's minimum chain work. With mainnet's
+    /// (the release constant, what `main` passes on a mainnet node without
+    /// `--minimumchainwork`) the same valid block, whose chain is far below
+    /// it, is refused before its proof or any storage; with the minimum the
+    /// chain reaches (an override), it is accepted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpc_submit_applies_the_minimum_chain_work() {
+        assert_eq!(ingress::minimum_chain_work(), core::MIN_CHAIN_WORK, "the mainnet default is in force");
+        let genesis = mk_genesis(unix_now());
+        let node = node_with_genesis(&genesis);
+        let good = mk_child(&node, &genesis, true);
+        let err = (node.rpc_cb_with(core::MIN_CHAIN_WORK))(good.clone()).unwrap_err();
+        assert!(err.contains("below the minimum chain work") && err.contains("initial block download"), "{err}");
+        assert_eq!(node.dag.read().block_count(), 1, "nothing stored");
+        let lb = ingress::block_work_lower_bound(&node.dag.read(), &good.header.parents, good.header.bits, good.height)
+            .expect("parent known");
+        (node.rpc_cb_with(lb))(good).expect("a minimum the block's chain reaches");
         assert_eq!(node.dag.read().block_count(), 2);
     }
 

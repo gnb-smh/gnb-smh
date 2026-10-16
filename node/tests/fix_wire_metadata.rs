@@ -19,7 +19,11 @@
 //! Every block goes through the real ingress core
 //! (`ingress::BlockIngress::handle_block`) or `accept::accept_block`. Proofs
 //! of work are recorded as verified in the process-wide cache
-//! (`Block::test_only_assume_pow_valid`, dev-only `test-pow-limit`).
+//! (`Block::test_only_assume_pow_valid`, dev-only `test-pow-limit`). The
+//! ingress cores run with no minimum chain work (`with_minimum_chain_work(0)`):
+//! these chains are far below mainnet's, the default in this binary, and
+//! the gossip paths tested here are those of a node out of initial block
+//! download.
 
 mod fix_common;
 use fix_common::*;
@@ -173,7 +177,7 @@ fn block_accepted_from_gossip_and_served_from_storage_is_accepted_by_a_fresh_nod
         "the same size with the derived value (a fixed-width field)");
 
     // A takes the gossiped copy, stores and serves the derived blue score.
-    let mut core_a = BlockIngress::new();
+    let mut core_a = BlockIngress::new().with_minimum_chain_work(0);
     let o = deliver(&mut core_a, &a, &x, false);
     assert!(processed_ok(&o), "gossiped copy: {o:?}");
     assert_eq!(applied_tip(&a), Some(id));
@@ -182,7 +186,7 @@ fn block_accepted_from_gossip_and_served_from_storage_is_accepted_by_a_fresh_nod
     assert_eq!(copy.block_hash(), id);
 
     // C syncs it from A: the served copy is accepted.
-    let mut core_c = BlockIngress::new();
+    let mut core_c = BlockIngress::new().with_minimum_chain_work(0);
     let o = deliver(&mut core_c, &c, &copy, true);
     assert!(processed_ok(&o), "the copy every upgraded node serves must be accepted: {o:?}");
     assert_eq!(applied_tip(&c), Some(id));
@@ -197,7 +201,7 @@ fn block_accepted_from_gossip_and_served_from_storage_is_accepted_by_a_fresh_nod
         }
         let mut other = x.clone();
         other.blue_score = blue;
-        let o = deliver(&mut BlockIngress::new(), &v, &other, true);
+        let o = deliver(&mut BlockIngress::new().with_minimum_chain_work(0), &v, &other, true);
         assert!(processed_ok(&o), "blue_score {blue}: {o:?}");
         assert_eq!(served(&v, &id).blue_score, derived, "blue_score {blue}: stored derived");
     }
@@ -207,7 +211,7 @@ fn block_accepted_from_gossip_and_served_from_storage_is_accepted_by_a_fresh_nod
     for blue in [0u64, derived] {
         let mut o_copy = over.clone();
         o_copy.blue_score = blue;
-        match deliver(&mut BlockIngress::new(), &c, &o_copy, false) {
+        match deliver(&mut BlockIngress::new().with_minimum_chain_work(0), &c, &o_copy, false) {
             BlockOutcome::Invalid(e) => assert!(e.contains("block too large"), "{e}"),
             other => panic!("blue_score {blue}: {other:?}"),
         }
@@ -223,7 +227,7 @@ fn gossip_and_sync_paths_store_the_derived_blue_score() {
     let genesis = mk_genesis(unix_now() - 50_000);
     let gh = genesis.block_hash();
     let n = node_with(&genesis, &[]);
-    let mut core = BlockIngress::new();
+    let mut core = BlockIngress::new().with_minimum_chain_work(0);
     let mut tip = gh;
     for (i, (forged, solicited)) in [(0u64, false), (u64::MAX, true), (7, false), (1 << 40, true)].into_iter().enumerate() {
         let h = i as u64 + 1;

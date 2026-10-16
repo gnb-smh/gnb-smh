@@ -1091,7 +1091,7 @@ pub fn pin_finalized_with(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage, 
     let fin = {
         let d = dag.read();
         let enough_work = d.get_block_data(tip)
-            .is_some_and(|bd| core::finality_active_with(bd.blue_work, min_chain_work));
+            .is_some_and(|bd| bd.blue_work >= min_chain_work);
         if !enough_work {
             return;
         }

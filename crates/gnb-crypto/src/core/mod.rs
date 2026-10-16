@@ -168,31 +168,43 @@ pub const MAX_BLOCK_SIZE:        usize = 1_000_000;
 pub const MAX_TEMPLATE_TX_BYTES:  usize = MAX_BLOCK_SIZE - 32 * 1024;
 pub const TARGET_BLOCK_TIME:     u64   = tokenomics::TARGET_BLOCK_TIME_SECS;
 pub const PROTOCOL_VERSION:      u32   = 1;
-/// Minimum accumulated work (`blue_work` of the selected tip) a node must
-/// reach before it treats its chain as final.
+/// Mainnet minimum chain work (Bitcoin Core's `nMinimumChainWork`): the
+/// default of the node's `ingress::MAINNET_MINIMUM_CHAIN_WORK`. While its
+/// selected tip carries less blue work, a node is in initial block download:
+/// it does not mine or serve block templates, advertises no frontier to
+/// peers, processes no block it did not request unless that block's own
+/// chain reaches the value, and refuses `submitblock` blocks below it.
+/// Below it a node may be on a cheap chain an attacker fed it
+/// (ASERT eases the difficulty of a chain behind schedule, so a long low-work
+/// chain from genesis is cheap to build). Unlike a checkpoint it names no
+/// block and gives no one authority over which chain wins.
 ///
-/// Below it, a node may be on a cheap chain an attacker fed it during initial
-/// sync (ASERT eases the difficulty for a chain behind schedule, so a long
-/// low-work chain from genesis is cheap to build). Until its tip reaches this
-/// work the node keeps finality, the reorg depth cap and pruning OFF, so it can
-/// still switch to the heaviest chain at any depth. Unlike a checkpoint it
-/// names no block and gives no one authority over which chain wins.
+/// Node-local policy, not consensus: no block's validity, GhostDAG data or
+/// fork choice depends on it (the PoWit finalized checkpoint included), so
+/// nodes with different values, `--minimumchainwork` or an older release,
+/// reach the same verdicts on the same blocks; only when a node processes
+/// an unrequested block, and when it leaves initial block download, differ.
 ///
-/// Set at each release to a value somewhat below the live selected chain's
-/// `blue_work` at release time (as Bitcoin Core sets `nMinimumChainWork`).
-/// `0` before a chain exists, which leaves behaviour unchanged.
-pub const MIN_CHAIN_WORK: u128 = 0;
-
-/// Whether a node whose selected tip has `tip_blue_work` applies finality
-/// (the reorg depth cap, `finalized_height`, pruning). See [`MIN_CHAIN_WORK`].
-pub fn finality_active(tip_blue_work: u128) -> bool {
-    finality_active_with(tip_blue_work, MIN_CHAIN_WORK)
-}
-
-/// [`finality_active`] against an explicit minimum (testable).
-pub fn finality_active_with(tip_blue_work: u128, min_chain_work: u128) -> bool {
-    tip_blue_work >= min_chain_work
-}
+/// Unit: the `blue_work` of the selected tip (`getdaginfo` `tip_blue_work`,
+/// decimal), the sum of `block_work` over the blocks it counts:
+/// `bits_to_work` of each block (about 2^256 / target; the genesis target
+/// is 4,500 and the pre-activation pow limit 1), divided by
+/// 2^[`POW_V3_DIFFICULTY_SHIFT`] for GnB-SMH v3 blocks, whose target is that
+/// much harder, so the sum is continuous across the v1 -> v3 switch. Below
+/// the hardening activation the selected chain's blocks count, from it the
+/// merged blues as well (docs/CONSENSUS.md); both only add work.
+///
+/// Value: 7,000,000 = 0x6acfc0, docs/MAINNET-READINESS.md §1. The newest
+/// reading is the one mainnet node's on 2026-10-14 04:25 UTC: tip height
+/// 8,302 (GnB-SMH v1), `tip_blue_work` 7,782,451, consistent with the ASERT
+/// schedule (a steady ~29 evaluations/s from genesis reaches height ~8,308
+/// and ~7.77M work by then; test `min_chain_work_cross_check`). 7,000,000 is
+/// 10% below it, the work of a block about 900 blocks below that tip; the
+/// network's best chain work only grows, and its tip was near 14,500 at
+/// release time, so the value lies more than 6,000 blocks below it. Raised
+/// at each release (docs/RUNNING.md, "Initial sync and minimum chain work":
+/// `tools/release/min_chain_work.py`); testnet and regtest keep 0.
+pub const MIN_CHAIN_WORK: u128 = 7_000_000;
 
 pub const COINBASE_MATURITY:     u64   = 100;        // blocks before coinbase is spendable
 
@@ -2527,6 +2539,73 @@ mod powit_pow_tests {
         early.header.nonce = n;
         assert!(!early.validate_pow(), "a v3-only proof must fail below the activation height");
     }
+}
+
+/// [`MIN_CHAIN_WORK`] against the reading it is derived from
+/// (docs/MAINNET-READINESS.md §1) and the ASERT arithmetic that relates a
+/// chain's height and time to its work. Every input is a constant, so the
+/// relations are stable; they catch a value in another unit (a hexadecimal
+/// reading taken as decimal, a blue score, an unnormalised v3 work) or one
+/// above the reading.
+#[cfg(test)]
+mod min_chain_work_tests {
+    use super::*;
+
+    /// The reading: mainnet tip height 8,302 (all GnB-SMH v1 blocks, below
+    /// the PoWit height 10,000 and the hardening activation 17,500),
+    /// `getdaginfo` `tip_blue_work` 7,782,451, on 2026-10-14 04:25 UTC.
+    const READING_HEIGHT: u64 = 8_302;
+    const READING_WORK: u128 = 7_782_451;
+    const READING_TIME: u64 = 1_791_951_900;
+
+    fn asert_work(parent_time: u64, height: u64) -> u128 {
+        // Pre-activation pow limit, v1 (both readings and every height here
+        // are below the mainnet switches, whatever this test binary's PoWit
+        // override).
+        bits_to_work(expected_bits_at(parent_time, height, activation::MAINNET_HARDENING_ACTIVATION_HEIGHT).unwrap())
+    }
+
+    #[test]
+    fn min_chain_work_cross_check() {
+        // The unit. Per-block work at the ASERT anchor (genesis target) and
+        // at the pre-activation pow limit; a v3 block on the same ASERT
+        // target (4x harder) counts the same once normalised.
+        assert_eq!(bits_to_work(GENESIS_BITS), 4_500);
+        assert_eq!(bits_to_work(POW_LIMIT_BITS), 1);
+        let v3 = adjust_bits_for_algo(GENESIS_BITS, gnb_smh::Algo::V3);
+        assert_eq!(bits_to_work(v3), 18_000);
+        assert_eq!(bits_to_work(v3) >> POW_V3_DIFFICULTY_SHIFT, 4_500);
+
+        // The reading in that unit. 573 blocks behind the schedule, the next
+        // block's ASERT work is 859 (4,500 * 2^(-573/240)). A chain mined at
+        // a steady rate H from genesis settles at a constant lag where a
+        // block's work is 30 s * H, and its work is H * elapsed: here
+        // 859 * 8,875 = 7,623,625. The reading is within 3% of it (a steady
+        // ~29.2 evaluations/s, i.e. the one 28-thread v1 miner).
+        let elapsed = READING_TIME - GENESIS_TIMESTAMP;
+        let schedule = elapsed / TARGET_BLOCK_TIME;
+        assert_eq!((elapsed, schedule, schedule - READING_HEIGHT), (266_252, 8_875, 573));
+        let w_next = asert_work(READING_TIME, READING_HEIGHT + 1);
+        assert_eq!(w_next, 859);
+        let steady = w_next * u128::from(schedule);
+        assert!(READING_WORK * 100 >= steady * 97 && READING_WORK * 100 <= steady * 103,
+            "reading {READING_WORK} vs steady-rate model {steady}");
+        // Consensus floor: no chain of that height can carry less work than
+        // one whose every block is stamped at the reading time (the easiest
+        // targets ASERT gives); the minimum is far above it, so it excludes
+        // the cheapest chains, while the pow limit alone would admit 8,302.
+        let floor: u128 = (1..=READING_HEIGHT).map(|h| asert_work(READING_TIME, h)).sum();
+        assert_eq!(floor, 301_774);
+        assert!(floor < MIN_CHAIN_WORK && u128::from(READING_HEIGHT) < floor);
+
+        // The constant: 7,000,000 = 0x6acfc0, 10% below the reading (about
+        // 900 blocks of 859), never above it.
+        assert_eq!(MIN_CHAIN_WORK, 0x6a_cfc0);
+        assert!(MIN_CHAIN_WORK > READING_WORK - 1_000 * w_next, "within ~1,000 blocks of it");
+    }
+
+    // At least 10% below the reading (checked at compile time).
+    const _: () = assert!(MIN_CHAIN_WORK * 10 <= READING_WORK * 9);
 }
 
 #[cfg(test)]

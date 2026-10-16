@@ -116,6 +116,9 @@ pub struct NodeState {
     pub best_announced_blue_score: u64,
     pub peer_addresses: Vec<String>,
     pub version:        String,
+    /// How long the selected tip has stayed below the minimum chain work
+    /// (the IBD latch's long-sync warning, `maybe_release_ibd`).
+    pub min_work_watch: crate::ingress::MinimumWorkWatch,
 }
 
 /// Block-submission hook — the B5f pool seam.
@@ -261,6 +264,10 @@ struct AppState {
     /// trusted direct caller (set per request, like `cancel`); such callers
     /// are not charged to `tx_verify_budget`.
     caller_trusted:          bool,
+    /// POW-3: the node's minimum chain work (`ingress::minimum_chain_work`
+    /// at start-up). `getdaginfo` reports it; below it `getblocktemplate`
+    /// refuses (initial block download, `ingress::ibd_template_refusal`).
+    min_chain_work:          u128,
 }
 
 // ─── R3-audit H-R3-5 / L-8: bound the expensive analytics + template RPCs ───
@@ -626,6 +633,7 @@ pub async fn start_rpc_server(
         },
         tx_verify_budget:        Arc::new(auth::ByteBudget::new(ANON_TX_VERIFY_BURST_BYTES, ANON_TX_VERIFY_BYTES_PER_SEC)),
         caller_trusted:          false,
+        min_chain_work:          crate::ingress::minimum_chain_work(),
     };
 
     let app = build_router(app_state, &config.allowed_origins);
@@ -1801,6 +1809,14 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // (BIP22: 1-based positions in `transactions`): a block built from
             // a subset of the entries must keep every dependency of every
             // entry it keeps.
+            //
+            // POW-3: no template while the selected tip is below the minimum
+            // chain work (Bitcoin Core: "in initial sync and waiting for
+            // blocks"): it may be a chain this node's own pulls fetched from
+            // an eclipsing peer, not one to mine on.
+            if let Some(e) = crate::ingress::ibd_template_refusal(&state.dag.read(), state.min_chain_work) {
+                return json!({ "error": e });
+            }
             let tmpl = match crate::template::build_block_template(
                 &state.dag, &state.store, &state.mempool,
                 crate::template::EXTERNAL_COINBASE_RESERVE,
@@ -2016,10 +2032,17 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // apply at next_block_height, as getblocktemplate reports them
             // for its template's height.
             let activation_height = crate::core::activation::hardening_activation_height();
+            // POW-3: the minimum chain work in force (default or
+            // `--minimumchainwork`), in the unit and format of
+            // `tip_blue_work`; below it the node is in initial block download.
+            let min_chain_work = state.min_chain_work;
+            let tip_work = tip_data.as_ref().map_or(0, |d| d.blue_work);
             json!({
                 "tip":            tip.map(|h| hex::encode(h)),
                 "tip_blue_score": tip_data.as_ref().map(|d| d.blue_score).unwrap_or(0),
                 "tip_blue_work":  tip_data.as_ref().map(|d| d.blue_work.to_string()).unwrap_or_default(),
+                "minimum_chain_work": min_chain_work.to_string(),
+                "below_minimum_chain_work": tip_work < min_chain_work,
                 "tip_height":     tip_data.as_ref().map(|d| d.height).unwrap_or(0),
                 "next_block_height": next_block_height,
                 "hardening_activation_height": activation_height,
@@ -3106,6 +3129,10 @@ mod audit_2026_10_rpc_tests {
             proxy_client_header: auth::DEFAULT_PROXY_CLIENT_HEADER.into(),
             tx_verify_budget: Arc::new(auth::ByteBudget::new(ANON_TX_VERIFY_BURST_BYTES, ANON_TX_VERIFY_BYTES_PER_SEC)),
             caller_trusted: false,
+            // These fixture chains (work 1 per block) are far below
+            // mainnet's minimum chain work; the test of `getdaginfo`'s
+            // `minimum_chain_work` sets it.
+            min_chain_work: 0,
         };
         (tmp, state)
     }
@@ -4178,6 +4205,42 @@ mod audit_2026_10_rpc_tests {
         assert_eq!(r["hardening_activation_height"], 0);
     }
 
+    /// POW-3: `getdaginfo` reports the node's minimum chain work (here
+    /// mainnet's release value, what `start_rpc_server` takes from
+    /// `ingress::minimum_chain_work` on a mainnet node without
+    /// `--minimumchainwork`), in `tip_blue_work`'s unit and decimal format,
+    /// and whether the selected tip is below it (initial block download), so
+    /// an operator sees why a node does not leave IBD and the release tool
+    /// (tools/release/min_chain_work.py) prints the value a node runs.
+    /// Below it `getblocktemplate` refuses, as Bitcoin Core's does in
+    /// initial block download: the tip may be a cheap chain the node's own
+    /// pulls fetched from an eclipsing peer.
+    #[tokio::test]
+    async fn getdaginfo_and_getblocktemplate_apply_the_minimum_chain_work() {
+        let (_tmp, mut state) = state_with_chain(5);
+        assert_eq!(crate::ingress::minimum_chain_work(), crate::core::MIN_CHAIN_WORK, "the process default");
+        state.min_chain_work = crate::core::MIN_CHAIN_WORK;
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["minimum_chain_work"], "7000000");
+        assert_eq!(r["below_minimum_chain_work"], true, "a 5-block test chain");
+        let t = dispatch("getblocktemplate", None, &state).await;
+        let e = t["error"].as_str().unwrap_or_default();
+        assert!(e.contains("initial block download") && e.contains("0x6acfc0"), "{t}");
+        let tip_work: u128 = r["tip_blue_work"].as_str().unwrap().parse().unwrap();
+        state.dag.write().add_block([0xD7; 32], vec![[5u8; 32]], 20_000, crate::core::MIN_CHAIN_WORK - tip_work)
+            .unwrap();
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["tip_blue_work"], "7000000");
+        assert_eq!(r["below_minimum_chain_work"], false, "at the minimum: out of IBD");
+        let t = dispatch("getblocktemplate", None, &state).await;
+        let e = t["error"].as_str().unwrap_or_default();
+        assert!(!e.contains("initial block download"), "{t}");
+        // With no minimum (testnet, `--minimumchainwork 0`) nothing is gated.
+        let (_tmp0, state0) = state_with_chain(5);
+        let r = dispatch("getdaginfo", None, &state0).await;
+        assert_eq!((r["minimum_chain_work"].as_str(), r["below_minimum_chain_work"].as_bool()), (Some("0"), Some(false)));
+    }
+
     /// B2-T5: `getdaginfo` used to walk the whole selected chain (under the
     /// DAG read lock) for `chain_length` on every call. Its DAG work no
     /// longer grows with the chain, and `chain_length` is still the number
@@ -4252,6 +4315,10 @@ mod block_rules_template_tests {
             proxy_client_header: auth::DEFAULT_PROXY_CLIENT_HEADER.into(),
             tx_verify_budget: Arc::new(auth::ByteBudget::new(ANON_TX_VERIFY_BURST_BYTES, ANON_TX_VERIFY_BYTES_PER_SEC)),
             caller_trusted: false,
+            // These fixture chains (work 1 per block) are far below
+            // mainnet's minimum chain work; the test of `getdaginfo`'s
+            // `minimum_chain_work` sets it.
+            min_chain_work: 0,
         };
         (tmp, state)
     }
