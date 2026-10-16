@@ -1411,11 +1411,9 @@ async fn main() {
                     };
                     report_verdict(&vtx2, &origin, verdict);
                     // B1-T2: an invalid block sent as the ANSWER to one of our
-                    // pulls is judged exactly like a gossip copy, and a Reject
-                    // costs its sender the same: one penalty on the shared
-                    // misbehaviour score (gossipsub sees no frame to penalize).
-                    if let (network::GossipVerdict::Reject, network::InboundOrigin::Directed { peer }) = (verdict, &origin) {
-                        let _ = net_ctl_tx.try_send(network::NetworkControl::PenalizePeer(*peer));
+                    // pulls costs its sender a misbehaviour penalty.
+                    if let Some(peer) = directed_block_penalty(verdict, &origin) {
+                        let _ = net_ctl_tx.try_send(network::NetworkControl::PenalizePeer(peer));
                     }
                     // A body rejected for a witness-dependent reason, or found
                     // missing (pruned, DAG-6) during this acceptance: ask peers
@@ -2372,6 +2370,21 @@ fn announce_txs(otx: &mpsc::Sender<network::NetworkMessage>, txs: &[core::Transa
     }
 }
 
+/// B1-T2: the peer to penalize for a block judged `verdict`: the sender of
+/// an invalid block (`Reject`, the same judgement as for a gossip copy) that
+/// came as the ANSWER to one of our directed pulls. A gossip copy's sender is
+/// penalized by gossipsub through the reported `Reject` (and the network
+/// loop adds it to the shared misbehaviour score); a directed answer has no
+/// gossip frame, so the processor asks the network loop to
+/// (`NetworkControl::PenalizePeer`). It used to cost nothing, so a peer
+/// could answer every pull with an invalid block and keep being asked.
+fn directed_block_penalty(verdict: network::GossipVerdict, origin: &network::InboundOrigin) -> Option<libp2p::PeerId> {
+    match (verdict, origin) {
+        (network::GossipVerdict::Reject, network::InboundOrigin::Directed { peer }) => Some(*peer),
+        _ => None,
+    }
+}
+
 /// NET-2: report the processor's verdict for a deferred gossip frame. No-op
 /// for frames that owe none (directed answers, local frames, or gossip whose
 /// verdict the network loop already reported).
@@ -2508,6 +2521,27 @@ mod ingress_processor_tests {
     //! and the evidence-driven IBD latch release (NET-6).
     use super::*;
     use crate::ingress::{normalize_wire_metadata, process_orphans};
+
+    /// B1-T2: an invalid block that answered one of our pulls costs its
+    /// sender a penalty; a valid or ignored one does not, and a gossip copy
+    /// is penalized through its reported Reject instead (not twice).
+    #[test]
+    fn invalid_block_answering_our_pull_is_penalized() {
+        use network::{GossipVerdict, InboundOrigin};
+        let peer = libp2p::PeerId::random();
+        let directed = InboundOrigin::Directed { peer };
+        assert_eq!(directed_block_penalty(GossipVerdict::Reject, &directed), Some(peer));
+        assert_eq!(directed_block_penalty(GossipVerdict::Ignore, &directed), None);
+        assert_eq!(directed_block_penalty(GossipVerdict::Accept, &directed), None);
+        let gossip = InboundOrigin::Gossip {
+            propagation_source: peer,
+            author: None,
+            pending: None,
+            received_at: std::time::Instant::now(),
+        };
+        assert_eq!(directed_block_penalty(GossipVerdict::Reject, &gossip), None);
+        assert_eq!(directed_block_penalty(GossipVerdict::Reject, &InboundOrigin::Local), None);
+    }
 
     fn unix_now() -> u64 {
         std::time::SystemTime::now()
