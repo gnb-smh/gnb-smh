@@ -100,6 +100,9 @@ export async function loadCore(url, sha256Hex) {
     // JSON fields reach the strict shared parser. Caller-supplied `op` cannot
     // redirect this public-data binding to an operation using the session key.
     pqpsbt: (request) => call({ ...request, op: "pqpsbt" }),
+    // Public identities only; importing a pool never opens a signing session.
+    // Force the operation after spreading input, as for the public PQ-PSBT API.
+    descriptor: (request) => call({ ...request, op: "descriptor" }),
     // Offline context is supplied by the signer. The core checks commitments
     // and fee/height/network, but cannot attest current chain unspentness.
     signPqPsbt: (hex, network, nextHeight, maxFee) => call({
