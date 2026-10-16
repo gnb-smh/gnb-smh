@@ -16,6 +16,8 @@ use thiserror::Error;
 
 use crate::core::{MAINNET_PREFIX, TESTNET_PREFIX};
 
+mod bech32m;
+
 /// Bloch address prefixes. A Bloch address and a GnB address with the same
 /// 20-byte hash and checksum belong to the same key.
 pub const LEGACY_BLOCH_MAINNET_PREFIX: &str = "bloch1q";
@@ -69,6 +71,12 @@ impl PolicyAddress {
         self.network
     }
 
+    /// Opt-in GnB v2 address. The Bech32m checksum binds the network and kind.
+    /// `Display` retains the legacy representation for stored identities.
+    pub fn to_bech32m(&self) -> String {
+        bech32m::encode_address(self.network, 1, &self.hash)
+    }
+
     /// The 33-byte output script (`0x02 ‖ hash`).
     pub fn script_pubkey(&self) -> Vec<u8> {
         let mut s = vec![crate::core::policy::POLICY_TAG];
@@ -92,6 +100,15 @@ impl PolicyAddress {
     }
 
     pub fn parse(s: &str) -> Result<Self, AddressError> {
+        if bech32m::is_v2_candidate(s) {
+            let (network, kind, hash) = bech32m::decode_address(s)?;
+            if kind != 1 {
+                return Err(AddressError::BadEncoding);
+            }
+            let mut policy_hash = [0; 32];
+            policy_hash.copy_from_slice(&hash);
+            return Ok(Self { hash: policy_hash, network });
+        }
         let (network, payload) = if let Some(rest) = s.strip_prefix(POLICY_MAINNET_PREFIX) {
             (Network::Mainnet, rest)
         } else if let Some(rest) = s.strip_prefix(POLICY_TESTNET_PREFIX) {
@@ -121,9 +138,19 @@ impl std::fmt::Display for PolicyAddress {
 }
 
 /// Parse any payable address — single-key (`gnb1q…`/`gnb1t…`, Bloch forms
-/// accepted) or policy (`gnb1m…`/`gnb1n…`) — into its network and output
-/// script.
+/// accepted), policy (`gnb1m…`/`gnb1n…`), or GnB v2 Bech32m — into its
+/// network and output script. Equivalent representations produce identical
+/// scripts; callers must still require the expected network.
 pub fn destination_script(s: &str) -> Result<(Network, Vec<u8>), AddressError> {
+    if bech32m::is_v2_candidate(s) {
+        let (network, kind, hash) = bech32m::decode_address(s)?;
+        let mut script = Vec::with_capacity(hash.len() + usize::from(kind == 1));
+        if kind == 1 {
+            script.push(crate::core::policy::POLICY_TAG);
+        }
+        script.extend_from_slice(&hash);
+        return Ok((network, script));
+    }
     if s.starts_with(POLICY_MAINNET_PREFIX) || s.starts_with(POLICY_TESTNET_PREFIX) {
         let a = PolicyAddress::parse(s)?;
         return Ok((a.network(), a.script_pubkey()));
@@ -163,6 +190,12 @@ impl Address {
         Self { hash, network }
     }
 
+    /// Opt-in GnB v2 address. The Bech32m checksum binds the network and kind.
+    /// `Display` and serde retain the legacy representation and stored fields.
+    pub fn to_bech32m(&self) -> String {
+        bech32m::encode_address(self.network, 0, &self.hash)
+    }
+
     /// Borrow the 20-byte pubkey hash component of the address.
     pub fn hash_bytes(&self) -> &[u8; 20] {
         &self.hash
@@ -179,8 +212,18 @@ impl Address {
     /// Parse a user-facing address string (gnb1q... or gnb1t...). Bloch
     /// addresses (bloch1q... / bloch1t...) name the same owner — the checksum
     /// covers only the hash — and are accepted as their GnB equivalent.
-    /// Validates: prefix, hex format, length, and checksum.
+    /// Also accepts GnB v2 Bech32m single-key addresses, whose checksum binds
+    /// the network. Validates the selected format, length and checksum.
     pub fn parse(s: &str) -> Result<Self, AddressError> {
+        if bech32m::is_v2_candidate(s) {
+            let (network, kind, hash) = bech32m::decode_address(s)?;
+            if kind != 0 {
+                return Err(AddressError::BadEncoding);
+            }
+            let mut key_hash = [0; 20];
+            key_hash.copy_from_slice(&hash);
+            return Ok(Self { hash: key_hash, network });
+        }
         let normalized = normalize_legacy_address(s);
         let s = normalized.as_str();
         let (network, payload) = if let Some(rest) = s.strip_prefix(MAINNET_PREFIX) {
@@ -219,7 +262,7 @@ impl Address {
 
     /// Parse an address and require it to belong to `network` (CRY-7).
     ///
-    /// The 4-byte checksum covers only the 20-byte hash, NOT the prefix, so
+    /// The legacy 4-byte checksum covers only the 20-byte hash, NOT the prefix, so
     /// `gnb1q…` and `gnb1t…` forms of the same hash both pass [`Self::parse`].
     /// Every place that turns a user-supplied address into a script_pubkey
     /// for a specific chain (node `--miner-address`, wallet recipients) must
@@ -229,7 +272,8 @@ impl Address {
     /// checksum format itself is not network-bound, so a prefix typo between
     /// gnb1q and gnb1t is not caught by the checksum. It is caught by this
     /// network comparison wherever the expected network is known; binding the
-    /// prefix into the checksum (bech32m-style) needs a new address version.
+    /// prefix into the checksum is provided by the opt-in [`Self::to_bech32m`]
+    /// format. The network comparison is required for both formats.
     pub fn parse_for_network(s: &str, network: Network) -> Result<Self, AddressError> {
         let address = Self::parse(s)?;
         if address.network != network {
@@ -262,7 +306,7 @@ impl Address {
 
 /// User-facing string form with checksum: `prefix ‖ hex(hash ‖ SHA3d(hash)[..4])`.
 ///
-/// This is the ONE definition of the address string. It used to live in an
+/// This is the definition of the legacy address string. It used to live in an
 /// inherent `to_string(&self)` that `Display` called, which shadowed the
 /// blanket `ToString` impl (clippy `inherent_to_string_shadow_display`, a
 /// deny-level lint that the CI clippy gate stops on). `addr.to_string()`
@@ -296,6 +340,8 @@ pub enum AddressError {
     BadLength { got: usize, expected: usize },
     #[error("invalid hex encoding")]
     BadHex,
+    #[error("invalid Bech32m address encoding")]
+    BadEncoding,
     #[error("checksum mismatch")]
     BadChecksum,
     #[error("address is for {got:?}, expected {expected:?}")]
