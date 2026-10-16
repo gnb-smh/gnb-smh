@@ -590,11 +590,15 @@ fn header_hints_are_not_grindable_and_prefer_dialed_peers() {
         differs |= got != lowest;
     }
     assert!(differs, "the lowest-byte, highest-claim identities always took every hint slot");
-    // Dialed peers first among the hints.
+    // Dialed peers first among the hints, then the hints in their order —
+    // never by PeerId bytes: the dialed claimer has the highest bytes, the
+    // inbound claimers are named highest bytes first.
     let t0 = Instant::now();
     let mut s: PullScheduler<u64> = PullScheduler::new(HashSet::new());
-    let inbound: Vec<PeerId> = (0..4).map(|_| PeerId::random()).collect();
-    let outbound = PeerId::random();
+    let mut ids: Vec<PeerId> = (0..5).map(|_| PeerId::random()).collect();
+    ids.sort_by_key(|p| std::cmp::Reverse(p.to_bytes()));
+    let outbound = ids[0];
+    let inbound: Vec<PeerId> = ids[1..].to_vec();
     for p in &inbound {
         s.on_connect(*p, false, t0);
     }
@@ -603,7 +607,56 @@ fn header_hints_are_not_grindable_and_prefer_dialed_peers() {
     hints.push(outbound);
     s.enqueue(SyncRequest::GetHeaders { from_blue_score: 1, limit: 500 }, None, &hints, t0);
     let mut id = 0;
-    assert_eq!(drain(&mut s, t0, &mut id)[0].0, outbound, "the dialed claimer must be asked first");
+    let (first, rid, _) = drain(&mut s, t0, &mut id)[0].clone();
+    assert_eq!(first, outbound, "the dialed claimer must be asked first");
+    // A short answer: the next claimer in the given order, not the one with the lowest bytes.
+    s.on_response(rid, first, &SyncResponse::Headers { entries: vec![entry(1)] }, t0);
+    let (second, _, _) = drain(&mut s, t0, &mut id)[0].clone();
+    assert_eq!(second, inbound[0], "the hints were not asked in their order");
+}
+
+/// Review of B1-T6: a peer that answers only Busy is not free. The first
+/// FREE_BUSY_EPISODES back-offs in a row cost nothing (an honest server
+/// under load), each further one counts as a useless answer, so the peer
+/// becomes a poor one instead of staying the "better peer" every pull waits
+/// for; a useful answer starts the count again.
+#[test]
+fn a_peer_answering_only_busy_ranks_down() {
+    use gnb::network::sync_rr::{BUSY_COOLDOWN, FREE_BUSY_EPISODES, POOR_PEER_PENALTY};
+    let t0 = Instant::now();
+    let (mut s, p) = scheduler(2, t0);
+    let (busy, honest) = (p[0], p[1]);
+    s.on_misbehaving(&honest, t0); // away: every pull goes to `busy`
+    let mut id = 0;
+    s.enqueue(get_block(1), None, &[busy], t0);
+    let mut now = t0;
+    let mut episodes = 0u32;
+    while s.selector().penalty(&busy, now) < POOR_PEER_PENALTY {
+        let sent = drain(&mut s, now, &mut id);
+        assert_eq!(sent.len(), 1, "episode {episodes}");
+        assert_eq!(sent[0].0, busy);
+        s.on_response(sent[0].1, busy, &SyncResponse::Busy, now);
+        episodes += 1;
+        if episodes <= FREE_BUSY_EPISODES {
+            assert_eq!(s.selector().penalty(&busy, now), 0.0, "an early Busy was charged");
+        }
+        assert!(episodes < 20, "a peer answering only Busy never ranked down");
+        now += BUSY_COOLDOWN;
+    }
+    assert!(episodes >= FREE_BUSY_EPISODES + 4);
+    // A peer that alternates Busy with useful answers is never charged.
+    let (mut s, p) = scheduler(1, t0);
+    let server = p[0];
+    let mut now = t0;
+    for i in 0..20u32 {
+        s.enqueue(get_block(100 + i), None, &[server], now);
+        let sent = drain(&mut s, now, &mut id);
+        s.on_response(sent[0].1, server, &SyncResponse::Busy, now);
+        now += BUSY_COOLDOWN;
+        let sent = drain(&mut s, now, &mut id);
+        s.on_response(sent[0].1, server, &block(100 + i), now);
+    }
+    assert_eq!(s.selector().penalty(&server, now), 0.0, "honest back-pressure was charged");
 }
 
 /// NET-9 residual: a NotFound from a peer that connected to US (an identity
