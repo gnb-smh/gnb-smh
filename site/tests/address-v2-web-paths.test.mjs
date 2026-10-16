@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import * as safe from "../assets/safe.js";
 import worker from "../../worker/index.js";
+import { loadCore } from "../wallet/core.js";
 
 const LEGACY = "gnb1q0000000000000000000000000000000000000000335d2ee7";
 const V2 = "gnb1zqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdaq6uw";
@@ -16,6 +17,14 @@ const CASES = [
 ];
 const src = (p) => readFileSync(new URL(p, import.meta.url), "utf8");
 const noImports = (s) => s.replace(/^import .*;\n/gm, "");
+const walletBytes = readFileSync(new URL("../wallet/gnb_wallet.wasm", import.meta.url));
+const walletPin = src("../wallet/app.js").match(/^const WASM_SHA256 = "([0-9a-f]{64})";$/m)[1];
+async function realCore() {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => new Response(walletBytes);
+  try { return await loadCore("/wallet/gnb_wallet.wasm", walletPin); }
+  finally { globalThis.fetch = original; }
+}
 
 function explorer(path, address, valid = true) {
   const elements = new Map(), calls = [];
@@ -27,6 +36,8 @@ function explorer(path, address, valid = true) {
   const rpc = async (method, args) => {
     calls.push([method, args]);
     if (method === "validateaddress") return { isvalid: valid, canonical_address: valid ? canonical : undefined };
+    // Match the dispatcher contract: history indexes only single-key hashes.
+    if (method === "getaddresshistory" && /^gnb1[mn]/.test(args[0])) throw new Error("invalid address");
     if (method === "getutxos") return { satoshis: "0", utxo_count: 0, utxos: [] };
     return { balance: "0", utxo_count: 0, total: 0, items: [] };
   };
@@ -53,10 +64,11 @@ function explorer(path, address, valid = true) {
 
 async function watch(path, address, accepts = true) {
   const calls = [];
+  const core = await realCore();
   const code = src(path).slice(src(path).indexOf("// Shareable watch links:"));
   const context = vm.createContext({ ...safe, location: { hash: "#watch/" + address, pathname: "/wallet", search: "" },
     pollNetwork: async () => {}, history: { replaceState() {} }, setInterval() {},
-    getCore: async () => ({ normalize(a) { calls.push(["normalize", a]); if (!accepts) throw Error("invalid address"); return CASES.find(([v]) => v === a.toLowerCase())?.[1] ?? a; } }),
+    getCore: async () => ({ normalize(a) { calls.push(["normalize", a]); if (!accepts) throw Error("invalid address"); return core.normalize(a); } }),
     enter: (mode, a) => calls.push([mode, a]), renderGate: () => calls.push(["gate"]), route: () => calls.push(["gate"]),
   });
   await vm.runInContext(code, context);
@@ -87,7 +99,12 @@ for (const path of ["../explorer.js", "../explorer/explorer.js"]) {
     for (const [a, legacy] of CASES) for (const input of [a, a.toUpperCase()]) {
       const page = explorer(path, input); await page.route();
       assert.ok(page.calls.some(([m, p]) => m === "validateaddress" && p[0] === input), `${input}: checksum authority not called`);
-      assert.ok(page.calls.some(([m, p]) => ["getaddresshistory", "getutxos"].includes(m) && p[0] === legacy), `${input}: identity not canonicalized`);
+      if (path === "../explorer.js" && /^gnb1[mn]/.test(legacy)) {
+        assert.ok(!page.calls.some(([m]) => m === "getaddresshistory"), "policy must not call the single-key history index");
+        assert.match(page.elements.get("app").innerHTML, /history is not available for policy addresses/i);
+      } else {
+        assert.ok(page.calls.some(([m, p]) => ["getaddresshistory", "getutxos"].includes(m) && p[0] === legacy), `${input}: identity not canonicalized`);
+      }
       page.context.location.hash = "#/";
       assert.equal(await page.search(input), "#/address/" + input);
     }
@@ -101,10 +118,12 @@ for (const path of ["../explorer.js", "../explorer/explorer.js"]) {
 }
 
 for (const path of ["../wallet/app.js", "../wallet/main.js"]) {
-  test(`${path} watch links normalize all aliases before entering legacy state`, async () => {
+  test(`${path} watch links use real WASM and keep the single-key scope`, async () => {
     for (const [a, legacy] of CASES) for (const input of [a, a.toUpperCase()]) {
-      assert.deepEqual(await watch(path, input), [["normalize", input], ["watch", legacy]]);
+      const expected = /^gnb1[mn]/.test(legacy) ? ["gate"] : ["watch", legacy];
+      assert.deepEqual(await watch(path, input), [["normalize", input], expected]);
     }
+    for (const [, legacy] of CASES.slice(2)) assert.deepEqual(await watch(path, legacy), [["normalize", legacy], ["gate"]]);
     assert.deepEqual(await watch(path, V2, false), [["normalize", V2], ["gate"]]);
     for (const a of [V2 + "/more", V2 + '"', "G" + V2.slice(1)]) assert.deepEqual(await watch(path, a), [["gate"]]);
   });

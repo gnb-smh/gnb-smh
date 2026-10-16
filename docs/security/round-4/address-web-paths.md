@@ -11,9 +11,10 @@ change. The RPC/WASM codec remains authoritative for address validity; the
 local carryover table must verify Bech32m before deriving its legacy key.
 
 Acceptance: runtime tests first fail on the original source with legacy
-controls passing; all four network/kind aliases and uniform uppercase route;
+controls passing; both network/kind aliases and uniform uppercase are recognized;
 mixed case/markup/separators are rejected; explorers resolve aliases through
-`validateaddress`; wallet links resolve through WASM; carryover aliases retain
+`validateaddress`; single-key wallet links resolve through WASM; policy watch
+and indexed policy history remain unsupported. Carryover aliases retain
 network/identity and never silently return an empty balance for a known key.
 Tests use bounded public data and no network attack simulation.
 Production-only reversals retain final tests unchanged and restore exact bytes.
@@ -88,3 +89,25 @@ No bridge vault configuration/parser changes are included; those legacy-only
 paths are outside this package. The stale `CORE_SHA256` in wallet `main.js`
 was reported to the integration owner, who owns all WASM/pin work. Independent
 three-lens review and final CI are pending; no category score is assigned.
+
+## Independent review correction (R4-V1)
+
+The verdict reviewer reproduced a false capability in the original mock:
+`getaddresshistory` and WASM `normalize` were both simulated as accepting
+policy addresses, although their real contracts are single-key. A faithful
+RPC stub produced 6 pass/1 fail; replacing the wallet stub with the actual
+pinned WASM produced 4 pass/3 fail. Logs are
+`/private/tmp/gnb-r4-review-policy-ui-red.log` and
+`/private/tmp/gnb-r4-review-web-real-authorities-red.log`.
+
+The main explorer now recognizes a policy address and displays that policy
+history is unavailable before calling the single-key history index. The
+other explorer retains its existing policy UTXO view. No fabricated empty
+history or balance is rendered. Watch tests now execute the real pinned
+WASM: single-key aliases enter watch state; both legacy and v2 policies
+return to the gate. Policy wallet support was not added and is not claimed.
+This is a low-severity integration/test finding, not a consensus or signing
+bypass. The focused final suite passes 7/7. Production-only removal of the
+new page guard fails the unchanged final test and exact restoration passes;
+`policy-ui-reversal.json` records hashes and outcomes. Earlier package
+manifests remain historical evidence for their recorded source/test bytes.

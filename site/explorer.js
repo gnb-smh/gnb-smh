@@ -100,6 +100,13 @@ async function viewTx(txid) {
 // (`next_cursor`); the node and the API refuse offsets above 10,000.
 async function viewAddress(addr, page = 0, cursor = null) {
   addr = await canonicalAddress(addr, api);
+  if (/^gnb1[mn]/.test(addr)) {
+    // The history index is single-key only; a valid policy alias must not
+    // be sent to it or presented as an invalid address/empty history.
+    show(app, html`<div class="pagehead"><h1>Policy address</h1><div class="hash">${addr}</div></div>
+      <p class="empty">Transaction history is not available for policy addresses yet.</p>`);
+    return;
+  }
   const per = 25;
   show(app, V.loading("Loading address"));
   const params = cursor ? [addr, per, 0, cursor] : [addr, per, page * per];
