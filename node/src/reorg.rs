@@ -414,6 +414,9 @@ fn bc_encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, String> {
 pub trait UtxoView {
     fn view_utxo(&self, txid: &[u8; 32], index: u32) -> Result<Option<TxOutput>, String>;
     fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String>;
+    /// Confirmation height of `txid` (the tx index), for relative timelocks
+    /// (`blockval::check_policy_spends`). `Ok(None)` when unknown.
+    fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String>;
 }
 
 impl UtxoView for Storage {
@@ -423,6 +426,9 @@ impl UtxoView for Storage {
     fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String> {
         self.get_coinbase_height(txid).map_err(|e| e.to_string())
     }
+    fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String> {
+        self.get_tx_location(txid).map(|o| o.map(|(_, h)| h)).map_err(|e| e.to_string())
+    }
 }
 
 impl<'a> UtxoView for ReorgBatch<'a> {
@@ -431,6 +437,9 @@ impl<'a> UtxoView for ReorgBatch<'a> {
     }
     fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String> {
         self.get_coinbase_height(txid)
+    }
+    fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String> {
+        self.get_tx_location(txid).map(|o| o.map(|(_, h)| h))
     }
 }
 
@@ -1281,6 +1290,7 @@ mod reorg_hardening_unit_tests {
             blue_score: height,
             height,
             shielded_transactions: Vec::new(),
+            powit: Default::default(),
         }
     }
 

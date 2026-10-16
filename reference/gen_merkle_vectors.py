@@ -133,8 +133,8 @@ def block_vectors():
             "parents_commitment": m.parents_commitment(parents).hex(),
             "witness_root": wroot.hex(),
             "coinbase_commitment": commit.hex(),
-            "tagged_header_root": m.tagged_merkle_root(ids).hex(),
-            "legacy_header_root": m.legacy_merkle_root(ids).hex(),
+            "tagged_header_root": m.header_root(m.tagged_merkle_root(ids), height).hex(),
+            "legacy_header_root": m.header_root(m.legacy_merkle_root(ids), height).hex(),
         })
         # CRY-1: padding one witness keeps every txid, breaks the commitment.
         if others:

@@ -709,6 +709,9 @@ impl Storage {
     }
 
     /// O(k) UTXO lookup via address index (was O(n) full UTXO scan)
+    /// UTXOs paying exactly `address_bytes`, the FULL script_pubkey (20-byte
+    /// key hash or 33-byte policy script): the index key is
+    /// `script ‖ txid ‖ index`, so a shorter prefix finds nothing.
     pub fn get_utxos_for_address(&self, address_bytes: &[u8]) -> Result<Vec<(Vec<u8>, u32, TxOutput)>, StorageError> {
         if address_bytes.len() < 20 {
             return Ok(vec![]);
@@ -954,6 +957,26 @@ impl Storage {
         reach_upserts: &[(BlockHash, Vec<u8>)],
         reach_removals: &[BlockHash],
     ) -> Result<[u8; 32], StorageError> {
+        let mut batch = rocksdb::WriteBatch::default();
+        let integrity = self.stage_dag_entry(&mut batch, hash, data, reach_upserts, reach_removals)?;
+        self.db.write(batch)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        Ok(integrity)
+    }
+
+    /// Stage a block's CF_DAG entry, its integrity link and a reachability
+    /// delta into `batch`, so a caller can commit them together with the
+    /// chain-state change of the same block (one atomic write: a crash can
+    /// never leave the UTXO set applied for a block CF_DAG does not know).
+    /// The selected parent's integrity hash must already be committed.
+    pub fn stage_dag_entry(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        hash: &BlockHash,
+        data: &GhostdagData,
+        reach_upserts: &[(BlockHash, Vec<u8>)],
+        reach_removals: &[BlockHash],
+    ) -> Result<[u8; 32], StorageError> {
         let parent_integrity: [u8; 32] = match &data.selected_parent {
             Some(sp) => self.get_integrity_hash(sp)?.unwrap_or([0u8; 32]),
             None     => [0u8; 32],
@@ -967,7 +990,6 @@ impl Storage {
         let cf_reach = self.db.cf_handle(CF_REACHABILITY)
             .ok_or(StorageError::CfNotFound(CF_REACHABILITY.into()))?;
 
-        let mut batch = rocksdb::WriteBatch::default();
         batch.put_cf(&cf_dag, hash, &encode(data)?);
         batch.put_cf(&cf_int, hash, &integrity);
         for (h, rec) in reach_upserts {
@@ -976,8 +998,6 @@ impl Storage {
         for h in reach_removals {
             batch.delete_cf(&cf_reach, h);
         }
-        self.db.write(batch)
-            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         Ok(integrity)
     }
 
@@ -1856,6 +1876,24 @@ mod sprint_f_tests {
         }
     }
 
+    /// Policy outputs (33-byte scripts) are found by their full script, and
+    /// a key-hash script that shares their first 20 bytes never mixes in.
+    #[test]
+    fn utxos_for_address_finds_policy_scripts() {
+        let (_tmp, s) = mk_storage();
+        let mut policy = vec![0x02u8];
+        policy.extend_from_slice(&[0x55u8; 32]);
+        let key_hash = policy[..20].to_vec();
+        s.put_utxo(&[1u8; 32], 0, &TxOutput { value: 7, script_pubkey: policy.clone() }).unwrap();
+        s.put_utxo(&[2u8; 32], 1, &TxOutput { value: 9, script_pubkey: key_hash.clone() }).unwrap();
+        let p = s.get_utxos_for_address(&policy).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].1, p[0].2.value), (0, 7));
+        let k = s.get_utxos_for_address(&key_hash).unwrap();
+        assert_eq!(k.len(), 1);
+        assert_eq!((k[0].1, k[0].2.value), (1, 9));
+    }
+
     #[test]
     fn key_value_encoding_roundtrip() {
         let addr = dummy_addr(0x42);
@@ -2112,6 +2150,60 @@ mod shielded_cf_tests {
         assert!(store.ensure_aggregates().unwrap(), "the upgrade rebuilds the aggregates");
         assert_eq!(store.address_history_count(&a).unwrap(), Some(5));
     }
+
+    /// B1-T11 with `--reindex-addresses` (main d400bd0): the reindex rewrites
+    /// the history rows outside the indexing paths that keep the per-address
+    /// counters, so it rebuilds the counters from the new rows: afterwards
+    /// every counter equals its address's rows (receipts AND spends, the rows
+    /// the reindex restores), the aggregates are complete again and equal a
+    /// full recomputation.
+    #[test]
+    fn b1_t11_reindex_addresses_keeps_the_history_counters_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Storage::open(tmp.path()).unwrap();
+        let (a, b) = ([0x41u8; 20], [0x42u8; 20]);
+        let coinbase = |tag: &str, to: [u8; 20], value: u64| crate::core::Transaction {
+            version: 1,
+            inputs: vec![crate::core::TxInput { prev_txid: [0; 32], prev_index: u32::MAX, script_sig: tag.as_bytes().to_vec(), sequence: u32::MAX }],
+            outputs: vec![TxOutput { value, script_pubkey: to.to_vec() }],
+            locktime: 0,
+        };
+        let mut b0 = crate::core::genesis_block();
+        b0.transactions = vec![coinbase("b0", a, 50)];
+        let pay = crate::core::Transaction {
+            version: 1,
+            inputs: vec![crate::core::TxInput { prev_txid: b0.transactions[0].txid(), prev_index: 0, script_sig: vec![1], sequence: u32::MAX }],
+            outputs: vec![TxOutput { value: 30, script_pubkey: b.to_vec() }, TxOutput { value: 19, script_pubkey: a.to_vec() }],
+            locktime: 0,
+        };
+        let mut b1 = b0.clone();
+        b1.header.parents = vec![b0.block_hash()];
+        b1.height = 1;
+        b1.transactions = vec![coinbase("b1", b, 50), pay];
+        store.put_block(&b0).unwrap();
+        store.put_block(&b1).unwrap();
+        // A history that lost its spend row (the pre-d400bd0 reorg defect):
+        // the counter follows the deletion through the indexing path.
+        let spend_row = indexer::make_key(&a, 1, 1, 0x8000_0000);
+        store.unindex_tx_addresses(&b1.transactions[1], 1, 1,
+            &[((b0.transactions[0].txid(), 0), b0.transactions[0].outputs[0].clone())].into_iter().collect()).unwrap();
+        let rows = |s: &Storage, x: &[u8; 20]| s.count_address_history(x, 0, u64::MAX).unwrap();
+        assert_eq!((store.address_history_count(&a).unwrap(), rows(&store, &a)), (Some(1), 1));
+        let cf = store.db.cf_handle(indexer::CF_ADDR_TX_HISTORY).unwrap();
+        assert!(store.db.get_cf(cf, &spend_row).unwrap().is_none());
+
+        let (blocks, written, unresolved) = store
+            .reindex_addresses(&[b0.block_hash(), b1.block_hash()], Default::default())
+            .unwrap();
+        assert_eq!((blocks, written, unresolved), (2, 5, 0));
+        assert!(store.db.get_cf(cf, &spend_row).unwrap().is_some(), "the spend row is back");
+        assert!(store.aggregates_ready(), "complete again after the reindex");
+        for (x, n) in [(a, 3u64), (b, 2)] {
+            assert_eq!((store.address_history_count(&x).unwrap(), rows(&store, &x)), (Some(n), n));
+        }
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(store.aggregate_snapshot().unwrap(), store.recompute_aggregates(&cancel).unwrap());
+    }
 }
 
 // ── Bloch Genesis-3 carryover ingestion ─────────────────────────────────────
@@ -2124,6 +2216,7 @@ impl Storage {
     pub fn ingest_carryover(
         &self,
         snap: &crate::core::carryover::VerifiedCarryover,
+        locked: &[crate::core::vesting::Tranche],
     ) -> Result<u64, StorageError> {
         let _agg = self.agg_lock();
         let mut deltas = aggregates::HolderDeltas::default();
@@ -2133,17 +2226,23 @@ impl Storage {
             }
             deltas.add(&u.output);
         }
+        for t in locked {
+            if let Some(prev) = self.get_utxo(&t.txid, t.vout)? {
+                deltas.remove(&prev);
+            }
+            deltas.add(&t.output);
+        }
         let mut batch = rocksdb::WriteBatch::default();
-        self.stage_carryover(&mut batch, snap)?;
+        self.stage_carryover(&mut batch, snap, locked)?;
         // NET-12: holder aggregates in the same batch.
         self.stage_holder_deltas(&mut batch, &deltas)?;
         self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
-        Ok(snap.utxos.len() as u64)
+        Ok((snap.utxos.len() + locked.len()) as u64)
     }
 
     /// Stage exactly the UTXO rows [`ingest_carryover`](Self::ingest_carryover)
-    /// writes (the carryover UTXOs, their address-index rows and the
-    /// `carryover_sha3` marker) into a caller-owned batch, WITHOUT the NET-12
+    /// writes (the carryover UTXOs, the locked vesting tranches, their
+    /// address-index rows and the `carryover_sha3` / `vesting_sha3` markers) into a caller-owned batch, WITHOUT the NET-12
     /// holder aggregates: `ingest_carryover` stages those itself, and the
     /// chain-state rebuild (audit DAG-11), which uses this to restore the
     /// genesis state, recomputes every aggregate once it has reconnected the
@@ -2152,6 +2251,7 @@ impl Storage {
         &self,
         batch: &mut rocksdb::WriteBatch,
         snap: &crate::core::carryover::VerifiedCarryover,
+        locked: &[crate::core::vesting::Tranche],
     ) -> Result<(), StorageError> {
         let cf_utxo = self.db.cf_handle(CF_UTXO)
             .ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
@@ -2163,7 +2263,14 @@ impl Storage {
             batch.put_cf(&cf_utxo, utxo_key(&u.txid, u.vout), encode(&u.output)?);
             batch.put_cf(&cf_ai, addr_utxo_key(&u.output.script_pubkey, &u.txid, u.vout), [0u8; 0]);
         }
+        // Locked team and founder tranches (core::vesting), same batch: the
+        // genesis ledger lands complete or not at all.
+        for t in locked {
+            batch.put_cf(&cf_utxo, utxo_key(&t.txid, t.vout), encode(&t.output)?);
+            batch.put_cf(&cf_ai, addr_utxo_key(&t.output.script_pubkey, &t.txid, t.vout), [0u8; 0]);
+        }
         batch.put_cf(&cf_meta, b"carryover_sha3", snap.sha3);
+        batch.put_cf(&cf_meta, b"vesting_sha3", crate::core::vesting::VESTING_SPEC_SHA3);
         Ok(())
     }
 }

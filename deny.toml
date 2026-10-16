@@ -37,11 +37,13 @@ ignore = [
     "RUSTSEC-2026-0165", # pqcrypto-falcon unmaintained (PQClean archived)
     "RUSTSEC-2026-0166", # pqcrypto-mldsa unmaintained (PQClean archived)
     "RUSTSEC-2026-0162", # pqcrypto-traits unmaintained (PQClean archived)
-    # pqcrypto-kyber is "replaced by pqcrypto-mlkem": the node's P2P
-    # transport handshake (node/src/transport) uses Kyber-1024 directly.
-    # Switching to ML-KEM changes the handshake wire format for every peer,
-    # so it is a coordinated network upgrade, not a dependency bump.
-    "RUSTSEC-2024-0381", # pqcrypto-kyber superseded by pqcrypto-mlkem
+    # pqcrypto-mlkem (pinned =0.1.1): the node's post-quantum P2P handshake
+    # (node/src/transport/upgrade.rs) is ML-KEM-768 hybrid with X25519 on the
+    # mainnet line; it replaced pqcrypto-kyber, whose RUSTSEC-2024-0381
+    # ignore was removed with it. Moving to the pure-Rust `ml-kem` crate keeps
+    # the FIPS 203 wire format but swaps the implementation under every
+    # peer's handshake: a reviewed change, not a `cargo update`.
+    "RUSTSEC-2026-0161", # pqcrypto-mlkem unmaintained (PQClean archived)
     # ── Unmaintained, no runtime alternative needed ────────────────────────
     # bincode 2.0.1 is unmaintained (no advisory against its code). Used for
     # the node's local caches and the bounded gossip decoder
@@ -90,6 +92,10 @@ deny = [
 #   * thiserror 1 vs 2, hashbrown, base64 0.22 vs 0.23, syn 2 vs 3:
 #     ordinary ecosystem lag inside libp2p / reqwest, no crypto-facing
 #     surface shared between the copies.
+#   * x25519-dalek 2 (curve25519-dalek 4) is the node's own X25519 half of
+#     the hybrid P2P handshake (node/src/transport/upgrade.rs, mainnet line);
+#     libp2p-noise 0.47 brings 3.0 (curve25519-dalek 5). Each copy derives
+#     its own keys; nothing passes values between them.
 #   * libp2p 0.57 (audit OPS-2) moved its identity/noise stack to the
 #     RustCrypto 0.11 generation: sha2 0.11, hmac 0.13, hkdf 0.13,
 #     crypto-common 0.2, cpufeatures 0.3, chacha20 0.10, curve25519-dalek 5,
@@ -128,6 +134,7 @@ skip = [
     { crate = "windows-sys@=0.52.0" },
     { crate = "windows-sys@=0.59.0" },
     { crate = "wit-bindgen@=0.51.0" },
+    { crate = "x25519-dalek@=2.0.1" },
 ]
 
 [licenses]

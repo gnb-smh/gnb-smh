@@ -335,6 +335,24 @@ fn validate_tx_in_view(
         }
         view.view_utxo(txid, idx)
     };
+    // This chain's rules (`blockval`: finality, output kinds, dust, policy
+    // timelocks). Outputs created earlier in this block are confirmed at its
+    // height.
+    let mut prevouts = Vec::with_capacity(tx.inputs.len());
+    for inp in &tx.inputs {
+        if let Some(out) = lookup(&inp.prev_txid, inp.prev_index)? {
+            prevouts.push(out);
+        }
+    }
+    if prevouts.len() == tx.inputs.len() {
+        let confirm = |t: &[u8; 32]| -> Result<Option<u64>, String> {
+            if earlier.keys().any(|(c, _)| c == t) {
+                return Ok(Some(block_height));
+            }
+            view.view_tx_height(t)
+        };
+        crate::blockval::check_tx_chain_rules(tx, &prevouts, block_height, &confirm)?;
+    }
     validate_tx_inputs_classified(tx, &lookup, Some(spent_in_block), block_height, activation_height)
 }
 
@@ -418,16 +436,17 @@ pub fn validate_block_in_view_classified_at(
     let committed = |reason: String| BlockInvalidity { reason, witness_dependent: false };
     let height = block.height;
     let hardened = core::block_rules::rules_active_at(height, activation_height);
-    if hardened {
-        for tx in &block.transactions {
-            check_no_unspent_overwrite(view, tx).map_err(committed)?;
-        }
+    // BIP30 and no spend of the block's own coinbase: this chain's rules from
+    // genesis (the audit's VAL-2 / VAL-3 at the activation), so at every
+    // height here.
+    for tx in &block.transactions {
+        check_no_unspent_overwrite(view, tx).map_err(committed)?;
     }
-    let same_block_coinbase = if hardened {
-        block.transactions.first().map(|cb| cb.txid())
-    } else {
-        None
-    };
+    if let Some(cb) = block.transactions.first() {
+        crate::blockval::check_tx_context_free(cb, height)
+            .map_err(|e| committed(format!("coinbase rejected: {}", e)))?;
+    }
+    let same_block_coinbase = block.transactions.first().map(|cb| cb.txid());
     let mut spent_in_block: HashSet<([u8; 32], u32)> = HashSet::new();
     let mut earlier: HashMap<([u8; 32], u32), core::TxOutput> = HashMap::new();
     let mut total_fees: u64 = 0;
@@ -438,13 +457,15 @@ pub fn validate_block_in_view_classified_at(
                 activation_height,
             ).map_err(|f| BlockInvalidity {
                 reason: f.reason,
-                // At/after the activation the witness commitment fixed the body.
-                witness_dependent: f.witness && !hardened,
+                // From WITNESS_COMMITMENT_HEIGHT (the `|wc:` suffix, then
+                // the audit's commitment at the activation) the block id
+                // commits to every witness, which fixes the body.
+                witness_dependent: f.witness && !hardened && !core::witnesses_committed(height),
             })?;
             total_fees = core::limits::money_add(total_fees, fee)
                 .map_err(|e| committed(format!("block fee sum: {}", e)))?;
         }
-        if hardened && i == 0 {
+        if i == 0 {
             continue; // VAL-3: the coinbase's outputs are not spendable in its own block
         }
         let txid = tx.txid();
@@ -1164,6 +1185,17 @@ pub fn accept_block_tracking(
     //    no-op below the activation.
     core::block_rules::check_block_hardened_at(block, core::activation::hardening_activation_height())
         .map_err(|e| format!("consensus rejection: {}", e))?;
+    // This chain's context-free rules that depend on the header height
+    // (re-checked now that the height is verified; every ingress path ran
+    // them in `validate_structure` on the claimed height): the `|wc:` witness
+    // commitment from WITNESS_COMMITMENT_HEIGHT, the PoWit section's shape
+    // from `powit_height()`, and dust.
+    block.validate_witness_commitment()
+        .map_err(|e| format!("consensus rejection: {}", e))?;
+    block.validate_powit_structure()
+        .map_err(|e| format!("consensus rejection: {}", e))?;
+    block.validate_dust()
+        .map_err(|e| format!("consensus rejection: {}", e))?;
 
     // ── Proof of work (expensive: 64 MiB GnB-SMH, cached by block id) ─
     if !block.validate_pow() {
@@ -1191,6 +1223,21 @@ pub fn accept_block_tracking(
         return Err("shielded consensus rejection: ProofInvalid (no shielded verifier active)".into());
     }
 
+    // ── PoWit section, in context (from powit_height) ────────────────
+    // Share proofs, attested blocks and share uniqueness against this
+    // block's own selected chain, then the witness-set state transition
+    // (attestations, equivocation proofs, justification, finality). A pure
+    // function of the block and its past (never of the UTXO set), so a
+    // failure is refused like a bad height or difficulty: the block is not
+    // stored. `storage:` errors are local and refuse only this attempt.
+    let powit_state = if replacing {
+        None // same id, same PoWit section: its state is already stored
+    } else {
+        let d = dag.read();
+        crate::powit::block_state(block, &block_hash, &d, store)
+            .map_err(|e| if e.starts_with("storage:") { e } else { format!("consensus rejection: {}", e) })?
+    };
+
     // ── Insert into GhostDAG and store the body ──────────────────────
     let applied_tip = match old_tip {
         Some(t) => t,
@@ -1204,12 +1251,23 @@ pub fn accept_block_tracking(
         info!("block {} h={}: new body stored for a block that waited for one; re-evaluating",
             hex::encode(&block_hash[..8]), block.height);
     } else {
-        let work = pow::work_from_bits(block.header.bits);
+        // Chain work normalised across the GnB-SMH v1 -> v3 switch
+        // (`core::block_work`).
+        let work = pow::block_work(block.header.bits, block.height);
         dag.write().add_block(block_hash, block.header.parents.clone(), block.header.timestamp, work)
             .map_err(|e| format!("consensus rejection: {}", e))?;
         if let Err(e) = store.put_block_body(block) {
             dag.write().remove_block(&block_hash);
             return Err(e.to_string());
+        }
+        // The block's PoWit state, keyed by its hash (deterministic; inert
+        // if the block never joins the selected chain).
+        if let Some(st) = &powit_state {
+            if let Err(e) = crate::powit::save_state(store, &block_hash, st) {
+                let _ = store.delete_block_body(&block_hash);
+                dag.write().remove_block(&block_hash);
+                return Err(e);
+            }
         }
     }
     // Informational only (RPC / tip notifications).
@@ -1359,9 +1417,12 @@ pub fn accept_block_tracking(
         info!("✓ block h={} accepted", height);
     }
 
-    // (No finality checkpoint any more — audit DAG-6. The pruning cursor
-    // below uses the selected tip's DAG height, never tip_blue_score(); see
-    // the DAG-8 note on `GhostdagData::height`.)
+    // No depth-based finality any more (audit DAG-6). PoWit finality: the
+    // checkpoint the applied chain's witness set finalized pins fork choice
+    // (`GhostDAG::set_finalized`). The pruning cursor below uses the
+    // selected tip's DAG height, never tip_blue_score(); see the DAG-8 note
+    // on `GhostdagData::height`.
+    crate::powit::update_finalized(dag, store);
     let tip_height = {
         let d = dag.read();
         d.selected_tip()
@@ -2629,15 +2690,14 @@ pub fn validate_tx_in_block_with_maturity(
         .unwrap_or(block.transactions.len());
     // Same gate and height as `validate_block_in_view_classified_at`.
     let activation_height = core::activation::hardening_activation_height();
-    let hardened = core::block_rules::rules_active_at(block.height, activation_height);
     let view: &storage::Storage = store;
-    if hardened {
-        check_no_unspent_overwrite(view, tx)?;
-    }
-    let same_block_coinbase = if hardened { block.transactions.first().map(|cb| cb.txid()) } else { None };
+    // BIP30 / no own-coinbase spend: this chain's rules at every height
+    // (see `validate_block_in_view_classified_at`).
+    check_no_unspent_overwrite(view, tx)?;
+    let same_block_coinbase = block.transactions.first().map(|cb| cb.txid());
     let earlier: HashMap<([u8; 32], u32), core::TxOutput> = block.transactions[..cutoff]
         .iter()
-        .filter(|t| !(hardened && t.is_coinbase()))
+        .filter(|t| !t.is_coinbase())
         .flat_map(|t| {
             let txid = t.txid();
             t.outputs.iter().enumerate().map(move |(i, o)| ((txid, i as u32), o.clone()))

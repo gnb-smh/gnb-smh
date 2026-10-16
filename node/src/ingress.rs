@@ -1650,6 +1650,7 @@ mod tests {
             blue_score: 0,
             height: 0,
             shielded_transactions: vec![],
+            powit: Default::default(),
         }
     }
 

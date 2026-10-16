@@ -87,6 +87,7 @@ pub const WRITE_METHODS: &[&str] = &[
     "sendrawtransaction",
     "submitblock",
     "getblocktemplate",
+    "submitpowititem",
     "invalidateblock",
     "reconsiderblock",
 ];

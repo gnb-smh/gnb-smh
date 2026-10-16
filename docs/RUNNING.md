@@ -103,9 +103,9 @@ the node cannot tell its operator from anyone the proxy serves by the
 connection alone. Any setup that exposes the RPC port this way MUST:
 
 1. set an API key (`--rpc-api-key-file <file>`) and require it for writes
-   (`--rpc-require-auth-for-writes`), so `sendrawtransaction`, `submitblock`
-   and the administrative methods need the key (Bitcoin Core never serves
-   RPC without credentials);
+   (`--rpc-require-auth-for-writes`), so `sendrawtransaction`, `submitblock`,
+   `submitpowititem` and the administrative methods need the key (Bitcoin
+   Core never serves RPC without credentials);
 2. NOT use `--rpc-trust-loopback`. The node never extends that trust to a
    request that carries a forwarding header, but a proxy that adds none (a
    raw TCP forward, an SSH tunnel from another user) would make every remote
@@ -161,7 +161,9 @@ trusted direct caller) is charged to one node-wide budget by its size before
 its signatures are verified: 2,000,000 bytes, refilled at 50,000 bytes per
 second. An admitted transaction is refunded, so the budget only runs out
 under transactions the node refuses (a flood of forged signatures relayed
-by the explorer API, from any number of addresses). While it is exhausted,
+by the explorer API, from any number of addresses). `submitpowititem` (a
+PoWit share, attestation or equivocation proof, whose KES signature is
+checked) is charged to the same budget the same way. While it is exhausted,
 anonymous submissions are answered "busy: ..."; callers presenting the API
 key are never charged.
 
@@ -262,8 +264,10 @@ or from GnB before the fix, authenticate neither: editing `gnb1q…` to
 other network. Every path that opens a keystore therefore authenticates the
 network (re-audit CRY-7): a v3 file proves its own; a v2 file opens only for
 a network the caller states, on every path, not only for spending:
-`gnb-cli send`, `keyinfo` and `importfounder` (`--mainnet` / `--testnet`),
-`gnb-wallet send`, `sign`, `address` and `pubkey` (same flags), the web
+`gnb-cli send`, `keyinfo`, `importfounder` and `pubkey` (`--mainnet` /
+`--testnet`), `gnb-cli policysign` and `vaultlock` (the network of the spend
+or vault file), `gnb-wallet send`, `sign`, `address` and `pubkey` (same
+flags), the web
 wallet's `open` (the page states mainnet; this takes effect with the
 rebuilt `site/wallet/gnb_wallet.wasm`: the file the site serves, pinned in
 `site/wallet/app.js`, was built before this fix, and the same holds for the
@@ -313,9 +317,20 @@ to the network (bech32m-style) was evaluated and is **not** introduced:
   states for a v2 file): `TxBuilder::build_payment`, `Wallet` payments,
   `gnb-cli send`, `gnb-wallet send` and the web wallet's `pay` refuse a
   destination of the other network, and the node's `--miner-address` uses
-  `Address::parse_for_network`. A prefix typo therefore fails before anything
+  `Address::parse_for_network`. The policy and bridge-vault commands do the
+  same against the network of the spend: `gnb-cli policyspend` (the network
+  stated with `--testnet` / `--mainnet`, mainnet by default),
+  `vaultrelease`, `vaultrecover` and `vaultcheckrelease` (the vault file's
+  network) refuse a destination of the other network, `vaultlock` opens the
+  paying keystore for the vault's network and `policysign` for the spend's.
+  A prefix typo therefore fails before anything
   is signed, and a transaction signed for one chain is invalid on the other
   (the chain id is in every sighash).
+
+Policy addresses (multisig / timelocks: `gnb1m` mainnet, `gnb1n` testnet,
+`address::PolicyAddress`) are newer and already commit to the network: their
+checksum is `SHA3-256(SHA3-256(prefix ‖ hash))[..4]`, so the other network's
+prefix on the same hash fails to parse.
 
 Read-only RPC methods (`getbalance`, `getutxos`, `validateaddress`) accept
 either prefix for the same hash; `validateaddress` reports the prefix's

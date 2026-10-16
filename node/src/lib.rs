@@ -14,7 +14,7 @@
 // (crates/gnb-crypto). Re-export its modules under the original paths so every
 // `crate::core::…` / `crate::crypto::…` reference in the node keeps resolving
 // unchanged, and so external embedders keep importing `gnb::{core,crypto,…}`.
-pub use gnb_crypto::{types, crypto, core, address, wallet, hd_wallet, util};
+pub use gnb_crypto::{types, crypto, core, address, wallet, hd_wallet, util, bridge};
 
 #[cfg(feature = "node")]
 pub mod analytics;   // Sprint B      // Sprint A — new unified Address type
@@ -43,6 +43,7 @@ pub mod tip;
 // Sprint U.3 — Reorg detection & execution primitives (towards audit C-1).
 #[cfg(feature = "node")]
 pub mod reorg;
+pub mod blockval;   // single block-transaction rule set (accept + reorg)
 #[cfg(feature = "node")]
 pub mod attestation;  // Bloch-SIS-Linux L3 — pluggable remote attestation
 #[cfg(feature = "node")]
@@ -52,6 +53,7 @@ pub mod dandelion;    // Coherence P3 — Dandelion++ tx-relay metadata privacy
 #[cfg(feature = "node")]
 pub mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer (frontier reconciliation)
 #[cfg(feature = "node")]
+pub mod powit;        // PoW + PoWit node side (shares, attestations, finality)
 pub mod ingress;      // audit fixes: block-ingress / orphan / IBD-latch policy
 // Block acceptance pipeline (accept / connect split, audit DAG-1/10/11),
 // moved out of main.rs so integration tests drive the real path.

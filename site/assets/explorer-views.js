@@ -4,7 +4,15 @@
 // fields are type-checked (hex64, address, num, sats) before use.
 import { html, raw, hex64, address, num, numOr, sats, isHex } from "./safe.js";
 
-export const SAT = 100000000n, CAP = 1000000000000000n, CARRY = 99999999789793n;
+export const SAT = 100000000n, CAP = 1250000000000000n, CARRY = 99999999789793n;
+// Team and founder allocations (core::vesting): 2 × 36 tranches of 1,250,000 GNB / 36,
+// tranche k spendable from height 1,051,200 + k × 87,600.
+export const LOCK_EACH = 125000000000000n, LOCK_CLIFF = 1051200, LOCK_STEP = 87600, LOCK_N = 36;
+export const unlockedSat = (h) => {
+  const k = Math.max(0, Math.min(LOCK_N, Math.floor((h - LOCK_CLIFF) / LOCK_STEP)));
+  const base = LOCK_EACH / BigInt(LOCK_N);
+  return 2n * (k === LOCK_N ? LOCK_EACH : base * BigInt(k));
+};
 export const TARGET = 30;
 const POW_LIMIT = BigInt("0xffff" + "0".repeat(60)); // target of compact bits 0x2100ffff = difficulty 1
 
@@ -175,7 +183,9 @@ export function txCard(t, standalone = false, offChain = false) {
 export const homeHead = () => html`<div class="pagehead"><span class="eyebrow">GnB mainnet</span><h1>Network overview</h1><p class="sub">A BlockDAG secured by GnB-SMH, a sequential memory-hard proof of work. Live data, refreshed every 10 seconds.</p></div><div id="h-stats">${loading("Reading the chain")}</div><div id="h-rest"></div>`;
 
 export function homeStats({ dag, supply, stats, pct, chain, mem }) {
-  const issued = sats(supply.issued_sat) ?? 0n, total = CARRY + issued;
+  const height = num(supply.current_height);
+  const issued = sats(supply.issued_sat) ?? 0n, unlocked = Number.isSafeInteger(height) ? unlockedSat(height) : 0n;
+  const locked = 2n * LOCK_EACH - unlocked, total = CARRY + issued + unlocked;
   const nextHalving = num(supply.next_halving_height) - num(supply.current_height);
   const stat = (k, v, d, hot = false) => html`<div class="stat"><span class="k">${k}</span><span class="v ${hot ? "hot" : ""}">${v}</span>${d ? html`<span class="d">${d}</span>` : ""}</div>`;
   const pctCarry = Number((CARRY * 10000n) / CAP) / 100, pctMined = Number((issued * 1000000n) / CAP) / 10000;
@@ -185,7 +195,7 @@ export function homeStats({ dag, supply, stats, pct, chain, mem }) {
    ${stat("Block time", `${numOr(pct.p50_secs)}s`, `median of last ${numOr(pct.window)} · mean ${numOr(pct.avg_secs, (n) => n.toFixed(1))}s · target ${numOr(pct.target_secs)}s`)}
    ${stat("Hashrate", hashrate(stats.hashrate_hs), "GnB-SMH evaluations per second")}
    ${stat("Difficulty", diff(first?.difficulty || 0), `ASERT · bits ${first?.bits || ""}`)}
-   ${stat("Circulating", compact(total.toString()), html`of 10M GNB cap · ${pctCarry.toFixed(2)}% carryover + ${pctMined.toFixed(4)}% mined<div class="meter" aria-hidden="true"><i style="width:${pctWidth(pctCarry)}%;background:var(--mark)"></i><i style="width:${pctWidth(Math.max(pctMined, 0.3))}%;background:var(--fluor-hi)"></i></div>`)}
+   ${stat("Circulating", compact(total.toString()), html`of 12.5M GNB cap · ${pctCarry.toFixed(2)}% carryover + ${pctMined.toFixed(4)}% mined · ${compact(locked.toString())} team/founder locked<div class="meter" aria-hidden="true"><i style="width:${pctWidth(pctCarry)}%;background:var(--mark)"></i><i style="width:${pctWidth(Math.max(pctMined, 0.3))}%;background:var(--fluor-hi)"></i></div>`)}
    ${stat("Block reward", numOr(supply.subsidy_per_block_sat, (n) => (n / 1e8).toFixed(4)), `GNB · next halving in ${int(nextHalving)} blocks`)}
    ${stat("Mempool", int(mem.size), `min fee ${numOr(supply.min_tx_fee_sat, (n) => (n / 1e8).toFixed(4))} GNB`)}
    ${stat("Tips", int(dag.tip_count), `GhostDAG k = ${numOr(dag.k)}`)}
@@ -286,7 +296,7 @@ export function addressPage(addrIn, h, carry, page, per) {
    <section class="card"><div class="kv">
     <div>Balance</div><div class="amount">${gnb(h.balance)}</div>
     <div>Unspent outputs</div><div class="mono">${int(h.utxo_count)}</div>
-    <div>Share of 10M cap</div><div class="mono">${(Number((balance * 1000000n) / CAP) / 10000).toFixed(4)}%</div>
+    <div>Share of 12.5M cap</div><div class="mono">${(Number((balance * 1000000n) / CAP) / 10000).toFixed(4)}%</div>
     <div>Transactions</div><div class="mono">${int(h.total)} <span class="muted">indexed movements</span></div>
    </div></section>
    <section class="card"><div class="cardhead"><h2>Bloch carryover</h2></div>${inCarry

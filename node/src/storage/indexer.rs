@@ -299,6 +299,81 @@ impl Storage {
         }
     }
 
+    /// Rebuild `CF_ADDR_TX_HISTORY` from scratch over `chain` (selected chain,
+    /// genesis first): every output a block's transactions create (received)
+    /// and every output they spend (sent). Spent outputs are resolved from
+    /// the outputs seen so far, seeded with the genesis ledger (`genesis_outputs`:
+    /// carryover + locked tranches, which have no creating transaction), then
+    /// from storage. Returns (blocks, rows written, inputs left unresolved).
+    ///
+    /// B1-T11: the per-address history counters (`agg/hist/`, which
+    /// `getaddresshistory` and `listtransactions` report as the total) must
+    /// equal the rows. The rows are rewritten in one batch per block, so the
+    /// aggregates are marked incomplete first (the counters are then neither
+    /// read nor updated, and a crash part-way leaves the version marker
+    /// absent, so the next start-up rebuilds them) and rebuilt from the new
+    /// rows at the end. Runs at start-up, before anything else writes.
+    pub fn reindex_addresses(
+        &self,
+        chain: &[[u8; 32]],
+        mut known: std::collections::HashMap<([u8; 32], u32), crate::core::TxOutput>,
+    ) -> Result<(u64, u64, u64), StorageError> {
+        let cf = self.db.cf_handle(CF_ADDR_TX_HISTORY)
+            .ok_or_else(|| StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
+        let counters_were_ready = self.aggregates_ready();
+        {
+            let mut batch = rocksdb::WriteBatch::default();
+            self.stage_aggregates_incomplete(&mut batch)?;
+            self.write_batch(batch)?;
+        }
+        // Clear: keys are 36 bytes, so this range covers them all.
+        self.db.delete_range_cf(&cf, [0u8; 0].as_slice(), [0xffu8; 37].as_slice())
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        let (mut blocks, mut rows, mut unresolved) = (0u64, 0u64, 0u64);
+        for hash in chain {
+            let Some(block) = self.get_block(hash)? else { continue };
+            let mut batch = rocksdb::WriteBatch::default();
+            for (tx_idx, tx) in block.transactions.iter().enumerate() {
+                let txid = tx.txid();
+                if !tx.is_coinbase() {
+                    for (vin_idx, input) in tx.inputs.iter().enumerate() {
+                        let key = (input.prev_txid, input.prev_index);
+                        let prev = match known.get(&key) {
+                            Some(o) => Some(o.clone()),
+                            None => self.get_utxo_including_spent(&input.prev_txid, input.prev_index)?,
+                        };
+                        match prev.as_ref().and_then(|o| Self::script_pubkey_to_addr_hash(&o.script_pubkey).map(|a| (a, o.value))) {
+                            Some((addr, value)) => {
+                                batch.put_cf(&cf, make_key(&addr, block.height, tx_idx as u32, 0x8000_0000 | vin_idx as u32),
+                                             make_value(&txid, DIR_IN, value));
+                                rows += 1;
+                            }
+                            None => unresolved += 1,
+                        }
+                    }
+                }
+                for (vout_idx, output) in tx.outputs.iter().enumerate() {
+                    if let Some(addr) = Self::script_pubkey_to_addr_hash(&output.script_pubkey) {
+                        batch.put_cf(&cf, make_key(&addr, block.height, tx_idx as u32, vout_idx as u32),
+                                     make_value(&txid, DIR_OUT, output.value));
+                        rows += 1;
+                    }
+                    known.insert((txid, vout_idx as u32), output.clone());
+                }
+            }
+            self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+            blocks += 1;
+        }
+        // B1-T11: counters recounted from the rows just written (with every
+        // other aggregate, which the reindex did not change), marker restored.
+        // Aggregates that were incomplete before stay so: start-up rebuilds
+        // them.
+        if counters_were_ready {
+            self.rebuild_aggregates(&std::sync::atomic::AtomicBool::new(false))?;
+        }
+        Ok((blocks, rows, unresolved))
+    }
+
     /// Query address history by range. Returns entries sorted by height ascending.
     pub fn query_address_history(
         &self,

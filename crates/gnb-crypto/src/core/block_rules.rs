@@ -332,7 +332,7 @@ pub fn check_coinbase_commitment(block: &Block) -> Result<(), &'static str> {
 // ── Block size (VAL-12) ──────────────────────────────────────────────────────
 
 /// The size `MAX_BLOCK_SIZE` is compared with: the canonical wire encoding
-/// when `hardened`, bincode (`Block::size_bytes`) otherwise.
+/// when `hardened`, `Block::size_bytes` (the wire encoding on this chain) otherwise.
 pub fn block_size_for_rules(block: &Block, hardened: bool) -> usize {
     if hardened {
         block.wire_size()
@@ -432,6 +432,7 @@ mod tests {
             blue_score: height,
             height,
             shielded_transactions: vec![],
+            powit: Default::default(),
         };
         let c = expected_coinbase_commitment(&b);
         b.transactions[0].inputs[0].script_sig = coinbase_script_sig(&c, b"extranonce");

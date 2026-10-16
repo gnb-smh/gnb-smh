@@ -487,17 +487,25 @@ fn non_canonical_witnesses_policy_at_all_heights_consensus_from_activation() {
     let n = node_with(&mk_genesis(unix_now() - 10_000), &[pre.clone(), post.clone()].concat());
     advance_to(&n, H - 2);
 
-    // Below the activation.
+    // Below the activation. This chain's v2 rules (consensus since
+    // cc5c450): the exact `script_sig` framing and Falcon's compact encoding
+    // are consensus at every height; only the suite envelope may be absent
+    // (raw carried-over keys and signatures stay valid).
     let mut mined = Vec::new();
     for (m, f) in MUTATIONS.iter().zip(&pre) {
         let canonical = v2_spend(&k, &[(f.0, 0)], vec![out(2 * SAT - FEE, &[0x84; 20])]);
         let bad = mutate(&canonical, *m);
         let err = admit(&n, &bad).unwrap_err();
         assert!(matches!(&err, AdmissionError::NonStandard(e) if e.contains("non-standard")), "{m:?}: {err}");
-        mined.push(bad);
+        if matches!(m, Mutation::EnvelopeStripped) {
+            mined.push(bad);
+        } else {
+            assert!(extend(&n, vec![bad]).is_err(), "{m:?} is consensus-invalid on this chain");
+            assert!(!spent(&n, f));
+        }
     }
-    extend(&n, mined).expect("non-canonical v2 witnesses are consensus-valid below H");
-    assert!(pre.iter().all(|f| spent(&n, f)));
+    extend(&n, mined).expect("an unenveloped v2 signature is consensus-valid below H");
+    assert!(spent(&n, &pre[0]));
 
     // From the activation.
     assert_eq!(next_height(&n), H);
@@ -740,11 +748,19 @@ fn never_activated_regime_reproduces_the_old_verdicts() {
         v2_spend(&k2, &[(f2.0, 0)], o(3)),
         v2_spend(&kr, &[(fr.0, 0)], o(4)),
     ];
+    // This chain's v2 rules: an unenveloped signature is valid, a padded
+    // Falcon half or trailing bytes are not (at every height).
     for (m, f) in MUTATIONS.iter().zip(&fk[2..5]) {
-        txs.push(mutate(&v2_spend(&k, &[(f.0, 0)], o(5)), *m));
+        let bad = mutate(&v2_spend(&k, &[(f.0, 0)], o(5)), *m);
+        if matches!(m, Mutation::EnvelopeStripped) {
+            txs.push(bad);
+        } else {
+            assert!(extend(&n, vec![bad]).is_err(), "{m:?} is consensus-invalid on this chain");
+        }
     }
     extend(&n, txs).expect("old verdicts: all valid");
-    assert!(fk[..5].iter().all(|f| spent(&n, f)) && spent(&n, &f2) && spent(&n, &fr));
+    assert!(fk[..3].iter().all(|f| spent(&n, f)) && spent(&n, &f2) && spent(&n, &fr));
+    assert!(!spent(&n, &fk[3]) && !spent(&n, &fk[4]));
     // Version 3 signed over the v2 digest (what pre-upgrade nodes check):
     // non-standard, but consensus-valid exactly as before the upgrade.
     let v3_with_v2_digest = sign_v2(&k, unsigned(3, &[(fk[5].0, 0)], o(6)));

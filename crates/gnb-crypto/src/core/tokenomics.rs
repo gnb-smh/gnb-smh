@@ -1,21 +1,30 @@
 //! GNB monetary policy. Consensus rules: changing anything here is a hard fork.
 //!
-//! Hard cap of 10,000,000 GNB, split in two fixed allocations:
+//! Hard cap of 12,500,000 GNB, split in four fixed allocations:
 //!
-//! - **Bloch carryover, 10% (1,000,000 GNB).** The Bloch Genesis-3 terminal
+//! - **Bloch carryover, 1,000,000 GNB (8%).** The Bloch Genesis-3 terminal
 //!   snapshot (3,810,744,000 BLCH over 452,726 outputs) is converted
 //!   proportionally into the genesis ledger: every output of `v` BLCH base
 //!   units becomes `floor(v × CARRYOVER_ALLOCATION_SAT / CARRYOVER_SOURCE_TOTAL_SAT)`
 //!   GNB base units, same 20-byte owner hash. See `core::carryover`.
-//! - **Mining, 90% (9,000,000 GNB).** No premine, no founder allocation, no
-//!   pools: 100% of every block subsidy and 100% of every transaction fee go
-//!   to the miner. The subsidy starts at `INITIAL_SUBSIDY_SAT` and halves
-//!   (integer right shift, in base units) every `HALVING_INTERVAL` blocks,
-//!   about 4 years at 30-second blocks. After 27 halvings it is zero and stays
-//!   zero: there is no tail emission. Mined issuance is 8,999,998.51392253 GNB.
+//! - **Team, 1,250,000 GNB (10%), and founder, 1,250,000 GNB (10%), locked.**
+//!   Written into the genesis ledger as 36 monthly tranches each, every
+//!   tranche an output locked by a spend policy (`core::policy`) with an
+//!   absolute timelock: nothing is spendable during the first year
+//!   ([`VESTING_CLIFF_BLOCKS`]), then one tranche unlocks every
+//!   [`VESTING_TRANCHE_BLOCKS`] for three years; the last unlocks at height
+//!   4,204,800. The lock is a consensus rule, not a promise. Keys and tranche
+//!   layout: `core::vesting`.
+//! - **Mining, 9,000,000 GNB (72%).** 100% of every block subsidy and 100% of
+//!   every transaction fee go to the miner. The subsidy starts at
+//!   `INITIAL_SUBSIDY_SAT` and halves (integer right shift, in base units)
+//!   every `HALVING_INTERVAL` blocks, about 4 years at 30-second blocks.
+//!   After 27 halvings it is zero and stays zero: there is no tail emission.
+//!   Mined issuance is 8,999,998.51392253 GNB.
 //! - The genesis coinbase is unspendable and pays nothing, so mining starts
-//!   at height 1. Carryover plus mining is 9,999,998.51182046 GNB, strictly
-//!   below `MAX_SUPPLY_SAT` (asserted by the tests below).
+//!   at height 1. Carryover, team, founder and mining together are
+//!   12,499,998.51182046 GNB, strictly below `MAX_SUPPLY_SAT` (asserted by
+//!   the tests below).
 //! - Once the subsidy is exhausted, miners are paid by fees alone. Every
 //!   non-coinbase transaction must pay at least [`min_tx_fee_sat`] by
 //!   consensus, so block production always carries a revenue floor.
@@ -24,13 +33,53 @@
 pub const SAT_PER_GNB: u64 = 100_000_000;
 
 /// Hard cap: total issuance never reaches this.
-pub const MAX_SUPPLY_SAT: u64 = 10_000_000 * SAT_PER_GNB;
+pub const MAX_SUPPLY_SAT: u64 = 12_500_000 * SAT_PER_GNB;
 
-/// Share of the cap allocated to the converted Bloch Genesis-3 carryover (10%).
-pub const CARRYOVER_ALLOCATION_SAT: u64 = MAX_SUPPLY_SAT / 10;
+/// Converted Bloch Genesis-3 carryover (8% of the cap).
+pub const CARRYOVER_ALLOCATION_SAT: u64 = 1_000_000 * SAT_PER_GNB;
 
-/// Share of the cap emitted by mining (90%).
-pub const MINING_ALLOCATION_SAT: u64 = MAX_SUPPLY_SAT - CARRYOVER_ALLOCATION_SAT;
+/// Team allocation, locked (10%).
+pub const TEAM_ALLOCATION_SAT: u64 = 1_250_000 * SAT_PER_GNB;
+
+/// Founder allocation, locked (10%).
+pub const FOUNDER_ALLOCATION_SAT: u64 = 1_250_000 * SAT_PER_GNB;
+
+/// Emitted by mining (72%).
+pub const MINING_ALLOCATION_SAT: u64 = 9_000_000 * SAT_PER_GNB;
+
+const _: () = assert!(
+    CARRYOVER_ALLOCATION_SAT + TEAM_ALLOCATION_SAT + FOUNDER_ALLOCATION_SAT + MINING_ALLOCATION_SAT
+        == MAX_SUPPLY_SAT
+);
+
+/// Blocks per year at 30 s (365 × 2,880).
+pub const BLOCKS_PER_YEAR: u64 = 365 * 2_880;
+
+/// Team and founder allocations: nothing unlocks before this height (1 year).
+pub const VESTING_CLIFF_BLOCKS: u64 = BLOCKS_PER_YEAR;
+
+/// One monthly tranche (1/12 year).
+pub const VESTING_TRANCHE_BLOCKS: u64 = BLOCKS_PER_YEAR / 12;
+
+/// Monthly tranches after the cliff (3 years).
+pub const VESTING_TRANCHES: u32 = 36;
+
+/// Height from which tranche `k` (1-based, 1..=36) is spendable.
+pub const fn vesting_unlock_height(k: u32) -> u64 {
+    VESTING_CLIFF_BLOCKS + k as u64 * VESTING_TRANCHE_BLOCKS
+}
+
+/// Value of tranche `k` (1-based) of an allocation of `total`: equal
+/// tranches rounded down, the remainder in the last one, so the tranches sum
+/// to exactly `total`.
+pub const fn vesting_tranche_value(total: u64, k: u32) -> u64 {
+    let base = total / VESTING_TRANCHES as u64;
+    if k == VESTING_TRANCHES {
+        total - base * (VESTING_TRANCHES as u64 - 1)
+    } else {
+        base
+    }
+}
 
 /// Target block spacing in seconds.
 pub const TARGET_BLOCK_TIME_SECS: u64 = 30;
@@ -103,10 +152,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vesting_schedule_is_one_year_cliff_then_36_monthly_tranches() {
+        assert_eq!(VESTING_TRANCHE_BLOCKS, 87_600);
+        assert_eq!(vesting_unlock_height(1), 1_051_200 + 87_600, "first tranche: month 13");
+        assert_eq!(vesting_unlock_height(VESTING_TRANCHES), 4_204_800, "last tranche: 4 years");
+        assert_eq!(vesting_unlock_height(VESTING_TRANCHES), HALVING_INTERVAL);
+        for total in [TEAM_ALLOCATION_SAT, FOUNDER_ALLOCATION_SAT, 1, 35, 37, u64::MAX / 2] {
+            let sum: u128 = (1..=VESTING_TRANCHES).map(|k| vesting_tranche_value(total, k) as u128).sum();
+            assert_eq!(sum, total as u128, "tranches must sum to the allocation ({total})");
+        }
+        assert_eq!(vesting_tranche_value(TEAM_ALLOCATION_SAT, 1), 3_472_222_222_222);
+        assert_eq!(vesting_tranche_value(TEAM_ALLOCATION_SAT, 36), 3_472_222_222_230);
+    }
+
+    #[test]
     fn schedule_constants() {
         assert_eq!(HALVING_INTERVAL, 4_204_800);
         assert_eq!(INITIAL_SUBSIDY_SAT, 107_020_547);
-        assert_eq!(CARRYOVER_ALLOCATION_SAT + MINING_ALLOCATION_SAT, MAX_SUPPLY_SAT);
+        assert_eq!(CARRYOVER_ALLOCATION_SAT + TEAM_ALLOCATION_SAT + FOUNDER_ALLOCATION_SAT
+                   + MINING_ALLOCATION_SAT, MAX_SUPPLY_SAT);
         assert_eq!(SUBSIDY_HALVINGS, 27);
         assert_eq!(INITIAL_SUBSIDY_SAT >> SUBSIDY_HALVINGS, 0);
         assert!(INITIAL_SUBSIDY_SAT >> (SUBSIDY_HALVINGS - 1) > 0);
@@ -120,7 +184,9 @@ mod tests {
         let carryover = crate::core::carryover::CARRYOVER_CONVERTED_TOTAL_SAT;
         assert!(carryover <= CARRYOVER_ALLOCATION_SAT);
         assert_eq!(total + carryover, 999_999_851_182_046);
-        assert!(total + carryover < MAX_SUPPLY_SAT);
+        let all = total + carryover + TEAM_ALLOCATION_SAT + FOUNDER_ALLOCATION_SAT;
+        assert_eq!(all, 1_249_999_851_182_046);
+        assert!(all < MAX_SUPPLY_SAT);
         assert_eq!(issued_through_sat(LAST_SUBSIDY_HEIGHT_EXCLUSIVE - 1), total);
     }
 
@@ -147,7 +213,8 @@ mod tests {
 
     #[test]
     fn hard_cap_and_allocations() {
-        assert_eq!(MAX_SUPPLY_SAT, 1_000_000_000_000_000);
+        assert_eq!(MAX_SUPPLY_SAT, 1_250_000_000_000_000);
+        assert_eq!(TEAM_ALLOCATION_SAT + FOUNDER_ALLOCATION_SAT, 250_000_000_000_000);
         assert_eq!(CARRYOVER_ALLOCATION_SAT, 100_000_000_000_000);
         assert_eq!(MINING_ALLOCATION_SAT, 900_000_000_000_000);
         assert_eq!(LAST_SUBSIDY_HEIGHT_EXCLUSIVE, 27 * 4_204_800);

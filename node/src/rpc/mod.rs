@@ -254,7 +254,8 @@ struct AppState {
     /// B2-T11 (review): `RpcConfig::proxy_client_header`.
     proxy_client_header:     Arc<str>,
     /// B1-T10: node-wide verification budget (wire bytes) of transactions
-    /// submitted by untrusted callers (`sendrawtransaction`).
+    /// and PoWit items submitted by untrusted callers (`sendrawtransaction`,
+    /// `submitpowititem`).
     tx_verify_budget:        Arc<auth::ByteBudget>,
     /// B1-T10: THIS request's caller presented the API key or is a fully
     /// trusted direct caller (set per request, like `cancel`); such callers
@@ -306,6 +307,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getblockbyheight", "getrecentblocks", "gettransaction", "getrawtransaction", "getbalance",
     "getaddresscount", "getutxos", "sendrawtransaction", "validateaddress", "estimatefee",
     "getrawmempool", "decoderawtransaction", "getblocktemplate", "submitblock", "getdaginfo",
+    "submitpowititem", "getpowitinfo",
     "listtransactions", "getpeerinfo", "getpeers", "getsupplyinfo", "getchainstats",
     "getsupplydistribution", "getselectedchain", "getblockdag", "gettransactionfull",
     "getdagwindow", "getaddresshistory", "getrichlist", "gethashrate", "getdifficultyhistory",
@@ -1261,7 +1263,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             "parents":     b.header.parents.iter().map(|p| hex::encode(p)).collect::<Vec<_>>(),
                             "merkle_root": hex::encode(b.header.merkle_root),
                             "size":        b.size_bytes(),
+                            "pow":         crate::core::pow_algo(b.height).name(),
                         });
+                        if crate::core::powit_active(b.height) {
+                            result["powit"] = format_powit(&b.powit);
+                        }
                         if verbose {
                             result["transactions"] = json!(b.transactions.iter().map(|tx| {
                                 format_tx(tx)
@@ -1298,7 +1304,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             "parents":     b.header.parents.iter().map(|p| hex::encode(p)).collect::<Vec<_>>(),
                             "merkle_root": hex::encode(b.header.merkle_root),
                             "size":        b.size_bytes(),
+                            "pow":         crate::core::pow_algo(b.height).name(),
                         });
+                        if crate::core::powit_active(b.height) {
+                            result["powit"] = format_powit(&b.powit);
+                        }
                         if verbose {
                             result["transactions"] = json!(b.transactions.iter().map(|tx| {
                                 format_tx(tx)
@@ -1481,10 +1491,17 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let limit = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64())
                 .map(|n| usize::try_from(n).unwrap_or(usize::MAX).min(GETUTXOS_MAX))
                 .unwrap_or(GETUTXOS_MAX);
-            let addr_bytes = parse_address(addr);
-            match addr_bytes {
-                Some(ab) => match state.store.get_utxos_for_address_limited(&ab, limit) {
+            // Single-key (gnb1q…, 20-byte script) or policy (gnb1m…, 33-byte
+            // script) address. The address index is keyed by the FULL script,
+            // so the lookup must use all of it (a 20-byte prefix never matches
+            // a policy entry); results are still filtered on the full script.
+            let script = crate::address::destination_script(addr).ok().map(|(_, spk)| spk);
+            match script {
+                Some(spk) => match state.store.get_utxos_for_address_limited(&spk, limit) {
                     Ok((utxos, truncated)) => {
+                        let utxos: Vec<_> = utxos.into_iter()
+                            .filter(|(_, _, o)| o.script_pubkey == spk)
+                            .collect();
                         let total: u64 = utxos.iter().map(|(_, _, o)| o.value).fold(0u64, u64::saturating_add);
                         // R3: `value` is a satoshi amount → decimal string.
                         // An output of a coinbase also carries the coinbase's
@@ -1751,6 +1768,29 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 crate::template::EXTERNAL_COINBASE_RESERVE,
             );
 
+            let witness_commitment = if crate::core::suffix_witness_commitment_required(tmpl.height) {
+                let probe = crate::core::Block {
+                    header: crate::core::BlockHeader { version: 1, parents: vec![],
+                        merkle_root: crate::core::MerkleRoot::ZERO, timestamp: 0, bits: tmpl.bits, nonce: 0 },
+                    transactions: std::iter::once(crate::core::Transaction {
+                        version: 1, inputs: vec![], outputs: vec![], locktime: 0 })
+                        .chain(tmpl.transactions.iter().map(|(t, _)| t.clone())).collect(),
+                    blue_score: tmpl.blue_score, height: tmpl.height,
+                    shielded_transactions: Vec::new(), powit: tmpl.powit.clone(),
+                };
+                hex::encode(probe.witness_commitment())
+            } else {
+                String::new()
+            };
+            let powit_hex = {
+                let mut v = Vec::new();
+                tmpl.powit.write_wire(&mut v);
+                hex::encode(v)
+            };
+            let coinbase_outputs: Vec<Value> = tmpl.coinbase_outputs(Vec::new()).iter().map(|o| json!({
+                "value": o.value.to_string(), "script_pubkey": hex::encode(&o.script_pubkey),
+            })).collect();
+
             json!({
                 "hardening_active":     tmpl.hardened,
                 "hardening_activation_height": tmpl.activation_height,
@@ -1789,9 +1829,31 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // (version u32le | n_parents u32le | parents | merkle_root |
                 // timestamp u64le | bits u32le) and the u64 nonce; valid iff
                 // the 32-byte output, big-endian, is < target(bits).
-                "pow":                  "gnb-smh-v1",
-                "pow_log2_n":           gnb_smh::LOG2_N,
+                // From powit_height the proof of work is GnB-SMH v3 (4 MiB);
+                // "pow" names the function for THIS height.
+                "pow":                  crate::core::pow_algo(tmpl.height).name(),
+                "pow_log2_n":           match crate::core::pow_algo(tmpl.height) {
+                    gnb_smh::Algo::V1 => gnb_smh::LOG2_N,
+                    gnb_smh::Algo::V3 => gnb_smh::v3::LOG2_N,
+                },
                 "target":               hex::encode(crate::core::bits_to_target(tmpl.bits)),
+                // This chain measures the block size on the wire encoding at
+                // every height (`size_rule` above names the audit's regime).
+                "chain_size_rule":      "wire",
+                // From witness_commitment_height up to the hardening
+                // activation the coinbase script_sig must END with these
+                // bytes (tag ‖ Merkle root of the wtxids, the coinbase counted
+                // as zero); see Block::commit_witnesses.
+                "witness_commitment_height": crate::core::WITNESS_COMMITMENT_HEIGHT,
+                "witness_commitment":   witness_commitment,
+                // PoWit (from powit_height): the block must carry this section
+                // (wire hex, `PowitBody::write_wire`) and its coinbase exactly
+                // these outputs, the first paid to the miner's script (one per
+                // witness share after it; the miner output is subsidy share +
+                // fees, see `core::Block::coinbase_outputs`).
+                "powit_height":         crate::core::powit_height().to_string(),
+                "powit":                powit_hex,
+                "coinbase_outputs":     coinbase_outputs,
             })
         }
 
@@ -1818,6 +1880,49 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         // reconsiderblock). Admin methods: never anonymous (auth::ADMIN_METHODS).
         "invalidateblock" => chain_admin_call(ChainAdminOp::Invalidate, params, state),
         "reconsiderblock" => chain_admin_call(ChainAdminOp::Reconsider, params, state),
+
+        // submitpowititem [kind, hex]: kind 1 = witness share, 2 = attestation,
+        // 3 = equivocation proof. Validated like a gossiped item, then relayed.
+        "submitpowititem" => {
+            let kind = params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(0);
+            let data = match params.and_then(|p| p.get(1)).and_then(|v| v.as_str()).map(hex::decode) {
+                Some(Ok(d)) => d,
+                _ => return json!({ "error": "usage: submitpowititem [kind, hex]" }),
+            };
+            if !(1..=3).contains(&kind) || data.len() > crate::network::MAX_WIRE_POWIT_ITEM {
+                return json!({ "error": "bad kind or item too large" });
+            }
+            let kind = kind as u8;
+            // B1-T10: the same node-wide budget as `sendrawtransaction`. An
+            // untrusted caller's item is charged by its size before its KES
+            // signature is checked (under the DAG read lock), and refunded
+            // once admitted: items the node refuses cannot buy unbounded
+            // verification work from many addresses behind a proxy.
+            let charged = if state.caller_trusted { 0 } else { data.len() };
+            if charged > 0 && !state.tx_verify_budget.take(charged) {
+                return json!({ "accepted": false, "error": "busy: the node's verification budget for \
+                    unauthenticated callers is exhausted (it refills within a minute); retry shortly, \
+                    or authenticate with the API key" });
+            }
+            let res = {
+                let dag = state.dag.read();
+                crate::powit::admit_item(kind, &data, &dag, &state.store)
+            };
+            match res {
+                Ok(()) => {
+                    state.tx_verify_budget.refund(charged);
+                    let id = crate::powit::item_id(kind, &data);
+                    let _ = state.outbound_tx.try_send(NetworkMessage::NewPowitItem { id, kind, data });
+                    json!({ "accepted": true, "id": hex::encode(id) })
+                }
+                Err(e) => json!({ "accepted": false, "error": e }),
+            }
+        }
+
+        "getpowitinfo" => {
+            let dag = state.dag.read();
+            crate::powit::info_json(&dag, &state.store)
+        }
 
         "getdaginfo" => {
             let dag = state.dag.read();
@@ -2356,6 +2461,33 @@ fn template_tx_entries(tmpl: &crate::template::BlockTemplate) -> Vec<Value> {
             "depends": depends,
         })
     }).collect()
+}
+
+/// A block's PoWit section for explorers: witness shares, KES-signed
+/// attestations (with the epoch leaf each one used) and equivocation proofs.
+fn format_powit(p: &crate::core::powit::PowitBody) -> Value {
+    let cp = |c: &crate::core::powit::Checkpoint| json!({ "slot": c.height, "hash": hex::encode(c.hash) });
+    let att = |a: &crate::core::powit::Attestation| json!({
+        "witness":    hex::encode(a.key_id()),
+        "source":     cp(&a.source),
+        "target":     cp(&a.target),
+        "kes_epoch":  a.sig.index,
+        "kes_depth":  a.witness.depth,
+        "kes_root":   hex::encode(a.witness.root),
+        "sig_bytes":  a.sig.sig.len(),
+    });
+    json!({
+        "shares": p.shares.iter().map(|s| json!({
+            "id":       hex::encode(crate::core::witness_share::share_id(s)),
+            "attested": hex::encode(s.attested),
+            "witness":  hex::encode(s.witness),
+            "payout":   hex::encode(&s.payout),
+        })).collect::<Vec<_>>(),
+        "attestations": p.attestations.iter().map(att).collect::<Vec<_>>(),
+        "evidence": p.evidence.iter().map(|e| json!({
+            "witness": hex::encode(e.a.key_id()), "a": att(&e.a), "b": att(&e.b),
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn format_tx(tx: &Transaction) -> Value {
@@ -3070,6 +3202,7 @@ mod audit_2026_10_rpc_tests {
             transactions: vec![(a.clone(), 10), (b.clone(), 20), (c.clone(), 30), (d.clone(), 40)],
             total_fees: 100, subsidy: 0, evicted: 0, tx_byte_budget: 0,
             activation_height: u64::MAX, hardened: false,
+            powit: Default::default(),
         };
         let entries = template_tx_entries(&tmpl);
         let depends: Vec<Value> = entries.iter().map(|e| e["depends"].clone()).collect();
@@ -3131,6 +3264,7 @@ mod audit_2026_10_rpc_tests {
             header: BlockHeader { version: 1, parents: vec![[0; 32]], merkle_root: MerkleRoot::ZERO, timestamp: 1_030, bits: 0x2100_FFFF, nonce: 0 },
             transactions: vec![coinbase.clone(), spend.clone()],
             blue_score: 1, height: 1, shielded_transactions: vec![],
+            powit: Default::default(),
         };
         block.header.merkle_root = block.body_merkle_root();
         state.store.put_block(&block).unwrap();
@@ -3622,6 +3756,36 @@ mod audit_2026_10_rpc_tests {
         assert!(!e.is_empty() && !e.starts_with("busy"), "{r}");
     }
 
+    /// B1-T10 on main's `submitpowititem` (a write method that checks a KES
+    /// signature under the DAG read lock): an untrusted caller's item is
+    /// charged to the same node-wide verification budget as a transaction,
+    /// before it is decoded or verified; the operator is not charged.
+    #[tokio::test]
+    async fn anonymous_powit_items_share_the_verification_budget() {
+        let (_tmp, mut state) = state_with_chain(1);
+        state.rate_limiter = Arc::new(auth::RateLimiterSet::new(600, 600));
+        state.api_key = Some("operator-key".into());
+        let item = vec![0u8; 600];
+        assert!(item.len() <= crate::network::MAX_WIRE_POWIT_ITEM);
+        // Room for two items and no refill.
+        state.tx_verify_budget = Arc::new(auth::ByteBudget::new(2 * item.len() as u64 + 16, 0));
+        let submit = || rpc_body("submitpowititem", json!([2, hex::encode(&item)]));
+        for i in 0..2u8 {
+            let (status, r) = post_raw(&state, "127.0.0.1:5000",
+                &[("x-forwarded-for", &format!("198.51.100.{}", 20 + i))], submit()).await;
+            assert_eq!(status, StatusCode::OK, "{r}");
+            let e = r["result"]["error"].as_str().unwrap_or_default();
+            assert!(r["result"]["accepted"] == false && !e.is_empty() && !e.starts_with("busy"), "refused on its merits: {r}");
+        }
+        for (peer, hdrs) in [("127.0.0.1:5000", vec![("x-forwarded-for", "198.51.100.30")]), ("127.0.0.1:5001", vec![])] {
+            let (_, r) = post_raw(&state, peer, &hdrs, submit()).await;
+            assert!(r["result"]["error"].as_str().unwrap_or_default().starts_with("busy"), "{r}");
+        }
+        let (_, r) = post_raw(&state, "127.0.0.1:5000", &[("x-api-key", "operator-key")], submit()).await;
+        let e = r["result"]["error"].as_str().unwrap_or_default();
+        assert!(!e.is_empty() && !e.starts_with("busy"), "the operator is not charged: {r}");
+    }
+
     /// B1-T21 / MEM-6: `estimatefeeadvanced` never recommends a fee the
     /// network refuses. On a quiet pool it answered 5,000 sat (medium,
     /// `recommended_gnb`) and 1,000 sat (slow) against the 10,000-sat
@@ -3916,6 +4080,7 @@ mod block_rules_template_tests {
             blue_score: t["blue_score"].as_u64().unwrap(),
             height: t["height"].as_u64().unwrap(),
             shielded_transactions: vec![],
+            powit: Default::default(),
         }
     }
 
@@ -3941,6 +4106,7 @@ mod block_rules_template_tests {
             blue_score: 1,
             height: 1,
             shielded_transactions: vec![],
+            powit: Default::default(),
         }
     }
 
