@@ -72,9 +72,11 @@ function dom() {
 
 async function review({ next = H, destination = V2, rows = [funding.row], previous = funding.raw, dagError, dag = { next_block_height: next, tip_height: 7 } } = {}) {
   const ui = dom(), calls = [], paid = [], planned = [], broadcasts = [];
+  const planAttempts = [], payAttempts = [];
   const tracked = { ...core,
-    plan(...args) { const plan = core.plan(...args); planned.push({ args, plan }); return plan; },
-    pay(...args) { const tx = core.pay(...args); paid.push({ args, tx }); return tx; },
+    // Count before entering WASM: an exception is still an attempted call.
+    plan(...args) { planAttempts.push(args); const plan = core.plan(...args); planned.push({ args, plan }); return plan; },
+    pay(...args) { payAttempts.push(args); const tx = core.pay(...args); paid.push({ args, tx }); return tx; },
   };
   const api = async (method, params) => {
     calls.push({ method, params });
@@ -98,7 +100,7 @@ async function review({ next = H, destination = V2, rows = [funding.row], previo
   vm.runInContext(source.slice(start, end) + "\nviewSend();", context);
   ui.get("#to").value = destination; ui.get("#amt").value = "1";
   await ui.get("#review").click();
-  return { ui, calls, planned, paid, broadcasts, html: ui.get("#out").innerHTML };
+  return { ui, calls, planned, paid, planAttempts, payAttempts, broadcasts, html: ui.get("#out").innerHTML };
 }
 
 function gate(c, testnet) {
@@ -136,6 +138,7 @@ for (const next of [H - 1, H]) for (const destination of [LEGACY, V2]) {
     assert.equal(r.paid[0].tx.version, next < H ? 1 : 3);
     assert.equal(r.paid[0].args[4], next, "tip_height + 1 is deliberately wrong");
     assert.equal(r.planned.length, 1);
+    assert.equal(r.planAttempts.length, 1); assert.equal(r.payAttempts.length, 1);
     assert.deepEqual(r.calls.map(c => c.method), next < H ? ["getdaginfo", "getrawtransaction"] : ["getdaginfo"]);
     assert.equal(r.ui.get("#confirm").disabled, false);
     assert.equal(r.paid[0].tx.unverified_inputs, 0);
@@ -149,6 +152,7 @@ test("secondary review requires next_block_height, and never signs after a faile
     const r = await review(input);
     assert.deepEqual(r.calls.map(c => c.method), ["getdaginfo"]);
     assert.equal(r.paid.length, 0); assert.equal(r.planned.length, 0);
+    assert.equal(r.planAttempts.length, 0); assert.equal(r.payAttempts.length, 0);
     assert.equal(r.ui.get("#confirm"), null);
     assert.match(r.html, /node unavailable|next block height/i);
   }
@@ -157,6 +161,7 @@ test("secondary review requires next_block_height, and never signs after a faile
 test("secondary review rejects a destination on another network", async () => {
   const r = await review({ destination: TESTNET });
   assert.equal(r.paid.length, 0); assert.equal(r.ui.get("#confirm"), null);
+  assert.equal(r.planAttempts.length, 1); assert.equal(r.payAttempts.length, 1);
   assert.match(r.html, /network/i);
 });
 
@@ -164,17 +169,21 @@ test("secondary review rechecks coinbase maturity at the current next height", a
   const cb = { ...funding.row, coinbase_height: H - COINBASE_MATURITY };
   const early = await review({ next: H - 1, rows: [cb] });
   assert.equal(early.paid.length, 0); assert.equal(early.planned.length, 0);
+  assert.equal(early.planAttempts.length, 0); assert.equal(early.payAttempts.length, 0);
   assert.match(early.html, /No spendable outputs at the next block/);
   const mature = await review({ next: H, rows: [cb] });
   assert.equal(mature.paid.length, 1); assert.match(mature.html, /Confirm and send/);
+  assert.equal(mature.planAttempts.length, 1); assert.equal(mature.payAttempts.length, 1);
   const mixed = await review({ next: H - 1, rows: [{ ...cb, index: 1 }, funding.row] });
   // Discard the immature row before even asking the core to plan the payment.
   assert.equal(mixed.planned.length, 1);
+  assert.equal(mixed.planAttempts.length, 1); assert.equal(mixed.payAttempts.length, 1);
   assert.deepEqual(mixed.planned[0].args[0].map(row => row.index), [0]);
   assert.equal(mixed.paid.length, 1);
   for (const coinbase_height of ["17400", -1, H]) {
     const rejected = await review({ rows: [{ ...funding.row, coinbase_height }] });
     assert.equal(rejected.paid.length, 0); assert.equal(rejected.planned.length, 0);
+    assert.equal(rejected.planAttempts.length, 0); assert.equal(rejected.payAttempts.length, 0);
   }
 });
 
@@ -198,6 +207,7 @@ test("secondary review makes missing previous values visible and requires explic
 test("secondary review refuses supplied previous transaction bytes that do not verify", async () => {
   const r = await review({ next: H - 1, previous: "00" });
   assert.equal(r.paid.length, 0); assert.equal(r.ui.get("#confirm"), null);
+  assert.equal(r.planAttempts.length, 1); assert.equal(r.payAttempts.length, 1);
   assert.match(r.html, /previous|transaction|decode|truncat/i);
 });
 

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Replay bounded local UI production reversals, restoring files in finally.
 
-Usage: python3 docs/security/round-4/replay-wallet-secondary.py /path/to/node
+Usage: python3 docs/security/round-4/replay-wallet-secondary.py /path/to/node --output /new/output/directory
 Run only in a clean dedicated worktree containing the completed fix. The
 unchanged tests use actual pinned WASM with synthetic metadata, without network
 or broadcast. This is not a mainnet or security-stress experiment.
 """
+import argparse
 import hashlib
 import json
 from pathlib import Path
 import re
 import subprocess
-import sys
 
 ROOT = Path(__file__).resolve().parents[3]
 BASE = "70ca8a2"
@@ -35,7 +35,14 @@ def send_region(text):
 
 
 def main():
-    node = sys.argv[1]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("node", help="Node executable")
+    parser.add_argument("--output", required=True, type=Path, help="New evidence directory; existing paths are refused")
+    args = parser.parse_args()
+    node = args.node
+    output_dir = args.output.resolve()
+    # Fail before touching production if evidence could be overwritten.
+    output_dir.mkdir(parents=True, exist_ok=False)
     fixed = {path: (ROOT / path).read_bytes() for path in (MAIN, CORE)}
     baseline = {path: subprocess.check_output(["git", "show", f"{BASE}:{path}"], cwd=ROOT).decode() for path in fixed}
     tests_hash = digest((ROOT / TEST).read_bytes())
@@ -67,7 +74,7 @@ def main():
             assert digest((ROOT / TEST).read_bytes()) == tests_hash
             command = [node, "--test", TEST]
             run = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
-            log = Path(f"/private/tmp/gnb-r4-wallet-secondary-reversal-{name}.log")
+            log = output_dir / f"{name}.log"
             log.write_bytes(run.stdout)
             output = run.stdout.decode()
             record = {"case": name, "production_files_reverted": list(changes), "command": command,
@@ -84,7 +91,7 @@ def main():
         assert digest((ROOT / TEST).read_bytes()) == tests_hash
     manifest = {"baseline": BASE, "fixed_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip(),
                 "fixed_production_sha256": {path: digest(data) for path, data in fixed.items()}, "records": records}
-    (ROOT / "docs/security/round-4/wallet-secondary-reversals.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
 if __name__ == "__main__":
