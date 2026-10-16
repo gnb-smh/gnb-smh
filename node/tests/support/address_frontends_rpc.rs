@@ -129,6 +129,15 @@ async fn address_frontends_v2_aliases_keep_existing_index_identity() {
     assert_eq!(new["satoshis"], "23456", "{new}");
     assert_eq!(old["utxos"], new["utxos"]);
     assert_eq!(old["returned"], new["returned"]);
+    // The existing holder/history APIs are single-key only. A policy alias
+    // must not be truncated into a 20-byte identity by accepting v2.
+    for method in ["getbalance", "getaddressinfo", "getaddresshistory", "listtransactions", "getaddressbalance_at_height"] {
+        for input in [policy.to_string().as_str(), POLICY_V2_MAIN_44] {
+            let before = state.store.storage_reads();
+            assert_eq!(dispatch(method, Some(&json!([input])), &state).await["error"], "invalid address");
+            assert_eq!(state.store.storage_reads() - before, 0);
+        }
+    }
     for other in [ADDRESS_V2_TEST_42, POLICY_V2_TEST_44] {
         let before = state.store.storage_reads();
         assert_eq!(dispatch("getutxos", Some(&json!([other])), &state).await["error"],
