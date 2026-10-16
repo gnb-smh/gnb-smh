@@ -1,5 +1,5 @@
 //! Explicit v2 rendering and bounded transcription-error checks.
-use gnb_crypto::address::{destination_script, Address, Network, PolicyAddress};
+use gnb_crypto::address::{destination_script, Address, AddressError, Network, PolicyAddress};
 
 const SINGLE_MAIN: &str = "gnb1zqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdaq6uw";
 const SINGLE_TEST: &str = "tgnb1zqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqtxkpzc";
@@ -49,4 +49,19 @@ fn every_single_ascii_character_substitution_is_rejected() {
         }
     }
     assert_eq!(checked, 20_274);
+}
+
+#[test]
+fn v2_hash_lengths_report_encoding_failure_not_character_counts() {
+    // Independent Python vectors with a correct checksum but a 19-byte key
+    // hash or a 31-byte policy hash. The legacy BadLength error counts text
+    // characters; reusing it for decoded bytes produces a misleading message.
+    for invalid in [
+        "gnb1zqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqhh5asf",
+        "tgnb1zqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9h5rr",
+        "gnb1zpqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqepzqzc",
+        "tgnb1zpqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq5x9krt",
+    ] {
+        assert_eq!(destination_script(invalid), Err(AddressError::BadEncoding));
+    }
 }

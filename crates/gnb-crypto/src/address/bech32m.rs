@@ -144,10 +144,7 @@ pub(super) fn decode_address(s: &str) -> Result<(Network, u8, Vec<u8>), AddressE
     };
     let hash = convert_bits(&words[2..], 5, 8, false).ok_or(AddressError::BadEncoding)?;
     if hash.len() != expected {
-        return Err(AddressError::BadLength {
-            got: hash.len(),
-            expected,
-        });
+        return Err(AddressError::BadEncoding);
     }
     Ok((network, words[1], hash))
 }
