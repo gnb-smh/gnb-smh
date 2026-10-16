@@ -149,12 +149,17 @@ fn main() {
         "witnesskeygen" => {
             require_params(params, 1, "witnesskeygen <out.json> [depth=12]");
             let depth: u8 = params.get(1).and_then(|d| d.parse().ok()).unwrap_or(gnb::core::kes::DEFAULT_DEPTH);
-            let pw = std::env::var("GNB_WALLET_PASSWORD").unwrap_or_else(|_| {
-                let a = read_password("Set witness key password: ");
-                let b = read_password("Confirm: ");
-                if *a != *b { eprintln!("Passwords don't match."); process::exit(1); }
-                a.as_str().to_owned()
-            });
+            // CRY-4: the password stays in wiping storage (it was copied
+            // into a plain String).
+            let pw = match std::env::var("GNB_WALLET_PASSWORD") {
+                Ok(p) => zeroize::Zeroizing::new(p),
+                Err(_) => {
+                    let a = read_password("Set witness key password: ");
+                    let b = read_password("Confirm: ");
+                    if *a != *b { eprintln!("Passwords don't match."); process::exit(1); }
+                    a
+                }
+            };
             let mut seed = zeroize::Zeroizing::new([0u8; 32]);
             rand::fill(&mut seed[..]);
             let total = 1u64 << depth;
@@ -178,7 +183,11 @@ fn main() {
         "powitattest" => {
             require_params(params, 6,
                 "powitattest <witness-key.json> <mainnet|testnet> <src_slot> <src_hash> <tgt_slot> <tgt_hash> [activation]");
-            let pw = std::env::var("GNB_WALLET_PASSWORD").unwrap_or_else(|_| read_password("Witness key password: ").as_str().to_owned());
+            // CRY-4: wiping storage, as for witnesskeygen.
+            let pw = match std::env::var("GNB_WALLET_PASSWORD") {
+                Ok(p) => zeroize::Zeroizing::new(p),
+                Err(_) => read_password("Witness key password: "),
+            };
             let path = std::path::Path::new(params[0]);
             let file = gnb::core::kes::KesKeyFile::load(path).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
             let mut signer = file.open(&pw).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
@@ -245,23 +254,23 @@ fn main() {
         // ── Multisig / timelock policies (core::policy) ────────────
         "pubkey" => {
             require_params(params, 1, "pubkey <wallet.json>");
-            let kp = load_keypair(params[0]);
+            let kp = load_keypair(params[0], stated_network);
             println!("{}", hex::encode(&kp.public_key));
             return;
         }
         "policyaddress" => {
             require_params(params, 2, POLICY_ADDRESS_USAGE);
-            do_policy_address(params);
+            do_policy_address(params, stated_network);
             return;
         }
         "policyspend" => {
             require_params(params, 3, POLICY_SPEND_USAGE);
-            do_policy_spend(params);
+            do_policy_spend(params, stated_network);
             return;
         }
         "policysign" => {
             require_params(params, 2, "policysign <spend.json> <wallet.json>");
-            do_policy_sign(params);
+            do_policy_sign(params, stated_network);
             return;
         }
         "policysend" => {
@@ -273,12 +282,12 @@ fn main() {
         // ── Bloch bridge vault (docs/SIDECHAIN-BLOCH.md) ──────────────
         "vaultcreate" => {
             require_params(params, 1, VAULT_CREATE_USAGE);
-            do_vault_create(params);
+            do_vault_create(params, stated_network);
             return;
         }
         "vaultlock" => {
             require_params(params, 4, "vaultlock <wallet.json> <vault.json> <amount GNB> <0xL2address> [--fee GNB]");
-            do_vault_lock(params, &rpc_target);
+            do_vault_lock(params, &rpc_target, stated_network);
             return;
         }
         "vaultchecklock" => {
@@ -288,17 +297,17 @@ fn main() {
         }
         "vaultrelease" => {
             require_params(params, 4, "vaultrelease <vault.json> <burn_id hex> <gnb1 recipient> <burn amount SATS> --utxo TXID:VOUT:SATS ... --out spend.json");
-            do_vault_release(params);
+            do_vault_release(params, stated_network);
             return;
         }
         "vaultcheckrelease" => {
             require_params(params, 5, "vaultcheckrelease <vault.json> <spend.json> <burn_id hex> <gnb1 recipient> <burn amount SATS>");
-            do_vault_check_release(params, &rpc_target);
+            do_vault_check_release(params, &rpc_target, stated_network);
             return;
         }
         "vaultrecover" => {
             require_params(params, 3, "vaultrecover <vault.json> <gnb1 destination> <amount GNB> --utxo TXID:VOUT:SATS ... --out spend.json");
-            do_vault_recover(params);
+            do_vault_recover(params, stated_network);
             return;
         }
         "vaultutxos" => {
@@ -312,18 +321,31 @@ fn main() {
             require_params(params, 1, "keyinfo <wallet.json>");
             let pw = read_password("Wallet password: ");
             let path = std::path::Path::new(params[0]);
-            match gnb::wallet::Keypair::load_encrypted(path, &pw) {
+            // CRY-7: a v2 keystore opens only for the network stated with
+            // --mainnet / --testnet (v3 authenticates its own).
+            match open_keystore(path, &pw, stated_network) {
                 Ok(kp) => {
                     let pk = &kp.public_key; let sk = &kp.private_key;
-                    let suite = |b: &[u8]| -> String {
-                        if b.len() >= 4 && b[0]==0xB1 && b[1]==0x0C {
-                            format!("enveloped suite 0x{:04x}", u16::from_le_bytes([b[2],b[3]]))
-                        } else { "RAW (no envelope)".into() }
+                    // B2-T2: encodings are told apart by exact length, never by
+                    // the first bytes (a raw key starts with random bytes).
+                    let suite = gnb::crypto::public_key_suite(pk);
+                    let pk_form = match suite {
+                        Some(_) if pk.len() == 3_745 => "RAW hybrid (pre-envelope)".to_string(),
+                        Some(s) => format!("enveloped suite 0x{s:04x}"),
+                        None => "UNKNOWN encoding".to_string(),
+                    };
+                    let sk_form = match suite {
+                        Some(1) if sk.len() == 6_337 => "RAW hybrid (pre-envelope)",
+                        Some(1) if sk.len() == 6_341 => "enveloped suite 0x0001",
+                        Some(2) if sk.len() == 4_032 => "RAW ML-DSA-65",
+                        Some(2) if sk.len() == 4_036 => "enveloped suite 0x0002",
+                        _ => "does not match the public key's suite",
                     };
                     println!("address:      {}", kp.address);
-                    println!("pubkey  len:  {}  ({})", pk.len(), suite(pk));
-                    println!("privkey len:  {}  ({})", sk.len(), suite(sk));
-                    println!("expected: hybrid pk=3749 sk=4032+falcon(~2300); mldsa-only pk=1956 sk=4036");
+                    println!("pubkey  len:  {}  ({})", pk.len(), pk_form);
+                    println!("privkey len:  {}  ({})", sk.len(), sk_form);
+                    println!("expected: hybrid pk=3745 raw / 3749 enveloped, sk=6337 raw / 6341 enveloped; \
+                              mldsa-only pk=1956 sk=4036");
                 }
                 Err(e) => { eprintln!("load failed: {}", e); process::exit(1); }
             }
@@ -366,7 +388,7 @@ fn main() {
 
         "importfounder" | "import-founder" => {
             require_params(params, 2, "importfounder <wallet-hd.json> <founder.json>");
-            do_import_founder(params[0], params[1], allow_large_hd_wallet);
+            do_import_founder(params[0], params[1], allow_large_hd_wallet, stated_network);
             return;
         }
 
@@ -630,12 +652,13 @@ fn do_newseed(output_path: &str, testnet: bool) {
     let use_passphrase = read_password("Optional passphrase (press Enter to skip): ");
     let passphrase = if use_passphrase.is_empty() { None } else { Some(use_passphrase.as_str()) };
 
-    let wallet = match gnb::hd_wallet::HdWallet::create(&password, passphrase, testnet) {
+    // CRY-4: the wallet does not keep the phrase; `create` hands it over
+    // once, it is printed from one wiping buffer and wiped when dropped.
+    let (wallet, phrase) = match gnb::hd_wallet::HdWallet::create(&password, passphrase, testnet) {
         Ok(w) => w,
         Err(e) => { eprintln!("Failed to create wallet: {}", e); process::exit(1); }
     };
 
-    let mnemonic_str = zeroize::Zeroizing::new(wallet.mnemonic.to_string());
     let first_addr = wallet.addresses[0].1.address.clone();
 
     let path = std::path::Path::new(output_path);
@@ -649,13 +672,12 @@ fn do_newseed(output_path: &str, testnet: bool) {
     println!("  BACKUP YOUR MNEMONIC PHRASE (24 words)");
     println!("══════════════════════════════════════════════════════════════");
     println!();
-    let words: Vec<&str> = mnemonic_str.split_whitespace().collect();
-    for (i, chunk) in words.chunks(4).enumerate() {
-        let line: Vec<String> = chunk.iter().enumerate().map(|(j, w)| {
-            format!("{:2}. {:<10}", i * 4 + j + 1, w)
-        }).collect();
-        println!("  {}", line.join(" "));
+    let words: Vec<&str> = phrase.words().collect();
+    if let Err(e) = gnb::wallet::print_phrase_grid(&words, "  ") {
+        die(&format!("cannot print the mnemonic: {e}"));
     }
+    drop(words);
+    drop(phrase);
     println!();
     println!("══════════════════════════════════════════════════════════════");
     println!();
@@ -769,13 +791,21 @@ fn do_list_addresses(wallet_path: &str, allow_large_hd_wallet: bool) {
     println!("Total: {} address(es)", wallet.addresses.len());
 }
 
-fn do_import_founder(hd_wallet_path: &str, founder_path: &str, allow_large_hd_wallet: bool) {
+fn do_import_founder(
+    hd_wallet_path: &str,
+    founder_path: &str,
+    allow_large_hd_wallet: bool,
+    stated_network: Option<gnb::address::Network>,
+) {
     println!("Importing founder.json into HD wallet...");
     println!();
 
     let founder_password = read_password("founder.json password: ");
     let founder_path_p = std::path::Path::new(founder_path);
-    let founder_kp = match gnb::wallet::Keypair::load_encrypted(founder_path_p, &founder_password) {
+    // CRY-7: a v2 founder keystore authenticates no network: it opens only
+    // for the network stated with --mainnet / --testnet; the HD wallet then
+    // refuses a key of the other network (HdWallet::try_import_keypair).
+    let founder_kp = match open_keystore(founder_path_p, &founder_password, stated_network) {
         Ok(kp) => kp,
         Err(e) => { eprintln!("Failed to load founder.json: {}", e); process::exit(1); }
     };
@@ -831,11 +861,11 @@ fn do_new_wallet(output_path: &str, testnet: bool, random_key: bool) {
         println!();
         println!("RECOVERY PHRASE (24 words). Write them down offline; anyone with them controls the funds:");
         println!();
-        for (row, chunk) in phrase.words().chunks(4).enumerate() {
-            let line: Vec<String> = chunk.iter().enumerate()
-                .map(|(j, w)| format!("{:2}. {:<10}", row * 4 + j + 1, w)).collect();
-            println!("  {}", line.join(" "));
+        // CRY-4: one wiping buffer, written straight to the terminal.
+        if let Err(e) = gnb::wallet::print_phrase_grid(&phrase.words(), "  ") {
+            die(&format!("cannot print the recovery phrase: {e}"));
         }
+        drop(phrase);
         println!();
         if !gnb::wallet::send::confirm("I have written the 24 words down") {
             die("aborted: no wallet file was written");
@@ -880,6 +910,21 @@ fn do_restore_wallet(output_path: &str, testnet: bool) {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Open a keystore without spending it (CRY-7): v3 authenticates its own
+/// network (which must be the stated one, if any); a v2 file opens only for a
+/// stated network.
+fn open_keystore(
+    path: &std::path::Path,
+    password: &str,
+    network: Option<gnb::address::Network>,
+) -> Result<gnb::wallet::Keypair, String> {
+    match network {
+        Some(n) => gnb::wallet::Keypair::load_encrypted_on(path, password, n),
+        None => gnb::wallet::Keypair::load_encrypted(path, password)
+            .map_err(|e| format!("{e} (pass --mainnet or --testnet for a v2 keystore)")),
+    }
+}
+
 /// CRY-4: passwords and mnemonics are read into wiping storage.
 fn read_password(prompt: &str) -> zeroize::Zeroizing<String> {
     eprint!("{}", prompt);
@@ -919,17 +964,58 @@ const POLICY_ADDRESS_USAGE: &str =
     "policyaddress <m> <pubkey-hex|file>... [--after HEIGHT] [--older BLOCKS] [--testnet]";
 const POLICY_SPEND_USAGE: &str =
     "policyspend <policy-hex|file> <to_address> <amount_gnb> --utxo TXID:VOUT:SATS [--utxo ...] \
-     [--fee 0.0005] [--locktime HEIGHT] [--next-height N] --out spend.json";
+     [--fee 0.0005] [--locktime HEIGHT] [--next-height N] [--testnet] --out spend.json";
 
-fn load_keypair(path: &str) -> gnb::wallet::Keypair {
+/// Open a keystore to sign with (`pubkey`, `policysign`, `vaultlock`).
+/// CRY-7: every open path authenticates the network. A keystore v3 proves
+/// its own, which must be `network` when one is given; a v2 file (which
+/// authenticates none) opens only for a stated network, checked against its
+/// address; a keyfile v1 must record that network.
+fn load_keypair(path: &str, network: Option<gnb::address::Network>) -> gnb::wallet::Keypair {
     let password = read_password("Wallet password: ");
     let p = std::path::Path::new(path);
-    match gnb::wallet::Keypair::load_encrypted(p, &password) {
+    match open_keystore(p, &password, network) {
         Ok(kp) => kp,
+        Err(e2) if is_keystore_v2_or_v3(p) => die(&format!("Failed to load wallet: {e2}")),
         Err(e2) => match gnb::wallet::Wallet::load_encrypted(p, &password) {
-            Ok(w) => w.into_keypair(),
-            Err(e1) => die(&format!("Failed to load wallet: {} (keystore v2) / {} (keyfile v1)", e2, e1)),
+            Ok(w) => {
+                if network.is_some_and(|n| n != w.network()) {
+                    die("the wallet's network does not match the network required here");
+                }
+                w.into_keypair()
+            }
+            Err(e1) => die(&format!("Failed to load wallet: {} (keystore v2/v3) / {} (keyfile v1)", e2, e1)),
         },
+    }
+}
+
+/// The network of a policy / vault command (CRY-7): `--testnet` or
+/// `--mainnet` as parsed by `main` (the global parser consumes both flags,
+/// so they never reach `params`), mainnet by default.
+fn policy_network(stated: Option<gnb::address::Network>) -> gnb::address::Network {
+    stated.unwrap_or(gnb::address::Network::Mainnet)
+}
+
+/// A destination of a policy or vault spend (`gnb1q`/`gnb1t` or
+/// `gnb1m`/`gnb1n`) as its output script, refused unless it is an address of
+/// `network` (CRY-7: every payment path requires the expected network; a
+/// single-key address's checksum does not cover its prefix, so a mistyped
+/// prefix would otherwise make the spend one of the other chain).
+fn destination_on(address: &str, network: gnb::address::Network, what: &str) -> Result<Vec<u8>, String> {
+    let (dest_net, script) = gnb::address::destination_script(address)
+        .map_err(|_| format!("invalid {what}"))?;
+    if dest_net != network {
+        return Err(format!("the {what} is a {dest_net:?} address; this spend is on {network:?} \
+                            (pass --testnet / --mainnet to state the network)"));
+    }
+    Ok(script)
+}
+
+/// A network the caller stated (`--testnet` / `--mainnet`) must be the one
+/// the spend or vault file records.
+fn require_stated(stated: Option<gnb::address::Network>, recorded: gnb::address::Network, file: &str) {
+    if stated.is_some_and(|n| n != recorded) {
+        die(&format!("{file} is for {recorded:?}, not the network stated on the command line"));
     }
 }
 
@@ -947,7 +1033,7 @@ fn flag_value<'a>(params: &[&'a str], flag: &str) -> Option<&'a str> {
     params.windows(2).find(|w| w[0] == flag).map(|w| w[1])
 }
 
-fn do_policy_address(params: &[&str]) {
+fn do_policy_address(params: &[&str], stated: Option<gnb::address::Network>) {
     let m: u8 = params[0].parse().unwrap_or_else(|_| die("m must be a number"));
     let mut keys = Vec::new();
     let mut i = 1;
@@ -960,7 +1046,9 @@ fn do_policy_address(params: &[&str]) {
     }
     let after: u32 = flag_value(params, "--after").map(|v| v.parse().unwrap_or_else(|_| die("--after: height"))).unwrap_or(0);
     let older: u32 = flag_value(params, "--older").map(|v| v.parse().unwrap_or_else(|_| die("--older: blocks"))).unwrap_or(0);
-    let network = if params.contains(&"--testnet") { gnb::address::Network::Testnet } else { gnb::address::Network::Mainnet };
+    // CRY-7: `--testnet` reaches this function as `stated` (it was tested
+    // in `params`, where it never is: a testnet policy got a mainnet address).
+    let network = policy_network(stated);
     let policy = gnb::core::policy::SpendPolicy::new(m, keys, after, older)
         .unwrap_or_else(|e| die(&format!("invalid policy: {}", e)));
     println!("address: {}", gnb::address::PolicyAddress::from_policy(&policy, network));
@@ -971,11 +1059,14 @@ fn do_policy_address(params: &[&str]) {
     println!("Keep the policy hex: it is needed to spend, and the address alone does not reveal it.");
 }
 
-fn do_policy_spend(params: &[&str]) {
+fn do_policy_spend(params: &[&str], stated: Option<gnb::address::Network>) {
     let policy = gnb::core::policy::SpendPolicy::decode(&hex_arg(params[0]))
         .unwrap_or_else(|e| die(&format!("invalid policy: {}", e)));
-    let (network, to_script) = gnb::address::destination_script(params[1])
-        .unwrap_or_else(|_| die("invalid destination address"));
+    // CRY-7: the spend's network is the one stated (mainnet by default), not
+    // whatever the destination's prefix says; a destination of the other
+    // network is refused.
+    let network = policy_network(stated);
+    let to_script = destination_on(params[1], network, "destination address").unwrap_or_else(|e| die(&e));
     let amount = bloch_to_sats(params[2]);
     let fee = gnb::wallet::parse_bloch_satoshis(flag_value(params, "--fee").unwrap_or("0.0005"))
         .unwrap_or_else(|m| die(m));
@@ -1012,12 +1103,14 @@ fn print_spend_summary(spend: &gnb::wallet::policy_spend::PolicySpend) {
     println!("Signed by keys {:?} of {}-of-{}", spend.signers(), spend.policy.threshold, spend.policy.pubkeys.len());
 }
 
-fn do_policy_sign(params: &[&str]) {
+fn do_policy_sign(params: &[&str], stated: Option<gnb::address::Network>) {
     let text = std::fs::read_to_string(params[0]).unwrap_or_else(|e| die(&format!("read {}: {}", params[0], e)));
     let mut spend = gnb::wallet::policy_spend::PolicySpend::from_json(&text).unwrap_or_else(|e| die(&e));
     print_spend_summary(&spend);
     println!("Check the outputs above before signing.");
-    let kp = load_keypair(params[1]);
+    // CRY-7: the signing keystore is opened for the spend's network.
+    require_stated(stated, spend.network, params[0]);
+    let kp = load_keypair(params[1], Some(spend.network));
     // Sighash v2 (version 1) or v3 (version 3, from the hardening
     // activation): the spend file fixes which.
     let idx = spend.sign_digest(&kp.public_key, |d, v| kp.sign_tx_digest(d, v)).unwrap_or_else(|e| die(&e));
@@ -1066,9 +1159,11 @@ fn utxo_args(params: &[&str]) -> Vec<([u8; 32], u32, u64)> {
     }).collect()
 }
 
-fn do_vault_create(params: &[&str]) {
+fn do_vault_create(params: &[&str], stated: Option<gnb::address::Network>) {
     let out = params[0];
-    let network = if params.contains(&"--testnet") { gnb::address::Network::Testnet } else { gnb::address::Network::Mainnet };
+    // CRY-7: `--testnet` reaches this function as `stated` (see
+    // do_policy_address).
+    let network = policy_network(stated);
     let section = |flag: &str| -> (u8, Vec<Vec<u8>>) {
         let start = params.iter().position(|p| *p == flag).unwrap_or_else(|| die(VAULT_CREATE_USAGE));
         let t: u8 = params.get(start + 1).and_then(|v| v.parse().ok()).unwrap_or_else(|| die(VAULT_CREATE_USAGE));
@@ -1087,13 +1182,16 @@ fn do_vault_create(params: &[&str]) {
     println!("Publish this file once; signers and users check the address against it.");
 }
 
-fn do_vault_lock(params: &[&str], target: &RpcTarget) {
+fn do_vault_lock(params: &[&str], target: &RpcTarget, stated: Option<gnb::address::Network>) {
     let vault = load_vault(params[1]);
+    require_stated(stated, vault.network(), params[1]);
     let amount = bloch_to_sats(params[2]);
     let l2: [u8; 20] = hex::decode(params[3].trim_start_matches("0x")).ok().and_then(|v| v.try_into().ok())
         .unwrap_or_else(|| die("L2 address must be 0x + 40 hex digits"));
     let fee = gnb::wallet::parse_bloch_satoshis(flag_value(params, "--fee").unwrap_or("0.0005")).unwrap_or_else(|m| die(m));
-    let keypair = load_keypair(params[0]);
+    // CRY-7: the paying keystore is opened for the vault's network, so the
+    // lock is signed for the chain the vault's signers watch.
+    let keypair = load_keypair(params[0], Some(vault.network()));
     let utxos = rpc_call(target, "getutxos", &serde_json::json!([keypair.address, 50]))
         .unwrap_or_else(|e| die(&format!("RPC: {}", e)));
     // Only outputs spendable in the next block (mature coinbase outputs).
@@ -1173,10 +1271,14 @@ fn burn_id_arg(s: &str) -> [u8; 32] {
         .unwrap_or_else(|| die("burn id must be 32-byte hex"))
 }
 
-fn do_vault_release(params: &[&str]) {
+fn do_vault_release(params: &[&str], stated: Option<gnb::address::Network>) {
     let vault = load_vault(params[0]);
+    require_stated(stated, vault.network(), params[0]);
     let burn = burn_id_arg(params[1]);
-    let (network, recipient) = gnb::address::destination_script(params[2]).unwrap_or_else(|_| die("invalid recipient"));
+    // CRY-7: the release is on the vault's network; a recipient of the other
+    // network is refused.
+    let network = vault.network();
+    let recipient = destination_on(params[2], network, "recipient").unwrap_or_else(|e| die(&e));
     let burn_amount: u64 = params[3].parse().unwrap_or_else(|_| die("burn amount in base units"));
     let out = flag_value(params, "--out").unwrap_or_else(|| die("--out spend.json is required"));
     let inputs = utxo_args(params);
@@ -1203,13 +1305,19 @@ fn do_vault_release(params: &[&str]) {
         out, payout, fee, spend.policy.threshold);
 }
 
-fn do_vault_check_release(params: &[&str], target: &RpcTarget) {
+fn do_vault_check_release(params: &[&str], target: &RpcTarget, stated: Option<gnb::address::Network>) {
     let vault = load_vault(params[0]);
+    require_stated(stated, vault.network(), params[0]);
     let text = std::fs::read_to_string(params[1]).unwrap_or_else(|e| die(&format!("read {}: {}", params[1], e)));
     let spend = gnb::wallet::policy_spend::PolicySpend::from_json(&text).unwrap_or_else(|e| die(&e));
     let burn = burn_id_arg(params[2]);
     let verdict = (|| -> Result<serde_json::Value, String> {
-        let (_, recipient) = gnb::address::destination_script(params[3]).map_err(|_| "invalid recipient")?;
+        // CRY-7: the recipient must be an address of the vault's network, and
+        // so must the spend.
+        let recipient = destination_on(params[3], vault.network(), "recipient")?;
+        if spend.network != vault.network() {
+            return Err(format!("the spend is for {:?}, the vault for {:?}", spend.network, vault.network()));
+        }
         let burn_amount: u64 = params[4].parse().map_err(|_| "burn amount")?;
         if spend.tree.as_ref().map(|(_, b)| *b) != Some(gnb::bridge::RELEASE_BRANCH)
             || spend.locking_script() != vault.script()? {
@@ -1238,9 +1346,12 @@ fn do_vault_check_release(params: &[&str], target: &RpcTarget) {
     }
 }
 
-fn do_vault_recover(params: &[&str]) {
+fn do_vault_recover(params: &[&str], stated: Option<gnb::address::Network>) {
     let vault = load_vault(params[0]);
-    let (network, dest) = gnb::address::destination_script(params[1]).unwrap_or_else(|_| die("invalid destination"));
+    require_stated(stated, vault.network(), params[0]);
+    // CRY-7: the recovery is on the vault's network.
+    let network = vault.network();
+    let dest = destination_on(params[1], network, "destination").unwrap_or_else(|e| die(&e));
     let amount = bloch_to_sats(params[2]);
     let out = flag_value(params, "--out").unwrap_or_else(|| die("--out spend.json is required"));
     let spend = gnb::wallet::policy_spend::PolicySpend::new_branch(network, vault.tree().unwrap_or_else(|e| die(&e)),
@@ -1389,11 +1500,19 @@ fn print_usage() {
                                            private CA or self-signed certificate)
     --allow-large-hd-wallet                Trusted-backup recovery (up to 512 MiB)
     --testnet                              New wallets are testnet (newwallet,
-                                           restorewallet, newseed); for send: the
-                                           keystore must be a testnet key
-    --mainnet                              For send: the keystore must be a mainnet
-                                           key. A v2 keystore needs --mainnet or
-                                           --testnet and is rewritten as v3 (CRY-7)
+                                           restorewallet, newseed); for send,
+                                           keyinfo, importfounder, pubkey: the
+                                           keystore must be a testnet key;
+                                           policyaddress, policyspend and
+                                           vaultcreate work on testnet
+    --mainnet                              For send, keyinfo, importfounder,
+                                           pubkey: the keystore must be a mainnet
+                                           key. A v2 keystore (which authenticates
+                                           no network) opens only with --mainnet
+                                           or --testnet; send rewrites it as v3.
+                                           policysign / vaultlock open the
+                                           keystore for the spend's / vault's
+                                           network (CRY-7)
     GNB_RPC_API_KEY=<key>                  Sent over https to any host; over plain
                                            http only to loopback (or SSH tunnel)
     --help                                 This message
@@ -1479,5 +1598,33 @@ mod audit_send_inputs {
         assert!(rejected.contains("--allow-large-hd-wallet"));
         assert_eq!(read_public_hd_wallet(path_str, true).unwrap().addresses.len(), 1025);
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// CRY-7 on main's policy and vault commands: their network is the one
+    /// stated (`--testnet` / `--mainnet`, which `main`'s parser consumes, so
+    /// a test of `params` never saw it and a testnet policy address or vault
+    /// came out as mainnet), mainnet by default; a destination of the other
+    /// network is refused. A single-key address's checksum does not cover
+    /// its prefix, so `gnb1t…` with a mainnet hash parses: the network check
+    /// is the only thing that stops a mistyped prefix.
+    #[test]
+    fn policy_and_vault_destinations_must_be_on_the_spends_network() {
+        use gnb::address::{Address, Network, PolicyAddress};
+        assert_eq!(policy_network(None), Network::Mainnet);
+        assert_eq!(policy_network(Some(Network::Testnet)), Network::Testnet);
+        let main = Address::from_hash([0x11; 20], Network::Mainnet).to_string();
+        let test = Address::from_hash([0x11; 20], Network::Testnet).to_string();
+        assert_eq!(destination_on(&main, Network::Mainnet, "recipient").unwrap(), vec![0x11; 20]);
+        let err = destination_on(&test, Network::Mainnet, "recipient").unwrap_err();
+        assert!(err.contains("Testnet") && err.contains("Mainnet"), "{err}");
+        assert!(destination_on(&main, Network::Testnet, "recipient").is_err());
+        let keys: Vec<Vec<u8>> = (0..2).map(|_| gnb::crypto::generate_keypair().0).collect();
+        let policy = gnb::core::policy::SpendPolicy::new(1, keys, 0, 0).unwrap();
+        let pm = PolicyAddress::from_policy(&policy, Network::Mainnet).to_string();
+        let pt = PolicyAddress::from_policy(&policy, Network::Testnet).to_string();
+        assert_eq!(destination_on(&pm, Network::Mainnet, "destination").unwrap(), policy.script_pubkey());
+        assert!(destination_on(&pt, Network::Mainnet, "destination").is_err());
+        assert_eq!(destination_on(&pt, Network::Testnet, "destination").unwrap(), policy.script_pubkey());
+        assert!(destination_on("gnb1zz", Network::Mainnet, "destination").is_err());
     }
 }

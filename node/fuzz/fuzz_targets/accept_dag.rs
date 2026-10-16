@@ -113,6 +113,7 @@ fn genesis() -> Block {
         blue_score: 0,
         height: 0,
         shielded_transactions: vec![],
+        powit: Default::default(),
     }
 }
 
@@ -291,6 +292,7 @@ fn build(inp: &mut Input, genesis: &Block) -> Vec<Built> {
             blue_score: header_height,
             height: header_height,
             shielded_transactions: vec![],
+            powit: Default::default(),
         };
         if hardened {
             let c = block_rules::expected_coinbase_commitment(&b);

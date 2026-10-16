@@ -9,6 +9,15 @@ import { loadCore, splitByMaturity, spendableWindow, COINBASE_MATURITY } from ".
 
 const wasm = readFileSync(new URL("../wallet/gnb_wallet.wasm", import.meta.url));
 const pin = readFileSync(new URL("../wallet/app.js", import.meta.url), "utf8").match(/^const WASM_SHA256 = "([0-9a-f]{64})";$/m)[1];
+// The mainnet hardening activation height, read from the consensus source
+// (never a literal here): the core compiles it in, so a core built before the
+// height moved fails the activation test below until it is rebuilt.
+const MAINNET_ACTIVATION = (() => {
+  const rust = readFileSync(new URL("../../crates/gnb-crypto/src/core/activation.rs", import.meta.url), "utf8");
+  const m = rust.match(/pub const MAINNET_HARDENING_ACTIVATION_HEIGHT:\s*u64\s*=\s*([0-9_]+);/);
+  assert.ok(m, "MAINNET_HARDENING_ACTIVATION_HEIGHT not found in crates/gnb-crypto/src/core/activation.rs");
+  return Number(m[1].replaceAll("_", ""));
+})();
 globalThis.fetch = async () => new Response(wasm);
 
 test("loadCore refuses a missing or wrong pin", async () => {
@@ -32,8 +41,9 @@ test("phrase-backed wallet, plan, verified pay and the actual fee", async () => 
     { txid: "22".repeat(32), index: 0, value: "20000000", script_pubkey: spk },
   ];
   const dest = core.normalize(created.address); // own address is a valid destination
-  // Mainnet, next block far below the hardening activation (110,000): version 1.
+  // Mainnet, next block far below the hardening activation: version 1.
   const next = 12;
+  assert.ok(next < MAINNET_ACTIVATION);
   const plan = core.plan(utxos, dest, "100000000", "0", next);
   assert.equal(plan.version, 1);
   assert.deepEqual(plan.prev_txids, ["11".repeat(32)], "one covering input, not the small one");
@@ -58,9 +68,11 @@ test("from the activation height the core signs version 3 and fetches nothing", 
   const spk = created.address.slice(5, 45);
   const utxos = [{ txid: "33".repeat(32), index: 1, value: "500000000", script_pubkey: spk }];
   const dest = core.normalize(created.address);
-  const activation = 110000;
+  const activation = MAINNET_ACTIVATION;
   const plan = core.plan(utxos, dest, "100000000", "0", activation);
-  assert.equal(plan.version, 3);
+  assert.equal(plan.version, 3,
+    `the committed core does not activate at ${activation} (MAINNET_HARDENING_ACTIVATION_HEIGHT): ` +
+    "it was built with another height; rebuild and re-pin it (scripts/build-wallet-wasm.sh)");
   assert.deepEqual(plan.prev_txids, [], "a version-3 signature commits every spent value");
   const tx = core.pay(utxos, dest, "100000000", "0", activation, {});
   assert.equal(tx.version, 3);

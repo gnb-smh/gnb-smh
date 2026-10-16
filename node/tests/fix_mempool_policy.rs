@@ -184,12 +184,19 @@ fn mem5_verdict_mapping_rejects_only_consensus_invalid() {
 }
 
 /// Signatures are verified LAST and charged to the delivering connection's
-/// budget (one token per input, all-or-nothing): cheap failures cost
-/// nothing; a connection out of budget is ignored without any signature
+/// budget (all-or-nothing): cheap failures cost nothing but their frame's
+/// decoding; a connection out of budget is ignored without any signature
 /// work and the transaction stays admissible from another connection.
 /// Review finding: the tokens are REFUNDED when the transaction enters the
-/// pool, so only verification that did not lead to admission is charged
-/// (pre-fix an honest relay forwarding valid traffic spent its budget).
+/// pool, so only work that did not lead to admission is charged (pre-fix an
+/// honest relay forwarding valid traffic spent its budget).
+///
+/// Phase 4 (B1-T19): the gate used to cost one token per input, whatever
+/// the bytes the sighash v2 digests hash (`fix_ingress_dos::
+/// b1t19_gate_is_priced_in_bytes_hashed`); it is now priced in signatures
+/// AND bytes hashed (`relay::signature_gate_cost`), and every frame's
+/// decoding is charged first (`relay::frame_cost`). The budgets below are
+/// sized with those functions; the behaviour checked is unchanged.
 #[test]
 fn mem5_signature_work_is_last_and_budgeted_per_connection() {
     let genesis = mk_genesis(unix_now() - 10_000);
@@ -197,41 +204,63 @@ fn mem5_signature_work_is_last_and_budgeted_per_connection() {
     let funds: Vec<_> = (0..10u8).map(|i| ([0x70 + i; 32], 0u32, out(1_000_000, &k.spk))).collect();
     let n = node_with(&genesis, &funds);
     let next = admission::next_block_height(&n.dag.read());
-    // Penalties in force (see mem5_gossip_tx_verdicts_follow_admission).
-    let mut relay = TxRelay::with_limits(3, 0.0, OrphanLimits::default()).with_penalty_height(0);
-    let (a, b) = (Some(PeerId::random()), Some(PeerId::random()));
-    let t0 = Instant::now();
-    let go = |relay: &mut TxRelay, tx: &Transaction, p: Option<PeerId>| {
-        relay.on_gossip_tx(&n.store, &n.mempool, next, &tx.txid(), &wire(tx), p, t0, unix_now())
-    };
+    let act = core::activation::hardening_activation_height();
+    let frame = |t: &Transaction| relay::frame_cost(wire(t).len());
+    let gate = |t: &Transaction| relay::signature_gate_cost(t, wire(t).len(), next, act);
     let bad_last = |inputs: &[([u8; 32], u32)], v: u64, tag: u8| {
         let mut t = signed_spend(&k, inputs, vec![out(v, &[tag; 20])]);
         let last = t.inputs.len() - 1;
         t.inputs[last].script_sig[10] ^= 0xFF;
         t
     };
-
     // Three transactions below the consensus minimum fee (fee 1 sat), each
-    // also badly signed: refused at the fee step, signatures never touched.
-    for i in 0..3u8 {
-        let mut cheap = signed_spend(&k, &[(funds[0].0, 0)], vec![out(999_999 - i as u64, &[0x10 + i; 20])]);
-        cheap.inputs[0].script_sig[10] ^= 0xFF;
-        let o = go(&mut relay, &cheap, a);
+    // also badly signed.
+    let cheap: Vec<Transaction> = (0..3u8).map(|i| {
+        let mut c = signed_spend(&k, &[(funds[0].0, 0)], vec![out(999_999 - i as u64, &[0x10 + i; 20])]);
+        c.inputs[0].script_sig[10] ^= 0xFF;
+        c
+    }).collect();
+    let three = signed_spend(&k, &[(funds[1].0, 0), (funds[2].0, 0), (funds[3].0, 0)], vec![out(2_900_000, &[0x20; 20])]);
+    let one = signed_spend(&k, &[(funds[4].0, 0)], vec![out(900_000, &[0x21; 20])]);
+    let bad = bad_last(&[(funds[5].0, 0), (funds[6].0, 0), (funds[7].0, 0)], 2_900_000, 0x22);
+    let next_one = signed_spend(&k, &[(funds[8].0, 0)], vec![out(900_000, &[0x23; 20])]);
+    let b1 = bad_last(&[(funds[9].0, 0)], 900_000, 0x24);
+    let b2 = bad_last(&[(funds[5].0, 0), (funds[6].0, 0)], 1_900_000, 0x25);
+    let b3 = bad_last(&[(funds[7].0, 0)], 880_000, 0x26);
+    let cost = |t: &Transaction| frame(t) + gate(t);
+    // Every connection's budget: the three cheap frames' decoding plus one
+    // 3-input verification.
+    let spent_cheap: usize = cheap.iter().map(frame).sum();
+    let budget = spent_cheap + cost(&three);
+    assert!(spent_cheap + cost(&bad) <= budget && spent_cheap + cost(&bad) + cost(&next_one) > budget,
+        "A: the invalid 3-input transaction fits once, then nothing");
+    assert!(cost(&b1) + cost(&b2) <= budget && cost(&b1) + cost(&b2) + cost(&b3) > budget,
+        "B: two invalid transactions fit, a third does not");
+    // Penalties in force (see mem5_gossip_tx_verdicts_follow_admission).
+    let mut relay = TxRelay::with_limits(budget as u32, 0.0, OrphanLimits::default())
+        .with_penalty_height(0)
+        .with_node_budget(1_000_000, 0.0);
+    let (a, b) = (Some(PeerId::random()), Some(PeerId::random()));
+    let t0 = Instant::now();
+    let go = |relay: &mut TxRelay, tx: &Transaction, p: Option<PeerId>| {
+        relay.on_gossip_tx(&n.store, &n.mempool, next, &tx.txid(), &wire(tx), p, t0, unix_now())
+    };
+
+    // Refused at the fee step, signatures never touched (only the frames'
+    // decoding is charged).
+    for c in &cheap {
+        let o = go(&mut relay, c, a);
         assert_eq!(o.verdict, GossipVerdict::Reject);
         assert!(o.detail.contains("below consensus minimum"), "the fee error, not the signature: {}", o.detail);
     }
-    // A still has its full budget of 3: a 3-input transaction passes...
-    let three = signed_spend(&k, &[(funds[1].0, 0), (funds[2].0, 0), (funds[3].0, 0)], vec![out(2_900_000, &[0x20; 20])]);
+    // A still has the budget of one 3-input verification: it passes...
     assert_eq!(go(&mut relay, &three, a).verdict, GossipVerdict::Accept);
     // ... and, admitted, it was refunded: A still verifies another one.
-    let one = signed_spend(&k, &[(funds[4].0, 0)], vec![out(900_000, &[0x21; 20])]);
     let o = go(&mut relay, &one, a);
     assert_eq!(o.verdict, GossipVerdict::Accept, "refunded on admission: {}", o.detail);
     // A consensus-invalid 3-input transaction is charged in full.
-    let bad = bad_last(&[(funds[5].0, 0), (funds[6].0, 0), (funds[7].0, 0)], 2_900_000, 0x22);
     assert_eq!(go(&mut relay, &bad, a).verdict, GossipVerdict::Reject);
     // A's budget is now spent: the next transaction is ignored unverified.
-    let next_one = signed_spend(&k, &[(funds[8].0, 0)], vec![out(900_000, &[0x23; 20])]);
     let o = go(&mut relay, &next_one, a);
     assert_eq!(o.verdict, GossipVerdict::Ignore);
     assert!(o.detail.contains("budget"), "{}", o.detail);
@@ -240,14 +269,11 @@ fn mem5_signature_work_is_last_and_budgeted_per_connection() {
     assert!(!n.mempool.is_recently_rejected(&admission::wtxid(&next_one)), "not cached: it may be valid");
     // Another connection is unaffected.
     assert_eq!(go(&mut relay, &next_one, b).verdict, GossipVerdict::Accept);
-    // B pays for invalid signatures only: 1 + 2 tokens, then out of budget.
-    let b1 = bad_last(&[(funds[9].0, 0)], 900_000, 0x24);
+    // B pays for invalid signatures only: two of them, then out of budget.
     assert_eq!(go(&mut relay, &b1, b).verdict, GossipVerdict::Reject);
-    let b2 = bad_last(&[(funds[5].0, 0), (funds[6].0, 0)], 1_900_000, 0x25);
     assert_eq!(go(&mut relay, &b2, b).verdict, GossipVerdict::Reject);
-    let b3 = bad_last(&[(funds[7].0, 0)], 880_000, 0x26);
     let o = go(&mut relay, &b3, b);
-    assert_eq!(o.verdict, GossipVerdict::Ignore, "B spent 1 + 2 tokens: {}", o.detail);
+    assert_eq!(o.verdict, GossipVerdict::Ignore, "B spent its budget on b1 and b2: {}", o.detail);
     // A closed connection forgets its bucket (and its orphans).
     let tracked = relay.budgets_tracked();
     let ev = relay.on_peer_disconnected(a.unwrap());
@@ -433,18 +459,26 @@ fn mem5_orphan_quotas_and_budget_follow_the_connection_not_the_author() {
 
     // (b) The re-try signature work: five 3-input orphans with bad scripts,
     // under five fresh authors, all waiting on one cheap parent. A bucket
-    // of 10 verifies three of them (9 tokens); the other two wait.
+    // holding the five frames' decoding and three 3-input verifications
+    // (Phase 4, B1-T19: `relay::frame_cost`, `relay::signature_gate_cost`)
+    // verifies three of them; the other two wait.
     // Penalties in force: invalid re-tries are reported as `rejected`.
-    let mut relay = TxRelay::with_limits(10, 0.0, OrphanLimits::default()).with_penalty_height(0);
     let p = signed_spend(&k, &[(fund.0, 0)], (0..15).map(|_| out(600_000, &k.spk)).collect());
-    for j in 0..5u32 {
-        let t = junk_signed(&w, &[(p.txid(), 3 * j), (p.txid(), 3 * j + 1), (p.txid(), 3 * j + 2)], &[1_700_000], 0x60 + j as u8);
-        let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &t.txid(), &wire(&t), fresh_author_origin(attacker).peer(), t0, unix_now());
+    let junk: Vec<Transaction> = (0..5u32)
+        .map(|j| junk_signed(&w, &[(p.txid(), 3 * j), (p.txid(), 3 * j + 1), (p.txid(), 3 * j + 2)], &[1_700_000], 0x60 + j as u8))
+        .collect();
+    let act = core::activation::hardening_activation_height();
+    let frames: usize = junk.iter().map(|t| relay::frame_cost(wire(t).len())).sum();
+    let gate = relay::signature_gate_cost(&junk[0], wire(&junk[0]).len(), next, act);
+    assert!(junk.iter().all(|t| relay::signature_gate_cost(t, wire(t).len(), next, act) == gate));
+    let mut relay = TxRelay::with_limits((frames + 3 * gate) as u32, 0.0, OrphanLimits::default()).with_penalty_height(0);
+    for t in &junk {
+        let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &t.txid(), &wire(t), fresh_author_origin(attacker).peer(), t0, unix_now());
         assert!(o.orphaned, "{}", o.detail);
     }
     let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &p.txid(), &wire(&p), fresh_author_origin(honest).peer(), t0, unix_now());
     assert_eq!(o.verdict, GossipVerdict::Accept, "{}", o.detail);
-    assert_eq!(o.orphans.rejected.len(), 3, "one bucket: 3 × 3 input signatures, then out of budget");
+    assert_eq!(o.orphans.rejected.len(), 3, "one bucket: three 3-input verifications, then out of budget");
     assert!(o.orphans.rejected.iter().all(|r| r.peer == Some(attacker)));
     assert_eq!(relay.orphans().peer_usage(Some(attacker)).0, 2, "the rest wait for the connection's budget");
     // The honest connection paid nothing for its admitted parent.
@@ -979,16 +1013,23 @@ fn mem6_reorg_reinjects_a_cross_block_chain_parents_first() {
 /// order inside each block, coinbases skipped.
 #[test]
 fn mem6_disconnected_txs_are_ordered_oldest_block_first() {
-    let mk = |tag: &str, txs: Vec<Transaction>| Block {
-        header: BlockHeader { version: 1, parents: vec![[0; 32]], merkle_root: MerkleRoot::ZERO, timestamp: 0, bits: 0, nonce: 0 },
+    let mk = |tag: &str, nonce: u64, txs: Vec<Transaction>| Block {
+        header: BlockHeader { version: 1, parents: vec![[0; 32]], merkle_root: MerkleRoot::ZERO, timestamp: 0, bits: 0, nonce },
         transactions: std::iter::once(coinbase(tag, 1, vec![1; 20])).chain(txs).collect(),
         blue_score: 0, height: 0, shielded_transactions: vec![],
         powit: Default::default(),
     };
     let (a, b, c, d) = (syn(&[(ext(1), 0)], &[9], 1, 4), syn(&[(ext(2), 0)], &[9], 2, 4), syn(&[(ext(3), 0)], &[9], 3, 4), syn(&[(ext(4), 0)], &[9], 4, 4));
-    // `disconnected` is tip-first: [B2 (c, d), B1 (a, b)].
-    let outcome = reorg::ConnectOutcome { disconnected: vec![mk("b2", vec![c.clone(), d.clone()]), mk("b1", vec![a.clone(), b.clone()])], ..Default::default() };
-    let ids: Vec<_> = outcome.disconnected_txs_oldest_first().iter().map(|t| t.txid()).collect();
+    // `disconnected` is tip-first: [B2 (c, d), B1 (a, b)]; the outcome lists
+    // hashes and the bodies are read back from storage (R4, B2-T0).
+    let (b2, b1) = (mk("b2", 2, vec![c.clone(), d.clone()]), mk("b1", 1, vec![a.clone(), b.clone()]));
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = gnb::storage::Storage::open(tmp.path()).unwrap();
+    store.put_block_body(&b2).unwrap();
+    store.put_block_body(&b1).unwrap();
+    let outcome = reorg::ConnectOutcome { disconnected: vec![b2.block_hash(), b1.block_hash()], ..Default::default() };
+    let ids: Vec<_> = outcome.reinjection_candidates(&store, reorg::MAX_DISCONNECTED_TX_POOL_BYTES)
+        .txs.iter().map(|t| t.txid()).collect();
     assert_eq!(ids, vec![a.txid(), b.txid(), c.txid(), d.txid()]);
 }
 
@@ -1403,13 +1444,12 @@ fn orphan_bookkeeping_follows_the_applied_chain_only() {
         accept_block_tracking(b, b.block_hash(), b.height, &n.dag, &n.store, &n.mempool, &n.node_state,
             Some(&n.tip_tx), &n.shielded, m)
     };
-    let hashes = |v: &[Block]| v.iter().map(|b| b.block_hash()).collect::<Vec<_>>();
 
     // The applied chain G -> A1 -> A2; an extension is reported as such.
     let a1 = empty_child(&n, gh, "a1");
     let mut m = ChainMove::default();
     track(&a1, &mut m).unwrap();
-    assert_eq!((hashes(&m.connected), m.disconnected.len()), (vec![a1.block_hash()], 0));
+    assert_eq!((m.connected(), m.disconnected().len()), (vec![a1.block_hash()], 0));
     let a2 = empty_child(&n, a1.block_hash(), "a2");
     track(&a2, &mut ChainMove::default()).unwrap();
 
@@ -1430,7 +1470,7 @@ fn orphan_bookkeeping_follows_the_applied_chain_only() {
     track(&f1, &mut m).expect("accepted into the DAG");
     assert_eq!(applied_tip(&n), Some(a2.block_hash()));
     assert!(m.is_empty(), "a fork-loser applies none of its transactions");
-    let ev = relay.on_chain_moved(&n.store, &n.mempool, next, &m.connected_txs(), &m.disconnected_txs(), t0, unix_now());
+    let ev = relay.on_chain_moved(&n.store, &n.mempool, next, &m.connected_txs(&n.store), &m.disconnected_txs(&n.store), t0, unix_now());
     assert!(ev.is_empty(), "{ev:?}");
     assert!(relay.orphans().contains(&admission::wtxid(&c)), "C is still valid: P's input is unspent");
     // (The pre-fix call, the arriving block's transactions, erased it.)
@@ -1452,23 +1492,23 @@ fn orphan_bookkeeping_follows_the_applied_chain_only() {
     let f3 = empty_child(&n, f2.block_hash(), "f3");
     track(&f3, &mut m).unwrap();
     assert_eq!(applied_tip(&n), Some(f3.block_hash()));
-    assert_eq!(hashes(&m.connected), vec![f1.block_hash(), f2.block_hash(), f3.block_hash()]);
-    assert_eq!(hashes(&m.disconnected), vec![a2.block_hash(), a1.block_hash()]);
-    assert_eq!(m.connected_txs().iter().filter(|t| !t.is_coinbase()).map(|t| t.txid()).collect::<Vec<_>>(),
+    assert_eq!(m.connected(), vec![f1.block_hash(), f2.block_hash(), f3.block_hash()]);
+    assert_eq!(m.disconnected(), vec![a2.block_hash(), a1.block_hash()]);
+    assert_eq!(m.connected_txs(&n.store).iter().filter(|t| !t.is_coinbase()).map(|t| t.txid()).collect::<Vec<_>>(),
         vec![p.txid(), c.txid()]);
     assert_eq!(n.mempool.size(), 0, "P and C confirmed by F1");
 
     // A plan undone by a later one cancels out.
     let mut m = ChainMove::default();
-    m.record(reorg::ConnectOutcome { connected: vec![a1.clone(), a2.clone()], ..Default::default() });
-    m.record(reorg::ConnectOutcome { disconnected: vec![a2.clone()], connected: vec![f2.clone()], ..Default::default() });
-    assert_eq!(hashes(&m.connected), vec![a1.block_hash(), f2.block_hash()]);
-    assert!(m.disconnected.is_empty());
+    m.record(&reorg::ConnectOutcome { connected: vec![a1.block_hash(), a2.block_hash()], ..Default::default() });
+    m.record(&reorg::ConnectOutcome { disconnected: vec![a2.block_hash()], connected: vec![f2.block_hash()], ..Default::default() });
+    assert_eq!(m.connected(), vec![a1.block_hash(), f2.block_hash()]);
+    assert!(m.disconnected().is_empty());
     // DAG-6: a block rolled back from its undo record alone (body pruned)
     // has no transactions to report; it only cancels its earlier connect.
-    m.record(reorg::ConnectOutcome { disconnected_pruned: vec![f2.block_hash()], ..Default::default() });
-    assert_eq!(hashes(&m.connected), vec![a1.block_hash()]);
-    assert!(m.disconnected.is_empty());
+    m.record(&reorg::ConnectOutcome { disconnected_pruned: vec![f2.block_hash()], ..Default::default() });
+    assert_eq!(m.connected(), vec![a1.block_hash()]);
+    assert!(m.disconnected().is_empty());
 }
 
 /// Review finding (getblocktemplate x CPFP): since ancestor-package
@@ -1674,7 +1714,7 @@ impl Sim {
         self.pruned_rollbacks += plan.to_rollback.iter()
             .filter(|h| !self.store.has_block_body(h).unwrap())
             .count();
-        let validate = |_: &dyn UtxoView, _: &Block| -> Result<(), String> { Ok(()) };
+        let validate = |_: &dyn UtxoView, _: &Block| -> Result<(), reorg::ValidationFailure> { Ok(()) };
         let stage = |st: &Storage, b: &mut rocksdb::WriteBatch| -> Result<(), String> {
             st.stage_meta(b, "tip_hash", &new_tip).map_err(|e| e.to_string())
         };

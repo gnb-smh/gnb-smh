@@ -153,7 +153,6 @@ fn genesis_header_digests_match_the_python_reference() {
         hex::encode(g.header.pow_preimage()),
         "01000000000000006af2543ab67b047d3ef1d63c7141fd308cf9c8b96e223d8ce9ecdc1b7db8190d10f4ca6a0000000036900e1f"
     );
-    assert_eq!(hex::encode(g.header.dag_hash()), "4604d53d596a9d3f394d0d662e8dba94793f3c0b1abcf6ae1ef4a0ccced214fe");
     assert_eq!(hex::encode(g.block_hash()), "a63fd2c124cf34312d2730609204dc3071b8924e24d54f938cf738968fb8f810");
     let pow = g.header.pow_hash(0);
     assert_eq!(hex::encode(pow), "00009bf116a2451ac6af9a11c2ff40808efe96abf4238feb084596826e516682");
@@ -208,6 +207,84 @@ fn pow_cache_is_a_bounded_fifo() {
     assert_eq!((c.set.len(), c.order.len()), (POW_CACHE_CAPACITY, POW_CACHE_CAPACITY));
     assert!(!c.set.contains(&id(0)), "the oldest id is evicted");
     assert!(c.set.contains(&id(1)) && c.set.contains(&id(POW_CACHE_CAPACITY)));
+}
+
+/// Audit POW-9 (residual): `validate_pow` refuses a NON-CANONICAL compact
+/// encoding before any evaluation, even when the proof meets the target it
+/// decodes to. `0x21007fff` decodes (Bitcoin Core's `SetCompact` semantics,
+/// which `try_bits_to_target` keeps) to `0x7fff << 240`, whose canonical
+/// encoding is `0x207fff00`. About one nonce in two meets that target.
+#[test]
+fn non_canonical_bits_never_validate() {
+    let _g = activation::scoped_override(activation::NEVER);
+    const NON_CANONICAL: u32 = 0x2100_7FFF;
+    const CANONICAL: u32 = 0x207F_FF00;
+    let t = gnb_smh::difficulty::try_bits_to_target(NON_CANONICAL).expect("decodes");
+    assert_eq!(gnb_smh::difficulty::target_to_bits(&t), CANONICAL);
+    assert_eq!(gnb_smh::difficulty::try_bits_to_target(CANONICAL), Ok(t), "same target");
+    assert!(!gnb_smh::difficulty::is_canonical_bits(NON_CANONICAL));
+    assert!(gnb_smh::difficulty::is_canonical_bits(CANONICAL));
+    let mut b = valid_block(1, vec![[0x22; 32]], 20, vec![], activation::NEVER);
+    b.header.bits = NON_CANONICAL;
+    // A nonce whose GnB-SMH output meets the decoded target.
+    let nonce = (0..64u64)
+        .find(|&n| {
+            b.header.nonce = n;
+            hash_meets_target(&b.header.pow_hash(b.height), &t.0)
+        })
+        .expect("half of all nonces meet a 2^255 target");
+    b.header.nonce = nonce;
+    assert!(!b.validate_pow(), "non-canonical bits must not validate (nonce {nonce})");
+    assert_eq!(b.validate_structure(), Err("invalid PoW"));
+    // The canonical encoding of the same target validates with a nonce of its own.
+    b.header.bits = CANONICAL;
+    assert!((0..64u64).any(|n| {
+        b.header.nonce = n;
+        b.validate_pow()
+    }));
+}
+
+/// Why the canonical requirement changes no verdict: every block must carry
+/// `bits == expected_bits(...)` (checked before the proof), and
+/// `expected_bits` encodes with `target_to_bits`, whose output is always
+/// canonical. Checked over the whole schedule's range of targets (every
+/// exponent, random mantissas, both activation regimes, both proofs of work)
+/// and the constants.
+#[test]
+fn expected_bits_are_always_canonical() {
+    use gnb_smh::difficulty::{is_canonical_bits, target_to_bits, Target};
+    for bits in [POW_LIMIT_BITS, GENESIS_BITS, block_rules::HARDENED_POW_LIMIT_BITS] {
+        assert!(is_canonical_bits(bits), "{bits:#x}");
+    }
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+    for _ in 0..20_000 {
+        let mut t = [0u8; 32];
+        let first = (next() % 32) as usize;
+        for b in t.iter_mut().skip(first) {
+            *b = next() as u8;
+        }
+        if t == [0u8; 32] {
+            continue;
+        }
+        let bits = target_to_bits(&Target(t));
+        assert!(is_canonical_bits(bits), "target_to_bits({}) = {bits:#x} is not canonical", hex::encode(t));
+    }
+    // Both proofs of work: from POWIT_HEIGHT_MAINNET the ASERT bits are
+    // shifted for GnB-SMH v3 (`adjust_bits_for_algo`), re-encoded with
+    // `target_to_bits` too.
+    let switch = POWIT_HEIGHT_MAINNET;
+    let heights = [1u64, 2, 1_000, switch - 1, switch, switch + 1, 500_000];
+    assert_eq!(pow_algo(switch), gnb_smh::Algo::V3, "the node chain id of the tests is mainnet's");
+    for (act, heights) in [(0u64, heights), (activation::NEVER, heights)] {
+        for h in heights {
+            for dt in [-1_000_000i64, -7_200, -30, 0, 30, 7_200, 1_000_000, 50_000_000] {
+                let ts = (GENESIS_TIMESTAMP as i64 + 30 * h as i64 + dt).max(0) as u64;
+                let bits = expected_bits_at(ts, h, act).expect("in range");
+                assert!(is_canonical_bits(bits), "expected_bits_at({ts}, {h}, {act}) = {bits:#x}");
+            }
+        }
+    }
 }
 
 // ── Coinbase, dust, duplicates, timestamps, fees, maturity ───────────────────
@@ -335,6 +412,63 @@ fn block_size_limit_is_inclusive_under_both_measures() {
         if hardened {
             assert_eq!(block_rules::check_block_hardened_at(&at, activation), Ok(()));
             assert_eq!(block_rules::check_block_hardened_at(&over, activation), Err("block too large"));
+        }
+    }
+}
+
+/// Re-audit B1-T0 / B2-T8: the block id does not commit to `blue_score`, and
+/// the node replaces the received value before it stores and serves a body
+/// (POW-8). The size verdict of a block id must therefore be the same for
+/// every `blue_score` a copy can carry (under the audit's bincode measure a
+/// block of exactly `MAX_BLOCK_SIZE` bytes with `blue_score` 0 was "too
+/// large" with 251 or more, a 3-, 5- or 9-byte varint). This chain measures
+/// the wire encoding in both regimes, where it is a fixed-width u64.
+#[test]
+fn size_verdict_does_not_depend_on_the_uncommitted_blue_score() {
+    let scores = [0u64, 1, 250, 251, 65_535, 65_536, 70_000, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX];
+    for activation in [activation::NEVER, 0] {
+        let at = block_of_size(MAX_BLOCK_SIZE, 1, activation);
+        let over = block_of_size(MAX_BLOCK_SIZE + 1, 1, activation);
+        for &bs in &scores {
+            let (mut a, mut o) = (at.clone(), over.clone());
+            a.blue_score = bs;
+            o.blue_score = bs;
+            assert_eq!(a.block_hash(), at.block_hash(), "the id does not commit to blue_score");
+            assert_eq!(a.validate_structure_without_pow_at(activation), Ok(()), "activation {activation}, blue_score {bs}");
+            assert_eq!(o.validate_structure_without_pow_at(activation), Err("block too large"),
+                "activation {activation}, blue_score {bs}");
+            assert_eq!(block_rules::check_block_size_at(&a, activation), Ok(()));
+            assert_eq!(block_rules::check_block_size_at(&o, activation), Err("block too large"));
+        }
+    }
+}
+
+/// `legacy_block_size` (the measure below the activation) is the length of
+/// the wire encoding, `to_wire_bytes().len()`, whatever the `blue_score` (the
+/// same as with it written as 0), the PoWit section included from
+/// `powit_height()` (main's 45c9c97: what this chain's nodes measure), and
+/// equal to the hardened measure `wire_size()`.
+#[test]
+fn legacy_block_size_is_the_wire_length_whatever_the_blue_score() {
+    // The PoWit activation of this test binary (`powit_pow_tests`).
+    let powit = 1u64 << 40;
+    super::set_powit_height_override(powit).expect("one PoWit height per test binary");
+    for (height, n_shielded) in [(1u64, 0usize), (300, 2), (70_000, 1), (powit - 1, 0), (powit, 1)] {
+        let mut b = valid_block(height, vec![[2; 32], [3; 32]], 20, vec![spend_tx(4, &[1_000, 2_000])], activation::NEVER);
+        b.shielded_transactions = (0..n_shielded).map(|i| shielded(i as u8, 2, 1, 50)).collect();
+        let mut zero = b.clone();
+        zero.blue_score = 0;
+        let len0 = zero.to_wire_bytes().len();
+        let mut section = Vec::new();
+        b.powit.write_wire(&mut section);
+        let without_powit = len0 - if height >= powit { section.len() } else { 0 };
+        assert_eq!(height >= powit, len0 > without_powit, "the PoWit section is counted from powit_height");
+        for bs in [0u64, 1, 250, 251, 0xFFFF, 0x1_0000, 0xFFFF_FFFF, 0x1_0000_0000, u64::MAX] {
+            b.blue_score = bs;
+            assert_eq!(block_rules::legacy_block_size(&b), len0, "height {height}, blue_score {bs}");
+            assert_eq!(b.to_wire_bytes().len(), len0);
+            assert_eq!(block_rules::block_size_for_rules(&b, false), len0);
+            assert_eq!(block_rules::block_size_for_rules(&b, true), len0);
         }
     }
 }

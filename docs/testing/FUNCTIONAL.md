@@ -54,6 +54,24 @@ with this binary, and those rules are covered by Rust tests only. Everything
 else is the production code path, including the evaluation itself, which
 every node still runs for every block.
 
+Because every node test (`cargo test -p gnb`) is built with the same feature,
+the node's own difficulty call sites (`accept_block`'s height and parent
+timestamp, the template's bits, the ingress orphan floor as
+`BlockIngress::handle_block` computes it from the selected tip's height) are exercised with
+the real ASERT rule by `node/tests/fix_pow_real_asert.rs` (re-audit POW-5):
+the test-only seam `core::scoped_real_expected_bits()`, compiled only with
+this feature, makes `expected_bits` compute the real rule on the calling
+thread, and the tests reject bits computed for the wrong height or parent
+timestamp. The GnB-SMH v3 switch (`core::adjust_bits_for_algo`: from
+`powit_height()`, 10,000 on mainnet, the ASERT target is 4x harder) is
+covered twice: at the mainnet height for the rule and the ingress reference
+(`expected_bits_switch_to_v3_at_the_mainnet_powit_height`), and at the call
+sites by `node/tests/fix_pow_real_asert_v3.rs`, a binary that moves the
+switch to height 3 (`core::set_powit_height_override`) so that
+`accept_block`, the template and `handle_block` judge the first v3 block
+(its unshifted v1 bits are refused, the template carries the shifted bits,
+an orphan at the v1 floor is dropped).
+
 The feature is consensus-breaking, so it is fenced in four ways:
 
 | Guard | Where | What it checks |
@@ -187,6 +205,8 @@ types the password at the prompt, exactly as a user would:
 | `feature_restart_persistence.py` | 2 | Stop/start keeps tip, tips, heights, block hashes, balances, tx index and P2P identity; the mempool is memory-only by design and a re-broadcast re-admits the transaction; SIGKILL right after a block is accepted loses nothing. |
 | `feature_invalidateblock.py` | 2 | Operator `invalidateblock` / `reconsiderblock` (DAG-6): invalidating the block that confirmed a payment rolls node0 back two blocks and re-admits the payment to its mempool while node1 keeps the blocks; `submitblock` of a block on the invalidated chain is refused; node0 mines a competing block (re-confirming the payment) that node1 stores as a fork block; the invalidation survives a restart; `reconsiderblock` re-qualifies the chain, including the descendant whose mark was inherited, moves node0 to it (1 block rolled back, 3 connected) and both nodes converge on the same chain state. |
 | `mining_getblocktemplate_submitblock.py` | 2 | External mining: template fields and coinbase commitment match the Python encoding; a Python-built block is accepted, relayed and becomes the template's parent at once (the cached template never outlives the tips); duplicates refused; a mempool transaction is offered with its fee within the 5 s template cache period; a coinbase claiming one satoshi too much is refused and not relayed; two blocks on one template are both kept and merged by the next template. |
+| `rpc_gettxoutsetinfo.py` | 2 | The supply audit (VAL-11): on the cached chain the UTXO set holds no more than carryover + the subsidy of every connected block, with one undo record per chain position and the scan agreeing with the maintained aggregates; a payment and its block leave the unclaimed amount unchanged (fees are not issuance); a coinbase claiming 1,234 sat less raises it by exactly that; both nodes report the same count, total and hash, also after a restart. |
+| `mining_full_template.py` | 2 | A full template mined externally (audit B1-T4): two fresh wallets with 40 coinbase outputs each pay 40-input hybrid-signed transactions (mempool above 0.6 MB); the block built from the template (above 600 kB, a `submitblock` body above the old 1 MiB cap) is accepted, confirms both, and is relayed. |
 | `rpc_auth.py` | 2 | `getblocktemplate`, `submitblock`, `sendrawtransaction` without or with a wrong key: 401 / -32001 and no effect; a wrong key is refused for reads too and answered slowly; the key works as `X-API-Key` and `Bearer`; browser Origin / foreign Host refused; batches refused; `gnb-cli` without the key cannot write; `GNB_RPC_REQUIRE_AUTH_FOR_READS=1`; start-up refusals (auth without key, loose or empty key file, short key). |
 | `p2p_invalid_blocks_txs.py` | 3 | Invalid transactions (malformed, coinbase, duplicate input, missing input, outputs above inputs, dust, version 1, forged signature, conflicts under full-RBF: one at T's fee rate fails the replacement rules before any signature work, one paying more fails the signature check; duplicate) and invalid blocks (malformed, bad / legacy Merkle root, every coinbase-commitment defect, no / two coinbases, duplicate tx, undecodable or unexpected bits, wrong height, unknown parent, timestamps, coinbase over-claim, two coinbase outputs, a confirmed tx again: BIP30) are rejected with the right reason and never move the tip. None of them is delivered to the observer node: checked on its receipt trace (every gossiped block is logged at info, every gossiped transaction with the debug target `gnb_gossip_rx_tx`), not on its storage, since the observer would drop most of them itself; the trace does show the valid transaction and blocks node0 relays. |
 | `feature_activation_testnet.py` | 2 | Testnet activation 0: the template announces the hardened rules at height 1; the pre-activation block format, and each half of the change alone, is rejected at height 1; the hardened block is accepted; blocks from the internal miner satisfy the rules, checked in Python. |
@@ -203,7 +223,9 @@ of failed tests.
   (`peer_count_counts_distinct_peers_not_connections`). The network
   heartbeat's first tick comes 30 s after start-up, so start-up does not
   re-dial the bootstrap peers it has just dialed
-  (`heartbeat_first_tick_is_one_period_after_start`).
+  (`heartbeat_first_tick_is_one_period_after_start`). From then on every
+  heartbeat re-dials each `--peer` that is not connected, whatever else is
+  connected (re-audit B1-T9: it used to happen only with no peer at all).
 - A disqualified block stays in the DAG and in `getdaginfo.tips` (DAG-1), but
   is never selected, never offered as a parent and never relayed.
 - The mempool is not persisted across restarts.
@@ -232,7 +254,7 @@ of failed tests.
   submit paths, which run the same `accept_block` and `admission::admit` as
   gossip ingress; the wire decoders are covered by `node/fuzz` and
   `node/tests`.
-- The mainnet side of the activation (110,000): unreachable by a build that
+- The mainnet side of the activation (17,500): unreachable by a build that
   refuses mainnet; covered by Rust tests with `activation::scoped_override`.
 - A target above the pow limit (POW-9, POW-3): the test build pins the pow
   limit to the largest encodable target, so no such block exists for it;

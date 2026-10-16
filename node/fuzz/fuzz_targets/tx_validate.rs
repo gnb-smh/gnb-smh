@@ -5,8 +5,16 @@
 //! would stop at "missing input"). Also checks the wire encoding round-trips.
 //! Must reject or accept, never panic.
 use libfuzzer_sys::fuzz_target;
-use gnb::core::{policy::PolicyWitness, Transaction, TxOutput};
+use gnb::core::{policy::PolicyWitness, tokenomics::SAT_PER_GNB, Transaction, TxOutput};
 use sha3::{Digest, Sha3_256};
+
+/// Value of every output in the view. Within the money range: an input worth
+/// more than `MAX_SUPPLY_SAT` (the earlier `u64::MAX / 4`) made
+/// `validate_tx_inputs` return "input overflow" at the first input, so no
+/// input ever reached the witness, policy or signature checks. The generated
+/// seeds (node/tests/fuzz_seed_corpus.rs, `TX_VALIDATE_SPENT_VALUE`) are
+/// signed against this value, so they pass every rule.
+const SPENT_VALUE: u64 = 1_000 * SAT_PER_GNB;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(tx) = Transaction::from_wire_bytes(data) else { return };
@@ -28,7 +36,7 @@ fuzz_target!(|data: &[u8]| {
         .collect();
     let utxo = |t: &[u8; 32], i: u32| -> Result<Option<TxOutput>, String> {
         Ok(views.iter().find(|(o, _)| *o == (*t, i))
-            .map(|(_, spk)| TxOutput { value: u64::MAX / 4, script_pubkey: spk.clone() }))
+            .map(|(_, spk)| TxOutput { value: SPENT_VALUE, script_pubkey: spk.clone() }))
     };
     let confirm = |_: &[u8; 32]| -> Result<Option<u64>, String> { Ok(Some(0)) };
     let ctx = gnb::blockval::SpendContext { height: 10_000_000, confirm_height: &confirm };

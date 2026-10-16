@@ -10,7 +10,7 @@ that command.
 | --- | --- | --- | --- |
 | `asan` | AddressSanitizer + LeakSanitizer over the test suites of `gnb-smh`, `gnb-crypto` (alone) and `pqcrypto-internals`, with the Rust code and the PQClean C code instrumented | `sanitizers` | pass; one leak report (in two tests, F1), fixed |
 | `ubsan` | UndefinedBehaviorSanitizer over the PQClean C code, under the `gnb-crypto` and `pqcrypto-internals` test suites | `sanitizers` | pass; no report |
-| `ubsan-noavx2` | the UBSan ML-DSA, wallet-signing and ACVP tests on qemu's Nehalem CPU (no AVX2), so the clean ML-DSA C code runs | `sanitizers` | pass; no report |
+| `ubsan-noavx2` | the UBSan ML-DSA, wallet-signing, ACVP and Wycheproof tests on qemu's Nehalem CPU (no AVX2): the same binaries on a second CPU, so a CPU-dependent ML-DSA verdict fails (F6) | `sanitizers` | pass; no report |
 | `ubsan-noavx2-full` | every `gnb-crypto` lib and integration test, under UBSan, on qemu's Nehalem CPU | `sanitizers` (nightly schedule and manual dispatch only) | pass; no report (363 tests) |
 | `miri` | Miri over the pure-Rust consensus arithmetic and the unsafe RNG override | `miri` | pass; no undefined behaviour |
 | `miri-cross` | Miri over `gnb-smh` (including the Python PoW vectors) on `i686` (32-bit) and `s390x` (big-endian), and over the wasm wallet's C ABI on `i686` | `miri` | pass |
@@ -42,8 +42,9 @@ timeout (the `miri` jobs of merge commit `299a718`, whose two `core::limits`
 cap tests build 10^5 to 10^6 elements, were still in their host step after
 115 minutes). Every Miri command therefore also runs under `timeout(1)`
 (`with_miri_timeout`, `SANITIZER_MIRI_TIMEOUT` seconds, default 1800, about
-six times the slowest command), which stops the whole process group and
-names the remedy, `cfg_attr(miri, ignore = "<why>")`. A test that calls the
+four times the slowest command, `gnb-smh` with its v2/v3 vectors), which
+stops the whole process group and names the remedy, `cfg_attr(miri, ignore =
+"<why>")` or a smaller input under `cfg(miri)`. A test that calls the
 PQClean C code needs the same attribute; it fails at once under Miri
 (unsupported foreign call) rather than hanging.
 
@@ -74,8 +75,8 @@ Configuration (all set by the script):
 The C code covered is every PQClean archive the build scripts produce: the
 vendored `pqcrypto-internals` common code (`fips202.c`, `aes.c`, `sha2.c`,
 `nistseedexpander.c`, `sp800-185.c`, the AVX2 `keccak4x`), and from the
-`pqcrypto-mldsa` / `pqcrypto-falcon` crates ML-DSA-44/65/87 (clean and AVX2)
-and Falcon-512/1024 (clean, padded and unpadded). After the tests the script
+`pqcrypto-mldsa` / `pqcrypto-falcon` crates ML-DSA-44/65/87 (clean; the AVX2
+archives too before F6) and Falcon-512/1024 (clean, padded and unpadded). After the tests the script
 checks that each of these archives references `__asan_report_*` and fails
 otherwise, so a build change that silently drops the C flags fails CI.
 `pqcrypto-mldsa` and `pqcrypto-falcon` cannot be tested as packages here
@@ -108,11 +109,12 @@ Limits:
 - Writes made by the kernel are invisible to ASan. With the same `len + 1`
   mutation, `default_behavior_is_random` (OS entropy: the buffer is filled by
   the `getrandom` system call) passes under ASan. Miri reports it (below).
-- On an AVX2 machine `pqcrypto-mldsa` dispatches ML-DSA to its AVX2 code at
-  run time, so the clean ML-DSA code is linked and instrumented but not
-  executed by this job. It runs natively in the `i686` job (no AVX2 build) and
-  under UBSan on an emulated CPU without AVX2 (`ubsan-noavx2`, next section).
-  Falcon is always the clean variant (`scripts/falcon-clean-guard.sh`).
+- Until F6, `pqcrypto-mldsa` dispatched ML-DSA to its AVX2 code at run time
+  on an AVX2 machine, so the clean ML-DSA code was linked and instrumented
+  but not executed by this job. Since F6 every build links the clean ML-DSA
+  code only, like Falcon (`scripts/falcon-clean-guard.sh` guards both), and
+  this job executes it; `ubsan-noavx2` (next section) runs it again on a CPU
+  without AVX2.
 
 ## UndefinedBehaviorSanitizer for the C code (`ubsan`)
 
@@ -142,7 +144,7 @@ Positive control: changing the shift in `keccak_inc_absorb` to
 runtime error: shift exponent 64 is too large for 64-bit type 'long unsigned
 int'` and fails the test run.
 
-### The clean ML-DSA code without AVX2 (`ubsan-noavx2`)
+### ML-DSA without AVX2 (`ubsan-noavx2`)
 
 ```sh
 sudo apt-get install qemu-user
@@ -151,15 +153,20 @@ sh scripts/sanitizers.sh ubsan-noavx2
 ```
 
 The `ubsan` binaries run under `qemu-x86_64 -cpu Nehalem`, a CPU model
-without AVX/AVX2, where `is_x86_feature_detected!("avx2")` is false and
-`pqcrypto-mldsa` takes the clean ML-DSA C code: the code non-AVX2 x86_64
-nodes run and the code compiled into the wasm32 wallet. Selection (from
-`crates/gnb-crypto`, where cargo runs its tests): the `gnb-crypto` lib tests
-`crypto::` (hybrid key generation, signing, verification, KATs),
-`wallet::payment::`, `wallet::legacy_sign_tests::`,
-`wallet::sighash_v3_signers::` (63 passed, 1 ignored; minimum 63) and the
-`acvp_mldsa` integration test (the official ACVP ML-DSA-65 vectors; 3
-passed; minimum 3). About 35 s locally; the whole lib suite took 575 s under
+without AVX/AVX2, where `is_x86_feature_detected!("avx2")` is false. Until
+F6 that made `pqcrypto-mldsa` take its clean ML-DSA C code instead of the
+AVX2 code the `ubsan` step ran; since F6 every build runs the clean code, and
+this mode runs the same binaries on a second CPU, so an ML-DSA verdict that
+depends on the CPU (F6: Wycheproof tcId 161) fails one of the two runs.
+Selection (from `crates/gnb-crypto`, where cargo runs its tests): the
+`gnb-crypto` lib tests `crypto::` (hybrid key generation, signing,
+verification, KATs, the FIPS 204 UseHint verdicts of
+`crypto::mldsa_one_verdict`), `wallet::payment::`,
+`wallet::legacy_sign_tests::`, `wallet::sighash_v3_signers::` (67 passed, 1
+ignored; minimum 67), the `acvp_mldsa` integration test (the official ACVP
+ML-DSA-65 vectors; 3 passed; minimum 3) and `wycheproof_mldsa65` (the
+Wycheproof ML-DSA-65 vectors through the library and the consensus wrapper;
+2 passed; minimum 2). About 35 s locally before F6; the whole lib suite took 575 s under
 emulation (280 passed, no report; mostly keystore KDFs with no ML-DSA in
 them), so it is not in the per-push job; the whole suite is its own mode,
 `ubsan-noavx2-full`, which CI runs nightly (next section).
@@ -208,7 +215,7 @@ JavaScript); isolation stays on (no file system or clock access). What runs
 
 | Crate | Tests | Notes |
 | --- | --- | --- |
-| `gnb-smh` | every unit test (compact bits, chain work, ASERT including the AUD-1 wide multiply and shift, the lane-level Keccak step, the scratchpad), `tests/difficulty_vectors.rs` and `tests/vectors.rs` (the Python PoW vectors with log2_n = 1 and 2) [30] | the log2_n = 10 and 19 PoW vectors skipped, `canonical_entry_points_match_the_reference_vector` ignored (below) |
+| `gnb-smh` | every unit test (compact bits, chain work, ASERT including the AUD-1 wide multiply and shift, the lane-level Keccak step, the scratchpad, the v2 SHA-256 draft and v3), `tests/difficulty_vectors.rs`, `tests/vectors.rs` (the Python PoW vectors with log2_n = 1 and 2), `tests/vectors_v2.rs` and `tests/vectors_v3.rs` (the log2_n = 4 vectors) [36] | the log2_n = 10 and 19 PoW vectors and the large v2/v3 vectors skipped, `canonical_entry_points_match_the_reference_vector` ignored (below) |
 | `gnb-crypto` | `core::limits`, `core::tokenomics`, `core::block_rules` (Merkle roots, coinbase branch, coinbase commitment, witness root), `core::sighash`, `core::activation` [42] | six tests ignored (below) |
 | `pqcrypto-internals` | the library tests: the `unsafe extern "C"` RNG entry point and the thread-local seeded-RNG stack, including guard drops after TLS destruction [15] | the two re-exec tests ignored |
 | `gnb-smh` on `i686-unknown-linux-gnu` and `s390x-unknown-linux-gnu` | the same `gnb-smh` tests on a 32-bit and a big-endian target, including the whole PoW pipeline against the Python reference [30 each] | `miri-cross`; std for the target is built by `cargo miri setup` |
@@ -238,6 +245,11 @@ ignored with the reason in the attribute:
 | `gnb-smh` `tests/difficulty_vectors.rs` | the vector file is parsed once per binary | 35 s per parse; natively unchanged |
 | `gnb-crypto` Merkle tests (`legacy_root_is_bit_identical_...`, `duplicate_last_mutation_...`, `coinbase_branch_reproduces_the_root`) | trees up to 5 leaves (17 natively) | SHA-256 cost; empty, single, odd and even levels and a carried-up node are still covered |
 | `gnb-smh` `matches_python_reference` | the 10 vectors with log2_n = 1 and 2 (all 17 natively); fails if fewer than 10 ran | log2_n = 10 and 19 cost 2^11 and 2^20 Keccak permutations per vector; log2_n <= 2 is at most 8 inner permutations and still runs seed, fill, data-dependent mix and final digest |
+| `gnb-smh` `v2::tests::step_matches_sha256` | 3 trials (200 natively) | SHA-256 cost (~0.2 s per compression) |
+| `gnb-smh` `v2::tests::nonce_and_header_change_output` | 2-block scratchpad (256 natively) | SHA-256 cost; both phases and both tags still run |
+| `gnb-smh` `v3::tests::inputs_change_output` | 4-block scratchpad (64 natively), 30 s | two Keccak permutations per step; pass 0, the later passes and their wrap-around predecessor still run |
+| `gnb-smh` `v2_matches_python_reference` (`tests/vectors_v2.rs`) | the 5 vectors with log2_n = 4 (all 10 natively); fails if fewer than 5 ran | log2_n = 13 is 16,384 compressions per vector, about an hour each under Miri; log2_n = 4 still runs seed, fill, data-dependent mix and final digest |
+| `gnb-smh` `v3_matches_python_reference` (`tests/vectors_v3.rs`) | the 5 log2_n = 4 one-pass vectors and the first log2_n = 4 three-pass vector (all 15 natively); fails if fewer than 6 ran | log2_n = 15 is 2^16 steps (2^17 permutations) per vector, about 15 hours each under Miri; the small ones still run the seed, pass 0, the later passes and the final digest |
 | `gnb-crypto` `v3_cost_is_linear_in_the_input_count` | ignored | ~300 Keccak permutations of byte counting; its arithmetic also runs in `v3_commits_to_every_field` |
 | `gnb-smh` `canonical_entry_points_match_the_reference_vector` | ignored | five canonical evaluations (log2_n = 19, 64 MiB, ~2^20 Keccak permutations each); the log2_n <= 2 Python vectors run the same pipeline under Miri |
 | `gnb-crypto` `core::sighash` `v3_scripts_verify_and_every_fault_is_rejected`, `v2_scripts_verify_below_the_activation` | ignored | hybrid key generation and signing through the PQClean C code, which Miri cannot execute |
@@ -417,11 +429,15 @@ is not ruled out.
 | F3 | concurrent runs | `wallet::legacy_keystore_tests::save_load_roundtrip_still_works` failed with "No such file or directory" in the i686 run while the UBSan suite ran the same test in another process | Seven keystore tests (`wallet::legacy_keystore_tests` x4, `hd_wallet::tests` x3) write a fixed file name in the shared temp directory and delete it at start and end, so two test processes delete each other's file. Reproduced by running one test binary twice at once, 15 times: 15 of 30 runs failed for one test, 1 of 30 for another | The names carry the process id (as the neighbouring tests already do); 0 of 30 concurrent runs fail for each of the seven. Matters for parallel sanitizer runs and for `cargo mutants -j N` |
 | F4 | review (code reading), confirmed on `i686` | The wasm wallet's `minfee` request quoted the floor fee for a size of 2^32 bytes or more on 32-bit targets: 2^32 + 100 was priced as 100 bytes (10,000 instead of 8,589,934,792) | CRY-8: `size as usize` wraps modulo 2^32 where `usize` has 32 bits (wasm32, i686); `gnb-wallet-wasm` was in none of the 32-bit runs | `usize::try_from(size)`, error "`size` too large". `minfee_does_not_truncate_sizes_on_32_bit_targets` and `c_abi_roundtrip_on_32_bit` fail on i686 with the old cast (fee "10000") and pass after; on x86_64 the old cast passes. Low impact: such sizes are absurd |
 | F5 | `i686-node` | `network::tests::wire_decode_rejects_multi_gb_declared_vec` failed on i686: a gossip frame whose `block_data` declares 8 GiB (a 9-byte varint, then nothing) decoded as a `NewBlock` with an empty `block_data` | bincode 2.0.1's serde bridge reads every sequence and map length with `usize::decode` (`varint_decode_usize`: `u64 as usize`), so on a 32-bit target a declared length of 2^32 * k + n decodes as n. A frame that every 64-bit node refuses (it announces more bytes than it carries) decoded on a 32-bit node into a different message; the `/gnb/sync/1` codec decodes the same way. P2P framing only: no consensus encoding is decoded with bincode from untrusted input | The gossip and sync decoders require the canonical encoding: the decoded message must re-encode to the frame (`WireDecodeError::NonCanonical`, a penalized protocol violation, except for `NewBlock` and `NewTransaction` frames, which releases without the rule relay, so they are dropped without penalty: docs/CONSENSUS.md, "Wire encoding"; `InvalidData` on the sync path). The same rule refuses non-minimal varints on every target (byte-distinct frames of one message, each a fresh gossip message id: the NET-7 de-duplication bypass without trailing bytes), which the fuzzing package (merged after this one, docs/testing/FUZZING.md) found independently; its code (commit `f471e83`) is used verbatim so that its merge is clean. `wire_decode_requires_the_canonical_encoding` and `non_canonical_frames_are_rejected` fail on x86_64 without the check (non-minimal tag, integer and length forms decode) and pass with it; `wire_decode_rejects_multi_gb_declared_vec` fails on i686 without it and passes with it |
+| F6 | `i686`, confirmed on x86_64 under `qemu-x86_64 -cpu Nehalem` | After the merge of the relaunched mainnet line, `wycheproof_mldsa65` failed on i686: the consensus wrapper ACCEPTED Wycheproof tcId 161 (a valid ML-DSA-65 signature under an all-zero public key), which the test expected it to refuse, and the library disagreed with Wycheproof on none of the 42 cases it was pinned to disagree on. The same x86_64 test binary gives the i686 verdicts on a CPU without AVX2 | `pqcrypto-mldsa`'s default features compile PQClean's AVX2 (x86_64, except Windows) and AArch64 ML-DSA and dispatch to them, AVX2 at run time per CPU; everything else (i686, wasm32, x86_64 without AVX2, Windows) runs `clean`. The AVX2 verifier is not FIPS 204: it never checks ‖z‖∞ < γ1 − β (41 Wycheproof cases accepted; the wrapper already refused them, `mldsa65_z_within_bound`) and `use_hint_avx` treats r0 = 0 as positive, so h = 1 gives (r1 + 1) mod 16 where FIPS 204 Algorithm 40 gives (r1 − 1) mod 16. Under a public key with t1 = 0 (any ρ), z = 0 gives w'_approx = 0 for every challenge, so ANYONE can make a signature that AVX2 nodes refuse and all others accept (w1 = 15 at a hinted coefficient, tcId 161) or the reverse (w1 = 1): lock coins to such a key (in a standard hybrid key with a genuine Falcon half, so the spend relays) and spend them, and the network splits by CPU. An honest signer's hints sit where |r0| ≥ β, never at r0 = 0, so both implementations agree on honest signatures (and on every KAT) | Every build links the clean implementation only: `pqcrypto-mldsa` with `default-features = false` in `gnb-crypto` and `gnb` (as Falcon since F1), so the verdict is FIPS 204 everywhere: tcId 161 accepted, its AVX2 twin refused. `crypto::mldsa_one_verdict::use_hint_at_r0_zero_follows_fips_204` crafts both signatures for two t1 = 0 keys and checks them through every consensus path (library, suite 0x0002 legacy and canonical, hybrid suite 0x0001, wallet verifier, sighash v3 `verify_bound` of both suites); `mldsa_avx2_and_aarch64_variants_are_not_linked` is the symbol tripwire, and `scripts/falcon-clean-guard.sh` checks the feature graph of both crates. With the AVX2 code linked, on an AVX2 CPU: the verdict test fails ("FIPS 204: (0 - 1) mod 16"; every path refuses the FIPS signature and accepts its AVX2 twin) and the tripwire fails; the same binary on qemu's Nehalem passes the verdict test. `wycheproof_mldsa65` now requires the Wycheproof verdict on all 210 cases from the library and on all 203 empty-context cases from the wrapper, and runs in `ubsan-noavx2` too |
 
 No memory error, no C undefined behaviour and no Rust undefined behaviour
-was found in the code under test. F4 and F5 are the defects in shipped code
-(F4 low impact; F5 affects only 32-bit builds of the node, which accepted
-some frames that 64-bit nodes refuse).
+was found in the code under test. F4, F5 and F6 are the defects in shipped
+code (F4 low impact; F5 affects only 32-bit builds of the node, which
+accepted some frames that 64-bit nodes refuse; F6 is a consensus split
+between nodes on AVX2 CPUs and all other nodes, open to anyone, at every
+height of the relaunched mainnet, see
+[After the relaunched mainnet merge](#after-the-relaunched-mainnet-merge)).
 
 ## Review follow-ups (2026-10-15)
 
@@ -547,3 +563,69 @@ the maintainers.
   mode): pass, 327 unit tests, 5, 3, 6, 3 and 14; the committed seed corpus
   is reproduced unchanged on 32 bits (`fuzz_seed_corpus` regenerates it and
   compares).
+
+## After the relaunched mainnet merge
+
+The PR branch merged `origin/main`, the relaunched mainnet line, up to
+`820c102` (merge `0a60b20`). Two jobs then failed on `main` itself and on the
+PR branch, both through tests `main` added after `e3e45df`:
+
+- `i686`: `wycheproof_mldsa65` (added in `279067f`, "FIPS 204 z bound
+  (Wycheproof)") failed. On i686 the library disagreed with Wycheproof on
+  none of the 42 cases the test pinned it to disagree on, and the consensus
+  wrapper accepted tcId 161. The test had been written on an AVX2 machine and
+  pinned the AVX2 code's verdicts: this is F6, a consensus split between
+  nodes on AVX2 CPUs and all other nodes (Findings). The same x86_64 test
+  binary gives the i686 verdicts under `qemu-x86_64 -cpu Nehalem`.
+- `miri`, step "Miri (host)": failed after 30 minutes. Not undefined
+  behaviour: the step ran exactly 30:00 and ended with exit status 124
+  (Actions API), the `with_miri_timeout` bound of 1800 s on its first
+  command, `cargo miri test -p gnb-smh`. `main` added GnB-SMH v2 (draft,
+  `2ceb287`) and v3 (`40d3751`, the proof of work from the PoWit activation
+  height) with unit tests and Python reference vectors, none of them reduced
+  under Miri: `tests/vectors_v2.rs` has five log2_n = 13 vectors (16,384
+  SHA-256 compressions each, about an hour apiece under Miri) and
+  `tests/vectors_v3.rs` five log2_n = 15 vectors (2^17 Keccak permutations
+  each, about 15 hours apiece); the v2 and v3 unit tests at their native
+  sizes took 10 minutes under Miri. The `gnb-crypto` and
+  `pqcrypto-internals` commands of the step never ran on GitHub, and
+  `miri-cross` (the same `gnb-smh` tests on i686 and s390x) would have
+  stopped the same way.
+
+Fixes: F6 (Findings), and the new `gnb-smh` tests run smaller under
+`cfg(miri)`, like the v1 ones (Miri table): the five log2_n = 4 v2 vectors,
+the five log2_n = 4 one-pass v3 vectors and one three-pass one (each test
+fails if fewer ran), smaller scratchpads and fewer trials in the unit tests.
+`gnb-smh` has no unsafe code (`forbid(unsafe_code)`), and every code path of
+v2 and v3 still runs under Miri, against the Python reference on s390x and
+i686 too. The `gnb-smh` minimum of `miri` and `miri-cross` is now 36 (29
+unit, 4 difficulty-vector tests, and the v1, v2 and v3 vector tests).
+
+The web-wallet core links `gnb-crypto` and so `pqcrypto-mldsa`: it was
+rebuilt with `scripts/build-wallet-wasm.sh` (1.94.1, wasi-sdk 25, checked
+download) and re-pinned (`WASM_SHA256`, SRI). It ran the clean ML-DSA code
+before as well (wasm32 has no AVX2 build); the binary changes with the crate
+features. The same script on the unchanged PR head `0a7127f` reproduced the
+committed binary (`bd335806...`) in this environment.
+
+Local results on the fixed tree (x86_64 with AVX2, the environment above;
+the Miri times are wall-clock with other builds running in parallel):
+
+| Mode or command | Result |
+| --- | --- |
+| `miri`: `gnb-smh` | pass, no undefined behaviour: 29 unit (1 ignored), 4, 1, 1 and 1 (36); 421 s (unit tests 125 s, difficulty vectors 101 s, v1 vectors 38 s, v2 vectors 18 s, v3 vectors 136 s) |
+| `miri`: the `gnb-crypto` selection | pass, no undefined behaviour: 44 passed, 6 ignored (minimum 42); 576 s with the build |
+| `miri`: `pqcrypto-internals` | pass: 15 passed, 3 ignored |
+| `miri-cross` | pass, no undefined behaviour: `gnb-smh` 36 on i686 (409 s) and 36 on s390x (421 s), the v2 and v3 vectors matching the Python reference on both; `gnb-wallet-wasm` 3 (1 ignored) on i686 |
+| `i686` | pass: `gnb-smh` 30 unit, 4, 1, 1, 1; `gnb-crypto` 404 unit (1 ignored) and its integration tests (`wycheproof_mldsa65` 2 of them), doctests; `coherence-core` 12, 3, 1, 8, 5; `pqcrypto-internals` 17, 2, 2; `gnb-wallet-wasm` 4 |
+| `gnb-crypto`, x86_64 with AVX2 | pass: 404 unit (1 ignored), every integration test, doctests |
+| `gnb` `kat_mldsa65`, `sprint_s_crypto_sizes`, x86_64 | pass: 4 and 4 (the seeded ML-DSA-65 golden key hashes are unchanged with the clean code) |
+| `ubsan-noavx2` selection on qemu's Nehalem (the plain debug binaries, not the UBSan build) | pass: 67 (1 ignored), 3 and 2 |
+| `scripts/falcon-clean-guard.sh` | pass; with `node/Cargo.toml` back on the default features of `pqcrypto-mldsa`, the feature-graph check reports `avx2`, `neon` and `default` |
+
+Not re-run here: the `asan`, `ubsan`, `ubsan-noavx2` and
+`ubsan-noavx2-full` modes with their instrumented builds (disk space); they
+now execute the clean ML-DSA C code on the AVX2 runner as well, the code
+`ubsan-noavx2` already ran under UBSan. The AArch64 variant was never
+executed here (no AArch64 toolchain): by its source it checks the z bound and
+implements UseHint as FIPS 204 does, and it is no longer linked.

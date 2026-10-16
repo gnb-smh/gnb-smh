@@ -40,6 +40,13 @@ jobs:
         run: |
           python3 reference/gen_merkle_vectors.py
           git diff --exit-code reference/merkle_vectors.json
+      # docs/CONSENSUS.md "Coloring" / "Parent list" (audit B2-T9, B2-T10):
+      # the GhostDAG candidate order and parent-list shapes; the node checks
+      # them in node/tests/ghostdag_vectors.rs.
+      - name: GhostDAG vectors are reproducible
+        run: |
+          python3 reference/gen_ghostdag_vectors.py
+          git diff --exit-code reference/ghostdag_vectors.json
       - name: Ledger reference tests
         run: python3 reference/test_ledger.py
       - name: Ledger vectors are reproducible
@@ -187,18 +194,20 @@ jobs:
           path: ${{ runner.temp }}/functional
           retention-days: 7
 
-  # Vendored fork: PQClean source pin (VENDOR.toml), and the Falcon
-  # clean-variant guard. (The libp2p-yamux fork was retired with libp2p 0.57,
-  # audit OPS-2; its yamux lockfile guard, GHSA-vxx9-2994-q338, now lives in
-  # node/tests/supply_chain_lockfile_guard.rs and runs in workspace-test, and
-  # `cargo deny` in supply-chain refuses a second yamux.)
+  # Vendored fork: PQClean source pin (VENDOR.toml), and the clean-variant
+  # guard of Falcon-1024 (constant-time signing) and ML-DSA-65 (one
+  # verification verdict on every CPU). (The libp2p-yamux fork was retired
+  # with libp2p 0.57, audit OPS-2; its yamux lockfile guard,
+  # GHSA-vxx9-2994-q338, now lives in node/tests/supply_chain_lockfile_guard.rs
+  # and runs in workspace-test, and `cargo deny` in supply-chain refuses a
+  # second yamux.)
   vendored-guards:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: pqcrypto-internals (tests/vendor_pin.rs + unit tests)
         run: cargo test -p pqcrypto-internals --locked
-      - name: Falcon clean-variant guard
+      - name: Clean-variant guard (Falcon-1024, ML-DSA-65)
         run: sh scripts/falcon-clean-guard.sh
 
   # WAL-5: the committed browser wallet core must be reproducible from source.
@@ -257,6 +266,23 @@ jobs:
       - name: node --test site/tests
         run: node --test site/tests/*.test.mjs
 
+  # Deployment files (audit OPS-3): the systemd units keep their sandboxing
+  # and separate users (systemd-analyze security / verify), the shell
+  # scripts pass ShellCheck; and the explorer API's own unit tests (limiter,
+  # broadcast budget, parameter validation). ubuntu-latest ships
+  # systemd-analyze and shellcheck; GNB_REQUIRE_TOOLS=1 fails instead of
+  # skipping when either is missing.
+  deploy-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deploy/test_deploy_files.py
+        env:
+          GNB_REQUIRE_TOOLS: "1"
+        run: python3 deploy/test_deploy_files.py -v
+      - name: explorer API unit tests
+        run: python3 deploy/explorer-api/test_gnb_explorer_api.py -v
+
   clippy:
     runs-on: ubuntu-latest
     steps:
@@ -279,9 +305,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Audit OPS-2: exact tool releases (the ones the policy was last
+      # verified with), so a new cargo-deny/cargo-audit release cannot change
+      # what the job checks without a reviewed bump here. The advisory
+      # database itself is fetched fresh on every run.
+      # node/tests/supply_chain_lockfile_guard.rs checks these pins.
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-audit
+          tool: cargo-deny@0.20.2,cargo-audit@0.22.2
+      # deny.toml [graph] all-features = true: every feature's graph (e.g.
+      # the node's sev-snp) is held to the policy.
       - name: cargo deny (advisories, bans, licenses, sources; deny.toml)
         run: cargo deny check
       - name: cargo audit (exceptions in .cargo/audit.toml)
@@ -305,10 +338,11 @@ jobs:
   # the Rust code (nightly -Zsanitizer=address) AND the PQClean C code that
   # the pqcrypto build scripts compile (clang -fsanitize=address); then
   # UndefinedBehaviorSanitizer instruments that C code (gcc, no recovery).
-  # Each mode checks that every PQClean archive really is instrumented. The
-  # runner has AVX2, so ML-DSA runs its AVX2 code there; the last step runs
-  # the UBSan ML-DSA tests on qemu's Nehalem CPU (no AVX2) so the clean ML-DSA
-  # C code (non-AVX2 nodes, the wasm32 wallet) runs under UBSan too.
+  # Each mode checks that every PQClean archive really is instrumented. Every
+  # build links the clean ML-DSA C code only (pqcrypto-mldsa without avx2/neon:
+  # its AVX2 verifier gave other verdicts, SANITIZERS.md F6); the runner has
+  # AVX2, and the noavx2 steps run the UBSan ML-DSA, ACVP and Wycheproof tests
+  # again on qemu's Nehalem CPU (no AVX2), so a CPU-dependent verdict fails.
   sanitizers:
     runs-on: ubuntu-latest
     steps:
@@ -325,7 +359,7 @@ jobs:
         run: sh scripts/sanitizers.sh asan
       - name: UndefinedBehaviorSanitizer (PQClean C under gnb-crypto and pqcrypto-internals)
         run: sh scripts/sanitizers.sh ubsan
-      - name: UBSan on a CPU without AVX2 (clean ML-DSA C code; ML-DSA, wallet signing and ACVP tests)
+      - name: UBSan on a CPU without AVX2 (ML-DSA, wallet signing, ACVP and Wycheproof tests)
         run: sh scripts/sanitizers.sh ubsan-noavx2
       # The whole gnb-crypto suite on that CPU: about 10 minutes of emulation
       # (the keystore KDFs), so nightly and on demand only.

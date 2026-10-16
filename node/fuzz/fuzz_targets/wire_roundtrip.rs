@@ -94,7 +94,12 @@ fn gen_block(inp: &mut Input) -> Block {
             binding_sig: inp.var_bytes(32),
         })
         .collect();
-    Block { header, transactions, blue_score, height, shielded_transactions }
+    // The PoWit section is empty, as on every block the node builds below
+    // `powit_height()` and on its templates without witness items; from
+    // `powit_height()` it is still encoded (three zero counts) and checked
+    // against the reference. Non-empty sections come from the untrusted
+    // inputs (mode 3).
+    Block { header, transactions, blue_score, height, shielded_transactions, powit: Default::default() }
 }
 
 fn prefixes_refused<T>(enc: &[u8], decode: impl Fn(&[u8]) -> Result<T, String>, cut: usize) {

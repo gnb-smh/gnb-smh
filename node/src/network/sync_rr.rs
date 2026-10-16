@@ -27,16 +27,26 @@
 //! `request-response` protocol (`/gnb/sync/1`): one request → one chosen
 //! peer, not a broadcast. This removes the O(peers) IBD amplification entirely.
 //!
-//! ## Failure handling (audit NET-5 / NET-7 / NET-9)
+//! ## Failure handling (audit NET-5 / NET-7 / NET-9, re-audit B1-T2 / B1-T6)
 //!
-//! A directed request that fails (timeout, reset, peer without
-//! `/gnb/sync/1`) or is answered [`SyncResponse::Busy`] is retried on ANOTHER
-//! connected peer chosen by [`PullPeerSelector`] (rotation, per-peer in-flight
-//! cap, stall cooldown). It is NEVER re-published on the gossip sync topic:
+//! Every answer is bound to the request it answers ([`check_response`]);
+//! any other answer is a protocol violation. A directed request that fails
+//! (timeout, reset, peer without `/gnb/sync/1`), is answered
+//! [`SyncResponse::Busy`] or `BlockNotFound`, or gets a wrong answer is
+//! retried on ANOTHER connected peer by `network::pull::PullScheduler`
+//! ([`PullPeerSelector`]: hint first, usefulness- and stall-aware, per-peer
+//! in-flight cap). It is NEVER re-published on the gossip sync topic:
 //! gossip pulls are no longer answered by anyone, because answering them made
 //! every node broadcast a reply to the whole mesh (O(N²) amplification). A
 //! request that exhausts its attempts is dropped; the processor's own retry
 //! paths (frontier expiry, orphan sweep, the 30 s nudge) re-issue it.
+//!
+//! ## Serving (re-audit B1-T3 / B1-T18 / B2-T5 / B2-T6)
+//!
+//! Requests are answered off the swarm task by `network::serve`, each in
+//! O(log n + limit), under per-class request budgets
+//! ([`SyncRequestLimiter`]) and per-peer / global send-byte budgets (a peer
+//! that does not read gets `Busy`).
 
 use futures::prelude::*;
 use libp2p::request_response::{self, Codec as RrCodec, Config as RrConfig, ProtocolSupport};
@@ -73,6 +83,11 @@ pub const MAX_REQUEST_FRAME: u64 = 64;
 /// bincode-level limit is not redundant with it.
 const MAX_FRAME_LIMIT: usize = MAX_FRAME as usize;
 
+/// B1-T18 / B2-T6: longest an answer may take to be written to its peer
+/// (the whole stream, request and answer, still has the 30 s request
+/// timeout). 15 s is about 70 KB/s for a 1 MB block.
+pub const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+
 // ── Wire types ─────────────────────────────────────────────────────────────
 
 /// A directed sync request (the PULL path). Deliberately carries NO `nonce`:
@@ -93,6 +108,30 @@ pub enum SyncRequest {
     /// `/gnb/sync/1` makes it what it always should have been: one
     /// requester, one direct answer.
     GetPeers,
+    /// Never on the wire (serde skips it; appended last so every real
+    /// variant keeps its bincode tag): what [`BlochSyncCodec::read_request`]
+    /// reports for an inbound request frame that is not a valid request
+    /// (undecodable, out of bounds, non-canonical, or 64 bytes long). The
+    /// codec used to return an error, and libp2p-request-response 0.30 does
+    /// not report a request that fails to decode to the behaviour at all (it
+    /// only logs it), so the H-R3-4 penalty for malformed requests never
+    /// fired. Returned as a request, it reaches the network loop with its
+    /// peer and is penalized there like every other protocol violation.
+    #[serde(skip)]
+    Malformed,
+}
+
+impl SyncRequest {
+    /// Variant name for diagnostics.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            SyncRequest::GetBlock { .. } => "GetBlock",
+            SyncRequest::GetHeaders { .. } => "GetHeaders",
+            SyncRequest::GetTips => "GetTips",
+            SyncRequest::GetPeers => "GetPeers",
+            SyncRequest::Malformed => "Malformed",
+        }
+    }
 }
 
 /// A directed sync response, returned to the ONE requesting peer.
@@ -130,6 +169,20 @@ pub enum SyncResponse {
     Busy,
 }
 
+impl SyncResponse {
+    /// Variant name for diagnostics.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            SyncResponse::Block { .. } => "Block",
+            SyncResponse::BlockNotFound { .. } => "BlockNotFound",
+            SyncResponse::Headers { .. } => "Headers",
+            SyncResponse::Tips { .. } => "Tips",
+            SyncResponse::Peers { .. } => "Peers",
+            SyncResponse::Busy => "Busy",
+        }
+    }
+}
+
 /// Map an outbound `NetworkMessage` to a `SyncRequest` IFF it is a PULL message
 /// that must go out as a directed request rather than a gossip broadcast.
 ///
@@ -163,6 +216,47 @@ pub fn as_pull_request(msg: &NetworkMessage) -> Option<SyncRequest> {
 /// for the 30-60 s sweeps (test/functional/feature_partition_heal.py).
 pub fn retry_pull_elsewhere(resp: &SyncResponse) -> bool {
     matches!(resp, SyncResponse::Busy | SyncResponse::BlockNotFound { .. })
+}
+
+/// Audit B1-T2 / NET-10: whether `resp` is an answer an honest server can
+/// give to `req`. Every answer is bound to the request it answers:
+///
+/// * `GetBlock { h }`: `Block` or `BlockNotFound` for exactly `h`;
+/// * `GetHeaders { from, limit }`: `Headers` with at most `limit` entries,
+///   none below `from` (what every release's `ordered_hashes_from` returns);
+/// * `GetTips`: `Tips`; `GetPeers`: `Peers`;
+/// * `Busy` (NET-5): to any request.
+///
+/// Anything else is a protocol violation by the answering peer: it is
+/// penalized, not delivered to the processor, and does not complete the pull.
+/// Before, any well-formed answer completed any pull and reached the
+/// processor as solicited data: a peer answering the on-connect GetPeers or
+/// GetTips with 2,000 made-up headers made the node issue 2,000 GetBlocks.
+/// (Bitcoin Core processes a `block` only if it is in `mapBlocksInFlight`
+/// from that peer and `headers` only if they connect.)
+pub fn check_response(req: &SyncRequest, resp: &SyncResponse) -> Result<(), &'static str> {
+    use SyncRequest as Q;
+    use SyncResponse as A;
+    match (req, resp) {
+        (_, A::Busy) => Ok(()),
+        (Q::GetBlock { block_hash }, A::Block { block_hash: got, .. }) => {
+            if got == block_hash { Ok(()) } else { Err("Block answer for another block") }
+        }
+        (Q::GetBlock { block_hash }, A::BlockNotFound { block_hash: got }) => {
+            if got == block_hash { Ok(()) } else { Err("BlockNotFound answer for another block") }
+        }
+        (Q::GetHeaders { from_blue_score, limit }, A::Headers { entries }) => {
+            if entries.len() > *limit as usize {
+                Err("more headers than requested")
+            } else if entries.iter().any(|e| e.blue_score < *from_blue_score) {
+                Err("header below the requested blue score")
+            } else {
+                Ok(())
+            }
+        }
+        (Q::GetTips, A::Tips { .. }) | (Q::GetPeers, A::Peers { .. }) => Ok(()),
+        _ => Err("answer of the wrong kind for the request"),
+    }
 }
 
 /// Convert a received `SyncResponse` into the `NetworkMessage` the existing
@@ -211,15 +305,20 @@ impl RrCodec for BlochSyncCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
+        // A stream closed without a frame stays a transport error.
         let buf = read_raw_frame(io, MAX_REQUEST_FRAME).await?;
+        // No valid request is MAX_REQUEST_FRAME bytes long, and a frame that
+        // fails `decode_request` is no valid request either: both are
+        // reported as `Malformed` so the network loop can attribute and
+        // penalize them (see `SyncRequest::Malformed`).
         if buf.len() as u64 >= MAX_REQUEST_FRAME {
-            // No valid request is this long: a violation, not a transport error.
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("sync request frame reached {MAX_REQUEST_FRAME} bytes (no valid request is that long)"),
-            ));
+            return Ok(SyncRequest::Malformed);
         }
-        decode_request(&buf)
+        match decode_request(&buf) {
+            Ok(req) => Ok(req),
+            Err(e) if is_sync_protocol_violation(&e) => Ok(SyncRequest::Malformed),
+            Err(e) => Err(e),
+        }
     }
 
     async fn read_response<T>(&mut self, _: &StreamProtocol, io: &mut T) -> io::Result<SyncResponse>
@@ -243,6 +342,13 @@ impl RrCodec for BlochSyncCodec {
         io.write_all(&data).await
     }
 
+    /// B1-T18 / B2-T6: a `Block` answer is streamed (its frame prefix, then
+    /// the stored block bytes as they are) instead of being encoded into a
+    /// second full copy, and every answer is given at most
+    /// [`RESPONSE_WRITE_TIMEOUT`] to be written: a peer that does not read
+    /// stops holding the answer (and its send-budget charge) at that point,
+    /// not at the 30 s stream timeout. The bytes written are exactly
+    /// `encode_frame(&resp)` (`block_response_is_written_as_its_exact_frame`).
     async fn write_response<T>(
         &mut self,
         _: &StreamProtocol,
@@ -252,9 +358,74 @@ impl RrCodec for BlochSyncCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let data = encode_frame(&resp)?;
-        io.write_all(&data).await
+        with_write_deadline(async move {
+            match &resp {
+                SyncResponse::Block { block_data, .. } => {
+                    io.write_all(&block_frame_prefix(&resp)?).await?;
+                    io.write_all(block_data).await
+                }
+                _ => io.write_all(&encode_frame(&resp)?).await,
+            }
+        })
+        .await
     }
+}
+
+/// Bounds a response write by [`RESPONSE_WRITE_TIMEOUT`] when it runs on a
+/// tokio runtime (the swarm's connection tasks do); elsewhere (the fuzz
+/// target and codec tests drive the codec with `block_on`) it is unbounded.
+async fn with_write_deadline<F>(write: F) -> io::Result<()>
+where
+    F: std::future::Future<Output = io::Result<()>> + Send,
+{
+    if tokio::runtime::Handle::try_current().is_err() {
+        return write.await;
+    }
+    match tokio::time::timeout(RESPONSE_WRITE_TIMEOUT, write).await {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "sync response not written within RESPONSE_WRITE_TIMEOUT (the peer does not read)",
+        )),
+    }
+}
+
+/// Append bincode's `standard()` varint encoding of `v`.
+fn push_varint(out: &mut Vec<u8>, v: u64) {
+    match v {
+        0..=250 => out.push(v as u8),
+        251..=0xFFFF => {
+            out.push(0xFB);
+            out.extend_from_slice(&(v as u16).to_le_bytes());
+        }
+        0x1_0000..=0xFFFF_FFFF => {
+            out.push(0xFC);
+            out.extend_from_slice(&(v as u32).to_le_bytes());
+        }
+        _ => {
+            out.push(0xFD);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+/// The bytes of `encode_frame(resp)` before the block bytes of a `Block`
+/// answer: the encoding of the same answer with an empty `block_data`, whose
+/// last byte (the length 0) is replaced by the real length.
+fn block_frame_prefix(resp: &SyncResponse) -> io::Result<Vec<u8>> {
+    let SyncResponse::Block { block_hash, blue_score, height, block_data } = resp else {
+        return encode_frame(resp);
+    };
+    let mut prefix = encode_frame(&SyncResponse::Block {
+        block_hash: *block_hash,
+        blue_score: *blue_score,
+        height: *height,
+        block_data: Vec::new(),
+    })?;
+    debug_assert_eq!(prefix.last(), Some(&0));
+    prefix.pop();
+    push_varint(&mut prefix, block_data.len() as u64);
+    Ok(prefix)
 }
 
 /// Read the raw frame bytes off the wire, capped at `cap` ([`MAX_REQUEST_FRAME`]
@@ -286,6 +457,40 @@ pub fn check_nonempty_frame(buf: Vec<u8>) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(buf)
+}
+
+/// Length of bincode's `standard()` varint encoding of `v`.
+fn varint_len(v: u64) -> usize {
+    match v {
+        0..=250 => 1,
+        251..=0xFFFF => 3,
+        0x1_0000..=0xFFFF_FFFF => 5,
+        _ => 9,
+    }
+}
+
+fn entries_wire_len(entries: &[SyncEntry]) -> usize {
+    varint_len(entries.len() as u64)
+        + entries.iter().map(|e| 32 + varint_len(e.blue_score) + varint_len(e.height)).sum::<usize>()
+}
+
+/// Exact length of `encode_frame(resp)`, computed without encoding: what a
+/// response costs while it waits to be written to a peer (B1-T18 / B2-T6
+/// send-buffer accounting).
+pub fn response_wire_len(resp: &SyncResponse) -> usize {
+    // Every variant index is below 251: a one-byte tag.
+    1 + match resp {
+        SyncResponse::Block { blue_score, height, block_data, .. } => {
+            32 + varint_len(*blue_score) + varint_len(*height) + varint_len(block_data.len() as u64) + block_data.len()
+        }
+        SyncResponse::BlockNotFound { .. } => 32,
+        SyncResponse::Headers { entries } => entries_wire_len(entries),
+        SyncResponse::Tips { tips, locator } => entries_wire_len(tips) + varint_len(locator.len() as u64) + 32 * locator.len(),
+        SyncResponse::Peers { peers } => {
+            varint_len(peers.len() as u64) + peers.iter().map(|p| varint_len(p.len() as u64) + p.len()).sum::<usize>()
+        }
+        SyncResponse::Busy => 0,
+    }
 }
 
 /// Bincode-encode a frame (same wire config as the gossip path uses).
@@ -356,7 +561,10 @@ pub fn decode_request(buf: &[u8]) -> io::Result<SyncRequest> {
 /// peer did not serve (its sync rate limiter dropped it, or it shut down):
 /// not a protocol violation. It is reported as a plain I/O failure, which is
 /// never penalized, so an honest peer is not graylisted for pacing us; the
-/// pull is retried. Anything else must decode and pass the bounds.
+/// pull is retried. Anything else must decode and pass the bounds. (On the
+/// codec path `read_raw_frame` already reports an empty frame as
+/// `UnexpectedEof`, `check_nonempty_frame`; a server of this release answers
+/// `Busy` instead of dropping a request, NET-5.)
 pub fn response_from_frame(buf: &[u8]) -> io::Result<SyncResponse> {
     if buf.is_empty() {
         return Err(io::Error::new(io::ErrorKind::ConnectionAborted,
@@ -398,6 +606,8 @@ fn validate_sync_request_bounds(req: &SyncRequest) -> io::Result<()> {
             }
         }
         SyncRequest::GetBlock { .. } | SyncRequest::GetTips | SyncRequest::GetPeers => {}
+        // Unreachable from a decode (serde never produces it).
+        SyncRequest::Malformed => return Err(bounds_violation("malformed request")),
     }
     Ok(())
 }
@@ -421,11 +631,16 @@ fn validate_sync_response_bounds(resp: &SyncResponse) -> io::Result<()> {
             }
         }
         SyncResponse::Tips { tips, locator } => {
-            if tips.len() > MAX_WIRE_TIPS {
-                return Err(bounds_violation("Tips tips longer than MAX_WIRE_TIPS"));
-            }
+            // Every release caps the locator: checked first, so only a
+            // frame an honest older release can send escapes the penalty.
             if locator.len() > MAX_WIRE_LOCATOR {
                 return Err(bounds_violation("Tips locator longer than MAX_WIRE_LOCATOR"));
+            }
+            if tips.len() > MAX_WIRE_TIPS {
+                // B2-T7: refused, but releases before this one answered
+                // GetTips with every DAG leaf, so an honest server with more
+                // than MAX_WIRE_TIPS leaves sends this: not penalized.
+                return Err(honest_overflow("Tips tips longer than MAX_WIRE_TIPS"));
             }
         }
         // M-10: mirrors the gossip PeerExchange/PeerCount bound exactly —
@@ -442,15 +657,35 @@ fn validate_sync_response_bounds(resp: &SyncResponse) -> io::Result<()> {
     Ok(())
 }
 
-/// True iff an `io::Error` surfaced from this codec (via `InboundFailure::Io`
-/// / `OutboundFailure::Io` in the caller) represents a DELIBERATE protocol
-/// violation (oversized/malformed/out-of-bounds frame) rather than an
-/// ordinary transport failure (peer disconnected, timed out, reset). Callers
-/// use this to decide whether to apply a `WirePenaltyTracker` penalty —
-/// penalizing a peer for a network hiccup would be a correctness bug, not
-/// just an accounting one.
+/// Marker inside an `InvalidData` error for a frame that breaks a wire bound
+/// but that an honest older release can send (B2-T7): refused, never
+/// penalized.
+#[derive(Debug)]
+struct HonestOverflow(&'static str);
+
+impl std::fmt::Display for HonestOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sync wire bound exceeded (sent by older releases, not penalized): {}", self.0)
+    }
+}
+
+impl std::error::Error for HonestOverflow {}
+
+fn honest_overflow(msg: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, HonestOverflow(msg))
+}
+
+/// True iff an `io::Error` surfaced from this codec (via `OutboundFailure::Io`
+/// in the caller) represents a DELIBERATE protocol violation
+/// (oversized/malformed/out-of-bounds frame) rather than an ordinary
+/// transport failure (peer disconnected, timed out, reset). Callers use this
+/// to decide whether to apply a `WirePenaltyTracker` penalty — penalizing a
+/// peer for a network hiccup would be a correctness bug, not just an
+/// accounting one. B2-T7: only answers an honest node cannot produce count;
+/// a Tips answer over `MAX_WIRE_TIPS` (every release before this one sent
+/// all its DAG leaves) is refused but is not a violation.
 pub fn is_sync_protocol_violation(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::InvalidData
+    e.kind() == io::ErrorKind::InvalidData && !e.get_ref().is_some_and(|inner| inner.is::<HonestOverflow>())
 }
 
 // ── Behaviour ──────────────────────────────────────────────────────────────
@@ -467,37 +702,51 @@ pub type Event = request_response::Event<SyncRequest, SyncResponse>;
 /// inbound peering handshake get dropped — the follower sits `syncing:false` at its
 /// snapshot tip and never converges.
 ///
-/// H-R3-1: the original justification for raising this to 2048 ("DoS headroom
-/// is a non-issue on the small trusted fleet") is exactly the assumption this
-/// finding rejects — `/gnb/sync/1` is not restricted to a trusted fleet, and
-/// 2048 concurrent inbound streams per connection was 2048 concurrently
-/// in-flight `serve_sync_request` calls before the `ordered_hashes_from`
-/// bound and the per-peer token bucket below existed. Lowered to 256: still
-/// well above the observed ~80 streams/s legitimate IBD burst this constant
-/// exists to serve, while no longer being an order of magnitude beyond it.
-/// Combined with [`SyncRequestLimiter`] (per-peer request RATE) and the now
-/// O(limit) cost of any single served request, the product of
-/// (concurrent streams) × (per-request cost) is bounded on every axis, not
-/// just this one.
-const MAX_CONCURRENT_SYNC_STREAMS: usize = 256;
+/// H-R3-1 lowered it from 2048 to 256. B1-T18 / B2-T6 (re-audit): every open
+/// inbound stream can hold one answer until it is written (up to
+/// [`RESPONSE_WRITE_TIMEOUT`]), and yamux lets each stream push up to its
+/// 256 KiB window into the connection, so the cap bounds the memory a peer
+/// that does not read can pin. An honest client keeps at most
+/// [`MAX_INFLIGHT_PER_PEER`] (16) pulls in flight to one peer, plus its
+/// on-connect GetPeers / GetTips and claim-driven GetTips, and the server
+/// answers Busy above [`crate::network::serve::PER_PEER_SEND_BUDGET`] bytes
+/// anyway: 64 keeps a 4x margin over an honest client. A stream over the cap
+/// is dropped by libp2p, which the requester sees as a transport failure
+/// (retried elsewhere, never penalized).
+pub const MAX_CONCURRENT_SYNC_STREAMS: usize = 64;
 
-// ── H-R3-1 fix #4: per-peer token bucket on inbound sync requests ──────────
+// ── H-R3-1 fix #4: per-peer token buckets on inbound sync requests ─────────
 //
-// Even with `ordered_hashes_from` now O(limit) and every SyncRequest/
-// SyncResponse field bounded (H-R3-4), a single peer could still open
-// MAX_CONCURRENT_SYNC_STREAMS legitimately-shaped requests back-to-back and
-// impose Σ(per-request cost) on the node — the algorithmic fix bounds a
-// single request's cost, not the aggregate RATE. This bucket bounds the rate,
-// independent of it.
+// Each served request is O(log n + limit) (B1-T3 / B2-T5: indexed DAG reads,
+// stored block bytes), but a peer could still send legitimately-shaped
+// requests back-to-back: these buckets bound the RATE, per peer and in
+// total, independently of the per-request cost. GetHeaders and GetTips (the
+// answers that read the DAG: up to 2,000 headers / 256 tips) have their own
+// per-peer budgets, far lower than GetBlock's, and an exhausted class does
+// not eat into another.
 
-/// Bucket capacity (burst allowance) per peer.
-const SYNC_BUCKET_CAPACITY: u32 = 128;
-/// Refill rate per peer, tokens/second. At capacity 128 this allows a burst
-/// of 128 immediately, then a sustained 24 req/s. Measured: at 8 req/s a
-/// fresh node pulling one block per request synced ~2 blocks/s, and every
-/// dropped request looked like a protocol violation to it (fixed in
-/// `read_response`). Each request is one bounded store read.
+/// GetBlock bucket capacity (burst allowance) per peer.
+pub const SYNC_BUCKET_CAPACITY: u32 = 128;
+/// GetBlock refill rate per peer, tokens/second. At capacity 128 this allows
+/// a burst of 128 immediately, then a sustained 24 req/s. Measured on the
+/// mainnet line: at 8 req/s a fresh node pulling one block per request
+/// synced ~2 blocks/s. Each GetBlock is one bounded store read of stored
+/// bytes, and the send budgets (`network::serve`) bound what a peer that
+/// does not read can make the node hold.
 const SYNC_BUCKET_REFILL_PER_SEC: u32 = 24;
+/// GetHeaders per peer: burst 16, then 2/s. An honest follower asks one
+/// GetHeaders per 500-block batch it has fetched, per 30 s nudge and per
+/// tip claim it acts on.
+pub const SYNC_HEADERS_BUCKET_CAPACITY: u32 = 16;
+const SYNC_HEADERS_REFILL_PER_SEC: f64 = 2.0;
+/// GetTips per peer: burst 8, then one per 2 s. An honest peer asks on
+/// connect, per tip claim of ours it acts on (rate-limited per author), and
+/// on its 30 s nudge.
+pub const SYNC_TIPS_BUCKET_CAPACITY: u32 = 8;
+const SYNC_TIPS_REFILL_PER_SEC: f64 = 0.5;
+/// GetPeers per peer: burst 4, then one per 10 s (asked once per connection).
+pub const SYNC_PEERS_BUCKET_CAPACITY: u32 = 4;
+const SYNC_PEERS_REFILL_PER_SEC: f64 = 0.1;
 /// Cap on the number of peers tracked, mirroring
 /// `network::WIRE_PENALTY_TRACK_CAP` — bounds memory against an attacker
 /// cycling libp2p identities (free to generate).
@@ -511,12 +760,13 @@ const SYNC_GLOBAL_REFILL_PER_SEC: f64 = 256.0;
 /// Keys idle this long (or whose bucket refilled) are garbage-collected.
 pub const SYNC_LIMITER_IDLE_TTL: Duration = Duration::from_secs(120);
 
-/// Per-peer token bucket for inbound `/gnb/sync/1` REQUESTS (as opposed to
-/// [`super::WirePenaltyTracker`], which scores DECODE/BOUNDS violations).
-/// `allow` is the only entry point: it refills lazily on each call (no
-/// background task) and consumes one token per call, returning whether the
-/// request should be served. A refused request is answered with
-/// [`SyncResponse::Busy`] (NET-5), never by dropping the channel.
+/// Per-peer token buckets for inbound `/gnb/sync/1` REQUESTS (as opposed to
+/// [`super::WirePenaltyTracker`], which scores DECODE/BOUNDS violations), one
+/// per request class, plus a global bucket. They refill lazily on each call
+/// (no background task); a call consumes one token of the request's class
+/// and one of the global bucket and says whether the request should be
+/// served. A refused request is answered with [`SyncResponse::Busy`]
+/// (NET-5), never by dropping the channel.
 ///
 /// NET-8 (audit): the per-peer map used to fail CLOSED once 1,024 identities
 /// had been seen — every later peer, honest or not, was refused forever. It is
@@ -525,6 +775,9 @@ pub const SYNC_LIMITER_IDLE_TTL: Duration = Duration::from_secs(120);
 /// bucket bounds the aggregate rate so eviction cannot be farmed.
 pub struct SyncRequestLimiter {
     per_peer: super::ratelimit::TokenBuckets<PeerId>,
+    headers: super::ratelimit::TokenBuckets<PeerId>,
+    tips: super::ratelimit::TokenBuckets<PeerId>,
+    peers: super::ratelimit::TokenBuckets<PeerId>,
     global: super::ratelimit::TokenBuckets<()>,
 }
 
@@ -536,19 +789,19 @@ impl Default for SyncRequestLimiter {
 
 impl SyncRequestLimiter {
     pub fn new() -> Self {
+        use super::ratelimit::TokenBuckets;
         Self {
-            per_peer: super::ratelimit::TokenBuckets::new(
-                SYNC_BUCKET_CAPACITY,
-                f64::from(SYNC_BUCKET_REFILL_PER_SEC),
-                SYNC_LIMITER_TRACK_CAP,
-            ),
-            global: super::ratelimit::TokenBuckets::new(SYNC_GLOBAL_CAPACITY, SYNC_GLOBAL_REFILL_PER_SEC, 1),
+            per_peer: TokenBuckets::new(SYNC_BUCKET_CAPACITY, f64::from(SYNC_BUCKET_REFILL_PER_SEC), SYNC_LIMITER_TRACK_CAP),
+            headers: TokenBuckets::new(SYNC_HEADERS_BUCKET_CAPACITY, SYNC_HEADERS_REFILL_PER_SEC, SYNC_LIMITER_TRACK_CAP),
+            tips: TokenBuckets::new(SYNC_TIPS_BUCKET_CAPACITY, SYNC_TIPS_REFILL_PER_SEC, SYNC_LIMITER_TRACK_CAP),
+            peers: TokenBuckets::new(SYNC_PEERS_BUCKET_CAPACITY, SYNC_PEERS_REFILL_PER_SEC, SYNC_LIMITER_TRACK_CAP),
+            global: TokenBuckets::new(SYNC_GLOBAL_CAPACITY, SYNC_GLOBAL_REFILL_PER_SEC, 1),
         }
     }
 
-    /// Returns `true` iff a token was available (and is now consumed) for
-    /// `peer`. Callers must NOT serve the request when this returns `false`
-    /// (they answer [`SyncResponse::Busy`] instead).
+    /// Returns `true` iff a GetBlock token was available (and is now
+    /// consumed) for `peer`. Callers must NOT serve the request when this
+    /// returns `false` (they answer [`SyncResponse::Busy`] instead).
     pub fn allow(&mut self, peer: PeerId) -> bool {
         self.allow_at(peer, std::time::Instant::now())
     }
@@ -561,9 +814,25 @@ impl SyncRequestLimiter {
         self.global.allow_at((), now)
     }
 
+    /// Whether `req` from `peer` may be served now: one token of the
+    /// request's own class (GetBlock, GetHeaders, GetTips, GetPeers) and one
+    /// of the global bucket. A `Malformed` request is never served.
+    pub fn allow_request(&mut self, peer: PeerId, req: &SyncRequest, now: std::time::Instant) -> bool {
+        let class_ok = match req {
+            SyncRequest::GetBlock { .. } => self.per_peer.allow_at(peer, now),
+            SyncRequest::GetHeaders { .. } => self.headers.allow_at(peer, now),
+            SyncRequest::GetTips => self.tips.allow_at(peer, now),
+            SyncRequest::GetPeers => self.peers.allow_at(peer, now),
+            SyncRequest::Malformed => false,
+        };
+        class_ok && self.global.allow_at((), now)
+    }
+
     /// Drop idle / fully-refilled peers (heartbeat housekeeping).
     pub fn gc_at(&mut self, now: std::time::Instant) {
-        self.per_peer.gc_at(now, SYNC_LIMITER_IDLE_TTL);
+        for b in [&mut self.per_peer, &mut self.headers, &mut self.tips, &mut self.peers] {
+            b.gc_at(now, SYNC_LIMITER_IDLE_TTL);
+        }
     }
 
     /// Number of peers currently tracked (observability for tests/metrics).
@@ -574,10 +843,14 @@ impl SyncRequestLimiter {
 
 /// Build the request-response behaviour for `/gnb/sync/1`. `Full` support =
 /// this node both serves inbound pulls and issues outbound pulls.
-pub fn new_behaviour() -> Behaviour {
+///
+/// `protocol` is the network's directed-sync protocol: each network has its
+/// own (audit POW-9, `network::chain_separation`); [`SYNC_PROTOCOL`] is
+/// mainnet's.
+pub fn new_behaviour(protocol: StreamProtocol) -> Behaviour {
     Behaviour::with_codec(
         BlochSyncCodec,
-        std::iter::once((SYNC_PROTOCOL, ProtocolSupport::Full)),
+        std::iter::once((protocol, ProtocolSupport::Full)),
         RrConfig::default()
             .with_request_timeout(Duration::from_secs(30))
             .with_max_concurrent_streams(MAX_CONCURRENT_SYNC_STREAMS),
@@ -630,32 +903,134 @@ fn score_cmp(
 /// NET-5: client-side cap on concurrent directed pulls to ONE peer. Kept well
 /// below the server's per-peer burst (`SYNC_BUCKET_CAPACITY`) so an honest
 /// IBD burst is spread across peers instead of tripping one server's limiter.
+/// (Bitcoin Core: MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16.)
 pub const MAX_INFLIGHT_PER_PEER: u32 = 16;
-/// NET-9: consecutive failures (timeouts, resets, undecodable answers) after
-/// which a peer is considered stalled and put on cooldown.
+/// NET-9: stall score (timeouts, transport failures, violations; decaying
+/// with [`SCORE_HALF_LIFE`]) at which a peer is put on cooldown.
 pub const STALL_FAILURES: u32 = 2;
-/// NET-9: cooldown applied to a stalled peer.
+/// NET-9: first cooldown of a stalled peer. Each further cooldown within
+/// [`COOLDOWN_MEMORY`] of the previous one doubles it, up to
+/// [`MAX_STALL_COOLDOWN`].
 pub const STALL_COOLDOWN: Duration = Duration::from_secs(60);
+/// Longest stall cooldown.
+pub const MAX_STALL_COOLDOWN: Duration = Duration::from_secs(16 * 60);
+/// A cooldown this long after the previous one starts again at
+/// [`STALL_COOLDOWN`].
+pub const COOLDOWN_MEMORY: Duration = Duration::from_secs(30 * 60);
 /// NET-5: short back-off after a `Busy` answer (honest back-pressure).
 pub const BUSY_COOLDOWN: Duration = Duration::from_secs(2);
+/// B1-T6 (review): Busy back-off episodes in a row (no useful answer in
+/// between) that cost nothing. Each further episode counts as one useless
+/// answer: an honest server under load alternates Busy with answers (its
+/// limiter refills), a peer that answers only Busy becomes a poor peer
+/// instead of staying the "better peer" every pull waits for.
+pub const FREE_BUSY_EPISODES: u32 = 2;
+/// B1-T6: half-life of a peer's stall and useless-answer scores.
+pub const SCORE_HALF_LIFE: Duration = Duration::from_secs(60);
+/// B1-T6: a peer whose penalty (useless answers + 2 x stall score) reaches
+/// this is asked only when no better connected peer could take the pull,
+/// even later: a pull waits for a better peer to have a free slot instead.
+pub const POOR_PEER_PENALTY: f64 = 4.0;
+/// NET-9 residual: selector state of disconnected peers is kept (bounded) so
+/// a cooldown survives a reconnect; beyond this many entries the longest
+/// disconnected ones are forgotten.
+pub const MAX_TRACKED_PULL_PEERS: usize = 1024;
 
 #[derive(Clone, Debug, Default)]
 struct PullPeer {
+    connected: bool,
+    /// The current connection was dialed by us (not an identity that
+    /// connected to us).
+    outbound: bool,
     in_flight: u32,
-    consecutive_failures: u32,
+    /// Timeouts, transport failures and violations (decaying).
+    stall: f64,
+    /// NotFound and other answers that did not help (decaying).
+    useless: f64,
+    /// When `stall` / `useless` were last brought up to date.
+    scored_at: Option<std::time::Instant>,
     cooldown_until: Option<std::time::Instant>,
+    /// Consecutive stall cooldowns (each doubles the next).
+    cooldown_level: u32,
+    last_cooldown: Option<std::time::Instant>,
     last_selected: Option<std::time::Instant>,
+    disconnected_at: Option<std::time::Instant>,
+    /// Busy back-off episodes since its last useful answer
+    /// ([`FREE_BUSY_EPISODES`]).
+    busy_streak: u32,
 }
 
-/// NET-9 (audit): stateful directed-pull peer selection with ROTATION, stall
-/// detection and a per-peer in-flight cap.
+impl PullPeer {
+    fn decay_factor(&self, now: std::time::Instant) -> f64 {
+        match self.scored_at {
+            Some(t) => 0.5f64.powf(now.saturating_duration_since(t).as_secs_f64() / SCORE_HALF_LIFE.as_secs_f64()),
+            None => 1.0,
+        }
+    }
+
+    /// Bring the decaying scores up to `now`.
+    fn decay(&mut self, now: std::time::Instant) {
+        let f = self.decay_factor(now);
+        self.stall *= f;
+        self.useless *= f;
+        self.scored_at = Some(now);
+    }
+
+    fn penalty_at(&self, now: std::time::Instant) -> f64 {
+        (self.useless + 2.0 * self.stall) * self.decay_factor(now)
+    }
+
+    fn eligible(&self, now: std::time::Instant) -> bool {
+        self.connected && self.in_flight < MAX_INFLIGHT_PER_PEER && self.cooldown_until.is_none_or(|t| now >= t)
+    }
+
+    fn cool_down(&mut self, now: std::time::Instant) {
+        self.cooldown_level = match self.last_cooldown {
+            Some(t) if now.saturating_duration_since(t) < COOLDOWN_MEMORY => self.cooldown_level.saturating_add(1),
+            _ => 0,
+        };
+        let d = STALL_COOLDOWN.saturating_mul(1u32 << self.cooldown_level.min(4)).min(MAX_STALL_COOLDOWN);
+        let until = now + d;
+        self.cooldown_until = Some(self.cooldown_until.map_or(until, |t| t.max(until)));
+        self.last_cooldown = Some(now);
+    }
+}
+
+/// Rank class of a penalty: 0 below 2, then one more per doubling.
+fn penalty_rank(p: f64) -> u32 {
+    if p < 2.0 { 0 } else { p.log2().floor().min(30.0) as u32 }
+}
+
+/// NET-9 / B1-T6 (audit, re-audit): stateful directed-pull peer selection.
 ///
-/// Candidates are the currently connected peers. Among those not on cooldown
-/// and below [`MAX_INFLIGHT_PER_PEER`], the least-loaded peer wins, then the
-/// one with fewer recent failures, then the one selected LEAST recently — so
-/// consecutive pulls rotate across peers and no single peer (whatever it
-/// claims about itself) can capture the pull path. Nothing self-declared
-/// (archival bit, announced score) influences the choice.
+/// Candidates are the connected peers below [`MAX_INFLIGHT_PER_PEER`] and not
+/// on cooldown, minus the peers a pull already tried. Among them the
+/// selector prefers, in order:
+///
+/// 1. peers in good standing (penalty below [`POOR_PEER_PENALTY`]);
+/// 2. the peers the pull names as having the block (the peer whose answer
+///    announced it — Bitcoin Core downloads a block from a peer whose headers
+///    chain contains it), in the pull's order (a GetHeaders names the peers
+///    we dialed first, then the others in a per-node secret order:
+///    `PullScheduler::enqueue`, `PeerStateTable::claiming_above`);
+/// 3. a lower penalty class: useless answers (NotFound — at once for the
+///    node's own pull or a block a dialed peer announced, for a block an
+///    inbound identity announced only once a dialed peer serves it —, an
+///    empty answer from a peer that claimed more, an announced block the
+///    announcer could not serve, each Busy episode after
+///    [`FREE_BUSY_EPISODES`] in a row)
+///    and twice the stall score (timeouts,
+///    violations), both decaying with [`SCORE_HALF_LIFE`] — so a peer that
+///    answers fast with nothing, which always has the fewest pulls in flight,
+///    no longer wins by being fast;
+/// 4. fewer pulls in flight, then the least recently selected (rotation),
+///    then an explicit `--peer`, then the PeerId.
+///
+/// A poor peer is chosen only when no better connected peer could take the
+/// pull at all (the caller waits instead while one is busy or cooling down).
+/// Nothing self-declared (archival bit, announced score) influences the
+/// choice. The state of a disconnected peer (scores, cooldown, rotation slot)
+/// is kept in a bounded table, so reconnecting does not clear a cooldown.
 #[derive(Debug, Default)]
 pub struct PullPeerSelector {
     peers: HashMap<PeerId, PullPeer>,
@@ -667,36 +1042,106 @@ impl PullPeerSelector {
         Self { peers: HashMap::new(), explicit }
     }
 
-    /// A connection to `peer` was established: it becomes a candidate.
+    /// A connection to `peer` was established (direction unknown: inbound).
+    #[allow(dead_code)] // library API and tests; the node binary compiles this module too
     pub fn on_connect(&mut self, peer: PeerId) {
-        self.peers.entry(peer).or_default();
+        self.on_connect_with(peer, false, std::time::Instant::now());
     }
 
-    /// The last connection to `peer` closed: it stops being a candidate.
+    /// A connection to `peer` was established; `outbound` = we dialed it.
+    /// A known peer keeps its scores, cooldown and rotation slot.
+    pub fn on_connect_with(&mut self, peer: PeerId, outbound: bool, now: std::time::Instant) {
+        if !self.peers.contains_key(&peer) && self.peers.len() >= MAX_TRACKED_PULL_PEERS {
+            self.forget_one_disconnected();
+        }
+        let s = self.peers.entry(peer).or_default();
+        s.outbound = if s.connected { s.outbound || outbound } else { outbound };
+        s.connected = true;
+        s.disconnected_at = None;
+        s.decay(now);
+    }
+
+    fn forget_one_disconnected(&mut self) {
+        let victim = self
+            .peers
+            .iter()
+            .filter(|(_, s)| !s.connected)
+            .min_by_key(|(p, s)| (s.disconnected_at, p.to_bytes()))
+            .map(|(p, _)| *p);
+        if let Some(v) = victim {
+            self.peers.remove(&v);
+        }
+    }
+
+    /// The last connection to `peer` closed: it stops being a candidate. Its
+    /// state is kept (bounded by [`MAX_TRACKED_PULL_PEERS`]).
+    #[allow(dead_code)] // library API and tests; the node binary compiles this module too
     pub fn on_disconnect(&mut self, peer: &PeerId) {
-        self.peers.remove(peer);
+        self.on_disconnect_at(peer, std::time::Instant::now());
+    }
+
+    /// [`Self::on_disconnect`] with an explicit clock.
+    pub fn on_disconnect_at(&mut self, peer: &PeerId, now: std::time::Instant) {
+        if let Some(s) = self.peers.get_mut(peer) {
+            s.connected = false;
+            s.outbound = false;
+            s.in_flight = 0;
+            s.disconnected_at = Some(now);
+        }
     }
 
     /// Pick the peer for the next pull, skipping `exclude` (peers that already
-    /// failed this particular request). `None` = no eligible peer right now
-    /// (none connected, all saturated, or all cooling down).
+    /// answered or failed this particular request). `None` = no eligible peer
+    /// right now (none connected, all saturated, or all cooling down).
+    #[allow(dead_code)] // library API and tests; the node binary compiles this module too
     pub fn select(&self, now: std::time::Instant, exclude: &[PeerId]) -> Option<PeerId> {
-        self.peers
+        self.select_for(now, exclude, &[])
+    }
+
+    /// [`Self::select`] preferring the peers in `prefer` (the peers that
+    /// announced what is pulled). `None` also when the best eligible peer is
+    /// a poor one ([`POOR_PEER_PENALTY`]) while a better connected peer that
+    /// is not excluded is only busy or cooling down: the pull waits for it.
+    pub fn select_for(&self, now: std::time::Instant, exclude: &[PeerId], prefer: &[PeerId]) -> Option<PeerId> {
+        let key = |p: &PeerId, s: &PullPeer| {
+            let penalty = s.penalty_at(now);
+            (
+                penalty >= POOR_PEER_PENALTY,
+                // B1-T6 review: the hint order, not PeerId bytes (anyone can
+                // grind those), decides between named peers.
+                prefer.iter().position(|q| q == p).unwrap_or(usize::MAX),
+                penalty_rank(penalty),
+                s.in_flight,
+                s.last_selected,
+                !self.explicit.contains(p),
+            )
+        };
+        let (best, poor) = self
+            .peers
             .iter()
-            .filter(|(p, s)| {
-                s.in_flight < MAX_INFLIGHT_PER_PEER
-                    && s.cooldown_until.is_none_or(|t| now >= t)
-                    && !exclude.contains(p)
-            })
-            .min_by(|(pa, a), (pb, b)| {
-                a.in_flight
-                    .cmp(&b.in_flight)
-                    .then(a.consecutive_failures.cmp(&b.consecutive_failures))
-                    .then(a.last_selected.cmp(&b.last_selected))
-                    .then(self.explicit.contains(*pb).cmp(&self.explicit.contains(*pa)))
-                    .then_with(|| pa.to_bytes().cmp(&pb.to_bytes()))
-            })
-            .map(|(p, _)| *p)
+            .filter(|(p, s)| s.eligible(now) && !exclude.contains(p))
+            .min_by(|(pa, a), (pb, b)| key(pa, a).cmp(&key(pb, b)).then_with(|| pa.to_bytes().cmp(&pb.to_bytes())))
+            .map(|(p, s)| (*p, s.penalty_at(now) >= POOR_PEER_PENALTY))?;
+        if poor
+            && self
+                .peers
+                .iter()
+                .any(|(p, s)| s.connected && !exclude.contains(p) && s.penalty_at(now) < POOR_PEER_PENALTY)
+        {
+            return None;
+        }
+        Some(best)
+    }
+
+    /// Whether any connected peer could take a pull now (cheap early exit).
+    pub fn any_eligible(&self, now: std::time::Instant) -> bool {
+        self.peers.values().any(|s| s.eligible(now))
+    }
+
+    /// Whether some connected peer is not in `tried` (a pull that has asked
+    /// every connected peer can only wait for a new one).
+    pub fn has_untried(&self, tried: &[PeerId]) -> bool {
+        self.peers.iter().any(|(p, s)| s.connected && !tried.contains(p))
     }
 
     /// A request was sent to `peer`.
@@ -706,52 +1151,143 @@ impl PullPeerSelector {
         s.last_selected = Some(now);
     }
 
-    /// `peer` answered (any well-formed, non-Busy answer — NotFound included).
+    /// `peer` answered usefully (the block, the asked-for headers / tips /
+    /// peers).
     pub fn on_success(&mut self, peer: &PeerId) {
         if let Some(s) = self.peers.get_mut(peer) {
             s.in_flight = s.in_flight.saturating_sub(1);
-            s.consecutive_failures = 0;
+            s.busy_streak = 0;
         }
     }
 
-    /// `peer` answered `Busy`: back off briefly, no failure recorded.
+    /// Charge `peer` one or more useless answers without touching its
+    /// in-flight count (B1-T6 review: the announcer of a block nobody
+    /// served).
+    pub fn charge_useless(&mut self, peer: &PeerId, now: std::time::Instant, weight: f64) {
+        if let Some(s) = self.peers.get_mut(peer) {
+            s.decay(now);
+            s.useless += weight;
+        }
+    }
+
+    /// B1-T6: `peer` answered, but uselessly (NotFound; an empty answer from
+    /// a peer that claimed more): ranks it down by `weight`. Never a
+    /// cooldown: honest peers answer NotFound for blocks they pruned or never
+    /// had, and an attacker can make them do so for blocks that do not
+    /// exist.
+    pub fn on_useless(&mut self, peer: &PeerId, now: std::time::Instant, weight: f64) {
+        if let Some(s) = self.peers.get_mut(peer) {
+            s.in_flight = s.in_flight.saturating_sub(1);
+            s.decay(now);
+            s.useless += weight;
+        }
+    }
+
+    /// Take back a useless-answer charge: the NotFound was true (the pull was
+    /// dropped because no peer had the block).
+    pub fn refund_useless(&mut self, peer: &PeerId, now: std::time::Instant, weight: f64) {
+        if let Some(s) = self.peers.get_mut(peer) {
+            s.decay(now);
+            s.useless = (s.useless - weight).max(0.0);
+        }
+    }
+
+    /// `peer` answered `Busy`: back off briefly. Free for the first
+    /// [`FREE_BUSY_EPISODES`] back-off episodes in a row; each further one
+    /// (still no useful answer) counts as one useless answer (B1-T6 review:
+    /// a peer answering only Busy used to cost nothing and stay preferred,
+    /// so pulls waited on it while honest peers sat idle).
     pub fn on_busy(&mut self, peer: &PeerId, now: std::time::Instant) {
         if let Some(s) = self.peers.get_mut(peer) {
             s.in_flight = s.in_flight.saturating_sub(1);
-            s.cooldown_until = Some(now + BUSY_COOLDOWN);
+            if s.cooldown_until.is_none_or(|t| now >= t) {
+                s.busy_streak = s.busy_streak.saturating_add(1);
+                if s.busy_streak > FREE_BUSY_EPISODES {
+                    s.decay(now);
+                    s.useless += 1.0;
+                }
+            }
+            let until = now + BUSY_COOLDOWN;
+            s.cooldown_until = Some(s.cooldown_until.map_or(until, |t| t.max(until)));
         }
     }
 
     /// The request to `peer` failed (timeout, reset, undecodable answer).
-    /// [`STALL_FAILURES`] in a row put the peer on [`STALL_COOLDOWN`].
+    /// A stall score of [`STALL_FAILURES`] (decaying) puts the peer on
+    /// cooldown ([`STALL_COOLDOWN`], doubling for repeat offenders).
     pub fn on_failure(&mut self, peer: &PeerId, now: std::time::Instant) {
         if let Some(s) = self.peers.get_mut(peer) {
             s.in_flight = s.in_flight.saturating_sub(1);
-            s.consecutive_failures = s.consecutive_failures.saturating_add(1);
-            if s.consecutive_failures >= STALL_FAILURES {
-                s.cooldown_until = Some(now + STALL_COOLDOWN);
-                s.consecutive_failures = 0;
+            s.decay(now);
+            s.stall += 1.0;
+            if s.stall >= f64::from(STALL_FAILURES) - 1e-9 {
+                s.stall = 0.0;
+                s.cool_down(now);
             }
         }
     }
 
+    /// The request to `peer` ended without a verdict on the peer (its
+    /// connection closed): frees the slot only.
+    pub fn on_closed(&mut self, peer: &PeerId) {
+        if let Some(s) = self.peers.get_mut(peer) {
+            s.in_flight = s.in_flight.saturating_sub(1);
+        }
+    }
+
+    /// `peer` broke the protocol (a wrong answer, a malformed frame): an
+    /// immediate stall cooldown, escalating like a stall's.
+    pub fn on_misbehaving(&mut self, peer: &PeerId, now: std::time::Instant) {
+        if let Some(s) = self.peers.get_mut(peer) {
+            s.decay(now);
+            s.stall += 1.0;
+            s.cool_down(now);
+        }
+    }
+
     /// Requests currently outstanding to `peer`.
+    #[allow(dead_code)] // library API and tests; the node binary compiles this module too
     pub fn in_flight(&self, peer: &PeerId) -> u32 {
         self.peers.get(peer).map(|s| s.in_flight).unwrap_or(0)
     }
 
     /// True while `peer` is on a stall/Busy cooldown.
+    #[allow(dead_code)] // library API and tests; the node binary compiles this module too
     pub fn is_cooling_down(&self, peer: &PeerId, now: std::time::Instant) -> bool {
         self.peers.get(peer).and_then(|s| s.cooldown_until).is_some_and(|t| now < t)
     }
 
-    /// Number of candidate (connected) peers.
-    pub fn len(&self) -> usize {
-        self.peers.len()
+    /// True while `peer` is connected.
+    pub fn is_connected(&self, peer: &PeerId) -> bool {
+        self.peers.get(peer).is_some_and(|s| s.connected)
     }
 
+    /// True while `peer` is connected through a connection we dialed.
+    pub fn is_outbound(&self, peer: &PeerId) -> bool {
+        self.peers.get(peer).is_some_and(|s| s.connected && s.outbound)
+    }
+
+    /// The peer's current penalty (useless answers + 2 x stall score).
+    #[allow(dead_code)] // library API and tests; the node binary compiles this module too
+    pub fn penalty(&self, peer: &PeerId, now: std::time::Instant) -> f64 {
+        self.peers.get(peer).map_or(0.0, |s| s.penalty_at(now))
+    }
+
+    /// Number of candidate (connected) peers.
+    #[allow(dead_code)] // library API and tests; the node binary compiles this module too
+    pub fn len(&self) -> usize {
+        self.peers.values().filter(|s| s.connected).count()
+    }
+
+    #[allow(dead_code)] // library API and tests; the node binary compiles this module too
     pub fn is_empty(&self) -> bool {
-        self.peers.is_empty()
+        self.len() == 0
+    }
+
+    /// Peers whose state is remembered (connected or not).
+    #[allow(dead_code)] // library API and tests; the node binary compiles this module too
+    pub fn tracked(&self) -> usize {
+        self.peers.len()
     }
 }
 
@@ -1303,15 +1839,18 @@ mod tests {
     /// MAX_REQUEST_FRAME bytes before it is judged, not up to the 4 MiB block
     /// frame cap — so 256 open streams per connection can no longer pin about
     /// 1 GiB of junk for the request timeout. The oversized request is a
-    /// protocol violation (penalized like any malformed frame).
+    /// protocol violation. Re-audit B1-T2: the codec used to return it as an
+    /// `InvalidData` error, which libp2p-request-response 0.30 never reports
+    /// to the behaviour (it only logs a request that fails to decode), so the
+    /// penalty never fired; it is now reported as `SyncRequest::Malformed`,
+    /// which the network loop attributes to its peer and penalizes.
     #[test]
     fn oversized_request_is_cut_at_the_request_cap_and_is_a_violation() {
         use futures::executor::block_on;
         let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut io = EndlessJunk { served: served.clone() };
-        let e = block_on(BlochSyncCodec.read_request(&SYNC_PROTOCOL, &mut io)).expect_err("junk request");
-        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
-        assert!(is_sync_protocol_violation(&e));
+        let r = block_on(BlochSyncCodec.read_request(&SYNC_PROTOCOL, &mut io)).expect("reported, not an error");
+        assert_eq!(r, SyncRequest::Malformed);
         assert!(
             served.load(std::sync::atomic::Ordering::Relaxed) as u64 <= MAX_REQUEST_FRAME,
             "read {} bytes from a request stream",
@@ -1321,9 +1860,18 @@ mod tests {
         // A valid request followed by padding up to the cap is refused too.
         let mut padded = encode_frame(&SyncRequest::GetTips).unwrap();
         padded.resize(MAX_REQUEST_FRAME as usize + 10, 0);
-        let e = block_on(BlochSyncCodec.read_request(&SYNC_PROTOCOL, &mut futures::io::Cursor::new(padded)))
-            .expect_err("padded request");
-        assert!(is_sync_protocol_violation(&e));
+        let r = block_on(BlochSyncCodec.read_request(&SYNC_PROTOCOL, &mut futures::io::Cursor::new(padded)))
+            .expect("padded request");
+        assert_eq!(r, SyncRequest::Malformed);
+        // So is an undecodable short frame; a stream closed without a frame
+        // stays a transport error (never penalized).
+        let r = block_on(BlochSyncCodec.read_request(&SYNC_PROTOCOL, &mut futures::io::Cursor::new(vec![0xFF; 5])));
+        assert_eq!(r.unwrap(), SyncRequest::Malformed);
+        let e = block_on(BlochSyncCodec.read_request(&SYNC_PROTOCOL, &mut futures::io::Cursor::new(Vec::new())))
+            .expect_err("no frame");
+        assert!(!is_sync_protocol_violation(&e));
+        // `Malformed` never goes on the wire.
+        assert!(encode_frame(&SyncRequest::Malformed).is_err());
     }
 
     /// Every valid request fits well under the request cap, including the
@@ -1345,7 +1893,7 @@ mod tests {
             );
             match req {
                 SyncRequest::GetHeaders { limit, .. } if limit > MAX_WIRE_GETHEADERS_LIMIT => {
-                    assert!(back.is_err(), "bounds still apply")
+                    assert_eq!(back.unwrap(), SyncRequest::Malformed, "bounds still apply")
                 }
                 _ => assert_eq!(back.unwrap(), req),
             }
@@ -1463,6 +2011,113 @@ mod tests {
         assert!(sel.is_empty());
     }
 
+    // ── Phase 4, package R2a ────────────────────────────────────────────────
+
+    /// The send-buffer accounting (B1-T18 / B2-T6) charges exactly what the
+    /// codec writes: `response_wire_len` equals the encoded length for every
+    /// variant and every varint width.
+    #[test]
+    fn response_wire_len_is_the_encoded_length() {
+        let mut cases = sample_responses();
+        for v in [0u64, 250, 251, 0xFFFF, 0x1_0000, 0xFFFF_FFFF, 0x1_0000_0000, u64::MAX] {
+            cases.push(SyncResponse::Block { block_hash: [1; 32], blue_score: v, height: v, block_data: vec![3; (v % 70_000) as usize] });
+            cases.push(SyncResponse::Headers { entries: vec![SyncEntry { hash: [2; 32], blue_score: v, height: v }; 3] });
+            cases.push(SyncResponse::Tips { tips: vec![SyncEntry { hash: [2; 32], blue_score: v, height: 1 }], locator: vec![[4; 32]; 2] });
+        }
+        cases.push(SyncResponse::Peers { peers: vec!["x".repeat(300), String::new(), "/ip4/1.2.3.4/tcp/1".into()] });
+        cases.push(SyncResponse::Headers { entries: vec![SyncEntry { hash: [9; 32], blue_score: 1, height: 1 }; 300] });
+        for r in &cases {
+            assert_eq!(response_wire_len(r), encode_frame(r).unwrap().len(), "{r:?}");
+        }
+    }
+
+    /// B2-T7: releases before this one answered GetTips with EVERY DAG tip, so
+    /// an honest server with more than MAX_WIRE_TIPS tips sends a Tips frame
+    /// over the wire bound. It is still refused (the bound holds), but it is
+    /// not a protocol violation: only answers an honest node cannot produce
+    /// are penalized.
+    #[test]
+    fn oversized_tips_answer_is_refused_without_penalty() {
+        let resp = SyncResponse::Tips {
+            tips: (0..(MAX_WIRE_TIPS + 1)).map(|i| SyncEntry { hash: [i as u8; 32], blue_score: i as u64, height: 1 }).collect(),
+            locator: vec![],
+        };
+        let e = decode_response(&encode_frame(&resp).unwrap()).expect_err("over the wire bound");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(!is_sync_protocol_violation(&e), "an honest older server's answer must not be penalized");
+        // Every other bound is still a violation.
+        let headers = SyncResponse::Headers {
+            entries: (0..(MAX_WIRE_SYNC_ENTRIES + 1)).map(|i| SyncEntry { hash: [0; 32], blue_score: i as u64, height: 0 }).collect(),
+        };
+        assert!(is_sync_protocol_violation(&decode_response(&encode_frame(&headers).unwrap()).unwrap_err()));
+        let locator = SyncResponse::Tips { tips: vec![], locator: vec![[0; 32]; MAX_WIRE_LOCATOR + 1] };
+        assert!(is_sync_protocol_violation(&decode_response(&encode_frame(&locator).unwrap()).unwrap_err()));
+    }
+
+    /// B1-T3 / B2-T5: GetTips and GetHeaders have their own per-peer budgets,
+    /// much lower than GetBlock's, and exhausting them does not touch the
+    /// GetBlock budget.
+    #[test]
+    fn tips_and_headers_requests_have_their_own_lower_budgets() {
+        let mut lim = SyncRequestLimiter::new();
+        let p = PeerId::random();
+        let t0 = std::time::Instant::now();
+        let tips = (0..SYNC_BUCKET_CAPACITY).filter(|_| lim.allow_request(p, &SyncRequest::GetTips, t0)).count();
+        assert!(tips >= 2 && tips < SYNC_BUCKET_CAPACITY as usize / 4, "GetTips burst {tips}");
+        let get_headers = SyncRequest::GetHeaders { from_blue_score: 0, limit: 500 };
+        let headers = (0..SYNC_BUCKET_CAPACITY).filter(|_| lim.allow_request(p, &get_headers, t0)).count();
+        assert!(headers >= 4 && headers < SYNC_BUCKET_CAPACITY as usize / 2, "GetHeaders burst {headers}");
+        let blocks = (0..SYNC_BUCKET_CAPACITY)
+            .filter(|_| lim.allow_request(p, &SyncRequest::GetBlock { block_hash: [0; 32] }, t0))
+            .count();
+        assert_eq!(blocks, SYNC_BUCKET_CAPACITY as usize, "the GetBlock budget is separate");
+    }
+
+    /// A writer that never accepts a byte: a peer that never reads.
+    struct NeverDrains;
+
+    impl futures::io::AsyncWrite for NeverDrains {
+        fn poll_write(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, _: &[u8]) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// B1-T18 / B2-T6: a response to a peer that never reads is given up after
+    /// RESPONSE_WRITE_TIMEOUT (shorter than the 30 s stream timeout), which
+    /// frees it and its send-budget charge sooner.
+    #[tokio::test(start_paused = true)]
+    async fn response_write_gives_up_on_a_peer_that_never_reads() {
+        assert!(RESPONSE_WRITE_TIMEOUT < Duration::from_secs(30));
+        let resp = SyncResponse::Block { block_hash: [1; 32], blue_score: 1, height: 1, block_data: vec![0; 1 << 20] };
+        let started = tokio::time::Instant::now();
+        let r = tokio::time::timeout(
+            RESPONSE_WRITE_TIMEOUT * 2,
+            BlochSyncCodec.write_response(&SYNC_PROTOCOL, &mut NeverDrains, resp),
+        )
+        .await
+        .expect("the codec must give up on its own");
+        assert_eq!(r.expect_err("never written").kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), RESPONSE_WRITE_TIMEOUT);
+    }
+
+    /// A Block response is written as exactly the bytes `encode_frame` gives,
+    /// for every length-prefix width (it is streamed: no second copy).
+    #[test]
+    fn block_response_is_written_as_its_exact_frame() {
+        for len in [0usize, 1, 250, 251, 0xFFFF, 0x1_0000, 300_000] {
+            let resp = SyncResponse::Block { block_hash: [7; 32], blue_score: 300, height: 70_000, block_data: (0..len).map(|i| i as u8).collect() };
+            let mut out = futures::io::Cursor::new(Vec::new());
+            futures::executor::block_on(BlochSyncCodec.write_response(&SYNC_PROTOCOL, &mut out, resp.clone())).unwrap();
+            assert_eq!(out.into_inner(), encode_frame(&resp).unwrap(), "len {len}");
+        }
+    }
+
     /// A peer that did not serve a request (empty frame) is not a protocol
     /// violator; a truncated or garbage frame still is.
     #[test]
@@ -1470,5 +2125,4 @@ mod tests {
         assert_eq!(response_from_frame(&[]).unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
         assert_eq!(response_from_frame(&[0xFF; 3]).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
-
 }

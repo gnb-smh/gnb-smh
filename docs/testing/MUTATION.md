@@ -272,7 +272,7 @@ consensus module's own tests catch it.
 | `check_coinbase_maturity` | 5 | `coinbase_maturity_boundary_is_exact` (99 confirmations refused with the exact message, 100 accepted; height 0 and non-coinbase inputs skipped) |
 | `check_min_fee` | 4 | `min_fee_boundary_is_inclusive` |
 | `MerkleRoot::into_inner`, `From` both ways, `Deref` | 6 | `merkle_root_newtype_is_transparent` |
-| `BlockHeader::pow_hash`, `BlockHeader::dag_hash` | 4 | `genesis_header_digests_match_the_python_reference` (pow preimage, DAG hash, block id and GnB-SMH output of the genesis header, computed with `reference/gnb_smh.py`) |
+| `BlockHeader::pow_hash` (and `BlockHeader::dag_hash`, removed since: audit POW-9, it was dead code) | 4 | `genesis_header_digests_match_the_python_reference` (pow preimage, block id and GnB-SMH output of the genesis header, computed with `reference/gnb_smh.py`) |
 | `BlockHeader::read_wire_bytes` (parent cap), `BlockHeader::from_wire_bytes` (trailing bytes) | 3 | `header_wire_round_trip_and_parent_cap` |
 | wire-parser caps: `read_shielded_tx` (12), `Transaction::from_wire_bytes` (4), `Block::from_wire_bytes` (4) | 20 | `wire_parser_caps_are_exact` (every count/length cap at the cap and one above it, with the exact error) |
 | `Transaction::is_coinbase` (`&&` -> `\|\|`) | 1 | `coinbase_shape_is_exact` |

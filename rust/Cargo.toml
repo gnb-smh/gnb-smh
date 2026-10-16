@@ -23,3 +23,7 @@ hex = "0.4"
 opt-level = 3
 lto = true
 codegen-units = 1
+# Audit POW-9: like the consensus workspace (root Cargo.toml), every profile
+# fails closed identically on integer overflow (panic), never wraps in
+# release and panics in debug. Guarded by tests/build_profile.rs.
+overflow-checks = true

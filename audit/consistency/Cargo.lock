@@ -561,6 +561,7 @@ name = "gnb-smh"
 version = "0.1.0"
 dependencies = [
  "keccak",
+ "sha2",
  "sha3",
 ]
 

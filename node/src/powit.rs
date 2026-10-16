@@ -82,10 +82,29 @@ pub fn load_state(store: &Storage, hash: &Hash) -> Option<PowitState> {
     bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).ok().map(|(s, _)| s)
 }
 
+fn encode_state(state: &PowitState) -> Result<Vec<u8>, String> {
+    bincode::serde::encode_to_vec(state, bincode::config::standard())
+        .map_err(|e| format!("powit state encode: {e}"))
+}
+
+/// Write `hash`'s PoWit state on its own. The acceptance pipeline uses
+/// [`stage_state`] (committed with the block's DAG record); this is for tools
+/// and tests.
+#[allow(dead_code)] // tools and tests; the node binary compiles this module too
 pub fn save_state(store: &Storage, hash: &Hash, state: &PowitState) -> Result<(), String> {
-    let bytes = bincode::serde::encode_to_vec(state, bincode::config::standard())
-        .map_err(|e| format!("powit state encode: {e}"))?;
+    let bytes = encode_state(state)?;
     store.put_meta(&state_key(hash), &bytes).map_err(|e| format!("storage: powit state: {e}"))
+}
+
+/// [`save_state`] into a caller-owned batch: the acceptance pipeline commits
+/// a block's PoWit state in the same batch as its DAG record (the first chunk
+/// of the chain move it triggers, or its fork-loser record), so a block is
+/// never recorded without its state and a refused block leaves none behind.
+pub fn stage_state(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, state: &PowitState)
+    -> Result<(), String>
+{
+    let bytes = encode_state(state)?;
+    store.stage_meta(batch, &state_key(hash), &bytes).map_err(|e| format!("storage: powit state: {e}"))
 }
 
 /// State a child of `parent` builds on: the parent's stored state, or the
@@ -432,7 +451,9 @@ impl WitnessDuty {
     /// Load a KES witness key (`gnb-cli witnesskeygen`); the password is read
     /// from `password_file` (first line), never from the command line.
     pub fn load(key: &Path, password_file: &Path, payout_script: Vec<u8>, data_dir: &Path) -> Result<Self, String> {
-        let pw = std::fs::read_to_string(password_file).map_err(|e| format!("witness password file: {e}"))?;
+        // CRY-4: the file's contents are wiped once the first line is copied.
+        let pw = zeroize::Zeroizing::new(
+            std::fs::read_to_string(password_file).map_err(|e| format!("witness password file: {e}"))?);
         let password = zeroize::Zeroizing::new(pw.lines().next().unwrap_or("").trim().to_string());
         let file = gnb_crypto::core::kes::KesKeyFile::load(key)?;
         let signer = file.open(&password)?;
@@ -640,10 +661,24 @@ pub fn evidence_item(e: &Equivocation) -> (Hash, u8, Vec<u8>) {
 /// The activation checkpoint is final only by definition and never pins fork
 /// choice (two chains may compete right at activation).
 pub fn update_finalized(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage) {
+    let tip = dag.read().selected_tip();
+    if let Some(t) = tip {
+        pin_finalized_of(dag, store, &t);
+    }
+}
+
+/// Pin fork choice to the checkpoint `tip`'s witness set has finalized, as
+/// [`update_finalized`] does for the selected tip. A chain move that commits
+/// in chunks (`accept::resolve_best_chain`) calls it with each committed
+/// chunk's applied tip, so the finality the applied chain reached binds the
+/// rest of the move; start-up calls it with the persisted applied tip before
+/// it resumes a stopped move. A no-op when `tip` has no PoWit state or its
+/// state finalized nothing beyond the activation checkpoint; never moves the
+/// pin back (`GhostDAG::set_finalized`).
+pub fn pin_finalized_of(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage, tip: &Hash) {
     let fin = {
         let d = dag.read();
-        d.selected_tip()
-            .and_then(|t| load_state(store, &t))
+        load_state(store, tip)
             .filter(|st| st.finalized.height > st.activation)
             .and_then(|st| d.get_block_data(&st.finalized.hash).map(|bd| (st.finalized.hash, bd.height)))
     };

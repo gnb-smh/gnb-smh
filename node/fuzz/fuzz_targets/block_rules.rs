@@ -1,6 +1,7 @@
 //! The hardening block rules of `core::block_rules` (audit VAL-2, VAL-10,
-//! VAL-12, CRY-1) against independent implementations written from the
-//! specification (`common`), on two kinds of input selected by the first byte:
+//! VAL-12, CRY-1, re-audit B2-T10) against independent implementations
+//! written from the specification (`common`), on two kinds of input selected
+//! by the first byte:
 //!
 //! * an id list: the tagged Merkle root equals an RFC 6962-style recursive
 //!   reference, the legacy root equals Bitcoin's in-place `ComputeMerkleRoot`,
@@ -10,10 +11,13 @@
 //! * a block decoded from untrusted wire bytes (the attacker's path): wire
 //!   size, txids, wtxids, header roots, witness root, parents commitment and
 //!   the 80-byte coinbase commitment equal the references; the 64-byte rule
-//!   fires exactly on a 64-byte txid preimage; the coinbase-commitment verdict
-//!   equals a reference parser of the commitment; no check panics. Then the
-//!   block is REPAIRED with the references (coinbase shape, commitment, root)
-//!   so the library must accept it unless a transaction is 64 bytes, and one
+//!   fires exactly on a 64-byte txid preimage; the distinct-parents rule
+//!   fires exactly on a repeated parent id; the coinbase-commitment verdict
+//!   equals a reference parser of the commitment, and the body verdict
+//!   (parents, then 64-byte, then commitment) the reference order; no check
+//!   panics. Then the block is REPAIRED with the references (coinbase shape,
+//!   each parent listed once, commitment, root) so the library must accept
+//!   it unless a transaction is 64 bytes or the block is too large, and one
 //!   input-chosen field the commitment covers is altered: the library must
 //!   reject it (and must keep accepting when only the miner's extra bytes
 //!   change with the root recomputed).
@@ -22,7 +26,7 @@
 mod common;
 
 use common::*;
-use gnb_crypto::core::{activation, block_rules as br, Block, Transaction, TxInput, MAX_BLOCK_SIZE};
+use gnb_crypto::core::{activation, block_rules as br, powit_height, Block, Transaction, TxInput, MAX_BLOCK_SIZE};
 use libfuzzer_sys::fuzz_target;
 use sha3::{Digest, Sha3_256};
 
@@ -80,35 +84,53 @@ fn check_id_list(inp: &mut Input) {
     }
 }
 
-/// The reference header root of `b` in the regime `hardened`.
+/// The reference header root of `b` in the regime `hardened`: from
+/// `powit_height()` the v2 body root (transparent, shielded and PoWit
+/// sections, always); below it the transaction root, or the v1 body root
+/// when the block carries shielded transactions.
 fn ref_body_root(b: &Block, hardened: bool) -> [u8; 32] {
     let ids: Vec<[u8; 32]> = b.transactions.iter().map(ref_txid).collect();
     let tx_root = if hardened { ref_tagged_root(&ids) } else { ref_legacy_root(&ids) };
+    if b.height >= powit_height() {
+        let mut c = Sha3_256::new();
+        c.update(b"gnb:block:body:v2");
+        c.update(tx_root);
+        c.update(ref_shielded_root(b));
+        c.update(ref_powit_root(&b.powit));
+        return c.finalize().into();
+    }
     if b.shielded_transactions.is_empty() {
         return tx_root;
     }
+    let mut c = Sha3_256::new();
+    c.update(b"gnb:block:body:v1");
+    c.update(tx_root);
+    c.update(ref_shielded_root(b));
+    c.finalize().into()
+}
+
+/// The shielded section's root (also over an empty list).
+fn ref_shielded_root(b: &Block) -> [u8; 32] {
     let mut sh = Sha3_256::new();
     sh.update(b"gnb:block:shielded:v1");
     for s in &b.shielded_transactions {
         // The shielded encoding is the block wire encoding of one entry:
-        // re-encode a block holding only it and cut the fixed prefix.
+        // re-encode a block holding only it and cut the fixed prefix (and
+        // the PoWit section, were height 0 at or above `powit_height()`).
         let lone = Block {
             header: b.header.clone(),
             transactions: vec![],
             blue_score: 0,
             height: 0,
             shielded_transactions: vec![s.clone()],
+            powit: Default::default(),
         };
         let enc = ref_block_wire(&lone);
         let prefix = ref_header_wire(&lone.header, 0, 0).len() + 1 + 1; // tx count 0, shielded count 1
-        sh.update(sha3(&enc[prefix..]));
+        let suffix = if lone.height >= powit_height() { ref_powit_wire(&lone.powit).len() } else { 0 };
+        sh.update(sha3(&enc[prefix..enc.len() - suffix]));
     }
-    let sh_root: [u8; 32] = sh.finalize().into();
-    let mut c = Sha3_256::new();
-    c.update(b"gnb:block:body:v1");
-    c.update(tx_root);
-    c.update(sh_root);
-    c.finalize().into()
+    sh.finalize().into()
 }
 
 /// Reference verdict of `check_coinbase_commitment`: which field (if any)
@@ -135,6 +157,12 @@ fn ref_commitment_verdict(b: &Block) -> Result<(), &'static str> {
         return Err("witness");
     }
     Ok(())
+}
+
+/// Reference of the distinct-parents rule (B2-T10, docs/CONSENSUS.md "Parent
+/// list"): no id appears twice in the header's parent list.
+fn ref_parents_distinct(parents: &[[u8; 32]]) -> bool {
+    parents.iter().enumerate().all(|(i, p)| !parents[..i].contains(p))
 }
 
 fn lib_commitment_kind(r: Result<(), &'static str>) -> Result<(), &'static str> {
@@ -200,10 +228,23 @@ fn check_block(b: &Block) {
     );
     assert_eq!(lib_commitment_kind(br::check_coinbase_commitment(b)), ref_commitment_verdict(b), "commitment verdict");
 
+    // B2-T10: from the activation a header lists each parent once. The body
+    // rules run in the specified order: parents, the 64-byte rule, then the
+    // coinbase commitment.
+    let distinct = ref_parents_distinct(&b.header.parents);
+    assert_eq!(br::check_parents_distinct(&b.header.parents).is_ok(), distinct, "distinct-parents rule");
+    let body = br::check_hardened_body(b);
+    if !distinct {
+        assert_eq!(body, Err("duplicate parent"), "body verdict (repeated parent)");
+    } else if b.transactions.iter().any(|t| ref_tx_wire(t, ref_is_coinbase(t)).len() == 64) {
+        assert!(body.unwrap_err().starts_with("64-byte"), "body verdict (64-byte transaction)");
+    } else {
+        assert_eq!(lib_commitment_kind(body), ref_commitment_verdict(b), "body verdict (commitment)");
+    }
+
     // The full context-free checks never panic; below the activation they are
     // a no-op, and the genesis height is never subject to them.
     let _ = br::check_block_hardened_at(b, 0);
-    let _ = br::check_hardened_body(b);
     let _ = b.validate_structure_without_pow_at(0);
     let _ = b.validate_structure_without_pow_at(activation::NEVER);
     if !ref_active(b.height, activation::NEVER) {
@@ -232,6 +273,15 @@ fn check_repaired(b: &Block, ctl: &mut Input) {
         }
     }
     r.height = r.height.max(1);
+    // B2-T10: each parent listed once (first occurrences, in order).
+    let mut seen: Vec<[u8; 32]> = Vec::with_capacity(r.header.parents.len());
+    r.header.parents.retain(|p| {
+        if seen.contains(p) {
+            return false;
+        }
+        seen.push(*p);
+        true
+    });
     let commit = |r: &mut Block, extra: &[u8]| {
         let mut ss = ref_commitment(r.height, &r.header.parents, &r.transactions).to_vec();
         ss.extend_from_slice(extra);

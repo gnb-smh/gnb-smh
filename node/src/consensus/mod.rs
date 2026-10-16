@@ -13,13 +13,16 @@
 //!   - Both candidate and existing blue blocks satisfy the K constraint
 //!
 //! Performance:
-//!   - is_ancestor: O(height_diff) with blue_score/height shortcuts (vs O(DAG) naive)
-//!   - past_blue_set: bounded to K*100 depth on selected chain (audit H-5)
+//!   - ancestry: the interval reachability index (`reachability`), live for
+//!     every block (`CORRECTED_COLORING_ACTIVATION_HEIGHT = 0`), O(log) per
+//!     query; the bounded legacy `is_ancestor` (blue_work shortcut, DAG-8)
+//!     and the k*100-bounded `past_blue_set` serve only the Legacy coloring,
+//!     which the activation gate never selects on GnB
 //!   - blue_work: cumulative work; see the hardening activation note below
 //!
 //! Hardening activation (audit 2026-10-14, DAG-3 / DAG-4 / DAG-7):
 //!   Blocks whose `GhostdagData::height` is at or above
-//!   [`GhostDAG::hardening_activation_height`] (mainnet 110,000; testnet and
+//!   [`GhostDAG::hardening_activation_height`] (mainnet 17,500; testnet and
 //!   regtest 0, see `crate::core::activation`) are processed under corrected
 //!   rules. Blocks below it are processed exactly as before.
 //!   - blue_work = sp.blue_work + work of the mergeset blues + own work, i.e.
@@ -33,7 +36,7 @@
 //!   The ledger stays selected-chain-only at every height: transactions of
 //!   merged blocks are never applied (docs/CONSENSUS.md).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use serde::{Serialize, Deserialize};
 use log::warn;
 use crate::core::GHOSTDAG_K;
@@ -72,6 +75,29 @@ pub const MERGE_DEPTH: u64 = 360;
 
 pub mod reachability;
 use reachability::ReachabilityStore;
+
+thread_local! {
+    static COMPUTE_BLOCK_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BLOCK_DATA_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of per-block GhostDAG record lookups (`DagStore::get`, behind
+/// `GhostDAG::get_block_data`) on the calling thread since it started.
+/// Every walk over the DAG's records goes through it, whatever the walking
+/// code, so cost tests bound it (audit B1-T16: planning a chain move reads
+/// O(move) records, not the chain back to genesis). No effect on behaviour.
+#[allow(dead_code)] // tests only; the node binary compiles this module too
+pub fn block_data_lookups() -> u64 {
+    BLOCK_DATA_LOOKUPS.with(|c| c.get())
+}
+
+/// Number of full GhostDAG block computations (`compute_block`: mergeset,
+/// coloring, merge-depth check) run on the calling thread since it started.
+/// Instrumentation for cost tests (audit B1-T15); no effect on behaviour.
+#[allow(dead_code)] // tests only; the node binary compiles this module too
+pub fn compute_block_calls() -> u64 {
+    COMPUTE_BLOCK_CALLS.with(|c| c.get())
+}
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -240,9 +266,37 @@ pub struct LoadedIntegrity {
     pub fresh_map:     Option<std::collections::HashMap<BlockHash, [u8; 32]>>,
 }
 
-/// Errors that can be returned by `load_persisted_validated`. Every
-/// variant is, in the intended threat model, fatal: the caller should
-/// log loudly and exit rather than continue with an unverifiable DAG.
+/// The header fields a block's GhostDAG data are computed from (what
+/// `accept_block` passes to `add_block`): its parents, its timestamp and the
+/// work of its bits.
+#[derive(Debug, Clone)]
+pub struct StoredHeader {
+    pub parents: Vec<BlockHash>,
+    pub timestamp: u64,
+    pub work: u128,
+}
+
+/// Outcome of [`GhostDAG::load_persisted_repairing`] (audit DAG-11).
+#[derive(Debug, Default)]
+pub struct DagRepair {
+    /// Blocks loaded into the DAG.
+    pub blocks_loaded: usize,
+    /// Records kept as stored whose integrity link was re-derived.
+    pub relinked: Vec<BlockHash>,
+    /// Blocks whose GhostDAG data were recomputed from their stored header
+    /// (no record, or a record matching no integrity link), with the data.
+    pub recomputed: Vec<(BlockHash, GhostdagData)>,
+    /// Blocks not loaded (no header to recompute from, or an unloadable
+    /// parent), every descendant of one included.
+    pub dropped: Vec<BlockHash>,
+    /// The re-derived integrity hash of every loaded block.
+    pub integrity: HashMap<BlockHash, [u8; 32]>,
+}
+
+/// Errors that can be returned by `load_persisted_validated`. In the
+/// original threat model every variant was fatal; the start-up path now
+/// repairs the footprints a pre-fix binary left
+/// ([`GhostDAG::load_persisted_repairing`], audit DAG-11) instead of exiting.
 #[derive(Debug)]
 pub enum IntegrityError {
     /// Some blocks have integrity records and some don't. Ambiguous —
@@ -296,29 +350,143 @@ impl std::error::Error for IntegrityError {}
 
 // ── DAG Store ────────────────────────────────────────────────────────────────
 
+/// GhostDAG's tip order key: (blue_work, blue_score, hash), larger wins — the
+/// order of `select_parent` and `selected_tip`.
+type TipKey = (u128, u64, BlockHash);
+
+/// The GhostDAG data of every stored block (`DagStore::data`).
+///
+/// Audit B1-T3 / B2-T5 (review): every whole-store iteration (`iter`,
+/// `keys`, `values`, a `for` loop over `&map`) adds the number of stored
+/// blocks to [`BlockDataMap::scanned`], which `GhostDAG::query_visits`
+/// includes. So the served-request work test notices any remotely
+/// triggerable path that scans the DAG — e.g. the old `ordered_hashes_from`,
+/// which walked every entry and counted only what it returned — whatever
+/// that path counts itself. Point reads (`get`, `contains_key`, `[h]`) are
+/// not counted. Not consensus state.
+#[derive(Default)]
+pub struct BlockDataMap {
+    map: HashMap<BlockHash, GhostdagData>,
+    scanned: std::sync::atomic::AtomicU64,
+}
+
+impl BlockDataMap {
+    fn note_scan(&self) {
+        self.scanned.fetch_add(self.map.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Entries walked by whole-store iterations so far (monotonic).
+    pub fn scanned(&self) -> u64 {
+        self.scanned.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn get(&self, hash: &BlockHash) -> Option<&GhostdagData> {
+        self.map.get(hash)
+    }
+
+    pub fn contains_key(&self, hash: &BlockHash) -> bool {
+        self.map.contains_key(hash)
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Every entry (counted in [`Self::scanned`]).
+    pub fn iter(&self) -> std::collections::hash_map::Iter<'_, BlockHash, GhostdagData> {
+        self.note_scan();
+        self.map.iter()
+    }
+
+    /// Every stored hash (counted in [`Self::scanned`]).
+    pub fn keys(&self) -> std::collections::hash_map::Keys<'_, BlockHash, GhostdagData> {
+        self.note_scan();
+        self.map.keys()
+    }
+
+    /// Every entry's data (counted in [`Self::scanned`]).
+    pub fn values(&self) -> std::collections::hash_map::Values<'_, BlockHash, GhostdagData> {
+        self.note_scan();
+        self.map.values()
+    }
+
+    fn insert(&mut self, hash: BlockHash, data: GhostdagData) -> Option<GhostdagData> {
+        self.map.insert(hash, data)
+    }
+
+    fn remove(&mut self, hash: &BlockHash) -> Option<GhostdagData> {
+        self.map.remove(hash)
+    }
+}
+
+impl std::ops::Index<&BlockHash> for BlockDataMap {
+    type Output = GhostdagData;
+
+    fn index(&self, hash: &BlockHash) -> &GhostdagData {
+        &self.map[hash]
+    }
+}
+
+impl<'a> IntoIterator for &'a BlockDataMap {
+    type Item = (&'a BlockHash, &'a GhostdagData);
+    type IntoIter = std::collections::hash_map::Iter<'a, BlockHash, GhostdagData>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// In-memory DAG — production would use RocksDB for this
+///
+/// `data`, `children` and `tips` are read by tests and tools; they are only
+/// ever MUTATED through [`DagStore::insert`], [`DagStore::remove_leaf`] and
+/// [`DagStore::set_tips`], which keep the two ordered indexes below in step.
 pub struct DagStore {
-    /// GhostDAG data per block
-    pub data: HashMap<BlockHash, GhostdagData>,
+    /// GhostDAG data per block (whole-store iterations are counted,
+    /// [`BlockDataMap`])
+    pub data: BlockDataMap,
     /// Children index: block → set of blocks that reference it as parent
     pub children: HashMap<BlockHash, HashSet<BlockHash>>,
     /// Current tips (leaf blocks with no children)
     pub tips: HashSet<BlockHash>,
     /// Genesis hash
     pub genesis: Option<BlockHash>,
+    /// Audit B1-T3 / B2-T5: every stored block keyed by (blue_score, hash),
+    /// so `GhostDAG::ordered_hashes_from` (the `/gnb/sync/1` GetHeaders
+    /// answer) is a range read, O(log n + limit), instead of a scan of the
+    /// whole store per request. Not consensus state (derived from `data`).
+    by_score: BTreeSet<(u64, BlockHash)>,
+    /// The tips ordered by GhostDAG's tip order ([`TipKey`]), so the
+    /// selected tip and the best tips for peers (`GhostDAG::tips_for_peers`)
+    /// are read from the top instead of scanning every leaf. Not consensus
+    /// state (derived from `tips` and `data`).
+    tips_by_work: BTreeSet<TipKey>,
+}
+
+impl Default for DagStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DagStore {
     pub fn new() -> Self {
         Self {
-            data: HashMap::new(),
+            data: BlockDataMap::default(),
             children: HashMap::new(),
             tips: HashSet::new(),
             genesis: None,
+            by_score: BTreeSet::new(),
+            tips_by_work: BTreeSet::new(),
         }
     }
 
     pub fn get(&self, hash: &BlockHash) -> Option<&GhostdagData> {
+        BLOCK_DATA_LOOKUPS.with(|c| c.set(c.get().wrapping_add(1)));
         self.data.get(hash)
     }
 
@@ -326,15 +494,76 @@ impl DagStore {
         self.data.contains_key(hash)
     }
 
+    fn tip_key(&self, hash: &BlockHash) -> Option<TipKey> {
+        self.data.get(hash).map(|d| (d.blue_work, d.blue_score, *hash))
+    }
+
+    /// Mark a stored block as a tip (no-op for an unknown block).
+    fn add_tip(&mut self, hash: BlockHash) {
+        if let Some(k) = self.tip_key(&hash) {
+            self.tips.insert(hash);
+            self.tips_by_work.insert(k);
+        }
+    }
+
+    /// Unmark a tip (its data must still be stored).
+    fn remove_tip(&mut self, hash: &BlockHash) {
+        if self.tips.remove(hash) {
+            if let Some(k) = self.tip_key(hash) {
+                self.tips_by_work.remove(&k);
+            }
+        }
+    }
+
     pub fn insert(&mut self, hash: BlockHash, data: GhostdagData) {
+        // A re-insert replaces the entry: drop its old index keys first.
+        if self.data.contains_key(&hash) {
+            self.remove_tip(&hash);
+            if let Some(old) = self.data.get(&hash) {
+                self.by_score.remove(&(old.blue_score, hash));
+            }
+        }
         // Remove parents from tips (they now have a child)
         for p in &data.parents {
-            self.tips.remove(p);
+            self.remove_tip(p);
             self.children.entry(*p).or_default().insert(hash);
         }
-        // This block is a new tip
-        self.tips.insert(hash);
+        self.by_score.insert((data.blue_score, hash));
         self.data.insert(hash, data);
+        // This block is a new tip
+        self.add_tip(hash);
+    }
+
+    /// Exact inverse of [`insert`](Self::insert) for a block without
+    /// children: drops it, its index keys and its child edges; a parent
+    /// becomes a tip again iff it is stored and has no child left. Returns
+    /// the removed data (`None` when the block is unknown).
+    fn remove_leaf(&mut self, hash: &BlockHash) -> Option<GhostdagData> {
+        if !self.data.contains_key(hash) {
+            return None;
+        }
+        self.remove_tip(hash);
+        let data = self.data.remove(hash)?;
+        self.by_score.remove(&(data.blue_score, *hash));
+        self.children.remove(hash);
+        for p in &data.parents {
+            if let Some(ch) = self.children.get_mut(p) {
+                ch.remove(hash);
+                if ch.is_empty() {
+                    self.children.remove(p);
+                }
+            }
+            if self.data.contains_key(p) && self.children.get(p).is_none_or(|c| c.is_empty()) {
+                self.add_tip(*p);
+            }
+        }
+        Some(data)
+    }
+
+    /// Replace the tip set (start-up recomputation).
+    fn set_tips(&mut self, tips: HashSet<BlockHash>) {
+        self.tips_by_work = tips.iter().filter_map(|h| self.tip_key(h)).collect();
+        self.tips = tips;
     }
 }
 
@@ -435,34 +664,6 @@ fn compute_past(store: &DagStore, b: &BlockHash) -> HashSet<BlockHash> {
     past
 }
 
-/// Compute the blue set of block B (all blue blocks in past(B))
-#[allow(dead_code)]
-fn compute_blue_set(store: &DagStore, b: &BlockHash) -> HashSet<BlockHash> {
-    let past = compute_past(store, b);
-    let mut blue_set = HashSet::new();
-    for h in &past {
-        if let Some(_data) = store.get(h) {
-            // A block is in the blue set if it appears in any ancestor's mergeset_blues
-            // or is the genesis
-            blue_set.insert(*h); // simplified: walk selected parent chain
-        }
-    }
-    // More precisely: walk selected parent chain + collect mergeset_blues
-    let mut blue = HashSet::new();
-    let mut cur = Some(*b);
-    while let Some(h) = cur {
-        if let Some(data) = store.get(&h) {
-            for mb in &data.mergeset_blues {
-                blue.insert(*mb);
-            }
-            cur = data.selected_parent;
-        } else {
-            break;
-        }
-    }
-    blue
-}
-
 // ── Mergeset computation ──────────────────────────────────────────────────────
 
 /// Compute mergeset(B, selected_parent):
@@ -502,7 +703,15 @@ fn compute_mergeset(
     topological_sort(store, mergeset_set.into_iter().collect())
 }
 
-/// Topological sort: ancestors first, descendants last
+/// The coloring order of a mergeset (consensus, audit B2-T9; specified in
+/// docs/CONSENSUS.md, "Coloring", executable in reference/gnb_ghostdag.py):
+/// Kahn's algorithm with a FIFO queue. The in-degree of a block counts its
+/// parents inside `blocks`; the queue starts with the blocks of in-degree 0
+/// in ascending byte order of their ids; each block taken from the FRONT
+/// appends the blocks it makes ready at the BACK, in ascending id order. It
+/// is NOT "the lowest id among the blocks ready now": a block that becomes
+/// ready later comes after every block already queued, whatever its id
+/// (`node/tests/ghostdag_vectors.rs`, case `order/fifo-not-lowest-id`).
 fn topological_sort(store: &DagStore, blocks: Vec<BlockHash>) -> Vec<BlockHash> {
     // Build in-degree map within this set
     let set: HashSet<BlockHash> = blocks.iter().cloned().collect();
@@ -788,7 +997,25 @@ pub struct GhostDAG {
     /// disqualified: nothing is persisted. The value lists the witness roots
     /// of the bodies already rejected for this id (most recent last, at most
     /// [`MAX_REJECTED_BODIES`]), so the same bad body is refused cheaply.
+    /// Waiting is not wanting: a body is requested from peers, and a copy
+    /// processed, only while [`is_body_wanted`](Self::is_body_wanted).
     body_pending: HashMap<BlockHash, Vec<[u8; 32]>>,
+    /// Cache, never consensus state (audit DAG-7): the heaviest block seen by
+    /// `(blue_work, blue_score, hash)`, validity ignored — the selected-tip
+    /// hint that moves the reachability index's reindex root
+    /// (`ReachabilityStore::hint_virtual_selected_parent`).
+    reach_hint: Option<BlockHash>,
+    /// Instrumentation, never consensus state: DAG entries touched by the
+    /// read queries that peers can trigger remotely (`/gnb/sync/1` serving:
+    /// `selected_chain`, `ordered_hashes_from`, `tips_for_peers`) and by
+    /// `selected_tip`; `query_visits()` adds every whole-store iteration
+    /// (`BlockDataMap::scanned`). Regression tests (audit B1-T3 / B2-T5)
+    /// assert that the per-request count does not grow with the DAG size.
+    query_visits: std::sync::atomic::AtomicU64,
+    /// The body-pending blocks an operator override needs
+    /// ([`request_body`](Self::request_body)): wanted whatever the weight of
+    /// their chain, until a body arrives. A subset of `body_pending`'s keys.
+    body_requested: HashSet<BlockHash>,
 }
 
 /// Rejected-body witness roots remembered per body-pending block.
@@ -822,7 +1049,21 @@ impl GhostDAG {
             invalid_all_edges_roots: HashSet::new(),
             invalid_all_edges: HashSet::new(),
             body_pending: HashMap::new(),
+            reach_hint: None,
+            query_visits: std::sync::atomic::AtomicU64::new(0),
+            body_requested: HashSet::new(),
         }
+    }
+
+    /// DAG entries touched so far by the remotely triggerable read queries
+    /// (see the `query_visits` field). Monotonic; tests take differences.
+    #[allow(dead_code)] // library API and tests; the node binary compiles this module too
+    pub fn query_visits(&self) -> u64 {
+        self.query_visits.load(std::sync::atomic::Ordering::Relaxed) + self.store.data.scanned()
+    }
+
+    fn note_visits(&self, n: u64) {
+        self.query_visits.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn with_default_k() -> Self {
@@ -963,10 +1204,18 @@ impl GhostDAG {
         self.reach.take_persist_delta()
     }
 
-    /// Undo [`Self::reach_take_delta`] when its write failed (see
-    /// `ReachabilityIndex::restore_persist_delta`).
-    pub fn reach_restore_delta(&mut self, upserts: &[(BlockHash, Vec<u8>)], removals: &[BlockHash]) {
-        self.reach.restore_persist_delta(upserts, removals)
+    /// The pending reachability delta, NOT drained (audit DAG-11): stage it
+    /// with the block's CF_DAG record and call
+    /// [`reach_mark_persisted`](Self::reach_mark_persisted) once the batch has
+    /// committed; a batch that fails leaves it pending.
+    pub fn reach_peek_delta(&self) -> (Vec<(BlockHash, Vec<u8>)>, Vec<BlockHash>) {
+        self.reach.peek_persist_delta()
+    }
+
+    /// Clear what a committed batch wrote from the pending reachability delta
+    /// (see [`ReachabilityStore::mark_persisted`]).
+    pub fn reach_mark_persisted(&mut self, upserts: &[(BlockHash, Vec<u8>)], deletes: &[BlockHash]) {
+        self.reach.mark_persisted(upserts, deletes)
     }
 
     /// The current reachability root (genesis), for persisting the meta tag.
@@ -997,6 +1246,7 @@ impl GhostDAG {
     /// (every block dirty) so the caller can flush a full snapshot.
     pub fn rebuild_reachability_from_store(&mut self) -> Result<usize, String> {
         self.reach = ReachabilityStore::new();
+        self.reach_hint = None;
         let order = self.topological_order()?;
         for h in &order {
             let d = self.store.get(h).ok_or_else(|| {
@@ -1011,9 +1261,38 @@ impl GhostDAG {
                 let mut mergeset = d.mergeset_blues.clone();
                 mergeset.extend_from_slice(&d.mergeset_reds);
                 self.reach.add_block(*h, &sp, &mergeset);
+                // The replay moves the reindex root along, as live insertion
+                // does (DAG-7).
+                self.advance_reach_hint(*h);
             }
         }
         Ok(order.len())
+    }
+
+    /// Audit DAG-7: after `new` was added to the index, move the reindex root
+    /// if `new` is the heaviest block seen (the selected-tip hint). Pure
+    /// performance: no answer of the index depends on it.
+    fn advance_reach_hint(&mut self, new: BlockHash) {
+        if !self.maintains_reachability_index() || !self.reach.has(&new) {
+            return;
+        }
+        let current = match self.reach_hint.filter(|h| self.store.has(h) && self.reach.has(h)) {
+            Some(h) => h,
+            // After a restart: the heaviest tip so far.
+            None => match self.store.tips.iter().copied()
+                .filter(|t| self.reach.has(t))
+                .max_by_key(|t| self.order_key(t))
+            {
+                Some(t) => t,
+                None => new,
+            },
+        };
+        let hint = if self.order_key(&new) > self.order_key(&current) { new } else { current };
+        let moved = self.reach_hint != Some(hint);
+        self.reach_hint = Some(hint);
+        if moved {
+            self.reach.hint_virtual_selected_parent(&hint);
+        }
     }
 
     /// Kahn topological sort of the in-memory DAG: every parent strictly
@@ -1167,7 +1446,7 @@ impl GhostDAG {
             .filter(|h| self.store.children.get(*h).map_or(true, |c| c.is_empty()))
             .copied()
             .collect();
-        self.store.tips = tips;
+        self.store.set_tips(tips);
     }
 
     /// Sprint Y (M-2): verified variant of `load_persisted`.
@@ -1271,6 +1550,190 @@ impl GhostDAG {
         })
     }
 
+    /// Load persisted entries whose integrity chain does NOT verify, repairing
+    /// what the pre-fix binary left behind (audit DAG-11), instead of refusing
+    /// to start. The pre-fix commit wrote a block's CF_DAG record and
+    /// integrity link with `.ok()`-ignored errors and zero-filled a missing
+    /// parent link, so a node that lost one DAG write kept running and stored
+    /// descendants chaining to a missing record or a zero link;
+    /// [`load_persisted_validated`](Self::load_persisted_validated) then fails
+    /// (`ParentNotLoaded`, `ChainMismatch`, `PartialCoverage`, `MissingEntry`).
+    ///
+    /// Blocks are processed in a topological order (parents first), and each
+    /// one's data is decided as follows:
+    ///
+    /// * the stored integrity matches the chain link re-derived from its
+    ///   selected parent: kept as is;
+    /// * otherwise, if the stored record is consistent with its OWN integrity
+    ///   hash (linked to the selected parent's STORED integrity, or to the
+    ///   pre-fix zero link), or has no integrity record at all: the stored
+    ///   data are kept and only the link is re-derived (`relinked`). The data
+    ///   were computed by the node when the block arrived; recomputing them
+    ///   could only disagree with the history the network holds;
+    /// * otherwise (no record: a lost write; or a record that matches no link:
+    ///   corrupted), the data are recomputed with the consensus code from the
+    ///   block's stored header (`header_of`), whose parents, timestamp and
+    ///   bits the proof of work commits to (`recomputed`);
+    /// * with no header to recompute from, or a parent that could not be
+    ///   loaded, the block and every block that descends from it are dropped
+    ///   (`dropped`): the node fetches them again from its peers.
+    ///
+    /// The DAG must be empty. The reachability index is rebuilt alongside;
+    /// the caller persists the repair (`Storage::stage_dag_repair`), which
+    /// also makes the next start rebuild the persisted index.
+    pub fn load_persisted_repairing<F>(
+        &mut self,
+        entries: Vec<(BlockHash, GhostdagData)>,
+        integrity_map: HashMap<BlockHash, [u8; 32]>,
+        header_of: F,
+    ) -> Result<DagRepair, String>
+    where
+        F: Fn(&BlockHash) -> Option<StoredHeader>,
+    {
+        if !self.store.data.is_empty() {
+            return Err("load_persisted_repairing needs an empty DAG".into());
+        }
+        let records: HashMap<BlockHash, GhostdagData> = entries.into_iter().collect();
+        // Blocks referenced as parents without a record (lost writes), and
+        // their own record-less ancestors, recoverable from their headers.
+        let mut headers: HashMap<BlockHash, StoredHeader> = HashMap::new();
+        let mut stack: Vec<BlockHash> = records.values()
+            .flat_map(|d| d.parents.iter().copied())
+            .filter(|p| !records.contains_key(p))
+            .collect();
+        while let Some(p) = stack.pop() {
+            if records.contains_key(&p) || headers.contains_key(&p) {
+                continue;
+            }
+            if let Some(h) = header_of(&p) {
+                stack.extend(h.parents.iter().copied().filter(|q| !records.contains_key(q)));
+                headers.insert(p, h);
+            }
+        }
+        // Kahn order over records ∪ recoverable headers (ties by id).
+        let parents_of = |h: &BlockHash| -> Vec<BlockHash> {
+            let ps = match records.get(h) {
+                Some(d) => d.parents.clone(),
+                None => headers.get(h).map(|x| x.parents.clone()).unwrap_or_default(),
+            };
+            let mut seen = HashSet::new();
+            ps.into_iter().filter(|p| seen.insert(*p)).collect()
+        };
+        let universe: Vec<BlockHash> = records.keys().chain(headers.keys()).copied().collect();
+        let known: HashSet<BlockHash> = universe.iter().copied().collect();
+        let mut indegree: HashMap<BlockHash, usize> = HashMap::new();
+        let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
+        for h in &universe {
+            let ps: Vec<BlockHash> = parents_of(h).into_iter().filter(|p| known.contains(p)).collect();
+            indegree.insert(*h, ps.len());
+            for p in ps {
+                children.entry(p).or_default().push(*h);
+            }
+        }
+        let mut ready: std::collections::BTreeSet<BlockHash> =
+            indegree.iter().filter(|(_, d)| **d == 0).map(|(h, _)| *h).collect();
+        let mut order = Vec::with_capacity(universe.len());
+        while let Some(h) = ready.pop_first() {
+            order.push(h);
+            for c in children.get(&h).cloned().unwrap_or_default() {
+                if let Some(d) = indegree.get_mut(&c) {
+                    *d -= 1;
+                    if *d == 0 {
+                        ready.insert(c);
+                    }
+                }
+            }
+        }
+
+        let mut rep = DagRepair::default();
+        self.reach = ReachabilityStore::new();
+        let index = self.maintains_reachability_index();
+        for h in order {
+            let parents = parents_of(&h);
+            if parents.iter().any(|p| !self.store.has(p)) {
+                rep.dropped.push(h);
+                continue;
+            }
+            let link = |sp: &Option<BlockHash>, integ: &HashMap<BlockHash, [u8; 32]>| -> Option<[u8; 32]> {
+                match sp {
+                    None => Some([0u8; 32]),
+                    Some(s) => integ.get(s).copied(),
+                }
+            };
+            let stored = records.get(&h);
+            let stored_int = integrity_map.get(&h);
+            let mut decided: Option<GhostdagData> = None;
+            if let Some(d) = stored {
+                let chained = link(&d.selected_parent, &rep.integrity)
+                    .map(|l| compute_integrity_hash(&h, d, &l));
+                if chained.is_some() && stored_int == chained.as_ref() {
+                    decided = Some(d.clone());
+                } else {
+                    let self_consistent = match stored_int {
+                        None => true,
+                        Some(si) => {
+                            *si == compute_integrity_hash(&h, d, &[0u8; 32])
+                                || link(&d.selected_parent, &integrity_map)
+                                    .is_some_and(|l| *si == compute_integrity_hash(&h, d, &l))
+                        }
+                    };
+                    let sp_loaded = d.selected_parent.is_none_or(|s| self.store.has(&s));
+                    if self_consistent && sp_loaded {
+                        rep.relinked.push(h);
+                        decided = Some(d.clone());
+                    }
+                }
+            }
+            let data = match decided {
+                Some(d) => d,
+                None => match header_of(&h) {
+                    Some(hdr) if hdr.parents.is_empty() => {
+                        let d = GhostdagData { timestamp: hdr.timestamp, ..GhostdagData::genesis() };
+                        rep.recomputed.push((h, d.clone()));
+                        d
+                    }
+                    Some(hdr) if hdr.parents.iter().all(|p| self.store.has(p)) => {
+                        match self.compute_block(&hdr.parents, hdr.timestamp, hdr.work) {
+                            Ok(c) => {
+                                rep.recomputed.push((h, c.data.clone()));
+                                c.data
+                            }
+                            Err(_) => {
+                                rep.dropped.push(h);
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {
+                        rep.dropped.push(h);
+                        continue;
+                    }
+                },
+            };
+            let parent_link = link(&data.selected_parent, &rep.integrity).unwrap_or([0u8; 32]);
+            rep.integrity.insert(h, compute_integrity_hash(&h, &data, &parent_link));
+            if index {
+                match data.selected_parent {
+                    None => self.reach.add_genesis(h),
+                    Some(sp) => {
+                        let mut mergeset = data.mergeset_blues.clone();
+                        mergeset.extend_from_slice(&data.mergeset_reds);
+                        self.reach.add_block(h, &sp, &mergeset);
+                    }
+                }
+            }
+            if data.parents.is_empty() {
+                self.store.genesis = Some(h);
+            }
+            self.store.insert(h, data);
+            rep.blocks_loaded += 1;
+        }
+        self.recompute_tips();
+        // The caller makes the next start rebuild the persisted index.
+        let _ = self.reach.take_persist_delta();
+        Ok(rep)
+    }
+
     /// Add a new block and compute its full GhostDAG data.
     /// Returns the computed GhostdagData on success.
     ///
@@ -1332,6 +1795,8 @@ impl GhostDAG {
 
         let result = data.clone();
         self.store.insert(hash, data);
+        // DAG-7: keep the reachability index's reindex root behind the tip.
+        self.advance_reach_hint(hash);
         // DAG-1: a block whose selected parent is chain-disqualified is
         // itself disqualified (its UTXO context does not exist). It still
         // enters the DAG so other blocks can merge it deterministically.
@@ -1358,6 +1823,7 @@ impl GhostDAG {
         timestamp: u64,
         work: u128,
     ) -> Result<ComputedBlock, ConsensusError> {
+        COMPUTE_BLOCK_CALLS.with(|c| c.set(c.get().wrapping_add(1)));
         if parents.is_empty() {
             return Err(ConsensusError::NoParents);
         }
@@ -1483,7 +1949,10 @@ impl GhostDAG {
         if self.store.children.get(hash).map_or(false, |c| !c.is_empty()) {
             return false;
         }
-        let data = match self.store.data.remove(hash) {
+        // Exact inverse of `DagStore::insert` (its indexes included): drop
+        // the child edge from each parent; a parent becomes a tip again iff
+        // it is still stored and now has no children at all.
+        let data = match self.store.remove_leaf(hash) {
             Some(d) => d,
             None => return false,
         };
@@ -1499,28 +1968,14 @@ impl GhostDAG {
         // to it.
         self.block_work.remove(hash);
         self.merge_skip.remove(hash);
-        self.store.tips.remove(hash);
-        self.store.children.remove(hash);
         self.invalid.remove(hash);
         self.invalid_roots.remove(hash);
         self.invalid_all_edges_roots.remove(hash);
         self.invalid_all_edges.remove(hash);
         self.body_pending.remove(hash);
-        // Exact inverse of `DagStore::insert`: drop the child edge from each
-        // parent; a parent becomes a tip again iff it is still stored and now
-        // has no children at all.
-        for p in &data.parents {
-            if let Some(ch) = self.store.children.get_mut(p) {
-                ch.remove(hash);
-                if ch.is_empty() {
-                    self.store.children.remove(p);
-                }
-            }
-            if self.store.data.contains_key(p)
-                && self.store.children.get(p).map_or(true, |c| c.is_empty())
-            {
-                self.store.tips.insert(*p);
-            }
+        self.body_requested.remove(hash);
+        if self.reach_hint == Some(*hash) {
+            self.reach_hint = None;
         }
         true
     }
@@ -1908,9 +2363,10 @@ impl GhostDAG {
     /// Exact GHOSTDAG coloring (PHANTOM paper, Kaspa's algorithm) for blocks at
     /// or above the hardening activation (audit DAG-4).
     ///
-    /// Candidates are taken in the deterministic mergeset order (ancestors
-    /// first, hash tie-break). With `blue` = blue(selected_parent) ∪
-    /// {selected_parent} ∪ the candidates already coloured blue, a candidate
+    /// Candidates are taken in the mergeset order of [`topological_sort`]
+    /// (FIFO Kahn, ids ascending among the blocks each step makes ready).
+    /// With `blue` = blue(selected_parent) ∪ {selected_parent} ∪ the
+    /// candidates already coloured blue, a candidate
     /// `c` is blue iff
     ///   (a) |anticone(c) ∩ blue| ≤ k, and
     ///   (b) every `x ∈ anticone(c) ∩ blue` has |anticone(x) ∩ blue| + 1 ≤ k.
@@ -2204,6 +2660,38 @@ impl GhostDAG {
         Ok(())
     }
 
+    /// Audit B1-T15: a predicate telling whether a candidate template parent
+    /// can be merged at all by a block whose selected parent is `sp` (at or
+    /// above the hardening activation): it must be the LOWEST possible
+    /// merge-depth root of such a block, or in its future. The lowest root is
+    /// the one of a block with no mergeset blue
+    /// (`blue_score = sp.blue_score + 1`); any actual block's root is at or
+    /// above it on `sp`'s chain, so a
+    /// candidate below it is below the actual root too. Such a candidate is
+    /// red (it is in the anticone of every chain block from the root to `sp`,
+    /// far more than k blues) and, when it is a tip, nothing kosherizes it (a
+    /// tip is in no block's past): every parent set containing it fails
+    /// [`check_merge_depth`](Self::check_merge_depth). Its whole branch is
+    /// below the root (an ancestor above the root would put it in the root's
+    /// future), so no block can merge it again after the activation; it stays
+    /// in the DAG and in the valid tips (chain selection is unaffected) but
+    /// is never offered as a template parent again (Kaspa filters virtual
+    /// parent candidates the same way). Always true below the activation or
+    /// while `sp`'s chain is shallower than `MERGE_DEPTH`. O(MERGE_DEPTH) once,
+    /// then one reachability query per candidate.
+    fn mergeable_below(&self, sp: &BlockHash, use_index: bool) -> impl Fn(&BlockHash) -> bool + '_ {
+        let sp_data = self.store.get(sp);
+        let hardened = sp_data.is_some_and(|d| self.is_hardened_at(d.height + 1));
+        let root = match (hardened, sp_data) {
+            (true, Some(d)) => self.merge_depth_root(sp, d.blue_score + 1),
+            _ => None,
+        };
+        move |c: &BlockHash| match root {
+            None => true,
+            Some(r) => *c == r || self.dag_ancestor(&r, c, use_index && self.reach.has(c)),
+        }
+    }
+
     /// Parents for a block template (audit DAG-2 / DAG-7).
     ///
     /// Returns at most `max_parents` of `candidates` (normally the bodied tips)
@@ -2245,12 +2733,18 @@ impl GhostDAG {
         let budget = MERGESET_SIZE_LIMIT.min(MAX_MERGESET_SIZE - 1);
         let mut chosen = vec![sp];
         let mut merged: HashSet<BlockHash> = HashSet::new();
+        let mergeable = self.mergeable_below(&sp, use_index);
         for c in cands.iter().skip(1) {
             if chosen.len() >= max_parents {
                 break;
             }
             if merged.contains(c) || self.dag_ancestor(c, &sp, use_index) {
                 continue; // adds nothing to the mergeset
+            }
+            // B1-T15: a candidate below the merge-depth root can only be a
+            // red nothing kosherizes; skip it before any mergeset work.
+            if !mergeable(c) {
+                continue;
             }
             // The blocks `c` would add to the mergeset, bounded by the budget.
             let mut added: Vec<BlockHash> = Vec::new();
@@ -2277,9 +2771,13 @@ impl GhostDAG {
             chosen.push(*c);
         }
 
-        // Drop parents responsible for merge-depth violations, re-checking
-        // with the consensus code until the template is valid. Each round
-        // removes at least one parent; the selected parent alone always is.
+        // Check the result with the consensus code (one `compute_block`
+        // normally: the candidates that can never be merged were skipped
+        // above). A violation can remain only through the coloring (a red
+        // above the lowest root that ends below the actual root, or below
+        // it and not kosherized): drop the parents responsible and check
+        // again. Each round removes at least one parent; the selected parent
+        // alone always is valid.
         loop {
             match self.compute_block(&chosen, 0, 0) {
                 Ok(_) => break,
@@ -2488,9 +2986,204 @@ impl GhostDAG {
         self.propagate_invalid(hash)
     }
 
+    /// [`mark_body_pending`](Self::mark_body_pending) for a body an operator
+    /// override needs (`accept::request_bodies`): the block also stays
+    /// wanted ([`is_body_wanted`](Self::is_body_wanted)) whatever the weight
+    /// of its chain, until a body arrives
+    /// ([`clear_body_pending`](Self::clear_body_pending)). Unknown hashes are
+    /// ignored.
+    pub fn request_body(&mut self, hash: BlockHash) -> Vec<BlockHash> {
+        if !self.store.has(&hash) {
+            return Vec::new();
+        }
+        self.body_requested.insert(hash);
+        self.mark_body_pending(hash, None)
+    }
+
     /// True iff `hash` waits for a body (see `mark_body_pending`).
     pub fn is_body_pending(&self, hash: &BlockHash) -> bool {
         self.body_pending.contains_key(hash)
+    }
+
+    /// True iff `hash` waits for a body AND that body is wanted now (re-audit
+    /// B1-T13): an operator override asked for it
+    /// ([`request_body`](Self::request_body)), or a body could make a chain
+    /// through `hash` the best one — some block on whose selected chain
+    /// `hash` lies, with no persistent disqualification root between them
+    /// (`hash` included), orders above the selected tip under GhostDAG's tip
+    /// order (`order_key`) and could be selected at all (its selected chain
+    /// passes through the PoWit-finalized checkpoint,
+    /// [`conflicts_with_finality`](Self::conflicts_with_finality): a chain
+    /// that would roll finalized history back never wins, whatever its
+    /// work). Bitcoin Core downloads only the blocks of chains
+    /// with more work than its tip and ignores an unrequested block with
+    /// less work (`AcceptBlock`); here a body-pending block on a lighter
+    /// branch is neither requested from peers nor processed when a copy
+    /// arrives (`accept::awaits_body`), so a block whose body no witness can
+    /// fix stops costing pulls and validations as soon as the honest chain is
+    /// heavier, and is wanted again if its branch grows heavier. NOT
+    /// consensus (which bodies are fetched, not which are valid).
+    pub fn is_body_wanted(&self, hash: &BlockHash) -> bool {
+        if !self.body_pending.contains_key(hash) {
+            return false;
+        }
+        if self.body_requested.contains(hash) {
+            return true;
+        }
+        let Some(height) = self.store.get(hash).map(|d| d.height) else {
+            return false;
+        };
+        self.wanted_pending(height).0.contains(hash)
+    }
+
+    /// Every block whose body is wanted now
+    /// ([`is_body_wanted`](Self::is_body_wanted)), sorted: the set the
+    /// message processor requests (`ingress::awaited_bodies_to_request`) and
+    /// the orphan sweep chases (`ingress::awaited_bodies_to_chase`).
+    pub fn wanted_body_blocks(&self) -> Vec<BlockHash> {
+        if self.body_pending.is_empty() {
+            return Vec::new();
+        }
+        let min_height = self.body_pending.keys()
+            .filter_map(|h| self.store.get(h).map(|d| d.height))
+            .min()
+            .unwrap_or(0);
+        let (wanted, _) = self.wanted_pending(min_height);
+        let mut v: Vec<BlockHash> = self.body_pending.keys()
+            .filter(|h| self.body_requested.contains(*h) || wanted.contains(*h))
+            .copied()
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The body-pending blocks at DAG height >= `min_dag_height` on whose
+    /// selected chain lies a block ordering above the selected tip, with no
+    /// disqualification root (or all-edges block) strictly between them and
+    /// no persistent disqualification of their own (the relation
+    /// [`is_body_wanted`](Self::is_body_wanted) describes), and the number of
+    /// blocks visited to find them.
+    ///
+    /// One memoised pass (review of re-audit B1-T13: a selected-subtree DFS
+    /// per pending block cost O(pending x depth) under the DAG read lock,
+    /// twice per processed block, while a pruned node follows a deep reorg).
+    /// blue_work strictly increases along every parent -> child edge (the
+    /// selected parent has the greatest blue_work of the parents and a block
+    /// adds its own non-zero work), so every block ordering above the
+    /// selected tip is reached from a tip that does through blocks that also
+    /// do: those are the seeds. Each seed's selected-parent chain is then
+    /// walked toward genesis, stopping after a disqualification root (a
+    /// chain through it is invalid whatever body the blocks below get), at a
+    /// block already reached, or below `min_dag_height` (DAG heights strictly
+    /// decrease along it), so every block is visited at most once. A seed
+    /// whose selected chain misses the PoWit-finalized checkpoint is dropped
+    /// (it can never be selected); that check is memoised along the shared
+    /// chains too.
+    fn wanted_pending(&self, min_dag_height: u64) -> (HashSet<BlockHash>, usize) {
+        let mut visits = 0usize;
+        let mut reached: HashSet<BlockHash> = HashSet::new();
+        // `conflicts_with_finality`, memoised: true = the block's selected
+        // chain misses the finalized checkpoint.
+        let mut finality_memo: HashMap<BlockHash, bool> = HashMap::new();
+        let mut conflicts = |h: BlockHash, visits: &mut usize| -> bool {
+            let Some((fh, fheight)) = self.finalized else { return false };
+            let mut path = Vec::new();
+            let mut cur = h;
+            let verdict = loop {
+                if let Some(&v) = finality_memo.get(&cur) {
+                    break v;
+                }
+                if cur == fh {
+                    break false;
+                }
+                *visits += 1;
+                let Some(d) = self.store.get(&cur) else { break true };
+                if d.height <= fheight {
+                    break true;
+                }
+                path.push(cur);
+                match d.selected_parent {
+                    Some(sp) => cur = sp,
+                    None => break true,
+                }
+            };
+            for p in path {
+                finality_memo.insert(p, verdict);
+            }
+            verdict
+        };
+        match self.selected_tip().map(|t| self.order_key(&t)) {
+            // No selected tip: any chain can win.
+            None => reached.extend(self.body_pending.keys().copied()),
+            Some(best) => {
+                let mut seeds = Vec::new();
+                let mut seen: HashSet<BlockHash> = HashSet::new();
+                let mut stack: Vec<BlockHash> = self.store.tips.iter()
+                    .filter(|t| self.order_key(t) > best)
+                    .copied()
+                    .collect();
+                while let Some(h) = stack.pop() {
+                    if !seen.insert(h) {
+                        continue;
+                    }
+                    visits += 1;
+                    seeds.push(h);
+                    if let Some(d) = self.store.get(&h) {
+                        stack.extend(d.parents.iter().filter(|p| !seen.contains(*p) && self.order_key(p) > best));
+                    }
+                }
+                for seed in seeds {
+                    if conflicts(seed, &mut visits) {
+                        continue;
+                    }
+                    let mut x = seed;
+                    while let Some(d) = self.store.get(&x) {
+                        if d.height < min_dag_height || !reached.insert(x) {
+                            break;
+                        }
+                        visits += 1;
+                        if self.invalid_roots.contains(&x) || self.invalid_all_edges.contains(&x) {
+                            break;
+                        }
+                        match d.selected_parent {
+                            Some(p) => x = p,
+                            None => break,
+                        }
+                    }
+                }
+            }
+        }
+        // `is_invalid_persistently`, memoised along the shared chains.
+        let mut persistent: HashMap<BlockHash, bool> = HashMap::new();
+        let mut wanted = HashSet::new();
+        for h in self.body_pending.keys().filter(|h| reached.contains(*h)) {
+            let mut path = Vec::new();
+            let mut cur = *h;
+            let verdict = loop {
+                if let Some(&v) = persistent.get(&cur) {
+                    break v;
+                }
+                visits += 1;
+                if !self.invalid.contains(&cur) {
+                    break false;
+                }
+                path.push(cur);
+                if self.invalid_roots.contains(&cur) || self.invalid_all_edges.contains(&cur) {
+                    break true;
+                }
+                match self.store.get(&cur).and_then(|d| d.selected_parent) {
+                    Some(sp) => cur = sp,
+                    None => break false,
+                }
+            };
+            for p in path {
+                persistent.insert(p, verdict);
+            }
+            if !verdict {
+                wanted.insert(*h);
+            }
+        }
+        (wanted, visits)
     }
 
     /// Every block waiting for a body, sorted.
@@ -2510,6 +3203,7 @@ impl GhostDAG {
     /// disqualified only through `hash` become candidates again. Returns
     /// `false` (no change) if `hash` was not waiting for a body.
     pub fn clear_body_pending(&mut self, hash: &BlockHash) -> bool {
+        self.body_requested.remove(hash);
         if self.body_pending.remove(hash).is_none() {
             return false;
         }
@@ -2688,14 +3382,8 @@ impl GhostDAG {
         out
     }
 
-    // ── Public query API ────────────────────────────────────────────────────
+    // ── PoWit finality ──────────────────────────────────────────────────────
 
-    /// Best tip: highest blue_work, then blue_score, then hash, among blocks
-    /// that are NOT chain-disqualified (DAG-1). With no invalid block this is
-    /// exactly the maximum over `tips()`. Otherwise a best-first search from
-    /// the tips through disqualified blocks finds the best valid block: every
-    /// descendant of the best valid block is disqualified (a valid descendant
-    /// would carry more blue_work), so it is reached through them.
     /// Record the PoWit-finalized checkpoint (hash, DAG height). Only ever
     /// moves forward in height; see [`GhostDAG::finalized`].
     pub fn set_finalized(&mut self, hash: BlockHash, height: u64) {
@@ -2735,7 +3423,116 @@ impl GhostDAG {
         !self.invalid.contains(h) && !self.conflicts_with_finality(h)
     }
 
+    /// [`selectable`](Self::selectable) for the remotely triggerable reads
+    /// (`selected_tip`, `tips_for_peers`): the same answer, with the
+    /// finality walk memoized across the calls of one query and its DAG
+    /// reads counted in `visits` (audit B1-T3 / B2-T5). Every block on the
+    /// walk from `h` down to where it ends shares `h`'s answer (its own walk
+    /// is a suffix of `h`'s), so tips whose selected chains meet are walked
+    /// once below the meeting point instead of once per tip.
+    fn selectable_memo(&self, h: &BlockHash, memo: &mut HashMap<BlockHash, bool>, visits: &mut u64) -> bool {
+        if self.invalid.contains(h) {
+            return false;
+        }
+        let Some((fh, fheight)) = self.finalized else { return true };
+        let mut path: Vec<BlockHash> = Vec::new();
+        let mut cur = *h;
+        let conflicts = loop {
+            if let Some(&c) = memo.get(&cur) {
+                break c;
+            }
+            if cur == fh {
+                break false;
+            }
+            *visits += 1;
+            let Some(d) = self.store.get(&cur) else { break true };
+            if d.height <= fheight {
+                break true;
+            }
+            path.push(cur);
+            match d.selected_parent {
+                Some(sp) => cur = sp,
+                None => break true,
+            }
+        };
+        for b in path {
+            memo.insert(b, conflicts);
+        }
+        !conflicts
+    }
+
+    // ── Public query API ────────────────────────────────────────────────────
+
+    /// Best tip: highest blue_work, then blue_score, then hash, among the
+    /// selectable blocks: NOT chain-disqualified (DAG-1) and on the PoWit
+    /// finalized chain. With no invalid block and no finalized checkpoint
+    /// this is exactly the maximum over `tips()`. Otherwise a best-first
+    /// search from the tips through unselectable blocks finds the best
+    /// selectable block: every descendant of it is unselectable (a
+    /// selectable descendant would carry more blue_work), so it is reached
+    /// through them.
+    ///
+    /// Audit B1-T3 / B2-T5 (cost only, same result): the tips are read in
+    /// descending order from the store's ordered tip index, merged with the
+    /// heap of parents pushed below unselectable blocks, so the search
+    /// touches only the unselectable blocks ranked above the answer (and
+    /// their parents) instead of every leaf of the DAG. The candidate
+    /// sequence is exactly the one the full heap of all tips produced: at
+    /// every step the largest remaining candidate is max(next tip from the
+    /// index, top of the parent heap), and a parent is never a tip (it has a
+    /// child), so the two sources never overlap. The finality walk is
+    /// memoized within the call. `sync_index_tests` cross-check it against
+    /// the full-heap search (`selected_tip_reference`).
     pub fn selected_tip(&self) -> Option<BlockHash> {
+        let mut memo = HashMap::new();
+        let mut visits = 0u64;
+        let found = self.selected_tip_memo(&mut memo, &mut visits);
+        self.note_visits(visits);
+        found
+    }
+
+    /// [`selected_tip`](Self::selected_tip), sharing the finality memo and
+    /// the visit count with its caller.
+    fn selected_tip_memo(&self, memo: &mut HashMap<BlockHash, bool>, visits: &mut u64) -> Option<BlockHash> {
+        let mut tips = self.store.tips_by_work.iter().rev().peekable();
+        if self.invalid.is_empty() && self.finalized.is_none() {
+            *visits += 1;
+            return tips.next().map(|k| k.2);
+        }
+        use std::collections::BinaryHeap;
+        let mut heap: BinaryHeap<TipKey> = BinaryHeap::new();
+        let mut pushed: HashSet<BlockHash> = HashSet::new();
+        loop {
+            let from_tips = match (tips.peek(), heap.peek()) {
+                (Some(t), Some(p)) => *t > p,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => return None,
+            };
+            let (_, _, h) = if from_tips {
+                *tips.next().expect("peeked")
+            } else {
+                heap.pop().expect("peeked")
+            };
+            *visits += 1;
+            if self.selectable_memo(&h, memo, visits) {
+                return Some(h);
+            }
+            if let Some(d) = self.store.get(&h) {
+                for p in &d.parents {
+                    if self.store.has(p) && pushed.insert(*p) {
+                        heap.push(self.order_key(p));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The selected tip by the original search: a heap of EVERY tip, then
+    /// the parents of unselectable blocks (test reference for
+    /// [`selected_tip`](Self::selected_tip)).
+    #[cfg(test)]
+    fn selected_tip_reference(&self) -> Option<BlockHash> {
         if self.invalid.is_empty() && self.finalized.is_none() {
             return self.store.tips.iter()
                 .max_by(|a, b| self.order_key(a).cmp(&self.order_key(b)))
@@ -2764,6 +3561,43 @@ impl GhostDAG {
         None
     }
 
+    /// Audit B2-T7: the frontier this node advertises to peers (the
+    /// `/gnb/sync/1` GetTips answer): the selected tip first, then the other
+    /// selectable tips (not chain-disqualified, on the PoWit finalized
+    /// chain) by GhostDAG's tip order (blue work, blue score, hash), at most
+    /// `max` in all. An unselectable block is never advertised (it is never
+    /// selected or merged as a template parent, `valid_tips`, so it stays a
+    /// leaf for good, and advertising it made every requester fetch it).
+    /// Reads at most `4 × max` leaves from the ordered tip index, the
+    /// finality walk memoized across them (B1-T3: the cost does not grow
+    /// with the DAG); when more unselectable leaves than that outrank the
+    /// selectable ones, fewer tips are returned, the selected tip always
+    /// among them.
+    pub fn tips_for_peers(&self, max: usize) -> Vec<BlockHash> {
+        let mut out = Vec::with_capacity(max.min(self.store.tips.len() + 1));
+        if max == 0 {
+            return out;
+        }
+        let mut memo = HashMap::new();
+        let mut visits = 0u64;
+        let selected = self.selected_tip_memo(&mut memo, &mut visits);
+        if let Some(s) = selected {
+            out.push(s);
+        }
+        let mut read = 0u64;
+        for (_, _, h) in self.store.tips_by_work.iter().rev() {
+            if out.len() >= max || read >= 4 * max as u64 {
+                break;
+            }
+            read += 1;
+            if Some(*h) != selected && self.selectable_memo(h, &mut memo, &mut visits) {
+                out.push(*h);
+            }
+        }
+        self.note_visits(visits + read);
+        out
+    }
+
     /// Template parents (audit DAG-2): the bodied valid tips, highest
     /// (blue_work, blue_score, hash) first, capped at `max`. The first entry
     /// is therefore the template's selected parent. Header-only tips are
@@ -2771,17 +3605,30 @@ impl GhostDAG {
     /// valid ancestor (see `best_bodied_tip`). Shared by the internal miner
     /// and `getblocktemplate` so both stay under `core::MAX_PARENTS`.
     ///
-    /// At or above the hardening activation the candidates go through
+    /// The candidates go through
     /// [`select_parents_for_template`](Self::select_parents_for_template), so
-    /// the template also respects `MAX_MERGESET_SIZE` and the merge-depth
-    /// rule; below it the result is the plain capped list, as before.
+    /// the template respects `MERGESET_SIZE_LIMIT` at every height and, at or
+    /// above the hardening activation, the merge-depth rule.
+    ///
+    /// Audit B1-T15: the selected parent is found first (the heaviest valid
+    /// tip with a body); then a tip that can never be merged by a block on it
+    /// (its whole branch below the merge-depth root, `mergeable_below`) is
+    /// dropped BEFORE its body is looked up (`has_body` reads storage) and
+    /// before any mergeset work, so such tips cost one reachability query
+    /// each per template instead of a stored-body lookup and a full
+    /// `compute_block`. Pre-activation the candidate list is unchanged.
     pub fn template_parents<F: Fn(&BlockHash) -> bool>(&self, max: usize, has_body: F) -> Vec<BlockHash> {
-        let cands: Vec<BlockHash> = self.valid_tips().into_iter()
-            .filter(|h| has_body(h))
-            .collect();
-        if cands.is_empty() {
+        let mut tips = self.valid_tips();
+        tips.sort_by_key(|h| std::cmp::Reverse(self.order_key(h)));
+        let Some(pos) = tips.iter().position(&has_body) else {
             return self.best_bodied_tip(has_body).into_iter().collect();
-        }
+        };
+        let sp = tips[pos];
+        let use_index = self.maintains_reachability_index() && self.reach.has(&sp);
+        let mergeable = self.mergeable_below(&sp, use_index);
+        let cands: Vec<BlockHash> = std::iter::once(sp)
+            .chain(tips[pos + 1..].iter().copied().filter(|h| mergeable(h) && has_body(h)))
+            .collect();
         self.select_parents_for_template(&cands, max.max(1))
     }
 
@@ -2887,83 +3734,64 @@ impl GhostDAG {
             chain.push(h);
             cur = self.store.get(&h).and_then(|d| d.selected_parent);
         }
+        self.note_visits(chain.len() as u64);
         chain
     }
 
-    /// Is `hash` in the blue set of the current DAG?
-    /// Bounded check: walks selected chain up to 2*K depth.
+    /// Is `hash` in the blue set of the selected tip, i.e. in
+    /// `blue(tip) ∪ {tip}`: the selected chain from the tip down to genesis
+    /// and every mergeset blue of a block on it? Exact at any depth (audit
+    /// DAG-12: it used the legacy `past_blue_set` walk, bounded to k * 100
+    /// chain blocks, and missed the selected chain itself).
+    ///
+    /// The walk down the selected chain stops at the first chain block whose
+    /// `blue_work` is below `hash`'s: `blue_work` never decreases along a
+    /// parent edge (a block's is at least its selected parent's, the
+    /// heaviest of its parents), so neither that block nor anything below it
+    /// has `hash` in its past or mergeset. Diagnostics and tests only; no
+    /// consensus or relay decision calls it.
     pub fn is_blue(&self, hash: &BlockHash) -> bool {
-        if let Some(tip) = self.selected_tip() {
-            let blue = self.past_blue_set(&tip);
-            return blue.contains(hash);
+        let (Some(tip), Some(target)) = (self.selected_tip(), self.store.get(hash)) else {
+            return false;
+        };
+        let mut cur = Some(tip);
+        while let Some(h) = cur {
+            if h == *hash {
+                return true;
+            }
+            let Some(d) = self.store.get(&h) else { return false };
+            if d.mergeset_blues.contains(hash) {
+                return true;
+            }
+            if d.blue_work < target.blue_work {
+                return false;
+            }
+            cur = d.selected_parent;
         }
         false
     }
 
-    /// Informational confirmation depth: true when `hash`'s blue_score is more
-    /// than `CHECKPOINT_DEPTH` below the current tip.
-    ///
-    /// Audit DAG-6: this is NOT finality. The node has no finality checkpoint
-    /// and no reorg-depth limit; a heavier valid chain is followed at any
-    /// depth, so a "final" block can still be reorganized out by a chain with
-    /// more work (as in Bitcoin). Kept for diagnostics only.
-    pub fn is_final(&self, hash: &BlockHash) -> bool {
-        let tip_score = self.tip_blue_score();
-        if let Some(data) = self.store.get(hash) {
-            tip_score.saturating_sub(data.blue_score) > crate::core::CHECKPOINT_DEPTH
-        } else {
-            false
-        }
-    }
+    // (Audit DAG-12: `is_final`, a diagnostic that compared a blue-score gap
+    // with the header-height constant `CHECKPOINT_DEPTH` and that nothing
+    // called, was removed. There is no finality: docs/CONSENSUS.md, "Selected
+    // parent and fork choice".)
 
-    /// Ordered block hashes from blue_score `from` for IBD sync.
+    /// Ordered block hashes from blue_score `from` for IBD sync: the first
+    /// `limit` blocks in (blue_score, hash) order with `blue_score >= from`
+    /// (the `/gnb/sync/1` GetHeaders answer).
     ///
-    /// H-R3-1: this used to `.collect()` every `GhostdagData` with
-    /// `blue_score >= from_blue_score` into a `Vec`, `sort_by_key` the WHOLE
-    /// thing, and only then `take(limit)` — an O(n log n) time, O(n) memory
-    /// operation charged in full for every request regardless of `limit`
-    /// (on the historical Genesis-3 datadir, n ~= 50,600). The directed-sync
-    /// server (`network/mod.rs::serve_sync_request`) calls this inline on the
-    /// swarm event loop with an attacker-supplied, unclamped `limit`, so an
-    /// unbounded `limit` (e.g. `u32::MAX`) forced a full-DAG sort per 13-byte
-    /// request on the very thread that also drives block propagation.
-    ///
-    /// INVARIANT (H-R3-1): this call is O(n) time — a HashMap keyed by hash
-    /// gives no cheaper way to find "blue_score >= from" without an
-    /// auxiliary index — but MUST be O(limit) memory, never O(n) memory. A
-    /// max-heap bounded to capacity `limit` gives both: keep only the
-    /// `limit` smallest qualifying blue_scores seen so far, evicting the
-    /// current maximum whenever a smaller candidate arrives and the heap is
-    /// already full. Ties break on hash for a deterministic result (the
-    /// previous `sort_by_key` broke ties on HashMap iteration order, which is
-    /// not consensus-critical but was needlessly nondeterministic).
+    /// H-R3-1 made this O(limit) memory but left it O(n) time: it scanned
+    /// every stored block per request. Audit B1-T3 / B2-T5: it is now a range
+    /// read of the store's (blue_score, hash) index, O(log n + limit) time,
+    /// with the same result (ascending (blue_score, hash), ties by hash).
     pub fn ordered_hashes_from(&self, from_blue_score: u64, limit: usize) -> Vec<BlockHash> {
-        if limit == 0 {
-            return Vec::new();
-        }
-        use std::collections::BinaryHeap;
-
-        // `BinaryHeap` is a max-heap: `peek()`/`pop()` always return the
-        // LARGEST retained entry — exactly the one to evict when a smaller
-        // candidate shows up and the heap is already at `limit` capacity.
-        let cap = limit.min(self.store.data.len().saturating_add(1));
-        let mut heap: BinaryHeap<(u64, BlockHash)> = BinaryHeap::with_capacity(cap);
-        for (h, d) in self.store.data.iter() {
-            if d.blue_score < from_blue_score {
-                continue;
-            }
-            if heap.len() < limit {
-                heap.push((d.blue_score, *h));
-            } else if let Some(&(max_score, max_hash)) = heap.peek() {
-                if (d.blue_score, *h) < (max_score, max_hash) {
-                    heap.pop();
-                    heap.push((d.blue_score, *h));
-                }
-            }
-        }
-        let mut out: Vec<(u64, BlockHash)> = heap.into_vec();
-        out.sort_unstable();
-        out.into_iter().map(|(_, h)| h).collect()
+        let out: Vec<BlockHash> = self.store.by_score
+            .range((from_blue_score, [0u8; 32])..)
+            .take(limit)
+            .map(|(_, h)| *h)
+            .collect();
+        self.note_visits(out.len() as u64);
+        out
     }
 
     pub fn get_node(&self, hash: &BlockHash) -> Option<&GhostdagData> {
@@ -3086,6 +3914,199 @@ mod tests {
         assert!(matches!(dag.effective_coloring(1), ColoringMode::Fast));
     }
 
+    /// The pre-review wanted-body relation (re-audit B1-T13): a DFS over the
+    /// selected-chain subtree of each pending block. Kept as the oracle of
+    /// `wanted_pending`; returns the wanted set and the blocks it visited.
+    fn wanted_by_subtree_dfs(dag: &GhostDAG) -> (Vec<BlockHash>, usize) {
+        let best = dag.selected_tip().map(|t| dag.order_key(&t));
+        let mut visits = 0usize;
+        let mut out = Vec::new();
+        for root in dag.body_pending.keys() {
+            if dag.is_invalid_persistently(root) {
+                continue;
+            }
+            let Some(best) = best else { out.push(*root); continue };
+            let mut stack = vec![*root];
+            let mut seen: HashSet<BlockHash> = HashSet::new();
+            let mut wins = false;
+            while let Some(h) = stack.pop() {
+                if !seen.insert(h) {
+                    continue;
+                }
+                visits += 1;
+                if dag.order_key(&h) > best {
+                    wins = true;
+                    break;
+                }
+                for c in dag.store.children.get(&h).into_iter().flatten() {
+                    let on_chain = dag.store.get(c).is_some_and(|d| d.selected_parent == Some(h));
+                    let dead = dag.invalid_roots.contains(c) || dag.invalid_all_edges.contains(c);
+                    if on_chain && !dead {
+                        stack.push(*c);
+                    }
+                }
+            }
+            if wins {
+                out.push(*root);
+            }
+        }
+        out.sort_unstable();
+        (out, visits)
+    }
+
+    /// Review of re-audit B1-T13 (cost): a pruned node following a deep
+    /// reorg waits for many bodies of the heavier branch at once. The wanted
+    /// set is computed in one memoised pass (each block visited at most a
+    /// small constant number of times), not one selected-subtree DFS per
+    /// pending block (O(pending x depth), under the DAG read lock, twice per
+    /// processed block); it equals the DFS relation, also with persistent
+    /// disqualification roots on and below the heavy branch.
+    #[test]
+    fn wanted_body_set_is_one_memoised_pass_over_the_pending_branch() {
+        let id = |tag: u8, i: u32| {
+            let mut x = [0u8; 32];
+            x[0] = tag;
+            x[1..5].copy_from_slice(&i.to_le_bytes());
+            x
+        };
+        // genesis - 20 common blocks - B (600) | A (700); the node waits for
+        // the bodies of A's first 500 blocks (pruned): A is disqualified in
+        // memory, the selected tip is B's, and only A's last 100 blocks order
+        // above it.
+        // With `side`, a 700-block branch S leaves A at a[100].
+        let fixture = |side: bool| {
+            let mut dag = GhostDAG::with_k(3);
+            let g = id(0, 0);
+            dag.add_genesis(g, 1_000);
+            let mut ts = 1_000u64;
+            let mut chain = |dag: &mut GhostDAG, tag: u8, from: BlockHash, len: u32| -> Vec<BlockHash> {
+                let mut v = Vec::new();
+                let mut parent = from;
+                for i in 1..=len {
+                    ts += 1;
+                    let h = id(tag, i);
+                    dag.add_block(h, vec![parent], ts, 1_000).unwrap();
+                    v.push(h);
+                    parent = h;
+                }
+                v
+            };
+            let common = chain(&mut dag, 1, g, 20);
+            let fork = *common.last().unwrap();
+            let b = chain(&mut dag, 2, fork, 600);
+            let a = chain(&mut dag, 3, fork, 700);
+            if side {
+                chain(&mut dag, 4, a[100], 700);
+            }
+            for h in &a[..500] {
+                dag.mark_body_pending(*h, None);
+            }
+            (dag, a, b)
+        };
+        let (dag, a, b) = fixture(false);
+        assert_eq!(dag.selected_tip(), Some(*b.last().unwrap()));
+        let min = dag.store.get(&a[0]).unwrap().height;
+        let (wanted, visits) = dag.wanted_pending(min);
+        let mut wanted: Vec<BlockHash> = wanted.into_iter().collect();
+        wanted.sort_unstable();
+        let (oracle, oracle_visits) = wanted_by_subtree_dfs(&dag);
+        let mut all: Vec<BlockHash> = a[..500].to_vec();
+        all.sort_unstable();
+        assert_eq!(wanted, all, "every pending block of the heavier branch is wanted");
+        assert_eq!(wanted, oracle);
+        assert_eq!(dag.wanted_body_blocks(), oracle);
+        assert!(a[..500].iter().all(|h| dag.is_body_wanted(h)));
+        // 700 blocks on the branch: seeds (100) + walk (600) + memoised
+        // persistence checks (500 + 1). The per-block DFS visits ~175,000.
+        assert!(visits <= 3 * 700, "visits {visits}");
+        assert!(oracle_visits > 100_000, "oracle visits {oracle_visits}");
+
+        // A persistent root between the pending blocks and the blocks above
+        // the tip makes none of them wanted. With a heavy side branch S
+        // leaving A at a[100], a persistent root at a[300] leaves wanted
+        // exactly a[0..=100] (through S); a[101..300] have no winning chain
+        // and a[300..500] are disqualified for good.
+        let (mut cut, _, _) = fixture(false);
+        cut.mark_invalid(a[550]);
+        assert_eq!(cut.wanted_body_blocks(), wanted_by_subtree_dfs(&cut).0);
+        assert!(cut.wanted_body_blocks().is_empty());
+        let (mut cut, _, _) = fixture(true);
+        cut.mark_invalid(a[300]);
+        let w = cut.wanted_body_blocks();
+        assert_eq!(w, wanted_by_subtree_dfs(&cut).0);
+        let mut expect: Vec<BlockHash> = a[..=100].to_vec();
+        expect.sort_unstable();
+        assert_eq!(w, expect);
+        assert!(cut.is_body_wanted(&a[10]) && cut.is_body_wanted(&a[100]));
+        assert!(!cut.is_body_wanted(&a[101]) && !cut.is_body_wanted(&a[300]) && !cut.is_body_wanted(&a[301]));
+    }
+
+    /// Re-audit B1-T13 with main's PoWit finality (`set_finalized`): a body
+    /// is wanted only while a chain through it can be SELECTED, and a chain
+    /// whose selected-parent chain misses the finalized checkpoint never is
+    /// (`selectable`), however heavy. A heavier branch forking below the
+    /// checkpoint therefore stops wanting its pending bodies once the
+    /// checkpoint is finalized on the other branch; a checkpoint below the
+    /// fork changes nothing.
+    #[test]
+    fn wanted_bodies_never_include_a_branch_that_misses_the_finalized_checkpoint() {
+        let id = |tag: u8, i: u32| {
+            let mut x = [0u8; 32];
+            x[0] = tag;
+            x[1..5].copy_from_slice(&i.to_le_bytes());
+            x
+        };
+        // genesis - 5 common blocks - B (10) | A (15); A's first 5 blocks
+        // wait for bodies.
+        let fixture = || {
+            let mut dag = GhostDAG::with_k(3);
+            let g = id(0, 0);
+            dag.add_genesis(g, 1_000);
+            let mut ts = 1_000u64;
+            let mut chain = |dag: &mut GhostDAG, tag: u8, from: BlockHash, len: u32| -> Vec<BlockHash> {
+                let mut v = Vec::new();
+                let mut parent = from;
+                for i in 1..=len {
+                    ts += 1;
+                    let h = id(tag, i);
+                    dag.add_block(h, vec![parent], ts, 1_000).unwrap();
+                    v.push(h);
+                    parent = h;
+                }
+                v
+            };
+            let common = chain(&mut dag, 1, g, 5);
+            let fork = *common.last().unwrap();
+            let b = chain(&mut dag, 2, fork, 10);
+            let a = chain(&mut dag, 3, fork, 15);
+            for h in &a[..5] {
+                dag.mark_body_pending(*h, None);
+            }
+            (dag, common, a, b)
+        };
+        let (dag, _, a, b) = fixture();
+        assert_eq!(dag.selected_tip(), Some(*b.last().unwrap()));
+        let mut pending: Vec<BlockHash> = a[..5].to_vec();
+        pending.sort_unstable();
+        assert_eq!(dag.wanted_body_blocks(), pending, "the heavier branch can win: its bodies are wanted");
+
+        // Finalized on B, above the fork: A can never be selected.
+        let (mut dag, _, a, b) = fixture();
+        let fh = dag.store.get(&b[2]).unwrap().height;
+        dag.set_finalized(b[2], fh);
+        assert!(dag.conflicts_with_finality(a.last().unwrap()));
+        assert_eq!(dag.selected_tip(), Some(*b.last().unwrap()));
+        assert!(dag.wanted_body_blocks().is_empty(), "a branch that misses the checkpoint is never wanted");
+        assert!(a[..5].iter().all(|h| dag.is_body_pending(h) && !dag.is_body_wanted(h)));
+
+        // Finalized below the fork: both branches pass through it.
+        let (mut dag, common, a, _) = fixture();
+        let fh = dag.store.get(&common[2]).unwrap().height;
+        dag.set_finalized(common[2], fh);
+        assert!(!dag.conflicts_with_finality(a.last().unwrap()));
+        assert_eq!(dag.wanted_body_blocks(), pending);
+    }
+
     #[test]
     fn genesis_blue_score_zero() {
         let mut dag = GhostDAG::with_k(3);
@@ -3116,7 +4137,8 @@ mod tests {
     /// H-R3-1 regression: `ordered_hashes_from` must return exactly the
     /// `limit` smallest qualifying blue_scores, in ascending order — the same
     /// observable result the old "collect everything, sort, take(limit)"
-    /// implementation produced, but via the O(n)/O(limit) bounded-heap path.
+    /// implementation produced (now via the (blue_score, hash) index range
+    /// read, B1-T3 / B2-T5; `sync_index_tests` cross-checks it at random).
     /// Reverting to a naive `.filter().collect()` without the `limit`
     /// respected before materialising would still pass this on correctness,
     /// but the point of the invariant is memory/CPU, not just the return
@@ -3850,5 +4872,228 @@ mod hardening_tests {
             dag.add_block(blk, parents, i, 1 + state as u128 % 100).unwrap();
             all.push(blk);
         }
+    }
+}
+
+/// Audit B1-T3 / B2-T5 / B2-T7: the ordered indexes of `DagStore` (sync
+/// serving) are derived state; these tests check them against the store
+/// itself, and the index-driven `selected_tip` against the full-heap search,
+/// over random DAGs with random disqualified sets, removals and reloads.
+#[cfg(test)]
+mod sync_index_tests {
+    use super::*;
+
+    fn h(i: u64) -> BlockHash {
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&i.to_be_bytes());
+        b[31] = 0x1D;
+        b
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    /// The two ordered indexes equal what they index.
+    fn assert_indexes_consistent(dag: &GhostDAG) {
+        let by_score: BTreeSet<(u64, BlockHash)> = dag.store.data.iter().map(|(h, d)| (d.blue_score, *h)).collect();
+        assert_eq!(dag.store.by_score, by_score, "(blue_score, hash) index");
+        let tips: BTreeSet<TipKey> = dag.store.tips.iter()
+            .map(|h| {
+                let d = &dag.store.data[h];
+                (d.blue_work, d.blue_score, *h)
+            })
+            .collect();
+        assert_eq!(dag.store.tips_by_work, tips, "tip index");
+        for t in &dag.store.tips {
+            assert!(dag.store.children.get(t).is_none_or(|c| c.is_empty()), "a tip with children");
+        }
+    }
+
+    /// `tips_for_peers` by brute force: every tip sorted by GhostDAG's tip
+    /// order, the unmemoized `selectable`, the same `4 × max` read cap.
+    fn tips_for_peers_reference(dag: &GhostDAG, max: usize) -> Vec<BlockHash> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let selected = dag.selected_tip_reference();
+        let mut out: Vec<BlockHash> = selected.into_iter().collect();
+        let mut tips: Vec<TipKey> = dag.store.tips.iter().map(|t| dag.order_key(t)).collect();
+        tips.sort_unstable_by(|a, b| b.cmp(a));
+        for (_, _, t) in tips.into_iter().take(4 * max) {
+            if out.len() >= max {
+                break;
+            }
+            if Some(t) != selected && dag.selectable(&t) {
+                out.push(t);
+            }
+        }
+        for t in &out {
+            assert!(dag.selectable(t), "an unselectable tip in the reference");
+        }
+        out
+    }
+
+    /// `ordered_hashes_from` by brute force (the pre-index algorithm).
+    fn ordered_reference(dag: &GhostDAG, from: u64, limit: usize) -> Vec<BlockHash> {
+        let mut v: Vec<(u64, BlockHash)> = dag.store.data.iter()
+            .filter(|(_, d)| d.blue_score >= from)
+            .map(|(h, d)| (d.blue_score, *h))
+            .collect();
+        v.sort_unstable();
+        v.into_iter().take(limit).map(|(_, h)| h).collect()
+    }
+
+    fn random_dag(seed: u64, n: u64, rng: &mut Rng) -> (GhostDAG, Vec<BlockHash>) {
+        let mut dag = GhostDAG::with_k_and_activation(4, u64::MAX);
+        let g = h(seed << 32);
+        dag.add_genesis(g, 0);
+        let mut all = vec![g];
+        for i in 1..=n {
+            let len = all.len();
+            let mut parents = vec![all[len - 1 - (rng.next() as usize % len.min(6))]];
+            for _ in 0..(rng.next() % 3) {
+                let p = all[rng.next() as usize % len];
+                if !parents.contains(&p) {
+                    parents.push(p);
+                }
+            }
+            let b = h((seed << 32) + i);
+            if dag.add_block(b, parents, i, 1 + u128::from(rng.next() % 50)).is_ok() {
+                all.push(b);
+            }
+        }
+        (dag, all)
+    }
+
+    #[test]
+    fn indexes_and_selected_tip_match_the_reference() {
+        let mut rng = Rng(0x5EED_0F51_DE7E_5701);
+        for seed in 1..=12u64 {
+            let (mut dag, all) = random_dag(seed, 120, &mut rng);
+            assert_indexes_consistent(&dag);
+            assert_eq!(dag.selected_tip(), dag.selected_tip_reference(), "seed {seed}: no invalid block");
+            // Disqualify random blocks (with their selected-chain closure).
+            for _ in 0..(1 + rng.next() % 12) {
+                let x = all[1 + rng.next() as usize % (all.len() - 1)];
+                dag.mark_invalid(x);
+                assert_eq!(dag.selected_tip(), dag.selected_tip_reference(), "seed {seed}: after invalidating");
+            }
+            // A PoWit finalized checkpoint (main's `set_finalized`): on the
+            // selected chain for even seeds, anywhere for odd ones. The
+            // memoized finality walk gives the reference's answers.
+            let fin = if seed % 2 == 0 {
+                let chain = dag.selected_chain();
+                chain[chain.len() / 2]
+            } else {
+                all[rng.next() as usize % all.len()]
+            };
+            let fin_height = dag.get_block_data(&fin).unwrap().height;
+            dag.set_finalized(fin, fin_height);
+            assert_eq!(dag.selected_tip(), dag.selected_tip_reference(), "seed {seed}: with a finalized checkpoint");
+            for max in [0usize, 1, 3, 8, 64] {
+                assert_eq!(dag.tips_for_peers(max), tips_for_peers_reference(&dag, max), "seed {seed}: max {max}");
+            }
+            // Range reads equal the brute-force scan.
+            for _ in 0..20 {
+                let from = rng.next() % 140;
+                let limit = (rng.next() % 60) as usize;
+                assert_eq!(dag.ordered_hashes_from(from, limit), ordered_reference(&dag, from, limit), "seed {seed}");
+            }
+            // Remove leaves: the indexes follow.
+            for _ in 0..10 {
+                let mut tips: Vec<BlockHash> =
+                    dag.store.tips.iter().copied().filter(|t| Some(*t) != dag.store.genesis).collect();
+                if tips.is_empty() {
+                    break;
+                }
+                tips.sort_unstable();
+                assert!(dag.remove_block(&tips[rng.next() as usize % tips.len()]));
+                assert_indexes_consistent(&dag);
+                assert_eq!(dag.selected_tip(), dag.selected_tip_reference(), "seed {seed}: after a removal");
+            }
+            // A reload rebuilds the same indexes.
+            let entries: Vec<(BlockHash, GhostdagData)> = dag.store.data.iter().map(|(h, d)| (*h, d.clone())).collect();
+            let mut reloaded = GhostDAG::with_k_and_activation(4, u64::MAX);
+            reloaded.load_persisted(entries);
+            assert_indexes_consistent(&reloaded);
+            assert_eq!(reloaded.store.tips_by_work, dag.store.tips_by_work, "seed {seed}: reload");
+            assert_eq!(reloaded.store.by_score, dag.store.by_score);
+        }
+    }
+
+    /// The advertised frontier: selected tip first, then valid tips by
+    /// blue work, never a disqualified one, at most `max`.
+    #[test]
+    fn tips_for_peers_is_the_best_valid_frontier() {
+        let mut dag = GhostDAG::with_k_and_activation(10, u64::MAX);
+        let g = h(0);
+        dag.add_genesis(g, 0);
+        for i in 1..=40u64 {
+            dag.add_block(h(i), vec![g], i, 100 + u128::from(i)).unwrap();
+        }
+        for i in 36..=40u64 {
+            dag.mark_invalid(h(i));
+        }
+        let t = dag.tips_for_peers(10);
+        assert_eq!(t, (26..=35u64).rev().map(h).collect::<Vec<_>>());
+        assert_eq!(dag.tips_for_peers(0), Vec::<BlockHash>::new());
+        assert_eq!(dag.tips_for_peers(1000).len(), 35);
+        // The selected tip leads even when it is not a leaf (its only child
+        // is disqualified).
+        dag.add_block(h(100), vec![h(35)], 100, 1).unwrap();
+        dag.mark_invalid(h(100));
+        assert_eq!(dag.tips_for_peers(3), vec![h(35), h(34), h(33)]);
+    }
+
+    /// PoWit finality (main's `set_finalized`): a tip whose selected chain
+    /// misses the finalized checkpoint is never selected nor merged by a
+    /// template (`valid_tips`), so it is not advertised either; tips that
+    /// fork above the checkpoint are. The finality walk is shared by the
+    /// tips whose chains meet: its reads do not grow with the number of
+    /// such tips times the distance to the checkpoint.
+    #[test]
+    fn tips_for_peers_skips_tips_that_conflict_with_finality() {
+        let mut dag = GhostDAG::with_k_and_activation(10, u64::MAX);
+        let g = h(0);
+        dag.add_genesis(g, 0);
+        // The chain c1..c60, heavy.
+        for i in 1..=60u64 {
+            dag.add_block(h(i), vec![h(i - 1)], i, 1_000).unwrap();
+        }
+        // Stale siblings of c1 (they fork below the checkpoint).
+        for i in 0..10u64 {
+            dag.add_block(h(200 + i), vec![g], 200 + i, 1 + u128::from(i)).unwrap();
+        }
+        // Side tips off c50 (above the checkpoint), all lighter than c60.
+        for i in 0..10u64 {
+            dag.add_block(h(300 + i), vec![h(50)], 300 + i, 1 + u128::from(i)).unwrap();
+        }
+        dag.set_finalized(h(5), 5);
+        assert_eq!(dag.selected_tip(), Some(h(60)));
+        assert_eq!(dag.selected_tip(), dag.selected_tip_reference());
+        let before = dag.query_visits();
+        let t = dag.tips_for_peers(64);
+        let work = dag.query_visits() - before;
+        let mut want = vec![h(60)];
+        want.extend((0..10u64).rev().map(|i| h(300 + i)));
+        assert_eq!(t, want, "no tip that forks below the checkpoint");
+        assert_eq!(t, tips_for_peers_reference(&dag, 64));
+        let mut valid = dag.valid_tips();
+        valid.sort_unstable();
+        let mut advertised = t.clone();
+        advertised.sort_unstable();
+        assert_eq!(advertised, valid, "advertised = what templates may merge");
+        // 21 tips read; c60 walks down to c5 once (56 reads); each side tip
+        // reads itself and meets the memo at c50; each stale tip reads
+        // itself (below the checkpoint height). Unshared, every side tip
+        // would walk 46 blocks again: over 500 reads.
+        assert!(work <= 21 + 56 + 10 + 10, "finality walk not shared: {work} reads");
     }
 }

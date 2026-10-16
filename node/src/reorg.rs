@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::consensus::{BlockHash, GhostDAG};
+use crate::consensus::{BlockHash, GhostDAG, GhostdagData};
 use crate::core::{Block, Transaction, TxOutput, UndoData, UndoEntry};
 use crate::mempool::Mempool;
 use crate::storage::Storage;
@@ -51,6 +51,70 @@ use crate::storage::Storage;
 // never undo records), and a pruned body's rollback needs are recorded when it
 // is pruned (`storage::PrunedBodyRecord`), so a reorg of any depth can be
 // executed on a pruned node.
+
+// ── Instrumentation (thread-local; no effect on behaviour) ──────────────────
+
+thread_local! {
+    static CHAIN_WALK_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn note_chain_step() {
+    CHAIN_WALK_STEPS.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+/// Selected-parent steps walked by the chain-move planning functions
+/// ([`find_lca`], [`compute_connect_plan`], [`compute_reorg_plan`]) on the
+/// calling thread since it started. Tests read it to prove that planning a
+/// move costs O(move), not O(chain) (audit B1-T16).
+#[allow(dead_code)] // tests only; the node binary compiles this module too
+pub fn chain_walk_steps() -> u64 {
+    CHAIN_WALK_STEPS.with(|c| c.get())
+}
+
+/// Test-only fault injection for chain-move commits (thread-local, inert
+/// unless a test on the same thread sets it).
+#[doc(hidden)]
+pub mod fault_injection {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MAX_BLOCKS: Cell<Option<usize>> = const { Cell::new(None) };
+        static COMMITS_LEFT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Simulated memory limit: a [`super::connect_plan`] call that stages
+    /// more than `limit` blocks fails as if the process had run out of
+    /// memory before its commit (nothing is written).
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn set_max_blocks_per_commit(limit: Option<usize>) {
+        MAX_BLOCKS.with(|c| c.set(limit));
+    }
+
+    /// Simulated crash: after `n` more successful commits on this thread,
+    /// every later [`super::connect_plan`] call fails before writing.
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn fail_after_commits(n: Option<usize>) {
+        COMMITS_LEFT.with(|c| c.set(n));
+    }
+
+    pub(crate) fn before_commit(blocks: usize) -> Result<(), String> {
+        if let Some(limit) = MAX_BLOCKS.with(|c| c.get()) {
+            if blocks > limit {
+                return Err(format!(
+                    "injected fault: simulated out-of-memory staging {blocks} blocks (limit {limit})"));
+            }
+        }
+        match COMMITS_LEFT.with(|c| c.get()) {
+            Some(0) => Err("injected fault: simulated crash before the commit".to_string()),
+            Some(n) => {
+                COMMITS_LEFT.with(|c| c.set(Some(n - 1)));
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+}
 
 /// A committed chain move that rolled back more than this many selected-chain
 /// blocks is logged at error level and counted
@@ -89,6 +153,60 @@ pub struct ReorgPlan {
     pub to_apply:    Vec<BlockHash>,
 }
 
+impl ReorgPlan {
+    /// The applied tip the plan ends at.
+    pub fn target(&self) -> BlockHash {
+        self.to_apply.last().copied().unwrap_or(self.lca)
+    }
+
+    /// Audit B2-T0: the plan as consecutive sub-plans of at most `max`
+    /// blocks each (rollback chunks first, tip-first, then apply chunks,
+    /// LCA-first). Each sub-plan starts at the tip the previous one ends at,
+    /// and ends at a block of the selected chain of the starting tip (the
+    /// first block of `to_rollback`, or `lca`) or of `target()`,
+    /// so committing them one by one passes through consistent applied tips
+    /// only (a rollback sub-plan's `lca` is the block it ends at).
+    pub fn chunks(&self, max: usize) -> Vec<ReorgPlan> {
+        let max = max.max(1);
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.to_rollback.len() {
+            let j = (i + max).min(self.to_rollback.len());
+            let end = self.to_rollback.get(j).copied().unwrap_or(self.lca);
+            out.push(ReorgPlan { lca: end, to_rollback: self.to_rollback[i..j].to_vec(), to_apply: Vec::new() });
+            i = j;
+        }
+        let mut from = self.lca;
+        for chunk in self.to_apply.chunks(max) {
+            out.push(ReorgPlan { lca: from, to_rollback: Vec::new(), to_apply: chunk.to_vec() });
+            from = *chunk.last().expect("chunks are non-empty");
+        }
+        out
+    }
+}
+
+/// Audit B2-T0: the most blocks one chain-move commit stages. A move of any
+/// depth (no reorg-depth limit, audit DAG-6) is committed in sub-plans of at
+/// most this many blocks, each atomically with the tip pointer, the shielded
+/// tip and the DAG records, so the memory a move needs is bounded by one
+/// chunk (one block body at a time, plus the UTXO overlay and the WriteBatch
+/// of at most this many blocks), and every intermediate state is a consistent
+/// applied tip that start-up reconciliation resumes from. Bitcoin Core's
+/// `ActivateBestChainStep` connects at most 32 blocks per step, one body at a
+/// time, with a bounded coins cache; 16 keeps one chunk of maximal blocks
+/// (`core::MAX_BLOCK_SIZE`) far below a small node's memory.
+pub const MAX_BLOCKS_PER_COMMIT: usize = 16;
+
+/// Audit B1-T20: Bitcoin Core's `MAX_DISCONNECTED_TX_POOL_BYTES`. At most this
+/// many bytes (`Transaction::actual_size`) of the disconnected blocks'
+/// transactions are considered for re-admission to the mempool after a
+/// chain move. As in Core's `DisconnectedBlockTransactions`, the most
+/// recently confirmed transactions are the ones dropped beyond the budget:
+/// what is kept — the transactions of the OLDEST disconnected blocks, in
+/// block order — is closed under in-block ancestry, so no kept transaction
+/// misses a parent that was dropped.
+pub const MAX_DISCONNECTED_TX_POOL_BYTES: usize = 20_000_000;
+
 /// Statistics returned by `execute_reorg`. Fed into logs / metrics by the
 /// U.4 caller. All counts reflect successful operations only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -103,57 +221,40 @@ pub struct ReorgOutcome {
 // LCA computation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Walk the selected-parent chain from `start` up to genesis, collecting
-/// every hash we visit. Used by `find_lca` to mark A's ancestors so we can
-/// scan B's ancestors for the first intersection.
-///
-/// The walk terminates at genesis (selected_parent = None) or when a
-/// referenced selected_parent is absent from the DAG — the latter should
-/// never happen on a consistent store but we don't panic on it.
-fn collect_selected_ancestors(
-    dag: &GhostDAG,
-    start: &BlockHash,
-) -> HashSet<BlockHash> {
-    let mut out = HashSet::new();
-    let mut cur = Some(*start);
-    while let Some(h) = cur {
-        if !out.insert(h) {
-            // Cycle (shouldn't happen on a DAG) — break to avoid infinite loop.
-            break;
-        }
-        cur = match dag.get_block_data(&h) {
-            Some(data) => data.selected_parent,
-            None       => None,
-        };
-    }
-    out
-}
-
 /// Find the lowest common ancestor of two blocks along their selected-parent
-/// chains. Returns None if the two chains never intersect — this indicates
-/// either a corrupted DAG or blocks from incompatible genesis, and the
-/// caller should refuse to reorg.
+/// chains. Returns None if the two chains never intersect (or a block is
+/// unknown) — this indicates either a corrupted DAG or blocks from
+/// incompatible genesis, and the caller should refuse to reorg.
 ///
-/// Runtime: O(depth_a + depth_b) hash-map lookups; a deep reorg pays one
-/// walk proportional to its depth.
+/// Audit B1-T16: the DAG height (`GhostdagData::height`) strictly decreases
+/// along selected-parent edges, so the two chains are walked down together,
+/// always stepping the higher one, until they meet — Bitcoin Core's
+/// `LastCommonAncestor` on `nHeight`. Runtime: O(distance from `a` to the
+/// LCA + distance from `b` to the LCA) lookups, i.e. the size of the move.
+/// (The previous version inserted `a`'s whole selected chain, back to
+/// genesis, into a set on every call: every tip-moving acceptance cost
+/// O(chain height), initial sync Θ(N²).)
 pub fn find_lca(
     dag: &GhostDAG,
     a: &BlockHash,
     b: &BlockHash,
 ) -> Option<BlockHash> {
-    if a == b { return Some(*a); }
-
-    let a_ancestors = collect_selected_ancestors(dag, a);
-
-    // Walk B's chain; first hit in A's ancestor set is the LCA.
-    let mut cur = Some(*b);
-    while let Some(h) = cur {
-        if a_ancestors.contains(&h) {
-            return Some(h);
+    let (mut x, mut y) = (*a, *b);
+    let mut hx = dag.get_block_data(&x)?.height;
+    let mut hy = dag.get_block_data(&y)?.height;
+    loop {
+        if x == y {
+            return Some(x);
         }
-        cur = dag.get_block_data(&h).and_then(|d| d.selected_parent);
+        note_chain_step();
+        if hx >= hy {
+            x = dag.get_block_data(&x)?.selected_parent?;
+            hx = dag.get_block_data(&x)?.height;
+        } else {
+            y = dag.get_block_data(&y)?.selected_parent?;
+            hy = dag.get_block_data(&y)?.height;
+        }
     }
-    None
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -173,6 +274,7 @@ fn selected_path_to(
     let mut path = Vec::new();
     let mut cur = Some(*start);
     while let Some(h) = cur {
+        note_chain_step();
         if h == *stop { return Some(path); }
         path.push(h);
         cur = dag.get_block_data(&h).and_then(|d| d.selected_parent);
@@ -297,7 +399,9 @@ pub fn apply_block_utxo_mutations(
         let txid = tx.txid();
 
         // VAL-2: capture every row this block replaces (restored on rollback).
-        if let Ok(Some((prev_block, prev_height))) = store.get_tx_location(&txid) {
+        // Reads fail the apply, never read as "absent" (re-audit B1-T12).
+        let read = |what: &str, e: crate::storage::StorageError| format!("apply_block_utxo_mutations: {what} failed: {e}");
+        if let Some((prev_block, prev_height)) = store.get_tx_location(&txid).map_err(|e| read("get_tx_location", e))? {
             undo.overwritten.tx_index.push((txid, prev_block, prev_height));
         }
         store.put_tx_index(&txid, &block_hash, block.height)
@@ -306,7 +410,7 @@ pub fn apply_block_utxo_mutations(
         undo.tx_index_keys.push(txid);
 
         for (j, out) in tx.outputs.iter().enumerate() {
-            if let Ok(Some(prev)) = store.get_utxo(&txid, j as u32) {
+            if let Some(prev) = store.get_utxo(&txid, j as u32).map_err(|e| read("get_utxo", e))? {
                 undo.overwritten.utxos.push(UndoEntry { prev_txid: txid, prev_index: j as u32, output: prev });
             }
             store.put_utxo(&txid, j as u32, out)
@@ -316,7 +420,7 @@ pub fn apply_block_utxo_mutations(
         }
 
         if tx.is_coinbase() {
-            if let Ok(Some(prev_height)) = store.get_coinbase_height(&txid) {
+            if let Some(prev_height) = store.get_coinbase_height(&txid).map_err(|e| read("get_coinbase_height", e))? {
                 undo.overwritten.coinbase_heights.push((txid, prev_height));
             }
             store.put_coinbase_info(&txid, block.height)
@@ -326,7 +430,7 @@ pub fn apply_block_utxo_mutations(
         } else {
             for inp in &tx.inputs {
                 // Capture BEFORE delete so rollback can restore the pre-spend output.
-                if let Ok(Some(output)) = store.get_utxo(&inp.prev_txid, inp.prev_index) {
+                if let Some(output) = store.get_utxo(&inp.prev_txid, inp.prev_index).map_err(|e| read("get_utxo", e))? {
                     undo.spent_utxos.push(UndoEntry {
                         prev_txid:  inp.prev_txid,
                         prev_index: inp.prev_index,
@@ -407,39 +511,87 @@ fn bc_encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("reorg batch: encode failed: {}", e))
 }
 
+/// A failure to READ a [`UtxoView`] (an I/O error, a corrupted or
+/// undecodable row, an inconsistent index): the view could not answer, so
+/// nothing can be concluded about the block being validated (re-audit
+/// B1-T12). It is never a consensus verdict and is never persisted; the
+/// connect fails as a storage failure (`ConnectError::Failed`), nothing is
+/// written, and the block can be validated again once the row reads.
+/// Bitcoin Core makes the same distinction: a coins-database read error goes
+/// to `CCoinsViewErrorCatcher`, which aborts the node, and only genuine
+/// consensus failures are cached as `BLOCK_FAILED_VALID`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewError(pub String);
+
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "storage read failed: {}", self.0)
+    }
+}
+
 /// Read-only view of a UTXO set plus its coinbase-height index. Implemented by
 /// the committed [`Storage`] and by the staging overlay of an in-progress
 /// connect, so the SAME validation code checks a block against the live tip
 /// state (extension) or against the incrementally re-organised state (reorg).
+/// `Ok(None)` means "absent"; a read that fails is a [`ViewError`], never
+/// "absent".
 pub trait UtxoView {
-    fn view_utxo(&self, txid: &[u8; 32], index: u32) -> Result<Option<TxOutput>, String>;
-    fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String>;
-    /// Confirmation height of `txid` (the tx index), for relative timelocks
-    /// (`blockval::check_policy_spends`). `Ok(None)` when unknown.
-    fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String>;
+    fn view_utxo(&self, txid: &[u8; 32], index: u32) -> Result<Option<TxOutput>, ViewError>;
+    /// The HEADER height of the block whose coinbase `txid` is (the
+    /// coinbase-height row), `None` for any other txid.
+    fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError>;
+    /// The block that holds `txid` on the applied chain (the tx-index row,
+    /// written by every connect together with the transaction's coins).
+    fn view_tx_block(&self, txid: &[u8; 32]) -> Result<Option<BlockHash>, ViewError>;
+    /// The HEADER height of the block that holds `txid` on the applied chain
+    /// (the same tx-index row), for relative timelocks below the activation
+    /// (`blockval::check_policy_spends`, `accept::MaturityRule`). `Ok(None)`
+    /// when unknown.
+    fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError>;
+    /// The persisted GhostDAG record of `block` (blocks are persisted when
+    /// accepted, before any later block is connected on them).
+    fn view_dag_data(&self, block: &BlockHash) -> Result<Option<GhostdagData>, ViewError>;
 }
 
 impl UtxoView for Storage {
-    fn view_utxo(&self, txid: &[u8; 32], index: u32) -> Result<Option<TxOutput>, String> {
-        self.get_utxo(txid, index).map_err(|e| e.to_string())
+    fn view_utxo(&self, txid: &[u8; 32], index: u32) -> Result<Option<TxOutput>, ViewError> {
+        self.get_utxo(txid, index).map_err(|e| ViewError(e.to_string()))
     }
-    fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String> {
-        self.get_coinbase_height(txid).map_err(|e| e.to_string())
+    fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
+        self.get_coinbase_height(txid).map_err(|e| ViewError(e.to_string()))
     }
-    fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String> {
-        self.get_tx_location(txid).map(|o| o.map(|(_, h)| h)).map_err(|e| e.to_string())
+    fn view_tx_block(&self, txid: &[u8; 32]) -> Result<Option<BlockHash>, ViewError> {
+        self.get_tx_location(txid).map(|l| l.map(|(b, _)| b)).map_err(|e| ViewError(e.to_string()))
+    }
+    fn view_dag_data(&self, block: &BlockHash) -> Result<Option<GhostdagData>, ViewError> {
+        self.get_dag_data(block).map_err(|e| ViewError(e.to_string()))
+    }
+    fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
+        self.get_tx_location(txid).map(|o| o.map(|(_, h)| h)).map_err(|e| ViewError(e.to_string()))
     }
 }
 
 impl<'a> UtxoView for ReorgBatch<'a> {
-    fn view_utxo(&self, txid: &[u8; 32], index: u32) -> Result<Option<TxOutput>, String> {
-        self.get_utxo(txid, index)
+    fn view_utxo(&self, txid: &[u8; 32], index: u32) -> Result<Option<TxOutput>, ViewError> {
+        self.get_utxo(txid, index).map_err(ViewError)
     }
-    fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String> {
-        self.get_coinbase_height(txid)
+    fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
+        self.get_coinbase_height(txid).map_err(ViewError)
     }
-    fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, String> {
-        self.get_tx_location(txid).map(|o| o.map(|(_, h)| h))
+    fn view_tx_block(&self, txid: &[u8; 32]) -> Result<Option<BlockHash>, ViewError> {
+        self.get_tx_location(txid).map(|l| l.map(|(b, _)| b)).map_err(ViewError)
+    }
+    fn view_dag_data(&self, block: &BlockHash) -> Result<Option<GhostdagData>, ViewError> {
+        // DAG records are never staged by a connect plan: every block of the
+        // plan was persisted when it was accepted, except the trigger, whose
+        // record is staged in the same batch and never read here (maturity
+        // reads the DAG records of a block's PARENTS and of the blocks whose
+        // coinbases it spends, all accepted before it; no block spends its
+        // own coinbase from the activation, VAL-3).
+        self.store.get_dag_data(block).map_err(|e| ViewError(e.to_string()))
+    }
+    fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
+        self.get_tx_location(txid).map(|o| o.map(|(_, h)| h)).map_err(ViewError)
     }
 }
 
@@ -462,6 +614,9 @@ struct ReorgBatch<'a> {
     tx_index_overlay: HashMap<[u8; 32], Option<([u8; 32], u64)>>,
     /// NET-12: net holder changes of every staged UTXO mutation.
     holders: crate::storage::aggregates::HolderDeltas,
+    /// B1-T11: every address-history row staged (put or delete), for the
+    /// per-address history counters.
+    history: crate::storage::aggregates::HistoryDeltas,
     /// NET-12: running connected-chain totals.
     chain: crate::storage::aggregates::ChainTotals,
     /// NET-12: running XOR of the connected blocks' hashes (`agg/conn`).
@@ -481,6 +636,7 @@ impl<'a> ReorgBatch<'a> {
             coinbase_overlay: HashMap::new(),
             tx_index_overlay: HashMap::new(),
             holders: Default::default(),
+            history: Default::default(),
             chain,
             conn,
             _agg: agg,
@@ -613,6 +769,7 @@ impl<'a> ReorgBatch<'a> {
     fn delete_addr_history_key(&mut self, key: &[u8]) -> Result<(), String> {
         let cf = self.cf(CF_ADDR_TX_HISTORY)?;
         self.batch.delete_cf(cf, key);
+        self.history.delete(key);
         Ok(())
     }
 
@@ -639,10 +796,12 @@ impl<'a> ReorgBatch<'a> {
     fn commit(mut self) -> Result<(), String> {
         self.store.stage_holder_deltas(&mut self.batch, &self.holders)
             .map_err(|e| format!("reorg batch: aggregates: {}", e))?;
+        self.store.stage_history_deltas(&mut self.batch, &self.history)
+            .map_err(|e| format!("reorg batch: aggregates: {}", e))?;
         self.store.stage_chain_totals(&mut self.batch, self.chain, &self.conn)
             .map_err(|e| format!("reorg batch: aggregates: {}", e))?;
         let ReorgBatch { store, batch, _agg, .. } = self;
-        let r = store.db().write(batch)
+        let r = store.write_batch(batch)
             .map_err(|e| format!("reorg batch: atomic commit failed: {}", e));
         drop(_agg);
         r
@@ -711,6 +870,7 @@ fn rollback_block_batched(
     batch: &mut ReorgBatch,
     block: &Block,
     block_hash: &BlockHash,
+    position: u64,
 ) -> Result<(), String> {
     let undo = undo_for_rollback(batch.store, block_hash)?;
 
@@ -722,14 +882,14 @@ fn rollback_block_batched(
 
     // 1. Un-index addr_tx_history: exactly the keys `stage_chain_index`
     //    wrote (`indexer::addr_history_keys`, the single definition).
-    for key in crate::storage::indexer::addr_history_keys(block, &spent_lookup) {
+    for key in crate::storage::indexer::addr_history_keys(block, position, &spent_lookup) {
         batch.delete_addr_history_key(&key)?;
     }
 
     rollback_undo_effects(batch, &undo, block_hash)?;
 
-    // 7. Selected-chain height/timestamp index rows (DAG-12).
-    batch.store.stage_chain_unindex(&mut batch.batch, block)
+    // 7. Selected-chain position/timestamp index rows (DAG-12, DAG-8).
+    batch.store.stage_chain_unindex_at(&mut batch.batch, position, block_hash)
         .map_err(|e| format!("rollback: chain unindex failed: {}", e))?;
 
     // 8. NET-12: the block leaves the connected chain.
@@ -749,6 +909,7 @@ fn rollback_block_batched(
 fn rollback_pruned_block_batched(
     batch: &mut ReorgBatch,
     block_hash: &BlockHash,
+    position: u64,
 ) -> Result<(), String> {
     let undo = undo_for_rollback(batch.store, block_hash)?;
     match batch.store.get_pruned_body_record(block_hash)
@@ -767,7 +928,7 @@ fn rollback_pruned_block_batched(
         ),
     }
     rollback_undo_effects(batch, &undo, block_hash)?;
-    batch.store.stage_chain_unindex_at(&mut batch.batch, undo.block_height, block_hash)
+    batch.store.stage_chain_unindex_at(&mut batch.batch, position, block_hash)
         .map_err(|e| format!("rollback: chain unindex failed: {}", e))?;
     // NET-12: the block leaves the connected chain, exactly as on the bodied
     // path (its transaction count is the undo record's tx-index key count).
@@ -780,6 +941,7 @@ fn rollback_pruned_block_batched(
 fn apply_block_utxo_mutations_batched(
     batch: &mut ReorgBatch,
     block: &Block,
+    position: u64,
 ) -> Result<(), String> {
     let block_hash = block.block_hash();
     let mut undo = UndoData::new(block_hash, block.height);
@@ -791,7 +953,7 @@ fn apply_block_utxo_mutations_batched(
         let spent: HashMap<([u8; 32], u32), TxOutput> = undo.spent_utxos.iter()
             .map(|e| ((e.prev_txid, e.prev_index), e.output.clone()))
             .collect();
-        batch.store.stage_chain_index(&mut batch.batch, block, &spent)
+        batch.store.stage_chain_index(&mut batch.batch, block, position, &spent, &mut batch.history)
             .map_err(|e| format!("apply: chain index failed: {}", e))
     };
 
@@ -824,8 +986,11 @@ fn apply_block_utxo_mutations_batched(
         } else {
             for inp in &tx.inputs {
                 // Capture BEFORE delete (through the overlay — the pre-spend
-                // output may have been staged by an earlier fork block).
-                if let Ok(Some(output)) = batch.get_utxo(&inp.prev_txid, inp.prev_index) {
+                // output may have been staged by an earlier fork block). A
+                // read error fails the apply (re-audit B1-T12): swallowing it
+                // wrote an undo record without the spent coin, which a
+                // rollback could never restore.
+                if let Some(output) = batch.get_utxo(&inp.prev_txid, inp.prev_index)? {
                     undo.spent_utxos.push(UndoEntry {
                         prev_txid:  inp.prev_txid,
                         prev_index: inp.prev_index,
@@ -856,7 +1021,7 @@ fn apply_block_utxo_mutations_batched(
 ///
 /// Reads go through the [`ReorgBatch`] overlay so the "incrementally-reorged"
 /// state is visible even though nothing has been committed to disk yet.
-pub fn validate_fork_block_state(batch: &dyn UtxoView, block: &Block) -> Result<(), String> {
+pub fn validate_fork_block_state(batch: &dyn UtxoView, block: &Block) -> Result<(), ValidationFailure> {
     // Outputs created earlier in THIS block (outpoint -> value) so a later tx
     // can spend an earlier one; coinbase outputs are tracked separately because
     // they are immature to spend within the same block.
@@ -872,30 +1037,40 @@ pub fn validate_fork_block_state(batch: &dyn UtxoView, block: &Block) -> Result<
                 let op = (inp.prev_txid, inp.prev_index);
                 if !spent.insert(op) {
                     return Err(format!("double-spend of {}:{} within fork block",
-                        hex::encode(&op.0[..4]), op.1));
+                        hex::encode(&op.0[..4]), op.1).into());
                 }
                 let val = if let Some(v) = created.get(&op) {
                     if created_coinbase.contains(&op) {
                         return Err(format!("spends immature same-block coinbase {}:{}",
-                            hex::encode(&op.0[..4]), op.1));
+                            hex::encode(&op.0[..4]), op.1).into());
                     }
                     *v
                 } else {
                     match batch.view_utxo(&inp.prev_txid, inp.prev_index) {
                         Ok(Some(out)) => out.value,
-                        _ => return Err(format!("input {}:{} absent from reorged UTXO set",
-                            hex::encode(&op.0[..4]), op.1)),
+                        Ok(None) => return Err(format!("input {}:{} absent from reorged UTXO set",
+                            hex::encode(&op.0[..4]), op.1).into()),
+                        Err(e) => return Err(e.into()),
                     }
                 };
                 in_sum = in_sum.saturating_add(val);
             }
             let out_sum: u64 = tx.outputs.iter().map(|o| o.value).sum();
             if in_sum < out_sum {
-                return Err(format!("value violation: inputs {} < outputs {}", in_sum, out_sum));
+                return Err(format!("value violation: inputs {} < outputs {}", in_sum, out_sum).into());
             }
-            crate::core::check_coinbase_maturity(tx, block.height, |t| {
-                batch.view_coinbase_height(t).ok().flatten()
-            })?;
+            // The connect path's own maturity rule (re-audit B1-T14):
+            // header heights below the activation, selected-chain depth
+            // from it.
+            let spend_dag_height = || crate::accept::block_dag_height(batch, block);
+            let rule = if crate::core::block_rules::rules_active_at(
+                block.height, crate::core::activation::hardening_activation_height(),
+            ) {
+                crate::accept::MaturityRule::SelectedChainDepth(&spend_dag_height)
+            } else {
+                crate::accept::MaturityRule::HeaderHeights(block.height)
+            };
+            crate::accept::check_coinbase_maturity_in_view(tx, batch, rule)??;
         }
         for (j, out) in tx.outputs.iter().enumerate() {
             let op = (txid, j as u32);
@@ -930,6 +1105,18 @@ pub fn validate_fork_block_state(batch: &dyn UtxoView, block: &Block) -> Result<
 /// transaction mined below the activation was checked against the v2 digest
 /// only. `next_block_height` is the node's next template height after the
 /// move (`Mempool::next_height`), never the new tip's header height + 1.
+///
+/// Audit B1-T20, modeled on Bitcoin Core's `MaybeUpdateMempoolForReorg`: the
+/// caller passes at most [`MAX_DISCONNECTED_TX_POOL_BYTES`] of candidates
+/// ([`ConnectOutcome::reinjection_candidates`]); they are re-added WITHOUT
+/// the pool's size trimming and rolling minimum fee (Core's
+/// `bypass_limits`: they were mined, the relay floor is not a reason to
+/// lose them), except that a candidate the final trim would remove at once
+/// (the pool is full and it pays no more than the cheapest pooled package,
+/// `Mempool::would_only_trim`) is not inserted at all; then the pool is
+/// trimmed ONCE to its caps (Core's `LimitMempoolSize`). The pool keeps the
+/// best-paying packages of the pooled and re-added transactions, and the
+/// work under the acceptance lock is bounded by the candidate budget.
 pub fn reinject_disconnected(
     store: &Storage,
     mempool: &Mempool,
@@ -944,6 +1131,10 @@ pub fn reinject_disconnected(
             Ok(_)  => reinjected = reinjected.saturating_add(1),
             Err(_) => discarded = discarded.saturating_add(1),
         }
+    }
+    let trimmed = mempool.trim_to_size();
+    if trimmed > 0 {
+        log::info!("reorg: mempool trimmed {} tx(s) back to its limits after re-admission", trimmed);
     }
     (reinjected, discarded)
 }
@@ -975,31 +1166,72 @@ impl std::fmt::Display for ConnectError {
     }
 }
 
-/// What a committed [`connect_plan`] changed.
-#[derive(Debug, Clone, Default)]
+/// What a committed [`connect_plan`] changed. Block HASHES only (audit
+/// B2-T0): a move of any depth must not keep the bodies of both branches in
+/// memory; the few consumers that need transactions re-read the bodies one at
+/// a time from storage (bodies are never deleted by a chain move).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConnectOutcome {
     /// Blocks removed from the selected chain, tip-first, whose bodies were
     /// available (their transactions can be re-admitted to the mempool).
-    pub disconnected: Vec<Block>,
+    pub disconnected: Vec<BlockHash>,
     /// Blocks removed from the selected chain whose bodies had been pruned
     /// (rolled back from their undo records; nothing to re-admit), tip-first.
     pub disconnected_pruned: Vec<BlockHash>,
     /// Blocks added to the selected chain, LCA-first (last = new tip).
-    pub connected: Vec<Block>,
+    pub connected: Vec<BlockHash>,
+}
+
+/// The transactions [`ConnectOutcome::reinjection_candidates`] selected.
+#[derive(Debug, Clone, Default)]
+pub struct ReinjectionCandidates {
+    /// Oldest disconnected block first, block order inside each block.
+    pub txs: Vec<Transaction>,
+    /// Σ `actual_size` of `txs`.
+    pub bytes: usize,
+    /// Some transactions were left out because of the byte budget.
+    pub truncated: bool,
 }
 
 impl ConnectOutcome {
     /// The non-coinbase transactions of the disconnected blocks in the order
-    /// they must be re-admitted to the mempool: OLDEST disconnected block
+    /// they must be re-admitted to the mempool — OLDEST disconnected block
     /// first, block order inside each block (Bitcoin Core's
-    /// `DisconnectedBlockTransactions`). A child confirmed one block after its
-    /// parent therefore comes back after the parent, as an in-pool chain
-    /// (MEM-6); `disconnected` itself is tip-first, and re-admitting in that
-    /// order refused the child with "missing inputs" and lost it.
-    pub fn disconnected_txs_oldest_first(&self) -> Vec<Transaction> {
-        self.disconnected.iter().rev()
-            .flat_map(|b| b.transactions.iter().filter(|t| !t.is_coinbase()).cloned())
-            .collect()
+    /// `DisconnectedBlockTransactions`): a child confirmed one block after its
+    /// parent comes back after the parent, as an in-pool chain (MEM-6) —
+    /// keeping at most `max_bytes` of them (audit B1-T20; the node passes
+    /// [`MAX_DISCONNECTED_TX_POOL_BYTES`]). The budget keeps the longest
+    /// prefix of that order, i.e. it drops the most recently confirmed
+    /// transactions first, as Core does, so every kept transaction's in-block
+    /// ancestors are kept too. Bodies are read one at a time; a body that
+    /// cannot be read is skipped (logged).
+    pub fn reinjection_candidates(&self, store: &Storage, max_bytes: usize) -> ReinjectionCandidates {
+        let mut out = ReinjectionCandidates::default();
+        'blocks: for h in self.disconnected.iter().rev() {
+            let block = match store.get_block(h) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    log::warn!("reorg: disconnected block {} has no body; its transactions are not re-admitted",
+                        hex::encode(&h[..8]));
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("reorg: body of disconnected block {} unreadable ({}); not re-admitted",
+                        hex::encode(&h[..8]), e);
+                    continue;
+                }
+            };
+            for tx in block.transactions.into_iter().filter(|t| !t.is_coinbase()) {
+                let size = tx.actual_size();
+                if out.bytes.saturating_add(size) > max_bytes {
+                    out.truncated = true;
+                    break 'blocks;
+                }
+                out.bytes += size;
+                out.txs.push(tx);
+            }
+        }
+        out
     }
 
     /// Number of selected-chain blocks the move rolled back.
@@ -1008,12 +1240,149 @@ impl ConnectOutcome {
     }
 }
 
+/// Insertion-ordered set of block hashes with O(1) membership, insertion and
+/// removal (removed entries are skipped on iteration and compacted lazily).
+#[derive(Debug, Clone, Default)]
+struct OrderedHashes {
+    order: Vec<BlockHash>,
+    /// hash → its live index in `order`.
+    live: HashMap<BlockHash, usize>,
+}
+
+impl OrderedHashes {
+    fn push(&mut self, h: BlockHash) {
+        if self.live.contains_key(&h) {
+            return;
+        }
+        self.live.insert(h, self.order.len());
+        self.order.push(h);
+    }
+
+    fn remove(&mut self, h: &BlockHash) -> bool {
+        if self.live.remove(h).is_none() {
+            return false;
+        }
+        if self.order.len() > 64 && self.live.len() * 2 < self.order.len() {
+            let live = &self.live;
+            let kept: Vec<BlockHash> = self.order.iter().enumerate()
+                .filter(|(i, x)| live.get(*x) == Some(i))
+                .map(|(_, x)| *x)
+                .collect();
+            self.live = kept.iter().enumerate().map(|(i, x)| (*x, i)).collect();
+            self.order = kept;
+        }
+        true
+    }
+
+    fn to_vec(&self) -> Vec<BlockHash> {
+        self.order.iter().enumerate()
+            .filter(|(i, x)| self.live.get(*x) == Some(i))
+            .map(|(_, x)| *x)
+            .collect()
+    }
+}
+
+/// The NET effect of several committed chain moves, in order (audit B2-T0 /
+/// B1-T20): a block connected by one move and disconnected by a later one
+/// (or the reverse) appears in neither list. Hashes only; every operation is
+/// O(1) per block (the previous `ChainMove::record` searched its lists
+/// linearly for every block, O(n·m)).
+#[derive(Debug, Clone, Default)]
+pub struct ChainDelta {
+    connected: OrderedHashes,
+    disconnected: OrderedHashes,
+    disconnected_pruned: OrderedHashes,
+}
+
+impl ChainDelta {
+    /// Fold one committed move in.
+    pub fn record(&mut self, outcome: &ConnectOutcome) {
+        for h in &outcome.disconnected_pruned {
+            if !self.connected.remove(h) {
+                self.disconnected_pruned.push(*h);
+            }
+        }
+        for h in &outcome.disconnected {
+            if !self.connected.remove(h) {
+                self.disconnected.push(*h);
+            }
+        }
+        for h in &outcome.connected {
+            if !self.disconnected.remove(h) && !self.disconnected_pruned.remove(h) {
+                self.connected.push(*h);
+            }
+        }
+    }
+
+    /// Blocks added and still on the applied chain, in connect order.
+    pub fn connected(&self) -> Vec<BlockHash> {
+        self.connected.to_vec()
+    }
+
+    /// Blocks (with a body) removed from the applied chain that were on it
+    /// before the first recorded move, in disconnect order (tip first).
+    pub fn disconnected(&self) -> Vec<BlockHash> {
+        self.disconnected.to_vec()
+    }
+
+    /// The net effect as one [`ConnectOutcome`].
+    pub fn to_outcome(&self) -> ConnectOutcome {
+        ConnectOutcome {
+            disconnected: self.disconnected.to_vec(),
+            disconnected_pruned: self.disconnected_pruned.to_vec(),
+            connected: self.connected.to_vec(),
+        }
+    }
+}
+
+/// Log and count a committed chain move that rolled back more than
+/// [`DEEP_REORG_ALERT_DEPTH`] blocks (policy that never changes the outcome).
+pub fn alert_if_deep(outcome: &ConnectOutcome, lca: Option<&BlockHash>) {
+    let depth = outcome.rolled_back() as u64;
+    if depth > DEEP_REORG_ALERT_DEPTH {
+        crate::metrics::inc_deep_reorg();
+        log::error!(
+            "DEEP REORG committed: rolled back {} selected-chain block(s) (alert depth {}; {} with \
+             pruned bodies), applied {} (lca={}). The node follows the best valid chain at any depth; \
+             if this chain is unwanted, inspect it and use `invalidateblock`.",
+            depth, DEEP_REORG_ALERT_DEPTH, outcome.disconnected_pruned.len(),
+            outcome.connected.len(), lca.map(|h| hex::encode(&h[..8])).unwrap_or_else(|| "?".into()),
+        );
+    }
+}
+
+/// Why a [`ConnectHooks::validate`] call did not pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationFailure {
+    /// The block is invalid in its own selected-chain context: a verdict
+    /// ([`ConnectError::Invalid`]).
+    Invalid(String),
+    /// The view could not be read ([`ViewError`]): NO verdict. The connect
+    /// fails as [`ConnectError::Failed`] (nothing written, nothing marked;
+    /// re-audit B1-T12).
+    Storage(String),
+}
+
+impl From<String> for ValidationFailure {
+    fn from(reason: String) -> Self {
+        ValidationFailure::Invalid(reason)
+    }
+}
+
+impl From<ViewError> for ValidationFailure {
+    fn from(e: ViewError) -> Self {
+        ValidationFailure::Storage(e.0)
+    }
+}
+
 /// Hooks the caller plugs into [`connect_plan`].
 pub struct ConnectHooks<'h> {
     /// Validate one block against the staged view of ITS OWN selected-chain
-    /// context (every earlier block of the plan already staged). `Err` marks
-    /// the block invalid (see [`ConnectError::Invalid`]).
-    pub validate: &'h dyn Fn(&dyn UtxoView, &Block) -> Result<(), String>,
+    /// context (every earlier block of the plan already staged).
+    /// `Err(Invalid)` marks the block invalid (see [`ConnectError::Invalid`]);
+    /// `Err(Storage)` is a read failure and fails the connect without any
+    /// verdict ([`ConnectError::Failed`]).
+    pub validate: &'h dyn Fn(&dyn UtxoView, &Block) -> Result<(), ValidationFailure>,
     /// Extra writes folded into the SAME batch right before the commit (DAG
     /// record of the arriving block, tip pointer, invalid marks, ...).
     pub stage_extra: &'h dyn Fn(&Storage, &mut rocksdb::WriteBatch) -> Result<(), String>,
@@ -1030,6 +1399,12 @@ pub struct ConnectHooks<'h> {
 /// applied in its own context. All UTXO effects, undo records, chain indexes
 /// and the caller's extra writes land together or not at all (DAG-11): a crash
 /// leaves either the complete old state or the complete new state.
+///
+/// Memory (audit B2-T0): bodies are read one at a time and dropped once
+/// staged; the outcome lists hashes. What the call holds grows with the
+/// plan's size (overlay and batch), so the acceptance pipeline passes
+/// sub-plans of at most [`MAX_BLOCKS_PER_COMMIT`] blocks
+/// ([`ReorgPlan::chunks`]), each with the tip pointer in its own batch.
 pub fn connect_plan(
     store: &Storage,
     plan: &ReorgPlan,
@@ -1053,24 +1428,61 @@ pub fn connect_plan(
         )));
     }
 
+    // Selected-chain positions (DAG heights) of the moved blocks, for the
+    // chain indexes (audit DAG-8): the plan walks selected-parent edges from
+    // the LCA, so the j-th block of `to_rollback` (tip-first) sits at
+    // lca + len - j and the i-th of `to_apply` at lca + 1 + i. This holds
+    // for every chunk of a chunked move too (audit B2-T0,
+    // `ReorgPlan::chunks`): a rollback chunk's `lca` is the block it ends
+    // at (the selected parent of its last block), an apply chunk's the
+    // block the previous chunk ended at.
+    // A node always has the LCA's DAG record (the genesis record is written
+    // at first boot, every applied block's with its connect); only a store
+    // that never wrote one (bare storage fixtures) lacks it, and then each
+    // block's own DAG record, else its header height, is used.
+    let lca_position = store.chain_position(&plan.lca)
+        .map_err(|e| ConnectError::Failed(e.to_string()))?;
+    if lca_position.is_none() {
+        log::warn!("connect: no DAG record for the LCA {}; chain-index positions fall back to each block's \
+                    own record", hex::encode(&plan.lca[..8]));
+    }
+    let own_position = |hash: &BlockHash, header_height: u64| -> Result<u64, ConnectError> {
+        Ok(store.chain_position(hash).map_err(|e| ConnectError::Failed(e.to_string()))?.unwrap_or(header_height))
+    };
+    let rollback_position = |j: usize, hash: &BlockHash, header_height: u64| -> Result<u64, ConnectError> {
+        match lca_position {
+            Some(p) => Ok(p + (plan.to_rollback.len() - j) as u64),
+            None => own_position(hash, header_height),
+        }
+    };
+    let apply_position = |i: usize, hash: &BlockHash, header_height: u64| -> Result<u64, ConnectError> {
+        match lca_position {
+            Some(p) => Ok(p + 1 + i as u64),
+            None => own_position(hash, header_height),
+        }
+    };
+
     let mut batch = ReorgBatch::new(store).map_err(ConnectError::Failed)?;
     let mut outcome = ConnectOutcome::default();
 
-    for hash in &plan.to_rollback {
+    for (j, hash) in plan.to_rollback.iter().enumerate() {
         let body = store.get_block(hash)
             .map_err(|e| ConnectError::Failed(format!(
                 "execute_reorg: get_block on rollback target failed: {}", e)))?;
         match body {
             Some(block) => {
-                rollback_block_batched(&mut batch, &block, hash)
+                let position = rollback_position(j, hash, block.height)?;
+                rollback_block_batched(&mut batch, &block, hash, position)
                     .map_err(|e| ConnectError::Failed(format!(
                         "execute_reorg: rollback failed at h={} (reorg aborted, no storage mutation committed): {}",
                         block.height, e
                     )))?;
-                outcome.disconnected.push(block);
+                outcome.disconnected.push(*hash);
             }
             None => {
-                rollback_pruned_block_batched(&mut batch, hash)
+                let header_height = store.get_undo_data(hash).ok().flatten().map(|u| u.block_height).unwrap_or(0);
+                let position = rollback_position(j, hash, header_height)?;
+                rollback_pruned_block_batched(&mut batch, hash, position)
                     .map_err(|e| ConnectError::Failed(format!(
                         "execute_reorg: rollback of pruned block {}.. failed (reorg aborted, no storage \
                          mutation committed): {}",
@@ -1081,40 +1493,43 @@ pub fn connect_plan(
         }
     }
 
-    for hash in &plan.to_apply {
+    for (i, hash) in plan.to_apply.iter().enumerate() {
         let block = store.get_block(hash)
             .map_err(|e| ConnectError::Failed(format!(
                 "execute_reorg: get_block on apply target failed: {}", e)))?
             .ok_or_else(|| ConnectError::Failed(
                 "execute_reorg: block body missing for apply target".to_string()))?;
-        if let Err(reason) = (hooks.validate)(&batch, &block) {
-            log::warn!(
-                "connect: block h={} {} failed in-context validation ({}); batch dropped, storage untouched",
-                block.height, hex::encode(&hash[..8]), reason
-            );
-            return Err(ConnectError::Invalid { block: *hash, height: block.height, reason });
+        match (hooks.validate)(&batch, &block) {
+            Ok(()) => {}
+            Err(ValidationFailure::Invalid(reason)) => {
+                log::warn!(
+                    "connect: block h={} {} failed in-context validation ({}); batch dropped, storage untouched",
+                    block.height, hex::encode(&hash[..8]), reason
+                );
+                return Err(ConnectError::Invalid { block: *hash, height: block.height, reason });
+            }
+            Err(ValidationFailure::Storage(m)) => {
+                log::error!(
+                    "connect: block h={} {} could not be validated, storage read failed ({}); no verdict, \
+                     batch dropped, storage untouched",
+                    block.height, hex::encode(&hash[..8]), m
+                );
+                return Err(ConnectError::Failed(format!(
+                    "connect: block h={} {} could not be validated (storage read failed, no verdict): {}",
+                    block.height, hex::encode(&hash[..8]), m)));
+            }
         }
-        apply_block_utxo_mutations_batched(&mut batch, &block)
+        let position = apply_position(i, hash, block.height)?;
+        apply_block_utxo_mutations_batched(&mut batch, &block, position)
             .map_err(|e| ConnectError::Failed(format!(
                 "execute_reorg: batched apply failed at h={}: {}", block.height, e)))?;
-        outcome.connected.push(block);
+        outcome.connected.push(*hash);
     }
 
     (hooks.stage_extra)(store, &mut batch.batch).map_err(ConnectError::Failed)?;
+    fault_injection::before_commit(plan.to_rollback.len() + plan.to_apply.len())
+        .map_err(ConnectError::Failed)?;
     batch.commit().map_err(ConnectError::Failed)?;
-
-    // Deep-reorg alerting (policy that never changes the outcome).
-    let depth = outcome.rolled_back() as u64;
-    if depth > DEEP_REORG_ALERT_DEPTH {
-        crate::metrics::inc_deep_reorg();
-        log::error!(
-            "DEEP REORG committed: rolled back {} selected-chain block(s) (alert depth {}; {} with \
-             pruned bodies), applied {} (lca={}). The node follows the best valid chain at any depth; \
-             if this chain is unwanted, inspect it and use `invalidateblock`.",
-            depth, DEEP_REORG_ALERT_DEPTH, outcome.disconnected_pruned.len(),
-            outcome.connected.len(), hex::encode(&plan.lca[..8]),
-        );
-    }
     Ok(outcome)
 }
 
@@ -1133,15 +1548,21 @@ pub fn connect_plan(
 /// 3. **Reinject** candidate txs into the mempool through the shared
 ///    admission function (`reinject_disconnected`, audit MEM-7): UTXO
 ///    presence, maturity and minimum fees at the new tip. Candidates are
-///    re-admitted OLDEST disconnected block first, in block order
-///    ([`ConnectOutcome::disconnected_txs_oldest_first`]), so a parent is
-///    back in the pool before a child confirmed in a later block. Rejected
-///    ones are counted as discarded.
+///    re-admitted OLDEST disconnected block first, in block order, so a
+///    parent is back in the pool before a child confirmed in a later block,
+///    and only up to [`MAX_DISCONNECTED_TX_POOL_BYTES`] of them (audit
+///    B1-T20, Bitcoin Core's `DisconnectedBlockTransactions` budget: the
+///    transactions of the most recently confirmed blocks are dropped first;
+///    [`ConnectOutcome::reinjection_candidates`]). Rejected candidates are
+///    counted as discarded (those beyond the budget are not counted).
 ///
 /// Fork blocks are re-validated with the audit-H1 UTXO-state rules
 /// (`validate_fork_block_state`). The acceptance pipeline does not call this
 /// function: it calls [`connect_plan`] directly with the FULL in-context
-/// block validator.
+/// block validator, one bounded chunk at a time (audit B2-T0). This
+/// storage-only entry point (tools and tests) has no tip pointer to record
+/// an intermediate position in, so it stays ONE atomic batch: use it for
+/// moves of bounded size only.
 ///
 /// # Preconditions
 ///
@@ -1211,13 +1632,15 @@ fn execute_reorg_inner(
     let no_extra = |_: &Storage, _: &mut rocksdb::WriteBatch| -> Result<(), String> { Ok(()) };
     let hooks = ConnectHooks { validate: &validate, stage_extra: &no_extra };
     let outcome = connect_plan(store, plan, &hooks).map_err(|e| e.to_string())?;
+    alert_if_deep(&outcome, Some(&plan.lca));
 
     // Phase 3: re-admit the disconnected blocks' transactions through the
     // shared admission function, evaluated at the new tip (MEM-7), oldest
-    // disconnected block first so parents precede their children (MEM-6).
+    // disconnected block first so parents precede their children (MEM-6),
+    // at most MAX_DISCONNECTED_TX_POOL_BYTES of them (B1-T20).
     // Blocks rolled back from their undo records alone (pruned bodies,
     // DAG-6) have no transactions to re-admit.
-    let candidates: Vec<Transaction> = outcome.disconnected_txs_oldest_first();
+    let candidates = outcome.reinjection_candidates(store, MAX_DISCONNECTED_TX_POOL_BYTES);
     // The next block's height: this storage-only entry point has no DAG, so
     // it uses the new tip's DAG height + 1 (its CF_DAG record) — the template
     // height when the new tip is the only tip — never the tip's HEADER height
@@ -1225,18 +1648,19 @@ fn execute_reorg_inner(
     // height (DAG-8). The acceptance pipeline passes the template height.
     // The new tip is the last connected block, or the LCA for a pure
     // rollback (DAG-6: compute_connect_plan plans backward moves).
-    let new_tip = outcome.connected.last().map(|b| b.block_hash()).unwrap_or(plan.lca);
+    let new_tip = plan.target();
+    let header_height = |h: &BlockHash| store.get_block(h).ok().flatten().map(|b| b.height);
     let next_height = match store.get_dag_data(&new_tip) {
         Ok(Some(d)) => d.height.saturating_add(1),
-        _ => outcome.connected.last().map(|b| b.height.saturating_add(1))
-            .or_else(|| outcome.disconnected.last().map(|b| b.height))
+        _ => outcome.connected.last().and_then(header_height).map(|h| h.saturating_add(1))
+            .or_else(|| outcome.disconnected.last().and_then(header_height))
             .unwrap_or(0),
     };
     if next_height != 0 {
         mempool.set_next_height(next_height);
     }
     let (txs_reinjected, txs_discarded) =
-        reinject_disconnected(store, mempool, candidates, next_height);
+        reinject_disconnected(store, mempool, candidates.txs, next_height);
 
     Ok(ReorgOutcome {
         rolled_back:    plan.to_rollback.len(),

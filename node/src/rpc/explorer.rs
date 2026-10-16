@@ -1,9 +1,10 @@
 //! Read-only explorer RPCs: DAG-aware block, chain, address and holder views.
 //!
-//! The height index in storage is last-write-wins (any block at a height), so
-//! these methods never use it for chain membership. They walk the GhostDAG
-//! instead: the selected chain is the selected-parent chain from the selected
-//! tip, cached and extended incrementally as the tip moves.
+//! These methods walk the GhostDAG for chain membership: the selected chain
+//! is the selected-parent chain from the selected tip, cached and extended
+//! incrementally as the tip moves. (The height index in storage holds the
+//! APPLIED selected chain by position since audit DAG-8; it was keyed by
+//! header height before, where two chain blocks could share a row.)
 
 use super::*;
 use crate::consensus::GhostdagData;
@@ -12,16 +13,114 @@ use std::collections::{HashMap, HashSet};
 const MAX_PAGE: usize = 100;
 const MAX_DAG_WINDOW: usize = 300;
 
-/// Selected chain from genesis (index 0) to the selected tip.
+/// Selected chain from genesis (index 0) to the selected tip, cached per
+/// DAG instance.
 struct ChainCache {
+    /// The DAG this cache describes. A `Weak` keeps the allocation alive,
+    /// so the pointer comparison can never match a new DAG at a reused
+    /// address; an entry whose DAG was dropped is purged.
+    dag: std::sync::Weak<RwLock<GhostDAG>>,
     tip: [u8; 32],
     chain: Vec<[u8; 32]>,
     pos: HashMap<[u8; 32], usize>,
+    /// NET-15: most blocks handled under one DAG read-lock hold by the last
+    /// update (tests).
+    work: usize,
 }
 
-fn chain_cache() -> &'static parking_lot::Mutex<Option<ChainCache>> {
-    static C: std::sync::OnceLock<parking_lot::Mutex<Option<ChainCache>>> = std::sync::OnceLock::new();
-    C.get_or_init(|| parking_lot::Mutex::new(None))
+/// At most this many DAGs are cached (one in a node; tests build many).
+const CHAIN_CACHE_SLOTS: usize = 8;
+
+/// NET-15: blocks the first build of the chain cache walks per DAG read-lock
+/// hold (it releases the lock between chunks).
+pub(super) const CHAIN_BUILD_CHUNK: usize = if cfg!(test) { 64 } else { 4_096 };
+
+fn chain_cache() -> &'static parking_lot::Mutex<Vec<ChainCache>> {
+    static C: std::sync::OnceLock<parking_lot::Mutex<Vec<ChainCache>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+impl ChainCache {
+    /// First build: walk the selected-parent chain back from the selected
+    /// tip in chunks of [`CHAIN_BUILD_CHUNK`] blocks, releasing the DAG read
+    /// lock between chunks so a writer (`accept_block`) is never held for
+    /// the whole chain (NET-15). A block's selected parent never changes, so
+    /// the walk is consistent across chunks; a tip that moved meanwhile is
+    /// caught up by [`Self::advance`].
+    fn build(state: &AppState) -> Option<ChainCache> {
+        let tip = state.dag.read().selected_tip()?;
+        let mut chain = Vec::new();
+        let mut cur = Some(tip);
+        let mut work = 0;
+        while cur.is_some() {
+            let dag = state.dag.read();
+            let mut steps = 0;
+            while let Some(h) = cur {
+                if steps == CHAIN_BUILD_CHUNK { break; }
+                chain.push(h);
+                cur = dag.get_block_data(&h).and_then(|d| d.selected_parent);
+                steps += 1;
+            }
+            work = work.max(steps);
+        }
+        chain.reverse();
+        let pos = chain.iter().enumerate().map(|(i, h)| (*h, i)).collect();
+        Some(ChainCache { dag: Arc::downgrade(&state.dag), tip, chain, pos, work })
+    }
+
+    /// Follow a selected-tip change incrementally: walk back from the new
+    /// tip to the cached chain, drop the cached blocks above the meeting
+    /// point and append the new ones. Work is proportional to the blocks
+    /// that left and joined the chain, not to its length (NET-15; pre-fix:
+    /// a clone of the chain and a rebuild of the position map on every tip
+    /// change).
+    ///
+    /// The walk takes the DAG read lock for at most [`CHAIN_BUILD_CHUNK`]
+    /// blocks at a time, like [`Self::build`] (review: after a long gap with
+    /// no explorer traffic, e.g. a sync of a few hundred thousand blocks,
+    /// the catch-up walked every new block under one hold and blocked
+    /// `accept_block`). A block's selected parent never changes, so the
+    /// walk from `tip` is consistent across chunks, and the cache (whose
+    /// mutex the caller holds) does not move meanwhile; the chain itself is
+    /// updated without the DAG lock. `dag` is the caller's guard, which
+    /// read `tip`; it is released between chunks and returned re-taken.
+    fn advance<'a>(
+        &mut self,
+        state: &'a AppState,
+        mut dag: parking_lot::RwLockReadGuard<'a, GhostDAG>,
+        tip: [u8; 32],
+    ) -> parking_lot::RwLockReadGuard<'a, GhostDAG> {
+        let mut tail = Vec::new();
+        let mut cur = Some(tip);
+        let mut meet = None;
+        let mut work = 0;
+        loop {
+            let mut steps = 0;
+            while let Some(h) = cur {
+                if let Some(&p) = self.pos.get(&h) { meet = Some(p); cur = None; break; }
+                if steps == CHAIN_BUILD_CHUNK { break; }
+                tail.push(h);
+                cur = dag.get_block_data(&h).and_then(|d| d.selected_parent);
+                steps += 1;
+            }
+            work = work.max(steps + 1);
+            if cur.is_none() { break; }
+            drop(dag);
+            dag = state.dag.read();
+        }
+        drop(dag);
+        let keep = meet.map_or(0, |p| p + 1);
+        for h in self.chain.drain(keep..) {
+            self.pos.remove(&h);
+        }
+        for h in tail.iter().rev() {
+            self.pos.insert(*h, self.chain.len());
+            self.chain.push(*h);
+        }
+        self.tip = tip;
+        self.work = work;
+        state.dag.read()
+    }
 }
 
 /// Run `f` with an up-to-date selected-chain cache.
@@ -29,42 +128,42 @@ fn chain_cache() -> &'static parking_lot::Mutex<Option<ChainCache>> {
 /// NET-15: `f` runs while the DAG read lock is held, so it must only read
 /// DAG data (copying what it needs). Every storage (RocksDB) access happens
 /// after `with_chain` returns, so a slow disk read can no longer hold the
-/// lock that `accept_block` needs to write.
+/// lock that `accept_block` needs to write. The cache follows the tip
+/// incrementally ([`ChainCache::advance`]); its first build takes the lock
+/// in bounded chunks ([`ChainCache::build`]). Lock order: the cache mutex,
+/// then the DAG lock.
 fn with_chain<R>(state: &AppState, f: impl FnOnce(&ChainCache, &GhostDAG) -> R) -> Option<R> {
-    let dag = state.dag.read();
-    let tip = dag.selected_tip()?;
-    let mut guard = chain_cache().lock();
-    let fresh = match guard.as_ref() {
-        Some(c) if c.tip == tip => None,
-        Some(c) => {
-            // Walk back from the new tip until we meet the cached chain.
-            let mut tail = Vec::new();
-            let mut cur = Some(tip);
-            let mut meet = None;
-            while let Some(h) = cur {
-                if let Some(&p) = c.pos.get(&h) { meet = Some(p); break; }
-                tail.push(h);
-                cur = dag.get_block_data(&h).and_then(|d| d.selected_parent);
-            }
-            let mut chain = match meet {
-                Some(p) => c.chain[..=p].to_vec(),
-                None => Vec::new(),
-            };
-            tail.reverse();
-            chain.extend(tail);
-            Some(chain)
-        }
+    let mut caches = chain_cache().lock();
+    caches.retain(|c| c.dag.strong_count() > 0);
+    let me = Arc::downgrade(&state.dag);
+    let idx = match caches.iter().position(|c| c.dag.ptr_eq(&me)) {
+        Some(i) => i,
         None => {
-            let mut chain = dag.selected_chain();
-            chain.reverse();
-            Some(chain)
+            let built = ChainCache::build(state)?;
+            if caches.len() >= CHAIN_CACHE_SLOTS {
+                caches.remove(0);
+            }
+            caches.push(built);
+            caches.len() - 1
         }
     };
-    if let Some(chain) = fresh {
-        let pos = chain.iter().enumerate().map(|(i, h)| (*h, i)).collect();
-        *guard = Some(ChainCache { tip, chain, pos });
+    let c = &mut caches[idx];
+    let mut dag = state.dag.read();
+    // The tip may move again while a long catch-up released the lock: follow
+    // it until the cache matches the tip under the guard `f` runs with.
+    loop {
+        let tip = dag.selected_tip()?;
+        if c.tip == tip {
+            return Some(f(c, &dag));
+        }
+        dag = c.advance(state, dag, tip);
     }
-    guard.as_ref().map(|c| f(c, &dag))
+}
+
+#[cfg(test)]
+pub(super) fn chain_cache_probe(state: &AppState) -> Option<(Vec<[u8; 32]>, usize)> {
+    let me = Arc::downgrade(&state.dag);
+    chain_cache().lock().iter().find(|c| c.dag.ptr_eq(&me)).map(|c| (c.chain.clone(), c.work))
 }
 
 fn hex32(h: &[u8; 32]) -> String { hex::encode(h) }
@@ -405,35 +504,81 @@ pub(super) fn get_dag_window(params: Option<&Value>, state: &AppState) -> Value 
     }).unwrap_or_else(|| json!({ "error": "no selected tip yet" }))
 }
 
-/// `getaddresshistory [address, limit=25, offset=0]` — newest first.
+/// `getaddresshistory [address, limit=25, offset=0, cursor]` — newest first.
+///
+/// B1-T11 + NET-12: bounded per request, whatever the address's history and
+/// UTXO count (the carryover address holds about 426,000 UTXOs): the total
+/// is the per-address history counter and the balance / UTXO count the
+/// holder aggregate (one read each, `storage::aggregates`); the page is a
+/// reverse walk of the index from the newest entry, or from `cursor` (the
+/// `next_cursor` of the previous page, 32 hex characters), skipping at most
+/// `offset` ≤ [`MAX_HISTORY_OFFSET`](crate::storage::indexer::MAX_HISTORY_OFFSET)
+/// entries (a larger offset is refused with an error that names the cursor,
+/// as the explorer API answers 400: a silently clamped offset returned the
+/// same page for every deeper offset, so offset paging never ended), and the walk
+/// stops when the request is cancelled. Pre-fix every call counted the whole
+/// history, skipped forward from the oldest entry and walked every UTXO.
 pub(super) fn get_address_history(params: Option<&Value>, state: &AppState) -> Value {
+    use crate::storage::indexer::{HISTORY_CURSOR_LEN, MAX_HISTORY_OFFSET};
     let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
     let Some(hash) = parse_address(addr).and_then(|b| <[u8; 20]>::try_from(b).ok()) else {
         return json!({ "error": "invalid address" });
     };
     let limit = (params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).unwrap_or(25) as usize).clamp(1, MAX_PAGE);
-    let offset = params.and_then(|p| p.get(2)).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let total = match state.store.count_address_history(&hash, 0, u64::MAX) {
-        Ok(n) => n as usize,
+    let offset = params.and_then(|p| p.get(2)).and_then(|v| v.as_u64()).unwrap_or(0);
+    if offset > MAX_HISTORY_OFFSET as u64 {
+        return offset_too_large();
+    }
+    let offset = offset as usize;
+    let cursor = match params.and_then(|p| p.get(3)) {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_str().and_then(|s| hex::decode(s).ok())
+            .and_then(|b| <[u8; HISTORY_CURSOR_LEN]>::try_from(b).ok())
+        {
+            Some(c) => Some(c),
+            None => return json!({ "error": "invalid cursor" }),
+        },
+    };
+    let cancelled = |e: &crate::storage::StorageError| {
+        if state.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            json!({ "error": "cancelled" })
+        } else {
+            storage_err_response(e)
+        }
+    };
+    let page = match state.store.address_history_page(&hash, cursor.as_ref(), offset, limit, &state.cancel) {
+        Ok(p) => p,
+        Err(e) => return cancelled(&e),
+    };
+    // None while the aggregates are rebuilt (start-up after an upgrade).
+    let total = match state.store.address_history_count(&hash) {
+        Ok(n) => n,
         Err(e) => return storage_err_response(&e),
     };
-    // The index is ascending; page from the end for newest-first.
-    let end = total.saturating_sub(offset);
-    let start = end.saturating_sub(limit);
-    let entries = match state.store.query_address_history(&hash, 0, u64::MAX, end - start, start) {
-        Ok(e) => e,
-        Err(e) => return storage_err_response(&e),
+    let (balance, utxos) = match state.store.address_balance(&hash, &state.cancel) {
+        Ok(b) => b,
+        Err(e) => return cancelled(&e),
     };
-    let items: Vec<Value> = entries.iter().rev().map(|e| json!({
+    let items: Vec<Value> = page.entries.iter().map(|e| json!({
         "txid":      hex32(&e.txid),
         "height":    e.height,
         "direction": e.direction_str(),
         "amount":    e.amount.to_string(),
     })).collect();
-    let (balance, utxos) = state.store.get_balance(&hash).unwrap_or((0, 0));
     json!({
         "address": addr, "balance": balance.to_string(), "utxo_count": utxos,
-        "total": total, "offset": offset, "items": items,
+        "total": total, "offset": offset, "max_offset": MAX_HISTORY_OFFSET,
+        "items": items, "next_cursor": page.next_cursor.map(hex::encode),
+    })
+}
+
+/// B1-T11 (review): the answer to an address-history offset above
+/// [`MAX_HISTORY_OFFSET`](crate::storage::indexer::MAX_HISTORY_OFFSET).
+pub(super) fn offset_too_large() -> Value {
+    json!({
+        "error": format!("offset above {}: page deeper with the cursor (next_cursor) or a narrower height range",
+            crate::storage::indexer::MAX_HISTORY_OFFSET),
+        "max_offset": crate::storage::indexer::MAX_HISTORY_OFFSET,
     })
 }
 

@@ -20,13 +20,20 @@
 //!   response stream is exactly `check_nonempty_frame` + the decoder applied
 //!   to its first 4 MiB (`MAX_FRAME`, restated here). A request stream is
 //!   read up to 64 bytes only (`MAX_REQUEST_FRAME`, restated; the largest
-//!   request encodes to 33): one that reaches 64 bytes is a penalized
-//!   refusal, a shorter one is `check_nonempty_frame` + `decode_request`.
-//!   Writing is `encode_frame`, every generated request encodes below the
-//!   request cap, a written message reads back exactly when it is within the
-//!   bounds, and a stream past the cap (a valid frame followed by padding:
-//!   64 bytes for a request, 4 MiB for a response) is a penalized refusal,
-//!   never a decode of its first frame.
+//!   request encodes to 33): one that reaches 64 bytes, or a shorter frame
+//!   `decode_request` refuses, reads as `SyncRequest::Malformed` (re-audit
+//!   B1-T2: libp2p never reports a request that fails to decode, so the
+//!   codec reports it as a request the network loop penalizes); an empty
+//!   stream stays a transport error. Writing is `encode_frame`, every
+//!   generated request encodes below the request cap, a written message
+//!   reads back exactly when it is within the bounds (`Malformed` for a
+//!   request out of bounds), and a stream past the cap (a valid frame
+//!   followed by padding: 64 bytes for a request, 4 MiB for a response) is
+//!   refused, never a decode of its first frame.
+//! * Every response refusal is `InvalidData` and a penalized violation,
+//!   except a Tips answer over `MAX_WIRE_TIPS` tips with a locator within
+//!   its bound (B2-T7: every release before the fix sent all its DAG
+//!   leaves): refused without penalty.
 #![no_main]
 
 mod common;
@@ -40,8 +47,8 @@ use futures::io::Cursor;
 // The node's own libp2p (re-exported): the trait BlochSyncCodec implements.
 use gnb::libp2p::request_response::Codec as _;
 use gnb::network::sync_rr::{
-    as_pull_request, check_nonempty_frame, decode_request, decode_response, encode_frame, is_sync_protocol_violation,
-    response_to_message, BlochSyncCodec, SyncRequest, SyncResponse, SYNC_PROTOCOL,
+    as_pull_request, check_nonempty_frame, decode_frame, decode_request, decode_response, encode_frame,
+    is_sync_protocol_violation, response_to_message, BlochSyncCodec, SyncRequest, SyncResponse, SYNC_PROTOCOL,
 };
 use gnb::network::{
     decode_wire_message, NetworkMessage, SyncEntry, MAX_WIRE_ADDRS, MAX_WIRE_ADDR_LEN, MAX_WIRE_BYTES,
@@ -77,15 +84,18 @@ fn codec_read(stream: &[u8]) -> (io::Result<SyncRequest>, io::Result<SyncRespons
 /// on the first 4 MiB for a response.
 fn check_codec_read(stream: &[u8]) {
     let (req, resp) = codec_read(stream);
+    // A request frame no honest node sends reads as `Malformed` (attributed
+    // and penalized by the network loop); an empty stream stays an error.
     let want_req = if stream.len() >= MAX_REQUEST_FRAME {
-        Err(io::Error::new(io::ErrorKind::InvalidData, "request stream reached the request cap"))
+        Ok(SyncRequest::Malformed)
     } else {
-        check_nonempty_frame(stream.to_vec()).and_then(|f| decode_request(&f))
+        check_nonempty_frame(stream.to_vec()).and_then(|f| match decode_request(&f) {
+            Err(e) if is_sync_protocol_violation(&e) => Ok(SyncRequest::Malformed),
+            other => other,
+        })
     };
     if let Err(e) = &req {
-        if stream.len() >= MAX_REQUEST_FRAME {
-            assert!(is_sync_protocol_violation(e), "a request stream at the cap refused without a penalty: {e}");
-        }
+        assert!(!stream.is_empty() || !is_sync_protocol_violation(e), "an empty request stream penalized: {e}");
     }
     let frame = &stream[..stream.len().min(MAX_FRAME)];
     let want_resp = check_nonempty_frame(frame.to_vec()).and_then(|f| decode_response(&f));
@@ -100,7 +110,8 @@ fn check_codec_write_request(req: &SyncRequest) {
     let written = out.into_inner();
     assert_eq!(written, encode_frame(req).unwrap(), "write_request is not encode_frame");
     let (back, _) = codec_read(&written);
-    assert_eq!(back.ok(), request_in_bounds(req).then(|| req.clone()), "codec request round trip");
+    let want = if request_in_bounds(req) { req.clone() } else { SyncRequest::Malformed };
+    assert_eq!(back.ok(), Some(want), "codec request round trip");
 }
 
 fn check_codec_write_response(resp: &SyncResponse) {
@@ -113,14 +124,14 @@ fn check_codec_write_response(resp: &SyncResponse) {
 }
 
 /// A request stream padded to the request cap (a valid request followed by
-/// zeros) is refused as a protocol violation, never decoded from its first
-/// frame. Cheap (64 bytes), so it runs for every generated request.
+/// zeros) is reported as `Malformed` (a penalized violation), never decoded
+/// from its first frame. Cheap (64 bytes), so it runs for every generated
+/// request.
 fn check_request_cap(enc: &[u8], extra: usize) {
     let mut padded = enc.to_vec();
     padded.resize(MAX_REQUEST_FRAME + extra, 0);
     let (req, _) = codec_read(&padded);
-    let e = req.expect_err("a request stream at the 64-byte cap was accepted");
-    assert!(is_sync_protocol_violation(&e), "request stream at the cap refused without a penalty: {e}");
+    assert_eq!(req.ok(), Some(SyncRequest::Malformed), "a request stream at the 64-byte cap was accepted");
 }
 
 /// A stream past the 4 MiB read cap (a valid frame followed by padding) is
@@ -132,9 +143,20 @@ fn check_oversize(enc: &[u8], extra: usize) {
     let mut padded = enc.to_vec();
     padded.resize(MAX_FRAME + 1 + extra, 0);
     let (req, resp) = codec_read(&padded);
-    for e in [req.err(), resp.err()] {
-        let e = e.expect("a stream over the 4 MiB cap was accepted");
-        assert!(is_sync_protocol_violation(&e), "oversize stream refused without a penalty: {e}");
+    assert_eq!(req.ok(), Some(SyncRequest::Malformed), "a request stream over the cap was accepted");
+    let e = resp.err().expect("a stream over the 4 MiB cap was accepted");
+    assert!(is_sync_protocol_violation(&e), "oversize stream refused without a penalty: {e}");
+}
+
+/// B2-T7: the one response refusal that is not a violation — a canonical
+/// Tips answer over MAX_WIRE_TIPS tips whose locator is within its bound
+/// (what every release before the fix sent with more DAG leaves than that).
+fn honest_overflow(b: &[u8]) -> bool {
+    match decode_frame::<SyncResponse>(b) {
+        Ok(resp @ SyncResponse::Tips { .. }) if encode_frame(&resp).is_ok_and(|e| e == b) => {
+            matches!(resp, SyncResponse::Tips { tips, locator } if tips.len() > MAX_WIRE_TIPS && locator.len() <= MAX_WIRE_LOCATOR)
+        }
+        _ => false,
     }
 }
 
@@ -192,7 +214,10 @@ fn check_frame(b: &[u8]) {
                 assert_eq!(resp, SyncResponse::Busy);
             }
         }
-        Err(e) => assert!(is_sync_protocol_violation(&e), "response refusal is not InvalidData: {e}"),
+        Err(e) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "response refusal is not InvalidData: {e}");
+            assert_eq!(!is_sync_protocol_violation(&e), honest_overflow(b), "response refusal penalty: {e}");
+        }
     }
     // The gossip side: a pull message accepted there is accepted here.
     if let Ok(msg) = decode_wire_message(b) {

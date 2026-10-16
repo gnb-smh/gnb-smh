@@ -8,7 +8,7 @@
 //!
 //! | height | `tx.version` | consensus | digest | witness | component binding |
 //! | --- | --- | --- | --- | --- | --- |
-//! | below the activation | any (3 included) | valid | sighash v2 ([`Transaction::sighash`]) | lenient (historical) | every component signs the digest verbatim |
+//! | below the activation | any (3 included) | valid | sighash v2 ([`Transaction::sighash`]) | exact framing, any signature encoding the verifier accepts | every component signs the digest verbatim |
 //! | at/after the activation | 3 | valid | sighash v3 ([`SighashV3Precomputed`]) | canonical ([`canonical_witness`]) | each component signs `crypto::bound_component_message` |
 //! | at/after the activation | anything else | invalid | — | — | — |
 //!
@@ -82,7 +82,8 @@ pub const TAG_OUTPUTS: &[u8] = b"GNB-SIGHASH-v3/outputs";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SighashVersion {
     /// Historical digest ([`Transaction::sighash`]); components sign it
-    /// verbatim; lenient witness framing.
+    /// verbatim; exact witness framing, any signature encoding the verifier
+    /// accepts.
     V2,
     /// [`SighashV3Precomputed::digest`]; components sign bound messages;
     /// canonical witnesses.
@@ -110,8 +111,9 @@ pub const fn tx_version_for_height(height: u64, activation_height: u64) -> u32 {
 /// header height `height`. Returns the digest (and witness rule) that applies.
 ///
 /// * below the activation: every version is valid and uses sighash v2 with
-///   the historical lenient witness rule — exactly the pre-upgrade rule
-///   (version 3 included: nodes that predate the upgrade accept it);
+///   the v2 witness rule (exact framing, any signature encoding the verifier
+///   accepts) — exactly the pre-upgrade rule of this chain (version 3
+///   included: nodes that predate the upgrade accept it);
 /// * at/after the activation: only version 3 is valid; it uses sighash v3
 ///   with the canonical witness rule.
 ///
@@ -378,9 +380,9 @@ pub type Witness<'a> = (&'a [u8], &'a [u8]);
 /// its public key hashes to the spent `script_pubkey` (`prevouts[i]`).
 /// No signature math.
 ///
-/// * V2 (historical, unchanged): the lenient `Transaction::parse_script_sig`
-///   framing (trailing bytes ignored), any signature encoding the verifier
-///   accepts.
+/// * V2: the exact `Transaction::parse_script_sig_borrowed` framing (no
+///   trailing bytes: on this chain at every height since cc5c450), any
+///   signature encoding the verifier accepts.
 /// * V3: [`canonical_witness`].
 pub fn check_input_witnesses<'a>(
     tx: &'a Transaction,
@@ -785,7 +787,7 @@ mod tests {
             Err("sighash v3 needs one spent output per input (1 for 2 inputs)".into()));
     }
 
-    /// Below the activation: the historical v2 rule, lenient framing included.
+    /// Below the activation: the v2 rule, its exact framing included.
     #[test]
     #[cfg_attr(
         miri,

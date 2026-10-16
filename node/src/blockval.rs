@@ -26,6 +26,7 @@ use crate::core::{self, policy, Transaction, TxOutput};
 
 /// Confirmation-height reader for a txid's outputs (the tx index):
 /// `Ok(None)` when unknown, `Err` when the index could not be read.
+#[allow(dead_code)] // library API (fuzz targets, tests); the binary counts confirmations
 pub type ConfirmHeightLookup<'a> = dyn Fn(&[u8; 32]) -> Result<Option<u64>, String> + 'a;
 
 /// Marks an error caused by missing local index data, never by the block.
@@ -48,15 +49,39 @@ pub fn check_tx_context_free(tx: &Transaction, height: u64) -> Result<(), String
     Ok(())
 }
 
+/// Confirmations reader for a txid's outputs at the spending block: `Ok(None)`
+/// when unknown (no confirmation), `Err` when it could not be read.
+pub type ConfirmationsLookup<'a> = dyn Fn(&[u8; 32]) -> Result<Option<u64>, String> + 'a;
+
 /// The policy-spend rules that depend on the chain, for a non-coinbase `tx`
 /// spending `prevouts` (one per input, in order) in a block at `height`.
 /// `confirm_height` resolves the block height a spent output was confirmed
-/// at; its read failures are reported with the [`STORAGE_ERR`] prefix.
+/// at; its read failures are reported with the [`STORAGE_ERR`] prefix. A
+/// relative timelock counts `height - confirm_height` (header heights: the
+/// measure below the hardening activation; the node's connect, mempool and
+/// template paths use [`check_policy_spends_with_confirmations`] with the
+/// measure of the regime, `accept::confirmations_in_view`, re-audit B1-T14).
+#[allow(dead_code)] // library API (fuzz targets, tests)
 pub fn check_policy_spends(
     tx: &Transaction,
     prevouts: &[TxOutput],
     height: u64,
     confirm_height: &ConfirmHeightLookup<'_>,
+) -> Result<(), String> {
+    check_policy_spends_with_confirmations(tx, prevouts, height,
+        &|t| confirm_height(t).map(|c| c.map(|c| height.saturating_sub(c))))
+}
+
+/// [`check_policy_spends`] with the confirmations of each spent output given
+/// directly (`confirmations`, the measure of the spending block's regime:
+/// header-height difference below the hardening activation, selected-chain
+/// depth from it, `accept::MaturityRule`). Absolute timelocks (`after`)
+/// compare `tx.locktime`, a header height, in both regimes.
+pub fn check_policy_spends_with_confirmations(
+    tx: &Transaction,
+    prevouts: &[TxOutput],
+    height: u64,
+    confirmations: &ConfirmationsLookup<'_>,
 ) -> Result<(), String> {
     for (i, (inp, prev)) in tx.inputs.iter().zip(prevouts).enumerate() {
         if policy::output_kind(&prev.script_pubkey) != Some(policy::OutputKind::Policy) {
@@ -72,10 +97,9 @@ pub fn check_policy_spends(
             return Err(format!("input {}: absolute timelock: locktime {} < {}", i, tx.locktime, pol.after));
         }
         if pol.older != 0 {
-            let confirmed = confirm_height(&inp.prev_txid)
+            let age = confirmations(&inp.prev_txid)
                 .map_err(|e| format!("{}{}", STORAGE_ERR, e))?
                 .ok_or_else(|| format!("{}confirmation height of input {} unknown", STORAGE_ERR, i))?;
-            let age = height.saturating_sub(confirmed);
             if age < u64::from(pol.older) {
                 return Err(format!("input {}: relative timelock: {} confirmations < {}", i, age, pol.older));
             }
@@ -84,7 +108,9 @@ pub fn check_policy_spends(
     Ok(())
 }
 
-/// Every rule of this module for a non-coinbase transaction.
+/// Every rule of this module for a non-coinbase transaction (relative
+/// timelocks in header heights, see [`check_policy_spends`]).
+#[allow(dead_code)] // library API (fuzz targets, tests)
 pub fn check_tx_chain_rules(
     tx: &Transaction,
     prevouts: &[TxOutput],
@@ -93,6 +119,18 @@ pub fn check_tx_chain_rules(
 ) -> Result<(), String> {
     check_tx_context_free(tx, height)?;
     check_policy_spends(tx, prevouts, height, confirm_height)
+}
+
+/// [`check_tx_chain_rules`] with relative timelocks counted by
+/// `confirmations` ([`check_policy_spends_with_confirmations`]).
+pub fn check_tx_chain_rules_with_confirmations(
+    tx: &Transaction,
+    prevouts: &[TxOutput],
+    height: u64,
+    confirmations: &ConfirmationsLookup<'_>,
+) -> Result<(), String> {
+    check_tx_context_free(tx, height)?;
+    check_policy_spends_with_confirmations(tx, prevouts, height, confirmations)
 }
 
 /// Where a transaction is being validated: the height of the block it is (or
@@ -183,25 +221,38 @@ pub fn validate_block_transactions(
         confirm: &'a ConfirmHeightLookup<'a>,
         error: std::cell::RefCell<Option<String>>,
     }
+    use crate::reorg::ViewError;
     impl View<'_> {
-        fn note<T>(&self, r: Result<T, String>) -> Result<T, String> {
-            r.inspect_err(|e| { self.error.borrow_mut().get_or_insert_with(|| e.clone()); })
+        fn note<T>(&self, r: Result<T, String>) -> Result<T, ViewError> {
+            r.map_err(|e| {
+                self.error.borrow_mut().get_or_insert_with(|| e.clone());
+                ViewError(e)
+            })
         }
     }
+    // No tx-block or DAG records in this view: from the hardening activation
+    // coinbase maturity and relative timelocks count selected-chain depth
+    // (`accept::MaturityRule`), which needs them, so such a block is reported
+    // as a storage error (no verdict), never judged on another measure.
+    const NO_DAG: &str = "selected-chain depth needs the tx index and DAG records (not in this view)";
     impl crate::reorg::UtxoView for View<'_> {
-        fn view_utxo(&self, t: &[u8; 32], i: u32) -> Result<Option<TxOutput>, String> { self.note((self.utxo)(t, i)) }
-        fn view_coinbase_height(&self, t: &[u8; 32]) -> Result<Option<u64>, String> { self.note((self.coinbase)(t)) }
-        fn view_tx_height(&self, t: &[u8; 32]) -> Result<Option<u64>, String> { self.note((self.confirm)(t)) }
+        fn view_utxo(&self, t: &[u8; 32], i: u32) -> Result<Option<TxOutput>, ViewError> { self.note((self.utxo)(t, i)) }
+        fn view_coinbase_height(&self, t: &[u8; 32]) -> Result<Option<u64>, ViewError> { self.note((self.coinbase)(t)) }
+        fn view_tx_height(&self, t: &[u8; 32]) -> Result<Option<u64>, ViewError> { self.note((self.confirm)(t)) }
+        fn view_tx_block(&self, _: &[u8; 32]) -> Result<Option<[u8; 32]>, ViewError> { self.note(Err(NO_DAG.into())) }
+        fn view_dag_data(&self, _: &[u8; 32]) -> Result<Option<crate::consensus::GhostdagData>, ViewError> {
+            self.note(Err(NO_DAG.into()))
+        }
     }
     let view = View { utxo: utxo_lookup, coinbase: coinbase_height, confirm: confirm_height, error: Default::default() };
     let verdict = crate::accept::validate_block_in_view_classified(&view, block);
     if let Some(e) = view.error.into_inner() {
         return Err(BlockTxError::Storage(e));
     }
-    verdict.map_err(|e| if e.witness_dependent {
-        BlockTxError::InvalidWitness(e.reason)
-    } else {
-        BlockTxError::Invalid(e.reason)
+    verdict.map_err(|f| match f {
+        crate::accept::ConnectFailure::Invalid(e) if e.witness_dependent => BlockTxError::InvalidWitness(e.reason),
+        crate::accept::ConnectFailure::Invalid(e) => BlockTxError::Invalid(e.reason),
+        crate::accept::ConnectFailure::Storage(e) => BlockTxError::Storage(e),
     })?;
     // The fee total the coinbase may claim (the verdict already checked it).
     let mut created: std::collections::HashMap<([u8; 32], u32), u64> = std::collections::HashMap::new();

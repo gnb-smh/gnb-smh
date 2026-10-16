@@ -115,7 +115,9 @@ def block_vectors():
     """Blocks at/after the activation: commitment, witness root, header roots."""
     rng = Rng(b"gnb-merkle-vectors/block")
     out = []
-    shapes = ((1, [], 1), (2, [(1, 1)], 2), (110_000, [(2, 2), (1, 3), (1, 1)], 3), (2**40 + 5, [(1, 1)] * 4, 1))
+    # Heights: the first blocks, the mainnet activation height, a large one.
+    shapes = ((1, [], 1), (2, [(1, 1)], 2), (m.MAINNET_HARDENING_ACTIVATION_HEIGHT, [(2, 2), (1, 3), (1, 1)], 3),
+              (2**40 + 5, [(1, 1)] * 4, 1))
     for height, spends, n_parents in shapes:
         parents = [rng.bytes(32) for _ in range(n_parents)]
         others = [spend(rng, a, b, 30, 20) for a, b in spends]

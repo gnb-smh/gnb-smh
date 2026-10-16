@@ -231,10 +231,13 @@ pub fn signed_message_digest(message: &[u8]) -> [u8; 32] {
 /// The v1 tag above carries no chain identifier, so a v1 message signature
 /// verifies identically on Bloch, GnB mainnet and GnB testnet, which share
 /// keys. New signatures use this v2 domain, which appends the 4-byte chain id
-/// ([`crate::core::ChainId`]) before the length-prefixed message. Wallets keep
-/// VERIFYING v1 for signatures made before the change (see
-/// `wallet::Keypair::verify_message`). Like v1, the tag is not a prefix of any
-/// other signing domain in the codebase and none of them is a prefix of it.
+/// ([`crate::core::ChainId`]) before the length-prefixed message. No default
+/// GnB verifier accepts v1 (re-audit CRY-8: a Bloch v1 signature verified as
+/// a GnB mainnet and testnet proof); only the explicit legacy mode
+/// `wallet::Keypair::verify_message_allowing_legacy_v1` (`gnb-wallet
+/// verify-message --legacy-v1`) does, and never a canonical verifier. Like
+/// v1, the tag is not a prefix of any other signing domain in the codebase
+/// and none of them is a prefix of it.
 pub const SIGNED_MESSAGE_DOMAIN_V2: &[u8] = b"GNB-SIGNED-MESSAGE-v2";
 
 /// The digest a v2 "sign this message" flow signs:
@@ -371,6 +374,23 @@ fn parse_envelope_or_legacy(b: &[u8]) -> (u16, &[u8]) {
 /// legacy-vs-enveloped with no ambiguity — see [`parse_pubkey_envelope_or_legacy`].
 fn legacy_hybrid_pubkey_len() -> usize {
     MLDSA_PUBKEY_LEN.saturating_add(falcon::pubkey_len())
+}
+
+/// Exact byte length of a raw (non-enveloped) SECRET key of `suite`:
+/// `mldsa_sk(4,032) ‖ falcon_sk(2,305)` = 6,337 for suite 0x0001 (the
+/// pre-envelope founder / Bloch v2 keystores store this), the bare ML-DSA-65
+/// secret (4,032) for suite 0x0002. An enveloped secret of the same suite is
+/// exactly `SUITE_HEADER_LEN` bytes longer, so the two never collide on
+/// length (B2-T2: the wallet signer classifies secrets by these lengths, as
+/// consensus classifies public keys, never by their leading bytes). `None`
+/// for any other suite.
+pub(crate) fn raw_secret_key_len(suite: u16) -> Option<usize> {
+    match suite {
+        SUITE_MLDSA65_FALCON1024 => Some(MLDSA_SECRET_LEN.saturating_add(
+            pqcrypto_falcon::falcon1024::secret_key_bytes())),
+        SUITE_MLDSA65_ONLY => Some(MLDSA_SECRET_LEN),
+        _ => None,
+    }
 }
 
 /// Public-key-specific version of [`parse_envelope_or_legacy`] (audit A4
@@ -569,12 +589,12 @@ fn verify_hybrid_mldsa_falcon(pk_body: &[u8], message: &[u8], sig_body: &[u8]) -
 /// FIPS 204 bound on an ML-DSA-65 signature's response vector `z`: every
 /// coefficient must satisfy |z| < γ1 − β (γ1 = 2^19, β = τ·η = 49·4 = 196).
 ///
-/// Checked here, before the library: the linked PQClean-based verifier
-/// (pqcrypto-mldsa 0.1.2) accepts 41 Wycheproof vectors that violate this
-/// bound (tests/wycheproof_mldsa65.rs), including the exact boundary
-/// −(γ1 − β). Such signatures can only be made with the private key, but
-/// accepting them would let a key holder produce signatures a conforming
-/// implementation refuses: a consensus divergence between clients.
+/// Checked here, before the library, as a rule of its own: PQClean's AVX2
+/// ML-DSA-65 (pqcrypto-mldsa's default features) skips it and accepts 41
+/// Wycheproof vectors that violate it (tests/wycheproof_mldsa65.rs), the exact
+/// boundary −(γ1 − β) included. The clean implementation that every build
+/// links now (`mldsa_one_verdict` below) checks it too; this check keeps the
+/// verdict independent of the implementation a build links.
 ///
 /// Layout (FIPS 204, ML-DSA-65): c̃ (48 bytes) ‖ z (5 polynomials × 256
 /// coefficients × 20 bits, packed little-endian as γ1 − z) ‖ h (61 bytes).
@@ -2297,5 +2317,217 @@ mod kat {
         // reproduce (pk, sk, sig) for each seed, and assert byte-equality through
         // the pqcrypto primitives. This gives standards-traceable KATs on top of
         // the crate-oracle equivalence already proven here.
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ML-DSA-65: one implementation, so one verdict, on every platform.
+//
+// With its default features, pqcrypto-mldsa also compiles PQClean's AVX2
+// (x86_64 except Windows) and AArch64 ML-DSA-65 and dispatches to them: on
+// x86_64 at RUN TIME (`is_x86_feature_detected!("avx2")`), so one node binary
+// verifies with AVX2 code on one CPU and with the clean code on another; i686,
+// wasm32, Windows and x86_64 CPUs without AVX2 run the clean code. The AVX2
+// verifier is not FIPS 204 (tests/wycheproof_mldsa65.rs): it never checks
+// ‖z‖∞ < γ1 − β (41 Wycheproof cases accepted), and its UseHint
+// (`use_hint_avx`, a blend on the sign bit of r0) treats r0 = 0 as positive,
+// so h = 1 moves r1 UP where FIPS 204 Algorithm 40 (r0 ≤ 0) moves it DOWN
+// (Wycheproof tcId 161 refused). The second needs no secret key: coins locked
+// to a key whose ML-DSA t1 is 0 can be spent with a signature that AVX2 nodes
+// refuse and every other node accepts, or the other way round. Every build of
+// the workspace therefore links the clean implementation only
+// (`default-features = false`, as for Falcon); these tests pin the FIPS 204
+// verdicts on whatever CPU runs them and the absence of the other
+// implementations from the binary.
+// ═════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod mldsa_one_verdict {
+    use super::*;
+    use sha3::digest::{ExtendableOutput, Update, XofReader};
+    use sha3::Shake256;
+
+    // FIPS 204 ML-DSA-65 parameters.
+    const K: usize = 6;
+    const L: usize = 5;
+    const N: usize = 256;
+    const OMEGA: usize = 55;
+    const CTILDE_LEN: usize = 48;
+    const GAMMA1: u64 = 1 << 19;
+
+    /// Hinted coefficients (polynomial, coefficient), in HintBitPack order.
+    const HINTS: [(usize, usize); 3] = [(0, 0), (2, 77), (5, 255)];
+    /// UseHint(1, r) for r1 = 0, r0 = 0: FIPS 204 Algorithm 40 takes the
+    /// r0 ≤ 0 branch, (r1 − 1) mod 16.
+    const FIPS_204: u8 = 15;
+    /// What PQClean's AVX2 `use_hint_avx` returns there: (r1 + 1) mod 16.
+    const AVX2_RULE: u8 = 1;
+
+    fn shake256(parts: &[&[u8]], out: &mut [u8]) {
+        let mut h = Shake256::default();
+        for p in parts {
+            h.update(p);
+        }
+        h.finalize_xof().read(out);
+    }
+
+    /// An ML-DSA-65 public key ρ ‖ t1 with t1 = 0. Nobody holds its secret
+    /// key and nobody needs it: for z = 0, w'_approx = A·z − c·t1·2^d is 0
+    /// whatever ρ (A) and c are, so every coefficient decomposes into r1 = 0
+    /// and r0 = 0, the UseHint input the AVX2 code gets wrong.
+    fn t1_zero_public_key(rho: [u8; 32]) -> Vec<u8> {
+        let mut pk = rho.to_vec();
+        pk.resize(MLDSA_PUBKEY_LEN, 0);
+        pk
+    }
+
+    /// w1 (K·N coefficients) that is 0 except `value` at `at`.
+    fn w1_with(at: &[(usize, usize)], value: u8) -> Vec<u8> {
+        let mut w1 = vec![0u8; K * N];
+        for &(i, j) in at {
+            w1[i * N + j] = value;
+        }
+        w1
+    }
+
+    /// The ML-DSA-65 signature (c̃, z = 0, h) of `msg` (empty context) whose
+    /// challenge commits to `w1` and whose hint bits are `hints`. It is valid
+    /// under a key from [`t1_zero_public_key`] iff UseHint(h, 0) = w1.
+    fn signature(pk: &[u8], msg: &[u8], w1: &[u8], hints: &[(usize, usize)]) -> Vec<u8> {
+        // tr = H(pk, 64), μ = H(tr ‖ 0x00 ‖ |ctx| = 0 ‖ M, 64) (FIPS 204
+        // Algorithms 3 and 8), c̃ = H(μ ‖ w1Encode(w1), 48) with 4-bit
+        // coefficients, low nibble first (γ2 = (q − 1)/32).
+        let mut tr = [0u8; 64];
+        shake256(&[pk], &mut tr);
+        let mut mu = [0u8; 64];
+        shake256(&[&tr, &[0, 0], msg], &mut mu);
+        let w1_packed: Vec<u8> = w1.chunks(2).map(|p| p[0] | p[1] << 4).collect();
+        let mut sig = vec![0u8; CTILDE_LEN];
+        shake256(&[&mu, &w1_packed], &mut sig);
+        // z = 0: every coefficient packs as γ1 − 0, 20 bits little-endian.
+        let pair = (GAMMA1 | GAMMA1 << 20).to_le_bytes();
+        for _ in 0..L * N / 2 {
+            sig.extend_from_slice(&pair[..5]);
+        }
+        // HintBitPack: the hinted coefficients, then K running counts.
+        let mut h = [0u8; OMEGA + K];
+        let mut k = 0;
+        for i in 0..K {
+            for &(_, j) in hints.iter().filter(|&&(p, _)| p == i) {
+                h[k] = u8::try_from(j).unwrap();
+                k += 1;
+            }
+            h[OMEGA + i] = u8::try_from(k).unwrap();
+        }
+        sig.extend_from_slice(&h);
+        assert_eq!(sig.len(), MLDSA_SIG_LEN);
+        sig
+    }
+
+    /// The verdict of every consensus path on an ML-DSA-65 component: the
+    /// library, suite 0x0002 (legacy-tolerant and canonical), suite 0x0001
+    /// with a genuine Falcon-1024 half (a standard key shape), and sighash v3
+    /// component-bound signatures of both suites. All must agree.
+    fn consensus_verdict(
+        mpk: &[u8],
+        (fpk, fsk): &(Vec<u8>, Vec<u8>),
+        msg: &[u8],
+        w1: &[u8],
+        hints: &[(usize, usize)],
+    ) -> bool {
+        let msig = signature(mpk, msg, w1, hints);
+        let library = mldsa65::verify_detached_signature(
+            &mldsa65::DetachedSignature::from_bytes(&msig).unwrap(),
+            msg,
+            &mldsa65::PublicKey::from_bytes(mpk).unwrap(),
+        )
+        .is_ok();
+        let mut verdicts = vec![library, verify_mldsa65_raw(mpk, msg, &msig)];
+
+        let pk2 = wrap_envelope(SUITE_MLDSA65_ONLY, mpk);
+        let sig2 = wrap_envelope(SUITE_MLDSA65_ONLY, &msig);
+        verdicts.push(verify(&pk2, msg, &sig2));
+        verdicts.push(verify_canonical(&pk2, msg, &sig2));
+        verdicts.push(verify_enveloped_canonical(&pk2, msg, &sig2));
+
+        let pk1 = wrap_envelope(SUITE_MLDSA65_FALCON1024, &[mpk, &fpk[..]].concat());
+        assert!(is_hybrid_public_key(&pk1), "a standard (relayable) key shape");
+        let fsig = falcon::sign(fsk, msg).unwrap();
+        let sig1 = wrap_envelope(SUITE_MLDSA65_FALCON1024, &[&msig[..], &fsig[..]].concat());
+        verdicts.push(verify(&pk1, msg, &sig1));
+        verdicts.push(verify_canonical(&pk1, msg, &sig1));
+        verdicts.push(verify_wallet_signature(&pk1, msg, &sig1));
+
+        let digest = [0x3C; 32];
+        let m1 = bound_component_message(SUITE_MLDSA65_FALCON1024, COMPONENT_MLDSA65, &digest);
+        let f1 = bound_component_message(SUITE_MLDSA65_FALCON1024, COMPONENT_FALCON1024, &digest);
+        let bound1 = [signature(mpk, &m1, w1, hints), falcon::sign(fsk, &f1).unwrap()].concat();
+        verdicts.push(verify_bound(&pk1, &digest, &wrap_envelope(SUITE_MLDSA65_FALCON1024, &bound1)));
+        let m2 = bound_component_message(SUITE_MLDSA65_ONLY, COMPONENT_MLDSA65, &digest);
+        let bound2 = signature(mpk, &m2, w1, hints);
+        verdicts.push(verify_bound(&pk2, &digest, &wrap_envelope(SUITE_MLDSA65_ONLY, &bound2)));
+
+        assert!(
+            verdicts.iter().all(|&v| v == library),
+            "consensus paths disagree with each other: {verdicts:?}"
+        );
+        library
+    }
+
+    /// FIPS 204 UseHint at r0 = 0, through every consensus path, on whatever
+    /// CPU runs the test. With the AVX2 implementation linked, an AVX2 CPU
+    /// fails the FIPS 204 and AVX2-rule cases; CI runs this test on an AVX2
+    /// runner, on i686 and on qemu's Nehalem (no AVX2), so a verdict that
+    /// depends on the platform fails somewhere.
+    #[test]
+    fn use_hint_at_r0_zero_follows_fips_204() {
+        let msg = b"GnB: one ML-DSA-65 verdict on every platform";
+        // The attacker's own Falcon-1024 key for the hybrid suite.
+        let falcon_key = pqcrypto_internals::with_seeded_rng_scope(&[0x61; 32], falcon::keypair);
+        for rho in [[0u8; 32], [0x5A; 32]] {
+            let pk = t1_zero_public_key(rho);
+            let verdict = |w1: &[u8], hints: &[(usize, usize)]| consensus_verdict(&pk, &falcon_key, msg, w1, hints);
+            // Controls, where both UseHint rules agree: no hint keeps r1 = 0.
+            assert!(verdict(&w1_with(&[], 0), &[]), "w1 = 0, no hint");
+            assert!(!verdict(&w1_with(&HINTS, FIPS_204), &[]), "w1 = 15 needs hints");
+            assert!(!verdict(&w1_with(&[], 0), &HINTS), "a hint moves r1");
+            // The case the implementations disagreed on.
+            assert!(verdict(&w1_with(&HINTS, FIPS_204), &HINTS), "FIPS 204: (0 - 1) mod 16");
+            assert!(!verdict(&w1_with(&HINTS, AVX2_RULE), &HINTS), "AVX2 rule: (0 + 1) mod 16");
+            // One hinted coefficient is enough.
+            assert!(verdict(&w1_with(&HINTS[1..2], FIPS_204), &HINTS[1..2]));
+            assert!(!verdict(&w1_with(&HINTS[1..2], AVX2_RULE), &HINTS[1..2]));
+        }
+    }
+
+    /// Plain forward byte-substring scan.
+    fn binary_contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// The clean ML-DSA-65 is the only one in the binary: with pqcrypto-mldsa's
+    /// `avx2` or `neon` feature on (Cargo features are additive across the
+    /// workspace), the dispatch code references the AVX2 / AArch64 symbols
+    /// and the linker keeps them. Needles are assembled at run time so this
+    /// test's own strings cannot match.
+    #[test]
+    fn mldsa_avx2_and_aarch64_variants_are_not_linked() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let bytes = std::fs::read(&exe).expect("read test executable");
+        let sym = |variant: &str| format!("PQCLEAN_{}{}_{}_crypto_sign_verify", "MLDSA", "65", variant);
+        let clean = sym("CLEAN");
+        assert!(
+            binary_contains(&bytes, clean.as_bytes()),
+            "control failed: `{clean}` not found in {}: symbol names are not observable \
+             (stripped test binary?), so this guard cannot run",
+            exe.display()
+        );
+        for other in [sym("AVX2"), sym("AARCH64")] {
+            assert!(
+                !binary_contains(&bytes, other.as_bytes()),
+                "`{other}` is linked: pqcrypto-mldsa's default features (avx2/neon) are \
+                 enabled somewhere in the workspace. Its AVX2 verifier is not FIPS 204 \
+                 and splits consensus between CPUs; keep `default-features = false`."
+            );
+        }
     }
 }

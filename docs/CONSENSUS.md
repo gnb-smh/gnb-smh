@@ -6,7 +6,7 @@
 BlockHeader { version u32, parents [hash32], merkle_root hash32, timestamp u64, bits u32, nonce u64 }
 
 pow_preimage = version u32le | n_parents u32le | parents | merkle_root | timestamp u64le | bits u32le
-pow          = GnB-SMH-v1(header = pow_preimage, nonce)          // 32 bytes
+pow          = GnB-SMH(height)(header = pow_preimage, nonce)     // 32 bytes; v1, v3 from the PoWit height
 valid       <=> be256(pow) < target(bits)
 block_hash   = SHA3-256("GNB-BLOCK-ID-v1" | pow_preimage | nonce u64le)
 ```
@@ -15,12 +15,36 @@ GnB-SMH v1 is specified in `crates/gnb-smh/README.md`; the Python file in
 `crates/gnb-smh/reference/` is normative and the Rust crate reproduces its
 vectors byte for byte. One evaluation costs 64 MiB and about 0.5 s on one core
 of a current x86-64 or Apple CPU (`smh-bench verify 19`). Verified block ids are
-cached, so a block's proof is evaluated once per node.
+cached, so a block's proof is evaluated once per node. From the PoWit height
+(`core::pow_algo(height)`; mainnet 10,000, testnet off unless
+`--powit-height`) the function is GnB-SMH v3 (`crates/gnb-smh/src/v3.rs`, a
+4 MiB Argon2d-style fill), and the expected bits are the ASERT bits with the
+target lowered by `POW_V3_DIFFICULTY_SHIFT` (2) and re-encoded with
+`target_to_bits` (`core::adjust_bits_for_algo`); see "Chain work" for the
+matching work normalisation and docs/DESIGN-pow-powit.md.
 
 `bits` is the Bitcoin compact encoding. Malformed encodings never validate.
 The easiest allowed target is `POW_LIMIT_BITS = 0x2100ffff` below the
 hardening activation and the genesis target `0x1f0e9036` at and after it
 (see "Block rules at the hardening activation", POW-3).
+
+Non-canonical encodings never validate either (audit POW-9, every height):
+`bits` must be the encoding `target_to_bits` produces for the target it
+decodes to, `target_to_bits(target(bits)) == bits`
+(`gnb_smh::difficulty::is_canonical_bits`; `reference/gnb_difficulty.py`
+`is_canonical_bits`). Decoding itself keeps Bitcoin Core's `SetCompact`
+semantics (`try_bits_to_target` decodes `0x21007fff` and `0x207fff00` to the
+same target), and `Block::validate_pow` refuses the non-canonical one before
+any evaluation. The rule changes no verdict: every block must also carry
+`bits == expected_bits(parents, height)`, checked before the proof, and
+`expected_bits` is a `target_to_bits` output, which is always canonical,
+on both sides of the v3 switch (`expected_bits_are_always_canonical`). A
+witness share's `bits` must equal its attested block's
+(`witness_share::verify_share`), so they are canonical too. Like Bitcoin Core, whose consensus
+compares `nBits` with the expected value as a u32, GnB never relied on
+decoding to reject a non-canonical header; the explicit check only makes
+that independent of the equality check. Vector:
+`block_vectors.json` `pow/non-canonical-bits`.
 
 ## Difficulty
 
@@ -86,7 +110,11 @@ Each block contributes
 work(target) = max(floor((2^128 - 1) / (floor(target / 2^128) + 1)), 1),   work(0) = 0
 ```
 
-to blue work (`gnb_smh::difficulty::work`, u128). This approximates
+to blue work (`gnb_smh::difficulty::work`, u128); a GnB-SMH v3 block (from
+the PoWit height, mainnet 10,000) contributes `work(target) >>
+POW_V3_DIFFICULTY_SHIFT` (2), the factor its target is lowered by, so
+cumulative work is continuous across the switch (`core::block_work(bits,
+height)`, the one function every place that adds a block's work calls). This approximates
 2^256 / target: it never exceeds floor(2^256 / target) or Bitcoin Core's
 floor(2^256 / (target + 1)), is monotone in the target, saturates at
 2^128 - 1 for targets below 2^128, and is within one part in 2^64 of the
@@ -96,6 +124,62 @@ formula, not floor(2^256 / target), or they compute different blue work.
 Block timestamps must be at least the latest parent timestamp and at most
 600 s ahead of the validator's clock, which bounds the easing a miner can
 obtain from a future timestamp to about 6%.
+
+## Networks (mainnet and testnet)
+
+Mainnet and testnet share the genesis block (`core::genesis_block()`, the
+same id `a63fd2c1…`), so they also share the ASERT anchor (the genesis time
+and target) and the genesis ledger (the carryover and the locked team and
+founder allocations). They differ in the chain id (`ChainId`: mainnet
+`0x474E0001`, testnet `0x474E0002`, set with `--testnet`), in the hardening
+activation height derived from it (mainnet 17,500, testnet 0) and in the
+PoWit height (GnB-SMH v3 and PoWit: mainnet 10,000; testnet off unless
+`--powit-height`). Consequences, and what separates them (audit POW-9):
+
+- **Transactions cannot be replayed across networks.** Every signature digest
+  commits to the chain id: sighash v2 and v3 both hash `chain_id u32 LE`
+  right after the version byte ("Transaction signatures"), so a mainnet
+  signature never verifies on testnet and vice versa, below and after the
+  activation (`core::chain_id_tests::cross_chain_id_replay_is_rejected`;
+  vectors `net/*` in `tx_vectors.json`). A transaction is replayable only
+  where its digest is, i.e. on its own network. Policy (multisig, timelock)
+  spends sign the same digests. PoWit's own signatures are bound too: a
+  witness attestation signs `attestation_message(chain_id, source, target)`,
+  so it never verifies on the other network even for the same checkpoints,
+  and a witness share commits to a block id of its network.
+- **Blocks cannot be valid on both networks**, but only because their rules
+  differ, not because a block names its network. A block above the genesis
+  at header height h < 17,500 follows the pre-activation rules on mainnet
+  (legacy Merkle root, free-form coinbase) and the hardening rules on
+  testnet (tagged Merkle root, 80-byte coinbase commitment), which exclude
+  each other. From 17,500 the rules agree, but every block there descends
+  from blocks of one network only, which the other never accepts, so its
+  parents are unknown to the other network.
+- **The networks are separated on the wire** (node-local), as Bitcoin Core
+  separates them with per-network message start bytes: each network has its
+  own gossip topics, directed-sync protocol and identify protocol version
+  (`network::chain_separation`; mainnet keeps `gnb/blocks/1`,
+  `gnb/txs/1`, `gnb/sync/1`, `/gnb/sync/1` and `/gnb/1.0.0`, testnet uses
+  `gnb-testnet/...`; PoWit items travel on the transaction topic), so
+  neither network subscribes to, pulls from or serves the other's frames,
+  and a peer that identifies with another network's
+  protocol version is disconnected (`node/tests/fix_pow9_network_separation.rs`).
+  A dialed address enters the tried table (`known_peers`) only after a
+  same-network identify, as Core marks an address good only after the
+  version handshake; another network's address is removed from it.
+- **A data directory belongs to one network**: the genesis check at start-up
+  cannot tell the networks apart, so the data dir records its chain id in
+  CF_META (`chain_id`, written on its first start) and a node of the other
+  network refuses it (`Storage::check_chain_marker`; docs/RUNNING.md). A
+  data dir without the marker (from an earlier release) that holds chain
+  blocks is marked only for the network its blocks follow: the first stored
+  body among the highest chain-index rows at header height 1..17,499
+  carries the hardened coinbase commitment and passes the hardened body
+  rules (`block_rules::check_hardened_body`) on testnet and fails them on
+  mainnet (`Storage::stored_chain_network`); a node of the other network is
+  refused. The Merkle root is not used: from a network's PoWit height the
+  body root is the v2 commitment, and which heights that covers depends on
+  the running node's PoWit height, not on the stored chain's.
 
 ## Acceptance order
 
@@ -110,17 +194,91 @@ obtain from a future timestamp to about 6%.
 3. `bits == expected_bits(parents, height)`;
 4. timestamp bounds;
 5. at/after the hardening activation: the context-free block rules (wire
-   size, tagged Merkle root, no 64-byte transaction, coinbase commitment),
-   before the block is stored;
+   size, tagged Merkle root, each parent listed once, no 64-byte
+   transaction, coinbase commitment), and at every height the block-size
+   limit of the block's verified height in the measure of the regime (see
+   "Block size (VAL-12)"), before the block is stored;
 6. GnB-SMH proof (64 MiB, cached by block id);
 7. transactions (version rule, witnesses and signatures as specified in
-   "Transaction signatures" below, double spends, coinbase maturity at the
-   block's consensus height, consensus minimum fee, and at/after the
-   activation BIP30 and no same-block coinbase spend), coinbase value.
+   "Transaction signatures" below, double spends, coinbase maturity and
+   relative timelocks in the depth measure of the block's regime ("Coinbase
+   maturity"), this chain's locktime, output-kind, dust and policy-spend
+   rules (`node/src/blockval.rs`), consensus minimum fee, BIP30 and no
+   same-block coinbase spend, this chain's rules at every height),
+   coinbase value (the miner output and, from `powit_height()`, one
+   witness-share output per PoWit share).
 
 Structural checks (size, merkle root, coinbase shape, duplicates, dust, and
-at/after the activation the 64-byte rule and the coinbase commitment) run
-before `accept_block` on every ingress path.
+at/after the activation distinct parents, the 64-byte rule and the coinbase
+commitment) also run before `accept_block` on every ingress path, on the
+height the block claims, so no proof of work is spent on a block that fails
+them.
+
+The `blue_score` a block carries on the wire is not committed by its id and
+no rule reads it. `accept_block` stores the body with the value derived from
+its parents (`max(parent blue_score) + 1`), whichever path delivered it
+(gossip, directed sync, orphan drain, body re-fetch, `submitblock`, the
+miner), so every node stores, serves and relays the same bytes for one block
+id (POW-8; re-audit B1-T0).
+
+## Value ranges (MoneyRange, all heights)
+
+`MAX_SUPPLY_SAT = 12,500,000 GNB = 1.25 x 10^15` base units. A block is
+invalid if any of these values leaves `0..=MAX_SUPPLY_SAT` (a sum that
+overflows u64 is out of range too):
+
+- every output value of every transaction, the coinbase included (its
+  witness-share outputs from `powit_height()` too) (context-free:
+  `limits::check_block_context_free`, before the block is stored; also
+  mempool admission and the template self-check);
+- each transaction's output total (context-free, same check);
+- each shielded transaction's fee (context-free);
+- each non-coinbase transaction's input total (connect time);
+- the block's accumulated fees, the sum over its non-coinbase transactions
+  of inputs minus outputs (connect time).
+
+These are Bitcoin Core's bounds (`nValueOut` in CheckTransaction, `nValueIn`
+and the fee in CheckTxInputs, `bad-txns-accumulated-fee-outofrange` in
+ConnectBlock). Each is a sum of distinct coins (a transaction's inputs are
+distinct outpoints, its outputs at most its inputs, fees are conserved along
+in-block chains), so a block whose amounts are conserved never violates
+them. The coinbase's own total is bounded by the coinbase value rule
+(subsidy plus fees: the miner output at most its share plus the fees, each
+witness-share output exactly `per_attester`, `Block::validate_coinbase_value`).
+The sum of ALL outputs of a block is not bounded: a chain of in-block
+spends moves the same coins once per hop, so the outputs of a valid block
+can sum above the supply (three hops of 4,500,000 GNB: 13,500,000 GNB).
+The VAL-11 remediation (commit e3e45df, merged into this chain's line by
+28a619d) had also bounded that sum; the rule rejected such valid blocks at
+every height and made the template self-check refuse every template
+carrying such a mempool chain, so it is removed (re-audit B1-T1): only a
+node running 28a619d .. cb60040 rejects such a block, every release of this
+chain before them accepts it. Vectors: `value/*`, among them
+`value/chained-spends-output-total-above-max-supply/*` (valid in both
+regimes) and `value/block-output-total-above-max-supply/*` (valid; the
+vectors of cb60040 pinned the removed rule there).
+
+Node-local (not consensus; NET-2 residual, Phase 4): on the message
+processor, the GnB-SMH proof of a gossiped or pulled block is evaluated only
+after every check above that precedes it, and not on the processor itself.
+The ingress core (`ingress::BlockIngress::handle_block_gated`) runs the
+cheap checks — for a block whose parents are known the anti-DoS work rule
+and steps 2–5 (`ingress::passes_pre_pow_checks`; a block that fails one goes
+to `accept_block`, which refuses it before evaluating anything), for an
+orphan the floor — and then hands the block to a bounded proof-of-work
+scheduler (`pow::verifier`): at most half the logical CPUs (1 to 4)
+evaluations at a time on the blocking thread pool, a queue bounded
+globally, per delivering peer and per network group, and a budget of
+failed evaluations per peer and per network group (a valid proof is
+refunded). The evaluation is `Block::validate_pow`, whose algorithm follows
+the header height: GnB-SMH v1 (64 MiB) below the PoW + PoWit activation
+(`core::powit_height()`), v3 (4 MiB) from it — results are keyed by block id
+and height for that reason. The processor resumes the block when its result
+arrives (the proof is then in `validate_pow`'s cache, so `accept_block` does
+not evaluate it again). A gossip frame whose block waited in the queue longer
+than gossipsub keeps it is answered `Ignore` unevaluated; every queued
+frame gets exactly one verdict. See "Anti-DoS work rule" below for the
+budgets and for who is charged.
 
 ## Wire encoding (all heights)
 
@@ -168,7 +326,8 @@ minimal varints the bytes a transaction consumes are its canonical length).
 Every encoder in the code base (`write_varint`, used by the node, its miner
 and templates, the wallets and the WASM wallet core) writes only minimal
 varints (`core::wire_canonical_tests::varint_minimality_boundaries`), and the
-node stores blocks as `to_wire_bytes()` and serves those bytes to sync
+node stores blocks as `to_wire_bytes()` (with the `blue_score` derived from
+the parents, see "Acceptance order") and serves those bytes to sync
 requests and gossip. An external miner that assembles a block from
 `getblocktemplate` must write the transaction count and the coinbase's
 varints minimally, as Bitcoin's CompactSize writers do: `submitblock` refuses
@@ -231,7 +390,7 @@ height cannot serve as the cut-off).
 k = 10. Blocks below the hardening activation height use the interval-index
 ("Fast") coloring, which is applied from genesis but does not count the whole
 selected chain in a candidate's anticone. From the activation height (mainnet
-110,000; testnet and regtest 0) the exact GHOSTDAG coloring, Kaspa blue work
+17,500; testnet and regtest 0) the exact GHOSTDAG coloring, Kaspa blue work
 and the mergeset limits below apply.
 
 ## GhostDAG rules, ledger semantics and the hardening activation
@@ -246,9 +405,68 @@ exactly, and their stored `GhostdagData` stays valid.
 
 | Network | Hardening activation height |
 | --- | --- |
-| mainnet | 110,000 (`MAINNET_HARDENING_ACTIVATION_HEIGHT`) |
+| mainnet | 17,500 (`MAINNET_HARDENING_ACTIVATION_HEIGHT`; about 2026-10-17 04:17 UTC) |
 | testnet | 0 (from genesis) |
 | regtest | 0 (from genesis) |
+
+The mainnet height was moved on 2026-10-16 from 110,000 (about 30 days after
+the release) to about one day after that decision. No mainnet node was
+reachable, so it was derived from the ASERT schedule, not from an observed
+tip. Genesis timestamp 1,791,685,648 (2026-10-11 02:27:28 UTC, the relaunched
+chain), 30 s target spacing: at the decision, 2026-10-16 03:47 UTC, the
+schedule height is about 14,560; one day is 2,880 blocks, about 17,440,
+rounded to 17,500, whose scheduled time is 1,791,685,648 + 17,500 × 30 =
+1,792,210,648 (2026-10-17 04:17:28 UTC). An earlier move to 25,800 was
+derived from the pre-relaunch genesis (2026-10-08 03:11:32 UTC); on this
+chain 25,800 is scheduled for 2026-10-20 01:27 UTC.
+
+The ASERT schedule bounds the real height only loosely. ASERT is anchored at
+the genesis block (`GENESIS_TIMESTAMP`, `GENESIS_BITS`) with 30 s spacing and
+a 2 h half-life, so the schedule height at time `t` is `(t - genesis time) /
+30 s`, and at a steady network hashrate `H` the chain runs `240 × log2(H /
+H0)` blocks ahead of the schedule (behind it when negative), where `H0` is the
+hashrate at which the scheduled target gives 30 s blocks. Below the PoWit
+height (GnB-SMH v1) that target is the genesis target, about 4,500
+evaluations per block: `H0` ≈ 150 v1 evaluations/s. From the PoWit height
+(mainnet 10,000) blocks use GnB-SMH v3 and `core::adjust_bits_for_algo`
+shifts the ASERT target right by `POW_V3_DIFFICULTY_SHIFT` = 2 bits (4 times
+harder; `DESIGN-pow-powit.md`), about 18,000 v3 evaluations per block on the
+schedule: `H0` ≈ 600 v3 evaluations/s. The shift is applied after ASERT, so
+the anchor and the schedule height are unchanged; only `H0` moves (a v3
+evaluation costs about a sixth of a v1 one, so the same hardware tracks the
+schedule at about two thirds of the v1 `H0`). Each doubling of `H` above `H0`
+brings the activation 240 blocks (2 h) before its scheduled time: at 16 ×
+`H0` 17,500 arrives about 8 h before 2026-10-17 04:17 UTC, at 128 × `H0`
+about 14 h before, and the chain would already have been past it at the
+decision only above about 4,900 × `H0`. The two tips recorded in this
+repository were behind the schedule: 2,888 on 2026-10-12 10:06 UTC (909
+blocks, `WITNESS_COMMITMENT_HEIGHT`) and 8,302 on 2026-10-14 04:25 UTC (574
+blocks, `MAINNET-READINESS.md`), about 0.07 and 0.19 × the v1 `H0`. If the
+network is still below `H0`, the activation comes after its scheduled time
+(2 h later per halving of `H / H0`), and from the activation the hardened
+pow limit (the genesis target, "Pow limit (POW-3)", which clamps the ASERT
+target before the v3 shift, so a v3 block needs at least about 18,000
+evaluations) stretches block times to about 30 s × `H0 / H` until the
+hashrate rises.
+Before the release, the mainnet tip (`getdaginfo` `tip_height`,
+`next_block_height`) and the current `bits` must be read from a node: the tip
+must be well below the activation height, else the height must be moved
+again before the chain reaches it; the observed block rate gives the real
+time of the activation; template `bits` easier than `0x1f03a40d` (the
+genesis target shifted for v3; `0x1f0e9036` below the PoWit height) mean the
+post-activation slowdown above (`RUNNING.md`, "Hardening activation"). The
+rules switch at the height, whatever the time.
+
+Every node and miner must run a release with this height before the chain
+reaches it (`RUNNING.md`, "Hardening activation"); a node with the old height
+(or none) keeps the old rules there and splits from the upgraded nodes.
+Moving the height again is one constant
+(`crates/gnb-crypto/src/core/activation.rs`), its copies in the generator of
+the consensus vectors (`MAINNET_ACT`) and the three Python references
+(`gnb_validity.py`, `gnb_merkle.py`, `gnb_difficulty.py`), the regenerated
+`reference/{tx,block,merkle,difficulty}_vectors.json`, a rebuilt and re-pinned
+web-wallet core (`site/wallet/gnb_wallet.wasm` compiles the height in;
+`scripts/build-wallet-wasm.sh`) and a new node package version.
 
 Every consensus change of the 2026-10-14 audit activates at this ONE height.
 The schedule is defined in `crates/gnb-crypto/src/core/activation.rs`, and the
@@ -267,7 +485,9 @@ activation height:
 | Coinbase commitment: header height (BIP34), parent list, witness root | VAL-2, CRY-1 | `B.height` | same |
 | No overwrite of an unspent coin (BIP30) | VAL-2 | `B.height` | same |
 | No spend of the same block's coinbase | VAL-3 | `B.height` | same |
+| Coinbase maturity and relative timelocks (`older`) count selected-chain blocks (DAG heights) instead of header heights | re-audit B1-T14 | `B.height` (the regime); the depth itself compares `GhostdagData::height` | "Coinbase maturity" |
 | `MAX_BLOCK_SIZE` measured on the wire encoding | VAL-12 | `B.height` | same |
+| Each parent listed once | B2-T10 (DAG-12) | `B.height` | same, "Parent list" |
 | Pow limit = genesis target | POW-3 | `B.height` (the height `expected_bits` is computed for) | same |
 
 A GhostDAG rule applies to block B iff `height(B) >= activation`, where
@@ -305,6 +525,15 @@ own pre-activation behaviour in their sections). That pre-activation behaviour i
 bit-identical to the code that produced the existing chain by
 `node/tests/fix_ghostdag_preactivation_identity.rs`.
 
+The block-wide output total that the VAL-11 remediation (e3e45df, merged
+here by 28a619d) introduced at every height is removed, which restores the
+verdict every earlier release of this chain gives ("Value ranges",
+re-audit B1-T1). The pre-activation block-size measure is this chain's own,
+the wire encoding (`Block::size_bytes`, the PoWit section included from
+`powit_height()`), unchanged: it does not read the uncommitted
+`blue_score`, which the audit's bincode measure did (re-audit B1-T0 /
+B2-T8, "Block size (VAL-12)").
+
 ### Selected parent and fork choice
 
 The selected parent of B is the parent with the largest `(blue_work,
@@ -317,7 +546,13 @@ own selected-chain context. Blocks that fail connect-time validation, and
 every block whose selected-parent chain passes through one, are disqualified
 and never selected.
 
-There is no reorg-depth limit and no finality checkpoint (audit DAG-6). The
+There is no reorg-depth limit and no depth-based finality (audit DAG-6).
+From the PoWit height (mainnet 10,000) the checkpoint the applied chain's
+witness set has finalized pins fork choice: a block whose selected-parent
+chain does not pass through it is never selected, nor offered as a template
+parent (`GhostDAG::set_finalized`; docs/DESIGN-pow-powit.md). It restricts
+which blocks are selectable, never a block's GhostDAG data (selected parent,
+coloring, blue work). The
 former 1,000-block `MAX_REORG_DEPTH` and the `finalized_height` gate compared
 a fork with the node's own history, so nodes that received the same blocks in
 different orders could end on different chains. As in Bitcoin Core (no depth
@@ -326,8 +561,27 @@ holds, whatever their arrival order and however deep the fork. What bounds
 merging objectively is the merge depth below, a function of each block's
 past. Reorgs deeper than 1,000 selected-chain blocks are logged and counted
 (`gnb_deep_reorgs_total`), never refused. Undo records are kept for every
-connected block and a pruned body leaves a rollback record, so a reorg of any
-depth also works on a pruned node. A pruned node that reorganized away from
+connected block and a pruned body of an applied block leaves a rollback
+record, so a reorg of any depth also works on a pruned node. A move is
+committed in atomic chunks of at most `reorg::MAX_BLOCKS_PER_COMMIT` (16)
+blocks, each with the tip pointer at its end (node-local; Bitcoin Core's
+`ActivateBestChain` steps the same way): its memory is bounded by one chunk,
+every intermediate state is a consistent applied tip, and start-up continues
+an interrupted move. When a block of a later chunk turns out invalid the best
+valid chain is resolved again from where the applied chain stands, which can
+move back to the old branch; the end state is the same as with one batch.
+The PoWit finality pin above (`GhostDAG::set_finalized`) moves with the
+applied chain: each committed chunk pins the checkpoint its applied tip
+finalized before the move goes on, and start-up restores the pin
+from the applied tip before it resumes a move, so neither a block of a later
+chunk that turns out invalid nor a crash between chunks takes the node back
+across finality its applied chain reached (it ends where a node that
+followed the branch block by block ends). A block's PoWit state and the
+reachability records its insertion changed are committed in the same batch
+as its DAG record (the in-memory copy of those records is marked written
+only once that batch commits), and the selected-chain index rows of the
+blocks a chunk moves, keyed by chain position (`Storage::stage_chain_index`),
+in that chunk's batch. A pruned node that reorganized away from
 blocks whose bodies it had pruned and needs them again (the old chain became
 the heaviest once more, or an operator override below moves to it) re-fetches
 those bodies from its peers before it connects them; nothing is written in
@@ -376,7 +630,7 @@ requests the next (at most 4,096) of those bodies and asks to be retried.
 blue_work(genesis) = 0
 blue_work(B)       = blue_work(sp) + Σ work(m) for m in mergeset_blues(B) + work(B)   // at/after activation
 blue_work(B)       = blue_work(sp) + work(B)                                          // before activation
-work(B)            = work_from_bits(B.bits)
+work(B)            = block_work(B.bits, B.height)   // "Chain work": v3 blocks >> 2
 ```
 
 After activation, `blue_work(B)` is the total work of `blue(B) ∪ {B}`.
@@ -389,10 +643,33 @@ boundary.
 
 ### Coloring
 
-`mergeset(B) = past(B) \ past(sp) \ {sp}`. Candidates are processed in a fixed
-topological order: ancestors first, and among blocks that are ready at the
-same time, lower hash first. With `blue` = blue(sp) ∪ {sp} ∪ the candidates
-already colored blue, candidate c is blue iff:
+`mergeset(B) = past(B) \ past(sp) \ {sp}`. The coloring is greedy, so the
+order in which the candidates are processed decides which of them become
+blue; it is part of consensus (audit B2-T9) and is, at every height (the
+pre-activation coloring uses the same order):
+
+1. the in-degree of a candidate is the number of its distinct parents that
+   are themselves in the mergeset;
+2. a FIFO queue starts with the candidates of in-degree 0, in ascending byte
+   order of their 32-byte block ids;
+3. repeatedly the candidate at the FRONT of the queue is taken; the
+   candidates whose in-degree drops to 0 by its removal are appended at the
+   BACK of the queue, in ascending byte order of their ids.
+
+This is Kahn's algorithm with a FIFO queue. It is NOT "always the lowest id
+among the candidates ready at that point": a candidate that becomes ready
+later is processed after every candidate already queued, whatever its id.
+The two readings color differently (`reference/ghostdag_vectors.json`, case
+`order/fifo-not-lowest-id`: a mergeset of eleven siblings T1..T11 of the
+selected parent and U, a child of T1 with the lowest id; FIFO colors
+T1..T10 blue, the other reading T1, U, T2..T9). `reference/gnb_ghostdag.py`
+is the executable definition of the order and of the coloring below, and
+`node/tests/ghostdag_vectors.rs` checks the node against its vectors. (Kaspa
+orders the mergeset by blue work, then hash; GnB keeps its own order, which
+every GnB release since genesis has used.)
+
+With `blue` = blue(sp) ∪ {sp} ∪ the candidates already colored blue,
+candidate c is blue iff:
 
 1. |anticone(c) ∩ blue| ≤ k, and
 2. every x in anticone(c) ∩ blue has |anticone(x) ∩ blue| + 1 ≤ k.
@@ -410,14 +687,18 @@ Before activation the old walk is used. It never counts selected-chain blocks
 below the selected parent, and it restarts older blues' anticone counts at 0,
 so it can color blue a block with more than k blues in its anticone.
 
-### Mergeset size and merge depth (after activation)
+### Mergeset size and merge depth
 
-- `|mergeset(B)| + 1 ≤ MAX_MERGESET_SIZE = 180`. The "+ 1" counts the
-  selected parent, as Kaspa does. 180 is Kaspa's production limit. With
-  k = 10, at most 11 entries are blue, which leaves room for a post-partition
-  merge and bounds one block's coloring to 179 candidates. A larger mergeset
-  is rejected with `MergesetTooLarge` before any coloring work.
-- Merge depth: let R be the highest selected-chain block of B with
+- `|mergeset(B)| ≤ MERGESET_SIZE_LIMIT = 64`, at every height: blocks merged
+  besides the selected parent. This chain's rule since before the
+  2026-10-14 reset; it is tighter than the audit's hardened bound
+  (`|mergeset(B)| + 1 ≤ MAX_MERGESET_SIZE = 180`, Kaspa's production limit),
+  so it is the one limit on both sides of the activation. With k = 10 at
+  most 10 merged blocks are blue, and one block's coloring is bounded to 64
+  candidates. A larger mergeset is rejected with `MergesetTooLarge` before
+  any coloring work, and nothing is inserted (vector case
+  `mergeset/size-limit` in `reference/ghostdag_vectors.json`).
+- Merge depth (at/after the activation): let R be the highest selected-chain block of B with
   `blue_score(R) ≤ blue_score(B) - MERGE_DEPTH`, where `MERGE_DEPTH = 360`
   (3 hours at 30 s). Every red in B's
   mergeset must be R itself, in the future of R, or in the past of a blue in
@@ -429,8 +710,21 @@ A rejected block is not inserted. Since `MAX_PARENTS` (256) exceeds the
 mergeset limit, block templates must choose parents with
 `GhostDAG::select_parents_for_template(&bodied_tips, MAX_PARENTS)`. It puts the
 selected parent first, adds the other tips by decreasing blue work while the
-mergeset fits, and drops tips that would break the merge depth. Before
-activation it returns the heaviest `MAX_PARENTS` tips.
+mergeset fits `MERGESET_SIZE_LIMIT`, and drops tips that would break the
+merge depth; the budgeted selection runs on both sides of the activation.
+
+A tip that is not the lowest possible merge-depth root of the template (the
+root of a block with no mergeset blue: `blue_score = sp.blue_score + 1`) and
+not in its future can never be merged again (audit B1-T15): it is red (in the
+anticone of every chain block from the root to the selected parent) and, being
+a tip, in no block's past, so nothing kosherizes it; its whole branch is below
+the root. Such tips are skipped with one reachability query each, before their
+bodies are looked up and before any mergeset work, and one final
+`compute_block` checks the result (Kaspa filters virtual-parent candidates the
+same way). They stay in the DAG and among the valid tips: chain selection is
+unchanged. Previously each one cost a full `compute_block` and a stored-body
+lookup at every template computation (twice per accepted block), forever.
+This is template policy: no verdict changes.
 
 ### Ledger semantics: selected-chain-only
 
@@ -464,22 +758,38 @@ These changes leave every result unchanged and apply at all heights:
   selected-chain blocks that merged nothing.
 - Reachability reindexing computes subtree sizes once per reindex instead of
   once per visited node.
+- Reachability reindexing follows Kaspa's reindex-root scheme (audit DAG-7
+  residual, `node/src/consensus/reachability.rs`): a selected-chain block
+  100 to 200 blocks below the heaviest tip is the reindex root; when it
+  advances (in jumps of 100), the chain from the old root to the new one is
+  concentrated, with 4,096 free slots reserved around the children of every
+  chain block. A block above the root is reindexed inside that window; a
+  deep side block or a genesis sibling reclaims slack along the chain toward
+  the root and re-lays out only its own branch and the side branches it
+  shifts. The previous scheme re-laid out the whole subtree under the first
+  ancestor with room: O(DAG) for one such block, under the DAG write lock.
+  The answers of the index are exact under any layout, so GhostDAG's output
+  is unchanged; the reindex root is a performance hint persisted with the
+  root's reachability record.
 
 At the audit's 12,000-block scenario (dev profile), these changes reduced a
 deep side block from 10–26 s to 50–84 ms, a genesis sibling that forces a
 reindex from 46 s to 0.1 s, and the 1,000-block side-chain merge from 35 s to
 29 ms. After activation, that merge is rejected in under 1 ms.
 
-What remained proportional to the DAG is the reachability reindex that one
-genesis sibling or one deep side block triggers on insertion (about 100 ms at
-12,000 blocks, dev profile) and, before activation, the coloring walk for a
-candidate that forks deep. Neither block is inserted any more unless a chain
-carrying enough work backs it: the node-local anti-DoS work rule below runs
-before the proof of work, storage or insertion of every block whose parents
-are known. GhostDAG's results and the reachability index are unchanged by
-it. Measured in `node/tests/fix_ghostdag_dag7_perf.rs` (80 such blocks,
-dev profile): 747 ms of insertions at 12,000 blocks become 0.5 ms of
-refusals.
+Before the reindex-root scheme, the reachability reindex that one genesis
+sibling or one deep side block triggers on insertion stayed proportional to
+the DAG (about 100 ms at 12,000 blocks, dev profile); counted in
+`node/tests/fix_dag_hot_path_cost.rs`, the largest of 83 such insertions
+re-laid out 18,009 nodes of an 8,000-block DAG (4,509 at 2,000 blocks), and
+now 101 at both sizes. What remains, before activation, is the coloring walk
+for a candidate that forks deep. Such blocks are not inserted unless a chain
+carrying enough work backs them: the node-local anti-DoS work rule below
+runs before the proof of work, storage or insertion of every block whose
+parents are known. GhostDAG's results and the reachability index's answers
+are unchanged by it. Measured in `node/tests/fix_ghostdag_dag7_perf.rs` (80
+such blocks, dev profile): 747 ms of insertions at 12,000 blocks become
+0.5 ms of refusals.
 
 Why a peer cannot reach the pre-activation coloring walk without passing the
 work rule:
@@ -492,14 +802,15 @@ work rule:
   rejected for its witness bytes) inserts nothing.
 - `accept_block` is called by the ingress core for a block whose parents are
   all known, after the work rule admitted it; by the orphan drain, for a
-  buffered orphan whose last missing parent was just inserted (the orphan
-  passed the bits floor and its proof of work to be buffered, and it becomes
-  connectable only after that parent passed the work rule); by the RPC
-  `submitblock` (a write method, served on loopback by default: the
-  operator's own pool, which, like Bitcoin Core's `submitblock`, bypasses the
-  anti-DoS rule); and by the built-in miner. Every call checks the header
-  height, the exact ASERT bits, the timestamp and the proof of work before
-  insertion.
+  buffered orphan whose last missing parent was just inserted, after the
+  work rule admitted it again with its parents known (Phase 4, B1-T5: the
+  orphan passed only the bits floor and its proof of work to be buffered);
+  by the RPC `submitblock`, after the minimum chain work (Phase 4, POW-3;
+  not the tip-relative work threshold, like Bitcoin Core's `submitblock`, so
+  an operator can feed the node a heavier chain that forks deep below its
+  tip); and by the built-in miner. Every call checks the
+  header height, the exact ASERT bits, the timestamp and the proof of work
+  before insertion.
 
 What the rule still admits is bounded by work. For a candidate c merged by a
 new block B, the walk visits B's selected chain downward, skipping chain
@@ -510,10 +821,11 @@ steps each step is a distinct block of c's past that the selected chain
 merged as blue without that chain block being in c's past. All of these
 blocks, and c, entered the DAG through the work rule: within the 360-block
 window (a chain keeping pace with ours), merge-backed (each needs a buffered,
-proof-of-work-verified orphan whose blue-work bound reaches the threshold,
-and more than 1,000 blocks below the tip at most 4, then one per 30 s, from
-one shared budget), or chain-backed (announced orphans covering the fork's
-whole depth below the window). A walk therefore lengthens by at most one
+proof-of-work-verified orphan that passes its contextual checks and whose
+blue-work bound reaches the threshold — below the activation only — and
+every such admission is charged to one shared budget: 4, then one per
+30 s), or chain-backed (announced orphans covering the fork's whole depth
+below the window). A walk therefore lengthens by at most one
 step per such paid admission. After activation, the mergeset limit and the
 merge depth bound every block's coloring outright.
 
@@ -539,7 +851,10 @@ bound of B's blue work:
    along an evicted path is used instead (it chains through any number of
    evictions, so a linear fork deeper than every store still proves its work).
    Each orphan passed the orphan bits floor (the target a child of the
-   selected tip would carry now, eased 16-fold and capped at the pow limit of
+   selected tip would carry now — re-expressed in the orphan's own GnB-SMH
+   algorithm when the two heights straddle the v1 -> v3 switch, v3 targets
+   being 2^`POW_V3_DIFFICULTY_SHIFT` harder for equal work
+   (`ingress::reference_for_height`) — eased 16-fold and capped at the pow limit of
    the height the orphan claims — the limit its own proof of work is checked
    against: the genesis target at/after the hardening activation, the legacy
    limit below it, see "Pow limit (POW-3)" — so the pre-activation blocks of
@@ -549,9 +864,25 @@ bound of B's blue work:
    (at most 8), charged to the peer that delivered it (at most a quarter of
    each store per peer) and, when full, give way only to an entry of greater
    work, so orphans at the floor cannot flush them; or
-3. a buffered orphan whose own lower bound reaches `T` needs B as a parent;
-   such blocks more than 1,000 blocks below the tip are rationed (4, then one
-   per 30 s).
+3. a buffered orphan VOUCHES for B (it merges B, a lower-work block):
+   Phase 4 (B1-T5) — the orphan waits on B directly and every other parent
+   of it is in the DAG; its header passes, with B in hand, the contextual
+   checks `accept_block` will apply (header height = max parent height + 1,
+   bits = the expected ASERT bits of its parent set, timestamp at least the
+   latest parent's and at most 600 s ahead); its height is below the
+   hardening activation; and its own bound (largest parent blue work, `lb(B)`
+   for B, + its work) reaches `T`. Every such admission is charged to one
+   budget (4, then one per 30 s), once, when B is about to be stored with
+   its proof known valid (charged before the proof, a block whose proof the
+   PoW workers evaluated was charged twice, and junk-nonce candidates spent
+   it). Before Phase 4 the bound came from the
+   self-declared parents and bits of any orphan above B, directly or through
+   other orphans, unchecked: one orphan listing the tip and a low-work block
+   (even one stamped before its parents, so never valid) got that block
+   admitted, and only admissions more than 1,000 blocks deep were rationed.
+   From the activation no orphan vouches: B's own chain cannot come within
+   the 360-block window, so B is below the merge-depth root of every block
+   that builds on the tip and merging it is a `MergeDepthViolation`.
 
 Otherwise B is ignored without penalty (a refused block is not re-evaluated
 until the orphan pool, the DAG or the selected tip changes). A chain that
@@ -562,6 +893,180 @@ with more blocks above its first block than the pool and the 50,000 kept
 evicted orphans hold is credited the summed work of the part they hold, or
 its heaviest path if larger.
 
+The rule applies again to every buffered orphan the drain connects once its
+last missing parent is in the DAG (Phase 4, B1-T5; it used to be stored
+without any work check, so the low-work fork above a merge-backed block was
+stored whole); one it refuses is not stored, and the orphans above it keep
+waiting (if more work is announced above it, the orphan sweep fetches it
+again). The gossip verdict of a buffered orphan's frame is withheld until
+the orphan connects (`Accept`, relayed then), is refused (`Ignore`, or the
+penalty below for an `accept_block` rejection), leaves the pool or outlives
+gossipsub's cache (`Ignore`): an orphan has passed only the floor and its
+proof, and relaying it at once let floor-meeting orphans travel the whole
+network, charged at every hop to the honest relay that forwarded them
+(`ingress::DeferredBlockVerdicts`).
+
+### Minimum chain work and unrequested blocks (node-local policy, not consensus)
+
+Audit POW-3 (Phase 4). The work rule's threshold is relative to the node's
+own tip, so it does not protect a node whose tip is far behind the network
+(initial sync, or a node that was offline): an attacker mines one block A on
+that tip stamped "now", and under the absolute-schedule ASERT every child of
+A has the pow-limit target — near-free blocks, all above the threshold.
+Bitcoin Core's defences, adapted (`ingress::unrequested_block_admission`):
+
+- **Minimum chain work** (Core's `nMinimumChainWork`), in blue work:
+  `ingress::MAINNET_MINIMUM_CHAIN_WORK` (testnet and regtest: 0), or
+  `--minimumchainwork <hex>`. While the selected tip's blue work is below it
+  the node is in initial block download: it latches the IBD state (the
+  miner stays paused) and processes no block it did not ask for, unless that
+  block's own bound reaches the minimum. Mainnet's value is
+  `core::MIN_CHAIN_WORK`, the one release constant that also turns finality,
+  the reorg depth cap and pruning on (`core::finality_active`), 0 today: the
+  newest chain data the repository carries is the reading of
+  docs/MAINNET-READINESS.md §1 (one node, 14 Oct 2026), whose proposed value
+  is a release decision not yet taken, and a value the real chain does not
+  reach would stop every new node from syncing; docs/RUNNING.md gives the
+  release step that raises it. Block work bounds (`lb`, the announced work
+  of orphans) count each block as `accept_block` adds it to the DAG,
+  `core::block_work`: normalised across the GnB-SMH v1 -> v3 switch.
+- **Unrequested blocks** (Core's `AcceptBlock`, `!fRequested`): a block that
+  is neither the answer to one of this node's directed pulls nor a block it
+  has an outstanding request for (whoever delivers it) is processed only if
+  `lb(B)` reaches the blue work of the selected-chain block
+  `UNREQUESTED_WINDOW_BLOCKS` = k + 1 = 11 below the tip (Core requires at
+  least the tip's work; GhostDAG's honest concurrency, and `lb` omitting the
+  merged blues after the activation, need the k + 1 margin). A deeper fork
+  block is processed only when requested (the parent of a buffered orphan,
+  a frontier tip, an IBD pull), where the 360-block rule above applies. An
+  unrequested orphan is buffered only outside initial block download; one
+  claiming a height more than 1,000 above the tip is dropped before decoding
+  (`ingress::unsolicited_height_too_far_ahead`).
+- **`submitblock`**: refused below the minimum chain work
+  (`ingress::submitted_block_admission`, before the proof of work). The
+  tip-relative threshold `T` is not applied, as Bitcoin Core's `submitblock`
+  (`ProcessNewBlock` with `force_processing`) skips its anti-DoS checks: the
+  RPC is how an operator replays the heavier chain to a node that sat on a
+  minority branch (a partition or an eclipse), and that chain's first blocks
+  above a deep fork point are, judged one at a time, below `T` (a review of
+  an earlier Phase-4 version, which applied `T`, found such a replay refused
+  block by block). A deep-fork block is cheap below the activation, so a
+  public RPC should run with `--rpc-require-auth-for-writes`.
+
+What remains: with the mainnet minimum at 0, a node that is behind but not
+below the minimum is protected only by the rules relative to its tip, so a
+block A as above and its cheap children (each costing one evaluation) are
+processed — at most at the rate the attacker evaluates proofs, and within
+the per-peer and per-network-group proof-of-work budgets below; raising the
+minimum at each release closes this for every node that has not reached it.
+Blocks this node requested (IBD pulls answered by an attacker's header list)
+are not checked against the minimum: that needs a header chain with proofs
+(Core's headers presync), which the sync protocol (`/gnb/sync/1`
+`Headers`: ids and claimed scores only) does not carry.
+
+### Gossip penalties and proof-of-work budgets (node-local policy, not consensus)
+
+Audit NET-2 residual, B1-T7, NET-4 residual (Phase 4).
+
+**Who is charged for a refused block frame** (`ingress::block_penalty`).
+Gossipsub's `Reject` charges its invalid-message penalty (P4) to the peer
+that delivered the frame and to every peer that delivered a duplicate.
+Releases older than the validated relay (NET-2) forward every frame
+unvalidated and follow the chain until the hardening activation block
+(which they reject); releases older than Phase 4 relay an orphan once its
+bits meet their own floor and its proof is valid, before its parents are
+known, at every height. Either can be an honest peer that delivers a frame
+this node refuses (Bitcoin Core: never punish for data that may be invalid
+only because of a rule change, `BLOCK_RECENT_CONSENSUS_CHANGE`; punish the
+peer that sent it). So:
+
+- a frame the delivering peer authored (gossipsub's signed source is the
+  propagation source), or sent as the answer to this node's pull, is charged
+  to it as a misbehaviour: the peer is disconnected and its address
+  discouraged (below), and gossipsub is told `Ignore` (no relay that
+  forwarded a duplicate is charged) unless the next rule applies;
+- a relayed frame is charged (`Reject`, and a misbehaviour) only for a
+  context-free fault — malformed body, id or height binding, structure,
+  proof of work: what every release on the chain checks before relaying —
+  and only once the selected chain contains the activation block
+  (`ingress::block_penalties_in_force`, the transaction relay's gate);
+- a relayed frame with a contextual fault (height, bits, timestamp,
+  coinbase) or below the orphan floor (a function of the node's own tip and
+  clock) is never charged to the relay; an orphan below the floor that
+  answers this node's own pull is dropped without any charge
+  (`ingress::orphan_floor_penalty`: the node asked for it, and an old block
+  of an era with far easier bits fails the floor honestly).
+
+Before the activation a frame signed by a throwaway author key and delivered
+by another connection is a relayed frame: an attacker that signs each
+invalid block with a fresh key is never disconnected or discouraged for it
+(an honest legacy relay cannot be told apart from it), and is limited only
+by the per-peer and per-network-group proof-of-work budgets below.
+Discouragement before the activation covers self-signed gossip and answers
+to this node's pulls.
+
+Wire violations (oversized, bounds-violating, padded or non-canonical
+frames, which releases older than NET-2 forward) follow the same rule
+(`network::wire_violation_penalty`): the application-score penalty is charged
+to an author that delivered its own frame, or once penalties are in force;
+`Reject` (P4 on duplicates too) only once they are in force. A peer the
+bounded wire-penalty tracker forgets has its application score reset (it
+used to keep its last score forever).
+
+**Address discouragement** (`network::discourage`, Bitcoin Core's
+`m_discouraged`): a misbehaving peer is disconnected and its address — the
+IPv4 address, or the IPv6 /64 — discouraged for 24 hours (at most 50,000
+addresses); a connection from a discouraged address is closed at once, so a
+fresh libp2p identity from the same address buys nothing. Local addresses
+(loopback) and operator-configured peers (`--peer`) are never discouraged.
+
+**Proof-of-work budgets** (`pow::verifier`, see "Acceptance order"): every
+gossip evaluation is charged to the delivering peer (4, refilled one per
+60 s) and to its network group (IPv4 /16, IPv6 /32: 8, one per 30 s) and
+refunded when the proof is valid, so only failed proofs — and gossip orphans
+whose bits fail the floor, which are charged one evaluation — consume them;
+a gossip block from a peer or group whose budget is spent, or when the queue
+is full (64 gossip blocks, 4 per peer, 8 per group), is answered `Ignore`
+unevaluated. Answers to this node's own pulls are not charged up front (sync
+keeps up to 16 pulls in flight per peer, answered faster than proofs are
+evaluated): they have their own queue bound of 1,024, go first, and are
+charged to the peer and its group only when the proof is invalid (the peer
+is then also disconnected and discouraged). Results are remembered by block
+id and header height (the pow limit a proof is judged against depends on the
+height, which the id does not commit). The audit measured about three
+zero-cost invalid blocks per libp2p identity, identities being free; now
+identities and addresses inside one /16 share eight evaluations, and an
+author that delivers one invalid block of its own is disconnected and its
+address discouraged.
+
+**PoWit gossip** (`NewPowitItem`: witness shares, attestations, equivocation
+proofs; `ingress::PowitIngress`). Merged from the mainnet line, where each
+item was verified with `powit::admit_item` awaited inline on the block
+processor, unbudgeted — a share's proof is a GnB-SMH v3 evaluation (4 MiB,
+~90 ms), an attestation a KES signature check, both free to fake — and an
+item whose claimed id did not match was `Reject`ed whoever delivered it.
+Now the items, which travel on the transaction topic, are delivered to the
+transaction relay task (`network::goes_to_tx_ingest`), never to the block
+processor. The claimed id and the item's encoding are checked first
+(`ingress::powit_item_precheck`); verification then runs on the blocking
+pool through a proof-of-work scheduler of its own
+(`pow::verifier::PowLimits::powit_items`: half the block pool's workers, at
+least one; a queue of 256, 32 per peer, 64 per network group; budgets of
+failed verifications of 16 per peer, one per 5 s, and 32 per group, one per
+2 s; a stale queued item is answered `Ignore` unverified). An admitted item
+is relayed and refunded. A context-free fault — wrong id, malformed item,
+invalid share proof (or bits, target or payout that the share's attested
+block contradicts), invalid witness signature, an equivocation proof that
+does not verify (`ingress::powit_admit_error_fault`): what no release that
+knows `NewPowitItem` relays, since they all admit an item before relaying
+it — keeps its charge and is penalised through `ingress::block_penalty`,
+the block gate above (its author when it delivered the item itself; a relay
+only once penalties are in force). A refusal that depends on this node's
+chain or state (a share for a block that is not on its selected chain or is
+outside the share window, an attestation from another justified checkpoint
+or by a key outside the witness set, a full pool) is refunded and answered
+`Ignore`, never penalised.
+
 ## Transaction signatures (sighash v2 and v3, hardening activation)
 
 The audit found that the signature digest was whatever a serialization
@@ -570,7 +1075,7 @@ WAL-1), that its cost was quadratic in the transaction size (MEM-5), that a
 hybrid signature could be split into a valid ML-DSA-only signature (CRY-2),
 and that witnesses were malleable (CRY-1). The fixes below change validity, so
 the consensus parts take effect at the hardening activation height (mainnet
-110,000; testnet and regtest 0). The rules live in
+17,500; testnet and regtest 0). The rules live in
 `crates/gnb-crypto/src/core/sighash.rs`; the node applies them through one
 function, `mempool::admission::verify_input_scripts`, which block acceptance
 and connect (`accept::validate_tx_inputs`), reorg connect, the template
@@ -737,6 +1242,21 @@ verifies a signature of another. Because the suite is in every component
 message (and in the digest), stripping the Falcon half of a hybrid signature
 and relabelling it 0x0002 never verifies (`crypto::verify_bound`).
 
+### ML-DSA-65 verification
+
+Every ML-DSA-65 component, at every height and under both sighash versions,
+is verified by FIPS 204 ML-DSA.Verify with the empty context, including the
+bound ‖z‖∞ < γ1 − β (also checked by `crypto::mldsa65_z_within_bound` before
+the library) and UseHint as in Algorithm 40 (h = 1 with r0 ≤ 0, r0 = 0
+included, gives (r1 − 1) mod 16). Nodes link PQClean's portable `clean`
+implementation only (`pqcrypto-mldsa` without its `avx2` / `neon` features):
+its AVX2 code, which those features select at run time on AVX2 CPUs, skips
+the z bound and moves r1 up at r0 = 0, so nodes on different CPUs gave
+different verdicts on crafted signatures, which needed no secret key under a
+public key with t1 = 0 (docs/testing/SANITIZERS.md, F6). The Wycheproof
+ML-DSA-65 vectors (`crates/gnb-crypto/tests/wycheproof_mldsa65.rs`) pin the
+verdicts.
+
 ### Witnesses
 
 `script_sig` = `[u32 LE sig_len][sig][u32 LE pk_len][pk]`, and the public key
@@ -836,7 +1356,8 @@ round as soon as a new tip arrives. External miners use `getblocktemplate`
 (which returns the preimage fields, `bits`, `target` and `min_time`) and
 `submitblock`. `getblocktemplate` also returns the rules of the template's
 height: `hardening_active`, `merkle_rule` (`sha256d-duplicate-last` or
-`gnb-tagged-v1`), `size_rule` (`bincode` or `wire`),
+`gnb-tagged-v1`), `size_rule` (`bincode` or `wire`: the audit's regime;
+`chain_size_rule` is this chain's, `wire` at every height),
 `coinbase_script_sig_prefix` (the 80-byte coinbase commitment for exactly the
 listed transactions in that order, empty before the activation),
 `max_coinbase_extra_bytes`, `max_coinbase_script_pubkey_bytes`, and
@@ -849,15 +1370,16 @@ must keep every dependency of every entry it keeps, in the listed order.
 
 The listed transactions may fill the block up to `max_block_size` minus a
 framing bound minus `coinbase_reserve` (1,000 bytes), so the WHOLE coinbase,
-measured with `size_rule`, must fit in `coinbase_reserve`.
+measured on the wire encoding (`chain_size_rule`), must fit in
+`coinbase_reserve`.
 `max_coinbase_extra_bytes` (the miner bytes allowed after the prefix) already
 includes that bound: it is the largest number of extra bytes for which a
 coinbase with one input and one output whose `script_pubkey` is at most
 `max_coinbase_script_pubkey_bytes` (64) bytes, with every other field at its
 widest encoding, fits in `coinbase_reserve`, capped by the 10,000-byte
 `script_sig` limit (`template::external_coinbase_max_extra`). That is 794
-bytes at/after the activation (wire measure, 80-byte prefix) and 869 bytes
-before it (bincode measure, no prefix). A coinbase within both fields never
+bytes at/after the activation (80-byte prefix) and 874 bytes before it (no
+prefix), both on the wire measure. A coinbase within both fields never
 pushes a block built from the template over `max_block_size`.
 
 ## Block rules at the hardening activation
@@ -869,7 +1391,7 @@ domain separation and no 64-byte rule (VAL-10), nothing committed to witness
 bytes (CRY-1), the block-size limit used a different encoding than fees
 (VAL-12), and the pow limit allowed blocks worth one evaluation (POW-3). The
 rules below take effect at the same hardening activation height as the
-GhostDAG rules (mainnet 110,000; testnet and regtest 0). The code is
+GhostDAG rules (mainnet 17,500; testnet and regtest 0). The code is
 `crates/gnb-crypto/src/core/block_rules.rs` and `validate_block_in_view` in
 `node/src/accept.rs`. The executable reference is `reference/gnb_merkle.py`
 (pow limit: `reference/gnb_difficulty.py`). The golden vectors in
@@ -1005,32 +1527,89 @@ encoding itself is made canonical by the version-3 rule of the same
 activation ("Transaction signatures", "Witnesses"): with both rules there is
 exactly one valid block body per block id.
 
-**Below the activation (node-local, all heights of the old rules).** The
-blocks below the activation (109,999 on mainnet) stay malleable forever, so a
-node must not let a mutated copy disqualify their ids. This is node policy,
-not a consensus rule: it changes no verdict, only what a node remembers. A
-connect-time failure of a block below the activation is classified by what it
-depends on (`accept::BlockInvalidity::witness_dependent`):
+**Below the activation (node-local, all heights of the old rules).** On
+this chain the block id commits to every witness from
+`WITNESS_COMMITMENT_HEIGHT` (5,000) up to the activation too: the coinbase
+`script_sig` ends with the `|wc:` suffix and the witness root
+(`Block::validate_witness_commitment`, checked by `accept_block` before the
+block is stored), so a connect failure of a block at a height >= 5,000 is
+id-committed whatever rule failed (`accept::witnesses_fixed_at`). The
+blocks below 5,000 stay malleable forever, so a node must not let a
+mutated copy disqualify their ids. This is node policy, not a consensus
+rule: it changes no verdict, only what a node remembers. A connect-time
+failure of a block below both heights is classified by whether another body
+with the same id could cure it (`accept::BlockInvalidity::witness_dependent`;
+Bitcoin Core likewise caches every failure as `BLOCK_CONSENSUS` except a
+detected malleation):
 
-- witness-dependent: a non-coinbase `script_sig` that does not parse, a public
-  key that does not hash to the prevout's `script_pubkey` (the key lives in
-  the `script_sig`), a signature that does not verify (sighash v2: below the
-  activation every transaction version is verified with it, under the
-  lenient witness framing), and the consensus minimum fee (measured on the
-  wire size, `script_sig` included). Size limits measured with witnesses are
-  context-free and checked before a block is stored, so they never reach this
-  point;
-- id-committed: everything else (missing or double-spent inputs, coinbase
+- witness-dependent (curable): a non-coinbase `script_sig` that does not
+  parse, a public key that does not hash to the prevout's 20-byte
+  `script_pubkey` (the key lives in the `script_sig`), a signature that does
+  not verify (sighash v2: below the activation every transaction version is
+  verified with it, under the lenient witness framing), a policy-spend rule
+  (`blockval::check_policy_spends`: the policy witness's framing, a
+  policy-tree branch before `powit_height()`, the revealed policy's
+  absolute or relative timelock; the policy, its branch and so its
+  timelocks are revealed by the `script_sig`, whose hash match with the
+  33-byte policy output is checked with the scripts), and the size-based
+  consensus minimum fee (measured on the wire size, `script_sig` included)
+  when the fee reaches the floor below. Size limits measured with witnesses
+  are context-free and checked before a block is stored, so they never
+  reach this point;
+- id-committed: everything else — missing or double-spent inputs, coinbase
   maturity, values and MoneyRange, coinbase value, shielded state, the
-  transaction version rule — the txid covers the version, and the rule can
-  fail only at/after the activation —, and at/after the activation BIP30 and
-  the same-block coinbase spend).
+  transaction version rule (the txid covers the version, and the rule can
+  fail only at/after the activation), BIP30 and the same-block coinbase
+  spend, this chain's context-free transaction rules (locktime finality,
+  the two output kinds, dust: `blockval::check_tx_context_free`, of the
+  coinbase too) — and the failures no witness can cure (re-audit B1-T13): a
+  fee below `min_tx_fee_sat(s)` with `s` the size of the transaction with
+  every `script_sig` empty (one length byte each: the smallest any body
+  with this txid can have; at least `MIN_TX_FEE_SAT`, so a transaction
+  without inputs, whose fee is 0, is here too), and a spend of a coin whose
+  `script_pubkey` is neither output kind (neither a 20-byte key hash nor a
+  33-byte spend policy: no public key hashes to it and no policy witness
+  is accepted for it).
+
+The PoWit section (from `powit_height()`) is covered by the block id (the
+v2 body root) and checked in context before the block is stored
+(`powit::block_state`): a failure there is refused like a bad height, it
+never reaches this classification.
+
+The class is decided by the whole block: the connect validates in two passes
+(`accept::validate_block_in_view_classified_at`, and the reference
+`reference/gnb_validity.py` `connect_block`): first the id-committed checks
+of every transaction in block order (same-block coinbase spend and maturity,
+once every prevout is found this chain's context-free rules, inputs,
+version rule, values, the fee floor, prevout output kinds), then the
+coinbase value; then the witness checks of every transaction in block
+order (the policy-spend rules, the scripts, then the size-based minimum
+fee). A block with a bad
+signature in one transaction and an overspend in a later one is therefore
+id-committed. The verdict is the one of any order (every rule must hold);
+only the first failure reported, and so the error class of a block failing
+several rules, follows this order. It also means no signature is checked
+for a block that fails a cheap rule (Bitcoin Core's `ConnectBlock` likewise
+runs `CheckTxInputs` for every transaction and leaves the scripts to its
+check queue).
 
 The failures that exist only at/after the activation (an invalid version, a
 non-canonical witness, a sighash-v3 signature) are id-committed there like
 every other failure. Relay-policy verdicts (`non-standard-version`, a
 non-canonical witness or a suite 0x0002 key below the activation) are not
 block-validity rules and never reach this classification.
+
+A failure to READ the node's own UTXO view while a block is validated (an
+I/O error, a corrupted or undecodable row, a coin row without its index
+row, a confirmed policy coin without its tx-index row when a relative
+timelock needs its confirmation) is neither: it is no verdict at all, at
+every height (re-audit B1-T12). The connect is abandoned before anything is written, nothing is
+marked or persisted, the triggering block is rolled back out of the DAG,
+and the block is validated again when it is next received or the node
+restarts. A coinbase-height row that cannot be read is never taken for "not
+a coinbase" (which skipped the maturity rule). Bitcoin Core draws the same
+line: a coins-database read error aborts the node
+(`CCoinsViewErrorCatcher`), it is never cached as an invalid block.
 
 An id-committed failure disqualifies the block and its selected-chain
 descendants and is persisted (`invalid_block/<id>`), as before. A
@@ -1053,7 +1632,24 @@ the pull is retried at the sweep's backoff. `accept_block` takes a copy of the
 same id whose witness root differs from every body already rejected for it:
 the copy passes the same acceptance checks as a new block, replaces the body,
 and the chain is re-evaluated. A block in the DAG whose body is missing (for example after a
-restart) is treated the same way. At/after the activation the witness
+restart) is treated the same way.
+
+Waiting is bounded by the best chain (re-audit B1-T13,
+`GhostDAG::is_body_wanted`): the body of a waiting block is wanted — requested
+from peers, chased by the sweep, and a copy processed — only while some
+block on whose selected chain it lies (itself included, with no persisted
+disqualification in between) orders above the selected tip under the tip
+order (`blue_work`, then `blue_score`, then hash), or while an operator
+override needs it (`accept::request_bodies`, and a body dropped during the
+override's own move), until a body arrives. Once the honest chain is heavier
+than the waiting branch its bodies are neither fetched nor taken (a copy is
+known, like an unrequested block with less work than the tip in Bitcoin
+Core); they are wanted again if the branch becomes heavier. A branch whose
+selected chain misses the PoWit-finalized checkpoint
+(`GhostDAG::set_finalized`, `conflicts_with_finality`) can never be
+selected, so its bodies are never wanted, however heavy it is. A block whose
+body no witness can fix is disqualified outright (above), so it never
+waits. At/after the activation the witness
 commitment fixes every byte of a stored body, so every connect-time failure is
 id-committed and is persisted as before. `node/tests/fix_block_rules.rs`
 (`witness_corrupted_*`) covers the corrupted-then-honest order, restarts, and
@@ -1075,6 +1671,10 @@ descendants, which is a hash cycle. BIP30 below is the rule that guarantees
 safety in any case.
 
 ### No overwrite of an unspent coin (VAL-2 BIP30)
+
+(On this chain BIP30 and the rule of the next section apply at every
+height, as they have since before the 2026-10-14 reset; the audit's text
+below describes them from its activation.)
 
 From the activation, a block is invalid if any output `(txid, i)` of any of
 its transactions, the coinbase included, is an UNSPENT coin in the state of
@@ -1107,14 +1707,190 @@ txid, which covers the commitment. Mempool admission and templates never
 produce such a spend, because a coinbase can be referenced only after its
 block is connected, and it is then immature.
 
+### Coinbase maturity (re-audit B1-T14)
+
+An output of the coinbase of block C may be spent by a transaction of block B
+only if `depth(B, C) >= COINBASE_MATURITY` (100). Every output of the
+coinbase counts, the witness-share outputs of a PoWit coinbase (from
+`powit_height()`) as much as the miner's: the coinbase-height row is kept
+per txid. C is always on B's selected chain: only selected-chain blocks are
+applied, and the coinbase-height row of a coinbase exists exactly while its
+block is applied.
+
+- Below the activation (`B.height < activation`): `depth = B.height -
+  C.height`, both HEADER heights (saturating at 0; the coinbase-height row
+  stores `C.height`). This is the historical rule, kept exactly. A header
+  height is `max(parent DAG heights) + 1`, so it is not a position on the
+  selected chain: a B that merges a long, light side tip sits far above its
+  selected-chain position, and B can then spend a coinbase with fewer than
+  100 selected-chain confirmations (and, symmetrically, a coinbase whose own
+  block merged such a tip stays immature longer).
+- From the activation (`B.height >= activation`, the block-rule predicate):
+  `depth = dag_height(B) - dag_height(C)` (saturating at 0), where
+  `dag_height` is `GhostdagData::height` (selected parent's + 1). `dag_height(B)`
+  is computed from B's parents' DAG records: the parent GhostDAG selects
+  (greatest `(blue_work, blue_score, hash)`) plus one. `dag_height(C)` is the
+  DAG record of the block the transaction index names for the coinbase txid.
+  This is the number of selected-chain blocks from C's child to B inclusive,
+  as Bitcoin Core's `nSpendHeight - coin.nHeight` counts active-chain blocks.
+
+One function decides, `accept::check_coinbase_maturity_in_view`, for the
+connect path (extension, reorg, start-up: `validate_block_in_view`), the fork
+state check (`reorg::validate_fork_block_state`), mempool admission and the
+post-connect revalidation, and the template self-check
+(`admission::coinbase_maturity_for_next_block`). For a block not yet built
+the regime is that of the node's next block height, and `dag_height(B)` is
+the applied tip's DAG height + 1 (the template's selected parent is the
+applied tip). A read failure of any of these rows is a storage error, never
+"not a coinbase" (re-audit B1-T12).
+
+**Timelocks.** A relative timelock (`older` of a spend policy,
+docs/MULTISIG.md; `blockval::check_policy_spends_with_confirmations`)
+counts the confirmations of the output it spends, the quantity maturity
+counts, and the same measure decides it (`accept::MaturityRule`,
+`accept::confirmations_in_view`): below the activation `B.height` minus the
+header height the transaction index records for the spent output's
+transaction (this chain's rule, kept exactly); from the activation
+`dag_height(B)` minus the DAG height of the block the transaction index
+names for it. An output created earlier in B itself has 0 confirmations in
+both regimes; an output of an unconfirmed transaction has none (a relative
+timelock on it is not met). The connect path, mempool admission and the
+template self-check use it (`admission::confirmations_for_next_block` for
+a block not yet built). Absolute heights are not depths: the locktime
+finality rule (`locktime <= B.height`) and a policy's absolute timelock
+(`after <= locktime`) compare with B's header height in both regimes, the
+height every other height-gated rule (subsidy, activations, PoWit) reads,
+and are unchanged. A coinbase output locked to a policy needs both its
+maturity and its policy's timelocks.
+
+Wallets: `getutxos` reports, for a coinbase output (witness-share outputs
+included), a `coinbase_height` such that the wallets' unchanged comparison
+`next_block_height - coinbase_height >= COINBASE_MATURITY`
+(`next_block_height` from `getdaginfo`; `wallet::send::utxo_row_spendable_at`,
+which the CLI and web wallets use to leave immature rows out) applies the
+rule in force for the next block: below the activation the header height of
+C; from it `next_block_height - depth(next block, C)`
+(`admission::coinbase_height_for_wallets`). The CLI wallet and the WASM wallet
+therefore need no change.
+
+Vectors: `maturity/merge-header-depth-100-dag-depth-10/{pre,post}` (valid
+below, immature from the activation) and
+`maturity/inflated-coinbase-header-dag-depth-100/{pre,post}` (immature below,
+valid from it) in `reference/tx_vectors.json`. A case's optional `dag_height`
+is the evaluation block's DAG height and a prevout's optional
+`coinbase_dag_height` the DAG height of the coinbase's block; when absent
+they equal `height` and `coinbase_height` (a linear chain).
+
 ### Block size (VAL-12)
 
-From the activation, `MAX_BLOCK_SIZE = 1,000,000` bytes is compared with the
-canonical wire encoding `Block::to_wire_bytes` (`Block::wire_size`). That is
-the encoding transaction fee rates and the minimum fee use, so witness bytes
-count as they do for fees. Before the activation it is compared with the
-bincode encoding `Block::size_bytes`, as before. Templates budget with the
-measure of their own height.
+On this chain `MAX_BLOCK_SIZE = 1,000,000` bytes is compared with the
+canonical wire encoding `Block::to_wire_bytes` at every height: from the
+activation `Block::wire_size`, below it `block_rules::legacy_block_size`
+(`Block::size_bytes`, "the bytes that are relayed and stored"), the same
+length. That is the encoding transaction fee rates and the minimum fee use,
+so witness bytes count as they do for fees. From `powit_height()` (10,000 on
+mainnet) the encoding carries the PoWit section, and the section counts in
+both measures (`wire_size` since main's 45c9c97, `size_bytes` since PoWit
+itself). The audit's VAL-12 measured bincode below its activation; this
+chain never did.
+
+```text
+size(B) = 4 + cs(n_parents) + 32*n_parents + 32 + 8 + 4 + 8      // version, parents, merkle_root, timestamp, bits, nonce
+        + 8 + 8                                                  // blue_score, height: fixed-width u64 LE
+        + cs(n_tx) + Σ tx.to_wire_bytes(true)                    // transactions, block order
+        + cs(n_shielded) + Σ shielded                            // none is valid today
+        + powit_section                                          // from powit_height(): PowitBody::write_wire
+```
+
+(`cs` the minimal CompactSize varint of "Wire encoding".) The measure does
+not depend on the `blue_score` a copy carries (re-audit B1-T0 / B2-T8): the
+block id does not commit to it (POW-8), and the node replaces the received
+value with the one derived from the block's parents (`max(parent
+blue_score) + 1`) before it stores, serves or relays the body. A measure
+that read the received value could put one block id within the limit in the
+copy gossip delivered and over it in the copy every upgraded node served (the
+audit's bincode measure: a block of exactly 1,000,000 bytes mined with
+`blue_score` 0 was accepted by the online network and refused by every node
+that synced it later once blue scores pass 250, a 3-byte varint; a
+permanent split). The wire header writes `blue_score` as a fixed-width u64,
+so every copy measures the same, the same as with `blue_score` written as 0:
+one verdict per block id. Main's nodes measure exactly this
+(`Block::size_bytes`, PoWit section included), so the rule changes no
+verdict of theirs: no block they accepted becomes invalid and none they
+refused becomes valid. Heights are measured as carried: `accept_block`
+requires `height = max(parent DAG heights) + 1`, so every accepted copy
+carries the same value and the same PoWit section presence.
+
+`accept_block` checks the size rule of the block's verified header height
+(`block_rules::check_block_size_at`, the one size check of both regimes,
+also called by `Block::validate_structure_without_pow_at`,
+`check_block_hardened_at` and the template self-check), and every ingress
+path checks it before (no proof of work is spent on a block that is too
+large). Templates budget with the measure of their own height, the PoWit
+section and the witness-share coinbase outputs on top of the transactions.
+Vectors: `size/*` in `reference/block_vectors.json` (`wire_size` recorded
+for every block); the `size/wire-exactly-1000000-blue-score-*/pre` and
+`size/wire-1000001-bincode-below-blue-score-*/pre` cases are the same block
+ids as `size/wire-exactly-1000000/pre` (valid) and
+`size/wire-1000001-bincode-below/pre` (`block-size`) carrying `blue_score` 0
+and `u64::MAX`, with the same verdicts (`node/tests/fix_wire_metadata.rs`
+replays the finding end to end).
+
+### Parent list (B2-T10, DAG-12)
+
+`header.parents` is a list of 32-byte block ids, encoded as `varint(n) ‖ n ×
+id` ("Wire encoding"). The rules, at every height unless stated:
+
+- **Count**: `1 ≤ n ≤ MAX_PARENTS = 256` for every block but the genesis
+  (which has none). A header with more than 256 parents does not decode.
+- **Known**: every listed parent must be in the DAG; a block with an unknown
+  parent waits as an orphan until it is (never accepted before).
+- **Order**: free. The list as written is committed by the block id (it is
+  part of `pow_preimage`) and, from the activation, by the coinbase parents
+  commitment ("Coinbase commitment", which covers header order: a reordered
+  list is another commitment). Nothing else depends on the order: the
+  selected parent is the maximum of a total order (`(blue_work, blue_score,
+  id)`), and the mergeset and the coloring depend only on the set of
+  parents.
+- **Repeated parent**: below the activation a parent may be listed more
+  than once; the DAG treats the list as a set, so `[X, Y, X]` has exactly
+  the GhostDAG data of `[X, Y]` (only the stored parent list differs). At and
+  after the activation (`B.height`, the block-rule predicate of "Which
+  height") a header that lists any id twice is invalid: `duplicate parent`
+  (`block_rules::check_parents_distinct`, run by `check_hardened_body`, so by
+  `Block::validate_structure` on every ingress path, by `accept_block`
+  before the block is stored, and by the start-up recheck of blocks a
+  pre-upgrade binary stored, which disqualifies such a block with its id).
+  Why: a repeated parent is never useful (it changes no GhostDAG data), it
+  only adds a second header (and block id) for the same DAG position and
+  spends the parent budget, and Kaspa, whose post-activation rules GnB
+  follows, rejects it; a second implementation following Kaspa would
+  otherwise split from GnB on such a block. Every producer lists each parent
+  once (`GhostDAG::select_parents_for_template` takes distinct tips; the
+  template self-check runs the rule), on both sides of the boundary
+  (`node/tests/fix_b2t10_parent_list.rs`).
+- **Redundant parent** (a parent in the past of another listed parent): valid
+  at every height. It is never the selected parent (its blue work is below
+  that of the parent it is an ancestor of: blue work strictly grows along
+  every parent edge) and adds nothing to the mergeset (it is already in that
+  parent's past). It does count in the header height below. GnB does not
+  forbid it, unlike Kaspa: the check needs a reachability query per pair of
+  parents at header validation, a DAG-context rule rather than a
+  context-free one, and no producer emits one (template parents are tips,
+  which are never ancestors of each other). Forbidding it later would be a
+  new activation.
+- **Header height**: `B.height = 1 + max(p.height for p in parents)`, where
+  `p.height` is the DAG height `GhostdagData::height` of the listed parent
+  (the selected-parent chain length), over EVERY listed parent: a repeated
+  parent does not change it; a redundant parent can raise it (a parent with
+  a larger DAG height than the parent it is an ancestor of, which DAG-8
+  allows), and with it the height-gated rules, the expected bits and the
+  coinbase maturity of B.
+
+Vectors: `reference/block_vectors.json` `parents/duplicate/*` and
+`parents/duplicate-at-mainnet-height-*`; `reference/ghostdag_vectors.json`
+`parents/duplicate` and `parents/redundant-ancestor` (the GhostDAG data of
+both shapes and their header heights, `node/tests/ghostdag_vectors.rs`).
 
 ### Pow limit (POW-3)
 
@@ -1160,7 +1936,29 @@ accepted elsewhere. At start-up, before the applied chain is reconnected,
 `accept::recheck_stored_blocks_under_hardening` checks every stored block at
 header height >= the activation (computed from the DAG; no body is read when
 there is none) against the context-free rules above, once per activation
-height (meta key `hardening_block_rules_checked`, u64 LE). A failure the
+height (meta key `hardening_block_rules_checked`, u64 LE). The recheck runs
+at the first start of a binary with these rules, before any block is accepted,
+so every candidate was stored by a binary without them. A candidate whose body
+is gone (a pre-upgrade binary pruned it, keeping its undo record) cannot be
+read, and is disqualified conservatively, like an id-committed failure
+(re-audit B2-T1): that binary checked the LEGACY header root against the body
+before storing the block, so its id commits to a legacy root that no body
+can match under the tagged rule, and no upgraded node ever accepted it. It
+used to be counted as unchecked while the recheck still recorded itself as
+done, so a pruned legacy block stayed valid and could become the best valid
+tip once its unpruned descendants were disqualified (Bitcoin Core likewise
+never trusts blocks connected without a newly activated deployment's checks:
+`NeedsRedownload` requires them to be validated again). The recheck runs
+again whenever the recorded activation height differs from the binary's (a
+switch between builds with different activation heights), when the candidates
+can include blocks this node accepted under the rules and pruned since. So
+pruning writes, in the batch that deletes a body, a marker (CF_META key
+`hardened_body/<hash>`) when that body passed every context-free rule above as
+if active; these rules depend only on the block's own height, so the marker
+holds for every activation at or below it. A body-less candidate with the
+marker stays valid; one without it is disqualified as above. If the recheck itself
+fails (a storage error), nothing is recorded and the node refuses to start,
+so it never stores a block before the recheck has completed. A failure the
 block id commits to (legacy or wrong header root, coinbase format, a 64-byte
 transaction, the commitment's tag, height or parents, or any failure of a body
 whose witness root matches) disqualifies the block and EVERY block that

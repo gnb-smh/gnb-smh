@@ -4,7 +4,15 @@
 // fields are type-checked (hex64, address, num, sats) before use.
 import { html, raw, hex64, address, num, numOr, sats, isHex } from "./safe.js";
 
-export const SAT = 100000000n, CAP = 1000000000000000n, CARRY = 99999999789793n;
+export const SAT = 100000000n, CAP = 1250000000000000n, CARRY = 99999999789793n;
+// Team and founder allocations (core::vesting): 2 × 36 tranches of 1,250,000 GNB / 36,
+// tranche k spendable from height 1,051,200 + k × 87,600.
+export const LOCK_EACH = 125000000000000n, LOCK_CLIFF = 1051200, LOCK_STEP = 87600, LOCK_N = 36;
+export const unlockedSat = (h) => {
+  const k = Math.max(0, Math.min(LOCK_N, Math.floor((h - LOCK_CLIFF) / LOCK_STEP)));
+  const base = LOCK_EACH / BigInt(LOCK_N);
+  return 2n * (k === LOCK_N ? LOCK_EACH : base * BigInt(k));
+};
 export const TARGET = 30;
 const POW_LIMIT = BigInt("0xffff" + "0".repeat(60)); // target of compact bits 0x2100ffff = difficulty 1
 
@@ -175,7 +183,9 @@ export function txCard(t, standalone = false, offChain = false) {
 export const homeHead = () => html`<div class="pagehead"><span class="eyebrow">GnB mainnet</span><h1>Network overview</h1><p class="sub">A BlockDAG secured by GnB-SMH, a sequential memory-hard proof of work. Live data, refreshed every 10 seconds.</p></div><div id="h-stats">${loading("Reading the chain")}</div><div id="h-rest"></div>`;
 
 export function homeStats({ dag, supply, stats, pct, chain, mem }) {
-  const issued = sats(supply.issued_sat) ?? 0n, total = CARRY + issued;
+  const height = num(supply.current_height);
+  const issued = sats(supply.issued_sat) ?? 0n, unlocked = Number.isSafeInteger(height) ? unlockedSat(height) : 0n;
+  const locked = 2n * LOCK_EACH - unlocked, total = CARRY + issued + unlocked;
   const nextHalving = num(supply.next_halving_height) - num(supply.current_height);
   const stat = (k, v, d, hot = false) => html`<div class="stat"><span class="k">${k}</span><span class="v ${hot ? "hot" : ""}">${v}</span>${d ? html`<span class="d">${d}</span>` : ""}</div>`;
   const pctCarry = Number((CARRY * 10000n) / CAP) / 100, pctMined = Number((issued * 1000000n) / CAP) / 10000;
@@ -185,7 +195,7 @@ export function homeStats({ dag, supply, stats, pct, chain, mem }) {
    ${stat("Block time", `${numOr(pct.p50_secs)}s`, `median of last ${numOr(pct.window)} · mean ${numOr(pct.avg_secs, (n) => n.toFixed(1))}s · target ${numOr(pct.target_secs)}s`)}
    ${stat("Hashrate", hashrate(stats.hashrate_hs), "GnB-SMH evaluations per second")}
    ${stat("Difficulty", diff(first?.difficulty || 0), `ASERT · bits ${first?.bits || ""}`)}
-   ${stat("Circulating", compact(total.toString()), html`of 10M GNB cap · ${pctCarry.toFixed(2)}% carryover + ${pctMined.toFixed(4)}% mined<div class="meter" aria-hidden="true"><i style="width:${pctWidth(pctCarry)}%;background:var(--mark)"></i><i style="width:${pctWidth(Math.max(pctMined, 0.3))}%;background:var(--fluor-hi)"></i></div>`)}
+   ${stat("Circulating", compact(total.toString()), html`of 12.5M GNB cap · ${pctCarry.toFixed(2)}% carryover + ${pctMined.toFixed(4)}% mined · ${compact(locked.toString())} team/founder locked<div class="meter" aria-hidden="true"><i style="width:${pctWidth(pctCarry)}%;background:var(--mark)"></i><i style="width:${pctWidth(Math.max(pctMined, 0.3))}%;background:var(--fluor-hi)"></i></div>`)}
    ${stat("Block reward", numOr(supply.subsidy_per_block_sat, (n) => (n / 1e8).toFixed(4)), `GNB · next halving in ${int(nextHalving)} blocks`)}
    ${stat("Mempool", int(mem.size), `min fee ${numOr(supply.min_tx_fee_sat, (n) => (n / 1e8).toFixed(4))} GNB`)}
    ${stat("Tips", int(dag.tip_count), `GhostDAG k = ${numOr(dag.k)}`)}
@@ -276,12 +286,17 @@ export function addressPage(addrIn, h, carry, page, per) {
   const items = arr(h.items);
   const off = raw(`style="opacity:.4;pointer-events:none"`);
   const inCarry = carry && carry.in_carryover === true;
+  // B1-T11: "Older" follows the page's cursor; "Newer" uses the offset form,
+  // which the node serves up to max_offset (deeper: back to the newest page).
+  const cursor = typeof h.next_cursor === "string" && /^[0-9a-f]{32}$/.test(h.next_cursor) ? h.next_cursor : null;
+  const maxOffset = numOr(h.max_offset, (n) => n, 10000);
+  const newer = page === 0 ? off : (page - 1) * per <= maxOffset ? html`href="#/address/${addr}/${page - 1}"` : html`href="#/address/${addr}"`;
   return html`<div class="pagehead"><span class="eyebrow">Address</span><h1 class="amount" style="font-family:var(--f-display)">${gnb(h.balance)}</h1><div class="hash">${addr}${copyBtn(addr)}</div></div>
   <div class="grid2">
    <section class="card"><div class="kv">
     <div>Balance</div><div class="amount">${gnb(h.balance)}</div>
     <div>Unspent outputs</div><div class="mono">${int(h.utxo_count)}</div>
-    <div>Share of 10M cap</div><div class="mono">${(Number((balance * 1000000n) / CAP) / 10000).toFixed(4)}%</div>
+    <div>Share of 12.5M cap</div><div class="mono">${(Number((balance * 1000000n) / CAP) / 10000).toFixed(4)}%</div>
     <div>Transactions</div><div class="mono">${int(h.total)} <span class="muted">indexed movements</span></div>
    </div></section>
    <section class="card"><div class="cardhead"><h2>Bloch carryover</h2></div>${inCarry
@@ -292,8 +307,8 @@ export function addressPage(addrIn, h, carry, page, per) {
   ${items.length ? html`<div class="tablewrap"><table><thead><tr><th class="num">Height</th><th>Transaction</th><th>Direction</th><th class="num">Amount</th></tr></thead><tbody>
    ${items.map((i) => { const incoming = i.direction === "in"; return html`<tr><td class="num mono">${int(i.height)}</td><td>${link.tx(i.txid)}</td><td>${incoming ? "received" : "sent"}</td><td class="num amount ${incoming ? "pos" : "neg"}">${incoming ? "+" : "−"}${gnb(i.amount)}</td></tr>`; })}
   </tbody></table></div><div class="pager"><span>page ${page + 1} of ${pages}</span>
-   <a class="btn ghost" ${page ? html`href="#/address/${addr}/${page - 1}"` : off}>← Newer</a>
-   <a class="btn ghost" ${page + 1 < pages ? html`href="#/address/${addr}/${page + 1}"` : off}>Older →</a></div>`
+   <a class="btn ghost" ${newer}>← Newer</a>
+   <a class="btn ghost" ${cursor ? html`href="#/address/${addr}/${page + 1}/${cursor}"` : page + 1 < pages ? html`href="#/address/${addr}/${page + 1}"` : off}>Older →</a></div>`
    : html`<div class="empty">${inCarry ? "No on-chain movements yet; the balance comes from the genesis carryover." : "No movements yet."}</div>`}</section>`;
 }
 

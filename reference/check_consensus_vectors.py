@@ -65,6 +65,8 @@ def view_of(prevouts: list) -> gv.View:
         v.confirmed_txids.add(txid)
         if p["coinbase_height"] is not None:
             v.coinbase_heights[txid] = int(p["coinbase_height"])
+        if p.get("coinbase_dag_height") is not None:
+            v.coinbase_dag_heights[txid] = int(p["coinbase_dag_height"])
     return v
 
 
@@ -170,6 +172,8 @@ def check_tx_vectors(chk: Checker) -> int:
 
         # Consensus.
         view = view_of(case["prevouts"])
+        if case.get("dag_height") is not None:
+            view.dag_height = int(case["dag_height"])
         block = wrapper_block(tx, height, case["prevouts"], wrapper_ss)
 
         def consensus(out):
@@ -229,6 +233,8 @@ def check_block_vectors(chk: Checker) -> int:
         chk.eq(cid, "parents_commitment", d["parents_commitment"], mk.parents_commitment(b.header.parents).hex())
         chk.eq(cid, "subsidy", int(d["subsidy"]), gv.subsidy(b.height))
         chk.eq(cid, "wire_size", d["wire_size"], len(raw))
+        # Re-audit B1-T0: the pre-activation size measure is the wire length.
+        chk.eq(cid, "legacy size", d["wire_size"], gv.legacy_block_size(b))
 
         view = view_of(case["prevouts"])
         got, _ = verdict_of(lambda out: gv.validate_block(b, view, act, case["scope"], case["pow"], out))

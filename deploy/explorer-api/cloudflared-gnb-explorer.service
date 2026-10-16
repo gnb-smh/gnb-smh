@@ -6,11 +6,20 @@
 #
 # One-time setup (as root; the credentials file is created by cloudflared and
 # must stay mode 0600, owned by the cloudflared user):
+#   useradd --system --no-create-home --home-dir /nonexistent \
+#           --shell /usr/sbin/nologin cloudflared
 #   cloudflared tunnel login
 #   cloudflared tunnel create gnb-explorer-<host>
 #   cloudflared tunnel route dns gnb-explorer-<host> <tunnel hostname>
 #   install -m 0644 cloudflared-config.example.yml /etc/cloudflared/gnb-explorer.yml
 #   (edit the tunnel id, credentials path and hostname in that file)
+#   chown cloudflared: /etc/cloudflared/<tunnel id>.json; chmod 0600 it
+#
+# Audit OPS-3: sandboxed like the node. cloudflared only reads its config and
+# credentials under /etc/cloudflared, connects out to Cloudflare (QUIC/UDP or
+# HTTP/2 over TCP) and to the API on loopback. Check with
+# `systemd-analyze security cloudflared-gnb-explorer`;
+# deploy/test_deploy_files.py keeps the directives below in place.
 [Unit]
 Description=Cloudflare Tunnel for the GnB explorer API
 After=network-online.target gnb-explorer-api.service
@@ -23,10 +32,43 @@ Group=cloudflared
 ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel --config /etc/cloudflared/gnb-explorer.yml run
 Restart=on-failure
 RestartSec=5
+UMask=0077
+
+# ── Sandboxing (audit OPS-3) ────────────────────────────────────────────────
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+PrivateIPC=true
+PrivateUsers=true
+RemoveIPC=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+# No capabilities. (cloudflared's ICMP proxy would need CAP_NET_RAW or the
+# ping group; the explorer tunnel does not use it.)
+CapabilityBoundingSet=
+AmbientCapabilities=
+# AF_NETLINK: Go's resolver and interface lookups use rtnetlink.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# A Go binary: no writable-executable mappings.
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+DevicePolicy=closed
+KeyringMode=private
 
 [Install]
 WantedBy=multi-user.target

@@ -5,8 +5,21 @@
 //! FIX #6: Peer memory (known_peers.json).
 //! Sprint P: PEX hardening (rate limit, address validation, known_peers cap).
 
+pub mod chain_separation;
+pub mod misbehaviour;
+pub mod discourage;
+// NET-11 / B1-T9 connection management. Parts of their API serve the
+// library's tests and embedders only, not the binary.
+#[allow(dead_code)]
+pub mod addrbook;
+#[allow(dead_code)]
+pub mod connmgr;
+#[allow(dead_code)]
+pub mod gossip_gate;
 pub mod pex_validator;
+pub mod pull;
 pub mod ratelimit;
+pub mod serve;
 pub mod sync_rr;
 
 use libp2p::{
@@ -23,9 +36,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use sha2::{Sha256, Digest};
 
+use connmgr::{ConnKind, ConnManager, DialIntent, OutboundAction};
 use pex_validator::{
-    PexRateLimiter, PexStats, AddrBook,
-    is_valid_public_multiaddr, is_lan_multiaddr, enforce_cap, prune_invalid, add_tried, addr_peer_id,
+    PexRateLimiter, PexStats, AddrBook, TriedTable,
+    is_valid_public_multiaddr, is_lan_multiaddr, is_acceptable_ip, enforce_cap, prune_invalid, addr_peer_id,
+    netgroup, normalize_peer_addr,
     PEX_BATCH_LIMIT, KNOWN_PEERS_CAP,
 };
 
@@ -50,6 +65,14 @@ static INGEST_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// Total inbound frames dropped because the swarm→processor channel was full.
 pub fn ingest_drops_total() -> u64 {
     INGEST_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Bytes of `/gnb/sync/1` answers handed to libp2p and not yet written to
+/// their peer (no `ResponseSent` / `InboundFailure` yet), over every
+/// network loop of the process (B1-T18 / B2-T6; see [`serve`]).
+#[allow(dead_code)] // library API and tests; the node binary compiles this module too
+pub fn sync_send_bytes_outstanding() -> u64 {
+    serve::send_bytes_outstanding()
 }
 
 /// Forward an inbound frame to the processor, counting + logging drops instead
@@ -129,12 +152,32 @@ pub const GOSSIP_HISTORY_LENGTH: usize = 12;
 /// (see [`NetworkNode::attach_control`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetworkControl {
-    /// MEM-5 / MEM-6: `peer` delivered a consensus-invalid transaction whose
+    /// One misbehaviour of `peer` that the processor proved and gossipsub
+    /// cannot see: MEM-5 / MEM-6, a consensus-invalid transaction whose
     /// gossip frame can no longer be answered `Reject` (it was buffered as an
     /// orphan and left gossipsub's cache before its re-try proved it
-    /// invalid). The network loop applies one application-score penalty, as
-    /// for a wire violation (decaying, shared with the wire tracker).
+    /// invalid); B1-T2, an invalid block sent as the ANSWER to one of our
+    /// directed pulls (judged `Reject` exactly like a gossip copy, which
+    /// would cost its author gossipsub's invalid-delivery penalty). The
+    /// network loop applies one penalty to the shared misbehaviour score
+    /// (`misbehaviour`: decaying; disconnect and discourage at the
+    /// threshold).
     PenalizePeer(PeerId),
+    /// B1-T2: GetBlock pulls for blocks that `source`'s directed Headers or
+    /// Tips answer announced (the processor found them missing). Queued
+    /// with `source` as the preferred peer and charged to its quota
+    /// (`pull::MAX_PENDING_PER_SOURCE`; with every other source that
+    /// connected to us, `pull::MAX_PENDING_INBOUND_ATTRIBUTED`), so peers'
+    /// answers cannot fill the shared pull queue.
+    Fetch { source: PeerId, hashes: Vec<[u8; 32]> },
+    /// NET-2 residual / B1-T7 (Phase 4): `peer` sent data no honest node
+    /// sends (a block frame it authored with an invalid proof of work, an
+    /// invalid structure or contextually invalid header, or one whose bits
+    /// fail the orphan floor — see `ingress::block_penalty`). Bitcoin Core's
+    /// `Misbehaving`: the network loop disconnects it and discourages its
+    /// address (`discourage::Discouraged`), so a fresh identity from the
+    /// same address is not accepted either.
+    Misbehaving(PeerId),
 }
 
 /// Peer lifecycle notices from the network loop to the message processor
@@ -175,6 +218,18 @@ impl InboundOrigin {
     /// True for answers to our own directed pulls (solicited data).
     pub fn is_solicited(&self) -> bool {
         matches!(self, InboundOrigin::Directed { .. })
+    }
+
+    /// B1-T7: the delivering peer authored the frame (gossipsub's signed
+    /// source is the propagation source), or sent it as the answer to our own
+    /// pull. Who a refused block frame is charged to follows this
+    /// (`ingress::block_penalty`).
+    pub fn delivered_by_author(&self) -> bool {
+        match self {
+            InboundOrigin::Gossip { propagation_source, author, .. } => *author == Some(*propagation_source),
+            InboundOrigin::Directed { .. } => true,
+            InboundOrigin::Local => false,
+        }
     }
 
     /// The remote peer responsible for this frame: the directed responder or
@@ -271,22 +326,58 @@ pub fn gossip_disposition(msg: &NetworkMessage, validator_attached: bool, claim_
 enum IngestSink {
     /// Legacy consumer: bare messages, no verdicts expected.
     Legacy(mpsc::Sender<NetworkMessage>),
-    /// Validated consumer: frames with origin; verdicts come back.
-    Validated(mpsc::Sender<Inbound>),
+    /// Validated consumer: frames with origin; verdicts come back. B1-T19:
+    /// with `txs` attached ([`NetworkNode::attach_tx_ingest`]) gossip
+    /// transactions — and PoWit items, which travel on the transaction topic
+    /// and cost a GnB-SMH v3 evaluation or a KES signature check each — go
+    /// to their own channel (and their own consumer), so a flood of either
+    /// can neither fill the block channel (a full channel drops frames) nor
+    /// queue block work behind its own.
+    Validated { main: mpsc::Sender<Inbound>, txs: Option<mpsc::Sender<Inbound>> },
 }
 
 impl IngestSink {
     fn validator_attached(&self) -> bool {
-        matches!(self, IngestSink::Validated(_))
+        matches!(self, IngestSink::Validated { .. })
     }
 
     fn deliver(&self, msg: NetworkMessage, origin: InboundOrigin, source: &str) -> bool {
         let kind = msg.kind_name();
         match self {
             IngestSink::Legacy(tx) => forward_to_processor(tx, msg, kind, source),
-            IngestSink::Validated(tx) => forward_to_processor(tx, Inbound { msg, origin }, kind, source),
+            IngestSink::Validated { txs: Some(txs), .. } if goes_to_tx_ingest(&msg) => {
+                forward_to_processor(txs, Inbound { msg, origin }, kind, source)
+            }
+            IngestSink::Validated { main, .. } => forward_to_processor(main, Inbound { msg, origin }, kind, source),
         }
     }
+}
+
+/// B1-T19: the frames a validated consumer with a transaction ingest
+/// ([`NetworkNode::attach_tx_ingest`]) receives there instead of on the block
+/// channel: gossip transactions and PoWit items (both on the transaction
+/// topic, both judged by the transaction relay task).
+pub fn goes_to_tx_ingest(msg: &NetworkMessage) -> bool {
+    matches!(msg, NetworkMessage::NewTransaction { .. } | NetworkMessage::NewPowitItem { .. })
+}
+
+/// B1-T7 / NET-4 residual (Phase 4): may a wire violation (oversized,
+/// bounds-violating, padded or non-canonical frame) be charged to the peer
+/// that delivered it? Releases older than the validated relay (NET-2)
+/// forward every frame unvalidated and follow the chain until the hardening
+/// activation block, so a violation can reach us through an honest older
+/// relay: it is charged only if the delivering peer AUTHORED the frame
+/// (`self_authored`: gossipsub's signed source is the propagation source),
+/// or once the chain contains the activation block (`penalties_in_force`,
+/// `ingress::block_penalties_in_force`; every release since NET-2 refuses
+/// such a frame instead of forwarding it). Returns `(charge, reject)`:
+/// whether to apply the application-score penalty to the delivering peer,
+/// and whether to report `Reject` to gossipsub — only when no honest relay
+/// can have forwarded a duplicate (gossipsub charges every peer that
+/// delivered one); a self-authored violation before that is answered
+/// `Ignore` and charged to its author alone.
+pub fn wire_violation_penalty(self_authored: bool, penalties_in_force: bool) -> (bool, bool) {
+    (self_authored || penalties_in_force, penalties_in_force)
 }
 
 // ── Messages ──────────────────────────────────────────────────────────────────
@@ -697,6 +788,9 @@ pub enum WireReaction {
 pub struct WirePenaltyTracker {
     /// peer -> (score, last decay step, last penalty)
     penalties: std::collections::HashMap<PeerId, (f64, std::time::Instant, std::time::Instant)>,
+    /// Peers forgotten to make room, whose gossipsub application score the
+    /// network loop must reset ([`Self::take_evicted`]).
+    evicted: Vec<PeerId>,
 }
 
 impl Default for WirePenaltyTracker {
@@ -707,7 +801,7 @@ impl Default for WirePenaltyTracker {
 
 impl WirePenaltyTracker {
     pub fn new() -> Self {
-        Self { penalties: std::collections::HashMap::new() }
+        Self { penalties: std::collections::HashMap::new(), evicted: Vec::new() }
     }
 
     /// Decode an untrusted gossip frame and decide the reaction. This is the
@@ -721,15 +815,31 @@ impl WirePenaltyTracker {
     ///   - plain-malformed frames and non-canonical frames of a relayable
     ///     message (`NewBlock`, `NewTransaction`) are ignored (version skew:
     ///     an older release accepts and relays the latter).
+    #[allow(dead_code)] // tests only (the network loop uses `classify_gated`); the node binary compiles this module too
     pub fn classify(&mut self, peer: PeerId, data: &[u8]) -> WireReaction {
+        self.classify_gated(peer, data, true)
+    }
+
+    /// [`Self::classify`] with the B1-T7 penalty gate
+    /// ([`wire_violation_penalty`]): with `charge = false` a protocol
+    /// violation is refused like a malformed frame (`IgnoreMalformed`, never
+    /// forwarded) and nothing is recorded against `peer`.
+    pub fn classify_gated(&mut self, peer: PeerId, data: &[u8], charge: bool) -> WireReaction {
         match decode_wire_message(data) {
             Ok(msg) => WireReaction::Accept(msg),
-            Err(e) if e.is_protocol_violation() => {
+            Err(e) if e.is_protocol_violation() && charge => {
                 let score = self.record_violation(peer);
                 WireReaction::Penalize { error: e, score }
             }
             Err(e) => WireReaction::IgnoreMalformed(format!("{:?}", e)),
         }
+    }
+
+    /// Peers the bounded map forgot to make room since the last call
+    /// (NET-4 residual): their gossipsub application score must be reset, or
+    /// it would stay at its last value forever.
+    pub fn take_evicted(&mut self) -> Vec<PeerId> {
+        std::mem::take(&mut self.evicted)
     }
 
     /// H-R3-4: apply one [`WIRE_VIOLATION_PENALTY`] to `peer` and return its
@@ -759,6 +869,10 @@ impl WirePenaltyTracker {
                 .map(|(p, _)| *p);
             if let Some(v) = victim {
                 self.penalties.remove(&v);
+                if self.evicted.len() >= WIRE_PENALTY_TRACK_CAP {
+                    self.evicted.remove(0);
+                }
+                self.evicted.push(v);
             }
         }
         let e = self.penalties.entry(peer).or_insert((0.0, now, now));
@@ -889,7 +1003,27 @@ impl Default for NetworkConfig {
 // `BlochBehaviourEvent`.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct BlochBehaviour {
-    gossipsub: gossipsub::Behaviour,
+    // P0 (roadmap §1.3 / §4.1): swarm-level connection limits. `max_peers` was
+    // previously only an app-side counter checked in the PEX/mDNS dial paths,
+    // so inbound connection floods / eclipse setup were NOT bounded by libp2p.
+    // This behaviour rejects connections at the transport layer once the caps
+    // are hit (B1-T9 / NET-11: inbound gets `max_peers` + 1 slots — the extra
+    // one lets a newcomer in so the connection manager can EVICT an
+    // unprotected inbound peer instead of refusing everyone once full — and
+    // the swarm-wide cap leaves room for every outbound slot).
+    // FIRST field: the derive macro runs `handle_established_*` in field
+    // order, so a denial here happens before any other behaviour allocates
+    // per-connection state for the connection (NET-11 review).
+    connection_limits: libp2p::connection_limits::Behaviour,
+    // B1-T2: discouraged identities (`misbehaviour`). Blocking a peer closes
+    // its connections and refuses new ones, inbound and outbound; second, so
+    // a refused identity is denied right after the connection limits,
+    // before any other behaviour allocates per-connection state.
+    blocked: libp2p::allow_block_list::Behaviour<libp2p::allow_block_list::BlockedPeers>,
+    // NET-11 (d): gossipsub behind a per-peer gate, so block-relay-only
+    // connections carry no gossip at all (see `gossip_gate`). Every other
+    // call goes to the wrapped gossipsub behaviour (`Deref`).
+    gossipsub: gossip_gate::GossipGate,
     // Toggle: mDNS is present only when `--enable-mdns` is set (off by default).
     // Disabled → the hickory-proto mDNS parser is never exercised (RUSTSEC-2026-0118/0119).
     mdns:      libp2p::swarm::behaviour::toggle::Toggle<mdns::tokio::Behaviour>,
@@ -899,19 +1033,17 @@ struct BlochBehaviour {
     // is a directed request to ONE peer instead of a gossipsub broadcast to the
     // whole mesh (removes the O(peers) IBD amplification). See `sync_rr`.
     sync_rr:   sync_rr::Behaviour,
-    // P0 (roadmap §1.3 / §4.1): swarm-level connection limits. `max_peers` was
-    // previously only an app-side counter checked in the PEX/mDNS dial paths,
-    // so inbound connection floods / eclipse setup were NOT bounded by libp2p.
-    // This behaviour rejects connections at the transport layer once the caps
-    // are hit, matching max_peers.
-    connection_limits: libp2p::connection_limits::Behaviour,
+    // NET-11 (a): latency measurement for the inbound eviction protection of
+    // low-latency peers (Core's minimum ping time). Never closes connections.
+    ping: libp2p::ping::Behaviour,
 }
 
 // ── Node ──────────────────────────────────────────────────────────────────────
 
 /// Yamux per-connection substream cap.
 ///
-/// Must sit ABOVE `sync_rr::MAX_CONCURRENT_SYNC_STREAMS` (2048) or the
+/// Must sit ABOVE `sync_rr::MAX_CONCURRENT_SYNC_STREAMS` (2048 then, 64
+/// since re-audit B1-T18 / B2-T6) or the
 /// transport vetoes the request-response layer: fecf29b raised the rr cap
 /// 100 → 2048 so sync bursts flow, but the swarm was still built with
 /// `yamux::Config::default`, whose yamux-0.13 backend caps a connection at
@@ -943,6 +1075,30 @@ struct BlochBehaviour {
 /// connection, so the churn only fully stops once both endpoints run this
 /// build.
 const MAX_YAMUX_STREAMS: usize = 4096;
+
+/// The swarm-level connection caps for `max_peers` inbound slots (B1-T9 /
+/// NET-11 a):
+///
+/// * established INCOMING: `max_peers + 1` — one transient slot over the
+///   inbound budget, so a newcomer reaches the connection manager, which then
+///   evicts an unprotected inbound peer (Core's `AttemptToEvictConnection`)
+///   or closes the newcomer; the manager keeps inbound at `max_peers`;
+/// * established total: room for every inbound slot PLUS every outbound slot
+///   ([`connmgr::OUTBOUND_CONNECTION_HEADROOM`]): inbound connections can
+///   never use the connections outbound dialing needs;
+/// * at most 2 connections per peer (a simultaneous dial in both directions;
+///   one identity cannot hold many inbound connections);
+/// * pending caps blunt half-open connection floods.
+pub fn swarm_connection_limits(max_peers: usize) -> libp2p::connection_limits::ConnectionLimits {
+    let max = max_peers as u32;
+    let total = max_peers.saturating_mul(2).max(max_peers + connmgr::OUTBOUND_CONNECTION_HEADROOM) as u32;
+    libp2p::connection_limits::ConnectionLimits::default()
+        .with_max_established(Some(total))
+        .with_max_established_incoming(Some(max.saturating_add(1)))
+        .with_max_established_per_peer(Some(2))
+        .with_max_pending_incoming(Some(max.max(1)))
+        .with_max_pending_outgoing(Some(max.max(connmgr::OUTBOUND_CONNECTION_HEADROOM as u32)))
+}
 
 /// Builder for the swarm's yamux config — passed to `with_tcp` /
 /// `with_websocket` in place of `yamux::Config::default` (the builder accepts
@@ -1043,6 +1199,25 @@ pub struct NetworkNode {
     pq_pins:     Arc<PeerPins>,
     control_rx:  Option<mpsc::Receiver<NetworkControl>>,
     peer_events: Option<mpsc::Sender<PeerEvent>>,
+    /// The network this node speaks (audit POW-9: its protocol identifiers,
+    /// [`chain_separation`]). The node's chain id unless overridden.
+    chain:       crate::core::ChainId,
+    /// B1-T19: gossip transactions and PoWit items go here instead of the
+    /// block channel.
+    tx_ingest:   Option<mpsc::Sender<Inbound>>,
+    /// NET-2 residual: remote addresses of connected peers (shared with the
+    /// processor's proof-of-work budgets).
+    peer_addrs:  discourage::PeerAddrs,
+    /// B1-T7: the hardening activation height whose block, once on the
+    /// selected chain, puts wire-violation penalties in force for relayed
+    /// frames (`wire_violation_penalty`).
+    penalty_activation: u64,
+    /// (full-relay, block-relay-only) automatic outbound slot targets.
+    outbound_targets: (usize, usize),
+    /// Mean interval between feeler connections.
+    feeler_interval: Duration,
+    /// Period of the block-relay-only frontier polls.
+    block_relay_poll_interval: Duration,
 }
 
 impl NetworkNode {
@@ -1058,7 +1233,64 @@ impl NetworkNode {
         info!("P2P PQ identity fingerprint: {}", hex::encode(pq_identity.fingerprint()));
         let pq_pins = Arc::new(PeerPins::load(&config.data_dir.join("p2p_pq_pins.json"))
             .map_err(NetworkError::StartFailed)?);
-        Ok(Self { peer_id, config, local_key, pq_identity, pq_pins, control_rx: None, peer_events: None })
+        Ok(Self {
+            peer_id, config, local_key, pq_identity, pq_pins, control_rx: None, peer_events: None, tx_ingest: None,
+            chain: crate::core::node_chain_id(),
+            peer_addrs: discourage::PeerAddrs::new(),
+            penalty_activation: crate::core::activation::hardening_activation_height(),
+            outbound_targets: (connmgr::OUTBOUND_FULL_RELAY_TARGET, connmgr::BLOCK_RELAY_ONLY_TARGET),
+            feeler_interval: connmgr::FEELER_INTERVAL,
+            block_relay_poll_interval: connmgr::BLOCK_RELAY_POLL_INTERVAL,
+        })
+    }
+
+    /// Speak `chain`'s protocol identifiers instead of the node chain id's
+    /// (in-process harnesses that run nodes of two networks).
+    pub fn with_chain(mut self, chain: crate::core::ChainId) -> Self {
+        self.chain = chain;
+        self
+    }
+
+    /// B1-T19: deliver gossip `NewTransaction` and `NewPowitItem` frames
+    /// ([`goes_to_tx_ingest`]) on `tx` (their own consumer) instead of the
+    /// block channel of [`Self::run_validated`].
+    pub fn attach_tx_ingest(&mut self, tx: mpsc::Sender<Inbound>) {
+        self.tx_ingest = Some(tx);
+    }
+
+    /// The remote addresses of connected peers, kept current by the running
+    /// network loop.
+    pub fn peer_addrs(&self) -> discourage::PeerAddrs {
+        self.peer_addrs.clone()
+    }
+
+    /// Use `activation` instead of the process-wide hardening activation
+    /// height for the wire-violation penalty gate (tests).
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn set_penalty_activation(&mut self, activation: u64) {
+        self.penalty_activation = activation;
+    }
+
+    /// Override the automatic outbound slot targets (defaults: Bitcoin
+    /// Core's 8 full-relay + 2 block-relay-only). For tests and experiments;
+    /// operators have no reason to change them.
+    #[allow(dead_code)] // library / test knob; the binary keeps the defaults
+    pub fn set_outbound_targets(&mut self, full_relay: usize, block_relay_only: usize) {
+        self.outbound_targets = (full_relay, block_relay_only);
+    }
+
+    /// Override the mean feeler interval (default: Core's 2 minutes). For
+    /// tests.
+    #[allow(dead_code)] // library / test knob; the binary keeps the default
+    pub fn set_feeler_interval(&mut self, mean: Duration) {
+        self.feeler_interval = mean;
+    }
+
+    /// Override the period of the block-relay-only frontier polls (default
+    /// `connmgr::BLOCK_RELAY_POLL_INTERVAL`). For tests.
+    #[allow(dead_code)] // library / test knob; the binary keeps the default
+    pub fn set_block_relay_poll_interval(&mut self, period: Duration) {
+        self.block_relay_poll_interval = period;
     }
 
     /// Accept [`NetworkControl`] requests from the processor on `rx`.
@@ -1109,7 +1341,7 @@ impl NetworkNode {
     /// relayed (they expire from gossipsub's message cache).
     #[allow(clippy::too_many_arguments)]
     pub async fn run_validated(
-        self,
+        mut self,
         inbound_tx:     mpsc::Sender<Inbound>,
         verdict_rx:     mpsc::Receiver<GossipValidation>,
         outbound_rx:    mpsc::Receiver<NetworkMessage>,
@@ -1118,7 +1350,8 @@ impl NetworkNode {
         store:          std::sync::Arc<crate::storage::Storage>,
         listen_report:  Option<mpsc::UnboundedSender<Multiaddr>>,
     ) -> Result<(), NetworkError> {
-        self.run_inner(IngestSink::Validated(inbound_tx), Some(verdict_rx), outbound_rx, dag, peer_state, store, listen_report)
+        let txs = self.tx_ingest.take();
+        self.run_inner(IngestSink::Validated { main: inbound_tx, txs }, Some(verdict_rx), outbound_rx, dag, peer_state, store, listen_report)
             .await
     }
 
@@ -1139,6 +1372,9 @@ impl NetworkNode {
     ) -> Result<(), NetworkError> {
         use std::time::Instant;
         let gs_cfg = gossipsub_config()?;
+        // Audit POW-9: this network's protocol identifiers (topics, sync
+        // protocol, identify version), so no frame crosses networks.
+        let protos = chain_separation::chain_protocols(self.chain);
 
         // ── Peer scoring: penalize invalid messages, reward participation ──
         let peer_score_params = {
@@ -1201,9 +1437,9 @@ impl NetworkNode {
                 ..Default::default()
             };
 
-            params.topics.insert(IdentTopic::new(TOPIC_BLOCKS).hash(), block_topic_params);
-            params.topics.insert(IdentTopic::new(TOPIC_TXS).hash(), tx_topic_params);
-            params.topics.insert(IdentTopic::new(TOPIC_SYNC).hash(), sync_topic_params);
+            params.topics.insert(IdentTopic::new(protos.blocks_topic).hash(), block_topic_params);
+            params.topics.insert(IdentTopic::new(protos.txs_topic).hash(), tx_topic_params);
+            params.topics.insert(IdentTopic::new(protos.sync_topic).hash(), sync_topic_params);
             params
         };
 
@@ -1267,36 +1503,27 @@ impl NetworkNode {
                 // (`gnb/<ver>/a|n`) for operators, but NET-9: peers no longer
                 // use this self-declared bit to choose whom to pull from.
                 let identify = identify::Behaviour::new(
-                    identify::Config::new("/gnb/1.0.0".into(), key.public())
+                    identify::Config::new(protos.identify.into(), key.public())
                         .with_agent_version(sync_rr::agent_version(archive)),
                 );
-                // Cap connections at the swarm layer to match max_peers. We
-                // allow 2× established total for churn/reconnect headroom, but
-                // hold established-INCOMING to max_peers so an attacker can't
-                // fill every slot with inbound dials. Pending caps blunt
-                // half-open connection floods.
-                let max = max_peers as u32;
-                let limits = libp2p::connection_limits::ConnectionLimits::default()
-                    .with_max_established(Some(max.saturating_mul(2)))
-                    .with_max_established_incoming(Some(max))
-                    .with_max_pending_incoming(Some(max))
-                    .with_max_pending_outgoing(Some(max.max(1)));
-                let connection_limits = libp2p::connection_limits::Behaviour::new(limits);
+                let connection_limits = libp2p::connection_limits::Behaviour::new(swarm_connection_limits(max_peers));
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(BlochBehaviour {
-                    gossipsub: gs,
+                    gossipsub: gossip_gate::GossipGate::new(gs),
                     mdns,
                     identify,
-                    sync_rr: sync_rr::new_behaviour(),
+                    sync_rr: sync_rr::new_behaviour(protos.sync_protocol.clone()),
                     connection_limits,
+                    blocked: libp2p::allow_block_list::Behaviour::default(),
+                    ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::new()),
                 })
             })
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
             .build();
 
-        let block_t = IdentTopic::new(TOPIC_BLOCKS);
-        let tx_t    = IdentTopic::new(TOPIC_TXS);
-        let sync_t  = IdentTopic::new(TOPIC_SYNC);
+        let block_t = IdentTopic::new(protos.blocks_topic);
+        let tx_t    = IdentTopic::new(protos.txs_topic);
+        let sync_t  = IdentTopic::new(protos.sync_topic);
 
         for t in [&block_t, &tx_t, &sync_t] {
             swarm.behaviour_mut().gossipsub.subscribe(t)
@@ -1326,10 +1553,22 @@ impl NetworkNode {
             }
         }
 
-        // FIX #6: Load saved peers and dial them
+        // NET-11 (e): the per-node secret that keys address-table bucketing
+        // and the eviction netgroup order (Core's nKey), derived from the
+        // identity key so the persisted tried table keeps its layout.
+        let addr_key = match self.local_key.to_protobuf_encoding() {
+            Ok(bytes) => addrbook::derive_key(&bytes),
+            Err(_) => addrbook::random_key(),
+        };
+
+        // FIX #6 / NET-11: the persisted known peers are the keyed "tried"
+        // table (addresses we connected to outbound). They are no longer all
+        // dialed at start-up: the connection manager selects from the tables
+        // to fill its outbound slots (B1-T9).
         let peers_path = self.config.data_dir.join("known_peers.json");
         let mut known_peers = load_known_peers(&peers_path);
-        // Sprint P: drop any legacy pollution that doesn't pass the new validator.
+        // Sprint P / B1-T8: drop any entry that doesn't pass the validator
+        // (legacy pollution, host names, re-spelled private IPs).
         let pruned = prune_invalid(&mut known_peers, self.config.allow_private_peers);
         if pruned > 0 {
             info!("known_peers: pruned {} invalid entries on load (Sprint P)", pruned);
@@ -1339,63 +1578,118 @@ impl NetworkNode {
         if evicted > 0 {
             info!("known_peers: evicted {} entries to enforce cap", evicted);
         }
+        let mut tried = TriedTable::load(addr_key, known_peers.iter().filter_map(|a| normalize_peer_addr(a)));
 
         // Sprint P / NET-11: PEX hardening state. Rate limits are keyed by the
         // AUTHOR of the addresses (the peer that answered our GetPeers), and
-        // received addresses only ever enter `addr_book` — they are dialed
-        // later, a few per tick, never straight from a message.
+        // received addresses only ever enter the keyed new table `addr_book`.
         let mut pex_limiter = PexRateLimiter::new();
         let mut pex_stats   = PexStats::new();
-        let mut addr_book   = AddrBook::new();
+        let mut addr_book   = AddrBook::with_key(addr_key);
+        // POW-9: dialed addresses enter the tried table after identify.
+        let mut pending_tried = chain_separation::PendingTried::default();
         let allow_private   = self.config.allow_private_peers;
+
+        // B1-T9 / NET-11 (a)-(d): connection manager (outbound slots apart
+        // from inbound, eviction, feelers, block-relay-only peers, anchors).
+        let mut conn_mgr = ConnManager::new(addr_key, self.config.max_peers);
+        conn_mgr.set_targets(self.outbound_targets.0, self.outbound_targets.1);
+        let anchors_path = self.config.data_dir.join(connmgr::ANCHORS_FILE);
+        let mut anchors: std::collections::VecDeque<String> =
+            connmgr::read_anchors(&anchors_path, allow_private).into_iter().collect();
+        if !anchors.is_empty() {
+            info!("anchors: {} block-relay-only peer(s) from the last run", anchors.len());
+        }
+        let mut feeler = {
+            use rand::Rng;
+            connmgr::FeelerSchedule::new(std::time::Instant::now(), self.feeler_interval, rand::rng().random())
+        };
+        // Core's cached getaddr answer (anti-scraping): one sample of the tried
+        // table per GETADDR_CACHE_LIFETIME.
+        let mut getaddr_cache = GetAddrCache::default();
+        // NET-11 (a): kind of each gossip frame awaiting a processor verdict
+        // (an Accept = a novel block / transaction from that peer).
+        let mut novel_kinds: std::collections::HashMap<gossipsub::MessageId, bool> = std::collections::HashMap::new();
+        // NET-11 (c): established feeler connections and when to close them.
+        let mut feelers_closing: Vec<(libp2p::swarm::ConnectionId, std::time::Instant)> = Vec::new();
 
         // C1 / NET-4 / NET-8: cumulative, decaying, bounded app-score
         // penalties for wire-violating peers.
         let mut wire_tracker = WirePenaltyTracker::new();
+        // NET-2 residual: addresses discouraged after a peer misbehaved, and
+        // the operator-configured peers that are never discouraged. One
+        // misbehaviour model with `discouraged_ids` below
+        // (`act_on_misbehaviour`, `discourage_now`).
+        let mut discouraged_addrs = discourage::Discouraged::new();
+        let manual_peers: HashSet<PeerId> = sync_rr::explicit_peer_ids(&self.config.bootstrap_peers);
+        // Peers whose connections were refused at a discouraged address (not
+        // counted; their `ConnectionClosed` events are skipped).
+        let mut refused_peers: HashSet<PeerId> = HashSet::new();
         // MEM-5 / MEM-6: processor → network penalties (optional).
         let mut control_rx = self.control_rx.take();
 
         // H-R3-1 fix #4 / NET-8: bounded per-peer + global rate of served
         // inbound directed-sync requests. Refusals are answered `Busy` (NET-5).
         let mut sync_limiter = sync_rr::SyncRequestLimiter::new();
+        // B1-T3 / B1-T18 / B2-T5 / B2-T6: serving off the swarm task, with
+        // per-peer and global send budgets (`serve`).
+        let mut serve_q: serve::ServeQueue<
+            libp2p::request_response::InboundRequestId,
+            libp2p::request_response::ResponseChannel<sync_rr::SyncResponse>,
+        > = serve::ServeQueue::new();
+        let (served_tx, mut served_rx) = mpsc::channel::<
+            serve::Served<libp2p::request_response::InboundRequestId, libp2p::request_response::ResponseChannel<sync_rr::SyncResponse>>,
+        >(serve::MAX_SERVE_WORKERS * 4);
+        // B1-T2: identities disconnected for misbehaviour (`misbehaviour`);
+        // their addresses go to `discouraged_addrs` at the same time.
+        let mut discouraged_ids = misbehaviour::Discouraged::new();
 
         // NET-6: per-AUTHOR rate limit on tip claims (PeerTip / Version).
         let mut claim_limiter: ratelimit::TokenBuckets<PeerId> =
             ratelimit::TokenBuckets::new(CLAIM_BURST, CLAIM_REFILL_PER_SEC, CLAIM_LIMITER_TRACK_CAP);
 
-        // Add hardcoded default seeds
-        let mut all_seeds: Vec<String> = crate::core::DEFAULT_SEEDS.iter().map(|s| s.to_string()).collect();
+        // Start-up dials: the shipped seeds, the DNS seeds' answers and the
+        // configured `--peer`s, as MANUAL connections (Core's -addnode /
+        // -seednode: they never use the automatic outbound slots).
+        let mut manual: Vec<Multiaddr> = Vec::new();
+        for p in crate::core::DEFAULT_SEEDS.iter().map(|s| s.to_string()).chain(self.config.bootstrap_peers.iter().cloned()) {
+            // Operator-configured: a host name is resolved; its answer may be
+            // private (docker / LAN setups) but never an invalid range.
+            if let Some(addr) = resolve_dial_addr(&p, true).await {
+                manual.push(addr);
+            }
+        }
         // DNS seeds (opt-in, non-privileged): resolve each hostname's A/AAAA
-        // records into peer multiaddrs (Bitcoin-style cold-start).
+        // records into peer multiaddrs (Bitcoin-style cold-start). B1-T8: the
+        // answers are third-party data and are screened like learned
+        // addresses (Core's addrman refuses unroutable seed results).
         for host in self.config.dns_seeds.iter() {
             let hp = if host.contains(':') { host.clone() } else { format!("{host}:17110") };
             match tokio::net::lookup_host(hp).await {
                 Ok(addrs) => {
                     for sa in addrs {
+                        if !is_acceptable_ip(sa.ip(), allow_private) {
+                            warn!("dns-seed {} answered a non-routable address {}; ignored", host, sa.ip());
+                            continue;
+                        }
                         let ma = match sa.ip() {
                             std::net::IpAddr::V4(v4) => format!("/ip4/{}/tcp/{}", v4, sa.port()),
                             std::net::IpAddr::V6(v6) => format!("/ip6/{}/tcp/{}", v6, sa.port()),
                         };
                         info!("dns-seed {} → {}", host, ma);
-                        all_seeds.push(ma);
+                        if let Ok(addr) = ma.parse() {
+                            manual.push(addr);
+                        }
                     }
                 }
                 Err(e) => warn!("dns-seed {}: resolve failed: {}", host, e),
             }
         }
-        // Add CLI bootstrap peers + known peers
-        all_seeds.extend(self.config.bootstrap_peers.iter().cloned());
-        all_seeds.extend(known_peers.iter().cloned());
-        // Deduplicate
-        all_seeds.sort();
-        all_seeds.dedup();
-
-        for p in all_seeds.iter() {
-            let resolved = resolve_multiaddr(p).await;
-            if let Ok(addr) = resolved.parse::<Multiaddr>() {
-                info!("dialing: {}", resolved);
-                let _ = swarm.dial(addr);
-            }
+        manual.sort();
+        manual.dedup();
+        for addr in manual {
+            info!("dialing: {}", addr);
+            dial_with_intent(&mut swarm, &mut conn_mgr, addr, DialIntent::manual());
         }
 
         let peer_id_str = self.peer_id.to_string();
@@ -1403,21 +1697,22 @@ impl NetworkNode {
 
         // AUDIT (external-address poisoning): a peer-reported identify
         // `observed_addr` is only a CANDIDATE; it is confirmed as our external
-        // address only when EXTERNAL_ADDR_QUORUM distinct peers report it.
+        // address only when peers in EXTERNAL_ADDR_QUORUM distinct NETGROUPS
+        // report it (NET-11 residual: identities are free, netgroups are not).
         const EXTERNAL_ADDR_QUORUM: usize = 3;
         const OBSERVED_ADDR_CAP: usize = 64;
         const MDNS_DIAL_LIMIT: usize = 8; // max LAN peers auto-dialed per mDNS event
-        let mut observed_by: std::collections::HashMap<Multiaddr, std::collections::HashSet<PeerId>> =
+        let mut observed_by: std::collections::HashMap<Multiaddr, std::collections::HashSet<String>> =
             std::collections::HashMap::new();
 
-        // NET-5 / NET-9: directed pulls go through a rotating, stall-aware
-        // selector with a per-peer in-flight cap; requests wait in a bounded
-        // queue when no peer is eligible, and a failed or Busy pull is retried
-        // on ANOTHER peer — never re-published on gossip (NET-7).
-        let mut selector = sync_rr::PullPeerSelector::new(sync_rr::explicit_peer_ids(&self.config.bootstrap_peers));
-        let mut pending_pulls: std::collections::VecDeque<PendingPull> = std::collections::VecDeque::new();
-        let mut inflight_pull: std::collections::HashMap<libp2p::request_response::OutboundRequestId, (PendingPull, PeerId)> =
-            std::collections::HashMap::new();
+        // NET-5 / NET-9 / B1-T2 / B1-T6: directed pulls go through the pull
+        // scheduler (`pull`): answers bound to their request, hint-first,
+        // stall- and usefulness-aware peer choice, per-source queue quotas,
+        // never the same peer twice for one pull, spaced retries — never
+        // re-published on gossip (NET-7).
+        let explicit_ids = sync_rr::explicit_peer_ids(&self.config.bootstrap_peers);
+        let mut pulls: pull::PullScheduler<libp2p::request_response::OutboundRequestId> =
+            pull::PullScheduler::new(explicit_ids.clone());
 
         // Re-gossip rate-limit: suppress re-publishes of the SAME block within
         // the duplicate-cache window (a guaranteed local `Duplicate` anyway).
@@ -1431,9 +1726,17 @@ impl NetworkNode {
         // NET-5/NET-9: re-try queued pulls (cooldowns expire, slots free up).
         let mut pull_tick = tokio::time::interval(PULL_RETRY_TICK);
         pull_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // NET-11: dial a few PEX-learned addresses per tick, from the table.
-        let mut pex_dial = tokio::time::interval(PEX_DIAL_TICK);
-        pex_dial.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // B1-T9 / NET-11: open at most one automatic outbound connection per
+        // tick, from the address tables, whenever an outbound slot is free
+        // (Core's ThreadOpenConnections loop).
+        let mut outbound_tick = tokio::time::interval(OUTBOUND_TICK);
+        outbound_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // B1-T9 / M-11: heartbeat re-dials of configured peers resolve their
+        // host names on separate tasks, never inside this loop.
+        let (mut manual_resolver, mut manual_resolved_rx) = ManualResolver::new(MANUAL_RESOLVE_TIMEOUT);
+        let mut block_relay_poll = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.block_relay_poll_interval, self.block_relay_poll_interval);
+        block_relay_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -1442,20 +1745,50 @@ impl NetworkNode {
                         SwarmEvent::Behaviour(BlochBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message_id, message })) => {
                             // C1: bounded decode (4 MiB frame/read limit, per-field
                             // bounds, NET-7: no trailing bytes).
-                            let reaction = wire_tracker.classify(propagation_source, &message.data);
+                            // B1-T7 / NET-4 residual: a violation is charged to the
+                            // delivering peer only if it authored the frame, or
+                            // once no release that forwards unvalidated frames
+                            // follows the chain (`wire_violation_penalty`).
+                            let self_authored = message.source == Some(propagation_source);
+                            let in_force = {
+                                let d = dag.read();
+                                let tip_h = d.selected_tip().and_then(|t| d.get_block_data(&t).map(|x| x.height)).unwrap_or(0);
+                                crate::ingress::block_penalties_in_force(tip_h, self.penalty_activation)
+                            };
+                            let (charge, reject) = wire_violation_penalty(self_authored, in_force);
+                            let reaction = wire_tracker.classify_gated(propagation_source, &message.data, charge);
+                            // A peer the bounded tracker forgot keeps no stale
+                            // application score (NET-4 residual).
+                            for p in wire_tracker.take_evicted() {
+                                swarm.behaviour_mut().gossipsub.set_application_score(&p, 0.0);
+                            }
                             let msg = match reaction {
                                 WireReaction::Penalize { error, score } => {
                                     // Oversized / bounds-violating / padded frames can't
-                                    // come from a compliant node. NET-2/NET-4: Reject it,
-                                    // so gossipsub's P4 penalty hits the DELIVERING peer
-                                    // (its author: honest nodes never relay invalid
-                                    // frames now) and it is never forwarded.
+                                    // come from a compliant node. NET-2/NET-4: the
+                                    // DELIVERING peer is charged (application score, the
+                                    // shared misbehaviour score of B1-T2) and the frame is
+                                    // never forwarded; gossipsub's P4 penalty (`Reject`,
+                                    // which also hits every peer that sent a duplicate)
+                                    // only when no honest relay can have forwarded one
+                                    // (B1-T7).
                                     swarm.behaviour_mut().gossipsub
                                         .set_application_score(&propagation_source, score);
+                                    let acceptance = if reject {
+                                        gossipsub::MessageAcceptance::Reject
+                                    } else {
+                                        gossipsub::MessageAcceptance::Ignore
+                                    };
                                     swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                                        &message_id, &propagation_source, gossipsub::MessageAcceptance::Reject);
+                                        &message_id, &propagation_source, acceptance);
                                     warn!("wire violation from {}: {:?} (app score → {})",
                                         propagation_source, error, score);
+                                    // B1-T2: one shared misbehaviour score (disconnect at the
+                                    // threshold), and no pulls to it while it cools down.
+                                    let now = Instant::now();
+                                    pulls.on_misbehaving(&propagation_source, now);
+                                    act_on_misbehaviour(&mut swarm, &mut discouraged_ids, &mut discouraged_addrs,
+                                        &self.peer_addrs, &manual_peers, propagation_source, score, now);
                                     continue;
                                 }
                                 WireReaction::IgnoreMalformed(_) => {
@@ -1531,8 +1864,7 @@ impl NetworkNode {
                                             // stay with the processor). Bounded by
                                             // the per-author claim limiter above.
                                             if claim_warrants_directed_pull(bs, our_score) {
-                                                send_directed_pull(&mut swarm, &mut selector, &mut inflight_pull, a,
-                                                    NetworkMessage::GetTips, now);
+                                                send_directed_pull(&mut swarm, &mut pulls, a, sync_rr::SyncRequest::GetTips, now);
                                             }
                                         }
                                     }
@@ -1551,6 +1883,12 @@ impl NetworkNode {
                             let source = InboundOrigin::Gossip { propagation_source, author, pending: None, received_at: now };
                             match gossip_disposition(&msg, sink.validator_attached(), claim_ok) {
                                 GossipDisposition::DeliverDeferred => {
+                                    // NET-11 (a): remember the frame kind; the
+                                    // processor's Accept marks a novel block / tx
+                                    // (a PoWit item earns no protection).
+                                    if let Some(is_block) = novel_kind(&msg) {
+                                        note_pending_kind(&mut novel_kinds, &message_id, is_block);
+                                    }
                                     let origin = InboundOrigin::Gossip {
                                         propagation_source, author, pending: Some(message_id.clone()), received_at: now,
                                     };
@@ -1572,42 +1910,124 @@ impl NetworkNode {
                                 }
                             }
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
-                            info!("✓ connected: {}", peer_id);
-                            // DO NOT call gossipsub.add_explicit_peer() here: explicit
-                            // peers are excluded from the mesh (libp2p-gossipsub
-                            // behaviour.rs), which once made the mesh unbuildable.
-                            let first_connection = num_established.get() == 1;
-                            // The count is of distinct peers, not connections, and the
-                            // processor (RPC `peers`, the miner's has-peers check) sees
-                            // it at once, not at the next 30 s heartbeat.
-                            if let Some(count) = peer_count_after_connect(peer_count, num_established.get()) {
-                                peer_count = count;
-                                crate::metrics::set_peer_count(peer_count as i64);
-                                sink.deliver(NetworkMessage::PeerCount {
-                                    count: peer_count, addresses: known_peers.iter().cloned().collect(),
-                                }, InboundOrigin::Local, "connect");
+                        SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
+                            let now = Instant::now();
+                            // NET-2 residual: Bitcoin Core does not take connections
+                            // from (nor make them to) discouraged addresses; a fresh
+                            // identity from a discouraged address buys nothing.
+                            // Operator-configured peers are exempt (Core's `noban`).
+                            // Checked before the connection manager counts it.
+                            if let Some(ip) = discourage::ip_of(endpoint.get_remote_address()) {
+                                if discouraged_addrs.is_discouraged(ip, now) && !manual_peers.contains(&peer_id) {
+                                    info!("✗ {} at a discouraged address: disconnecting", peer_id);
+                                    let _ = swarm.disconnect_peer_id(peer_id);
+                                    // Never counted: its closing connections must not
+                                    // be uncounted either (a peer already counted
+                                    // through an earlier connection is closed through
+                                    // the normal path).
+                                    if num_established.get() == 1 {
+                                        refused_peers.insert(peer_id);
+                                    }
+                                    continue;
+                                }
+                                self.peer_addrs.insert(peer_id, ip);
                             }
-                            peer_state.on_connect(peer_id, Instant::now());
-                            selector.on_connect(peer_id);
+                            // B1-T9 / NET-11: classify the connection (inbound, or the
+                            // outbound kind it was dialed for).
+                            let est = conn_mgr.on_established(
+                                connection_id, peer_id, endpoint.is_dialer(), endpoint.get_remote_address(), now);
                             // PROPAGAÇÃO-CHURN fix: persist only the canonical form of
                             // a DIALED address (the Listener's send_back_addr is an
-                            // ephemeral socket). NET-11: confirmed addresses enter
-                            // the netgroup-capped "tried" table.
-                            let addr_to_remember = match &endpoint {
-                                libp2p::core::ConnectedPoint::Dialer { address, .. } => {
-                                    Some(canonical_peer_addr(address, &peer_id))
-                                }
-                                libp2p::core::ConnectedPoint::Listener { .. } => None,
-                            };
-                            if let Some(addr_str) = addr_to_remember {
-                                addr_book.remove(&addr_str);
+                            // ephemeral socket). NET-11: an address we connected to
+                            // outbound enters the keyed "tried" table (Core's Good) —
+                            // POW-9: once the peer's identify shows it runs this
+                            // network (`chain_separation::PendingTried`); a full
+                            // bucket then queues a test-before-evict collision.
+                            if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                                let addr_str = canonical_peer_addr(address, &peer_id);
                                 if is_valid_public_multiaddr(&addr_str, allow_private) {
-                                    add_tried(&mut known_peers, addr_str);
+                                    pending_tried.on_dialed(peer_id, addr_str);
                                 } else {
                                     debug!("not adding peer to known_peers (validator rejected): {}",
                                         truncate_utf8(&addr_str, 80));
                                 }
+                            }
+                            // NET-11 (c): a feeler only tests reachability. Its success
+                            // keeps a tried occupant (test-before-evict) or promotes a
+                            // new-table address (above, on its same-network identify,
+                            // POW-9). It carries no gossip (gated)
+                            // and none of our protocol traffic, and is closed after
+                            // connmgr::FEELER_LINGER — as Core closes a feeler once the
+                            // handshake is complete: closing at once cut the remote's
+                            // side of the connection setup short.
+                            if est.kind == ConnKind::Feeler {
+                                if let Some(i) = &est.intent {
+                                    if let (Some(newcomer), Some(occupant)) = (&i.collision_newcomer, &i.addr) {
+                                        tried.resolve_collision(newcomer, occupant, true, now);
+                                    }
+                                }
+                                debug!("feeler to {} succeeded; closing it shortly", peer_id);
+                                feelers_closing.push((connection_id, now + connmgr::FEELER_LINGER));
+                                continue;
+                            }
+                            // NET-11 (a): inbound slots full → evict an unprotected
+                            // inbound peer (Core's AttemptToEvictConnection), or refuse
+                            // the newcomer when every inbound peer is protected.
+                            if est.kind == ConnKind::Inbound && conn_mgr.inbound_over_capacity() {
+                                // A second connection of an already-connected peer
+                                // is just closed: it must not evict someone else.
+                                // R2b: a peer connected from an address discouraged
+                                // since (another identity there misbehaved) is
+                                // Core's `m_prefer_evict`.
+                                let victim = if est.new_peer {
+                                    conn_mgr.eviction_victim(&peer_id, |p| {
+                                        self.peer_addrs.get(p).is_some_and(|ip| discouraged_addrs.is_discouraged(ip, now))
+                                    })
+                                } else {
+                                    None
+                                };
+                                match victim {
+                                    Some(victim) => {
+                                        info!("inbound slots full: evicting {} to admit {}", victim, peer_id);
+                                        let _ = swarm.disconnect_peer_id(victim);
+                                    }
+                                    None => {
+                                        info!("inbound slots full and every inbound peer protected: refusing {}", peer_id);
+                                        swarm.close_connection(connection_id);
+                                        continue;
+                                    }
+                                }
+                            }
+                            info!("✓ connected: {}", peer_id);
+                            // DO NOT call gossipsub.add_explicit_peer() here: explicit
+                            // peers are excluded from the mesh (libp2p-gossipsub
+                            // behaviour.rs), which once made the mesh unbuildable.
+                            let first_connection = est.new_peer;
+                            // The count is of distinct peers, not connections, and the
+                            // processor (RPC `peers`, the miner's has-peers check) sees
+                            // it at once, not at the next 30 s heartbeat. NET-11:
+                            // block-relay-only peers are left out — nothing we
+                            // publish crosses such a link, so a node holding only
+                            // anchors must not mine / relay as if connected.
+                            if conn_mgr.relay_peer_count() != peer_count {
+                                peer_count = conn_mgr.relay_peer_count();
+                                crate::metrics::set_peer_count(peer_count as i64);
+                                sink.deliver(NetworkMessage::PeerCount {
+                                    count: peer_count, addresses: tried.addresses(),
+                                }, InboundOrigin::Local, "connect");
+                            }
+                            peer_state.on_connect(peer_id, now);
+                            // NET-9 residual: we dialed it (counts toward
+                            // abandoning a frontier tip) or it dialed us.
+                            pulls.on_connect(peer_id, endpoint.is_dialer(), now);
+                            // B1-T18 review: peers we dialed and `--peer` peers
+                            // keep a reserved part of the send budget.
+                            if endpoint.is_dialer() || explicit_ids.contains(&peer_id) {
+                                serve_q.set_protected(peer_id, true);
+                            }
+                            // NET-11 (b): a new block-relay-only peer is an anchor.
+                            if first_connection && est.kind == ConnKind::BlockRelayOnly {
+                                connmgr::write_anchors(&anchors_path, &conn_mgr.anchors());
                             }
                             // Version handshake + tip announce with FRESH DAG values.
                             let (v_score, v_height) = {
@@ -1636,17 +2056,13 @@ impl NetworkNode {
                             }
                             // M-10: directed PEX request to the peer that just
                             // connected (one requester, one answer). Not retried on
-                            // other peers if it fails.
-                            let now = Instant::now();
-                            let req_id = swarm.behaviour_mut().sync_rr
-                                .send_request(&peer_id, sync_rr::SyncRequest::GetPeers);
-                            selector.on_sent(peer_id, now);
-                            inflight_pull.insert(req_id, (PendingPull {
-                                msg: NetworkMessage::PeerRequest,
-                                req: sync_rr::SyncRequest::GetPeers,
-                                attempts: MAX_PULL_ATTEMPTS,
-                                tried: vec![peer_id],
-                            }, peer_id));
+                            // other peers if it fails. NET-11: only to outbound
+                            // full-relay and manual peers, as Core sends getaddr
+                            // (inbound peers would answer nothing; block-relay-only
+                            // connections carry no address relay).
+                            if est.kind.sends_getaddr() {
+                                send_directed_pull(&mut swarm, &mut pulls, peer_id, sync_rr::SyncRequest::GetPeers, now);
+                            }
                             // Directed frontier exchange with the new peer: its tips,
                             // asked of IT. The gossip announcements above reach a
                             // second peer connecting within the same second as
@@ -1656,10 +2072,9 @@ impl NetworkNode {
                             // test/functional/feature_partition_heal.py). Both ends
                             // do this, so each learns the other's frontier now.
                             if first_connection {
-                                send_directed_pull(&mut swarm, &mut selector, &mut inflight_pull, peer_id,
-                                    NetworkMessage::GetTips, now);
+                                send_directed_pull(&mut swarm, &mut pulls, peer_id, sync_rr::SyncRequest::GetTips, now);
                             }
-                            drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, now);
+                            drain_pulls(&mut swarm, &mut pulls, now);
                         }
                         // Mesh fix (fresh-joiner IBD): THIS event is the moment the
                         // peer provably subscribed, so re-announce the handshake and
@@ -1693,19 +2108,49 @@ impl NetworkNode {
                                 }
                             }
                         }
-                        SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                        SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
+                            // A connection refused at a discouraged address was never
+                            // counted nor announced (nor given to the connection
+                            // manager): nothing to undo.
+                            if refused_peers.contains(&peer_id) {
+                                if num_established == 0 {
+                                    refused_peers.remove(&peer_id);
+                                }
+                                continue;
+                            }
+                            let closed = conn_mgr.on_closed(connection_id, peer_id);
+                            if num_established == 0 {
+                                pending_tried.on_closed(&peer_id);
+                                self.peer_addrs.remove(&peer_id);
+                            }
+                            if closed.kind == Some(ConnKind::Feeler) {
+                                continue;
+                            }
                             info!("✗ disconnected: {}", peer_id);
-                            if let Some(count) = peer_count_after_disconnect(peer_count, num_established) {
-                                peer_count = count;
+                            // Checked even when the peer keeps another connection:
+                            // its role (block-relay-only or not) may have changed.
+                            if conn_mgr.relay_peer_count() != peer_count {
+                                peer_count = conn_mgr.relay_peer_count();
                                 crate::metrics::set_peer_count(peer_count as i64);
                                 sink.deliver(NetworkMessage::PeerCount {
-                                    count: peer_count, addresses: known_peers.iter().cloned().collect(),
+                                    count: peer_count, addresses: tried.addresses(),
                                 }, InboundOrigin::Local, "disconnect");
+                            }
+                            if let Some(gone) = closed.peer_gone {
                                 peer_state.on_disconnect(&peer_id);
-                                selector.on_disconnect(&peer_id);
+                                // Its in-flight pulls go to other peers at once; its
+                                // selector state (cooldown, scores) is kept.
+                                let now = Instant::now();
+                                pulls.on_disconnect(&peer_id, now);
+                                serve_q.forget_queued(&peer_id);
+                                serve_q.set_protected(peer_id, false);
                                 if let Some(tx) = &self.peer_events {
                                     let _ = tx.try_send(PeerEvent::Disconnected(peer_id));
                                 }
+                                if gone.role == ConnKind::BlockRelayOnly {
+                                    connmgr::write_anchors(&anchors_path, &conn_mgr.anchors());
+                                }
+                                drain_pulls(&mut swarm, &mut pulls, now);
                             }
                         }
                         SwarmEvent::NewListenAddr { address, .. } => {
@@ -1714,10 +2159,33 @@ impl NetworkNode {
                                 let _ = report.send(address.clone());
                             }
                         }
-                        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                            warn!("dial failed{}: {}",
-                                peer_id.map(|p| format!(" to {}", p)).unwrap_or_default(),
-                                error);
+                        SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
+                            let intent = conn_mgr.on_dial_failed(connection_id);
+                            match intent.as_ref().map(|i| i.kind) {
+                                // Feelers and automatic dials fail routinely
+                                // (that is what feelers find out).
+                                Some(ConnKind::Feeler | ConnKind::OutboundFullRelay | ConnKind::BlockRelayOnly) => {
+                                    debug!("{:?} dial failed{}: {}", intent.as_ref().map(|i| i.kind),
+                                        peer_id.map(|p| format!(" to {}", p)).unwrap_or_default(), error);
+                                }
+                                _ => warn!("dial failed{}: {}",
+                                    peer_id.map(|p| format!(" to {}", p)).unwrap_or_default(),
+                                    error),
+                            }
+                            if let Some(i) = intent {
+                                // NET-11 (c): test-before-evict — an unreachable tried
+                                // occupant is replaced by the newcomer it blocked.
+                                if let (ConnKind::Feeler, Some(newcomer), Some(occupant)) = (i.kind, &i.collision_newcomer, &i.addr) {
+                                    tried.resolve_collision(newcomer, occupant, false, Instant::now());
+                                }
+                                // A failed block-relay-only / feeler dial: its peer's
+                                // future connections carry gossip again.
+                                if let (ConnKind::BlockRelayOnly | ConnKind::Feeler, Some(p)) = (i.kind, i.peer) {
+                                    if !swarm.is_connected(&p) {
+                                        swarm.behaviour_mut().gossipsub.ungate_peer(&p);
+                                    }
+                                }
+                            }
                         }
                         SwarmEvent::IncomingConnectionError { error, .. } => {
                             warn!("incoming failed: {}", error);
@@ -1735,7 +2203,7 @@ impl NetworkNode {
                                     continue;
                                 }
                                 info!("mDNS discovered (LAN): {} at {}", peer_id, addr);
-                                if swarm.dial(addr).is_ok() { dialed += 1; }
+                                if dial_with_intent(&mut swarm, &mut conn_mgr, addr, DialIntent::manual()) { dialed += 1; }
                             }
                         }
                         SwarmEvent::Behaviour(BlochBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
@@ -1746,17 +2214,33 @@ impl NetworkNode {
                         // identify: our observed address (quorum-confirmed before it
                         // is advertised). Peer listen addrs are NOT persisted.
                         SwarmEvent::Behaviour(BlochBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                            // Audit POW-9: a peer of another network (or not
+                            // GnB at all) is dropped, as Bitcoin Core drops a
+                            // connection carrying another network's magic. Its
+                            // observed address of us is not counted either.
+                            let same = chain_separation::same_network(&protos, &info.protocol_version);
+                            pending_tried.on_identified(&peer_id, same, &mut tried, &mut addr_book, Instant::now());
+                            if !same {
+                                info!("peer {} identifies as {:?}, not {:?}: another network; disconnecting \
+                                       (its address leaves the tried table)",
+                                    peer_id, truncate_utf8(&info.protocol_version, 64), protos.identify);
+                                let _ = swarm.disconnect_peer_id(peer_id);
+                                continue;
+                            }
                             let cand = canonical_peer_addr(&info.observed_addr, &self.peer_id);
-                            if is_valid_public_multiaddr(&cand, allow_private)
-                                && (observed_by.len() < OBSERVED_ADDR_CAP
-                                    || observed_by.contains_key(&info.observed_addr))
-                            {
+                            // A voter counts once per NETGROUP of its connection.
+                            let voter_group = conn_mgr.peer(&peer_id).map(|i| i.netgroup.clone());
+                            if let Some(voter_group) = voter_group.filter(|_| {
+                                is_valid_public_multiaddr(&cand, allow_private)
+                                    && (observed_by.len() < OBSERVED_ADDR_CAP
+                                        || observed_by.contains_key(&info.observed_addr))
+                            }) {
                                 let voters = observed_by.entry(info.observed_addr.clone()).or_default();
                                 let was_below = voters.len() < EXTERNAL_ADDR_QUORUM;
-                                voters.insert(peer_id);
+                                voters.insert(voter_group);
                                 if was_below && voters.len() >= EXTERNAL_ADDR_QUORUM {
                                     swarm.add_external_address(info.observed_addr.clone());
-                                    info!("external address confirmed by {} peers: {}",
+                                    info!("external address confirmed by peers in {} netgroups: {}",
                                         EXTERNAL_ADDR_QUORUM, info.observed_addr);
                                 }
                             }
@@ -1764,45 +2248,109 @@ impl NetworkNode {
                                 debug!("peer {} self-declares archival={} (not used for pull selection)", peer_id, arch);
                             }
                         }
+                        // NET-11 (a): latency for the eviction protection.
+                        SwarmEvent::Behaviour(BlochBehaviourEvent::Ping(libp2p::ping::Event { peer, result: Ok(rtt), .. })) => {
+                            conn_mgr.on_ping(&peer, rtt);
+                        }
                         // ── Announce-then-pull: directed IBD sync ────────────
                         SwarmEvent::Behaviour(BlochBehaviourEvent::SyncRr(ev)) => match ev {
                             libp2p::request_response::Event::Message { peer, message, .. } => match message {
                                 // SERVER: answer THIS peer only. H-R3-1 / NET-8: rate
-                                // limited per peer and globally; NET-5: a refusal is
-                                // an explicit `Busy`, never a dropped channel.
-                                libp2p::request_response::Message::Request { request, channel, .. } => {
-                                    let resp = if !sync_limiter.allow(peer) {
-                                        debug!("sync_rr: rate-limited request from {} → Busy", peer);
-                                        sync_rr::SyncResponse::Busy
-                                    } else if matches!(request, sync_rr::SyncRequest::GetPeers) {
-                                        let external: Vec<Multiaddr> =
-                                            swarm.external_addresses().cloned().collect();
-                                        serve_get_peers(&known_peers, &external, &self.peer_id, allow_private)
-                                    } else {
-                                        serve_sync_request(&dag, &store, &request)
-                                    };
-                                    if swarm.behaviour_mut().sync_rr.send_response(channel, resp).is_err() {
-                                        debug!("sync_rr: response channel closed for {}", peer);
+                                // limited per peer and request class and globally;
+                                // NET-5: a refusal is an explicit `Busy`, never a
+                                // dropped channel. B1-T3 / B2-T5: computed off this
+                                // task by the bounded serving workers; B1-T18 /
+                                // B2-T6: Busy above the peer's send budget.
+                                libp2p::request_response::Message::Request { request_id, request, channel } => {
+                                    let now = Instant::now();
+                                    match request {
+                                        // A frame no honest node sends (the codec
+                                        // reports it as a request so it can be
+                                        // attributed): penalized, not answered.
+                                        sync_rr::SyncRequest::Malformed => {
+                                            let score = wire_tracker.record_violation_at(peer, now);
+                                            warn!("sync_rr: malformed request from {} (app score → {})", peer, score);
+                                            pulls.on_misbehaving(&peer, now);
+                                            act_on_misbehaviour(&mut swarm, &mut discouraged_ids, &mut discouraged_addrs,
+                                            &self.peer_addrs, &manual_peers, peer, score, now);
+                                            drop(channel);
+                                        }
+                                        req if !sync_limiter.allow_request(peer, &req, now) => {
+                                            debug!("sync_rr: rate-limited [{}] from {} → Busy", req.kind_name(), peer);
+                                            respond(&mut swarm, &mut serve_q, peer, request_id, channel, sync_rr::SyncResponse::Busy);
+                                        }
+                                        sync_rr::SyncRequest::GetPeers => {
+                                            // NET-11: answered for INBOUND peers only,
+                                            // once per connection, from a sample cached
+                                            // for about a day (Core: getaddr from
+                                            // outbound peers is ignored;
+                                            // m_addr_response_caches). Anyone else gets
+                                            // an empty, well-formed answer. B1-T18:
+                                            // Busy above the peer's send budget.
+                                            let resp = if !serve_q.has_send_budget(&peer) {
+                                                sync_rr::SyncResponse::Busy
+                                            } else if conn_mgr.take_getaddr_answer(&peer) {
+                                                let external: Vec<Multiaddr> = swarm.external_addresses().cloned().collect();
+                                                let sample = getaddr_cache.sample(now, &tried, allow_private);
+                                                serve_get_peers(&sample, &external, &self.peer_id, allow_private)
+                                            } else {
+                                                sync_rr::SyncResponse::Peers { peers: Vec::new() }
+                                            };
+                                            respond(&mut swarm, &mut serve_q, peer, request_id, channel, resp);
+                                        }
+                                        req => {
+                                            if let Err(job) = serve_q.submit(serve::Job { peer, id: request_id, req, channel }) {
+                                                debug!("sync_rr: [{}] from {} refused (serving queue / send budget) → Busy",
+                                                    job.req.kind_name(), peer);
+                                                respond(&mut swarm, &mut serve_q, peer, job.id, job.channel, sync_rr::SyncResponse::Busy);
+                                            }
+                                            pump_serving(&mut swarm, &mut serve_q, &dag, &store, &served_tx);
+                                        }
                                     }
                                 }
-                                // CLIENT: our directed pull was answered.
+                                // CLIENT: our directed pull was answered. B1-T2: the
+                                // answer is bound to the request it answers
+                                // (`sync_rr::check_response`); a wrong one is a
+                                // violation, never delivered, and the pull goes on.
                                 libp2p::request_response::Message::Response { request_id, response } => {
                                     let now = Instant::now();
-                                    let entry = inflight_pull.remove(&request_id);
-                                    // NET-5 / NET-9: selector bookkeeping, and Busy /
-                                    // BlockNotFound send the pull to another peer
-                                    // (`on_pull_response`); the processor still sees
-                                    // a NotFound below (NET-9 count).
-                                    on_pull_response(entry, &response, peer, &mut selector, &mut pending_pulls, now);
-                                    if !matches!(response, sync_rr::SyncResponse::Busy) {
+                                    let act = pulls.on_response(request_id, peer, &response, now);
+                                    // NET-11: a `Peers` answer feeds the table only as
+                                    // the answer to OUR GetPeers (B1-T2: `check_response`
+                                    // delivers a `Peers` answer for a GetPeers pull
+                                    // only) sent to a peer we ask for addresses.
+                                    let asked_for_peers = solicited_peers_answer(
+                                        matches!(response, sync_rr::SyncResponse::Peers { .. })
+                                            .then_some(&sync_rr::SyncRequest::GetPeers),
+                                        conn_mgr.role(&peer));
+                                    if let Some(why) = act.violation {
+                                        let score = wire_tracker.record_violation_at(peer, now);
+                                        warn!("sync_rr: {} answered a pull with [{}]: {} (app score → {})",
+                                            peer, response.kind_name(), why, score);
+                                        act_on_misbehaviour(&mut swarm, &mut discouraged_ids, &mut discouraged_addrs,
+                                            &self.peer_addrs, &manual_peers, peer, score, now);
+                                    } else if act.deliver {
                                         match response {
+                                            sync_rr::SyncResponse::Peers { peers } if !asked_for_peers => {
+                                                // NET-11: addresses answered to a GetTips /
+                                                // GetHeaders / … request (or by a
+                                                // block-relay-only / inbound peer) are a
+                                                // protocol violation, never table input.
+                                                debug!("sync_rr: unsolicited Peers answer ({} addresses) from {}; ignored",
+                                                    peers.len(), peer);
+                                            }
                                             sync_rr::SyncResponse::Peers { peers } => {
                                                 // NET-11: solicited addresses go to the
                                                 // table, rate-limited per author; never
                                                 // dialed from here.
+                                                // NET-11 (e): bucketed by the answering
+                                                // peer's netgroup (Core's addr source).
+                                                let source_group = conn_mgr.peer(&peer)
+                                                    .map(|i| i.netgroup.clone()).unwrap_or_default();
                                                 ingest_pex_addresses(
                                                     &mut addr_book, &mut pex_limiter, &mut pex_stats,
-                                                    peer, &peers, allow_private, &self.peer_id, &known_peers,
+                                                    peer, &source_group, &peers, allow_private, &self.peer_id,
+                                                    |a| tried.contains(a),
                                                 );
                                                 pex_stats.set_distinct_peers(pex_limiter.tracked_peer_count());
                                             }
@@ -1835,7 +2383,7 @@ impl NetworkNode {
                                             }
                                         }
                                     }
-                                    drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, now);
+                                    drain_pulls(&mut swarm, &mut pulls, now);
                                 }
                             },
                             // Directed pull failed (timeout, reset, unsupported
@@ -1848,35 +2396,40 @@ impl NetworkNode {
                                 // is a protocol violation by the ANSWERING peer. NET-5:
                                 // a clean EOF or timeout is a transport failure and is
                                 // never penalized (`is_sync_protocol_violation`).
-                                if let libp2p::request_response::OutboundFailure::Io(e) = &error {
-                                    if sync_rr::is_sync_protocol_violation(e) {
-                                        let score = wire_tracker.record_violation(peer);
-                                        swarm.behaviour_mut().gossipsub.set_application_score(&peer, score);
-                                        warn!("sync_rr wire violation (outbound) from {}: {} (app score → {})",
-                                            peer, e, score);
+                                // B2-T7: an over-long Tips answer (sent by every
+                                // release before this one) is refused, not penalized.
+                                let kind = match &error {
+                                    libp2p::request_response::OutboundFailure::Io(e) if sync_rr::is_sync_protocol_violation(e) => {
+                                        let score = wire_tracker.record_violation_at(peer, now);
+                                        warn!("sync_rr wire violation (answer) from {}: {} (app score → {})", peer, e, score);
+                                        act_on_misbehaviour(&mut swarm, &mut discouraged_ids, &mut discouraged_addrs,
+                                            &self.peer_addrs, &manual_peers, peer, score, now);
+                                        pull::FailureKind::Violation
                                     }
-                                }
-                                selector.on_failure(&peer, now);
-                                if let Some((p, _)) = inflight_pull.remove(&request_id) {
-                                    debug!("directed pull [{}] to {} failed ({}); retrying on another peer",
-                                        p.msg.kind_name(), peer, error);
-                                    requeue_pull(&mut pending_pulls, p, peer);
-                                }
-                                drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, now);
-                            }
-                            // H-R3-4: a REQUEST we received failed to decode or
-                            // violated wire bounds.
-                            libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
-                                if let libp2p::request_response::InboundFailure::Io(e) = &error {
-                                    if sync_rr::is_sync_protocol_violation(e) {
-                                        let score = wire_tracker.record_violation(peer);
-                                        swarm.behaviour_mut().gossipsub.set_application_score(&peer, score);
-                                        warn!("sync_rr wire violation (inbound) from {}: {} (app score → {})",
-                                            peer, e, score);
+                                    libp2p::request_response::OutboundFailure::Io(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                                        debug!("sync_rr: answer from {} refused without penalty: {}", peer, e);
+                                        pull::FailureKind::Refused
                                     }
-                                }
+                                    libp2p::request_response::OutboundFailure::ConnectionClosed => pull::FailureKind::Closed,
+                                    _ => pull::FailureKind::Transport,
+                                };
+                                debug!("directed pull to {} failed ({}); retrying on another peer", peer, error);
+                                pulls.on_failure(request_id, peer, kind, now);
+                                drain_pulls(&mut swarm, &mut pulls, now);
                             }
-                            _ => {}
+                            // B1-T18 / B2-T6: an answer was written, or failed
+                            // (timeout, reset, closed connection): its bytes no
+                            // longer count against the peer's send budget. (A
+                            // request that fails to DECODE never gets here:
+                            // libp2p only logs it, which is why the codec reports
+                            // it as `SyncRequest::Malformed` instead.)
+                            libp2p::request_response::Event::ResponseSent { request_id, .. } => {
+                                serve_q.release(&request_id);
+                            }
+                            libp2p::request_response::Event::InboundFailure { peer, error, request_id, .. } => {
+                                serve_q.release(&request_id);
+                                debug!("sync_rr: answer to {} not delivered: {}", peer, error);
+                            }
                         },
                         _ => {}
                     }
@@ -1886,6 +2439,16 @@ impl NetworkNode {
                 v = recv_verdict(&mut verdict_rx) => {
                     match v {
                         Some(v) => {
+                            // NET-11 (a): an accepted frame was a novel block / tx.
+                            if let Some(is_block) = novel_kinds.remove(&v.message_id) {
+                                if v.verdict == GossipVerdict::Accept {
+                                    if is_block {
+                                        conn_mgr.on_novel_block(&v.propagation_source, Instant::now());
+                                    } else {
+                                        conn_mgr.on_novel_tx(&v.propagation_source, Instant::now());
+                                    }
+                                }
+                            }
                             let relayed = swarm.behaviour_mut().gossipsub.report_message_validation_result(
                                 &v.message_id, &v.propagation_source, v.verdict.into());
                             if !relayed && v.verdict == GossipVerdict::Accept {
@@ -1893,20 +2456,100 @@ impl NetworkNode {
                                 // forwarded (a late orphan release is re-announced).
                                 debug!("late Accept: frame from {} no longer in the gossip cache", v.propagation_source);
                             }
+                            if v.verdict == GossipVerdict::Reject {
+                                // B1-T2: a frame the processor proved invalid is a
+                                // misbehaviour of the peer that delivered it (its
+                                // author: honest nodes relay only validated frames,
+                                // and the processor answers Ignore where an honest
+                                // older relay may be the deliverer). Gossipsub's
+                                // P4 penalty is per topic; this feeds the ONE score
+                                // shared with the directed protocol and the wire
+                                // checks, which disconnects at its threshold.
+                                let now = Instant::now();
+                                let score = wire_tracker.record_violation_at(v.propagation_source, now);
+                                debug!("invalid gossip frame from {} (app score → {})", v.propagation_source, score);
+                                pulls.on_misbehaving(&v.propagation_source, now);
+                                act_on_misbehaviour(&mut swarm, &mut discouraged_ids, &mut discouraged_addrs,
+                                    &self.peer_addrs, &manual_peers, v.propagation_source, score, now);
+                            }
                         }
                         None => verdict_rx = None,
                     }
                 }
 
-                // MEM-5 / MEM-6: out-of-band penalties from the processor.
+                // MEM-5 / MEM-6 / B1-T2: out-of-band requests from the processor.
                 c = recv_control(&mut control_rx) => {
                     match c {
                         Some(NetworkControl::PenalizePeer(peer)) => {
-                            let score = wire_tracker.record_violation(peer);
-                            swarm.behaviour_mut().gossipsub.set_application_score(&peer, score);
-                            warn!("invalid orphan transaction from {} (app score → {})", peer, score);
+                            let now = Instant::now();
+                            let score = wire_tracker.record_violation_at(peer, now);
+                            for p in wire_tracker.take_evicted() {
+                                swarm.behaviour_mut().gossipsub.set_application_score(&p, 0.0);
+                            }
+                            warn!("peer {} sent invalid data the processor could not reject on gossip (an invalid \
+                                   orphan transaction, or an invalid answer to one of our pulls; app score → {})",
+                                peer, score);
+                            pulls.on_misbehaving(&peer, now);
+                            act_on_misbehaviour(&mut swarm, &mut discouraged_ids, &mut discouraged_addrs,
+                                &self.peer_addrs, &manual_peers, peer, score, now);
+                        }
+                        Some(NetworkControl::Fetch { source, hashes }) => {
+                            let now = Instant::now();
+                            let mut refused = 0usize;
+                            for block_hash in hashes {
+                                if pulls.enqueue(sync_rr::SyncRequest::GetBlock { block_hash }, Some(source), &[source], now)
+                                    == pull::Enqueued::Refused
+                                {
+                                    refused += 1;
+                                }
+                            }
+                            if refused > 0 {
+                                debug!("{} block pull(s) announced by {} refused (its pull quota or the queue is full; \
+                                        they will be re-issued)", refused, source);
+                            }
+                            drain_pulls(&mut swarm, &mut pulls, now);
+                        }
+                        // NET-2 residual: Bitcoin Core's `Misbehaving` for
+                        // data no honest node sends — disconnect at once and
+                        // discourage the address (never a local one, never an
+                        // operator-configured peer) and, as the shared score
+                        // does at its threshold (B1-T2), the identity.
+                        Some(NetworkControl::Misbehaving(peer)) => {
+                            let now = Instant::now();
+                            pulls.on_misbehaving(&peer, now);
+                            let addr_discouraged = discourage_now(&mut swarm, &mut discouraged_ids, &mut discouraged_addrs,
+                                &self.peer_addrs, &manual_peers, peer, now);
+                            warn!("peer {} misbehaved (invalid block data); {}", peer,
+                                if manual_peers.contains(&peer) {
+                                    "operator-configured: kept"
+                                } else if addr_discouraged {
+                                    "disconnected, identity and address discouraged"
+                                } else {
+                                    "disconnected, identity discouraged"
+                                });
                         }
                         None => control_rx = None,
+                    }
+                }
+
+                // B1-T3 / B2-T5: an answer computed by a serving worker.
+                Some(done) = served_rx.recv() => {
+                    serve_q.computed(&done.peer);
+                    respond(&mut swarm, &mut serve_q, done.peer, done.id, done.channel, done.response);
+                    pump_serving(&mut swarm, &mut serve_q, &dag, &store, &served_tx);
+                }
+
+                // B1-T9: a configured peer's re-dial address, resolved off
+                // the loop by `manual_resolver` (heartbeat).
+                Some((p, addr)) = manual_resolved_rx.recv() => {
+                    manual_resolver.finished(&p);
+                    let still_wanted = match addr_peer_id(&p) {
+                        Some(id) => !swarm.is_connected(&id) && !conn_mgr.is_dialing(&id),
+                        None => conn_mgr.count(ConnKind::Manual) + conn_mgr.pending_count(ConnKind::Manual) == 0,
+                    };
+                    if let (Some(addr), true) = (addr, still_wanted) {
+                        info!("reconnecting: {}", addr);
+                        dial_with_intent(&mut swarm, &mut conn_mgr, addr, DialIntent::manual());
                     }
                 }
 
@@ -1915,12 +2558,23 @@ impl NetworkNode {
                     // GetHeaders / GetTips / PeerRequest) are DIRECTED to one
                     // selected peer over request-response, never broadcast.
                     if let Some(req) = sync_rr::as_pull_request(&msg) {
-                        if pending_pulls.len() >= MAX_PENDING_PULLS {
+                        let now = Instant::now();
+                        // B1-T6: a GetHeaders prefers the peers whose (fresh,
+                        // clamped) claim is ahead of `from`, in a per-node
+                        // secret order, the peers we dialed first (the
+                        // scheduler keeps `pull::MAX_HINTS` of them); an empty
+                        // answer from one of them counts as useless, and a
+                        // short one also goes to the next of them.
+                        let hints = match &req {
+                            sync_rr::SyncRequest::GetHeaders { from_blue_score, .. } => {
+                                peer_state.claiming_above(*from_blue_score, now, 4 * pull::MAX_HINTS)
+                            }
+                            _ => Vec::new(),
+                        };
+                        if pulls.enqueue(req, None, &hints, now) == pull::Enqueued::Refused {
                             debug!("pull queue full; dropping [{}] (it will be re-issued)", msg.kind_name());
-                        } else {
-                            pending_pulls.push_back(PendingPull { msg, req, attempts: 0, tried: Vec::new() });
                         }
-                        drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, Instant::now());
+                        drain_pulls(&mut swarm, &mut pulls, now);
                         continue;
                     }
                     // Re-gossip rate-limit: drop a re-broadcast of a block already
@@ -1947,35 +2601,46 @@ impl NetworkNode {
                 }
 
                 _ = pull_tick.tick() => {
-                    drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, Instant::now());
+                    drain_pulls(&mut swarm, &mut pulls, Instant::now());
                 }
 
-                // NET-11: dial from the address table, never from a message —
-                // a few per tick, at most one per netgroup, only below target.
-                _ = pex_dial.tick() => {
-                    if peer_count < self.config.max_peers {
-                        let want = if peer_count < PEX_LOW_PEER_THRESHOLD { PEX_DIALS_WHEN_LOW } else { 1 };
-                        let me = self.peer_id;
-                        let cands = addr_book.take_dial_candidates(want, |a| {
-                            known_peers.contains(a)
-                                || addr_peer_id(a).is_none_or(|p| p == me || swarm.is_connected(&p))
-                        });
-                        for a in cands {
-                            if let Ok(addr) = a.parse::<libp2p::Multiaddr>() {
-                                info!("PEX dial (from table): {}", truncate_utf8(&a, 60));
-                                let _ = swarm.dial(addr);
-                                pex_stats.record_accept(1);
-                            }
+                // B1-T9 / NET-11: keep the OUTBOUND slots full from the address
+                // tables — never from a message, never limited by inbound
+                // connections (Core's ThreadOpenConnections, one attempt per tick).
+                _ = outbound_tick.tick() => {
+                    let now = Instant::now();
+                    feelers_closing.retain(|(c, at)| {
+                        if now < *at {
+                            return true;
                         }
-                    }
+                        swarm.close_connection(*c);
+                        false
+                    });
+                    // POW-9: a peer that identified as another network's
+                    // during this run is not dialed again; NET-2 residual:
+                    // nor is an address discouraged after a peer there
+                    // misbehaved (Core makes no connection to one either).
+                    let excluded = |a: &str| {
+                        addr_peer_id(a).is_some_and(|p| pending_tried.is_other_network(&p))
+                            || a.parse::<Multiaddr>().ok()
+                                .and_then(|m| discourage::ip_of(&m))
+                                .is_some_and(|ip| discouraged_addrs.is_discouraged(ip, now))
+                    };
+                    open_next_outbound(
+                        &mut swarm, &mut conn_mgr, &mut tried, &mut addr_book, &mut anchors, &mut feeler,
+                        &self.peer_id, allow_private, &excluded, now,
+                    );
                 }
 
                 _ = heartbeat.tick() => {
                     let now = Instant::now();
                     let current_height = dag.read().block_count() as u64;
                     info!("peers: {} | height: {}", peer_count, current_height);
-                    let addrs: Vec<String> = known_peers.iter().cloned().collect();
-                    sink.deliver(NetworkMessage::PeerCount { count: peer_count, addresses: addrs }, InboundOrigin::Local, "heartbeat");
+                    sink.deliver(NetworkMessage::PeerCount { count: peer_count, addresses: tried.addresses() }, InboundOrigin::Local, "heartbeat");
+                    // Frames never answered must not pin the map at its cap.
+                    if novel_kinds.len() >= NOVEL_KINDS_CAP {
+                        novel_kinds.clear();
+                    }
 
                     // Sprint P: emit aggregated PEX stats (every 60s, only if activity)
                     if let Some(line) = pex_stats.tick() {
@@ -1985,11 +2650,19 @@ impl NetworkNode {
                     pex_limiter.gc();
                     sync_limiter.gc_at(now);
                     claim_limiter.gc_at(now, CLAIM_LIMITER_IDLE_TTL);
+                    // B1-T2: discouragement ends after its TTL.
+                    for p in discouraged_ids.expire(now) {
+                        swarm.behaviour_mut().blocked.unblock_peer(p);
+                    }
                     // NET-4 / NET-8: decayed penalties are re-installed so a
                     // peer recovers once it stops misbehaving.
                     for (p, score) in wire_tracker.decay_tick_at(now) {
                         swarm.behaviour_mut().gossipsub.set_application_score(&p, score);
                     }
+                    for p in wire_tracker.take_evicted() {
+                        swarm.behaviour_mut().gossipsub.set_application_score(&p, 0.0);
+                    }
+                    discouraged_addrs.gc_at(now);
 
                     // FIX v0.5.1: Re-subscribe every 30s (idempotent; restores a
                     // mesh that peer scoring silently dropped).
@@ -2003,19 +2676,45 @@ impl NetworkNode {
                         warn!("tx mesh empty: {} peers but 0 in tx-mesh — re-subscribing", peer_count);
                     }
 
-                    if peer_count == 0 {
-                        for p in self.config.bootstrap_peers.iter() {
-                            let resolved = resolve_multiaddr(p).await;
-                            if let Ok(addr) = resolved.parse::<libp2p::Multiaddr>() {
-                                info!("reconnecting: {}", resolved);
-                                let _ = swarm.dial(addr);
-                            }
+                    // B1-T9: configured peers are re-dialed whenever they are
+                    // not connected (Core keeps -addnode peers connected), not
+                    // only when the node has no peer at all — inbound
+                    // connections used to stop this for good. An entry without
+                    // a peer id cannot be matched to a connection and is
+                    // re-dialed when no manual connection is up.
+                    let manual_up = conn_mgr.count(ConnKind::Manual) + conn_mgr.pending_count(ConnKind::Manual);
+                    for p in self.config.bootstrap_peers.iter() {
+                        let wanted = match addr_peer_id(p) {
+                            Some(id) => id != self.peer_id && !swarm.is_connected(&id) && !conn_mgr.is_dialing(&id),
+                            None => manual_up == 0,
+                        };
+                        if !wanted {
+                            continue;
                         }
+                        // Never awaited here: a host name's lookup (slow or
+                        // unreachable resolver, a seed that is down) runs on
+                        // its own task and the dial happens when the answer
+                        // arrives (`manual_resolved_rx` arm below), so the
+                        // swarm keeps being polled meanwhile (M-11).
+                        manual_resolver.request(p, |p| async move { resolve_dial_addr(&p, true).await });
                     }
+                    drain_pulls(&mut swarm, &mut pulls, now);
+                }
+
+                // NET-11 (d): block-relay-only peers carry no gossip; their
+                // frontier is polled (then pulled block by block) every
+                // BLOCK_RELAY_POLL_INTERVAL — the only way a block reaches us
+                // over such a connection after the connect-time GetTips.
+                _ = block_relay_poll.tick() => {
+                    let now = Instant::now();
+                    for p in conn_mgr.block_relay_peers() {
+                        send_directed_pull(&mut swarm, &mut pulls, p, sync_rr::SyncRequest::GetTips, now);
+                    }
+                    drain_pulls(&mut swarm, &mut pulls, now);
                 }
 
                 _ = save_peers.tick() => {
-                    save_known_peers(&peers_path, &known_peers);
+                    save_known_peers(&peers_path, &tried.to_set());
                 }
 
                 // Sprint CC: periodic tip announcement for IBD recovery (60s).
@@ -2057,51 +2756,24 @@ impl NetworkNode {
     }
 }
 
-// ── Directed-pull pipeline (NET-5 / NET-9) ───────────────────────────────────
+// ── Directed-pull pipeline (NET-5 / NET-9 / B1-T2 / B1-T6) ───────────────────
 
-/// Max queued pulls waiting for an eligible peer.
-pub const MAX_PENDING_PULLS: usize = 4096;
-/// A pull is attempted on at most this many peers before it is dropped (the
-/// processor's own retry paths — frontier expiry, orphan sweep, the 30s
-/// nudge — re-issue anything still needed).
-pub const MAX_PULL_ATTEMPTS: u8 = 3;
+pub use pull::MAX_PENDING_PULLS;
 /// How often queued pulls are retried.
 const PULL_RETRY_TICK: Duration = Duration::from_millis(250);
-/// NET-11: PEX dial cadence and batch sizes.
-const PEX_DIAL_TICK: Duration = Duration::from_secs(10);
-const PEX_LOW_PEER_THRESHOLD: usize = 4;
-const PEX_DIALS_WHEN_LOW: usize = 4;
+/// B1-T9 / NET-11: cadence of the outbound connection loop: at most one
+/// automatic outbound dial per tick (Core's ThreadOpenConnections loops every
+/// 500 ms, one connection attempt at a time).
+const OUTBOUND_TICK: Duration = Duration::from_secs(1);
+/// NET-11 (a): bound on the gossip frames whose kind is remembered while their
+/// verdict is pending (cleared on overflow; the processor answers every
+/// pending frame within seconds).
+const NOVEL_KINDS_CAP: usize = 8192;
 /// NET-6: per-author tip-claim rate limit (burst, refill/sec, tracked authors).
 const CLAIM_BURST: u32 = 16;
 const CLAIM_REFILL_PER_SEC: f64 = 0.2;
 const CLAIM_LIMITER_TRACK_CAP: usize = 4096;
 const CLAIM_LIMITER_IDLE_TTL: Duration = Duration::from_secs(600);
-
-/// One directed pull, queued or in flight.
-#[derive(Clone, Debug)]
-struct PendingPull {
-    msg:      NetworkMessage,
-    req:      sync_rr::SyncRequest,
-    attempts: u8,
-    /// Peers this pull already failed on (excluded on retry when possible).
-    tried:    Vec<PeerId>,
-}
-
-/// Put a failed / Busy pull back at the END of the queue, remembering the
-/// peer it failed on, unless it has used up its attempts.
-fn requeue_pull(pending: &mut std::collections::VecDeque<PendingPull>, mut p: PendingPull, failed_on: PeerId) {
-    p.attempts = p.attempts.saturating_add(1);
-    if p.attempts >= MAX_PULL_ATTEMPTS {
-        debug!("directed pull [{}] dropped after {} attempts", p.msg.kind_name(), p.attempts);
-        return;
-    }
-    if !p.tried.contains(&failed_on) {
-        p.tried.push(failed_on);
-    }
-    if pending.len() < MAX_PENDING_PULLS {
-        pending.push_back(p);
-    }
-}
 
 /// Log target of the debug-level receipt trace of gossiped transactions
 /// (`RUST_LOG=info,gnb_gossip_rx_tx=debug`). Every gossiped block is logged
@@ -2111,6 +2783,8 @@ pub const GOSSIP_RX_TX_LOG_TARGET: &str = "gnb_gossip_rx_tx";
 /// Period of the network heartbeat (peer count, housekeeping, re-subscribe,
 /// bootstrap re-dial with no peers).
 const HEARTBEAT_PERIOD: Duration = Duration::from_secs(30);
+// The heartbeat polls the block-relay-only peers' frontiers (NET-11 d).
+const _: () = assert!(HEARTBEAT_PERIOD.as_secs() == connmgr::BLOCK_RELAY_POLL_INTERVAL.as_secs());
 
 /// The network heartbeat timer. Its first tick comes after one period, not
 /// at once: at start-up no connection is established yet, so an immediate
@@ -2120,20 +2794,267 @@ fn new_heartbeat() -> tokio::time::Interval {
     tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT_PERIOD, HEARTBEAT_PERIOD)
 }
 
-/// The distinct-peer count after a connection to a peer is established
-/// (`num_established`: that peer's connections, this one included), or
-/// `None` when it is unchanged: only a peer's first connection counts. The
-/// count (RPC `peers`, the miner's has-peers check) used to count
-/// connections, so a peer dialed twice counted twice.
-fn peer_count_after_connect(count: usize, num_established: u32) -> Option<usize> {
-    (num_established == 1).then(|| count.saturating_add(1))
+/// NET-11 (a): which eviction protection an accepted gossip frame earns its
+/// delivering peer: `Some(true)` a novel block, `Some(false)` a novel
+/// transaction (Core's `m_last_block_time` / `m_last_tx_time`), `None` none.
+/// PoWit items (shares, attestations, equivocation proofs) are relayed like
+/// transactions but are neither: Core protects only for novel blocks and
+/// transactions, and an item (a witness share is 1/16 of a block's work and
+/// pays no fee) would otherwise compete for the 4 novel-transaction
+/// protections.
+fn novel_kind(msg: &NetworkMessage) -> Option<bool> {
+    match msg {
+        NetworkMessage::NewBlock { .. } => Some(true),
+        NetworkMessage::NewTransaction { .. } => Some(false),
+        _ => None,
+    }
 }
 
-/// The distinct-peer count after a connection to a peer is closed
-/// (`num_established`: that peer's connections still open), or `None` when
-/// it is unchanged: only a peer's last connection closing counts.
-fn peer_count_after_disconnect(count: usize, num_established: u32) -> Option<usize> {
-    (num_established == 0).then(|| count.saturating_sub(1))
+/// Remember whether a gossip frame awaiting the processor's verdict is a block
+/// (`true`) or a transaction (NET-11 a: an `Accept` marks the delivering peer
+/// as a source of novel blocks / transactions, which protects it from
+/// inbound eviction).
+fn note_pending_kind(map: &mut std::collections::HashMap<gossipsub::MessageId, bool>, id: &gossipsub::MessageId, is_block: bool) {
+    if map.len() < NOVEL_KINDS_CAP {
+        map.insert(id.clone(), is_block);
+    }
+}
+
+/// Dial `addr` for `intent`, registering the dial with the connection manager
+/// under its connection id (so the established connection gets its kind).
+/// An address with a `/p2p/<id>` is dialed only if that peer is neither
+/// connected nor being dialed. Returns whether the dial was started.
+fn dial_with_intent(
+    swarm:    &mut libp2p::Swarm<BlochBehaviour>,
+    conn_mgr: &mut ConnManager,
+    addr:     Multiaddr,
+    mut intent: DialIntent,
+) -> bool {
+    use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+    let peer = addr.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::P2p(id) => Some(id),
+        _ => None,
+    });
+    let opts = match peer {
+        Some(id) => DialOpts::peer_id(id)
+            .addresses(vec![addr])
+            .condition(PeerCondition::DisconnectedAndNotDialing)
+            .build(),
+        None => DialOpts::unknown_peer_id().address(addr).build(),
+    };
+    intent.peer = intent.peer.or(peer);
+    let id = opts.connection_id();
+    conn_mgr.register_dial(id, intent);
+    match swarm.dial(opts) {
+        Ok(()) => true,
+        Err(e) => {
+            let failed = conn_mgr.on_dial_failed(id);
+            if let Some(DialIntent { kind: ConnKind::BlockRelayOnly | ConnKind::Feeler, peer: Some(p), .. }) = failed {
+                if !swarm.is_connected(&p) {
+                    swarm.behaviour_mut().gossipsub.ungate_peer(&p);
+                }
+            }
+            debug!("dial not started: {}", e);
+            false
+        }
+    }
+}
+
+/// One step of the outbound connection loop (B1-T9 / NET-11, Core's
+/// `ThreadOpenConnections`): decide what the next automatic outbound
+/// connection is for ([`connmgr::next_outbound_action`]: anchors, full-relay
+/// slots, block-relay-only slots, feelers), pick an address and dial it.
+///
+/// * full-relay / block-relay-only: [`connmgr::select_outbound_candidate`]
+///   — a random entry of the tried or the new table (50/50, as Core's
+///   `Select`), outside the netgroups of the current automatic outbound
+///   peers (full-relay: the small-network fallback when no such entry
+///   exists), not connected, not ourselves, not tried in the last
+///   `addrbook::RETRY_INTERVAL`;
+/// * anchor: the next anchor from the last run, as block-relay-only;
+/// * feeler: the occupant of a queued tried collision first
+///   (test-before-evict), else a random new-table address.
+///
+/// A new-table address leaves the table when it is dialed (a success moves it
+/// to the tried table, once the peer's identify shows it runs this network,
+/// POW-9; a failure drops it). Never an `excluded` address: a peer that
+/// identified as another network's during this run (POW-9), or an address
+/// discouraged after a peer there misbehaved (NET-2 residual).
+#[allow(clippy::too_many_arguments)]
+fn open_next_outbound(
+    swarm:         &mut libp2p::Swarm<BlochBehaviour>,
+    conn_mgr:      &mut ConnManager,
+    tried:         &mut TriedTable,
+    addr_book:     &mut AddrBook,
+    anchors:       &mut std::collections::VecDeque<String>,
+    feeler:        &mut connmgr::FeelerSchedule,
+    me:            &PeerId,
+    allow_private: bool,
+    excluded:      &dyn Fn(&str) -> bool,
+    now:           std::time::Instant,
+) {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let feeler_u: f64 = rng.random();
+    let action = connmgr::next_outbound_action(
+        conn_mgr.full_relay_slots_used(),
+        conn_mgr.full_relay_target(),
+        conn_mgr.block_relay_slots_used(),
+        conn_mgr.block_relay_target(),
+        !anchors.is_empty(),
+        || feeler.poll(now, feeler_u),
+    );
+    let reachable = |a: &str, conn_mgr: &ConnManager, swarm: &libp2p::Swarm<BlochBehaviour>| -> bool {
+        is_valid_public_multiaddr(a, allow_private)
+            && !excluded(a)
+            && addr_peer_id(a).is_some_and(|p| p != *me && !swarm.is_connected(&p) && !conn_mgr.is_dialing(&p))
+    };
+    let (kind, pick, collision_newcomer) = match action {
+        OutboundAction::Idle => return,
+        OutboundAction::Anchor => {
+            // Core skips an anchor in the netgroup of a current outbound peer.
+            let groups = conn_mgr.outbound_groups();
+            let mut pick = None;
+            while let Some(a) = anchors.pop_front() {
+                if reachable(&a, conn_mgr, swarm) && netgroup(&a).is_some_and(|g| !groups.contains(&g)) {
+                    pick = Some(a);
+                    break;
+                }
+            }
+            (ConnKind::BlockRelayOnly, pick, None)
+        }
+        OutboundAction::FullRelay | OutboundAction::BlockRelay => {
+            let kind = if action == OutboundAction::FullRelay { ConnKind::OutboundFullRelay } else { ConnKind::BlockRelayOnly };
+            let group_counts = conn_mgr.outbound_group_counts();
+            let eligible = |a: &str| reachable(a, conn_mgr, swarm) && !tried.recently_tried(a, now);
+            let pick = connmgr::select_outbound_candidate(&mut rng, tried, addr_book, kind, &group_counts, eligible);
+            (kind, pick, None)
+        }
+        OutboundAction::Feeler => match tried.pending_collision(now) {
+            Some((newcomer, occupant)) if reachable(&occupant, conn_mgr, swarm) => (ConnKind::Feeler, Some(occupant), Some(newcomer)),
+            Some((newcomer, occupant)) => {
+                // The occupant is connected right now: it is reachable.
+                tried.resolve_collision(&newcomer, &occupant, true, now);
+                return;
+            }
+            None => (ConnKind::Feeler, addr_book.select(&mut rng, |a| reachable(a, conn_mgr, swarm)), None),
+        },
+    };
+    let Some(a) = pick else { return };
+    addr_book.remove(&a);
+    tried.mark_attempt(&a, now);
+    let Ok(ma) = a.parse::<Multiaddr>() else { return };
+    let peer = addr_peer_id(&a);
+    if matches!(kind, ConnKind::BlockRelayOnly | ConnKind::Feeler) {
+        if let Some(p) = peer {
+            // NET-11 (c)/(d): gate BEFORE dialing, so gossipsub never sees
+            // a block-relay-only or feeler connection.
+            swarm.behaviour_mut().gossipsub.gate_peer(p);
+        }
+    }
+    debug!("outbound {:?} dial: {}", kind, truncate_utf8(&a, 80));
+    let group = netgroup(&a);
+    dial_with_intent(swarm, conn_mgr, ma, DialIntent { kind, addr: Some(a), peer, group, collision_newcomer });
+}
+
+/// Longest a heartbeat re-dial lookup of a configured host name may take.
+const MANUAL_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// B1-T9 / M-11: resolution of configured (`--peer`) addresses for the
+/// heartbeat re-dials, OFF the network loop. Since B1-T9 every configured
+/// peer that is not connected is re-dialed each heartbeat (not only with no
+/// peer at all); awaiting its DNS lookup inline froze the whole swarm loop
+/// (gossip, eviction, pulls, sync answers) for as long as the resolver took
+/// whenever a configured host was down or its DNS slow. Each lookup now runs
+/// on its own task, bounded by a timeout, at most one per address at a time;
+/// the answer comes back over a channel the loop reads.
+struct ManualResolver {
+    in_flight: HashSet<String>,
+    timeout: Duration,
+    tx: mpsc::UnboundedSender<(String, Option<Multiaddr>)>,
+}
+
+impl ManualResolver {
+    fn new(timeout: Duration) -> (Self, mpsc::UnboundedReceiver<(String, Option<Multiaddr>)>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self { in_flight: HashSet::new(), timeout, tx }, rx)
+    }
+
+    /// Start resolving `addr` with `resolve` on a spawned task and return at
+    /// once; `false` (nothing started) while a lookup of `addr` is running.
+    /// The result, `None` on failure or timeout, arrives on the receiver.
+    fn request<F, Fut>(&mut self, addr: &str, resolve: F) -> bool
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Option<Multiaddr>> + Send + 'static,
+    {
+        if !self.in_flight.insert(addr.to_string()) {
+            return false;
+        }
+        let (tx, timeout, key) = (self.tx.clone(), self.timeout, addr.to_string());
+        let lookup = resolve(addr.to_string());
+        tokio::spawn(async move {
+            let out = tokio::time::timeout(timeout, lookup).await.ok().flatten();
+            let _ = tx.send((key, out));
+        });
+        true
+    }
+
+    /// The lookup of `addr` has been delivered.
+    fn finished(&mut self, addr: &str) {
+        self.in_flight.remove(addr);
+    }
+}
+
+/// NET-11: whether a `Peers` answer may feed the new table — only when the
+/// request it answers was our `GetPeers` and the answering peer is one we ask
+/// for addresses (outbound full-relay or manual: Core reads `addr` from
+/// neither inbound nor block-relay-only peers). A `Peers` answer to any other
+/// request (every connection gets a `GetTips` on connect, block-relay-only
+/// peers one per poll) is ignored.
+fn solicited_peers_answer(req: Option<&sync_rr::SyncRequest>, role: Option<ConnKind>) -> bool {
+    matches!(req, Some(sync_rr::SyncRequest::GetPeers)) && role.is_some_and(|k| k.sends_getaddr())
+}
+
+/// Core's cached `getaddr` answer (`m_addr_response_caches`): the sample of
+/// the tried table served to inbound peers is recomputed only about once a
+/// day (21-27 h), so reconnecting and asking again reveals nothing more of
+/// the table. While the cached sample is not full and the table has grown,
+/// it is refreshed at most every [`GETADDR_CACHE_GROW_REFRESH`] (a young
+/// node would otherwise serve its near-empty start-up table for a day).
+#[derive(Default)]
+struct GetAddrCache {
+    sample: Vec<String>,
+    built_at: Option<std::time::Instant>,
+    expires: Option<std::time::Instant>,
+}
+
+/// Minimum lifetime of the cached `GetPeers` sample (Core: 21 h + up to 6 h).
+const GETADDR_CACHE_LIFETIME: Duration = Duration::from_secs(21 * 3600);
+const GETADDR_CACHE_JITTER: Duration = Duration::from_secs(6 * 3600);
+const GETADDR_CACHE_GROW_REFRESH: Duration = Duration::from_secs(600);
+
+impl GetAddrCache {
+    fn sample(&mut self, now: std::time::Instant, tried: &TriedTable, allow_private: bool) -> Vec<String> {
+        use rand::seq::SliceRandom;
+        use rand::Rng;
+        let expired = self.expires.is_none_or(|t| now >= t);
+        let growing = self.sample.len() < PEX_RESPONSE_SAMPLE_SIZE
+            && tried.len() > self.sample.len()
+            && self.built_at.is_some_and(|b| now.saturating_duration_since(b) >= GETADDR_CACHE_GROW_REFRESH);
+        if expired || growing {
+            let mut all: Vec<String> = tried.addresses().into_iter()
+                .filter(|a| is_valid_public_multiaddr(a, allow_private))
+                .collect();
+            all.shuffle(&mut rand::rng());
+            all.truncate(PEX_RESPONSE_SAMPLE_SIZE);
+            self.sample = all;
+            self.built_at = Some(now);
+            let jitter = GETADDR_CACHE_JITTER.mul_f64(rand::rng().random::<f64>());
+            self.expires = Some(now + GETADDR_CACHE_LIFETIME + jitter);
+        }
+        self.sample.clone()
+    }
 }
 
 /// Whether a tip claim, clamped to `claimed` (blue score), is worth a directed
@@ -2142,77 +3063,126 @@ fn claim_warrants_directed_pull(claimed: u64, our_score: u64) -> bool {
     claimed > our_score
 }
 
-/// Send the pull `msg` (GetTips / GetHeaders / GetBlock / PeerRequest) to
-/// `peer` itself, bypassing the selector's choice: a request about THAT
-/// peer's state (its frontier on connect; the headers and frontier it claims
-/// to have). Never retried on another peer (`attempts` = MAX_PULL_ATTEMPTS);
-/// the answer flows through the same `on_pull_response` / processor path as
-/// any other pull.
+/// Send `req` (GetTips / GetPeers) to `peer` itself, bypassing the queue: a
+/// request about THAT peer's state (its frontier and peers on connect; the
+/// frontier it claims to have). Never retried on another peer; the answer is
+/// bound to the request and handled like any other (`PullScheduler`).
 fn send_directed_pull(
-    swarm:    &mut libp2p::Swarm<BlochBehaviour>,
-    selector: &mut sync_rr::PullPeerSelector,
-    inflight: &mut std::collections::HashMap<libp2p::request_response::OutboundRequestId, (PendingPull, PeerId)>,
-    peer:     PeerId,
-    msg:      NetworkMessage,
-    now:      std::time::Instant,
+    swarm: &mut libp2p::Swarm<BlochBehaviour>,
+    pulls: &mut pull::PullScheduler<libp2p::request_response::OutboundRequestId>,
+    peer:  PeerId,
+    req:   sync_rr::SyncRequest,
+    now:   std::time::Instant,
 ) {
-    let Some(req) = sync_rr::as_pull_request(&msg) else { return };
-    let id = swarm.behaviour_mut().sync_rr.send_request(&peer, req.clone());
-    debug!("→ directed pull [{}] to {} (its own state)", msg.kind_name(), peer);
-    selector.on_sent(peer, now);
-    inflight.insert(id, (PendingPull { msg, req, attempts: MAX_PULL_ATTEMPTS, tried: vec![peer] }, peer));
+    debug!("→ directed pull [{}] to {} (its own state)", req.kind_name(), peer);
+    pulls.send_pinned(peer, req, now, |p, r| swarm.behaviour_mut().sync_rr.send_request(&p, r.clone()));
 }
 
-/// The answer `response` from `peer` to a directed pull (`entry`: the pull
-/// and the peer it was sent to, `None` for an unknown request id). Updates the
-/// selector (`Busy`: a short back-off; any other answer: a success) and puts
-/// the pull back in `pending` for ANOTHER peer when the answer does not
-/// complete it (`sync_rr::retry_pull_elsewhere`: `Busy`, and `BlockNotFound`,
-/// a peer that does not have the body; bounded by `MAX_PULL_ATTEMPTS`). Every
-/// other answer completes the pull. The swarm loop calls this for every
-/// response, so the retry decision is unit-tested where it is made:
-/// a `BlockNotFound` that completed the pull left a healing partition
-/// waiting for the 30-60 s sweeps (test/functional/feature_partition_heal.py).
-fn on_pull_response(
-    entry:    Option<(PendingPull, PeerId)>,
-    response: &sync_rr::SyncResponse,
-    peer:     PeerId,
-    selector: &mut sync_rr::PullPeerSelector,
-    pending:  &mut std::collections::VecDeque<PendingPull>,
-    now:      std::time::Instant,
-) {
-    if matches!(response, sync_rr::SyncResponse::Busy) {
-        // NET-5: back-pressure, not an offence.
-        selector.on_busy(&peer, now);
-    } else {
-        selector.on_success(&peer);
-    }
-    if sync_rr::retry_pull_elsewhere(response) {
-        if let Some((p, _)) = entry {
-            requeue_pull(pending, p, peer);
-        }
-    }
-}
-
-/// Send queued pulls to eligible peers until the queue is empty or no peer is
-/// eligible. A pull prefers a peer it has not failed on yet.
+/// Send the queued pulls the scheduler picks.
 fn drain_pulls(
-    swarm:    &mut libp2p::Swarm<BlochBehaviour>,
-    selector: &mut sync_rr::PullPeerSelector,
-    pending:  &mut std::collections::VecDeque<PendingPull>,
-    inflight: &mut std::collections::HashMap<libp2p::request_response::OutboundRequestId, (PendingPull, PeerId)>,
-    now:      std::time::Instant,
+    swarm: &mut libp2p::Swarm<BlochBehaviour>,
+    pulls: &mut pull::PullScheduler<libp2p::request_response::OutboundRequestId>,
+    now:   std::time::Instant,
 ) {
-    while let Some(p) = pending.front() {
-        let pick = selector.select(now, &p.tried).or_else(|| {
-            if p.tried.is_empty() { None } else { selector.select(now, &[]) }
-        });
-        let Some(peer) = pick else { break };
-        let Some(p) = pending.pop_front() else { break };
-        let id = swarm.behaviour_mut().sync_rr.send_request(&peer, p.req.clone());
-        debug!("→ directed pull [{}] to {}", p.msg.kind_name(), peer);
-        selector.on_sent(peer, now);
-        inflight.insert(id, (p, peer));
+    pulls.drain(now, |p, r| swarm.behaviour_mut().sync_rr.send_request(&p, r.clone()));
+}
+
+/// B1-T2: install `peer`'s new shared misbehaviour score (`score`, from the
+/// `WirePenaltyTracker`) in gossipsub, and at the threshold
+/// (`misbehaviour::should_disconnect`) disconnect and discourage it
+/// ([`discourage_now`]; Bitcoin Core: `Misbehaving` → discouraged and
+/// disconnected).
+#[allow(clippy::too_many_arguments)]
+fn act_on_misbehaviour(
+    swarm:        &mut libp2p::Swarm<BlochBehaviour>,
+    ids:          &mut misbehaviour::Discouraged,
+    addrs:        &mut discourage::Discouraged,
+    peer_addrs:   &discourage::PeerAddrs,
+    manual_peers: &HashSet<PeerId>,
+    peer:         PeerId,
+    score:        f64,
+    now:          std::time::Instant,
+) {
+    swarm.behaviour_mut().gossipsub.set_application_score(&peer, score);
+    if misbehaviour::should_disconnect(score) && !ids.contains(&peer, now) {
+        warn!("disconnecting and discouraging {} (misbehaviour score {})", peer, score);
+        discourage_now(swarm, ids, addrs, peer_addrs, manual_peers, peer, now);
+    }
+}
+
+/// The one misbehaviour model's sanction (B1-T2 with the NET-2 residual):
+/// the peer's identity is refused for `misbehaviour::DISCOURAGE_TTL` (libp2p
+/// block list: its connections close and new ones are refused, both
+/// directions) and its address (IPv4, or IPv6 /64) is discouraged
+/// (`discourage::Discouraged`, Core's `m_discouraged`), so neither the same
+/// identity from another address nor a fresh identity from the same address
+/// gets back in. Reached when the shared score crosses its threshold
+/// ([`act_on_misbehaviour`]) or at once for data no honest node sends
+/// (`NetworkControl::Misbehaving`). Operator-configured peers (`--peer`,
+/// Core's `noban`) are never sanctioned: an operator who listed a peer keeps
+/// it. Returns whether the address was discouraged (a local address never
+/// is).
+fn discourage_now(
+    swarm:        &mut libp2p::Swarm<BlochBehaviour>,
+    ids:          &mut misbehaviour::Discouraged,
+    addrs:        &mut discourage::Discouraged,
+    peer_addrs:   &discourage::PeerAddrs,
+    manual_peers: &HashSet<PeerId>,
+    peer:         PeerId,
+    now:          std::time::Instant,
+) -> bool {
+    if manual_peers.contains(&peer) {
+        return false;
+    }
+    let addr_discouraged = peer_addrs.get(&peer).is_some_and(|ip| addrs.discourage(ip, now));
+    for forgotten in ids.insert(peer, now) {
+        swarm.behaviour_mut().blocked.unblock_peer(forgotten);
+    }
+    // Closes its connections and refuses new ones, both directions.
+    swarm.behaviour_mut().blocked.block_peer(peer);
+    addr_discouraged
+}
+
+type ServeQ = serve::ServeQueue<
+    libp2p::request_response::InboundRequestId,
+    libp2p::request_response::ResponseChannel<sync_rr::SyncResponse>,
+>;
+type ServedTx = mpsc::Sender<
+    serve::Served<libp2p::request_response::InboundRequestId, libp2p::request_response::ResponseChannel<sync_rr::SyncResponse>>,
+>;
+
+/// Hand an answer to libp2p and charge its bytes to `peer` until it is
+/// written (B1-T18 / B2-T6).
+fn respond(
+    swarm:   &mut libp2p::Swarm<BlochBehaviour>,
+    serve_q: &mut ServeQ,
+    peer:    PeerId,
+    id:      libp2p::request_response::InboundRequestId,
+    channel: libp2p::request_response::ResponseChannel<sync_rr::SyncResponse>,
+    resp:    sync_rr::SyncResponse,
+) {
+    let bytes = serve::charge_for(&resp);
+    if swarm.behaviour_mut().sync_rr.send_response(channel, resp).is_err() {
+        debug!("sync_rr: answer channel to {} already closed", peer);
+    } else {
+        serve_q.charge(peer, id, bytes);
+    }
+}
+
+/// Start the queued serving jobs the free workers can take (B1-T3 / B2-T5);
+/// a job whose peer reached its send budget meanwhile is answered Busy.
+fn pump_serving(
+    swarm:   &mut libp2p::Swarm<BlochBehaviour>,
+    serve_q: &mut ServeQ,
+    dag:     &std::sync::Arc<parking_lot::RwLock<crate::consensus::GhostDAG>>,
+    store:   &std::sync::Arc<crate::storage::Storage>,
+    done:    &ServedTx,
+) {
+    while let Some(next) = serve_q.next_job() {
+        match next {
+            serve::Next::Compute(job) => serve::spawn_worker(job, dag.clone(), store.clone(), done.clone()),
+            serve::Next::Busy(job) => respond(swarm, serve_q, job.peer, job.id, job.channel, sync_rr::SyncResponse::Busy),
+        }
     }
 }
 
@@ -2236,19 +3206,25 @@ async fn recv_verdict(rx: &mut Option<mpsc::Receiver<GossipValidation>>) -> Opti
 
 /// NET-11: admit peer-exchange addresses from `author` (the peer that answered
 /// OUR GetPeers) into the unverified address table. Rate-limited per author,
-/// batch-capped, validated, never our own id, never already-known entries.
-/// Nothing is dialed here — the network loop dials from the table, a few
-/// per tick. Returns how many addresses entered the table.
+/// batch-capped, validated, never our own id, never already-known entries
+/// (`known`: the tried table). B1-T8: every address is normalised (an
+/// IPv4-mapped / -compatible IPv6 literal becomes its `/ip4/` form) before it
+/// is validated, so a re-spelled private address cannot pass. NET-11 (e): the
+/// entry is bucketed by `source_group`, the netgroup of `author`'s
+/// connection (Core's addr source). Nothing is dialed here — the connection
+/// manager selects from the tables. Returns how many addresses entered the
+/// table.
 #[allow(clippy::too_many_arguments)]
 pub fn ingest_pex_addresses(
     book:          &mut AddrBook,
     limiter:       &mut PexRateLimiter,
     stats:         &mut PexStats,
     author:        PeerId,
+    source_group:  &str,
     peers:         &[String],
     allow_private: bool,
     self_peer:     &PeerId,
-    known:         &HashSet<String>,
+    known:         impl Fn(&str) -> bool,
 ) -> usize {
     let original_len = peers.len();
     let admitted = limiter.admit(author, original_len);
@@ -2263,21 +3239,23 @@ pub fn ingest_pex_addresses(
         }
     }
     let mut added = 0usize;
-    for addr_str in peers.iter().take(admitted) {
-        if !is_valid_public_multiaddr(addr_str, allow_private) {
-            if is_valid_public_multiaddr(addr_str, true) {
+    for raw in peers.iter().take(admitted) {
+        let addr_str = normalize_peer_addr(raw).unwrap_or_else(|| raw.clone());
+        if !is_valid_public_multiaddr(&addr_str, allow_private) {
+            if is_valid_public_multiaddr(&addr_str, true) {
                 stats.record_private(1);
             } else {
                 stats.record_invalid(1);
             }
             // H4: addr_str is attacker-controlled; UTF-8-safe truncation.
-            debug!("PEX rejected: {}", truncate_utf8(addr_str, 80));
+            debug!("PEX rejected: {}", truncate_utf8(raw, 80));
             continue;
         }
-        if known.contains(addr_str) || addr_peer_id(addr_str).is_some_and(|p| p == *self_peer) {
+        if known(&addr_str) || addr_peer_id(&addr_str).is_some_and(|p| p == *self_peer) {
             continue;
         }
-        if book.add(addr_str) {
+        if book.add_from(&addr_str, source_group) {
+            stats.record_accept(1);
             added += 1;
         }
     }
@@ -2394,62 +3372,70 @@ async fn poll_swarm(
 
 
 
-/// Resolve a `/dns4/...` multiaddr to a `/ip4/...` form using async DNS.
+/// Turn an OPERATOR-configured address (`--peer`, the shipped seeds) into a
+/// dialable multiaddr: a leading `/dns`, `/dns4` or `/dns6` host name of a
+/// plain-TCP address is resolved here (the swarm's TCP transport has no DNS
+/// layer), and the first answer of the right family that
+/// [`is_acceptable_ip`]`(ip, allow_private)` accepts replaces it — B1-T8: a
+/// name never resolves into an invalid range (unspecified, multicast,
+/// documentation, link-local / cloud metadata …), and with `allow_private =
+/// false` not into a loopback or private one either. Websocket addresses keep
+/// their name (the websocket transport resolves it itself, and `wss` needs it
+/// for TLS). `None`: unparseable, or no acceptable answer.
 ///
-/// Audit M-11 fix: this function was previously synchronous, calling
-/// `std::net::ToSocketAddrs::to_socket_addrs` — a blocking C library
-/// call that can stall the caller for the full DNS timeout (seconds)
-/// on an unreachable nameserver. Every caller lives inside the
-/// libp2p swarm event loop in `Swarm::run`; blocking the loop stalls
-/// gossipsub propagation, connection events, and outbound dials for
-/// every other peer. On a network with even one slow DNS seed this
-/// was a periodic latency spike visible to the whole node.
+/// Learned addresses never come here: the address tables accept IP literals
+/// only.
 ///
-/// Now uses `tokio::net::lookup_host`, which runs the lookup on the
-/// blocking thread pool instead of holding the async executor. The
-/// public API is now `async`; all three callers are inside async
-/// code already, so the `.await` points add no new complexity.
-///
-/// Audit L-3 concern (silent fallback) is preserved: warn logs fire
-/// on DNS failure and on no-IPv4-records, both paths still return
-/// the unresolved multiaddr so upstream `parse::<Multiaddr>()` can
-/// decide whether to dial.
-async fn resolve_multiaddr(addr: &str) -> String {
-    if !addr.contains("/dns4/") { return addr.to_string(); }
-    let parts: Vec<&str> = addr.splitn(2, "/dns4/").collect();
-    if parts.len() < 2 { return addr.to_string(); }
-    let rest = parts[1];
-    let mut iter = rest.splitn(3, '/');
-    let host = iter.next().unwrap_or("");
-    let _ = iter.next();
-    let remainder = iter.next().unwrap_or("");
-
+/// Audit M-11 fix: the lookup is async (`tokio::net::lookup_host`, on the
+/// blocking pool), so a slow resolver never stalls the swarm event loop.
+/// Audit L-3: every failure is logged.
+async fn resolve_dial_addr(addr: &str, allow_private: bool) -> Option<Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+    let ma: Multiaddr = addr.parse().ok()?;
+    let mut parts: Vec<Protocol<'static>> = ma.iter().map(|p| p.acquire()).collect();
+    let (host, want_v4, want_v6) = match parts.first()? {
+        Protocol::Dns(h) => (h.to_string(), true, true),
+        Protocol::Dns4(h) => (h.to_string(), true, false),
+        Protocol::Dns6(h) => (h.to_string(), false, true),
+        _ => return Some(ma),
+    };
+    if parts.iter().any(|p| matches!(p, Protocol::Ws(_) | Protocol::Wss(_))) {
+        return Some(ma);
+    }
     match tokio::net::lookup_host(format!("{}:0", host)).await {
-        Ok(addrs) => {
-            if let Some(sa) = addrs.into_iter().find(|a| a.is_ipv4()) {
-                let ip = sa.ip();
-                let tcp_rest: Vec<&str> = remainder.splitn(2, '/').collect();
-                let port = tcp_rest.first().unwrap_or(&"");
-                let p2p = tcp_rest.get(1).map(|s| format!("/{}", s)).unwrap_or_default();
-                return format!("/ip4/{}/tcp/{}{}", ip, port, p2p);
-            }
-            // Audit L-3: DNS returned records but none were IPv4.
-            warn!(
-                "resolve_multiaddr: DNS for host '{}' returned no IPv4 records; \
-                 falling back to the unresolved multiaddr. Dial may fail.",
-                host,
-            );
+        Ok(answers) => {
+            let answers: Vec<std::net::IpAddr> = answers.map(|sa| sa.ip()).collect();
+            let Some(ip) = pick_resolved_ip(&answers, want_v4, want_v6, allow_private) else {
+                warn!("resolve: no acceptable address for '{}' among {:?}; not dialing {}", host, answers, addr);
+                return None;
+            };
+            parts[0] = match ip {
+                std::net::IpAddr::V4(v4) => Protocol::Ip4(v4),
+                std::net::IpAddr::V6(v6) => Protocol::Ip6(v6),
+            };
+            Some(parts.into_iter().collect())
         }
         Err(e) => {
-            // Audit L-3: DNS resolution itself failed.
-            warn!(
-                "resolve_multiaddr: DNS lookup for host '{}' failed: {}. \
-                 Falling back to the unresolved multiaddr; dial may fail.",
-                host, e,
-            );
+            warn!("resolve: DNS lookup for '{}' failed: {}; not dialing {}", host, e, addr);
+            None
         }
     }
-    addr.to_string()
+}
+
+/// The DNS answer [`resolve_dial_addr`] dials: the first of the wanted family
+/// (IPv4 first, as Core prefers what it can reach) that
+/// [`is_acceptable_ip`]`(ip, allow_private)` accepts.
+fn pick_resolved_ip(
+    answers: &[std::net::IpAddr],
+    want_v4: bool,
+    want_v6: bool,
+    allow_private: bool,
+) -> Option<std::net::IpAddr> {
+    let mut v: Vec<std::net::IpAddr> = answers.to_vec();
+    v.sort_by_key(|ip| !ip.is_ipv4());
+    v.into_iter().find(|ip| {
+        ((ip.is_ipv4() && want_v4) || (ip.is_ipv6() && want_v6)) && is_acceptable_ip(*ip, allow_private)
+    })
 }
 
 /// PROPAGAÇÃO-CHURN fix (2026-08-09): the ONE canonical string form of a
@@ -2576,7 +3562,7 @@ fn ws_listen_addr_from(listen_addr: &str) -> Option<Multiaddr> {
 /// RANDOM SAMPLE of `known_peers`, never the whole table. Mirrors the
 /// rationale Bitcoin's `getaddr` uses (return a fraction of the table, not
 /// all of it): a requester wanting more addresses simply asks again (and, on
-/// this transport, asks a DIFFERENT peer next time via `select_pull_peer`),
+/// this transport, every new connection is asked once),
 /// while a single answer can never hand over the complete peer table in one
 /// shot — the reconnaissance value of one answer is bounded regardless of
 /// how large `known_peers` (capped at `KNOWN_PEERS_CAP`, 1000) has grown.
@@ -2588,7 +3574,7 @@ const PEX_RESPONSE_SAMPLE_SIZE: usize = 30;
 /// only the transport and the "return everything" -> "return a sample"
 /// change are new.
 fn serve_get_peers(
-    known_peers:     &std::collections::HashSet<String>,
+    known_peers:     &[String],
     external_addrs:  &[Multiaddr],
     self_peer_id:    &PeerId,
     allow_private:   bool,
@@ -2613,79 +3599,8 @@ fn serve_get_peers(
     sync_rr::SyncResponse::Peers { peers: candidates }
 }
 
-/// Serve an inbound directed `SyncRequest` from our DAG + block store. This is
-/// the SERVER side of announce-then-pull: block bodies live in the store (not
-/// the DAG), headers/tips come from the DAG — exactly the same sources the
-/// legacy gossip responders in `main.rs` read, so the answers are identical;
-/// only the transport (directed request-response vs. gossip broadcast) differs.
-///
-/// `GetPeers` (M-10) is handled by the caller via [`serve_get_peers`] instead
-/// of here, because it needs `known_peers` / the swarm's external addresses /
-/// this node's own `PeerId` — none of which this function otherwise needs —
-/// so this match still covers it (exhaustiveness) but never actually reaches
-/// this arm in the real event loop.
-fn serve_sync_request(
-    dag:   &std::sync::Arc<parking_lot::RwLock<crate::consensus::GhostDAG>>,
-    store: &std::sync::Arc<crate::storage::Storage>,
-    req:   &sync_rr::SyncRequest,
-) -> sync_rr::SyncResponse {
-    use sync_rr::{SyncRequest, SyncResponse};
-    match req {
-        SyncRequest::GetPeers => {
-            // See the function doc comment: unreachable via the real
-            // dispatch (the caller special-cases GetPeers before calling
-            // this function), kept only so this match stays exhaustive.
-            // Answering with an empty, well-formed response here — rather
-            // than `unreachable!()` — means a future refactor that DID
-            // route GetPeers here by mistake would get an empty PEX answer
-            // instead of a panic on the swarm event loop.
-            SyncResponse::Peers { peers: Vec::new() }
-        }
-        SyncRequest::GetBlock { block_hash } => match store.get_block(block_hash) {
-            Ok(Some(block)) => SyncResponse::Block {
-                block_hash: *block_hash,
-                blue_score: block.blue_score,
-                height:     block.height,
-                block_data: block.to_wire_bytes(),
-            },
-            // Pruned or unknown — answer explicitly (same semantics as the
-            // gossip BlockNotFound) so the requester tries another peer.
-            _ => SyncResponse::BlockNotFound { block_hash: *block_hash },
-        },
-        SyncRequest::GetHeaders { from_blue_score, limit } => {
-            // H-R3-1: defense in depth. `sync_rr::decode_request` already
-            // rejects any wire `limit` above `MAX_WIRE_GETHEADERS_LIMIT`
-            // before a request reaches here, so this clamp is normally a
-            // no-op — but this function's OWN contract must not trust that
-            // upstream check alone: bound the work unconditionally, so a
-            // future caller (or a future codec change) cannot reintroduce
-            // the "peer asks for u32::MAX headers" cost on the strength of a
-            // check that lives in a different module.
-            let bounded_limit = (*limit as usize).min(MAX_WIRE_GETHEADERS_LIMIT as usize);
-            let d = dag.read();
-            let entries: Vec<SyncEntry> = d
-                .ordered_hashes_from(*from_blue_score, bounded_limit)
-                .iter()
-                .filter_map(|h| d.get_node(h).map(|n| SyncEntry {
-                    hash: *h, blue_score: n.blue_score, height: n.height,
-                }))
-                .collect();
-            SyncResponse::Headers { entries }
-        }
-        SyncRequest::GetTips => {
-            let d = dag.read();
-            let tips: Vec<SyncEntry> = d
-                .tips()
-                .iter()
-                .filter_map(|h| d.get_node(h).map(|n| SyncEntry {
-                    hash: *h, blue_score: n.blue_score, height: n.height,
-                }))
-                .collect();
-            let locator = crate::sync::locator::build_locator(&d.selected_chain());
-            SyncResponse::Tips { tips, locator }
-        }
-    }
-}
+// The directed-sync answers themselves (`serve_sync_request`) are computed by
+// `serve`, off this task (re-audit B1-T3 / B2-T5).
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -2700,7 +3615,7 @@ mod tests {
     /// before this fix, the (gossip-broadcast) answer was the WHOLE table.
     #[test]
     fn get_peers_response_is_bounded_even_with_a_large_table() {
-        let known: std::collections::HashSet<String> = (0..500)
+        let known: Vec<String> = (0..500)
             .map(|i| format!("/ip4/10.0.{}.{}/tcp/17110/p2p/{}", i / 256, i % 256, PeerId::random()))
             .collect();
         let resp = serve_get_peers(&known, &[], &PeerId::random(), true);
@@ -2719,10 +3634,10 @@ mod tests {
     /// invalid/filtered entries) without padding or fabrication.
     #[test]
     fn get_peers_response_returns_all_of_a_small_table() {
-        let known: std::collections::HashSet<String> = [
+        let known: Vec<String> = vec![
             format!("/ip4/45.76.1.1/tcp/17110/p2p/{}", PeerId::random()),
             format!("/ip4/45.76.2.2/tcp/17110/p2p/{}", PeerId::random()),
-        ].into_iter().collect();
+        ];
         let resp = serve_get_peers(&known, &[], &PeerId::random(), true);
         match resp {
             sync_rr::SyncResponse::Peers { peers } => assert_eq!(peers.len(), 2),
@@ -2734,7 +3649,7 @@ mod tests {
     /// node is a seed), de-duplicated against `known_peers`.
     #[test]
     fn get_peers_response_includes_self_external_address() {
-        let known: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let known: Vec<String> = Vec::new();
         let self_id = PeerId::random();
         let ext: Multiaddr = "/ip4/1.2.3.4/tcp/17110".parse().unwrap();
         let resp = serve_get_peers(&known, std::slice::from_ref(&ext), &self_id, true);
@@ -2745,6 +3660,37 @@ mod tests {
             }
             other => panic!("expected Peers, got {:?}", other),
         }
+    }
+
+    /// NET-11 (Core's addr response cache): the GetPeers sample is computed
+    /// once and served unchanged until it expires (21-27 h), so asking again
+    /// (from a new connection, a new identity) reveals nothing more of the
+    /// tried table; it is refreshed early only while it is not full and the
+    /// table has grown.
+    #[test]
+    fn get_peers_sample_is_cached_against_scraping() {
+        let now = std::time::Instant::now();
+        let mut tried = TriedTable::with_key(addrbook::random_key());
+        for i in 0..200u32 {
+            tried.insert(&format!("/ip4/{}.{}.1.1/tcp/17110/p2p/{}", 20 + i / 100, i % 100, PeerId::random()), now);
+        }
+        let mut cache = GetAddrCache::default();
+        let first = cache.sample(now, &tried, false);
+        assert_eq!(first.len(), PEX_RESPONSE_SAMPLE_SIZE);
+        for k in 1..50u64 {
+            assert_eq!(cache.sample(now + Duration::from_secs(k * 600), &tried, false), first, "same sample within its lifetime");
+        }
+        let later = now + GETADDR_CACHE_LIFETIME + GETADDR_CACHE_JITTER;
+        assert_ne!(cache.sample(later, &tried, false), first, "a fresh sample after expiry");
+
+        // A young node's near-empty sample grows with its table.
+        let mut small = TriedTable::with_key(addrbook::random_key());
+        let mut cache = GetAddrCache::default();
+        small.insert(&format!("/ip4/45.1.1.1/tcp/17110/p2p/{}", PeerId::random()), now);
+        assert_eq!(cache.sample(now, &small, false).len(), 1);
+        small.insert(&format!("/ip4/46.1.1.1/tcp/17110/p2p/{}", PeerId::random()), now);
+        assert_eq!(cache.sample(now + Duration::from_secs(60), &small, false).len(), 1, "not before the refresh delay");
+        assert_eq!(cache.sample(now + GETADDR_CACHE_GROW_REFRESH, &small, false).len(), 2);
     }
 
     // ── M-9 regressions: announced blue_score clamp ─────────────────────────
@@ -2829,54 +3775,125 @@ mod tests {
     #[tokio::test]
     async fn resolve_multiaddr_passes_through_ip4_unchanged() {
         let input = "/ip4/80.78.28.142/tcp/17110/p2p/12D3KooWQfXJzXRG7t4r1hQVHfijHsuMZ22ecAUD3YGhMvjvDbQp";
-        let out = resolve_multiaddr(input).await;
-        assert_eq!(out, input);
+        let out = resolve_dial_addr(input, false).await;
+        assert_eq!(out, Some(input.parse().unwrap()));
     }
 
-    /// Degenerate edge case: a string that happens to not contain
-    /// "/dns4/" at all should short-circuit immediately, no DNS lookup.
+    /// Unparseable input is not dialed (it used to be returned verbatim and
+    /// then fail to parse); IP literals pass through.
     #[tokio::test]
     async fn resolve_multiaddr_passes_through_empty_and_garbage() {
-        assert_eq!(resolve_multiaddr("").await, "");
-        assert_eq!(resolve_multiaddr("garbage").await, "garbage");
-        assert_eq!(resolve_multiaddr("/ip6/::1/tcp/1").await, "/ip6/::1/tcp/1");
+        assert_eq!(resolve_dial_addr("", true).await, None);
+        assert_eq!(resolve_dial_addr("garbage", true).await, None);
+        assert_eq!(resolve_dial_addr("/ip6/::1/tcp/1", true).await, Some("/ip6/::1/tcp/1".parse().unwrap()));
     }
 
-    /// If `/dns4/` appears but the address is malformed enough that
-    /// the `splitn(2, "/dns4/")` returns fewer than 2 parts, the
-    /// function must fall back to returning the input verbatim.
-    /// (Today this branch is actually unreachable because splitn(2)
-    /// on a string that CONTAINS "/dns4/" always yields 2 parts, but
-    /// the guard is in place and we pin it here in case the parser
-    /// is ever restructured.)
+    /// Malformed `/dns4/` input must never panic.
     #[tokio::test]
     async fn resolve_multiaddr_never_panics_on_weird_input() {
-        // These call into the DNS path but with a host that won't
-        // resolve to anything useful. The function must still return
-        // a String — never panic.
-        let weird = "/dns4/";
-        let _ = resolve_multiaddr(weird).await;
-        // If we got here, no panic.
+        let _ = resolve_dial_addr("/dns4/", true).await;
+        let _ = resolve_dial_addr("/dns4/x/tcp", false).await;
+        let _ = resolve_dial_addr("/dns6/", false).await;
     }
 
-    /// M-11 core property: the function is `async`. A synchronous
-    /// version would block the libp2p event loop. We don't assert on
-    /// timing (brittle in CI), but we do assert the shape: the return
-    /// value only materializes after `.await`, which is only true for
-    /// an async function.
-    ///
-    /// This is a compile-time check more than a runtime one — if
-    /// someone regresses `resolve_multiaddr` to a sync function, this
-    /// test fails to compile.
+    /// M-11 core property: the function is `async` (a synchronous lookup
+    /// would block the libp2p event loop). Compile-time guard: if the
+    /// signature regresses to a sync fn, `.await` stops compiling.
     #[tokio::test]
     async fn resolve_multiaddr_is_async() {
-        // Cannot call an async fn without `.await`, so if the fn
-        // signature regresses to `fn resolve_multiaddr(...) -> String`
-        // the `.await` here becomes a compile error on "method `await`
-        // does not exist on String". That is exactly the guard we want.
-        let future = resolve_multiaddr("/ip4/127.0.0.1/tcp/1");
+        let future = resolve_dial_addr("/ip4/127.0.0.1/tcp/1", true);
         let out = future.await;
-        assert_eq!(out, "/ip4/127.0.0.1/tcp/1");
+        assert_eq!(out, Some("/ip4/127.0.0.1/tcp/1".parse().unwrap()));
+    }
+
+    /// B1-T8, as production uses it: OPERATOR-configured names (`--peer`,
+    /// the shipped seeds — both callers pass `allow_private = true`, like an
+    /// operator's IP literal, which is dialed as given) may resolve to a
+    /// private or loopback address (docker / LAN setups), but NEVER into an
+    /// invalid range (link-local / cloud metadata, multicast, unspecified,
+    /// documentation, broadcast, …), whatever `allow_private` says. The
+    /// `allow_private = false` branch (refuses loopback / private too) is kept
+    /// for callers that screen like learned addresses. Before the fix every
+    /// `/dns4` name was turned into whatever IPv4 it resolved to, unfiltered.
+    #[tokio::test]
+    async fn operator_host_names_never_resolve_into_invalid_ranges() {
+        use std::net::IpAddr;
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // What production does (allow_private = true): invalid ranges are
+        // skipped, private / loopback accepted, IPv4 preferred.
+        let invalid = ["169.254.169.254", "224.0.0.1", "0.0.0.0", "192.0.2.7", "255.255.255.255", "ff02::1", "2001:db8::1", "::"];
+        for bad in invalid {
+            assert_eq!(pick_resolved_ip(&[ip(bad)], true, true, true), None, "{bad} is never dialed");
+        }
+        assert_eq!(pick_resolved_ip(&[ip("169.254.169.254"), ip("10.0.0.5")], true, true, true), Some(ip("10.0.0.5")));
+        assert_eq!(pick_resolved_ip(&[ip("2606:4700::1"), ip("80.78.28.142")], true, true, true), Some(ip("80.78.28.142")));
+        assert_eq!(pick_resolved_ip(&[ip("80.78.28.142")], false, true, true), None, "/dns6 wants IPv6 only");
+        // The screened branch: loopback / private refused as well.
+        assert_eq!(pick_resolved_ip(&[ip("127.0.0.1"), ip("10.0.0.5")], true, true, false), None);
+
+        let id = PeerId::random();
+        let named = format!("/dns4/localhost/tcp/17110/p2p/{id}");
+        assert_eq!(
+            resolve_dial_addr(&named, true).await,
+            Some(format!("/ip4/127.0.0.1/tcp/17110/p2p/{id}").parse().unwrap()),
+            "an operator name may resolve to loopback; only the host part changes"
+        );
+        assert_eq!(resolve_dial_addr(&named, false).await, None, "the screened branch refuses loopback");
+        // Websocket addresses keep their name (the ws transport resolves it).
+        let ws = format!("/dns4/localhost/tcp/17111/ws/p2p/{id}");
+        assert_eq!(resolve_dial_addr(&ws, false).await, Some(ws.parse().unwrap()));
+    }
+
+    /// NET-11 review: a `Peers` answer feeds the new table only when it
+    /// answers OUR GetPeers sent to an outbound full-relay or manual peer.
+    /// Before the fix any `Peers` answer was ingested: an inbound or
+    /// block-relay-only peer answered the connect-time / poll `GetTips` with
+    /// `Peers { attacker addresses }` and they entered the table.
+    #[test]
+    fn only_answers_to_our_get_peers_feed_the_address_table() {
+        use sync_rr::SyncRequest;
+        let get_peers = SyncRequest::GetPeers;
+        let get_tips = SyncRequest::GetTips;
+        let get_headers = SyncRequest::GetHeaders { from_blue_score: 0, limit: 1 };
+        for role in [ConnKind::OutboundFullRelay, ConnKind::Manual] {
+            assert!(solicited_peers_answer(Some(&get_peers), Some(role)), "{role:?} answering our GetPeers");
+            assert!(!solicited_peers_answer(Some(&get_tips), Some(role)), "{role:?}: Peers answering GetTips");
+            assert!(!solicited_peers_answer(Some(&get_headers), Some(role)));
+        }
+        for role in [ConnKind::Inbound, ConnKind::BlockRelayOnly, ConnKind::Feeler] {
+            assert!(!solicited_peers_answer(Some(&get_peers), Some(role)), "{role:?} never relays addresses");
+            assert!(!solicited_peers_answer(Some(&get_tips), Some(role)));
+        }
+        assert!(!solicited_peers_answer(None, Some(ConnKind::OutboundFullRelay)), "no matching request");
+        assert!(!solicited_peers_answer(Some(&get_peers), None), "peer gone");
+    }
+
+    /// B1-T9 / M-11 review: heartbeat re-dials of configured peers never
+    /// await a DNS lookup on the network loop. `request` returns at once even
+    /// when the lookup never completes, starts at most one lookup per address,
+    /// bounds it with the timeout (a `None` answer arrives), and delivers a
+    /// finished lookup's address over the channel. Before the fix the
+    /// heartbeat awaited `resolve_dial_addr` inline for every disconnected
+    /// configured peer, freezing the swarm loop for the whole lookup.
+    #[tokio::test]
+    async fn heartbeat_redial_lookups_run_off_the_network_loop() {
+        let (mut r, mut rx) = ManualResolver::new(Duration::from_millis(300));
+        let slow = "/dns4/down.example/tcp/17110";
+        let t = std::time::Instant::now();
+        assert!(r.request(slow, |_| std::future::pending::<Option<Multiaddr>>()));
+        assert!(t.elapsed() < Duration::from_millis(100), "request never waits for the lookup");
+        assert!(!r.request(slow, |_| std::future::pending::<Option<Multiaddr>>()), "one lookup per address at a time");
+        let fast = "/ip4/80.78.28.142/tcp/17110";
+        assert!(r.request(fast, |p| async move { resolve_dial_addr(&p, true).await }));
+        let mut got = std::collections::HashMap::new();
+        for _ in 0..2 {
+            let (p, a) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+            r.finished(&p);
+            got.insert(p, a);
+        }
+        assert_eq!(got[fast], Some(fast.parse().unwrap()));
+        assert_eq!(got[slow], None, "a lookup that never completes times out");
+        assert!(r.request(slow, |_| async { None }), "a finished address can be looked up again");
     }
 
     // ─── Sprint CC regression: dynamic PeerTip construction ──────────────
@@ -3565,144 +4582,371 @@ mod tests {
         let author = PeerId::random();
         let mut peers: Vec<String> = (0..30u8).map(|i| format!("/ip4/45.{}.1.1/tcp/17110/p2p/{}", i, PeerId::random())).collect();
         peers.push(format!("/ip4/45.200.1.1/tcp/17110/p2p/{}", me)); // ourselves
-        let added = ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, &peers, false, &me, &HashSet::new());
+        let added = ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, "ip4:9.9", &peers, false, &me, |_| false);
         assert_eq!(added, PEX_BATCH_LIMIT, "batch-capped per message");
         assert_eq!(book.len(), PEX_BATCH_LIMIT);
         // The same author is rate-limited across messages.
         for _ in 0..10 {
-            ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, &peers, false, &me, &HashSet::new());
+            ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, "ip4:9.9", &peers, false, &me, |_| false);
         }
         assert!(book.len() <= pex_validator::PEX_MAX_PER_WINDOW);
     }
 
-    // ── Directed-pull answers (`on_pull_response`) ──────────────────────────
+    // ── Directed-pull answers (`pull::PullScheduler::on_response`) ──────────
+    //
+    // Ported from the tests of the removed `on_pull_response` (re-audit
+    // B1-T2 / B1-T6): the BlockNotFound retry and the Busy back-off are kept;
+    // what changed is pinned below and listed in the commit message.
 
     use std::time::Instant;
 
-    fn get_block_pull(attempts: u8, tried: Vec<PeerId>) -> PendingPull {
-        let msg = NetworkMessage::GetBlock { block_hash: [5u8; 32], nonce: 1 };
-        let req = sync_rr::as_pull_request(&msg).expect("GetBlock is a directed pull");
-        PendingPull { msg, req, attempts, tried }
-    }
-
-    /// A selector with `peers` connected and one pull in flight to `sent_to`.
-    fn selector_with(peers: &[PeerId], sent_to: PeerId, now: Instant) -> sync_rr::PullPeerSelector {
-        let mut sel = sync_rr::PullPeerSelector::new(HashSet::new());
+    /// A scheduler with `peers` connected (dialed by us) and one GetBlock
+    /// pull of block [5; 32] sent to `first` (its hint). Returns the request id.
+    fn one_get_block(peers: &[PeerId], first: PeerId, now: Instant) -> (pull::PullScheduler<u64>, u64) {
+        let mut s = pull::PullScheduler::new(HashSet::new());
         for p in peers {
-            sel.on_connect(*p);
+            s.on_connect(*p, true, now);
         }
-        sel.on_sent(sent_to, now);
-        sel
+        assert_eq!(s.enqueue(sync_rr::SyncRequest::GetBlock { block_hash: [5u8; 32] }, None, &[first], now), pull::Enqueued::Queued);
+        let mut sent = Vec::new();
+        s.drain(now, |p, _| {
+            sent.push(p);
+            1
+        });
+        assert_eq!(sent, vec![first]);
+        (s, 1)
     }
 
     /// THE regression for the BlockNotFound retry (feature_partition_heal.py
     /// waited 80 s to more than 120 s): a peer that does not have the body
-    /// answers NotFound, and the pull goes back in the queue, one attempt
-    /// used, that peer recorded as tried, so the next drain sends it to the
-    /// OTHER peer. The answer counts as a success for the answering peer (no
-    /// back-off). Deleting the requeue fails this test.
+    /// answers NotFound, and the pull goes to the OTHER peer at once. The
+    /// answer is delivered (a NotFound from a peer we dialed may count toward
+    /// abandoning a frontier tip), ranks the answering peer down (B1-T6; the
+    /// old code counted it as a success), and is not a back-off. The old test
+    /// then sent the pull back to the first peer and expected it dropped after
+    /// three attempts — exactly the B1-T6 defect: now a pull is never sent to
+    /// the same peer twice and, once every connected peer said NotFound, it is
+    /// dropped (and the NotFound charges refunded: nobody had the block).
     #[test]
     fn block_not_found_requeues_the_pull_for_another_peer() {
         let (a, b) = (PeerId::random(), PeerId::random());
         let now = Instant::now();
-        let mut sel = selector_with(&[a, b], a, now);
-        let mut pending = std::collections::VecDeque::new();
+        let (mut s, id) = one_get_block(&[a, b], a, now);
         let not_found = sync_rr::SyncResponse::BlockNotFound { block_hash: [5u8; 32] };
-        on_pull_response(Some((get_block_pull(0, vec![]), a)), &not_found, a, &mut sel, &mut pending, now);
-
-        assert_eq!(pending.len(), 1, "the pull must be retried, not completed");
-        let p = &pending[0];
-        assert_eq!((p.attempts, p.tried.clone()), (1, vec![a]));
-        assert!(matches!(p.req, sync_rr::SyncRequest::GetBlock { block_hash } if block_hash == [5u8; 32]));
-        assert_eq!(sel.in_flight(&a), 0);
-        assert!(!sel.is_cooling_down(&a, now), "NotFound is an answer, not back-pressure");
-        assert_eq!(sel.select(now, &p.tried), Some(b), "the retry goes to the peer not tried yet");
-
-        // B does not have it either: the third attempt would exceed
-        // MAX_PULL_ATTEMPTS, so the pull is dropped (the processor's sweeps
-        // re-issue anything still needed).
-        let p = pending.pop_front().unwrap();
-        sel.on_sent(b, now);
-        on_pull_response(Some((p, b)), &not_found, b, &mut sel, &mut pending, now);
-        assert_eq!((pending.len(), pending[0].attempts, pending[0].tried.clone()), (1, 2, vec![a, b]));
-        let p = pending.pop_front().unwrap();
-        sel.on_sent(a, now);
-        on_pull_response(Some((p, a)), &not_found, a, &mut sel, &mut pending, now);
-        assert!(pending.is_empty(), "dropped after MAX_PULL_ATTEMPTS ({MAX_PULL_ATTEMPTS})");
+        let act = s.on_response(id, a, &not_found, now);
+        assert_eq!((act.deliver, act.violation), (true, None));
+        assert_eq!(s.pending_len(), 1, "the pull must be retried, not completed");
+        assert_eq!(s.selector().in_flight(&a), 0);
+        assert!(!s.selector().is_cooling_down(&a, now), "NotFound is an answer, not back-pressure");
+        assert!(s.selector().penalty(&a, now) > 0.0, "but it ranks the peer down");
+        let mut sent = Vec::new();
+        s.drain(now, |p, _| {
+            sent.push(p);
+            2
+        });
+        assert_eq!(sent, vec![b], "the retry goes to the peer not tried yet");
+        s.on_response(2, b, &not_found, now);
+        s.drain(now, |_, _| panic!("no peer left that has not answered"));
+        assert_eq!((s.pending_len(), s.in_flight_len(), s.dropped()), (0, 0, 1));
+        assert_eq!(s.selector().penalty(&a, now), 0.0, "a true NotFound is refunded");
     }
 
     /// Busy (NET-5): back-pressure. The peer backs off and the pull is
-    /// retried elsewhere.
+    /// retried elsewhere (without using an attempt or excluding the peer).
     #[test]
     fn busy_backs_the_peer_off_and_requeues_the_pull() {
         let (a, b) = (PeerId::random(), PeerId::random());
         let now = Instant::now();
-        let mut sel = selector_with(&[a, b], a, now);
-        let mut pending = std::collections::VecDeque::new();
-        on_pull_response(Some((get_block_pull(0, vec![]), a)), &sync_rr::SyncResponse::Busy, a,
-            &mut sel, &mut pending, now);
-        assert!(sel.is_cooling_down(&a, now));
-        assert_eq!(sel.in_flight(&a), 0);
-        assert_eq!((pending.len(), pending[0].attempts, pending[0].tried.clone()), (1, 1, vec![a]));
-        assert_eq!(sel.select(now, &[]), Some(b));
+        let (mut s, id) = one_get_block(&[a, b], a, now);
+        let act = s.on_response(id, a, &sync_rr::SyncResponse::Busy, now);
+        assert_eq!((act.deliver, act.violation), (false, None));
+        assert!(s.selector().is_cooling_down(&a, now));
+        assert_eq!(s.selector().in_flight(&a), 0);
+        assert_eq!(s.pending_len(), 1);
+        let mut sent = Vec::new();
+        s.drain(now, |p, _| {
+            sent.push(p);
+            2
+        });
+        assert_eq!(sent, vec![b]);
     }
 
-    /// Every other answer completes the pull: nothing is requeued, and an
-    /// answer to an unknown request id requeues nothing either.
+    /// B1-T2: only the requested block completes a GetBlock pull. The old
+    /// test pinned the defect: it asserted that a Block for ANOTHER hash, a
+    /// Headers (even empty), a Tips or a Peers answer completed the GetBlock
+    /// pull, with no penalty. Now each is a violation that is not delivered,
+    /// puts the peer on cooldown, and sends the pull on.
     #[test]
-    fn answers_that_complete_a_pull_do_not_requeue_it() {
+    fn only_the_requested_block_completes_a_block_pull() {
         let entry = || SyncEntry { hash: [1u8; 32], blue_score: 1, height: 1 };
-        for resp in [
-            sync_rr::SyncResponse::Block { block_hash: [5u8; 32], blue_score: 1, height: 1, block_data: vec![1] },
+        let ok = sync_rr::SyncResponse::Block { block_hash: [5u8; 32], blue_score: 1, height: 1, block_data: vec![1] };
+        let a = PeerId::random();
+        let now = Instant::now();
+        let (mut s, id) = one_get_block(&[a], a, now);
+        let act = s.on_response(id, a, &ok, now);
+        assert_eq!((act.deliver, act.violation), (true, None));
+        assert_eq!((s.pending_len(), s.selector().in_flight(&a)), (0, 0));
+        assert!(!s.selector().is_cooling_down(&a, now));
+        for wrong in [
+            sync_rr::SyncResponse::Block { block_hash: [6u8; 32], blue_score: 1, height: 1, block_data: vec![1] },
             sync_rr::SyncResponse::Headers { entries: vec![entry()] },
             sync_rr::SyncResponse::Headers { entries: vec![] },
             sync_rr::SyncResponse::Tips { tips: vec![entry()], locator: vec![] },
             sync_rr::SyncResponse::Peers { peers: vec![] },
         ] {
-            let a = PeerId::random();
-            let now = Instant::now();
-            let mut sel = selector_with(&[a], a, now);
-            let mut pending = std::collections::VecDeque::new();
-            on_pull_response(Some((get_block_pull(0, vec![]), a)), &resp, a, &mut sel, &mut pending, now);
-            assert!(pending.is_empty(), "{resp:?} completes the pull");
-            assert_eq!(sel.in_flight(&a), 0, "{resp:?}");
-            assert!(!sel.is_cooling_down(&a, now), "{resp:?}");
+            let b = PeerId::random();
+            let (mut s, id) = one_get_block(&[a, b], a, now);
+            let act = s.on_response(id, a, &wrong, now);
+            assert!(!act.deliver && act.violation.is_some(), "{wrong:?}");
+            assert_eq!(s.pending_len(), 1, "{wrong:?} must not complete the pull");
+            assert!(s.selector().is_cooling_down(&a, now), "{wrong:?}");
         }
+    }
+
+    /// An answer to a request the scheduler does not know is ignored.
+    #[test]
+    fn answer_to_an_unknown_request_is_ignored() {
         let a = PeerId::random();
         let now = Instant::now();
-        let mut sel = selector_with(&[a], a, now);
-        let mut pending = std::collections::VecDeque::new();
-        on_pull_response(None, &sync_rr::SyncResponse::BlockNotFound { block_hash: [5u8; 32] }, a,
-            &mut sel, &mut pending, now);
-        assert!(pending.is_empty());
-        assert_eq!(sel.in_flight(&a), 0);
+        let mut s: pull::PullScheduler<u64> = pull::PullScheduler::new(HashSet::new());
+        s.on_connect(a, true, now);
+        let act = s.on_response(9, a, &sync_rr::SyncResponse::BlockNotFound { block_hash: [5u8; 32] }, now);
+        assert_eq!(act, pull::ResponseAction::default());
+        assert_eq!(s.pending_len(), 0);
     }
 
     // ── Peer count and heartbeat ────────────────────────────────────────────
 
-    /// The peer count is of distinct peers: a second connection to a peer
-    /// (both ends dialing, a re-dial) does not count, closing one of two
+    /// The peer count is of distinct peers (`ConnManager::peer_count`): a
+    /// second connection to a peer does not count, closing one of two
     /// connections does not uncount, closing the last one does. Counting
     /// connections reported a peer dialed twice as two peers.
     #[test]
     fn peer_count_counts_distinct_peers_not_connections() {
-        // Peer P connects twice, Q once: 2 peers.
-        let mut count = 0usize;
-        for n in [1u32, 2, 1] {
-            if let Some(c) = peer_count_after_connect(count, n) {
-                count = c;
-            }
+        let now = Instant::now();
+        let mut m = ConnManager::new(addrbook::random_key(), 8);
+        let (p, q) = (PeerId::random(), PeerId::random());
+        let a: Multiaddr = "/ip4/80.1.1.1/tcp/1".parse().unwrap();
+        let c = libp2p::swarm::ConnectionId::new_unchecked;
+        m.on_established(c(1), p, false, &a, now);
+        m.on_established(c(2), p, false, &a, now);
+        m.on_established(c(3), q, false, &a, now);
+        assert_eq!(m.peer_count(), 2);
+        m.on_closed(c(1), p);
+        assert_eq!(m.peer_count(), 2, "P is still connected");
+        m.on_closed(c(2), p);
+        assert_eq!(m.peer_count(), 1);
+        m.on_closed(c(3), q);
+        assert_eq!(m.peer_count(), 0);
+        m.on_closed(c(3), q);
+        assert_eq!(m.peer_count(), 0, "never below zero");
+    }
+
+    /// B1-T9 / NET-11 (a): the swarm caps leave inbound one transient slot
+    /// over `max_peers` (so the connection manager can evict instead of the
+    /// transport refusing) and room for every outbound slot on top.
+    #[test]
+    fn swarm_caps_reserve_outbound_room_and_one_eviction_slot() {
+        // The limits type has no getters; its Debug form names every field.
+        let dbg = format!("{:?}", swarm_connection_limits(50));
+        assert!(dbg.contains("max_established_incoming: Some(51)"), "{dbg}");
+        assert!(dbg.contains("max_established_total: Some(100)"), "{dbg}");
+        assert!(dbg.contains("max_established_per_peer: Some(2)"), "{dbg}");
+        let dbg = format!("{:?}", swarm_connection_limits(8));
+        assert!(dbg.contains("max_established_incoming: Some(9)"), "{dbg}");
+        assert!(dbg.contains(&format!("max_established_total: Some({})", 8 + connmgr::OUTBOUND_CONNECTION_HEADROOM)), "{dbg}");
+    }
+
+    // ── Phase 4, package R2a: serving cost and answer bounds ────────────────
+
+    fn hh(i: u32) -> [u8; 32] {
+        let mut h = [0u8; 32];
+        h[..4].copy_from_slice(&i.to_be_bytes());
+        h[31] = 0x5A;
+        h
+    }
+
+    fn served(
+        dag: &std::sync::Arc<parking_lot::RwLock<crate::consensus::GhostDAG>>,
+        store: &std::sync::Arc<crate::storage::Storage>,
+        req: sync_rr::SyncRequest,
+    ) -> sync_rr::SyncResponse {
+        serve::serve_sync_request(dag, store, &req)
+    }
+
+    /// B2-T7: the GetTips answer of a DAG with more than MAX_WIRE_TIPS leaves
+    /// (here 300 siblings, 20 of them chain-disqualified) must decode at the
+    /// requester (`decode_response`), carry no disqualified block, and be the
+    /// best valid tips by blue work. The server used to send every leaf, which
+    /// every requester refused as a protocol violation.
+    #[test]
+    fn get_tips_answer_is_bounded_valid_and_decodable() {
+        use crate::consensus::GhostDAG;
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::storage::Storage::open(&dir.path().join("db")).unwrap());
+        let mut d = GhostDAG::with_k(10);
+        let g = hh(0);
+        d.add_genesis(g, 0);
+        for i in 1..=300u32 {
+            d.add_block(hh(i), vec![g], u64::from(i), 1_000 + u128::from(i)).unwrap();
         }
-        assert_eq!(count, 2);
-        assert_eq!(peer_count_after_connect(count, 2), None, "a second connection to a peer");
-        // One of P's two connections closes: P is still connected.
-        assert_eq!(peer_count_after_disconnect(count, 1), None);
-        // P's last connection closes, then Q's.
-        count = peer_count_after_disconnect(count, 0).unwrap();
-        assert_eq!(count, 1);
-        count = peer_count_after_disconnect(count, 0).unwrap();
-        assert_eq!(count, 0);
-        assert_eq!(peer_count_after_disconnect(0, 0), Some(0), "never below zero");
+        // The 20 heaviest leaves are disqualified (as after a connect failure).
+        let invalid: Vec<[u8; 32]> = (281..=300u32).map(hh).collect();
+        for h in &invalid {
+            d.mark_invalid(*h);
+        }
+        let selected = d.selected_tip().unwrap();
+        assert_eq!(selected, hh(280));
+        let dag = std::sync::Arc::new(parking_lot::RwLock::new(d));
+        let resp = served(&dag, &store, sync_rr::SyncRequest::GetTips);
+        let bytes = sync_rr::encode_frame(&resp).unwrap();
+        let back = sync_rr::decode_response(&bytes).expect("an honest GetTips answer must pass the requester's bounds");
+        let sync_rr::SyncResponse::Tips { tips, .. } = back else { panic!("expected Tips") };
+        assert!(!tips.is_empty() && tips.len() <= MAX_WIRE_TIPS, "{} tips", tips.len());
+        assert_eq!(tips[0].hash, selected, "the selected tip leads");
+        assert!(tips.iter().all(|t| !invalid.contains(&t.hash)), "a disqualified tip was advertised");
+        // The best valid tips by blue work: 280, 279, ... (256 of them).
+        let want: Vec<[u8; 32]> = (25..=280u32).rev().map(hh).collect();
+        assert_eq!(tips.iter().map(|t| t.hash).collect::<Vec<_>>(), want);
+    }
+
+    /// A linear chain of `n` blocks after genesis.
+    fn chain_dag(n: u32) -> crate::consensus::GhostDAG {
+        let mut d = crate::consensus::GhostDAG::with_k(10);
+        d.add_genesis(hh(0), 0);
+        for i in 1..=n {
+            d.add_block(hh(i), vec![hh(i - 1)], u64::from(i), 1).unwrap();
+        }
+        d
+    }
+
+    /// B1-T3 / B2-T5: the DAG entries touched to serve GetTips and GetHeaders
+    /// (the counter `GhostDAG::query_visits`) do not grow with the DAG size.
+    /// GetTips walked the whole selected chain for an unused locator and
+    /// GetHeaders scanned every stored block, on the swarm event loop.
+    #[test]
+    fn served_request_work_does_not_grow_with_dag_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::storage::Storage::open(&dir.path().join("db")).unwrap());
+        let mut work = Vec::new();
+        for n in [300u32, 3_000] {
+            let dag = std::sync::Arc::new(parking_lot::RwLock::new(chain_dag(n)));
+            let before = dag.read().query_visits();
+            let reqs = [
+                sync_rr::SyncRequest::GetTips,
+                sync_rr::SyncRequest::GetHeaders { from_blue_score: 0, limit: 200 },
+                sync_rr::SyncRequest::GetHeaders { from_blue_score: u64::from(n) - 100, limit: 200 },
+                sync_rr::SyncRequest::GetBlock { block_hash: hh(5) },
+            ];
+            for r in reqs {
+                let resp = served(&dag, &store, r.clone());
+                if let (sync_rr::SyncRequest::GetHeaders { from_blue_score: 0, .. }, sync_rr::SyncResponse::Headers { entries }) = (&r, &resp) {
+                    assert_eq!(entries.len(), 200);
+                    assert_eq!(entries[0].hash, hh(0));
+                    assert_eq!(entries[199].hash, hh(199));
+                }
+            }
+            work.push(dag.read().query_visits() - before);
+        }
+        assert!(work[1] <= work[0] + 8, "per-request work grew with the DAG: {work:?}");
+        assert!(work[1] < 1_000, "per-request work is not O(log n + limit): {work:?}");
+    }
+
+    /// PoWit finality (the mainnet line's checkpoint, `GhostDAG::set_finalized`):
+    /// with the checkpoint a fixed distance below the tip, serving GetTips
+    /// still does not grow with the DAG (the finality walk is bounded by
+    /// that distance and shared by the tips), and a tip that forks below the
+    /// checkpoint is not advertised: it can never be selected or merged by a
+    /// template, so advertising it only made every requester fetch it.
+    #[test]
+    fn get_tips_with_a_finalized_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::storage::Storage::open(&dir.path().join("db")).unwrap());
+        let mut work = Vec::new();
+        for n in [300u32, 3_000] {
+            let mut d = chain_dag(n);
+            // A stale sibling of block 1, far below the checkpoint.
+            d.add_block(hh(1_000_000), vec![hh(0)], 1, 1).unwrap();
+            // Another tip, off block n - 10 (above the checkpoint).
+            d.add_block(hh(2_000_000), vec![hh(n - 10)], u64::from(n), 1).unwrap();
+            d.set_finalized(hh(n - 50), u64::from(n - 50));
+            let dag = std::sync::Arc::new(parking_lot::RwLock::new(d));
+            let before = dag.read().query_visits();
+            let resp = served(&dag, &store, sync_rr::SyncRequest::GetTips);
+            work.push(dag.read().query_visits() - before);
+            let back = sync_rr::decode_response(&sync_rr::encode_frame(&resp).unwrap()).expect("decodes at the requester");
+            let sync_rr::SyncResponse::Tips { tips, .. } = back else { panic!("expected Tips") };
+            assert_eq!(tips.iter().map(|t| t.hash).collect::<Vec<_>>(), vec![hh(n), hh(2_000_000)]);
+        }
+        assert!(work[1] <= work[0] + 4, "GetTips work grew with the DAG under finality: {work:?}");
+        assert!(work[0] < 100, "GetTips is not O(log n + limit + finality distance): {work:?}");
+    }
+
+    /// Blocks from the PoWit activation carry the PoWit section in their
+    /// wire encoding (the mainnet line's 45c9c97: `Block::wire_size` counts
+    /// it). GetBlock serves the stored bytes as they are (B2-T6); the frame
+    /// written must be byte-identical to the one the old path (decode the
+    /// stored block, encode it again) produced, be charged its exact length,
+    /// and decode at the requester to the same block, PoWit section included.
+    #[test]
+    fn powit_blocks_are_served_as_their_exact_stored_frames() {
+        use crate::core::{powit::PowitBody, witness_share::WitnessShare, Block, BlockHeader, MerkleRoot, Transaction, TxInput, TxOutput};
+        use libp2p::request_response::Codec as _;
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::storage::Storage::open(&dir.path().join("db")).unwrap());
+        let dag = std::sync::Arc::new(parking_lot::RwLock::new(crate::consensus::GhostDAG::with_k(10)));
+        let activation = crate::core::powit_height();
+        for height in [activation - 1, activation, activation + 7] {
+            let powit = PowitBody {
+                shares: (0..3u8)
+                    .map(|i| WitnessShare { attested: [i; 32], witness: [0x44; 20], payout: vec![0x76; 25], bits: 0x1f00_ffff, nonce: u64::from(i) << 40 })
+                    .collect(),
+                attestations: Vec::new(),
+                evidence: Vec::new(),
+            };
+            let txs = vec![Transaction {
+                version: 1,
+                inputs: vec![TxInput { prev_txid: [0; 32], prev_index: u32::MAX, script_sig: height.to_le_bytes().to_vec(), sequence: u32::MAX }],
+                outputs: vec![TxOutput { value: 50, script_pubkey: vec![0xCD; 20] }],
+                locktime: 0,
+            }];
+            let block = Block {
+                header: BlockHeader { version: 1, parents: vec![[0x11; 32]], merkle_root: MerkleRoot::ZERO, timestamp: 1_000 + height, bits: 0x2100_ffff, nonce: 9 },
+                transactions: txs,
+                blue_score: height + 3,
+                height,
+                shielded_transactions: Vec::new(),
+                powit,
+            };
+            let active = crate::core::powit_active(height);
+            assert_eq!(block.wire_size(), block.to_wire_bytes().len(), "h {height}");
+            store.put_block_body(&block).unwrap();
+            let hash = block.block_hash();
+            let req = sync_rr::SyncRequest::GetBlock { block_hash: hash };
+            let resp = served(&dag, &store, req.clone());
+            // The old serving path: decode the stored block, encode it again.
+            let old = sync_rr::SyncResponse::Block {
+                block_hash: hash,
+                blue_score: block.blue_score,
+                height,
+                block_data: store.get_block(&hash).unwrap().unwrap().to_wire_bytes(),
+            };
+            assert_eq!(resp, old, "h {height}: stored bytes differ from the re-encoding");
+            let mut out = futures::io::Cursor::new(Vec::new());
+            futures::executor::block_on(sync_rr::BlochSyncCodec.write_response(&sync_rr::SYNC_PROTOCOL, &mut out, resp.clone()))
+                .unwrap();
+            let frame = out.into_inner();
+            assert_eq!(frame, sync_rr::encode_frame(&old).unwrap(), "h {height}: frame");
+            assert_eq!(serve::charge_for(&resp), frame.len(), "h {height}: charge");
+            // The requester.
+            let back = sync_rr::decode_response(&frame).expect("decodes");
+            sync_rr::check_response(&req, &back).expect("bound to its request");
+            let sync_rr::SyncResponse::Block { block_data, .. } = back else { panic!("expected Block") };
+            let got = Block::from_wire_bytes(&block_data).expect("block decodes");
+            assert_eq!(got.block_hash(), hash);
+            assert_eq!(got.powit, if active { block.powit.clone() } else { PowitBody::default() }, "h {height}");
+            assert_eq!(block_data.len(), block.wire_size());
+        }
     }
 
     /// The heartbeat's first tick comes one period after start-up, not at
@@ -3718,5 +4962,44 @@ mod tests {
         assert_eq!(start.elapsed(), HEARTBEAT_PERIOD);
         hb.tick().await;
         assert_eq!(start.elapsed(), 2 * HEARTBEAT_PERIOD);
+    }
+
+    /// B1-T19 (PoWit): transactions and PoWit items (the transaction topic's
+    /// two message kinds) go to the transaction ingest; blocks and
+    /// everything else stay on the block channel. A wire violation in a
+    /// PoWit frame (an oversized item, an unknown kind) goes through the
+    /// same rollout-gated classifier as every frame (`classify_gated`).
+    #[test]
+    fn powit_items_and_transactions_go_to_the_tx_ingest() {
+        assert!(goes_to_tx_ingest(&NetworkMessage::NewTransaction { txid: [1; 32], tx_data: vec![] }));
+        assert!(goes_to_tx_ingest(&NetworkMessage::NewPowitItem { id: [2; 32], kind: 1, data: vec![0; 8] }));
+        assert!(!goes_to_tx_ingest(&NetworkMessage::NewBlock { block_hash: [3; 32], block_data: vec![], height: 1, blue_score: 1 }));
+        assert!(!goes_to_tx_ingest(&NetworkMessage::GetTips));
+
+        let oversized = bincode::serde::encode_to_vec(
+            &NetworkMessage::NewPowitItem { id: [2; 32], kind: 1, data: vec![0; MAX_WIRE_POWIT_ITEM + 1] },
+            bincode::config::standard()).unwrap();
+        let p = PeerId::random();
+        let mut t = WirePenaltyTracker::new();
+        assert!(matches!(t.classify_gated(p, &oversized, false), WireReaction::IgnoreMalformed(_)),
+            "before the activation a relayed violation is refused, not charged");
+        assert!(matches!(t.classify_gated(p, &oversized, true), WireReaction::Penalize { .. }));
+    }
+
+    /// NET-11 (a): only novel blocks and transactions earn inbound-eviction
+    /// protection. PoWit items (main's `NewPowitItem`) are deferred to the
+    /// processor like transactions, but an accepted one protects nobody.
+    #[test]
+    fn only_blocks_and_transactions_earn_novel_delivery_protection() {
+        let block = NetworkMessage::NewBlock { block_hash: [1; 32], blue_score: 1, height: 1, block_data: vec![] };
+        let tx = NetworkMessage::NewTransaction { txid: [2; 32], tx_data: vec![] };
+        assert_eq!(novel_kind(&block), Some(true));
+        assert_eq!(novel_kind(&tx), Some(false));
+        for kind in 1..=3u8 {
+            let item = NetworkMessage::NewPowitItem { id: [3; 32], kind, data: vec![0; 8] };
+            assert_eq!(gossip_disposition(&item, true, false), GossipDisposition::DeliverDeferred);
+            assert_eq!(novel_kind(&item), None, "a PoWit item (kind {kind}) earns no eviction protection");
+        }
+        assert_eq!(novel_kind(&NetworkMessage::GetTips), None);
     }
 }

@@ -13,6 +13,14 @@ wrong-length public keys, and modified signatures.
 
 `tests/wycheproof_mldsa65.rs` checks every empty-context case through the
 consensus wrapper `crypto::verify` (ML-DSA-65-only suite envelope) and every
-case, with its context, through `pqcrypto_mldsa::mldsa65` directly. These are
+case, with its context, through `pqcrypto_mldsa::mldsa65` directly. Both must
+give the Wycheproof verdict on every case, on every target and CPU. These are
 third-party known answers: a match shows agreement with the standard's edge
 cases, not an audit.
+
+The vectors found that PQClean's AVX2 ML-DSA-65, which `pqcrypto-mldsa`'s
+default features select at run time on AVX2 CPUs, differs from FIPS 204 on
+42 cases: it accepts 41 signatures whose z violates the infinity norm and
+refuses tcId 161 (UseHint with r0 = 0), while the clean implementation (i686,
+wasm32, x86_64 without AVX2) agrees with Wycheproof. Every build therefore
+links the clean implementation only (docs/testing/SANITIZERS.md, F6).

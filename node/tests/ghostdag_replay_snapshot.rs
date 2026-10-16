@@ -42,7 +42,7 @@ use gnb::consensus::{
     canonical_encode, BlockHash, ColoringMode, GhostDAG, GhostdagData,
     CORRECTED_COLORING_ACTIVATION_HEIGHT,
 };
-use gnb::core::GHOSTDAG_K;
+use gnb::core::{activation, GHOSTDAG_K};
 use gnb::storage::Storage;
 
 // ── comparison helpers (mirror tests/ghostdag_differential.rs) ────────────────
@@ -172,6 +172,15 @@ fn topo_sort(
 /// `blue_work`: `work(b) = b.blue_work - selected_parent(b).blue_work`
 /// (`add_block` sets `blue_work = sp.blue_work + work`), so parent selection —
 /// which tie-breaks on `blue_work` — is reproduced faithfully.
+///
+/// The snapshot is history mined and stored under the old (pre-hardening)
+/// rules, and both the work recovery above and the on-disk comparison assume
+/// them (from the activation, `blue_work` also adds the mergeset blues' work),
+/// so the replay pins the old rules at every height (`activation::NEVER`)
+/// instead of taking the process-wide mainnet activation, which a long
+/// snapshot's chain may pass. A snapshot of a chain mined past its hardening
+/// activation is out of scope: its per-block work would have to come from the
+/// headers' bits, not from the `blue_work` difference.
 fn replay(
     order: &[BlockHash],
     snapshot: &HashMap<BlockHash, GhostdagData>,
@@ -180,7 +189,8 @@ fn replay(
     let mut dag = match mode {
         ColoringMode::Legacy => GhostDAG::with_k(GHOSTDAG_K),
         ColoringMode::Fast => GhostDAG::with_k_fast(GHOSTDAG_K),
-    };
+    }
+    .with_hardening_activation(activation::NEVER);
     for h in order {
         let d = &snapshot[h];
         if d.parents.is_empty() {

@@ -3,12 +3,15 @@
 //!
 //! * Nothing panics, whatever the index (in or out of range) or the number of
 //!   spent outputs.
-//! * Sighash v2 (`Transaction::sighash`) equals an independent hand-written
-//!   bincode (standard configuration) encoding of the stripped transaction
-//!   (`reference/gnb_sighash.py`'s `v2_body`), hashed with the v2 prefix, for
-//!   every index (an out-of-range index omits the marker); the bincode crate
-//!   produces the same body. `sighash_v2_checked` is `Ok(sighash)` exactly for
-//!   an index below the input count. No `script_sig` is committed.
+//! * Sighash v2 (`Transaction::sighash`) equals an independent encoding of
+//!   the specification (`reference/gnb_sighash.py`'s `v2_body`): the
+//!   stripped transaction in the WIRE format (fixed-width little-endian
+//!   integers, CompactSize lengths; on this chain since cc5c450, no
+//!   serde/bincode), hashed with the v2 prefix (`SIGHASH_VERSION` 0x02), for
+//!   every index (an out-of-range index omits the marker); the library's wire
+//!   encoder produces the same body. `sighash_v2_checked` is `Ok(sighash)`
+//!   exactly for an index below the input count. No `script_sig` is
+//!   committed.
 //! * Sighash v3 equals an independent implementation of the 195-byte preimage
 //!   of the specification; it is an error exactly when the spent-output count
 //!   differs from the input count or the index is out of range.
@@ -32,48 +35,35 @@ fn chain(b: bool) -> ChainId {
     }
 }
 
-fn bincode_varint(out: &mut Vec<u8>, v: u64) {
-    if v <= 250 {
-        out.push(v as u8);
-    } else if v <= 0xFFFF {
-        out.push(0xFB);
-        out.extend_from_slice(&(v as u16).to_le_bytes());
-    } else if v <= 0xFFFF_FFFF {
-        out.push(0xFC);
-        out.extend_from_slice(&(v as u32).to_le_bytes());
-    } else {
-        out.push(0xFD);
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-}
-
-/// `v2_body` of the reference: bincode of the transaction with every
+/// `v2_body` of the reference: the wire encoding of the transaction (u32 /
+/// u64 little-endian, CompactSize counts and lengths) with every
 /// `script_sig` emptied except the signed input's, which is the marker.
 fn ref_v2_body(tx: &Transaction, index: usize) -> Vec<u8> {
     let mut out = Vec::new();
-    bincode_varint(&mut out, tx.version as u64);
-    bincode_varint(&mut out, tx.inputs.len() as u64);
+    out.extend_from_slice(&tx.version.to_le_bytes());
+    ref_compact_size(&mut out, tx.inputs.len() as u64);
     for (i, inp) in tx.inputs.iter().enumerate() {
         let ss: &[u8] = if i == index { b"GNB_SIGHASH" } else { b"" };
         out.extend_from_slice(&inp.prev_txid);
-        bincode_varint(&mut out, inp.prev_index as u64);
-        bincode_varint(&mut out, ss.len() as u64);
+        out.extend_from_slice(&inp.prev_index.to_le_bytes());
+        ref_compact_size(&mut out, ss.len() as u64);
         out.extend_from_slice(ss);
-        bincode_varint(&mut out, inp.sequence as u64);
+        out.extend_from_slice(&inp.sequence.to_le_bytes());
     }
-    bincode_varint(&mut out, tx.outputs.len() as u64);
+    ref_compact_size(&mut out, tx.outputs.len() as u64);
     for o in &tx.outputs {
-        bincode_varint(&mut out, o.value);
-        bincode_varint(&mut out, o.script_pubkey.len() as u64);
+        out.extend_from_slice(&o.value.to_le_bytes());
+        ref_compact_size(&mut out, o.script_pubkey.len() as u64);
         out.extend_from_slice(&o.script_pubkey);
     }
-    bincode_varint(&mut out, tx.locktime as u64);
+    out.extend_from_slice(&tx.locktime.to_le_bytes());
     out
 }
 
+/// `"GNB-SIGHASH-v1\0\0" || 0x02 || chain_id u32 LE || v2_body`, SHA3-256.
 fn ref_v2(tx: &Transaction, index: usize, c: ChainId) -> [u8; 32] {
     let mut pre = b"GNB-SIGHASH-v1\0\0".to_vec();
-    pre.push(0x01);
+    pre.push(0x02);
     pre.extend_from_slice(&c.to_u32().to_le_bytes());
     pre.extend_from_slice(&ref_v2_body(tx, index));
     sha3(&pre)
@@ -173,13 +163,9 @@ fuzz_target!(|data: &[u8]| {
     for (i, x) in stripped.inputs.iter_mut().enumerate() {
         x.script_sig = if i == index { b"GNB_SIGHASH".to_vec() } else { vec![] };
     }
-    assert_eq!(
-        bincode::serde::encode_to_vec(&stripped, bincode::config::standard()).unwrap(),
-        body,
-        "hand-written bincode body differs from the bincode crate"
-    );
+    assert_eq!(stripped.to_wire_bytes(true), body, "v2 body differs from the library's wire encoding");
     let v2 = tx.sighash(index, c);
-    assert_eq!(v2, ref_v2(&tx, index, c), "sighash v2 differs from the bincode-based legacy digest");
+    assert_eq!(v2, ref_v2(&tx, index, c), "sighash v2 differs from the specification (wire body)");
     match tx.sighash_v2_checked(index, c) {
         Ok(d) => {
             assert!(index < tx.inputs.len());

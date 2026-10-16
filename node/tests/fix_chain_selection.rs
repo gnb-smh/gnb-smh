@@ -564,7 +564,11 @@ fn dag6_restored_body_is_bound_to_the_dag_height() {
     forged.height = 0;
     assert_eq!(forged.block_hash(), a10.block_hash(), "the id does not commit the height");
     match feed(&mut core, &f.x, &forged) {
-        BlockOutcome::Invalid(e) => assert!(e.contains("invalid height") && e.contains("expected h=10"), "{e}"),
+        BlockOutcome::BodyRefused(e) => {
+            assert!(e.contains("invalid height") && e.contains("expected h=10"), "{e}");
+            // No honest server sends a wrong height: its sender is penalized.
+            assert_eq!(ingress::verdict_for_accept_error(&e), gnb::network::GossipVerdict::Reject);
+        }
         other => panic!("a body with a forged height must be refused: {other:?}"),
     }
     assert!(accept::awaits_body(&f.x.dag, &f.x.store, &a10.block_hash()), "still wanted");
@@ -882,16 +886,35 @@ fn merge_witness_rejected_body_is_refetched_through_the_ingress_core() {
     assert_eq!(tip_meta(&n), gh);
     // Only the answer to the node's own pull is taken as a body.
     assert!(matches!(feed_as(&mut core, &n, &honest, None, false, honest.to_wire_bytes().len()), BlockOutcome::Known));
+    // B1-T2 review: neither the same rejected body nor another malleated
+    // one is held against the peer that served it (an honest peer may store
+    // a malleated copy: merged blocks are never tx-validated), so the
+    // directed-answer penalty (`directed_block_penalty`) never fires for it.
+    // Both used to be `Invalid`, which the processor maps to Reject.
     match feed(&mut core, &n, &bad) {
-        BlockOutcome::Invalid(e) => assert!(e.contains("already rejected"), "{e}"),
+        BlockOutcome::BodyRefused(e) => {
+            assert!(e.contains("already rejected"), "{e}");
+            assert_eq!(ingress::verdict_for_accept_error(&e), gnb::network::GossipVerdict::Ignore);
+        }
         other => panic!("the same rejected body again: {other:?}"),
     }
+    let mut other_bad = honest.clone();
+    other_bad.transactions[1].inputs[0].script_sig[120] ^= 0x01;
+    assert_eq!(other_bad.block_hash(), id);
+    match feed(&mut core, &n, &other_bad) {
+        BlockOutcome::BodyRefused(e) => {
+            assert!(e.contains("body rejected"), "{e}");
+            assert_eq!(ingress::verdict_for_accept_error(&e), gnb::network::GossipVerdict::Ignore, "{e}");
+        }
+        other => panic!("another malleated body: {other:?}"),
+    }
+    assert!(accept::awaits_body(&n.dag, &n.store, &id), "still waiting for a body");
     assert!(matches!(feed(&mut core, &n, &honest), BlockOutcome::BodyRestored));
     assert_eq!(tip_meta(&n), id);
     assert!(!accept::awaits_body(&n.dag, &n.store, &id));
     assert!(n.store.get_utxo(&pay.txid(), 0).unwrap().is_some());
     let moved = core.take_chain_move();
-    assert_eq!(moved.connected.iter().map(|x| x.block_hash()).collect::<Vec<_>>(), vec![id]);
+    assert_eq!(moved.connected(), vec![id]);
     assert!(matches!(feed(&mut core, &n, &honest), BlockOutcome::Known), "once only");
 }
 
@@ -1503,7 +1526,7 @@ fn sync_tip_first_with(
             }
             BlockOutcome::Dropped(r) => drops.push((h, r)),
             BlockOutcome::Known | BlockOutcome::PoolRefused | BlockOutcome::BodyRestored => {}
-            BlockOutcome::Invalid(e) => panic!("invalid: {e}"),
+            BlockOutcome::Invalid(e) | BlockOutcome::BodyRefused(e) => panic!("invalid: {e}"),
         }
         between(core);
     }
@@ -1599,17 +1622,17 @@ fn pow3_merge_backed_deep_blocks_are_rationed() {
 }
 
 /// Audit POW-3 follow-up (review): under the hardened rules (testnet and
-/// regtest from genesis, mainnet from 110,000) blue work counts merged blues,
-/// so the threshold is real blue work — but the work rule credited an
-/// announced fork with the work of ONE path of orphans. A heavier DAG-shaped
-/// fork (here two blocks per level, each merging both blocks of the level
-/// below) was refused for good: its first block's single-path credit
-/// (51 + 500 blocks of work) never reached the threshold (640), while the fork
-/// (1,051 blocks of blue work) beats the 1,000-block chain. The credit is now
-/// the summed work of the distinct orphans announced above a block, buffered
-/// or evicted, each counted once; the node follows the fork tip first through
-/// a pool much smaller than the fork and ends with the UTXO set of a node fed
-/// in order.
+/// regtest from genesis, mainnet from `MAINNET_HARDENING_ACTIVATION_HEIGHT`)
+/// blue work counts merged blues, so the threshold is real blue work — but the
+/// work rule credited an announced fork with the work of ONE path of orphans.
+/// A heavier DAG-shaped fork (here two blocks per level, each merging both
+/// blocks of the level below) was refused for good: its first block's
+/// single-path credit (51 + 500 blocks of work) never reached the threshold
+/// (640), while the fork (1,051 blocks of blue work) beats the 1,000-block
+/// chain. The credit is now the summed work of the distinct orphans announced
+/// above a block, buffered or evicted, each counted once; the node follows the
+/// fork tip first through a pool much smaller than the fork and ends with the
+/// UTXO set of a node fed in order.
 #[test]
 fn pow3_heavier_dag_shaped_fork_is_followed_under_the_hardened_rules() {
     let _hardened = gnb::core::activation::scoped_override(0);

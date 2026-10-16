@@ -133,7 +133,10 @@ mod tests {
 
     #[test]
     fn inputs_change_output() {
-        let mut sp = Scratchpad::new(6);
+        // 2^6 blocks natively; 4 blocks under Miri (each step is two
+        // Keccak-f[1600] permutations, ~0.4 s each there): still pass 0, the
+        // later passes with their wrap-around predecessor, and every index.
+        let mut sp = Scratchpad::new(if cfg!(miri) { 2 } else { 6 });
         let a = trace_with(&mut sp, 2, b"gnb", 0).out;
         assert_ne!(a, trace_with(&mut sp, 2, b"gnb", 1).out);
         assert_ne!(a, trace_with(&mut sp, 3, b"gnb", 0).out);

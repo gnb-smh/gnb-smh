@@ -12,10 +12,13 @@
 //!   before children (child-pays-for-parent, audit MEM-6 —
 //!   `mempool::select_packages`; without in-pool chains this is highest fee
 //!   rate first), under a BYTE budget measured exactly as the consensus rule
-//!   measures AT THE TEMPLATE'S HEIGHT (bincode `Block::size_bytes` below the
-//!   hardening activation, the canonical wire encoding `Block::wire_size`
-//!   at/after it, audit VAL-12 — package sizes and fee rates use the same
-//!   measure): the budget is `MAX_BLOCK_SIZE` minus an upper bound of the
+//!   measures AT THE TEMPLATE'S HEIGHT (on this chain the wire encoding at
+//!   every height: `block_rules::legacy_block_size` below the hardening
+//!   activation, `Block::wire_size` at/after it, audit VAL-12, neither
+//!   reading the uncommitted `blue_score`, re-audit B1-T0 — package sizes
+//!   and fee rates use the same measure, the PoWit section and the
+//!   witness-share coinbase outputs are budgeted on top): the budget is
+//!   `MAX_BLOCK_SIZE` minus an upper bound of the
 //!   header and block framing (every varint at its maximum width) minus a
 //!   coinbase reserve. A count-only cap let ~116 ordinary transactions push
 //!   every template past `MAX_BLOCK_SIZE` (MEM-2).
@@ -261,8 +264,11 @@ fn framing_upper_bound(parents: &[BlockHash], hardened: bool) -> usize {
         shielded_transactions: Vec::new(),
         powit: Default::default(),
     };
-    // + 9: the transaction-count varint grows from 1 byte (empty) to at most 9.
-    empty.size_bytes().saturating_add(9)
+    // The rule's own measure (`legacy_block_size`, the wire length, with
+    // the PoWit section of a height at/after `powit_height()`; blue_score
+    // fixed-width, re-audit B1-T0). + 9: the transaction-count varint grows
+    // from 1 byte (empty) to at most 9.
+    core::block_rules::legacy_block_size(&empty).saturating_add(9)
 }
 
 /// The node's own coinbase for `height` paying `value` to `script_pubkey`.
@@ -365,6 +371,24 @@ pub fn next_template_height(d: &GhostDAG, store: &Storage) -> u64 {
     template_parents_and_height(d, store).1.max(1)
 }
 
+/// `Some((applied, best))` when the block the UTXO set sits on (the persisted
+/// tip pointer `tip_hash`) is not the DAG's selected tip: a chain move that
+/// commits in chunks (audit B2-T0, `accept::resolve_best_chain`) stopped after
+/// committed chunks (a storage failure; Bitcoin Core aborts the node on such
+/// a failure) and resumes with the next acceptance or at the next start. In
+/// between, a template would take its parents and height from the DAG tip but
+/// check its transactions against the UTXO set of an intermediate block (a
+/// transaction the best chain already confirmed or conflicts with would pass),
+/// so [`build_block_template_with`] refuses to build one. `None` when they
+/// agree, or without a tip pointer (fixtures).
+pub fn chain_move_incomplete(d: &GhostDAG, store: &Storage) -> Option<(BlockHash, BlockHash)> {
+    let applied = store.get_meta("tip_hash").ok().flatten()
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        .filter(|t| d.has_block(t))?;
+    let best = d.selected_tip()?;
+    (best != applied).then_some((applied, best))
+}
+
 /// Build a template on the current DAG / UTXO / mempool state.
 ///
 /// `coinbase_reserve` is the number of bytes kept free for the coinbase
@@ -403,6 +427,12 @@ pub fn build_block_template_with(
 
     let (parents, height, blue_score, parent_ts) = {
         let d = dag.read();
+        if let Some((applied, best)) = chain_move_incomplete(&d, store) {
+            return Err(format!(
+                "chain move in progress: the UTXO set is at {} but the best chain's tip is {}; no \
+                 template until the move completes (next block or restart)",
+                hex::encode(&applied[..8]), hex::encode(&best[..8])));
+        }
         let (parents, height) = template_parents_and_height_at(&d, store, activation_height);
         if parents.is_empty() {
             return Err("node has no bodied tip yet (still syncing genesis?)".into());
@@ -589,20 +619,25 @@ fn self_check(
             .map_err(TemplateReject::Evict)?;
         prevouts.push(out);
     }
-    core::check_coinbase_maturity(tx, height, |t| store.get_coinbase_height(t).ok().flatten())
+    // A height that cannot be read is no verdict: skip, never evict, and
+    // never treat the input as "not a coinbase" (re-audit B1-T12).
+    admission::coinbase_maturity_for_next_block(store, tx, height)
+        .map_err(|_| TemplateReject::Skip)?
         .map_err(TemplateReject::Evict)?;
     // This chain's rules (`blockval`): finality at the template height,
     // output kinds, dust, policy timelocks. An output created earlier in the
-    // template is confirmed at the template's height.
-    let confirm = |t: &[u8; 32]| -> Result<Option<u64>, String> {
+    // template is confirmed in the template's block (0 confirmations); a
+    // confirmed one counts in the connect path's measure for the template's
+    // height (`admission::confirmations_for_next_block`, re-audit B1-T14).
+    let confirmations = |t: &[u8; 32]| -> Result<Option<u64>, String> {
         // Every transaction has an output 0: its presence among the
         // template's outputs means `t` was placed earlier in the template.
         if created(&(*t, 0)).is_some() {
-            return Ok(Some(height));
+            return Ok(Some(0));
         }
-        store.get_tx_location(t).map(|o| o.map(|(_, h)| h)).map_err(|e| e.to_string())
+        admission::confirmations_for_next_block(store, t, height).map_err(|e| e.0)
     };
-    match crate::blockval::check_tx_chain_rules(tx, &prevouts, height, &confirm) {
+    match crate::blockval::check_tx_chain_rules_with_confirmations(tx, &prevouts, height, &confirmations) {
         Ok(()) => {}
         Err(e) if e.starts_with(crate::blockval::STORAGE_ERR) => return Err(TemplateReject::Skip),
         // A timelock or locktime that is not yet satisfied may be later.

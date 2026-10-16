@@ -117,6 +117,10 @@ pub struct AdmissionPolicy {
     /// when the block was mined); at/after it the input scripts are verified
     /// anyway, since the block may have been mined below it under v2. The
     /// version rule and policy at `next_block_height` apply either way.
+    /// `false` also selects the re-admission insert (audit B1-T20, Core's
+    /// `bypass_limits`): no rolling-minimum check and no per-transaction
+    /// trim (the caller trims once), but a transaction the trim would evict
+    /// at once is refused (`Mempool::would_only_trim`).
     pub check_signatures: bool,
     /// Consult and update the recent-rejects filter.
     pub use_reject_filter: bool,
@@ -225,11 +229,41 @@ fn from_mempool_error(e: MempoolError) -> AdmissionError {
 /// encoding INCLUDING script_sigs. Two encodings of the same txid with
 /// different signatures get different wtxids (reject filter, sig cache).
 pub fn wtxid(tx: &Transaction) -> [u8; 32] {
+    wtxid_of_canonical_bytes(&tx.to_wire_bytes(true))
+}
+
+/// The wtxid of the transaction whose canonical wire encoding
+/// (`to_wire_bytes(true)`) is `bytes` — B1-T19: the gossip relay hashes the
+/// frame it received (checked canonical by [`decode_tx_canonical`]) once,
+/// instead of re-encoding the decoded transaction for every use.
+pub fn wtxid_of_canonical_bytes(bytes: &[u8]) -> [u8; 32] {
     use sha3::{Digest, Sha3_256};
     let mut h = Sha3_256::new();
     h.update(b"gnb-wtxid-v1");
-    h.update(tx.to_wire_bytes(true));
+    h.update(bytes);
     h.finalize().into()
+}
+
+/// [`decode_tx_strict`] that also proves `bytes` IS the canonical encoding
+/// byte for byte (not only of the canonical length), so
+/// [`wtxid_of_canonical_bytes`]`(bytes) == `[`wtxid`]`(&tx)`. One
+/// re-encoding, as `decode_tx_strict` already did.
+pub fn decode_tx_canonical(bytes: &[u8]) -> Result<Transaction, String> {
+    if bytes.len() > MAX_TX_SIZE {
+        return Err(format!("transaction of {} bytes exceeds MAX_TX_SIZE {}", bytes.len(), MAX_TX_SIZE));
+    }
+    let tx = Transaction::from_wire_bytes(bytes)?;
+    let canonical = tx.to_wire_bytes(true);
+    if canonical.len() != bytes.len() {
+        return Err(format!(
+            "non-canonical transaction encoding: {} trailing byte(s)",
+            bytes.len().saturating_sub(canonical.len())
+        ));
+    }
+    if canonical != bytes {
+        return Err("non-canonical transaction encoding".into());
+    }
+    Ok(tx)
 }
 
 /// Strict gossip/RPC decode (MEM-5): `Transaction::from_wire_bytes` ignores
@@ -309,6 +343,12 @@ fn sig_cache() -> &'static parking_lot::Mutex<(HashSet<[u8; 32]>, std::collectio
 ///   the spent script. Included for v2 too, so the key never depends on the
 ///   regime-specific reasoning above.
 fn sig_cache_key(tx: &Transaction, version: SighashVersion, active: bool, prevouts: &[TxOutput]) -> [u8; 32] {
+    sig_cache_key_for(&wtxid(tx), version, active, prevouts)
+}
+
+/// [`sig_cache_key`] from the transaction's wtxid (B1-T19: the gossip relay
+/// computes it once per frame, from the frame's canonical bytes).
+fn sig_cache_key_for(wtxid: &[u8; 32], version: SighashVersion, active: bool, prevouts: &[TxOutput]) -> [u8; 32] {
     use sha3::{Digest, Sha3_256};
     #[cfg(test)]
     tests::SIG_KEYS_COMPUTED.with(|c| c.set(c.get() + 1));
@@ -316,7 +356,7 @@ fn sig_cache_key(tx: &Transaction, version: SighashVersion, active: bool, prevou
     h.update(b"gnb-sigcache-v4");
     h.update(core::node_chain_id().to_le_bytes());
     h.update([match version { SighashVersion::V2 => 2u8, SighashVersion::V3 => 3u8 }, u8::from(active)]);
-    h.update(wtxid(tx));
+    h.update(wtxid);
     h.update((prevouts.len() as u64).to_le_bytes());
     for p in prevouts {
         h.update(p.value.to_le_bytes());
@@ -409,9 +449,22 @@ pub fn verify_input_scripts_gated_at(
     act: u64,
     gate: &mut SignatureGate<'_>,
 ) -> Result<(), AdmissionError> {
+    verify_input_scripts_gated_with_wtxid_at(tx, &wtxid(tx), prevouts, block_height, act, gate)
+}
+
+/// [`verify_input_scripts_gated_at`] with the transaction's wtxid already
+/// computed (`tx_wtxid` MUST be [`wtxid`]`(tx)`; B1-T19: once per frame).
+pub fn verify_input_scripts_gated_with_wtxid_at(
+    tx: &Transaction,
+    tx_wtxid: &[u8; 32],
+    prevouts: &[TxOutput],
+    block_height: u64,
+    act: u64,
+    gate: &mut SignatureGate<'_>,
+) -> Result<(), AdmissionError> {
     let version = core::sighash::check_tx_version(tx.version, block_height, act).map_err(AdmissionError::Rejected)?;
     let witnesses = core::sighash::check_input_witnesses(tx, prevouts, version).map_err(AdmissionError::Rejected)?;
-    let key = sig_cache_key(tx, version, core::activation::is_active_at(block_height, act), prevouts);
+    let key = sig_cache_key_for(tx_wtxid, version, core::activation::is_active_at(block_height, act), prevouts);
     if sig_cache().lock().0.contains(&key) {
         return Ok(());
     }
@@ -649,6 +702,20 @@ pub fn check_transaction_gated(
     policy: &AdmissionPolicy,
     gate: &mut SignatureGate<'_>,
 ) -> Result<u64, AdmissionError> {
+    check_transaction_gated_with_wtxid(store, mempool, tx, &wtxid(tx), policy, gate)
+}
+
+/// [`check_transaction_gated`] with the transaction's wtxid already
+/// computed (`tx_wtxid` MUST be [`wtxid`]`(tx)`; B1-T19: the gossip relay
+/// computes it once per frame).
+pub fn check_transaction_gated_with_wtxid(
+    store: &Storage,
+    mempool: Option<&Mempool>,
+    tx: &Transaction,
+    tx_wtxid: &[u8; 32],
+    policy: &AdmissionPolicy,
+    gate: &mut SignatureGate<'_>,
+) -> Result<u64, AdmissionError> {
     check_structure_and_size(tx)?;
 
     // Known: pooled, recently rejected (a replay costs one bounded hash), or
@@ -658,7 +725,7 @@ pub fn check_transaction_gated(
         if mp.contains(&txid) {
             return Err(AdmissionError::Duplicate("duplicate transaction".into()));
         }
-        if policy.use_reject_filter && mp.is_recently_rejected(&wtxid(tx)) {
+        if policy.use_reject_filter && mp.is_recently_rejected(tx_wtxid) {
             return Err(AdmissionError::Duplicate("recently rejected".into()));
         }
     }
@@ -719,18 +786,19 @@ pub fn check_transaction_gated(
     }
 
     // Coinbase maturity at the next block's height (MEM-4).
-    core::check_coinbase_maturity(tx, policy.next_block_height, |t| {
-        store.get_coinbase_height(t).ok().flatten()
-    }).map_err(AdmissionError::Immature)?;
+    coinbase_maturity_for_next_block(store, tx, policy.next_block_height)
+        .map_err(|e| AdmissionError::Pool(format!("storage: {}", e)))?
+        .map_err(AdmissionError::Immature)?;
 
     // This chain's rules (`blockval`): finality at the next height, output
     // kinds, dust, policy timelocks. An output of a pooled (unconfirmed)
     // parent has no confirmation height yet: a relative timelock on it is
-    // not satisfied.
-    let confirm = |t: &[u8; 32]| -> Result<Option<u64>, String> {
-        store.get_tx_location(t).map(|o| o.map(|(_, h)| h)).map_err(|e| e.to_string())
+    // not satisfied. Relative timelocks count confirmations in the connect
+    // path's measure for the next block (re-audit B1-T14).
+    let confirmations = |t: &[u8; 32]| -> Result<Option<u64>, String> {
+        confirmations_for_next_block(store, t, policy.next_block_height).map_err(|e| e.0)
     };
-    crate::blockval::check_tx_chain_rules(tx, &prevouts, policy.next_block_height, &confirm)
+    crate::blockval::check_tx_chain_rules_with_confirmations(tx, &prevouts, policy.next_block_height, &confirmations)
         .map_err(|e| if e.starts_with(crate::blockval::STORAGE_ERR) {
             AdmissionError::Pool(e)
         } else {
@@ -750,9 +818,18 @@ pub fn check_transaction_gated(
             "fee {} below minimum relay rate ({} sat/byte for {} bytes)", fee, MIN_RELAY_FEE_RATE, size)));
     }
     if let Some(mp) = mempool {
-        if !mp.meets_rolling_min(fee, size) {
+        if policy.check_signatures {
+            if !mp.meets_rolling_min(fee, size) {
+                return Err(AdmissionError::LowFee(format!(
+                    "fee {} below the mempool's rolling minimum ({} sat/byte)", fee, mp.rolling_min_fee_rate())));
+            }
+        } else if mp.would_only_trim(fee, size) {
+            // Re-admission after a reorg (B1-T20, Bitcoin Core's
+            // `MaybeUpdateMempoolForReorg`): the rolling minimum (relay
+            // policy) does not apply to a transaction that was mined, but
+            // one the pool's final trim would evict at once is not inserted.
             return Err(AdmissionError::LowFee(format!(
-                "fee {} below the mempool's rolling minimum ({} sat/byte)", fee, mp.rolling_min_fee_rate())));
+                "the pool is full and fee {} for {} bytes does not beat its cheapest package", fee, size)));
         }
         // MEM-6: replacement rules (when it conflicts) and chain limits,
         // still before any signature work.
@@ -773,9 +850,100 @@ pub fn check_transaction_gated(
         // Behind the caller's gate (MEM-5: the relay's per-connection
         // budget), charged only when the work is not already cached; one
         // cache-key computation for the lookup and the insertion.
-        verify_input_scripts_gated_at(tx, &prevouts, policy.next_block_height, activation_height(), gate)?;
+        verify_input_scripts_gated_with_wtxid_at(tx, tx_wtxid, &prevouts, policy.next_block_height, activation_height(), gate)?;
     }
     Ok(fee)
+}
+
+/// Coinbase maturity of `tx` for the next block, at header height
+/// `next_block_height` (`0` skips it), under the connect path's own rule
+/// (`accept::check_coinbase_maturity_in_view`, re-audit B1-T14): below the
+/// activation header heights, from it the selected-chain depth, the next
+/// block being a child of the applied tip (its selected parent: the
+/// template's first parent is the applied tip, whose UTXO set the template's
+/// transactions are checked against). `Ok(Err(reason))` when an input spends
+/// an immature coinbase, `Err` when a height could not be read. A failed
+/// read is never "not a coinbase" (re-audit B1-T12: the lookups used
+/// `.ok().flatten()`, which skipped the check). Shared by admission, the
+/// post-connect revalidation and the template self-check.
+pub fn coinbase_maturity_for_next_block(
+    store: &Storage,
+    tx: &Transaction,
+    next_block_height: u64,
+) -> Result<Result<(), String>, crate::storage::StorageError> {
+    use crate::accept::{check_coinbase_maturity_in_view, MaturityRule};
+    let next_dag_height = || next_block_dag_height(store);
+    let rule = if next_block_height == 0 {
+        MaturityRule::Skip
+    } else if core::block_rules::rules_active_at(next_block_height, activation_height()) {
+        MaturityRule::SelectedChainDepth(&next_dag_height)
+    } else {
+        MaturityRule::HeaderHeights(next_block_height)
+    };
+    check_coinbase_maturity_in_view(tx, store, rule)
+        .map_err(|e| crate::storage::StorageError::ReadFailed(e.0))
+}
+
+/// The confirmations the outputs of the confirmed transaction `txid` have at
+/// the next block, at header height `next_block_height`, for relative
+/// timelocks (`blockval::check_policy_spends_with_confirmations`), under the
+/// connect path's own measure (`accept::confirmations_in_view`, the
+/// coinbase-maturity measure, re-audit B1-T14): below the activation header
+/// heights, from it selected-chain depth (the next block a child of the
+/// applied tip, as for [`coinbase_maturity_for_next_block`]). `Ok(None)`:
+/// `txid` is not confirmed. Shared by admission and the template self-check.
+pub fn confirmations_for_next_block(
+    store: &Storage,
+    txid: &[u8; 32],
+    next_block_height: u64,
+) -> Result<Option<u64>, crate::reorg::ViewError> {
+    use crate::accept::{confirmations_in_view, MaturityRule};
+    let next_dag_height = || next_block_dag_height(store);
+    let rule = if core::block_rules::rules_active_at(next_block_height, activation_height()) {
+        MaturityRule::SelectedChainDepth(&next_dag_height)
+    } else {
+        MaturityRule::HeaderHeights(next_block_height)
+    };
+    confirmations_in_view(store, rule, txid)
+}
+
+/// The DAG height of the next block: the applied tip's (`tip_hash`, its DAG
+/// record) plus one.
+fn next_block_dag_height(store: &Storage) -> Result<u64, crate::reorg::ViewError> {
+    use crate::reorg::{UtxoView, ViewError};
+    let tip = store.get_meta("tip_hash").map_err(|e| ViewError(e.to_string()))?
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        .ok_or_else(|| ViewError("no applied tip pointer".into()))?;
+    let data = store.view_dag_data(&tip)?
+        .ok_or_else(|| ViewError(format!("applied tip {} has no DAG record", hex::encode(&tip[..8]))))?;
+    Ok(data.height + 1)
+}
+
+/// The `coinbase_height` `getutxos` reports for an output of the coinbase
+/// `txid` (`None`: not a coinbase), for wallets, which treat such an output
+/// as spendable in the next block iff
+/// `next_block_height - coinbase_height >= COINBASE_MATURITY`
+/// (`wallet::send::utxo_row_spendable_at`,
+/// `next_block_height` from `getdaginfo`): below the activation (of the next
+/// block) the header height of the coinbase's block, as before; from it
+/// `next_block_height` minus the coinbase's selected-chain depth at the next
+/// block (re-audit B1-T14), so the same comparison applies the rule in
+/// force. Both values are for the same next block.
+pub fn coinbase_height_for_wallets(
+    store: &Storage,
+    txid: &[u8; 32],
+    next_block_height: u64,
+) -> Result<Option<u64>, crate::storage::StorageError> {
+    use crate::reorg::UtxoView;
+    let read = |e: crate::reorg::ViewError| crate::storage::StorageError::ReadFailed(e.0);
+    if next_block_height == 0 || !core::block_rules::rules_active_at(next_block_height, activation_height()) {
+        return store.view_coinbase_height(txid).map_err(read);
+    }
+    let Some(cb) = crate::accept::coinbase_dag_height(store, txid).map_err(read)? else {
+        return Ok(None);
+    };
+    let depth = next_block_dag_height(store).map_err(read)?.saturating_sub(cb);
+    Ok(Some(next_block_height.saturating_sub(depth)))
 }
 
 /// Check and insert `tx` into `mempool`. On success returns the txid.
@@ -812,16 +980,34 @@ pub fn admit_gated(
     policy: &AdmissionPolicy,
     gate: &mut SignatureGate<'_>,
 ) -> Result<AddOutcome, AdmissionError> {
+    let w = wtxid(&tx);
+    admit_gated_with_wtxid(store, mempool, tx, &w, policy, gate)
+}
+
+/// [`admit_gated`] with the transaction's wtxid already computed
+/// (`tx_wtxid` MUST be [`wtxid`]`(&tx)`). B1-T19: the gossip relay hashes
+/// each frame once ([`wtxid_of_canonical_bytes`]) instead of re-encoding and
+/// re-hashing the whole transaction for the reject filter, the signature
+/// cache key and the rejection record (three SHA3 passes over up to 400 kB
+/// per frame, budget-refused frames included).
+pub fn admit_gated_with_wtxid(
+    store: &Storage,
+    mempool: &Mempool,
+    tx: Transaction,
+    tx_wtxid: &[u8; 32],
+    policy: &AdmissionPolicy,
+    gate: &mut SignatureGate<'_>,
+) -> Result<AddOutcome, AdmissionError> {
     // The filter's epoch BEFORE any state is read: a verdict computed against
     // a next height or a tip that changed meanwhile (the change clears the
     // filter and starts a new epoch) is not remembered, so it can never be
     // replayed at the new height (review finding).
     let epoch = mempool.recent_rejects_epoch();
-    let fee = match check_transaction_gated(store, Some(mempool), &tx, policy, gate) {
+    let fee = match check_transaction_gated_with_wtxid(store, Some(mempool), &tx, tx_wtxid, policy, gate) {
         Ok(fee) => fee,
         Err(e) => {
             if policy.use_reject_filter && e.is_cacheable() {
-                mempool.note_rejected_in_epoch(wtxid(&tx), epoch);
+                mempool.note_rejected_in_epoch(*tx_wtxid, epoch);
             }
             return Err(e);
         }
@@ -838,10 +1024,17 @@ pub fn admit_gated(
     if current != 0 && current != policy.next_block_height {
         check_tx_for_next_block(&tx, current).map_err(|e| AdmissionError::NonStandard(format!(
             "{e} (the next block moved to height {current} while the transaction was being checked)")))?;
-        core::check_coinbase_maturity(&tx, current, |t| store.get_coinbase_height(t).ok().flatten())
+        coinbase_maturity_for_next_block(store, &tx, current)
+            .map_err(|e| AdmissionError::Pool(format!("storage: {}", e)))?
             .map_err(AdmissionError::Immature)?;
     }
-    mempool.add_with_replacement(tx, fee).map_err(from_mempool_error)
+    if policy.check_signatures {
+        mempool.add_with_replacement(tx, fee).map_err(from_mempool_error)
+    } else {
+        // Re-admission (B1-T20): no per-transaction trim; the caller
+        // (`reorg::reinject_disconnected`) trims once after the batch.
+        mempool.add_readmitted(tx, fee).map_err(from_mempool_error)
+    }
 }
 
 /// Parent txids of `tx` that are neither confirmed (an unspent output in

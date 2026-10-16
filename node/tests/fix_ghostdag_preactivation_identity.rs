@@ -10,7 +10,7 @@
 //!    `canonical_encode` over 45 DAGs, captured by running this file's
 //!    generators against the consensus code of commit 125e9e5 (before the
 //!    change), are reproduced with the activation at `NEVER` and with the
-//!    default (mainnet, 110,000) activation.
+//!    default (mainnet, `MAINNET_HARDENING_ACTIVATION_HEIGHT`) activation.
 //! 2. `frozen_old_algorithm_matches_on_random_dags`: a verbatim copy of the old
 //!    `add_block` path (O(past) mergeset, the old fast coloring without the
 //!    k + 1 exit or skip pointers, old blue work) is compared block by block on

@@ -9,7 +9,8 @@
 //! directly.
 #![allow(dead_code)]
 
-use gnb_crypto::core::{Block, BlockHeader, Transaction, TxInput, TxOutput};
+use gnb_crypto::core::powit::PowitBody;
+use gnb_crypto::core::{powit_height, Block, BlockHeader, Transaction, TxInput, TxOutput};
 use sha2::{Digest as _, Sha256};
 use sha3::Sha3_256;
 
@@ -184,7 +185,41 @@ pub fn ref_block_wire(b: &Block) -> Vec<u8> {
         ref_compact_size(&mut out, s.binding_sig.len() as u64);
         out.extend_from_slice(&s.binding_sig);
     }
+    if b.height >= powit_height() {
+        out.extend_from_slice(&ref_powit_wire(&b.powit));
+    }
     out
+}
+
+/// The PoWit section a block's wire encoding ends with from `powit_height()`
+/// (and that the v2 body root commits to): three counted lists, witness
+/// shares, attestations and equivocation proofs. The framing is re-derived
+/// here; each item keeps its own wire encoding (`to_wire_bytes`, decoded by
+/// `Block::from_wire_bytes` on the untrusted inputs of `block_parse`,
+/// `block_rules` and `wire_roundtrip`).
+pub fn ref_powit_wire(p: &PowitBody) -> Vec<u8> {
+    let mut out = Vec::new();
+    ref_compact_size(&mut out, p.shares.len() as u64);
+    for s in &p.shares {
+        out.extend_from_slice(&s.to_wire_bytes());
+    }
+    ref_compact_size(&mut out, p.attestations.len() as u64);
+    for a in &p.attestations {
+        out.extend_from_slice(&a.to_wire_bytes());
+    }
+    ref_compact_size(&mut out, p.evidence.len() as u64);
+    for e in &p.evidence {
+        out.extend_from_slice(&e.to_wire_bytes());
+    }
+    out
+}
+
+/// The PoWit section's commitment: SHA3-256("GNB-POWIT-v1/body" ‖ section).
+pub fn ref_powit_root(p: &PowitBody) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(b"GNB-POWIT-v1/body");
+    h.update(ref_powit_wire(p));
+    h.finalize().into()
 }
 
 pub fn sha256d(b: &[u8]) -> [u8; 32] {

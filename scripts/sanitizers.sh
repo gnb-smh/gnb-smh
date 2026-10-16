@@ -10,7 +10,7 @@
 #                                        (gcc + libubsan)
 #   sh scripts/sanitizers.sh ubsan-noavx2
 #                                        the UBSan ML-DSA tests on an emulated CPU without AVX2
-#                                        (qemu-user), so the CLEAN ML-DSA C code runs
+#                                        (qemu-user): no ML-DSA verdict may depend on the CPU
 #   sh scripts/sanitizers.sh ubsan-noavx2-full
 #                                        every gnb-crypto lib and integration test on that CPU
 #                                        (about 10 minutes; CI runs it nightly)
@@ -93,8 +93,8 @@ expect_passed() { # <min passed> <command...>
 # runs until the CI job times out (the miri jobs of the merge commit 299a718
 # were still in their host step after 115 minutes). Each Miri
 # command therefore gets a wall-clock bound of SANITIZER_MIRI_TIMEOUT seconds
-# (default 1800, about six times the slowest command, the gnb-crypto
-# selection) and fails with the remedy. timeout(1) signals its whole process
+# (default 1800, about four times the slowest command, gnb-smh with its
+# v1/v2/v3 vectors, about 7 minutes) and fails with the remedy. timeout(1) signals its whole process
 # group, so the interpreted test process stops too.
 miri_timeout=${SANITIZER_MIRI_TIMEOUT:-1800}
 with_miri_timeout() { # <command...>
@@ -151,26 +151,35 @@ ubsan_test_bin() {
     | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1
 }
 
-# On an AVX2 machine pqcrypto-mldsa dispatches ML-DSA to its AVX2 code at run
-# time, so the ubsan and asan modes never execute the clean ML-DSA C code that
-# non-AVX2 x86_64 nodes run and that is compiled into the wasm32 wallet.
-# qemu's Nehalem model has no AVX2: is_x86_feature_detected!("avx2") is false
-# there and the same UBSan binaries take the clean path.
+# The asan and ubsan modes run on the CI runner's AVX2 CPU. pqcrypto-mldsa is
+# built without its avx2/neon features (crates/gnb-crypto/Cargo.toml), so every
+# build runs the clean ML-DSA C code; with the AVX2 code linked, verification
+# was dispatched on the CPU at run time and the verdict depended on it
+# (Wycheproof tcId 161 refused on AVX2 CPUs, accepted on others:
+# docs/testing/SANITIZERS.md, F6). qemu's Nehalem model has no AVX2
+# (is_x86_feature_detected!("avx2") is false there), so running the same UBSan
+# binaries there runs the clean C code under UBSan on a CPU without AVX2 and
+# gives the verdict tests a second CPU: a CPU-dependent verdict fails one of
+# the two runs.
 ubsan_noavx2() {
   ubsan_env
   lib=$(ubsan_test_bin --lib)
   acvp=$(ubsan_test_bin --test acvp_mldsa)
-  for b in "$lib" "$acvp"; do
+  wycheproof=$(ubsan_test_bin --test wycheproof_mldsa65)
+  for b in "$lib" "$acvp" "$wycheproof"; do
     [ -x "$b" ] || { echo "sanitizers: missing UBSan test binary '$b'" >&2; exit 1; }
   done
   cd crates/gnb-crypto # where cargo runs this crate's tests
   # Hybrid ML-DSA-65 + Falcon-1024 key generation, signing, verification and
-  # KATs (crypto::), the wallet code that signs transactions with it, and the
-  # official ACVP ML-DSA-65 vectors: about 35 s under emulation (all 280 lib
-  # tests: ~10 min, mostly keystore KDFs with no ML-DSA in them).
-  expect_passed 63 qemu-x86_64 -cpu Nehalem "$lib" \
+  # KATs (crypto::, with the FIPS 204 UseHint verdicts of
+  # crypto::mldsa_one_verdict), the wallet code that signs transactions with
+  # it, the official ACVP and the Wycheproof ML-DSA-65 vectors: about a minute
+  # under emulation (all lib tests: ~10 min, mostly keystore KDFs with no
+  # ML-DSA in them).
+  expect_passed 67 qemu-x86_64 -cpu Nehalem "$lib" \
     crypto:: wallet::payment:: wallet::legacy_sign_tests:: wallet::sighash_v3_signers::
   expect_passed 3 qemu-x86_64 -cpu Nehalem "$acvp"
+  expect_passed 2 qemu-x86_64 -cpu Nehalem "$wycheproof"
 }
 
 # Runs each test binary to completion on the Nehalem CPU; stops at the first
@@ -211,7 +220,7 @@ miri() {
   # large to interpret (the test never ends: with_miri_timeout). A new test
   # in gnb-smh or in the gnb-crypto modules selected below needs one if it
   # does either.
-  expect_passed 30 with_miri_timeout cargo +"$nightly" miri test --locked -p gnb-smh
+  expect_passed 36 with_miri_timeout cargo +"$nightly" miri test --locked -p gnb-smh
   expect_passed 42 with_miri_timeout cargo +"$nightly" miri test --locked -p gnb-crypto --lib -- \
     core::limits:: core::tokenomics:: core::block_rules:: core::sighash:: core::activation::
   # Library tests only: tests/vendor_pin.rs reads files (Miri isolation) and
@@ -223,9 +232,10 @@ miri_cross() {
   export CARGO_TARGET_DIR="$root/miri"
   export MIRIFLAGS="${MIRIFLAGS:--Zmiri-strict-provenance}"
   # gnb-smh has no C code, so Miri can interpret it for any target. Its Python
-  # PoW vectors (log2_n <= 2) check every byte-order site on s390x.
+  # PoW vectors (v1 log2_n <= 2, v2 and v3 log2_n = 4) check every byte-order
+  # site on s390x.
   for t in i686-unknown-linux-gnu s390x-unknown-linux-gnu; do
-    expect_passed 30 with_miri_timeout cargo +"$nightly" miri test --locked -p gnb-smh --target "$t"
+    expect_passed 36 with_miri_timeout cargo +"$nightly" miri test --locked -p gnb-smh --target "$t"
   done
   # The wasm wallet's C ABI (gnb_alloc / gnb_call / gnb_free) packs a 32-bit
   # pointer into a u64, so its round trip runs on a 32-bit target. Its

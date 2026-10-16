@@ -17,7 +17,7 @@
 #   block_parse       Block::from_wire_bytes (+ idempotence)
 #   header_parse      BlockHeader::from_wire_bytes (+ idempotence)
 #   netmsg_decode     gnb::network::decode_wire_message (gossip frames)
-#   handshake_decode  transport handshake messages (HandshakeInit / HandshakeResp)
+#   handshake_decode  transport handshake messages (upgrade::Init / Resp / Finish)
 #   pow_decode        compact bits <-> target, chain work, ASERT (vs a U512 oracle)
 #   pow_verify        GnB-SMH output vs target (small scratchpad), hybrid signature verify
 #   merkle_path       coherence_core::verify_path
@@ -31,6 +31,12 @@
 #   address_parse     Address::parse / parse_for_network vs a reference parser
 #   sync_rr_codec     /gnb/sync/1 frames and the libp2p codec (bounds, canonicality, read cap)
 #   accept_dag        accept_block on small DAGs: arrival-order independence
+#   sync_decode       /gnb/sync/1 decode_request / decode_response
+#   pq_handshake_decode  upgrade::Init / Resp / Finish without the size bound
+#   block_validate    structure, then the block transaction rules (empty view)
+#   tx_validate       validate_tx_inputs against a view paying each witness
+#   policy_witness_decode  PolicyWitness / SpendPolicy decode (canonical)
+#   script_sig_verify single-key witness: exact parse, verify_canonical
 #
 # docs/testing/FUZZING.md describes every target, the campaign results and
 # how to reproduce them.

@@ -20,6 +20,7 @@
 //! (números só fazem sentido em --release)
 
 use gnb::consensus::GhostDAG;
+use gnb::core::activation;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -50,8 +51,14 @@ fn h(salt: u8, i: u64) -> [u8; 32] {
 /// Monta a cadeia principal linear: genesis + TIP_HEIGHT blocos.
 /// Igual ao live: `with_default_k()` (Legacy + gate 21430 armado → índice de
 /// reachability mantido; coloração Legacy abaixo do gate, Fast acima).
+///
+/// O incidente aconteceu sob as regras antigas (sem a ativação de hardening).
+/// A altura de ativação de mainnet (`MAINNET_HARDENING_ACTIVATION_HEIGHT`)
+/// pode ficar ABAIXO de TIP_HEIGHT, então o lab fixa a ativação em `NEVER`
+/// para reproduzir o incidente com as regras antigas em todas as alturas,
+/// qualquer que seja a altura de ativação.
 fn build_mainchain() -> (GhostDAG, Vec<[u8; 32]>) {
-    let mut dag = GhostDAG::with_default_k();
+    let mut dag = GhostDAG::with_default_k().with_hardening_activation(activation::NEVER);
     let g = h(0, 0);
     dag.add_genesis(g, 1_000_000);
     let mut hashes = Vec::with_capacity(TIP_HEIGHT as usize + 1);

@@ -17,6 +17,7 @@
 //! | `agg/bal/<20-byte address>` | balance `u64 LE` ‖ UTXO count `u64 LE` (present iff count > 0) |
 //! | `agg/rich/<u64 BE (u64::MAX − balance)><20-byte address>` | UTXO count `u64 LE` — iterates highest balance first, ties by address |
 //! | `agg/tiers` | per [`TIERS`] entry: holders `u64 LE` ‖ sats `u64 LE` ‖ UTXOs `u64 LE` |
+//! | `agg/hist/<20-byte address>` | number of `CF_ADDR_TX_HISTORY` rows of the address `u64 LE` (present iff > 0; audit B1-T11, layout version 2) |
 //!
 //! A holder is a 20-byte `script_pubkey` with at least one UTXO (exactly what
 //! the previous full-scan rich list counted). The chain totals count the
@@ -48,20 +49,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use rocksdb::{IteratorMode, WriteBatch};
 
-use super::{decode, Storage, StorageError, CF_DAG, CF_META, CF_UNDO, CF_UTXO};
+use super::{decode, Storage, StorageError, CF_ADDR_TX_HISTORY, CF_DAG, CF_META, CF_UNDO, CF_UTXO};
 use crate::core::TxOutput;
 use crate::consensus::GhostdagData;
 
-/// Layout version of the aggregate keys.
-pub const AGG_VERSION: u32 = 1;
+/// Layout version of the aggregate keys. Version 2 (audit B1-T11) adds the
+/// per-address history counters (`agg/hist/`); a data directory written with
+/// version 1 has its aggregates rebuilt once at start-up
+/// ([`Storage::ensure_aggregates`]).
+pub const AGG_VERSION: u32 = 2;
 
-const K_VERSION: &[u8] = b"agg/version";
+pub(crate) const K_VERSION: &[u8] = b"agg/version";
 const K_CHAIN: &[u8] = b"agg/chain";
 const K_CONN: &[u8] = b"agg/conn";
-const K_TIERS: &[u8] = b"agg/tiers";
+pub(crate) const K_TIERS: &[u8] = b"agg/tiers";
 const P_CUM: &[u8] = b"agg/cum/";
 const P_BAL: &[u8] = b"agg/bal/";
 const P_RICH: &[u8] = b"agg/rich/";
+const P_HIST: &[u8] = b"agg/hist/";
 
 /// Balance tiers of the supply distribution: (exclusive upper bound in sat,
 /// label).
@@ -121,6 +126,8 @@ pub struct AggregateSnapshot {
     /// Holders in rich-list order (balance descending, address ascending).
     pub rich_order: Vec<([u8; 20], HolderEntry)>,
     pub tiers:      Vec<TierTotals>,
+    /// B1-T11: address-history rows per address (`agg/hist/`).
+    pub history:    BTreeMap<[u8; 20], u64>,
 }
 
 /// Net holder changes accumulated while staging UTXO mutations.
@@ -150,6 +157,34 @@ impl HolderDeltas {
 
     pub fn is_empty(&self) -> bool {
         self.map.values().all(|(b, c)| *b == 0 && *c == 0)
+    }
+}
+
+/// B1-T11: the address-history rows (`CF_ADDR_TX_HISTORY` keys) a batch
+/// puts and deletes, last operation per key winning. When the batch is
+/// staged, [`Storage::stage_history_deltas`] compares each key's final state
+/// with its presence on disk, so the per-address counters equal the number
+/// of rows exactly: a key written twice (two parallel DAG blocks at one
+/// height paying one address from the same position) or deleted and written
+/// again in one reorg counts once.
+#[derive(Clone, Debug, Default)]
+pub struct HistoryDeltas {
+    keys: HashMap<Vec<u8>, bool>,
+}
+
+impl HistoryDeltas {
+    /// The batch writes history row `key`.
+    pub fn put(&mut self, key: &[u8]) {
+        self.keys.insert(key.to_vec(), true);
+    }
+
+    /// The batch deletes history row `key`.
+    pub fn delete(&mut self, key: &[u8]) {
+        self.keys.insert(key.to_vec(), false);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
     }
 }
 
@@ -202,7 +237,7 @@ fn enc_tiers(t: &[TierTotals]) -> Vec<u8> {
     v
 }
 
-fn dec_tiers(v: &[u8]) -> Option<Vec<TierTotals>> {
+pub(crate) fn dec_tiers(v: &[u8]) -> Option<Vec<TierTotals>> {
     if v.len() != TIERS.len() * 24 {
         return None;
     }
@@ -343,6 +378,66 @@ impl Storage {
         Ok(self.meta_get_raw(&key(P_BAL, addr))?
             .and_then(|v| dec2(&v))
             .map(|(balance, utxos)| HolderEntry { balance, utxos }))
+    }
+
+    /// B1-T11: number of address-history rows of `addr` (one read), or None
+    /// while the aggregates are incomplete (being rebuilt).
+    pub fn address_history_count(&self, addr: &[u8; 20]) -> Result<Option<u64>, StorageError> {
+        if !self.aggregates_ready() {
+            return Ok(None);
+        }
+        Ok(Some(self.meta_get_raw(&key(P_HIST, addr))?
+            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0)))
+    }
+
+    /// B1-T11: stage the effect of `deltas` on the per-address history
+    /// counters into `batch`: one presence read per touched row, one counter
+    /// read per touched address. The caller holds [`Self::agg_lock`] until
+    /// the batch is written. No-op while the aggregates are incomplete.
+    pub(crate) fn stage_history_deltas(&self, batch: &mut WriteBatch, deltas: &HistoryDeltas) -> Result<(), StorageError> {
+        if !self.aggregates_ready() || deltas.is_empty() {
+            return Ok(());
+        }
+        let cf_hist = self.db.cf_handle(CF_ADDR_TX_HISTORY)
+            .ok_or(StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
+        let mut per_addr: BTreeMap<[u8; 20], i64> = BTreeMap::new();
+        for (k, present) in &deltas.keys {
+            let Ok(addr) = <[u8; 20]>::try_from(&k[..k.len().min(20)]) else { continue };
+            self.note_reads(1);
+            let existed = self.db.get_pinned_cf(cf_hist, k)
+                .map_err(|e| StorageError::ReadFailed(e.to_string()))?
+                .is_some();
+            let d = i64::from(*present) - i64::from(existed);
+            if d != 0 {
+                *per_addr.entry(addr).or_default() += d;
+            }
+        }
+        let cf = self.meta_cf()?;
+        let mut drift = false;
+        for (addr, d) in per_addr {
+            if d == 0 {
+                continue;
+            }
+            let old = self.address_history_count(&addr)?.unwrap_or(0) as i128;
+            let new = old + d as i128;
+            if new < 0 {
+                drift = true;
+            }
+            let new = new.clamp(0, u64::MAX as i128) as u64;
+            if new > 0 {
+                batch.put_cf(cf, key(P_HIST, &addr), new.to_le_bytes());
+            } else {
+                batch.delete_cf(cf, key(P_HIST, &addr));
+            }
+        }
+        if drift {
+            log::error!("B1-T11 history counters drifted (underflow); marked for rebuild");
+            batch.delete_cf(cf, K_VERSION);
+            self.agg_ready.store(false, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// The supply-distribution tiers (one read).
@@ -542,6 +637,13 @@ impl Storage {
                 snap.holders.insert(a, HolderEntry { balance, utxos });
             }
         }
+        for item in self.db.iterator_cf(cf, IteratorMode::From(P_HIST, rocksdb::Direction::Forward)) {
+            let (k, v) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            if !k.starts_with(P_HIST) { break; }
+            if let (Ok(a), Ok(n)) = (<[u8; 20]>::try_from(&k[P_HIST.len()..]), <[u8; 8]>::try_from(v.as_ref())) {
+                snap.history.insert(a, u64::from_le_bytes(n));
+            }
+        }
         snap.rich_order = self.rich_list_page(0, usize::MAX, &AtomicBool::new(false))?;
         Ok(snap)
     }
@@ -595,7 +697,21 @@ impl Storage {
             cumulative.insert(hash, running);
             xor_into(&mut conn, &hash);
         }
-        Ok(AggregateSnapshot { chain: running, conn, cumulative, holders, rich_order, tiers })
+        // B1-T11: history rows per address, one pass over the index keys.
+        let cf_hist = self.db.cf_handle(CF_ADDR_TX_HISTORY)
+            .ok_or(StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
+        let mut history: BTreeMap<[u8; 20], u64> = BTreeMap::new();
+        let mut it = self.db.raw_iterator_cf(cf_hist);
+        it.seek_to_first();
+        while let Some(k) = it.key() {
+            check_cancel(cancel)?;
+            if let Ok(a) = <[u8; 20]>::try_from(&k[..k.len().min(20)]) {
+                *history.entry(a).or_default() += 1;
+            }
+            it.next();
+        }
+        it.status().map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+        Ok(AggregateSnapshot { chain: running, conn, cumulative, holders, rich_order, tiers, history })
     }
 
     /// Replace the stored aggregates by a full recomputation, atomically,
@@ -605,7 +721,7 @@ impl Storage {
         let snap = self.recompute_aggregates(cancel)?;
         let cf = self.meta_cf()?;
         let mut batch = WriteBatch::default();
-        for prefix in [P_CUM, P_BAL, P_RICH] {
+        for prefix in [P_CUM, P_BAL, P_RICH, P_HIST] {
             for item in self.db.iterator_cf(cf, IteratorMode::From(prefix, rocksdb::Direction::Forward)) {
                 let (k, _) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
                 if !k.starts_with(prefix) { break; }
@@ -620,6 +736,9 @@ impl Storage {
         for (a, h) in &snap.holders {
             batch.put_cf(cf, key(P_BAL, a), enc2(h.balance, h.utxos));
             batch.put_cf(cf, rich_key(h.balance, a), h.utxos.to_le_bytes());
+        }
+        for (a, n) in &snap.history {
+            batch.put_cf(cf, key(P_HIST, a), n.to_le_bytes());
         }
         batch.put_cf(cf, K_TIERS, enc_tiers(&snap.tiers));
         batch.put_cf(cf, K_VERSION, AGG_VERSION.to_le_bytes());

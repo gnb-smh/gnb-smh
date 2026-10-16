@@ -96,10 +96,13 @@ async function viewTx(txid) {
   show(app, V.txPage(await api("gettransactionfull", [txid])));
 }
 
-async function viewAddress(addr, page = 0) {
+// B1-T11: older pages follow the cursor the previous page returned
+// (`next_cursor`); the node and the API refuse offsets above 10,000.
+async function viewAddress(addr, page = 0, cursor = null) {
   const per = 25;
   show(app, V.loading("Loading address"));
-  const [h, carry] = await Promise.all([api("getaddresshistory", [addr, per, page * per]), carryover(addr)]);
+  const params = cursor ? [addr, per, 0, cursor] : [addr, per, page * per];
+  const [h, carry] = await Promise.all([api("getaddresshistory", params), carryover(addr)]);
   show(app, V.addressPage(addr, h, carry, page, per));
 }
 
@@ -137,7 +140,7 @@ function go(h) { if (location.hash === h) route(); else location.hash = h; }
 async function route() {
   clearInterval(timer); timer = null;
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
-  const [v, a, b] = parts;
+  const [v, a, b, c] = parts;
   document.querySelectorAll("[data-nav]").forEach((n) => n.removeAttribute("aria-current"));
   const nav = { "": "home", blocks: "blocks", dag: "dag", holders: "holders" }[v || ""];
   if (nav) document.querySelector(`[data-nav="${nav}"]`)?.setAttribute("aria-current", "page");
@@ -150,7 +153,7 @@ async function route() {
     else if (v === "holders") await viewHolders();
     else if (v === "block" && /^[0-9a-f]{64}$/.test(a)) await viewBlock(a);
     else if (v === "tx" && /^[0-9a-f]{64}$/.test(a)) await viewTx(a);
-    else if (v === "address" && /^gnb1[qt][0-9a-f]{48}$/.test(a)) await viewAddress(a, pageNo(b));
+    else if (v === "address" && /^gnb1[qt][0-9a-f]{48}$/.test(a)) await viewAddress(a, pageNo(b), /^[0-9a-f]{32}$/.test(c || "") ? c : null);
     else show(app, html`<div class="err">Page not found. <a href="#/">Back to the overview</a></div>`);
   } catch (e) { show(app, V.fail(e)); }
 }

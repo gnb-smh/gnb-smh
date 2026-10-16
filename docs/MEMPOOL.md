@@ -87,7 +87,7 @@ sending it a few garbage frames. Those releases reject the hardening
 activation block (`CONSENSUS.md`, "Block rules at the hardening
 activation"), so **penalties are in force once the node's next block height
 is above the activation height** (the chain contains the activation block;
-`TxRelay::penalties_in_force`; mainnet from height 110,001, testnet and
+`TxRelay::penalties_in_force`; mainnet from height 17,501, testnet and
 regtest from block 1). From then on every peer that follows the chain
 validates before forwarding, an invalid frame is delivered only by its
 author, and the penalty lands on the author and never on an honest relay.
@@ -96,15 +96,47 @@ Before that, the node still never forwards an invalid frame.
 **Signature budget.** Step 11 is charged to the **connection that delivered
 the frame** (the gossipsub `propagation_source`), never to the signed gossip
 author: one connection can sign every frame with a fresh keypair, so an
-author key bounds nothing. One token per input signature, all-or-nothing,
-from a token bucket per connection: burst 400, refill 20 per second, at most
-4,096 connections tracked (far above the connection limit). A cache hit costs
-nothing. The tokens are **refunded when the transaction enters the pool**, so
-a connection pays only for verification that did not lead to admission (an
-invalid signature, a full pool, a failed orphan re-try) and an honest relay
-forwarding valid traffic is never throttled. A connection without enough
-tokens gets `Ignore` and no signature is checked. A connection's bucket is
-dropped when it disconnects.
+author key bounds nothing. All-or-nothing, from a token bucket per
+connection (burst 400, refill 20 per second, at most 4,096 connections
+tracked, far above the connection limit) **and** from one node-wide bucket
+shared by every connection (burst 4,000, refill 400 per second). A cache hit
+costs nothing. The tokens are **refunded when the transaction enters the
+pool**, so a connection pays only for verification that did not lead to
+admission (an invalid signature, a full pool, a failed orphan re-try) and an
+honest relay forwarding valid traffic is never throttled. A connection
+without enough tokens gets `Ignore` and no signature is checked. A
+connection's bucket is dropped when it disconnects.
+
+The price (audit B1-T19, Phase 4; `relay::signature_gate_cost`,
+`relay::frame_cost`). A token pays for one input signature check or for
+64 KiB hashed or decoded (about the same time). Step 11 costs one token per
+input plus the bytes its digests hash: under sighash v2 (below the
+activation; mainnet's regime until height 17,500) every input clones,
+re-encodes and hashes the whole transaction, outputs included, so the bytes
+are inputs × size; under sighash v3 the transaction is hashed once into
+precomputed midstates plus a fixed preimage of at most 256 bytes per input.
+Before Phase 4 a token was one input whatever the size: a one-input
+transaction carrying 390 kB of outputs cost one token, and 50 connections
+each spent their own full burst at once. Decoding a frame, checking its
+canonical encoding and hashing its wtxid (once per frame, from the received
+bytes; the transaction used to be re-encoded and hashed up to four times per
+frame: the orphan check, the reject filter, the signature cache key and the
+rejection record) are charged before decoding, at one token per
+64 KiB of frame, so a connection out of budget costs one size check.
+
+**Its own task.** Transactions are judged on a task of their own, fed by a
+channel of their own (`network::IngestSink::Validated`, `txs`), not by the
+block processor: a backlog of expensive transaction frames used to queue the
+blocks of every peer behind it (and fill the shared channel, dropping
+blocks). `node/tests/fix_ingress_live.rs::live_tx_flood_does_not_delay_blocks`
+(one attacker floods 1,500 frames, an honest peer's block arrives within a
+fraction of a second) and its control on a shared channel (the block does not
+arrive within 5 s). PoWit items (witness shares, attestations, equivocation
+proofs), the transaction topic's other message, take the same channel and
+task (`network::goes_to_tx_ingest`); their verification runs off the task on
+a bounded, budgeted pool of its own (`ingress::PowitIngress`, docs/CONSENSUS.md
+"PoWit gossip"), so neither blocks nor transactions wait behind it
+(`fix_ingress_live.rs::live_powit_flood_does_not_delay_blocks`).
 
 ## 3. Orphan transactions
 
@@ -216,6 +248,20 @@ coinbase commitment covers exactly the listed transactions in that order.
   normally a verified-signature cache hit), pooled transactions that spent
   their outputs become their children again, and the whole pool is
   re-validated against the new UTXO set plus the pool.
+  At most 20 MB of them are considered (Bitcoin Core's
+  `MAX_DISCONNECTED_TX_POOL_BYTES`, `reorg::MAX_DISCONNECTED_TX_POOL_BYTES`,
+  measured with `Transaction::actual_size`): the transactions of the OLDEST
+  disconnected blocks, in block order. Beyond the budget the most recently
+  confirmed ones are dropped, as in Core, so no kept transaction misses a
+  parent; dropped ones must be rebroadcast (the node logs the truncation).
+  Re-admission follows Core's `MaybeUpdateMempoolForReorg`: the rolling
+  minimum fee rate (relay policy) does not apply to a transaction that was
+  mined; the pool is not trimmed after each one but once, at the end (Core's
+  `LimitMempoolSize`), so it keeps the best-paying packages of the pooled and
+  the re-added transactions; and a transaction the final trim would evict at
+  once (the pool is full and it pays no more than the cheapest pooled
+  package) is not inserted at all. The orphan-transaction bookkeeping reads
+  the moved blocks back within the same budget.
   Exception: a disconnected block whose body this node had pruned is rolled
   back from its undo record alone, so its transactions are not available to
   re-admit. They leave the pool's view (and the orphan-transaction
@@ -276,3 +322,14 @@ is an admission decision (`Mempool::add_with_replacement`).
   rate and this policy's parameters under `policy`.
 * `estimatefee` returns a fee rate never below the consensus minimum nor the
   rolling minimum.
+* `estimatefeeadvanced [n_inputs=1, n_outputs=2]` (re-audit B1-T21) returns
+  ABSOLUTE fees for a transaction of that shape (`tx_bytes`,
+  `Transaction::estimate_size`): `slow_priority` at the floor rate (the
+  consensus minimum rate or the rolling minimum, whichever is higher),
+  `medium_priority` (also `mempool_median` and `recommended_gnb`) at the
+  median pooled fee rate, `next_block_sats` at the 75th-percentile pooled
+  rate, none of them below `min_tx_fee_sat(tx_bytes)`; the rates are reported
+  under `feerate_sat_per_kb`. It used to return raw absolute-fee percentiles
+  that ignored the size, and 5,000 / 1,000 sat on a quiet pool, below the
+  10,000-sat consensus minimum. The wallet client floors whatever a node
+  answers at the consensus minimum.

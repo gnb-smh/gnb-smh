@@ -65,7 +65,17 @@ test-pow-limit = []
 # could silently change keygen's internal byte consumption and rotate every
 # derived key. Bumping this pin is a deliberate, reviewed action, not
 # something `cargo update` should ever do on its own.
-pqcrypto-mldsa     = "=0.1.2"
+# CONSENSUS: `default-features = false` links PQClean's `clean` ML-DSA-65 only.
+# The default features ("avx2", "neon") add the AVX2 and AArch64 variants and
+# dispatch verification to them (AVX2: at run time, per CPU). The AVX2 verifier
+# is not FIPS 204: no ‖z‖∞ bound, and UseHint moves r1 up at r0 = 0 where FIPS
+# 204 moves it down, so AVX2 and non-AVX2 nodes (same binary, different CPU;
+# i686; aarch64 builds) gave opposite verdicts on crafted signatures — a chain
+# split for anyone who can lock coins to a key with t1 = 0
+# (tests/wycheproof_mldsa65.rs, tcId 161; `crypto::mldsa_one_verdict`).
+# Guarded by `mldsa_avx2_and_aarch64_variants_are_not_linked` in crypto/mod.rs
+# and by scripts/falcon-clean-guard.sh in CI. Do not re-enable avx2/neon.
+pqcrypto-mldsa     = { version = "=0.1.2", default-features = false, features = ["std"] }
 # F1 (BLOCH-FALCON-ONLINE-SIGNING.md §3.2): default features ("avx2","neon")
 # dispatch Falcon SIGNING to PQClean's native floating-point variants — forbidden
 # for a PoS validator that signs on a public schedule. `default-features = false`

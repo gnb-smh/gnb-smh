@@ -102,19 +102,45 @@ export function splitByMaturity(rows, nextHeight) {
   return { spendable, immature };
 }
 
+// One payment spends at most UTXO_WINDOW outputs (each input carries an
+// ~8.5 kB post-quantum signature), so getutxos is asked for that many rows,
+// and for UTXO_WIDE_WINDOW when immature coinbase outputs took part of a
+// cut-short list. B2-T3: the explorer API accepts limits up to exactly
+// UTXO_WIDE_WINDOW (deploy/explorer-api: GETUTXOS_MAX; its tests and
+// site/tests/wallet-api-window.test.mjs keep the two equal).
+export const UTXO_WINDOW = 50, UTXO_WIDE_WINDOW = 1000;
+
 /** The coins one payment may spend in the block at `nextHeight`: the first
  *  `window` spendable rows the node lists, and the immature coinbase outputs
  *  seen. `fetchRows(limit)` resolves to { rows, truncated } from getutxos
  *  (the node lists an address's outputs in index order and sets `truncated`
  *  when it stops at the limit). When immature coinbase outputs took part of a
  *  truncated window, a `wide` one is asked for, so mature coins listed after
- *  them are found; `truncated` then says whether even that was cut short. */
-export async function spendableWindow(fetchRows, nextHeight, window = 50, wide = 1000) {
+ *  them are found; `truncated` then says whether even that was cut short.
+ *  B2-T3: if the wide request fails, the narrow result is kept (its mature
+ *  coins stay spendable and `widenFailed` is set) instead of failing the
+ *  whole refresh, which left the wallet with no balance and no coins. */
+export async function spendableWindow(fetchRows, nextHeight, window = UTXO_WINDOW, wide = UTXO_WIDE_WINDOW) {
   let { rows, truncated } = await fetchRows(window);
   let { spendable, immature } = splitByMaturity(rows, nextHeight);
+  let widenFailed = false;
   if (truncated && immature.length > 0 && wide > window) {
-    ({ rows, truncated } = await fetchRows(wide));
-    ({ spendable, immature } = splitByMaturity(rows, nextHeight));
+    try {
+      const w = await fetchRows(wide);
+      ({ rows, truncated } = w);
+      ({ spendable, immature } = splitByMaturity(rows, nextHeight));
+    } catch {
+      widenFailed = true;
+    }
   }
-  return { spendable: spendable.slice(0, window), immature, truncated: truncated === true, listed: rows.length };
+  return { spendable: spendable.slice(0, window), immature, truncated: truncated === true, listed: rows.length, widenFailed };
+}
+
+/** `fetchRows` for spendableWindow over the explorer API's getutxos:
+ *  `api(method, params)` resolves to the method's `result` (throws on error). */
+export function getutxosFetcher(api, address) {
+  return async (limit) => {
+    const r = await api("getutxos", [address, limit]);
+    return { rows: Array.isArray(r.utxos) ? r.utxos : [], truncated: r.truncated === true };
+  };
 }
