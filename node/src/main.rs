@@ -899,7 +899,11 @@ async fn main() {
         archive:         cli.archive,
     };
     // Audit POW-9: the node speaks its own network's protocol identifiers.
-    let mut node = match network::NetworkNode::new(net_cfg).map(|n| n.with_chain(core::node_chain_id())) {
+    // POW-3: below the minimum chain work the node advertises no frontier or
+    // headers to peers (initial block download; `serve::serve_sync_request`).
+    let mut node = match network::NetworkNode::new(net_cfg)
+        .map(|n| n.with_chain(core::node_chain_id()).with_minimum_chain_work(ingress::minimum_chain_work()))
+    {
         Ok(n)  => { info!("P2P: {}", n.peer_id); n }
         Err(e) => { error!("network: {}", e); std::process::exit(1); }
     };
@@ -913,6 +917,9 @@ async fn main() {
         tip_blue_score: our_score,
         block_count:    our_count,
         version:        env!("CARGO_PKG_VERSION").into(),
+        // POW-3: in initial block download from the start when the stored
+        // chain is below the minimum chain work (the latch keeps it so).
+        is_syncing:     ingress::below_minimum_chain_work(&dag.read(), ingress::minimum_chain_work()),
         ..Default::default()
     }));
 
@@ -2108,6 +2115,14 @@ async fn main() {
                     let out = tokio::task::spawn_blocking(move || {
                         let d = dag_b.read();
                         powit::pool().prune(&d, &store_b);
+                        // POW-3: no vote on a checkpoint of a selected chain
+                        // below the minimum chain work (initial block
+                        // download; it may be an eclipsing peer's cheap
+                        // chain, and the persistent vote record would then
+                        // bar this key's vote on the real one).
+                        if ingress::below_minimum_chain_work(&d, ingress::minimum_chain_work()) {
+                            return (None, powit::pool_evidence());
+                        }
                         let att = match duty_b.maybe_attest(&d, &store_b) {
                             Ok(Some(a)) => {
                                 let _ = powit::pool().admit_attestation(a.clone(), &d, &store_b);
@@ -2143,9 +2158,16 @@ async fn main() {
             std::thread::Builder::new().name(format!("share-miner-{t}")).spawn(move || {
                 let stop = std::sync::atomic::AtomicBool::new(false);
                 loop {
+                    // POW-3: no share on a selected tip below the minimum
+                    // chain work (initial block download), as no block is
+                    // mined there.
                     let tip = {
                         let d = dag_s.read();
-                        d.selected_tip().and_then(|h| d.get_block_data(&h).map(|bd| (h, bd.height)))
+                        if ingress::below_minimum_chain_work(&d, ingress::minimum_chain_work()) {
+                            None
+                        } else {
+                            d.selected_tip().and_then(|h| d.get_block_data(&h).map(|bd| (h, bd.height)))
+                        }
                     };
                     let Some((tip, tip_h)) = tip.filter(|(_, h)| core::powit_active(h + 1)) else {
                         std::thread::sleep(std::time::Duration::from_secs(5));
@@ -2286,6 +2308,24 @@ async fn main() {
                 // limit, audit DAG-6 — a strictly heavier chain reorgs us at
                 // any depth once its blocks arrive. The old FINALITY_FROZEN
                 // flag is gone.)
+                // POW-3: never mine on a selected tip below the minimum chain
+                // work, stalled or not (Bitcoin Core's miners get no template
+                // in initial block download): it may be a cheap chain this
+                // node's own pulls fetched from an eclipsing peer, and the
+                // stall release below exists for an unreachable frontier,
+                // not for a chain the release does not trust.
+                let below_min_work = {
+                    let d = dag_m.read();
+                    ingress::ibd_template_refusal(&d, ingress::minimum_chain_work())
+                };
+                if let Some(why) = below_min_work {
+                    if !was_syncing_last_tick {
+                        info!("⛏  miner paused: {why}");
+                        was_syncing_last_tick = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
                 if syncing_now && !sync_stalled {
                     if !was_syncing_last_tick {
                         info!("⛏  IBD in progress — miner paused, will resume when sync completes");

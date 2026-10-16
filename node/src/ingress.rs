@@ -272,7 +272,9 @@ pub fn bits_meet_floor(bits: u32, floor: &[u8; 32]) -> bool {
 /// mainnet reading of docs/MAINNET-READINESS.md §1, tip height 8,302 and
 /// blue work 7,782,451 on 2026-10-14, see its documentation), the one
 /// constant a release raises. It gates this node's initial-block-download
-/// state, its unrequested-block rule and `submitblock`, nothing else: no
+/// state, its unrequested-block rule, `submitblock`, and whether its
+/// selected tip is its chain of record ([`below_minimum_chain_work`]: block
+/// templates, mining, the frontier it advertises), nothing else: no
 /// verdict on a block, no GhostDAG data and no fork choice (the PoWit
 /// finalized checkpoint included) reads it, so a node with another value
 /// (`--minimumchainwork`, an older release, main's 0) reaches the same
@@ -447,9 +449,31 @@ pub fn tip_blue_work(dag: &GhostDAG) -> u128 {
 
 /// Bitcoin Core's first initial-block-download criterion: the selected tip
 /// has less blue work than the minimum chain work.
-#[allow(dead_code)] // tests only; the node binary compiles this module too
+///
+/// Blocks this node requested are processed below it (as in Core, which
+/// downloads them during initial block download), so its selected tip may
+/// be a chain below the minimum, the real chain part-synced or an eclipsing
+/// peer's cheap chain. Such a tip is not the node's chain of record: while
+/// this holds the node mines nothing and serves no block template
+/// ([`ibd_template_refusal`]), advertises no frontier or headers to peers
+/// (`network::serve::serve_sync_request`), a witness node neither attests
+/// checkpoints nor mines shares, and the IBD latch holds.
 pub fn below_minimum_chain_work(dag: &GhostDAG, min_chain_work: u128) -> bool {
     tip_blue_work(dag) < min_chain_work
+}
+
+/// Why no block template is built on `dag`'s selected tip: it is below the
+/// minimum chain work (initial block download). Bitcoin Core's
+/// `getblocktemplate` refuses the same way ("is in initial sync and waiting
+/// for blocks", `RPC_CLIENT_IN_INITIAL_DOWNLOAD`), and its miners only ever
+/// build on a chain that left initial block download. `None`: a template
+/// may be built.
+pub fn ibd_template_refusal(dag: &GhostDAG, min_chain_work: u128) -> Option<String> {
+    let tip_work = tip_blue_work(dag);
+    (tip_work < min_chain_work).then(|| format!(
+        "in initial block download: the selected tip's chain work {tip_work:#x} is below the minimum chain work \
+         {min_chain_work:#x}; no block template until the node has synced a chain with at least that much work \
+         (--minimumchainwork lowers it)"))
 }
 
 /// How far below the selected tip an UNREQUESTED block may branch, in

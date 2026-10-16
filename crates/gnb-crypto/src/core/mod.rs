@@ -171,9 +171,10 @@ pub const PROTOCOL_VERSION:      u32   = 1;
 /// Mainnet minimum chain work (Bitcoin Core's `nMinimumChainWork`): the
 /// default of the node's `ingress::MAINNET_MINIMUM_CHAIN_WORK`. While its
 /// selected tip carries less blue work, a node is in initial block download:
-/// it does not mine, processes no block it did not request unless that
-/// block's own chain reaches the value, and refuses `submitblock` blocks
-/// below it. Below it a node may be on a cheap chain an attacker fed it
+/// it does not mine or serve block templates, advertises no frontier to
+/// peers, processes no block it did not request unless that block's own
+/// chain reaches the value, and refuses `submitblock` blocks below it.
+/// Below it a node may be on a cheap chain an attacker fed it
 /// (ASERT eases the difficulty of a chain behind schedule, so a long low-work
 /// chain from genesis is cheap to build). Unlike a checkpoint it names no
 /// block and gives no one authority over which chain wins.

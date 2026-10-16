@@ -1218,6 +1218,10 @@ pub struct NetworkNode {
     feeler_interval: Duration,
     /// Period of the block-relay-only frontier polls.
     block_relay_poll_interval: Duration,
+    /// POW-3: the node's minimum chain work; below it the node answers
+    /// GetTips / GetHeaders empty (`serve::serve_sync_request`). 0 (no
+    /// minimum) unless [`Self::with_minimum_chain_work`] sets it.
+    min_chain_work: u128,
 }
 
 impl NetworkNode {
@@ -1241,6 +1245,7 @@ impl NetworkNode {
             outbound_targets: (connmgr::OUTBOUND_FULL_RELAY_TARGET, connmgr::BLOCK_RELAY_ONLY_TARGET),
             feeler_interval: connmgr::FEELER_INTERVAL,
             block_relay_poll_interval: connmgr::BLOCK_RELAY_POLL_INTERVAL,
+            min_chain_work: 0,
         })
     }
 
@@ -1248,6 +1253,17 @@ impl NetworkNode {
     /// (in-process harnesses that run nodes of two networks).
     pub fn with_chain(mut self, chain: crate::core::ChainId) -> Self {
         self.chain = chain;
+        self
+    }
+
+    /// POW-3: the node's minimum chain work (`ingress::minimum_chain_work`,
+    /// set by `main`): while the selected tip is below it the node is in
+    /// initial block download and advertises no frontier or headers to
+    /// peers (Bitcoin Core ignores `getheaders` then), so a chain it does not
+    /// trust yet, such as an eclipsing peer's cheap chain its own pulls
+    /// fetched, is not relayed. Default 0 (in-process harnesses).
+    pub fn with_minimum_chain_work(mut self, min_chain_work: u128) -> Self {
+        self.min_chain_work = min_chain_work;
         self
     }
 
@@ -2304,7 +2320,7 @@ impl NetworkNode {
                                                     job.req.kind_name(), peer);
                                                 respond(&mut swarm, &mut serve_q, peer, job.id, job.channel, sync_rr::SyncResponse::Busy);
                                             }
-                                            pump_serving(&mut swarm, &mut serve_q, &dag, &store, &served_tx);
+                                            pump_serving(&mut swarm, &mut serve_q, &dag, &store, &served_tx, self.min_chain_work);
                                         }
                                     }
                                 }
@@ -2536,7 +2552,7 @@ impl NetworkNode {
                 Some(done) = served_rx.recv() => {
                     serve_q.computed(&done.peer);
                     respond(&mut swarm, &mut serve_q, done.peer, done.id, done.channel, done.response);
-                    pump_serving(&mut swarm, &mut serve_q, &dag, &store, &served_tx);
+                    pump_serving(&mut swarm, &mut serve_q, &dag, &store, &served_tx, self.min_chain_work);
                 }
 
                 // B1-T9: a configured peer's re-dial address, resolved off
@@ -3177,10 +3193,11 @@ fn pump_serving(
     dag:     &std::sync::Arc<parking_lot::RwLock<crate::consensus::GhostDAG>>,
     store:   &std::sync::Arc<crate::storage::Storage>,
     done:    &ServedTx,
+    min_chain_work: u128,
 ) {
     while let Some(next) = serve_q.next_job() {
         match next {
-            serve::Next::Compute(job) => serve::spawn_worker(job, dag.clone(), store.clone(), done.clone()),
+            serve::Next::Compute(job) => serve::spawn_worker(job, dag.clone(), store.clone(), done.clone(), min_chain_work),
             serve::Next::Busy(job) => respond(swarm, serve_q, job.peer, job.id, job.channel, sync_rr::SyncResponse::Busy),
         }
     }
@@ -4771,7 +4788,7 @@ mod tests {
         store: &std::sync::Arc<crate::storage::Storage>,
         req: sync_rr::SyncRequest,
     ) -> sync_rr::SyncResponse {
-        serve::serve_sync_request(dag, store, &req)
+        serve::serve_sync_request(dag, store, &req, 0)
     }
 
     /// B2-T7: the GetTips answer of a DAG with more than MAX_WIRE_TIPS leaves
@@ -4880,6 +4897,38 @@ mod tests {
         }
         assert!(work[1] <= work[0] + 4, "GetTips work grew with the DAG under finality: {work:?}");
         assert!(work[0] < 100, "GetTips is not O(log n + limit + finality distance): {work:?}");
+    }
+
+    /// POW-3: below its minimum chain work (initial block download) a node
+    /// answers GetTips and GetHeaders empty, as Bitcoin Core ignores
+    /// `getheaders` in IBD: a chain it does not trust yet (an eclipsing
+    /// peer's cheap chain its own pulls fetched) is not advertised for others
+    /// to pull. At the minimum (or with none, as harnesses run) it answers
+    /// as before.
+    #[test]
+    fn below_the_minimum_chain_work_no_frontier_or_headers_are_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::storage::Storage::open(&dir.path().join("db")).unwrap());
+        let dag = std::sync::Arc::new(parking_lot::RwLock::new(chain_dag(40)));
+        let work = crate::ingress::tip_blue_work(&dag.read());
+        let tips = |min| match serve::serve_sync_request(&dag, &store, &sync_rr::SyncRequest::GetTips, min) {
+            sync_rr::SyncResponse::Tips { tips, .. } => tips.len(),
+            other => panic!("{other:?}"),
+        };
+        let headers = |min| match serve::serve_sync_request(
+            &dag, &store, &sync_rr::SyncRequest::GetHeaders { from_blue_score: 0, limit: 500 }, min,
+        ) {
+            sync_rr::SyncResponse::Headers { entries } => entries.len(),
+            other => panic!("{other:?}"),
+        };
+        for min in [0, work] {
+            assert_eq!(tips(min), 1, "at or above the minimum ({min})");
+            assert!(headers(min) > 30, "at or above the minimum ({min})");
+        }
+        for min in [work + 1, crate::core::MIN_CHAIN_WORK] {
+            assert_eq!(tips(min), 0, "below the minimum ({min})");
+            assert_eq!(headers(min), 0, "below the minimum ({min})");
+        }
     }
 
     /// Blocks from the PoWit activation carry the PoWit section in their

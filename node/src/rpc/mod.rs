@@ -265,7 +265,8 @@ struct AppState {
     /// are not charged to `tx_verify_budget`.
     caller_trusted:          bool,
     /// POW-3: the node's minimum chain work (`ingress::minimum_chain_work`
-    /// at start-up), which `getdaginfo` reports.
+    /// at start-up). `getdaginfo` reports it; below it `getblocktemplate`
+    /// refuses (initial block download, `ingress::ibd_template_refusal`).
     min_chain_work:          u128,
 }
 
@@ -1808,6 +1809,14 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // (BIP22: 1-based positions in `transactions`): a block built from
             // a subset of the entries must keep every dependency of every
             // entry it keeps.
+            //
+            // POW-3: no template while the selected tip is below the minimum
+            // chain work (Bitcoin Core: "in initial sync and waiting for
+            // blocks"): it may be a chain this node's own pulls fetched from
+            // an eclipsing peer, not one to mine on.
+            if let Some(e) = crate::ingress::ibd_template_refusal(&state.dag.read(), state.min_chain_work) {
+                return json!({ "error": e });
+            }
             let tmpl = match crate::template::build_block_template(
                 &state.dag, &state.store, &state.mempool,
                 crate::template::EXTERNAL_COINBASE_RESERVE,
@@ -4203,20 +4212,29 @@ mod audit_2026_10_rpc_tests {
     /// and whether the selected tip is below it (initial block download), so
     /// an operator sees why a node does not leave IBD and the release tool
     /// (tools/release/min_chain_work.py) prints the value a node runs.
+    /// Below it `getblocktemplate` refuses, as Bitcoin Core's does in
+    /// initial block download: the tip may be a cheap chain the node's own
+    /// pulls fetched from an eclipsing peer.
     #[tokio::test]
-    async fn getdaginfo_reports_the_minimum_chain_work() {
+    async fn getdaginfo_and_getblocktemplate_apply_the_minimum_chain_work() {
         let (_tmp, mut state) = state_with_chain(5);
         assert_eq!(crate::ingress::minimum_chain_work(), crate::core::MIN_CHAIN_WORK, "the process default");
         state.min_chain_work = crate::core::MIN_CHAIN_WORK;
         let r = dispatch("getdaginfo", None, &state).await;
         assert_eq!(r["minimum_chain_work"], "7000000");
         assert_eq!(r["below_minimum_chain_work"], true, "a 5-block test chain");
+        let t = dispatch("getblocktemplate", None, &state).await;
+        let e = t["error"].as_str().unwrap_or_default();
+        assert!(e.contains("initial block download") && e.contains("0x6acfc0"), "{t}");
         let tip_work: u128 = r["tip_blue_work"].as_str().unwrap().parse().unwrap();
         state.dag.write().add_block([0xD7; 32], vec![[5u8; 32]], 20_000, crate::core::MIN_CHAIN_WORK - tip_work)
             .unwrap();
         let r = dispatch("getdaginfo", None, &state).await;
         assert_eq!(r["tip_blue_work"], "7000000");
         assert_eq!(r["below_minimum_chain_work"], false, "at the minimum: out of IBD");
+        let t = dispatch("getblocktemplate", None, &state).await;
+        let e = t["error"].as_str().unwrap_or_default();
+        assert!(!e.contains("initial block download"), "{t}");
         // With no minimum (testnet, `--minimumchainwork 0`) nothing is gated.
         let (_tmp0, state0) = state_with_chain(5);
         let r = dispatch("getdaginfo", None, &state0).await;

@@ -304,11 +304,25 @@ impl<R, C> Drop for ServeQueue<R, C> {
 ///
 /// `GetPeers` is answered by the network loop (it needs the peer table);
 /// here it gets an empty answer, and `Malformed` is never served.
+///
+/// POW-3: while the selected tip carries less blue work than
+/// `min_chain_work` (the node's minimum chain work: it is in initial block
+/// download), GetTips and GetHeaders get empty answers, as Bitcoin Core
+/// ignores `getheaders` in initial block download: the node does not
+/// advertise a chain it does not yet trust as a frontier for others to pull
+/// (an eclipsing peer's cheap chain, which the node's own requested pulls
+/// may have made its selected tip). Bodies it stores are still served by
+/// GetBlock. `0` (testnet, `--minimumchainwork 0`) answers as before.
 pub fn serve_sync_request(
     dag: &Arc<RwLock<crate::consensus::GhostDAG>>,
     store: &Arc<crate::storage::Storage>,
     req: &SyncRequest,
+    min_chain_work: u128,
 ) -> SyncResponse {
+    // One selected-tip lookup (constant cost), skipped without a minimum.
+    let in_ibd = |d: &crate::consensus::GhostDAG| {
+        min_chain_work > 0 && crate::ingress::below_minimum_chain_work(d, min_chain_work)
+    };
     match req {
         SyncRequest::GetPeers => SyncResponse::Peers { peers: Vec::new() },
         SyncRequest::Malformed => SyncResponse::Busy,
@@ -325,6 +339,9 @@ pub fn serve_sync_request(
             // H-R3-1: bound the work here too, whatever the decoder let in.
             let limit = (*limit as usize).min(MAX_WIRE_GETHEADERS_LIMIT as usize);
             let d = dag.read();
+            if in_ibd(&d) {
+                return SyncResponse::Headers { entries: Vec::new() };
+            }
             let entries: Vec<SyncEntry> = d
                 .ordered_hashes_from(*from_blue_score, limit)
                 .iter()
@@ -334,6 +351,9 @@ pub fn serve_sync_request(
         }
         SyncRequest::GetTips => {
             let d = dag.read();
+            if in_ibd(&d) {
+                return SyncResponse::Tips { tips: Vec::new(), locator: Vec::new() };
+            }
             let tips: Vec<SyncEntry> = d
                 .tips_for_peers(MAX_WIRE_TIPS)
                 .iter()
@@ -354,19 +374,23 @@ pub struct Served<R, C> {
 
 /// Compute `job` on the blocking pool and send the answer to `done`. A panic
 /// while serving answers Busy (the queue's worker count stays exact).
+/// `min_chain_work`: see [`serve_sync_request`].
 pub fn spawn_worker<R, C>(
     job: Job<R, C>,
     dag: Arc<RwLock<crate::consensus::GhostDAG>>,
     store: Arc<crate::storage::Storage>,
     done: tokio::sync::mpsc::Sender<Served<R, C>>,
+    min_chain_work: u128,
 ) where
     R: Send + 'static,
     C: Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
         let Job { peer, id, req, channel } = job;
-        let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serve_sync_request(&dag, &store, &req)))
-            .unwrap_or(SyncResponse::Busy);
+        let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            serve_sync_request(&dag, &store, &req, min_chain_work)
+        }))
+        .unwrap_or(SyncResponse::Busy);
         let _ = done.blocking_send(Served { peer, id, channel, response });
     });
 }
