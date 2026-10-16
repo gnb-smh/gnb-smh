@@ -139,6 +139,12 @@ fn sized_block(n: &Node, tip: BlockHash, k: &Key, fund: &([u8; 32], u32, gnb::co
 /// UTXO set. A block one byte over the limit is refused in every copy.
 #[test]
 fn block_accepted_from_gossip_and_served_from_storage_is_accepted_by_a_fresh_node() {
+    // Synthetic test keys/signatures only. This seed reproduces the old
+    // size builder's same-id pair at the 1,000,000 / 1,000,001-byte boundary.
+    pqcrypto_internals::with_seeded_rng_scope(&[1; 32], check_gossip_and_storage_size_boundary);
+}
+
+fn check_gossip_and_storage_size_boundary() {
     let genesis = mk_genesis(unix_now() - 50_000);
     let gh = genesis.block_hash();
     let k = key();
@@ -207,10 +213,31 @@ fn block_accepted_from_gossip_and_served_from_storage_is_accepted_by_a_fresh_nod
     }
 
     // One byte over the limit with blue_score 0: refused in every copy.
-    let over = sized_block(&a, tip, &k, &fund, core::MAX_BLOCK_SIZE + 1);
+    // Keep the valid signed spend byte-identical. A second randomized
+    // signature can add one wire byte without changing its txid, leaving
+    // the same coinbase padding and block id as x: ingress then says Known.
+    // Coinbase script bytes ARE committed by its txid; grow those instead.
+    let mut over = x.clone();
+    over.transactions[0].inputs[0].script_sig.push(0x20);
+    commit_block(&mut over);
+    over.test_only_assume_pow_valid();
+    let over_id = over.block_hash();
+    assert_eq!(over.to_wire_bytes().len(), core::MAX_BLOCK_SIZE + 1, "exactly one byte over");
+    assert_eq!(over.transactions[1].to_wire_bytes(true), x.transactions[1].to_wire_bytes(true),
+        "the already-validated spend and its signature are unchanged");
+    assert_ne!(over_id, id, "the size-negative case must not reuse the accepted id");
+    assert!(!c.dag.read().has_block(&over_id), "the size-negative case must reach structural validation");
+    for (label, b) in [("at-limit", &x), ("over-limit", &over)] {
+        eprintln!("{label}: id={} bytes={} coinbase_script={} spend_script={} spend_txid={}",
+            hex::encode(b.block_hash()), b.to_wire_bytes().len(),
+            b.transactions[0].inputs[0].script_sig.len(), b.transactions[1].inputs[0].script_sig.len(),
+            hex::encode(b.transactions[1].txid()));
+    }
     for blue in [0u64, derived] {
         let mut o_copy = over.clone();
         o_copy.blue_score = blue;
+        assert_eq!(o_copy.block_hash(), over_id, "blue_score {blue}: same oversize id");
+        assert_eq!(o_copy.to_wire_bytes().len(), core::MAX_BLOCK_SIZE + 1, "blue_score {blue}: exactly one byte over");
         match deliver(&mut BlockIngress::new().with_minimum_chain_work(0), &c, &o_copy, false) {
             BlockOutcome::Invalid(e) => assert!(e.contains("block too large"), "{e}"),
             other => panic!("blue_score {blue}: {other:?}"),
