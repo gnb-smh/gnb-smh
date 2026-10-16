@@ -1,0 +1,159 @@
+# Round 4 independent review: verdict consistency
+
+Reviewer: `/root/r4_review_verdict`, 2026-10-16. Reviewed integration candidate
+`2cb9980` against base `7d6a67e`, plus wallet candidate `299389a` and its tests
+from `60b3c7e`. Worktree `gnb-r4-review-verdict`; native Cargo target
+`/private/tmp/gnb-r4-target-review-verdict`, dev/test codegen-units **107**,
+debug information and incremental compilation disabled. No production file
+was changed by this reviewer. Only public synthetic addresses and local
+transactions were exercised; no broadcast or external service was used.
+
+**Disposition: changes requested for the two low-severity findings below.**
+No numeric score or whole-round acceptance is assigned. No consensus verdict
+change or wrong-script mapping was identified in the reviewed diff and finite
+tests. That observation is not an exhaustive proof or approval of other work.
+
+## R4-V1: policy UI routes and mocks disagree with real capabilities — low, open
+
+`site/explorer.js:101` normalizes a v2 alias and always calls
+`getaddresshistory` at line 106. Its new route accepts both kinds at line 159.
+However, `node/src/rpc/explorer.rs:524` calls the single-key parser at
+`node/src/rpc/mod.rs:2625`; policy destinations intentionally remain invalid
+for balance/history methods, as documented in `docs/RUNNING.md`.
+
+The original web test passes because its RPC mock returns history success
+for any address. `site/tests/address-v2-web-paths.test.mjs:86` accepts either a
+history or UTXO call, so it does not establish a functional policy page.
+With the same actual explorer functions and a mock that faithfully rejects
+policy `getaddresshistory`, the ordinary single-key control passes and the
+policy assertion fails: the sequence is `validateaddress` →
+`getaddresshistory(gnb1m...)`; rendering is `Error: invalid address`. No UTXO
+request is made. Command:
+
+```sh
+node --test /private/tmp/gnb-r4-review-verdict-policy-route.mjs
+```
+
+Result: exit 1, **1 passed / 1 failed**. This is a bounded UI reproduction,
+not a live-node integration test. The endpoint's single-key restriction was
+also inspected directly in the dispatcher and its tests.
+
+The same package's watch tests at lines 104–108 model policy normalization as
+successful, but actual wallet `Address::parse` intentionally accepts only
+single-key destinations. With the exact `299389a` WASM and loader, both
+policy legacy/v2 normalization reject. Executing both actual boot functions
+with that loader enters watch mode for the single-key control and returns to
+the gate for policy v2 (**2/2 observational tests passed**). Thus those mocked
+policy watch assertions must not be cited as real wallet support.
+
+Minimal resolution: expose a clear unsupported-policy-history state in the
+first explorer without querying a single-key index, or use a dedicated UTXO
+view without claiming history. Keep wallet watch capability explicitly
+single-key and test policy refusal/fallback using the real WASM. Do not extend
+consensus or invent policy history to satisfy the mock. The second explorer
+already uses the full-script `getutxos` path.
+
+Impact is unavailable/misleading UI coverage, not demonstrated fund loss,
+signing bypass, acceptance of an invalid transaction, or a network mix-up.
+
+## R4-V2: JSON oracle adapters disagree outside the corpus — low, open
+
+The Rust oracle `crates/gnb-crypto/examples/address_v2_oracle.rs:33` ignores
+unknown fields and treats a present `expected_network: null` as invalid.
+The Python adapter `reference/address_v2.py:139` rejects unknown fields, and
+line 141 treats a null expected network like the omitted field.
+
+Built this candidate's Rust oracle locally. For the ordinary zero-hash
+single-key decode, both implementations return exactly the same object.
+Three additional bounded requests reproduce different `ok` verdicts:
+
+| Request modification | Python | Rust |
+| --- | --- | --- |
+| Decode with `expected_network: null` | accept | reject |
+| Decode with `unknown: 1` | reject | accept |
+| Valid encode with `unknown: 1` | reject | accept |
+
+The comparison assertion exits 1; exact requests/responses are retained in
+`/private/tmp/gnb-r4-review-verdict-oracle-shape.json`. In contrast, the existing
+corpus differential passes **630 requests / 0 divergences** because it never
+uses those request shapes. That count is valid only for its present corpus.
+
+Minimal resolution: specify one request-envelope contract, align both
+adapters, and add these shape variants plus the positive control to the
+executable differential. Keep the Rust decode path calling the production
+unified destination parser. This finding concerns testing infrastructure;
+it does not demonstrate any different address checksum, output script, or
+consensus verdict between implementations.
+
+## Checked boundaries and compatibility
+
+- The Rust v2 selector is disjoint from exact legacy prefixes. Both public
+  parsers reject the other kind; `destination_script` returns the existing
+  20-byte hash or `02 || policy_hash`. Encoding, length, padding, mixed-case,
+  checksum and network checks agree on the finite vector corpus. Uniform
+  uppercase maps to the same canonical lowercase v2 output.
+- Existing `Display`, serde fields and legacy encodings are unchanged.
+  `address_v2` golden tests cover both networks, policy and single-key
+  scripts, legacy hex case and Bloch alias identity. Changes do not touch
+  transaction serialization, sighashes, script validation or activation.
+- RPC network checks share `require_rpc_address_network` before their address
+  indices; `getutxos` retains the complete policy script. The intentional
+  cross-network read-policy change is documented. CLI production behavior
+  is unchanged and shares the core parser/network checks. I inspected the
+  dispatcher/CLI tests; I did not independently rerun the full node suite.
+- JavaScript/Worker routing is explicitly syntax-only. Alias normalization
+  in the explorers calls the RPC; carryover has its own bounded checksum
+  decoder because it does not query the node. Standalone API tests passed
+  for both networks/kinds and preserved legacy table identity.
+- Wallet `normalize` keeps legacy output by default and only renders v2 on
+  an explicit format request. Unknown/nonstring format values are rejected.
+  Actual WASM payments at heights 17499 and 17500 decode through the Python
+  reference to the expected unchanged scripts/amounts and versions 1/3;
+  a testnet recipient is refused by the mainnet wallet. These local offline
+  tests use synthetic UTXOs and do not establish chain unspentness.
+- Build-script changes pin both served wallet entry points. I ran the
+  exact candidate binary/loader copied out of git into an isolated temporary
+  tree, not a newly rebuilt binary. Canonical Linux reconstruction and fresh
+  CI comparison remain required; the documented R3 cross-host issue remains.
+- Added CI steps run the independent reference, vector regeneration, the
+  Rust/Python differential and standalone API tests. I did not assert a green
+  round-4 CI run or verify every platform in the requested long-term matrix.
+
+## Independent executions
+
+All Rust commands used `--locked --offline`, package `gnb-crypto`, and this
+review's target/CGU; no `gnb` and `gnb-crypto` tests shared an invocation.
+
+| Execution | Result |
+| --- | --- |
+| `cargo test -p gnb-crypto --test address_v2 --test address_v2_render` | exit 0; 4 + 3 passed |
+| `cargo test -p gnb-crypto --lib address::bech32m` | exit 0; 4 passed |
+| `python3 reference/address_v2_test.py -v` | exit 0; 13 passed |
+| `python3 reference/address_v2_differential.py <review oracle>` | exit 0; 630 requests / 0 corpus divergences |
+| `node --test site/tests/address-v2-web-paths.test.mjs` | exit 0; 7 passed, subject to R4-V1 mock limitation |
+| `python3 deploy/explorer-api/test_address_v2.py -v` | exit 0; 5 passed |
+| Candidate WASM suite plus real policy-normalize rejection | exit 0; 6 existing + 1 reviewer check passed |
+| Both actual wallet boot functions using candidate WASM | exit 0; 2 capability checks passed |
+| Policy explorer route with faithful RPC rejection | exit 1; 1 control passed / 1 failed |
+| Oracle request-envelope equality | exit 1; control agreed / 3 divergences |
+
+Node version: 22.23.3. The WASM temporary suite changes only fixture paths to
+read the frozen candidate and local Python reference, plus the stated
+policy-rejection check. Production-only reversals are the implementers'
+separate evidence; this lens does not assert they ran merely from inspection.
+No prior automatically rejected PoWit, R7 or excessive-witness task was
+retried. Full integration, the other review lenses, canonical CI and findings
+closure are still required before delivery acceptance.
+
+### Evidence hashes
+
+- crypto tests: `/private/tmp/gnb-r4-review-verdict-crypto.log` — SHA-256 `87b2224d5c856cdc1e1c35e7dd113e3a2771ce48d1db10af0b427d4f579f56f4`.
+- codec unit tests: `/private/tmp/gnb-r4-review-verdict-bech32m.log` — SHA-256 `baa42f0251fc61c94da3d8662af20d04048cafb7746327dfedf541c2eff199e5`.
+- reference: `/private/tmp/gnb-r4-review-verdict-python.log` — SHA-256 `7fbd9309a535f01b422d08b8d875e1c6ae8c66ebaf040d96508fe36d22e6b087`.
+- differential: `/private/tmp/gnb-r4-review-verdict-differential.log` — SHA-256 `52117b672f6ee130a4bcebf8c0d7906aa07de10e3538e1a598fc2745056111ed`.
+- web tests: `/private/tmp/gnb-r4-review-verdict-web.log` — SHA-256 `ffcb25c3f98310117cc978e21c8cae19a0a24208b0d66ff4739aa5566f16d374`.
+- API tests: `/private/tmp/gnb-r4-review-verdict-api.log` — SHA-256 `e106cd416361d7d3832e5fc173f8e74d8f8849477c9153136632dace49a0ab62`.
+- WASM tests: `/private/tmp/gnb-r4-review-verdict-wasm.log` — SHA-256 `1f0e7c3f45b23526b0ddc37144d4223ebf3a2c4a0b2644f63ad902cdfa399dc8`.
+- policy route reproduction: `/private/tmp/gnb-r4-review-verdict-policy-route.log` — SHA-256 `a6f5036e8ae6602970356b89c4b540bbb233a72be52917e12f3a40646366fe36`.
+- real WASM watch checks: `/private/tmp/gnb-r4-review-verdict-real-watch.log` — SHA-256 `934e47dbe843b453ea726d05a06fba6f7653ce2d77d3ff89164b18865999d470`.
+- oracle request divergence: `/private/tmp/gnb-r4-review-verdict-oracle-shape.json` — SHA-256 `d64d70454f030ca88da14566a9e43a1af792613ec484ad8d2bd99409831a856a`.
