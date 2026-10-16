@@ -15,9 +15,11 @@ check itself is reported as "not evaluated".
 
 Rule order follows the node: a block applies each structural rule to every
 transaction before the next rule (`Block::validate_structure_without_pow_at`,
-then `limits::check_block_context_free`), then connects the transactions one
-by one (`accept::validate_block_in_view`). The first failing rule names the
-error class (the classes are listed in docs/testing/VECTORS.md).
+then `limits::check_block_context_free`), then connects the transactions
+(`accept::validate_block_in_view`) in two passes: the checks the block id
+commits to for every transaction and the coinbase value, then the witness
+checks of every transaction (re-audit B1-T13). The first failing rule names
+the error class (the classes are listed in docs/testing/VECTORS.md).
 """
 
 from __future__ import annotations
@@ -443,10 +445,11 @@ def check_input_scripts(tx: mk.Tx, prevouts: list, height: int, activation: int,
         out.signatures.append((tx, i, rule, prevouts))
 
 
-def connect_tx(tx: mk.Tx, view: View, earlier: dict, spent_in_block: set, height: int, activation: int,
-               same_block_coinbase, out: Outcome) -> int:
-    """`validate_tx_in_view`: one non-coinbase transaction of a block at
-    `height`; returns the fee."""
+def connect_tx_committed(tx: mk.Tx, view: View, earlier: dict, spent_in_block: set, height: int,
+                         activation: int, same_block_coinbase) -> tuple:
+    """`check_tx_in_view_committed`: the checks of one non-coinbase
+    transaction of a block at `height` that depend only on data the block id
+    commits to; returns (fee, prevouts)."""
     if same_block_coinbase is not None and any(i.prev_txid == same_block_coinbase for i in tx.inputs):
         raise Invalid("same-block-coinbase")
     if height != 0:
@@ -467,20 +470,46 @@ def connect_tx(tx: mk.Tx, view: View, earlier: dict, spent_in_block: set, height
             raise Invalid("missing-input")
         total_in = money_add(total_in, coin.value)
         prevouts.append(coin)
-    check_input_scripts(tx, prevouts, height, activation, out)
+    if sh.version_rule(tx.version, height, activation) == "invalid":
+        raise Invalid("bad-version")
     spent_in_block |= local
     total_out = tx_money_range(tx)
     if total_in < total_out:
         raise Invalid("inputs-below-outputs")
     fee = total_in - total_out
+    # The floor no script_sig can lower: the size with every script_sig
+    # empty (its one-byte length prefix only).
+    if fee < min_fee(len(tx.wire(False)) + len(tx.inputs)):
+        raise Invalid("min-fee")
+    # No public key hashes to a script that is not 20 bytes.
+    if any(len(p.script_pubkey) != 20 for p in prevouts):
+        raise Invalid("pubkey-mismatch")
+    return fee, prevouts
+
+
+def connect_tx_witness(tx: mk.Tx, prevouts: list, fee: int, height: int, activation: int,
+                       out: Outcome) -> None:
+    """`check_tx_witnesses`: the scripts and the size-based minimum fee."""
+    check_input_scripts(tx, prevouts, height, activation, out)
     if fee < min_fee(len(tx.wire(True))):
         raise Invalid("min-fee")
+
+
+def connect_tx(tx: mk.Tx, view: View, earlier: dict, spent_in_block: set, height: int, activation: int,
+               same_block_coinbase, out: Outcome) -> int:
+    """`validate_tx_in_view`: one non-coinbase transaction in full; returns
+    the fee."""
+    fee, prevouts = connect_tx_committed(tx, view, earlier, spent_in_block, height, activation,
+                                         same_block_coinbase)
+    connect_tx_witness(tx, prevouts, fee, height, activation, out)
     return fee
 
 
 def connect_block(b: Block, view: View, activation: int, out: Outcome) -> None:
     """`validate_block_in_view_at`: BIP30 and the same-block coinbase rule
-    from the activation, every transaction, the coinbase value."""
+    from the activation; pass 1, the id-committed checks of every
+    transaction, then the coinbase value; pass 2, the witness checks of every
+    transaction (re-audit B1-T13)."""
     hardened = block_rules_active(b.height, activation)
     if hardened:
         for tx in b.txs:
@@ -488,10 +517,12 @@ def connect_block(b: Block, view: View, activation: int, out: Outcome) -> None:
             if any((txid, j) in view.utxos for j in range(len(tx.outputs))):
                 raise Invalid("bip30")
     same_cb = b.txs[0].txid() if hardened and b.txs else None
-    earlier, spent, fees = {}, set(), 0
+    earlier, spent, fees, checked = {}, set(), 0, []
     for i, tx in enumerate(b.txs):
         if i > 0:
-            fees = money_add(fees, connect_tx(tx, view, earlier, spent, b.height, activation, same_cb, out))
+            fee, prevouts = connect_tx_committed(tx, view, earlier, spent, b.height, activation, same_cb)
+            fees = money_add(fees, fee)
+            checked.append((tx, prevouts, fee))
         if hardened and i == 0:
             continue
         txid = tx.txid()
@@ -503,6 +534,8 @@ def connect_block(b: Block, view: View, activation: int, out: Outcome) -> None:
     allowed = subsidy(b.height) + fees
     if allowed >= 1 << 64 or cb.outputs[0].value > allowed:
         raise Invalid("coinbase-value")
+    for tx, prevouts, fee in checked:
+        connect_tx_witness(tx, prevouts, fee, b.height, activation, out)
 
 
 # ── Block rules ─────────────────────────────────────────────────────────────

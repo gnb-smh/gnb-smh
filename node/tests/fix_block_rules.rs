@@ -1210,10 +1210,11 @@ fn connect_failures_are_classified_by_what_the_block_id_commits_to() {
 /// witness framing), so the witness-dependent set is exactly a malformed
 /// `script_sig`, a public key that does not hash to the prevout, an invalid
 /// signature (a version-3 transaction included: it is verified with sighash
-/// v2 there) and the size-based minimum fee. At/after the activation every
-/// failure (the version rule, a non-canonical witness, a sighash-v3
-/// signature, the minimum fee) is id-committed. The verdict is
-/// `validate_block_in_view_at`'s on both sides.
+/// v2 there) and the size-based minimum fee above the floor no witness can
+/// lower (re-audit B1-T13: a fee below that floor, here 0, is id-committed).
+/// At/after the activation every failure (the version rule, a non-canonical
+/// witness, a sighash-v3 signature, the minimum fee) is id-committed. The
+/// verdict is `validate_block_in_view_at`'s on both sides.
 #[test]
 fn transaction_rule_failures_are_classified_on_both_sides_of_the_activation() {
     let genesis = mk_genesis(unix_now() - 10_000);
@@ -1244,7 +1245,9 @@ fn transaction_rule_failures_are_classified_on_both_sides_of_the_activation() {
         ("another key's witness", signed_spend(&other, &ins, pay(4_900_000)), BELOW, "pubkey mismatch", true),
         ("v1 signature byte flipped", mutate(&v1, &|ss| ss[100] ^= 1), BELOW, "invalid signature", true),
         ("version 3 below the activation", v3.clone(), BELOW, "invalid signature", true),
-        ("v1 fee below the minimum", signed_spend(&k, &ins, pay(5_000_000)), BELOW, "below consensus minimum", true),
+        ("v1 fee above the floor, below the size-based minimum", signed_spend(&k, &ins, pay(4_988_000)), BELOW,
+         "below consensus minimum", true),
+        ("v1 fee of 0, below the floor", signed_spend(&k, &ins, pay(5_000_000)), BELOW, "below consensus minimum", false),
         ("version 1 at the activation", v1.clone(), 1, "bad-txns-version", false),
         ("non-canonical witness", mutate(&v3, &|ss| ss.extend_from_slice(&[0, 1, 2])), 1, "non-canonical", false),
         ("v3 signature byte flipped", mutate(&v3, &|ss| ss[100] ^= 1), 1, "invalid signature", false),
@@ -1257,7 +1260,9 @@ fn transaction_rule_failures_are_classified_on_both_sides_of_the_activation() {
         pipeline::validate_block_in_view_classified_at(view, &b, act).expect("valid on its side");
     }
     for (label, tx, act, fragment, witness_dependent) in cases {
-        let mut b = raw_block(&n, vec![gh], vec![coinbase("p1p2", subsidy(1) + 100_000, vec![0x9E; 20]), tx]);
+        // The coinbase claims the subsidy alone (valid whatever the fee), so
+        // the transaction's failure is the block's.
+        let mut b = raw_block(&n, vec![gh], vec![coinbase("p1p2", subsidy(1), vec![0x9E; 20]), tx]);
         b.header.merkle_root = b.body_merkle_root_at(act);
         let e = verdict_of(pipeline::validate_block_in_view_classified_at(view, &b, act));
         assert!(e.reason.contains(fragment), "{label}: {e:?}");

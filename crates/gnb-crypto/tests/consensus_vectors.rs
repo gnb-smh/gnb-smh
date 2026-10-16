@@ -13,10 +13,13 @@
 //!   a block, which must reject exactly the cases whose class is context-free
 //!   (`context_free_expectation`, the output-side MoneyRange included); then
 //!   the connect-time rules in the node's order through gnb-crypto's own
-//!   functions: `core::check_coinbase_maturity`, the input sum
-//!   (`limits::money_add`), `core::sighash::verify_tx_scripts` with the
-//!   case's chain id, `limits::check_tx_money_range`, inputs >= outputs and
-//!   `core::check_min_fee`. The rules implemented in the node crate (BIP30,
+//!   functions: the id-committed ones (`core::check_coinbase_maturity`, the
+//!   input sum with `limits::money_add`, `core::sighash::check_tx_version`,
+//!   `limits::check_tx_money_range`, inputs >= outputs, the fee floor
+//!   `tokenomics::min_tx_fee_sat` of the size with empty script_sigs, 20-byte
+//!   prevout scripts), then the witness ones
+//!   (`core::sighash::verify_tx_scripts` with the case's chain id,
+//!   `core::check_min_fee`; re-audit B1-T13). The rules implemented in the node crate (BIP30,
 //!   the same-block coinbase rule, duplicate and missing inputs:
 //!   [`TX_DEFERRED_TO_NODE`]) are left to the node runner, explicitly: every
 //!   case is either decided here or listed as deferred;
@@ -59,8 +62,8 @@ enum Connect {
 }
 
 /// The connect-time rules for the one transaction of a wrapper block, in the
-/// node's order (`accept::validate_tx_in_view`, then
-/// `validate_tx_inputs_classified`), through gnb-crypto's functions.
+/// node's order (`accept::check_tx_in_view_committed`, the coinbase value,
+/// then `check_tx_witnesses`), through gnb-crypto's functions.
 fn connect_core(c: &TxVector, tx: &Transaction, chain: ChainId, act: u64, expected: &str) -> Connect {
     let fail = |e: String| Connect::Decided(Err(classify(&e).to_string()));
     // BIP30 (checked for the whole block first) and VAL-3: accept.rs.
@@ -97,8 +100,11 @@ fn connect_core(c: &TxVector, tx: &Transaction, chain: ChainId, act: u64, expect
         };
         spent.push(coin.out());
     }
-    // Version rule, witnesses, public-key hashes, signatures.
-    if let Err(e) = core::sighash::verify_tx_scripts(tx, &spent, chain, c.height, act) {
+    // The id-committed rest: the version rule, the values, the fee floor no
+    // script_sig can lower (the size with every script_sig empty: one length
+    // byte each) and 20-byte prevout scripts (no public key hashes to another
+    // length).
+    if let Err(e) = core::sighash::check_tx_version(tx.version, c.height, act) {
         return fail(e);
     }
     let total_out = match limits::check_tx_money_range(tx) {
@@ -108,7 +114,19 @@ fn connect_core(c: &TxVector, tx: &Transaction, chain: ChainId, act: u64, expect
     if total_in < total_out {
         return Connect::Decided(Err("inputs-below-outputs".into()));
     }
-    match core::check_min_fee(tx, total_in - total_out) {
+    let fee = total_in - total_out;
+    if fee < core::tokenomics::min_tx_fee_sat(tx.wire_size(false) + tx.inputs.len()) {
+        return Connect::Decided(Err("min-fee".into()));
+    }
+    if spent.iter().any(|o| o.script_pubkey.len() != 20) {
+        return Connect::Decided(Err("pubkey-mismatch".into()));
+    }
+    // Then the witness rules: witnesses, public-key hashes, signatures, and
+    // the size-based minimum fee.
+    if let Err(e) = core::sighash::verify_tx_scripts(tx, &spent, chain, c.height, act) {
+        return fail(e);
+    }
+    match core::check_min_fee(tx, fee) {
         Ok(()) => Connect::Decided(Ok(())),
         Err(e) => fail(e),
     }
@@ -349,5 +367,13 @@ fn vector_coverage() {
             let full = format!("{id}/{r}");
             assert!(b.iter().any(|c| c.id == full && c.error.is_none()), "{full} must be a valid case");
         }
+    }
+    // Re-audit B1-T13: the connect order (the rules the block id commits to
+    // for every transaction before any witness rule) is pinned.
+    for r in ["pre", "post"] {
+        let full = format!("order/bad-signature-then-overspend/{r}");
+        assert!(b.iter().any(|c| c.id == full && c.error.as_deref() == Some("inputs-below-outputs")), "{full}");
+        let full = format!("fee/zero-with-a-bad-signature/{r}");
+        assert!(has(&|c| c.id == full && c.error.as_deref() == Some("min-fee")), "{full}");
     }
 }

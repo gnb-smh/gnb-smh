@@ -774,6 +774,19 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         sign_all(&mut tx, &[ka], &[p.out()], r.how(), ChainId::Mainnet, &l);
         c.invalid("fee/zero", r, "Inputs equal outputs: fee 0.", vec![p], &tx, "min-fee");
 
+        // Re-audit B1-T13: the fee floor no script_sig can lower is checked
+        // with the rules the block id commits to, before any witness rule.
+        let l = format!("value/zero-fee-bad-sig/{t}");
+        let p = fund(&l, FUND, &ka.spk());
+        let mut tx = unsigned(r.version(), &[&p], vec![pay(FUND, &l)]);
+        sign_all(&mut tx, &[ka], &[p.out()], r.how(), ChainId::Mainnet, &l);
+        let (sig, pk) = witness(&tx, 0);
+        let mut f = sig.clone();
+        f[4 + MLDSA_SIG + 5] ^= 0x01; // inside the Falcon nonce: still canonical
+        c.invalid("fee/zero-with-a-bad-signature", r,
+            "Fee 0 and a signature that does not verify: the fee floor (the minimum fee of the transaction with every script_sig empty, at least 10,000) is a rule the txid commits to and is checked before any witness rule, so the class is min-fee (re-audit B1-T13).",
+            vec![p], &with_ss(&tx, 0, script_sig(&f, &pk)), "min-fee");
+
         for (delta, id, err) in [(0i64, "fee/exact-minimum", None), (-1, "fee/minimum-minus-one", Some("min-fee"))] {
             let l = format!("{id}/{t}");
             let p = fund(&l, FUND, &ka.spk());
@@ -1709,6 +1722,22 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         let mut b = raw_block(h, ACT, one_parent(), vec![coinbase(subsidy(h), &l("double"), b""), d1, d2]);
         seal(&mut b, ACT);
         c.push("order/two-transactions-spend-one-coin", r, "Two different transactions of the block spend the same coin.", b, vec![pd], Some("double-spend"));
+
+        // Re-audit B1-T13: the rules the block id commits to are checked for
+        // EVERY transaction before any witness rule.
+        let (mut bad_sig, pb) = block_spend(ka, r, &l("bad-sig-then-overspend/1"), FUND);
+        let (sig, pk) = witness(&bad_sig, 0);
+        let mut f = sig.clone();
+        f[4 + MLDSA_SIG + 5] ^= 0x01; // inside the Falcon nonce: still canonical
+        bad_sig = with_ss(&bad_sig, 0, script_sig(&f, &pk));
+        let po = fund(&l("bad-sig-then-overspend/2"), FUND, &ka.spk());
+        let mut over = unsigned(r.version(), &[&po], vec![pay(FUND + 1, &l("bad-sig-then-overspend/2"))]);
+        sign_all(&mut over, &[ka], &[po.out()], r.how(), ChainId::Mainnet, &l("bad-sig-then-overspend/2"));
+        let mut b = raw_block(h, ACT, one_parent(), vec![coinbase(subsidy(h), &l("bad-sig-then-overspend"), b""), bad_sig, over]);
+        seal(&mut b, ACT);
+        c.push("order/bad-signature-then-overspend", r,
+            "Transaction 1's signature does not verify and transaction 2 spends more than its input: the connect checks the rules the block id commits to for every transaction before any witness rule, so the class is inputs-below-outputs (below the activation the failure is then id-committed, re-audit B1-T13).",
+            b, vec![pb, po], Some("inputs-below-outputs"));
 
         // Merkle roots.
         let base = {

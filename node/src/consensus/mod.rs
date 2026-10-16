@@ -783,7 +783,13 @@ pub struct GhostDAG {
     /// disqualified: nothing is persisted. The value lists the witness roots
     /// of the bodies already rejected for this id (most recent last, at most
     /// [`MAX_REJECTED_BODIES`]), so the same bad body is refused cheaply.
+    /// Waiting is not wanting: a body is requested from peers, and a copy
+    /// processed, only while [`is_body_wanted`](Self::is_body_wanted).
     body_pending: HashMap<BlockHash, Vec<[u8; 32]>>,
+    /// The body-pending blocks an operator override needs
+    /// ([`request_body`](Self::request_body)): wanted whatever the weight of
+    /// their chain, until a body arrives. A subset of `body_pending`'s keys.
+    body_requested: HashSet<BlockHash>,
 }
 
 /// Rejected-body witness roots remembered per body-pending block.
@@ -816,6 +822,7 @@ impl GhostDAG {
             invalid_all_edges_roots: HashSet::new(),
             invalid_all_edges: HashSet::new(),
             body_pending: HashMap::new(),
+            body_requested: HashSet::new(),
         }
     }
 
@@ -1492,6 +1499,7 @@ impl GhostDAG {
         self.invalid_all_edges_roots.remove(hash);
         self.invalid_all_edges.remove(hash);
         self.body_pending.remove(hash);
+        self.body_requested.remove(hash);
         // Exact inverse of `DagStore::insert`: drop the child edge from each
         // parent; a parent becomes a tip again iff it is still stored and now
         // has no children at all.
@@ -2466,9 +2474,100 @@ impl GhostDAG {
         self.propagate_invalid(hash)
     }
 
+    /// [`mark_body_pending`](Self::mark_body_pending) for a body an operator
+    /// override needs (`accept::request_bodies`): the block also stays
+    /// wanted ([`is_body_wanted`](Self::is_body_wanted)) whatever the weight
+    /// of its chain, until a body arrives
+    /// ([`clear_body_pending`](Self::clear_body_pending)). Unknown hashes are
+    /// ignored.
+    pub fn request_body(&mut self, hash: BlockHash) -> Vec<BlockHash> {
+        if !self.store.has(&hash) {
+            return Vec::new();
+        }
+        self.body_requested.insert(hash);
+        self.mark_body_pending(hash, None)
+    }
+
     /// True iff `hash` waits for a body (see `mark_body_pending`).
     pub fn is_body_pending(&self, hash: &BlockHash) -> bool {
         self.body_pending.contains_key(hash)
+    }
+
+    /// True iff `hash` waits for a body AND that body is wanted now (re-audit
+    /// B1-T13): an operator override asked for it
+    /// ([`request_body`](Self::request_body)), or a body could make a chain
+    /// through `hash` the best one — some block on whose selected chain
+    /// `hash` lies, with no persistent disqualification root between them
+    /// (`hash` included), orders above the selected tip under GhostDAG's tip
+    /// order (`order_key`). Bitcoin Core downloads only the blocks of chains
+    /// with more work than its tip and ignores an unrequested block with
+    /// less work (`AcceptBlock`); here a body-pending block on a lighter
+    /// branch is neither requested from peers nor processed when a copy
+    /// arrives (`accept::awaits_body`), so a block whose body no witness can
+    /// fix stops costing pulls and validations as soon as the honest chain is
+    /// heavier, and is wanted again if its branch grows heavier. NOT
+    /// consensus (which bodies are fetched, not which are valid).
+    pub fn is_body_wanted(&self, hash: &BlockHash) -> bool {
+        if !self.body_pending.contains_key(hash) {
+            return false;
+        }
+        if self.body_requested.contains(hash) {
+            return true;
+        }
+        let best = self.selected_tip().map(|t| self.order_key(&t));
+        self.chain_through_can_win(hash, best.as_ref())
+    }
+
+    /// Every block whose body is wanted now
+    /// ([`is_body_wanted`](Self::is_body_wanted)), sorted: the set the
+    /// message processor requests (`ingress::awaited_bodies_to_request`) and
+    /// the orphan sweep chases (`ingress::awaited_bodies_to_chase`).
+    pub fn wanted_body_blocks(&self) -> Vec<BlockHash> {
+        if self.body_pending.is_empty() {
+            return Vec::new();
+        }
+        let best = self.selected_tip().map(|t| self.order_key(&t));
+        let mut v: Vec<BlockHash> = self.body_pending.keys()
+            .filter(|h| self.body_requested.contains(*h) || self.chain_through_can_win(h, best.as_ref()))
+            .copied()
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// True iff `root` or one of its selected-chain descendants orders above
+    /// `best` (the selected tip's key; `None`: no selected tip, anything can
+    /// win), following selected-parent edges only and never through a
+    /// persistent disqualification root (that chain is invalid whatever body
+    /// `root` gets). Stops at the first such block; otherwise visits the
+    /// selected-chain subtree of `root` once.
+    fn chain_through_can_win(&self, root: &BlockHash, best: Option<&(u128, u64, BlockHash)>) -> bool {
+        if self.is_invalid_persistently(root) {
+            return false;
+        }
+        let Some(best) = best else {
+            return true;
+        };
+        let mut stack = vec![*root];
+        let mut seen: HashSet<BlockHash> = HashSet::new();
+        while let Some(h) = stack.pop() {
+            if !seen.insert(h) {
+                continue;
+            }
+            if self.order_key(&h) > *best {
+                return true;
+            }
+            if let Some(children) = self.store.children.get(&h) {
+                for c in children {
+                    let on_chain = self.store.get(c).is_some_and(|d| d.selected_parent == Some(h));
+                    let dead = self.invalid_roots.contains(c) || self.invalid_all_edges.contains(c);
+                    if on_chain && !dead {
+                        stack.push(*c);
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Every block waiting for a body, sorted.
@@ -2488,6 +2587,7 @@ impl GhostDAG {
     /// disqualified only through `hash` become candidates again. Returns
     /// `false` (no change) if `hash` was not waiting for a body.
     pub fn clear_body_pending(&mut self, hash: &BlockHash) -> bool {
+        self.body_requested.remove(hash);
         if self.body_pending.remove(hash).is_none() {
             return false;
         }

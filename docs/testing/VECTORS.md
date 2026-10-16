@@ -38,8 +38,8 @@ What the vectors do NOT pin:
 
 | What | Where |
 | --- | --- |
-| Transaction vectors (187 cases) | `reference/tx_vectors.json` |
-| Block vectors (102 cases) | `reference/block_vectors.json` |
+| Transaction vectors (189 cases) | `reference/tx_vectors.json` |
+| Block vectors (110 cases) | `reference/block_vectors.json` |
 | Generator (deterministic Rust, seeded keys and signatures) | `crates/gnb-crypto/tests/gen_consensus_vectors.rs` |
 | Runner through gnb-crypto (real pow limit, explicit chain ids) | `crates/gnb-crypto/tests/consensus_vectors.rs` |
 | Runner through the node (connect path, mempool admission, testnet) | `node/tests/consensus_vectors.rs` |
@@ -183,11 +183,16 @@ in the node's order:
    the acceptance pipeline calls for an extension and for every block of a
    reorg; the case's activation height installed, or the schedule's) on a
    RocksDB store holding
-   exactly the `utxo` prevouts: at/after the activation BIP30 and no spend of
-   the block's own coinbase; coinbase maturity; double spends; missing
-   inputs; input MoneyRange; the version rule; witnesses; public-key hashes;
-   signatures (sighash v2 or v3 as the version rule selects); value; the
-   consensus minimum fee; the coinbase value.
+   exactly the `utxo` prevouts, in two passes (re-audit B1-T13): at/after
+   the activation BIP30 and no spend of the block's own coinbase; then for
+   every transaction the rules the block id commits to — coinbase maturity;
+   double spends; missing inputs; input MoneyRange; the version rule; value;
+   the minimum-fee floor no `script_sig` can lower (`min-fee`: the fee rule
+   on the size with every `script_sig` empty); every spent coin's script 20
+   bytes (`pubkey-mismatch`) —; the coinbase value; then for every
+   transaction the witness rules — witnesses; public-key hashes; signatures
+   (sighash v2 or v3 as the version rule selects); the consensus minimum
+   fee.
 
 The block-level rules of the wrapper (Merkle root, commitment, size) are the
 block vectors' subject.
@@ -206,8 +211,10 @@ runners even where a step-2 rule would reject the case with the same class
 
 The gnb-crypto runner evaluates step 2 through gnb-crypto's own functions in
 the node's order (`core::check_coinbase_maturity`, the input sum with
-`limits::money_add`, `core::sighash::verify_tx_scripts`,
-`limits::check_tx_money_range`, inputs >= outputs, `core::check_min_fee`).
+`limits::money_add`, `core::sighash::check_tx_version`,
+`limits::check_tx_money_range`, inputs >= outputs, the fee floor with
+`tokenomics::min_tx_fee_sat`, 20-byte prevout scripts, then
+`core::sighash::verify_tx_scripts` and `core::check_min_fee`).
 BIP30, the same-block coinbase rule, duplicate inputs and missing inputs are
 implemented in `node/src/accept.rs`, so for the 7 cases of those classes it
 checks every earlier rule and lists the case as deferred to the node runner
@@ -389,7 +396,7 @@ Policy classes (`policy.error_class` of a refused case; the
 
 ## Coverage
 
-Transactions (187: 98 pre-activation, 89 post-activation; 66 valid; 182 on mainnet, 5 on testnet):
+Transactions (189: 99 pre-activation, 90 post-activation; 66 valid; 184 on mainnet, 5 on testnet):
 
 | Area | Cases | What |
 | --- | --- | --- |
@@ -397,7 +404,7 @@ Transactions (187: 98 pre-activation, 89 post-activation; 66 valid; 182 on mainn
 | `struct/` | 15 | no outputs (valid, non-standard), no inputs, coinbase-shaped transaction, missing input, null outpoint in a 2-input transaction, duplicate inputs, two vouts of one txid, lock time and sequence not enforced |
 | `decode/` | 8 | truncated, trailing byte, non-minimal varint, empty, input / output count above the cap, 10,001-byte script_sig and script_pubkey |
 | `size/` | 6 | a 10,000-byte script_sig (lenient padding: valid pre, non-canonical post), a 10,000-byte output script, 300 outputs |
-| `value/`, `fee/`, `dust/` | 29 | MoneyRange of outputs, output sums, `u64::MAX`, the `MAX_SUPPLY_SAT` boundary, prevout amounts and sums; inputs below outputs; zero fee; fee exactly the minimum and one below (fixed point over the variable Falcon length); witness padding raising the minimum; dust 1 / 545 / 546; zero-value outputs |
+| `value/`, `fee/`, `dust/` | 31 | MoneyRange of outputs, output sums, `u64::MAX`, the `MAX_SUPPLY_SAT` boundary, prevout amounts and sums; inputs below outputs; zero fee; zero fee with a bad signature (`min-fee`: the fee floor is checked before the witness rules, re-audit B1-T13); fee exactly the minimum and one below (fixed point over the variable Falcon length); witness padding raising the minimum; dust 1 / 545 / 546; zero-value outputs |
 | `maturity/` | 12 | depth 100 / 99 / 0 (a parallel block's coinbase) / negative, a second immature input, a carry-over coin at height 1, the block's own coinbase (valid pre, `same-block-coinbase` post) |
 | `version/` | 18 | versions 0, 1, 2, 3, 4, 2^32-1 in both regimes; version 3 over the wrong digest in each regime; the mainnet boundary; never-activated |
 | `sig/` | 26 | wrong amount and wrong script (v2 does not commit: valid; v3 does: invalid), another input's amount, wrong input index, the v2 out-of-range marker quirk, testnet signature on mainnet, components swapped between inputs, component ids swapped, legacy binding over a v3 digest and bound binding over a v2 digest, a digest with another suite id, tampered ML-DSA and Falcon nonce bytes, another key's signature, a key that does not hash to the coin, a bad second input |
@@ -408,11 +415,11 @@ Transactions (187: 98 pre-activation, 89 post-activation; 66 valid; 182 on mainn
 | `tx64/` | 8 | 63 / 64 / 65-byte txid preimages in both regimes; the mainnet boundary |
 | `bip30/` | 2 | an output on an unspent coin's outpoint (valid pre, invalid post) |
 
-Blocks (108: 47 pre-activation, 61 post-activation; 40 valid):
+Blocks (110: 48 pre-activation, 62 post-activation; 40 valid):
 
 | Area | Cases | What |
 | --- | --- | --- |
-| `basic/`, `order/` | 10 | coinbase only, coinbase and spend, a spend of an earlier transaction in the block, the reverse order, two transactions spending one coin |
+| `basic/`, `order/` | 12 | coinbase only, coinbase and spend, a spend of an earlier transaction in the block, the reverse order, two transactions spending one coin, a bad signature followed by an overspend (`inputs-below-outputs`: the rules the block id commits to are checked for every transaction before any witness rule, re-audit B1-T13) |
 | `merkle/`, `dup/` | 10 | the other regime's root, a zero root, a three-transaction block and its CVE-2012-2459 mutation (duplicate-tx pre, bad root post), a duplicated transaction |
 | `coinbase/` | 23 | not first, two coinbases, no transactions, two / zero outputs, subsidy + 1, subsidy + fees (exact and + 1), paying zero, above `MAX_SUPPLY_SAT`, the halving at 4,204,800 |
 | `decode/` | 2 | a valid block's bytes with one varint in the non-minimal 3-byte form (the transaction count post; a coinbase script_sig length pre, with a coinbase locktime ending `FD 00` so that the decoder before the rule, which framed each transaction at its re-encoded length, accepted the bytes as the same block): the decoder accepts only minimal varints, at every height (docs/CONSENSUS.md, "Wire encoding"). The decoder before the rule (the Python reference before H-fuzz too) accepts both byte strings |
@@ -599,6 +606,20 @@ version 1 at it.
   the `check_block_money_range` row) describe the rule as it was; the runners
   now require both cases to be valid (`vector_coverage`), and restoring the
   block-wide sum fails both runners on the four cases. No other case changed.
+
+- **Re-audit B1-T13 (phase 4): the connect order.** The connect validates a
+  block in two passes: the rules the block id commits to for every
+  transaction (now including the minimum-fee floor computed on the size with
+  every `script_sig` empty, and 20-byte prevout scripts) and the coinbase
+  value, then the witness rules of every transaction. No verdict changes;
+  the class of a case failing several rules can. Four cases are new and pin
+  the order: `fee/zero-with-a-bad-signature/{pre,post}` (`min-fee`, not
+  `bad-signature`) and `order/bad-signature-then-overspend/{pre,post}`
+  (`inputs-below-outputs`, not `bad-signature`). The gnb-crypto runner and
+  the Python model follow the same order. Checked by mutation: running the
+  witness rules of each transaction inside the first pass (the old order)
+  fails the node runner on both block cases, and dropping the fee floor
+  fails it on both transaction cases. No existing case changed.
 
 ## Findings while building the vectors
 

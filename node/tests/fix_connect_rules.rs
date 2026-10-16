@@ -214,3 +214,158 @@ fn coinbase_height_read_failure_never_skips_maturity() {
     assert!(err.contains("coinbase maturity"), "{err}");
     assert!(n.store.invalid_block_reason(&id).unwrap().is_some(), "now a genuine verdict, persisted");
 }
+
+// ── B1-T13: classify witness-dependent failures by curability ──────────────
+
+fn subsidy(h: u64) -> u64 {
+    core::tokenomics::block_subsidy_sat(h)
+}
+
+/// A block on genesis carrying `txs`, its coinbase claiming the subsidy plus
+/// `fees`.
+fn block_with_txs(n: &Node, gh: gnb::consensus::BlockHash, tag: &str, fees: u64, txs: Vec<Transaction>) -> core::Block {
+    let mut all = vec![coinbase(tag, subsidy(1) + fees, vec![0xC3; 20])];
+    all.extend(txs);
+    mk_block(n, vec![gh], all)
+}
+
+/// The connect-time verdict of `b` on `n`'s state (below the activation).
+fn classify_below(n: &Node, b: &core::Block) -> gnb::accept::BlockInvalidity {
+    let view: &gnb::storage::Storage = &n.store;
+    match gnb::accept::validate_block_in_view_classified_at(view, b, activation::NEVER) {
+        Err(gnb::accept::ConnectFailure::Invalid(e)) => e,
+        other => panic!("expected a verdict, got {other:?}"),
+    }
+}
+
+/// B1-T13: below the activation a failure that NO body with the same block
+/// id can cure is id-committed: the block is disqualified and the mark
+/// persisted, like any other consensus failure. Before the fix every script
+/// and minimum-fee failure was "witness-dependent", so such a block (and its
+/// descendants) waited for another body forever and every re-malleated copy
+/// was re-validated. Incurable here: a fee below the size-independent floor
+/// (MIN_TX_FEE_SAT), a transaction without inputs (its fee is 0), a spend of
+/// a coin whose script is not 20 bytes (no public key hashes to it), and a
+/// block whose first failure is a bad signature but which also spends more
+/// than it has in a later transaction (id-committed checks of the whole
+/// block run before any witness check).
+#[test]
+fn incurable_failures_below_the_activation_are_id_committed() {
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0xD1u8; 32], 0u32, out(5_000_000, &k.spk));
+    let fund2 = ([0xD2u8; 32], 0u32, out(5_000_000, &k.spk));
+    let odd = ([0xD3u8; 32], 0u32, out(5_000_000, &[0x55; 5]));
+    let funds = [fund.clone(), fund2.clone(), odd.clone()];
+    let pay = |v: u64| vec![out(v, &[0x9A; 20])];
+
+    let mut bad_sig = signed_spend(&k, &[(fund.0, 0)], pay(4_900_000));
+    bad_sig.inputs[0].script_sig[100] ^= 0x01;
+    let overspend = signed_spend(&k, &[(fund2.0, 0)], pay(5_000_001));
+    let cases: Vec<(&str, Vec<Transaction>, u64, &str)> = vec![
+        ("fee of 1 below the 10,000 floor", vec![signed_spend(&k, &[(fund.0, 0)], pay(4_999_999))], 1, "below consensus minimum"),
+        ("transaction without inputs", vec![Transaction { version: 1, inputs: vec![], outputs: vec![], locktime: 0 }], 0, "below consensus minimum"),
+        ("coin locked to a 5-byte script", vec![signed_spend(&k, &[(odd.0, 0)], pay(4_900_000))], 100_000, "pubkey mismatch"),
+        ("bad signature, then an overspend", vec![bad_sig, overspend], 100_000, "inputs"),
+    ];
+    for (what, txs, fees, fragment) in cases {
+        let n = node_with(&genesis, &funds);
+        let b = block_with_txs(&n, gh, what, fees, txs);
+        let e = classify_below(&n, &b);
+        assert!(e.reason.contains(fragment), "{what}: {e:?}");
+        assert!(!e.witness_dependent, "{what}: no body with this id can be valid: {e:?}");
+        let err = accept(&n, &b).expect_err(what);
+        assert!(err.contains("invalid in its own chain context"), "{what}: {err}");
+        assert!(n.dag.read().is_invalid_persistently(&b.block_hash()), "{what}: disqualified");
+        assert!(!n.dag.read().is_body_pending(&b.block_hash()), "{what}: not waiting for a body");
+        assert!(n.store.invalid_block_reason(&b.block_hash()).unwrap().is_some(), "{what}: persisted");
+    }
+}
+
+/// The curable failures stay witness-dependent below the activation (another
+/// body with the same id can be valid): a bad signature alone, and a fee at
+/// or above the floor but below the size-based minimum of this body (a body
+/// with shorter witnesses can meet it).
+#[test]
+fn curable_failures_below_the_activation_stay_witness_dependent() {
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0xD4u8; 32], 0u32, out(5_000_000, &k.spk));
+    let pay = |v: u64| vec![out(v, &[0x9A; 20])];
+    let mut bad_sig = signed_spend(&k, &[(fund.0, 0)], pay(4_900_000));
+    bad_sig.inputs[0].script_sig[100] ^= 0x01;
+    let low_fee = signed_spend(&k, &[(fund.0, 0)], pay(5_000_000 - 12_000));
+    assert!(core::tokenomics::min_tx_fee_sat(low_fee.to_wire_bytes(true).len()) > 12_000);
+    for (what, tx, fees, fragment) in [
+        ("bad signature", bad_sig, 100_000, "invalid signature"),
+        ("fee above the floor, below this body's minimum", low_fee, 12_000, "below consensus minimum"),
+    ] {
+        let n = node_with(&genesis, std::slice::from_ref(&fund));
+        let b = block_with_txs(&n, gh, what, fees, vec![tx]);
+        let e = classify_below(&n, &b);
+        assert!(e.reason.contains(fragment) && e.witness_dependent, "{what}: {e:?}");
+        accept(&n, &b).expect_err(what);
+        assert!(n.dag.read().is_body_pending(&b.block_hash()), "{what}: waits for another body");
+        assert!(n.store.invalid_block_reason(&b.block_hash()).unwrap().is_none(), "{what}: nothing persisted");
+    }
+}
+
+/// B1-T13: a block whose body was rejected for a witness-dependent reason
+/// waits for another body, but its body is WANTED (requested and chased from
+/// peers) only while the chain through it can become the best one: a tip on
+/// it is heavier than the selected tip (Bitcoin Core downloads blocks of the
+/// best header chain only). Before the fix it was chased forever, so each
+/// such block (one block of proof of work) held a body-pull slot and every
+/// re-malleated answer re-validated it, however far the honest chain moved
+/// on. Once the honest chain is heavier the pulls stop; if the waiting branch
+/// grows heavier again they resume.
+#[test]
+fn wanted_bodies_are_bounded_by_the_best_chain() {
+    use gnb::ingress::{awaited_bodies_to_chase, awaited_bodies_to_request};
+    use gnb::sync::parent_fetch::ParentFetchTracker;
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0xD5u8; 32], 0u32, out(5_000_000, &k.spk));
+    let n = node_with(&genesis, std::slice::from_ref(&fund));
+    let m1 = empty_child(&n, gh, "main-1");
+    accept(&n, &m1).unwrap();
+    let mut bad = signed_spend(&k, &[(fund.0, 0)], vec![out(4_900_000, &[0x9A; 20])]);
+    bad.inputs[0].script_sig[100] ^= 0x01;
+    let f = block_with_txs(&n, gh, "fork", 100_000, vec![bad]);
+    // Equal weight to m1: stored unevaluated as a fork-loser, or (when it
+    // wins the hash tie-break) evaluated and its body rejected right away.
+    let _ = accept(&n, &f);
+    let g = empty_child(&n, f.block_hash(), "fork-child");
+    let _ = accept(&n, &g); // stored; the branch is evaluated and waits for F's body
+    assert!(n.dag.read().is_body_pending(&f.block_hash()));
+    let tracker = ParentFetchTracker::new();
+    let wanted = |n: &Node| awaited_bodies_to_request(&n.dag.read(), &tracker, 64);
+    let chased = |n: &Node| awaited_bodies_to_chase(&n.dag.read(), &tracker, 64);
+    assert_eq!(wanted(&n), vec![f.block_hash()], "the waiting branch is the heaviest");
+    assert_eq!(chased(&n), vec![f.block_hash()]);
+
+    // The honest chain moves on: three blocks against the branch's two.
+    let m2 = empty_child(&n, m1.block_hash(), "main-2");
+    accept(&n, &m2).unwrap();
+    let m3 = empty_child(&n, m2.block_hash(), "main-3");
+    accept(&n, &m3).unwrap();
+    assert!(n.dag.read().is_body_pending(&f.block_hash()), "still waiting (in memory, never persisted)");
+    assert!(wanted(&n).is_empty(), "no longer requested: the honest chain is heavier");
+    assert!(chased(&n).is_empty(), "no longer chased");
+    // ... and a copy that arrives anyway is known (an unrequested low-work
+    // block in Bitcoin Core): it is not validated again.
+    assert!(!gnb::accept::awaits_body(&n.dag, &n.store, &f.block_hash()));
+    let err = accept(&n, &f).expect_err("known");
+    assert!(err.contains("already in DAG"), "{err}");
+
+    // The waiting branch grows heavier again: its body is wanted again.
+    let g2 = empty_child(&n, g.block_hash(), "fork-2");
+    accept(&n, &g2).unwrap();
+    let g3 = empty_child(&n, g2.block_hash(), "fork-3");
+    accept(&n, &g3).unwrap();
+    assert_eq!(wanted(&n), vec![f.block_hash()]);
+    assert!(gnb::accept::awaits_body(&n.dag, &n.store, &f.block_hash()));
+}

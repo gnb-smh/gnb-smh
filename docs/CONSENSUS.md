@@ -1060,22 +1060,46 @@ exactly one valid block body per block id.
 blocks below the activation (109,999 on mainnet) stay malleable forever, so a
 node must not let a mutated copy disqualify their ids. This is node policy,
 not a consensus rule: it changes no verdict, only what a node remembers. A
-connect-time failure of a block below the activation is classified by what it
-depends on (`accept::BlockInvalidity::witness_dependent`):
+connect-time failure of a block below the activation is classified by
+whether another body with the same id could cure it
+(`accept::BlockInvalidity::witness_dependent`; Bitcoin Core likewise caches
+every failure as `BLOCK_CONSENSUS` except a detected malleation):
 
-- witness-dependent: a non-coinbase `script_sig` that does not parse, a public
-  key that does not hash to the prevout's `script_pubkey` (the key lives in
-  the `script_sig`), a signature that does not verify (sighash v2: below the
-  activation every transaction version is verified with it, under the
-  lenient witness framing), and the consensus minimum fee (measured on the
-  wire size, `script_sig` included). Size limits measured with witnesses are
-  context-free and checked before a block is stored, so they never reach this
-  point;
-- id-committed: everything else (missing or double-spent inputs, coinbase
+- witness-dependent (curable): a non-coinbase `script_sig` that does not
+  parse, a public key that does not hash to the prevout's 20-byte
+  `script_pubkey` (the key lives in the `script_sig`), a signature that does
+  not verify (sighash v2: below the activation every transaction version is
+  verified with it, under the lenient witness framing), and the size-based
+  consensus minimum fee (measured on the wire size, `script_sig` included)
+  when the fee reaches the floor below. Size limits measured with witnesses
+  are context-free and checked before a block is stored, so they never
+  reach this point;
+- id-committed: everything else — missing or double-spent inputs, coinbase
   maturity, values and MoneyRange, coinbase value, shielded state, the
-  transaction version rule — the txid covers the version, and the rule can
-  fail only at/after the activation —, and at/after the activation BIP30 and
-  the same-block coinbase spend).
+  transaction version rule (the txid covers the version, and the rule can
+  fail only at/after the activation), at/after the activation BIP30 and the
+  same-block coinbase spend — and the failures no witness can cure
+  (re-audit B1-T13): a fee below `min_tx_fee_sat(s)` with `s` the size of
+  the transaction with every `script_sig` empty (one length byte each: the
+  smallest any body with this txid can have; at least `MIN_TX_FEE_SAT`, so
+  a transaction without inputs, whose fee is 0, is here too), and a spend
+  of a coin whose `script_pubkey` is not 20 bytes (no public key hashes to
+  it).
+
+The class is decided by the whole block: the connect validates in two passes
+(`accept::validate_block_in_view_classified_at`, and the reference
+`reference/gnb_validity.py` `connect_block`): first the id-committed checks
+of every transaction in block order (same-block coinbase spend and maturity,
+inputs, version rule, values, the fee floor, 20-byte prevout scripts), then
+the coinbase value; then the witness checks of every transaction in block
+order (scripts, then the size-based minimum fee). A block with a bad
+signature in one transaction and an overspend in a later one is therefore
+id-committed. The verdict is the one of any order (every rule must hold);
+only the first failure reported, and so the error class of a block failing
+several rules, follows this order. It also means no signature is checked
+for a block that fails a cheap rule (Bitcoin Core's `ConnectBlock` likewise
+runs `CheckTxInputs` for every transaction and leaves the scripts to its
+check queue).
 
 The failures that exist only at/after the activation (an invalid version, a
 non-canonical witness, a sighash-v3 signature) are id-committed there like
@@ -1115,7 +1139,21 @@ the pull is retried at the sweep's backoff. `accept_block` takes a copy of the
 same id whose witness root differs from every body already rejected for it:
 the copy passes the same acceptance checks as a new block, replaces the body,
 and the chain is re-evaluated. A block in the DAG whose body is missing (for example after a
-restart) is treated the same way. At/after the activation the witness
+restart) is treated the same way.
+
+Waiting is bounded by the best chain (re-audit B1-T13,
+`GhostDAG::is_body_wanted`): the body of a waiting block is wanted — requested
+from peers, chased by the sweep, and a copy processed — only while some
+block on whose selected chain it lies (itself included, with no persisted
+disqualification in between) orders above the selected tip under the tip
+order (`blue_work`, then `blue_score`, then hash), or while an operator
+override needs it (`accept::request_bodies`, and a body dropped during the
+override's own move), until a body arrives. Once the honest chain is heavier
+than the waiting branch its bodies are neither fetched nor taken (a copy is
+known, like an unrequested block with less work than the tip in Bitcoin
+Core); they are wanted again if the branch becomes heavier. A block whose
+body no witness can fix is disqualified outright (above), so it never
+waits. At/after the activation the witness
 commitment fixes every byte of a stored body, so every connect-time failure is
 id-committed and is persisted as before. `node/tests/fix_block_rules.rs`
 (`witness_corrupted_*`) covers the corrupted-then-honest order, restarts, and
