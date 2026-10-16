@@ -2310,8 +2310,9 @@ mod hardening_core_tests {
         assert_eq!(expected_bits_at(on, act, act).unwrap(), GENESIS_BITS);
         let ahead = GENESIS_TIMESTAMP;
         assert_eq!(expected_bits_at(ahead, act, act).unwrap(), expected_bits_at(ahead, act, activation::NEVER).unwrap());
-        // Mainnet schedule: identical to the pre-activation rule below 110,000.
-        for h in [1u64, 2, 100, 109_999] {
+        // Mainnet schedule: identical to the pre-activation rule below its
+        // activation height.
+        for h in [1u64, 2, 100, activation::MAINNET_HARDENING_ACTIVATION_HEIGHT - 1] {
             assert_eq!(
                 expected_bits_at(late, h, activation::MAINNET_HARDENING_ACTIVATION_HEIGHT).unwrap(),
                 gnb_smh::difficulty::asert_next_bits(&asert_params(), &asert_anchor(), late as i64, h).unwrap(),

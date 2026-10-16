@@ -53,8 +53,8 @@ HARDENED_POW_LIMIT_BITS = 0x1F0E9036  # the genesis target
 BLOCK_ID_DOMAIN = b"GNB-BLOCK-ID-v1"
 
 # The hardening activation schedule of each network (docs/CONSENSUS.md,
-# "Activation"): mainnet 110,000, testnet/regtest 0.
-HARDENING_ACTIVATION_HEIGHT = {"mainnet": 110_000, "testnet": 0}
+# "Activation"): mainnet 25,800 (110,000 before 2026-10-16), testnet/regtest 0.
+HARDENING_ACTIVATION_HEIGHT = {"mainnet": 25_800, "testnet": 0}
 
 # Relay policy (node/src/mempool).
 MAX_TX_SIZE = 400 * 1024

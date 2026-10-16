@@ -1707,7 +1707,7 @@ mod tests {
             assert_eq!(ease_target_to(&[0u8; 32], 4, &limit), limit, "a zero target falls back to the limit");
         }
         assert_eq!(ease_target(&legacy, 4, 1), core::Block::pow_limit_target_for_height(1));
-        for h in [1u64, 110_000, u64::MAX] {
+        for h in [1u64, core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT, u64::MAX] {
             assert!(reference_target(h.saturating_sub(1), 0) <= core::Block::pow_limit_target_for_height(h));
         }
         let limit = core::bits_to_target(core::POW_LIMIT_BITS);
@@ -1722,19 +1722,20 @@ mod tests {
     /// Review of the P3 merge: the orphan floor is capped at the pow limit of
     /// the height the orphan CLAIMS (what `validate_pow` checks its proof
     /// against), not of the tip's next height. Mainnet schedule (activation
-    /// 110,000), tip past the activation with the network at the genesis
-    /// target: an orphan of a heavier fork at a pre-activation height whose
-    /// legal bits are 4x easier than the genesis target is admitted (it was
-    /// dropped as `OrphanBelowFloor` when the cap was the genesis target of
-    /// height tip+1), while the same bits at a post-activation height still
-    /// fail (they fail `validate_pow` there anyway).
+    /// `MAINNET_HARDENING_ACTIVATION_HEIGHT`), tip past the activation with
+    /// the network at the genesis target: an orphan of a heavier fork at a
+    /// pre-activation height whose legal bits are 4x easier than the genesis
+    /// target is admitted (it was dropped as `OrphanBelowFloor` when the cap
+    /// was the genesis target of height tip+1), while the same bits at a
+    /// post-activation height still fail (they fail `validate_pow` there
+    /// anyway).
     #[test]
     fn orphan_floor_cap_follows_the_orphans_own_height() {
-        const ACT: u64 = 110_000;
+        const ACT: u64 = core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
         let pow_limit_at = |h: u64| core::bits_to_target(core::block_rules::pow_limit_bits_at(h, ACT));
         let genesis = core::bits_to_target(core::GENESIS_BITS);
         // Network target near the genesis target after the activation: the
-        // reference a child of the tip at 110,500 would carry.
+        // reference a child of the tip at ACT + 500 would carry.
         let reference = genesis;
         let easier_4x = {
             use primitive_types::U256;
@@ -1752,7 +1753,7 @@ mod tests {
         assert_eq!(pre, ease_target_to(&reference, ORPHAN_WORK_FLOOR_SHIFT, &pow_limit_at(0)),
             "below the activation: the legacy cap, i.e. 16x the reference");
         // The pre-merge cap (pow limit of tip_h + 1) dropped it.
-        let at_tip_next = floor(110_501);
+        let at_tip_next = floor(ACT + 501);
         assert_eq!(at_tip_next, genesis);
         assert!(!bits_meet_floor(bits_4x, &at_tip_next));
         // Never easier than 16x the reference, whatever height is claimed.

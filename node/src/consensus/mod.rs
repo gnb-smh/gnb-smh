@@ -19,7 +19,7 @@
 //!
 //! Hardening activation (audit 2026-10-14, DAG-3 / DAG-4 / DAG-7):
 //!   Blocks whose `GhostdagData::height` is at or above
-//!   [`GhostDAG::hardening_activation_height`] (mainnet 110,000; testnet and
+//!   [`GhostDAG::hardening_activation_height`] (mainnet 25,800; testnet and
 //!   regtest 0, see `crate::core::activation`) are processed under corrected
 //!   rules. Blocks below it are processed exactly as before.
 //!   - blue_work = sp.blue_work + work of the mergeset blues + own work, i.e.

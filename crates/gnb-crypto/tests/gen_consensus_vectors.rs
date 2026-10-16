@@ -62,8 +62,12 @@ fn subsidy(height: u64) -> u64 {
 
 /// The explicit activation height of most cases, and the heights either side.
 const ACT: u64 = 1_000;
-/// The networks' activation schedules (docs/CONSENSUS.md, "Activation").
-const MAINNET_ACT: u64 = 110_000;
+/// The networks' activation schedules (docs/CONSENSUS.md, "Activation"):
+/// this file's own copy of `activation::MAINNET_HARDENING_ACTIVATION_HEIGHT`
+/// (25,800 since 2026-10-16; 110,000 before). The `schedule` cases built from
+/// it pin the consensus constant: the runners take the height from the
+/// schedule, so they fail if the two disagree.
+const MAINNET_ACT: u64 = 25_800;
 const TESTNET_ACT: u64 = 0;
 const NEVER: u64 = u64::MAX;
 
@@ -583,13 +587,15 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         c.valid("basic/three-inputs-same-key", r, "Three inputs locked to one key; each signature commits to its own input index.", ps, &tx);
     }
     for (id, act, h, r, desc) in [
-        ("basic/mainnet-schedule/109999", MAINNET_ACT, MAINNET_ACT - 1, Pre, "The mainnet activation height 110,000: the last pre-activation height."),
-        ("basic/mainnet-schedule/110000", MAINNET_ACT, MAINNET_ACT, Post, "The mainnet activation height 110,000: the first post-activation height."),
-        ("basic/activation-zero/height-1", 0, 1, Post, "Activation height 0 (testnet/regtest schedule): the rules apply from height 1."),
-        ("basic/never-activated/height-4000000", NEVER, 4_000_000, Pre, "Activation height u64::MAX (never): the old rules at any height."),
+        (format!("basic/mainnet-schedule/{}", MAINNET_ACT - 1), MAINNET_ACT, MAINNET_ACT - 1, Pre,
+            format!("The mainnet activation height {MAINNET_ACT}: the last pre-activation height.")),
+        (format!("basic/mainnet-schedule/{MAINNET_ACT}"), MAINNET_ACT, MAINNET_ACT, Post,
+            format!("The mainnet activation height {MAINNET_ACT}: the first post-activation height.")),
+        ("basic/activation-zero/height-1".to_string(), 0, 1, Post, "Activation height 0 (testnet/regtest schedule): the rules apply from height 1.".to_string()),
+        ("basic/never-activated/height-4000000".to_string(), NEVER, 4_000_000, Pre, "Activation height u64::MAX (never): the old rules at any height.".to_string()),
     ] {
-        let (tx, p) = simple(ka, r, id);
-        c.push_full(id, desc, ChainId::Mainnet, act, h, vec![p], tx.to_wire_bytes(true), None, Policy::Accept);
+        let (tx, p) = simple(ka, r, &id);
+        c.push_full(&id, &desc, ChainId::Mainnet, act, h, vec![p], tx.to_wire_bytes(true), None, Policy::Accept);
     }
 
     // ── Structure ───────────────────────────────────────────────────────────
@@ -921,16 +927,16 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
             "Version 3 signed over sighash v2 (legacy binding) from the activation: verified against sighash v3, the signature fails. No transaction is valid in both regimes.",
             vec![p], &tx, "bad-signature");
         for (id, act, h, r, ver, err, pol, desc) in [
-            ("version/mainnet-boundary/v1-at-110000", MAINNET_ACT, MAINNET_ACT, Pre, 1u32, Some("bad-version"), Policy::Reject("bad-version"),
-                "Version 1 at the mainnet activation height 110,000."),
-            ("version/mainnet-boundary/v3-sighash-v2-at-109999", MAINNET_ACT, MAINNET_ACT - 1, Pre, 3, None, Policy::Reject("non-standard-version"),
-                "Version 3 over sighash v2 at height 109,999 under the mainnet schedule: consensus-valid, non-standard."),
-            ("version/never/v3-sighash-v2", NEVER, 4_000_000, Pre, 3, None, Policy::Reject("non-standard-version"),
-                "Never activated: version 3 over sighash v2 at height 4,000,000 is consensus-valid, non-standard."),
-            ("version/never/v2", NEVER, 4_000_000, Pre, 2, None, Policy::Accept, "Never activated: version 2 at height 4,000,000."),
+            (format!("version/mainnet-boundary/v1-at-{MAINNET_ACT}"), MAINNET_ACT, MAINNET_ACT, Pre, 1u32, Some("bad-version"), Policy::Reject("bad-version"),
+                format!("Version 1 at the mainnet activation height {MAINNET_ACT}.")),
+            (format!("version/mainnet-boundary/v3-sighash-v2-at-{}", MAINNET_ACT - 1), MAINNET_ACT, MAINNET_ACT - 1, Pre, 3, None, Policy::Reject("non-standard-version"),
+                format!("Version 3 over sighash v2 at height {} under the mainnet schedule: consensus-valid, non-standard.", MAINNET_ACT - 1)),
+            ("version/never/v3-sighash-v2".to_string(), NEVER, 4_000_000, Pre, 3, None, Policy::Reject("non-standard-version"),
+                "Never activated: version 3 over sighash v2 at height 4,000,000 is consensus-valid, non-standard.".to_string()),
+            ("version/never/v2".to_string(), NEVER, 4_000_000, Pre, 2, None, Policy::Accept, "Never activated: version 2 at height 4,000,000.".to_string()),
         ] {
-            let (tx, p) = simple_with(ka, r, id, |t| t.version = ver);
-            c.push_full(id, desc, ChainId::Mainnet, act, h, vec![p], tx.to_wire_bytes(true), err, pol);
+            let (tx, p) = simple_with(ka, r, &id, |t| t.version = ver);
+            c.push_full(&id, &desc, ChainId::Mainnet, act, h, vec![p], tx.to_wire_bytes(true), err, pol);
         }
     }
 
@@ -2043,6 +2049,15 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
     }
 
     // ── Pow limit (POW-3) ───────────────────────────────────────────────────
+    let mainnet_pre = MAINNET_ACT - 1;
+    let (mainnet_pre_id, mainnet_pre_desc) = (
+        format!("pow/mainnet-{mainnet_pre}-pow-limit-bits"),
+        format!("bits = 0x2100ffff at height {mainnet_pre} under the mainnet schedule."),
+    );
+    let (mainnet_at_id, mainnet_at_desc) = (
+        format!("pow/mainnet-{MAINNET_ACT}-pow-limit-bits"),
+        format!("bits = 0x2100ffff at height {MAINNET_ACT} under the mainnet schedule."),
+    );
     for (id, act, hh, bits, pow, err, desc) in [
         ("pow/pow-limit-bits-below-the-activation", ACT, ACT - 1, POW_LIMIT_BITS, Pow::Full, None,
             "bits = 0x2100ffff (the pre-activation pow limit) below the activation; the proof is evaluated and holds (at this target all but about 1 output in 65,536 do, so this case pins the limit, not the proof: see pow/genesis-bits-*)."),
@@ -2054,10 +2069,8 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
             "bits = 0x1f0e9037: one mantissa unit above the genesis target, from the activation."),
         ("pow/genesis-target-plus-one-below-the-activation", ACT, ACT - 1, GENESIS_BITS + 1, Pow::Limit, None,
             "bits = 0x1f0e9037 below the activation: within the old pow limit."),
-        ("pow/mainnet-109999-pow-limit-bits", MAINNET_ACT, MAINNET_ACT - 1, POW_LIMIT_BITS, Pow::Limit, None,
-            "bits = 0x2100ffff at height 109,999 under the mainnet schedule."),
-        ("pow/mainnet-110000-pow-limit-bits", MAINNET_ACT, MAINNET_ACT, POW_LIMIT_BITS, Pow::Limit, Some("pow-limit"),
-            "bits = 0x2100ffff at height 110,000 under the mainnet schedule."),
+        (mainnet_pre_id.as_str(), MAINNET_ACT, mainnet_pre, POW_LIMIT_BITS, Pow::Limit, None, mainnet_pre_desc.as_str()),
+        (mainnet_at_id.as_str(), MAINNET_ACT, MAINNET_ACT, POW_LIMIT_BITS, Pow::Limit, Some("pow-limit"), mainnet_at_desc.as_str()),
         ("pow/negative-bits", ACT, ACT, 0x0480_0001, Pow::Limit, Some("bad-bits"), "bits with the sign bit set: malformed."),
         ("pow/zero-mantissa-bits", ACT, ACT - 1, 0x1F00_0000, Pow::Limit, Some("bad-bits"), "bits with a zero mantissa: malformed."),
         ("pow/exponent-out-of-range-bits", ACT, ACT - 1, 0x2300_0001, Pow::Limit, Some("bad-bits"), "bits with exponent 0x23: the target does not fit 256 bits."),

@@ -29,7 +29,8 @@
 //! Activation: an `explicit` case installs its height with
 //! `activation::scoped_override`; a `schedule` case installs nothing, so every
 //! rule runs under the process-wide height of the node's chain id (mainnet
-//! 110,000 here, testnet 0 in the testnet child), which the case thereby pins.
+//! `MAINNET_HARDENING_ACTIVATION_HEIGHT` here, testnet 0 in the testnet
+//! child), which the case thereby pins.
 //! The node's chain id is process-wide (`core::set_node_chain_id`, a
 //! `OnceLock`), so the testnet cases run in a child process of this test
 //! binary (`tx_vectors_testnet`).

@@ -232,7 +232,7 @@ of failed tests.
   submit paths, which run the same `accept_block` and `admission::admit` as
   gossip ingress; the wire decoders are covered by `node/fuzz` and
   `node/tests`.
-- The mainnet side of the activation (110,000): unreachable by a build that
+- The mainnet side of the activation (25,800): unreachable by a build that
   refuses mainnet; covered by Rust tests with `activation::scoped_override`.
 - A target above the pow limit (POW-9, POW-3): the test build pins the pow
   limit to the largest encodable target, so no such block exists for it;

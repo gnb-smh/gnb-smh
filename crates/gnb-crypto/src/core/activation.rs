@@ -11,7 +11,7 @@
 //!
 //! | network | activation height |
 //! | --- | --- |
-//! | mainnet | [`MAINNET_HARDENING_ACTIVATION_HEIGHT`] = 110,000 (about 30 days after the release at 30 s blocks) |
+//! | mainnet | [`MAINNET_HARDENING_ACTIVATION_HEIGHT`] = 25,800 (about 2026-10-17 02:11 UTC on the ASERT schedule; see the constant) |
 //! | testnet | [`TESTNET_HARDENING_ACTIVATION_HEIGHT`] = 0 (active from genesis) |
 //! | regtest | [`REGTEST_HARDENING_ACTIVATION_HEIGHT`] = 0 (active from genesis) |
 //!
@@ -60,8 +60,11 @@
 //! `node_chain_id()` then reports Mainnet. [`hardening_activation_height`]
 //! follows the same rule and returns the **mainnet** height. Consequences:
 //!
-//! - every existing test, which builds DAGs far below 110,000, keeps exercising
-//!   the old rules and keeps passing unchanged;
+//! - every existing test, which builds DAGs far below the mainnet height
+//!   (25,800), keeps exercising the old rules and keeps passing unchanged; a
+//!   test that needs a mainnet-regime height above that, or a boundary
+//!   height, derives it from [`MAINNET_HARDENING_ACTIVATION_HEIGHT`] or pins
+//!   its own activation height, never a literal;
 //! - a binary that forgot to set its chain id behaves like a mainnet node, the
 //!   conservative choice (it never applies the new rules early);
 //! - tests of the new rules must opt in explicitly, with an activation-height
@@ -83,15 +86,38 @@
 //! coordinated network upgrade in its own right: lowering it below the tip of
 //! any node's chain re-validates history under new rules and can split the
 //! network. Raising it is safe only before the old value is reached.
+//!
+//! Moving it (as on 2026-10-16, from 110,000 to 25,800, before the release)
+//! is one change of this constant plus its copies in the independent
+//! references, which must move with it: the generator of the consensus
+//! vectors (`crates/gnb-crypto/tests/gen_consensus_vectors.rs`, `MAINNET_ACT`)
+//! and the Python references (`reference/gnb_validity.py`,
+//! `reference/gnb_merkle.py`, `reference/gnb_difficulty.py`), followed by
+//! regenerating `reference/{tx,block,merkle,difficulty}_vectors.json` with
+//! their generators. The pinned web-wallet core (`site/wallet/gnb_wallet.wasm`)
+//! compiles the height in (`hardening_activation_height_for_signer`) and must
+//! be rebuilt and re-pinned (`scripts/build-wallet-wasm.sh`).
 
 use std::cell::Cell;
 
 use super::ChainId;
 
-/// Mainnet activation height of the hardening rules (about 30 days after the
-/// release at 30 s blocks: 30 * 86,400 / 30 = 86,400 blocks on top of the
-/// chain height at release, rounded up).
-pub const MAINNET_HARDENING_ACTIVATION_HEIGHT: u64 = 110_000;
+/// Mainnet activation height of the hardening rules: about one day after the
+/// decision of 2026-10-16 (it was 110,000, about 30 days after the release,
+/// before that decision).
+///
+/// Derivation (no node was queried; the height comes from the ASERT
+/// schedule, which anchors the difficulty at the genesis block and keeps the
+/// chain height on `(time - genesis time) / 30 s`): genesis timestamp
+/// 1,791,429,092 (2026-10-08 03:11:32 UTC), 30 s target spacing. On
+/// 2026-10-16 02:00 UTC the schedule height is about 22,897; one day more is
+/// 86,400 / 30 = 2,880 blocks, about 25,777, rounded to 25,800, whose
+/// scheduled time is 1,791,429,092 + 25,800 * 30 = 1,792,203,092
+/// (2026-10-17 02:11:32 UTC). Every mainnet block at the time of the decision
+/// is below 25,800, so no existing block changes regime. If the release ships
+/// later than planned, this height must be moved again (before the chain
+/// reaches it), with the vectors regenerated (module docs).
+pub const MAINNET_HARDENING_ACTIVATION_HEIGHT: u64 = 25_800;
 
 /// Testnet activates the hardening rules from genesis.
 pub const TESTNET_HARDENING_ACTIVATION_HEIGHT: u64 = 0;
@@ -217,10 +243,11 @@ mod tests {
 
     #[test]
     fn schedule_matches_the_decision() {
-        assert_eq!(MAINNET_HARDENING_ACTIVATION_HEIGHT, 110_000);
+        // The decision of 2026-10-16 (see the constant's documentation).
+        assert_eq!(MAINNET_HARDENING_ACTIVATION_HEIGHT, 25_800);
         assert_eq!(TESTNET_HARDENING_ACTIVATION_HEIGHT, 0);
         assert_eq!(REGTEST_HARDENING_ACTIVATION_HEIGHT, 0);
-        assert_eq!(hardening_activation_height_for_chain(ChainId::Mainnet), 110_000);
+        assert_eq!(hardening_activation_height_for_chain(ChainId::Mainnet), MAINNET_HARDENING_ACTIVATION_HEIGHT);
         assert_eq!(hardening_activation_height_for_chain(ChainId::Testnet), 0);
         for net in [ActivationNetwork::Mainnet, ActivationNetwork::Testnet, ActivationNetwork::Regtest] {
             let via_chain = match net {
@@ -239,10 +266,22 @@ mod tests {
         assert_eq!(hardening_activation_height_for_network(ActivationNetwork::Regtest), 0);
     }
 
+    /// The documented derivation of the mainnet height: its time on the ASERT
+    /// schedule (genesis timestamp + height * target spacing) is
+    /// 1,792,203,092 = 2026-10-17 02:11:32 UTC.
+    #[test]
+    fn mainnet_height_matches_its_documented_schedule_time() {
+        assert_eq!(super::super::TARGET_BLOCK_TIME, 30);
+        assert_eq!(
+            super::super::GENESIS_TIMESTAMP + MAINNET_HARDENING_ACTIVATION_HEIGHT * super::super::TARGET_BLOCK_TIME,
+            1_792_203_092
+        );
+    }
+
     #[test]
     fn boundary_is_inclusive() {
-        assert!(!is_active_at(109_999, MAINNET_HARDENING_ACTIVATION_HEIGHT));
-        assert!(is_active_at(110_000, MAINNET_HARDENING_ACTIVATION_HEIGHT));
+        assert!(!is_active_at(MAINNET_HARDENING_ACTIVATION_HEIGHT - 1, MAINNET_HARDENING_ACTIVATION_HEIGHT));
+        assert!(is_active_at(MAINNET_HARDENING_ACTIVATION_HEIGHT, MAINNET_HARDENING_ACTIVATION_HEIGHT));
         assert!(is_active_at(0, 0));
         assert!(!is_active_at(u64::MAX - 1, NEVER));
     }

@@ -231,7 +231,7 @@ height cannot serve as the cut-off).
 k = 10. Blocks below the hardening activation height use the interval-index
 ("Fast") coloring, which is applied from genesis but does not count the whole
 selected chain in a candidate's anticone. From the activation height (mainnet
-110,000; testnet and regtest 0) the exact GHOSTDAG coloring, Kaspa blue work
+25,800; testnet and regtest 0) the exact GHOSTDAG coloring, Kaspa blue work
 and the mergeset limits below apply.
 
 ## GhostDAG rules, ledger semantics and the hardening activation
@@ -246,9 +246,28 @@ exactly, and their stored `GhostdagData` stays valid.
 
 | Network | Hardening activation height |
 | --- | --- |
-| mainnet | 110,000 (`MAINNET_HARDENING_ACTIVATION_HEIGHT`) |
+| mainnet | 25,800 (`MAINNET_HARDENING_ACTIVATION_HEIGHT`; about 2026-10-17 02:11 UTC) |
 | testnet | 0 (from genesis) |
 | regtest | 0 (from genesis) |
+
+The mainnet height was moved on 2026-10-16 from 110,000 (about 30 days after
+the release) to about one day after that decision. It was derived from the
+ASERT schedule, not from a node: ASERT anchors the difficulty at the genesis
+block and keeps the chain height on the schedule `(time - genesis time) /
+30 s`. Genesis timestamp 1,791,429,092 (2026-10-08 03:11:32 UTC), 30 s target
+spacing: on 2026-10-16 02:00 UTC the schedule height is about 22,897; one day
+is 2,880 blocks, about 25,777, rounded to 25,800, whose scheduled time is
+1,791,429,092 + 25,800 × 30 = 1,792,203,092 (2026-10-17 02:11:32 UTC). Every
+mainnet block at the time of the decision is below 25,800, so no existing
+block changes regime. The real chain can run somewhat ahead of or behind the
+schedule; the rules switch at the height, whatever the time. Every node and
+miner must run a release with this height before the chain reaches it
+(`RUNNING.md`, "Hardening activation"); a node with the old height (or none)
+keeps the old rules there and splits from the upgraded nodes. Moving the
+height again is one constant (`crates/gnb-crypto/src/core/activation.rs`),
+its copies in the generator of the consensus vectors and the Python
+references, the regenerated vectors, and a rebuilt web-wallet core
+(`site/wallet/gnb_wallet.wasm` compiles the height in).
 
 Every consensus change of the 2026-10-14 audit activates at this ONE height.
 The schedule is defined in `crates/gnb-crypto/src/core/activation.rs`, and the
@@ -570,7 +589,7 @@ WAL-1), that its cost was quadratic in the transaction size (MEM-5), that a
 hybrid signature could be split into a valid ML-DSA-only signature (CRY-2),
 and that witnesses were malleable (CRY-1). The fixes below change validity, so
 the consensus parts take effect at the hardening activation height (mainnet
-110,000; testnet and regtest 0). The rules live in
+25,800; testnet and regtest 0). The rules live in
 `crates/gnb-crypto/src/core/sighash.rs`; the node applies them through one
 function, `mempool::admission::verify_input_scripts`, which block acceptance
 and connect (`accept::validate_tx_inputs`), reorg connect, the template
@@ -869,7 +888,7 @@ domain separation and no 64-byte rule (VAL-10), nothing committed to witness
 bytes (CRY-1), the block-size limit used a different encoding than fees
 (VAL-12), and the pow limit allowed blocks worth one evaluation (POW-3). The
 rules below take effect at the same hardening activation height as the
-GhostDAG rules (mainnet 110,000; testnet and regtest 0). The code is
+GhostDAG rules (mainnet 25,800; testnet and regtest 0). The code is
 `crates/gnb-crypto/src/core/block_rules.rs` and `validate_block_in_view` in
 `node/src/accept.rs`. The executable reference is `reference/gnb_merkle.py`
 (pow limit: `reference/gnb_difficulty.py`). The golden vectors in
@@ -1006,8 +1025,8 @@ activation ("Transaction signatures", "Witnesses"): with both rules there is
 exactly one valid block body per block id.
 
 **Below the activation (node-local, all heights of the old rules).** The
-blocks below the activation (109,999 on mainnet) stay malleable forever, so a
-node must not let a mutated copy disqualify their ids. This is node policy,
+blocks below the activation (up to 25,799 on mainnet) stay malleable forever,
+so a node must not let a mutated copy disqualify their ids. This is node policy,
 not a consensus rule: it changes no verdict, only what a node remembers. A
 connect-time failure of a block below the activation is classified by what it
 depends on (`accept::BlockInvalidity::witness_dependent`):

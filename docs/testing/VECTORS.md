@@ -122,13 +122,13 @@ itself). Further cases use activation 0 on mainnet, "never"
 - `explicit`: the recorded height, installed for the case
   (`activation::scoped_override` in the node runner, the `_at` functions'
   argument in the gnb-crypto runner);
-- `schedule`: the case's network's own activation schedule (mainnet 110,000,
+- `schedule`: the case's network's own activation schedule (mainnet 25,800,
   testnet 0; docs/CONSENSUS.md, "Activation"), which the runners do NOT
   install: the gnb-crypto runner evaluates the case under
   `activation::hardening_activation_height_for_chain(chain)` (and
   `validate_pow` under the process-wide height), the node runner under the
   process-wide height of its chain id (mainnet in the main process, testnet
-  in the testnet child). These cases (mainnet 109,999 / 110,000 for the
+  in the testnet child). These cases (mainnet 25,799 / 25,800 for the
   version rule, the 64-byte rule, the coinbase commitment and the pow limit;
   testnet activation 0 at height 1) therefore pin the schedule constants and
   the chain-id-to-schedule mapping; the Python check verifies that the
@@ -392,7 +392,7 @@ Transactions (187: 98 pre-activation, 89 post-activation; 66 valid; 182 on mainn
 
 | Area | Cases | What |
 | --- | --- | --- |
-| `basic/` | 10 | honest signers of both regimes; 1-3 inputs; the mainnet schedule (109,999 / 110,000, `activation_source: schedule`), activation 0 on mainnet, never activated |
+| `basic/` | 10 | honest signers of both regimes; 1-3 inputs; the mainnet schedule (25,799 / 25,800, `activation_source: schedule`), activation 0 on mainnet, never activated |
 | `struct/` | 15 | no outputs (valid, non-standard), no inputs, coinbase-shaped transaction, missing input, null outpoint in a 2-input transaction, duplicate inputs, two vouts of one txid, lock time and sequence not enforced |
 | `decode/` | 8 | truncated, trailing byte, non-minimal varint, empty, input / output count above the cap, 10,001-byte script_sig and script_pubkey |
 | `size/` | 6 | a 10,000-byte script_sig (lenient padding: valid pre, non-canonical post), a 10,000-byte output script, 300 outputs |
@@ -458,7 +458,7 @@ build):
 | dust threshold off by one (546 is dust) | both | `dust/output-546/*`, `value/output-u64-max/*` (its second output is 546), the 1 MB blocks of 546-unit outputs |
 | coinbase maturity off by one (depth 99 accepted) | node | `maturity/depth-99/*` (consensus and mempool), `maturity/immature-coinbase-spend-in-block/*` |
 | VAL-3 removed (same-block coinbase) | node | `maturity/same-block-coinbase/post`, `same-block-coinbase/post/connect` |
-| 64-byte rule measured with script_sig | both | gnb-crypto: the recorded txid preimage size of 175 cases; node: `tx64/64-byte-transaction/post`, `tx64/mainnet-boundary/110000`, `tx64/64-byte-transaction-in-block/post` |
+| 64-byte rule measured with script_sig | both | gnb-crypto: the recorded txid preimage size of 175 cases; node: `tx64/64-byte-transaction/post`, `tx64/mainnet-boundary/25800`, `tx64/64-byte-transaction-in-block/post` |
 | version 2 accepted from the activation | both | `version/v2-sighash-v2/post` |
 | canonical witness accepts trailing bytes | both | `witness/one-trailing-byte/post`, `witness/1000-trailing-bytes/post`, `witness/pk-length-one-short/post`, `size/script-sig-10000-bytes/post`, and the mempool verdicts of the padded pre-activation cases |
 | sighash v3 verifier ignores the signature's suite | both | `suite/mldsa-only-0x0002-spend/post` |
@@ -467,7 +467,7 @@ build):
 | tagged Merkle tree pairs an odd node with itself | both | gnb-crypto: tagged and witness roots of 25 block cases; node: the 5 post-activation blocks with an odd transaction count |
 | coinbase may not claim the full subsidy + fees | node | 27 block cases |
 | block size measured on bincode from the activation | both | `size/bincode-1000001-wire-below/post` |
-| hardened pow limit = the old pow limit | both | `pow/pow-limit-bits-from-the-activation`, `pow/genesis-target-plus-one-from-the-activation`, `pow/mainnet-110000-pow-limit-bits` |
+| hardened pow limit = the old pow limit | both | `pow/pow-limit-bits-from-the-activation`, `pow/genesis-target-plus-one-from-the-activation`, `pow/mainnet-25800-pow-limit-bits` |
 | commitment height also accepted big-endian | both | `commitment/height-big-endian/post` |
 | lenient witness framing made exact below the activation | both | `witness/one-trailing-byte/pre`, `witness/1000-trailing-bytes/pre`, `size/script-sig-10000-bytes/pre`, `fee/witness-padding-raises-the-minimum/pre`, `witness/padded-witness-same-block-id/pre` |
 | MoneyRange allows `MAX_SUPPLY_SAT + 1` | node | `value/output-above-max-supply/*`, `value/prevout-above-max-supply/*`, `coinbase/above-max-supply/*` (the gnb-crypto runner of that round compared no `value-out-of-range` verdict at all, on either side; fixed in the second round) |
@@ -494,7 +494,7 @@ with its own target dir; the baselines passed in both.
 | admission without its "no inputs" rule (still refused, as zero-value) | node runner passed | node runner: `struct/no-inputs/*` (refusal class) |
 | `core::check_min_fee` accepts one unit below the minimum | gnb-crypto runner passed | gnb-crypto runner: `fee/minimum-minus-one/*` |
 | `core::check_coinbase_maturity` accepts depth 99 | gnb-crypto runner passed | gnb-crypto runner: `maturity/depth-99/*` |
-| `MAINNET_HARDENING_ACTIVATION_HEIGHT` = 110,001 | both runners passed | both runners: `basic/mainnet-schedule/110000`, `version/mainnet-boundary/v1-at-110000`, `tx64/mainnet-boundary/110000`, `commitment/no-commitment-at-mainnet-height-110000`, `pow/mainnet-110000-pow-limit-bits` (node: also their mempool verdicts) |
+| `MAINNET_HARDENING_ACTIVATION_HEIGHT` + 1 (run as 110,001 when the height was 110,000; the cases were then named `.../110000`) | both runners passed | both runners: `basic/mainnet-schedule/25800`, `version/mainnet-boundary/v1-at-25800`, `tx64/mainnet-boundary/25800`, `commitment/no-commitment-at-mainnet-height-25800`, `pow/mainnet-25800-pow-limit-bits` (node: also their mempool verdicts) |
 | `TESTNET_HARDENING_ACTIVATION_HEIGHT` = 2 | node runner passed | both runners: `net/testnet-schedule/height-1` (node: the testnet child, consensus and mempool) |
 
 Python corruptions of the second round, each reported: the mined nonce + 1
@@ -565,6 +565,22 @@ version 1 at it.
   generator also refuses to record `witness-non-canonical` as the refusal
   class of anything but a version-3 transaction at/after the activation. No
   other case changed; `block_vectors.json` is unchanged.
+
+- **Mainnet activation moved to 25,800 (2026-10-16).** The generator's
+  `MAINNET_ACT` went from 110,000 to 25,800 with
+  `MAINNET_HARDENING_ACTIVATION_HEIGHT`, and both files were regenerated. The
+  ten `activation_source: schedule` cases of the mainnet boundary moved from
+  109,999 / 110,000 to 25,799 / 25,800 and were renamed with their heights
+  (`basic/mainnet-schedule/*`, `version/mainnet-boundary/*`,
+  `tx64/mainnet-boundary/*`, `commitment/no-commitment-at-mainnet-height-*`,
+  `pow/mainnet-*-pow-limit-bits`). The id seeds each case's funding outpoint
+  and destination, so their prevouts, transaction or block bytes and derived
+  values changed too. Every verdict, refusal class, regime and activation
+  source is unchanged, and no other case changed. In `merkle_vectors.json`
+  the block at the mainnet activation height moved from 110,000 to 25,800
+  (`gen_merkle_vectors.py` now takes it from `gnb_merkle.py`), and
+  `difficulty_vectors.json` section `hardening_pow_limit` moved its mainnet
+  cases to 25,799 / 25,800 / 25,801 with the same bits.
 
 ## Findings while building the vectors
 

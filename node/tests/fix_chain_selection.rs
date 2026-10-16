@@ -1598,17 +1598,17 @@ fn pow3_merge_backed_deep_blocks_are_rationed() {
 }
 
 /// Audit POW-3 follow-up (review): under the hardened rules (testnet and
-/// regtest from genesis, mainnet from 110,000) blue work counts merged blues,
-/// so the threshold is real blue work — but the work rule credited an
-/// announced fork with the work of ONE path of orphans. A heavier DAG-shaped
-/// fork (here two blocks per level, each merging both blocks of the level
-/// below) was refused for good: its first block's single-path credit
-/// (51 + 500 blocks of work) never reached the threshold (640), while the fork
-/// (1,051 blocks of blue work) beats the 1,000-block chain. The credit is now
-/// the summed work of the distinct orphans announced above a block, buffered
-/// or evicted, each counted once; the node follows the fork tip first through
-/// a pool much smaller than the fork and ends with the UTXO set of a node fed
-/// in order.
+/// regtest from genesis, mainnet from `MAINNET_HARDENING_ACTIVATION_HEIGHT`)
+/// blue work counts merged blues, so the threshold is real blue work — but the
+/// work rule credited an announced fork with the work of ONE path of orphans.
+/// A heavier DAG-shaped fork (here two blocks per level, each merging both
+/// blocks of the level below) was refused for good: its first block's
+/// single-path credit (51 + 500 blocks of work) never reached the threshold
+/// (640), while the fork (1,051 blocks of blue work) beats the 1,000-block
+/// chain. The credit is now the summed work of the distinct orphans announced
+/// above a block, buffered or evicted, each counted once; the node follows the
+/// fork tip first through a pool much smaller than the fork and ends with the
+/// UTXO set of a node fed in order.
 #[test]
 fn pow3_heavier_dag_shaped_fork_is_followed_under_the_hardened_rules() {
     let _hardened = gnb::core::activation::scoped_override(0);

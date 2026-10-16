@@ -17,7 +17,7 @@ hardening activation") apply from height 1, the first block after genesis
   of its transaction ids, checked in Python on block data read back from
   the node over RPC.
 
-The other side of the boundary (mainnet, 110,000) cannot be reached by this
+The other side of the boundary (mainnet, 25,800) cannot be reached by this
 test-only binary, which refuses mainnet; it is covered by the Rust tests
 that move the activation height (activation::scoped_override). Transaction
 rules at the activation are exercised by mempool_tx_relay.py (gnb-cli signs

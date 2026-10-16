@@ -1,5 +1,33 @@
 # Running a GnB node
 
+## Hardening activation: upgrade before mainnet height 25,800
+
+> **Every mainnet node and miner must run this release before the chain
+> reaches height 25,800** (about **2026-10-17 02:11 UTC** on the ASERT
+> schedule: genesis time + 25,800 × 30 s).
+
+- From height 25,800 the consensus rules of the 2026-10-14 audit apply on
+  mainnet (`docs/CONSENSUS.md`, "Activation"; testnet and regtest apply them
+  from genesis). The height is `MAINNET_HARDENING_ACTIVATION_HEIGHT` in
+  `crates/gnb-crypto/src/core/activation.rs`.
+- A node that has not upgraded by then keeps the old rules: it accepts
+  blocks and transactions the upgraded nodes reject (and the reverse), so it
+  splits from the upgraded network at the activation block and follows a
+  separate chain. A build of this release made before 2026-10-16 activates
+  at 110,000 and splits the same way: upgrade it too.
+- Miners: a template for the activation block and after must come from an
+  upgraded node. `getblocktemplate` reports `hardening_activation_height`
+  (25800 on mainnet) and `hardening_active` for the template's height;
+  `getdaginfo` reports `next_block_height`.
+- Wallets sign version-3 transactions from the activation height on; a
+  wallet built before this release (including a web-wallet core compiled
+  with the old height) signs version 1 there, which every upgraded node
+  refuses.
+- The height comes from the schedule, not from a fixed date: if the release
+  ships later than planned, or the chain is ahead of the schedule, the
+  height must be moved again before the chain reaches it (one constant plus
+  the regenerated vectors; see the constant's documentation).
+
 ## Requirements
 
 - 64-bit Linux or macOS, Rust toolchain from `rust-toolchain.toml`.

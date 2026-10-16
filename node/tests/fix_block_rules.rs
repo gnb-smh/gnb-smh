@@ -1572,11 +1572,12 @@ fn unsealed_block_at(height: u64, spend: &Transaction, fee: u64) -> Block {
 /// `block.height` but evaluated the transaction rules (version, sighash
 /// regime) at its `current_height` argument, which `validate_tx_in_block`
 /// passes as 0. With the mainnet activation, a valid version-3 / sighash-v3
-/// spend in a block at 110,001 was rejected ("invalid signature") and an
-/// invalid version-1 spend accepted. Every rule is now evaluated at
-/// `block.height` (`current_height` only drives coinbase maturity), so both
-/// helpers and the connect rule (`validate_block_in_view_at`) give the same
-/// verdict on both sides of the activation.
+/// spend in a block at the activation height + 1 was rejected ("invalid
+/// signature") and an invalid version-1 spend accepted. Every rule is now
+/// evaluated at `block.height` (`current_height` only drives coinbase
+/// maturity), so both helpers and the connect rule
+/// (`validate_block_in_view_at`) give the same verdict on both sides of the
+/// activation.
 #[test]
 fn in_block_helpers_evaluate_transaction_rules_at_the_block_height() {
     const A: u64 = core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
@@ -1663,8 +1664,9 @@ fn in_block_helper_applies_bip30_to_its_transaction() {
 /// there and the 64-byte rule did not).
 #[test]
 fn block_and_transaction_rule_predicates_agree_at_every_next_block_height() {
-    for act in [0, 1, 2, 7, 109_999, 110_000, activation::NEVER] {
-        for h in [1, 2, 6, 7, 8, 109_998, 109_999, 110_000, 110_001, u64::MAX] {
+    const M: u64 = activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
+    for act in [0, 1, 2, 7, M - 1, M, activation::NEVER] {
+        for h in [1, 2, 6, 7, 8, M - 2, M - 1, M, M + 1, u64::MAX] {
             assert_eq!(block_rules::rules_active_at(h, act), activation::is_active_at(h, act), "h={h} act={act}");
         }
     }

@@ -443,8 +443,9 @@ mod tests {
     fn activation_predicate_excludes_genesis_and_is_inclusive() {
         assert!(!rules_active_at(0, 0), "the genesis is never subject to the new rules");
         assert!(rules_active_at(1, 0));
-        assert!(!rules_active_at(109_999, 110_000));
-        assert!(rules_active_at(110_000, 110_000));
+        let mainnet = activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
+        assert!(!rules_active_at(mainnet - 1, mainnet));
+        assert!(rules_active_at(mainnet, mainnet));
         assert!(!rules_active_at(u64::MAX - 1, activation::NEVER));
     }
 
@@ -671,8 +672,9 @@ mod tests {
 
     #[test]
     fn pow_limit_switches_at_the_boundary() {
-        assert_eq!(pow_limit_bits_at(109_999, 110_000), POW_LIMIT_BITS);
-        assert_eq!(pow_limit_bits_at(110_000, 110_000), GENESIS_BITS);
+        let mainnet = activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
+        assert_eq!(pow_limit_bits_at(mainnet - 1, mainnet), POW_LIMIT_BITS);
+        assert_eq!(pow_limit_bits_at(mainnet, mainnet), GENESIS_BITS);
         assert_eq!(pow_limit_bits_at(1, activation::NEVER), POW_LIMIT_BITS);
         assert_eq!(pow_limit_bits_at(1, 0), GENESIS_BITS);
     }

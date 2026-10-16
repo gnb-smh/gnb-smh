@@ -87,7 +87,7 @@ sending it a few garbage frames. Those releases reject the hardening
 activation block (`CONSENSUS.md`, "Block rules at the hardening
 activation"), so **penalties are in force once the node's next block height
 is above the activation height** (the chain contains the activation block;
-`TxRelay::penalties_in_force`; mainnet from height 110,001, testnet and
+`TxRelay::penalties_in_force`; mainnet from height 25,801, testnet and
 regtest from block 1). From then on every peer that follows the chain
 validates before forwarding, an invalid frame is delivered only by its
 author, and the penalty lands on the author and never on an honest relay.
