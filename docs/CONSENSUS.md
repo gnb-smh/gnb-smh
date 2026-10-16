@@ -1242,6 +1242,21 @@ verifies a signature of another. Because the suite is in every component
 message (and in the digest), stripping the Falcon half of a hybrid signature
 and relabelling it 0x0002 never verifies (`crypto::verify_bound`).
 
+### ML-DSA-65 verification
+
+Every ML-DSA-65 component, at every height and under both sighash versions,
+is verified by FIPS 204 ML-DSA.Verify with the empty context, including the
+bound ‖z‖∞ < γ1 − β (also checked by `crypto::mldsa65_z_within_bound` before
+the library) and UseHint as in Algorithm 40 (h = 1 with r0 ≤ 0, r0 = 0
+included, gives (r1 − 1) mod 16). Nodes link PQClean's portable `clean`
+implementation only (`pqcrypto-mldsa` without its `avx2` / `neon` features):
+its AVX2 code, which those features select at run time on AVX2 CPUs, skips
+the z bound and moves r1 up at r0 = 0, so nodes on different CPUs gave
+different verdicts on crafted signatures, which needed no secret key under a
+public key with t1 = 0 (docs/testing/SANITIZERS.md, F6). The Wycheproof
+ML-DSA-65 vectors (`crates/gnb-crypto/tests/wycheproof_mldsa65.rs`) pin the
+verdicts.
+
 ### Witnesses
 
 `script_sig` = `[u32 LE sig_len][sig][u32 LE pk_len][pk]`, and the public key

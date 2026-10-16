@@ -194,18 +194,20 @@ jobs:
           path: ${{ runner.temp }}/functional
           retention-days: 7
 
-  # Vendored fork: PQClean source pin (VENDOR.toml), and the Falcon
-  # clean-variant guard. (The libp2p-yamux fork was retired with libp2p 0.57,
-  # audit OPS-2; its yamux lockfile guard, GHSA-vxx9-2994-q338, now lives in
-  # node/tests/supply_chain_lockfile_guard.rs and runs in workspace-test, and
-  # `cargo deny` in supply-chain refuses a second yamux.)
+  # Vendored fork: PQClean source pin (VENDOR.toml), and the clean-variant
+  # guard of Falcon-1024 (constant-time signing) and ML-DSA-65 (one
+  # verification verdict on every CPU). (The libp2p-yamux fork was retired
+  # with libp2p 0.57, audit OPS-2; its yamux lockfile guard,
+  # GHSA-vxx9-2994-q338, now lives in node/tests/supply_chain_lockfile_guard.rs
+  # and runs in workspace-test, and `cargo deny` in supply-chain refuses a
+  # second yamux.)
   vendored-guards:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: pqcrypto-internals (tests/vendor_pin.rs + unit tests)
         run: cargo test -p pqcrypto-internals --locked
-      - name: Falcon clean-variant guard
+      - name: Clean-variant guard (Falcon-1024, ML-DSA-65)
         run: sh scripts/falcon-clean-guard.sh
 
   # WAL-5: the committed browser wallet core must be reproducible from source.
@@ -336,10 +338,11 @@ jobs:
   # the Rust code (nightly -Zsanitizer=address) AND the PQClean C code that
   # the pqcrypto build scripts compile (clang -fsanitize=address); then
   # UndefinedBehaviorSanitizer instruments that C code (gcc, no recovery).
-  # Each mode checks that every PQClean archive really is instrumented. The
-  # runner has AVX2, so ML-DSA runs its AVX2 code there; the last step runs
-  # the UBSan ML-DSA tests on qemu's Nehalem CPU (no AVX2) so the clean ML-DSA
-  # C code (non-AVX2 nodes, the wasm32 wallet) runs under UBSan too.
+  # Each mode checks that every PQClean archive really is instrumented. Every
+  # build links the clean ML-DSA C code only (pqcrypto-mldsa without avx2/neon:
+  # its AVX2 verifier gave other verdicts, SANITIZERS.md F6); the runner has
+  # AVX2, and the noavx2 steps run the UBSan ML-DSA, ACVP and Wycheproof tests
+  # again on qemu's Nehalem CPU (no AVX2), so a CPU-dependent verdict fails.
   sanitizers:
     runs-on: ubuntu-latest
     steps:
@@ -356,7 +359,7 @@ jobs:
         run: sh scripts/sanitizers.sh asan
       - name: UndefinedBehaviorSanitizer (PQClean C under gnb-crypto and pqcrypto-internals)
         run: sh scripts/sanitizers.sh ubsan
-      - name: UBSan on a CPU without AVX2 (clean ML-DSA C code; ML-DSA, wallet signing and ACVP tests)
+      - name: UBSan on a CPU without AVX2 (ML-DSA, wallet signing, ACVP and Wycheproof tests)
         run: sh scripts/sanitizers.sh ubsan-noavx2
       # The whole gnb-crypto suite on that CPU: about 10 minutes of emulation
       # (the keystore KDFs), so nightly and on demand only.

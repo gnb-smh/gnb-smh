@@ -84,7 +84,14 @@ sha2_v9      = { package = "sha2", version = "0.9", default-features = false }
 sha3         = "0.10"
 
 # FIX: pqcrypto-dilithium deprecated → pqcrypto-mldsa (official NIST name)
-pqcrypto-mldsa   = "0.1"
+# CONSENSUS: the `clean` ML-DSA-65 only, as in crates/gnb-crypto/Cargo.toml.
+# The default features ("avx2", "neon") dispatch verification to PQClean's
+# AVX2 / AArch64 code, whose verdicts differ from FIPS 204 (and so from every
+# other node) on crafted signatures: a chain split between CPUs. Features are
+# additive: enabling the defaults here would re-enable them for gnb-crypto too
+# (tripwire: `mldsa_avx2_and_aarch64_variants_are_not_linked`, CI:
+# scripts/falcon-clean-guard.sh). Do not re-enable avx2/neon here.
+pqcrypto-mldsa   = { version = "0.1", default-features = false, features = ["std"] }
 # Sprint B6b: Falcon-1024 for hybrid PQ signatures (Falcon ‖ ML-DSA). Two
 # distinct lattice families (NTRU + Module-LWE/SIS) for defence in depth.
 #
