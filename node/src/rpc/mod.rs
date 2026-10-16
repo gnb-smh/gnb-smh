@@ -3186,6 +3186,7 @@ mod h_r3_5_tests {
 #[cfg(test)]
 mod audit_2026_10_rpc_tests {
     include!("../../tests/support/pqpsbt_rpc_unit.rs");
+    include!("../../tests/support/address_frontends_rpc.rs");
     use super::*;
     use crate::core::{Block, BlockHeader, MerkleRoot, TxInput, TxOutput};
     use tempfile::TempDir;
