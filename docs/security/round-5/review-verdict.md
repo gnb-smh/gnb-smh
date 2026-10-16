@@ -4,8 +4,13 @@ Reviewer: `/root/r5_review_verdict`, independent of the implementation agents.
 Base: `2848dcf6bd89a85afe4828042227c9a2c2b433f0`.
 Core, reference and browser review point: `0dc3bdb3b8a30f2966ddde7cabbf274206d1e87b`.
 Browser correction reviewed: integration commits `c5ceb22` and `21dff0d`.
-Status: partial; final CLI/RPC production remains pending. The browser finding
-below is resolved in the new descriptor binding.
+Final CLI/RPC production reviewed:
+`0cb572ba01dc69865ad29b21fa87a4b1abb5714a` (frontend original `0898b01`).
+Status: this verdict/identity lens is complete for the scoped descriptor
+package. The browser finding below is resolved in the new descriptor binding;
+no additional verdict or identity finding was identified in the final CLI/RPC
+diff. This is not approval of the whole round, its CI, native reversals or
+unrelated inherited findings.
 
 ## Finding R5-VERDICT-1 — browser serialization can redirect the public operation
 
@@ -100,3 +105,45 @@ Using Python 3.12.15 in this review worktree:
 
 No native Rust build, full suite, production reversal or CI run is attributed
 to this reviewer. No numeric score or Bitcoin-superiority conclusion is given.
+
+## Final CLI/RPC addendum
+
+I read the exact production diff in `0cb572b`, its surrounding dispatch and
+argument handling, and the frontend tests. The CLI path at
+`node/src/bin/gnb-cli.rs:1138` requires an explicit network, accepts only the
+five frozen actions and exact positional argument count, and returns before
+the ordinary RPC call path. `RpcTarget::new` constructs configuration without
+connecting to a node. The CLI has no key loading or signing operation here.
+
+The existing bounded reader at `node/src/bin/gnb-cli.rs:1116` reads at most
+`limit + 1` bytes and rejects oversize input before descriptor/bundle parsing.
+The bundle remains raw JSON text through `public_request`, so duplicate pool
+fields are not lost in a frontend `Value`. Export/pool inputs are typed arrays
+of strings; all descriptor, network, script-identity and pool validation stays
+in the shared codec. Output creation at `node/src/bin/gnb-cli.rs:1178` uses
+`create_new(true)` after validation, refusing an existing destination or symlink.
+The code reports write/sync errors; it does not promise atomic completed-file
+publication or recovery after a partial I/O failure.
+
+Both RPC methods call `inspect_rpc_descriptor` at `node/src/rpc/mod.rs:2612`.
+That helper requires exactly one string parameter, binds the request to the
+node's configured `ChainId`, and forces the shared `inspect` action. It neither
+accepts a caller-selected action/network nor accesses storage or wallet state.
+`deriveaddresses` renders the legacy address from that same inspection result.
+Both names are included in `KNOWN_RPC_METHODS` and retain the existing read
+authentication policy. This package does not change or claim strict duplicate
+rejection for the old JSON-RPC envelope parser.
+
+I reviewed the frontend author's receipts in
+`/private/tmp/gnb-r5-frontends-final/results.json`, read the actual passing test
+summaries, and recomputed each log hash:
+
+| Frontend-authored execution | Result | Log SHA256 |
+| --- | --- | --- |
+| `cargo test -p gnb --test descriptor_cli --locked --offline -- --nocapture` | 7 passed | `3d2930974be7825732673d7f94dac2641ad4f369833a1c18913a628065c562e3` |
+| `cargo test -p gnb --lib descriptor_rpc --locked --offline -- --nocapture` | 5 passed | `15a3586ba3d6306c9bed0743e169277eeba57fdee1aefe23232eaafe818b3b21` |
+| `cargo test -p gnb --lib known_methods_list_matches_dispatch --locked --offline` | 1 passed | `2d5c72e8259c1843e1c55663519236454bce378f7e4ee2e60905ebe2c4e715a0` |
+
+These are reviewed third-party executions, not native tests I ran. Native
+frontend production reversals and whole-round integration remain the root
+engineer's delivery gates; this addendum does not assert their completion.
