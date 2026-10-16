@@ -83,9 +83,17 @@ a separate, optional sighash flag and is not part of this change.
   backup, forward security is lost for that operator. Rule: back up nothing
   but the current encrypted seed, and treat older backups as toxic.
 - **Restoring an old backup** can make a node sign an earlier epoch again.
-  The node refuses to sign any epoch below the last one in its vote record,
-  but a lost vote record together with an old backup can still produce a
-  double vote, and the key would be barred.
+  The node keeps the highest source and target heights the key signed, in
+  its vote record and beside the key file (`<key>.votes-highwater.json`, so
+  it moves with the key onto a fresh data directory), and never signs a
+  link with a lower source or a target not above them (EIP-3076's minimal
+  slashing protection). The key file, the record and the high-water file
+  are written durably (fsync of the file, rename, fsync of the directory)
+  before a signature is released, and a record or high-water file that
+  exists but cannot be read makes the witness refuse to start instead of
+  reading as "no votes". Losing the record AND the high-water file together
+  with an old backup can still produce a double vote, and the key would be
+  barred.
 - **A key compromised in the current epoch** can still sign the current and
   future epochs until the operator rotates. That is unchanged from today.
 

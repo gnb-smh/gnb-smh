@@ -2515,7 +2515,10 @@ impl BlockIngress {
 //   in force ([`block_penalties_in_force`]); a fault that depends on this
 //   node's chain (a share for a block not on its selected chain or outside
 //   the window, an attestation from another justified checkpoint or by a key
-//   outside the witness set, a full pool) is `Ignore`, never penalised.
+//   outside the witness set, a full pool) is `Ignore`, never penalised;
+//   an equivocation proof against a key outside the recent witness sets is
+//   refused before its signatures are checked and keeps its budget charge
+//   ([`powit_admit_error_keeps_charge`]).
 
 /// The context-free checks of a gossiped PoWit item, before any
 /// verification is queued: the claimed id is `powit::item_id(kind, data)` and
@@ -2566,6 +2569,18 @@ pub fn powit_admit_error_fault(kind: u8, err: &str) -> Option<BlockFault> {
         _ => false,
     };
     context_free.then_some(BlockFault::ContextFree)
+}
+
+/// Whether a `powit::admit_item` refusal keeps the delivering peer's
+/// verification-budget charge although it is no misbehaviour (`Ignore`): an
+/// equivocation proof against a key outside this node's recent witness sets
+/// (`powit::EVIDENCE_NOT_A_WITNESS`, PoWit audit finding 1). Such a proof is
+/// valid wherever its key is a witness, so it is never penalised; but it is
+/// free to forge in bulk (one SHA3 per re-rooted KES key), so relaying them
+/// costs the relay its budget as an invalid item would, as Bitcoin Core
+/// counts what a peer makes it do before the expensive checks.
+pub fn powit_admit_error_keeps_charge(kind: u8, err: &str) -> bool {
+    kind == crate::powit::ITEM_EVIDENCE && err == crate::powit::EVIDENCE_NOT_A_WITNESS
 }
 
 /// A gossiped PoWit item waiting for (or under) verification.
@@ -2662,15 +2677,18 @@ impl PowitIngress {
 
     /// The result of a started job (`powit::admit_item`): frees its worker
     /// slot, refunds the budget charge unless the item failed for a
-    /// context-free fault, and returns what to report for its frame
+    /// context-free fault or is a charged refusal
+    /// ([`powit_admit_error_keeps_charge`]), and returns what to report for its frame
     /// (`Accept` for an admitted item: relayed).
     pub fn complete(&mut self, job: PowitJob, result: &Result<(), String>, penalties_in_force: bool, now: Instant) -> PowitVerdict {
         let fault = match result {
             Ok(()) => None,
             Err(e) => powit_admit_error_fault(job.payload.kind, e),
         };
-        // `valid` = no context-free failure: the charge is refunded.
-        self.sched.complete(job.outcome(fault.is_none()), now);
+        let keeps_charge = matches!(result, Err(e) if powit_admit_error_keeps_charge(job.payload.kind, e));
+        // `valid` = no context-free failure and no charged refusal: the
+        // charge is refunded.
+        self.sched.complete(job.outcome(fault.is_none() && !keeps_charge), now);
         let penalty = match (result, fault) {
             (Ok(()), _) => plain_penalty(GossipVerdict::Accept),
             (Err(_), Some(f)) => block_penalty(GossipVerdict::Reject, f, job.payload.self_authored, penalties_in_force),
@@ -3380,5 +3398,55 @@ mod tests {
         assert_eq!(p.complete(job, &Ok(()), false, late).penalty, plain(Accept));
         let StartNext::Expired(stale) = p.start_next(late) else { panic!("stale: expired, not verified") };
         assert_eq!(stale.id, b);
+    }
+
+    fn evidence_frame(n: u64) -> ([u8; 32], u8, Vec<u8>) {
+        use gnb_crypto::core::kes::{KesPublic, KesSignature};
+        use gnb_crypto::core::powit::{Attestation, Checkpoint, Equivocation};
+        let link = |m: u64| Attestation {
+            source: Checkpoint { height: 1, hash: [0; 32] },
+            target: Checkpoint { height: 10, hash: [m as u8; 32] },
+            witness: KesPublic { depth: 1, root: [n as u8; 32] },
+            sig: KesSignature { index: 0, leaf_pk: vec![1], sig: n.to_le_bytes().to_vec(), path: vec![[2; 32]] },
+        };
+        crate::powit::evidence_item(&Equivocation { a: link(1), b: link(2) })
+    }
+
+    /// PoWit audit finding 1: an equivocation proof against a key outside
+    /// this node's recent witness sets is refused before its signatures are
+    /// checked, is no misbehaviour (`Ignore`: the witness set is this node's
+    /// view), but keeps its verification-budget charge: re-rooted proofs are
+    /// free to forge in bulk, so a peer relaying them runs out of budget and
+    /// its next items are refused unverified.
+    #[test]
+    fn powit_evidence_against_a_non_witness_keeps_its_charge() {
+        use crate::network::GossipVerdict::Ignore;
+        use crate::pow::verifier::StartNext;
+        let t0 = Instant::now();
+        let limits = PowLimits {
+            workers: 1, max_queued: 8, max_queued_per_peer: 4, max_queued_per_group: 8, max_queued_solicited: 0,
+            peer_burst: 2, peer_refill_per_sec: 0.0, group_burst: 100, group_refill_per_sec: 0.0,
+            verdict_ttl: Duration::from_secs(10), results_cap: 1,
+        };
+        let mut p = PowitIngress::new(limits);
+        let relay = PeerId::random();
+        let src = PowSource { peer: Some(relay), group: None };
+        let not_witness = crate::powit::EVIDENCE_NOT_A_WITNESS;
+        assert_eq!(powit_admit_error_fault(crate::powit::ITEM_EVIDENCE, not_witness), None, "not penalised");
+        assert!(powit_admit_error_keeps_charge(crate::powit::ITEM_EVIDENCE, not_witness));
+        assert!(!powit_admit_error_keeps_charge(crate::powit::ITEM_ATTESTATION, not_witness), "per kind");
+        for n in 0..2 {
+            let (id, kind, data) = evidence_frame(n);
+            assert!(p.on_item(id, kind, data, gossip_from(relay, None, t0), src, false, t0).is_none(), "queued");
+            let StartNext::Start(job) = p.start_next(t0) else { panic!("a free worker") };
+            let v = p.complete(job, &Err(not_witness.into()), false, t0);
+            assert_eq!(v.penalty, BlockPenalty { gossip: Ignore, misbehaving: false });
+        }
+        let (id, kind, data) = evidence_frame(2);
+        let v = p.on_item(id, kind, data, gossip_from(relay, None, t0), src, false, t0)
+            .expect("budget spent on refused proofs: refused unverified");
+        assert_eq!(v.penalty, BlockPenalty { gossip: Ignore, misbehaving: false });
+        assert_eq!(p.scheduler().stats().invalid, 2);
+        assert_eq!(p.scheduler().stats().valid, 0);
     }
 }
