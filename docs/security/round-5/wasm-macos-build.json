@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "compiled_rust_source_commit": "e1bbe6d",
+  "observation_revision": "15675bb73b69a9333bad8fe1cb81aab5fd198fa9",
+  "host": "Darwin-x86_64",
+  "target": "wasm32-wasip1",
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "wasi_sdk_version": "25",
+  "command": "CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/private/tmp/gnb-r5-wasm-build WASI_SDK=/private/tmp/gnb-r3-wasi-sdk-25 sh scripts/build-wallet-wasm.sh",
+  "exit_code": 0,
+  "build_log": "/private/tmp/gnb-r5-wasm-build.log",
+  "build_log_sha256": "cc016f2735ac675812ef13a98381aef141f5bc9ab289817349b4c181ecfdc59b",
+  "cargo_lock_sha256": "2edda7ed73536ed13a7ad22ec01aab6ee66b4de06ac9aad19cb43ec1c080a779",
+  "build_script_sha256": "201aa76b18d1e2c942deb4a8cd5788c8e35dc17c0e32827f9bc309bec2d780a6",
+  "wasm_sha256": "d6dc794e7be5f4dfca7f4da05719f05adc4c762a93acd1b396e3a183bdc22569",
+  "note": "Both pins and SRI refreshed by repository script. This macOS build does not establish cross-host equality; inherited R3-BUILD-1 remains open."
+}
