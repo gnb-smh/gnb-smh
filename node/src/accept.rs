@@ -2574,13 +2574,21 @@ fn after_failed_override(
 /// `hash` and every block whose selected-parent chain passes through it,
 /// persist the mark (`invalid_block/<hash>`, reason
 /// [`OPERATOR_INVALIDATE_REASON`]) and move the applied chain to the best
-/// valid block that remains — rolling back past `hash` if it was applied —
-/// in one atomic batch. Survives restarts; undone by [`reconsider_block`].
-/// A block that already carries a persisted mark keeps it (a consensus or
-/// hardening verdict never becomes an operator mark the operator could clear
-/// without re-validation): the call changes nothing. On a pruned node whose
-/// new chain needs pruned bodies it changes nothing and returns
-/// [`OverrideError::MissingBodies`] (they are requested; retry).
+/// valid block that remains — rolling back past `hash` if it was applied.
+/// The move commits in chunks of at most `reorg::MAX_BLOCKS_PER_COMMIT`
+/// blocks (audit B2-T0), the mark with the first one; each chunk is atomic
+/// and leaves a consistent applied tip. Survives restarts; undone by
+/// [`reconsider_block`]. A block that already carries a persisted mark keeps
+/// it (a consensus or hardening verdict never becomes an operator mark the
+/// operator could clear without re-validation): no new mark is written. On a
+/// pruned node whose new chain needs pruned bodies it returns
+/// [`OverrideError::MissingBodies`] (they are requested; retry): nothing is
+/// written when the first plan needs them, but when a block of a later chunk
+/// fails validation and the chain resolved again needs pruned bodies, the
+/// chunks committed until then (the mark included) stand. Likewise
+/// [`OverrideError::Failed`] can follow committed chunks (a storage
+/// failure). In both cases the move resumes on the retried call, with the
+/// next block, or at the next start.
 #[allow(clippy::too_many_arguments)]
 pub fn invalidate_block(
     hash: BlockHash,
@@ -2620,7 +2628,8 @@ pub fn invalidate_block(
 /// Operator `reconsiderblock` (Bitcoin Core's `ReconsiderBlock`): consider
 /// every persisted disqualification whose root is `hash`, a selected-chain
 /// ancestor of `hash` or a block whose selected chain passes through `hash`,
-/// and move the applied chain to the best valid block, in one atomic batch:
+/// and move the applied chain to the best valid block, committed in chunks
+/// like [`invalidate_block`] (the marks removed with the first one):
 ///
 /// * operator marks and marks inherited from a selected parent are removed;
 /// * a hardening-recheck mark (context-free, audit VAL/CRY hardening rules)
@@ -2632,9 +2641,10 @@ pub fn invalidate_block(
 ///   own context; a block the move does not apply keeps its mark, and one
 ///   that fails again is disqualified again with its new reason.
 ///
-/// Like [`invalidate_block`], it returns [`OverrideError::MissingBodies`] and
-/// changes nothing when the chain to move to needs bodies this pruned node no
-/// longer has.
+/// Like [`invalidate_block`], it returns [`OverrideError::MissingBodies`] when
+/// the chain to move to needs bodies this pruned node no longer has: nothing
+/// is written when the first plan needs them, and the chunks committed
+/// before a later failure stand (the move resumes on the retried call).
 #[allow(clippy::too_many_arguments)]
 pub fn reconsider_block(
     hash: BlockHash,

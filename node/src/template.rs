@@ -342,6 +342,24 @@ pub fn next_template_height(d: &GhostDAG, store: &Storage) -> u64 {
     template_parents_and_height(d, store).1.max(1)
 }
 
+/// `Some((applied, best))` when the block the UTXO set sits on (the persisted
+/// tip pointer `tip_hash`) is not the DAG's selected tip: a chain move that
+/// commits in chunks (audit B2-T0, `accept::resolve_best_chain`) stopped after
+/// committed chunks (a storage failure; Bitcoin Core aborts the node on such
+/// a failure) and resumes with the next acceptance or at the next start. In
+/// between, a template would take its parents and height from the DAG tip but
+/// check its transactions against the UTXO set of an intermediate block (a
+/// transaction the best chain already confirmed or conflicts with would pass),
+/// so [`build_block_template_with`] refuses to build one. `None` when they
+/// agree, or without a tip pointer (fixtures).
+pub fn chain_move_incomplete(d: &GhostDAG, store: &Storage) -> Option<(BlockHash, BlockHash)> {
+    let applied = store.get_meta("tip_hash").ok().flatten()
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        .filter(|t| d.has_block(t))?;
+    let best = d.selected_tip()?;
+    (best != applied).then_some((applied, best))
+}
+
 /// Build a template on the current DAG / UTXO / mempool state.
 ///
 /// `coinbase_reserve` is the number of bytes kept free for the coinbase
@@ -380,6 +398,12 @@ pub fn build_block_template_with(
 
     let (parents, height, blue_score, parent_ts) = {
         let d = dag.read();
+        if let Some((applied, best)) = chain_move_incomplete(&d, store) {
+            return Err(format!(
+                "chain move in progress: the UTXO set is at {} but the best chain's tip is {}; no \
+                 template until the move completes (next block or restart)",
+                hex::encode(&applied[..8]), hex::encode(&best[..8])));
+        }
         let (parents, height) = template_parents_and_height_at(&d, store, activation_height);
         if parents.is_empty() {
             return Err("node has no bodied tip yet (still syncing genesis?)".into());

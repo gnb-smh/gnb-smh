@@ -7,7 +7,10 @@
 //!   start-up resumes from; a move larger than the memory available to one
 //!   commit still completes.
 //! * B1-T20 — reorg re-injection is capped by Bitcoin Core's 20 MB
-//!   `DisconnectedBlockTransactions` budget and stops once the pool is full.
+//!   `DisconnectedBlockTransactions` budget; into a full pool, a candidate
+//!   that would only be trimmed again is skipped (`Mempool::would_only_trim`)
+//!   and the pool is trimmed once at the end (Core's `bypass_limits`, then
+//!   `LimitMempoolSize`).
 //!
 //! Every block goes through the REAL acceptance pipeline
 //! (`gnb::accept::accept_block`, after `validate_structure`), with the proof
@@ -20,7 +23,7 @@ use fix_common::*;
 use std::sync::Arc;
 
 use gnb::accept;
-use gnb::consensus::{BlockHash, GhostDAG};
+use gnb::consensus::{self, BlockHash, GhostDAG};
 use gnb::core::{self, Block, BlockHeader, MerkleRoot, Transaction, TxInput, TxOutput, GHOSTDAG_K};
 use gnb::core::activation::NEVER;
 use gnb::mempool::Mempool;
@@ -156,25 +159,34 @@ fn b1_t16_connect_plan_walks_the_move_not_the_chain() {
         fp = hx(2, j);
     }
 
+    // Cost is measured as GhostDAG record lookups (`DagStore::get`, behind
+    // `get_block_data`): any planner, whatever its code, reads the records
+    // it walks through it (the pre-fix `find_lca` read all N of them). The
+    // planner's own step counter is checked too.
+    let lookups = consensus::block_data_lookups;
+
     // One-block extension: the fast path every honest block takes.
-    let before = reorg::chain_walk_steps();
+    let (before, before_l) = (reorg::chain_walk_steps(), lookups());
     let plan = reorg::compute_connect_plan(&dag, &hx(1, N - 1), &hx(1, N)).expect("extension plan");
-    let steps = reorg::chain_walk_steps() - before;
+    let (steps, reads) = (reorg::chain_walk_steps() - before, lookups() - before_l);
     assert_eq!(plan.to_apply, vec![hx(1, N)]);
     assert!(plan.to_rollback.is_empty());
     assert!(steps <= 4, "a one-block extension walked {steps} selected-parent steps (chain of {N})");
+    assert!(reads <= 16, "a one-block extension read {reads} DAG records (chain of {N})");
 
     // A 5-block reorg onto the 7-block fork.
-    let before = reorg::chain_walk_steps();
+    let (before, before_l) = (reorg::chain_walk_steps(), lookups());
     let plan = reorg::compute_connect_plan(&dag, &hx(1, N), &hx(2, 7)).expect("reorg plan");
-    let steps = reorg::chain_walk_steps() - before;
+    let (steps, reads) = (reorg::chain_walk_steps() - before, lookups() - before_l);
     assert_eq!(plan.lca, hx(1, N - 5));
     assert_eq!(plan.to_rollback.len(), 5);
     assert_eq!(plan.to_apply.len(), 7);
     assert!(steps <= 2 * (5 + 7) + 8, "a 5-block reorg walked {steps} steps (chain of {N})");
-    let before = reorg::chain_walk_steps();
+    assert!(reads <= 4 * (5 + 7) + 16, "a 5-block reorg read {reads} DAG records (chain of {N})");
+    let (before, before_l) = (reorg::chain_walk_steps(), lookups());
     assert_eq!(reorg::find_lca(&dag, &hx(2, 7), &hx(1, N)), Some(hx(1, N - 5)));
     assert!(reorg::chain_walk_steps() - before <= 2 * (5 + 7) + 4);
+    assert!(lookups() - before_l <= 4 * (5 + 7) + 8);
 
     // A backward move (operator invalidateblock) and the degenerate cases.
     let plan = reorg::compute_connect_plan(&dag, &hx(1, N), &hx(1, N - 3)).expect("backward plan");
@@ -290,6 +302,58 @@ fn b2_t0_a_crash_between_chunks_resumes_at_restart() {
     assert_eq!(digest(&n), digest(&reference), "same UTXO set as a node that never crashed");
     restart(&mut n);
     assert_eq!(digest(&n), digest(&reference));
+}
+
+/// Review finding on B2-T0: a move that stops after committed chunks (a
+/// storage failure, here injected) leaves the UTXO set on an intermediate
+/// block while the DAG's selected tip is the new branch's tip. A template
+/// then took its parents and height from the DAG tip but checked its
+/// transactions against the intermediate UTXO set, so the node's own miner
+/// could mine blocks its connect path rejects. The template builder now
+/// refuses while the applied tip is not the selected tip, and builds again
+/// once the move has resumed (next acceptance) and completed.
+#[test]
+fn b2_t0_no_template_while_a_stopped_move_is_incomplete() {
+    let _guard = NoFaults;
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let a = b.chain(gh, 60, "a");
+    let fork = b.chain(gh, 64, "b");
+    let build = |n: &Node| gnb::template::build_block_template(
+        &n.dag, &n.store, &n.mempool, gnb::template::EXTERNAL_COINBASE_RESERVE);
+
+    let n = node_with(&genesis, &[]);
+    deliver_all(&n, &a);
+    let a_tip = a.last().unwrap().block_hash();
+    deliver_all(&n, &fork[..59]);
+    assert_eq!(applied_tip(&n), Some(a_tip));
+    build(&n).expect("a template on a node whose applied tip is the selected tip");
+
+    // The fourth commit of the reorg fails (storage failure): the move stops
+    // on an intermediate block; the acceptance itself returns Ok.
+    reorg::fault_injection::fail_after_commits(Some(3));
+    let mut next = 59;
+    while applied_tip(&n) == Some(a_tip) && next < 61 {
+        let _ = accept(&n, &fork[next]);
+        next += 1;
+    }
+    let mid = applied_tip(&n).unwrap();
+    assert_ne!(mid, a_tip, "the move committed chunks before it stopped");
+    assert_ne!(sel_tip(&n), Some(mid), "the DAG's selected tip is ahead of the applied tip");
+    assert_eq!(gnb::template::chain_move_incomplete(&n.dag.read(), &n.store), Some((mid, sel_tip(&n).unwrap())));
+    let err = build(&n).expect_err("no template on the DAG tip over an intermediate UTXO set");
+    assert!(err.contains("chain move in progress"), "{err}");
+
+    // The next acceptance resumes the move; templates are built again.
+    reorg::fault_injection::fail_after_commits(None);
+    for blk in &fork[next..] {
+        accept(&n, blk).expect("later blocks connect and resume the move");
+    }
+    assert_eq!(applied_tip(&n), Some(fork.last().unwrap().block_hash()));
+    assert_eq!(gnb::template::chain_move_incomplete(&n.dag.read(), &n.store), None);
+    let t = build(&n).expect("a template once the move completed");
+    assert_eq!(t.height, fork.len() as u64 + 1);
 }
 
 fn genesis_seed(genesis: &Block)

@@ -75,6 +75,17 @@ use reachability::ReachabilityStore;
 
 thread_local! {
     static COMPUTE_BLOCK_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BLOCK_DATA_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of per-block GhostDAG record lookups (`DagStore::get`, behind
+/// `GhostDAG::get_block_data`) on the calling thread since it started.
+/// Every walk over the DAG's records goes through it, whatever the walking
+/// code, so cost tests bound it (audit B1-T16: planning a chain move reads
+/// O(move) records, not the chain back to genesis). No effect on behaviour.
+#[allow(dead_code)] // tests only; the node binary compiles this module too
+pub fn block_data_lookups() -> u64 {
+    BLOCK_DATA_LOOKUPS.with(|c| c.get())
 }
 
 /// Number of full GhostDAG block computations (`compute_block`: mergeset,
@@ -331,6 +342,7 @@ impl DagStore {
     }
 
     pub fn get(&self, hash: &BlockHash) -> Option<&GhostdagData> {
+        BLOCK_DATA_LOOKUPS.with(|c| c.set(c.get().wrapping_add(1)));
         self.data.get(hash)
     }
 

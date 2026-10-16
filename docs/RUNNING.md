@@ -125,13 +125,18 @@ On a pruned node (the default; not `--archive`) the chain to move to may
 contain blocks whose bodies were pruned: for example, `invalidateblock` on the
 first block of a fork the node followed in a reorg deeper than the pruning
 depth, or `reconsiderblock` after an `invalidateblock` that rolled the node
-back through pruned blocks. The call then changes nothing and returns an error
-saying how many block bodies it is re-fetching from the peers (at most 4,096
+back through pruned blocks. The call then returns an error saying how many
+block bodies it is re-fetching from the peers (at most 4,096
 per call, nearest the new tip first; the node keeps at most 1,024 body
 requests in flight and sends the next ones as bodies arrive, so the transfer
 never crowds out its other block requests). Repeat the same call once they have
 arrived (a few seconds to minutes, depending on the count); each retry
-requests the next missing bodies, until the call succeeds. Ordinary block
+requests the next missing bodies, until the call succeeds. A chain move
+commits in steps of at most 16 blocks, each one atomic, so this error (or a
+storage error) can come after some steps were already written, the mark
+included: the node then sits on a consistent intermediate block, builds no
+block template until the move completes, and finishes the move on the
+retried call, with the next block or at the next start. Ordinary block
 acceptance needs no retry: when a heavier chain needs pruned bodies, the node
 accepts its blocks, fetches the bodies and moves to it once they are back.
 The transactions of blocks rolled back from pruned bodies cannot be put back

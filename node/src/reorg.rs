@@ -1389,10 +1389,13 @@ pub fn connect_plan(
 /// 3. **Reinject** candidate txs into the mempool through the shared
 ///    admission function (`reinject_disconnected`, audit MEM-7): UTXO
 ///    presence, maturity and minimum fees at the new tip. Candidates are
-///    re-admitted OLDEST disconnected block first, in block order
-///    ([`ConnectOutcome::disconnected_txs_oldest_first`]), so a parent is
-///    back in the pool before a child confirmed in a later block. Rejected
-///    ones are counted as discarded.
+///    re-admitted OLDEST disconnected block first, in block order, so a
+///    parent is back in the pool before a child confirmed in a later block,
+///    and only up to [`MAX_DISCONNECTED_TX_POOL_BYTES`] of them (audit
+///    B1-T20, Bitcoin Core's `DisconnectedBlockTransactions` budget: the
+///    transactions of the most recently confirmed blocks are dropped first;
+///    [`ConnectOutcome::reinjection_candidates`]). Rejected candidates are
+///    counted as discarded (those beyond the budget are not counted).
 ///
 /// Fork blocks are re-validated with the audit-H1 UTXO-state rules
 /// (`validate_fork_block_state`). The acceptance pipeline does not call this

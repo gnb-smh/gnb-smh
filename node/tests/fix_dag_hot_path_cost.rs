@@ -13,8 +13,9 @@
 //!   reindex-root scheme (slack reserved along the selected chain, reindexing
 //!   only inside a bounded window), so such a block costs O(window).
 //!
-//! Costs are counted (`consensus::compute_block_calls`,
-//! `ReachabilityStore::reindex_work`), not timed.
+//! Costs are counted (`consensus::compute_block_calls`; for the reindex, the
+//! reachability records each insertion rewrote, `GhostDAG::reach_take_delta`),
+//! not timed.
 
 use gnb::consensus::{self, BlockHash, GhostDAG, MERGE_DEPTH};
 use gnb::core::activation::NEVER;
@@ -95,8 +96,11 @@ fn b1_t15_unmergeable_tips_cost_no_compute_block() {
 // DAG-7 residual: a deep side block costs O(window), not O(DAG)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Reindex work (nodes counted or re-laid out) of every insertion after an
-/// `n`-block chain: deep side blocks under three chain blocks, genesis
+/// Reindex cost of every insertion after an `n`-block chain, measured as the
+/// number of reachability records the insertion rewrote (the persist delta,
+/// `GhostDAG::reach_take_delta`: every block whose interval changed must be
+/// written back, whatever the reindex algorithm, so the measure does not
+/// depend on instrumentation inside the new code): deep side blocks under three chain blocks, genesis
 /// siblings, more side blocks under the same parent, and a 40-block side
 /// chain grown under a deep block. Returns (largest single insertion, total
 /// over all of them, work of building the chain itself).
@@ -104,18 +108,20 @@ fn deep_insertion_work(n: u64) -> (u64, u64, u64) {
     let g = hx(0xEE, 0);
     let mut dag = GhostDAG::with_k_and_activation(GHOSTDAG_K, NEVER);
     dag.add_genesis(g, 0);
+    let rewritten = |dag: &mut GhostDAG| dag.reach_take_delta().0.len() as u64;
+    rewritten(&mut dag);
     let mut chain = vec![g];
+    let mut build = 0u64;
     for i in 1..=n {
         dag.add_block(hx(1, i), vec![chain[(i - 1) as usize]], i, 1_000).unwrap();
+        build += rewritten(&mut dag);
         chain.push(hx(1, i));
     }
-    let build = dag.reachability().reindex_work();
     let mut worst = 0u64;
     let mut total = 0u64;
     let mut insert = |dag: &mut GhostDAG, h: BlockHash, parent: BlockHash| {
-        let before = dag.reachability().reindex_work();
         dag.add_block(h, vec![parent], 1, 1).unwrap();
-        let w = dag.reachability().reindex_work() - before;
+        let w = rewritten(dag);
         worst = worst.max(w);
         total += w;
     };
@@ -137,9 +143,8 @@ fn deep_insertion_work(n: u64) -> (u64, u64, u64) {
     let mut tip = chain[n as usize];
     for i in 1..=300 {
         let h = hx(7, i);
-        let before = dag.reachability().reindex_work();
         dag.add_block(h, vec![tip], n + i, 1_000).unwrap();
-        total += dag.reachability().reindex_work() - before;
+        total += rewritten(&mut dag);
         tip = h;
     }
     dag.reach_self_check_sample(2_000, 0x0DA6_0007).expect("the index answers exactly");
@@ -157,10 +162,10 @@ fn dag7_deep_side_blocks_cost_a_bounded_reindex() {
     let (worst_l, total_l, build_l) = deep_insertion_work(8_000);
     println!("DAG-7 reindex work: n=2000 worst {worst_s} total {total_s} build {build_s}; \
               n=8000 worst {worst_l} total {total_l} build {build_l}");
-    assert!(worst_l <= 1_000, "one deep insertion re-laid out {worst_l} nodes of an 8,000-block DAG");
+    assert!(worst_l <= 1_000, "one deep insertion rewrote {worst_l} reachability records of an 8,000-block DAG");
     assert!(total_l <= 2 * total_s + 1_000,
         "the deep insertions cost {total_l} at 8,000 blocks vs {total_s} at 2,000: the cost grows with the DAG");
     // Tip extensions stay amortized O(1): the reindex root advances in jumps
     // of REINDEX_DEPTH, re-laying out its window once per jump.
-    assert!(build_l <= 16 * 8_000, "building the chain cost {build_l} reindex steps");
+    assert!(build_l <= 16 * 8_000, "building the chain rewrote {build_l} reachability records");
 }
