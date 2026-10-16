@@ -28,9 +28,9 @@ assertion failure, which libFuzzer reports as a crash like any panic.
 | `pow_verify` | GnB-SMH on small scratchpads, `crypto::verify` | no panic; strict `out < target`; malformed bits never validate; the hybrid verifier returns a bool on arbitrary keys and signatures |
 | `merkle_path` | `coherence_core::verify_path` | no panic; wrong-length paths and indices above the tree depth never verify |
 | `mempool_ops` | `Mempool` add / remove / remove_confirmed op stream | the `txs` / `spent` / rate-index invariant after every operation |
-| `block_rules` | `core::block_rules` (VAL-2, VAL-10, VAL-12, CRY-1) | tagged Merkle root equals an RFC 6962-style recursive reference; legacy root equals Bitcoin's in-place `ComputeMerkleRoot`; coinbase branch folds back to the root and ignores position 0; a duplicated last id changes the tagged root; on blocks decoded from untrusted bytes: wire encoding and `wire_size` (the PoWit section included from `powit_height()`), txid, wtxid, header roots (the v2 body root over the transparent, shielded and PoWit sections from `powit_height()`), witness root, parents commitment and the 80-byte coinbase commitment equal the references; the 64-byte rule fires exactly on 64-byte txid preimages; the commitment verdict (which field fails) equals a reference parser; a block repaired to the specification is accepted, and altering any committed field (commitment byte, height, parent list, a witness, a truncated commitment, an extra transaction) is rejected while the miner's extra bytes are free |
-| `sighash` | `Transaction::sighash`, `sighash_v2_checked`, `sighash_v3`, `SighashV3Precomputed` | no panic for any transaction, index or spent-output count; v2 equals an independent hand-written bincode encoding of the stripped transaction (and the bincode crate); v3 equals an independent 195-byte preimage; v3 errors exactly on a spent-output count mismatch or an out-of-range index; changing any single committed field (version, locktime, chain, suite, index, prevout, sequence, spent amount, spent script, output value or script) changes the v3 digest; no `script_sig` changes either digest |
-| `witness_parse` | `parse_script_sig{,_borrowed,_exact}`, `build_script_sig`, `sighash::canonical_witness`, `check_input_witnesses` | the parsers equal a reference parser (lenient and exact); exact round trip of `build_script_sig`; trailing bytes refused by the exact parser only; the canonical-witness and per-regime witness rules agree with the framing and `is_canonical_signature_encoding`; genuine canonical hybrid signatures altered by the input exercise the envelope and Falcon compact-encoding checks |
+| `block_rules` | `core::block_rules` (VAL-2, VAL-10, VAL-12, CRY-1, B2-T10) | tagged Merkle root equals an RFC 6962-style recursive reference; legacy root equals Bitcoin's in-place `ComputeMerkleRoot`; coinbase branch folds back to the root and ignores position 0; a duplicated last id changes the tagged root; on blocks decoded from untrusted bytes: wire encoding and `wire_size` (the PoWit section included from `powit_height()`), txid, wtxid, header roots (the v2 body root over the transparent, shielded and PoWit sections from `powit_height()`), witness root, parents commitment and the 80-byte coinbase commitment equal the references; the 64-byte rule fires exactly on 64-byte txid preimages; the distinct-parents rule fires exactly on a repeated parent; the commitment verdict (which field fails) equals a reference parser, and the body verdict follows the specified order (parents, 64-byte, commitment); a block repaired to the specification (each parent once) is accepted, and altering any committed field (commitment byte, height, parent list, a witness, a truncated commitment, an extra transaction) is rejected while the miner's extra bytes are free |
+| `sighash` | `Transaction::sighash`, `sighash_v2_checked`, `sighash_v3`, `SighashV3Precomputed` | no panic for any transaction, index or spent-output count; v2 equals an independent encoding of the specification (version byte 0x02 over the stripped transaction's wire encoding, `reference/gnb_sighash.py`), and the library's wire encoder produces the same body; v3 equals an independent 195-byte preimage; v3 errors exactly on a spent-output count mismatch or an out-of-range index; changing any single committed field (version, locktime, chain, suite, index, prevout, sequence, spent amount, spent script, output value or script) changes the v3 digest; no `script_sig` changes either digest |
+| `witness_parse` | `parse_script_sig{,_borrowed,_exact}`, `build_script_sig`, `sighash::canonical_witness`, `check_input_witnesses` | the three parsers equal one exact reference parser (on this chain the framing is exact at every height, cc5c450); every accepted input is exactly `build_script_sig` of what it parsed to; trailing bytes are refused by every parser and by both witness rules; the canonical-witness and per-regime witness rules agree with the framing and `is_canonical_signature_encoding`; genuine canonical hybrid signatures altered by the input exercise the envelope and Falcon compact-encoding checks |
 | `wire_roundtrip` | `Transaction` / `BlockHeader` / `Block` wire encoding, `admission::decode_tx_strict` | generated values: the encoding equals an independent encoder (whose PoWit-section framing applies from `powit_height()`), `wire_size` its length, `decode(encode(x)) == x` exactly when `x` is within the parser caps (values at and one past the script-length and parent caps are generated; the count and size caps need 100 KB to 10 MB values and are checked at and one past each cap by the unit test `core::limits::tests::count_and_size_caps_match_the_wire_parser` instead), every proper prefix and one extra byte are refused; untrusted bytes: the strict decoders are the exact inverse of the encoder (`decode(b) = x` implies `encode(x) == b`) |
 | `undo_decode` | `UndoData::{from_bytes, to_bytes}` | no panic; decode/encode fixed point; a record without overwrites is byte-identical to the legacy six-field record; the legacy prefix decodes alone; an empty extension is normalised away; trailing garbage and a truncated extension are refused |
 | `keystore_decode` | keyfile v1/v2 (`EncryptedKeyfile`, `Wallet::from_encrypted_bytes`), keystore v2/v3 (`Keypair::from_encrypted_bytes`), the spending unlock `Keypair::unlock_for_spending_bytes` (entry point of the keystore v2 -> v3 migration) | arbitrary JSON: no panic, decrypt driven to completion with cheap Argon2 parameters, parameters over the bounds refused before any KDF; the spending unlock never unlocks what the plain load refuses, never migrates without a stated network, and unlocks a keystore v3 only for its own network; library-written keyfiles (fast parameters) round-trip and refuse a wrong password and any altered AEAD-bound field; a keystore v3 written by an independent implementation of the format loads to the same key pair, unlocks for spending with no migration on its own network (or none stated) and not on the other, and refuses an altered network, address, version, ciphertext or KDF output length |
@@ -38,13 +38,32 @@ assertion failure, which libFuzzer reports as a crash like any panic.
 | `sync_rr_codec` | `/gnb/sync/1` frames: `decode_request`, `decode_response`, `encode_frame`, `check_nonempty_frame`, and the libp2p codec `BlochSyncCodec` (`read_request` / `read_response` / `write_request` / `write_response`) over an in-memory stream | no panic; every refusal is `InvalidData` and an empty frame `UnexpectedEof` (not penalized); every response refusal is penalized except a Tips answer over `MAX_WIRE_TIPS` tips with a locator within its bound (refused without penalty: releases before the re-audit fix B2-T7 sent all their DAG leaves); accepted frames obey every bound and are canonical; both transports enforce the same bounds (a response accepted here passes the gossip decoder, a gossip pull accepted there is accepted here); generated messages round-trip exactly when within bounds; reading a response stream through the codec is exactly `check_nonempty_frame` + the decoder on its first 4 MiB; a request stream is read up to 64 bytes (`MAX_REQUEST_FRAME`): one that reaches 64 bytes, or a shorter frame `decode_request` refuses, reads as `SyncRequest::Malformed` (re-audit B1-T2: libp2p does not report a request that fails to decode, so the codec reports it as a request the network loop penalizes), an empty one is `UnexpectedEof`; every generated request encodes below 64 bytes; writing is `encode_frame` and reads back (`Malformed` for a request out of bounds); a stream past the read cap (a valid frame followed by padding: 64 bytes for a request, 4 MiB for a response) is refused (`Malformed` / a penalized response refusal) |
 | `accept_dag` | the message processor's path for a gossiped block: `Block::from_wire_bytes`, then `ingress::BlockIngress::handle_block` (structure without proof of work, the orphan pool with its floor and proof check, the POW-3 work rule, `normalize_wire_metadata`, `accept::accept_block_tracking`, the drain of waiting orphans) and the periodic orphan sweep, on a RocksDB `Storage` in a temporary directory with a real `GhostDAG` | small arbitrary DAGs (up to 6 sealed blocks, PoW-cheap through the crate's `test-pow-limit` feature) with signed spends of funded outputs, conflicting spends, spend chains, version 1 and 3 transactions, broken signatures, missing inputs and deliberate faults (coinbase over-claim, wrong height, wrong difficulty bits sealed at their own easy target so that the difficulty rule is what refuses them, timestamp before a parent, duplicated transaction), under the hardening activation never / from genesis / inside the DAG; no panic, and two different arrival orders of the same block set (orphans buffered in the core's pool and drained when a parent is accepted or by the sweep) end with the same selected tip, applied tip, UTXO set digest and DAG block set; a block with a wrong height, a timestamp before a parent, wrong bits or a duplicated transaction is in neither node's DAG; optionally a reload from storage (`reconcile_on_startup`) keeps that state |
 
+The relaunched mainnet line brought six more targets, smaller ones with no
+reference implementation of their own:
+
+| Target | Entry points | What it checks |
+| --- | --- | --- |
+| `sync_decode` | `network::sync_rr::{decode_request, decode_response}` | no panic |
+| `pq_handshake_decode` | `transport::upgrade::{Init, Resp, Finish}` bincode decode, without `handshake_decode`'s size bound | no panic |
+| `block_validate` | `Block::from_wire_bytes`, `validate_structure_cheap`, `blockval::validate_block_transactions` against an empty UTXO view | no panic |
+| `tx_validate` | `Transaction::from_wire_bytes`, `blockval::validate_tx_inputs` at height 10,000,000 against a view paying every input (1,000 GNB) to the key or policy its witness reveals | no panic; the wire encoding round-trips |
+| `policy_witness_decode` | `PolicyWitness::decode`, `SpendPolicy::decode` | no panic; an accepted witness or policy re-encodes to the same bytes; a witness fits `MAX_SCRIPT_SIG_LEN` |
+| `script_sig_verify` | `Transaction::parse_script_sig`, `crypto::verify_canonical` | no panic; an accepted witness is exactly `build_script_sig` of its parts |
+
 The seed corpora of eight of the nine original targets are generated (and
 replayed on stable Rust) by `node/tests/parser_corpus_floor.rs`; those of
-`header_parse` and of the nine targets added in October 2026 by
-`node/tests/fuzz_seed_corpus.rs`, which also
+`header_parse`, of the nine targets added in October 2026 and of the six
+mainnet-line targets by `node/tests/fuzz_seed_corpus.rs`, which also
 checks that every committed `seed_*` file is reproducible and replays every
 corpus file (seeds and crash regressions `regress_*`) through the parsing
-entry points on stable Rust. Each corpus stays below 200 KB.
+entry points on stable Rust (for the mainnet-line targets, through
+everything the target does with its bytes). The mainnet-line seeds start on
+the accepting paths (`mainnet_line_seeds_reach_their_entry_points`): the
+`tx_validate` seeds are signed against the target's view and pass every
+rule (one and two single-key inputs, a 1-of-2 policy with timelocks), the
+`block_validate` seeds pass the structural checks on mainnet (below the
+activation, with the suffix witness commitment, with the PoWit section,
+and under the hardening rules). Each corpus stays below 200 KB.
 
 ## Defects found
 
@@ -260,6 +279,68 @@ accepted, 4 buffered as orphans (children of refused blocks), and the rest
 refused for a missing UTXO (6), a timestamp before a parent (2), wrong
 difficulty bits (2), an invalid selected parent (2), a coinbase over-claim
 (2), a wrong height (1) and a duplicated transaction (1).
+
+### The first CI run of the merged tree
+
+The merge of the relaunched mainnet line had not been fuzzed in CI (the job
+does not run on pushes). Its first run on the pull request (run
+38873936215, at `c9fdb6d`) failed nine targets:
+
+* `tx_validate`, `block_validate`, `policy_witness_decode`,
+  `pq_handshake_decode`, `script_sig_verify` and `sync_decode`, the targets
+  of the mainnet line, had no committed seed corpus. `fuzz_seed_corpus.rs`
+  now generates one for each (above).
+* `witness_parse`, `sighash` and `block_rules`, targets of the hardening
+  branch, checked specifications the merge had changed. In each case the
+  library follows the specification of the merged tree and the target was
+  corrected:
+  * `witness_parse` (crash after 76 executions): it asserted the historical
+    lenient framing (`parse_script_sig_borrowed` ignoring bytes after the
+    public key). This chain made the single-key `script_sig` exact at every
+    height in cc5c450, so the three parsers are one exact parser and a tail
+    is refused by each of them and by both witness rules.
+  * `sighash` (every seed): its v2 reference was the hardening branch's
+    digest, a bincode body under version byte 0x01. Sighash v2 here hashes
+    the stripped transaction's wire encoding under version byte 0x02
+    (`reference/gnb_sighash.py`); the reference is rewritten from that.
+  * `block_rules`: its repair of a decoded block predated re-audit B2-T10
+    (from the activation each parent is listed once), so a block whose
+    header repeats a parent, repaired otherwise to the specification, was
+    refused by the library and the target reported `a block repaired to the
+    specification is rejected` (`64-byte transaction accepted` when the block
+    also carries a 64-byte transaction: the parent rule runs first). The
+    repair now lists each parent once, and the target checks the
+    distinct-parents rule and the order of the body rules against
+    references.
+
+The job log the API returns holds only its last 5,000 lines (from the end of
+`tx_parse` on), and the uploaded reproducers could not be downloaded from the
+machine that did this work, so only the `witness_parse` input came from CI.
+The others were reproduced on stable Rust: the target bodies, compiled into
+a throwaway test, ran over the committed seeds and random mutations of them
+(`sighash` failed on its first seed; `block_rules` failed once a seed's
+parent was listed twice). Both crash inputs fail the old target bodies and
+pass the corrected ones; they are in the corpora as
+`witness_parse/regress_trailing_bytes_after_witness` and
+`block_rules/regress_duplicate_parent`, and pinned with the specified
+behaviour by `node/tests/fuzz_regressions.rs`.
+
+`tx_validate` also had a defect no run could report: its view paid every
+input `u64::MAX / 4`, more than `MAX_SUPPLY_SAT`, so `validate_tx_inputs`
+stopped at the first input (`input overflow`) and no input reached the
+witness, policy or signature checks the target is about. The view now pays
+1,000 GNB per input, and the target's seeds are signed against it.
+
+The corrected and the newly seeded targets then ran in the same stable
+harness (debug build, so far fewer executions than libFuzzer) with no
+finding: `block_rules` 200 s (73,976 executions) plus 180 s (36,731) of
+structural mutations (parents repeated or dropped, heights at the
+activation, PoWit and witness-commitment boundaries, transactions added,
+removed and duplicated, shielded transactions, PoWit shares), `sighash`
+200 s (1,292,820), `witness_parse` 200 s (1,440,562), `tx_validate` 300 s
+(49,361,225), `block_validate` 200 s (27,637,996), `policy_witness_decode`
+150 s (24,486,901), `script_sig_verify`, `pq_handshake_decode` and
+`sync_decode` 60 s each (24,528,548; 2,363,068; 7,201,992).
 
 ### Do the targets detect what they are meant to detect?
 
