@@ -64,6 +64,10 @@ jobs:
       # `pow: full` proofs, ~2 s each).
       - name: Consensus tx/block vectors against the Python references
         run: python3 reference/check_consensus_vectors.py
+      - name: PQ-PSBT independent reference and reproducible differential corpus
+        run: |
+          python3 reference/pqpsbt_test.py
+          python3 reference/pqpsbt_vectors.py --check
 
   rust:
     runs-on: ubuntu-latest
