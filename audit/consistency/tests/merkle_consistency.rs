@@ -80,9 +80,9 @@ fn cve_2012_2459_duplicate_tail_collides() {
         nonce: 0,
     };
     let b1 = Block { header: header.clone(), transactions: honest, blue_score: 0, height: 1,
-                     shielded_transactions: vec![] };
+                     shielded_transactions: vec![], powit: Default::default() };
     let b2 = Block { header, transactions: mutated, blue_score: 0, height: 1,
-                     shielded_transactions: vec![] };
+                     shielded_transactions: vec![], powit: Default::default() };
     assert!(b1.validate_merkle() && b2.validate_merkle());
     assert_eq!(b1.block_hash(), b2.block_hash());
 }
@@ -105,9 +105,9 @@ fn block_id_does_not_commit_to_signatures() {
         nonce: 0,
     };
     let b1 = Block { header: header.clone(), transactions: honest, blue_score: 0, height: 1,
-                     shielded_transactions: vec![] };
+                     shielded_transactions: vec![], powit: Default::default() };
     let b2 = Block { header, transactions: forged, blue_score: 0, height: 1,
-                     shielded_transactions: vec![] };
+                     shielded_transactions: vec![], powit: Default::default() };
     assert!(b1.validate_merkle() && b2.validate_merkle());
     assert_eq!(b1.block_hash(), b2.block_hash());
 }
