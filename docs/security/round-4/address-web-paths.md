@@ -21,3 +21,70 @@ Production-only reversals retain final tests unchanged and restore exact bytes.
 Reference: [BIP350](https://github.com/bitcoin/bips/blob/master/bip-0350.mediawiki)
 and `docs/ADDRESS-V2.md` from independent reference commit `a8e8b78`.
 Review and integration evidence will be recorded after implementation.
+
+## Implementation and evidence
+
+Production/test commit: `8525a0e64ee1b4f2f244ab0d2cb952ffc4c3bb2c`.
+No Rust source or compiled artifact changed in this package.
+
+- `site/assets/safe.js`: bounded syntax gate accepts both network/kind forms
+  and uniform uppercase. It explicitly does not verify checksum. Mixed-case
+  v2 is never lowercased before validation; legacy/hash search keeps its old
+  case normalization.
+- Both explorers call `validateaddress` for v2 before classifying prefixes
+  or querying by legacy identity; invalid results never reach the data query.
+- Both watch-link boot paths give the untouched alias to WASM and enter
+  watch state with its canonical result. The existing watch input already
+  calls the same WASM normalizer and required no routing change.
+- Worker accepts the same syntax and forwards unchanged. The Python API's
+  parameter gate is syntax-only; its local carryover lookup additionally
+  verifies Bech32m and zero padding and derives the existing network-bound
+  legacy identity. This decoder is embedded in the deployed script, with
+  no dependency on the uninstalled `reference/` tree.
+
+Before production edits, the focused JS run had one passing legacy control
+and six runtime assertion failures. Python had five methods: two passed;
+three failed (eight subtest ValueErrors for valid v2 rejected by the old gate,
+four assertions including an empty carryover result for a known identity).
+The final tests strengthened uppercase legacy search controls; a regression
+introduced during implementation was observed and corrected before freezing.
+
+`address-web-reversals.json` records seven separate production-file reversals,
+then all production files together reverted to the baseline. Each returned
+exit 1 with a runtime assertion failure. Final baseline JS: one pass/six fail;
+final baseline Python: two methods pass/three fail. The final test files were
+unchanged throughout; production was restored byte for byte. Restored suites:
+**7/7 JS, 5/5 Python**, no skips. Replayer and hashes are versioned here; raw
+logs are local `/private/tmp/gnb-r4-address-web-reversals/` artifacts.
+
+Broader validation at this package's source revision:
+
+| Check | Result |
+| --- | --- |
+| Explorer API `unittest discover` | 21/21 pass after loopback permission retry |
+| Site `node --test site/tests/*.test.mjs` | 42 pass, 2 fail, no skips |
+| Site loopback fixture retry | 2/2 pass |
+| Site remaining failure | stale SRI after JS changes; integration must repin |
+| `git diff --check` | pass |
+
+The first attempt `node --test site/tests/` was a test-launch failure
+(`MODULE_NOT_FOUND`), not a regression reproduction. The API's sandbox run
+failed 16 socket binds with EPERM; the five new socket-free methods passed.
+The site's one socket fixture likewise failed EPERM and passed after an
+explicitly authorized loopback retry. All original negative logs and their
+hashes remain in `address-web-validation.json`; these are not a claim of a
+fully green site suite before integration repins its SRI.
+
+## Limits and integration requirements
+
+These routing tests execute real source functions/event handlers in a VM with
+DOM and RPC/WASM adapters; they do not establish a live browser/node/WASM
+journey. The independent WASM and RPC packages must supply the normalizer and
+`validateaddress.canonical_address` contract, then rebuild/repin and rerun the
+integrated suite. Add `python3 deploy/explorer-api/test_address_v2.py -v` to CI;
+the existing explicit API test command does not discover this new test file.
+
+No bridge vault configuration/parser changes are included; those legacy-only
+paths are outside this package. The stale `CORE_SHA256` in wallet `main.js`
+was reported to the integration owner, who owns all WASM/pin work. Independent
+three-lens review and final CI are pending; no category score is assigned.
