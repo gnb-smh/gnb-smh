@@ -75,10 +75,39 @@ validators expose `canonical_address` and `bech32m` without changing `address`
 echoing, normal address generation or persistent data. Their validity field
 means validity for the node's network; `checksum` remains syntactic.
 
-Focused RPC tests passed 8/8 and the complete CLI unit binary passed 17/17.
-The RPC matrix was then strengthened with wrong-network v2 variants on both
-networks. Production-only reversal and independent reviews are still pending;
-these focused results do not stand in for the integrated node suite or CI.
+Final focused RPC tests passed 9/9 and the complete CLI unit binary passed
+17/17. The RPC matrix includes wrong-network v2 variants on both networks.
+Reverting only the shared network guard failed 4 tests (5 controls passed).
+Restoring baseline RPC production, with the final tests and v2 core unchanged,
+failed 7 tests (2 controls passed). Both reversals reached runtime assertions;
+exact production restoration passed all 9 tests with unchanged test bytes.
+Commands, source hashes and log hashes are recorded in
+[`address-frontends-evidence.json`](address-frontends-evidence.json).
+Independent reviews are still pending; these focused results do not stand in
+for the integrated node suite or CI.
+
+One additional ordinary-input variant was found during diff review:
+`validateaddress`'s old shadow parser reported a repeated `gnb1q` prefix as
+valid, although `Address::parse` and `validateaddressverbose` rejected it. The
+new test was added **after** the shared-parser fix. It failed against isolated
+baseline production and passed after exact restoration, with no additional
+production change. This ordering is recorded rather than presented as a
+separate reproduce-before-fix implementation.
+
+To replay the production-only checks in a worktree containing the original
+test-only revision and cached dependencies:
+
+```sh
+python3 node/tests/support/address_frontends_reversal.py \
+  --worktree /path/to/isolated/worktree \
+  --baseline 23237fff9531cba78461fd4a6b6c2d748564ad2c \
+  --output /private/tmp/gnb-r4-address-frontends-replay
+```
+
+The driver uses the package's CGU/target settings and restores fixed production
+in a `finally` block. Its manifest records both the baseline and fixed source
+hashes. Local log paths in the evidence are archival locations; the versioned
+tests and driver provide the replay procedure.
 
 Scope limits: RPC tests exercise the real dispatcher with storage fixtures and
 a separate process for testnet. CLI tests exercise its actual destination
