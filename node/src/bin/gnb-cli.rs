@@ -268,9 +268,13 @@ fn main() {
             do_policy_spend(params, stated_network);
             return;
         }
+        "pqpsbt" => {
+            do_pqpsbt(params);
+            return;
+        }
         "policysign" => {
-            require_params(params, 2, "policysign <spend.json> <wallet.json>");
-            do_policy_sign(params, stated_network);
+            require_params(params, 2, POLICY_SIGN_USAGE);
+            do_policy_sign(params, &rpc_target, stated_network);
             return;
         }
         "policysend" => {
@@ -1103,20 +1107,196 @@ fn print_spend_summary(spend: &gnb::wallet::policy_spend::PolicySpend) {
     println!("Signed by keys {:?} of {}-of-{}", spend.signers(), spend.policy.threshold, spend.policy.pubkeys.len());
 }
 
-fn do_policy_sign(params: &[&str], stated: Option<gnb::address::Network>) {
-    let text = std::fs::read_to_string(params[0]).unwrap_or_else(|e| die(&format!("read {}: {}", params[0], e)));
-    let mut spend = gnb::wallet::policy_spend::PolicySpend::from_json(&text).unwrap_or_else(|e| die(&e));
-    print_spend_summary(&spend);
-    println!("Check the outputs above before signing.");
-    // CRY-7: the signing keystore is opened for the spend's network.
-    require_stated(stated, spend.network, params[0]);
-    let kp = load_keypair(params[1], Some(spend.network));
-    // Sighash v2 (version 1) or v3 (version 3, from the hardening
-    // activation): the spend file fixes which.
-    let idx = spend.sign_digest(&kp.public_key, |d, v| kp.sign_tx_digest(d, v)).unwrap_or_else(|e| die(&e));
-    std::fs::write(params[0], spend.to_json().unwrap_or_else(|e| die(&e)))
-        .unwrap_or_else(|e| die(&format!("write {}: {}", params[0], e)));
-    println!("Signed as key {}; {} of {} signatures present.", idx, spend.signers().len(), spend.policy.threshold);
+const POLICY_SIGN_USAGE: &str = "policysign <spend-or-pqpsbt.json> <wallet.json> [--max-fee GNB] [--yes]";
+
+fn read_public_document(path: &str, limit: usize) -> Result<String, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("read {path}: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take((limit + 1) as u64).read_to_end(&mut bytes).map_err(|e| format!("read {path}: {e}"))?;
+    if bytes.len() > limit { return Err(format!("public document exceeds {limit} bytes")); }
+    String::from_utf8(bytes).map_err(|_| "public document must be UTF-8".into())
+}
+
+fn do_pqpsbt(params: &[&str]) {
+    if params.len() != 1 { die("pqpsbt <public-request.json>: exactly one request file is required"); }
+    // Documents remain strings inside the request, so the core sees the
+    // original text and can reject duplicate fields before they are lost.
+    let text = read_public_document(params[0], 2 * gnb::wallet::pqpsbt::MAX_JSON_BYTES + 4096)
+        .unwrap_or_else(|e| die(&e));
+    let request = serde_json::from_str(&text).unwrap_or_else(|e| die(&format!("public request: {e}")));
+    let response = gnb::wallet::pqpsbt::public_request(&request).unwrap_or_else(|e| die(&e));
+    println!("{}", serde_json::to_string_pretty(&response).unwrap());
+}
+
+fn public_rpc_result(
+    rpc: &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let result = rpc(method, params).map_err(|e| format!("{method}: {e}"))?;
+    if let Some(error) = result.get("error").filter(|e| !e.is_null()) {
+        return Err(format!("{method}: {error}"));
+    }
+    Ok(result)
+}
+
+fn policy_snapshot(result: &serde_json::Value) -> Result<(u64, [u8;32]), String> {
+    let height = gnb::wallet::send::next_block_height_from_daginfo(result)?;
+    let tip = result.get("tip").and_then(serde_json::Value::as_str)
+        .and_then(|s| hex::decode(s).ok()).and_then(|b| b.try_into().ok())
+        .ok_or("node did not report a 32-byte tip hash")?;
+    Ok((height, tip))
+}
+
+/// PF-2: BIP174's signer checks bind previous outputs, payment and fee before
+/// key access; BIP370's role separation never rewrites an already signed
+/// transaction. GnB's PQ-PSBT format is distinct from Bitcoin PSBT.
+/// https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#signer
+/// https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki#roles
+fn with_policy_preflight<F>(
+    text: &str,
+    stated: Option<gnb::address::Network>,
+    max_fee: u64,
+    rpc: &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>,
+    signer: F,
+) -> Result<(gnb::wallet::pqpsbt::PqPsbt, bool, u8), String>
+where F: FnOnce(&mut gnb::wallet::pqpsbt::PqPsbt, &gnb::wallet::pqpsbt::SignContext,
+                &gnb::wallet::pqpsbt::Review) -> Result<u8, String>,
+{
+    use gnb::wallet::pqpsbt::{PqPsbt, SignContext};
+    use serde_json::{json, Value};
+    let (mut document, legacy) = match PqPsbt::from_json(text) {
+        Ok(p) => (p, false),
+        Err(pq_error) => (PqPsbt::from_legacy_json(text)
+            .map_err(|legacy_error| format!("{pq_error}; {legacy_error}"))?, true),
+    };
+    let network = document.spend.network;
+    if stated.is_some_and(|n| n != network) { return Err("spend network differs from the command line".into()); }
+    let info = public_rpc_result(rpc,"getnetworkinfo",&Value::Null)?;
+    let node_network = gnb::wallet::pqpsbt::parse_network(info.get("network").and_then(Value::as_str)
+        .ok_or("node did not report its network")?)?;
+    if node_network != network { return Err("node network differs from the spend network".into()); }
+    let activation = gnb::core::activation::hardening_activation_height_for_signer(document.spend.chain_id());
+    if info.get("hardening_activation_height").and_then(Value::as_u64) != Some(activation) {
+        return Err("node hardening activation differs from this signer's network rules".into());
+    }
+    let initial = policy_snapshot(&public_rpc_result(rpc,"getdaginfo",&Value::Null)?)?;
+    let context = SignContext { network, next_height: initial.0, max_fee };
+    gnb::core::sighash::check_tx_version_standard(document.spend.tx.version,initial.0,activation)?;
+    if u64::from(document.spend.tx.locktime) > initial.0 { return Err("transaction locktime is not reached".into()); }
+    let address = gnb::address::PolicyAddress::from_script(&document.spend.locking_script(),network)
+        .ok_or("unsupported policy output")?;
+    let selected: Vec<Value> = document.spend.tx.inputs.iter().map(|i|
+        json!({"txid":hex::encode(i.prev_txid),"index":i.prev_index})).collect();
+    let result = public_rpc_result(rpc,"getutxos",&json!([
+        address.to_string(),gnb::wallet::send::GETUTXOS_MAX_ROWS,selected]))?;
+    if policy_snapshot(&result)? != initial { return Err("node snapshot changed during UTXO lookup; retry preflight".into()); }
+    let truncated = result.get("truncated").and_then(Value::as_bool).ok_or("getutxos did not report whether its window was truncated")?;
+    let rows = result.get("utxos").and_then(Value::as_array).ok_or("getutxos missing UTXO array")?;
+    if rows.len() > gnb::wallet::send::GETUTXOS_MAX_ROWS as usize { return Err("getutxos response exceeds its row limit".into()); }
+    let utxos = gnb::wallet::send::parse_utxo_rows(&result)?;
+    let mut by_outpoint = std::collections::BTreeMap::new();
+    for (position, utxo) in utxos.iter().enumerate() {
+        if by_outpoint.insert((utxo.txid,utxo.index),position).is_some() { return Err("duplicate outpoint in node UTXO response".into()); }
+    }
+    for i in 0..document.inputs.len() {
+        let input = &document.spend.tx.inputs[i];
+        let position = *by_outpoint.get(&(input.prev_txid,input.prev_index)).ok_or_else(||
+            format!("input {i} cannot be confirmed unspent in the node's {}UTXO window",if truncated {"truncated "} else {""}))?;
+        let actual = &utxos[position].output;
+        let claimed = &document.inputs[i].prevout;
+        if actual.value != claimed.value || actual.script_pubkey != claimed.script_pubkey {
+            return Err(format!("input {i}: node value/script differs from the document"));
+        }
+        let row = &rows[position];
+        match row.get("spent_in_mempool").and_then(Value::as_bool) {
+            Some(false) => {},
+            Some(true) => return Err(format!("input {i} is already spent by a pooled transaction")),
+            None => return Err(format!("input {i}: node did not report mempool spend status")),
+        }
+        if !gnb::wallet::send::utxo_row_spendable_at(row,initial.0)? {
+            return Err(format!("input {i}: immature coinbase output"));
+        }
+        if document.spend.policy.older != 0 {
+            // This field comes from admission's confirmations_for_next_block:
+            // selected-chain depth after activation, not header subtraction.
+            let age = row.get("confirmations_at_next_block").and_then(Value::as_u64)
+                .ok_or_else(|| format!("input {i}: relative timelock confirmations unknown"))?;
+            if age < u64::from(document.spend.policy.older) { return Err(format!("input {i}: relative timelock is not satisfied")); }
+        }
+        if document.spend.tx.version == 1 {
+            let raw = public_rpc_result(rpc,"getrawtransaction",&json!([hex::encode(input.prev_txid)]))?;
+            let raw = raw.get("hex").and_then(Value::as_str).ok_or("getrawtransaction missing hex")?;
+            if raw.len() > 2 * gnb::wallet::pqpsbt::MAX_TX_BYTES { return Err("previous transaction exceeds byte limit".into()); }
+            let mut update = document.inputs[i].clone();
+            update.previous_tx = Some(hex::decode(raw).map_err(|_| "previous transaction is not hex")?);
+            // The core checks complete canonical bytes, txid, output index,
+            // value and locking script before accepting this public metadata.
+            document.update_input(i,update)?;
+        }
+    }
+    let review = document.review_for_signing(&context)?;
+    if policy_snapshot(&public_rpc_result(rpc,"getdaginfo",&Value::Null)?)? != initial {
+        return Err("node tip or next height changed during preflight; retry".into());
+    }
+    let key = signer(&mut document,&context,&review)?;
+    Ok((document,legacy,key))
+}
+
+fn format_base_units(value: u64) -> String {
+    format!("{}.{:08} GNB ({} base units)",value / 100_000_000,value % 100_000_000,value)
+}
+
+fn policy_review_lines(document: &gnb::wallet::pqpsbt::PqPsbt,
+    context: &gnb::wallet::pqpsbt::SignContext, review: &gnb::wallet::pqpsbt::Review) -> Vec<String>
+{
+    let mut lines = vec![format!("Network: {:?}; next block height: {}; transaction version: {}",
+        context.network,context.next_height,document.spend.tx.version)];
+    for (i,(input,data)) in document.spend.tx.inputs.iter().zip(&document.inputs).enumerate() {
+        lines.push(format!("Input {i}: {}:{}; {}; script {}",hex::encode(input.prev_txid),input.prev_index,
+            format_base_units(data.prevout.value),hex::encode(&data.prevout.script_pubkey)));
+    }
+    let locking_script = document.spend.locking_script();
+    for (i,output) in document.spend.tx.outputs.iter().enumerate() {
+        let change = if output.script_pubkey == locking_script {" (change: same policy script)"} else {""};
+        lines.push(format!("Output {i}: {}; script {}{}",format_base_units(output.value),hex::encode(&output.script_pubkey),change));
+    }
+    lines.extend([
+        format!("Input total: {}",format_base_units(review.total_inputs)),
+        format!("Output total: {}",format_base_units(review.total_outputs)),
+        format!("Fee: {}; maximum: {}",format_base_units(review.fee),format_base_units(context.max_fee)),
+        format!("Change: {}",format_base_units(review.change)),
+        format!("Full previous transactions verified: {} of {}",review.previous_transactions_verified,document.inputs.len()),
+        "Unspentness, maturity and locks reflect the configured node's snapshot; they are not a reservation against a later spend or reorganization.".into(),
+        "Derivation labels are metadata, not proof of ownership or change.".into(),
+    ]);
+    lines
+}
+
+fn do_policy_sign(params: &[&str], target: &RpcTarget, stated: Option<gnb::address::Network>) {
+    let mut max_fee = gnb::wallet::payment::FeePolicy::DEFAULT_MAX_FEE_SAT;
+    let mut yes = false;
+    let mut i = 2;
+    while i < params.len() {
+        match params[i] {
+            "--yes" | "-y" => { yes = true; i += 1; },
+            "--max-fee" if i+1 < params.len() => {
+                max_fee = gnb::wallet::parse_bloch_satoshis(params[i+1]).unwrap_or_else(|e| die(e)); i += 2;
+            },
+            other => die(&format!("unknown policysign option {other:?}; {POLICY_SIGN_USAGE}")),
+        }
+    }
+    let text = read_public_document(params[0],gnb::wallet::pqpsbt::MAX_JSON_BYTES).unwrap_or_else(|e| die(&e));
+    let (document,legacy,index) = with_policy_preflight(&text,stated,max_fee,&|m,p| rpc_call(target,m,p),|doc,ctx,review| {
+        for line in policy_review_lines(doc,ctx,review) { println!("{line}"); }
+        if !yes && !gnb::wallet::send::confirm("Sign this policy spend?") { return Err("not signed".into()); }
+        let key = load_keypair(params[1],Some(ctx.network));
+        doc.sign(ctx,&key.public_key,|digest,version| key.sign_tx_digest(digest,version))
+    }).unwrap_or_else(|e| die(&e));
+    let output = if legacy { document.spend.to_json() } else { document.to_json() }.unwrap_or_else(|e| die(&e));
+    std::fs::write(params[0],output).unwrap_or_else(|e| die(&format!("write {}: {e}",params[0])));
+    println!("Signed as key {}; {} of {} signatures present.",index,document.spend.signers().len(),document.spend.policy.threshold);
 }
 
 fn do_policy_send(params: &[&str], target: &RpcTarget) {
@@ -1490,6 +1670,11 @@ fn print_usage() {
     gnb-cli submitclaim <commit> <cat:0-3> <desc> <addr> [ci_hex]    Submit improvement
     gnb-cli vote <claim_id> <voter_addr> <yes|no|abstain>            Vote on claim
 
+  POLICY SIGNING AND PUBLIC DOCUMENT ROLES
+    gnb-cli pqpsbt <public-request.json>    Offline create/decode/update/combine/review/finalize/extract
+    gnb-cli policysign <document.json> <wallet.json> [--max-fee GNB] [--yes]
+                                           Verify the configured node before key access
+
   OPTIONS
     --rpc-host <host>                      RPC host (default: 127.0.0.1)
     --rpc-port <port>                      RPC port (default: 17210)
@@ -1628,3 +1813,7 @@ mod audit_send_inputs {
         assert!(destination_on("gnb1zz", Network::Mainnet, "destination").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/pqpsbt_cli_unit.rs"]
+mod pqpsbt_cli_tests;

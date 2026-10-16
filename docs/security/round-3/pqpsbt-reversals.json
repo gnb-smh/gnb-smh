@@ -1,0 +1,233 @@
+[
+  {
+    "case": "policy-shape",
+    "path": "crates/gnb-crypto/src/wallet/policy_spend.rs",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "gnb-crypto",
+      "--lib",
+      "pqpsbt_policy_signer_checks_all_amounts_before_the_signing_callback",
+      "--",
+      "--nocapture"
+    ],
+    "before_sha256": "12e23c5bab2b26261e875fb6ffbfc6f54eecf1921af7f3ae00cdc26aa49a2bf5",
+    "mutated_sha256": "ad507cae7d195811d861b324fbb1056e986c58f875a6cf32f0fb5c2d2dc69e59",
+    "restored_sha256": "12e23c5bab2b26261e875fb6ffbfc6f54eecf1921af7f3ae00cdc26aa49a2bf5",
+    "exit": 101,
+    "assertion_failed": true,
+    "log": "reversal-policy-shape.log"
+  },
+  {
+    "case": "wasm-public",
+    "path": "crates/gnb-wallet-wasm/src/lib.rs",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "gnb-wallet-wasm",
+      "--lib",
+      "pqpsbt_public_decode_reaches_the_format_parser",
+      "--",
+      "--nocapture"
+    ],
+    "before_sha256": "0483c533728037c28d39288c59e7c5782afde67f26d7f41fda8daed4ca34704a",
+    "mutated_sha256": "1f06e8cb74366e5672573e378896e7309818074d7677dd719319f08f0c34b0ba",
+    "restored_sha256": "0483c533728037c28d39288c59e7c5782afde67f26d7f41fda8daed4ca34704a",
+    "exit": 101,
+    "assertion_failed": true,
+    "log": "reversal-wasm-public.log"
+  },
+  {
+    "case": "fee-ceiling",
+    "path": "crates/gnb-crypto/src/wallet/pqpsbt.rs",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "gnb-crypto",
+      "--lib",
+      "pqpsbt_signer_rejects_bad_public_data_before_callback_and_honors_activation",
+      "--",
+      "--nocapture"
+    ],
+    "before_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "mutated_sha256": "c6ae73f7a5ed788215ed53b05f5d421c53f2fbc14c2a41d9acc3fae858f3c4bd",
+    "restored_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "exit": 101,
+    "assertion_failed": true,
+    "log": "reversal-fee-ceiling.log"
+  },
+  {
+    "case": "verification-budget",
+    "path": "crates/gnb-crypto/src/wallet/pqpsbt.rs",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "gnb-crypto",
+      "--lib",
+      "pqpsbt_max_transport_budget_measures_48_verifications_and_zero_when_over",
+      "--",
+      "--nocapture"
+    ],
+    "before_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "mutated_sha256": "c59700fd1c942223a5a8a95c1b87d6d09e13a7948c4c0bbab58a117dc5f84a61",
+    "restored_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "exit": 101,
+    "assertion_failed": true,
+    "log": "reversal-verification-budget.log"
+  },
+  {
+    "case": "request-fields",
+    "path": "crates/gnb-crypto/src/wallet/pqpsbt.rs",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "gnb-crypto",
+      "--lib",
+      "pqpsbt_public_request_rejects_unknown_and_secret_fields",
+      "--",
+      "--nocapture"
+    ],
+    "before_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "mutated_sha256": "aaf86eb4f6969023e4549220795934a2f31ce0d52ad8a005771aa36eddec6a37",
+    "restored_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "exit": 101,
+    "assertion_failed": true,
+    "log": "reversal-request-fields.log"
+  },
+  {
+    "case": "json-cap",
+    "path": "crates/gnb-crypto/src/wallet/pqpsbt.rs",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "gnb-crypto",
+      "--lib",
+      "pqpsbt_binary_limit_preserves_equivalent_bounded_json",
+      "--",
+      "--nocapture"
+    ],
+    "before_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "mutated_sha256": "ce60edca79bba6b151e589689700617d3e9dc3ed1e7c4da39d35dbbd99a644e7",
+    "restored_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "exit": 101,
+    "assertion_failed": true,
+    "log": "reversal-json-cap.log"
+  },
+  {
+    "case": "wasm-session-network",
+    "path": "crates/gnb-wallet-wasm/src/lib.rs",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "gnb-wallet-wasm",
+      "--lib",
+      "pqpsbt_wasm_roles_sign_in_session_and_reject_bad_context",
+      "--",
+      "--nocapture"
+    ],
+    "before_sha256": "0483c533728037c28d39288c59e7c5782afde67f26d7f41fda8daed4ca34704a",
+    "mutated_sha256": "408eeb68dea8464155c67aa3c47ba586550b3941209a4648190b9f03e4a94ab6",
+    "restored_sha256": "0483c533728037c28d39288c59e7c5782afde67f26d7f41fda8daed4ca34704a",
+    "exit": 101,
+    "assertion_failed": true,
+    "log": "reversal-wasm-session-network.log"
+  },
+  {
+    "case": "money-range",
+    "path": "crates/gnb-crypto/src/wallet/pqpsbt.rs",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "gnb-crypto",
+      "--lib",
+      "pqpsbt_review_rejects_",
+      "--",
+      "--nocapture"
+    ],
+    "before_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "mutated_sha256": "5fda486da412ef9aa3a1a76c6e11b77f522b8b7c55f1a38ec1d27cfc5868f2ed",
+    "restored_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "exit": 101,
+    "assertion_failed": true,
+    "log": "reversal-money-range.log"
+  },
+  {
+    "case": "fee-floor",
+    "path": "crates/gnb-crypto/src/wallet/pqpsbt.rs",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "gnb-crypto",
+      "--lib",
+      "pqpsbt_review_rejects_fee_below_absolute_minimum_before_callback",
+      "--",
+      "--nocapture"
+    ],
+    "before_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "mutated_sha256": "cf61eb0f66009257389a6152e680e6ed51e9538811f3353a65d555641969d668",
+    "restored_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "exit": 101,
+    "assertion_failed": true,
+    "log": "reversal-fee-floor.log"
+  },
+  {
+    "case": "final-fee",
+    "path": "crates/gnb-crypto/src/wallet/pqpsbt.rs",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "gnb-crypto",
+      "--lib",
+      "pqpsbt_finalizer_rechecks_exact_consensus_minimum_with_real_witness",
+      "--",
+      "--nocapture"
+    ],
+    "before_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "mutated_sha256": "e34d4b65e5523fd992fc053719feea5248759a63eeb2e8f766c0ea105f3da169",
+    "restored_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "exit": 101,
+    "assertion_failed": true,
+    "log": "reversal-final-fee.log"
+  },
+  {
+    "case": "candidate-size",
+    "path": "crates/gnb-crypto/src/wallet/pqpsbt.rs",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "gnb-crypto",
+      "--lib",
+      "pqpsbt_signing_at_binary_limit_fails_atomically",
+      "--",
+      "--nocapture"
+    ],
+    "before_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "mutated_sha256": "20c953cdb1db2bc6597be25ba32acf4d433a3d998945e7a56a3ab2c478067d9c",
+    "restored_sha256": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "exit": 101,
+    "assertion_failed": true,
+    "log": "reversal-candidate-size.log"
+  }
+]

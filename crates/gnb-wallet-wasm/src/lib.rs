@@ -194,6 +194,19 @@ fn observe_wiped(req: Option<&Value>, out: &Value) {
 /// Dispatch one request. Pure Rust, testable on the host.
 pub fn handle(req: &Value) -> Result<Value, String> {
     match s(req, "op")? {
+        "pqpsbt" => gnb_crypto::wallet::pqpsbt::public_request(req),
+        "pqpsbt_sign" => {
+            use gnb_crypto::wallet::pqpsbt::{self, PqPsbt};
+            pqpsbt::check_request_fields(req, &["op", "hex", "network", "next_height", "max_fee"])?;
+            let context = pqpsbt::context_from_request(req)?;
+            let mut document = PqPsbt::from_bytes(&pqpsbt::decode_hex(s(req, "hex")?, pqpsbt::MAX_BYTES)?)?;
+            let review = document.review(&context)?;
+            let key_index = with_session(|kp| {
+                Address::parse_for_network(&kp.address, context.network).map_err(|e| e.to_string())?;
+                document.sign(&context, &kp.public_key, |digest, version| kp.sign_tx_digest(digest, version))
+            })?;
+            Ok(json!({"hex": hex::encode(document.to_bytes()?), "key_index": key_index, "review": review.to_json()}))
+        }
         "open" => {
             let kp = open_keypair(req)?;
             let out = json!({ "address": kp.address, "public_key": hex::encode(&kp.public_key) });
@@ -507,6 +520,49 @@ mod tests {
 
     /// The session is process-global: tests that change it take this lock.
     static SESSION_TESTS: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn pqpsbt_public_decode_reaches_the_format_parser() {
+        let err = handle(&json!({"op": "pqpsbt", "action": "decode", "hex": ""})).unwrap_err();
+        assert!(err.contains("PQ-PSBT magic"), "missing public decoder: {err}");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "key generation, signing and verification run the PQClean ML-DSA-65 and Falcon-1024 C code, which Miri cannot execute")]
+    fn pqpsbt_wasm_roles_sign_in_session_and_reject_bad_context() {
+        use gnb_crypto::core::policy::SpendPolicy;
+        use gnb_crypto::wallet::{policy_spend::PolicySpend, pqpsbt::PqPsbt};
+        let _session = SESSION_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut keys = (0..3).map(|_| generate_keypair(false)).collect::<Vec<_>>();
+        let policy = SpendPolicy::new(2, keys.iter().map(|k| k.public_key.clone()).collect(), 0, 0).unwrap();
+        let mut spend = PolicySpend::new(Network::Mainnet, policy, &[([7;32],0,5_000_000)], vec![9;20], 1_000_000,0,0).unwrap();
+        spend.target_height(17_500).unwrap();
+        let document=PqPsbt::from_policy_spend(spend).unwrap();
+        let hex=hex::encode(document.to_bytes().unwrap());
+        let public=json!({"op":"pqpsbt","action":"decode","hex":hex});
+        let decoded=handle(&public).unwrap();
+        assert_eq!(handle(&json!({"op":"pqpsbt","action":"encode","json":decoded["json"]})).unwrap()["hex"],hex);
+        let sign=json!({"op":"pqpsbt_sign","hex":hex,"network":"mainnet","next_height":"17500","max_fee":"5000000"});
+        handle(&json!({"op":"wipe"})).unwrap();
+        assert!(handle(&sign).unwrap_err().contains("locked"));
+        set_session(keys.remove(0));
+        for (field,value) in [("max_fee","0"),("network","testnet"),("next_height","17499")] {
+            let mut bad=sign.clone(); bad[field]=value.into(); assert!(handle(&bad).is_err());
+        }
+        handle(&json!({"op":"setnetwork","testnet":true})).unwrap();
+        assert!(handle(&sign).is_err(),"session network must be independently checked");
+        handle(&json!({"op":"setnetwork","testnet":false})).unwrap();
+        let first=handle(&sign).unwrap();
+        assert_eq!(first["review"]["current_unspentness"],"not_checked_offline");
+        set_session(keys.remove(1));
+        let second=handle(&sign).unwrap();
+        let combined=handle(&json!({"op":"pqpsbt","action":"combine","hex":first["hex"],"other_hex":second["hex"]})).unwrap();
+        let finalized=handle(&json!({"op":"pqpsbt","action":"finalize","hex":combined["hex"],"network":"mainnet","next_height":"17500","max_fee":"5000000"})).unwrap();
+        let tx=Transaction::from_wire_bytes(&hex::decode(finalized["hex"].as_str().unwrap()).unwrap()).unwrap();
+        assert!(!tx.inputs[0].script_sig.is_empty());
+        assert_eq!(finalized["txid"],hex::encode(document.spend.tx.txid()));
+        handle(&json!({"op":"wipe"})).unwrap();
+    }
 
     // The session is process-global: keep every flow in one test.
     #[test]

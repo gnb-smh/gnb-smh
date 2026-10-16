@@ -17,7 +17,7 @@ import { html, raw, isAddress, isHex64, num, sats } from "/assets/safe.js";
 
 // SHA-256 of /wallet/gnb_wallet.wasm. Written by scripts/build-wallet-wasm.sh
 // and checked by `node --test site/tests/`; loadCore refuses any other binary.
-const WASM_SHA256 = "1537c685477f4de1b71166d7932d8c0d2b5b97ab82d250f79486130e14165274";
+const WASM_SHA256 = "4571dbc61ed91468fc8841f60af55fc0a9a49065d82ffb00391f44007075e3a7";
 
 const SAT = 100000000n;
 // UTXO_WINDOW / UTXO_WIDE_WINDOW (core.js): rows asked of getutxos, the same
