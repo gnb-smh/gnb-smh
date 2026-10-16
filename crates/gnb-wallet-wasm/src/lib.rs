@@ -156,7 +156,11 @@ fn serialize_exact(v: &Value) -> Box<[u8]> {
 /// returned buffer is the only copy left; the page frees it through
 /// `gnb_free`, which wipes it.
 pub fn call_bytes(input: &[u8]) -> Box<[u8]> {
-    let mut req = serde_json::from_slice::<Value>(input);
+    let mut req = if gnb_crypto::wallet::descriptor::mentions_descriptor_operation(input) {
+        gnb_crypto::wallet::descriptor::request_from_json(input)
+    } else {
+        serde_json::from_slice::<Value>(input).map_err(|e| e.to_string())
+    };
     let mut out = match &mut req {
         Ok(req) => match dispatch_wiping(req) {
             Ok(v) => json!({ "ok": v }),
@@ -194,6 +198,7 @@ fn observe_wiped(req: Option<&Value>, out: &Value) {
 /// Dispatch one request. Pure Rust, testable on the host.
 pub fn handle(req: &Value) -> Result<Value, String> {
     match s(req, "op")? {
+        "descriptor" => gnb_crypto::wallet::descriptor::public_request(req),
         "pqpsbt" => gnb_crypto::wallet::pqpsbt::public_request(req),
         "pqpsbt_sign" => {
             use gnb_crypto::wallet::pqpsbt::{self, PqPsbt};
