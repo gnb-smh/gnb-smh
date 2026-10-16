@@ -141,6 +141,15 @@ struct Cli {
     /// present the API key like everyone else (a browser on this machine
     /// connects from loopback — the blanket bypass let any web page write).
     #[arg(long)]                                         rpc_trust_loopback: bool,
+    /// The forwarding header your reverse proxy / tunnel WRITES with the
+    /// client's address (B2-T11): the client of a proxied request is read
+    /// from this header only (for X-Forwarded-For and Forwarded, its last
+    /// hop), and only when the proxy connects from loopback (or a trusted
+    /// private range). Default x-forwarded-for (nginx
+    /// $proxy_add_x_forwarded_for, HAProxy option forwardfor, Caddy,
+    /// cloudflared); set x-real-ip, cf-connecting-ip, forwarded, ... if your
+    /// proxy sets that one instead.
+    #[arg(long, default_value = "x-forwarded-for")]      rpc_proxy_client_header: String,
 
     // ── Sprint D: Prometheus metrics ─────────────────────────────────
     /// Enable Prometheus metrics server. Off by default (opt-in).
@@ -457,6 +466,13 @@ async fn main() {
             eprintln!("   Do not combine them (docs/RUNNING.md).");
         }
     }
+    let rpc_proxy_client_header = match rpc::auth::validate_proxy_client_header(&cli.rpc_proxy_client_header) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("❌ {e}");
+            std::process::exit(2);
+        }
+    };
     if cli.rpc_allow_origins.iter().any(|o| o == "*") {
         eprintln!("⚠  --rpc-allow-origin '*': any web page may issue READ calls.");
         eprintln!("   Write methods still refuse wildcard origins.");
@@ -2044,6 +2060,7 @@ async fn main() {
             allowed_origins:           cli.rpc_allow_origins.clone(),
             allowed_hosts:             cli.rpc_allow_hosts.clone(),
             trust_loopback:            cli.rpc_trust_loopback,
+            proxy_client_header:       rpc_proxy_client_header.clone(),
         },
         node_state.clone(), store.clone(), mempool.clone(), dag.clone(), outbound_tx.clone(),
         // B5f pool seam: submitblock hook (see rpc::SubmitBlockFn).

@@ -72,18 +72,43 @@ impl ChainCache {
     /// point and append the new ones. Work is proportional to the blocks
     /// that left and joined the chain, not to its length (NET-15; pre-fix:
     /// a clone of the chain and a rebuild of the position map on every tip
-    /// change). The caller holds the DAG read lock.
-    fn advance(&mut self, dag: &GhostDAG, tip: [u8; 32]) {
+    /// change).
+    ///
+    /// The walk takes the DAG read lock for at most [`CHAIN_BUILD_CHUNK`]
+    /// blocks at a time, like [`Self::build`] (review: after a long gap with
+    /// no explorer traffic, e.g. a sync of a few hundred thousand blocks,
+    /// the catch-up walked every new block under one hold and blocked
+    /// `accept_block`). A block's selected parent never changes, so the
+    /// walk from `tip` is consistent across chunks, and the cache (whose
+    /// mutex the caller holds) does not move meanwhile; the chain itself is
+    /// updated without the DAG lock. `dag` is the caller's guard, which
+    /// read `tip`; it is released between chunks and returned re-taken.
+    fn advance<'a>(
+        &mut self,
+        state: &'a AppState,
+        mut dag: parking_lot::RwLockReadGuard<'a, GhostDAG>,
+        tip: [u8; 32],
+    ) -> parking_lot::RwLockReadGuard<'a, GhostDAG> {
         let mut tail = Vec::new();
         let mut cur = Some(tip);
         let mut meet = None;
-        while let Some(h) = cur {
-            if let Some(&p) = self.pos.get(&h) { meet = Some(p); break; }
-            tail.push(h);
-            cur = dag.get_block_data(&h).and_then(|d| d.selected_parent);
+        let mut work = 0;
+        loop {
+            let mut steps = 0;
+            while let Some(h) = cur {
+                if let Some(&p) = self.pos.get(&h) { meet = Some(p); cur = None; break; }
+                if steps == CHAIN_BUILD_CHUNK { break; }
+                tail.push(h);
+                cur = dag.get_block_data(&h).and_then(|d| d.selected_parent);
+                steps += 1;
+            }
+            work = work.max(steps + 1);
+            if cur.is_none() { break; }
+            drop(dag);
+            dag = state.dag.read();
         }
+        drop(dag);
         let keep = meet.map_or(0, |p| p + 1);
-        let removed = self.chain.len() - keep;
         for h in self.chain.drain(keep..) {
             self.pos.remove(&h);
         }
@@ -92,7 +117,8 @@ impl ChainCache {
             self.chain.push(*h);
         }
         self.tip = tip;
-        self.work = tail.len() + removed + 1;
+        self.work = work;
+        state.dag.read()
     }
 }
 
@@ -120,13 +146,17 @@ fn with_chain<R>(state: &AppState, f: impl FnOnce(&ChainCache, &GhostDAG) -> R) 
             caches.len() - 1
         }
     };
-    let dag = state.dag.read();
-    let tip = dag.selected_tip()?;
     let c = &mut caches[idx];
-    if c.tip != tip {
-        c.advance(&dag, tip);
+    let mut dag = state.dag.read();
+    // The tip may move again while a long catch-up released the lock: follow
+    // it until the cache matches the tip under the guard `f` runs with.
+    loop {
+        let tip = dag.selected_tip()?;
+        if c.tip == tip {
+            return Some(f(c, &dag));
+        }
+        dag = c.advance(state, dag, tip);
     }
-    Some(f(c, &dag))
 }
 
 #[cfg(test)]
@@ -482,7 +512,9 @@ pub(super) fn get_dag_window(params: Option<&Value>, state: &AppState) -> Value 
 /// reverse walk of the index from the newest entry, or from `cursor` (the
 /// `next_cursor` of the previous page, 32 hex characters), skipping at most
 /// `offset` ≤ [`MAX_HISTORY_OFFSET`](crate::storage::indexer::MAX_HISTORY_OFFSET)
-/// entries (a larger offset is clamped, as `getrichlist` does), and the walk
+/// entries (a larger offset is refused with an error that names the cursor,
+/// as the explorer API answers 400: a silently clamped offset returned the
+/// same page for every deeper offset, so offset paging never ended), and the walk
 /// stops when the request is cancelled. Pre-fix every call counted the whole
 /// history, skipped forward from the oldest entry and walked every UTXO.
 pub(super) fn get_address_history(params: Option<&Value>, state: &AppState) -> Value {
@@ -492,8 +524,11 @@ pub(super) fn get_address_history(params: Option<&Value>, state: &AppState) -> V
         return json!({ "error": "invalid address" });
     };
     let limit = (params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).unwrap_or(25) as usize).clamp(1, MAX_PAGE);
-    let offset = params.and_then(|p| p.get(2)).and_then(|v| v.as_u64()).unwrap_or(0)
-        .min(MAX_HISTORY_OFFSET as u64) as usize;
+    let offset = params.and_then(|p| p.get(2)).and_then(|v| v.as_u64()).unwrap_or(0);
+    if offset > MAX_HISTORY_OFFSET as u64 {
+        return offset_too_large();
+    }
+    let offset = offset as usize;
     let cursor = match params.and_then(|p| p.get(3)) {
         None | Some(Value::Null) => None,
         Some(v) => match v.as_str().and_then(|s| hex::decode(s).ok())
@@ -533,6 +568,16 @@ pub(super) fn get_address_history(params: Option<&Value>, state: &AppState) -> V
         "address": addr, "balance": balance.to_string(), "utxo_count": utxos,
         "total": total, "offset": offset, "max_offset": MAX_HISTORY_OFFSET,
         "items": items, "next_cursor": page.next_cursor.map(hex::encode),
+    })
+}
+
+/// B1-T11 (review): the answer to an address-history offset above
+/// [`MAX_HISTORY_OFFSET`](crate::storage::indexer::MAX_HISTORY_OFFSET).
+pub(super) fn offset_too_large() -> Value {
+    json!({
+        "error": format!("offset above {}: page deeper with the cursor (next_cursor) or a narrower height range",
+            crate::storage::indexer::MAX_HISTORY_OFFSET),
+        "max_offset": crate::storage::indexer::MAX_HISTORY_OFFSET,
     })
 }
 

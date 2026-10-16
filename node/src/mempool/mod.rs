@@ -120,6 +120,10 @@ pub struct MempoolEntry {
     /// Bincode size (`Transaction::actual_size`, the consensus block-size
     /// measure), cached.
     pub size:       usize,
+    /// Canonical wire size (`to_wire_bytes(true)`, the unit of the consensus
+    /// minimum fee), cached at admission so fee-rate estimates never
+    /// re-encode the pool (B1-T21 review).
+    pub wire_size:  usize,
     /// MEM-6: pooled transactions whose outputs this one spends.
     pub parents:    BTreeSet<[u8; 32]>,
     /// MEM-6: pooled transactions spending outputs of this one.
@@ -568,6 +572,7 @@ impl Mempool {
             crate::metrics::inc_tx_rejected("oversized");
             return Err(MempoolError::Oversized { size, max: MAX_TX_SIZE });
         }
+        let wire_size = tx.to_wire_bytes(true).len();
 
         // SECURITY (audit L2): enforce a minimum relay fee rate (sat/byte).
         if fee < (size as u64).saturating_mul(MIN_RELAY_FEE_RATE) {
@@ -628,7 +633,7 @@ impl Mempool {
         let replaced_ids: Vec<[u8; 32]> = g.remove_set(&replaced).into_iter().map(|(t, _)| t).collect();
         let now = self.clock.now_secs();
         g.insert(txid, MempoolEntry {
-            tx, fee, added_at: now, size, parents: BTreeSet::new(), children: BTreeSet::new(),
+            tx, fee, added_at: now, size, wire_size, parents: BTreeSet::new(), children: BTreeSet::new(),
         });
 
         // Trim to both caps: evict the lowest descendant-score package. If
@@ -893,36 +898,39 @@ impl Mempool {
         fee_rate_key(fee, size).0 >= floor
     }
 
-    /// Audit MEM-6: fee-rate estimate in sat per 1,000 bytes of the canonical
-    /// wire encoding — the unit of the consensus minimum fee. The median rate
-    /// of the pool, never below the consensus minimum rate
-    /// (`MIN_FEE_RATE_SAT_PER_KB`) nor the rolling minimum.
     /// Fee rates (sat per 1,000 wire bytes) of the pooled transactions,
     /// ascending (B1-T21: the advanced estimate's tiers are rates, applied to
-    /// the caller's transaction size).
+    /// the caller's transaction size). Review: computed from the wire size
+    /// cached on each entry at admission and sorted after the pool's lock is
+    /// released; it re-encoded every pooled transaction (up to
+    /// `MAX_MEMPOOL_BYTES`) under the read lock on every call, which held off
+    /// admission, eviction and block-connect cleanup.
     pub fn fee_rates_per_kb(&self) -> Vec<u64> {
-        let g = self.inner.read();
-        let mut rates: Vec<u64> = g.txs.values().map(|e| {
-            let wire = e.tx.to_wire_bytes(true).len().max(1) as u64;
-            e.fee.saturating_mul(1000) / wire
-        }).collect();
+        let mut rates: Vec<u64> = {
+            let g = self.inner.read();
+            g.txs.values().map(|e| e.fee.saturating_mul(1000) / e.wire_size.max(1) as u64).collect()
+        };
         rates.sort_unstable();
         rates
     }
 
+    /// Audit MEM-6: fee-rate estimate in sat per 1,000 bytes of the canonical
+    /// wire encoding — the unit of the consensus minimum fee. The median rate
+    /// of the pool, never below the consensus minimum rate
+    /// (`MIN_FEE_RATE_SAT_PER_KB`) nor the rolling minimum.
     pub fn estimate_fee_rate_per_kb(&self) -> u64 {
         let floor = crate::core::tokenomics::MIN_FEE_RATE_SAT_PER_KB
             .max(self.rolling_min_fee_rate().saturating_mul(1000));
-        let g = self.inner.read();
-        if g.txs.is_empty() {
-            return floor;
+        let rates = self.fee_rates_per_kb();
+        rates.get(rates.len() / 2).map_or(floor, |r| (*r).max(floor))
+    }
+
+    /// Test hook: overwrite the cached wire size of a pooled transaction.
+    #[cfg(test)]
+    pub(crate) fn set_cached_wire_size(&self, txid: &[u8; 32], wire_size: usize) {
+        if let Some(e) = self.inner.write().txs.get_mut(txid) {
+            e.wire_size = wire_size;
         }
-        let mut rates: Vec<u64> = g.txs.values().map(|e| {
-            let wire = e.tx.to_wire_bytes(true).len().max(1) as u64;
-            e.fee.saturating_mul(1000) / wire
-        }).collect();
-        rates.sort_unstable();
-        rates[rates.len() / 2].max(floor)
     }
 
     // ── MEM-5: recent-rejects filter ─────────────────────────────────────

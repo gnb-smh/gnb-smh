@@ -72,10 +72,15 @@ release rebuilds its aggregates once at start-up, and `total` is `null`
 until then), and a `getaddresshistory [address, limit<=100, offset, cursor]`
 page walks the index newest-first from its end, or from `cursor` (the
 `next_cursor` of the previous page, 32 hex characters, `null` on the last
-page). `offset` is capped at 10,000 (`max_offset`, clamped like
-`getrichlist`'s); deeper pages use the cursor. `listtransactions` caps its
-offset the same way. The explorer's selected-chain cache follows the tip
-incrementally and never walks the whole chain under the DAG lock (NET-15).
+page). `offset` is at most 10,000 (`max_offset`); a larger one is refused
+with an error that names the cursor (it is not clamped: a clamped offset
+returned the page at 10,000 again and again), and deeper pages use the
+cursor. `listtransactions` refuses an offset above 10,000 the same way; over
+a height range other than the whole history it counts at most 11,000 entries
+(`total_available` is `null` above that, and `total_at_least` gives the
+count it reached). The explorer's selected-chain cache follows the tip
+incrementally and takes the DAG lock for at most 4,096 blocks at a time, also
+when it catches up after a long gap (NET-15).
 
 The node serves plain HTTP. To reach a remote node, put a TLS reverse proxy in
 front of its RPC port or use an SSH tunnel
@@ -105,17 +110,31 @@ connection alone. Any setup that exposes the RPC port this way MUST:
    request that carries a forwarding header, but a proxy that adds none (a
    raw TCP forward, an SSH tunnel from another user) would make every remote
    caller an administrator;
-3. have the proxy set `X-Forwarded-For` (or `X-Real-IP` / `Forwarded`).
+3. have the proxy append the client's address to `X-Forwarded-For` (nginx
+   `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`, HAProxy
+   `option forwardfor`, Caddy and cloudflared by default), or, if it writes
+   another header, name that header with `--rpc-proxy-client-header`
+   (`x-real-ip`, `cf-connecting-ip`, `forwarded`, ...). The node reads the
+   client from that one header only: a proxy that sets only `X-Real-IP`
+   passes a client's own `X-Forwarded-For` through, so with the default the
+   client would name its own bucket.
 
 A request carrying any forwarding header (`X-Forwarded-For`, `X-Real-IP`,
 `True-Client-IP`, `CF-Connecting-IP`, `Forwarded`, ... : `FORWARDING_HEADERS`
 in `node/src/rpc/auth.rs`) is treated as a remote request even when it
-arrives from loopback: it is rate-limited in the bucket of the client the
-nearest proxy names (the last `X-Forwarded-For` entry; a header the node
-cannot parse shares one "unknown" bucket) and it is never a trusted caller.
-Direct loopback callers without such a header (the operator's `gnb-cli`, a
-co-located pool) keep the loopback exemption. The header is never trusted for
-authorization: it can only take trust away.
+arrives from loopback, and it is never a trusted caller. When the proxy
+connects from loopback (or from a trusted private range with
+`--rpc-trust-private-ranges`), the request is rate-limited in the bucket of
+the client named by `--rpc-proxy-client-header` (for `X-Forwarded-For` and
+`Forwarded` the last entry, the one the nearest proxy wrote; a request
+without a parsable address there shares the proxy's own bucket). A request
+from any other address is limited in the bucket of that address, whatever
+its headers say, so a remote client cannot pick a fresh bucket per request.
+A caller that presents the API key is the operator and is not rate-limited
+(the pool polling `getblocktemplate` through the proxy must still get its
+`submitblock` through). Direct loopback callers without a forwarding header
+(the operator's `gnb-cli`, a co-located pool) keep the loopback exemption.
+The header is never trusted for authorization: it can only take trust away.
 
 `submitblock` runs the cheap checks first (structure without the proof of
 work, known parents, height, expected bits, timestamp) and evaluates the
@@ -127,9 +146,13 @@ costs no proof evaluation unless it is otherwise a valid next block.
 RPC request bodies are capped at 1 MiB, except `submitblock`, whose body
 carries the block as hex (twice its wire size): it may be up to 4 MiB, room
 for a full 1,000,000-byte block. At most four bodies above 1 MiB are read at
-a time (the rest are answered HTTP 503, JSON-RPC -32005, "busy"); a body
-that is not `submitblock` and exceeds 1 MiB is answered HTTP 413. Bitcoin Core
-accepts bodies up to 32 MiB.
+a time (the rest are answered HTTP 503, JSON-RPC -32005, "busy"), plus two
+more reserved for the operator's callers (a caller that presents the API key,
+or a direct loopback caller without forwarding headers): the method is only
+known once the body is read, so anonymous uploads that stall could otherwise
+hold every permit and lock the operator's miner out of full-block
+`submitblock`. A body that is not `submitblock` and exceeds 1 MiB is answered
+HTTP 413. Bitcoin Core accepts bodies up to 32 MiB.
 
 ### Anonymous transaction submissions (audit B1-T10)
 
@@ -241,7 +264,11 @@ network (re-audit CRY-7): a v3 file proves its own; a v2 file opens only for
 a network the caller states, on every path, not only for spending:
 `gnb-cli send`, `keyinfo` and `importfounder` (`--mainnet` / `--testnet`),
 `gnb-wallet send`, `sign`, `address` and `pubkey` (same flags), the web
-wallet's `open` (the page states mainnet), and the library
+wallet's `open` (the page states mainnet; this takes effect with the
+rebuilt `site/wallet/gnb_wallet.wasm`: the file the site serves, pinned in
+`site/wallet/app.js`, was built before this fix, and the same holds for the
+wallet fixes B2-T2, CRY-4 and CRY-8, so the WASM must be rebuilt and
+re-pinned before release), and the library
 (`Keypair::from_encrypted_bytes_on` / `load_encrypted_on`;
 `from_encrypted_bytes` / `load_encrypted` open v3 files only). The stored
 address must be a valid address of that network and match the decrypted

@@ -508,12 +508,36 @@ pub const FORWARDING_HEADERS: &[&str] = &[
 /// The client a forwarded request came from, as far as the proxy said.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardedClient {
-    /// The address the proxy reported (the LAST `X-Forwarded-For` entry,
-    /// the one the nearest proxy appended, else a single-address header,
-    /// else the last `Forwarded: for=`).
+    /// The address the proxy reported in the operator's client header
+    /// (`--rpc-proxy-client-header`; for `X-Forwarded-For` and `Forwarded`
+    /// the LAST hop, the one the nearest proxy appended).
     Client(IpAddr),
-    /// A forwarding header without a usable address.
+    /// A forwarding header without a usable address in the client header.
     Unknown,
+}
+
+/// The default client header (`--rpc-proxy-client-header`): nginx with
+/// `$proxy_add_x_forwarded_for`, HAProxy `option forwardfor`, Caddy, Apache
+/// `mod_proxy`, Cloudflare and cloudflared all append the address they saw
+/// to `X-Forwarded-For`.
+pub const DEFAULT_PROXY_CLIENT_HEADER: &str = "x-forwarded-for";
+
+/// Headers `--rpc-proxy-client-header` may name: the ones that carry a
+/// client address.
+pub const PROXY_CLIENT_HEADERS: &[&str] = &[
+    "x-forwarded-for", "forwarded", "x-real-ip", "cf-connecting-ip", "true-client-ip",
+    "x-client-ip", "fastly-client-ip", "x-cluster-client-ip",
+];
+
+/// Validate `--rpc-proxy-client-header` (case-insensitive); the lower-case
+/// header name.
+pub fn validate_proxy_client_header(name: &str) -> Result<String, String> {
+    let lower = name.trim().to_ascii_lowercase();
+    if PROXY_CLIENT_HEADERS.contains(&lower.as_str()) {
+        Ok(lower)
+    } else {
+        Err(format!("--rpc-proxy-client-header {name:?}: expected one of {}", PROXY_CLIENT_HEADERS.join(", ")))
+    }
 }
 
 /// Parse an address as proxies write it: `1.2.3.4`, `1.2.3.4:5678`,
@@ -533,36 +557,52 @@ fn parse_forwarded_addr(s: &str) -> Option<IpAddr> {
 }
 
 /// `Some` iff the request carries a forwarding header (it came through a
-/// proxy), with the client the proxy named. Only the LAST hop of
-/// `X-Forwarded-For` / `Forwarded` is used: earlier entries are whatever the
-/// client sent and are not to be trusted (nginx's
-/// `$proxy_add_x_forwarded_for` appends the address it saw).
-pub fn forwarded_client(headers: &axum::http::HeaderMap) -> Option<ForwardedClient> {
+/// proxy), with the client named by `client_header`, the ONE header the
+/// operator's proxy writes (`--rpc-proxy-client-header`, lower case).
+///
+/// B2-T11 (review): only that header is read. With a fixed precedence over
+/// several headers, a client could write the header the proxy does not
+/// control and choose its own rate-limit bucket: nginx with only
+/// `proxy_set_header X-Real-IP $remote_addr` passes a client's own
+/// `X-Forwarded-For` through unchanged, and that header used to win. For
+/// `X-Forwarded-For` / `Forwarded` only the LAST hop is used: earlier
+/// entries are whatever the client sent (nginx's
+/// `$proxy_add_x_forwarded_for` appends the address it saw); for a
+/// single-address header, the last value (a proxy that sets it replaces the
+/// client's). Like nginx's `real_ip_header`.
+pub fn forwarded_client(headers: &axum::http::HeaderMap, client_header: &str) -> Option<ForwardedClient> {
     if !FORWARDING_HEADERS.iter().any(|h| headers.contains_key(*h)) {
         return None;
     }
-    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let last_xff = headers.get_all("x-forwarded-for").iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .filter(|s| !s.trim().is_empty())
-        .next_back()
-        .and_then(parse_forwarded_addr);
-    let single = ["x-real-ip", "cf-connecting-ip", "true-client-ip", "x-client-ip",
-                  "fastly-client-ip", "x-cluster-client-ip"]
-        .iter()
-        .find_map(|h| text(h).and_then(parse_forwarded_addr));
-    let forwarded_for = headers.get_all("forwarded").iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .last()
-        .and_then(|elem| elem.split(';')
-            .find_map(|kv| kv.trim().strip_prefix("for=").or_else(|| kv.trim().strip_prefix("For="))))
-        .and_then(parse_forwarded_addr);
-    Some(match last_xff.or(single).or(forwarded_for) {
+    let values = || headers.get_all(client_header).iter().filter_map(|v| v.to_str().ok());
+    let client = match client_header {
+        "x-forwarded-for" => values()
+            .flat_map(|v| v.split(','))
+            .filter(|s| !s.trim().is_empty())
+            .next_back()
+            .and_then(parse_forwarded_addr),
+        "forwarded" => values()
+            .flat_map(|v| v.split(','))
+            .next_back()
+            .and_then(|elem| elem.split(';')
+                .find_map(|kv| kv.trim().strip_prefix("for=").or_else(|| kv.trim().strip_prefix("For="))))
+            .and_then(parse_forwarded_addr),
+        _ => values().next_back().and_then(parse_forwarded_addr),
+    };
+    Some(match client {
         Some(ip) => ForwardedClient::Client(ip),
         None => ForwardedClient::Unknown,
     })
+}
+
+/// B2-T11 (review): a TCP peer whose forwarding headers name the client for
+/// rate limiting: a proxy on this host (loopback) or, with
+/// `--rpc-trust-private-ranges`, in a trusted private range. Any other peer
+/// wrote those headers itself, so it is limited by its own address (and a
+/// client that rotates `X-Forwarded-For` cannot mint a bucket per request or
+/// fill the limiter's table).
+pub fn peer_may_name_client(peer: IpAddr, trust_private_ranges: bool) -> bool {
+    peer.is_loopback() || is_trusted_local_ip(peer, trust_private_ranges)
 }
 
 /// True when the caller is the operator for the purpose of node-wide
@@ -639,10 +679,15 @@ impl ByteBudget {
 /// reverse proxy (B2-T11). With `forwarded == None` it is exactly
 /// `authorize_with_read_policy(peer, ...)`. With `Some(_)` the request is a
 /// remote one whatever its TCP peer: never fully trusted (no loopback /
-/// private-range bypass, `--rpc-trust-loopback` included), and rate-limited
-/// in the bucket of the client the proxy named (IPv6 by /64), or, for a
-/// proxied request that names none, in the bucket of the peer address itself,
-/// shared by all such requests; the API-key policy is unchanged.
+/// private-range bypass, `--rpc-trust-loopback` included). A caller that
+/// presents the configured API key is the operator (its pool behind the
+/// TLS proxy polling `getblocktemplate`): allowed without the limiter, as
+/// Bitcoin Core never rate-limits an authenticated RPC caller, so template
+/// polling can never use up the write bucket its `submitblock` needs.
+/// Anyone else is rate-limited in the bucket of the client the proxy named
+/// (IPv6 by /64) when the peer is a proxy ([`peer_may_name_client`]), else
+/// in the bucket of the peer address itself (a proxied request that names no
+/// client shares it); the API-key policy is unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn authorize_request(
     peer: IpAddr,
@@ -662,10 +707,15 @@ pub fn authorize_request(
             require_auth_for_reads, trust_private_ranges, trust_loopback_auth, rate_limiter,
         );
     };
+    if let (Some(p), Some(c)) = (presented_key, configured_key) {
+        if keys_match(p, c) {
+            return AuthDecision::Allow;
+        }
+    }
     let is_write = WRITE_METHODS.contains(&method);
     let key = match forwarded {
-        ForwardedClient::Client(ip) => ip,
-        ForwardedClient::Unknown => peer,
+        ForwardedClient::Client(ip) if peer_may_name_client(peer, trust_private_ranges) => ip,
+        _ => peer,
     };
     if !rate_limiter.check_key(key, is_write) {
         return AuthDecision::RateLimited;
@@ -1681,18 +1731,98 @@ mod b2_t11_proxy_tests {
     /// nearest proxy saw), never a client-written earlier entry.
     #[test]
     fn forwarded_client_takes_the_last_hop() {
-        assert_eq!(forwarded_client(&headers(&[])), None);
-        assert_eq!(forwarded_client(&headers(&[("user-agent", "curl")])), None);
+        let xff = DEFAULT_PROXY_CLIENT_HEADER;
+        assert_eq!(forwarded_client(&headers(&[]), xff), None);
+        assert_eq!(forwarded_client(&headers(&[("user-agent", "curl")]), xff), None);
         let ip = |s: &str| ForwardedClient::Client(s.parse().unwrap());
-        assert_eq!(forwarded_client(&headers(&[("x-forwarded-for", "10.9.9.9, 198.51.100.7")])), Some(ip("198.51.100.7")));
-        assert_eq!(forwarded_client(&headers(&[("x-forwarded-for", "1.1.1.1"), ("x-forwarded-for", "203.0.113.4:5000")])),
+        assert_eq!(forwarded_client(&headers(&[("x-forwarded-for", "10.9.9.9, 198.51.100.7")]), xff), Some(ip("198.51.100.7")));
+        assert_eq!(forwarded_client(&headers(&[("x-forwarded-for", "1.1.1.1"), ("x-forwarded-for", "203.0.113.4:5000")]), xff),
             Some(ip("203.0.113.4")));
-        assert_eq!(forwarded_client(&headers(&[("x-real-ip", "2001:db8::7")])), Some(ip("2001:db8::7")));
-        assert_eq!(forwarded_client(&headers(&[("cf-connecting-ip", "[2001:db8::8]:443")])), Some(ip("2001:db8::8")));
-        assert_eq!(forwarded_client(&headers(&[("forwarded", "for=192.0.2.60;proto=https, for=\"[2001:db8:cafe::17]:4711\"")])),
+        assert_eq!(forwarded_client(&headers(&[("x-real-ip", "2001:db8::7")]), "x-real-ip"), Some(ip("2001:db8::7")));
+        assert_eq!(forwarded_client(&headers(&[("cf-connecting-ip", "[2001:db8::8]:443")]), "cf-connecting-ip"), Some(ip("2001:db8::8")));
+        assert_eq!(forwarded_client(&headers(&[("forwarded", "for=192.0.2.60;proto=https, for=\"[2001:db8:cafe::17]:4711\"")]), "forwarded"),
             Some(ip("2001:db8:cafe::17")));
-        assert_eq!(forwarded_client(&headers(&[("via", "1.1 nginx")])), Some(ForwardedClient::Unknown));
-        assert_eq!(forwarded_client(&headers(&[("x-forwarded-for", "unknown")])), Some(ForwardedClient::Unknown));
+        assert_eq!(forwarded_client(&headers(&[("via", "1.1 nginx")]), xff), Some(ForwardedClient::Unknown));
+        assert_eq!(forwarded_client(&headers(&[("x-forwarded-for", "unknown")]), xff), Some(ForwardedClient::Unknown));
+        // Only the operator's client header names the client.
+        assert_eq!(forwarded_client(&headers(&[("x-real-ip", "2001:db8::7")]), xff), Some(ForwardedClient::Unknown));
+        assert_eq!(validate_proxy_client_header("X-Real-IP"), Ok("x-real-ip".into()));
+        assert!(validate_proxy_client_header("via").is_err());
+        assert!(validate_proxy_client_header("x-api-key").is_err());
+    }
+
+    /// B2-T11 (review): the client is read from the one header the
+    /// operator's proxy writes. nginx with only
+    /// `proxy_set_header X-Real-IP $remote_addr` passes a client's own
+    /// `X-Forwarded-For` through; with the old fixed precedence (last XFF
+    /// hop before X-Real-IP) such a client chose a fresh bucket per request.
+    #[test]
+    fn a_client_written_header_never_picks_the_bucket() {
+        let lo: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+        let rl = RateLimiterSet::new(60, 2);
+        let mut statuses = Vec::new();
+        for i in 0..5u8 {
+            let spoofed = HeaderValue::from_str(&format!("10.0.0.{i}")).unwrap();
+            let mut h = headers(&[("x-real-ip", "198.51.100.40")]);
+            h.append("x-forwarded-for", spoofed);
+            let f = forwarded_client(&h, "x-real-ip");
+            statuses.push(authorize_request(lo, f, "submitblock", None, None, false, false, false, false, &rl));
+        }
+        assert_eq!(statuses, [AuthDecision::Allow, AuthDecision::Allow, AuthDecision::RateLimited,
+            AuthDecision::RateLimited, AuthDecision::RateLimited], "limited in the X-Real-IP bucket");
+        assert_eq!(rl.tracked_ips(), 1, "one bucket, not one per spoofed value");
+    }
+
+    /// B2-T11 (review): forwarding headers name the client only when the
+    /// TCP peer is a proxy (loopback, or a trusted private range). A remote
+    /// peer (`--rpc-public`) that rotates `X-Forwarded-For` stays in its own
+    /// bucket: it can neither escape the limit nor fill the limiter's table
+    /// with spoofed keys (each held for 24 h, after which every new client
+    /// lands in the shared overflow bucket). It still loses any trust.
+    #[test]
+    fn a_remote_peer_cannot_mint_buckets_with_forwarding_headers() {
+        let peer: IpAddr = "203.0.113.50".parse().unwrap();
+        let rl = RateLimiterSet::new(3, 1);
+        let mut allowed = 0;
+        for i in 0..50u32 {
+            let spoofed = HeaderValue::from_str(&format!("10.{}.{}.{}", i >> 16, (i >> 8) & 255, i & 255)).unwrap();
+            let mut h = HeaderMap::new();
+            h.append("x-forwarded-for", spoofed);
+            let f = forwarded_client(&h, DEFAULT_PROXY_CLIENT_HEADER);
+            if authorize_request(peer, f, "getblockcount", None, None, false, false, false, false, &rl) == AuthDecision::Allow {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 3, "the peer's own read bucket");
+        assert_eq!(rl.tracked_ips(), 1);
+        // A trusted private-range peer that forwards is not fully trusted.
+        let lan: IpAddr = "10.1.2.3".parse().unwrap();
+        let f = Some(ForwardedClient::Client("198.51.100.1".parse().unwrap()));
+        assert_eq!(authorize_request(lan, f, "invalidateblock", None, None, false, false, true, true, &rl),
+            AuthDecision::Unauthorized);
+        assert!(peer_may_name_client(lan, true) && !peer_may_name_client(lan, false));
+    }
+
+    /// B2-T11 (review): an operator's pool behind the TLS proxy presents the
+    /// API key and polls `getblocktemplate` (a write method) every few
+    /// seconds; its `submitblock` must never be refused because the polling
+    /// used up the write bucket. A wrong key is still limited.
+    #[test]
+    fn a_keyed_proxied_caller_is_not_rate_limited() {
+        let lo: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+        let rl = RateLimiterSet::new(60, 5);
+        let key = "k".repeat(32);
+        let fwd = Some(ForwardedClient::Client("198.51.100.77".parse().unwrap()));
+        for _ in 0..20 {
+            assert_eq!(authorize_request(lo, fwd, "getblocktemplate", Some(&key), Some(&key), true, false, false, false, &rl),
+                AuthDecision::Allow);
+        }
+        assert_eq!(authorize_request(lo, fwd, "submitblock", Some(&key), Some(&key), true, false, false, false, &rl),
+            AuthDecision::Allow, "the found block reaches the node");
+        let other = Some(ForwardedClient::Client("198.51.100.78".parse().unwrap()));
+        let wrong: Vec<_> = (0..7).map(|_| authorize_request(lo, other, "submitblock", Some("wrong"), Some(&key),
+            true, false, false, false, &rl)).collect();
+        assert_eq!(wrong.last(), Some(&AuthDecision::RateLimited), "{wrong:?}");
     }
 
     /// Proxied requests from loopback: limited (IPv6 clients by /64, unnamed

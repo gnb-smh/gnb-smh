@@ -399,6 +399,21 @@ impl Storage {
         end_height: u64,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<u64, StorageError> {
+        self.count_address_history_capped(addr_hash, start_height, end_height, u64::MAX, cancel)
+    }
+
+    /// [`Self::count_address_history_cancellable`] that stops at `cap`
+    /// entries (returns `cap` when there are at least that many): at most
+    /// `cap` index steps whatever the address's history (B1-T11 review:
+    /// `listtransactions` over a height range).
+    pub fn count_address_history_capped(
+        &self,
+        addr_hash: &[u8; 20],
+        start_height: u64,
+        end_height: u64,
+        cap: u64,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<u64, StorageError> {
         let cf = self.db.cf_handle(CF_ADDR_TX_HISTORY)
             .ok_or_else(|| StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
         let mut lower = Vec::with_capacity(36);
@@ -416,6 +431,9 @@ impl Storage {
         for item in iter {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(super::aggregates::cancelled());
+            }
+            if count >= cap {
+                break;
             }
             self.note_reads(1);
             let (key, _) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
