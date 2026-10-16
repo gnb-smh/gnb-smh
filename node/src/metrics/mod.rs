@@ -79,6 +79,10 @@ pub struct MetricsState {
     /// S5: per-attempt depth distribution. `fork_depth` is last-value-only
     /// (racy under scrape); the histogram records every attempt.
     pub reorg_depth:                     Histogram,
+    /// Audit DAG-6: committed chain moves deeper than
+    /// `reorg::DEEP_REORG_ALERT_DEPTH`. Alert series only: there is no
+    /// reorg-depth limit, so every such reorg was followed.
+    pub deep_reorgs_total:               IntCounter,
 
     // ── Histograms (Phase 2) ────────────────────────────────────
     pub block_validation_seconds:        Histogram,
@@ -199,17 +203,24 @@ impl MetricsState {
             registry
         ).expect("register reorg_success_total");
 
-        // Depth buckets anchored to the finality window: MAX_REORG_DEPTH =
-        // core::CHECKPOINT_DEPTH = 1_000 in production builds, so the top
-        // bucket sits at the cap and +Inf catches only refused over-deep plans.
+        // Depth buckets up to the deep-reorg alert depth
+        // (`reorg::DEEP_REORG_ALERT_DEPTH` = core::CHECKPOINT_DEPTH = 1_000);
+        // +Inf counts deeper reorgs, which are executed (no depth limit, audit
+        // DAG-6) and also counted by `gnb_deep_reorgs_total`.
         let reorg_depth = register_histogram_with_registry!(
             histogram_opts!(
                 "gnb_reorg_depth",
-                "Blocks rolled back per reorg attempt (observed before execution; includes failed and depth-refused attempts)",
+                "Blocks rolled back per reorg attempt (observed before execution; includes failed attempts)",
                 vec![1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 50.0, 100.0, 250.0, 500.0, 1000.0]
             ),
             registry
         ).expect("register reorg_depth");
+
+        let deep_reorgs_total = register_int_counter_with_registry!(
+            opts!("gnb_deep_reorgs_total",
+                  "Committed chain moves that rolled back more than the deep-reorg alert depth (1,000 blocks); followed, never refused"),
+            registry
+        ).expect("register deep_reorgs_total");
 
         // ── Histograms ───────────────────────────────────────────
         // Block validation buckets tuned for expected range: 1ms..10s
@@ -253,6 +264,7 @@ impl MetricsState {
             fork_depth,
             reorg_success_total,
             reorg_depth,
+            deep_reorgs_total,
             block_validation_seconds,
             rpc_latency_seconds,
         }
@@ -333,11 +345,22 @@ pub fn inc_task_panic(task: &str) {
     }
 }
 
+/// NET-13 (defence in depth): the RPC layer already maps caller-supplied
+/// method names to a fixed set (`rpc::method_label`); any label that is not
+/// a short lowercase identifier still becomes `"unknown"` here, so a new
+/// call site can never mint unbounded Prometheus series.
+fn bounded_label(label: &str) -> &str {
+    let ok = !label.is_empty()
+        && label.len() <= 40
+        && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if ok { label } else { "unknown" }
+}
+
 /// Status label is "ok", "unauthorized", or "rate_limited".
 #[inline]
 pub fn inc_rpc_request(method: &str, status: &str) {
     if let Some(m) = METRICS.get() {
-        m.rpc_requests_total.with_label_values(&[method, status]).inc();
+        m.rpc_requests_total.with_label_values(&[bounded_label(method), bounded_label(status)]).inc();
     }
 }
 
@@ -368,10 +391,17 @@ pub fn inc_reorg_success() {
 
 /// S5: observe the depth (blocks rolled back) of a reorg attempt. Called at
 /// the start of `execute_reorg` alongside `set_fork_depth`, so the histogram
-/// counts every attempt — including ones later refused by the depth cap.
+/// counts every attempt, including ones that later fail.
 #[inline]
 pub fn observe_reorg_depth(depth: f64) {
     if let Some(m) = METRICS.get() { m.reorg_depth.observe(depth); }
+}
+
+/// Audit DAG-6: a committed reorg rolled back more than
+/// `reorg::DEEP_REORG_ALERT_DEPTH` blocks (alert only; it was followed).
+#[inline]
+pub fn inc_deep_reorg() {
+    if let Some(m) = METRICS.get() { m.deep_reorgs_total.inc(); }
 }
 
 #[inline]
@@ -382,7 +412,7 @@ pub fn observe_block_validation(seconds: f64) {
 #[inline]
 pub fn observe_rpc_latency(method: &str, seconds: f64) {
     if let Some(m) = METRICS.get() {
-        m.rpc_latency_seconds.with_label_values(&[method]).observe(seconds);
+        m.rpc_latency_seconds.with_label_values(&[bounded_label(method)]).observe(seconds);
     }
 }
 
@@ -418,11 +448,13 @@ pub async fn start_metrics_server(
         return;
     }
 
-    let addr_str = format!("{}:{}", config.bind_address, config.port);
-    let addr: SocketAddr = match addr_str.parse() {
+    // NET-14: `format!("{host}:{port}").parse()` rejected IPv6 hosts such as
+    // `::1`. Resolve explicitly; on failure only the metrics task stops (it
+    // runs as its own task, so the node keeps running).
+    let addr: SocketAddr = match crate::rpc::resolve_bind_address(&config.bind_address, config.port) {
         Ok(a)  => a,
         Err(e) => {
-            error!("metrics: invalid bind address {:?}: {}", addr_str, e);
+            error!("metrics: {}; metrics are disabled (the node keeps running)", e);
             return;
         }
     };
@@ -442,7 +474,7 @@ pub async fn start_metrics_server(
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            error!("metrics: bind failed: {}", e);
+            error!("metrics: bind {} failed: {}; metrics are disabled (the node keeps running)", addr, e);
             return;
         }
     };
@@ -638,5 +670,39 @@ mod tests {
         observe_reorg_depth(3.0);
         observe_rpc_latency("foo", 0.1);
         // If we got here without panic, test passes.
+    }
+}
+
+#[cfg(test)]
+mod net13_net14_tests {
+    use super::*;
+
+    /// NET-13: a caller-controlled label can never become a new series.
+    #[test]
+    fn labels_are_bounded() {
+        assert_eq!(bounded_label("getblockcount"), "getblockcount");
+        assert_eq!(bounded_label("rate_limited"), "rate_limited");
+        assert_eq!(bounded_label(&"x".repeat(41)), "unknown");
+        assert_eq!(bounded_label("Get<script>"), "unknown");
+        assert_eq!(bounded_label(""), "unknown");
+    }
+
+    /// NET-14: a server that cannot bind returns (its task ends) instead
+    /// of panicking; IPv6 literals such as `::1` are now valid addresses.
+    #[tokio::test]
+    async fn metrics_server_with_unusable_address_returns() {
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = busy.local_addr().unwrap().port();
+        let config = MetricsConfig { enabled: true, bind_address: "127.0.0.1".into(), port };
+        let state = Arc::new(MetricsState::new("test", "testnet"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), start_metrics_server(config, state.clone()))
+            .await
+            .expect("bind failure must end the metrics task, not hang or panic");
+        let config = MetricsConfig { enabled: true, bind_address: "not an address".into(), port: 1 };
+        tokio::time::timeout(std::time::Duration::from_secs(5), start_metrics_server(config, state))
+            .await
+            .expect("invalid address must end the metrics task");
+        assert!(crate::rpc::resolve_bind_address("::1", 17310).unwrap().is_ipv6());
+        assert!(crate::rpc::resolve_bind_address("[::1]", 17310).unwrap().is_ipv6());
     }
 }

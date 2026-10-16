@@ -54,6 +54,25 @@ pub mod dandelion;    // Coherence P3 — Dandelion++ tx-relay metadata privacy
 pub mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer (frontier reconciliation)
 #[cfg(feature = "node")]
 pub mod powit;        // PoW + PoWit node side (shares, attestations, finality)
+pub mod ingress;      // audit fixes: block-ingress / orphan / IBD-latch policy
+// Block acceptance pipeline (accept / connect split, audit DAG-1/10/11),
+// moved out of main.rs so integration tests drive the real path.
+#[cfg(feature = "node")]
+pub mod accept;
+// Block-template construction shared by the miner and getblocktemplate
+// (audit MEM-2, DAG-2).
+#[cfg(feature = "node")]
+pub mod template;
+
+// The libp2p crate the node is built with, for code that drives the node's
+// protocol implementations through libp2p traits and must name the SAME crate
+// instance (the fuzz target `sync_rr_codec` calls `BlochSyncCodec` through
+// `request_response::Codec`). Naming libp2p in such a crate with its own
+// version requirement could resolve to another 0.x minor, whose traits
+// `BlochSyncCodec` does not implement.
+#[cfg(feature = "node")]
+#[doc(hidden)]
+pub use libp2p;
 
 /// Convenience re-exports for consumers of the library (wallet UIs,
 /// block explorers, etc.). Import with `use gnb::prelude::*`.
@@ -81,4 +100,19 @@ pub mod prelude {
     // Mempool types (for RPC consumers and wallet indicators)
     #[cfg(feature = "node")]
     pub use crate::mempool::{Mempool, MempoolEntry, MempoolError, AddressTxInfo};
+}
+
+#[cfg(test)]
+mod build_profile_tests {
+    /// The node's lib tests run with debug assertions and overflow checks:
+    /// both are on by default in the dev/test profile (the root Cargo.toml
+    /// overrides only opt-level per package), and this test fails if a
+    /// profile change ever turns them off (docs/testing/SANITIZERS.md).
+    #[test]
+    fn test_build_traps_integer_overflow_and_debug_assertions() {
+        let d = std::panic::catch_unwind(|| debug_assert!(std::hint::black_box(false)));
+        assert!(d.is_err(), "debug_assert! did not fire: lib tests must run with debug assertions");
+        let r =std::panic::catch_unwind(|| std::hint::black_box(u64::MAX) + std::hint::black_box(1u64));
+        assert!(r.is_err(), "integer overflow did not panic: overflow-checks are off for the node lib");
+    }
 }

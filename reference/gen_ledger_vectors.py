@@ -28,8 +28,9 @@ SECRETS = {name: name.encode() for name in ("alice", "bob", "carol", "dave", "ma
 OWNER = {name: L.test_owner(s) for name, s in SECRETS.items()}
 
 
-def ctx(height: int) -> L.Context:
-    return L.Context(height=height, subsidy=SUBSIDY, auth=L.test_preimage_auth, coinbase_maturity=MATURITY)
+def ctx(height: int, parents_root: bytes = L.EMPTY) -> L.Context:
+    return L.Context(height=height, subsidy=SUBSIDY, auth=L.test_preimage_auth, coinbase_maturity=MATURITY,
+                     parents_root=parents_root)
 
 
 def wires(txs: list[L.Tx]) -> list[bytes]:
@@ -47,8 +48,10 @@ def mine(header: bytes, target: int) -> int:
     return nonce
 
 
-def coinbase(height: int, outputs: list[tuple[str, int]], extra: bytes = b"gnb") -> L.Tx:
-    return L.Tx(L.TX_COINBASE, (), tuple(L.TxOut(a, OWNER[n]) for n, a in outputs), height, extra)
+def coinbase(height: int, outputs: list[tuple[str, int]], extra: bytes = b"gnb",
+             parents_root: bytes = L.EMPTY) -> L.Tx:
+    return L.Tx(L.TX_COINBASE, (), tuple(L.TxOut(a, OWNER[n]) for n, a in outputs), height, extra,
+                parents_root=parents_root)
 
 
 def spend(inputs: list[tuple[bytes, int]], signer: list[str], outputs: list[tuple[str, int]]) -> L.Tx:
@@ -63,9 +66,10 @@ def fees_of(node: L.FullNode, regular: list[L.Tx], height: int) -> int:
     return fees
 
 
-def header_for(parent_id: bytes, txs: list[L.Tx], commitment: bytes, timestamp: int,
+def header_for(parent_id: bytes, txs: list[L.Tx], witness: bytes, commitment: bytes, timestamp: int,
                target: int = EASY_TARGET) -> tuple[bytes, int]:
-    hb = L.Header(parent_id, root_of(wires(txs)), commitment, timestamp, target).encode()
+    hb = L.Header(parent_id, root_of(wires(txs)), L.witness_commitment(witness), commitment, timestamp,
+                  target).encode()
     return hb, mine(hb, target) if 1 <= target else 0
 
 
@@ -76,12 +80,12 @@ def state_json(s: L.State) -> dict:
 def block(name: str, node: L.FullNode, parent_id: bytes, height: int, payee: str,
           regular: list[L.Tx], timestamp: int) -> tuple[dict, bytes]:
     fees = fees_of(node, regular, height)
-    txs = [coinbase(height, [(payee, SUBSIDY + fees)])] + regular
+    txs = [coinbase(height, [(payee, SUBSIDY + fees)], parents_root=parent_id)] + regular
     pre = node.state()
-    witness, accepted, got = node.build(txs, ctx(height))
+    witness, accepted, got = node.build(txs, ctx(height, parent_id))
     assert got == fees
     post = node.state()
-    hb, nonce = header_for(parent_id, txs, post.commitment(), timestamp)
+    hb, nonce = header_for(parent_id, txs, witness, post.commitment(), timestamp)
     v = {
         "name": name, "height": height, "subsidy": SUBSIDY, "coinbase_maturity": MATURITY,
         "log2_n": LOG2_N, "header_hex": hb.hex(), "nonce": str(nonce),
@@ -214,10 +218,15 @@ def main() -> None:
     invalid = []
 
     def add(name: str, code: str, *, witness: bytes = w3, header: bytes | None = None,
-            nonce: int | None = None, txs: list[L.Tx] = txs3, raw: list[bytes] | None = None) -> None:
+            nonce: int | None = None, txs: list[L.Tx] = txs3, raw: list[bytes] | None = None,
+            in_transit: bool = False) -> None:
+        """A changed witness is committed by a re-mined header (the producer's fault,
+        permanent) unless `in_transit`, where it arrives under the original header."""
+        ws = wires(txs) if raw is None else raw
+        if header is None and witness != w3 and not in_transit:
+            header, nonce = remined(ws, witness=witness)
         hb = h3 if header is None else header
         n = int(b3["nonce"]) if nonce is None else nonce
-        ws = wires(txs) if raw is None else raw
         try:
             L.validate_block(node_before_b3.state(), hb, n, ws, witness, ctx(3), log2_n=LOG2_N)
         except L.InvalidBlock as e:
@@ -233,9 +242,10 @@ def main() -> None:
         })
 
     def remined(ws: list[bytes], commitment: bytes = hdr3.state_commitment, target: int = EASY_TARGET,
-                tx_root: bytes | None = None) -> tuple[bytes, int]:
+                tx_root: bytes | None = None, witness: bytes = w3) -> tuple[bytes, int]:
         root = root_of(ws) if tx_root is None else tx_root
-        hb = L.Header(hdr3.parents_root, root, commitment, hdr3.timestamp, target).encode()
+        hb = L.Header(hdr3.parents_root, root, L.witness_commitment(witness), commitment, hdr3.timestamp,
+                      target).encode()
         return hb, (mine(hb, target) if target > 1 else 0)
 
     def mutated(index: int, change) -> bytes:
@@ -270,6 +280,10 @@ def main() -> None:
     add("default-sibling-listed", "noncanonical-proof",
         witness=mutated(0, lambda e: e["spends"][0].__setitem__(1, with_listed_default(e["spends"][0][1]))))
     add("trailing-byte", "witness-format", witness=w3 + b"\x00")
+    # The same damage applied by a relaying peer: the bundle no longer hashes to the
+    # header's witness_root, which is checked before any proof (one hash, transient).
+    add("witness-damaged-in-transit", "witness-commitment", in_transit=True,
+        witness=mutated(0, lambda e: e["spends"][0].__setitem__(1, flip_first_sibling(e["spends"][0][1]))))
     add("entry-count-off-by-one", "witness-format", witness=encode_witness(entries, count=len(entries) + 1))
     add("unknown-tag", "witness-format", witness=mutated(2, lambda e: e.__setitem__("tag", 7)))
     add("coinbase-entry-not-accept", "witness-format",
@@ -281,13 +295,18 @@ def main() -> None:
     swapped[1] = L.tx_wire(dataclasses.replace(txs3[1], auth=(b"garbage",)))
     add("auth-swapped-in-transit", "tx-root", raw=swapped)
 
-    over = [coinbase(3, [("carol", SUBSIDY + 1_500 + 1)])] + txs3[1:]
+    over = [coinbase(3, [("carol", SUBSIDY + 1_500 + 1)], parents_root=hdr3.parents_root)] + txs3[1:]
     hb, n = remined(wires(over))
     add("coinbase-claims-one-more", "coinbase", header=hb, nonce=n, txs=over)
 
-    cb_height = [coinbase(4, [("carol", SUBSIDY + 1_500)])] + txs3[1:]
+    cb_height = [coinbase(4, [("carol", SUBSIDY + 1_500)], parents_root=hdr3.parents_root)] + txs3[1:]
     hb, n = remined(wires(cb_height))
     add("coinbase-height-mismatch", "isolation", header=hb, nonce=n, txs=cb_height)
+
+    # Coinbase uniqueness: the coinbase must commit to the header's parents_root.
+    cb_parents = [coinbase(3, [("carol", SUBSIDY + 1_500)], parents_root=bytes(32))] + txs3[1:]
+    hb, n = remined(wires(cb_parents))
+    add("coinbase-parents-root-mismatch", "isolation", header=hb, nonce=n, txs=cb_parents)
 
     dup = txs3[:1] + [spend([(cb1, 0), (cb1, 0)], ["alice", "alice"], [("bob", 1)])]
     hb, n = remined(wires(dup))
@@ -306,7 +325,7 @@ def main() -> None:
     hb, n = remined(wires(txs3), target=1)
     add("pow-target-one", "pow", header=hb, nonce=n)
 
-    hb = h3[:108] + bytes(32)
+    hb = h3[:140] + bytes(32)
     add("target-zero", "target", header=hb)
     add("header-short", "header", header=h3[:-1])
 
@@ -317,13 +336,14 @@ def main() -> None:
     taken.insert(cb5_key, L.UtxoRecord(7, OWNER["mallory"], 4, False))
     pre5 = taken.state()
     ws5 = wires([cb5])
-    hb5 = L.Header(bytes(32), root_of(ws5), pre5.commitment(), 1_150, EASY_TARGET).encode()
-    n5 = mine(hb5, EASY_TARGET)
     proof5 = taken.tree.proof(cb5_key)
     value5 = L.utxo_value(taken.utxos[cb5_key])
     for name, code, proof in (("coinbase-output-taken-proven", "coinbase", proof5),
                               ("coinbase-output-taken-bad-proof", "witness-mismatch", flip_first_sibling(proof5))):
         w = struct.pack("<I", 1) + bytes([L.REJECT_OUTPUT_EXISTS]) + struct.pack("<I", 0) + value5 + proof
+        hb5 = L.Header(bytes(32), root_of(ws5), L.witness_commitment(w), pre5.commitment(), 1_150,
+                       EASY_TARGET).encode()
+        n5 = mine(hb5, EASY_TARGET)
         c5 = ctx(5)
         try:
             L.validate_block(pre5, hb5, n5, ws5, w, c5, log2_n=LOG2_N)
@@ -338,6 +358,69 @@ def main() -> None:
             "header_hex": hb5.hex(), "nonce": str(n5), "txs_hex": [x.hex() for x in ws5],
             "witness_hex": w.hex(), "pre": state_json(pre5),
         })
+
+    # ------------------------------------------------------------- mergeset coinbase rule (LED-1)
+    # Two blocks on the same parents at height 5 with identical coinbases. The selected
+    # chain applies A; a chain block merging the twin B applies it with merged=True and
+    # B forfeits its coinbase. Applied directly (no header): apply_block_txs(..., merged).
+    mergeset = []
+    m_node = copy.deepcopy(node)
+    m_parents = L._h(L._prefix(b"vector-parents"), b"A and B")
+    twin_cb = coinbase(5, [("dave", SUBSIDY), ("alice", 0)], b"twin", parents_root=m_parents)
+    m_ctx = ctx(5, m_parents)
+    wa, _, _ = m_node.build([twin_cb], m_ctx)
+    pre_b = m_node.state()
+    t8 = spend([(t1id, 1)], ["alice"], [("carol", 28_000)])
+    txs_b = [twin_cb, t8]
+    pre_b_node = copy.deepcopy(m_node)
+    wb, accepted_b, _ = m_node.build(txs_b, m_ctx, merged=True)
+    assert accepted_b == [False, True]
+    post_b, flags_b = L.apply_block_txs(pre_b, txs_b, wb, m_ctx, merged=True)
+    assert post_b == m_node.state() and flags_b == accepted_b
+
+    def merged_case(name: str, pre: L.State, txs: list[L.Tx], witness: bytes, merged: bool) -> dict:
+        v = {"name": name, "merged": merged, "height": 5, "subsidy": SUBSIDY, "coinbase_maturity": MATURITY,
+             "parents_root": m_parents.hex(), "txs_hex": [w.hex() for w in wires(txs)],
+             "witness_hex": witness.hex(), "pre": state_json(pre)}
+        try:
+            post, flags = L.apply_block_txs(pre, txs, witness, m_ctx, merged=merged)
+        except L.InvalidBlock as e:
+            v.update({"expected_error": e.code, "permanent": e.permanent})
+        else:
+            v.update({"post": state_json(post), "accepted": flags})
+        return v
+
+    mergeset.append(merged_case("twin-coinbase-forfeited", pre_b, txs_b, wb, True))
+    mergeset.append(merged_case("twin-coinbase-outside-mergeset", pre_b, txs_b, wb, False))
+    entries_b = parse_witness(txs_b, wb)        # [t8, coinbase]
+    bad_b = copy.deepcopy(entries_b)
+    bad_b[1]["proof"] = flip_first_sibling(bad_b[1]["proof"])
+    mergeset.append(merged_case("twin-proof-sibling-flipped", pre_b, txs_b, encode_witness(bad_b), True))
+    # A collision with an output that is NOT what this coinbase would create.
+    odd = copy.deepcopy(pre_b_node)
+    odd_key = L.outpoint_key(L.txid(twin_cb), 0)
+    odd.insert(odd_key, L.UtxoRecord(SUBSIDY, OWNER["dave"], 4, True))
+    w_odd = (struct.pack("<I", 1) + bytes([L.REJECT_OUTPUT_EXISTS]) + struct.pack("<I", 0)
+             + L.utxo_value(odd.utxos[odd_key]) + odd.tree.proof(odd_key))
+    mergeset.append(merged_case("collision-not-identical-coinbase", odd.state(), [twin_cb], w_odd, True))
+    # Review follow-up: twins share their template, so the merged twin carries the transactions
+    # the first one already spent. Its fees are 0 while its identical coinbase claims SUBSIDY plus
+    # the first one's fees; the forfeit is exempt from the claim check.
+    f_node = copy.deepcopy(node)
+    fee_cb = coinbase(5, [("dave", SUBSIDY + 1_000)], b"fee-twin", parents_root=m_parents)
+    txs_f = [fee_cb, t8]                         # t8 pays a fee of 1_000
+    _, accepted_fa, fees_fa = f_node.build(txs_f, m_ctx)
+    assert accepted_fa == [True, True] and fees_fa == 1_000
+    pre_f = f_node.state()
+    wf, accepted_f, fees_f = f_node.build(txs_f, m_ctx, merged=True)
+    assert accepted_f == [False, False] and fees_f == 0 and f_node.state() == pre_f
+    mergeset.append(merged_case("fee-paying-twin-forfeited", pre_f, txs_f, wf, True))
+    mergeset.append(merged_case("fee-paying-twin-outside-mergeset", pre_f, txs_f, wf, False))
+    assert [("expected_error" in v) for v in mergeset] == [False, True, True, True, False, True]
+    assert [v.get("expected_error") for v in mergeset[1:]] == ["coinbase", "witness-mismatch", "coinbase",
+                                                               None, "coinbase"]
+    assert mergeset[4]["post"] == state_json(pre_f) and mergeset[4]["accepted"] == [False, False]
+    _ = wa
 
     # ------------------------------------------------------------- sparse Merkle tree vectors
     t = L.SparseMerkleTree()
@@ -366,16 +449,20 @@ def main() -> None:
         "version": L.VERSION,
         "note": "auth = test_preimage_auth (TEST ONLY). nonce is a decimal string. Blocks are "
                 "validated with GnB-SMH at log2_n = 4; each invalid case has exactly one fault. "
-                "permanent = the block itself is invalid; otherwise the body or witness received "
-                "does not fit the header.",
+                "permanent = the block itself is invalid (the header commits to the transactions "
+                "and the witness bundle); otherwise the body or witness received does not hash "
+                "to the header's commitments. mergeset cases are applied directly with "
+                "apply_block_txs(pre, txs, witness, ctx, merged) (the LED-1 coinbase-collision rule).",
         "params": {"log2_n": LOG2_N, "coinbase_maturity": MATURITY, "subsidy": SUBSIDY},
         "smt": smt,
         "chain": chain,
         "synthetic": synthetic,
         "invalid": invalid,
+        "mergeset": mergeset,
     }
     (HERE / "ledger_vectors.json").write_text(json.dumps(doc, indent=1) + "\n")
-    print(f"{len(chain)} chain blocks, {len(synthetic)} synthetic, {len(invalid)} invalid cases", file=sys.stderr)
+    print(f"{len(chain)} chain blocks, {len(synthetic)} synthetic, {len(invalid)} invalid cases, "
+          f"{len(mergeset)} mergeset cases", file=sys.stderr)
     for b in chain + synthetic:
         print(f"  {b['name']}: {len(b['txs_hex'])} txs, witness {b['witness_bytes']} B, "
               f"accepted {b['accepted']}", file=sys.stderr)

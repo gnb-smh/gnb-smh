@@ -32,7 +32,11 @@ node = ["dep:reqwest", "dep:async-trait"]
 # hex/serde_json + this crate's lib are unconditional; no blst / secp256k1 /
 # tokio / rocksdb / libp2p anywhere in its tree. Off by default; combine with
 # `node` only if WalletClient is wanted.
-wallet-cli = ["dep:clap", "dep:rpassword"]
+wallet-cli = ["dep:clap", "dep:rpassword", "https-rpc"]
+# `https-rpc` (WAL-7): HTTPS for the CLI wallets' RPC client (wallet::http_rpc)
+# with rustls (ring provider) and the webpki-roots trust anchors. Off by
+# default so the WASM wallet core does not link a TLS stack.
+https-rpc = ["dep:rustls", "dep:webpki-roots"]
 # `mainnet` is an EMPTY marker feature (like `wallet-cli`) with NO deps. It exists
 # only so the release CI guard `mainnet_release_guard::canonical_k_activation_height_is_set_for_mainnet`
 # (core/mod.rs) compiles and runs. Ordinary `--features node` builds do NOT enable
@@ -40,8 +44,11 @@ wallet-cli = ["dep:clap", "dep:rpassword"]
 # the guard bites only when a mainnet artifact is cut:
 #   cargo test -p gnb-crypto --features mainnet canonical_k_activation_height_is_set_for_mainnet
 mainnet = []
-# TESTS ONLY: every expected target is the pow limit. Consensus-breaking; the
-# node binary refuses to start with it. Enabled through node dev-dependencies.
+# TESTS ONLY: every expected target is the pow limit. Consensus-breaking; a
+# node binary with it refuses mainnet, and an optimised one every network
+# (node/src/main.rs `test_pow_limit_guard`). Enabled through node
+# dev-dependencies and the node's own `test-pow-limit` feature (functional
+# tests, docs/testing/FUNCTIONAL.md).
 test-pow-limit = []
 # `auxpow-rehearsal` is an EMPTY marker feature (no deps). It ONLY lowers
 # AUXPOW_ACTIVATION_HEIGHT to 0 (core/mod.rs) so a LOCAL, off-mainnet build
@@ -81,7 +88,8 @@ aes-gcm = "0.10"
 
 # Secrets / encoding.
 zeroize = { version = "1", features = ["derive"] }
-bip39   = "2"
+# CRY-4: `zeroize` makes `bip39::Mnemonic` wipe its word indices on drop.
+bip39   = { version = "2", features = ["zeroize"] }
 rand    = "0.9"
 hex     = "0.4"
 base64  = "0.22"
@@ -111,9 +119,18 @@ coherence-core = { path = "../coherence-core" }
 reqwest     = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 async-trait = { version = "0.1", optional = true }
 
+# Optional — only with `https-rpc` (WAL-7). Versions already in Cargo.lock
+# (reqwest / libp2p); `ring` provider, no default features (no aws-lc).
+rustls       = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+
 [dev-dependencies]
 tempfile = "3"
 tokio    = { version = "1", features = ["full"] }
 # Property-based invariant tests for the Genesis-locked emission / halving /
 # founder-vesting math in src/core/tokenomics_v2.rs (consensus-critical).
 proptest = "1"
+# Reads the shipped genesis/bloch-g3-carryover.tsv.gz in the carryover
+# snapshot test (core::carryover::tests::shipped_snapshot_verifies). Pure-Rust
+# miniz_oxide backend; test-only, never linked into a build artifact.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

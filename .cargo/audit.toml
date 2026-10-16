@@ -1,0 +1,10 @@
+# cargo-audit configuration (read from .cargo/audit.toml in the repository
+# root). Mirrors the vulnerability exceptions of deny.toml, whose comments give
+# the full reachability argument; keep the two lists in sync. Unmaintained
+# notices are reported as warnings and do not fail `cargo audit`.
+#
+# Audit OPS-2: the hickory-proto 0.25.2 exceptions (RUSTSEC-2026-0118,
+# RUSTSEC-2026-0119) were removed with the move to libp2p 0.57 (hickory
+# 0.26.3). No vulnerability is ignored today.
+[advisories]
+ignore = []

@@ -6,26 +6,26 @@
 //! Sprint P: PEX hardening (rate limit, address validation, known_peers cap).
 
 pub mod pex_validator;
-pub mod pow_gate;
+pub mod ratelimit;
 pub mod sync_rr;
 
 use libp2p::{
     identity, identify, mdns, PeerId, Multiaddr,
     swarm::SwarmEvent,
     gossipsub::{self, IdentTopic, MessageAuthenticity, ValidationMode}, tcp, yamux,
-    SwarmBuilder, Swarm,
+    SwarmBuilder,
 };
 use serde::{Serialize, Deserialize};
 use tokio::sync::mpsc;
 use log::{info, warn, debug};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use sha2::{Sha256, Digest};
 
 use pex_validator::{
-    PexRateLimiter, PexStats,
-    is_valid_public_multiaddr, is_lan_multiaddr, enforce_cap, prune_invalid,
+    PexRateLimiter, PexStats, AddrBook,
+    is_valid_public_multiaddr, is_lan_multiaddr, enforce_cap, prune_invalid, add_tried, addr_peer_id,
     PEX_BATCH_LIMIT, KNOWN_PEERS_CAP,
 };
 
@@ -55,178 +55,236 @@ pub fn ingest_drops_total() -> u64 {
 /// Forward an inbound frame to the processor, counting + logging drops instead
 /// of discarding them silently. WARNs on the first drop and every 100th after
 /// (a storm that overflows a 1000-slot channel would otherwise flood the log).
-/// Result of an off-loop proof-of-work evaluation (network::pow_gate).
-struct PowVerdict {
-    peer: PeerId,
-    message_id: Option<gossipsub::MessageId>,
-    msg: NetworkMessage,
-    source: &'static str,
-    valid: bool,
-}
-
-/// Outbound connections a node keeps trying to have (Bitcoin Core keeps 8
-/// full-relay outbound peers).
-const MIN_OUTBOUND: usize = 8;
-
-/// Mempool verdict on a gossiped transaction, sent back by the message
-/// processor after full validation (`blockval`), so the network loop reports
-/// the gossip validation result only then: nothing is relayed unvalidated.
-#[derive(Debug, Clone, Copy)]
-pub struct TxVerdict {
-    pub txid:  [u8; 32],
-    pub valid: bool,
-}
-
-/// Gossiped transactions awaiting a [`TxVerdict`] older than this are
-/// dropped (gossipsub then never relays them).
-const TX_VERDICT_TTL: Duration = Duration::from_secs(60);
-/// Bound on distinct txids awaiting a verdict.
-const TX_PENDING_CAP: usize = 20_000;
-/// Per-peer gossiped-transaction budget: burst and refill per second. Each
-/// transaction costs hybrid post-quantum signature checks per input.
-const TX_BURST: f64 = 100.0;
-const TX_PER_SEC: f64 = 20.0;
-/// Bound on peers tracked by the transaction limiter.
-const TX_LIMITER_PEERS: usize = 4_096;
-
-/// Token bucket per peer for gossiped transactions, with a bounded map.
-#[derive(Default)]
-struct TxRateLimiter {
-    buckets: std::collections::HashMap<PeerId, (f64, Instant)>,
-}
-
-impl TxRateLimiter {
-    fn take(&mut self, peer: &PeerId, now: Instant) -> bool {
-        if self.buckets.len() >= TX_LIMITER_PEERS && !self.buckets.contains_key(peer) {
-            // A full bucket is equivalent to an absent one: drop those first.
-            self.buckets.retain(|_, (tokens, last)| {
-                *tokens + now.duration_since(*last).as_secs_f64() * TX_PER_SEC < TX_BURST
-            });
-            if self.buckets.len() >= TX_LIMITER_PEERS {
-                return false;
-            }
-        }
-        let (tokens, last) = self.buckets.entry(*peer).or_insert((TX_BURST, now));
-        *tokens = (*tokens + now.duration_since(*last).as_secs_f64() * TX_PER_SEC).min(TX_BURST);
-        *last = now;
-        if *tokens >= 1.0 {
-            *tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-/// Route a received block through the proof-of-work gate. Every exit path
-/// reports a gossip verdict (when the block came by gossip), so nothing is
-/// relayed unverified and nothing is held forever.
-#[allow(clippy::too_many_arguments)]
-fn gate_block(
-    gate: &mut pow_gate::PowGate,
-    dag: &parking_lot::RwLock<crate::consensus::GhostDAG>,
-    workers: &Arc<tokio::sync::Semaphore>,
-    verdict_tx: &mpsc::UnboundedSender<PowVerdict>,
-    block_tx: &mpsc::Sender<NetworkMessage>,
-    swarm: &mut Swarm<BlochBehaviour>,
-    peer: PeerId,
-    message_id: Option<gossipsub::MessageId>,
-    msg: NetworkMessage,
-    budgeted: bool,
-    source: &'static str,
-) {
-    use gossipsub::MessageAcceptance::{Accept, Ignore, Reject};
-    let report = |swarm: &mut Swarm<BlochBehaviour>, a: gossipsub::MessageAcceptance| {
-        if let Some(id) = &message_id {
-            let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(id, &peer, a);
-        }
-    };
-    let now = Instant::now();
-    if gate.is_banned(&peer, now) {
-        report(swarm, Ignore);
-        return;
-    }
-    let NetworkMessage::NewBlock { block_data, .. } = &msg else {
-        report(swarm, Accept);
-        forward_to_processor(block_tx, msg, source);
-        return;
-    };
-    let block = match crate::core::Block::from_wire_bytes(block_data) {
-        Ok(b) => b,
-        Err(_) => {
-            report(swarm, Reject);
-            return;
-        }
-    };
-    if block.pow_is_cached() {
-        report(swarm, Accept);
-        forward_to_processor(block_tx, msg, source);
-        return;
-    }
-    if let Err(reason) = pow_gate::pow_precheck(&block) {
-        // Cannot come from an honest node: penalize, do not relay.
-        debug!("P2P: block from {} failed precheck: {}", peer, reason);
-        swarm.behaviour_mut().gossipsub.set_application_score(&peer, -100.0);
-        report(swarm, Reject);
-        return;
-    }
-    // With every parent known, height and bits must be exactly what block
-    // acceptance requires: a block refused there never costs a proof
-    // evaluation. Not penalized: an honest relay without the parents passes
-    // such a block on after checking only its proof of work.
-    let parents: Option<Vec<(u64, u64)>> = {
-        let d = dag.read();
-        if d.get_block_data(&block.block_hash()).is_some() {
-            drop(d);
-            report(swarm, Ignore);
-            return;
-        }
-        block.header.parents.iter()
-            .map(|p| d.get_block_data(p).map(|x| (x.height, x.timestamp)))
-            .collect()
-    };
-    if let Some(ps) = &parents {
-        if let Err(reason) = pow_gate::contextual_precheck(&block, ps) {
-            debug!("P2P: block from {} fails in context: {}", peer, reason);
-            report(swarm, Ignore);
-            return;
-        }
-    }
-    let cost = if parents.is_some() { 1.0 } else { pow_gate::ORPHAN_COST };
-    if budgeted && !gate.take(&peer, cost, now) {
-        debug!("P2P: {} exceeded its proof-of-work budget; block ignored", peer);
-        report(swarm, Ignore);
-        return;
-    }
-    let (workers, tx, banned) = (workers.clone(), verdict_tx.clone(), gate.banned_handle());
-    tokio::spawn(async move {
-        let Ok(_permit) = workers.acquire_owned().await else { return };
-        // Banned while queued: drop it unevaluated (reported invalid).
-        let valid = if banned.read().contains(&peer) {
-            false
-        } else {
-            tokio::task::spawn_blocking(move || block.validate_pow())
-                .await
-                .unwrap_or(false)
-        };
-        let _ = tx.send(PowVerdict { peer, message_id, msg, source, valid });
-    });
-}
-
-fn forward_to_processor(block_tx: &mpsc::Sender<NetworkMessage>, msg: NetworkMessage, source: &str) {
+/// Returns `true` iff the frame was queued.
+fn forward_to_processor<T>(block_tx: &mpsc::Sender<T>, item: T, kind: &'static str, source: &str) -> bool {
     use tokio::sync::mpsc::error::TrySendError;
-    match block_tx.try_send(msg) {
-        Ok(())                       => {}
-        Err(TrySendError::Full(m))   => {
-            let n = INGEST_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    match block_tx.try_send(item) {
+        Ok(())                       => true,
+        Err(TrySendError::Full(_))   => {
+            let n = INGEST_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed).saturating_add(1);
             if n == 1 || n % 100 == 0 {
                 warn!("ingest channel FULL — dropped inbound [{}] from {} \
                        (total dropped: {}; lost GetBlock replies are re-requested \
-                       by the orphan sweep)", m.kind_name(), source, n);
+                       by the orphan sweep)", kind, source, n);
             }
+            false
         }
-        Err(TrySendError::Closed(m)) => {
-            warn!("ingest channel CLOSED — dropped inbound [{}] from {}", m.kind_name(), source);
+        Err(TrySendError::Closed(_)) => {
+            warn!("ingest channel CLOSED — dropped inbound [{}] from {}", kind, source);
+            false
+        }
+    }
+}
+
+// ── NET-2: application-validated gossip ──────────────────────────────────────
+//
+// Gossipsub runs with `validate_messages()`: a received frame is NOT relayed
+// until the application reports a verdict with
+// `report_message_validation_result`. `Accept` forwards it; `Reject` drops it
+// AND applies gossipsub's invalid-delivery (P4) penalty to the peer that
+// delivered it; `Ignore` drops it without penalty. Because every honest node
+// running this validation forwards only frames it accepted, an invalid frame
+// is then delivered only by its originator, so penalties land on the author
+// instead of on honest relays (NET-4). Earlier releases forward
+// `NewTransaction` frames without validating them, so the transaction relay
+// answers `Reject` only once no such release can be a peer on the chain
+// (`mempool::relay::TxRelay::penalties_in_force`).
+
+/// The application's verdict on one gossip frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GossipVerdict {
+    /// Valid: relay it to the mesh.
+    Accept,
+    /// Provably invalid: drop it and penalize the delivering peer (P4).
+    Reject,
+    /// Not relayed, not penalized (duplicate, stale, policy, unverifiable).
+    Ignore,
+}
+
+impl From<GossipVerdict> for gossipsub::MessageAcceptance {
+    fn from(v: GossipVerdict) -> Self {
+        match v {
+            GossipVerdict::Accept => gossipsub::MessageAcceptance::Accept,
+            GossipVerdict::Reject => gossipsub::MessageAcceptance::Reject,
+            GossipVerdict::Ignore => gossipsub::MessageAcceptance::Ignore,
+        }
+    }
+}
+
+/// A verdict the processor reports back to the network loop for a gossip
+/// frame whose validation was deferred to it.
+#[derive(Clone, Debug)]
+pub struct GossipValidation {
+    pub message_id:         gossipsub::MessageId,
+    pub propagation_source: PeerId,
+    pub verdict:            GossipVerdict,
+}
+
+/// Gossipsub `history_length`: heartbeats (1 s each) an unvalidated frame
+/// stays in the message cache, i.e. how long a withheld verdict can still
+/// forward it.
+pub const GOSSIP_HISTORY_LENGTH: usize = 12;
+
+/// Out-of-band requests from the message processor to the network loop
+/// (see [`NetworkNode::attach_control`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NetworkControl {
+    /// MEM-5 / MEM-6: `peer` delivered a consensus-invalid transaction whose
+    /// gossip frame can no longer be answered `Reject` (it was buffered as an
+    /// orphan and left gossipsub's cache before its re-try proved it
+    /// invalid). The network loop applies one application-score penalty, as
+    /// for a wire violation (decaying, shared with the wire tracker).
+    PenalizePeer(PeerId),
+}
+
+/// Peer lifecycle notices from the network loop to the message processor
+/// (see [`NetworkNode::attach_peer_events`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerEvent {
+    /// The last connection to this peer closed. The transaction relay drops
+    /// its per-connection signature budget and the orphans it delivered
+    /// (Bitcoin Core's `EraseForPeer`).
+    Disconnected(PeerId),
+}
+
+/// Where an inbound frame handed to the processor came from.
+#[derive(Clone, Debug)]
+pub enum InboundOrigin {
+    /// Unsolicited gossip. `author` is the signed originator (gossipsub
+    /// `Strict` validation), `propagation_source` the neighbour that
+    /// delivered it. `pending` is `Some(id)` iff the processor owes the
+    /// network loop a [`GossipValidation`] for this frame.
+    Gossip {
+        propagation_source: PeerId,
+        author:             Option<PeerId>,
+        pending:            Option<gossipsub::MessageId>,
+        /// When the network loop received the frame — gossipsub put it in
+        /// its message cache at that moment, and it is shifted out
+        /// [`GOSSIP_HISTORY_LENGTH`] heartbeats later. A withheld verdict
+        /// must be reported before then (review finding: the deferred-orphan
+        /// TTL used to start at processor time).
+        received_at:        std::time::Instant,
+    },
+    /// The answer to one of OUR directed `/gnb/sync/1` pulls, from `peer`.
+    Directed { peer: PeerId },
+    /// Generated locally by the network loop (heartbeat `PeerCount`).
+    Local,
+}
+
+impl InboundOrigin {
+    /// True for answers to our own directed pulls (solicited data).
+    pub fn is_solicited(&self) -> bool {
+        matches!(self, InboundOrigin::Directed { .. })
+    }
+
+    /// The remote peer responsible for this frame: the directed responder or
+    /// the gossip neighbour that delivered it.
+    pub fn peer(&self) -> Option<PeerId> {
+        match self {
+            InboundOrigin::Gossip { propagation_source, .. } => Some(*propagation_source),
+            InboundOrigin::Directed { peer } => Some(*peer),
+            InboundOrigin::Local => None,
+        }
+    }
+
+    /// When the network loop received this gossip frame (`None` for
+    /// directed and local frames).
+    pub fn received_at(&self) -> Option<std::time::Instant> {
+        match self {
+            InboundOrigin::Gossip { received_at, .. } => Some(*received_at),
+            _ => None,
+        }
+    }
+
+    /// `(message_id, propagation_source)` when a verdict is owed.
+    pub fn pending_verdict(&self) -> Option<(gossipsub::MessageId, PeerId)> {
+        match self {
+            InboundOrigin::Gossip { propagation_source, pending: Some(id), .. } => {
+                Some((id.clone(), *propagation_source))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// One inbound frame plus its origin, as delivered by
+/// [`NetworkNode::run_validated`].
+#[derive(Clone, Debug)]
+pub struct Inbound {
+    pub msg:    NetworkMessage,
+    pub origin: InboundOrigin,
+}
+
+/// What the network loop does with one decoded gossip frame (pure; unit
+/// tested). NET-7: gossip PULLS (`GetHeaders`, `GetBlock`, `GetTips`,
+/// `PeerRequest`) and gossip RESPONSES (`Headers`, `Tips`, `BlockNotFound`)
+/// are never delivered and never relayed — pulls are served only over the
+/// directed `/gnb/sync/1` protocol, one requester, one answer. NET-11:
+/// gossip `PeerExchange` is unsolicited and is neither relayed nor used to
+/// dial. `PeerCount` is a local-only frame and is never accepted from a peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GossipDisposition {
+    /// Deliver to the processor, which reports the verdict later.
+    DeliverDeferred,
+    /// Deliver to the processor and report this verdict now.
+    Deliver(GossipVerdict),
+    /// Do not deliver; report this verdict now.
+    Drop(GossipVerdict),
+}
+
+/// Decide [`GossipDisposition`] for a decoded, bounds-valid gossip frame.
+/// `validator_attached`: a processor that reports verdicts is wired
+/// ([`NetworkNode::run_validated`]); otherwise blocks and transactions are
+/// accepted on decode (legacy [`NetworkNode::run`]). `claim_ok`: the frame is a tip claim from
+/// a directly connected author within its rate limit.
+pub fn gossip_disposition(msg: &NetworkMessage, validator_attached: bool, claim_ok: bool) -> GossipDisposition {
+    use GossipDisposition::*;
+    match msg {
+        // MEM-5 / NET-2 / NET-4 (audit): transactions are judged by the
+        // processor (shared admission, signatures last, per-connection budget —
+        // `mempool::relay`) BEFORE gossipsub relays them, exactly like blocks.
+        // PoWit items (shares, attestations, equivocation proofs) are relayed
+        // like transactions: only once the processor admitted them.
+        NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. }
+        | NetworkMessage::NewPowitItem { .. } => {
+            if validator_attached { DeliverDeferred } else { Deliver(GossipVerdict::Accept) }
+        }
+        // Tip claims: consumed locally (author-attributed), never relayed —
+        // every node floods its own claims to all of its direct peers.
+        NetworkMessage::PeerTip { .. } | NetworkMessage::Version { .. } => {
+            if claim_ok { Deliver(GossipVerdict::Ignore) } else { Drop(GossipVerdict::Ignore) }
+        }
+        NetworkMessage::GetHeaders { .. }
+        | NetworkMessage::GetBlock { .. }
+        | NetworkMessage::GetTips
+        | NetworkMessage::PeerRequest
+        | NetworkMessage::Headers { .. }
+        | NetworkMessage::Tips { .. }
+        | NetworkMessage::BlockNotFound { .. }
+        | NetworkMessage::PeerExchange { .. }
+        | NetworkMessage::PeerCount { .. }
+        | NetworkMessage::VersionAck => Drop(GossipVerdict::Ignore),
+    }
+}
+
+/// Where the network loop hands inbound frames.
+enum IngestSink {
+    /// Legacy consumer: bare messages, no verdicts expected.
+    Legacy(mpsc::Sender<NetworkMessage>),
+    /// Validated consumer: frames with origin; verdicts come back.
+    Validated(mpsc::Sender<Inbound>),
+}
+
+impl IngestSink {
+    fn validator_attached(&self) -> bool {
+        matches!(self, IngestSink::Validated(_))
+    }
+
+    fn deliver(&self, msg: NetworkMessage, origin: InboundOrigin, source: &str) -> bool {
+        let kind = msg.kind_name();
+        match self {
+            IngestSink::Legacy(tx) => forward_to_processor(tx, msg, kind, source),
+            IngestSink::Validated(tx) => forward_to_processor(tx, Inbound { msg, origin }, kind, source),
         }
     }
 }
@@ -296,8 +354,9 @@ pub enum NetworkMessage {
     /// repeated question must be as unique as the question.
     BlockNotFound { block_hash: [u8; 32], nonce: u64 },
     // Frontier reconciliation (Phase 2 Kaspa sync-negotiation layer)
-    /// Frontier reconciliation: request the peer's DAG frontier. No payload —
-    /// broadcast on the sync topic; every peer replies with Tips.
+    /// Frontier reconciliation: request the peer's DAG frontier. No payload.
+    /// Sent only as a DIRECTED `/gnb/sync/1` request to one peer; a gossip
+    /// copy is neither answered nor relayed (audit NET-7).
     GetTips,
     /// Frontier reconciliation reply: full DAG frontier + selected-chain locator.
     Tips { tips: Vec<SyncEntry>, locator: Vec<[u8; 32]> },
@@ -311,9 +370,8 @@ pub enum NetworkMessage {
     },
     VersionAck,
     /// PoWit item (witness share, attestation or equivocation proof), relayed
-    /// like a transaction: only after the node validated it (`TxVerdict`
-    /// keyed by `id`). Appended last so older peers decode it as malformed
-    /// (ignored), never as another variant.
+    /// like a transaction: only after the node validated it. Appended last so
+    /// older peers decode it as malformed (ignored), never as another variant.
     NewPowitItem { id: [u8; 32], kind: u8, data: Vec<u8> },
 }
 
@@ -380,6 +438,17 @@ pub struct SyncEntry {
 // String headers before the bounds check rejects it. That is bounded and
 // short-lived (not the multi-GB pre-allocation this fixes), but tightening it
 // to zero would need a custom `Deserialize` impl — not done here.
+//
+// 32-bit targets (i686, wasm32, 32-bit ARM; the audit's CRY-8 class): bincode
+// 2.0.1's serde bridge reads every sequence and map length with
+// `usize::decode`, which casts the declared u64 with `as usize`. There a
+// declared length of 2^32 + n decodes as n, so a frame every 64-bit node
+// rejects (it announces more bytes than it has) decoded on a 32-bit node into
+// a different message (found by running the node's tests on i686:
+// `wire_decode_rejects_multi_gb_declared_vec`, docs/testing/SANITIZERS.md).
+// The one-encoding rule (`WireDecodeError::NonCanonical`) refuses it on every
+// target: the decoded message re-encodes with a 1- to 5-byte length, not the
+// 9 bytes the frame used.
 
 /// Hard ceiling on any single gossip frame. Must match gossipsub's
 /// `max_transmit_size` configured in `run()`.
@@ -419,6 +488,12 @@ pub const WIRE_PENALTY_FLOOR: f64 = -1000.0;
 /// Cap on the number of peers whose penalty score we track (bounds memory
 /// against an attacker cycling peer identities).
 pub const WIRE_PENALTY_TRACK_CAP: usize = 1024;
+/// NET-4 / NET-8 (audit): penalties decay toward zero. Every
+/// [`WIRE_PENALTY_DECAY_INTERVAL`] a tracked score is multiplied by
+/// [`WIRE_PENALTY_DECAY_FACTOR`] (≈ 6.6 min half-life); a score whose
+/// magnitude falls below 1.0 is forgotten (and reset to 0 in gossipsub).
+pub const WIRE_PENALTY_DECAY_INTERVAL: Duration = Duration::from_secs(60);
+pub const WIRE_PENALTY_DECAY_FACTOR: f64 = 0.9;
 
 #[derive(Debug)]
 pub enum WireDecodeError {
@@ -430,14 +505,43 @@ pub enum WireDecodeError {
     /// Plain malformed bincode (may be benign version skew, not penalized
     /// as harshly as a deliberate oversize).
     Malformed(String),
+    /// NET-7 (audit): the frame decoded but carried this many bytes past its
+    /// logical end. A compliant encoder never produces them; accepting them
+    /// let an attacker make any request byte-unique (fresh gossip message id)
+    /// and so bypass gossipsub's de-duplication.
+    TrailingBytes(usize),
+    /// The frame decoded but is not the encoding of what it decoded to:
+    /// bincode accepts non-minimal varints (`FB 05 00` for 5), so without
+    /// this check one message had many byte encodings, each a fresh gossip
+    /// message id — the NET-7 de-duplication bypass without trailing bytes
+    /// (fuzz target `netmsg_decode`, docs/testing/FUZZING.md). A compliant
+    /// encoder never produces them.
+    ///
+    /// `relayable`: the message is one that nodes relay after validating it
+    /// (`NewBlock`, `NewTransaction`; see [`gossip_disposition`]). Releases
+    /// before this rule (origin/main) decode such a frame, accept the
+    /// message and gossipsub forwards the bytes they received, so it can be
+    /// delivered by an honest older relay: it is refused but not a protocol
+    /// violation ([`Self::is_protocol_violation`]), so it is dropped
+    /// without penalty. Any other message type is never relayed by an
+    /// honest node, so its non-canonical frame comes from its author.
+    NonCanonical { relayable: bool },
 }
 
 impl WireDecodeError {
-    /// Oversized and bounds-violating frames are deliberate protocol
-    /// violations — a compliant node cannot produce them. Malformed frames
-    /// may just be a newer/older protocol version.
+    /// Oversized, bounds-violating, padded and non-canonical frames are
+    /// deliberate protocol violations — a compliant node cannot produce them
+    /// — except a non-canonical frame of a relayable message, which an
+    /// honest older release relays (see [`WireDecodeError::NonCanonical`]).
+    /// Malformed frames may just be a newer/older protocol version.
     pub fn is_protocol_violation(&self) -> bool {
-        matches!(self, WireDecodeError::Oversized(_) | WireDecodeError::Bounds(_))
+        matches!(
+            self,
+            WireDecodeError::Oversized(_)
+                | WireDecodeError::Bounds(_)
+                | WireDecodeError::TrailingBytes(_)
+                | WireDecodeError::NonCanonical { relayable: false }
+        )
     }
 }
 
@@ -453,7 +557,12 @@ pub fn decode_wire_message(data: &[u8]) -> Result<NetworkMessage, WireDecodeErro
     }
     let cfg = bincode::config::standard().with_limit::<MAX_WIRE_BYTES>();
     let msg: NetworkMessage = match bincode::serde::decode_from_slice(data, cfg) {
-        Ok((m, _)) => m,
+        Ok((m, consumed)) => {
+            if consumed != data.len() {
+                return Err(WireDecodeError::TrailingBytes(data.len().saturating_sub(consumed)));
+            }
+            m
+        }
         Err(bincode::error::DecodeError::LimitExceeded) => {
             return Err(WireDecodeError::Oversized(format!(
                 "declared content exceeds {} byte read limit", MAX_WIRE_BYTES
@@ -462,7 +571,14 @@ pub fn decode_wire_message(data: &[u8]) -> Result<NetworkMessage, WireDecodeErro
         Err(e) => return Err(WireDecodeError::Malformed(e.to_string())),
     };
     validate_wire_bounds(&msg)?;
-    Ok(msg)
+    // One encoding per message: the frame must be what the encoder writes.
+    match bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {
+        Ok(canonical) if canonical == data => Ok(msg),
+        _ => Err(WireDecodeError::NonCanonical {
+            relayable: matches!(msg, NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. }
+                                     | NetworkMessage::NewPowitItem { .. }),
+        }),
+    }
 }
 
 /// Explicit bounds on every variable-length field of NetworkMessage.
@@ -561,16 +677,32 @@ pub enum WireReaction {
     /// `gossipsub.set_application_score`. With app_specific_weight 1.0 and
     /// graylist_threshold -400, the fourth violation graylists the peer.
     Penalize { error: WireDecodeError, score: f64 },
-    /// Malformed bincode — possibly benign version skew. Log-only, no penalty.
+    /// Malformed bincode — possibly benign version skew — or a non-canonical
+    /// frame of a relayable message (`WireDecodeError::NonCanonical`, which
+    /// an older release relays). Log-only, no penalty.
     IgnoreMalformed(String),
 }
 
 /// Cumulative per-peer wire-violation penalty state. Bounded to
 /// [`WIRE_PENALTY_TRACK_CAP`] peers so an attacker cycling identities cannot
-/// grow the map without limit; once full, untracked offenders still receive a
-/// one-shot [`WIRE_VIOLATION_PENALTY`] without being inserted.
+/// grow the map without limit.
+///
+/// NET-8 (audit): once full, the map used to stop tracking newcomers — a late
+/// offender got a one-shot −100 forever and never reached the graylist. Now a
+/// newcomer evicts the entry with the MILDEST score (ties: least recently
+/// penalized), so real offenders stay tracked and every offender can
+/// accumulate. NET-4: scores also DECAY ([`Self::decay_tick_at`]), so a peer
+/// penalized for a burst of frames it merely relayed recovers instead of
+/// being cut off forever.
 pub struct WirePenaltyTracker {
-    penalties: std::collections::HashMap<PeerId, f64>,
+    /// peer -> (score, last decay step, last penalty)
+    penalties: std::collections::HashMap<PeerId, (f64, std::time::Instant, std::time::Instant)>,
+}
+
+impl Default for WirePenaltyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WirePenaltyTracker {
@@ -581,13 +713,14 @@ impl WirePenaltyTracker {
     /// Decode an untrusted gossip frame and decide the reaction. This is the
     /// exact logic previously inline in `run()`:
     ///   - decodes via [`decode_wire_message`] (4 MiB frame/read limit +
-    ///     post-decode bounds);
-    ///   - protocol violations (Oversized/Bounds) accumulate
+    ///     post-decode bounds + no trailing bytes);
+    ///   - protocol violations (Oversized/Bounds/TrailingBytes, and
+    ///     NonCanonical of a message that is never relayed) accumulate
     ///     [`WIRE_VIOLATION_PENALTY`] per offense, floored at
     ///     [`WIRE_PENALTY_FLOOR`];
-    ///   - if the tracking map is full and the peer untracked, the penalty is
-    ///     applied one-shot without growing the map;
-    ///   - plain-malformed frames are ignored (may be version skew).
+    ///   - plain-malformed frames and non-canonical frames of a relayable
+    ///     message (`NewBlock`, `NewTransaction`) are ignored (version skew:
+    ///     an older release accepts and relays the latter).
     pub fn classify(&mut self, peer: PeerId, data: &[u8]) -> WireReaction {
         match decode_wire_message(data) {
             Ok(msg) => WireReaction::Accept(msg),
@@ -608,14 +741,59 @@ impl WirePenaltyTracker {
     /// switching which protocol it sends violations on. Same cap/floor
     /// discipline as `classify`.
     pub fn record_violation(&mut self, peer: PeerId) -> f64 {
-        if self.penalties.len() >= WIRE_PENALTY_TRACK_CAP && !self.penalties.contains_key(&peer) {
-            // Tracking map is full: apply a one-shot penalty without growing it.
-            WIRE_VIOLATION_PENALTY
-        } else {
-            let s = self.penalties.entry(peer).or_insert(0.0);
-            *s = (*s + WIRE_VIOLATION_PENALTY).max(WIRE_PENALTY_FLOOR);
-            *s
+        self.record_violation_at(peer, std::time::Instant::now())
+    }
+
+    /// [`Self::record_violation`] with an explicit clock.
+    pub fn record_violation_at(&mut self, peer: PeerId, now: std::time::Instant) -> f64 {
+        if !self.penalties.contains_key(&peer) && self.penalties.len() >= WIRE_PENALTY_TRACK_CAP {
+            // NET-8: make room by forgetting the mildest (then stalest) entry.
+            let victim = self
+                .penalties
+                .iter()
+                .max_by(|(_, a), (_, b)| {
+                    a.0.partial_cmp(&b.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(b.2.cmp(&a.2))
+                })
+                .map(|(p, _)| *p);
+            if let Some(v) = victim {
+                self.penalties.remove(&v);
+            }
         }
+        let e = self.penalties.entry(peer).or_insert((0.0, now, now));
+        e.0 = (e.0 + WIRE_VIOLATION_PENALTY).max(WIRE_PENALTY_FLOOR);
+        e.2 = now;
+        e.0
+    }
+
+    /// NET-4 / NET-8: decay every tracked score by
+    /// [`WIRE_PENALTY_DECAY_FACTOR`] per full [`WIRE_PENALTY_DECAY_INTERVAL`]
+    /// elapsed. Returns `(peer, new_score)` for every score that changed, to
+    /// be re-installed with `set_application_score`; forgotten peers are
+    /// returned with `0.0` and removed from the map.
+    pub fn decay_tick_at(&mut self, now: std::time::Instant) -> Vec<(PeerId, f64)> {
+        let mut changed = Vec::new();
+        let mut forget = Vec::new();
+        for (peer, e) in self.penalties.iter_mut() {
+            let elapsed = now.saturating_duration_since(e.1);
+            let steps = (elapsed.as_secs() / WIRE_PENALTY_DECAY_INTERVAL.as_secs().max(1)).min(1_000);
+            if steps == 0 {
+                continue;
+            }
+            e.0 *= WIRE_PENALTY_DECAY_FACTOR.powi(steps as i32);
+            e.1 += WIRE_PENALTY_DECAY_INTERVAL * steps as u32;
+            if e.0.abs() < 1.0 {
+                forget.push(*peer);
+                changed.push((*peer, 0.0));
+            } else {
+                changed.push((*peer, e.0));
+            }
+        }
+        for p in forget {
+            self.penalties.remove(&p);
+        }
+        changed
     }
 
     /// Number of peers currently tracked (observability for tests/metrics).
@@ -625,7 +803,7 @@ impl WirePenaltyTracker {
 
     /// Current cumulative score for a peer, if tracked.
     pub fn score_of(&self, peer: &PeerId) -> Option<f64> {
-        self.penalties.get(peer).copied()
+        self.penalties.get(peer).map(|e| e.0)
     }
 }
 
@@ -752,27 +930,107 @@ struct BlochBehaviour {
 /// teardown. Memory stays bounded by the rr cap (sync frames are the only
 /// bulk payload; gossip is capped at 4 MiB per message elsewhere).
 ///
-/// KNOWN TRADE-OFF (libp2p-yamux 0.47 API, verified in the crate source):
-/// `Config::set_max_num_streams` — or ANY setter — switches the muxer
-/// backend from yamux 0.13 to yamux 0.12 (`Config::set()` replaces
-/// `Config013` with `Config012::default()`; the crate's own test
-/// `config_set_switches_to_v012` pins this as intended). There is NO way to
-/// raise the 0.13 cap through the 0.47 public API. yamux 0.12 (cap default
-/// 8192, static 256 KiB windows, `WindowUpdateMode::OnRead` backpressure)
-/// was libp2p's production muxer for years and speaks the same wire
-/// protocol, so mixed 0.12/0.13 fleets interoperate — but a NOT-yet-updated
-/// remote still enforces 512 on ITS side of the connection, so the churn
-/// only fully stops once both endpoints run this build.
+/// NET-17 (audit) — corrected: upstream libp2p-yamux 0.47 switched to the
+/// yamux 0.12 backend as soon as ANY config setter ran, which is why this
+/// workspace used to patch in a vendored fork without that backend
+/// (GHSA-vxx9-2994-q338). Since libp2p 0.57 (audit OPS-2) the upstream
+/// libp2p-yamux 0.48 has a single yamux 0.14 backend, the fork is retired, and
+/// `node/tests/supply_chain_lockfile_guard.rs` keeps a second (or pre-0.13.10)
+/// yamux out of Cargo.lock. `set_max_num_streams` configures that backend
+/// directly, and 4096 is exactly the largest cap its default receive window
+/// allows (yamux asserts `max_connection_receive_window >= 256 KiB × streams`).
+/// A NOT-yet-updated remote still enforces 512 on ITS side of the
+/// connection, so the churn only fully stops once both endpoints run this
+/// build.
 const MAX_YAMUX_STREAMS: usize = 4096;
 
 /// Builder for the swarm's yamux config — passed to `with_tcp` /
 /// `with_websocket` in place of `yamux::Config::default` (the builder accepts
 /// any `FnOnce() -> Config`). See `MAX_YAMUX_STREAMS` for why and for the
 /// 0.13→0.12 backend consequence.
-fn yamux_config() -> yamux::Config {
+pub fn yamux_config() -> yamux::Config {
     let mut cfg = yamux::Config::default();
     cfg.set_max_num_streams(MAX_YAMUX_STREAMS);
     cfg
+}
+
+/// Length of a gossipsub message id: SHA-256 of the frame, truncated.
+pub const GOSSIP_MESSAGE_ID_LEN: usize = 16;
+
+/// Most message ids this node puts in one IHAVE (and asks for in IWANTs per
+/// peer per heartbeat). One IHAVE is one RPC and gossipsub never splits it by
+/// size; with 16-byte ids every id costs 18 bytes on the wire (field tag,
+/// length, id), so 800 ids are about 14.4 KB, under the 16 KiB control limit a
+/// default-config libp2p-gossipsub 0.50 receiver enforces. gossipsub's default
+/// (5000 ids, about 90 KB) made a node's own IHAVE undecodable for such a peer:
+/// the receiver closes its inbound gossipsub stream and every later frame on
+/// the link (blocks included) is lost. Anyone can fill the tx topic's gossip
+/// window cheaply, so that was a remote way to cut honest links.
+pub const GOSSIP_MAX_CONTROL_IDS: usize = 800;
+
+/// Largest control part (IHAVE / IWANT / GRAFT / PRUNE / subscriptions) of one
+/// inbound RPC this node decodes. It covers what peers on gossipsub's default
+/// send side produce (5000 ids, about 90 KB: libp2p 0.49 nodes, other
+/// implementations) and stays far below `max_transmit_size` (4 MiB).
+pub const GOSSIP_MAX_CONTROL_BYTES: usize = 128 * 1024;
+
+/// The control-size limit a libp2p-gossipsub 0.50 peer applies with its
+/// default configuration; what this node sends must fit in it.
+pub const GOSSIP_PEER_DEFAULT_CONTROL_BYTES: usize = 16 * 1024;
+
+/// Bytes one message id costs inside an IHAVE / IWANT (tag, length, id).
+pub const GOSSIP_ID_WIRE_COST: usize = 2 + GOSSIP_MESSAGE_ID_LEN;
+
+// Build-time check of both directions (64 bytes: RPC / ControlIHave framing
+// and the topic id): our largest IHAVE fits a default 0.50 receiver, and we
+// decode a default sender's 5000-id IHAVE.
+const _: () = assert!(GOSSIP_MAX_CONTROL_IDS * GOSSIP_ID_WIRE_COST + 64 <= GOSSIP_PEER_DEFAULT_CONTROL_BYTES);
+const _: () = assert!(GOSSIP_MAX_CONTROL_BYTES >= 5000 * GOSSIP_ID_WIRE_COST + 64);
+
+/// Audit M-10 fix: SHA-256 (truncated to 16 bytes) message ids are
+/// deterministic across toolchains, unlike std's DefaultHasher.
+pub fn gossip_message_id(m: &gossipsub::Message) -> gossipsub::MessageId {
+    let digest = Sha256::digest(&m.data);
+    gossipsub::MessageId::from(&digest[..GOSSIP_MESSAGE_ID_LEN])
+}
+
+/// The node's gossipsub settings, before `build()` (tests derive topologies
+/// from it, e.g. a peer outside the mesh).
+pub fn gossipsub_config_builder() -> gossipsub::ConfigBuilder {
+    let mut b = gossipsub::ConfigBuilder::default();
+    b.heartbeat_interval(Duration::from_secs(1))
+        .validation_mode(ValidationMode::Strict)
+        .message_id_fn(gossip_message_id)
+        .max_transmit_size(4 * 1024 * 1024)
+        // NET-2 (audit): do NOT relay a frame before the application has
+        // validated it. Without this, libp2p forwarded every frame to the
+        // mesh first (an invalid-PoW block reached every node at zero
+        // cost to its author) and the configured invalid-delivery (P4)
+        // penalties could never fire.
+        .validate_messages()
+        // Keep unvalidated frames long enough for the processor to judge
+        // them (a block verdict waits behind its 64 MiB PoW check).
+        .history_length(GOSSIP_HISTORY_LENGTH)
+        // Mesh fix (fresh-joiner IBD): gossipsub's duplicate_cache_time
+        // defaults to 60s — the SAME period as tip_announce below, which
+        // made byte-identical periodic PeerTips Duplicate-dropped locally.
+        // 30s guarantees the 60s periodic announce always clears the
+        // cache; the tip-carrying Version (fresh timestamp → unique bytes)
+        // published alongside it can never be dedup-dropped at all.
+        .duplicate_cache_time(Duration::from_secs(30))
+        // Send small enough IHAVEs for a default 0.50 receiver, accept the
+        // large ones older or differently configured peers send (see
+        // GOSSIP_MAX_CONTROL_IDS / GOSSIP_MAX_CONTROL_BYTES).
+        .max_control_messages_sent(GOSSIP_MAX_CONTROL_IDS)
+        .max_control_message_size(GOSSIP_MAX_CONTROL_BYTES);
+    b
+}
+
+/// The node's gossipsub configuration (see [`gossipsub_config_builder`]).
+pub fn gossipsub_config() -> Result<gossipsub::Config, NetworkError> {
+    gossipsub_config_builder()
+        .build()
+        .map_err(|e| NetworkError::StartFailed(format!("gossipsub: {}", e)))
 }
 
 pub struct NetworkNode {
@@ -783,9 +1041,8 @@ pub struct NetworkNode {
     pq_identity: Arc<PqIdentity>,
     /// Per-peer PQ key pins (trust on first use).
     pq_pins:     Arc<PeerPins>,
-    /// Mempool verdicts on gossiped transactions ([`Self::tx_verdict_channel`]).
-    /// `None` (in-process harnesses): transactions are relayed on decode.
-    tx_verdicts: Option<mpsc::UnboundedReceiver<TxVerdict>>,
+    control_rx:  Option<mpsc::Receiver<NetworkControl>>,
+    peer_events: Option<mpsc::Sender<PeerEvent>>,
 }
 
 impl NetworkNode {
@@ -801,99 +1058,87 @@ impl NetworkNode {
         info!("P2P PQ identity fingerprint: {}", hex::encode(pq_identity.fingerprint()));
         let pq_pins = Arc::new(PeerPins::load(&config.data_dir.join("p2p_pq_pins.json"))
             .map_err(NetworkError::StartFailed)?);
-        Ok(Self { peer_id, config, local_key, pq_identity, pq_pins, tx_verdicts: None })
+        Ok(Self { peer_id, config, local_key, pq_identity, pq_pins, control_rx: None, peer_events: None })
     }
 
-    /// Defer the gossip verdict of every received transaction until the
-    /// message processor sends its mempool verdict on the returned sender:
-    /// valid ones are relayed, invalid ones are not (and the peer is not
-    /// penalized, since a transaction can also fail for a benign race).
-    pub fn tx_verdict_channel(&mut self) -> mpsc::UnboundedSender<TxVerdict> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.tx_verdicts = Some(rx);
-        tx
+    /// Accept [`NetworkControl`] requests from the processor on `rx`.
+    pub fn attach_control(&mut self, rx: mpsc::Receiver<NetworkControl>) {
+        self.control_rx = Some(rx);
     }
 
-    /// Run the network event loop.
+    /// Report [`PeerEvent`]s to the processor on `tx` (never blocks: a full
+    /// channel drops the notice).
+    pub fn attach_peer_events(&mut self, tx: mpsc::Sender<PeerEvent>) {
+        self.peer_events = Some(tx);
+    }
+
+    /// Run the network event loop for a consumer that does NOT report gossip
+    /// verdicts (tests, harnesses): inbound frames are delivered as bare
+    /// `NetworkMessage`s and blocks are relayed on decode. Production uses
+    /// [`Self::run_validated`].
     ///
-    /// Sprint CC (IBD live-tip fix): this function previously received
-    /// `our_blue_score: u64` and `our_height: u64` as values captured
-    /// at startup. Those values were baked into a single `my_tip`
-    /// message created once and republished verbatim whenever a peer
-    /// connected. Consequence in the wild: a node that started with
-    /// genesis and later built/accepted thousands of blocks kept
-    /// telling every new peer "I'm at height=1, blue_score=0". New
-    /// peers compared against their own tip, saw parity, and decided
-    /// not to request IBD. End result: fresh peers never synced from
-    /// peers already in mainnet. See discovery log 2026-04-21 in
-    /// docs/audit/AUDIT-2026-04-20.md under "Post-release findings".
-    ///
-    /// The fix here is to take the DAG by `Arc<RwLock<...>>` so the
-    /// network loop can read the *current* tip before each publish.
+    /// Sprint CC (IBD live-tip fix): the loop reads the *current* tip from the
+    /// DAG before each announce instead of a value captured at startup.
     ///
     /// Sprint EE (S3 transport harness): `listen_report`, when `Some`, receives
-    /// every address this swarm binds (fired from `SwarmEvent::NewListenAddr`).
-    /// This is the affordance the sprint_ee_convergence.rs header names as the
-    /// blocker for a real two-node in-process harness: with `/ip4/127.0.0.1/tcp/0`
-    /// the kernel picks the port, and before this parameter the bound address
-    /// was only *logged*, so a second in-process node could not be wired to the
-    /// first deterministically (fixed ports = CI flakiness). Production passes
-    /// `None` (see main.rs) — zero behavior change; the channel is unbounded so
-    /// the swarm loop never blocks on a slow observer, and a dropped receiver
-    /// is ignored (`let _ =`).
+    /// every address this swarm binds (fired from `SwarmEvent::NewListenAddr`),
+    /// so in-process harnesses can wire nodes on ephemeral ports. Production
+    /// passes `None`.
     pub async fn run(
         self,
         block_tx:       mpsc::Sender<NetworkMessage>,
-        mut outbound_rx: mpsc::Receiver<NetworkMessage>,
+        outbound_rx:    mpsc::Receiver<NetworkMessage>,
         dag:            std::sync::Arc<parking_lot::RwLock<crate::consensus::GhostDAG>>,
         peer_state:     std::sync::Arc<crate::sync::peer_state::PeerStateTable>,
+        store:          std::sync::Arc<crate::storage::Storage>,
+        listen_report:  Option<mpsc::UnboundedSender<Multiaddr>>,
+    ) -> Result<(), NetworkError> {
+        self.run_inner(IngestSink::Legacy(block_tx), None, outbound_rx, dag, peer_state, store, listen_report)
+            .await
+    }
+
+    /// NET-2 (audit): run the event loop with APPLICATION-VALIDATED gossip.
+    ///
+    /// Gossipsub is configured with `validate_messages()`: a received frame is
+    /// relayed only after a verdict is reported. Frames are delivered on
+    /// `inbound_tx` with their [`InboundOrigin`]; for every frame whose
+    /// origin carries a pending message id (gossip `NewBlock` and, since
+    /// audit MEM-5, gossip `NewTransaction`), the consumer
+    /// MUST send exactly one [`GossipValidation`] on the channel whose
+    /// receiver is `verdict_rx`. Frames it never answers are simply not
+    /// relayed (they expire from gossipsub's message cache).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_validated(
+        self,
+        inbound_tx:     mpsc::Sender<Inbound>,
+        verdict_rx:     mpsc::Receiver<GossipValidation>,
+        outbound_rx:    mpsc::Receiver<NetworkMessage>,
+        dag:            std::sync::Arc<parking_lot::RwLock<crate::consensus::GhostDAG>>,
+        peer_state:     std::sync::Arc<crate::sync::peer_state::PeerStateTable>,
+        store:          std::sync::Arc<crate::storage::Storage>,
+        listen_report:  Option<mpsc::UnboundedSender<Multiaddr>>,
+    ) -> Result<(), NetworkError> {
+        self.run_inner(IngestSink::Validated(inbound_tx), Some(verdict_rx), outbound_rx, dag, peer_state, store, listen_report)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_inner(
+        mut self,
+        sink:            IngestSink,
+        mut verdict_rx:  Option<mpsc::Receiver<GossipValidation>>,
+        mut outbound_rx: mpsc::Receiver<NetworkMessage>,
+        dag:             std::sync::Arc<parking_lot::RwLock<crate::consensus::GhostDAG>>,
+        peer_state:      std::sync::Arc<crate::sync::peer_state::PeerStateTable>,
         // Announce-then-pull: the network loop serves inbound directed
         // GetBlock pulls straight from the block store (bodies live here, not
         // in the DAG), replying to the ONE requesting peer over
         // request-response — no gossip, no O(peers) fan-out.
-        store:          std::sync::Arc<crate::storage::Storage>,
-        listen_report:  Option<mpsc::UnboundedSender<Multiaddr>>,
+        store:           std::sync::Arc<crate::storage::Storage>,
+        listen_report:   Option<mpsc::UnboundedSender<Multiaddr>>,
     ) -> Result<(), NetworkError> {
         use std::time::Instant;
-        // Audit M-10 fix: previously used std::hash::DefaultHasher, whose
-        // output is not stable across Rust versions (see the SipHasher13
-        // -> FxHash transition history). Two nodes on different Rust
-        // toolchains would compute different MessageIds for the same
-        // payload, breaking gossipsub deduplication and amplifying
-        // bandwidth. SHA-256 truncated to 16 bytes is deterministic,
-        // collision-resistant within any realistic network size, and
-        // costs a handful of microseconds per message.
-        let msg_id_fn = |m: &gossipsub::Message| {
-            let digest = Sha256::digest(&m.data);
-            gossipsub::MessageId::from(&digest[..16])
-        };
-
-        let gs_cfg = gossipsub::ConfigBuilder::default()
-            .heartbeat_interval(Duration::from_secs(1))
-            .validation_mode(ValidationMode::Strict)
-            // Relay only what this node has validated: every message is held
-            // until `report_message_validation_result`. A block is reported
-            // only after its proof of work verified, so an honest peer never
-            // relays an invalid proof and the peer that delivers one is the
-            // one held accountable (network::pow_gate).
-            .validate_messages()
-            .message_id_fn(msg_id_fn)
-            .max_transmit_size(4 * 1024 * 1024)
-            // Mesh fix (fresh-joiner IBD): gossipsub's duplicate_cache_time
-            // defaults to 60s — the SAME period as tip_announce below. When
-            // the tip hasn't advanced, the periodic PeerTip is byte-identical,
-            // hashes to the same MessageId, and publish() returns
-            // Err(PublishError::Duplicate) LOCALLY (behaviour.rs checks
-            // duplicate_cache before sending) — the re-announce never leaves
-            // this node. Worse: the on-connect PeerTip for a fresh joiner is
-            // Duplicate-dropped whenever any announce fired in the previous
-            // 60s, so on a quiet/stalled chain a new peer may NEVER receive a
-            // tip. 30s guarantees the 60s periodic announce always clears the
-            // cache; the tip-carrying Version (fresh timestamp → unique bytes)
-            // published alongside it can never be dedup-dropped at all.
-            .duplicate_cache_time(Duration::from_secs(30))
-            .build()
-            .map_err(|e| NetworkError::StartFailed(format!("gossipsub: {}", e)))?;
+        let gs_cfg = gossipsub_config()?;
 
         // ── Peer scoring: penalize invalid messages, reward participation ──
         let peer_score_params = {
@@ -902,29 +1147,18 @@ impl NetworkNode {
             params.app_specific_weight = 1.0;
             params.ip_colocation_factor_threshold = 3.0; // penalize >3 peers from same IP
             // Mesh fix: behind a fly.io-style proxy/NAT every inbound peer
-            // shares the proxy's source IP, so the colocation penalty
-            // (-50 × excess² above the threshold) crosses graylist_threshold
-            // (-400) at just 6 peers — the node then IGNORES its entire mesh
-            // and every tip announcement is blackholed. Operators who know
-            // they're proxied disable the weight with --behind-proxy; the
-            // default stays hostile to real sybil colocation.
+            // shares the proxy's source IP, so the colocation penalty crosses
+            // graylist_threshold at just 6 peers. Operators who know they're
+            // proxied disable the weight with --behind-proxy.
             params.ip_colocation_factor_weight =
                 if self.config.behind_proxy { 0.0 } else { -50.0 };
             params.decay_interval = Duration::from_secs(60);
             params.decay_to_zero = 0.01;
 
-            // Score params for each topic
-            // P3/P3b MUST be disabled on a low-rate chain. TopicScoreParams::default()
-            // ships mesh_message_deliveries_weight = -1.0 with threshold = 20.0 and
-            // activation = 5s. Five seconds after a peer joins the mesh, gossipsub
-            // charges -1.0 × (20 − delivered)² × topic_weight. Bloch produces roughly
-            // one block every 26 s, so `delivered` is 0 and the peer takes -400 ×
-            // topic_weight — summed across blocks/txs/sync that is ≈ -400, i.e. exactly
-            // graylist_threshold. Every peer that grafted was therefore guaranteed to be
-            // pruned within seconds ("Prune peer with negative score"), the mesh could
-            // never hold anyone, publish() returned NoPeersSubscribedToTopic and the
-            // miner's blocks never propagated. These penalties are designed for
-            // high-throughput topics; they are actively harmful here.
+            // P3/P3b MUST be disabled on a low-rate chain: the defaults charge
+            // every grafted peer ≈ graylist_threshold within seconds when it
+            // delivers fewer than 20 messages, which is always on a ~30 s
+            // block chain (the mesh could never hold anyone).
             let block_topic_params = TopicScoreParams {
                 topic_weight: 0.5,
                 time_in_mesh_weight: 0.1,
@@ -1029,13 +1263,9 @@ impl NetworkNode {
                     } else {
                         None.into()
                     };
-                // Announce-then-pull: advertise our archival status in the
-                // identify agent-version (`bloch/<ver>/a|n`). We deliberately do
-                // NOT add a field to the gossip `Version` frame — that would
-                // change the bincode wire layout and break a mixed old/new
-                // fleet — whereas the identify agent-version is a plain string
-                // old binaries simply don't parse. Peers read it to prefer an
-                // archival peer for directed IBD pulls (see sync_rr).
+                // The identify agent-version still advertises the archival bit
+                // (`gnb/<ver>/a|n`) for operators, but NET-9: peers no longer
+                // use this self-declared bit to choose whom to pull from.
                 let identify = identify::Behaviour::new(
                     identify::Config::new("/gnb/1.0.0".into(), key.public())
                         .with_agent_version(sync_rr::agent_version(archive)),
@@ -1043,10 +1273,8 @@ impl NetworkNode {
                 // Cap connections at the swarm layer to match max_peers. We
                 // allow 2× established total for churn/reconnect headroom, but
                 // hold established-INCOMING to max_peers so an attacker can't
-                // fill every slot with inbound dials (eclipse hardening — note
-                // this bounds the transport but is NOT yet adversarially
-                // tested; see roadmap §2.4/§4.1). Pending caps blunt half-open
-                // connection floods.
+                // fill every slot with inbound dials. Pending caps blunt
+                // half-open connection floods.
                 let max = max_peers as u32;
                 let limits = libp2p::connection_limits::ConnectionLimits::default()
                     .with_max_established(Some(max.saturating_mul(2)))
@@ -1079,25 +1307,8 @@ impl NetworkNode {
             .map_err(|e| NetworkError::StartFailed(format!("addr: {}", e)))?)
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?;
 
-        // M-6 (audit): this used to hard-code `/ip4/0.0.0.0/tcp/17111/ws` —
-        // an all-interfaces listener that ignored `--listen` entirely. An
-        // operator who bound P2P to a private interface
-        // (`--listen /ip4/10.0.0.5/tcp/17110`) still got a second, fully
-        // functional, all-interfaces P2P listener, with nothing but an
-        // `info!` line to notice it by. Two independent fixes, both applied:
-        //
-        // 1. The WS listen address is now DERIVED from `--listen` (same host
-        //    component, TCP port + 1, `/ws` appended) instead of a literal
-        //    `0.0.0.0` — an operator's interface choice is now honored on
-        //    both listeners, not just the primary one.
-        // 2. The listener is OPT-IN via `GNB_ENABLE_WS_LISTENER=1` (unset
-        //    = off), matching the finding's alternative fix
-        //    ("`--ws-listen` that defaults to off"). A CLI flag would need a
-        //    `NetworkConfig` field wired from `main.rs`'s arg parser, which
-        //    is outside this file's ownership for this change — an env var
-        //    achieves the same default-closed posture without touching it;
-        //    see this patch's notes for the `main.rs` flag wiring a future
-        //    change should add.
+        // M-6 (audit): the WS listener is opt-in (`GNB_ENABLE_WS_LISTENER=1`)
+        // and derived from `--listen` (same host, TCP port + 1, `/ws`).
         let ws_enabled = std::env::var("GNB_ENABLE_WS_LISTENER")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -1123,32 +1334,39 @@ impl NetworkNode {
         if pruned > 0 {
             info!("known_peers: pruned {} invalid entries on load (Sprint P)", pruned);
         }
-        // Sprint P: enforce cap (soft eviction).
+        // Sprint P / NET-11: enforce the (netgroup-aware) cap.
         let evicted = enforce_cap(&mut known_peers);
         if evicted > 0 {
             info!("known_peers: evicted {} entries to enforce cap", evicted);
         }
 
-        // Sprint P: PEX hardening state.
+        // Sprint P / NET-11: PEX hardening state. Rate limits are keyed by the
+        // AUTHOR of the addresses (the peer that answered our GetPeers), and
+        // received addresses only ever enter `addr_book` — they are dialed
+        // later, a few per tick, never straight from a message.
         let mut pex_limiter = PexRateLimiter::new();
         let mut pex_stats   = PexStats::new();
+        let mut addr_book   = AddrBook::new();
         let allow_private   = self.config.allow_private_peers;
 
-        // C1: cumulative app-score penalties for peers sending frames that
-        // violate wire bounds (oversized / over-long lists). Sprint EE (S3):
-        // the map + reaction logic moved into WirePenaltyTracker so the
-        // reaction is unit-testable without a live swarm; behavior unchanged.
+        // C1 / NET-4 / NET-8: cumulative, decaying, bounded app-score
+        // penalties for wire-violating peers.
         let mut wire_tracker = WirePenaltyTracker::new();
+        // MEM-5 / MEM-6: processor → network penalties (optional).
+        let mut control_rx = self.control_rx.take();
 
-        // H-R3-1 fix #4: per-peer token bucket bounding the RATE of served
-        // inbound directed-sync requests. See `sync_rr::SyncRequestLimiter`.
+        // H-R3-1 fix #4 / NET-8: bounded per-peer + global rate of served
+        // inbound directed-sync requests. Refusals are answered `Busy` (NET-5).
         let mut sync_limiter = sync_rr::SyncRequestLimiter::new();
+
+        // NET-6: per-AUTHOR rate limit on tip claims (PeerTip / Version).
+        let mut claim_limiter: ratelimit::TokenBuckets<PeerId> =
+            ratelimit::TokenBuckets::new(CLAIM_BURST, CLAIM_REFILL_PER_SEC, CLAIM_LIMITER_TRACK_CAP);
 
         // Add hardcoded default seeds
         let mut all_seeds: Vec<String> = crate::core::DEFAULT_SEEDS.iter().map(|s| s.to_string()).collect();
         // DNS seeds (opt-in, non-privileged): resolve each hostname's A/AAAA
-        // records into peer multiaddrs (Bitcoin-style cold-start). Only acts
-        // when an operator passes --dns-seed; DEFAULT_SEEDS stays empty.
+        // records into peer multiaddrs (Bitcoin-style cold-start).
         for host in self.config.dns_seeds.iter() {
             let hp = if host.contains(':') { host.clone() } else { format!("{host}:17110") };
             match tokio::net::lookup_host(hp).await {
@@ -1180,461 +1398,202 @@ impl NetworkNode {
             }
         }
 
-        // Sprint CC: build PeerTip fresh each time it's needed. The old
-        // code captured `our_blue_score` / `our_height` once at startup
-        // and reused them forever, which silently froze IBD triggering
-        // across reboots and late-joiner peers.
-        //
-        // build_current_tip (below, at module scope) reads the DAG under
-        // a short read lock — it's fine to call it from the swarm event
-        // loop because GhostDAG reads are O(1) (accessor fields, no
-        // walks) and parking_lot's RwLock has no writer-starvation
-        // guarantees that would stall a reader.
         let peer_id_str = self.peer_id.to_string();
-
         let mut peer_count = 0usize;
-        // Connections this node dialed. Inbound peers can fill `max_peers`,
-        // so outbound discovery continues until MIN_OUTBOUND of these exist:
-        // an attacker who only connects TO a node cannot surround it.
-        let mut outbound_count = 0usize;
 
         // AUDIT (external-address poisoning): a peer-reported identify
-        // `observed_addr` is only a CANDIDATE, never trusted from one peer. We
-        // confirm our own external address only when at least EXTERNAL_ADDR_QUORUM
-        // DISTINCT peers independently report the same addr — and only a confirmed
-        // addr becomes eligible for PEX self-advertise. Bounded to cap memory
-        // against a peer flooding many distinct fake observed_addrs.
+        // `observed_addr` is only a CANDIDATE; it is confirmed as our external
+        // address only when EXTERNAL_ADDR_QUORUM distinct peers report it.
         const EXTERNAL_ADDR_QUORUM: usize = 3;
         const OBSERVED_ADDR_CAP: usize = 64;
         const MDNS_DIAL_LIMIT: usize = 8; // max LAN peers auto-dialed per mDNS event
         let mut observed_by: std::collections::HashMap<Multiaddr, std::collections::HashSet<PeerId>> =
             std::collections::HashMap::new();
-        // Announce-then-pull: per-peer sync hints (highest announced blue_score
-        // + archival bit) used to pick the ONE peer a directed IBD pull goes to,
-        // the set of explicitly-configured `--peer`s, and the in-flight directed
-        // requests (so a request that fails — peer doesn't speak /bloch/sync/1,
-        // dial/timeout — can be re-published on gossip for a mixed fleet).
-        let mut peer_sync: std::collections::HashMap<PeerId, sync_rr::PeerSync> =
+
+        // NET-5 / NET-9: directed pulls go through a rotating, stall-aware
+        // selector with a per-peer in-flight cap; requests wait in a bounded
+        // queue when no peer is eligible, and a failed or Busy pull is retried
+        // on ANOTHER peer — never re-published on gossip (NET-7).
+        let mut selector = sync_rr::PullPeerSelector::new(sync_rr::explicit_peer_ids(&self.config.bootstrap_peers));
+        let mut pending_pulls: std::collections::VecDeque<PendingPull> = std::collections::VecDeque::new();
+        let mut inflight_pull: std::collections::HashMap<libp2p::request_response::OutboundRequestId, (PendingPull, PeerId)> =
             std::collections::HashMap::new();
-        let explicit_peers = sync_rr::explicit_peer_ids(&self.config.bootstrap_peers);
-        let mut inflight_pull: std::collections::HashMap<
-            libp2p::request_response::OutboundRequestId, NetworkMessage> =
-            std::collections::HashMap::new();
-        // Re-gossip rate-limit. Serving a legacy-gossip `GetBlock` re-broadcasts the
-        // whole block to the mesh; external peers spamming `GetBlock` for the same
-        // blocks turned that into a `publish blocks [NewBlock]: Duplicate` storm that
-        // saturated the send path (and the request-response handler alongside it). We
-        // keep the FIRST publish of each block (gossipsub then relays it mesh-wide) and
-        // suppress re-publishes of the SAME block within a short window; a peer that
-        // missed the first broadcast re-requests after the window. Pruned on insert, so
-        // the map stays bounded to blocks seen within the TTL.
+
+        // Re-gossip rate-limit: suppress re-publishes of the SAME block within
+        // the duplicate-cache window (a guaranteed local `Duplicate` anyway).
         let mut recent_block_publishes: std::collections::HashMap<[u8; 32], std::time::Instant> =
             std::collections::HashMap::new();
-        // Follow-up to 004c477 (which set 10s): the window MUST be >= gossipsub's
-        // `duplicate_cache_time` (30s, configured above). The message-id is a
-        // content hash, so a re-publish of the same block between 10s and 30s
-        // passed this filter only to be refused by gossipsub's duplicate cache
-        // anyway ("publish blocks [NewBlock]: Duplicate") — paying the bincode
-        // encode + SHA-256 of a multi-MB body per attempt and spamming the log.
-        // 10s < 30s made the 10–30s band pure waste; align the windows.
         const REGOSSIP_SUPPRESS_TTL: Duration = Duration::from_secs(30);
-        let mut heartbeat   = tokio::time::interval(Duration::from_secs(30));
+        let mut heartbeat   = new_heartbeat();
         let mut save_peers  = tokio::time::interval(Duration::from_secs(60));
-        // Sprint CC: periodic tip announce. Re-publishes the current
-        // tip to the sync topic every 60s. Catches the case where a
-        // peer already connected before we built new blocks — without
-        // this, such peers never learn the tip advanced and stay
-        // permanently behind.
+        // Sprint CC: periodic tip announce (every 60s).
         let mut tip_announce = tokio::time::interval(Duration::from_secs(60));
-
-        // Proof-of-work admission (network::pow_gate): per-peer budgets and
-        // bans, proofs evaluated on a bounded worker pool, verdicts returned
-        // to this loop.
-        let mut pow_gate = pow_gate::PowGate::new();
-        let pow_workers = Arc::new(tokio::sync::Semaphore::new(
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2)));
-        let (pow_verdict_tx, mut pow_verdict_rx) = mpsc::unbounded_channel::<PowVerdict>();
-        let mut tx_verdict_rx = self.tx_verdicts;
-        let mut tx_pending: std::collections::HashMap<[u8; 32], Vec<(gossipsub::MessageId, PeerId, Instant)>> =
-            std::collections::HashMap::new();
-        let mut tx_limiter = TxRateLimiter::default();
+        // NET-5/NET-9: re-try queued pulls (cooldowns expire, slots free up).
+        let mut pull_tick = tokio::time::interval(PULL_RETRY_TICK);
+        pull_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // NET-11: dial a few PEX-learned addresses per tick, from the table.
+        let mut pex_dial = tokio::time::interval(PEX_DIAL_TICK);
+        pex_dial.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
-                Some(v) = async {
-                    match tx_verdict_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    for (id, peer, _) in tx_pending.remove(&v.txid).unwrap_or_default() {
-                        let acceptance = if v.valid {
-                            gossipsub::MessageAcceptance::Accept
-                        } else {
-                            gossipsub::MessageAcceptance::Ignore
-                        };
-                        let _ = swarm.behaviour_mut().gossipsub
-                            .report_message_validation_result(&id, &peer, acceptance);
-                    }
-                }
-                Some(v) = pow_verdict_rx.recv() => {
-                    let acceptance = if v.valid {
-                        gossipsub::MessageAcceptance::Accept
-                    } else {
-                        gossipsub::MessageAcceptance::Reject
-                    };
-                    if let Some(id) = &v.message_id {
-                        let _ = swarm.behaviour_mut().gossipsub
-                            .report_message_validation_result(id, &v.peer, acceptance);
-                    }
-                    if v.valid {
-                        forward_to_processor(&block_tx, v.msg, v.source);
-                    } else {
-                        warn!("P2P: banning {} for {:?}: invalid GnB-SMH proof of work",
-                            v.peer, pow_gate::BAN_DURATION);
-                        pow_gate.ban(&v.peer, Instant::now());
-                        swarm.behaviour_mut().gossipsub.blacklist_peer(&v.peer);
-                        let _ = swarm.disconnect_peer_id(v.peer);
-                    }
-                }
                 event = poll_swarm(&mut swarm) => {
                     match event {
                         SwarmEvent::Behaviour(BlochBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message_id, message })) => {
-                            // C1: bounded decode. `decode_wire_message` (inside
-                            // `classify`) enforces the 4 MiB frame/read limit and
-                            // per-field length bounds; the unlimited
-                            // `bincode::config::standard()` decode used here
-                            // before let a tiny frame declare multi-GB lengths.
-                            // Sprint EE (S3): the reaction decision is computed by
-                            // WirePenaltyTracker (unit-testable, no swarm); this
-                            // arm only APPLIES it.
+                            // C1: bounded decode (4 MiB frame/read limit, per-field
+                            // bounds, NET-7: no trailing bytes).
                             let reaction = wire_tracker.classify(propagation_source, &message.data);
-                            match &reaction {
+                            let msg = match reaction {
                                 WireReaction::Penalize { error, score } => {
-                                    // Oversized / bounds-violating frames can't come from
-                                    // a compliant node: hit the sender's application score
-                                    // so repeat offenders get graylisted (4 × -100 crosses
-                                    // graylist_threshold -400 at app_specific_weight 1.0).
-                                    // NOTE (honesty): if `with_peer_score` failed above
-                                    // (non-fatal warn path), set_application_score is
-                                    // inert and this is effectively log-only.
+                                    // Oversized / bounds-violating / padded frames can't
+                                    // come from a compliant node. NET-2/NET-4: Reject it,
+                                    // so gossipsub's P4 penalty hits the DELIVERING peer
+                                    // (its author: honest nodes never relay invalid
+                                    // frames now) and it is never forwarded.
                                     swarm.behaviour_mut().gossipsub
-                                        .set_application_score(&propagation_source, *score);
+                                        .set_application_score(&propagation_source, score);
+                                    swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                        &message_id, &propagation_source, gossipsub::MessageAcceptance::Reject);
                                     warn!("wire violation from {}: {:?} (app score → {})",
                                         propagation_source, error, score);
+                                    continue;
                                 }
                                 WireReaction::IgnoreMalformed(_) => {
                                     debug!("undecodable gossip frame from {} ({} bytes)",
                                         propagation_source, message.data.len());
-                                }
-                                WireReaction::Accept(_) => {}
-                            }
-                            // Validation verdict for relaying (validate_messages):
-                            // blocks are decided by the proof-of-work gate below;
-                            // every other decoded message is relayed; anything
-                            // that failed the wire decoder is not.
-                            match &reaction {
-                                WireReaction::Penalize { .. } => {
-                                    let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                                        &message_id, &propagation_source, gossipsub::MessageAcceptance::Reject);
-                                }
-                                WireReaction::IgnoreMalformed(_) => {
-                                    let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                    swarm.behaviour_mut().gossipsub.report_message_validation_result(
                                         &message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
+                                    continue;
                                 }
-                                WireReaction::Accept(NetworkMessage::NewBlock { .. }) => {}
-                                // Decided below: rate limit, then the mempool verdict.
-                                WireReaction::Accept(NetworkMessage::NewTransaction { .. }
-                                                     | NetworkMessage::NewPowitItem { .. })
-                                    if tx_verdict_rx.is_some() => {}
-                                WireReaction::Accept(_) => {
-                                    let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                                        &message_id, &propagation_source, gossipsub::MessageAcceptance::Accept);
+                                WireReaction::Accept(m) => m,
+                            };
+                            let now = Instant::now();
+                            let author = message.source;
+                            let author_connected = author.is_some_and(|a| swarm.is_connected(&a));
+                            let mut claim_ok = false;
+                            match &msg {
+                                NetworkMessage::NewBlock  { block_hash, height, blue_score, .. } => {
+                                    tracing::info_span!(
+                                        "net_ingest_block",
+                                        block_hash = %hex::encode(&block_hash[..8]),
+                                        height = *height,
+                                        blue_score = *blue_score,
+                                        peer = %propagation_source,
+                                    ).in_scope(|| {
+                                        info!("← block h={} {}", height, hex::encode(&block_hash[..8]));
+                                    });
+                                    // Re-gossip suppression, RECEIVE side: a received
+                                    // block is in gossipsub's duplicate cache, so a
+                                    // re-publish within the TTL is a guaranteed local
+                                    // `Duplicate` — skip the wasted encode/hash work.
+                                    recent_block_publishes.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
+                                    recent_block_publishes.insert(*block_hash, now);
                                 }
-                            }
-                            if let WireReaction::Accept(msg) = reaction {
-                                match &msg {
-                                    NetworkMessage::NewBlock  { block_hash, height, blue_score, .. } => {
-                                        // P1 (roadmap §2): block-ingest correlation moved here from
-                                        // main.rs (owned by another dev). These fields let a P0
-                                        // supervisor restart be correlated to the block that
-                                        // triggered it. Inert unless a subscriber is installed.
-                                        tracing::info_span!(
-                                            "net_ingest_block",
-                                            block_hash = %hex::encode(&block_hash[..8]),
-                                            height = *height,
-                                            blue_score = *blue_score,
-                                            peer = %propagation_source,
-                                        ).in_scope(|| {
-                                            info!("← block h={} {}", height, hex::encode(&block_hash[..8]));
-                                        });
-                                        // Re-gossip suppression, RECEIVE side (the half 004c477
-                                        // missed): gossipsub's duplicate cache holds messages we
-                                        // RECEIVED as well as ones we published, and the message-id
-                                        // is a content hash — so answering a legacy-gossip GetBlock
-                                        // for a block that arrived on the mesh within the last 30s
-                                        // is a GUARANTEED local `Err(Duplicate)`: gossipsub refuses
-                                        // the publish before it leaves the node, after we already
-                                        // paid the store read, the bincode encode and the SHA-256 of
-                                        // a multi-MB body. That is exactly the persisting
-                                        // "publish blocks [NewBlock]: Duplicate" storm: each DISTINCT
-                                        // block a syncing peer walks produces one distinct
-                                        // (message-id) doomed publish that the publish-side map never
-                                        // saw. Recording received blocks here makes the outbound
-                                        // filter skip them — behavior-identical (the publish could
-                                        // never have left the node; gossipsub itself already relayed
-                                        // the received message mesh-wide), it only deletes the
-                                        // wasted encode/hash work and the log spam. A block we MINE
-                                        // can never be in this map (its content hash is new), so own
-                                        // announcements are never suppressed. Pruned on insert, same
-                                        // as the publish side, so the map stays bounded even if no
-                                        // publish attempt runs for a while.
-                                        let now = Instant::now();
-                                        recent_block_publishes.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
-                                        recent_block_publishes.insert(*block_hash, now);
-                                    }
-                                    NetworkMessage::PeerTip { peer_id, blue_score, height } => {
-                                        debug!("← tip from {} score={}", peer_id, blue_score);
-                                        // M-9: clamp before this untrusted hint is stored anywhere.
-                                        let our_score = dag.read().tip_blue_score();
-                                        let clamped = clamp_announced_blue_score(*blue_score, our_score);
-                                        // Phase-2: record the untrusted announced hint (no tips).
-                                        peer_state.observe(propagation_source, clamped, *height, &[], Instant::now());
-                                        // Announce-then-pull: track highest announced score
-                                        // for directed-pull peer selection.
-                                        track_peer_score(&mut peer_sync, propagation_source, clamped);
-                                    }
-                                    NetworkMessage::Headers { entries } =>
-                                        info!("← {} headers", entries.len()),
-                                    NetworkMessage::Tips { tips, .. } => {
-                                        // Phase-2 frontier reconciliation hint: record the peer's
-                                        // advertised DAG frontier + its highest announced score.
-                                        let hashes: Vec<[u8; 32]> = tips.iter().map(|e| e.hash).collect();
-                                        let (bs, ht) = tips.iter()
-                                            .map(|e| (e.blue_score, e.height))
-                                            .max_by_key(|(s, _)| *s)
-                                            .unwrap_or((0, 0));
-                                        // M-9: clamp before this untrusted hint is stored anywhere.
-                                        let our_score = dag.read().tip_blue_score();
-                                        let bs = clamp_announced_blue_score(bs, our_score);
-                                        peer_state.observe(propagation_source, bs, ht, &hashes, Instant::now());
-                                        track_peer_score(&mut peer_sync, propagation_source, bs);
-                                    }
-                                    NetworkMessage::Version { version, user_agent, blue_score, height, .. } => {
-                                        if *version < MIN_PROTOCOL_VERSION {
-                                            warn!("← incompatible version {} from {}", version, user_agent);
-                                        } else {
-                                            debug!("← version {} ({})", version, user_agent);
-                                        }
-                                        // M-9: clamp before this untrusted hint is stored anywhere.
-                                        let our_score = dag.read().tip_blue_score();
-                                        let clamped = clamp_announced_blue_score(*blue_score, our_score);
-                                        // Phase-2: record the untrusted announced hint (no tips).
-                                        peer_state.observe(propagation_source, clamped, *height, &[], Instant::now());
-                                        track_peer_score(&mut peer_sync, propagation_source, clamped);
-                                    }
-                                    NetworkMessage::PeerRequest => {
-                                        // PROPAGAÇÃO-CHURN fix: never put an entry on the wire
-                                        // that a compliant receiver must penalize. known_peers is
-                                        // kept canonical now, but a file written by an OLD binary
-                                        // survives until the startup prune — filter at the send
-                                        // seam too, so one stale entry can't graylist us
-                                        // (−100/frame at every receiver) for the whole session.
-                                        let mut my_peers: Vec<String> = known_peers.iter()
-                                            .filter(|a| is_valid_public_multiaddr(a, allow_private))
-                                            .cloned().collect();
-                                        // PRINCIPLES.md #2 ("every node is a seed"): advertise our
-                                        // OWN reachable address(es) — learned via identify's
-                                        // observed_addr and stored as external addresses — so a node
-                                        // that nobody knows can still be gossiped onward. Formatted
-                                        // exactly like the other PEX entries (canonical single
-                                        // /p2p/<peer_id> suffix); de-duplicated against known_peers.
-                                        for addr in swarm.external_addresses() {
-                                            let self_addr = canonical_peer_addr(addr, &self.peer_id);
-                                            if !my_peers.contains(&self_addr) {
-                                                my_peers.push(self_addr);
-                                            }
-                                        }
-                                        if !my_peers.is_empty() {
-                                            let pex = NetworkMessage::PeerExchange { peers: my_peers };
-                                            if let Ok(d) = bincode::serde::encode_to_vec(&pex, bincode::config::standard()) {
-                                                let _ = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d);
-                                            }
-                                        }
-                                    }
-                                    NetworkMessage::PeerExchange { peers } => {
-                                        // ── Sprint P: PEX hardening ──────────────────────
-                                        //
-                                        // 1. Rate-limit by propagation_source (sliding window)
-                                        // 2. Enforce batch limit PEX_BATCH_LIMIT per message
-                                        // 3. Validate each address (is_valid_public_multiaddr)
-                                        // 4. Respect MAX_PEERS ceiling (no new dials if already full)
-                                        // 5. Don't persist to known_peers until dial confirms
-                                        //    (now happens in ConnectionEstablished handler)
-                                        let original_len = peers.len();
-
-                                        // Rate limit admits at most PEX_MAX_PER_WINDOW per window
-                                        // AND at most PEX_BATCH_LIMIT per message.
-                                        let admitted = pex_limiter.admit(propagation_source, original_len);
-                                        if admitted < original_len {
-                                            let over_batch = original_len.saturating_sub(PEX_BATCH_LIMIT);
-                                            if over_batch > 0 {
-                                                pex_stats.record_batch(over_batch.min(original_len - admitted));
-                                            }
-                                            let over_rate = original_len - admitted - over_batch;
-                                            if over_rate > 0 {
-                                                pex_stats.record_rate(over_rate);
-                                            }
-                                        }
-
-                                        let mut valid_accepted = 0usize;
-                                        for addr_str in peers.iter().take(admitted) {
-                                            if peer_count >= self.config.max_peers && outbound_count >= MIN_OUTBOUND {
-                                                break; // ceiling reached, and enough peers of our own choosing
-                                            }
-                                            if !is_valid_public_multiaddr(addr_str, allow_private) {
-                                                // Is it private specifically? Check without the flag
-                                                // to know which bucket to count.
-                                                if is_valid_public_multiaddr(addr_str, true) {
-                                                    pex_stats.record_private(1);
-                                                } else {
-                                                    pex_stats.record_invalid(1);
-                                                }
-                                                // H4: addr_str is attacker-controlled; byte-index
-                                            // slicing panicked on multi-byte UTF-8 at byte 80.
-                                            debug!("PEX rejected: {}", truncate_utf8(addr_str, 80));
-                                                continue;
-                                            }
-                                            if known_peers.contains(addr_str) {
-                                                continue; // already known, skip silently
-                                            }
-                                            // SECURITY (audit L3): do NOT resolve DNS inline here —
-                                            // this runs inside the swarm event loop, so awaiting a
-                                            // lookup on an attacker-supplied /dns4/ host stalled block
-                                            // and tx propagation. Dial the multiaddr directly; libp2p's
-                                            // DNS transport resolves /dns*/ during the dial, off the
-                                            // critical path.
-                                            if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
-                                                // H4: UTF-8-safe truncation (attacker-controlled).
-                                                info!("PEX dial: {}", truncate_utf8(addr_str, 60));
-                                                let _ = swarm.dial(addr);
-                                                valid_accepted += 1;
-                                                // NB: don't insert into known_peers here; wait for
-                                                // ConnectionEstablished to confirm the peer is real.
-                                            } else {
-                                                pex_stats.record_invalid(1);
-                                            }
-                                        }
-                                        if valid_accepted > 0 {
-                                            pex_stats.record_accept(valid_accepted);
-                                        }
-                                        pex_stats.set_distinct_peers(pex_limiter.tracked_peer_count());
-                                    }
-                                    _ => {}
-                                }
-                                if matches!(msg, NetworkMessage::NewBlock { .. }) {
-                                    gate_block(
-                                        &mut pow_gate, &dag, &pow_workers, &pow_verdict_tx, &block_tx,
-                                        &mut swarm, propagation_source, Some(message_id), msg,
-                                        true, "gossip",
-                                    );
-                                } else if let (NetworkMessage::NewTransaction { txid, .. }
-                                               | NetworkMessage::NewPowitItem { id: txid, .. }, true) =
-                                    (&msg, tx_verdict_rx.is_some())
+                                // Receipt trace of a gossiped transaction, off by
+                                // default (`GOSSIP_RX_TX_LOG_TARGET`): the
+                                // functional tests check with it that an invalid
+                                // transaction never reaches a peer. The decode
+                                // runs only when the trace is enabled.
+                                NetworkMessage::NewTransaction { tx_data, .. }
+                                    if log::log_enabled!(target: GOSSIP_RX_TX_LOG_TARGET, log::Level::Debug) =>
                                 {
-                                    let now = Instant::now();
-                                    if !tx_limiter.take(&propagation_source, now) {
-                                        debug!("P2P: {} exceeded its transaction budget; tx ignored", propagation_source);
-                                        let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                                            &message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
-                                    } else {
-                                        if tx_pending.len() >= TX_PENDING_CAP {
-                                            tx_pending.retain(|_, v| {
-                                                v.retain(|(_, _, t)| now.duration_since(*t) < TX_VERDICT_TTL);
-                                                !v.is_empty()
-                                            });
-                                        }
-                                        if tx_pending.len() < TX_PENDING_CAP || tx_pending.contains_key(txid) {
-                                            tx_pending.entry(*txid).or_default()
-                                                .push((message_id, propagation_source, now));
-                                            forward_to_processor(&block_tx, msg, "gossip");
-                                        } else {
-                                            let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                                                &message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
+                                    match crate::core::Transaction::from_wire_bytes(tx_data) {
+                                        Ok(tx) => debug!(target: GOSSIP_RX_TX_LOG_TARGET, "← tx {} from {}",
+                                            hex::encode(&tx.txid()[..8]), propagation_source),
+                                        Err(_) => debug!(target: GOSSIP_RX_TX_LOG_TARGET, "← tx (undecodable, {} bytes) from {}",
+                                            tx_data.len(), propagation_source),
+                                    }
+                                }
+                                NetworkMessage::PeerTip { blue_score, height, .. }
+                                | NetworkMessage::Version { blue_score, height, .. } => {
+                                    // NET-6: claims are attributed to their signed AUTHOR
+                                    // and recorded only for directly connected authors,
+                                    // rate-limited per author, clamped once here.
+                                    if let Some(a) = author.filter(|_| author_connected) {
+                                        if claim_limiter.allow_at(a, now) {
+                                            let (our_score, our_count) = {
+                                                let d = dag.read();
+                                                (d.tip_blue_score(), d.block_count() as u64)
+                                            };
+                                            let bs = clamp_announced_blue_score(*blue_score, our_score);
+                                            let ht = clamp_announced_blue_score(*height, our_count);
+                                            peer_state.observe_claim(a, bs, ht, now);
+                                            claim_ok = true;
+                                            // A claim ahead of us: pull the frontier
+                                            // from its AUTHOR, the peer known to have
+                                            // it. The processor's own pulls for this
+                                            // claim go to the selector's choice
+                                            // (rotation, NET-9), often a peer without
+                                            // the blocks. Tips answers are
+                                            // deduplicated by the frontier tracker, so
+                                            // the extra pull fetches nothing twice
+                                            // (Headers answers are not: header pulls
+                                            // stay with the processor). Bounded by
+                                            // the per-author claim limiter above.
+                                            if claim_warrants_directed_pull(bs, our_score) {
+                                                send_directed_pull(&mut swarm, &mut selector, &mut inflight_pull, a,
+                                                    NetworkMessage::GetTips, now);
+                                            }
                                         }
                                     }
-                                } else {
-                                    forward_to_processor(&block_tx, msg, "gossip");
+                                    if let NetworkMessage::Version { version, user_agent, .. } = &msg {
+                                        if *version < MIN_PROTOCOL_VERSION {
+                                            warn!("← incompatible version {} from {}", version, truncate_utf8(user_agent, 64));
+                                        }
+                                    }
+                                }
+                                // NET-11: unsolicited gossip PeerExchange is never
+                                // dialed, never stored, never relayed (see
+                                // `gossip_disposition`). Addresses are only learned
+                                // from answers to our own directed GetPeers.
+                                _ => {}
+                            }
+                            let source = InboundOrigin::Gossip { propagation_source, author, pending: None, received_at: now };
+                            match gossip_disposition(&msg, sink.validator_attached(), claim_ok) {
+                                GossipDisposition::DeliverDeferred => {
+                                    let origin = InboundOrigin::Gossip {
+                                        propagation_source, author, pending: Some(message_id.clone()), received_at: now,
+                                    };
+                                    if !sink.deliver(msg, origin, "gossip") {
+                                        // Never queued: nobody will judge it. Do not relay.
+                                        swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                            &message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
+                                    }
+                                }
+                                GossipDisposition::Deliver(v) => {
+                                    swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                        &message_id, &propagation_source, v.into());
+                                    sink.deliver(msg, source, "gossip");
+                                }
+                                GossipDisposition::Drop(v) => {
+                                    debug!("gossip [{}] from {} not delivered/relayed", msg.kind_name(), propagation_source);
+                                    swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                        &message_id, &propagation_source, v.into());
                                 }
                             }
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                            // Budgets and bans follow the address, not only the identity.
-                            if let Some(ip) = pow_gate::multiaddr_ip(endpoint.get_remote_address()) {
-                                pow_gate.note_peer_ip(peer_id, ip);
-                            }
-                            if pow_gate.is_banned(&peer_id, Instant::now()) {
-                                debug!("P2P: dropping connection from banned peer {}", peer_id);
-                                let _ = swarm.disconnect_peer_id(peer_id);
-                                continue;
-                            }
-                            if endpoint.is_dialer() {
-                                outbound_count += 1;
-                            }
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                             info!("✓ connected: {}", peer_id);
-                            // DO NOT call gossipsub.add_explicit_peer() here.
-                            //
-                            // An "explicit peer" in gossipsub is a manually-pinned direct
-                            // link that is DELIBERATELY EXCLUDED from mesh construction.
-                            // libp2p-gossipsub 0.49.5 behaviour.rs:2224 filters mesh graft
-                            // candidates with `!explicit_peers.contains(peer)`, and :1395
-                            // answers an incoming GRAFT from an explicit peer by PRUNING it
-                            // on every topic ("we don't GRAFT to/from explicit peers").
-                            //
-                            // Marking EVERY connection explicit therefore made the mesh
-                            // permanently unbuildable: heartbeat logged
-                            // "Mesh low. Topic contains: 0" and "RANDOM PEERS: Got 0 peers"
-                            // forever, publish() returned NoPeersSubscribedToTopic, and the
-                            // miner's blocks never reached the network — every non-mining
-                            // node stalled while the producer kept extending alone.
-                            // Reproduced with two fresh nodes on localhost (2026-08-07).
-                            peer_count += 1;
-                            crate::metrics::set_peer_count(peer_count as i64);
+                            // DO NOT call gossipsub.add_explicit_peer() here: explicit
+                            // peers are excluded from the mesh (libp2p-gossipsub
+                            // behaviour.rs), which once made the mesh unbuildable.
+                            let first_connection = num_established.get() == 1;
+                            // The count is of distinct peers, not connections, and the
+                            // processor (RPC `peers`, the miner's has-peers check) sees
+                            // it at once, not at the next 30 s heartbeat.
+                            if let Some(count) = peer_count_after_connect(peer_count, num_established.get()) {
+                                peer_count = count;
+                                crate::metrics::set_peer_count(peer_count as i64);
+                                sink.deliver(NetworkMessage::PeerCount {
+                                    count: peer_count, addresses: known_peers.iter().cloned().collect(),
+                                }, InboundOrigin::Local, "connect");
+                            }
                             peer_state.on_connect(peer_id, Instant::now());
-                            // NOTE: re-calling gossipsub.subscribe() here would be a no-op —
-                            // it returns Ok(false) and sends nothing when the topic is already
-                            // subscribed (it logs "Topic is already in the mesh"). gossipsub
-                            // already sends our subscription set on connection establishment,
-                            // so there is nothing to force.
-                            // Save peer address for next startup.
-                            //
-                            // PROPAGAÇÃO-CHURN fix (2026-08-09), two parts:
-                            //
-                            // (a) Dialer: the dialed `address` already ENDS in
-                            //     `/p2p/<peer_id>` (bootstrap/PEX/known_peers
-                            //     entries all carry it), so the previous
-                            //     `format!("{}/p2p/{}", address, peer_id)`
-                            //     appended a second component — and one more on
-                            //     every later successful dial of the stored
-                            //     result. Mainnet files were measured with
-                            //     chains up to 15 components (885 bytes); past
-                            //     ~9 the string exceeds MAX_WIRE_ADDR_LEN and
-                            //     every PeerExchange carrying it graylists US
-                            //     at the receiver (−100/frame, −400 = graylist)
-                            //     → our blocks/tips blackholed with TCP up.
-                            //     `canonical_peer_addr` strips every P2p
-                            //     component and appends exactly one — it is
-                            //     idempotent, so re-observation never grows.
-                            //
-                            // (b) Listener: `send_back_addr` is the remote's
-                            //     EPHEMERAL socket (e.g. /tcp/55964), never its
-                            //     listen address — it is not dialable, so
-                            //     persisting it only filled known_peers with
-                            //     garbage (226 of node4's 265 entries) that
-                            //     wasted the receiver-side PEX_BATCH_LIMIT
-                            //     slots real peers needed. Reachable listeners
-                            //     are discovered via PEX self-advertise
-                            //     (identify observed_addr + quorum), not here.
+                            selector.on_connect(peer_id);
+                            // PROPAGAÇÃO-CHURN fix: persist only the canonical form of
+                            // a DIALED address (the Listener's send_back_addr is an
+                            // ephemeral socket). NET-11: confirmed addresses enter
+                            // the netgroup-capped "tried" table.
                             let addr_to_remember = match &endpoint {
                                 libp2p::core::ConnectedPoint::Dialer { address, .. } => {
                                     Some(canonical_peer_addr(address, &peer_id))
@@ -1642,23 +1601,15 @@ impl NetworkNode {
                                 libp2p::core::ConnectedPoint::Listener { .. } => None,
                             };
                             if let Some(addr_str) = addr_to_remember {
+                                addr_book.remove(&addr_str);
                                 if is_valid_public_multiaddr(&addr_str, allow_private) {
-                                    known_peers.insert(addr_str);
-                                    // Enforce cap on live state too
-                                    enforce_cap(&mut known_peers);
+                                    add_tried(&mut known_peers, addr_str);
                                 } else {
-                                    // H4: same panic-free truncation as the PEX log lines
-                                    // (send_back_addr strings are peer-influenced too).
                                     debug!("not adding peer to known_peers (validator rejected): {}",
                                         truncate_utf8(&addr_str, 80));
                                 }
                             }
-                            // Send version handshake. Sprint CC: read fresh
-                            // tip/height from DAG — same reason as the PeerTip
-                            // fix. Version messages also carry these fields
-                            // (some peers use them for compatibility checks
-                            // and for log display) and would otherwise stay
-                            // stuck at the startup values forever.
+                            // Version handshake + tip announce with FRESH DAG values.
                             let (v_score, v_height) = {
                                 let d = dag.read();
                                 (d.tip_blue_score(), d.block_count() as u64)
@@ -1672,55 +1623,47 @@ impl NetworkNode {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_secs()).unwrap_or(0),
                             };
-                            // Mesh fix (fresh-joiner IBD): these publishes were
-                            // silently discarded with `let _ =`. Two failure
-                            // modes were invisible in production: (a) publish
-                            // races the new peer's gossipsub Subscribe →
-                            // NoPeersSubscribedToTopic / not-yet-in-mesh, so the
-                            // joiner never receives the frame; (b) a byte-
-                            // identical PeerTip within duplicate_cache_time →
-                            // PublishError::Duplicate, dropped LOCALLY. Both are
-                            // now logged, and the Subscribed handler below
-                            // re-announces once the peer's subscription lands.
                             if let Ok(d) = bincode::serde::encode_to_vec(&version_msg, bincode::config::standard()) {
                                 if let Err(e) = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d) {
                                     info!("on-connect Version publish failed ({}); will re-announce when {} subscribes to sync", e, peer_id);
                                 }
                             }
-                            // Announce our tip to trigger IBD. Sprint CC:
-                            // fresh tip read from DAG, not the startup snapshot.
                             let my_tip = build_current_tip(&dag, &peer_id_str);
                             if let Ok(d) = bincode::serde::encode_to_vec(&my_tip, bincode::config::standard()) {
                                 if let Err(e) = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d) {
                                     info!("on-connect PeerTip publish failed ({}); will re-announce when {} subscribes to sync", e, peer_id);
                                 }
                             }
-                            // M-10 (audit): PEX request is now a DIRECTED
-                            // pull to the peer that just connected, not a
-                            // broadcast to the whole gossip mesh. The old
-                            // behavior made every mesh member — not just the
-                            // new peer — see the request and independently
-                            // publish their full peer table mesh-wide in
-                            // reply: a broadcast-amplifying answer to a
-                            // broadcast question. Falls back to gossip on
-                            // `OutboundFailure` (mixed fleet: an old binary
-                            // doesn't speak `/gnb/sync/1`), exactly like
-                            // the `outbound_rx` directed-pull path.
+                            // M-10: directed PEX request to the peer that just
+                            // connected (one requester, one answer). Not retried on
+                            // other peers if it fails.
+                            let now = Instant::now();
                             let req_id = swarm.behaviour_mut().sync_rr
                                 .send_request(&peer_id, sync_rr::SyncRequest::GetPeers);
-                            inflight_pull.insert(req_id, NetworkMessage::PeerRequest);
+                            selector.on_sent(peer_id, now);
+                            inflight_pull.insert(req_id, (PendingPull {
+                                msg: NetworkMessage::PeerRequest,
+                                req: sync_rr::SyncRequest::GetPeers,
+                                attempts: MAX_PULL_ATTEMPTS,
+                                tried: vec![peer_id],
+                            }, peer_id));
+                            // Directed frontier exchange with the new peer: its tips,
+                            // asked of IT. The gossip announcements above reach a
+                            // second peer connecting within the same second as
+                            // byte-identical frames, which gossipsub drops as
+                            // duplicates, so a healed partition used to wait for
+                            // the 30 s nudge / 60 s announce (about 60 s;
+                            // test/functional/feature_partition_heal.py). Both ends
+                            // do this, so each learns the other's frontier now.
+                            if first_connection {
+                                send_directed_pull(&mut swarm, &mut selector, &mut inflight_pull, peer_id,
+                                    NetworkMessage::GetTips, now);
+                            }
+                            drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, now);
                         }
-                        // Mesh fix (fresh-joiner IBD): the on-connect announce
-                        // above races the remote peer's Subscribe — until the
-                        // peer's subscription to the sync topic reaches us, any
-                        // publish either errors or is sent to a mesh the joiner
-                        // is not yet part of. THIS event is the moment the peer
-                        // provably subscribed, so re-announce the handshake and
-                        // tip here. The Version frame carries a fresh timestamp,
-                        // so its bytes — and therefore its MessageId — are
-                        // unique: it can never be Duplicate-dropped the way a
-                        // byte-identical PeerTip can, and main.rs treats a
-                        // Version with blue_score > ours as an IBD trigger.
+                        // Mesh fix (fresh-joiner IBD): THIS event is the moment the
+                        // peer provably subscribed, so re-announce the handshake and
+                        // tip here (the on-connect announce races its Subscribe).
                         SwarmEvent::Behaviour(BlochBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
                             if topic == sync_t.hash() {
                                 let (v_score, v_height) = {
@@ -1745,34 +1688,28 @@ impl NetworkNode {
                                 let my_tip = build_current_tip(&dag, &peer_id_str);
                                 if let Ok(d) = bincode::serde::encode_to_vec(&my_tip, bincode::config::standard()) {
                                     if let Err(e) = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d) {
-                                        // Duplicate is expected here when the tip
-                                        // hasn't moved since a recent announce;
-                                        // the Version above already carried it.
                                         debug!("post-subscribe PeerTip publish: {}", e);
                                     }
                                 }
                             }
                         }
-                        SwarmEvent::ConnectionClosed { peer_id, endpoint, .. } => {
-                            if endpoint.is_dialer() {
-                                outbound_count = outbound_count.saturating_sub(1);
-                            }
+                        SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                             info!("✗ disconnected: {}", peer_id);
-                            peer_count = peer_count.saturating_sub(1);
-                            crate::metrics::set_peer_count(peer_count as i64);
-                            peer_state.on_disconnect(&peer_id);
-                            // Announce-then-pull: drop the peer from directed-pull
-                            // candidates (only fires on the LAST connection to it).
-                            peer_sync.remove(&peer_id);
+                            if let Some(count) = peer_count_after_disconnect(peer_count, num_established) {
+                                peer_count = count;
+                                crate::metrics::set_peer_count(peer_count as i64);
+                                sink.deliver(NetworkMessage::PeerCount {
+                                    count: peer_count, addresses: known_peers.iter().cloned().collect(),
+                                }, InboundOrigin::Local, "disconnect");
+                                peer_state.on_disconnect(&peer_id);
+                                selector.on_disconnect(&peer_id);
+                                if let Some(tx) = &self.peer_events {
+                                    let _ = tx.try_send(PeerEvent::Disconnected(peer_id));
+                                }
+                            }
                         }
                         SwarmEvent::NewListenAddr { address, .. } => {
                             info!("listening: {}/p2p/{}", address, self.peer_id);
-                            // Sprint EE (S3 transport harness): report the bound
-                            // addr to an in-process observer so a peer node can
-                            // be wired to this one deterministically even with
-                            // an ephemeral `/tcp/0` listen port. `None` in
-                            // production — this arm then behaves exactly as
-                            // before (log only).
                             if let Some(report) = &listen_report {
                                 let _ = report.send(address.clone());
                             }
@@ -1785,15 +1722,9 @@ impl NetworkNode {
                         SwarmEvent::IncomingConnectionError { error, .. } => {
                             warn!("incoming failed: {}", error);
                         }
-                        // PRINCIPLES.md #2: zero-config LAN discovery. mDNS finds
-                        // peers on the local network with no configured seed —
-                        // add them to the gossipsub mesh and auto-dial.
+                        // PRINCIPLES.md #2: zero-config LAN discovery (opt-in). Only
+                        // LAN addresses, capped per event, honoring the peer ceiling.
                         SwarmEvent::Behaviour(BlochBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                            // AUDIT fix (Finding 3): a rogue LAN mDNS responder can
-                            // announce many peers and non-LAN targets. Only auto-dial
-                            // LAN addresses (an mDNS record naming a PUBLIC IP is a
-                            // reflection/SSRF attempt), honor the peer ceiling, and
-                            // cap the number dialed per event.
                             let mut dialed = 0usize;
                             for (peer_id, addr) in list {
                                 if dialed >= MDNS_DIAL_LIMIT || peer_count >= self.config.max_peers {
@@ -1804,9 +1735,6 @@ impl NetworkNode {
                                     continue;
                                 }
                                 info!("mDNS discovered (LAN): {} at {}", peer_id, addr);
-                                // Same reason as the ConnectionEstablished arm above: an
-                                // explicit peer is excluded from the mesh. Just dial it and
-                                // let normal mesh maintenance graft it.
                                 if swarm.dial(addr).is_ok() { dialed += 1; }
                             }
                         }
@@ -1815,21 +1743,9 @@ impl NetworkNode {
                                 swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                             }
                         }
-                        // PRINCIPLES.md #2: identify tells us how peers see us
-                        // (observed_addr) — our own public address. Register it as
-                        // an external address so we can self-advertise via PEX.
-                        // Verified peer listen addrs are persisted like other
-                        // known_peers (same validator/cap hygiene).
+                        // identify: our observed address (quorum-confirmed before it
+                        // is advertised). Peer listen addrs are NOT persisted.
                         SwarmEvent::Behaviour(BlochBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
-                            // AUDIT fix (Finding 1 — external-addr poisoning): a
-                            // peer-reported observed_addr is only a CANDIDATE.
-                            // Validate it (public, well-formed) and require an
-                            // independent quorum of DISTINCT peers before trusting
-                            // it as our external address — only then is it eligible
-                            // for PEX self-advertise. Never trust one peer.
-                            // PROPAGAÇÃO-CHURN fix: canonical form (strip any
-                            // P2p the remote may have echoed, append ours once)
-                            // — same normalization as every other stored addr.
                             let cand = canonical_peer_addr(&info.observed_addr, &self.peer_id);
                             if is_valid_public_multiaddr(&cand, allow_private)
                                 && (observed_by.len() < OBSERVED_ADDR_CAP
@@ -1844,89 +1760,94 @@ impl NetworkNode {
                                         EXTERNAL_ADDR_QUORUM, info.observed_addr);
                                 }
                             }
-                            // AUDIT fix (Finding 2): do NOT persist identify-reported
-                            // listen_addrs into known_peers — that bypassed the PEX
-                            // rate-limit / batch-cap / dial-confirmation guards and
-                            // let a peer inject a victim IP dialed on every boot.
-                            // Peer discovery goes exclusively through hardened PEX.
-                            //
-                            // Announce-then-pull: learn the peer's archival bit
-                            // from its identify agent-version so directed IBD
-                            // pulls prefer an archival peer. Old binaries don't
-                            // advertise it → archival stays unknown (fine).
                             if let Some(arch) = sync_rr::parse_archival_agent(&info.agent_version) {
-                                peer_sync.entry(peer_id).or_default().archival = Some(arch);
+                                debug!("peer {} self-declares archival={} (not used for pull selection)", peer_id, arch);
                             }
                         }
                         // ── Announce-then-pull: directed IBD sync ────────────
                         SwarmEvent::Behaviour(BlochBehaviourEvent::SyncRr(ev)) => match ev {
                             libp2p::request_response::Event::Message { peer, message, .. } => match message {
-                                // We are the SERVER: a peer directed a pull at
-                                // us. Serve it from our DAG + block store and
-                                // reply to THAT peer only (no gossip fan-out).
+                                // SERVER: answer THIS peer only. H-R3-1 / NET-8: rate
+                                // limited per peer and globally; NET-5: a refusal is
+                                // an explicit `Busy`, never a dropped channel.
                                 libp2p::request_response::Message::Request { request, channel, .. } => {
-                                    // H-R3-1 fix #4: bound the RATE of served
-                                    // requests per peer, independent of any
-                                    // single request's now-bounded cost. A
-                                    // peer that exceeds its bucket gets no
-                                    // response — the channel is dropped and
-                                    // its 30s request timeout fires on its
-                                    // side, which is the same degradation an
-                                    // overloaded honest peer would cause.
-                                    if !sync_limiter.allow(peer) {
-                                        debug!("sync_rr: rate-limited request from {}", peer);
+                                    let resp = if !sync_limiter.allow(peer) {
+                                        debug!("sync_rr: rate-limited request from {} → Busy", peer);
+                                        sync_rr::SyncResponse::Busy
                                     } else if matches!(request, sync_rr::SyncRequest::GetPeers) {
-                                        // M-10: directed peer-exchange — a
-                                        // bounded random sample, answered to
-                                        // THIS peer only (no gossip fan-out).
                                         let external: Vec<Multiaddr> =
                                             swarm.external_addresses().cloned().collect();
-                                        let resp = serve_get_peers(&known_peers, &external, &self.peer_id, allow_private);
-                                        if swarm.behaviour_mut().sync_rr.send_response(channel, resp).is_err() {
-                                            debug!("sync_rr: response channel closed for {}", peer);
-                                        }
+                                        serve_get_peers(&known_peers, &external, &self.peer_id, allow_private)
                                     } else {
-                                        let resp = serve_sync_request(&dag, &store, &request);
-                                        if swarm.behaviour_mut().sync_rr.send_response(channel, resp).is_err() {
-                                            debug!("sync_rr: response channel closed for {}", peer);
-                                        }
+                                        serve_sync_request(&dag, &store, &request)
+                                    };
+                                    if swarm.behaviour_mut().sync_rr.send_response(channel, resp).is_err() {
+                                        debug!("sync_rr: response channel closed for {}", peer);
                                     }
                                 }
-                                // We are the CLIENT: our directed pull was
-                                // answered. Feed the answer into the SAME ingest
-                                // channel the gossip path uses, so main.rs
-                                // processes fetched blocks/headers unchanged.
+                                // CLIENT: our directed pull was answered.
                                 libp2p::request_response::Message::Response { request_id, response } => {
-                                    inflight_pull.remove(&request_id);
-                                    let msg = sync_rr::response_to_message(response);
-                                    if matches!(msg, NetworkMessage::NewBlock { .. }) {
-                                        // Requested by us: not budgeted, still
-                                        // verified, still accountable.
-                                        gate_block(
-                                            &mut pow_gate, &dag, &pow_workers, &pow_verdict_tx, &block_tx,
-                                            &mut swarm, peer, None, msg, false, "directed-pull",
-                                        );
-                                    } else {
-                                        forward_to_processor(&block_tx, msg, "directed-pull");
+                                    let now = Instant::now();
+                                    let entry = inflight_pull.remove(&request_id);
+                                    // NET-5 / NET-9: selector bookkeeping, and Busy /
+                                    // BlockNotFound send the pull to another peer
+                                    // (`on_pull_response`); the processor still sees
+                                    // a NotFound below (NET-9 count).
+                                    on_pull_response(entry, &response, peer, &mut selector, &mut pending_pulls, now);
+                                    if !matches!(response, sync_rr::SyncResponse::Busy) {
+                                        match response {
+                                            sync_rr::SyncResponse::Peers { peers } => {
+                                                // NET-11: solicited addresses go to the
+                                                // table, rate-limited per author; never
+                                                // dialed from here.
+                                                ingest_pex_addresses(
+                                                    &mut addr_book, &mut pex_limiter, &mut pex_stats,
+                                                    peer, &peers, allow_private, &self.peer_id, &known_peers,
+                                                );
+                                                pex_stats.set_distinct_peers(pex_limiter.tracked_peer_count());
+                                            }
+                                            other => {
+                                                if let sync_rr::SyncResponse::Tips { tips, .. } = &other {
+                                                    // NET-6: directed Tips update the
+                                                    // RESPONDER's frontier (it is a direct
+                                                    // peer we asked) — this is what makes
+                                                    // the verified IBD release path live.
+                                                    let hashes: Vec<[u8; 32]> = tips.iter().map(|e| e.hash).collect();
+                                                    let (bs, ht) = tips.iter()
+                                                        .map(|e| (e.blue_score, e.height))
+                                                        .max_by_key(|(s, _)| *s)
+                                                        .unwrap_or((0, 0));
+                                                    let (our_score, our_count) = {
+                                                        let d = dag.read();
+                                                        (d.tip_blue_score(), d.block_count() as u64)
+                                                    };
+                                                    peer_state.observe(
+                                                        peer,
+                                                        clamp_announced_blue_score(bs, our_score),
+                                                        clamp_announced_blue_score(ht, our_count),
+                                                        &hashes,
+                                                        now,
+                                                    );
+                                                }
+                                                if let Some(m) = sync_rr::response_to_message(other) {
+                                                    sink.deliver(m, InboundOrigin::Directed { peer }, "directed-pull");
+                                                }
+                                            }
+                                        }
                                     }
+                                    drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, now);
                                 }
                             },
-                            // Directed pull failed: peer doesn't speak
-                            // /bloch/sync/1, dial failed, or timed out. Degrade
-                            // gracefully — re-publish the request on the gossip
-                            // sync topic so an OLD-binary peer can still answer.
+                            // Directed pull failed (timeout, reset, unsupported
+                            // protocol, undecodable answer). NET-9: count it against
+                            // the peer (stall detection) and retry on ANOTHER peer.
+                            // NET-7: never re-published on gossip.
                             libp2p::request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
-                                // H-R3-4: a peer's ANSWER to our pull failed to
-                                // decode/pass bounds (sync_rr::decode_response /
-                                // validate_sync_response_bounds returned an
-                                // `io::ErrorKind::InvalidData`) — that is a
-                                // deliberate protocol violation by the ANSWERING
-                                // peer, not an ordinary transport failure, and
-                                // must feed the same peer-score reputation the
-                                // gossip path uses (`is_sync_protocol_violation`
-                                // is exactly the gossip/directed-sync boundary
-                                // for this decision: timeouts/resets are never
-                                // penalized).
+                                let now = Instant::now();
+                                // H-R3-4: an answer that failed to decode / pass bounds
+                                // is a protocol violation by the ANSWERING peer. NET-5:
+                                // a clean EOF or timeout is a transport failure and is
+                                // never penalized (`is_sync_protocol_violation`).
                                 if let libp2p::request_response::OutboundFailure::Io(e) = &error {
                                     if sync_rr::is_sync_protocol_violation(e) {
                                         let score = wire_tracker.record_violation(peer);
@@ -1935,17 +1856,16 @@ impl NetworkNode {
                                             peer, e, score);
                                     }
                                 }
-                                if let Some(m) = inflight_pull.remove(&request_id) {
-                                    debug!("directed pull [{}] to {} failed ({}); falling back to gossip",
-                                        m.kind_name(), peer, error);
-                                    publish_gossip(&mut swarm, &sync_t, &m);
+                                selector.on_failure(&peer, now);
+                                if let Some((p, _)) = inflight_pull.remove(&request_id) {
+                                    debug!("directed pull [{}] to {} failed ({}); retrying on another peer",
+                                        p.msg.kind_name(), peer, error);
+                                    requeue_pull(&mut pending_pulls, p, peer);
                                 }
+                                drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, now);
                             }
                             // H-R3-4: a REQUEST we received failed to decode or
-                            // violated wire bounds (`decode_request` /
-                            // `validate_sync_request_bounds`) — the requesting
-                            // peer sent a malformed or oversized directed pull.
-                            // Same reputation channel as above.
+                            // violated wire bounds.
                             libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
                                 if let libp2p::request_response::InboundFailure::Io(e) = &error {
                                     if sync_rr::is_sync_protocol_violation(e) {
@@ -1962,35 +1882,49 @@ impl NetworkNode {
                     }
                 }
 
+                // NET-2: verdicts from the processor for deferred gossip frames.
+                v = recv_verdict(&mut verdict_rx) => {
+                    match v {
+                        Some(v) => {
+                            let relayed = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                &v.message_id, &v.propagation_source, v.verdict.into());
+                            if !relayed && v.verdict == GossipVerdict::Accept {
+                                // The frame already left gossipsub's cache: it is not
+                                // forwarded (a late orphan release is re-announced).
+                                debug!("late Accept: frame from {} no longer in the gossip cache", v.propagation_source);
+                            }
+                        }
+                        None => verdict_rx = None,
+                    }
+                }
+
+                // MEM-5 / MEM-6: out-of-band penalties from the processor.
+                c = recv_control(&mut control_rx) => {
+                    match c {
+                        Some(NetworkControl::PenalizePeer(peer)) => {
+                            let score = wire_tracker.record_violation(peer);
+                            swarm.behaviour_mut().gossipsub.set_application_score(&peer, score);
+                            warn!("invalid orphan transaction from {} (app score → {})", peer, score);
+                        }
+                        None => control_rx = None,
+                    }
+                }
+
                 Some(msg) = outbound_rx.recv() => {
                     // Announce-then-pull: IBD FETCH requests (GetBlock /
-                    // GetHeaders / GetTips) are DIRECTED to one selected peer
-                    // over request-response, NOT broadcast to the gossip mesh.
-                    // This is the fix for the O(peers × blocks) IBD
-                    // amplification that saturated the gossipsub send queue and
-                    // stalled block propagation. Everything else (PeerTip,
-                    // Version, NewBlock, NewTransaction, and the RESPONSE frames
-                    // Headers/Tips/BlockNotFound that answer legacy gossip
-                    // requesters) stays on gossip exactly as before.
+                    // GetHeaders / GetTips / PeerRequest) are DIRECTED to one
+                    // selected peer over request-response, never broadcast.
                     if let Some(req) = sync_rr::as_pull_request(&msg) {
-                        match sync_rr::select_pull_peer(&peer_sync, &explicit_peers) {
-                            Some(peer) => {
-                                let id = swarm.behaviour_mut().sync_rr.send_request(&peer, req);
-                                debug!("→ directed pull [{}] to {}", msg.kind_name(), peer);
-                                inflight_pull.insert(id, msg);
-                            }
-                            // No peer to direct to yet (very early boot). Fall
-                            // back to the legacy gossip request so it still goes
-                            // out; a connected peer will answer.
-                            None => publish_gossip(&mut swarm, &sync_t, &msg),
+                        if pending_pulls.len() >= MAX_PENDING_PULLS {
+                            debug!("pull queue full; dropping [{}] (it will be re-issued)", msg.kind_name());
+                        } else {
+                            pending_pulls.push_back(PendingPull { msg, req, attempts: 0, tried: Vec::new() });
                         }
+                        drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, Instant::now());
                         continue;
                     }
-                    // Re-gossip rate-limit (see `recent_block_publishes` decl): drop a
-                    // re-broadcast of a block already published within the TTL. The first
-                    // broadcast + gossipsub relay covers the mesh; this kills the
-                    // GetBlock-serving amplification storm without changing which blocks
-                    // propagate.
+                    // Re-gossip rate-limit: drop a re-broadcast of a block already
+                    // published within the TTL.
                     if let NetworkMessage::NewBlock { block_hash, .. } = &msg {
                         let now = std::time::Instant::now();
                         recent_block_publishes.retain(|_, t| now.duration_since(*t) < REGOSSIP_SUPPRESS_TTL);
@@ -2001,67 +1935,68 @@ impl NetworkNode {
                     }
                     let (topic, topic_name) = match &msg {
                         NetworkMessage::NewBlock { .. }        => (block_t.clone(), "blocks"),
-                        NetworkMessage::NewTransaction { .. }  => (tx_t.clone(),    "txs"),
-                        NetworkMessage::NewPowitItem { .. }    => (tx_t.clone(),    "txs"),
+                        NetworkMessage::NewTransaction { .. }
+                        | NetworkMessage::NewPowitItem { .. }  => (tx_t.clone(),    "txs"),
                         _                                      => (sync_t.clone(),  "sync"),
                     };
                     if let Ok(data) = bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {
                         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
-                            // Name the MESSAGE, not just the topic. The sync topic
-                            // carries GetHeaders, Tips, GetTips, PeerTip and
-                            // GetBlock, so "publish sync: Duplicate" identifies the
-                            // stream and hides the culprit — which cost a wrong fix:
-                            // GetBlock was given a nonce on the reasonable guess that
-                            // it was the suppressed message, the node stayed stalled,
-                            // and the log could not say why. A diagnostic that cannot
-                            // distinguish five causes is a diagnostic that invites
-                            // guessing.
-                            let kind = match &msg {
-                                NetworkMessage::NewBlock { .. }       => "NewBlock",
-                                NetworkMessage::NewTransaction { .. } => "NewTransaction",
-                                NetworkMessage::GetBlock { .. }       => "GetBlock",
-                                NetworkMessage::BlockNotFound { .. }  => "BlockNotFound",
-                                other => other.kind_name(),
-                            };
-                            warn!("publish {} [{}]: {}", topic_name, kind, e);
+                            warn!("publish {} [{}]: {}", topic_name, msg.kind_name(), e);
+                        }
+                    }
+                }
+
+                _ = pull_tick.tick() => {
+                    drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, Instant::now());
+                }
+
+                // NET-11: dial from the address table, never from a message —
+                // a few per tick, at most one per netgroup, only below target.
+                _ = pex_dial.tick() => {
+                    if peer_count < self.config.max_peers {
+                        let want = if peer_count < PEX_LOW_PEER_THRESHOLD { PEX_DIALS_WHEN_LOW } else { 1 };
+                        let me = self.peer_id;
+                        let cands = addr_book.take_dial_candidates(want, |a| {
+                            known_peers.contains(a)
+                                || addr_peer_id(a).is_none_or(|p| p == me || swarm.is_connected(&p))
+                        });
+                        for a in cands {
+                            if let Ok(addr) = a.parse::<libp2p::Multiaddr>() {
+                                info!("PEX dial (from table): {}", truncate_utf8(&a, 60));
+                                let _ = swarm.dial(addr);
+                                pex_stats.record_accept(1);
+                            }
                         }
                     }
                 }
 
                 _ = heartbeat.tick() => {
-                    for peer in pow_gate.expire_bans(Instant::now()) {
-                        info!("P2P: ban on {} expired", peer);
-                        swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer);
-                    }
-                    // Sprint CC: height displayed in the heartbeat log also
-                    // needs to come from the DAG, not a startup-captured
-                    // value. Without this fix the seed's heartbeat kept
-                    // logging 'height: 1' forever even as blocks accumulated.
+                    let now = Instant::now();
                     let current_height = dag.read().block_count() as u64;
                     info!("peers: {} | height: {}", peer_count, current_height);
                     let addrs: Vec<String> = known_peers.iter().cloned().collect();
-                    forward_to_processor(&block_tx, NetworkMessage::PeerCount { count: peer_count, addresses: addrs }, "heartbeat");
+                    sink.deliver(NetworkMessage::PeerCount { count: peer_count, addresses: addrs }, InboundOrigin::Local, "heartbeat");
 
                     // Sprint P: emit aggregated PEX stats (every 60s, only if activity)
                     if let Some(line) = pex_stats.tick() {
                         info!("{}", line);
                     }
-                    // Sprint P: periodic GC of rate-limiter state (remove dormant peers)
+                    // Housekeeping of every bounded per-peer map (NET-8).
                     pex_limiter.gc();
+                    sync_limiter.gc_at(now);
+                    claim_limiter.gc_at(now, CLAIM_LIMITER_IDLE_TTL);
+                    // NET-4 / NET-8: decayed penalties are re-installed so a
+                    // peer recovers once it stops misbehaving.
+                    for (p, score) in wire_tracker.decay_tick_at(now) {
+                        swarm.behaviour_mut().gossipsub.set_application_score(&p, score);
+                    }
 
-                    // FIX v0.5.1: Re-subscribe every 30s. In libp2p gossipsub,
-                    // peer_score can silently drop a peer from the mesh for a
-                    // given topic (we saw "Unexpected delivery trace" warnings
-                    // in 0.5.0 followed by NoPeersSubscribedToTopic on publish).
-                    // Calling subscribe() is idempotent; it re-advertises the
-                    // subscription to every connected peer, restoring the mesh.
+                    // FIX v0.5.1: Re-subscribe every 30s (idempotent; restores a
+                    // mesh that peer scoring silently dropped).
                     for t in [&block_t, &tx_t, &sync_t] {
                         let _ = swarm.behaviour_mut().gossipsub.subscribe(t);
                     }
 
-                    // FIX v0.5.1: Warn if mesh for the tx topic is empty. This
-                    // is the canary — if we have peers but no mesh for txs,
-                    // any tx we publish will hit NoPeersSubscribedToTopic.
                     let tx_hash = tx_t.hash();
                     let tx_mesh_peers = swarm.behaviour().gossipsub.mesh_peers(&tx_hash).count();
                     if peer_count > 0 && tx_mesh_peers == 0 {
@@ -2077,36 +2012,15 @@ impl NetworkNode {
                             }
                         }
                     }
-                    // Keep MIN_OUTBOUND connections of our own choosing, even
-                    // when inbound peers fill every slot: dial a few known
-                    // addresses (netgroup-diverse by construction, see
-                    // pex_validator::enforce_cap) at random.
-                    if peer_count > 0 && outbound_count < MIN_OUTBOUND {
-                        use rand::seq::IteratorRandom;
-                        let want = MIN_OUTBOUND - outbound_count;
-                        let picks: Vec<String> = known_peers.iter().cloned()
-                            .choose_multiple(&mut rand::thread_rng(), want);
-                        for a in picks {
-                            if let Ok(addr) = a.parse::<libp2p::Multiaddr>() {
-                                debug!("outbound top-up: dialing {}", truncate_utf8(&a, 80));
-                                let _ = swarm.dial(addr);
-                            }
-                        }
-                    }
                 }
 
                 _ = save_peers.tick() => {
                     save_known_peers(&peers_path, &known_peers);
                 }
 
-                // Sprint CC: periodic tip announcement for IBD recovery.
-                // Peers that connected before we built new blocks would
-                // otherwise never learn the tip advanced. Publishing the
-                // current tip every 60s is cheap (one gossipsub message
-                // to the sync topic) and guarantees that any peer still
-                // in the mesh gets a fresh tip at least once per minute,
-                // giving them a chance to request IBD if they're behind.
-                // Skipped when we have no peers — pointless and noisy.
+                // Sprint CC: periodic tip announcement for IBD recovery (60s).
+                // The Version frame carries a fresh timestamp, so it can never
+                // be dedup-dropped like a byte-identical PeerTip.
                 _ = tip_announce.tick() => {
                     if peer_count > 0 {
                         let tip = build_current_tip(&dag, &peer_id_str);
@@ -2114,22 +2028,10 @@ impl NetworkNode {
                             debug!("→ announcing tip: height={} score={}", height, blue_score);
                         }
                         if let Ok(d) = bincode::serde::encode_to_vec(&tip, bincode::config::standard()) {
-                            // Mesh fix: this error was silently discarded. On a
-                            // quiet chain the PeerTip bytes repeat, and with the
-                            // old 60s duplicate_cache_time this publish could
-                            // fail with PublishError::Duplicate every tick.
                             if let Err(e) = swarm.behaviour_mut().gossipsub.publish(sync_t.clone(), d) {
                                 info!("tip announce publish failed: {} (peers={})", e, peer_count);
                             }
                         }
-                        // Mesh fix (dedup-proof announce): also publish a
-                        // Version frame each tick. Its `timestamp` field is
-                        // fresh, so the bytes — and the SHA-256 MessageId —
-                        // differ every announce; gossipsub can never dedup-drop
-                        // it, unlike a byte-identical PeerTip. main.rs treats a
-                        // Version whose blue_score exceeds ours as an IBD
-                        // trigger, so this is a guaranteed once-per-minute
-                        // "you are behind" signal to every meshed peer.
                         let (v_score, v_height) = {
                             let d = dag.read();
                             (d.tip_blue_score(), d.block_count() as u64)
@@ -2155,10 +2057,242 @@ impl NetworkNode {
     }
 }
 
+// ── Directed-pull pipeline (NET-5 / NET-9) ───────────────────────────────────
+
+/// Max queued pulls waiting for an eligible peer.
+pub const MAX_PENDING_PULLS: usize = 4096;
+/// A pull is attempted on at most this many peers before it is dropped (the
+/// processor's own retry paths — frontier expiry, orphan sweep, the 30s
+/// nudge — re-issue anything still needed).
+pub const MAX_PULL_ATTEMPTS: u8 = 3;
+/// How often queued pulls are retried.
+const PULL_RETRY_TICK: Duration = Duration::from_millis(250);
+/// NET-11: PEX dial cadence and batch sizes.
+const PEX_DIAL_TICK: Duration = Duration::from_secs(10);
+const PEX_LOW_PEER_THRESHOLD: usize = 4;
+const PEX_DIALS_WHEN_LOW: usize = 4;
+/// NET-6: per-author tip-claim rate limit (burst, refill/sec, tracked authors).
+const CLAIM_BURST: u32 = 16;
+const CLAIM_REFILL_PER_SEC: f64 = 0.2;
+const CLAIM_LIMITER_TRACK_CAP: usize = 4096;
+const CLAIM_LIMITER_IDLE_TTL: Duration = Duration::from_secs(600);
+
+/// One directed pull, queued or in flight.
+#[derive(Clone, Debug)]
+struct PendingPull {
+    msg:      NetworkMessage,
+    req:      sync_rr::SyncRequest,
+    attempts: u8,
+    /// Peers this pull already failed on (excluded on retry when possible).
+    tried:    Vec<PeerId>,
+}
+
+/// Put a failed / Busy pull back at the END of the queue, remembering the
+/// peer it failed on, unless it has used up its attempts.
+fn requeue_pull(pending: &mut std::collections::VecDeque<PendingPull>, mut p: PendingPull, failed_on: PeerId) {
+    p.attempts = p.attempts.saturating_add(1);
+    if p.attempts >= MAX_PULL_ATTEMPTS {
+        debug!("directed pull [{}] dropped after {} attempts", p.msg.kind_name(), p.attempts);
+        return;
+    }
+    if !p.tried.contains(&failed_on) {
+        p.tried.push(failed_on);
+    }
+    if pending.len() < MAX_PENDING_PULLS {
+        pending.push_back(p);
+    }
+}
+
+/// Log target of the debug-level receipt trace of gossiped transactions
+/// (`RUST_LOG=info,gnb_gossip_rx_tx=debug`). Every gossiped block is logged
+/// at info (`← block h=… <hash>`); transactions only with this target.
+pub const GOSSIP_RX_TX_LOG_TARGET: &str = "gnb_gossip_rx_tx";
+
+/// Period of the network heartbeat (peer count, housekeeping, re-subscribe,
+/// bootstrap re-dial with no peers).
+const HEARTBEAT_PERIOD: Duration = Duration::from_secs(30);
+
+/// The network heartbeat timer. Its first tick comes after one period, not
+/// at once: at start-up no connection is established yet, so an immediate
+/// tick saw 0 peers and re-dialed every bootstrap peer the swarm loop had
+/// just dialed (two connections per peer).
+fn new_heartbeat() -> tokio::time::Interval {
+    tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT_PERIOD, HEARTBEAT_PERIOD)
+}
+
+/// The distinct-peer count after a connection to a peer is established
+/// (`num_established`: that peer's connections, this one included), or
+/// `None` when it is unchanged: only a peer's first connection counts. The
+/// count (RPC `peers`, the miner's has-peers check) used to count
+/// connections, so a peer dialed twice counted twice.
+fn peer_count_after_connect(count: usize, num_established: u32) -> Option<usize> {
+    (num_established == 1).then(|| count.saturating_add(1))
+}
+
+/// The distinct-peer count after a connection to a peer is closed
+/// (`num_established`: that peer's connections still open), or `None` when
+/// it is unchanged: only a peer's last connection closing counts.
+fn peer_count_after_disconnect(count: usize, num_established: u32) -> Option<usize> {
+    (num_established == 0).then(|| count.saturating_sub(1))
+}
+
+/// Whether a tip claim, clamped to `claimed` (blue score), is worth a directed
+/// pull from its author: only a claim ahead of our own selected tip.
+fn claim_warrants_directed_pull(claimed: u64, our_score: u64) -> bool {
+    claimed > our_score
+}
+
+/// Send the pull `msg` (GetTips / GetHeaders / GetBlock / PeerRequest) to
+/// `peer` itself, bypassing the selector's choice: a request about THAT
+/// peer's state (its frontier on connect; the headers and frontier it claims
+/// to have). Never retried on another peer (`attempts` = MAX_PULL_ATTEMPTS);
+/// the answer flows through the same `on_pull_response` / processor path as
+/// any other pull.
+fn send_directed_pull(
+    swarm:    &mut libp2p::Swarm<BlochBehaviour>,
+    selector: &mut sync_rr::PullPeerSelector,
+    inflight: &mut std::collections::HashMap<libp2p::request_response::OutboundRequestId, (PendingPull, PeerId)>,
+    peer:     PeerId,
+    msg:      NetworkMessage,
+    now:      std::time::Instant,
+) {
+    let Some(req) = sync_rr::as_pull_request(&msg) else { return };
+    let id = swarm.behaviour_mut().sync_rr.send_request(&peer, req.clone());
+    debug!("→ directed pull [{}] to {} (its own state)", msg.kind_name(), peer);
+    selector.on_sent(peer, now);
+    inflight.insert(id, (PendingPull { msg, req, attempts: MAX_PULL_ATTEMPTS, tried: vec![peer] }, peer));
+}
+
+/// The answer `response` from `peer` to a directed pull (`entry`: the pull
+/// and the peer it was sent to, `None` for an unknown request id). Updates the
+/// selector (`Busy`: a short back-off; any other answer: a success) and puts
+/// the pull back in `pending` for ANOTHER peer when the answer does not
+/// complete it (`sync_rr::retry_pull_elsewhere`: `Busy`, and `BlockNotFound`,
+/// a peer that does not have the body; bounded by `MAX_PULL_ATTEMPTS`). Every
+/// other answer completes the pull. The swarm loop calls this for every
+/// response, so the retry decision is unit-tested where it is made:
+/// a `BlockNotFound` that completed the pull left a healing partition
+/// waiting for the 30-60 s sweeps (test/functional/feature_partition_heal.py).
+fn on_pull_response(
+    entry:    Option<(PendingPull, PeerId)>,
+    response: &sync_rr::SyncResponse,
+    peer:     PeerId,
+    selector: &mut sync_rr::PullPeerSelector,
+    pending:  &mut std::collections::VecDeque<PendingPull>,
+    now:      std::time::Instant,
+) {
+    if matches!(response, sync_rr::SyncResponse::Busy) {
+        // NET-5: back-pressure, not an offence.
+        selector.on_busy(&peer, now);
+    } else {
+        selector.on_success(&peer);
+    }
+    if sync_rr::retry_pull_elsewhere(response) {
+        if let Some((p, _)) = entry {
+            requeue_pull(pending, p, peer);
+        }
+    }
+}
+
+/// Send queued pulls to eligible peers until the queue is empty or no peer is
+/// eligible. A pull prefers a peer it has not failed on yet.
+fn drain_pulls(
+    swarm:    &mut libp2p::Swarm<BlochBehaviour>,
+    selector: &mut sync_rr::PullPeerSelector,
+    pending:  &mut std::collections::VecDeque<PendingPull>,
+    inflight: &mut std::collections::HashMap<libp2p::request_response::OutboundRequestId, (PendingPull, PeerId)>,
+    now:      std::time::Instant,
+) {
+    while let Some(p) = pending.front() {
+        let pick = selector.select(now, &p.tried).or_else(|| {
+            if p.tried.is_empty() { None } else { selector.select(now, &[]) }
+        });
+        let Some(peer) = pick else { break };
+        let Some(p) = pending.pop_front() else { break };
+        let id = swarm.behaviour_mut().sync_rr.send_request(&peer, p.req.clone());
+        debug!("→ directed pull [{}] to {}", p.msg.kind_name(), peer);
+        selector.on_sent(peer, now);
+        inflight.insert(id, (p, peer));
+    }
+}
+
+/// Receive the next processor control request; pending forever when none
+/// is attached.
+async fn recv_control(rx: &mut Option<mpsc::Receiver<NetworkControl>>) -> Option<NetworkControl> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Receive the next processor verdict; pending forever when no validator is
+/// attached (legacy `run`).
+async fn recv_verdict(rx: &mut Option<mpsc::Receiver<GossipValidation>>) -> Option<GossipValidation> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// NET-11: admit peer-exchange addresses from `author` (the peer that answered
+/// OUR GetPeers) into the unverified address table. Rate-limited per author,
+/// batch-capped, validated, never our own id, never already-known entries.
+/// Nothing is dialed here — the network loop dials from the table, a few
+/// per tick. Returns how many addresses entered the table.
+#[allow(clippy::too_many_arguments)]
+pub fn ingest_pex_addresses(
+    book:          &mut AddrBook,
+    limiter:       &mut PexRateLimiter,
+    stats:         &mut PexStats,
+    author:        PeerId,
+    peers:         &[String],
+    allow_private: bool,
+    self_peer:     &PeerId,
+    known:         &HashSet<String>,
+) -> usize {
+    let original_len = peers.len();
+    let admitted = limiter.admit(author, original_len);
+    if admitted < original_len {
+        let over_batch = original_len.saturating_sub(PEX_BATCH_LIMIT);
+        if over_batch > 0 {
+            stats.record_batch(over_batch.min(original_len.saturating_sub(admitted)));
+        }
+        let over_rate = original_len.saturating_sub(admitted).saturating_sub(over_batch);
+        if over_rate > 0 {
+            stats.record_rate(over_rate);
+        }
+    }
+    let mut added = 0usize;
+    for addr_str in peers.iter().take(admitted) {
+        if !is_valid_public_multiaddr(addr_str, allow_private) {
+            if is_valid_public_multiaddr(addr_str, true) {
+                stats.record_private(1);
+            } else {
+                stats.record_invalid(1);
+            }
+            // H4: addr_str is attacker-controlled; UTF-8-safe truncation.
+            debug!("PEX rejected: {}", truncate_utf8(addr_str, 80));
+            continue;
+        }
+        if known.contains(addr_str) || addr_peer_id(addr_str).is_some_and(|p| p == *self_peer) {
+            continue;
+        }
+        if book.add(addr_str) {
+            added += 1;
+        }
+    }
+    added
+}
+
 // ── Persistent identity ───────────────────────────────────────────────────────
 
-fn load_or_create_identity(path: &Path) -> Result<identity::Keypair, NetworkError> {
+/// NET-16 (audit): the P2P identity is a private key. It is created with
+/// owner-only permissions (0600) through a temp file + rename, so a crash can
+/// never leave a truncated key and no other local user can read it; an
+/// existing key file with broader permissions is tightened on load.
+pub fn load_or_create_identity(path: &Path) -> Result<identity::Keypair, NetworkError> {
     if path.exists() {
+        restrict_to_owner(path);
         let bytes = std::fs::read(path)
             .map_err(|e| NetworkError::StartFailed(format!("read identity: {}", e)))?;
         return identity::Keypair::from_protobuf_encoding(&bytes)
@@ -2166,27 +2300,82 @@ fn load_or_create_identity(path: &Path) -> Result<identity::Keypair, NetworkErro
     }
     let kp = identity::Keypair::generate_ed25519();
     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).ok(); }
-    let bytes = zeroize::Zeroizing::new(kp.to_protobuf_encoding()
-        .map_err(|e| NetworkError::StartFailed(format!("encode identity: {}", e)))?);
-    // Owner-only permissions, atomic write (the file is a private key).
-    crate::transport::identity::write_private(path, &bytes)
+    let bytes = kp.to_protobuf_encoding()
+        .map_err(|e| NetworkError::StartFailed(format!("encode identity: {}", e)))?;
+    write_file_atomic(path, &bytes, true)
         .map_err(|e| NetworkError::StartFailed(format!("write identity: {}", e)))?;
     info!("created P2P identity: {}", path.display());
     Ok(kp)
 }
 
+/// NET-16: chmod an existing secret file to 0600 if it is group/other
+/// accessible (unix only; best effort, logged).
+fn restrict_to_owner(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode();
+            if mode & 0o077 != 0 {
+                warn!("{} had permissions {:o}; restricting to 0600", path.display(), mode & 0o777);
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// NET-16: write `bytes` to `path` atomically (temp file in the same
+/// directory, fsync, rename). With `secret`, the file is created 0600.
+pub fn write_file_atomic(path: &Path, bytes: &[u8], secret: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    // A stale temp file from a crash may carry other permissions; start fresh.
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(if secret { 0o600 } else { 0o644 });
+    }
+    #[cfg(not(unix))]
+    let _ = secret;
+    let mut f = opts.open(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
 // ── FIX #6: Peer persistence ──────────────────────────────────────────────────
 
-fn load_known_peers(path: &Path) -> HashSet<String> {
+pub fn load_known_peers(path: &Path) -> HashSet<String> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-fn save_known_peers(path: &Path, peers: &HashSet<String>) {
+/// NET-16: known_peers.json is written atomically (temp file + rename), so a
+/// crash mid-write can never leave a truncated table behind.
+pub fn save_known_peers(path: &Path, peers: &HashSet<String>) {
     if let Ok(json) = serde_json::to_string(peers) {
-        let _ = std::fs::write(path, json);
+        if let Err(e) = write_file_atomic(path, json.as_bytes(), false) {
+            warn!("saving {} failed: {}", path.display(), e);
+        }
     }
 }
 
@@ -2332,19 +2521,6 @@ pub fn build_current_tip(
 
 // ── Announce-then-pull: directed sync helpers ────────────────────────────────
 
-/// Record a peer's highest announced `blue_score` for directed-pull selection.
-/// Monotonic (never lowers a known score) and preserves any known archival bit.
-fn track_peer_score(
-    peer_sync: &mut std::collections::HashMap<PeerId, sync_rr::PeerSync>,
-    peer: PeerId,
-    blue_score: u64,
-) {
-    let e = peer_sync.entry(peer).or_default();
-    if blue_score > e.blue_score {
-        e.blue_score = blue_score;
-    }
-}
-
 /// M-9 (audit): bound on how far ahead of our OWN locally-verified tip an
 /// announced blue_score is allowed to be before it is clamped. A single
 /// crafted `PeerTip`/`Version`/`Tips` frame claiming `blue_score = u64::MAX`
@@ -2357,7 +2533,7 @@ fn track_peer_score(
 /// any plausible real growth burst while remaining astronomically smaller
 /// than `u64::MAX`, so it clamps only implausible/malicious announcements,
 /// never an honest peer that is genuinely far ahead.
-const MAX_ANNOUNCED_LOOKAHEAD: u64 = 1_000_000;
+pub const MAX_ANNOUNCED_LOOKAHEAD: u64 = 1_000_000;
 
 /// M-9: clamp a peer-announced blue_score to at most
 /// `our_verified_score + MAX_ANNOUNCED_LOOKAHEAD` before it is ever stored in
@@ -2366,7 +2542,7 @@ const MAX_ANNOUNCED_LOOKAHEAD: u64 = 1_000_000;
 /// LOCALLY-VERIFIED quantity (e.g. `dag.tip_blue_score()`) — clamping against
 /// an already-untrusted ceiling (another peer's announcement) would let one
 /// lie authorize the next.
-fn clamp_announced_blue_score(announced: u64, our_verified_score: u64) -> u64 {
+pub fn clamp_announced_blue_score(announced: u64, our_verified_score: u64) -> u64 {
     announced.min(our_verified_score.saturating_add(MAX_ANNOUNCED_LOOKAHEAD))
 }
 
@@ -2394,20 +2570,6 @@ fn ws_listen_addr_from(listen_addr: &str) -> Option<Multiaddr> {
     }
     out.push(Protocol::Ws(std::borrow::Cow::Borrowed("/")));
     Some(out)
-}
-
-/// Publish a message on the gossip sync topic (used for the very-early-boot and
-/// mixed-fleet graceful-degradation fallbacks of the directed pull path).
-fn publish_gossip(
-    swarm: &mut libp2p::Swarm<BlochBehaviour>,
-    topic: &IdentTopic,
-    msg:   &NetworkMessage,
-) {
-    if let Ok(data) = bincode::serde::encode_to_vec(msg, bincode::config::standard()) {
-        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
-            debug!("gossip fallback publish [{}]: {}", msg.kind_name(), e);
-        }
-    }
 }
 
 /// M-10: max peer addresses returned in one `GetPeers` answer — a bounded
@@ -2530,24 +2692,6 @@ fn serve_sync_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Gossiped transactions: a burst of TX_BURST per peer, then TX_PER_SEC;
-    /// peers are independent and the tracked-peer map stays bounded.
-    #[test]
-    fn tx_rate_limiter_bounds_each_peer() {
-        let mut l = TxRateLimiter::default();
-        let (a, b) = (PeerId::random(), PeerId::random());
-        let t0 = Instant::now();
-        let burst = TX_BURST as usize;
-        assert_eq!((0..burst + 10).filter(|_| l.take(&a, t0)).count(), burst);
-        assert!(l.take(&b, t0), "another peer has its own budget");
-        assert!(!l.take(&a, t0));
-        assert!(l.take(&a, t0 + Duration::from_millis(100)), "refills at TX_PER_SEC");
-        for _ in 0..TX_LIMITER_PEERS * 2 {
-            l.take(&PeerId::random(), t0);
-        }
-        assert!(l.buckets.len() <= TX_LIMITER_PEERS);
-    }
 
     // ── M-10 regressions: bounded random-sample PEX answer ──────────────────
 
@@ -3101,9 +3245,14 @@ mod tests {
         assert_eq!(t.tracked_peers(), 0);
     }
 
-    /// Once the tracking map is full, an untracked offender still gets a
-    /// one-shot penalty but the map does not grow (memory bound against
-    /// identity cycling).
+    /// Once the tracking map is full the map does not grow (memory bound
+    /// against identity cycling).
+    ///
+    /// NET-8 (audit): this test used to assert that a late offender is NOT
+    /// tracked ("one-shot offender is not inserted") — which let every
+    /// offender arriving after 1,024 identities violate forever without ever
+    /// reaching the graylist. It now pins the fixed behaviour: the mildest
+    /// entry is evicted and the late offender IS tracked and accumulates.
     #[test]
     fn wire_reaction_track_cap_bounds_memory() {
         let mut t = WirePenaltyTracker::new();
@@ -3113,7 +3262,6 @@ mod tests {
         }
         assert_eq!(t.tracked_peers(), WIRE_PENALTY_TRACK_CAP);
 
-        // Map full: a NEW offender is penalized one-shot, map unchanged.
         let late = PeerId::random();
         match t.classify(late, &bad) {
             WireReaction::Penalize { score, .. } => {
@@ -3122,6 +3270,453 @@ mod tests {
             other => panic!("expected Penalize, got {:?}", other),
         }
         assert_eq!(t.tracked_peers(), WIRE_PENALTY_TRACK_CAP, "map must not grow past cap");
-        assert_eq!(t.score_of(&late), None, "one-shot offender is not inserted");
+        assert_eq!(t.score_of(&late), Some(WIRE_VIOLATION_PENALTY), "late offender is tracked");
+        for _ in 0..4 {
+            t.classify(late, &bad);
+        }
+        assert!(t.score_of(&late).unwrap() <= -400.0, "late offender reaches the graylist");
+    }
+
+    /// NET-4 / NET-8: penalties decay and are eventually forgotten (and the
+    /// reset score is returned so gossipsub's app score is re-installed).
+    #[test]
+    fn wire_penalties_decay_and_are_forgotten() {
+        let mut t = WirePenaltyTracker::new();
+        let p = PeerId::random();
+        let t0 = std::time::Instant::now();
+        for _ in 0..4 {
+            t.record_violation_at(p, t0);
+        }
+        assert_eq!(t.score_of(&p), Some(-400.0));
+        assert!(t.decay_tick_at(t0 + Duration::from_secs(1)).is_empty(), "no decay within one interval");
+        let after = t.decay_tick_at(t0 + WIRE_PENALTY_DECAY_INTERVAL * 5);
+        let s = after.iter().find(|(q, _)| *q == p).map(|(_, s)| *s).expect("decayed score reported");
+        assert!(s > -400.0 && s < -200.0, "decayed toward zero: {s}");
+        let later = t.decay_tick_at(t0 + WIRE_PENALTY_DECAY_INTERVAL * 200);
+        assert_eq!(later, vec![(p, 0.0)], "forgotten peers are reset to 0");
+        assert_eq!(t.tracked_peers(), 0);
+    }
+
+    // ── NET-7 regressions ──────────────────────────────────────────────────
+
+    /// Trailing bytes after a valid frame are a protocol violation: they made
+    /// every request byte-unique and defeated gossipsub de-duplication.
+    #[test]
+    fn wire_decode_rejects_trailing_bytes() {
+        for base in [NetworkMessage::PeerRequest, NetworkMessage::GetTips] {
+            let clean = bincode::serde::encode_to_vec(&base, bincode::config::standard()).unwrap();
+            assert!(decode_wire_message(&clean).is_ok());
+            let mut padded = clean.clone();
+            padded.extend_from_slice(&7u32.to_le_bytes());
+            match decode_wire_message(&padded) {
+                Err(e @ WireDecodeError::TrailingBytes(4)) => assert!(e.is_protocol_violation()),
+                other => panic!("trailing bytes must be rejected, got {:?}", other.map(|m| m.kind_name())),
+            }
+        }
+    }
+
+    /// The frame must be the canonical encoding of the message it decodes to.
+    ///
+    /// (a) NET-7 on every target: a non-minimal varint (the enum tag, an
+    ///     integer field, a length) is a byte-distinct frame of the same
+    ///     message, so a fresh gossip message id. Each decoded before the
+    ///     check, on x86_64 too.
+    /// (b) CRY-8 on 32-bit targets: a `block_data` length of 2^32 + 3 written
+    ///     as a 9-byte varint, then 3 bytes. A 64-bit node rejects it (read
+    ///     limit); on i686 bincode truncated the length to 3 and the frame
+    ///     decoded as a 3-byte `block_data`. Now rejected on every target.
+    #[test]
+    fn wire_decode_requires_the_canonical_encoding() {
+        let msg = NetworkMessage::NewBlock {
+            block_hash: [0u8; 32],
+            blue_score: 5,
+            height:     9,
+            block_data: vec![7u8; 3],
+        };
+        let cfg = bincode::config::standard();
+        let enc = bincode::serde::encode_to_vec(&msg, cfg).unwrap();
+        assert!(decode_wire_message(&enc).is_ok(), "the canonical frame decodes");
+        // Layout guard: tag, 32 hash bytes, blue_score 5, height 9, len 3, data.
+        assert!(enc[0] < 0xFB, "single-byte enum tag");
+        assert_eq!(&enc[33..35], &[5, 9], "bincode encoding layout changed; update this test");
+        assert!(enc.ends_with(&[3, 7, 7, 7]), "bincode encoding layout changed; update this test");
+        let head = &enc[..enc.len() - 4];
+
+        let splice = |at: usize, len: usize, with: &[u8]| -> Vec<u8> {
+            let mut f = enc[..at].to_vec();
+            f.extend_from_slice(with);
+            f.extend_from_slice(&enc[at + len..]);
+            f
+        };
+        let mut non_minimal = vec![
+            ("enum tag as u16", splice(0, 1, &[0xFB, enc[0], 0])),
+            ("blue_score as u16", splice(33, 1, &[0xFB, 5, 0])),
+            ("height as u64", splice(34, 1, &[0xFD, 9, 0, 0, 0, 0, 0, 0, 0])),
+            ("length as u16", splice(head.len(), 1, &[0xFB, 3, 0])),
+            ("length as u32", splice(head.len(), 1, &[0xFC, 3, 0, 0, 0])),
+            ("length as u64", splice(head.len(), 1, &[0xFD, 3, 0, 0, 0, 0, 0, 0, 0])),
+        ];
+        let mut truncated = head.to_vec();
+        truncated.push(0xFD);
+        truncated.extend_from_slice(&((1u64 << 32) + 3).to_le_bytes());
+        truncated.extend_from_slice(&[7, 7, 7]);
+        non_minimal.push(("length 2^32 + 3", truncated));
+
+        for (what, frame) in &non_minimal {
+            // Every non-minimal frame still carries the same logical message:
+            // bincode itself accepts it (on 64-bit targets except the length
+            // of 2^32 + 3, which only 32-bit targets accept).
+            if *what != "length 2^32 + 3" || cfg!(target_pointer_width = "32") {
+                let (m, used): (NetworkMessage, usize) =
+                    bincode::serde::decode_from_slice(frame, cfg).expect(what);
+                assert_eq!(used, frame.len(), "{what}");
+                assert_eq!(
+                    bincode::serde::encode_to_vec(&m, cfg).unwrap(),
+                    enc,
+                    "{what}: the same message as the canonical frame"
+                );
+            }
+            match decode_wire_message(frame) {
+                // 64-bit targets: the 9-byte length announces 2^32 + 3 bytes
+                // and the frame ends after 3 (Malformed, as before).
+                Err(e) if *what == "length 2^32 + 3" && cfg!(target_pointer_width = "64") => {
+                    assert!(matches!(e, WireDecodeError::Malformed(_)), "{what}: {e:?}");
+                }
+                // A block announcement: refused, but an older release
+                // relays it, so not a protocol violation (no penalty).
+                Err(e) => {
+                    assert!(matches!(e, WireDecodeError::NonCanonical { relayable: true }), "{what}: {e:?}");
+                    assert!(!e.is_protocol_violation(), "{what}: {e:?}");
+                }
+                Ok(m) => panic!("{what}: a non-canonical frame must not decode, got {}", m.kind_name()),
+            }
+        }
+    }
+
+    /// Mixed-version rollout: releases before the one-encoding rule accept a
+    /// non-canonical `NewBlock` / `NewTransaction` frame and gossipsub relays
+    /// the bytes they received, so an upgraded node drops such a frame
+    /// WITHOUT penalty (four penalized frames would graylist an honest older
+    /// relay). A message that no honest node relays (here `GetHeaders`,
+    /// `PeerTip`) in a non-canonical frame comes from its author and is still
+    /// a penalized protocol violation.
+    #[test]
+    fn non_canonical_relayable_frames_are_dropped_without_penalty() {
+        let cfg = bincode::config::standard();
+        // Widen the varint at `at` (a value < 251) to bincode's 3-byte form.
+        let widen = |enc: &[u8], at: usize| -> Vec<u8> {
+            assert!(enc[at] < 0xFB);
+            let mut f = enc[..at].to_vec();
+            f.extend_from_slice(&[0xFB, enc[at], 0]);
+            f.extend_from_slice(&enc[at + 1..]);
+            f
+        };
+        let relayed = [
+            NetworkMessage::NewBlock { block_hash: [1; 32], blue_score: 5, height: 9, block_data: vec![7; 3] },
+            NetworkMessage::NewTransaction { txid: [2; 32], tx_data: vec![8; 4] },
+        ];
+        let authored = [
+            NetworkMessage::GetHeaders { from_blue_score: 5, limit: 9, nonce: 3 },
+            NetworkMessage::PeerTip { peer_id: "p".into(), blue_score: 5, height: 9 },
+        ];
+        let mut t = WirePenaltyTracker::new();
+        let peer = PeerId::random();
+        for (m, relayable) in relayed.iter().map(|m| (m, true)).chain(authored.iter().map(|m| (m, false))) {
+            let enc = bincode::serde::encode_to_vec(m, cfg).unwrap();
+            // The enum tag (index < 251) is the first byte of every frame.
+            let wide = widen(&enc, 0);
+            let (back, _): (NetworkMessage, usize) = bincode::serde::decode_from_slice(&wide, cfg).unwrap();
+            assert_eq!(bincode::serde::encode_to_vec(&back, cfg).unwrap(), enc, "{}: same message", m.kind_name());
+            match decode_wire_message(&wide) {
+                Err(e @ WireDecodeError::NonCanonical { .. }) => {
+                    assert!(matches!(e, WireDecodeError::NonCanonical { relayable: r } if r == relayable), "{e:?}");
+                    assert_eq!(e.is_protocol_violation(), !relayable, "{}", m.kind_name());
+                }
+                other => panic!("{}: {other:?}", m.kind_name()),
+            }
+            let before = t.score_of(&peer);
+            match t.classify(peer, &wide) {
+                WireReaction::IgnoreMalformed(_) if relayable => assert_eq!(t.score_of(&peer), before),
+                WireReaction::Penalize { error: WireDecodeError::NonCanonical { relayable: false }, score } if !relayable => {
+                    assert_eq!(score, before.unwrap_or(0.0) + WIRE_VIOLATION_PENALTY);
+                }
+                other => panic!("{}: {other:?}", m.kind_name()),
+            }
+        }
+        assert_eq!(t.score_of(&peer), Some(2.0 * WIRE_VIOLATION_PENALTY), "only the two authored frames were penalized");
+    }
+
+    /// Gossip pulls and gossip responses are neither delivered nor relayed;
+    /// blocks are deferred to the validating processor; local-only frames
+    /// from peers are dropped.
+    #[test]
+    fn gossip_pulls_are_never_served_or_relayed() {
+        let pulls = [
+            NetworkMessage::GetTips,
+            NetworkMessage::PeerRequest,
+            NetworkMessage::GetHeaders { from_blue_score: 0, limit: 500, nonce: 1 },
+            NetworkMessage::GetBlock { block_hash: [0u8; 32], nonce: 1 },
+            NetworkMessage::Headers { entries: vec![] },
+            NetworkMessage::Tips { tips: vec![], locator: vec![] },
+            NetworkMessage::BlockNotFound { block_hash: [0u8; 32], nonce: 1 },
+            NetworkMessage::PeerExchange { peers: vec![] },
+            NetworkMessage::PeerCount { count: 0, addresses: vec![] },
+        ];
+        for m in &pulls {
+            for validated in [false, true] {
+                assert_eq!(gossip_disposition(m, validated, true), GossipDisposition::Drop(GossipVerdict::Ignore),
+                    "{} must not be delivered or relayed", m.kind_name());
+            }
+        }
+        let blk = NetworkMessage::NewBlock { block_hash: [0u8; 32], blue_score: 0, height: 0, block_data: vec![] };
+        assert_eq!(gossip_disposition(&blk, true, false), GossipDisposition::DeliverDeferred);
+        assert_eq!(gossip_disposition(&blk, false, false), GossipDisposition::Deliver(GossipVerdict::Accept));
+        // MEM-5: transactions are validated before relay too.
+        let tx = NetworkMessage::NewTransaction { txid: [0u8; 32], tx_data: vec![] };
+        assert_eq!(gossip_disposition(&tx, true, false), GossipDisposition::DeliverDeferred);
+        assert_eq!(gossip_disposition(&tx, false, false), GossipDisposition::Deliver(GossipVerdict::Accept));
+        let v = NetworkMessage::Version { version: 1, user_agent: "x".into(), blue_score: 1, height: 1, timestamp: 0 };
+        assert_eq!(gossip_disposition(&v, true, true), GossipDisposition::Deliver(GossipVerdict::Ignore),
+            "claims are consumed locally, never relayed");
+        assert_eq!(gossip_disposition(&v, true, false), GossipDisposition::Drop(GossipVerdict::Ignore));
+    }
+
+    /// Gossip transactions are judged before they are relayed (deferred
+    /// verdict, answered by `mempool::relay::TxRelay` once admission decided);
+    /// only the legacy loop relays them on decode. Holds for tip-claim-capable
+    /// authors too.
+    #[test]
+    fn gossip_transactions_are_relayed_only_after_the_mempool_verdict() {
+        let tx = NetworkMessage::NewTransaction { txid: [1u8; 32], tx_data: vec![0u8; 8] };
+        assert_eq!(gossip_disposition(&tx, true, false), GossipDisposition::DeliverDeferred);
+        assert_eq!(gossip_disposition(&tx, true, true), GossipDisposition::DeliverDeferred);
+        assert_eq!(gossip_disposition(&tx, false, false), GossipDisposition::Deliver(GossipVerdict::Accept));
+    }
+
+    /// The IHAVEs this node sends fit the 16 KiB control limit of a default
+    /// libp2p-gossipsub 0.50 receiver, and it decodes the largest IHAVE a
+    /// default-configured sender (5000 ids, e.g. libp2p 0.49) produces.
+    #[test]
+    fn gossip_control_limits_are_consistent_in_both_directions() {
+        let cfg = gossipsub_config().expect("config builds");
+        // One IHAVE RPC: per id 18 bytes, plus at most 64 bytes of framing
+        // (RPC control field, ControlIHave, topic id "gnb/txs/1").
+        assert_eq!(GOSSIP_ID_WIRE_COST, 18);
+        assert!(cfg.max_control_messages_sent() * GOSSIP_ID_WIRE_COST + 64 <= GOSSIP_PEER_DEFAULT_CONTROL_BYTES,
+            "{} ids per IHAVE overflow a default receiver", cfg.max_control_messages_sent());
+        assert!(cfg.max_control_message_size() >= 5000 * GOSSIP_ID_WIRE_COST + 64,
+            "a default sender's 5000-id IHAVE must decode");
+        assert!(cfg.max_control_message_size() < cfg.max_transmit_size());
+        // IWANT replies stay generous: a peer may ask for 800 ids per heartbeat.
+        assert!(cfg.max_control_messages_sent() >= 500);
+        // The id size the arithmetic assumes.
+        let m = gossipsub::Message {
+            source: None, data: b"frame".to_vec(), sequence_number: None,
+            topic: IdentTopic::new(TOPIC_TXS).hash(),
+        };
+        assert_eq!(gossip_message_id(&m).0.len(), GOSSIP_MESSAGE_ID_LEN);
+        assert_eq!(cfg.message_id(&m), gossip_message_id(&m));
+        // The rest of the node's settings are unchanged by the refactor.
+        assert!(cfg.validate_messages());
+        assert_eq!(cfg.max_transmit_size(), 4 * 1024 * 1024);
+        assert_eq!(cfg.history_length(), 12);
+        assert_eq!(cfg.heartbeat_interval(), Duration::from_secs(1));
+        assert_eq!(cfg.duplicate_cache_time(), Duration::from_secs(30));
+    }
+
+    // ── NET-16 regressions ─────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_file_is_owner_only_and_reloadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p2p_identity.bin");
+        let kp = load_or_create_identity(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "identity must be created 0600, got {:o}", mode);
+        assert!(!dir.path().join("p2p_identity.bin.tmp").exists(), "no temp file left behind");
+        // A world-readable key is tightened on load and still decodes.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let again = load_or_create_identity(&path).unwrap();
+        assert_eq!(PeerId::from(kp.public()), PeerId::from(again.public()));
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn known_peers_are_written_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_peers.json");
+        std::fs::write(dir.path().join("known_peers.json.tmp"), b"stale garbage").unwrap();
+        let peers: HashSet<String> = ["/ip4/45.77.1.1/tcp/17110/p2p/x".to_string()].into_iter().collect();
+        save_known_peers(&path, &peers);
+        assert_eq!(load_known_peers(&path), peers);
+        assert!(!dir.path().join("known_peers.json.tmp").exists(), "temp file renamed into place");
+    }
+
+    // ── NET-11 regression: PEX ingestion never dials ───────────────────────
+
+    #[test]
+    fn pex_ingestion_only_fills_the_table() {
+        let mut book = AddrBook::new();
+        let mut lim = PexRateLimiter::new();
+        let mut stats = PexStats::new();
+        let me = PeerId::random();
+        let author = PeerId::random();
+        let mut peers: Vec<String> = (0..30u8).map(|i| format!("/ip4/45.{}.1.1/tcp/17110/p2p/{}", i, PeerId::random())).collect();
+        peers.push(format!("/ip4/45.200.1.1/tcp/17110/p2p/{}", me)); // ourselves
+        let added = ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, &peers, false, &me, &HashSet::new());
+        assert_eq!(added, PEX_BATCH_LIMIT, "batch-capped per message");
+        assert_eq!(book.len(), PEX_BATCH_LIMIT);
+        // The same author is rate-limited across messages.
+        for _ in 0..10 {
+            ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, &peers, false, &me, &HashSet::new());
+        }
+        assert!(book.len() <= pex_validator::PEX_MAX_PER_WINDOW);
+    }
+
+    // ── Directed-pull answers (`on_pull_response`) ──────────────────────────
+
+    use std::time::Instant;
+
+    fn get_block_pull(attempts: u8, tried: Vec<PeerId>) -> PendingPull {
+        let msg = NetworkMessage::GetBlock { block_hash: [5u8; 32], nonce: 1 };
+        let req = sync_rr::as_pull_request(&msg).expect("GetBlock is a directed pull");
+        PendingPull { msg, req, attempts, tried }
+    }
+
+    /// A selector with `peers` connected and one pull in flight to `sent_to`.
+    fn selector_with(peers: &[PeerId], sent_to: PeerId, now: Instant) -> sync_rr::PullPeerSelector {
+        let mut sel = sync_rr::PullPeerSelector::new(HashSet::new());
+        for p in peers {
+            sel.on_connect(*p);
+        }
+        sel.on_sent(sent_to, now);
+        sel
+    }
+
+    /// THE regression for the BlockNotFound retry (feature_partition_heal.py
+    /// waited 80 s to more than 120 s): a peer that does not have the body
+    /// answers NotFound, and the pull goes back in the queue, one attempt
+    /// used, that peer recorded as tried, so the next drain sends it to the
+    /// OTHER peer. The answer counts as a success for the answering peer (no
+    /// back-off). Deleting the requeue fails this test.
+    #[test]
+    fn block_not_found_requeues_the_pull_for_another_peer() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let now = Instant::now();
+        let mut sel = selector_with(&[a, b], a, now);
+        let mut pending = std::collections::VecDeque::new();
+        let not_found = sync_rr::SyncResponse::BlockNotFound { block_hash: [5u8; 32] };
+        on_pull_response(Some((get_block_pull(0, vec![]), a)), &not_found, a, &mut sel, &mut pending, now);
+
+        assert_eq!(pending.len(), 1, "the pull must be retried, not completed");
+        let p = &pending[0];
+        assert_eq!((p.attempts, p.tried.clone()), (1, vec![a]));
+        assert!(matches!(p.req, sync_rr::SyncRequest::GetBlock { block_hash } if block_hash == [5u8; 32]));
+        assert_eq!(sel.in_flight(&a), 0);
+        assert!(!sel.is_cooling_down(&a, now), "NotFound is an answer, not back-pressure");
+        assert_eq!(sel.select(now, &p.tried), Some(b), "the retry goes to the peer not tried yet");
+
+        // B does not have it either: the third attempt would exceed
+        // MAX_PULL_ATTEMPTS, so the pull is dropped (the processor's sweeps
+        // re-issue anything still needed).
+        let p = pending.pop_front().unwrap();
+        sel.on_sent(b, now);
+        on_pull_response(Some((p, b)), &not_found, b, &mut sel, &mut pending, now);
+        assert_eq!((pending.len(), pending[0].attempts, pending[0].tried.clone()), (1, 2, vec![a, b]));
+        let p = pending.pop_front().unwrap();
+        sel.on_sent(a, now);
+        on_pull_response(Some((p, a)), &not_found, a, &mut sel, &mut pending, now);
+        assert!(pending.is_empty(), "dropped after MAX_PULL_ATTEMPTS ({MAX_PULL_ATTEMPTS})");
+    }
+
+    /// Busy (NET-5): back-pressure. The peer backs off and the pull is
+    /// retried elsewhere.
+    #[test]
+    fn busy_backs_the_peer_off_and_requeues_the_pull() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let now = Instant::now();
+        let mut sel = selector_with(&[a, b], a, now);
+        let mut pending = std::collections::VecDeque::new();
+        on_pull_response(Some((get_block_pull(0, vec![]), a)), &sync_rr::SyncResponse::Busy, a,
+            &mut sel, &mut pending, now);
+        assert!(sel.is_cooling_down(&a, now));
+        assert_eq!(sel.in_flight(&a), 0);
+        assert_eq!((pending.len(), pending[0].attempts, pending[0].tried.clone()), (1, 1, vec![a]));
+        assert_eq!(sel.select(now, &[]), Some(b));
+    }
+
+    /// Every other answer completes the pull: nothing is requeued, and an
+    /// answer to an unknown request id requeues nothing either.
+    #[test]
+    fn answers_that_complete_a_pull_do_not_requeue_it() {
+        let entry = || SyncEntry { hash: [1u8; 32], blue_score: 1, height: 1 };
+        for resp in [
+            sync_rr::SyncResponse::Block { block_hash: [5u8; 32], blue_score: 1, height: 1, block_data: vec![1] },
+            sync_rr::SyncResponse::Headers { entries: vec![entry()] },
+            sync_rr::SyncResponse::Headers { entries: vec![] },
+            sync_rr::SyncResponse::Tips { tips: vec![entry()], locator: vec![] },
+            sync_rr::SyncResponse::Peers { peers: vec![] },
+        ] {
+            let a = PeerId::random();
+            let now = Instant::now();
+            let mut sel = selector_with(&[a], a, now);
+            let mut pending = std::collections::VecDeque::new();
+            on_pull_response(Some((get_block_pull(0, vec![]), a)), &resp, a, &mut sel, &mut pending, now);
+            assert!(pending.is_empty(), "{resp:?} completes the pull");
+            assert_eq!(sel.in_flight(&a), 0, "{resp:?}");
+            assert!(!sel.is_cooling_down(&a, now), "{resp:?}");
+        }
+        let a = PeerId::random();
+        let now = Instant::now();
+        let mut sel = selector_with(&[a], a, now);
+        let mut pending = std::collections::VecDeque::new();
+        on_pull_response(None, &sync_rr::SyncResponse::BlockNotFound { block_hash: [5u8; 32] }, a,
+            &mut sel, &mut pending, now);
+        assert!(pending.is_empty());
+        assert_eq!(sel.in_flight(&a), 0);
+    }
+
+    // ── Peer count and heartbeat ────────────────────────────────────────────
+
+    /// The peer count is of distinct peers: a second connection to a peer
+    /// (both ends dialing, a re-dial) does not count, closing one of two
+    /// connections does not uncount, closing the last one does. Counting
+    /// connections reported a peer dialed twice as two peers.
+    #[test]
+    fn peer_count_counts_distinct_peers_not_connections() {
+        // Peer P connects twice, Q once: 2 peers.
+        let mut count = 0usize;
+        for n in [1u32, 2, 1] {
+            if let Some(c) = peer_count_after_connect(count, n) {
+                count = c;
+            }
+        }
+        assert_eq!(count, 2);
+        assert_eq!(peer_count_after_connect(count, 2), None, "a second connection to a peer");
+        // One of P's two connections closes: P is still connected.
+        assert_eq!(peer_count_after_disconnect(count, 1), None);
+        // P's last connection closes, then Q's.
+        count = peer_count_after_disconnect(count, 0).unwrap();
+        assert_eq!(count, 1);
+        count = peer_count_after_disconnect(count, 0).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(peer_count_after_disconnect(0, 0), Some(0), "never below zero");
+    }
+
+    /// The heartbeat's first tick comes one period after start-up, not at
+    /// once: an immediate tick saw 0 peers (no connection established yet)
+    /// and re-dialed every bootstrap peer, giving two connections per peer.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_first_tick_is_one_period_after_start() {
+        let mut hb = new_heartbeat();
+        let start = tokio::time::Instant::now();
+        assert!(tokio::time::timeout(HEARTBEAT_PERIOD - Duration::from_millis(1), hb.tick()).await.is_err(),
+            "the heartbeat ticked at start-up");
+        hb.tick().await;
+        assert_eq!(start.elapsed(), HEARTBEAT_PERIOD);
+        hb.tick().await;
+        assert_eq!(start.elapsed(), 2 * HEARTBEAT_PERIOD);
     }
 }

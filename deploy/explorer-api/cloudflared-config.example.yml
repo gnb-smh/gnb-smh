@@ -1,0 +1,13 @@
+# /etc/cloudflared/gnb-explorer.yml — Cloudflare Tunnel for the explorer API.
+# Replace the placeholders; never commit the credentials file.
+tunnel: <TUNNEL-UUID>
+credentials-file: /etc/cloudflared/<TUNNEL-UUID>.json
+ingress:
+  # Only the explorer API path is published; everything else is refused.
+  - hostname: <tunnel hostname, e.g. explorer-origin-1.example.net>
+    path: ^/v1/
+    service: http://127.0.0.1:2086
+    originRequest:
+      connectTimeout: 10s
+      noTLSVerify: false
+  - service: http_status:404

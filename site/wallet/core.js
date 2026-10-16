@@ -3,13 +3,16 @@
 // JSON requests and responses. Randomness comes from crypto.getRandomValues.
 const WASI_EBADF = 8, WASI_ESUCCESS = 0;
 
-export async function loadCore(url = "/wallet/gnb_wallet.wasm", sha256Hex = null) {
-  const bytes = new Uint8Array(await (await fetch(url, { cache: "no-cache" })).arrayBuffer());
-  if (sha256Hex) {
-    const d = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-    const hex = [...d].map((b) => b.toString(16).padStart(2, "0")).join("");
-    if (hex !== sha256Hex) throw new Error("wallet core integrity check failed");
+// WAL-5: the SHA-256 of the binary is mandatory; app.js passes the hash that
+// scripts/build-wallet-wasm.sh pins, and any other binary is refused.
+export async function loadCore(url, sha256Hex) {
+  if (typeof sha256Hex !== "string" || !/^[0-9a-f]{64}$/.test(sha256Hex)) {
+    throw new Error("wallet core hash is not pinned; refusing to load it");
   }
+  const bytes = new Uint8Array(await (await fetch(url, { cache: "no-cache" })).arrayBuffer());
+  const d = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  const hex = [...d].map((b) => b.toString(16).padStart(2, "0")).join("");
+  if (hex !== sha256Hex) throw new Error("wallet core integrity check failed");
   let memory = null;
   const view = () => new DataView(memory.buffer);
   const u8 = () => new Uint8Array(memory.buffer);
@@ -58,14 +61,60 @@ export async function loadCore(url = "/wallet/gnb_wallet.wasm", sha256Hex = null
   }
   return {
     open: (json, password) => call({ op: "open", json, password }),
-    create: (testnet = false) => call({ op: "create", testnet: !!testnet }),
+    // WAL-7: phrase-backed by default; returns { address, public_key, words }.
+    create: () => call({ op: "create", mnemonic: true }),
+    restore: (words) => call({ op: "restore", words }),
     exportKeystore: (password) => call({ op: "export", password }).keystore,
-    pay: (utxos, to, amount, fee) => call({ op: "pay", utxos, to, amount: String(amount), fee: String(fee) }),
-    bridgeLock: (utxos, vaultScript, amount, l2, fee = "0") =>
-      call({ op: "bridgelock", utxos, vault_script: vaultScript, amount: String(amount), l2, fee: String(fee) }),
+    // WAL-1: `nextHeight` is the node's getdaginfo next_block_height; it selects
+    // the transaction version (3 / sighash v3 from the hardening activation
+    // height, 1 below it). Version 1 only: the outpoints whose previous
+    // transactions should be fetched...
+    plan: (utxos, to, amount, fee, nextHeight) => call({ op: "plan", utxos, to, amount: String(amount), fee: String(fee), next_height: String(nextHeight) }),
+    // ...and the payment, with those transactions (txid -> raw hex) so the
+    // core can check the claimed UTXO values before it signs. A version-3
+    // signature commits to every spent value, so nothing needs fetching.
+    pay: (utxos, to, amount, fee, nextHeight, prevtxs = {}) => call({ op: "pay", utxos, to, amount: String(amount), fee: String(fee), next_height: String(nextHeight), prevtxs }),
     address: () => call({ op: "address" }).address,
     normalize: (address) => call({ op: "normalize", address }).address,
     minFee: (size) => call({ op: "minfee", size }).fee,
     wipe: () => call({ op: "wipe" }),
   };
+}
+
+// ── Which coins a payment can spend ──────────────────────────────────────────
+// Coinbase outputs are spendable COINBASE_MATURITY blocks after the block that
+// created them (gnb_crypto::core::COINBASE_MATURITY; site/tests pins the two).
+export const COINBASE_MATURITY = 100;
+
+/** Split getutxos rows into those spendable in the block at `nextHeight` and
+ *  the immature coinbase outputs: a row carrying `coinbase_height` only from
+ *  coinbase_height + COINBASE_MATURITY on, a row without it always (the rule
+ *  of gnb_crypto::wallet::send::utxo_row_spendable_at, which the core and
+ *  gnb-cli apply). A malformed coinbase_height counts as immature. */
+export function splitByMaturity(rows, nextHeight) {
+  const spendable = [], immature = [];
+  for (const row of rows) {
+    const cb = row.coinbase_height;
+    const mature = cb === undefined || cb === null
+      || (Number.isSafeInteger(cb) && cb >= 0 && nextHeight - cb >= COINBASE_MATURITY);
+    (mature ? spendable : immature).push(row);
+  }
+  return { spendable, immature };
+}
+
+/** The coins one payment may spend in the block at `nextHeight`: the first
+ *  `window` spendable rows the node lists, and the immature coinbase outputs
+ *  seen. `fetchRows(limit)` resolves to { rows, truncated } from getutxos
+ *  (the node lists an address's outputs in index order and sets `truncated`
+ *  when it stops at the limit). When immature coinbase outputs took part of a
+ *  truncated window, a `wide` one is asked for, so mature coins listed after
+ *  them are found; `truncated` then says whether even that was cut short. */
+export async function spendableWindow(fetchRows, nextHeight, window = 50, wide = 1000) {
+  let { rows, truncated } = await fetchRows(window);
+  let { spendable, immature } = splitByMaturity(rows, nextHeight);
+  if (truncated && immature.length > 0 && wide > window) {
+    ({ rows, truncated } = await fetchRows(wide));
+    ({ spendable, immature } = splitByMaturity(rows, nextHeight));
+  }
+  return { spendable: spendable.slice(0, window), immature, truncated: truncated === true, listed: rows.length };
 }

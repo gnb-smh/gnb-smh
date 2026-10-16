@@ -17,6 +17,20 @@ pub mod powit;         // Proof of Witnesses: witness-set finality (from powit_h
 
 /// Bloch Genesis-3 carryover: verified, converted opening ledger.
 pub mod carryover;
+pub mod activation;
+
+/// Sighash v2/v3, the transaction-version activation rule and the shared
+/// input-script (witness + signature) rules (audit CRY-1/2/3, MEM-5).
+pub mod sighash;
+
+/// Block-validity rules of the hardening activation (audit VAL-2, VAL-3,
+/// VAL-10, CRY-1, VAL-12, POW-3): tagged Merkle root, 64-byte transactions,
+/// coinbase height / parents / witness commitment, wire-size block limit,
+/// pow limit.
+pub mod block_rules;
+
+/// MoneyRange and canonical-encoding size helpers (audit VAL-11 / VAL-12).
+pub mod limits;
 
 // ── Network identity ─────────────────────────────────────────────────────────
 
@@ -27,9 +41,14 @@ pub const NETWORK_MAGIC:         u32   = 0x474E_4231;
 
 // ── Sighash domain (replay separation) ──────────────────────────────────────
 //
+// Sighash v2 (every transaction below the hardening activation, whatever its
+// version):
 //   preimage = SIGHASH_DOMAIN(16) ‖ [SIGHASH_VERSION](1) ‖ chain_id.to_le_bytes()(4)
 //              ‖ wire(stripped_tx)   (Transaction::to_wire_bytes(true))
 //   sighash  = SHA3-256(preimage)
+// Sighash v3 (version-3 transactions, the only valid version at/after the
+// hardening activation): see `sighash` (module) — commits the spent amounts
+// and scripts and the signature suite, linear cost.
 //
 // The domain and the chain ids differ from Bloch's, so no signature made for a
 // Bloch chain verifies on GnB and vice versa, even over coinciding outpoints.
@@ -214,8 +233,8 @@ pub const DNS_SEED_DOMAIN: &str = "";
 /// No public seed infrastructure yet; peers are supplied with --peer.
 pub const DEFAULT_SEEDS: &[&str] = &[];
 
-pub const CHECKPOINT_DEPTH:      u64   = 1_000;      // finality: reorgs deeper than this rejected
-pub const PRUNING_DEPTH:         u64   = 10_000;     // block bodies pruned below tip - this
+pub const CHECKPOINT_DEPTH:      u64   = 1_000;      // node-local ingress window + deep-reorg alert depth; NOT a reorg-depth limit, no finality (audit DAG-6)
+pub const PRUNING_DEPTH:         u64   = 10_000;     // block bodies pruned below tip - this; undo records are kept, so reorgs of any depth still work
 
 // Hybrid ML-DSA-65 ‖ Falcon-1024 sizes, including the 4-byte crypto-agility
 // suite header. SIG_SIZE is an upper bound (Falcon is variable length) used
@@ -231,25 +250,42 @@ pub const SIG_SIZE:     usize = 4 + 3309 + 1462; // 4775
 // a big-endian 256-bit integer, is strictly below the target encoded by `bits`.
 //
 // Difficulty: ASERT anchored at the genesis block. The expected `bits` of a
-// block is a pure function of its selected parent's height and timestamp, so
-// miner and validator agree regardless of arrival order.
+// block is a pure function of its parent set: the LATEST timestamp over all
+// parents (`difficulty_parent_timestamp`) and the block height
+// max(parent heights) + 1 -- not the GhostDAG selected parent's timestamp or
+// height (docs/CONSENSUS.md, "Difficulty input"). Miner and validator agree
+// regardless of arrival order or parent order.
 
 /// True when built with the `test-pow-limit` feature, which pins every
 /// expected target to the pow limit so tests do not depend on the wall clock.
-/// Consensus-breaking; the node refuses to start when this is set.
+/// Consensus-breaking; a node binary with it refuses mainnet, and an
+/// optimised one every network (node/src/main.rs `test_pow_limit_guard`).
 pub const TEST_POW_LIMIT: bool = cfg!(feature = "test-pow-limit");
 
-/// Easiest target the chain accepts (≈ one evaluation per block).
+/// Easiest target the chain accepts below the hardening activation (≈ one
+/// evaluation per block). At/after the activation the pow limit is the genesis
+/// target (`block_rules::HARDENED_POW_LIMIT_BITS`, audit POW-3).
 pub const POW_LIMIT_BITS: u32 = 0x2100_FFFF;
 /// ASERT half-life: two hours (240 blocks at 30 s).
 pub const ASERT_HALFLIFE_SECS: i64 = 2 * 60 * 60;
 
-/// The chain's ASERT parameters.
+/// The chain's ASERT parameters below the hardening activation
+/// (`pow_limit = POW_LIMIT_BITS`). Use [`asert_params_at`] for a given height.
 pub fn asert_params() -> gnb_smh::difficulty::AsertParams {
     gnb_smh::difficulty::AsertParams {
         target_spacing: TARGET_BLOCK_TIME as i64,
         halflife: ASERT_HALFLIFE_SECS,
         pow_limit: gnb_smh::difficulty::bits_to_target(POW_LIMIT_BITS),
+    }
+}
+
+/// The chain's ASERT parameters for a block at header height `height`: the
+/// pow limit is `block_rules::pow_limit_bits_at(height, activation_height)`
+/// (the genesis target at/after the activation, POW-3).
+pub fn asert_params_at(height: u64, activation_height: u64) -> gnb_smh::difficulty::AsertParams {
+    gnb_smh::difficulty::AsertParams {
+        pow_limit: gnb_smh::difficulty::bits_to_target(block_rules::pow_limit_bits_at(height, activation_height)),
+        ..asert_params()
     }
 }
 
@@ -281,7 +317,8 @@ pub fn difficulty_parent_timestamp<I: IntoIterator<Item = u64>>(parent_timestamp
 
 /// Expected compact `bits` for a block at `height` (>= 1) whose parents'
 /// latest timestamp is `parent_timestamp` (see `difficulty_parent_timestamp`). Single source of truth for the
-/// validator, the internal miner and every block-template producer.
+/// validator, the internal miner and every block-template producer. Uses the
+/// process-wide hardening activation height (pow limit, POW-3).
 pub fn expected_bits(parent_timestamp: u64, height: u64) -> Result<u32, String> {
     #[cfg(feature = "test-pow-limit")]
     {
@@ -289,10 +326,19 @@ pub fn expected_bits(parent_timestamp: u64, height: u64) -> Result<u32, String> 
         return Ok(target_to_bits(&bits_to_target(POW_LIMIT_BITS)));
     }
     #[allow(unreachable_code)]
+    expected_bits_at(parent_timestamp, height, activation::hardening_activation_height())
+}
+
+/// The real ASERT rule with an explicit activation height. Never pinned by
+/// the `test-pow-limit` feature, so the pow-limit boundary can be tested in
+/// any build.
+pub fn expected_bits_at(parent_timestamp: u64, height: u64, activation_height: u64) -> Result<u32, String> {
     let parent_time = i64::try_from(parent_timestamp)
         .map_err(|_| format!("parent timestamp {parent_timestamp} out of range"))?;
-    let bits = gnb_smh::difficulty::asert_next_bits(&asert_params(), &asert_anchor(), parent_time, height)
-        .map_err(|e| e.to_string())?;
+    let bits = gnb_smh::difficulty::asert_next_bits(
+        &asert_params_at(height, activation_height), &asert_anchor(), parent_time, height,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(adjust_bits_for_algo(bits, pow_algo(height)))
 }
 
@@ -544,23 +590,63 @@ pub(crate) fn write_varint(out: &mut Vec<u8>, n: u64) {
     }
 }
 
+/// Encoded length of `write_varint(n)`.
+fn varint_len(n: u64) -> usize {
+    if n < 0xFD {
+        1
+    } else if n <= 0xFFFF {
+        3
+    } else if n <= 0xFFFF_FFFF {
+        5
+    } else {
+        9
+    }
+}
+
+/// Read one CompactSize varint. Only the minimal encoding of a value is
+/// accepted (Bitcoin Core's `ReadCompactSize`, "non-canonical
+/// ReadCompactSize()"), so every wire value has exactly one encoding.
+/// Accepting `FD 05 00` for 5 gave every block, header and transaction many
+/// byte-distinct encodings, and made `Block::from_wire_bytes` frame the next
+/// transaction at the re-encoded length of the previous one, fewer bytes than
+/// it consumed (fuzz target `wire_roundtrip`, docs/testing/FUZZING.md).
 fn read_varint(cur: &mut Cursor<&[u8]>) -> Result<u64, String> {
     let mut tag = [0u8; 1];
     cur.read_exact(&mut tag).map_err(|_| "varint: unexpected EOF on tag".to_string())?;
-    match tag[0] {
-        // Canonical only (as Bitcoin's CompactSize): each value has exactly one
-        // encoding, so the parsed bytes are the bytes that were hashed.
-        0xFF => { let mut b = [0u8; 8]; cur.read_exact(&mut b).map_err(|_| "varint u64 EOF")?;
-                  let v = u64::from_le_bytes(b);
-                  if v <= u32::MAX as u64 { return Err("varint: non-canonical u64".into()); } Ok(v) }
-        0xFE => { let mut b = [0u8; 4]; cur.read_exact(&mut b).map_err(|_| "varint u32 EOF")?;
-                  let v = u32::from_le_bytes(b) as u64;
-                  if v <= u16::MAX as u64 { return Err("varint: non-canonical u32".into()); } Ok(v) }
-        0xFD => { let mut b = [0u8; 2]; cur.read_exact(&mut b).map_err(|_| "varint u16 EOF")?;
-                  let v = u16::from_le_bytes(b) as u64;
-                  if v < 0xFD { return Err("varint: non-canonical u16".into()); } Ok(v) }
-        n    => Ok(n as u64),
+    let (value, min) = match tag[0] {
+        0xFF => { let mut b = [0u8; 8]; cur.read_exact(&mut b).map_err(|_| "varint u64 EOF")?; (u64::from_le_bytes(b), 0x1_0000_0000) }
+        0xFE => { let mut b = [0u8; 4]; cur.read_exact(&mut b).map_err(|_| "varint u32 EOF")?; (u32::from_le_bytes(b) as u64, 0x1_0000) }
+        0xFD => { let mut b = [0u8; 2]; cur.read_exact(&mut b).map_err(|_| "varint u16 EOF")?; (u16::from_le_bytes(b) as u64, 0xFD) }
+        n    => return Ok(n as u64),
+    };
+    if value < min {
+        return Err(format!("{NON_MINIMAL_VARINT}: {value} encoded with the 0x{:02X} form", tag[0]));
     }
+    Ok(value)
+}
+
+/// The text of every wire decoder error caused by a non-minimal CompactSize
+/// varint (`read_varint`); see [`is_non_minimal_varint_error`].
+pub const NON_MINIMAL_VARINT: &str = "non-canonical varint";
+
+/// Whether an error of `Block::from_wire_bytes` (or of the header and
+/// transaction decoders) is the minimal-varint rule: the first thing the
+/// decoder refused was a CompactSize varint written in a longer form than its
+/// value needs.
+///
+/// Every byte string that the decoders before this rule accepted and the
+/// current ones refuse fails this way. Both decoders read the same fields in
+/// the same order with the same checks; they differ only in refusing a
+/// non-minimal varint and in where the next transaction of a block starts
+/// (the bytes consumed, or the re-encoded length). A transaction whose
+/// varints are minimal consumes exactly its re-encoded length, so the two
+/// agree byte for byte up to the first non-minimal varint, which the current
+/// decoder refuses with this error (`core::wire_canonical_tests::
+/// pre_fix_acceptances_fail_on_a_non_minimal_varint`). The node uses this to
+/// tell a widened copy that an older node may have accepted and relayed from
+/// other malformed bytes (`ingress::verdict_for_block_decode_error`).
+pub fn is_non_minimal_varint_error(err: &str) -> bool {
+    err.contains(NON_MINIMAL_VARINT)
 }
 
 fn read_u32_le(cur: &mut Cursor<&[u8]>) -> Result<u32, String> {
@@ -588,6 +674,15 @@ fn read_bytes(cur: &mut Cursor<&[u8]>, n: usize) -> Result<Vec<u8>, String> {
 }
 
 // ── Coherence C2: shielded-transaction (de)serialization ──────────────────────
+
+/// `write_shielded_tx(tx).len()`, computed without encoding.
+fn shielded_tx_wire_size(tx: &coherence_core::ShieldedTx) -> usize {
+    32 + varint_len(tx.nullifiers.len() as u64) + 32 * tx.nullifiers.len()
+        + varint_len(tx.outputs.len() as u64) + 32 * tx.outputs.len()
+        + 8
+        + varint_len(tx.proof.len() as u64) + tx.proof.len()
+        + varint_len(tx.binding_sig.len() as u64) + tx.binding_sig.len()
+}
 
 fn write_shielded_tx(out: &mut Vec<u8>, tx: &coherence_core::ShieldedTx) {
     out.extend_from_slice(&tx.anchor);
@@ -660,6 +755,22 @@ fn merkle_of(mut hashes: Vec<[u8; 32]>) -> [u8; 32] {
 /// Activated ahead of the live tip (2,888 on 2026-10-12) so every miner can
 /// upgrade first.
 pub const WITNESS_COMMITMENT_HEIGHT: u64 = 5_000;
+
+/// Whether a block at `height` must carry the `|wc:` suffix commitment: from
+/// [`WITNESS_COMMITMENT_HEIGHT`] up to (excluding) the hardening activation,
+/// where the audit's 80-byte coinbase commitment
+/// (`block_rules::check_coinbase_commitment`, which also commits to the
+/// witness root) replaces it.
+pub fn suffix_witness_commitment_required(height: u64) -> bool {
+    height >= WITNESS_COMMITMENT_HEIGHT
+        && !activation::is_active_at(height, activation::hardening_activation_height())
+}
+
+/// Whether the block id commits to every witness at `height` (either
+/// commitment): a witness failure is then a verdict on the block.
+pub fn witnesses_committed(height: u64) -> bool {
+    height >= WITNESS_COMMITMENT_HEIGHT
+}
 /// Marker before the 32-byte witness root at the end of the coinbase script_sig.
 pub const WITNESS_COMMITMENT_TAG: &[u8; 4] = b"|wc:";
 
@@ -717,13 +828,47 @@ impl Transaction {
         out
     }
 
+    /// `to_wire_bytes(include_script_sig).len()`, computed without encoding.
+    pub fn wire_size(&self, include_script_sig: bool) -> usize {
+        let mut n = 4 + varint_len(self.inputs.len() as u64);
+        for inp in &self.inputs {
+            n += 32 + 4 + 4;
+            if include_script_sig {
+                n += varint_len(inp.script_sig.len() as u64) + inp.script_sig.len();
+            }
+        }
+        n += varint_len(self.outputs.len() as u64);
+        for o in &self.outputs {
+            n += 8 + varint_len(o.script_pubkey.len() as u64) + o.script_pubkey.len();
+        }
+        n + 4
+    }
+
+    /// Witness transaction id (consensus, audit CRY-1): SHA-256d over the
+    /// FULL wire encoding, `script_sig`s included (`to_wire_bytes(true)`).
+    /// Equal to `txid()` for a coinbase. The block's witness root commits to
+    /// these (`block_rules::witness_root`). Not the mempool's node-local
+    /// `admission::wtxid` cache key.
+    pub fn wtxid(&self) -> [u8; 32] {
+        Sha256::digest(Sha256::digest(self.to_wire_bytes(true))).into()
+    }
+
     /// Parse a Transaction from its stratum/Bitcoin-format serialization.
     /// Inverse of `to_wire_bytes(true)` — requires `include_script_sig=true`
     /// bytes since a round-trip without script_sig cannot recover the input's
-    /// signature.
+    /// signature. Bytes after the transaction are ignored (the gossip/RPC
+    /// decoder `mempool::admission::decode_tx_strict` refuses them); every
+    /// varint must be minimal, so the bytes consumed are exactly
+    /// `to_wire_bytes(true)` of the result.
     ///
     /// Returns Err with a short diagnostic on malformed input.
     pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, String> {
+        Self::read_wire_bytes(bytes).map(|(tx, _)| tx)
+    }
+
+    /// Parse a transaction from the front of `bytes`: the transaction and the
+    /// number of bytes it occupies (the framing `Block::from_wire_bytes` uses).
+    pub fn read_wire_bytes(bytes: &[u8]) -> Result<(Self, usize), String> {
         let mut cur = Cursor::new(bytes);
 
         let version = read_u32_le(&mut cur)?;
@@ -762,16 +907,20 @@ impl Transaction {
 
         let locktime = read_u32_le(&mut cur)?;
 
-        Ok(Transaction { version, inputs, outputs, locktime })
+        Ok((Transaction { version, inputs, outputs, locktime }, cur.position() as usize))
     }
 
     /// Transaction ID. SHA-256d over stratum-format bytes.
     ///
     /// Non-coinbase: serialized WITHOUT script_sig to prevent
     /// third-party signature malleability (VULN-06 preservation).
-    /// Coinbase: serialized WITH script_sig — the "height:N" encoding
-    /// plus any stratum extranonce bytes are what make each coinbase
-    /// unique; coinbase has no signature to malleate.
+    /// Coinbase: serialized WITH script_sig, so the txid commits to it; the
+    /// coinbase has no signature to malleate. Below the hardening activation
+    /// the script_sig is free-form (the node's miner writes
+    /// `gnb:h<height>:<random>`); at/after it, it starts with the 80-byte
+    /// commitment of `block_rules` (tag, header height, parent-list hash,
+    /// witness root), which makes every coinbase applied on one selected
+    /// chain unique (docs/CONSENSUS.md).
     ///
     /// **v0.6.0 change:** previously computed via bincode. Switched
     /// to stratum-format bytes so that external miners (which receive
@@ -789,6 +938,17 @@ impl Transaction {
     }
 
     /// Sighash (v2) for input at `index`, bound to `chain_id`.
+    ///
+    /// The digest of every transaction below the hardening activation,
+    /// whatever its version (see the `core::sighash` module for the selection
+    /// and the activation rule). Specified
+    /// byte for byte in `docs/CONSENSUS.md` (the bincode body is re-derived
+    /// by an independent encoder in `reference/gnb_sighash.py`) and pinned by
+    /// golden vectors; it must never change. Costs O(size) per input, so
+    /// O(size²) per transaction (bounded by the size limits, and invalid
+    /// at/after the activation). An out-of-range `input_index` silently
+    /// omits the marker (historical behaviour, kept for digest stability);
+    /// [`Transaction::sighash_v2_checked`] reports it as an error instead.
     ///
     /// `chain_id` is an EXPLICIT consensus input threaded from the node's network
     /// (`ChainId::for_network` / `node_chain_id()`), never a compile-time flag and
@@ -832,30 +992,60 @@ impl Transaction {
         h.finalize().into()
     }
 
+    /// The PRE-activation transaction Merkle root (SHA-256d, last node
+    /// duplicated on odd levels), unchanged. A block's header root depends on
+    /// its height: use `Block::body_merkle_root` (or
+    /// `block_rules::tx_merkle_root`), which switches to the tagged tree at
+    /// the hardening activation (audit VAL-10).
     pub fn merkle_root(txs: &[Transaction]) -> MerkleRoot {
-        if txs.is_empty() { return MerkleRoot::ZERO; }
-        MerkleRoot(merkle_of(txs.iter().map(|t| t.txid()).collect()))
+        let ids: Vec<[u8; 32]> = txs.iter().map(|t| t.txid()).collect();
+        block_rules::legacy_merkle_root(&ids)
     }
 
-    /// Witness transaction id: SHA-256d over the wire encoding WITH the
-    /// witness (`script_sig`), unlike [`Transaction::txid`].
-    pub fn wtxid(&self) -> [u8; 32] {
-        Sha256::digest(Sha256::digest(self.to_wire_bytes(true))).into()
-    }
-
-    /// Parse sig + pubkey out of script_sig
+    /// Parse sig + pubkey out of script_sig (historical, lenient framing:
+    /// bytes after the public key are ignored). Owned copy of
+    /// [`Self::parse_script_sig_borrowed`].
     pub fn parse_script_sig(script_sig: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        Self::parse_script_sig_borrowed(script_sig).map(|(s, p)| (s.to_vec(), p.to_vec()))
+    }
+
+    /// The sighash v2 witness framing `[u32 LE sig_len][sig][u32 LE
+    /// pk_len][pk]`, borrowed. Exact length: no trailing bytes, so a relay
+    /// cannot pad a witness (consensus on this chain at every height since
+    /// cc5c450; identical to [`Self::parse_script_sig_exact`]).
+    pub fn parse_script_sig_borrowed(script_sig: &[u8]) -> Option<(&[u8], &[u8])> {
+        Self::parse_script_sig_exact(script_sig)
+    }
+
+    /// The canonical witness framing: exactly
+    /// `[u32 LE sig_len][sig][u32 LE pk_len][pk]` with no trailing bytes
+    /// (CRY-1; consensus at/after the hardening activation, relay policy at
+    /// every height).
+    pub fn parse_script_sig_exact(script_sig: &[u8]) -> Option<(&[u8], &[u8])> {
+        match Self::parse_script_sig_prefix(script_sig) {
+            Some((s, p, end)) if end == script_sig.len() => Some((s, p)),
+            _ => None,
+        }
+    }
+
+    /// (sig, pk, bytes consumed).
+    fn parse_script_sig_prefix(script_sig: &[u8]) -> Option<(&[u8], &[u8], usize)> {
+        // CRY-8: checked arithmetic. On 64-bit targets no sum below can
+        // overflow (lengths are u32), so acceptance is unchanged; on 32-bit
+        // targets a huge declared length now returns None instead of panicking.
         if script_sig.len() < 8 { return None; }
-        let sig_len = u32::from_le_bytes(script_sig[..4].try_into().ok()?) as usize;
-        if script_sig.len() < sig_len.checked_add(8)? { return None; }
-        let sig = script_sig[4..4 + sig_len].to_vec();
-        let pk_len = u32::from_le_bytes(
-            script_sig[4 + sig_len..8 + sig_len].try_into().ok()?
-        ) as usize;
-        // Exact length: no trailing bytes, so a relay cannot pad a witness.
-        if script_sig.len() != 8usize.checked_add(sig_len)?.checked_add(pk_len)? { return None; }
-        let pk = script_sig[8 + sig_len..8 + sig_len + pk_len].to_vec();
-        Some((sig, pk))
+        let sig_len = usize::try_from(u32::from_le_bytes(script_sig[..4].try_into().ok()?)).ok()?;
+        let sig_end = sig_len.checked_add(4)?;
+        let pk_len_end = sig_end.checked_add(4)?;
+        if script_sig.len() < pk_len_end { return None; }
+        let sig = &script_sig[4..sig_end];
+        let pk_len = usize::try_from(u32::from_le_bytes(
+            script_sig[sig_end..pk_len_end].try_into().ok()?
+        )).ok()?;
+        let pk_end = pk_len_end.checked_add(pk_len)?;
+        if script_sig.len() < pk_end { return None; }
+        let pk = &script_sig[pk_len_end..pk_end];
+        Some((sig, pk, pk_end))
     }
 
     /// Build script_sig from sig + pubkey
@@ -1000,7 +1190,21 @@ impl Block {
         out
     }
 
-    /// Strict inverse of `to_wire_bytes`: trailing bytes are rejected.
+    /// `to_wire_bytes().len()`, computed without encoding. The size measure
+    /// of `MAX_BLOCK_SIZE` at/after the hardening activation (VAL-12).
+    pub fn wire_size(&self) -> usize {
+        let header = 4 + varint_len(self.header.parents.len() as u64) + 32 * self.header.parents.len()
+            + 32 + 8 + 4 + 8 + 8 + 8;
+        let txs: usize = self.transactions.iter().map(|t| t.wire_size(true)).sum();
+        let shielded: usize = self.shielded_transactions.iter().map(shielded_tx_wire_size).sum();
+        header
+            + varint_len(self.transactions.len() as u64) + txs
+            + varint_len(self.shielded_transactions.len() as u64) + shielded
+    }
+
+    /// Strict inverse of `to_wire_bytes`: trailing bytes and non-minimal
+    /// varints are rejected, so an accepted `bytes` is exactly
+    /// `to_wire_bytes()` of the result.
     pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, String> {
         let (header, blue_score, height, header_len) = BlockHeader::read_wire_bytes(bytes)?;
         let body = &bytes[header_len..];
@@ -1015,9 +1219,12 @@ impl Block {
         let mut transactions = Vec::with_capacity((tx_count as usize).min(remaining / 10 + 1));
         let mut offset = cur.position() as usize;
         for i in 0..tx_count {
-            let tx = Transaction::from_wire_bytes(&body[offset..])
+            // Advance by the bytes the transaction decoder consumed, never by
+            // the length of a re-encoding (a different frame for any input
+            // that does not round-trip byte for byte).
+            let (tx, used) = Transaction::read_wire_bytes(&body[offset..])
                 .map_err(|e| format!("tx[{}] parse: {}", i, e))?;
-            offset += tx.to_wire_bytes(true).len();
+            offset += used;
             transactions.push(tx);
         }
 
@@ -1048,12 +1255,24 @@ impl Block {
         Ok(Block { header, transactions, blue_score, height, shielded_transactions, powit })
     }
 
-    /// Merkle commitment over the block body — transparent and shielded txs.
-    /// With no shielded txs it equals `Transaction::merkle_root(transparent)`.
+    /// Merkle commitment over the block body — transparent and shielded txs —
+    /// under the process-wide hardening activation height (see
+    /// [`Block::body_merkle_root_at`]).
     pub fn body_merkle_root(&self) -> MerkleRoot {
-        let tx_root = Transaction::merkle_root(&self.transactions);
+        self.body_merkle_root_at(activation::hardening_activation_height())
+    }
+
+    /// Merkle commitment over the block body for an explicit activation
+    /// height. The transaction root is `Transaction::merkle_root` (legacy)
+    /// below the activation and the tagged tree of `block_rules` at/after it
+    /// (audit VAL-10), judged at this block's header height. From
+    /// `powit_height()` the body root is v2 (transparent, shielded and PoWit
+    /// sections, always); below it, with no shielded txs the commitment is
+    /// the transaction root itself.
+    pub fn body_merkle_root_at(&self, activation_height: u64) -> MerkleRoot {
+        let hardened = block_rules::rules_active_at(self.height, activation_height);
+        let tx_root = block_rules::tx_merkle_root(&self.transactions, hardened);
         if powit_active(self.height) {
-            // v2 body root: transparent, shielded and PoWit sections, always.
             let mut c = Sha3_256::new();
             c.update(b"gnb:block:body:v2");
             c.update(tx_root.0);
@@ -1097,6 +1316,11 @@ impl Block {
         self.body_merkle_root() == self.header.merkle_root
     }
 
+    /// [`Block::validate_merkle`] for an explicit activation height.
+    pub fn validate_merkle_at(&self, activation_height: u64) -> bool {
+        self.body_merkle_root_at(activation_height) == self.header.merkle_root
+    }
+
     /// GnB-SMH proof of work: GnB-SMH(pow_preimage, nonce) < target(bits).
     ///
     /// Malformed or zero `bits` never validate. This checks the proof against
@@ -1108,6 +1332,16 @@ impl Block {
             Ok(t) => t,
             Err(_) => return false,
         };
+        // POW-9 (audit): explicit `target <= pow_limit`. Below the hardening
+        // activation the largest decodable compact target IS the pow limit,
+        // but the proof must never rely on that coincidence of the encoding.
+        // At/after it (POW-3) the limit is the genesis target, judged at the
+        // block's header height (`accept_block` checks that height against
+        // the parents before the proof is used). Fails closed before any
+        // evaluation is spent.
+        if target.0 > Self::pow_limit_target_for_height(self.height) {
+            return false;
+        }
         let id = self.block_hash();
         if let Ok(cache) = pow_cache().lock() {
             if cache.set.contains(&id) {
@@ -1118,14 +1352,14 @@ impl Block {
                                       self.header.nonce, &target);
         if ok {
             if let Ok(mut cache) = pow_cache().lock() {
-                if cache.set.insert(id) {
-                    cache.order.push_back(id);
-                    if cache.order.len() > POW_CACHE_CAPACITY {
-                        if let Some(old) = cache.order.pop_front() {
-                            cache.set.remove(&old);
-                        }
-                    }
-                }
+                // Insert with FIFO eviction: `PowCache::insert`, defined at
+                // the end of this file so that the code the browser wallet
+                // core compiles keeps its line numbers (panic locations are
+                // part of the reproducible WASM, audit WAL-5; this comment
+                // fills the lines the inlined insert took). It is a function
+                // of its own so that its eviction bound can be tested
+                // (docs/testing/MUTATION.md).
+                cache.insert(id);
             }
         }
         ok
@@ -1136,6 +1370,33 @@ impl Block {
     pub fn pow_is_cached(&self) -> bool {
         let id = self.block_hash();
         pow_cache().lock().map(|c| c.set.contains(&id)).unwrap_or(false)
+    }
+
+    /// POW-9: `target <= POW_LIMIT_BITS` (both big-endian), the pre-activation
+    /// pow limit. `validate_pow` checks the limit of the block's own height
+    /// ([`Block::pow_limit_target_for_height`]).
+    pub fn target_within_pow_limit(target: &[u8; 32]) -> bool {
+        *target <= bits_to_target(POW_LIMIT_BITS)
+    }
+
+    /// POW-3: `target <= pow limit at header height `height`` for an explicit
+    /// activation height (`block_rules::pow_limit_bits_at`): the genesis
+    /// target at/after the activation, `POW_LIMIT_BITS` before.
+    pub fn target_within_pow_limit_at(target: &[u8; 32], height: u64, activation_height: u64) -> bool {
+        *target <= bits_to_target(block_rules::pow_limit_bits_at(height, activation_height))
+    }
+
+    /// The pow limit `validate_pow` enforces for a block at header height
+    /// `height` under the process-wide activation height. Under the dev-only
+    /// `test-pow-limit` feature every expected target is pinned to
+    /// `POW_LIMIT_BITS`, so the limit stays `POW_LIMIT_BITS` there too (a
+    /// node binary with that feature refuses mainnet; POW-9 / POW-3 are
+    /// therefore not reachable in the functional tests).
+    pub fn pow_limit_target_for_height(height: u64) -> [u8; 32] {
+        if TEST_POW_LIMIT {
+            return bits_to_target(POW_LIMIT_BITS);
+        }
+        bits_to_target(block_rules::pow_limit_bits_at(height, activation::hardening_activation_height()))
     }
 
     /// Basic coinbase format check (value is checked with fees in accept_block).
@@ -1214,7 +1475,8 @@ impl Block {
     }
 
     /// Validate the timestamp is within acceptable bounds.
-    /// `parent_timestamp`: timestamp of the selected parent (or 0 for genesis).
+    /// `parent_timestamp`: the latest timestamp over all of the block's
+    /// parents (the node passes the max; 0 for genesis).
     pub fn validate_timestamp(&self, parent_timestamp: u64) -> Result<(), &'static str> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1247,7 +1509,7 @@ impl Block {
     /// the witness commitment to the coinbase script_sig and refresh the
     /// header's merkle root. Call after the transaction list is final.
     pub fn commit_witnesses(&mut self) {
-        if self.height < WITNESS_COMMITMENT_HEIGHT || self.transactions.is_empty() {
+        if !suffix_witness_commitment_required(self.height) || self.transactions.is_empty() {
             return;
         }
         let commitment = self.witness_commitment();
@@ -1260,7 +1522,7 @@ impl Block {
     /// From [`WITNESS_COMMITMENT_HEIGHT`], the coinbase commits to every
     /// witness in the block, so the block hash covers them.
     pub fn validate_witness_commitment(&self) -> Result<(), &'static str> {
-        if self.height < WITNESS_COMMITMENT_HEIGHT {
+        if !suffix_witness_commitment_required(self.height) {
             return Ok(());
         }
         let cb = self.transactions.first().and_then(|t| t.inputs.first())
@@ -1291,17 +1553,52 @@ impl Block {
         Ok(())
     }
 
-    /// Structural validation WITHOUT the proof of work: every context-free
-    /// check that costs microseconds. Network and RPC ingress run this first
-    /// and evaluate the 64 MiB / ~0.5 s proof of work only after the
-    /// contextual checks (parents, height, `bits == expected_bits`), so a
-    /// peer cannot make a node evaluate GnB-SMH for a header whose difficulty
-    /// is not the consensus difficulty.
+    /// Every context-free check that costs microseconds (no proof of work);
+    /// same as [`Block::validate_structure_without_pow`].
     pub fn validate_structure_cheap(&self) -> Result<(), &'static str> {
+        self.validate_structure_without_pow()
+    }
+
+    /// Structural validation. Cheap checks run first; the proof of work runs
+    /// last. Does NOT check coinbase value, fees, bits or height (those need
+    /// consensus context).
+    ///
+    /// Exactly `validate_structure_without_pow()` followed by `validate_pow()`.
+    /// Network ingress (NET-2) calls the two halves separately so the cheap
+    /// contextual checks (expected bits, height, timestamp, or the orphan
+    /// anti-DoS work floor) can run BETWEEN them, before the 64 MiB
+    /// evaluation; the proof itself is still verified on every ingress path.
+    pub fn validate_structure(&self) -> Result<(), &'static str> {
+        self.validate_structure_without_pow()?;
+        if !self.validate_pow()                       { return Err("invalid PoW"); }
+        Ok(())
+    }
+
+    /// The cheap, context-free half of [`Block::validate_structure`]: parent
+    /// count, size, merkle commitment, coinbase format, duplicate txs, dust,
+    /// and at/after the hardening activation the 64-byte rule and the
+    /// coinbase commitment. Does NOT verify the proof of work — a caller that
+    /// uses this MUST call [`Block::validate_pow`] (directly or through the
+    /// node's `accept_block`) before treating the block as valid. Uses the
+    /// process-wide activation height and the block's (claimed) header
+    /// height; `accept_block` re-checks the height-dependent rules once the
+    /// height is verified against the parents.
+    pub fn validate_structure_without_pow(&self) -> Result<(), &'static str> {
+        self.validate_structure_without_pow_at(activation::hardening_activation_height())
+    }
+
+    /// [`Block::validate_structure_without_pow`] for an explicit activation
+    /// height. Below the activation it is exactly the pre-activation check
+    /// (bincode size, legacy Merkle root).
+    pub fn validate_structure_without_pow_at(&self, activation_height: u64) -> Result<(), &'static str> {
+        let hardened = block_rules::rules_active_at(self.height, activation_height);
         if self.header.parents.len() > MAX_PARENTS   { return Err("too many parents"); }
-        if self.size_bytes() > MAX_BLOCK_SIZE        { return Err("block too large"); }
-        if !self.validate_merkle()                    { return Err("invalid merkle root"); }
+        if block_rules::block_size_for_rules(self, hardened) > MAX_BLOCK_SIZE { return Err("block too large"); }
+        if !self.validate_merkle_at(activation_height) { return Err("invalid merkle root"); }
         if !self.validate_coinbase_format()           { return Err("invalid coinbase format"); }
+        if hardened {
+            block_rules::check_hardened_body(self)?;
+        }
         self.validate_no_duplicate_txs()?;
         self.validate_dust()?;
         self.validate_witness_commitment()?;
@@ -1327,20 +1624,470 @@ impl Block {
         Ok(())
     }
 
-    /// Structural validation including the proof of work against the
-    /// header's own `bits`. Does NOT check coinbase value, fees, bits or
-    /// height (those need consensus context). Prefer
-    /// `validate_structure_cheap` on untrusted ingress paths.
-    pub fn validate_structure(&self) -> Result<(), &'static str> {
-        self.validate_structure_cheap()?;
-        if !self.validate_pow()                       { return Err("invalid PoW"); }
-        Ok(())
-    }
-
     /// Consensus size: the hand-written wire encoding (`to_wire_bytes`), the
     /// bytes that are relayed and stored, never a serde/bincode encoding.
     pub fn size_bytes(&self) -> usize {
         self.to_wire_bytes().len()
+    }
+}
+
+#[cfg(test)]
+mod structure_split_tests {
+    //! NET-2 / POW-9 regressions: the cheap structural half is separable from
+    //! the proof of work, and `validate_pow` checks `target <= pow_limit`.
+    use super::*;
+
+    fn block_with(bits: u32, nonce: u64) -> Block {
+        let txs = vec![Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0u8; 32],
+                prev_index: u32::MAX,
+                script_sig: b"structure-split".to_vec(),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOutput { value: 1, script_pubkey: vec![7u8; 20] }],
+            locktime: 0,
+        }];
+        let mut b = Block {
+            header: BlockHeader {
+                version: 1,
+                parents: vec![[0x11; 32]],
+                merkle_root: MerkleRoot::ZERO,
+                timestamp: GENESIS_TIMESTAMP,
+                bits,
+                nonce,
+            },
+            transactions: txs,
+            blue_score: 1,
+            height: 1,
+            shielded_transactions: vec![],
+            powit: Default::default(),
+        };
+        b.header.merkle_root = b.body_merkle_root();
+        b
+    }
+
+    #[test]
+    fn target_above_pow_limit_is_rejected() {
+        assert!(!Block::target_within_pow_limit(&[0xFF; 32]), "target above the limit must fail");
+        assert!(Block::target_within_pow_limit(&bits_to_target(POW_LIMIT_BITS)), "the limit itself is allowed");
+        assert!(Block::target_within_pow_limit(&bits_to_target(GENESIS_BITS)));
+        // One unit above the limit is already out of range.
+        let mut above = bits_to_target(POW_LIMIT_BITS);
+        let last = above.iter().rposition(|&b| b != 0xFF).expect("limit is not all-ones");
+        above[last] = above[last].wrapping_add(1);
+        for b in above.iter_mut().skip(last + 1) { *b = 0; }
+        assert!(!Block::target_within_pow_limit(&above));
+    }
+
+    #[test]
+    fn malformed_bits_never_validate_and_cost_no_evaluation() {
+        // Negative-flag bits: rejected by the decoder before any evaluation.
+        let b = block_with(0x0480_0001, 0);
+        let t = std::time::Instant::now();
+        assert!(!b.validate_pow());
+        assert!(t.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn cheap_half_accepts_well_formed_block_regardless_of_pow() {
+        // Hard target, arbitrary nonce: the PoW fails, the cheap half passes.
+        let mut b = block_with(GENESIS_BITS, 0);
+        assert!((0..16).any(|n| { b.header.nonce = n; !b.validate_pow() }), "no FAILING nonce in 16 (each passes w.p. ~1/4,500; bounded: a broken proof check or cache must fail, not hang)");
+        assert_eq!(b.validate_structure_without_pow(), Ok(()));
+        assert_eq!(b.validate_structure(), Err("invalid PoW"),
+            "validate_structure must still verify the proof of work");
+    }
+
+    #[test]
+    fn cheap_half_still_rejects_structural_faults() {
+        let mut b = block_with(POW_LIMIT_BITS, 0);
+        b.header.merkle_root = MerkleRoot([9u8; 32]);
+        assert_eq!(b.validate_structure_without_pow(), Err("invalid merkle root"));
+        let mut b = block_with(POW_LIMIT_BITS, 0);
+        b.header.parents = vec![[1u8; 32]; MAX_PARENTS + 1];
+        assert_eq!(b.validate_structure_without_pow(), Err("too many parents"));
+        let mut b = block_with(POW_LIMIT_BITS, 0);
+        b.transactions.clear();
+        b.header.merkle_root = b.body_merkle_root();
+        assert_eq!(b.validate_structure_without_pow(), Err("invalid coinbase format"));
+    }
+}
+
+#[cfg(test)]
+mod wire_canonical_tests {
+    //! Regressions found by the `wire_roundtrip` fuzz target: the wire
+    //! decoders accepted non-minimal CompactSize varints, so a block, header
+    //! or transaction had many byte encodings, and `Block::from_wire_bytes`
+    //! advanced past each transaction by the length of its RE-ENCODING, not by
+    //! the bytes it consumed.
+    use super::*;
+
+    fn tx(script_len: usize, locktime: u32) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [7; 32], prev_index: 1, script_sig: vec![0xAB; script_len], sequence: 9 }],
+            outputs: vec![TxOutput { value: 1_000, script_pubkey: vec![0x5A; 20] }],
+            locktime,
+        }
+    }
+
+    fn block(txs: Vec<Transaction>) -> Block {
+        Block {
+            header: BlockHeader { version: 1, parents: vec![[1; 32]], merkle_root: MerkleRoot::ZERO, timestamp: 5, bits: POW_LIMIT_BITS, nonce: 3 },
+            transactions: txs,
+            blue_score: 2,
+            height: 2,
+            shielded_transactions: vec![],
+            powit: Default::default(),
+        }
+    }
+
+    /// Replace the one-byte varint at `at` (value < 0xFD) by `FD v 00`.
+    fn widen(bytes: &[u8], at: usize) -> Vec<u8> {
+        assert!(bytes[at] < 0xFD);
+        let mut v = bytes[..at].to_vec();
+        v.extend_from_slice(&[0xFD, bytes[at], 0x00]);
+        v.extend_from_slice(&bytes[at + 1..]);
+        v
+    }
+
+    /// Each form accepts exactly the values the shorter forms cannot hold.
+    #[test]
+    fn varint_minimality_boundaries() {
+        let rd = |b: &[u8]| read_varint(&mut Cursor::new(b));
+        assert_eq!(rd(&[0xFC]), Ok(0xFC));
+        assert!(rd(&[0xFD, 0xFC, 0x00]).is_err());
+        assert_eq!(rd(&[0xFD, 0xFD, 0x00]), Ok(0xFD));
+        assert_eq!(rd(&[0xFD, 0xFF, 0xFF]), Ok(0xFFFF));
+        assert!(rd(&[0xFE, 0xFF, 0xFF, 0x00, 0x00]).is_err());
+        assert_eq!(rd(&[0xFE, 0x00, 0x00, 0x01, 0x00]), Ok(0x1_0000));
+        assert!(rd(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]).is_err());
+        assert_eq!(rd(&[0xFF, 0, 0, 0, 0, 1, 0, 0, 0]), Ok(0x1_0000_0000));
+        for n in [0u64, 0xFC, 0xFD, 0xFFFF, 0x1_0000, 0xFFFF_FFFF, 0x1_0000_0000, u64::MAX] {
+            let mut v = Vec::new();
+            write_varint(&mut v, n);
+            assert_eq!(v.len(), varint_len(n));
+            let mut c = Cursor::new(&v[..]);
+            assert_eq!(read_varint(&mut c), Ok(n));
+            assert_eq!(c.position() as usize, v.len());
+        }
+    }
+
+    #[test]
+    fn non_minimal_varints_are_refused_by_every_decoder() {
+        let t = tx(12, 0);
+        let enc = t.to_wire_bytes(true);
+        // input count (offset 4), script_sig length (4 + 1 + 36), output
+        // count, script_pubkey length.
+        let sig_len_at = 4 + 1 + 32 + 4;
+        let out_count_at = sig_len_at + 1 + 12 + 4;
+        for at in [4, sig_len_at, out_count_at, out_count_at + 1 + 8] {
+            let wide = widen(&enc, at);
+            assert!(Transaction::from_wire_bytes(&wide).is_err(), "tx varint at {at} accepted in a 3-byte form");
+        }
+        // The 5- and 9-byte forms of a small value.
+        let mut five = enc[..4].to_vec();
+        five.extend_from_slice(&[0xFE, 1, 0, 0, 0]);
+        five.extend_from_slice(&enc[5..]);
+        assert!(Transaction::from_wire_bytes(&five).is_err());
+        let mut nine = enc[..4].to_vec();
+        nine.extend_from_slice(&[0xFF, 1, 0, 0, 0, 0, 0, 0, 0]);
+        nine.extend_from_slice(&enc[5..]);
+        assert!(Transaction::from_wire_bytes(&nine).is_err());
+
+        // Header parent count, block tx count, shielded count.
+        let b = block(vec![t.clone()]);
+        let h = b.header.to_wire_bytes(2, 2);
+        assert!(BlockHeader::from_wire_bytes(&widen(&h, 4)).is_err(), "parent count");
+        let w = b.to_wire_bytes();
+        assert!(Block::from_wire_bytes(&widen(&w, h.len())).is_err(), "tx count");
+        assert!(Block::from_wire_bytes(&widen(&w, w.len() - 1)).is_err(), "shielded count");
+        assert!(Block::from_wire_bytes(&w).is_ok());
+
+        // Minimal multi-byte forms stay valid at the boundaries.
+        for n in [0xFC, 0xFD, 0xFE, 0xFF, 0x100, 9_999] {
+            let t = tx(n, 1);
+            let e = t.to_wire_bytes(true);
+            let (back, used) = Transaction::read_wire_bytes(&e).unwrap();
+            assert_eq!((back.inputs[0].script_sig.len(), used), (n, e.len()));
+        }
+    }
+
+    /// `is_non_minimal_varint_error` names the minimal-varint refusals of
+    /// every decoder and no other decode error. The node answers the former
+    /// with Ignore and every other malformed block with Reject
+    /// (`ingress::verdict_for_block_decode_error`), so a classifier that
+    /// matched any error would spare every malformed block its penalty.
+    #[test]
+    fn non_minimal_varint_error_names_only_that_refusal() {
+        fn refusal<T>(r: Result<T, String>, what: &str) -> String {
+            match r {
+                Ok(_) => panic!("{what}: accepted"),
+                Err(e) => e,
+            }
+        }
+        let t = tx(12, 0);
+        let e = t.to_wire_bytes(true);
+        let b = block(vec![t.clone()]);
+        let h = b.header.to_wire_bytes(2, 2);
+        let w = b.to_wire_bytes();
+        let widened = [
+            refusal(Transaction::from_wire_bytes(&widen(&e, 4)), "tx input count"),
+            refusal(Transaction::read_wire_bytes(&widen(&e, 4 + 1 + 32 + 4)), "tx script_sig length"),
+            refusal(BlockHeader::from_wire_bytes(&widen(&h, 4)), "header parent count"),
+            refusal(Block::from_wire_bytes(&widen(&w, h.len())), "block tx count"),
+            refusal(Block::from_wire_bytes(&widen(&w, w.len() - 1)), "block shielded count"),
+        ];
+        for err in &widened {
+            assert!(is_non_minimal_varint_error(err), "{err}");
+        }
+
+        let mut trailing = w.clone();
+        trailing.push(0);
+        let mut too_many = w.clone();
+        too_many[h.len()] = 2; // two transactions announced, one present
+        let mut bad_tag = w.clone();
+        bad_tag[h.len()] = 0xFD; // a 3-byte tx count with its bytes missing
+        bad_tag.truncate(h.len() + 2);
+        let other = [
+            refusal(Block::from_wire_bytes(&w[..w.len() - 1]), "block truncated"),
+            refusal(Block::from_wire_bytes(&trailing), "block with a trailing byte"),
+            refusal(Block::from_wire_bytes(&too_many), "block missing a transaction"),
+            refusal(Block::from_wire_bytes(&bad_tag), "block with a cut varint"),
+            refusal(Block::from_wire_bytes(&[]), "empty block"),
+            refusal(BlockHeader::from_wire_bytes(&h[..h.len() - 1]), "header truncated"),
+            refusal(Transaction::from_wire_bytes(&e[..e.len() - 1]), "tx truncated"),
+            refusal(Transaction::from_wire_bytes(&[]), "empty tx"),
+        ];
+        for err in &other {
+            assert!(!is_non_minimal_varint_error(err), "{err}");
+        }
+    }
+
+    /// The pre-fix decoder accepted these bytes: the transaction's script
+    /// length is `FD 0C 00` (two bytes longer than minimal), the block parser
+    /// then read the shielded count from the transaction's last two locktime
+    /// bytes (`FD 00`) plus the real count byte, and the frame "fit".
+    #[test]
+    fn block_transactions_are_framed_by_the_bytes_consumed() {
+        let t = tx(12, u32::from_le_bytes([0x11, 0x22, 0xFD, 0x00]));
+        let b = block(vec![t]);
+        let w = b.to_wire_bytes();
+        let hdr = b.header.to_wire_bytes(2, 2).len();
+        let sig_len_at = hdr + 1 + 4 + 1 + 32 + 4;
+        assert_eq!(w[sig_len_at], 12);
+        let crafted = widen(&w, sig_len_at);
+        assert!(Block::from_wire_bytes(&crafted).is_err(), "a mis-framed block encoding was accepted");
+        // Canonical encodings: consumed bytes == encoding length.
+        for t in &b.transactions {
+            let e = t.to_wire_bytes(true);
+            let mut longer = e.clone();
+            longer.extend_from_slice(&[1, 2, 3]);
+            assert_eq!(Transaction::read_wire_bytes(&longer).unwrap().1, e.len());
+        }
+        let back = Block::from_wire_bytes(&w).unwrap();
+        assert_eq!(back.to_wire_bytes(), w);
+        // The pre-fix decoder (below) read these bytes as the same block.
+        let old = pre_fix_block(&crafted).expect("the pre-fix decoder accepted the crafted bytes");
+        assert_eq!(old.to_wire_bytes(), w);
+        assert!(is_non_minimal_varint_error(&Block::from_wire_bytes(&crafted).unwrap_err()));
+    }
+
+    // ── The block decoder before the minimal-varint rule ────────────────────
+    // A copy of the decoder of the releases before H-fuzz (origin/main at
+    // 6321605): lenient varints, each transaction framed at its re-encoded
+    // length. Kept only to pin which bytes the rule newly refuses.
+
+    fn pre_fix_varint(cur: &mut Cursor<&[u8]>) -> Result<u64, String> {
+        let mut tag = [0u8; 1];
+        cur.read_exact(&mut tag).map_err(|_| "varint: unexpected EOF on tag".to_string())?;
+        match tag[0] {
+            0xFF => { let mut b = [0u8; 8]; cur.read_exact(&mut b).map_err(|_| "varint u64 EOF")?; Ok(u64::from_le_bytes(b)) }
+            0xFE => { let mut b = [0u8; 4]; cur.read_exact(&mut b).map_err(|_| "varint u32 EOF")?; Ok(u32::from_le_bytes(b) as u64) }
+            0xFD => { let mut b = [0u8; 2]; cur.read_exact(&mut b).map_err(|_| "varint u16 EOF")?; Ok(u16::from_le_bytes(b) as u64) }
+            n => Ok(n as u64),
+        }
+    }
+
+    fn pre_fix_tx(bytes: &[u8]) -> Result<Transaction, String> {
+        let mut cur = Cursor::new(bytes);
+        let version = read_u32_le(&mut cur)?;
+        let in_count = pre_fix_varint(&mut cur)?;
+        if in_count > 100_000 { return Err(format!("implausible input count {in_count}")); }
+        let mut inputs = Vec::new();
+        for _ in 0..in_count {
+            let prev_txid = read_32(&mut cur)?;
+            let prev_index = read_u32_le(&mut cur)?;
+            let sig_len = pre_fix_varint(&mut cur)?;
+            if sig_len > 10_000 { return Err(format!("implausible script_sig length {sig_len}")); }
+            let script_sig = read_bytes(&mut cur, sig_len as usize)?;
+            let sequence = read_u32_le(&mut cur)?;
+            inputs.push(TxInput { prev_txid, prev_index, script_sig, sequence });
+        }
+        let out_count = pre_fix_varint(&mut cur)?;
+        if out_count > 100_000 { return Err(format!("implausible output count {out_count}")); }
+        let mut outputs = Vec::new();
+        for _ in 0..out_count {
+            let value = read_u64_le(&mut cur)?;
+            let spk_len = pre_fix_varint(&mut cur)?;
+            if spk_len > 10_000 { return Err(format!("implausible script_pubkey length {spk_len}")); }
+            let script_pubkey = read_bytes(&mut cur, spk_len as usize)?;
+            outputs.push(TxOutput { value, script_pubkey });
+        }
+        let locktime = read_u32_le(&mut cur)?;
+        Ok(Transaction { version, inputs, outputs, locktime })
+    }
+
+    fn pre_fix_shielded(cur: &mut Cursor<&[u8]>) -> Result<coherence_core::ShieldedTx, String> {
+        let anchor = read_32(cur)?;
+        let nf_n = pre_fix_varint(cur)?;
+        if nf_n > 100_000 { return Err(format!("implausible nullifier count {nf_n}")); }
+        let mut nullifiers = Vec::new();
+        for _ in 0..nf_n { nullifiers.push(read_32(cur)?); }
+        let out_n = pre_fix_varint(cur)?;
+        if out_n > 100_000 { return Err(format!("implausible output count {out_n}")); }
+        let mut outputs = Vec::new();
+        for _ in 0..out_n { outputs.push(read_32(cur)?); }
+        let fee = read_u64_le(cur)?;
+        let proof_len = pre_fix_varint(cur)?;
+        if proof_len > 8_000_000 { return Err(format!("implausible proof length {proof_len}")); }
+        let proof = read_bytes(cur, proof_len as usize)?;
+        let sig_len = pre_fix_varint(cur)?;
+        if sig_len > 100_000 { return Err(format!("implausible binding_sig length {sig_len}")); }
+        let binding_sig = read_bytes(cur, sig_len as usize)?;
+        Ok(coherence_core::ShieldedTx { anchor, nullifiers, outputs, fee, proof, binding_sig })
+    }
+
+    fn pre_fix_block(bytes: &[u8]) -> Result<Block, String> {
+        let mut cur = Cursor::new(bytes);
+        let version = read_u32_le(&mut cur)?;
+        let n = pre_fix_varint(&mut cur)?;
+        if n > MAX_PARENTS as u64 { return Err(format!("implausible parent count {n}")); }
+        let mut parents = Vec::new();
+        for _ in 0..n { parents.push(read_32(&mut cur)?); }
+        let merkle_root = MerkleRoot(read_32(&mut cur)?);
+        let timestamp = read_u64_le(&mut cur)?;
+        let bits = read_u32_le(&mut cur)?;
+        let nonce = read_u64_le(&mut cur)?;
+        let blue_score = read_u64_le(&mut cur)?;
+        let height = read_u64_le(&mut cur)?;
+        let header = BlockHeader { version, parents, merkle_root, timestamp, bits, nonce };
+        let body = &bytes[cur.position() as usize..];
+        let mut cur = Cursor::new(body);
+        let tx_count = pre_fix_varint(&mut cur)?;
+        if tx_count > 1_000_000 { return Err(format!("implausible tx count {tx_count}")); }
+        let mut offset = cur.position() as usize;
+        let mut transactions = Vec::new();
+        for _ in 0..tx_count {
+            let tx = pre_fix_tx(&body[offset..])?;
+            offset += tx.to_wire_bytes(true).len();
+            transactions.push(tx);
+        }
+        let mut sh_cur = Cursor::new(&body[offset..]);
+        let sh_count = pre_fix_varint(&mut sh_cur)?;
+        if sh_count > 100_000 { return Err(format!("implausible shielded count {sh_count}")); }
+        let mut shielded_transactions = Vec::new();
+        for _ in 0..sh_count { shielded_transactions.push(pre_fix_shielded(&mut sh_cur)?); }
+        offset += sh_cur.position() as usize;
+        // The PoWit section (from powit_height), read as the real decoder does.
+        let powit = if powit_active(height) {
+            let mut pc = Cursor::new(&body[offset..]);
+            let pb = powit::PowitBody::read_wire(&mut pc).map_err(|e| format!("powit section: {e}"))?;
+            offset += pc.position() as usize;
+            pb
+        } else {
+            powit::PowitBody::default()
+        };
+        if offset != body.len() { return Err("trailing bytes in block body".into()); }
+        Ok(Block { header, transactions, blue_score, height, shielded_transactions, powit })
+    }
+
+    /// Bytes the pre-fix decoder accepts are either accepted by the current
+    /// decoder as the same block, or refused with the minimal-varint error
+    /// (`is_non_minimal_varint_error`), never with another error: a node
+    /// can answer a widened copy relayed by an older node without a penalty
+    /// and keep the penalty for every other malformed block. Frames: every
+    /// one-byte value widened to the 3-, 5- and 9-byte forms, and seeded
+    /// random byte edits of those and of the canonical encodings.
+    #[test]
+    fn pre_fix_acceptances_fail_on_a_non_minimal_varint() {
+        let fd00 = u32::from_le_bytes([0x11, 0x22, 0xFD, 0x00]);
+        let mut shielded = block(vec![tx(3, 0)]);
+        shielded.shielded_transactions = vec![coherence_core::ShieldedTx {
+            anchor: [5; 32], nullifiers: vec![[6; 32]], outputs: vec![[7; 32], [8; 32]], fee: 3,
+            proof: vec![1, 2, 3], binding_sig: vec![4; 5],
+        }];
+        let bases = [
+            block(vec![tx(12, fd00)]),
+            block(vec![tx(0xFC, 7), tx(1, 0x00FD_0000), tx(12, fd00)]),
+            block(vec![tx(0xFD, 1), tx(0, 2)]),
+            shielded,
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let (mut frames, mut newly_refused, mut misframed) = (0usize, 0usize, 0usize);
+        for b in &bases {
+            let w = b.to_wire_bytes();
+            // The transactions' bytes (after the header and the 1-byte count).
+            let txs_at = b.header.to_wire_bytes(b.blue_score, b.height).len() + 1;
+            let txs_end = txs_at + b.transactions.iter().map(|t| t.wire_size(true)).sum::<usize>();
+            // (frame, widened inside a transaction)
+            let mut cands = vec![(w.clone(), false)];
+            for at in 0..w.len() {
+                if w[at] < 0xFD {
+                    for form in [&[0xFD, w[at], 0][..], &[0xFE, w[at], 0, 0, 0], &[0xFF, w[at], 0, 0, 0, 0, 0, 0, 0]] {
+                        let mut v = w[..at].to_vec();
+                        v.extend_from_slice(form);
+                        v.extend_from_slice(&w[at + 1..]);
+                        cands.push((v, (txs_at..txs_end).contains(&at)));
+                    }
+                }
+            }
+            for i in 0..cands.len() * 4 {
+                let mut v = cands[i % cands.len()].0.clone();
+                for _ in 0..1 + rnd(3) {
+                    let at = rnd(v.len());
+                    match rnd(3) {
+                        0 => v[at] = rnd(256) as u8,
+                        1 => v.insert(at, rnd(256) as u8),
+                        _ => { v.remove(at); }
+                    }
+                }
+                cands.push((v, false));
+            }
+            for (f, in_tx) in &cands {
+                frames += 1;
+                match (pre_fix_block(f), Block::from_wire_bytes(f)) {
+                    (old, Ok(new)) => {
+                        assert_eq!(new.to_wire_bytes(), *f, "an accepted frame is the encoding of its block");
+                        let old = old.expect("bytes the current decoder accepts were accepted before");
+                        assert_eq!(old.to_wire_bytes(), *f);
+                    }
+                    (Ok(_), Err(e)) => {
+                        assert!(is_non_minimal_varint_error(&e),
+                            "bytes the pre-fix decoder accepted are refused for another reason: {e}");
+                        newly_refused += 1;
+                        // Widened inside a transaction: framed at the
+                        // re-encoded length, the old decoder read the next
+                        // field from inside that transaction and still "fit".
+                        if *in_tx {
+                            misframed += 1;
+                        }
+                    }
+                    (Err(_), Err(_)) => {}
+                }
+            }
+        }
+        assert!(frames > 20_000, "{frames} frames");
+        assert!(newly_refused > 100, "{newly_refused} frames newly refused");
+        assert!(misframed >= 2, "{misframed} mis-framed acceptances");
     }
 }
 
@@ -1415,8 +2162,8 @@ mod validate_coinbase_value_tests {
 // blue work replaces the current selected chain, UTXOs mutated by the
 // losing branch must be reverted. We persist an UndoData record per block
 // so the eventual rollback_block() primitive (Sprint U.2) can replay the
-// mutations in reverse. Kept in storage only while the block is within the
-// finality window; records below finalized_height are pruned in Sprint U.3.
+// mutations in reverse. Kept for every connected block (never pruned): there
+// is no reorg-depth limit (audit DAG-6).
 
 /// A single input consumed by a block that must be restored on rollback.
 /// Captures the full pre-spend output so we can re-insert it verbatim.
@@ -1427,6 +2174,34 @@ pub struct UndoEntry {
     pub output:     TxOutput,
 }
 
+/// Rows a block REPLACED when it was applied (audit VAL-2 undo fix): an
+/// output whose outpoint was already unspent (a duplicate coinbase txid
+/// before the hardening activation), the coinbase-height row of a reused
+/// coinbase txid, and the tx-index row of a reused txid. Rollback deletes the
+/// block's own rows and then restores these, so a node that applied and then
+/// disconnected the block ends with exactly the state of a node that never
+/// applied it. Empty for every block that overwrote nothing (all of them in
+/// practice, and every block at/after the activation for UTXOs: BIP30).
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct UndoOverwrites {
+    /// Unspent coins replaced by an output of the block, with their old value.
+    pub utxos:            Vec<UndoEntry>,
+    /// Coinbase-height rows replaced: (txid, previous height).
+    pub coinbase_heights: Vec<([u8; 32], u64)>,
+    /// Tx-index rows replaced: (txid, previous block hash, previous height).
+    pub tx_index:         Vec<([u8; 32], [u8; 32], u64)>,
+}
+
+impl UndoOverwrites {
+    pub fn is_empty(&self) -> bool {
+        self.utxos.is_empty() && self.coinbase_heights.is_empty() && self.tx_index.is_empty()
+    }
+}
+
+/// Magic that introduces the version-1 undo extension ([`UndoOverwrites`])
+/// after the legacy encoding of an [`UndoData`] record.
+pub const UNDO_EXTENSION_MAGIC: [u8; 4] = *b"UDX1";
+
 /// Everything accept_block mutated for a given block that rollback_block
 /// needs to undo. Recorded on accept, replayed in reverse on reorg.
 ///
@@ -1435,6 +2210,18 @@ pub struct UndoEntry {
 ///   2. created_utxo_keys — UTXOs inserted via put_utxo    (undo by delete)
 ///   3. coinbase_txids    — coinbase rows in CF_COINBASE   (undo by delete)
 ///   4. tx_index_keys     — rows in CF_TX_INDEX            (undo by delete)
+///
+/// plus `overwritten`, the rows those inserts replaced (restored after the
+/// deletes).
+///
+/// # Stored encoding (backward compatible)
+///
+/// [`UndoData::to_bytes`] writes the bincode (standard config) encoding of
+/// the six legacy fields — byte-identical to the records written before the
+/// extension existed — and, ONLY when `overwritten` is non-empty, appends
+/// `UNDO_EXTENSION_MAGIC || bincode(UndoOverwrites)`. [`UndoData::from_bytes`]
+/// decodes a record without trailing bytes (every record already on disk) as
+/// having nothing overwritten. Old binaries ignore the trailing extension.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct UndoData {
     pub block_hash:        [u8; 32],
@@ -1443,6 +2230,10 @@ pub struct UndoData {
     pub created_utxo_keys: Vec<([u8; 32], u32)>,
     pub coinbase_txids:    Vec<[u8; 32]>,
     pub tx_index_keys:     Vec<[u8; 32]>,
+    /// Not part of the legacy serde encoding; stored as the trailing
+    /// extension (see the type docs).
+    #[serde(skip)]
+    pub overwritten:       UndoOverwrites,
 }
 
 impl UndoData {
@@ -1454,6 +2245,7 @@ impl UndoData {
             created_utxo_keys: Vec::new(),
             coinbase_txids:    Vec::new(),
             tx_index_keys:     Vec::new(),
+            overwritten:       UndoOverwrites::default(),
         }
     }
 
@@ -1463,6 +2255,41 @@ impl UndoData {
             + self.created_utxo_keys.len()
             + self.coinbase_txids.len()
             + self.tx_index_keys.len()
+    }
+
+    /// The stored encoding (see the type docs).
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        let cfg = bincode::config::standard();
+        let mut out = bincode::serde::encode_to_vec(self, cfg)
+            .map_err(|e| format!("undo record encode: {e}"))?;
+        if !self.overwritten.is_empty() {
+            out.extend_from_slice(&UNDO_EXTENSION_MAGIC);
+            out.extend_from_slice(&bincode::serde::encode_to_vec(&self.overwritten, cfg)
+                .map_err(|e| format!("undo extension encode: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    /// Decode a stored record, legacy (no extension) or extended.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let cfg = bincode::config::standard();
+        let (mut undo, used): (UndoData, usize) = bincode::serde::decode_from_slice(bytes, cfg)
+            .map_err(|e| format!("undo record decode: {e}"))?;
+        let rest = &bytes[used..];
+        if rest.is_empty() {
+            return Ok(undo);
+        }
+        if rest.len() < UNDO_EXTENSION_MAGIC.len() || rest[..UNDO_EXTENSION_MAGIC.len()] != UNDO_EXTENSION_MAGIC {
+            return Err(format!("undo record: {} unexpected trailing byte(s)", rest.len()));
+        }
+        let body = &rest[UNDO_EXTENSION_MAGIC.len()..];
+        let (ext, n): (UndoOverwrites, usize) = bincode::serde::decode_from_slice(body, cfg)
+            .map_err(|e| format!("undo extension decode: {e}"))?;
+        if n != body.len() {
+            return Err(format!("undo extension: {} trailing byte(s)", body.len() - n));
+        }
+        undo.overwritten = ext;
+        Ok(undo)
     }
 }
 
@@ -1557,7 +2384,8 @@ pub fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
     hash < target
 }
 
-/// Chain-work contribution of a block at `bits`: ≈ 2^256 / target, 0 for
+/// Chain-work contribution of a block at `bits`: ≈ 2^256 / target (exact
+/// definition: `gnb_smh::difficulty::work`), 0 for
 /// malformed bits.
 pub fn bits_to_work(bits: u32) -> u128 {
     gnb_smh::difficulty::work_from_bits(bits)
@@ -1653,6 +2481,9 @@ mod powit_pow_tests {
     #[test]
     fn v3_block_validates_only_with_v3() {
         activate();
+        // The test target is far easier than the hardened pow limit (the
+        // genesis target), so keep the hardening rules off here.
+        let _h = activation::scoped_override(activation::NEVER);
         // Target 2^252: 1 in 16 evaluations pass, so v1 and v3 disagree often.
         let bits = target_to_bits(&(U256::MAX >> 4).to_big_endian());
         let mut b = genesis_block();
@@ -1921,3 +2752,208 @@ mod canonical_encoding_tests {
         assert_eq!(b.size_bytes(), b.to_wire_bytes().len());
     }
 }
+// ── Hardening activation: core regressions (VAL-2 undo, VAL-12, POW-3) ──────
+#[cfg(test)]
+mod hardening_core_tests {
+    use super::*;
+
+    fn tx(n_in: usize, n_out: usize, ss: usize, spk: usize) -> Transaction {
+        Transaction {
+            version: 7,
+            inputs: (0..n_in).map(|i| TxInput {
+                prev_txid: [i as u8; 32], prev_index: i as u32, script_sig: vec![0xAB; ss], sequence: 3,
+            }).collect(),
+            outputs: (0..n_out).map(|i| TxOutput { value: 1_000 + i as u64, script_pubkey: vec![0xCD; spk] }).collect(),
+            locktime: 9,
+        }
+    }
+
+    /// VAL-12: the arithmetic wire size equals the encoding's length, across
+    /// every varint width.
+    #[test]
+    fn wire_size_matches_the_encoding() {
+        for (n_in, n_out, ss, spk) in [(0, 0, 0, 0), (1, 1, 0, 5), (2, 3, 252, 20), (1, 1, 253, 0xFFFF),
+                                      (300, 2, 10, 20), (1, 260, 4, 0x1_0000)] {
+            let t = tx(n_in, n_out, ss, spk);
+            for with_ss in [false, true] {
+                assert_eq!(t.wire_size(with_ss), t.to_wire_bytes(with_ss).len(), "{n_in} {n_out} {ss} {spk}");
+            }
+        }
+        let mut b = genesis_block();
+        b.transactions.push(tx(2, 2, 300, 20));
+        b.header.parents = vec![[1u8; 32]; 3];
+        b.shielded_transactions.push(coherence_core::ShieldedTx {
+            anchor: [1; 32], nullifiers: vec![[2; 32]; 3], outputs: vec![[3; 32]; 300], fee: 5,
+            proof: vec![9; 70_000], binding_sig: vec![8; 64],
+        });
+        assert_eq!(b.wire_size(), b.to_wire_bytes().len());
+        assert_eq!(genesis_block().wire_size(), genesis_block().to_wire_bytes().len());
+    }
+
+    /// The 6-field record layout written before the extension existed.
+    #[derive(Serialize)]
+    struct LegacyUndo {
+        block_hash: [u8; 32],
+        block_height: u64,
+        spent_utxos: Vec<UndoEntry>,
+        created_utxo_keys: Vec<([u8; 32], u32)>,
+        coinbase_txids: Vec<[u8; 32]>,
+        tx_index_keys: Vec<[u8; 32]>,
+    }
+
+    fn sample() -> UndoData {
+        let mut u = UndoData::new([0x42; 32], 7);
+        u.spent_utxos.push(UndoEntry { prev_txid: [1; 32], prev_index: 2, output: TxOutput { value: 3, script_pubkey: vec![4; 20] } });
+        u.created_utxo_keys.push(([5; 32], 0));
+        u.coinbase_txids.push([5; 32]);
+        u.tx_index_keys.push([5; 32]);
+        u
+    }
+
+    /// VAL-2: records already on disk (legacy layout, no extension) still
+    /// decode, and a record that overwrote nothing is still written
+    /// byte-identically to the legacy layout.
+    #[test]
+    fn undo_records_stay_backward_compatible() {
+        let u = sample();
+        let legacy = bincode::serde::encode_to_vec(&LegacyUndo {
+            block_hash: u.block_hash, block_height: u.block_height, spent_utxos: u.spent_utxos.clone(),
+            created_utxo_keys: u.created_utxo_keys.clone(), coinbase_txids: u.coinbase_txids.clone(),
+            tx_index_keys: u.tx_index_keys.clone(),
+        }, bincode::config::standard()).unwrap();
+        assert_eq!(u.to_bytes().unwrap(), legacy, "no overwrite: byte-identical to the legacy record");
+        // Golden prefix: the legacy encoding starts with the raw block hash.
+        assert_eq!(&legacy[..32], &[0x42; 32]);
+        assert_eq!(legacy[32], 7, "height 7 as a one-byte varint");
+        let back = UndoData::from_bytes(&legacy).unwrap();
+        assert_eq!(back.block_height, 7);
+        assert_eq!(back.spent_utxos.len(), 1);
+        assert!(back.overwritten.is_empty());
+
+        // With an extension: round-trips, and an old decoder (plain bincode)
+        // still reads the six legacy fields.
+        let mut x = sample();
+        x.overwritten.utxos.push(UndoEntry { prev_txid: [5; 32], prev_index: 0, output: TxOutput { value: 77, script_pubkey: vec![6; 20] } });
+        x.overwritten.coinbase_heights.push(([5; 32], 3));
+        x.overwritten.tx_index.push(([5; 32], [0x99; 32], 3));
+        let bytes = x.to_bytes().unwrap();
+        assert_eq!(&bytes[..legacy.len()], &legacy[..]);
+        assert_eq!(&bytes[legacy.len()..legacy.len() + 4], b"UDX1");
+        let back = UndoData::from_bytes(&bytes).unwrap();
+        assert_eq!(back.overwritten.utxos[0].output.value, 77);
+        assert_eq!(back.overwritten.coinbase_heights, vec![([5; 32], 3)]);
+        assert_eq!(back.overwritten.tx_index, vec![([5; 32], [0x99; 32], 3)]);
+        let (old_view, _): (UndoData, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(old_view.block_height, 7);
+
+        // Garbage after a record is refused, not silently dropped.
+        let mut junk = legacy.clone();
+        junk.extend_from_slice(b"XXXX");
+        assert!(UndoData::from_bytes(&junk).is_err());
+        let mut junk = bytes.clone();
+        junk.push(0);
+        assert!(UndoData::from_bytes(&junk).is_err());
+    }
+
+    /// POW-3 at the boundary, on the real ASERT path (explicit activation):
+    /// a chain far behind schedule eases to POW_LIMIT_BITS below the
+    /// activation and is clamped to the genesis target from it.
+    #[test]
+    fn pow_limit_clamp_switches_at_the_activation_height() {
+        let late = GENESIS_TIMESTAMP + 365 * 86_400;
+        let act = 1_000;
+        let below = expected_bits_at(late, act - 1, act).unwrap();
+        let at = expected_bits_at(late, act, act).unwrap();
+        assert_eq!(below, target_to_bits(&bits_to_target(POW_LIMIT_BITS)));
+        assert_eq!(at, GENESIS_BITS);
+        assert_eq!(expected_bits_at(late, act + 1, act).unwrap(), GENESIS_BITS);
+        // On schedule nothing changes; harder than genesis is never clamped.
+        let on = GENESIS_TIMESTAMP + 30 * (act - 1);
+        assert_eq!(expected_bits_at(on, act, act).unwrap(), GENESIS_BITS);
+        let ahead = GENESIS_TIMESTAMP;
+        assert_eq!(expected_bits_at(ahead, act, act).unwrap(), expected_bits_at(ahead, act, activation::NEVER).unwrap());
+        // Mainnet schedule: identical to the pre-activation rule below 110,000.
+        for h in [1u64, 2, 100, 109_999] {
+            assert_eq!(
+                expected_bits_at(late, h, activation::MAINNET_HARDENING_ACTIVATION_HEIGHT).unwrap(),
+                // From powit_height the v3 shift applies on top of ASERT.
+                adjust_bits_for_algo(
+                    gnb_smh::difficulty::asert_next_bits(&asert_params(), &asert_anchor(), late as i64, h).unwrap(),
+                    pow_algo(h)),
+            );
+        }
+        // The limit check validate_pow applies.
+        let limit = bits_to_target(POW_LIMIT_BITS);
+        assert!(Block::target_within_pow_limit_at(&limit, act - 1, act));
+        assert!(!Block::target_within_pow_limit_at(&limit, act, act));
+        assert!(Block::target_within_pow_limit_at(&bits_to_target(GENESIS_BITS), act, act));
+    }
+
+    /// validate_pow rejects a post-activation block claiming a target easier
+    /// than genesis before evaluating anything.
+    #[test]
+    fn validate_pow_enforces_the_height_pow_limit() {
+        if TEST_POW_LIMIT {
+            return; // the dev-only feature pins the limit to POW_LIMIT_BITS
+        }
+        let mut b = genesis_block();
+        b.header.bits = POW_LIMIT_BITS;
+        b.header.parents = vec![[3u8; 32]];
+        b.height = 5;
+        let _g = activation::scoped_override(5);
+        let t = std::time::Instant::now();
+        assert!(!b.validate_pow(), "target above the genesis target at/after activation");
+        assert!(t.elapsed() < std::time::Duration::from_millis(50), "rejected before any evaluation");
+        drop(_g);
+        let _g = activation::scoped_override(6);
+        // Below the activation the pow-limit target is allowed: almost any
+        // nonce passes (one or two evaluations).
+        // Bounded: a broken proof check must fail the test, not hang it.
+        assert!((0..32).any(|n| { b.header.nonce = n; b.validate_pow() }), "no valid nonce in 32");
+    }
+}
+
+// Test-only fixture support, kept at the END of the file: the code the
+// browser wallet core compiles keeps its line numbers (panic locations are
+// part of the reproducible WASM, audit WAL-5).
+#[cfg(feature = "test-pow-limit")]
+impl Block {
+    /// TEST FIXTURES ONLY — compiled only with the `test-pow-limit` feature,
+    /// which the node binary refuses to run with. Records this block's id in
+    /// the proof-of-work cache WITHOUT evaluating GnB-SMH, so integration
+    /// tests can build thousand-block chains (one evaluation takes most of a
+    /// second in a dev build). `validate_pow` still decodes `bits` and
+    /// enforces the pow limit before it consults the cache, and every check
+    /// after the proof (height, expected bits, timestamp, transactions,
+    /// GhostDAG, connect) runs unchanged.
+    pub fn test_only_assume_pow_valid(&self) {
+        let id = self.block_hash();
+        if let Ok(mut cache) = pow_cache().lock() {
+            cache.insert(id);
+        }
+    }
+}
+
+// Added after the browser wallet core was pinned, so kept at the END of the
+// file for the same reason as the fixture above (audit WAL-5).
+impl PowCache {
+    /// Record a verified block id; the oldest entry is evicted once more than
+    /// `POW_CACHE_CAPACITY` ids are held (FIFO). Re-inserting a held id is a
+    /// no-op.
+    fn insert(&mut self, id: [u8; 32]) {
+        if self.set.insert(id) {
+            self.order.push_back(id);
+            if self.order.len() > POW_CACHE_CAPACITY {
+                if let Some(old) = self.order.pop_front() {
+                    self.set.remove(&old);
+                }
+            }
+        }
+    }
+}
+
+/// Boundary and encoding tests of this module's consensus functions
+/// (mutation-tested: docs/testing/MUTATION.md).
+#[cfg(test)]
+mod consensus_tests;

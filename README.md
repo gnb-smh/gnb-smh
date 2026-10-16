@@ -28,15 +28,37 @@ Status: pre-release. Not audited.
 | `site/`, `worker/` | gnb-smh.com: site, explorer (`/explorer`) and web wallet (`/wallet`), served by a Cloudflare Worker that also proxies the read-only explorer API |
 | `deploy/` | Node and explorer-API systemd units and install scripts |
 | `genesis/` | The Bloch Genesis-3 terminal snapshot the genesis ledger is built from |
-| `docs/` | Protocol notes: [consensus](docs/CONSENSUS.md), [monetary policy and carryover](docs/MONETARY-POLICY.md), [running a node](docs/RUNNING.md), [ledger v1](docs/LEDGER.md), [P2P security](docs/P2P.md), [multisig and timelocks](docs/MULTISIG.md) |
+| `crates/pqcrypto-internals` | Vendored fork (patched in through `[patch.crates-io]`), a workspace member so its guard test runs. (The `libp2p-yamux` fork was retired with libp2p 0.57; `node/tests/supply_chain_lockfile_guard.rs` keeps a single yamux >= 0.13.10 and hickory >= 0.26.1 in `Cargo.lock`.) |
+| `node/fuzz` | cargo-fuzz targets (own workspace, nightly): wire decoders and round trips, difficulty, PoW and signature verify, Merkle paths, mempool, block rules, sighash, witnesses, undo records, keystores, addresses, the sync codec, block acceptance in any arrival order ([docs/testing/FUZZING.md](docs/testing/FUZZING.md)) |
+| `docs/` | Protocol notes: [consensus](docs/CONSENSUS.md), [monetary policy and carryover](docs/MONETARY-POLICY.md), [running a node](docs/RUNNING.md), [ledger v1](docs/LEDGER.md), [P2P security](docs/P2P.md), [multisig and timelocks](docs/MULTISIG.md); testing: [sanitizers, Miri, 32-bit](docs/testing/SANITIZERS.md), [fuzzing](docs/testing/FUZZING.md), [functional tests](docs/testing/FUNCTIONAL.md) |
+| `test/functional` | Multi-node functional tests and their framework (Python, stdlib only) |
 | `reference/`, `rust/`, `analysis/` | Standalone GnB-SMH v1 reference implementation and GnB ledger v1 (see below) |
 
 ## Build and test
 
 ```sh
 cargo build --release
-cargo test --release --workspace
+cargo test --workspace --locked
+# The consensus crates in their own invocations: in a workspace-wide run the
+# node's dev-only `test-pow-limit` feature is unified into gnb-crypto and pins
+# every expected target to the pow limit.
+cargo test -p gnb-smh --locked
+cargo test -p gnb-crypto --locked
+cargo clippy --workspace --all-targets --locked
+cargo deny check && cargo audit
+# Functional tests: real gnb / gnb-cli processes on loopback, built with the
+# test-only `test-pow-limit` feature (docs/testing/FUNCTIONAL.md)
+python3 test/functional/test_runner.py
 ```
+
+CI (`.github/workflows/ci.yml`) runs all of these, the Python references, the
+standalone `rust/` crate, the vendored-crate and Falcon guards, the sanitizer,
+Miri and 32-bit jobs ([docs/testing/SANITIZERS.md](docs/testing/SANITIZERS.md)),
+and, on pull requests and nightly, every fuzz target for 60 s
+(`.github/workflows/fuzz.yml`, which also runs a weekly 10-minute-per-target
+campaign; [docs/testing/FUZZING.md](docs/testing/FUZZING.md)). Mutation
+testing of the consensus code (`.github/workflows/mutants.yml`, [docs/testing/MUTATION.md](docs/testing/MUTATION.md))
+runs weekly and, on the lines a pull request changes, on every pull request.
 
 The toolchain is pinned in `rust-toolchain.toml`.
 
@@ -89,9 +111,12 @@ Research prototype, not yet wired into the node.
 | Path | What it is |
 | --- | --- |
 | `reference/gnb_smh.py` | GnB-SMH normative definition (Python standard library only) |
-| `reference/check_vectors.py`, `test_vectors.json` | 7 PoW vectors and their checker |
+| `reference/check_vectors.py`, `test_vectors.json` | 17 PoW vectors (log2_n = 1, 2, 10, 19) and the checker of both vector files |
+| `reference/gnb_difficulty.py` | Difficulty normative definition: compact bits, chain work, ASERT, GnB's difficulty input |
+| `reference/gen_difficulty_vectors.py`, `difficulty_vectors.json` | Compact, chain-work, ASERT and multi-parent expected-bits vectors, checked by `crates/gnb-smh` and `crates/gnb-crypto` |
+| `reference/gnb_sighash.py`, `sighash_vectors.json` | Transaction signature digests (sighash v2 byte by byte, sighash v3, v3 component messages) and their vectors (`python3 reference/gnb_sighash.py` regenerates them), checked by `crates/gnb-crypto/tests/sighash_vectors.rs` |
 | `reference/gnb_ledger.py` | Ledger normative definition: sparse Merkle tree, transactions, witness bundle, validation |
-| `reference/gen_ledger_vectors.py`, `ledger_vectors.json` | 5 valid and 23 single-fault invalid blocks, tree vectors |
+| `reference/gen_ledger_vectors.py`, `ledger_vectors.json` | 5 valid and 25 single-fault invalid blocks, tree vectors |
 | `reference/test_ledger.py` | Ledger tests, including a producer-versus-validator differential test |
 | `rust/` | Standalone crate (`#![forbid(unsafe_code)]`, outside the workspace): PoW, `ledger` module, `smh-bench` |
 | `analysis/` | PoW statistics and measured witness size versus live outputs |

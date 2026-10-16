@@ -80,14 +80,30 @@ fn rate_limit_key(ip: IpAddr) -> IpAddr {
 /// listed here anyway: it is EXPENSIVE (dual DAG reads, an ancestry walk for
 /// `bits`, draining + serialising up to 2000 mempool transactions) and was
 /// previously unauthenticated at the loose read bucket, letting a poll loop
-/// force that cost repeatedly for free. `rpc::mod::HEAVY_READ_METHODS` adds
-/// the matching short-TTL/single-flight cache on top of the stricter auth +
-/// rate limit this listing gives it.
+/// force that cost repeatedly for free. Its own short-TTL/single-flight gate
+/// (`rpc::mod::gated_dispatch`, `AppState::template_gate`) adds a cache on top
+/// of the stricter auth + rate limit this listing gives it.
 pub const WRITE_METHODS: &[&str] = &[
     "sendrawtransaction",
     "submitblock",
     "getblocktemplate",
     "submitpowititem",
+    "invalidateblock",
+    "reconsiderblock",
+];
+
+/// Operator chain-override methods (audit DAG-6): `invalidateblock` /
+/// `reconsiderblock` make this node leave or rejoin a chain regardless of its
+/// work, so they are write-class (Host/Origin gate, never a wildcard origin,
+/// write rate bucket — see [`WRITE_METHODS`]) AND they are never served to an
+/// anonymous caller: they need either a fully trusted caller (loopback with
+/// `--rpc-trust-loopback`, or a trusted private range) or the configured API
+/// key, whatever `--rpc-require-auth-for-writes` says. With no key configured
+/// and no trusted caller they are refused (fail-safe), like Bitcoin Core, where
+/// every RPC requires credentials.
+pub const ADMIN_METHODS: &[&str] = &[
+    "invalidateblock",
+    "reconsiderblock",
 ];
 
 /// Type alias for a direct (non-keyed) in-memory rate limiter.
@@ -201,6 +217,20 @@ impl RateLimiterSet {
     }
 }
 
+/// NET-16: constant-time key comparison over FIXED-LENGTH digests.
+///
+/// `subtle`'s slice `ct_eq` returns early when the lengths differ, which
+/// leaks the configured key's length through timing. Hashing both sides to
+/// SHA-256 first makes every comparison 32 bytes against 32 bytes, whatever
+/// the presented key looks like; equality of the digests is equality of the
+/// keys (collision resistance).
+pub fn keys_match(presented: &str, configured: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let p: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
+    let c: [u8; 32] = Sha256::digest(configured.as_bytes()).into();
+    p.ct_eq(&c).unwrap_u8() == 1
+}
+
 /// Authentication decision for a single incoming request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthDecision {
@@ -297,10 +327,10 @@ pub fn authorize_with_policy(
         return AuthDecision::RateLimited;
     }
 
-    if is_write && require_auth_for_writes {
+    if (is_write && require_auth_for_writes) || ADMIN_METHODS.contains(&method) {
         match (presented_key, configured_key) {
             (Some(p), Some(c)) => {
-                if p.as_bytes().ct_eq(c.as_bytes()).unwrap_u8() == 1 {
+                if keys_match(p, c) {
                     AuthDecision::Allow
                 } else {
                     AuthDecision::Unauthorized
@@ -309,7 +339,7 @@ pub fn authorize_with_policy(
             _ => AuthDecision::Unauthorized,
         }
     } else if let (Some(p), Some(c)) = (presented_key, configured_key) {
-        if p.as_bytes().ct_eq(c.as_bytes()).unwrap_u8() == 1 {
+        if keys_match(p, c) {
             AuthDecision::Allow
         } else {
             AuthDecision::Unauthorized
@@ -347,10 +377,10 @@ pub fn authorize_with_trust(
         return AuthDecision::RateLimited;
     }
 
-    if is_write && require_auth_for_writes {
+    if (is_write && require_auth_for_writes) || ADMIN_METHODS.contains(&method) {
         match (presented_key, configured_key) {
             (Some(p), Some(c)) => {
-                if p.as_bytes().ct_eq(c.as_bytes()).unwrap_u8() == 1 {
+                if keys_match(p, c) {
                     AuthDecision::Allow
                 } else {
                     AuthDecision::Unauthorized
@@ -359,7 +389,7 @@ pub fn authorize_with_trust(
             _ => AuthDecision::Unauthorized,
         }
     } else if let (Some(p), Some(c)) = (presented_key, configured_key) {
-        if p.as_bytes().ct_eq(c.as_bytes()).unwrap_u8() == 1 {
+        if keys_match(p, c) {
             AuthDecision::Allow
         } else {
             AuthDecision::Unauthorized
@@ -419,18 +449,19 @@ pub fn authorize_with_read_policy(
         return AuthDecision::RateLimited;
     }
 
-    let requires_key =
-        (is_write && require_auth_for_writes) || (!is_write && require_auth_for_reads);
+    let requires_key = (is_write && require_auth_for_writes)
+        || (!is_write && require_auth_for_reads)
+        || ADMIN_METHODS.contains(&method);
 
     if requires_key {
         match (presented_key, configured_key) {
-            (Some(p), Some(c)) if p.as_bytes().ct_eq(c.as_bytes()).unwrap_u8() == 1 => {
+            (Some(p), Some(c)) if keys_match(p, c) => {
                 AuthDecision::Allow
             }
             _ => AuthDecision::Unauthorized,
         }
     } else if let (Some(p), Some(c)) = (presented_key, configured_key) {
-        if p.as_bytes().ct_eq(c.as_bytes()).unwrap_u8() == 1 {
+        if keys_match(p, c) {
             AuthDecision::Allow
         } else {
             AuthDecision::Unauthorized
@@ -496,6 +527,53 @@ pub const MIN_API_KEY_LEN: usize = 16;
 /// (main.rs) AND defensively at server start (`start_rpc_server` does, on
 /// `RpcConfig.api_key`, regardless of how the caller sourced it).
 pub fn validate_api_key(key: &str) -> Result<(), &'static str> {
+    validate_api_key_inner(key)
+}
+
+/// NET-16: permission policy for `--rpc-api-key-file` (Unix).
+///
+/// - any access for "other" (world bits) or group WRITE: refuse (`Err`);
+/// - group READ (e.g. `0640 root:gnb`, a common service layout): allowed
+///   with a warning (`Ok(Some(..))`);
+/// - owner-only: `Ok(None)`.
+///
+/// On non-Unix platforms there are no mode bits to check (`Ok(None)`).
+pub fn check_key_file_permissions(path: &std::path::Path) -> Result<Option<String>, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path)
+            .map_err(|e| format!("cannot stat API key file {}: {e}", path.display()))?;
+        return key_file_mode_policy(meta.permissions().mode(), path);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
+/// Mode-bit half of [`check_key_file_permissions`] (testable without files).
+pub fn key_file_mode_policy(mode: u32, path: &std::path::Path) -> Result<Option<String>, String> {
+    let mode = mode & 0o777;
+    if mode & 0o027 != 0 {
+        return Err(format!(
+            "API key file {} has mode {:04o}: it must not be writable by its group or \
+             accessible to other users (chmod 600 or 640)",
+            path.display(), mode
+        ));
+    }
+    if mode & 0o040 != 0 {
+        return Ok(Some(format!(
+            "API key file {} is readable by its group (mode {:04o}); make sure only the \
+             node's service group can read it, or chmod 600",
+            path.display(), mode
+        )));
+    }
+    Ok(None)
+}
+
+fn validate_api_key_inner(key: &str) -> Result<(), &'static str> {
     if key.chars().any(|c| c.is_control()) {
         return Err("API key contains a control character (e.g. CR/LF) — refusing to use it");
     }
@@ -1154,6 +1232,48 @@ mod tests {
         assert_eq!(d, AuthDecision::Unauthorized);
     }
 
+    // ── Audit DAG-6: operator chain overrides are never anonymous ──
+    #[test]
+    fn admin_methods_need_a_key_or_a_trusted_caller() {
+        let rl = RateLimiterSet::new(1000, 1000);
+        let remote: IpAddr = "203.0.113.7".parse().unwrap();
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let key = "k".repeat(32);
+        for m in ADMIN_METHODS {
+            assert!(WRITE_METHODS.contains(m), "{m} must be write-class");
+            // Even with --rpc-require-auth-for-writes OFF, no key = refused.
+            for ip in [remote, lo] {
+                assert_eq!(
+                    authorize_with_read_policy(ip, m, None, None, false, false, false, false, &rl),
+                    AuthDecision::Unauthorized, "{m} anonymous from {ip}",
+                );
+                assert_eq!(
+                    authorize_with_read_policy(ip, m, None, Some(&key), false, false, false, false, &rl),
+                    AuthDecision::Unauthorized, "{m} without the key from {ip}",
+                );
+                assert_eq!(
+                    authorize_with_read_policy(ip, m, Some(&key), Some(&key), false, false, false, false, &rl),
+                    AuthDecision::Allow, "{m} with the key from {ip}",
+                );
+                assert_eq!(
+                    authorize_with_policy(ip, m, None, None, false, false, false, &rl),
+                    AuthDecision::Unauthorized,
+                );
+            }
+            // A fully trusted caller (--rpc-trust-loopback) needs no key.
+            assert_eq!(
+                authorize_with_read_policy(lo, m, None, None, false, false, false, true, &rl),
+                AuthDecision::Allow,
+            );
+        }
+        // Ordinary writes keep their policy (anonymous allowed when writes
+        // do not require auth).
+        assert_eq!(
+            authorize_with_read_policy(remote, "submitblock", None, None, false, false, false, false, &rl),
+            AuthDecision::Allow,
+        );
+    }
+
     // ── WRITE_METHODS must cover external block submission ──
 
     #[test]
@@ -1331,5 +1451,53 @@ mod tests {
             gate_browser_request(Some("127.0.0.1:17210"), None, "sendrawtransaction", &[], &[]),
             Ok(())
         );
+    }
+}
+
+#[cfg(test)]
+mod net16_tests {
+    use super::*;
+
+    /// NET-16: comparison is over fixed-length digests, so keys of any
+    /// length compare correctly (and in constant time w.r.t. length).
+    #[test]
+    fn keys_match_compares_fixed_length_digests() {
+        let key = "0123456789abcdef0123456789abcdef";
+        assert!(keys_match(key, key));
+        assert!(!keys_match("0123456789abcdef0123456789abcdee", key));
+        assert!(!keys_match("short", key));
+        assert!(!keys_match(&format!("{key}x"), key));
+        assert!(!keys_match("", key));
+        // The authorizer uses it for both reads and writes.
+        let rl = RateLimiterSet::new(60, 5);
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        assert_eq!(authorize_with_read_policy(ip, "getblockcount", Some(key), Some(key),
+            true, true, false, false, &rl), AuthDecision::Allow);
+        assert_eq!(authorize_with_read_policy(ip, "sendrawtransaction", Some("short"), Some(key),
+            true, true, false, false, &rl), AuthDecision::Unauthorized);
+    }
+
+    /// NET-16: key files readable or writable by others are refused; group
+    /// read only warns.
+    #[test]
+    fn api_key_file_mode_policy() {
+        let p = std::path::Path::new("/etc/gnb/rpc.key");
+        assert_eq!(key_file_mode_policy(0o100600, p), Ok(None));
+        assert_eq!(key_file_mode_policy(0o400, p), Ok(None));
+        assert!(key_file_mode_policy(0o640, p).unwrap().unwrap().contains("readable by its group"));
+        for bad in [0o644, 0o604, 0o660, 0o666, 0o601, 0o602] {
+            assert!(key_file_mode_policy(bad, p).is_err(), "{bad:o}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_key_file_permissions_are_checked_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(check_key_file_permissions(file.path()), Ok(None));
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(check_key_file_permissions(file.path()).is_err());
     }
 }

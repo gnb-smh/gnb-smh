@@ -311,8 +311,14 @@ impl HdWallet {
         if crypto::address_from_pubkey(&keypair.public_key, testnet) != keypair.address {
             return Err("imported keypair public key does not match address".into());
         }
+        // CRY-5: `sign_message` now verifies its own output under the public
+        // key, so a key pair that does not match fails here already.
         let proof = keypair.sign_message(IMPORT_KEY_AUTH_CHALLENGE)
-            .map_err(|_| "imported keypair private key is invalid".to_string())?;
+            .map_err(|e| if e.contains("does not verify under the wallet public key") {
+                "imported keypair private/public keys do not match".to_string()
+            } else {
+                "imported keypair private key is invalid".to_string()
+            })?;
         if !Keypair::verify_message(&keypair.public_key, IMPORT_KEY_AUTH_CHALLENGE, &proof) {
             return Err("imported keypair private/public keys do not match".into());
         }
@@ -1390,8 +1396,9 @@ mod tests {
 
     #[test]
     fn create_save_load_roundtrip() {
-        let tmp = std::env::temp_dir().join("bloch-hd-test.json");
-        let _ = std::fs::remove_file(&tmp);
+        // Unique per run: a fixed name made concurrent test runs race.
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("hd-wallet.json");
 
         let w = HdWallet::create("test-password-12345!", Some("my-passphrase"), true).unwrap();
         let mnemonic = w.mnemonic.to_string();
@@ -1465,7 +1472,7 @@ mod tests {
     /// re-derivation that would point at an empty address.
     #[test]
     fn loads_legacy_random_key_wallet() {
-        let tmp = std::env::temp_dir().join("bloch-hd-legacy-test.json");
+        let tmp = std::env::temp_dir().join(format!("bloch-hd-legacy-test-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
 
         // Build a wallet whose key is OS-random, exactly like a pre-v3 file.
@@ -1511,7 +1518,7 @@ mod tests {
     /// write turns this red again.
     #[test]
     fn v1_file_survives_load_new_address_save_load_roundtrip() {
-        let tmp = std::env::temp_dir().join("bloch-hd-v1-roundtrip-test.json");
+        let tmp = std::env::temp_dir().join(format!("bloch-hd-v1-roundtrip-test-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
 
         let password = "test-password-12345!";
@@ -1543,7 +1550,7 @@ mod tests {
     /// flags) — the version-persistence fix must not be special-cased to v1.
     #[test]
     fn v2_file_survives_load_new_address_save_load_roundtrip() {
-        let tmp = std::env::temp_dir().join("bloch-hd-v2-roundtrip-test.json");
+        let tmp = std::env::temp_dir().join(format!("bloch-hd-v2-roundtrip-test-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
 
         let password = "test-password-12345!";

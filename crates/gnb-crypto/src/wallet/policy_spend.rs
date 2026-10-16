@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::address::Network;
 use crate::core::policy::{BranchWitness, PolicyTree, PolicyWitness, SpendPolicy};
+use crate::core::sighash::{SighashV3Precomputed, SighashVersion};
 use crate::core::{self, ChainId, Transaction, TxInput, TxOutput};
 use crate::crypto;
 
@@ -34,6 +35,10 @@ pub struct PolicySpend {
     pub tx: Transaction,
     /// Per input: key index → signature.
     pub signatures: Vec<BTreeMap<u8, Vec<u8>>>,
+    /// Per input: the value of the spent output (its script is
+    /// [`Self::locking_script`]). A version-3 (sighash v3) signature commits
+    /// to it.
+    pub amounts: Vec<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -46,6 +51,8 @@ struct SpendFile {
     branch: Option<u8>,
     tx: String,
     signatures: Vec<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    amounts: Vec<String>,
 }
 
 /// Upper bound on a policy witness (sets the fee before anyone signs).
@@ -109,7 +116,8 @@ impl PolicySpend {
         } else {
             tx.outputs.pop(); // sub-dust change goes to the fee
         }
-        Ok(Self { network, policy, tree: None, tx, signatures: vec![BTreeMap::new(); inputs.len()] })
+        let amounts = inputs.iter().map(|(_, _, v)| *v).collect();
+        Ok(Self { network, policy, tree: None, tx, signatures: vec![BTreeMap::new(); inputs.len()], amounts })
     }
 
     /// Unsigned spend of policy-tree `inputs` through branch `branch`, paying
@@ -160,7 +168,8 @@ impl PolicySpend {
         } else {
             tx.outputs.pop();
         }
-        Ok(Self { network, policy, tree: Some((tree, branch)), tx, signatures: vec![BTreeMap::new(); inputs.len()] })
+        let amounts = inputs.iter().map(|(_, _, v)| *v).collect();
+        Ok(Self { network, policy, tree: Some((tree, branch)), tx, signatures: vec![BTreeMap::new(); inputs.len()], amounts })
     }
 
     /// The script the inputs are locked by (and change returns to).
@@ -180,20 +189,82 @@ impl PolicySpend {
         self.tx.outputs.iter().map(|o| o.value).sum()
     }
 
-    /// Add `public_key`'s signature (made by `sign`) to every input.
-    /// Returns the key's index in the policy.
+    /// Give the spend the transaction version (and so the sighash) of a
+    /// block at `next_block_height` (the node's getdaginfo
+    /// `next_block_height`): 3 / sighash v3 at/after the hardening
+    /// activation, 1 / sighash v2 below it. Only before anyone signed.
+    pub fn target_height(&mut self, next_block_height: u64) -> Result<(), String> {
+        if self.signatures.iter().any(|m| !m.is_empty()) {
+            return Err("the spend already carries signatures; its version is fixed".into());
+        }
+        let act = core::activation::hardening_activation_height_for_signer(self.chain_id());
+        self.tx.version = core::sighash::tx_version_for_height(next_block_height, act);
+        Ok(())
+    }
+
+    /// The sighash version this spend's signatures use.
+    pub fn sighash_version(&self) -> SighashVersion {
+        SighashVersion::for_tx_version(self.tx.version)
+    }
+
+    /// The digest `public_key` signs for input `i`.
+    fn digest(&self, i: usize, public_key: &[u8]) -> Result<[u8; 32], String> {
+        let chain_id = self.chain_id();
+        match self.sighash_version() {
+            SighashVersion::V2 => Ok(self.tx.sighash(i, chain_id)),
+            SighashVersion::V3 => {
+                if self.amounts.len() != self.tx.inputs.len() {
+                    return Err("the spend file has no input values (needed by sighash v3); rebuild it".into());
+                }
+                let spk = self.locking_script();
+                let spent: Vec<TxOutput> = self.amounts.iter()
+                    .map(|v| TxOutput { value: *v, script_pubkey: spk.clone() })
+                    .collect();
+                let suite = crypto::public_key_suite(public_key).ok_or("unknown public key suite")?;
+                SighashV3Precomputed::new(&self.tx, &spent)
+                    .and_then(|p| p.digest(i, suite, chain_id))
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    fn verifies(&self, public_key: &[u8], digest: &[u8; 32], sig: &[u8]) -> bool {
+        match self.sighash_version() {
+            SighashVersion::V2 => crypto::verify_enveloped_canonical(public_key, digest, sig),
+            SighashVersion::V3 => crypto::verify_bound(public_key, digest, sig),
+        }
+    }
+
+    /// Add `public_key`'s signature (made by `sign` over each input's
+    /// digest) to every input. Version 1 (sighash v2) only: the message is
+    /// signed as is. Returns the key's index in the policy.
     pub fn sign(
         &mut self,
         public_key: &[u8],
         sign: impl Fn(&[u8]) -> Result<Vec<u8>, String>,
     ) -> Result<u8, String> {
+        if self.sighash_version() != SighashVersion::V2 {
+            return Err("a version-3 spend is signed with sign_digest (sighash v3)".into());
+        }
+        self.sign_digest(public_key, |d, _| sign(d))
+    }
+
+    /// Add `public_key`'s signature to every input. `sign(digest, version)`
+    /// signs one input's digest: `crypto::sign` for sighash v2,
+    /// `crypto::sign_bound` for v3 (`Keypair::sign_tx_digest` does both).
+    /// Returns the key's index in the policy.
+    pub fn sign_digest(
+        &mut self,
+        public_key: &[u8],
+        sign: impl Fn(&[u8; 32], SighashVersion) -> Result<Vec<u8>, String>,
+    ) -> Result<u8, String> {
         let idx = self.policy.pubkeys.iter().position(|k| k == public_key)
             .ok_or("this key is not part of the policy")? as u8;
-        let chain_id = self.chain_id();
+        let version = self.sighash_version();
         for i in 0..self.tx.inputs.len() {
-            let sighash = self.tx.sighash(i, chain_id);
-            let sig = sign(&sighash)?;
-            if !crypto::verify_enveloped_canonical(public_key, &sighash, &sig) {
+            let digest = self.digest(i, public_key)?;
+            let sig = sign(&digest, version)?;
+            if !self.verifies(public_key, &digest, &sig) {
                 return Err("produced signature does not verify (wrong key or non-canonical encoding)".into());
             }
             self.signatures[i].insert(idx, sig);
@@ -223,13 +294,12 @@ impl PolicySpend {
         }
         let chosen = &signers[..need];
         let mut tx = self.tx.clone();
-        let chain_id = self.chain_id();
         for (i, input) in tx.inputs.iter_mut().enumerate() {
-            let sighash = self.tx.sighash(i, chain_id);
             let mut signatures = Vec::with_capacity(need);
             for k in chosen {
                 let sig = self.signatures[i][k].clone();
-                if !crypto::verify_enveloped_canonical(&self.policy.pubkeys[*k as usize], &sighash, &sig) {
+                let key = &self.policy.pubkeys[*k as usize];
+                if !self.verifies(key, &self.digest(i, key)?, &sig) {
                     return Err(format!("signature of key {} on input {} does not verify", k, i));
                 }
                 signatures.push((*k, sig));
@@ -258,6 +328,7 @@ impl PolicySpend {
             signatures: self.signatures.iter().map(|m| {
                 m.iter().map(|(k, v)| (k.to_string(), hex::encode(v))).collect()
             }).collect(),
+            amounts: self.amounts.iter().map(|v| v.to_string()).collect(),
         };
         serde_json::to_string_pretty(&file).map_err(|e| e.to_string())
     }
@@ -311,7 +382,13 @@ impl PolicySpend {
             // Tree: fixed outputs first; the last output, if it pays the tree, is change.
             Some(_) => {}
         }
-        Ok(Self { network, policy, tree, tx, signatures })
+        let amounts = f.amounts.iter()
+            .map(|v| v.parse::<u64>().map_err(|_| "input value".to_string()))
+            .collect::<Result<Vec<u64>, String>>()?;
+        if !amounts.is_empty() && amounts.len() != tx.inputs.len() {
+            return Err("input value list does not match the inputs".into());
+        }
+        Ok(Self { network, policy, tree, tx, signatures, amounts })
     }
 }
 

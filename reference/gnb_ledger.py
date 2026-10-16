@@ -9,10 +9,13 @@ How a node validates without the UTXO set:
 * The state is a SHAKE-256 sparse Merkle tree (depth 256) of unspent outputs,
   plus a second tree reserved for shielded-pool nullifiers. The node keeps only
   their roots; the header commits to both.
-* A block travels with a witness bundle (not committed by the header): for each
-  transaction, the spent output records and an O(log n) Merkle witness per touched
-  key, each against the root left by the previous operation. About 1 KB per key
-  at 2^30 outputs.
+* A block travels with a witness bundle: for each transaction, the spent output
+  records and an O(log n) Merkle witness per touched key, each against the root
+  left by the previous operation. About 1 KB per key at 2^30 outputs. The header
+  commits to the bundle's hash (witness_root), so a damaged bundle is detected by
+  one hash before any proof is checked, and a bad committed bundle makes the block
+  permanently invalid: a peer cannot make a node redo the proof checks of one
+  block id with a different bad bundle.
 * The header commits to every transaction byte, authorization included (the
   transaction root is built over wtxids), and every transaction gets exactly one
   outcome that the witness must prove: ACCEPT, or REJECT with a proof (an input
@@ -24,8 +27,8 @@ How a node validates without the UTXO set:
 
 Faults come in two classes (InvalidBlock.permanent). Permanent ones prove the block
 itself is invalid: mark its id invalid. Transient ones only show that the body or
-the witness received does not fit the header: penalize the peer and fetch again,
-because the witness is not committed and anyone relaying the block can damage it.
+the witness received does not hash to the header's commitments: penalize the peer
+and fetch again.
 
 Encodings are little-endian, enc(b) = u32le(len(b)) || b, and every hash is
 H(label, data) = SHAKE256(enc("GNB-LEDGER-v1/" + label) || data, 32).
@@ -40,6 +43,7 @@ ledger_vectors.json exactly, including which error code each invalid case raises
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import struct
 from dataclasses import dataclass, field
@@ -49,7 +53,7 @@ VERSION = 1
 DEPTH = 256
 HASH_LEN = 32
 RECORD_LEN = 49
-HEADER_LEN = 140
+HEADER_LEN = 172
 
 # Placeholder limits until GnB's monetary and block-size parameters are fixed.
 MAX_MONEY = (1 << 63) - 1
@@ -60,6 +64,12 @@ MAX_TXS = 65_536               # per block
 MAX_BLOCK_KEYS = 16_384        # per block: inputs + outputs of all transactions = witnesses to check
 MAX_BLOCK_TX_BYTES = 4_000_000 # per block: sum of transaction wire sizes
 MAX_COINBASE_EXTRA = 100
+# Per block: the committed witness bundle (consensus cap, audit LED-1). A bundle
+# above it is refused before it is hashed, so no attempt costs more hashing than
+# this; a block whose committed bundle is larger can never be validated. One
+# maximal transaction (1,024 inputs and 1,024 outputs, every proof at full depth,
+# about 17 MB) plus a maximal coinbase always fit.
+MAX_WITNESS_BYTES = 32 * 1024 * 1024
 COINBASE_MATURITY = 100
 
 TX_REGULAR = 0
@@ -91,6 +101,7 @@ _P_TXNODE = _prefix(b"txnode")
 _P_TXROOT = _prefix(b"txroot")
 _P_STATE = _prefix(b"state")
 _P_BLOCK = _prefix(b"block")
+_P_WITNESS = _prefix(b"witness")
 _P_TEST_OWNER = _prefix(b"test-owner")
 
 
@@ -101,16 +112,22 @@ def _h(prefix: bytes, *parts: bytes) -> bytes:
 class InvalidBlock(Exception):
     """Raised with one of the shared error codes below; vectors pin the code.
 
-    Permanent codes prove the committed block is invalid. Transient codes mean the
-    body or witness received does not match the header (wrong transactions for this
-    tx_root, or a malformed, forged or stale witness): the block may still be valid."""
+    Permanent codes prove the committed block is invalid; the witness bundle is
+    committed too, so a malformed, forged or stale committed bundle is permanent.
+    Transient codes mean the body or witness received does not hash to the header's
+    commitments (tx_root, witness_root), or the witness received is larger than any
+    committed bundle may be (witness-size: it is refused before it is hashed, so it
+    cannot be attributed to the header): the block may still be valid."""
 
     CODES = (
-        "header", "target", "pow", "tx-root", "isolation", "witness-format",
-        "noncanonical-proof", "witness-mismatch", "accept-invalid", "reject-invalid",
-        "coinbase", "state-commitment",
+        "header", "target", "pow", "tx-root", "witness-size", "witness-commitment", "isolation",
+        "witness-format", "noncanonical-proof", "witness-mismatch", "accept-invalid",
+        "reject-invalid", "coinbase", "state-commitment",
     )
-    PERMANENT = frozenset({"header", "target", "pow", "isolation", "coinbase", "state-commitment"})
+    PERMANENT = frozenset({
+        "header", "target", "pow", "isolation", "witness-format", "noncanonical-proof",
+        "witness-mismatch", "accept-invalid", "reject-invalid", "coinbase", "state-commitment",
+    })
 
     def __init__(self, code: str, detail: str = ""):
         assert code in self.CODES, code
@@ -270,6 +287,7 @@ class Tx:
     height: int = 0          # coinbase only: must equal the block height
     extra: bytes = b""       # coinbase only
     auth: tuple[bytes, ...] = ()   # one entry per input; not covered by the txid
+    parents_root: bytes = EMPTY    # coinbase only: must equal the header's parents_root
 
 
 @dataclass(frozen=True)
@@ -297,7 +315,7 @@ def tx_bytes(tx: Tx) -> bytes:
     """Canonical encoding covered by the txid (no authorization data)."""
     out = [struct.pack("<I", VERSION), bytes([tx.kind])]
     if tx.kind == TX_COINBASE:
-        out += [struct.pack("<Q", tx.height), enc(tx.extra)]
+        out += [struct.pack("<Q", tx.height), tx.parents_root, enc(tx.extra)]
     out.append(struct.pack("<I", len(tx.inputs)))
     for op in tx.inputs:
         out += [op.txid, struct.pack("<I", op.vout)]
@@ -349,9 +367,10 @@ def decode_tx_wire(buf: bytes) -> Tx:
     kind = r.u8()
     if kind not in (TX_REGULAR, TX_COINBASE):
         raise InvalidBlock("isolation", "tx kind")
-    height, extra = 0, b""
+    height, extra, parents_root = 0, b"", EMPTY
     if kind == TX_COINBASE:
         height = r.u64()
+        parents_root = r.take(32)
         extra = r.take(r.u32())
     n_in = r.u32()
     if n_in > MAX_INPUTS:
@@ -372,7 +391,7 @@ def decode_tx_wire(buf: bytes) -> Tx:
         auth.append(r.take(n))
     if not r.done():
         raise InvalidBlock("isolation", "trailing bytes")
-    return Tx(kind, inputs, outputs, height, extra, tuple(auth))
+    return Tx(kind, inputs, outputs, height, extra, tuple(auth), parents_root)
 
 
 def txid(tx: Tx) -> bytes:
@@ -419,7 +438,7 @@ def check_tx_isolation(tx: Tx) -> None:
             raise InvalidBlock("isolation", "auth count")
         if any(len(a) > MAX_AUTH_LEN for a in tx.auth):
             raise InvalidBlock("isolation", "auth entry too long")
-        if tx.height != 0 or tx.extra:
+        if tx.height != 0 or tx.extra or tx.parents_root != EMPTY:
             raise InvalidBlock("isolation", "coinbase fields on a regular tx")
         for op in tx.inputs:
             if len(op.txid) != 32 or not 0 <= op.vout < 1 << 32:
@@ -429,6 +448,8 @@ def check_tx_isolation(tx: Tx) -> None:
             raise InvalidBlock("isolation", "coinbase with inputs")
         if len(tx.extra) > MAX_COINBASE_EXTRA:
             raise InvalidBlock("isolation", "coinbase extra")
+        if len(tx.parents_root) != 32:
+            raise InvalidBlock("isolation", "coinbase parents root")
 
 
 # --------------------------------------------------------------------------- authorization
@@ -465,6 +486,9 @@ class Context:
     subsidy: int
     auth: AuthFn = field(compare=False)      # required: there is deliberately no default
     coinbase_maturity: int = COINBASE_MATURITY
+    # The block's parents_root. validate_body sets it from the header; callers of
+    # apply_block_txs / FullNode.build pass the parents_root the block will carry.
+    parents_root: bytes = EMPTY
 
 
 def context_fee(tx: Tx, records: Sequence[UtxoRecord], ctx: Context) -> int | None:
@@ -492,13 +516,30 @@ def check_block_txs(txs: Sequence[Tx], ctx: Context) -> None:
         raise InvalidBlock("isolation", "too many inputs and outputs in the block")
     if txs[0].height != ctx.height:
         raise InvalidBlock("isolation", "coinbase height")
+    # Coinbase uniqueness: the coinbase commits to the block's height AND its parent
+    # set, so two blocks can share a coinbase (and its output keys) only if they are
+    # built on the very same parents at the same height by the same payee with the
+    # same extra: a choice of their own producer, not something another miner can
+    # force on them without mining a sibling block that pays them.
+    if txs[0].parents_root != ctx.parents_root:
+        raise InvalidBlock("isolation", "coinbase parents root")
 
 
-def apply_block_txs(state: State, txs: Sequence[Tx], witness: bytes, ctx: Context
-                    ) -> tuple[State, list[bool]]:
+def apply_block_txs(state: State, txs: Sequence[Tx], witness: bytes, ctx: Context, *,
+                    merged: bool = False) -> tuple[State, list[bool]]:
     """Stateless transition. Regular transactions are processed in order, then the
     coinbase (txs[0]) last, so it can claim the fees accepted in the same block.
-    Every proof is checked against the root left by the previous operation."""
+    Every proof is checked against the root left by the previous operation.
+
+    merged=True applies a block of a chain block's MERGESET (not its selected
+    parent chain) under the mergeset coinbase-collision rule (audit LED-1): a
+    merged block whose coinbase output already exists -- an identical coinbase at
+    the same height on the same parents, i.e. a twin of a block applied before
+    it -- forfeits its coinbase. Its coinbase entry is then REJECT_OUTPUT_EXISTS
+    proving that one of its output keys holds exactly the record this coinbase
+    would create; no coinbase output is created, its other outcomes stand, and
+    the merging block stays valid. Without merged the same entry makes the block
+    invalid (coinbase), as before."""
     check_block_txs(txs, ctx)
     r = _Reader(witness, "witness-format")
     if r.u32() != len(txs):
@@ -561,7 +602,11 @@ def apply_block_txs(state: State, txs: Sequence[Tx], witness: bytes, ctx: Contex
     if tag not in (ACCEPT, REJECT_OUTPUT_EXISTS):
         raise InvalidBlock("witness-format", "coinbase entry must be ACCEPT or a collision proof")
     # Every regular outcome above is proven, so `fees` is forced: an overclaim is the block's fault.
-    if sum(o.amount for o in cb.outputs) > ctx.subsidy + fees:
+    # The one exception is a merged twin forfeiting its coinbase (checked below): it mints nothing,
+    # and its identical coinbase claimed the twin's fees when the twin was applied -- the same fees
+    # that make this block's own transactions fail now, so its `fees` here can be 0.
+    if (sum(o.amount for o in cb.outputs) > ctx.subsidy + fees
+            and not (merged and tag == REJECT_OUTPUT_EXISTS)):
         raise InvalidBlock("coinbase", "claims more than subsidy plus fees")
     cid = txid(cb)
     if tag == REJECT_OUTPUT_EXISTS:
@@ -574,7 +619,18 @@ def apply_block_txs(state: State, txs: Sequence[Tx], witness: bytes, ctx: Contex
         key = outpoint_key(cid, o)
         if root_from(key, leaf_hash(key, value), r.proof()) != root:
             raise InvalidBlock("witness-mismatch", "claimed-existing coinbase output is absent")
-        raise InvalidBlock("coinbase", "coinbase output already exists")
+        if not merged:
+            raise InvalidBlock("coinbase", "coinbase output already exists")
+        # Mergeset rule: the twin of an applied block forfeits its coinbase. The
+        # existing output must be exactly what this coinbase would create. A
+        # forfeit is exempt from the claim check above: nothing is minted, and
+        # the identical coinbase holding the output passed it when applied.
+        out = cb.outputs[o]
+        if value != utxo_value(UtxoRecord(out.amount, out.owner, ctx.height, True)):
+            raise InvalidBlock("coinbase", "colliding output is not an identical coinbase output")
+        if not r.done():
+            raise InvalidBlock("witness-format", "trailing bytes")
+        return State(root, state.nullifier_root), accepted
     for o, out in enumerate(cb.outputs):
         root = _create(root, cid, o, UtxoRecord(out.amount, out.owner, ctx.height, True), r.proof())
     accepted[0] = True
@@ -600,6 +656,7 @@ def _create(root: bytes, tid: bytes, vout: int, record: UtxoRecord, sibs: list[b
 class Header:
     parents_root: bytes      # commitment to the GhostDAG parents (consensus layer)
     tx_root: bytes
+    witness_root: bytes      # witness_commitment(bundle)
     state_commitment: bytes
     timestamp: int
     target: int
@@ -607,15 +664,20 @@ class Header:
 
     def encode(self) -> bytes:
         return (struct.pack("<I", self.version) + self.parents_root + self.tx_root
-                + self.state_commitment + struct.pack("<Q", self.timestamp)
+                + self.witness_root + self.state_commitment + struct.pack("<Q", self.timestamp)
                 + self.target.to_bytes(32, "big"))
 
     @staticmethod
     def decode(b: bytes) -> "Header":
         if len(b) != HEADER_LEN:
             raise InvalidBlock("header", "length")
-        return Header(b[4:36], b[36:68], b[68:100], struct.unpack_from("<Q", b, 100)[0],
-                      int.from_bytes(b[108:140], "big"), struct.unpack_from("<I", b, 0)[0])
+        return Header(b[4:36], b[36:68], b[68:100], b[100:132], struct.unpack_from("<Q", b, 132)[0],
+                      int.from_bytes(b[140:172], "big"), struct.unpack_from("<I", b, 0)[0])
+
+
+def witness_commitment(witness: bytes) -> bytes:
+    """What the header's witness_root commits to: the exact bundle bytes."""
+    return _h(_P_WITNESS, witness)
 
 
 def tx_root(wtxids: Sequence[bytes]) -> bytes:
@@ -654,15 +716,24 @@ def validate_header(header_bytes: bytes, nonce: int, *, log2_n: int | None = Non
 
 def validate_body(parent: State, hdr: Header, tx_wires: Sequence[bytes], witness: bytes,
                   ctx: Context) -> tuple[State, list[bool]]:
-    """Body stage. The transactions must hash to the header's tx_root before anything in
-    them is judged: a mismatch is transient (wrong body for this header), while a
-    committed body that breaks a rule is permanent. Peers' oversized bodies should be
-    cut at the network layer; hashing here is linear in what was received."""
+    """Body stage. The transactions must hash to the header's tx_root and the bundle to
+    its witness_root before anything in them is judged: a mismatch is transient (wrong
+    body or bundle for this header), while a committed body or bundle that breaks a
+    rule is permanent. So a bad bundle costs one hash per attempt, and the proof checks
+    of a block id run to completion at most once. Peers' oversized bodies should be
+    cut at the network layer; hashing here is linear in what was received, and a
+    witness above MAX_WITNESS_BYTES is refused before it is hashed (transient: it
+    cannot be the committed bundle of a valid block)."""
     if tx_root([wtxid(w) for w in tx_wires]) != hdr.tx_root:
         raise InvalidBlock("tx-root")
+    if len(witness) > MAX_WITNESS_BYTES:
+        raise InvalidBlock("witness-size", "bundle exceeds MAX_WITNESS_BYTES")
+    if witness_commitment(witness) != hdr.witness_root:
+        raise InvalidBlock("witness-commitment")
     if sum(len(w) for w in tx_wires) > MAX_BLOCK_TX_BYTES:
         raise InvalidBlock("isolation", "block size")
     txs = [decode_tx_wire(w) for w in tx_wires]
+    ctx = dataclasses.replace(ctx, parents_root=hdr.parents_root)
     new_state, accepted = apply_block_txs(parent, txs, witness, ctx)
     if new_state.commitment() != hdr.state_commitment:
         raise InvalidBlock("state-commitment")
@@ -694,7 +765,8 @@ class FullNode:
         self.tree.set(key, utxo_leaf(key, record))
         self.utxos[key] = record
 
-    def build(self, txs: Sequence[Tx], ctx: Context) -> tuple[bytes, list[bool], int]:
+    def build(self, txs: Sequence[Tx], ctx: Context, *, merged: bool = False
+              ) -> tuple[bytes, list[bool], int]:
         """Decide every outcome exactly as the validator will, apply it, and return
         (witness bundle, accepted flags, fees of the accepted transactions)."""
         check_block_txs(txs, ctx)
@@ -735,18 +807,31 @@ class FullNode:
             fees += fee
             accepted[idx] = True
         cb = txs[0]
-        if sum(o.amount for o in cb.outputs) > ctx.subsidy + fees:
-            raise InvalidBlock("coinbase", "claims more than subsidy plus fees")
+        overclaim = sum(o.amount for o in cb.outputs) > ctx.subsidy + fees
         cid = txid(cb)
-        parts.append(bytes([ACCEPT]))
-        for o, out in enumerate(cb.outputs):
-            k = outpoint_key(cid, o)
-            if k in self.utxos:
+        out_keys = [outpoint_key(cid, o) for o in range(len(cb.outputs))]
+        taken = next((o for o, k in enumerate(out_keys) if k in self.utxos), None)
+        # A merged twin forfeiting its coinbase is exempt from the claim check
+        # (see apply_block_txs); every other coinbase is held to it.
+        if overclaim and not (merged and taken is not None):
+            raise InvalidBlock("coinbase", "claims more than subsidy plus fees")
+        if taken is not None:
+            if not merged:
                 raise InvalidBlock("coinbase", "coinbase output already exists")
-            parts.append(self.tree.proof(k))
-            self.insert(k, UtxoRecord(out.amount, out.owner, ctx.height, True))
-        accepted[0] = True
-        return b"".join(parts), accepted, fees
+            # Mergeset rule: a twin of an applied block forfeits its coinbase.
+            k = out_keys[taken]
+            parts += [bytes([REJECT_OUTPUT_EXISTS]), struct.pack("<I", taken),
+                      utxo_value(self.utxos[k]), self.tree.proof(k)]
+        else:
+            parts.append(bytes([ACCEPT]))
+            for k, out in zip(out_keys, cb.outputs):
+                parts.append(self.tree.proof(k))
+                self.insert(k, UtxoRecord(out.amount, out.owner, ctx.height, True))
+            accepted[0] = True
+        bundle = b"".join(parts)
+        if len(bundle) > MAX_WITNESS_BYTES:
+            raise InvalidBlock("witness-size", "bundle exceeds MAX_WITNESS_BYTES: include fewer transactions")
+        return bundle, accepted, fees
 
 
 if __name__ == "__main__":

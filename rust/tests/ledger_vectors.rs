@@ -22,6 +22,8 @@ fn ctx(v: &serde_json::Value) -> Context {
         subsidy: v["subsidy"].as_u64().unwrap(),
         coinbase_maturity: v["coinbase_maturity"].as_u64().unwrap(),
         auth: ledger::test_preimage_auth,
+        // validate_block sets it from the header.
+        parents_root: ledger::EMPTY,
     }
 }
 
@@ -110,6 +112,45 @@ fn invalid_blocks_raise_the_same_error_codes() {
                 assert_eq!(e.code.as_str(), expected, "{name}: {e}");
                 assert_eq!(e.code.is_permanent(), v["permanent"].as_bool().unwrap(), "{name}: permanence");
             }
+        }
+    }
+}
+
+/// LED-1: the mergeset coinbase-collision rule (`merged` cases are applied with
+/// `apply_merged_block_txs`, the others with `apply_block_txs`; no header),
+/// including a fee-paying twin whose forfeited coinbase claims the first
+/// twin's fees (exempt from the claim check).
+#[test]
+fn mergeset_vectors() {
+    let d = doc();
+    let cases = d["mergeset"].as_array().unwrap();
+    assert_eq!(cases.len(), 6);
+    for v in cases {
+        let name = v["name"].as_str().unwrap();
+        let c = Context { parents_root: h32(&v["parents_root"]), ..ctx(v) };
+        let txs: Vec<ledger::Tx> = v["txs_hex"].as_array().unwrap().iter()
+            .map(|t| ledger::decode_tx_wire(&hex::decode(t.as_str().unwrap()).unwrap()).unwrap())
+            .collect();
+        let witness = hex::decode(v["witness_hex"].as_str().unwrap()).unwrap();
+        let pre = state(&v["pre"]);
+        let got = if v["merged"].as_bool().unwrap() {
+            ledger::apply_merged_block_txs(&pre, &txs, &witness, &c)
+        } else {
+            ledger::apply_block_txs(&pre, &txs, &witness, &c)
+        };
+        match (got, v.get("expected_error")) {
+            (Ok((post, accepted)), None) => {
+                assert_eq!(post, state(&v["post"]), "{name}");
+                let expected: Vec<bool> =
+                    v["accepted"].as_array().unwrap().iter().map(|b| b.as_bool().unwrap()).collect();
+                assert_eq!(accepted, expected, "{name}");
+            }
+            (Err(e), Some(code)) => {
+                assert_eq!(e.code.as_str(), code.as_str().unwrap(), "{name}: {e}");
+                assert_eq!(e.code.is_permanent(), v["permanent"].as_bool().unwrap(), "{name}: permanence");
+            }
+            (Ok(_), Some(code)) => panic!("{name}: accepted, expected {code}"),
+            (Err(e), None) => panic!("{name}: rejected with {e}, expected success"),
         }
     }
 }

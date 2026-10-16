@@ -83,17 +83,41 @@ fn hybrid_secret_body(mldsa: &[u8], falcon: &[u8]) -> zeroize::Zeroizing<Vec<u8>
     body
 }
 
+/// Best-effort wipe of a `pqcrypto` ML-DSA secret-key value (CRY-4).
+///
+/// The upstream `SecretKey` types are `Copy` and have no `Drop`, so they can
+/// never be zeroized by ownership. Overwriting the variable with an all-zero
+/// key (and keeping the store observable through `black_box`) clears the one
+/// copy this crate holds. Copies the compiler may have made elsewhere are out
+/// of reach without `unsafe`; every repository-owned *byte buffer* holding
+/// secret material is wrapped in `Zeroizing` instead.
+fn wipe_mldsa_secret(sk: &mut mldsa65::SecretKey) {
+    if let Ok(zero) = mldsa65::SecretKey::from_bytes(&[0u8; MLDSA_SECRET_LEN]) {
+        *sk = zero;
+    }
+    std::hint::black_box(&*sk);
+}
+
 pub fn generate_keypair() -> (Vec<u8>, Vec<u8>) {
-    let (mpk, msk) = mldsa65::keypair();
-    let (fpk, fsk) = falcon::keypair();
-    let fsk = zeroize::Zeroizing::new(fsk);
+    // Moves the allocation out of its owner (no copy); the caller owns it.
+    let (pk, mut sk) = generate_keypair_zeroizing();
+    (pk, std::mem::take(&mut *sk))
+}
+
+/// [`generate_keypair`] returning the secret key under wiping ownership
+/// (CRY-4). New code should prefer this entry point; the plain-`Vec` variant
+/// is kept for source compatibility.
+pub fn generate_keypair_zeroizing() -> (Vec<u8>, zeroize::Zeroizing<Vec<u8>>) {
+    let (mpk, mut msk) = mldsa65::keypair();
+    let (fpk, fsk) = falcon::keypair_zeroizing();
     let mut pk = mpk.as_bytes().to_vec(); pk.extend_from_slice(&fpk);
     let sk = hybrid_secret_body(msk.as_bytes(), &fsk);
+    wipe_mldsa_secret(&mut msk);
     // Enveloped under suite 0x0001 (magic ‖ 01 00 ‖ body). The enveloped pk is
     // THE public key everywhere (keygen, address hashing, script_sig) so
     // addresses become suite-committing (design §2.4).
     (wrap_envelope(SUITE_MLDSA65_FALCON1024, &pk),
-     wrap_envelope(SUITE_MLDSA65_FALCON1024, &sk))
+     zeroize::Zeroizing::new(wrap_envelope(SUITE_MLDSA65_FALCON1024, &sk)))
 }
 
 /// Deterministic keypair generation from a 32-byte seed.
@@ -113,6 +137,11 @@ pub fn generate_keypair() -> (Vec<u8>, Vec<u8>) {
 /// - The RNG state does not leak across calls: a thread-local RAII guard
 ///   owns cleanup and clears the override on return or unwind.
 ///
+/// Both halves are reproducible across platforms: ML-DSA-65 keygen is integer
+/// arithmetic, and Falcon-1024 is pinned to PQClean's `clean` variant, whose
+/// keygen and signing emulate IEEE-754 in integer code and are bit-exact on
+/// every target (pinned by `falcon_clean_seeded_kat_is_byte_stable_and_verifies`).
+///
 /// # Compatibility warning
 ///
 /// This produces keypairs compatible with `pqcrypto-mldsa 0.1.x`. A future
@@ -127,12 +156,21 @@ pub fn generate_keypair() -> (Vec<u8>, Vec<u8>) {
 /// the ChaCha20 key. Callers deriving seeds from BIP39 24-word phrases should
 /// pass the 64-byte PBKDF2 output truncated to or hashed to 32 bytes.
 pub fn generate_keypair_from_seed(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+    // Moves the allocation out of its owner (no copy); the caller owns it.
+    let (pk, mut sk) = generate_keypair_from_seed_zeroizing(seed)?;
+    Ok((pk, std::mem::take(&mut *sk)))
+}
+
+/// [`generate_keypair_from_seed`] returning the secret key under wiping
+/// ownership (CRY-4). Byte-identical output.
+pub fn generate_keypair_from_seed_zeroizing(
+    seed: &[u8],
+) -> Result<(Vec<u8>, zeroize::Zeroizing<Vec<u8>>), CryptoError> {
     if seed.len() < 32 {
         return Err(CryptoError::InvalidKey(
             format!("seed too short: {} bytes (need 32+)", seed.len())
         ));
     }
-
     // Use first 32 bytes as ChaCha20 key. For longer seeds (e.g. 64-byte
     // BIP39 PBKDF2), the caller is responsible for hashing down to 32 bytes
     // if they want the full entropy preserved — here we take the first 32
@@ -142,14 +180,14 @@ pub fn generate_keypair_from_seed(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Cry
 
     // Both keygens consume the unchanged stream within a non-escaping scope.
     // Cleanup also removes any accidentally forgotten nested legacy guards.
-    let ((mpk, msk), (fpk, fsk)) = pqcrypto_internals::with_seeded_rng_scope(&seed32, || {
-        (mldsa65::keypair(), falcon::keypair())
+    let ((mpk, mut msk), (fpk, fsk)) = pqcrypto_internals::with_seeded_rng_scope(&seed32, || {
+        (mldsa65::keypair(), falcon::keypair_zeroizing())
     });
-    let fsk = zeroize::Zeroizing::new(fsk);
     let mut pk = mpk.as_bytes().to_vec(); pk.extend_from_slice(&fpk);
     let sk = hybrid_secret_body(msk.as_bytes(), &fsk);
+    wipe_mldsa_secret(&mut msk);
     Ok((wrap_envelope(SUITE_MLDSA65_FALCON1024, &pk),
-        wrap_envelope(SUITE_MLDSA65_FALCON1024, &sk)))
+        zeroize::Zeroizing::new(wrap_envelope(SUITE_MLDSA65_FALCON1024, &sk))))
 }
 
 // ── Signed-message domain (A4-M-4) ──────────────────────────────────────────
@@ -188,6 +226,41 @@ pub fn signed_message_digest(message: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Domain tag of the chain-bound signed-message format (CRY-8).
+///
+/// The v1 tag above carries no chain identifier, so a v1 message signature
+/// verifies identically on Bloch, GnB mainnet and GnB testnet, which share
+/// keys. New signatures use this v2 domain, which appends the 4-byte chain id
+/// ([`crate::core::ChainId`]) before the length-prefixed message. Wallets keep
+/// VERIFYING v1 for signatures made before the change (see
+/// `wallet::Keypair::verify_message`). Like v1, the tag is not a prefix of any
+/// other signing domain in the codebase and none of them is a prefix of it.
+pub const SIGNED_MESSAGE_DOMAIN_V2: &[u8] = b"GNB-SIGNED-MESSAGE-v2";
+
+/// The digest a v2 "sign this message" flow signs:
+/// SHA3-256(`SIGNED_MESSAGE_DOMAIN_V2` ‖ chain_id u32 LE ‖
+/// `message.len() as u64 LE` ‖ `message`). Same caller contract as
+/// [`signed_message_digest`]: pass the raw message bytes, never hex-decoded text.
+pub fn signed_message_digest_v2(chain_id: crate::core::ChainId, message: &[u8]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(SIGNED_MESSAGE_DOMAIN_V2);
+    h.update(chain_id.to_le_bytes());
+    h.update((message.len() as u64).to_le_bytes());
+    h.update(message);
+    h.finalize().into()
+}
+
+/// Sign `message` with an enveloped secret key.
+///
+/// CRY-5: the output is checked before it is returned. The ML-DSA half must
+/// have its fixed length and the Falcon half must be a well-formed compact
+/// Falcon-1024 encoding: `pqcrypto-falcon` discards the C signer's return
+/// code, so a secret key the signer rejects (corrupt header, bad encoding)
+/// used to yield `Ok` with an EMPTY Falcon half. That case is now an error.
+///
+/// This function has no public key, so it cannot verify the signature
+/// itself; wallet code signs through [`sign_checked`], which also verifies
+/// both halves under the wallet's public key before returning.
 pub fn sign(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoError> {
     // Parse the suite envelope on the secret key, then produce a signature
     // enveloped under the SAME suite. Parse failure ⇒ Err (never a panic).
@@ -200,9 +273,7 @@ pub fn sign(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoEr
                 return Err(CryptoError::InvalidKey("hybrid secret key too short".into()));
             }
             let (msk, fsk) = sk_body.split_at(MLDSA_SECRET_LEN);
-            let sk = mldsa65::SecretKey::from_bytes(msk)
-                .map_err(|_| CryptoError::InvalidKey("bad ML-DSA secret key".into()))?;
-            let mut out = mldsa65::detached_sign(message, &sk).as_bytes().to_vec();
+            let mut out = mldsa_sign_checked(msk, message)?;
             out.extend_from_slice(&falcon::sign(fsk, message)?);
             Ok(wrap_envelope(suite, &out))
         }
@@ -210,13 +281,73 @@ pub fn sign(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoEr
             if sk_body.len() != MLDSA_SECRET_LEN {
                 return Err(CryptoError::InvalidKey("ML-DSA-only secret key wrong length".into()));
             }
-            let sk = mldsa65::SecretKey::from_bytes(sk_body)
-                .map_err(|_| CryptoError::InvalidKey("bad ML-DSA secret key".into()))?;
-            let out = mldsa65::detached_sign(message, &sk).as_bytes().to_vec();
+            let out = mldsa_sign_checked(sk_body, message)?;
             Ok(wrap_envelope(suite, &out))
         }
         _ => Err(CryptoError::InvalidKey(format!("unknown/reserved suite {:#06x}", suite))),
     }
+}
+
+/// ML-DSA-65 detached signature with an output-length check and a
+/// best-effort wipe of the `Copy` secret-key value (CRY-4/CRY-5).
+fn mldsa_sign_checked(secret: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let mut sk = mldsa65::SecretKey::from_bytes(secret)
+        .map_err(|_| CryptoError::InvalidKey("bad ML-DSA secret key".into()))?;
+    let sig = mldsa65::detached_sign(message, &sk).as_bytes().to_vec();
+    wipe_mldsa_secret(&mut sk);
+    if sig.len() != MLDSA_SIG_LEN {
+        return Err(CryptoError::SignFailed(format!(
+            "ML-DSA-65 signer returned {} bytes, expected {}", sig.len(), MLDSA_SIG_LEN
+        )));
+    }
+    Ok(sig)
+}
+
+/// Sign and verify before returning (CRY-5). This is the entry point for
+/// every wallet signer.
+///
+/// The produced signature must verify under `public_key_bytes` through BOTH
+/// the consensus verifier ([`verify`]) and the canonical policy (mandatory
+/// suite envelope on the signature, compact Falcon encoding: the wallet side
+/// of CRY-1/CRY-2, so a future canonical-witness rule cannot invalidate what
+/// wallets emit). Each hybrid half is therefore checked. A secret key that
+/// does not belong to `public_key_bytes`, a corrupted key, or a signer fault
+/// returns `Err` instead of a signature the network would reject.
+///
+/// `public_key_bytes` may be enveloped (every current key) or the exact raw
+/// legacy hybrid encoding of a pre-envelope carry-over wallet, whose address
+/// commits to the raw key; the signature itself is always enveloped.
+pub fn sign_checked(
+    secret_key_bytes: &[u8],
+    public_key_bytes: &[u8],
+    message: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let sig = sign(secret_key_bytes, message)?;
+    if !verify_wallet_signature(public_key_bytes, message, &sig) {
+        return Err(CryptoError::SignFailed(
+            "produced signature does not verify under the wallet public key \
+             (corrupted or mismatched secret key)".into(),
+        ));
+    }
+    Ok(sig)
+}
+
+/// True when `sig` is a canonical wallet signature over `message` that the
+/// consensus verifier accepts for `public_key_bytes`.
+pub fn verify_wallet_signature(public_key_bytes: &[u8], message: &[u8], sig: &[u8]) -> bool {
+    let canonical = if public_key_bytes.len() == legacy_hybrid_pubkey_len() {
+        // Pre-envelope key: the address commits to the raw key bytes, the
+        // signature still carries the suite-0x0001 envelope.
+        match parse_envelope(sig) {
+            Some((SUITE_MLDSA65_FALCON1024, body)) => {
+                verify_legacy_hybrid_raw_canonical(public_key_bytes, message, body)
+            }
+            _ => false,
+        }
+    } else {
+        verify_enveloped_canonical(public_key_bytes, message, sig)
+    };
+    canonical && verify(public_key_bytes, message, sig)
 }
 
 /// Parse a suite envelope, or fall back to the LEGACY pre-envelope encoding:
@@ -270,8 +401,11 @@ fn parse_pubkey_envelope_or_legacy(b: &[u8]) -> (u16, &[u8]) {
 /// accepts the exact legacy raw `ML-DSA-65 || Falcon-1024` key shape and the
 /// exact suite-0x0001 envelope shape.  In particular it refuses suite 0x0002
 /// even though [`verify`] deliberately retains support for that crypto-agility
-/// suite.  Admission callers use this distinction to keep new ML-DSA-only
-/// transfers out of the live network without changing historical consensus.
+/// suite.  CRY-2: mempool admission (`node/src/mempool/admission.rs`,
+/// standardness) refuses every input whose key fails this predicate, and the
+/// wallet builders refuse to sign with such a key, so new ML-DSA-only spends
+/// stay out of the live network while outputs that may already be locked to a
+/// 0x0002 key stay consensus-spendable.
 pub fn is_hybrid_public_key(public_key_bytes: &[u8]) -> bool {
     let (suite, body) = parse_pubkey_envelope_or_legacy(public_key_bytes);
     suite == SUITE_MLDSA65_FALCON1024 && body.len() == legacy_hybrid_pubkey_len()
@@ -496,9 +630,9 @@ fn verify_hybrid_mldsa_falcon_with(
 }
 
 /// Suite 0x0002 verifier — ML-DSA-65 only (Falcon removed). Exact-length bodies
-/// required. Provided so `SUITE_MLDSA65_ONLY` objects verify; no live output
-/// uses this suite yet (gating new 0x0002 acceptance behind a height activation
-/// is future work, design §2.5).
+/// required. Consensus-valid at every height so that outputs already locked to
+/// a 0x0002 key are never frozen; relay policy refuses new 0x0002 spends and
+/// wallets never produce them (CRY-2, see [`is_hybrid_public_key`]).
 fn verify_mldsa65_only(pk_body: &[u8], message: &[u8], sig_body: &[u8]) -> bool {
     if pk_body.len() != MLDSA_PUBKEY_LEN || sig_body.len() != MLDSA_SIG_LEN {
         debug!("crypto::verify: mldsa-only pk/sig body wrong length (pk={}, sig={})",
@@ -542,6 +676,168 @@ pub fn verify_mldsa65_raw(public_key_bytes: &[u8], message: &[u8], signature_byt
 /// format defined in exactly one place.
 pub fn split_envelope(bytes: &[u8]) -> Option<(u16, &[u8])> {
     parse_envelope(bytes)
+}
+
+// ── Canonical signature encoding and suite helpers (CRY-1, CRY-2) ────────────
+
+/// Suite named by a PUBLIC key: the exact raw legacy hybrid length is suite
+/// 0x0001 (genesis carry-over addresses commit to raw keys), otherwise the
+/// envelope's suite. `None` for anything else (no envelope, unknown or
+/// reserved suite). A format predicate; it does not check the key material.
+pub fn public_key_suite(public_key_bytes: &[u8]) -> Option<u16> {
+    if public_key_bytes.len() == legacy_hybrid_pubkey_len() {
+        return Some(SUITE_MLDSA65_FALCON1024);
+    }
+    match parse_envelope(public_key_bytes) {
+        Some((suite @ (SUITE_MLDSA65_FALCON1024 | SUITE_MLDSA65_ONLY), _)) => Some(suite),
+        _ => None,
+    }
+}
+
+/// `true` iff `signature_bytes` is the single canonical encoding of a
+/// signature: the 4-byte suite envelope is present and names a live suite,
+/// and the body has its exact form —
+///
+/// * suite 0x0001: `mldsa_sig(3,309) ‖ falcon_sig` where `falcon_sig` is
+///   Falcon-1024's COMPACT encoding (header byte 0x3A, 40-byte nonce,
+///   exactly framed coefficients, zero padding bits, nothing after it, at
+///   most `falcon1024::signature_bytes()` bytes). The 1,280-byte zero-padded
+///   form the historical verifier also accepts is NOT canonical;
+/// * suite 0x0002: exactly the 3,309-byte ML-DSA-65 signature.
+///
+/// Format only (no signature math): cheap enough for relay policy. Together
+/// with a successful [`verify`] it is equivalent to
+/// [`verify_enveloped_canonical`] / [`verify_legacy_hybrid_raw_canonical`].
+pub fn is_canonical_signature_encoding(signature_bytes: &[u8]) -> bool {
+    match parse_envelope(signature_bytes) {
+        Some((SUITE_MLDSA65_FALCON1024, body)) => {
+            body.len() > MLDSA_SIG_LEN && falcon::is_canonical_encoding(&body[MLDSA_SIG_LEN..])
+        }
+        Some((SUITE_MLDSA65_ONLY, body)) => body.len() == MLDSA_SIG_LEN,
+        _ => false,
+    }
+}
+
+// ── Component-bound transaction signatures (sighash v3, CRY-2) ───────────────
+//
+// Under the legacy binding every component of a hybrid signature signs the
+// same 32-byte digest, so the ML-DSA half of a suite-0x0001 signature is, by
+// itself, a valid suite-0x0002 signature over that digest ("split and
+// relabel"). Under sighash v3 each component signs a message that names the
+// suite AND the component (composite-signature practice):
+//
+//   message(suite, component, digest) =
+//       TX_SIG_COMPONENT_DOMAIN (12 bytes, "GNB-TXSIG-v3")
+//     ‖ suite      u16 LE
+//     ‖ component  u8      (0x01 = ML-DSA-65, 0x02 = Falcon-1024)
+//     ‖ digest     32 bytes (the sighash v3 digest)
+//
+// A suite-0x0001 ML-DSA component is a signature over a message containing
+// `01 00 01`; the suite-0x0002 verifier checks a message containing
+// `02 00 01`, so a stripped and relabelled half never verifies, even over
+// the same digest. The suite is also committed in the digest itself (sighash
+// v3 commits the signature's suite id), which is a second, independent bar.
+
+/// Domain tag of a v3 component message. Not a prefix of any other signing
+/// domain in the codebase, and none of them is a prefix of it.
+pub const TX_SIG_COMPONENT_DOMAIN: [u8; 12] = *b"GNB-TXSIG-v3";
+/// Component id of the ML-DSA-65 signature in a v3 component message.
+pub const COMPONENT_MLDSA65: u8 = 0x01;
+/// Component id of the Falcon-1024 signature in a v3 component message.
+pub const COMPONENT_FALCON1024: u8 = 0x02;
+/// Length of a v3 component message: 12 + 2 + 1 + 32.
+pub const BOUND_COMPONENT_MESSAGE_LEN: usize = 47;
+
+/// The message component `component` of suite `suite` signs under sighash v3.
+pub fn bound_component_message(suite: u16, component: u8, digest: &[u8; 32]) -> [u8; BOUND_COMPONENT_MESSAGE_LEN] {
+    let mut m = [0u8; BOUND_COMPONENT_MESSAGE_LEN];
+    m[..12].copy_from_slice(&TX_SIG_COMPONENT_DOMAIN);
+    m[12..14].copy_from_slice(&suite.to_le_bytes());
+    m[14] = component;
+    m[15..].copy_from_slice(digest);
+    m
+}
+
+/// Sign a sighash-v3 digest with an enveloped secret key: every component
+/// signs its own [`bound_component_message`]. The output is the canonical
+/// enveloped encoding of the key's suite.
+pub fn sign_bound(secret_key_bytes: &[u8], digest: &[u8; 32]) -> Result<Vec<u8>, CryptoError> {
+    let (suite, sk_body) = parse_envelope(secret_key_bytes)
+        .ok_or_else(|| CryptoError::InvalidKey("secret-key envelope: too short or bad magic".into()))?;
+    match suite {
+        SUITE_MLDSA65_FALCON1024 => {
+            if sk_body.len() <= MLDSA_SECRET_LEN {
+                return Err(CryptoError::InvalidKey("hybrid secret key too short".into()));
+            }
+            let (msk, fsk) = sk_body.split_at(MLDSA_SECRET_LEN);
+            let mut out = mldsa_sign_checked(msk, &bound_component_message(suite, COMPONENT_MLDSA65, digest))?;
+            out.extend_from_slice(&falcon::sign(fsk, &bound_component_message(suite, COMPONENT_FALCON1024, digest))?);
+            Ok(wrap_envelope(suite, &out))
+        }
+        SUITE_MLDSA65_ONLY => {
+            if sk_body.len() != MLDSA_SECRET_LEN {
+                return Err(CryptoError::InvalidKey("ML-DSA-only secret key wrong length".into()));
+            }
+            let out = mldsa_sign_checked(sk_body, &bound_component_message(suite, COMPONENT_MLDSA65, digest))?;
+            Ok(wrap_envelope(suite, &out))
+        }
+        _ => Err(CryptoError::InvalidKey(format!("unknown/reserved suite {:#06x}", suite))),
+    }
+}
+
+/// [`sign_bound`] followed by [`verify_bound`] under `public_key_bytes`
+/// (enveloped, or the exact raw legacy hybrid key of a carry-over wallet).
+/// The wallet entry point for version-3 transactions.
+pub fn sign_bound_checked(
+    secret_key_bytes: &[u8],
+    public_key_bytes: &[u8],
+    digest: &[u8; 32],
+) -> Result<Vec<u8>, CryptoError> {
+    let sig = sign_bound(secret_key_bytes, digest)?;
+    if !verify_bound(public_key_bytes, digest, &sig) {
+        return Err(CryptoError::SignFailed(
+            "produced signature does not verify under the wallet public key \
+             (corrupted or mismatched secret key)".into(),
+        ));
+    }
+    Ok(sig)
+}
+
+/// Consensus verifier of a sighash-v3 signature. Requires the canonical
+/// signature encoding ([`is_canonical_signature_encoding`]); the public key
+/// may be enveloped or the exact raw legacy hybrid encoding (genesis
+/// carry-over addresses commit to raw keys and must stay spendable). The
+/// key's suite must equal the signature's, and every component must verify
+/// over its [`bound_component_message`]. Never panics.
+pub fn verify_bound(public_key_bytes: &[u8], digest: &[u8; 32], signature_bytes: &[u8]) -> bool {
+    if !is_canonical_signature_encoding(signature_bytes) {
+        return false;
+    }
+    let Some((sig_suite, sig_body)) = parse_envelope(signature_bytes) else { return false };
+    let Some(pk_suite) = public_key_suite(public_key_bytes) else { return false };
+    if pk_suite != sig_suite {
+        return false;
+    }
+    let pk_body = if public_key_bytes.len() == legacy_hybrid_pubkey_len() {
+        public_key_bytes
+    } else {
+        &public_key_bytes[SUITE_HEADER_LEN..]
+    };
+    match sig_suite {
+        SUITE_MLDSA65_FALCON1024 => {
+            if pk_body.len() <= MLDSA_PUBKEY_LEN {
+                return false;
+            }
+            let (mpk, fpk) = pk_body.split_at(MLDSA_PUBKEY_LEN);
+            let (msig, fsig) = sig_body.split_at(MLDSA_SIG_LEN);
+            verify_mldsa65_only(mpk, &bound_component_message(sig_suite, COMPONENT_MLDSA65, digest), msig)
+                && falcon::verify_canonical(fpk, &bound_component_message(sig_suite, COMPONENT_FALCON1024, digest), fsig)
+        }
+        SUITE_MLDSA65_ONLY => {
+            verify_mldsa65_only(pk_body, &bound_component_message(sig_suite, COMPONENT_MLDSA65, digest), sig_body)
+        }
+        _ => false,
+    }
 }
 
 pub fn address_from_pubkey(public_key: &[u8], testnet: bool) -> String {
@@ -638,6 +934,80 @@ mod tests {
         let (pk, sk) = generate_keypair();
         let sig = sign(&sk, b"correct").unwrap();
         assert!(!verify(&pk, b"tampered", &sig));
+    }
+
+    // ── CRY-5 regressions ────────────────────────────────────────────────
+    /// A Falcon secret key the C signer rejects (corrupted header byte, same
+    /// length) used to produce `Ok` with an empty Falcon half.
+    #[test]
+    fn sign_fails_on_corrupted_falcon_secret_key() {
+        let (pk, mut sk) = generate_keypair();
+        sk[SUITE_HEADER_LEN + MLDSA_SECRET_LEN] ^= 0xFF;
+        let err = sign(&sk, b"m").unwrap_err();
+        assert!(matches!(err, CryptoError::SignFailed(_)), "{err}");
+        assert!(sign_checked(&sk, &pk, b"m").is_err());
+        let falcon_sk = &sk[SUITE_HEADER_LEN + MLDSA_SECRET_LEN..];
+        assert!(falcon::sign(falcon_sk, b"m").is_err());
+    }
+
+    /// A structurally valid secret key that belongs to another public key
+    /// signs, but the checked signer refuses to return the signature.
+    #[test]
+    fn sign_checked_refuses_a_secret_key_of_another_public_key() {
+        let (pk, _) = generate_keypair();
+        let (_, other_sk) = generate_keypair();
+        assert!(sign(&other_sk, b"m").is_ok());
+        assert!(matches!(sign_checked(&other_sk, &pk, b"m"), Err(CryptoError::SignFailed(_))));
+    }
+
+    /// Wallet side of CRY-1/CRY-2: what the checked signer returns is the
+    /// canonical witness form (enveloped, compact Falcon) and passes the
+    /// consensus verifier, for enveloped and raw legacy public keys alike.
+    #[test]
+    fn sign_checked_emits_canonical_signatures_for_both_key_encodings() {
+        let (pk, sk) = generate_keypair();
+        let sig = sign_checked(&sk, &pk, b"wallet-witness").unwrap();
+        assert!(verify_enveloped_canonical(&pk, b"wallet-witness", &sig));
+        assert!(verify(&pk, b"wallet-witness", &sig));
+        assert!(verify_wallet_signature(&pk, b"wallet-witness", &sig));
+
+        let raw_pk = &pk[SUITE_HEADER_LEN..];
+        let sig = sign_checked(&sk, raw_pk, b"wallet-witness").unwrap();
+        assert!(parse_envelope(&sig).is_some(), "signature keeps its suite envelope");
+        assert!(verify(raw_pk, b"wallet-witness", &sig));
+        assert!(!verify_wallet_signature(raw_pk, b"other", &sig));
+
+        // A zero-padded Falcon half is not what a wallet emits.
+        let mut padded = sig.clone();
+        padded.resize(SUITE_HEADER_LEN + MLDSA_SIG_LEN + falcon::padded_signature_len(), 0);
+        if padded != sig {
+            assert!(!verify_wallet_signature(raw_pk, b"wallet-witness", &padded));
+        }
+    }
+
+    // ── CRY-8: chain-bound signed-message domain ─────────────────────────
+    #[test]
+    fn signed_message_v2_digest_binds_the_chain_and_differs_from_v1() {
+        use crate::core::ChainId;
+        let m = b"prove you own this address";
+        let main = signed_message_digest_v2(ChainId::Mainnet, m);
+        let test = signed_message_digest_v2(ChainId::Testnet, m);
+        assert_ne!(main, test);
+        assert_ne!(main, signed_message_digest(m));
+        assert_eq!(main, signed_message_digest_v2(ChainId::Mainnet, m));
+        assert!(!SIGNED_MESSAGE_DOMAIN_V2.starts_with(SIGNED_MESSAGE_DOMAIN));
+    }
+
+    // ── CRY-4: zeroizing keygen entry points are byte-identical ──────────
+    #[test]
+    fn zeroizing_keygen_matches_compatibility_keygen() {
+        assert!(std::mem::needs_drop::<zeroize::Zeroizing<Vec<u8>>>());
+        let (pk_a, sk_a) = generate_keypair_from_seed(&[0x31; 32]).unwrap();
+        let (pk_b, sk_b) = generate_keypair_from_seed_zeroizing(&[0x31; 32]).unwrap();
+        assert_eq!(pk_a, pk_b);
+        assert_eq!(sk_a.as_slice(), sk_b.as_slice());
+        let (pk, sk) = generate_keypair_zeroizing();
+        assert!(verify(&pk, b"z", &sign(&sk, b"z").unwrap()));
     }
     #[test] fn diversified_addresses_are_distinct_deterministic_and_valid() {
         let seed = [7u8; 64];
@@ -785,15 +1155,47 @@ pub mod falcon {
         pqcrypto_falcon::falconpadded1024::signature_bytes()
     }
 
-    pub fn keypair() -> (Vec<u8>, Vec<u8>) {
-        let (pk, sk) = falcon1024::keypair();
-        (pk.as_bytes().to_vec(), sk.as_bytes().to_vec())
+    /// Best-effort wipe of the `Copy` upstream secret-key value (see
+    /// `super::wipe_mldsa_secret`).
+    fn wipe_secret(sk: &mut falcon1024::SecretKey) {
+        let zeros = vec![0u8; falcon1024::secret_key_bytes()];
+        if let Ok(zero) = falcon1024::SecretKey::from_bytes(&zeros) {
+            *sk = zero;
+        }
+        std::hint::black_box(&*sk);
     }
 
+    pub fn keypair() -> (Vec<u8>, Vec<u8>) {
+        let (pk, mut sk) = keypair_zeroizing();
+        (pk, std::mem::take(&mut *sk))
+    }
+
+    /// [`keypair`] with the secret key under wiping ownership (CRY-4).
+    pub fn keypair_zeroizing() -> (Vec<u8>, zeroize::Zeroizing<Vec<u8>>) {
+        let (pk, mut sk) = falcon1024::keypair();
+        let secret = zeroize::Zeroizing::new(sk.as_bytes().to_vec());
+        wipe_secret(&mut sk);
+        (pk.as_bytes().to_vec(), secret)
+    }
+
+    /// Falcon-1024 detached signature (compact encoding).
+    ///
+    /// CRY-5: `pqcrypto-falcon` ignores the C signer's return code; on
+    /// failure the output stays EMPTY. The output is therefore required to
+    /// be a well-formed compact encoding (header byte, nonce, exactly framed
+    /// coefficients) before it is returned; anything else is an error.
     pub fn sign(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        let sk = falcon1024::SecretKey::from_bytes(secret_key_bytes)
+        let mut sk = falcon1024::SecretKey::from_bytes(secret_key_bytes)
             .map_err(|_| CryptoError::InvalidKey("bad falcon secret key".into()))?;
-        Ok(falcon1024::detached_sign(message, &sk).as_bytes().to_vec())
+        let sig = falcon1024::detached_sign(message, &sk).as_bytes().to_vec();
+        wipe_secret(&mut sk);
+        if sig.len() > falcon1024::signature_bytes() || !is_compact_signature_encoding(&sig) {
+            return Err(CryptoError::SignFailed(format!(
+                "Falcon-1024 signer failed (returned {} bytes; corrupted secret key?)",
+                sig.len()
+            )));
+        }
+        Ok(sig)
     }
 
     /// Deterministic verification (consensus rule): malformed inputs → false.
@@ -821,6 +1223,13 @@ pub mod falcon {
     ) -> bool {
         is_compact_signature_encoding(signature_bytes)
             && verify(public_key_bytes, message, signature_bytes)
+    }
+
+    /// `true` iff `signature` is a well-formed COMPACT Falcon-1024 encoding
+    /// (the only one [`sign`] emits) no longer than the compact maximum.
+    /// Format only; no signature math.
+    pub fn is_canonical_encoding(signature: &[u8]) -> bool {
+        signature.len() <= falcon1024::signature_bytes() && is_compact_signature_encoding(signature)
     }
 
     const FALCON1024_HEADER: u8 = 0x30 + 10;
@@ -1466,15 +1875,15 @@ mod kat {
     }
 
     // ─── (B) Golden regression vector: deterministic keygen-from-seed ─────────
-    // Fixed seed → byte-stable keypair. We pin the ML-DSA-65 halves only: FIPS
-    // 204 keygen (Alg. 6) is deterministic AND platform-stable given the byte
-    // stream, so these hashes are portable regression anchors. The Falcon-1024
-    // half is deterministic on a fixed platform but carries the documented
-    // floating-point-platform caveat (see `generate_keypair_from_seed` docs), so
-    // its bytes are NOT pinned here — only asserted reproducible within a run and
-    // length-checked. If pqcrypto-mldsa's internal keygen order ever changes,
-    // these hashes change and wallet recovery breaks — that is exactly what this
-    // vector guards (cf. the crate's own compatibility warning).
+    // Fixed seed → byte-stable keypair. This vector pins the ML-DSA-65 halves:
+    // FIPS 204 keygen (Alg. 6) is deterministic AND platform-stable given the
+    // byte stream, so these hashes are portable regression anchors. The
+    // Falcon-1024 half is just as reproducible (PQClean's `clean` variant is
+    // integer-only, emulating IEEE-754 bit-exactly on every platform); it is
+    // pinned separately by `falcon::tests::falcon_clean_seeded_kat_is_byte_stable_and_verifies`.
+    // If pqcrypto-mldsa's internal keygen order ever changes, these hashes
+    // change and wallet recovery breaks — that is exactly what this vector
+    // guards (cf. the crate's own compatibility warning).
     const GOLDEN_SEED: [u8; 32] = [0x11u8; 32];
     const GOLDEN_MLDSA_PK_HASH: &str =
         "bb34618ab597cc394fcfa9c9c5791d4767baacce3648285e8069742a55e2de37";
@@ -1548,9 +1957,13 @@ mod kat {
         assert!(!verify(&pk, GOLDEN_MSG, &sig[..sig.len() - 1]), "truncated sig must fail");
         assert!(!verify(&pk, GOLDEN_MSG, &sig[..MLDSA_SIG_LEN]), "falcon-less sig must fail");
 
-        // Oversized signature (trailing garbage) → false.
+        // Oversized signature (trailing garbage) → false. The garbage byte is
+        // non-zero: signing is randomized, and a 1,279-byte compact Falcon half
+        // plus one 0x00 is the 1,280-byte zero-padded encoding, which this
+        // lenient verifier accepts by design (see
+        // `canonical_verifier_rejects_the_legacy_zero_padded_variant`).
         let mut over = sig.clone();
-        over.push(0x00);
+        over.push(0x01);
         assert!(!verify(&pk, GOLDEN_MSG, &over), "oversized sig must fail");
 
         // Tampered public key: ML-DSA body byte (pk[4]) and Falcon body byte
@@ -1735,6 +2148,140 @@ mod kat {
                 let _ = sign(&sk, b"fuzz-message");
             });
             assert!(r.is_ok(), "sign panicked on bad secret key (len={len})");
+        }
+    }
+
+    // ─── CRY-2: component-bound (sighash v3) signatures ──────────────────────
+
+    /// A compact-Falcon fixture whose signature leaves room for padding.
+    fn bound_fixture(digest: &[u8; 32]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let (pk, sk) = generate_keypair_from_seed(&[0x5B; 32]).unwrap();
+        for seed in 0u8..=255 {
+            let sig = pqcrypto_internals::with_seeded_rng_scope(&[seed; 32], || sign_bound(&sk, digest).unwrap());
+            if sig.len() < SUITE_HEADER_LEN + MLDSA_SIG_LEN + falcon::padded_signature_len() {
+                return (pk, sk, sig);
+            }
+        }
+        unreachable!("no compact Falcon signature shorter than the padded form");
+    }
+
+    #[test]
+    fn bound_signature_roundtrip_and_canonical_form() {
+        let d = [0x42u8; 32];
+        let (pk, sk, sig) = bound_fixture(&d);
+        assert!(is_canonical_signature_encoding(&sig));
+        assert!(verify_bound(&pk, &d, &sig));
+        assert!(!verify_bound(&pk, &[0x43; 32], &sig), "other digest");
+        // The bound signature is NOT a legacy signature over the digest, and
+        // a legacy signature is not a bound one: the bindings never collide.
+        assert!(!verify(&pk, &d, &sig));
+        let legacy = sign(&sk, &d).unwrap();
+        assert!(verify(&pk, &d, &legacy));
+        assert!(!verify_bound(&pk, &d, &legacy));
+        // The checked signer verifies under the raw legacy key encoding too
+        // (genesis carry-over addresses commit to raw keys).
+        let raw_pk = &pk[SUITE_HEADER_LEN..];
+        let s2 = sign_bound_checked(&sk, raw_pk, &d).unwrap();
+        assert!(verify_bound(raw_pk, &d, &s2));
+        assert!(verify_bound(&pk, &d, &s2));
+        let (other_pk, _) = generate_keypair();
+        assert!(sign_bound_checked(&sk, &other_pk, &d).is_err());
+    }
+
+    /// CRY-1: every non-canonical encoding of a valid bound signature fails:
+    /// envelope stripped, Falcon half zero-padded to 1,280 bytes, a trailing
+    /// byte, a truncated Falcon half, an unknown suite.
+    #[test]
+    fn bound_verifier_requires_the_canonical_encoding() {
+        let d = [0x24u8; 32];
+        let (pk, _sk, sig) = bound_fixture(&d);
+        let stripped = sig[SUITE_HEADER_LEN..].to_vec();
+        assert!(!is_canonical_signature_encoding(&stripped));
+        assert!(!verify_bound(&pk, &d, &stripped));
+        let mut padded = sig.clone();
+        padded.resize(SUITE_HEADER_LEN + MLDSA_SIG_LEN + falcon::padded_signature_len(), 0);
+        assert_ne!(padded, sig);
+        assert!(!is_canonical_signature_encoding(&padded));
+        assert!(!verify_bound(&pk, &d, &padded));
+        let mut trailing = sig.clone();
+        trailing.push(0);
+        assert!(!is_canonical_signature_encoding(&trailing));
+        assert!(!verify_bound(&pk, &d, &trailing));
+        assert!(!verify_bound(&pk, &d, &sig[..sig.len() - 1]));
+        let mut unknown = sig.clone();
+        unknown[2] = 0x09;
+        assert!(!is_canonical_signature_encoding(&unknown));
+        assert!(!verify_bound(&pk, &d, &unknown));
+        // Format predicate on suite 0x0002: exactly the ML-DSA length.
+        let only = wrap_envelope(SUITE_MLDSA65_ONLY, &[0u8; MLDSA_SIG_LEN]);
+        assert!(is_canonical_signature_encoding(&only));
+        assert!(!is_canonical_signature_encoding(&wrap_envelope(SUITE_MLDSA65_ONLY, &[0u8; MLDSA_SIG_LEN + 1])));
+    }
+
+    /// CRY-2, the finding's exact attack: strip the Falcon half of a hybrid
+    /// signature and relabel it suite 0x0002, for the 0x0002 key over the
+    /// same ML-DSA body. Under the legacy binding it verifies; under the v3
+    /// binding it does not, even over the very same digest.
+    #[test]
+    fn split_hybrid_relabelled_as_mldsa_only_fails_under_the_bound_scheme() {
+        let d = [0x77u8; 32];
+        let (pk, sk) = generate_keypair_from_seed(&[0x31; 32]).unwrap();
+        let mldsa_pk = wrap_envelope(SUITE_MLDSA65_ONLY, &pk[SUITE_HEADER_LEN..SUITE_HEADER_LEN + MLDSA_PUBKEY_LEN]);
+        let relabel = |hybrid: &[u8]| wrap_envelope(SUITE_MLDSA65_ONLY, &hybrid[SUITE_HEADER_LEN..SUITE_HEADER_LEN + MLDSA_SIG_LEN]);
+
+        // Legacy (sighash v2) binding: the split works (the finding).
+        let legacy = sign(&sk, &d).unwrap();
+        assert!(verify(&mldsa_pk, &d, &relabel(&legacy)), "pre-fix weakness reproduced");
+
+        // Bound (sighash v3) binding: the stripped half signed a message that
+        // names suite 0x0001, so the 0x0002 verifier rejects it.
+        let bound = sign_bound(&sk, &d).unwrap();
+        assert!(verify_bound(&pk, &d, &bound));
+        let split = relabel(&bound);
+        assert!(is_canonical_signature_encoding(&split), "the forgery is well-formed");
+        assert!(!verify_bound(&mldsa_pk, &d, &split), "split + relabel must fail under v3");
+        // A genuine 0x0002 signature still verifies (the suite stays valid).
+        let mldsa_sk = wrap_envelope(SUITE_MLDSA65_ONLY, &sk[SUITE_HEADER_LEN..SUITE_HEADER_LEN + MLDSA_SECRET_LEN]);
+        let only = sign_bound(&mldsa_sk, &d).unwrap();
+        assert!(verify_bound(&mldsa_pk, &d, &only));
+        assert!(!verify_bound(&pk, &d, &only), "suite mismatch");
+        assert_eq!(public_key_suite(&mldsa_pk), Some(SUITE_MLDSA65_ONLY));
+        assert_eq!(public_key_suite(&pk), Some(SUITE_MLDSA65_FALCON1024));
+        assert_eq!(public_key_suite(&pk[SUITE_HEADER_LEN..]), Some(SUITE_MLDSA65_FALCON1024));
+        assert_eq!(public_key_suite(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn bound_component_messages_are_distinct_per_suite_and_component() {
+        let d = [9u8; 32];
+        let a = bound_component_message(SUITE_MLDSA65_FALCON1024, COMPONENT_MLDSA65, &d);
+        let b = bound_component_message(SUITE_MLDSA65_FALCON1024, COMPONENT_FALCON1024, &d);
+        let c = bound_component_message(SUITE_MLDSA65_ONLY, COMPONENT_MLDSA65, &d);
+        assert!(a != b && a != c && b != c);
+        assert_eq!(&a[..12], b"GNB-TXSIG-v3");
+        assert_eq!(&a[12..15], &[0x01, 0x00, 0x01]);
+        assert_eq!(&c[12..15], &[0x02, 0x00, 0x01]);
+        assert_eq!(&a[15..], &d);
+    }
+
+    #[test]
+    fn fuzz_verify_bound_never_panics() {
+        let mut rng = SplitMix64(0xB0B0_0003_0000_0001);
+        let (pk, _) = generate_keypair();
+        for _ in 0..2000 {
+            let sig_len = (rng.next() % 4900) as usize;
+            let mut sig = rng.bytes(sig_len);
+            if rng.next().is_multiple_of(2) && sig.len() >= 4 {
+                sig[..2].copy_from_slice(&SUITE_MAGIC);
+                sig[2] = (rng.next() % 3) as u8;
+                sig[3] = 0;
+            }
+            let pk_choice = rng.next() % 3;
+            let random_len = (rng.next() % 4000) as usize;
+            let p: Vec<u8> = match pk_choice { 0 => pk.clone(), 1 => pk[SUITE_HEADER_LEN..].to_vec(), _ => rng.bytes(random_len) };
+            let r = std::panic::catch_unwind(|| verify_bound(&p, &[0u8; 32], &sig));
+            assert!(r.is_ok());
+            assert!(!r.unwrap());
         }
     }
 

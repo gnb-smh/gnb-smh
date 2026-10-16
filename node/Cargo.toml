@@ -49,14 +49,26 @@ node = [
     "dep:governor",
     "dep:reqwest",
     "gnb-crypto/node",
+    # WAL-7: HTTPS (certificate-verified) for gnb-cli's RPC client.
+    "gnb-crypto/https-rpc",
 ]
 sev-snp = ["dep:sev"]
 mobile  = ["dep:x509-parser", "dep:ciborium"]
+# FUNCTIONAL TESTS ONLY (test/functional, docs/testing/FUNCTIONAL.md): forwards
+# gnb-crypto's dev feature, which pins every expected target to the pow limit
+# (about one GnB-SMH evaluation per block). Consensus-breaking, so it is off by
+# default and fenced: a binary with gnb-crypto's feature, however enabled,
+# refuses to start on mainnet, and an optimised one on every network
+# (`test_pow_limit_guard` in main.rs); a release-profile build with THIS
+# feature does not compile; CI asserts that the default build graph does not
+# enable it and that the binary it builds is not a test build
+# (.github/workflows/ci.yml, job `workspace-test`).
+#   cargo build -p gnb --features test-pow-limit --bin gnb --bin gnb-cli
+test-pow-limit = ["gnb-crypto/test-pow-limit"]
 
 [dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing = "0.1"
-blst = "0.3"
 serde-big-array = "0.5"
 tokio        = { version = "1",    features = ["full"] }
 futures      = "0.3"
@@ -117,8 +129,11 @@ rand         = "0.9"
 
 rocksdb      = { version = "0.22", optional = true }
 
-# FIX: libp2p 0.53 → 0.56 (pulls ring 0.17+, fixes AES panic vulnerability)
-libp2p       = { version = "0.56", features = ["tcp", "noise", "yamux", "gossipsub", "mdns", "tokio", "dns", "websocket", "identify", "ping", "macros", "ed25519", "request-response"], optional = true }
+# FIX: libp2p 0.53 → 0.56 (pulls ring 0.17+, fixes AES panic vulnerability).
+# Audit OPS-2: 0.56 → 0.57 — hickory 0.26.3 (RUSTSEC-2026-0118/0119 fixed) and
+# upstream libp2p-yamux 0.48 (single yamux 0.14 backend; the vendored fork that
+# removed the vulnerable yamux 0.12 backend is retired).
+libp2p       = { version = "0.57", features = ["tcp", "noise", "yamux", "gossipsub", "mdns", "tokio", "dns", "websocket", "identify", "ping", "macros", "ed25519", "request-response"], optional = true }
 
 # FIX: jsonrpc-http-server uses net2+instant (unmaintained) → replace with axum
 axum         = { version = "0.8", optional = true }
@@ -133,7 +148,6 @@ hex          = "0.4"
 chrono       = { version = "0.4",  features = ["serde"] }
 thiserror    = "2"
 base64       = "0.22"
-async-trait  = "0.1"
 reqwest      = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 pbkdf2       = "0.12"
 hmac         = "0.12"
@@ -145,8 +159,8 @@ bytes        = "1"
 # audited) over rolling our own [u64; 4] limb arithmetic.
 primitive-types = "0.13"
 
-
-secp256k1                 = { version = "0.29", features = ["rand-std"] }
+# Audit CRY-6: `blst` and `secp256k1` were declared here but referenced by no
+# source file; their C/assembly was compiled on every build. Removed.
 
 gnb-smh                   = { path = "../crates/gnb-smh" }
 
@@ -188,6 +202,10 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # Property-based invariant tests for GhostDAG consensus ordering
 # (determinism, parent-order independence, blue-score monotonicity).
 proptest = "1"
+# WAL-7: a local TLS server with a throw-away CA for the HTTPS RPC client
+# tests (versions already in Cargo.lock through libp2p / reqwest).
+rcgen  = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [lints.rust]
 # `sp1-verify` gates an optional SP1 shielded-proof verifier whose dependency

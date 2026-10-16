@@ -1,0 +1,85 @@
+# cargo-mutants configuration: mutation testing of the consensus code.
+# Method, commands, results and the equivalent-mutant table:
+# docs/testing/MUTATION.md. Run each package in its own invocation (never
+# together with the node crate `gnb`, whose dev-dependency feature
+# `test-pow-limit` would pin every expected target):
+#
+#   cargo mutants -p gnb-smh    --test-tool cargo -j 2
+#   cargo mutants -p gnb-crypto --test-tool cargo -j 2
+
+# The consensus scope. gnb-smh: the library (GnB-SMH, compact bits, chain
+# work, ASERT). The benchmark binary src/bin/smh-bench.rs is not linked into
+# anything and only prints wall-clock timings; it is out of scope.
+# gnb-crypto: the consensus modules of `core`.
+examine_globs = [
+    "crates/gnb-smh/src/lib.rs",
+    "crates/gnb-smh/src/difficulty.rs",
+    "crates/gnb-crypto/src/core/mod.rs",
+    "crates/gnb-crypto/src/core/block_rules.rs",
+    "crates/gnb-crypto/src/core/sighash.rs",
+    "crates/gnb-crypto/src/core/limits.rs",
+    "crates/gnb-crypto/src/core/activation.rs",
+    "crates/gnb-crypto/src/core/tokenomics.rs",
+    "crates/gnb-crypto/src/core/carryover.rs",
+]
+
+# Non-consensus code in core/mod.rs: the pre-signing fee estimators and
+# output statistics ("Sprint A" helpers: estimate_size feeds the advisory
+# `estimatefee` RPC, total_output the wallet; none is called by validation,
+# mempool admission or the block template), and the human-facing difficulty
+# float used only by RPC/explorer output. `Transaction::actual_size` stays in
+# scope: it is the pre-activation (bincode) size measure that the node's
+# mempool admission and the miner's coinbase reserve use. Also excluded: the
+# node's integration-test fixture `Block::test_only_assume_pow_valid`, which is
+# compiled only with the `test-pow-limit` feature: these runs never enable
+# it, so its mutants are not even compiled and would be reported as missed.
+# (It inserts through `PowCache::insert`, which stays in scope.)
+exclude_re = [
+    "core/mod\\.rs:.* Transaction::(estimate_size|calc_fee|estimate_fee|total_output|unique_output_addresses)\\b",
+    "core/mod\\.rs:.* (difficulty_from_bits|difficulty_to_target|u256_to_f64)\\b",
+    "core/mod\\.rs:.*<impl std::fmt::(Debug|Display) for MerkleRoot>",
+    "core/mod\\.rs:.* Block::test_only_assume_pow_valid\\b",
+
+    # BEGIN equivalent mutants
+    # Equivalent mutants (no input distinguishes them from the original
+    # code). Each one is justified in the equivalent-mutant table of
+    # docs/testing/MUTATION.md. Matched by file, function and operator (and
+    # column where a function has several candidates), not by line, so that
+    # unrelated edits do not resurrect them. The patterns are wider than the
+    # nine mutants they are meant for, so scripts/mutants-equivalent-check.sh
+    # (CI) checks that this block excludes exactly the mutants listed in
+    # .cargo/mutants-equivalent.txt and fails on any drift (a new mutant
+    # caught by a pattern, or a documented one no longer matched). Keep the
+    # BEGIN/END marker lines: the check removes the block between them.
+    #
+    # E1: `|` -> `^` on disjoint bit fields (i: bits 0-31, tag 1 or 2: bits
+    # 32-39, 0x1F: bits 40-44, 0x80: bits 56-63).
+    "gnb-smh/src/lib\\.rs:\\d+:\\d+: replace \\| with \\^ in lane16$",
+    # E2: `|` -> `^` on disjoint bytes of the compact mantissa / exponent.
+    "gnb-smh/src/difficulty\\.rs:\\d+:\\d+: replace \\| with \\^ in target_to_bits$",
+    # E3: `(hi << 8) | x`: the low byte of `hi << 8` is zero.
+    "gnb-smh/src/difficulty\\.rs:\\d+:\\d+: replace \\| with \\^ in work$",
+    # E4: `if out > pow_limit { out = pow_limit }`: at equality the
+    # assignment is a no-op.
+    "gnb-smh/src/difficulty\\.rs:\\d+:12: replace > with >= in asert_next_target$",
+    # E5: `if by_size > MIN_TX_FEE_SAT { by_size } else { MIN_TX_FEE_SAT }`:
+    # at equality both branches return the same value.
+    "core/tokenomics\\.rs:\\d+:\\d+: replace > with >= in min_tx_fee_sat$",
+    # END equivalent mutants
+]
+
+test_tool = "cargo"
+additional_cargo_args = ["--locked"]
+# Unit + integration tests (no doctests), minus gnb-crypto's wallet and
+# keystore tests (`wallet::`, `hd_wallet::`: Argon2 and HD derivation, ~30 s
+# per run). The gate therefore requires the consensus code's own tests to
+# catch every mutant. The wallet tests do reach the consensus scope: some of
+# them sign transactions and verify them with `sighash::verify_tx_scripts`,
+# and at b6a2976 they caught 12 mutants (10 in sighash.rs, 2 in
+# activation.rs) that this configuration reports as missed
+# (docs/testing/MUTATION.md gives the "before" numbers both ways).
+# Skipping tests never turns a missed mutant into a caught one.
+additional_cargo_test_args = ["--tests", "--", "--skip", "wallet::"]
+# Per-mutant test timeout: 5x the baseline test time, at least 60 s.
+timeout_multiplier = 5.0
+minimum_test_timeout = 60

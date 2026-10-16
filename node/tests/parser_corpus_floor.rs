@@ -41,8 +41,12 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
+    /// Reduced in u64: `next() as usize` kept only the low 32 bits on a
+    /// 32-bit target, so `cargo test` there (sanitizers.sh i686-node) wrote a
+    /// different corpus over the committed one. Same values as before on
+    /// 64-bit targets.
     fn range(&mut self, n: usize) -> usize {
-        (self.next() as usize) % n.max(1)
+        (self.next() % n.max(1) as u64) as usize
     }
     fn bytes(&mut self, n: usize) -> Vec<u8> {
         (0..n).map(|_| self.next() as u8).collect()

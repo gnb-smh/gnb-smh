@@ -1,27 +1,43 @@
 //! Coherence — shielded pool (node integration).
 //!
 //! The pure primitives — notes, SHAKE-256 commitments/nullifiers, the Merkle
-//! accumulator, and `check_spend` (the exact statement the ZK circuit proves) —
-//! live in the lean `coherence-core` crate, shared as the single source of truth
-//! by the node, the SP1 guest prover (`crates/coherence-prover`), and the mobile
-//! wallet. This module re-exports them and adds the node-only consensus state
-//! (anchor history + nullifier set) — kept here because it uses std collections
-//! and is never part of the zkVM guest.
+//! accumulator, and `check_spend` (the exact statement a spend proof attests
+//! to, version 2 since audit COH-1) — live in the lean `coherence-core` crate.
+//! This module re-exports them and adds the node-only consensus state (anchor
+//! history + nullifier set), the in-place apply/undo engine, and (in
+//! [`persist`]) its RocksDB persistence.
 //!
-//! Zero-security testnet: no privacy claim until audited (Coherence C4).
+//! # State handling (audit COH-2)
+//!
+//! Shielded state follows the applied selected chain exactly like the UTXO
+//! set: the acceptance pipeline applies a block's shielded transactions only
+//! when the block joins the selected chain, disconnects them when a reorg
+//! removes it, and writes the changes (commitment-tree leaves, spent
+//! nullifiers, anchor window, a per-block undo record, the shielded tip) in
+//! the SAME RocksDB WriteBatch as the block's UTXO changes. The node reloads
+//! the state at start-up ([`ShieldedPool::load`]). Applying a block costs
+//! `O(outputs × TREE_DEPTH + nullifiers)`: no clone of the tree or the
+//! nullifier set, and an incremental tree (`coherence_core::CommitmentTree`).
+//!
+//! Zero-security testnet: no privacy claim until audited (Coherence C4). The
+//! node's only compiled proof verifier is `RejectAll`, so no shielded
+//! transaction is accepted today.
 
 pub use coherence_core::*;
 
 pub mod verifier;
 pub use verifier::ShieldedVerifier;
 
+pub mod persist;
+
+use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 
 /// How many recent commitment-tree roots are accepted as spend anchors.
 pub const ANCHOR_HISTORY: usize = 100;
 
 /// The shielded-pool state a node maintains and validates against.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ShieldedState {
     anchors: VecDeque<[u8; 32]>,
     spent_nullifiers: HashSet<[u8; 32]>,
@@ -34,32 +50,57 @@ pub enum TxError {
     DuplicateNullifierInTx([u8; 32]),
     DoubleSpend([u8; 32]),
     ProofInvalid,
-    /// Reorg wants to disconnect a block older than the bounded undo horizon —
-    /// the caller must rebuild the shielded state from the canonical chain.
+    /// The block's outputs do not fit in the commitment tree
+    /// (`coherence_core::TREE_CAPACITY` leaves).
+    TreeFull,
+    /// Reorg wants to disconnect a block older than the bounded in-memory
+    /// journal of [`ShieldedEngine::disconnect_block`]. (The node's persisted
+    /// path has no such horizon: undo records live in RocksDB.)
     ReorgBeyondUndoHorizon,
-    /// Disconnect was asked to undo a block that is NOT the top of the undo
-    /// stack (audit: apply happens in arrival order across branches, so a bare
-    /// LIFO pop could undo the wrong block). We refuse and demand a resync
-    /// rather than silently corrupt the shielded state. `{expected}` vs the
-    /// actual top block id.
+    /// Disconnect was asked to undo a block that is NOT the top of the
+    /// in-memory journal. We refuse rather than silently corrupt the state.
+    /// `{expected}` vs the actual top block id.
     ReorgOrderMismatch { expected: [u8; 32], found: [u8; 32] },
+    /// An undo record does not describe the current state (tree shorter than
+    /// the recorded length, or a recorded nullifier not spent): the persisted
+    /// state is corrupt.
+    InconsistentUndo(String),
 }
 
-/// How many recently-applied blocks can be undone on a reorg before a full
-/// shielded-state resync is required. Bounds the undo memory.
+/// How many recently-applied blocks the in-memory convenience journal of
+/// [`ShieldedEngine::apply_block`] / [`ShieldedEngine::disconnect_block`]
+/// keeps. The node does not use the journal: its undo records are persisted.
 pub const MAX_REORG_UNDO: usize = 128;
 
-/// Everything needed to exactly reverse one applied block's effect on the
-/// shielded state (reorg undo). Cheap: a length + the block's nullifiers + a
-/// clone of the bounded anchor window (never the whole commitment tree).
-#[derive(Debug, Clone)]
-struct BlockUndo {
-    /// The block whose effect this record reverses — checked on disconnect so a
-    /// LIFO pop can never silently undo the wrong block.
-    block_id: [u8; 32],
-    tree_len: usize,
+/// Everything needed to exactly reverse one applied block (reorg undo).
+/// Persisted per shielded block by the node (see [`persist`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockUndo {
+    /// Commitment-tree size before the block.
+    pub tree_len: u64,
+    /// The nullifiers the block spent, in block order.
+    pub nullifiers: Vec<[u8; 32]>,
+    /// The anchor window before the block, oldest first (≤ ANCHOR_HISTORY).
+    pub anchors_before: Vec<[u8; 32]>,
+}
+
+/// What [`ShieldedEngine::undo`] removed, so a disconnect can itself be
+/// reverted exactly (an aborted reorg).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockRedo {
+    leaves: Vec<[u8; 32]>,
     nullifiers: Vec<[u8; 32]>,
-    anchors: VecDeque<[u8; 32]>,
+    anchors_after: VecDeque<[u8; 32]>,
+}
+
+/// Canonical view of an engine's consensus state, for equality checks
+/// (restart and reorg round-trip tests, start-up verification).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShieldedSnapshot {
+    pub leaves: Vec<[u8; 32]>,
+    pub anchors: Vec<[u8; 32]>,
+    /// Sorted.
+    pub nullifiers: Vec<[u8; 32]>,
 }
 
 impl ShieldedState {
@@ -76,9 +117,9 @@ impl ShieldedState {
     pub fn is_spent(&self, nf: &[u8; 32]) -> bool { self.spent_nullifiers.contains(nf) }
 
     /// Validate a shielded tx WITHOUT seeing the witness: the anchor must be
-    /// recent, every nullifier unseen (and unique within the tx), and the FRI
-    /// proof must verify. `verify_proof` is pluggable — the SP1/FRI verifier, or
-    /// a closure in tests.
+    /// recent, every nullifier unseen (and unique within the tx), and the
+    /// proof must verify. `verify_proof` is pluggable — the node's
+    /// `ShieldedVerifier`, or a closure in tests.
     pub fn validate<F>(&self, tx: &ShieldedTx, verify_proof: F) -> Result<(), TxError>
     where
         F: Fn(&SpendPublic, &[u8]) -> bool,
@@ -105,29 +146,19 @@ impl ShieldedState {
     pub fn apply(&mut self, tx: &ShieldedTx) {
         for nf in &tx.nullifiers { self.spent_nullifiers.insert(*nf); }
     }
-
-    // ── reorg undo helpers ──────────────────────────────────────────────────
-    /// Snapshot the bounded anchor window (cheap; ≤ ANCHOR_HISTORY entries).
-    fn anchor_snapshot(&self) -> VecDeque<[u8; 32]> { self.anchors.clone() }
-    /// Restore the anchor window to a snapshot (exact reversal on reorg).
-    fn restore_anchors(&mut self, snap: VecDeque<[u8; 32]>) { self.anchors = snap; }
-    /// Un-spend nullifiers when their block is disconnected.
-    fn unspend(&mut self, nfs: &[[u8; 32]]) {
-        for nf in nfs { self.spent_nullifiers.remove(nf); }
-    }
 }
 
-/// The shielded pool as the node runs it: the commitment tree (whose root is the
-/// current anchor) plus the `ShieldedState` (anchor history + nullifier set).
-/// This is the consensus engine a block-acceptance path drives; wiring it into
-/// the `Block` wire format + `accept_block` + mempool is the remaining node
-/// integration (a block-format change, tracked separately).
+/// The shielded pool's consensus state: the commitment tree (whose root is
+/// the current anchor) plus the `ShieldedState` (anchor history + nullifier
+/// set), with an optional bounded in-memory undo journal for callers that do
+/// not persist undo records themselves.
 #[derive(Debug, Clone)]
 pub struct ShieldedEngine {
     tree: CommitmentTree,
     state: ShieldedState,
-    /// LIFO reorg-undo, one record per applied block, bounded by MAX_REORG_UNDO.
-    undo: Vec<BlockUndo>,
+    /// In-memory convenience journal for `apply_block` / `disconnect_block`,
+    /// bounded by MAX_REORG_UNDO. Not used by the node's persisted path.
+    journal: VecDeque<([u8; 32], BlockUndo)>,
 }
 
 impl Default for ShieldedEngine {
@@ -139,70 +170,164 @@ impl ShieldedEngine {
         let tree = CommitmentTree::new();
         let mut state = ShieldedState::new();
         state.record_anchor(tree.root()); // the empty-tree root is a valid anchor
-        Self { tree, state, undo: Vec::new() }
+        Self { tree, state, journal: VecDeque::new() }
+    }
+
+    /// Rebuild an engine from persisted parts. Fails if the anchor window is
+    /// empty, too long, or does not contain the tree's current root (every
+    /// applied transaction records the root it produced).
+    pub fn from_parts(
+        leaves: Vec<[u8; 32]>,
+        anchors: Vec<[u8; 32]>,
+        nullifiers: impl IntoIterator<Item = [u8; 32]>,
+    ) -> Result<Self, String> {
+        if leaves.len() as u64 > TREE_CAPACITY {
+            return Err("persisted commitment tree exceeds its capacity".into());
+        }
+        let tree = CommitmentTree::from_leaves(leaves);
+        if anchors.is_empty() || anchors.len() > ANCHOR_HISTORY {
+            return Err(format!("persisted anchor window has {} entries", anchors.len()));
+        }
+        if !anchors.contains(&tree.root()) {
+            return Err("persisted anchor window does not contain the commitment-tree root".into());
+        }
+        let state = ShieldedState {
+            anchors: anchors.into_iter().collect(),
+            spent_nullifiers: nullifiers.into_iter().collect(),
+        };
+        Ok(Self { tree, state, journal: VecDeque::new() })
     }
 
     /// The current anchor (commitment-tree root) new spends should reference.
     pub fn anchor(&self) -> [u8; 32] { self.tree.root() }
     pub fn is_spent(&self, nf: &[u8; 32]) -> bool { self.state.is_spent(nf) }
+    /// Number of note commitments in the tree.
+    pub fn tree_len(&self) -> u64 { self.tree.len() as u64 }
+    /// The anchor window, oldest first.
+    pub fn anchors(&self) -> Vec<[u8; 32]> { self.state.anchors.iter().copied().collect() }
 
-    /// Validate + apply a block's shielded txs **atomically**: nothing is
-    /// committed unless every tx validates against the *accumulating* state
-    /// (so an intra-block double-spend fails the whole block). On success the
-    /// nullifiers are spent, output commitments appended, and each resulting
-    /// root recorded as an anchor. Returns the number of txs applied.
+    /// The leaves from position `from` on (the outputs a block appended).
+    fn snapshot_leaves_from(&self, from: u64) -> Vec<[u8; 32]> {
+        self.tree.leaves().get(from as usize..).map(<[_]>::to_vec).unwrap_or_default()
+    }
+
+    /// Canonical copy of the consensus state (tests, start-up checks).
+    pub fn snapshot(&self) -> ShieldedSnapshot {
+        let mut nullifiers: Vec<[u8; 32]> = self.state.spent_nullifiers.iter().copied().collect();
+        nullifiers.sort_unstable();
+        ShieldedSnapshot { leaves: self.tree.leaves().to_vec(), anchors: self.anchors(), nullifiers }
+    }
+
+    /// Validate and apply a block's shielded txs IN PLACE and **atomically**:
+    /// every tx validates against the accumulating state (an intra-block
+    /// double spend fails the block); on any failure the block's partial
+    /// effects are reverted and the state is exactly as before. On success
+    /// the nullifiers are spent, the output commitments appended, each
+    /// resulting root recorded as an anchor, and the undo record returned.
+    /// Cost `O(outputs × TREE_DEPTH + nullifiers)` plus one copy of the
+    /// bounded anchor window.
+    pub fn apply_txs<F>(&mut self, txs: &[ShieldedTx], verify_proof: F) -> Result<BlockUndo, TxError>
+    where
+        F: Fn(&SpendPublic, &[u8]) -> bool,
+    {
+        let tree_len = self.tree_len();
+        let anchors_before = self.anchors();
+        let mut spent: Vec<[u8; 32]> = Vec::new();
+        let mut failure = None;
+        for tx in txs {
+            if let Err(e) = self.state.validate(tx, &verify_proof) {
+                failure = Some(e);
+                break;
+            }
+            if (tx.outputs.len() as u64) > self.tree.remaining_capacity() {
+                failure = Some(TxError::TreeFull);
+                break;
+            }
+            self.state.apply(tx);
+            spent.extend_from_slice(&tx.nullifiers);
+            for cm in &tx.outputs { self.tree.append(*cm); }
+            self.state.record_anchor(self.tree.root());
+        }
+        let undo = BlockUndo { tree_len, nullifiers: spent, anchors_before };
+        match failure {
+            None => Ok(undo),
+            Some(e) => {
+                self.revert_apply(&undo);
+                Err(e)
+            }
+        }
+    }
+
+    /// Exact inverse of a successful [`apply_txs`](Self::apply_txs) that is
+    /// still on top of the state (no checks; internal use).
+    fn revert_apply(&mut self, undo: &BlockUndo) {
+        self.tree.truncate(undo.tree_len as usize);
+        for nf in &undo.nullifiers { self.state.spent_nullifiers.remove(nf); }
+        self.state.anchors = undo.anchors_before.iter().copied().collect();
+    }
+
+    /// Reverse an applied block (reorg disconnect), tip-first, from its undo
+    /// record. Checks the record describes the current state first; on error
+    /// nothing changes. Returns what was removed so the disconnect can be
+    /// reverted with [`redo`](Self::redo).
+    pub fn undo(&mut self, undo: &BlockUndo) -> Result<BlockRedo, TxError> {
+        if undo.tree_len > self.tree_len() {
+            return Err(TxError::InconsistentUndo(format!(
+                "undo record expects {} leaves, the tree has {}", undo.tree_len, self.tree_len())));
+        }
+        if let Some(nf) = undo.nullifiers.iter().find(|nf| !self.state.is_spent(nf)) {
+            return Err(TxError::InconsistentUndo(format!(
+                "undo record un-spends {} which is not spent", hex::encode(&nf[..8]))));
+        }
+        if undo.anchors_before.is_empty() || undo.anchors_before.len() > ANCHOR_HISTORY {
+            return Err(TxError::InconsistentUndo("undo record has a malformed anchor window".into()));
+        }
+        let redo = BlockRedo {
+            leaves: self.tree.leaves()[undo.tree_len as usize..].to_vec(),
+            nullifiers: undo.nullifiers.clone(),
+            anchors_after: self.state.anchors.clone(),
+        };
+        self.revert_apply(undo);
+        Ok(redo)
+    }
+
+    /// Re-apply a block removed by [`undo`](Self::undo) (an aborted reorg).
+    pub fn redo(&mut self, redo: BlockRedo) {
+        for cm in redo.leaves { self.tree.append(cm); }
+        for nf in redo.nullifiers { self.state.spent_nullifiers.insert(nf); }
+        self.state.anchors = redo.anchors_after;
+    }
+
+    // ── in-memory convenience journal (tests, tools) ─────────────────────────
+
+    /// [`apply_txs`](Self::apply_txs) and remember the undo record under
+    /// `block_id` in the bounded in-memory journal. Returns the number of txs.
     pub fn apply_block<F>(&mut self, block_id: [u8; 32], txs: &[ShieldedTx], verify_proof: F) -> Result<usize, TxError>
     where
-        F: Fn(&SpendPublic, &[u8]) -> bool + Copy,
+        F: Fn(&SpendPublic, &[u8]) -> bool,
     {
-        let mut tree = self.tree.clone();
-        let mut state = self.state.clone();
-        for tx in txs {
-            state.validate(tx, verify_proof)?;
-            state.apply(tx);
-            for cm in &tx.outputs { tree.append(*cm); }
-            state.record_anchor(tree.root());
-        }
-        // Atomic success: capture an undo record of the PRE-apply state (keyed to
-        // this block's id) so this block can be reversed on a reorg, then commit.
-        let undo = BlockUndo {
-            block_id,
-            tree_len: self.tree.len(),
-            nullifiers: txs.iter().flat_map(|t| t.nullifiers.iter().copied()).collect(),
-            anchors: self.state.anchor_snapshot(),
-        };
-        self.tree = tree;
-        self.state = state;
-        self.undo.push(undo);
-        if self.undo.len() > MAX_REORG_UNDO { self.undo.remove(0); }
+        let undo = self.apply_txs(txs, verify_proof)?;
+        self.journal.push_back((block_id, undo));
+        if self.journal.len() > MAX_REORG_UNDO { self.journal.pop_front(); }
         Ok(txs.len())
     }
 
-    /// Reverse the most recently applied block (reorg disconnect): truncate the
-    /// commitment tree, un-spend that block's nullifiers, and restore the anchor
-    /// window — an exact inverse of `apply_block`. `expected` is the block the
-    /// caller intends to undo; if it is NOT the top of the undo stack we refuse
-    /// with `ReorgOrderMismatch` rather than silently undo the wrong block (the
-    /// audit's finding: apply happens in arrival order, so the stack may hold a
-    /// side/losing-fork block on top). Errs `ReorgBeyondUndoHorizon` if the stack
-    /// is empty — the caller must rebuild from the canonical chain. Disconnect
-    /// tip-first.
+    /// Reverse the most recent journaled block, which must be `expected`
+    /// (`ReorgOrderMismatch` otherwise, `ReorgBeyondUndoHorizon` if the
+    /// journal is empty). Disconnect tip-first.
     pub fn disconnect_block(&mut self, expected: [u8; 32]) -> Result<(), TxError> {
-        match self.undo.last() {
+        match self.journal.back() {
             None => return Err(TxError::ReorgBeyondUndoHorizon),
-            Some(top) if top.block_id != expected =>
-                return Err(TxError::ReorgOrderMismatch { expected, found: top.block_id }),
+            Some((top, _)) if *top != expected =>
+                return Err(TxError::ReorgOrderMismatch { expected, found: *top }),
             Some(_) => {}
         }
-        let u = self.undo.pop().expect("checked non-empty above");
-        self.tree.truncate(u.tree_len);
-        self.state.unspend(&u.nullifiers);
-        self.state.restore_anchors(u.anchors);
-        Ok(())
+        let (_, undo) = self.journal.pop_back().expect("checked non-empty above");
+        self.undo(&undo).map(|_| ())
     }
 
-    /// How many applied blocks can currently be undone (bounded reorg depth).
-    pub fn undo_depth(&self) -> usize { self.undo.len() }
+    /// How many journaled blocks can currently be undone.
+    pub fn undo_depth(&self) -> usize { self.journal.len() }
 
     /// Validate a tx against the current committed state WITHOUT applying it —
     /// same per-tx checks as block acceptance (anchor recent, nullifiers unseen
@@ -219,8 +344,7 @@ impl ShieldedEngine {
 /// rejects anything the chain would reject (anchor/nullifier/proof) AND anything
 /// that conflicts with an already-pending tx (a nullifier claimed twice), so the
 /// selected set is internally consistent by construction. Proof verification is
-/// pluggable — the SP1/FRI verifier in the node (stubbed to reject until wired),
-/// or a closure in tests.
+/// pluggable — the node's verifier (RejectAll), or a closure in tests.
 #[derive(Debug, Default, Clone)]
 pub struct ShieldedMempool {
     txs: Vec<ShieldedTx>,
@@ -264,6 +388,7 @@ impl ShieldedMempool {
         for tx in included {
             for nf in &tx.nullifiers { gone.insert(*nf); }
         }
+        if gone.is_empty() { return; }
         let mut kept = Vec::with_capacity(self.txs.len());
         for tx in std::mem::take(&mut self.txs) {
             if tx.nullifiers.iter().any(|nf| gone.contains(nf)) {
@@ -276,44 +401,50 @@ impl ShieldedMempool {
     }
 }
 
-/// The node's shielded pool: the committed `ShieldedEngine` plus the pending
-/// `ShieldedMempool`. One unit so block acceptance can apply committed txs AND
-/// evict them from the mempool atomically.
+/// The node's shielded pool: the committed `ShieldedEngine`, the pending
+/// `ShieldedMempool`, the proof verifier, and the block the committed state
+/// corresponds to (the shielded tip, persisted with it — see [`persist`]).
 #[derive(Debug, Default, Clone)]
 pub struct ShieldedPool {
     pub engine: ShieldedEngine,
     pub mempool: ShieldedMempool,
-    /// How shielded proofs are verified. Default `RejectAll` (safe); set
-    /// `GNB_SHIELDED_VERIFY=sp1` (feature `sp1-verify`) to verify FRI proofs.
+    /// How shielded proofs are verified. `RejectAll` is the only verifier
+    /// compiled into the node (see `verifier`).
     pub verifier: ShieldedVerifier,
+    /// The applied selected-chain tip the engine state corresponds to. `None`
+    /// for a pool not loaded from storage (tests): no order check is made
+    /// until the first committed plan sets it.
+    tip: Option<[u8; 32]>,
 }
 
 impl ShieldedPool {
+    /// An empty pool (genesis state) with the configured verifier. The node
+    /// itself uses [`ShieldedPool::load`].
     pub fn new() -> Self {
         Self {
             engine: ShieldedEngine::new(),
             mempool: ShieldedMempool::new(),
             verifier: ShieldedVerifier::from_env(),
+            tip: None,
         }
     }
 
-    /// Apply a block's shielded txs using the pool's configured verifier (no
-    /// external closure). This is what the node drives from `accept_block`:
-    /// transparent blocks are a no-op; a shielded tx is admitted only if
-    /// `self.verifier` accepts its proof (RejectAll until SP1 is wired).
+    /// The selected-chain block the committed shielded state corresponds to.
+    pub fn tip(&self) -> Option<[u8; 32]> { self.tip }
+
+    /// In-memory convenience: apply a block's shielded txs with the pool's
+    /// configured verifier (`RejectAll` in the node) and journal it.
     pub fn apply_block_self(&mut self, block_id: [u8; 32], txs: &[ShieldedTx]) -> Result<usize, TxError> {
         // Disjoint field borrows so the verifier can be read while the engine is
         // mutated.
-        let Self { engine, mempool, verifier } = self;
+        let Self { engine, mempool, verifier, .. } = self;
         let n = engine.apply_block(block_id, txs, |p, pf| verifier.verify(p, pf))?;
         mempool.remove_included(txs);
         Ok(n)
     }
 
-    /// Reverse block `expected`'s shielded effect on a reorg (tip-first). The
-    /// node's reorg driver calls this for each block it disconnects, mirroring
-    /// `apply_block_self` for connects. `expected` guards against undoing the
-    /// wrong block (see `ShieldedEngine::disconnect_block`).
+    /// In-memory convenience: reverse the journaled block `expected`
+    /// (tip-first; see [`ShieldedEngine::disconnect_block`]).
     pub fn disconnect_block_self(&mut self, expected: [u8; 32]) -> Result<(), TxError> {
         self.engine.disconnect_block(expected)
     }
@@ -329,12 +460,13 @@ impl ShieldedPool {
         self.mempool.admit(tx, &self.engine, verify_proof)
     }
 
-    /// Apply a block's shielded txs to the engine, then evict them from the
-    /// mempool. Err (block rejected) if any tx fails; the engine is unchanged on
-    /// failure (atomic), and the mempool is only touched on success.
+    /// In-memory convenience: apply a block's shielded txs to the engine
+    /// (journaled), then evict them from the mempool. Err (block rejected) if
+    /// any tx fails; the engine is unchanged on failure (atomic), and the
+    /// mempool is only touched on success.
     pub fn apply_block<F>(&mut self, block_id: [u8; 32], txs: &[ShieldedTx], verify_proof: F) -> Result<usize, TxError>
     where
-        F: Fn(&SpendPublic, &[u8]) -> bool + Copy,
+        F: Fn(&SpendPublic, &[u8]) -> bool,
     {
         let n = self.engine.apply_block(block_id, txs, verify_proof)?;
         self.mempool.remove_included(txs);

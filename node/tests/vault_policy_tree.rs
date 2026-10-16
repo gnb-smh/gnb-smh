@@ -41,9 +41,24 @@ fn setup() -> Setup {
 const DEPOSIT: ([u8; 32], u32, u64) = ([0x5A; 32], 0, 50_000_000);
 const DEPOSIT_HEIGHT: u64 = 1_200;
 
+/// Testnet has the hardening rules from genesis: every spend is version 3
+/// and signs the sighash-v3 digest (`crypto::sign_bound`).
+fn v3(mut spend: PolicySpend) -> PolicySpend {
+    spend.target_height(DEPOSIT_HEIGHT + 1).unwrap();
+    assert_eq!(spend.tx.version, core::sighash::TX_VERSION_V3);
+    spend
+}
+
+fn sign_key(spend: &mut PolicySpend, pk: &[u8], sk: &[u8]) -> Result<u8, String> {
+    spend.sign_digest(pk, |d, v| match v {
+        core::sighash::SighashVersion::V2 => crypto::sign(sk, d),
+        core::sighash::SighashVersion::V3 => crypto::sign_bound(sk, d),
+    }.map_err(|e| format!("{e:?}")))
+}
+
 fn sign_all(spend: &mut PolicySpend, keys: &[(Vec<u8>, Vec<u8>)]) {
     for (pk, sk) in keys {
-        spend.sign(pk, |m| crypto::sign(sk, m).map_err(|e| format!("{e:?}"))).unwrap();
+        sign_key(spend, pk, sk).unwrap();
     }
 }
 
@@ -64,8 +79,8 @@ fn release(s: &Setup, burn: [u8; 32], amount: u64) -> PolicySpend {
     let probe = PolicySpend::new_branch(Network::Testnet, s.vault.tree().unwrap(), RELEASE_BRANCH, &[DEPOSIT],
         bridge::release_outputs(&recipient, amount - bridge::MARKER_VALUE - 1, &burn), 0, 0).unwrap();
     let fee = DEPOSIT.2 - probe.outputs_total();
-    PolicySpend::new_branch(Network::Testnet, s.vault.tree().unwrap(), RELEASE_BRANCH, &[DEPOSIT],
-        bridge::release_outputs(&recipient, amount - bridge::MARKER_VALUE - fee, &burn), fee, 0).unwrap()
+    v3(PolicySpend::new_branch(Network::Testnet, s.vault.tree().unwrap(), RELEASE_BRANCH, &[DEPOSIT],
+        bridge::release_outputs(&recipient, amount - bridge::MARKER_VALUE - fee, &burn), fee, 0).unwrap())
 }
 
 #[test]
@@ -102,8 +117,8 @@ fn release_branch_spends_with_k_signatures_and_hides_the_recovery_keys() {
 #[test]
 fn recovery_branch_waits_for_its_relative_timelock() {
     let s = setup();
-    let mut spend = PolicySpend::new_branch(Network::Testnet, s.vault.tree().unwrap(), RECOVERY_BRANCH, &[DEPOSIT],
-        vec![TxOutput { value: 10_000_000, script_pubkey: vec![0x22; 20] }], 0, 0).unwrap();
+    let mut spend = v3(PolicySpend::new_branch(Network::Testnet, s.vault.tree().unwrap(), RECOVERY_BRANCH, &[DEPOSIT],
+        vec![TxOutput { value: 10_000_000, script_pubkey: vec![0x22; 20] }], 0, 0).unwrap());
     sign_all(&mut spend, &s.cold[..1]);
     let tx = spend.finalize().unwrap();
     let early = DEPOSIT_HEIGHT + OLDER as u64 - 1;
@@ -115,9 +130,9 @@ fn recovery_branch_waits_for_its_relative_timelock() {
 fn signers_cannot_use_the_recovery_branch_and_paths_cannot_be_forged() {
     let s = setup();
     // Signer keys are not in branch 1.
-    let mut spend = PolicySpend::new_branch(Network::Testnet, s.vault.tree().unwrap(), RECOVERY_BRANCH, &[DEPOSIT],
-        vec![TxOutput { value: 10_000_000, script_pubkey: vec![0x22; 20] }], 0, 0).unwrap();
-    assert!(spend.sign(&s.signers[0].0, |m| crypto::sign(&s.signers[0].1, m).map_err(|e| format!("{e:?}"))).is_err());
+    let mut spend = v3(PolicySpend::new_branch(Network::Testnet, s.vault.tree().unwrap(), RECOVERY_BRANCH, &[DEPOSIT],
+        vec![TxOutput { value: 10_000_000, script_pubkey: vec![0x22; 20] }], 0, 0).unwrap());
+    assert!(sign_key(&mut spend, &s.signers[0].0, &s.signers[0].1).unwrap_err().contains("not part of the policy"));
 
     // A branch witness whose path does not lead to the vault root is refused,
     // even with valid signatures for the branch it reveals.

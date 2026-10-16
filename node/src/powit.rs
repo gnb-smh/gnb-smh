@@ -632,3 +632,22 @@ pub fn evidence_item(e: &Equivocation) -> (Hash, u8, Vec<u8>) {
     let d = e.to_wire_bytes();
     (item_id(ITEM_EVIDENCE, &d), ITEM_EVIDENCE, d)
 }
+
+// ── Finality ─────────────────────────────────────────────────────────────────
+
+/// Pin fork choice to the checkpoint the selected tip's witness set has
+/// finalized (`GhostDAG::set_finalized`): no later selection may leave it.
+/// The activation checkpoint is final only by definition and never pins fork
+/// choice (two chains may compete right at activation).
+pub fn update_finalized(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage) {
+    let fin = {
+        let d = dag.read();
+        d.selected_tip()
+            .and_then(|t| load_state(store, &t))
+            .filter(|st| st.finalized.height > st.activation)
+            .and_then(|st| d.get_block_data(&st.finalized.hash).map(|bd| (st.finalized.hash, bd.height)))
+    };
+    if let Some((hash, height)) = fin {
+        dag.write().set_finalized(hash, height);
+    }
+}

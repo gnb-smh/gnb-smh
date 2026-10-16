@@ -37,8 +37,12 @@ def intermediates(header: bytes, nonce: int, log2_n: int):
 
 def main():
     vectors = []
-    for log2_n in (10, 19):
-        cases = CASES if log2_n == 10 else CASES[1:3]
+    # log2_n = 1 and 2: the whole pipeline (seed, fill, data-dependent mix,
+    # final digest) in a handful of Keccak permutations, so the vectors also
+    # run under Miri, on the 32-bit and big-endian targets
+    # (docs/testing/SANITIZERS.md). 10 and 19: the native cross-check.
+    for log2_n in (1, 2, 10, 19):
+        cases = CASES[1:3] if log2_n == 19 else CASES
         for header, nonce in cases:
             t0 = time.perf_counter()
             x0, xf, xm, out = intermediates(header, nonce, log2_n)

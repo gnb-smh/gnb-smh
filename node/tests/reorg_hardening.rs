@@ -474,7 +474,7 @@ fn reorg_aborts_and_restores_when_fork_spends_orphaned_output() {
 
     assert!(res.is_err(), "reorg must abort: B spends an output that only existed on A");
     let msg = res.unwrap_err();
-    assert!(msg.contains("not found"), "error must flag the orphaned input: {msg}");
+    assert!(msg.contains("absent"), "error must flag the orphaned input: {msg}");
 
     let snap_after = utxo_snapshot(&store, &universe);
     assert_eq!(snap_before, snap_after, "aborted reorg must restore the pre-attempt UTXO state");
@@ -595,103 +595,4 @@ fn shielded_disconnect_self_guards_order() {
 
     // Beyond the undo horizon → the caller must resync.
     assert_eq!(pool.disconnect_block_self(id_a), Err(TxError::ReorgBeyondUndoHorizon));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Branch blocks are validated against THEIR OWN parent's state.
-//
-// Regression for the accept-time bug: a block on a competing branch used to
-// be validated against the current tip's UTXO set. A valid branch that spends
-// an output the main chain also spent was therefore rejected and never
-// entered the DAG, so the node could not reorg to it even if it became the
-// heaviest chain.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Main chain A1 spends U. Branch block B1 (child of genesis) also spends U:
-/// valid on its branch, invalid against the tip.
-fn conflicting_branch_fixture() -> (TempDir, Storage, GhostDAG, BlockHash, BlockHash, Block, [u8; 32]) {
-    let (tmp, store) = mk_storage();
-    let mut dag = GhostDAG::with_default_k();
-    let g = [0u8; 32];
-    dag.store.insert(g, mk_dag_data(None, 0));
-
-    let u_txid = [0x66u8; 32];
-    store.put_utxo(&u_txid, 0, &TxOutput { value: 10_000_000, script_pubkey: owner_script() }).unwrap();
-
-    let a1 = mk_block_at(1, 1001, vec![
-        mk_coinbase(0xA1, 100_000_000, 1, 0x01),
-        signed(mk_spend_tx(u_txid, 0, 0xA9, 9_000_000, 0x01)),
-    ]);
-    let a1h = a1.block_hash();
-    dag.store.insert(a1h, mk_dag_data(Some(g), 1));
-    store.put_block(&a1).unwrap();
-    apply_block_utxo_mutations(&store, &a1).unwrap();
-
-    let b1 = mk_block_at(1, 2001, vec![
-        mk_coinbase(0xB1, 100_000_000, 1, 0x11),
-        signed(mk_spend_tx(u_txid, 0, 0xB9, 8_000_000, 0x02)),
-    ]);
-    (tmp, store, dag, a1h, g, b1, u_txid)
-}
-
-#[test]
-fn branch_block_is_valid_against_its_own_parent_state() {
-    use gnb::blockval::{validate_block_transactions, BlockTxError};
-    use gnb::reorg::{branch_path, validate_block_on_branch};
-
-    let (_tmp, store, dag, a1h, g, b1, u_txid) = conflicting_branch_fixture();
-
-    // The OLD behaviour: judged against the tip, B1 looks like it spends a
-    // missing output.
-    let tip_utxo = |t: &[u8; 32], i: u32| store.get_utxo(t, i).map_err(|e| e.to_string());
-    let tip_cb = |t: &[u8; 32]| store.get_coinbase_height(t).map_err(|e| e.to_string());
-    let tip_confirm = |t: &[u8; 32]| store.get_tx_location(t)
-        .map(|o| o.map(|(_, h)| h)).map_err(|e| e.to_string());
-    assert!(matches!(validate_block_transactions(&b1, &tip_utxo, &tip_cb, &tip_confirm),
-                     Err(BlockTxError::Invalid(_))));
-
-    // The fix: against its parent's (genesis) state, B1 is valid.
-    let path = branch_path(&dag, &a1h, &g).expect("path");
-    assert_eq!(path.to_rollback, vec![a1h]);
-    assert!(path.to_apply.is_empty());
-    let fees = validate_block_on_branch(&store, &path, &b1).expect("B1 valid on its branch");
-    assert_eq!(fees, 2_000_000);
-
-    // The in-memory branch state was discarded: storage still has A's view.
-    assert!(store.get_utxo(&u_txid, 0).unwrap().is_none(), "U still spent by A1 on disk");
-}
-
-#[test]
-fn branch_block_invalid_on_its_own_branch_is_rejected() {
-    use gnb::blockval::BlockTxError;
-    use gnb::reorg::{branch_path, validate_block_on_branch};
-
-    let (_tmp, store, dag, a1h, g, _b1, _u) = conflicting_branch_fixture();
-    // Spends an output that exists on NO branch.
-    let bad = mk_block_at(1, 2002, vec![
-        mk_coinbase(0xB2, 100_000_000, 1, 0x12),
-        signed(mk_spend_tx([0xEEu8; 32], 0, 0xB9, 1_000, 0x03)),
-    ]);
-    let path = branch_path(&dag, &a1h, &g).expect("path");
-    assert!(matches!(validate_block_on_branch(&store, &path, &bad),
-                     Err(BlockTxError::Invalid(m)) if m.contains("not found")));
-}
-
-#[test]
-fn branch_deeper_than_finality_is_rejected() {
-    use gnb::blockval::BlockTxError;
-    use gnb::reorg::{validate_block_on_branch, BranchPath, MAX_REORG_DEPTH};
-
-    let (_tmp, store, _dag, _a1h, _g, b1, _u) = conflicting_branch_fixture();
-    let path = BranchPath {
-        to_rollback: (0..=MAX_REORG_DEPTH).map(|i| { let mut h = [0u8; 32]; h[..8].copy_from_slice(&i.to_le_bytes()); h }).collect(),
-        to_apply: vec![],
-    };
-    // Beyond finality is a statement about the local tip: never recordable.
-    assert!(matches!(validate_block_on_branch(&store, &path, &b1),
-                     Err(BlockTxError::BeyondFinality(m)) if m.contains("forks")));
-    // With finality inactive (tip below MIN_CHAIN_WORK) there is no depth
-    // refusal; the fixture's fake ancestors are simply unavailable.
-    assert!(matches!(gnb::reorg::validate_block_on_branch_with(&store, &path, &b1, false),
-                     Err(BlockTxError::Storage(_))));
 }

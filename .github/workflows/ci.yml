@@ -3,101 +3,404 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 3 * * *"   # nightly: every job (fuzz: 60 s per target; the weekly 10-minute campaign is fuzz.yml)
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # Test binaries without debug info: the workspace has ~60 of them and the
+  # runner's disk is small. Incremental builds are useless on a fresh runner.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+  # The nightly of the sanitizers and miri jobs (scripts/sanitizers.sh reads
+  # it, and defaults to the same date). Pinned: a nightly without Miri, or a
+  # rustc change to -Zsanitizer, must not change their result with no change
+  # here. Bump it on purpose, together with the script's default.
+  SANITIZER_NIGHTLY: nightly-2026-10-14
 
 jobs:
   python-reference:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: PoW reference against test vectors
+      - name: PoW and difficulty references against their vectors
         run: python3 reference/check_vectors.py
+      - name: Difficulty vectors are reproducible
+        run: |
+          python3 reference/gen_difficulty_vectors.py
+          git diff --exit-code reference/difficulty_vectors.json
+      - name: Block-rule (Merkle, coinbase commitment) vectors are reproducible
+        run: |
+          python3 reference/gen_merkle_vectors.py
+          git diff --exit-code reference/merkle_vectors.json
       - name: Ledger reference tests
         run: python3 reference/test_ledger.py
       - name: Ledger vectors are reproducible
         run: |
           python3 reference/gen_ledger_vectors.py
           git diff --exit-code reference/ledger_vectors.json
+      - name: Sighash v2/v3 vectors are reproducible
+        run: |
+          python3 reference/gnb_sighash.py
+          git diff --exit-code reference/sighash_vectors.json
+      # docs/testing/VECTORS.md: every derived value, every non-signature
+      # verdict and every mempool refusal class of the tx/block consensus
+      # vectors, re-derived by the Python references (gnb_validity,
+      # gnb_merkle, gnb_sighash, gnb_difficulty; gnb_smh evaluates the three
+      # `pow: full` proofs, ~2 s each).
+      - name: Consensus tx/block vectors against the Python references
+        run: python3 reference/check_consensus_vectors.py
 
-  rust-reference:
+  rust:
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
       - name: Tests (release, includes both Python cross-checks)
         run: cargo test --release --locked
 
-  # The node and every consensus crate. The toolchain comes from
-  # rust-toolchain.toml.
-  workspace:
+  # The consensus workspace: node, gnb-crypto, gnb-smh, coherence-core, the
+  # wallet and the vendored forks. Dev profile with the per-package
+  # opt-levels configured in the root Cargo.toml.
+  workspace-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: System dependencies (RocksDB bindgen)
+      - name: System dependencies (librocksdb-sys needs clang/libclang)
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-      - name: Toolchain
-        run: rustup show
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: workspace-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - name: Build
-        run: cargo build --workspace --release --locked
-      - name: Tests
-        run: cargo test --workspace --release --locked
-      - name: Clippy (correctness and suspicious lints are errors)
-        run: cargo clippy --workspace --all-targets --release --locked -- -D clippy::correctness -D clippy::suspicious
+        run: cargo build --workspace --locked
+      # The functional-test feature `test-pow-limit` (node feature forwarding
+      # gnb-crypto's dev feature; every target is the pow limit) must never be
+      # part of an artifact build: not enabled by the default feature graph of
+      # the build above, not a default feature of the node, and the binary just
+      # built must not be a test build (a test build refuses mainnet with exit
+      # code 2; a production build gets past that guard and stops at the
+      # missing carryover snapshot with exit code 1).
+      - name: Artifact builds never enable test-pow-limit
+        run: |
+          tree=$(cargo tree --workspace --locked -e features,normal,build -i gnb-crypto)
+          echo "$tree"
+          if echo "$tree" | grep -q 'test-pow-limit'; then
+            echo "::error::test-pow-limit is enabled in the artifact build graph"; exit 1
+          fi
+          cargo metadata --locked --no-deps --format-version 1 | python3 -c '
+          import json, sys
+          gnb = next(p for p in json.load(sys.stdin)["packages"] if p["name"] == "gnb")
+          default = gnb["features"].get("default", [])
+          assert "test-pow-limit" not in default, f"test-pow-limit is a default feature: {default}"
+          print("gnb default features:", default)'
+          set +e
+          out=$(./target/debug/gnb --data-dir "$RUNNER_TEMP/artifact-probe" 2>&1); code=$?
+          set -e
+          echo "$out" | tail -3
+          if [ "$code" -eq 2 ] || echo "$out" | grep -q "test-pow-limit"; then
+            echo "::error::target/debug/gnb is a test-pow-limit build"; exit 1
+          fi
+      - name: Test
+        run: cargo test --workspace --locked
+
+  # POW-5: in a workspace-wide invocation the node's dev-dependency feature
+  # `test-pow-limit` is unified into gnb-crypto and pins every expected target
+  # to the pow limit. Test the consensus crates in their OWN invocations so
+  # the real ASERT path is exercised.
+  consensus-crates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: consensus-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: gnb-smh (PoW, compact bits, chain work, ASERT, Python vectors)
+        run: cargo test -p gnb-smh --locked
+      - name: gnb-crypto (real ASERT; test-pow-limit must be off)
+        run: cargo test -p gnb-crypto --locked
+      - name: The real-ASERT test ran and was not ignored
+        run: |
+          cargo test -p gnb-crypto --locked --lib expected_bits_at_schedule_is_genesis_bits 2>&1 \
+            | tee /dev/stderr | grep -q "test result: ok. 1 passed; 0 failed; 0 ignored"
+      # docs/testing/VECTORS.md: the deterministic Rust generator (seeded keys
+      # and signatures) must reproduce the frozen tx/block consensus vectors
+      # byte for byte. Their runners are tests/consensus_vectors.rs (above,
+      # real pow limit) and node/tests/consensus_vectors.rs (workspace-test).
+      - name: Consensus tx/block vectors are reproducible
+        run: |
+          GNB_WRITE_VECTORS=1 cargo test -p gnb-crypto --locked --test gen_consensus_vectors -- --ignored
+          git diff --exit-code reference/tx_vectors.json reference/block_vectors.json
+      - name: The release profile traps integer overflow (overflow-checks = true)
+        run: |
+          cargo test -p gnb-smh --locked --release --lib integer_overflow_panics_in_this_profile 2>&1 \
+            | tee /dev/stderr | grep -q "test result: ok. 1 passed; 0 failed; 0 ignored"
+
+  # Functional tests (test/functional, docs/testing/FUNCTIONAL.md): real gnb
+  # node processes on loopback, driven over JSON-RPC and gnb-cli. Needs the
+  # TEST-ONLY build (node feature test-pow-limit, debug profile); that binary
+  # refuses mainnet and is never published.
+  functional:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies (librocksdb-sys needs clang/libclang)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: functional-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Build the test-only binaries (gnb, gnb-cli; feature test-pow-limit)
+        run: cargo build -p gnb --features test-pow-limit --bin gnb --bin gnb-cli --locked
+      - name: Functional tests
+        run: >
+          python3 test/functional/test_runner.py --no-build --jobs 2 --timeout 300
+          --tmpdir "$RUNNER_TEMP/functional" --cachedir "$RUNNER_TEMP/functional-cache" --keep-failed
+      - name: Node logs of failed tests
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: functional-logs
+          path: ${{ runner.temp }}/functional
+          retention-days: 7
+
+  # Vendored fork: PQClean source pin (VENDOR.toml), and the Falcon
+  # clean-variant guard. (The libp2p-yamux fork was retired with libp2p 0.57,
+  # audit OPS-2; its yamux lockfile guard, GHSA-vxx9-2994-q338, now lives in
+  # node/tests/supply_chain_lockfile_guard.rs and runs in workspace-test, and
+  # `cargo deny` in supply-chain refuses a second yamux.)
+  vendored-guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: pqcrypto-internals (tests/vendor_pin.rs + unit tests)
+        run: cargo test -p pqcrypto-internals --locked
+      - name: Falcon clean-variant guard
+        run: sh scripts/falcon-clean-guard.sh
+
+  # WAL-5: the committed browser wallet core must be reproducible from source.
+  # Rebuild it with the pinned toolchain (rust-toolchain.toml, 1.94.1) and the
+  # pinned wasi-sdk 25 (download checked against its SHA-256) through
+  # scripts/build-wallet-wasm.sh, and fail if the binary's SHA-256 differs from
+  # the pin in site/wallet/app.js (which loadCore enforces in the browser) or
+  # from the committed site/wallet/gnb_wallet.wasm. Any source change that
+  # reaches the WASM (panic locations included) requires re-running the
+  # script and committing the new binary and pin.
+  wasm-reproducible:
+    runs-on: ubuntu-latest
+    env:
+      WASI_SDK_VERSION: "25"
+      WASI_SDK_SHA256: "52640dde13599bf127a95499e61d6d640256119456d1af8897ab6725bcf3d89c"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust 1.94.1 with the wasm32-wasip1 target
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal --target wasm32-wasip1
+          test "$(rustc --version | cut -d' ' -f2)" = "1.94.1"
+      - name: wasi-sdk 25 (pinned download and checksum)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/wasi-sdk.tar.gz" \
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz"
+          echo "${WASI_SDK_SHA256}  $RUNNER_TEMP/wasi-sdk.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wasi-sdk"
+          tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP/wasi-sdk" --strip-components=1
+      - name: Rebuild the wallet core and compare with the pin
+        run: |
+          pinned=$(sed -n 's/^const WASM_SHA256 = "\([0-9a-f]*\)";/\1/p' site/wallet/app.js)
+          committed=$(sha256sum site/wallet/gnb_wallet.wasm | cut -d' ' -f1)
+          WASI_SDK="$RUNNER_TEMP/wasi-sdk" sh scripts/build-wallet-wasm.sh
+          rebuilt=$(sha256sum site/wallet/gnb_wallet.wasm | cut -d' ' -f1)
+          echo "pinned    $pinned"
+          echo "committed $committed"
+          echo "rebuilt   $rebuilt"
+          test -n "$pinned"
+          test "$committed" = "$pinned"
+          test "$rebuilt" = "$pinned"
+          # The script re-pins and refreshes the SRI hashes: nothing may change.
+          git diff --exit-code -- site/
+
+  # The site's JavaScript tests (site/tests, Node's built-in runner, no npm
+  # dependencies): the committed wallet core loaded as the page loads it
+  # (pinned-hash refusal, phrase-backed create/restore, verified plan/pay,
+  # coinbase maturity), the SRI attributes, the explorer's HTML escaping and
+  # the Worker's security headers and origins.
+  site-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: node --test site/tests
+        run: node --test site/tests/*.test.mjs
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies (librocksdb-sys needs clang/libclang)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: clippy-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      # Fails on every deny-level lint (clippy's correctness group and any
+      # `#![deny]` in the code); warnings are reported, not fatal.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
 
   supply-chain:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
         with:
-          persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories bans licenses sources
+          tool: cargo-deny,cargo-audit
+      - name: cargo deny (advisories, bans, licenses, sources; deny.toml)
+        run: cargo deny check
+      - name: cargo audit (exceptions in .cargo/audit.toml)
+        run: cargo audit
 
-  # Coverage-guided fuzzing of every wire decoder and the block validator.
-  # Short runs on every push; a crash fails the job and uploads the input.
-  fuzz:
+  # Independent consistency harness from the 2026-10 code audit: Bitcoin Core,
+  # BCHN aserti3-2d and rust-bitcoin oracles, and the normative Python
+  # GnB-SMH. Its own workspace and lockfile.
+  audit-harness:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [tx_parse, block_parse, netmsg_decode, sync_decode, pq_handshake_decode, block_validate, tx_validate, policy_witness_decode, script_sig_verify]
+    defaults:
+      run:
+        working-directory: audit/consistency
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: System dependencies (RocksDB bindgen)
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-      - name: Nightly toolchain and cargo-fuzz
+      - name: Consistency harness (release)
+        run: cargo test --release --locked
+
+  # Sanitizers over the consensus crates (scripts/sanitizers.sh,
+  # docs/testing/SANITIZERS.md). AddressSanitizer + LeakSanitizer instrument
+  # the Rust code (nightly -Zsanitizer=address) AND the PQClean C code that
+  # the pqcrypto build scripts compile (clang -fsanitize=address); then
+  # UndefinedBehaviorSanitizer instruments that C code (gcc, no recovery).
+  # Each mode checks that every PQClean archive really is instrumented. The
+  # runner has AVX2, so ML-DSA runs its AVX2 code there; the last step runs
+  # the UBSan ML-DSA tests on qemu's Nehalem CPU (no AVX2) so the clean ML-DSA
+  # C code (non-AVX2 nodes, the wasm32 wallet) runs under UBSan too.
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nightly toolchain (pinned)
+        run: rustup toolchain install "$SANITIZER_NIGHTLY" --profile minimal
+      - name: clang, the UBSan runtime and qemu-user
+        run: sudo apt-get update && sudo apt-get install -y clang libubsan1 qemu-user
+      # Older ASan runtimes crash under the runner kernel's 32-bit mmap ASLR
+      # entropy; 28 bits is what they support. Harmless for current ones.
+      - name: ASLR entropy compatible with the ASan shadow layout
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: AddressSanitizer + LeakSanitizer (gnb-smh, gnb-crypto, pqcrypto-internals; Rust and C)
+        run: sh scripts/sanitizers.sh asan
+      - name: UndefinedBehaviorSanitizer (PQClean C under gnb-crypto and pqcrypto-internals)
+        run: sh scripts/sanitizers.sh ubsan
+      - name: UBSan on a CPU without AVX2 (clean ML-DSA C code; ML-DSA, wallet signing and ACVP tests)
+        run: sh scripts/sanitizers.sh ubsan-noavx2
+      # The whole gnb-crypto suite on that CPU: about 10 minutes of emulation
+      # (the keystore KDFs), so nightly and on demand only.
+      - name: UBSan on a CPU without AVX2, every gnb-crypto test (nightly)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: sh scripts/sanitizers.sh ubsan-noavx2-full
+
+  # Miri: undefined behaviour in the pure-Rust consensus arithmetic (gnb-smh
+  # difficulty/compact/ASERT/work, gnb-crypto core::limits, tokenomics,
+  # block_rules, sighash, activation) and in the unsafe RNG override of
+  # pqcrypto-internals; then gnb-smh (with the Python PoW vectors) on a
+  # 32-bit and a big-endian target, and the wasm wallet's C ABI on i686.
+  # Miri-incompatible tests carry #[cfg_attr(miri, ignore = "<why>")]; the
+  # script fails a step whose passed-test count drops below its minimum, and
+  # bounds each Miri command at 30 minutes (SANITIZER_MIRI_TIMEOUT): a test
+  # Miri cannot finish would otherwise hold the job until its timeout.
+  miri:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75   # about 15 minutes in total, locally and on GitHub
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nightly toolchain with Miri (pinned)
         run: |
-          rustup toolchain install nightly --profile minimal
-          cargo +nightly install cargo-fuzz --locked
-      - name: Fuzz ${{ matrix.target }} (120 s)
-        working-directory: node
+          rustup toolchain install "$SANITIZER_NIGHTLY" --profile minimal --component miri,rust-src
+          cargo +"$SANITIZER_NIGHTLY" miri setup
+      # gnb-wallet-wasm's dependencies compile the PQClean C for i686 in their
+      # build scripts (Miri never executes it).
+      - name: multilib gcc
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - name: Miri (host)
+        run: sh scripts/sanitizers.sh miri
+      - name: Miri (gnb-smh on i686 and s390x, gnb-wallet-wasm C ABI on i686)
+        run: sh scripts/sanitizers.sh miri-cross
+
+  # The node itself (gnb: RocksDB, libp2p, every unit and integration test) on
+  # i686. Its untrusted-input decoders must give a 32-bit build the verdicts
+  # a 64-bit one gives: bincode truncates declared lengths there (found by
+  # this run; node/src/network/mod.rs). About 25 minutes of building and
+  # testing, so nightly and on demand only.
+  i686-node:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: 32-bit target, multilib gcc and g++, libclang (RocksDB, PQClean C)
         run: |
-          mkdir -p fuzz/corpus/${{ matrix.target }}
-          cargo +nightly fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} -- -max_total_time=120
-      - name: Upload crash inputs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-crash-${{ matrix.target }}
-          path: node/fuzz/artifacts/${{ matrix.target }}
+          sudo apt-get update && sudo apt-get install -y g++-multilib clang libclang-dev
+          cargo --version   # installs the rust-toolchain.toml toolchain
+          rustup target add i686-unknown-linux-gnu
+      - name: gnb (lib, bins, integration tests) on i686
+        run: sh scripts/sanitizers.sh i686-node
+
+  # 32-bit build and tests (usize = 32 bits: the CRY-8 overflow class) of the
+  # consensus crates and the wasm wallet core on i686-unknown-linux-gnu,
+  # pinned toolchain.
+  i686:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 32-bit target and multilib gcc (PQClean C)
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc-multilib
+          cargo --version   # installs the rust-toolchain.toml toolchain
+          rustup target add i686-unknown-linux-gnu
+      - name: gnb-smh, gnb-crypto, coherence-core, pqcrypto-internals, gnb-wallet-wasm on i686
+        run: sh scripts/sanitizers.sh i686
+
+  # Builds every cargo-fuzz target (node/fuzz, nightly + libFuzzer + ASan) and
+  # runs each for 60 s over its committed seed corpus, on pull requests and
+  # the nightly run; crash reproducers are uploaded as the `fuzz-artifacts`
+  # artifact. Defined in fuzz.yml, which also runs the weekly 10-minute
+  # campaign (docs/testing/FUZZING.md).
+  fuzz:
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/fuzz.yml
+    with:
+      seconds: 60
