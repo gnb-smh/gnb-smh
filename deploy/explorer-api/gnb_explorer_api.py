@@ -439,8 +439,6 @@ class PostHandler(Handler):
             return self.send(403, {"error": "forbidden"})
         if urllib.parse.urlsplit(self.path).path != "/v1/sendrawtransaction":
             return self.send(404, {"error": "not found"})
-        if self.over_limit(POST_LIMIT):
-            return self.send(429, RATE_LIMITED)
         try:
             n = int(self.headers.get("content-length", "0"))
             if not 0 < n <= MAX_TX_HEX + 64:
@@ -449,6 +447,11 @@ class PostHandler(Handler):
             raw = doc.get("hex") if isinstance(doc, dict) else None
             if not isinstance(raw, str) or not raw or len(raw) > MAX_TX_HEX or len(raw) % 2 or not HEXTX.match(raw):
                 raise ValueError("hex-encoded transaction expected")
+            # Counted only once the body is valid (like GET requests): a
+            # malformed broadcast neither creates a limiter entry nor uses up
+            # the client's broadcasts.
+            if self.over_limit(POST_LIMIT):
+                return self.send(429, RATE_LIMITED)
             # B1-T10: the API-wide verification budget, in transaction bytes.
             if not POST_BYTES.take(len(raw) // 2):
                 return self.send(429, {"error": "broadcast budget exhausted; retry shortly"})

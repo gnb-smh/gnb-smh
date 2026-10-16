@@ -227,6 +227,18 @@ class ExplorerApiTests(unittest.TestCase):
         self.assertEqual(self.server.get("/v1/getblockcount", a)[0], 200)
         self.assertEqual(self.server.get("/v1/getblockcount", a)[0], 429)
 
+    def test_broadcasts_are_counted_only_once_validated(self):
+        """A malformed broadcast (empty body, no JSON, no hex) is answered 400
+        before the limiter: it neither creates a limiter entry nor uses up the
+        client's broadcasts (it was counted before the body was checked)."""
+        api.POST_LIMIT = api.RateLimiter(2)
+        a = {"x-gnb-client-ip": "198.51.100.8"}
+        for body in ["", "{", json.dumps({"hex": "zz"}), json.dumps({"hex": "abc"}), json.dumps([1])]:
+            self.assertEqual(self.server.post("/v1/sendrawtransaction", body, a)[0], 400, body)
+        self.assertEqual(len(api.POST_LIMIT.windows), 0, "no limiter entry for invalid broadcasts")
+        tx = json.dumps({"hex": "ab" * 10})
+        self.assertEqual([self.server.post("/v1/sendrawtransaction", tx, a)[0] for _ in range(3)], [200, 200, 429])
+
     def test_broadcast_verification_budget_is_api_wide(self):
         """Every broadcast costs the node signature verification; one byte
         budget for all clients bounds that work whatever the number of
