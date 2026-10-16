@@ -374,6 +374,10 @@ struct Prev {
     amount: u64,
     spk: Vec<u8>,
     coinbase_height: Option<u64>,
+    /// The DAG height of the block holding that coinbase, when it differs
+    /// from its header height `coinbase_height` (emitted only then; re-audit
+    /// B1-T14: from the activation maturity compares DAG heights).
+    coinbase_dag_height: Option<u64>,
     /// Created by the coinbase of the block the transaction is evaluated in
     /// (tx vectors only; never in the UTXO view).
     block_coinbase: bool,
@@ -392,6 +396,7 @@ fn fund(label: &str, amount: u64, spk: &[u8]) -> Prev {
         amount,
         spk: spk.to_vec(),
         coinbase_height: None,
+        coinbase_dag_height: None,
         block_coinbase: false,
     }
 }
@@ -401,7 +406,7 @@ fn fund_cb(label: &str, amount: u64, spk: &[u8], cb_height: u64) -> Prev {
 }
 
 fn prev_json(p: &Prev) -> J {
-    J::O(vec![
+    let mut fields = vec![
         ("txid", hx(&p.txid)),
         ("vout", J::N(p.vout as u64)),
         ("amount", dec(p.amount)),
@@ -409,7 +414,11 @@ fn prev_json(p: &Prev) -> J {
         ("is_coinbase", J::B(p.coinbase_height.is_some() || p.block_coinbase)),
         ("coinbase_height", p.coinbase_height.map(dec).unwrap_or(J::Null)),
         ("source", s(if p.block_coinbase { "block-coinbase" } else { "utxo" })),
-    ])
+    ];
+    if let Some(h) = p.coinbase_dag_height {
+        fields.push(("coinbase_dag_height", dec(h)));
+    }
+    J::O(fields)
 }
 
 /// A 20-byte destination nobody in the vectors spends.
@@ -502,6 +511,10 @@ struct TxCase {
     error: Option<&'static str>,
     /// Mempool admission at the case height.
     policy: Policy,
+    /// The DAG height of the evaluation block (its selected parent's plus
+    /// one), when it differs from its header height `height` (emitted only
+    /// then; re-audit B1-T14).
+    dag_height: Option<u64>,
 }
 
 fn net_name(c: ChainId) -> &'static str {
@@ -544,7 +557,16 @@ impl TxCases {
             "{id}: version 3 at/after the activation: a non-canonical witness is `witness-non-canonical`");
         assert!(v3_post || !matches!(policy, Policy::Reject("witness-non-canonical")),
             "{id}: only version 3 at/after the activation is refused with `witness-non-canonical`; elsewhere it is `non-standard-witness`");
-        self.cases.push(TxCase { id, description: description.into(), chain, activation, height, prevouts, bytes, error, policy });
+        self.cases.push(TxCase { id, description: description.into(), chain, activation, height, prevouts, bytes, error, policy, dag_height: None });
+    }
+
+    /// Sets the DAG height of the evaluation block of the last case pushed
+    /// (re-audit B1-T14: a block that merges a long side tip has a header
+    /// height above its selected-chain position).
+    fn with_dag_height(&mut self, dag_height: u64) {
+        let c = self.cases.last_mut().expect("a case");
+        assert!(dag_height <= c.height, "{}: the header height is at least the DAG height", c.id);
+        c.dag_height = Some(dag_height);
     }
 
     /// A mainnet case at the regime's height under `ACT`.
@@ -706,7 +728,7 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
     {
         let l = "struct/null-prevout-second-input";
         let p0 = fund(l, FUND, &ka.spk());
-        let null = Prev { txid: [0; 32], vout: u32::MAX, amount: FUND, spk: ka.spk(), coinbase_height: None, block_coinbase: false };
+        let null = Prev { txid: [0; 32], vout: u32::MAX, amount: FUND, spk: ka.spk(), coinbase_height: None, coinbase_dag_height: None, block_coinbase: false };
         let mut tx = unsigned(1, &[&p0, &null], vec![pay(PAY, l)]);
         sign_all(&mut tx, &[ka, ka], &outs_of(&[&p0, &null]), How::V2, ChainId::Mainnet, l);
         c.invalid(l, Pre, "A two-input transaction whose second input names the null outpoint: not a coinbase (two inputs), and no such coin exists.",
@@ -834,6 +856,19 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         sign_all(&mut tx, &[ka], &[p.out()], r.how(), ChainId::Mainnet, &l);
         c.invalid("fee/zero", r, "Inputs equal outputs: fee 0.", vec![p], &tx, "min-fee");
 
+        // Re-audit B1-T13: the fee floor no script_sig can lower is checked
+        // with the rules the block id commits to, before any witness rule.
+        let l = format!("value/zero-fee-bad-sig/{t}");
+        let p = fund(&l, FUND, &ka.spk());
+        let mut tx = unsigned(r.version(), &[&p], vec![pay(FUND, &l)]);
+        sign_all(&mut tx, &[ka], &[p.out()], r.how(), ChainId::Mainnet, &l);
+        let (sig, pk) = witness(&tx, 0);
+        let mut f = sig.clone();
+        f[4 + MLDSA_SIG + 5] ^= 0x01; // inside the Falcon nonce: still canonical
+        c.invalid("fee/zero-with-a-bad-signature", r,
+            "Fee 0 and a signature that does not verify: the fee floor (the minimum fee of the transaction with every script_sig empty, at least 10,000) is a rule the txid commits to and is checked before any witness rule, so the class is min-fee (re-audit B1-T13).",
+            vec![p], &with_ss(&tx, 0, script_sig(&f, &pk)), "min-fee");
+
         for (delta, id, err) in [(0i64, "fee/exact-minimum", None), (-1, "fee/minimum-minus-one", Some("min-fee"))] {
             let l = format!("{id}/{t}");
             let p = fund(&l, FUND, &ka.spk());
@@ -922,7 +957,7 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         let l = format!("maturity/same-block-coinbase/{}", r.tag());
         let cb_value = 100_000_000;
         let wrapper_cb = wrapper_coinbase(cb_value, &ka.spk());
-        let p = Prev { txid: wrapper_cb.txid(), vout: 0, amount: cb_value, spk: ka.spk(), coinbase_height: None, block_coinbase: true };
+        let p = Prev { txid: wrapper_cb.txid(), vout: 0, amount: cb_value, spk: ka.spk(), coinbase_height: None, coinbase_dag_height: None, block_coinbase: true };
         let mut tx = unsigned(r.version(), &[&p], vec![pay(cb_value - 100_000, &l)]);
         sign_all(&mut tx, &[ka], &[p.out()], r.how(), ChainId::Mainnet, &l);
         match r {
@@ -948,6 +983,39 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         let (tx, p) = simple(ka, Pre, l);
         c.push_full(l, "A non-coinbase coin (a genesis carry-over output) spent at height 1: no maturity rule applies.",
             ChainId::Mainnet, ACT, 1, vec![p], tx.to_wire_bytes(true), None, Policy::Accept);
+    }
+    // Header height vs selected-chain depth (re-audit B1-T14): below the
+    // activation maturity compares header heights, from it DAG heights
+    // (`dag_height` of the evaluation block, `coinbase_dag_height` of the
+    // coinbase's block).
+    for r in BOTH {
+        let h = r.height();
+        // The evaluation block merges a long side tip: header depth 100,
+        // selected-chain depth 10.
+        let id = "maturity/merge-header-depth-100-dag-depth-10";
+        let l = format!("{id}/{}", r.tag());
+        let p = Prev { coinbase_dag_height: Some(h - 100), ..fund_cb(&l, FUND, &ka.spk(), h - 100) };
+        let mut tx = unsigned(r.version(), &[&p], vec![pay(PAY, &l)]);
+        sign_all(&mut tx, &[ka], &[p.out()], r.how(), ChainId::Mainnet, &l);
+        let desc = format!("Spends the coinbase of a block at header and DAG height {} from a block at header height {h} whose selected parent is at DAG height {} (it merges a side tip at DAG height {}): header depth 100, selected-chain depth 10. Valid below the activation (header heights), immature from it (selected-chain depth).", h - 100, h - 91, h - 1);
+        match r {
+            Pre => c.valid(id, r, &desc, vec![p], &tx),
+            Post => c.invalid(id, r, &desc, vec![p], &tx, "immature-coinbase"),
+        }
+        c.with_dag_height(h - 90);
+
+        // The coinbase's own block merged a long side tip: header depth 51,
+        // selected-chain depth 100.
+        let id = "maturity/inflated-coinbase-header-dag-depth-100";
+        let l = format!("{id}/{}", r.tag());
+        let p = Prev { coinbase_dag_height: Some(h - 100), ..fund_cb(&l, FUND, &ka.spk(), h - 51) };
+        let mut tx = unsigned(r.version(), &[&p], vec![pay(PAY, &l)]);
+        sign_all(&mut tx, &[ka], &[p.out()], r.how(), ChainId::Mainnet, &l);
+        let desc = format!("Spends the coinbase of a block at header height {} but DAG height {} (it merged a side tip) from a block at header and DAG height {h}: header depth 51, selected-chain depth 100. Immature below the activation (header heights), valid from it (selected-chain depth).", h - 51, h - 100);
+        match r {
+            Pre => c.invalid(id, r, &desc, vec![p], &tx, "immature-coinbase"),
+            Post => c.valid(id, r, &desc, vec![p], &tx),
+        }
     }
 
     // ── Version rule (v0..v4, 2^32-1 x regime) ──────────────────────────────
@@ -1442,7 +1510,7 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
     for r in BOTH {
         let l = format!("bip30/tx-output/{}", r.tag());
         let (tx, p) = simple(ka, r, &l);
-        let stale = Prev { txid: tx.txid(), vout: 0, amount: 777, spk: dest("bip30/stale"), coinbase_height: None, block_coinbase: false };
+        let stale = Prev { txid: tx.txid(), vout: 0, amount: 777, spk: dest("bip30/stale"), coinbase_height: None, coinbase_dag_height: None, block_coinbase: false };
         match r {
             Pre => c.invalid_refused("bip30/output-overwrites-an-unspent-coin", r,
                 "An unspent coin already sits at this transaction's output 0 (models a coin created before): invalid at every height on this chain (BIP30). The mempool refuses it as already confirmed (the coin's txid is this transaction's).",
@@ -1518,6 +1586,10 @@ fn tx_case_json(case: &TxCase) -> J {
             ])
         }
     };
+    if let Some(d) = case.dag_height {
+        let at = fields.iter().position(|(k, _)| *k == "height").expect("height") + 1;
+        fields.insert(at, ("dag_height", dec(d)));
+    }
     fields.push(("derived", derived));
     J::O(fields)
 }
@@ -1780,7 +1852,7 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         let p0 = fund(&l("chain"), FUND, &ka.spk());
         let mut t1 = unsigned(r.version(), &[&p0], vec![TxOutput { value: FUND - 100_000, script_pubkey: kb.spk() }]);
         sign_all(&mut t1, &[ka], &[p0.out()], r.how(), ChainId::Mainnet, &l("chain/1"));
-        let mid = Prev { txid: t1.txid(), vout: 0, amount: FUND - 100_000, spk: kb.spk(), coinbase_height: None, block_coinbase: false };
+        let mid = Prev { txid: t1.txid(), vout: 0, amount: FUND - 100_000, spk: kb.spk(), coinbase_height: None, coinbase_dag_height: None, block_coinbase: false };
         let mut t2 = unsigned(r.version(), &[&mid], vec![pay(FUND - 200_000, &l("chain"))]);
         sign_all(&mut t2, &[kb], &[mid.out()], r.how(), ChainId::Mainnet, &l("chain/2"));
         let mut b = raw_block(h, ACT, one_parent(), vec![coinbase(subsidy(h) + 200_000, &l("chain"), b""), t1.clone(), t2.clone()]);
@@ -1799,6 +1871,22 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         let mut b = raw_block(h, ACT, one_parent(), vec![coinbase(subsidy(h), &l("double"), b""), d1, d2]);
         seal(&mut b, ACT);
         c.push("order/two-transactions-spend-one-coin", r, "Two different transactions of the block spend the same coin.", b, vec![pd], Some("double-spend"));
+
+        // Re-audit B1-T13: the rules the block id commits to are checked for
+        // EVERY transaction before any witness rule.
+        let (mut bad_sig, pb) = block_spend(ka, r, &l("bad-sig-then-overspend/1"), FUND);
+        let (sig, pk) = witness(&bad_sig, 0);
+        let mut f = sig.clone();
+        f[4 + MLDSA_SIG + 5] ^= 0x01; // inside the Falcon nonce: still canonical
+        bad_sig = with_ss(&bad_sig, 0, script_sig(&f, &pk));
+        let po = fund(&l("bad-sig-then-overspend/2"), FUND, &ka.spk());
+        let mut over = unsigned(r.version(), &[&po], vec![pay(FUND + 1, &l("bad-sig-then-overspend/2"))]);
+        sign_all(&mut over, &[ka], &[po.out()], r.how(), ChainId::Mainnet, &l("bad-sig-then-overspend/2"));
+        let mut b = raw_block(h, ACT, one_parent(), vec![coinbase(subsidy(h), &l("bad-sig-then-overspend"), b""), bad_sig, over]);
+        seal(&mut b, ACT);
+        c.push("order/bad-signature-then-overspend", r,
+            "Transaction 1's signature does not verify and transaction 2 spends more than its input: the connect checks the rules the block id commits to for every transaction before any witness rule, so the class is inputs-below-outputs (below the activation the failure is then id-committed, re-audit B1-T13).",
+            b, vec![pb, po], Some("inputs-below-outputs"));
 
         // Merkle roots.
         let base = {
@@ -1879,8 +1967,32 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         let mut b = raw_block(h, ACT, one_parent(), vec![coinbase(subsidy(h) + 200_000, &l("block-total"), b""), t1, t2]);
         seal(&mut b, ACT);
         c.push("value/block-output-total-above-max-supply", r,
-            "Two spends of MAX_SUPPLY_SAT coins, each paying MAX_SUPPLY_SAT - 100,000: every transaction is in the money range, the block's output total is not (the block-wide MoneyRange of VAL-11, a context-free rule).",
-            b, vec![p1, p2], Some("value-out-of-range"));
+            "Two spends of MAX_SUPPLY_SAT coins, each paying MAX_SUPPLY_SAT - 100,000: every transaction is in the money range and the block's outputs sum to about twice MAX_SUPPLY_SAT, which no rule bounds (re-audit B1-T1: like Bitcoin Core, MoneyRange applies to each output, each transaction's output and input totals and the accumulated fees, never to the sum of a block's outputs).",
+            b, vec![p1, p2], None);
+
+        // Re-audit B1-T1: chained spends inside the block move the same coins
+        // once per hop. Three hops of 4,500,000 GNB: outputs sum to about
+        // 13,500,000 GNB, above the 12,500,000 GNB supply, in a valid block.
+        let v = 450_000_000_000_000u64;
+        let keys = [ka, kb, &k.c, ka];
+        let p0 = fund(&l("chained-total"), v, &keys[0].spk());
+        let mut prev = p0.clone();
+        let mut hops = Vec::new();
+        for i in 0..3 {
+            let mut t = unsigned(r.version(), &[&prev], vec![TxOutput { value: prev.amount - 100_000, script_pubkey: keys[i + 1].spk() }]);
+            sign_all(&mut t, &[keys[i]], &[prev.out()], r.how(), ChainId::Mainnet, &l(&format!("chained-total/{i}")));
+            prev = Prev { txid: t.txid(), vout: 0, amount: prev.amount - 100_000, spk: keys[i + 1].spk(), coinbase_height: None, coinbase_dag_height: None, block_coinbase: false };
+            hops.push(t);
+        }
+        let total: u128 = hops.iter().flat_map(|t| &t.outputs).map(|o| u128::from(o.value)).sum();
+        assert!(total > u128::from(MAX_SUPPLY_SAT));
+        let mut txs = vec![coinbase(subsidy(h) + 300_000, &l("chained-total"), b"")];
+        txs.extend(hops);
+        let mut b = raw_block(h, ACT, one_parent(), txs);
+        seal(&mut b, ACT);
+        c.push("value/chained-spends-output-total-above-max-supply", r,
+            "Three chained spends of a 4,500,000 GNB coin inside the block (each spends the previous transaction's output, fee 100,000 each): every transaction is in the money range, the outputs sum to about 13,500,000 GNB, above MAX_SUPPLY_SAT (12,500,000 GNB). Valid in both regimes (re-audit B1-T1: the block-wide output total the VAL-11 remediation added rejected it).",
+            b, vec![p0], None);
 
         // Dust and in-block value rules.
         let pdust = fund(&l("dust"), FUND, &ka.spk());
@@ -1913,7 +2025,7 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
             b, vec![p64], Some(if r == Pre { "bad-output-script" } else { "tx-64-bytes" }));
 
         // BIP30.
-        let stale = Prev { txid: tx.txid(), vout: 0, amount: 777, spk: dest("bip30/stale"), coinbase_height: None, block_coinbase: false };
+        let stale = Prev { txid: tx.txid(), vout: 0, amount: 777, spk: dest("bip30/stale"), coinbase_height: None, coinbase_dag_height: None, block_coinbase: false };
         let mut b = raw_block(h, ACT, one_parent(), vec![coinbase(subsidy(h) + 100_000, &l("bip30-tx"), b""), tx.clone()]);
         seal(&mut b, ACT);
         c.push("bip30/transaction-output-overwrites-an-unspent-coin", r,
@@ -1921,7 +2033,7 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
             b, vec![p.clone(), stale], Some("bip30"));
         let mut b = raw_block(h, ACT, one_parent(), vec![coinbase(subsidy(h), &l("bip30-cb"), b"")]);
         seal(&mut b, ACT);
-        let stale_cb = Prev { txid: b.transactions[0].txid(), vout: 0, amount: 777, spk: dest("bip30/stale-cb"), coinbase_height: Some(h - 500), block_coinbase: false };
+        let stale_cb = Prev { txid: b.transactions[0].txid(), vout: 0, amount: 777, spk: dest("bip30/stale-cb"), coinbase_height: Some(h - 500), coinbase_dag_height: None, block_coinbase: false };
         c.push("bip30/coinbase-overwrites-an-unspent-coin", r,
             "An unspent coin already sits at the coinbase's output 0 (a repeated coinbase txid): invalid at every height on this chain (BIP30).", b, vec![stale_cb], Some("bip30"));
 
@@ -2143,7 +2255,7 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         let l = format!("block/same-block-cb/{}/{scope}", r.tag());
         let value = subsidy(h) + 100_000;
         let mk = |cb: &Transaction| {
-            let src = Prev { txid: cb.txid(), vout: 0, amount: value, spk: ka.spk(), coinbase_height: None, block_coinbase: false };
+            let src = Prev { txid: cb.txid(), vout: 0, amount: value, spk: ka.spk(), coinbase_height: None, coinbase_dag_height: None, block_coinbase: false };
             let mut spend = unsigned(r.version(), &[&src], vec![pay(subsidy(h), &l)]);
             sign_all(&mut spend, &[ka], &[src.out()], r.how(), ChainId::Mainnet, &l);
             raw_block(h, ACT, vec![parent("p1")], vec![cb.clone(), spend])
@@ -2245,7 +2357,9 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
     // Filler: one signed transaction with many identical outputs. 546-unit
     // outputs are 29 wire bytes but 24 bincode bytes; 5,000,000,000-unit
     // outputs are 29 wire bytes but 30 bincode bytes. (The audit's VAL-12
-    // measured bincode below the activation; this chain never did.)
+    // measured bincode below the activation; this chain never did. The wire
+    // header writes the uncommitted blue_score as a fixed-width u64, so the
+    // measure is the same for every copy of a block id, re-audit B1-T0.)
     for (id, r, value, target_wire, target_bincode, err) in [
         ("size/wire-1000001-bincode-below", Post, DUST_THRESHOLD, Some(MAX_BLOCK_SIZE + 1), None, Some("block-size")),
         ("size/wire-1000001-bincode-below", Pre, DUST_THRESHOLD, Some(MAX_BLOCK_SIZE + 1), None, Some("block-size")),
@@ -2319,8 +2433,30 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
             "A coinbase and one signed transaction with {n} outputs of {value}: wire size {}, bincode size {}. The limit (1,000,000) is measured on the wire encoding at every height (bincode is no consensus measure on this chain).",
             b.wire_size(), bincode_size(&b)
         );
-        c.push(id, r, &desc, b, vec![p], err);
-        c.cases.last_mut().unwrap().rle = Some((start, unit.len(), n));
+        let rle = Some((start, unit.len(), n));
+        c.push(id, r, &desc, b.clone(), vec![p.clone()], err);
+        c.cases.last_mut().unwrap().rle = rle;
+        // Re-audit B1-T0 / B2-T8: the same block id with other blue_score
+        // values (the field is not committed, and a node stores and serves
+        // the value derived from the parents): the size verdict is the same
+        // for every copy, the wire header writing blue_score as a
+        // fixed-width u64 (the run of outputs starts at the same offset).
+        // Paired with the two blocks at the wire limit below the activation.
+        if target_wire.is_some() && r == Pre {
+            for (tag, blue) in [("blue-score-0", 0u64), ("blue-score-max", u64::MAX)] {
+                let mut copy = b.clone();
+                copy.blue_score = blue;
+                assert_eq!(copy.block_hash(), b.block_hash());
+                assert_eq!(copy.wire_size(), b.wire_size());
+                assert_eq!(copy.to_wire_bytes()[start..start + n * unit.len()], bytes[start..start + n * unit.len()]);
+                let desc = format!(
+                    "The block of {id}/pre (same block id) carrying blue_score {blue}: wire size {} (blue_score is a fixed-width u64 there), bincode size {}. The verdict is that of every other copy of the id (re-audit B1-T0 / B2-T8).",
+                    copy.wire_size(), bincode_size(&copy)
+                );
+                c.push_full(format!("{id}-{tag}/pre"), &desc, ACT, copy, vec![p.clone()], err, "full", Pow::Skip);
+                c.cases.last_mut().unwrap().rle = rle;
+            }
+        }
     }
 
     c.cases

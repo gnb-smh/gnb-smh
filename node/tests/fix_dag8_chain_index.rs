@@ -399,7 +399,7 @@ fn the_migration_indexes_the_chain_reconciliation_leaves_applied() {
     let plan = reorg::ReorgPlan {
         lca: gh, to_rollback: vec![a1.block_hash()], to_apply: vec![b1.block_hash(), b2.block_hash()],
     };
-    let validate = |_: &dyn reorg::UtxoView, _: &Block| -> Result<(), String> { Ok(()) };
+    let validate = |_: &dyn reorg::UtxoView, _: &Block| -> Result<(), reorg::ValidationFailure> { Ok(()) };
     let stage_extra = |_: &gnb::storage::Storage, _: &mut rocksdb::WriteBatch| -> Result<(), String> { Ok(()) };
     reorg::connect_plan(&n.store, &plan, &reorg::ConnectHooks { validate: &validate, stage_extra: &stage_extra })
         .unwrap();

@@ -15,9 +15,11 @@ check itself is reported as "not evaluated".
 
 Rule order follows the node: a block applies each structural rule to every
 transaction before the next rule (`Block::validate_structure_without_pow_at`,
-then `limits::check_block_context_free`), then connects the transactions one
-by one (`accept::validate_block_in_view`). The first failing rule names the
-error class (the classes are listed in docs/testing/VECTORS.md).
+then `limits::check_block_context_free`), then connects the transactions
+(`accept::validate_block_in_view`) in two passes: the checks the block id
+commits to for every transaction and the coinbase value, then the witness
+checks of every transaction (re-audit B1-T13). The first failing rule names
+the error class (the classes are listed in docs/testing/VECTORS.md).
 """
 
 from __future__ import annotations
@@ -271,7 +273,7 @@ def decode_block(b: bytes) -> Block:
     return Block(Header(version, parents, merkle_root, timestamp, bits, nonce), txs, blue, height)
 
 
-# ── bincode-2 "standard" sizes (the block-size measure below the activation) ─
+# ── bincode-2 "standard" sizes (relay policy only: no consensus measure) ─────
 
 def tx_bincode(tx: mk.Tx) -> bytes:
     v = sh.bincode_varint
@@ -291,6 +293,19 @@ def block_bincode_size(b: Block) -> int:
     n += len(v(h.timestamp)) + len(v(h.bits)) + len(v(h.nonce))
     n += len(v(len(b.txs))) + sum(len(tx_bincode(t)) for t in b.txs)
     return n + len(v(b.blue_score)) + len(v(b.height)) + len(v(0))
+
+
+def legacy_block_size(b: Block) -> int:
+    """The MAX_BLOCK_SIZE measure below the hardening activation
+    (docs/CONSENSUS.md, "Block size (VAL-12)"; `block_rules::legacy_block_size`):
+    the length of the wire encoding, the PoWit section included from
+    POWIT_HEIGHT, as from the activation (this chain never measured bincode).
+    The wire header writes `blue_score` as a fixed-width u64, so the measure is
+    the same for every copy of a block id, whatever `blue_score` it carries
+    (the same as with 0 written): the block id does not commit to
+    `blue_score`, and the node stores and serves the value derived from the
+    parents (re-audit B1-T0 / B2-T8)."""
+    return len(b.wire())
 
 
 # ── Witnesses and signature encodings ───────────────────────────────────────
@@ -404,7 +419,13 @@ def signature_suite(ss: bytes) -> int:
 @dataclass
 class View:
     utxos: dict = field(default_factory=dict)          # (txid, vout) -> mk.TxOut
-    coinbase_heights: dict = field(default_factory=dict)  # txid -> height
+    coinbase_heights: dict = field(default_factory=dict)  # txid -> header height of its block
+    # txid -> DAG height of the coinbase's block, where it differs from its
+    # header height (re-audit B1-T14).
+    coinbase_dag_heights: dict = field(default_factory=dict)
+    # The DAG height of the block being evaluated / of the next block (its
+    # selected parent's plus one), when it differs from its header height.
+    dag_height: "int | None" = None
     # The transaction index: every coin's creating txid (mempool admission
     # refuses a transaction that is already confirmed).
     confirmed_txids: set = field(default_factory=set)
@@ -466,24 +487,46 @@ def check_input_scripts(tx: mk.Tx, prevouts: list, height: int, activation: int,
         out.signatures.append((tx, i, rule, prevouts))
 
 
+def check_maturity(tx: mk.Tx, view: View, height: int, activation: int) -> None:
+    """Coinbase maturity (`accept::check_coinbase_maturity_in_view`;
+    docs/CONSENSUS.md "Coinbase maturity"), for a block at header height
+    `height` (0 skips it). A spend of an output of a coinbase needs a depth
+    of at least COINBASE_MATURITY. Below the activation the depth is the
+    spending block's header height minus the coinbase block's header height;
+    from it (re-audit B1-T14) the spending block's DAG height minus the
+    coinbase block's DAG height: its selected-chain confirmations."""
+    if height == 0:
+        return
+    hardened = block_rules_active(height, activation)
+    spend = (view.dag_height if view.dag_height is not None else height) if hardened else height
+    for i in tx.inputs:
+        cbh = view.coinbase_heights.get(i.prev_txid)
+        if cbh is None:
+            continue
+        if hardened:
+            cbh = view.coinbase_dag_heights.get(i.prev_txid, cbh)
+        if max(0, spend - cbh) < COINBASE_MATURITY:
+            raise Invalid("immature-coinbase")
+
+
 def chain_rules(tx: mk.Tx, height: int) -> None:
+    """This chain's context-free transaction rules (node/src/blockval.rs
+    `check_tx_context_free`): finality (locktime is a block height), the two
+    output kinds. The txid commits to both."""
     if tx.locktime > height:
         raise Invalid("non-final")
     if any(not is_output_kind(o.script_pubkey) for o in tx.outputs):
         raise Invalid("bad-output-script")
 
 
-def connect_tx(tx: mk.Tx, view: View, earlier: dict, spent_in_block: set, height: int, activation: int,
-               same_block_coinbase, out: Outcome) -> int:
-    """`validate_tx_in_view`: one non-coinbase transaction of a block at
-    `height`; returns the fee."""
+def connect_tx_committed(tx: mk.Tx, view: View, earlier: dict, spent_in_block: set, height: int,
+                         activation: int, same_block_coinbase) -> tuple:
+    """`check_tx_in_view_committed`: the checks of one non-coinbase
+    transaction of a block at `height` that depend only on data the block id
+    commits to; returns (fee, prevouts)."""
     if same_block_coinbase is not None and any(i.prev_txid == same_block_coinbase for i in tx.inputs):
         raise Invalid("same-block-coinbase")
-    if height != 0:
-        for i in tx.inputs:
-            cbh = view.coinbase_heights.get(i.prev_txid)
-            if cbh is not None and max(0, height - cbh) < COINBASE_MATURITY:
-                raise Invalid("immature-coinbase")
+    check_maturity(tx, view, height, activation)
     # This chain's rules (node/src/blockval.rs), once every prevout is found:
     # finality (locktime is a block height), the two output kinds.
     if all((earlier.get((i.prev_txid, i.prev_index)) or view.utxos.get((i.prev_txid, i.prev_index))) is not None
@@ -502,20 +545,48 @@ def connect_tx(tx: mk.Tx, view: View, earlier: dict, spent_in_block: set, height
             raise Invalid("missing-input")
         total_in = money_add(total_in, coin.value)
         prevouts.append(coin)
-    check_input_scripts(tx, prevouts, height, activation, out)
+    if sh.version_rule(tx.version, height, activation) == "invalid":
+        raise Invalid("bad-version")
     spent_in_block |= local
     total_out = tx_money_range(tx)
     if total_in < total_out:
         raise Invalid("inputs-below-outputs")
     fee = total_in - total_out
+    # The floor no script_sig can lower: the size with every script_sig
+    # empty (its one-byte length prefix only).
+    if fee < min_fee(len(tx.wire(False)) + len(tx.inputs)):
+        raise Invalid("min-fee")
+    # No witness spends a script of neither output kind (no public key
+    # hashes to a script that is not 20 bytes; a policy witness spends only a
+    # 33-byte policy script).
+    if any(not is_output_kind(p.script_pubkey) for p in prevouts):
+        raise Invalid("pubkey-mismatch")
+    return fee, prevouts
+
+
+def connect_tx_witness(tx: mk.Tx, prevouts: list, fee: int, height: int, activation: int,
+                       out: Outcome) -> None:
+    """`check_tx_witnesses`: the scripts and the size-based minimum fee."""
+    check_input_scripts(tx, prevouts, height, activation, out)
     if fee < min_fee(len(tx.wire(True))):
         raise Invalid("min-fee")
+
+
+def connect_tx(tx: mk.Tx, view: View, earlier: dict, spent_in_block: set, height: int, activation: int,
+               same_block_coinbase, out: Outcome) -> int:
+    """`validate_tx_in_view`: one non-coinbase transaction in full; returns
+    the fee."""
+    fee, prevouts = connect_tx_committed(tx, view, earlier, spent_in_block, height, activation,
+                                         same_block_coinbase)
+    connect_tx_witness(tx, prevouts, fee, height, activation, out)
     return fee
 
 
 def connect_block(b: Block, view: View, activation: int, out: Outcome) -> None:
     """`validate_block_in_view_at`: BIP30 and the same-block coinbase rule
-    from the activation, every transaction, the coinbase value."""
+    at every height; pass 1, the id-committed checks of every transaction,
+    then the coinbase value; pass 2, the witness checks of every transaction
+    (re-audit B1-T13)."""
     # BIP30 and no spend of the block's own coinbase: this chain's rules at
     # every height (the audit's VAL-2 / VAL-3 from the activation).
     for tx in b.txs:
@@ -525,10 +596,12 @@ def connect_block(b: Block, view: View, activation: int, out: Outcome) -> None:
     # The coinbase's own finality and output kinds.
     chain_rules(b.txs[0], b.height)
     same_cb = b.txs[0].txid() if b.txs else None
-    earlier, spent, fees = {}, set(), 0
+    earlier, spent, fees, checked = {}, set(), 0, []
     for i, tx in enumerate(b.txs):
         if i > 0:
-            fees = money_add(fees, connect_tx(tx, view, earlier, spent, b.height, activation, same_cb, out))
+            fee, prevouts = connect_tx_committed(tx, view, earlier, spent, b.height, activation, same_cb)
+            fees = money_add(fees, fee)
+            checked.append((tx, prevouts, fee))
         if i == 0:
             continue
         txid = tx.txid()
@@ -540,6 +613,8 @@ def connect_block(b: Block, view: View, activation: int, out: Outcome) -> None:
     allowed = miner_subsidy(b.height) + fees
     if allowed >= 1 << 64 or cb.outputs[0].value > allowed:
         raise Invalid("coinbase-value")
+    for tx, prevouts, fee in checked:
+        connect_tx_witness(tx, prevouts, fee, b.height, activation, out)
 
 
 # ── Block rules ─────────────────────────────────────────────────────────────
@@ -563,8 +638,9 @@ def check_structure(b: Block, activation: int) -> None:
     hardened = block_rules_active(b.height, activation)
     if len(b.header.parents) > MAX_PARENTS:
         raise Invalid("too-many-parents")
-    # This chain measures the wire encoding at every height.
-    size = len(b.wire())
+    # This chain measures the wire encoding at every height (re-audit B1-T0:
+    # never a measure of the uncommitted blue_score).
+    size = len(b.wire()) if hardened else legacy_block_size(b)
     if size > MAX_BLOCK_SIZE:
         raise Invalid("block-size")
     if merkle_root_at(b, activation) != b.header.merkle_root:
@@ -612,10 +688,11 @@ def check_pow_proof(b: Block) -> None:
 
 def check_context_free(b: Block) -> None:
     """`limits::check_block_context_free` (the encoding caps hold for every
-    decoded block): MoneyRange of every output, transaction and the block."""
-    total = 0
+    decoded block): MoneyRange of every output and every transaction's output
+    total. There is no block-wide output total (re-audit B1-T1): chained
+    in-block spends move the same coins once per hop."""
     for t in b.txs:
-        total = money_add(total, tx_money_range(t))
+        tx_money_range(t)
 
 
 def validate_block(b: Block, view: View, activation: int, scope: str, pow_mode: str, out: Outcome) -> None:
@@ -697,11 +774,7 @@ def admission(tx: mk.Tx, view: View, height: int, activation: int, out: Outcome)
             raise Invalid("missing-input")
         total_in = money_add(total_in, coin.value)
         prevouts.append(coin)
-    if height != 0:
-        for i in tx.inputs:
-            cbh = view.coinbase_heights.get(i.prev_txid)
-            if cbh is not None and max(0, height - cbh) < COINBASE_MATURITY:
-                raise Invalid("immature-coinbase")
+    check_maturity(tx, view, height, activation)
     chain_rules(tx, height)
     total_out = tx_money_range(tx)
     if total_in < total_out:

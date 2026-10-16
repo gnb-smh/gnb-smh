@@ -157,6 +157,25 @@ fn body_index_height_key(hash: &BlockHash) -> Vec<u8> {
     k
 }
 
+/// CF_META key prefix of a hardened-body marker: `hardened_body/<hash>` (empty
+/// value) is written, in the same batch that prunes the body, when the pruned
+/// body passed every context-free hardening block rule as if active
+/// (`accept::classify_stored_block` at activation 0). Those rules are gated
+/// on the block's own header height only, so the marker answers "would this
+/// body pass the start-up hardening recheck" for EVERY activation at or below
+/// its height. The recheck reads it for a candidate whose body is gone
+/// (re-audit B2-T1 follow-up): a body pruned after it was checked is not
+/// disqualified when the recheck runs again under another activation height.
+/// It lives in CF_META, which a chain-state rebuild never clears.
+pub const HARDENED_BODY_PREFIX: &[u8] = b"hardened_body/";
+
+/// CF_META key of `hash`'s hardened-body marker.
+pub fn hardened_body_key(hash: &BlockHash) -> Vec<u8> {
+    let mut k = HARDENED_BODY_PREFIX.to_vec();
+    k.extend_from_slice(hash);
+    k
+}
+
 /// What disconnecting a selected-chain block needs from its body, kept when
 /// the body is pruned (audit DAG-6): the UTXO effects are reversed from the
 /// undo record, which is never pruned; the address-history rows to delete and
@@ -1740,13 +1759,18 @@ impl Storage {
     }
 
     /// Get the height at which a coinbase transaction was created.
-    /// Returns None if the txid is not a coinbase.
+    /// Returns None if the txid is not a coinbase. A row that is not exactly
+    /// 8 bytes is corrupted, an error: reading it as "not a coinbase" skipped
+    /// the coinbase-maturity check (re-audit B1-T12).
     pub fn get_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, StorageError> {
         self.note_reads(1);
         let cf = self.db.cf_handle(CF_COINBASE).ok_or(StorageError::CfNotFound(CF_COINBASE.into()))?;
         match self.db.get_cf(&cf, txid).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
-            Some(d) if d.len() == 8 => Ok(Some(u64::from_le_bytes(d[..8].try_into().unwrap()))),
-            _ => Ok(None),
+            Some(d) => <[u8; 8]>::try_from(d.as_slice()).map(|b| Some(u64::from_le_bytes(b))).map_err(|_| {
+                StorageError::DeserializeFailed(format!(
+                    "coinbase-height row of {} has {} bytes (expected 8)", hex::encode(&txid[..8]), d.len()))
+            }),
+            None => Ok(None),
         }
     }
 
@@ -1795,7 +1819,11 @@ impl Storage {
         Ok(())
     }
 
-    /// Lookup transaction location: returns (block_hash, block_height)
+    /// Lookup transaction location: returns (block_hash, block_height). A
+    /// row that is not 40 bytes is an error, never "not confirmed" (re-audit
+    /// B1-T12: coinbase maturity and relative timelocks read this row while
+    /// a block is connected, and an absent confirmation is not a verdict
+    /// either way).
     pub fn get_tx_location(&self, txid: &[u8; 32]) -> Result<Option<([u8; 32], u64)>, StorageError> {
         self.note_reads(1);
         let cf = self.db.cf_handle(CF_TX_INDEX).ok_or(StorageError::CfNotFound(CF_TX_INDEX.into()))?;
@@ -1806,7 +1834,9 @@ impl Storage {
                 let height = u64::from_le_bytes(d[32..40].try_into().unwrap());
                 Ok(Some((bh, height)))
             }
-            _ => Ok(None),
+            Some(d) => Err(StorageError::DeserializeFailed(format!(
+                "tx-index row of {} has {} bytes (expected 40)", hex::encode(&txid[..8]), d.len()))),
+            None => Ok(None),
         }
     }
 
@@ -2203,6 +2233,19 @@ impl Storage {
             if let Some(raw) = raw {
                 batch.delete_cf(&cf_blocks, hash);
                 let decoded = Block::from_wire_bytes(&raw);
+                // Re-audit B2-T1 follow-up (R1a) with B1-T17 (R4): EVERY body
+                // pruned here — merged, fork-loser and junk ones too — leaves
+                // the hardened-body marker when it passed the hardening block
+                // rules (see [`HARDENED_BODY_PREFIX`]). The start-up recheck
+                // considers every DAG block at or above the activation, and a
+                // merged block disqualified there for a missing body would
+                // take every block that merged it along.
+                if let Ok(body) = &decoded {
+                    if matches!(crate::accept::classify_stored_block(body, 0),
+                                crate::accept::StoredBlockCheck::Valid) {
+                        batch.put_cf(&cf_meta, hardened_body_key(&hash), [0u8; 0]);
+                    }
+                }
                 // The genesis is on every selected chain (its ledger is
                 // seeded, so it has no undo record): its record keeps its
                 // address-history keys, as every other chain block's does
@@ -2253,6 +2296,16 @@ impl Storage {
             self.put_meta("pruned_height", &below_height.to_le_bytes())?;
         }
         Ok(pruned)
+    }
+
+    /// True iff `hash`'s body was pruned after passing every context-free
+    /// hardening block rule (see [`HARDENED_BODY_PREFIX`]).
+    pub fn has_hardened_body_marker(&self, hash: &BlockHash) -> Result<bool, StorageError> {
+        self.note_reads(1);
+        let cf = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        self.db.get_cf(&cf, hardened_body_key(hash))
+            .map(|v| v.is_some())
+            .map_err(|e| StorageError::ReadFailed(e.to_string()))
     }
 
     /// The rollback record written when `hash`'s body was pruned, if any.

@@ -321,7 +321,7 @@ pub fn difficulty_parent_timestamp<I: IntoIterator<Item = u64>>(parent_timestamp
 /// process-wide hardening activation height (pow limit, POW-3).
 pub fn expected_bits(parent_timestamp: u64, height: u64) -> Result<u32, String> {
     #[cfg(feature = "test-pow-limit")]
-    {
+    if !test_real_expected_bits() {
         let _ = (parent_timestamp, height);
         return Ok(target_to_bits(&bits_to_target(POW_LIMIT_BITS)));
     }
@@ -1597,12 +1597,12 @@ impl Block {
     }
 
     /// [`Block::validate_structure_without_pow`] for an explicit activation
-    /// height. Below the activation it is exactly the pre-activation check
-    /// (bincode size, legacy Merkle root).
+    /// height. Below the activation: the wire size (`legacy_block_size`, never
+    /// dependent on the uncommitted blue_score, B1-T0), legacy Merkle root.
     pub fn validate_structure_without_pow_at(&self, activation_height: u64) -> Result<(), &'static str> {
         let hardened = block_rules::rules_active_at(self.height, activation_height);
         if self.header.parents.len() > MAX_PARENTS   { return Err("too many parents"); }
-        if block_rules::block_size_for_rules(self, hardened) > MAX_BLOCK_SIZE { return Err("block too large"); }
+        block_rules::check_block_size_at(self, activation_height)?; // VAL-12; B1-T0: blue_score-independent
         if !self.validate_merkle_at(activation_height) { return Err("invalid merkle root"); }
         if !self.validate_coinbase_format()           { return Err("invalid coinbase format"); }
         if hardened {
@@ -2972,3 +2972,43 @@ impl PowCache {
 /// (mutation-tested: docs/testing/MUTATION.md).
 #[cfg(test)]
 mod consensus_tests;
+
+// Test seam for the node's real-ASERT tests (re-audit POW-5), kept at the
+// END of the file like the fixture above (audit WAL-5). Compiled only with
+// `test-pow-limit`, which pins `expected_bits` to the pow limit for every
+// node test; a test that holds [`scoped_real_expected_bits`] gets the real
+// ASERT rule on its thread, so the node's call sites (accept_block's height
+// and parent timestamp, the template's bits, the ingress orphan floor) are
+// exercised against it.
+#[cfg(feature = "test-pow-limit")]
+thread_local! {
+    static REAL_EXPECTED_BITS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "test-pow-limit")]
+fn test_real_expected_bits() -> bool {
+    REAL_EXPECTED_BITS.with(|c| c.get())
+}
+
+/// Restores the calling thread's previous `expected_bits` mode on drop.
+#[cfg(feature = "test-pow-limit")]
+pub struct RealExpectedBitsGuard {
+    previous: bool,
+}
+
+#[cfg(feature = "test-pow-limit")]
+impl Drop for RealExpectedBitsGuard {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        REAL_EXPECTED_BITS.with(|c| c.set(previous));
+    }
+}
+
+/// TEST FIXTURES ONLY (`test-pow-limit`): until the guard drops,
+/// [`expected_bits`] on the calling thread computes the real ASERT rule
+/// ([`expected_bits_at`] under the process-wide activation height) instead
+/// of returning the pinned pow limit.
+#[cfg(feature = "test-pow-limit")]
+pub fn scoped_real_expected_bits() -> RealExpectedBitsGuard {
+    RealExpectedBitsGuard { previous: REAL_EXPECTED_BITS.with(|c| c.replace(true)) }
+}

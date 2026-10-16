@@ -67,6 +67,11 @@ pub struct Prevout {
     pub amount: u64,
     pub script_pubkey: Vec<u8>,
     pub coinbase_height: Option<u64>,
+    /// The DAG height of the block holding that coinbase (`coinbase_dag_height`
+    /// in the vectors when it differs; otherwise its header height
+    /// `coinbase_height`). From the activation maturity compares DAG heights
+    /// (re-audit B1-T14).
+    pub coinbase_dag_height: Option<u64>,
     /// Output 0 of the evaluation block's own coinbase (never in the view).
     pub block_coinbase: bool,
 }
@@ -89,6 +94,12 @@ fn prevouts_of(v: &Value) -> Vec<Prevout> {
             amount: u64_of(&p["amount"]),
             script_pubkey: bytes_of(&p["script_pubkey"]),
             coinbase_height,
+            coinbase_dag_height: if p["coinbase_dag_height"].is_null() {
+                coinbase_height
+            } else {
+                assert!(coinbase_height.is_some(), "only a coinbase prevout has a coinbase DAG height");
+                Some(u64_of(&p["coinbase_dag_height"]))
+            },
             block_coinbase: source == "block-coinbase",
         }
     }).collect()
@@ -115,6 +126,10 @@ pub struct TxVector {
     /// The activation height is the network's schedule (`activation_source`).
     pub schedule: bool,
     pub height: u64,
+    /// The DAG height of the evaluation block (its selected parent's plus
+    /// one): `dag_height` in the vectors when it differs, otherwise `height`
+    /// (re-audit B1-T14).
+    pub dag_height: u64,
     pub prevouts: Vec<Prevout>,
     pub bytes: Vec<u8>,
     /// `None`: valid.
@@ -140,6 +155,7 @@ pub fn load_tx_vectors() -> TxVectors {
         activation: u64_of(&c["activation_height"]),
         schedule: schedule_of(&c["activation_source"]),
         height: u64_of(&c["height"]),
+        dag_height: if c["dag_height"].is_null() { u64_of(&c["height"]) } else { u64_of(&c["dag_height"]) },
         prevouts: prevouts_of(&c["prevouts"]),
         bytes: bytes_of(&c["tx"]),
         error: expected_of(&c["expected"]),
@@ -313,22 +329,18 @@ pub const CONNECT_CLASSES: &[&str] = &[
     "inputs-below-outputs", "min-fee", "coinbase-output-count", "coinbase-value",
 ];
 
-/// Whether an output, a transaction's output total or the block's output
-/// total exceeds `max_supply` (u128 arithmetic on the data alone, not the
-/// code under test). Such a block fails the context-free MoneyRange of
+/// Whether an output or a transaction's output total exceeds `max_supply`
+/// (u128 arithmetic on the data alone, not the code under test). Such a
+/// block fails the context-free MoneyRange of
 /// `limits::check_block_context_free` (VAL-11); an input-side MoneyRange
-/// failure is connect-time.
+/// failure is connect-time. The block's output total is not bounded
+/// (re-audit B1-T1: chained in-block spends count coins once per hop).
 pub fn outputs_out_of_range(block: &Block, max_supply: u64) -> bool {
     let max = u128::from(max_supply);
-    let mut block_total = 0u128;
-    for tx in &block.transactions {
+    block.transactions.iter().any(|tx| {
         let tx_total: u128 = tx.outputs.iter().map(|o| u128::from(o.value)).sum();
-        if tx.outputs.iter().any(|o| u128::from(o.value) > max) || tx_total > max {
-            return true;
-        }
-        block_total += tx_total;
-    }
-    block_total > max
+        tx.outputs.iter().any(|o| u128::from(o.value) > max) || tx_total > max
+    })
 }
 
 /// The verdict the context-free stages must give for a case whose expected

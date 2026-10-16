@@ -49,15 +49,36 @@ use gnb::storage::Storage;
 /// txid: a node applies every coin together with its creating transaction's
 /// index row (`reorg::apply_block_utxo_mutations`: `put_tx_index` before
 /// `put_utxo`), which mempool admission reads ("already confirmed").
-fn store_with(prevouts: &[Prevout]) -> (tempfile::TempDir, Storage) {
+///
+/// The DAG records maturity reads from the activation (re-audit B1-T14):
+/// each coinbase prevout lives in a block of its own whose DAG record has
+/// height `coinbase_dag_height`; every parent of the evaluation block has DAG
+/// height `dag_height - 1` (so the block's DAG height is `dag_height`), and
+/// the first parent is the applied tip mempool admission builds on.
+fn store_with(prevouts: &[Prevout], dag_height: u64, parents: &[[u8; 32]]) -> (tempfile::TempDir, Storage) {
     let tmp = tempfile::TempDir::new().unwrap();
     let store = Storage::open(&tmp.path().join("db")).unwrap();
+    let record = |height: u64| {
+        let mut d = gnb::consensus::GhostdagData::genesis();
+        d.height = height;
+        d.blue_score = height;
+        d
+    };
     for p in prevouts.iter().filter(|p| !p.block_coinbase) {
-        store.put_tx_index(&p.txid, &[0xB0; 32], p.coinbase_height.unwrap_or(0)).unwrap();
-        store.put_utxo(&p.txid, p.vout, &p.out()).unwrap();
+        let mut holder = [0xB0; 32];
         if let Some(h) = p.coinbase_height {
+            holder[..8].copy_from_slice(&p.txid[..8]);
             store.put_coinbase_info(&p.txid, h).unwrap();
+            store.put_dag_data(&holder, &record(p.coinbase_dag_height.unwrap_or(h))).unwrap();
         }
+        store.put_tx_index(&p.txid, &holder, p.coinbase_height.unwrap_or(0)).unwrap();
+        store.put_utxo(&p.txid, p.vout, &p.out()).unwrap();
+    }
+    for parent in parents {
+        store.put_dag_data(parent, &record(dag_height.saturating_sub(1))).unwrap();
+    }
+    if let Some(tip) = parents.first() {
+        store.put_meta("tip_hash", tip).unwrap();
     }
     (tmp, store)
 }
@@ -168,7 +189,7 @@ fn run_tx_vectors(network: &str) -> usize {
     for c in v.cases.iter().filter(|c| c.network == network) {
         n += 1;
         let (_g, act) = activation_for(c.schedule, c.activation);
-        let (_tmp, store) = store_with(&c.prevouts);
+        let (_tmp, store) = store_with(&c.prevouts, c.dag_height, &[[0x11; 32]]);
         let tx = match admission::decode_tx_strict(&c.bytes) {
             Ok(tx) => tx,
             Err(_) => {
@@ -185,7 +206,7 @@ fn run_tx_vectors(network: &str) -> usize {
         let cf = tx_context_free(&block, act).map_err(|e| classify(&e).to_string());
         rep.expect(&c.id, "context-free rules", &context_free_expectation(&expected, &block, max_supply), &verdict(&cf));
         let got = cf.and_then(|()| {
-            accept::validate_block_in_view_classified(&store, &block).map_err(|e| classify(&e.reason).to_string())
+            accept::validate_block_in_view_classified(&store, &block).map_err(|e| classify(&e.into_message()).to_string())
         });
         rep.expect(&c.id, "consensus", &expected, &verdict(&got));
 
@@ -281,8 +302,8 @@ fn block_vectors() {
         } else {
             assert_eq!(c.scope, "connect", "{}", c.id);
         }
-        let (_tmp, store) = store_with(&c.prevouts);
-        let got = accept::validate_block_in_view_classified(&store, &block).map_err(|e| classify(&e.reason).to_string());
+        let (_tmp, store) = store_with(&c.prevouts, c.height, &block.header.parents);
+        let got = accept::validate_block_in_view_classified(&store, &block).map_err(|e| classify(&e.into_message()).to_string());
         rep.expect(&c.id, "block", &expected, &verdict(&got));
     }
     rep.finish("block vectors (node)");

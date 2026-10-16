@@ -195,17 +195,68 @@ PoWit height (GnB-SMH v3 and PoWit: mainnet 10,000; testnet off unless
 4. timestamp bounds;
 5. at/after the hardening activation: the context-free block rules (wire
    size, tagged Merkle root, each parent listed once, no 64-byte
-   transaction, coinbase commitment), before the block is stored;
+   transaction, coinbase commitment), and at every height the block-size
+   limit of the block's verified height in the measure of the regime (see
+   "Block size (VAL-12)"), before the block is stored;
 6. GnB-SMH proof (64 MiB, cached by block id);
 7. transactions (version rule, witnesses and signatures as specified in
-   "Transaction signatures" below, double spends, coinbase maturity at the
-   block's consensus height, consensus minimum fee, and at/after the
-   activation BIP30 and no same-block coinbase spend), coinbase value.
+   "Transaction signatures" below, double spends, coinbase maturity and
+   relative timelocks in the depth measure of the block's regime ("Coinbase
+   maturity"), this chain's locktime, output-kind, dust and policy-spend
+   rules (`node/src/blockval.rs`), consensus minimum fee, BIP30 and no
+   same-block coinbase spend, this chain's rules at every height),
+   coinbase value (the miner output and, from `powit_height()`, one
+   witness-share output per PoWit share).
 
 Structural checks (size, merkle root, coinbase shape, duplicates, dust, and
 at/after the activation distinct parents, the 64-byte rule and the coinbase
-commitment) run
-before `accept_block` on every ingress path.
+commitment) also run before `accept_block` on every ingress path, on the
+height the block claims, so no proof of work is spent on a block that fails
+them.
+
+The `blue_score` a block carries on the wire is not committed by its id and
+no rule reads it. `accept_block` stores the body with the value derived from
+its parents (`max(parent blue_score) + 1`), whichever path delivered it
+(gossip, directed sync, orphan drain, body re-fetch, `submitblock`, the
+miner), so every node stores, serves and relays the same bytes for one block
+id (POW-8; re-audit B1-T0).
+
+## Value ranges (MoneyRange, all heights)
+
+`MAX_SUPPLY_SAT = 12,500,000 GNB = 1.25 x 10^15` base units. A block is
+invalid if any of these values leaves `0..=MAX_SUPPLY_SAT` (a sum that
+overflows u64 is out of range too):
+
+- every output value of every transaction, the coinbase included (its
+  witness-share outputs from `powit_height()` too) (context-free:
+  `limits::check_block_context_free`, before the block is stored; also
+  mempool admission and the template self-check);
+- each transaction's output total (context-free, same check);
+- each shielded transaction's fee (context-free);
+- each non-coinbase transaction's input total (connect time);
+- the block's accumulated fees, the sum over its non-coinbase transactions
+  of inputs minus outputs (connect time).
+
+These are Bitcoin Core's bounds (`nValueOut` in CheckTransaction, `nValueIn`
+and the fee in CheckTxInputs, `bad-txns-accumulated-fee-outofrange` in
+ConnectBlock). Each is a sum of distinct coins (a transaction's inputs are
+distinct outpoints, its outputs at most its inputs, fees are conserved along
+in-block chains), so a block whose amounts are conserved never violates
+them. The coinbase's own total is bounded by the coinbase value rule
+(subsidy plus fees: the miner output at most its share plus the fees, each
+witness-share output exactly `per_attester`, `Block::validate_coinbase_value`).
+The sum of ALL outputs of a block is not bounded: a chain of in-block
+spends moves the same coins once per hop, so the outputs of a valid block
+can sum above the supply (three hops of 4,500,000 GNB: 13,500,000 GNB).
+The VAL-11 remediation (commit e3e45df, merged into this chain's line by
+28a619d) had also bounded that sum; the rule rejected such valid blocks at
+every height and made the template self-check refuse every template
+carrying such a mempool chain, so it is removed (re-audit B1-T1): only a
+node running 28a619d .. cb60040 rejects such a block, every release of this
+chain before them accepts it. Vectors: `value/*`, among them
+`value/chained-spends-output-total-above-max-supply/*` (valid in both
+regimes) and `value/block-output-total-above-max-supply/*` (valid; the
+vectors of cb60040 pinned the removed rule there).
 
 Node-local (not consensus; NET-2 residual, Phase 4): on the message
 processor, the GnB-SMH proof of a gossiped or pulled block is evaluated only
@@ -275,7 +326,8 @@ minimal varints the bytes a transaction consumes are its canonical length).
 Every encoder in the code base (`write_varint`, used by the node, its miner
 and templates, the wallets and the WASM wallet core) writes only minimal
 varints (`core::wire_canonical_tests::varint_minimality_boundaries`), and the
-node stores blocks as `to_wire_bytes()` and serves those bytes to sync
+node stores blocks as `to_wire_bytes()` (with the `blue_score` derived from
+the parents, see "Acceptance order") and serves those bytes to sync
 requests and gossip. An external miner that assembles a block from
 `getblocktemplate` must write the transaction count and the coinbase's
 varints minimally, as Bitcoin's CompactSize writers do: `submitblock` refuses
@@ -433,6 +485,7 @@ activation height:
 | Coinbase commitment: header height (BIP34), parent list, witness root | VAL-2, CRY-1 | `B.height` | same |
 | No overwrite of an unspent coin (BIP30) | VAL-2 | `B.height` | same |
 | No spend of the same block's coinbase | VAL-3 | `B.height` | same |
+| Coinbase maturity and relative timelocks (`older`) count selected-chain blocks (DAG heights) instead of header heights | re-audit B1-T14 | `B.height` (the regime); the depth itself compares `GhostdagData::height` | "Coinbase maturity" |
 | `MAX_BLOCK_SIZE` measured on the wire encoding | VAL-12 | `B.height` | same |
 | Each parent listed once | B2-T10 (DAG-12) | `B.height` | same, "Parent list" |
 | Pow limit = genesis target | POW-3 | `B.height` (the height `expected_bits` is computed for) | same |
@@ -471,6 +524,15 @@ pre-activation rule named with it (the block and transaction rules state their
 own pre-activation behaviour in their sections). That pre-activation behaviour is proven
 bit-identical to the code that produced the existing chain by
 `node/tests/fix_ghostdag_preactivation_identity.rs`.
+
+The block-wide output total that the VAL-11 remediation (e3e45df, merged
+here by 28a619d) introduced at every height is removed, which restores the
+verdict every earlier release of this chain gives ("Value ranges",
+re-audit B1-T1). The pre-activation block-size measure is this chain's own,
+the wire encoding (`Block::size_bytes`, the PoWit section included from
+`powit_height()`), unchanged: it does not read the uncommitted
+`blue_score`, which the audit's bincode measure did (re-audit B1-T0 /
+B2-T8, "Block size (VAL-12)").
 
 ### Selected parent and fork choice
 
@@ -1279,7 +1341,8 @@ round as soon as a new tip arrives. External miners use `getblocktemplate`
 (which returns the preimage fields, `bits`, `target` and `min_time`) and
 `submitblock`. `getblocktemplate` also returns the rules of the template's
 height: `hardening_active`, `merkle_rule` (`sha256d-duplicate-last` or
-`gnb-tagged-v1`), `size_rule` (`bincode` or `wire`),
+`gnb-tagged-v1`), `size_rule` (`bincode` or `wire`: the audit's regime;
+`chain_size_rule` is this chain's, `wire` at every height),
 `coinbase_script_sig_prefix` (the 80-byte coinbase commitment for exactly the
 listed transactions in that order, empty before the activation),
 `max_coinbase_extra_bytes`, `max_coinbase_script_pubkey_bytes`, and
@@ -1292,15 +1355,16 @@ must keep every dependency of every entry it keeps, in the listed order.
 
 The listed transactions may fill the block up to `max_block_size` minus a
 framing bound minus `coinbase_reserve` (1,000 bytes), so the WHOLE coinbase,
-measured with `size_rule`, must fit in `coinbase_reserve`.
+measured on the wire encoding (`chain_size_rule`), must fit in
+`coinbase_reserve`.
 `max_coinbase_extra_bytes` (the miner bytes allowed after the prefix) already
 includes that bound: it is the largest number of extra bytes for which a
 coinbase with one input and one output whose `script_pubkey` is at most
 `max_coinbase_script_pubkey_bytes` (64) bytes, with every other field at its
 widest encoding, fits in `coinbase_reserve`, capped by the 10,000-byte
 `script_sig` limit (`template::external_coinbase_max_extra`). That is 794
-bytes at/after the activation (wire measure, 80-byte prefix) and 869 bytes
-before it (bincode measure, no prefix). A coinbase within both fields never
+bytes at/after the activation (80-byte prefix) and 874 bytes before it (no
+prefix), both on the wire measure. A coinbase within both fields never
 pushes a block built from the template over `max_block_size`.
 
 ## Block rules at the hardening activation
@@ -1448,32 +1512,89 @@ encoding itself is made canonical by the version-3 rule of the same
 activation ("Transaction signatures", "Witnesses"): with both rules there is
 exactly one valid block body per block id.
 
-**Below the activation (node-local, all heights of the old rules).** The
-blocks below the activation (up to 17,499 on mainnet) stay malleable forever,
-so a node must not let a mutated copy disqualify their ids. This is node policy,
-not a consensus rule: it changes no verdict, only what a node remembers. A
-connect-time failure of a block below the activation is classified by what it
-depends on (`accept::BlockInvalidity::witness_dependent`):
+**Below the activation (node-local, all heights of the old rules).** On
+this chain the block id commits to every witness from
+`WITNESS_COMMITMENT_HEIGHT` (5,000) up to the activation too: the coinbase
+`script_sig` ends with the `|wc:` suffix and the witness root
+(`Block::validate_witness_commitment`, checked by `accept_block` before the
+block is stored), so a connect failure of a block at a height >= 5,000 is
+id-committed whatever rule failed (`accept::witnesses_fixed_at`). The
+blocks below 5,000 stay malleable forever, so a node must not let a
+mutated copy disqualify their ids. This is node policy, not a consensus
+rule: it changes no verdict, only what a node remembers. A connect-time
+failure of a block below both heights is classified by whether another body
+with the same id could cure it (`accept::BlockInvalidity::witness_dependent`;
+Bitcoin Core likewise caches every failure as `BLOCK_CONSENSUS` except a
+detected malleation):
 
-- witness-dependent: a non-coinbase `script_sig` that does not parse, a public
-  key that does not hash to the prevout's `script_pubkey` (the key lives in
-  the `script_sig`), a signature that does not verify (sighash v2: below the
-  activation every transaction version is verified with it, under the
-  lenient witness framing), and the consensus minimum fee (measured on the
-  wire size, `script_sig` included). Size limits measured with witnesses are
-  context-free and checked before a block is stored, so they never reach this
-  point;
-- id-committed: everything else (missing or double-spent inputs, coinbase
+- witness-dependent (curable): a non-coinbase `script_sig` that does not
+  parse, a public key that does not hash to the prevout's 20-byte
+  `script_pubkey` (the key lives in the `script_sig`), a signature that does
+  not verify (sighash v2: below the activation every transaction version is
+  verified with it, under the lenient witness framing), a policy-spend rule
+  (`blockval::check_policy_spends`: the policy witness's framing, a
+  policy-tree branch before `powit_height()`, the revealed policy's
+  absolute or relative timelock; the policy, its branch and so its
+  timelocks are revealed by the `script_sig`, whose hash match with the
+  33-byte policy output is checked with the scripts), and the size-based
+  consensus minimum fee (measured on the wire size, `script_sig` included)
+  when the fee reaches the floor below. Size limits measured with witnesses
+  are context-free and checked before a block is stored, so they never
+  reach this point;
+- id-committed: everything else — missing or double-spent inputs, coinbase
   maturity, values and MoneyRange, coinbase value, shielded state, the
-  transaction version rule — the txid covers the version, and the rule can
-  fail only at/after the activation —, and at/after the activation BIP30 and
-  the same-block coinbase spend).
+  transaction version rule (the txid covers the version, and the rule can
+  fail only at/after the activation), BIP30 and the same-block coinbase
+  spend, this chain's context-free transaction rules (locktime finality,
+  the two output kinds, dust: `blockval::check_tx_context_free`, of the
+  coinbase too) — and the failures no witness can cure (re-audit B1-T13): a
+  fee below `min_tx_fee_sat(s)` with `s` the size of the transaction with
+  every `script_sig` empty (one length byte each: the smallest any body
+  with this txid can have; at least `MIN_TX_FEE_SAT`, so a transaction
+  without inputs, whose fee is 0, is here too), and a spend of a coin whose
+  `script_pubkey` is neither output kind (neither a 20-byte key hash nor a
+  33-byte spend policy: no public key hashes to it and no policy witness
+  is accepted for it).
+
+The PoWit section (from `powit_height()`) is covered by the block id (the
+v2 body root) and checked in context before the block is stored
+(`powit::block_state`): a failure there is refused like a bad height, it
+never reaches this classification.
+
+The class is decided by the whole block: the connect validates in two passes
+(`accept::validate_block_in_view_classified_at`, and the reference
+`reference/gnb_validity.py` `connect_block`): first the id-committed checks
+of every transaction in block order (same-block coinbase spend and maturity,
+once every prevout is found this chain's context-free rules, inputs,
+version rule, values, the fee floor, prevout output kinds), then the
+coinbase value; then the witness checks of every transaction in block
+order (the policy-spend rules, the scripts, then the size-based minimum
+fee). A block with a bad
+signature in one transaction and an overspend in a later one is therefore
+id-committed. The verdict is the one of any order (every rule must hold);
+only the first failure reported, and so the error class of a block failing
+several rules, follows this order. It also means no signature is checked
+for a block that fails a cheap rule (Bitcoin Core's `ConnectBlock` likewise
+runs `CheckTxInputs` for every transaction and leaves the scripts to its
+check queue).
 
 The failures that exist only at/after the activation (an invalid version, a
 non-canonical witness, a sighash-v3 signature) are id-committed there like
 every other failure. Relay-policy verdicts (`non-standard-version`, a
 non-canonical witness or a suite 0x0002 key below the activation) are not
 block-validity rules and never reach this classification.
+
+A failure to READ the node's own UTXO view while a block is validated (an
+I/O error, a corrupted or undecodable row, a coin row without its index
+row, a confirmed policy coin without its tx-index row when a relative
+timelock needs its confirmation) is neither: it is no verdict at all, at
+every height (re-audit B1-T12). The connect is abandoned before anything is written, nothing is
+marked or persisted, the triggering block is rolled back out of the DAG,
+and the block is validated again when it is next received or the node
+restarts. A coinbase-height row that cannot be read is never taken for "not
+a coinbase" (which skipped the maturity rule). Bitcoin Core draws the same
+line: a coins-database read error aborts the node
+(`CCoinsViewErrorCatcher`), it is never cached as an invalid block.
 
 An id-committed failure disqualifies the block and its selected-chain
 descendants and is persisted (`invalid_block/<id>`), as before. A
@@ -1496,7 +1617,24 @@ the pull is retried at the sweep's backoff. `accept_block` takes a copy of the
 same id whose witness root differs from every body already rejected for it:
 the copy passes the same acceptance checks as a new block, replaces the body,
 and the chain is re-evaluated. A block in the DAG whose body is missing (for example after a
-restart) is treated the same way. At/after the activation the witness
+restart) is treated the same way.
+
+Waiting is bounded by the best chain (re-audit B1-T13,
+`GhostDAG::is_body_wanted`): the body of a waiting block is wanted — requested
+from peers, chased by the sweep, and a copy processed — only while some
+block on whose selected chain it lies (itself included, with no persisted
+disqualification in between) orders above the selected tip under the tip
+order (`blue_work`, then `blue_score`, then hash), or while an operator
+override needs it (`accept::request_bodies`, and a body dropped during the
+override's own move), until a body arrives. Once the honest chain is heavier
+than the waiting branch its bodies are neither fetched nor taken (a copy is
+known, like an unrequested block with less work than the tip in Bitcoin
+Core); they are wanted again if the branch becomes heavier. A branch whose
+selected chain misses the PoWit-finalized checkpoint
+(`GhostDAG::set_finalized`, `conflicts_with_finality`) can never be
+selected, so its bodies are never wanted, however heavy it is. A block whose
+body no witness can fix is disqualified outright (above), so it never
+waits. At/after the activation the witness
 commitment fixes every byte of a stored body, so every connect-time failure is
 id-committed and is persisted as before. `node/tests/fix_block_rules.rs`
 (`witness_corrupted_*`) covers the corrupted-then-honest order, restarts, and
@@ -1518,6 +1656,10 @@ descendants, which is a hash cycle. BIP30 below is the rule that guarantees
 safety in any case.
 
 ### No overwrite of an unspent coin (VAL-2 BIP30)
+
+(On this chain BIP30 and the rule of the next section apply at every
+height, as they have since before the 2026-10-14 reset; the audit's text
+below describes them from its activation.)
 
 From the activation, a block is invalid if any output `(txid, i)` of any of
 its transactions, the coinbase included, is an UNSPENT coin in the state of
@@ -1550,14 +1692,134 @@ txid, which covers the commitment. Mempool admission and templates never
 produce such a spend, because a coinbase can be referenced only after its
 block is connected, and it is then immature.
 
+### Coinbase maturity (re-audit B1-T14)
+
+An output of the coinbase of block C may be spent by a transaction of block B
+only if `depth(B, C) >= COINBASE_MATURITY` (100). Every output of the
+coinbase counts, the witness-share outputs of a PoWit coinbase (from
+`powit_height()`) as much as the miner's: the coinbase-height row is kept
+per txid. C is always on B's selected chain: only selected-chain blocks are
+applied, and the coinbase-height row of a coinbase exists exactly while its
+block is applied.
+
+- Below the activation (`B.height < activation`): `depth = B.height -
+  C.height`, both HEADER heights (saturating at 0; the coinbase-height row
+  stores `C.height`). This is the historical rule, kept exactly. A header
+  height is `max(parent DAG heights) + 1`, so it is not a position on the
+  selected chain: a B that merges a long, light side tip sits far above its
+  selected-chain position, and B can then spend a coinbase with fewer than
+  100 selected-chain confirmations (and, symmetrically, a coinbase whose own
+  block merged such a tip stays immature longer).
+- From the activation (`B.height >= activation`, the block-rule predicate):
+  `depth = dag_height(B) - dag_height(C)` (saturating at 0), where
+  `dag_height` is `GhostdagData::height` (selected parent's + 1). `dag_height(B)`
+  is computed from B's parents' DAG records: the parent GhostDAG selects
+  (greatest `(blue_work, blue_score, hash)`) plus one. `dag_height(C)` is the
+  DAG record of the block the transaction index names for the coinbase txid.
+  This is the number of selected-chain blocks from C's child to B inclusive,
+  as Bitcoin Core's `nSpendHeight - coin.nHeight` counts active-chain blocks.
+
+One function decides, `accept::check_coinbase_maturity_in_view`, for the
+connect path (extension, reorg, start-up: `validate_block_in_view`), the fork
+state check (`reorg::validate_fork_block_state`), mempool admission and the
+post-connect revalidation, and the template self-check
+(`admission::coinbase_maturity_for_next_block`). For a block not yet built
+the regime is that of the node's next block height, and `dag_height(B)` is
+the applied tip's DAG height + 1 (the template's selected parent is the
+applied tip). A read failure of any of these rows is a storage error, never
+"not a coinbase" (re-audit B1-T12).
+
+**Timelocks.** A relative timelock (`older` of a spend policy,
+docs/MULTISIG.md; `blockval::check_policy_spends_with_confirmations`)
+counts the confirmations of the output it spends, the quantity maturity
+counts, and the same measure decides it (`accept::MaturityRule`,
+`accept::confirmations_in_view`): below the activation `B.height` minus the
+header height the transaction index records for the spent output's
+transaction (this chain's rule, kept exactly); from the activation
+`dag_height(B)` minus the DAG height of the block the transaction index
+names for it. An output created earlier in B itself has 0 confirmations in
+both regimes; an output of an unconfirmed transaction has none (a relative
+timelock on it is not met). The connect path, mempool admission and the
+template self-check use it (`admission::confirmations_for_next_block` for
+a block not yet built). Absolute heights are not depths: the locktime
+finality rule (`locktime <= B.height`) and a policy's absolute timelock
+(`after <= locktime`) compare with B's header height in both regimes, the
+height every other height-gated rule (subsidy, activations, PoWit) reads,
+and are unchanged. A coinbase output locked to a policy needs both its
+maturity and its policy's timelocks.
+
+Wallets: `getutxos` reports, for a coinbase output (witness-share outputs
+included), a `coinbase_height` such that the wallets' unchanged comparison
+`next_block_height - coinbase_height >= COINBASE_MATURITY`
+(`next_block_height` from `getdaginfo`; `wallet::send::utxo_row_spendable_at`,
+which the CLI and web wallets use to leave immature rows out) applies the
+rule in force for the next block: below the activation the header height of
+C; from it `next_block_height - depth(next block, C)`
+(`admission::coinbase_height_for_wallets`). The CLI wallet and the WASM wallet
+therefore need no change.
+
+Vectors: `maturity/merge-header-depth-100-dag-depth-10/{pre,post}` (valid
+below, immature from the activation) and
+`maturity/inflated-coinbase-header-dag-depth-100/{pre,post}` (immature below,
+valid from it) in `reference/tx_vectors.json`. A case's optional `dag_height`
+is the evaluation block's DAG height and a prevout's optional
+`coinbase_dag_height` the DAG height of the coinbase's block; when absent
+they equal `height` and `coinbase_height` (a linear chain).
+
 ### Block size (VAL-12)
 
-From the activation, `MAX_BLOCK_SIZE = 1,000,000` bytes is compared with the
-canonical wire encoding `Block::to_wire_bytes` (`Block::wire_size`). That is
-the encoding transaction fee rates and the minimum fee use, so witness bytes
-count as they do for fees. Before the activation it is compared with the
-bincode encoding `Block::size_bytes`, as before. Templates budget with the
-measure of their own height.
+On this chain `MAX_BLOCK_SIZE = 1,000,000` bytes is compared with the
+canonical wire encoding `Block::to_wire_bytes` at every height: from the
+activation `Block::wire_size`, below it `block_rules::legacy_block_size`
+(`Block::size_bytes`, "the bytes that are relayed and stored"), the same
+length. That is the encoding transaction fee rates and the minimum fee use,
+so witness bytes count as they do for fees. From `powit_height()` (10,000 on
+mainnet) the encoding carries the PoWit section, and the section counts in
+both measures (`wire_size` since main's 45c9c97, `size_bytes` since PoWit
+itself). The audit's VAL-12 measured bincode below its activation; this
+chain never did.
+
+```text
+size(B) = 4 + cs(n_parents) + 32*n_parents + 32 + 8 + 4 + 8      // version, parents, merkle_root, timestamp, bits, nonce
+        + 8 + 8                                                  // blue_score, height: fixed-width u64 LE
+        + cs(n_tx) + Σ tx.to_wire_bytes(true)                    // transactions, block order
+        + cs(n_shielded) + Σ shielded                            // none is valid today
+        + powit_section                                          // from powit_height(): PowitBody::write_wire
+```
+
+(`cs` the minimal CompactSize varint of "Wire encoding".) The measure does
+not depend on the `blue_score` a copy carries (re-audit B1-T0 / B2-T8): the
+block id does not commit to it (POW-8), and the node replaces the received
+value with the one derived from the block's parents (`max(parent
+blue_score) + 1`) before it stores, serves or relays the body. A measure
+that read the received value could put one block id within the limit in the
+copy gossip delivered and over it in the copy every upgraded node served (the
+audit's bincode measure: a block of exactly 1,000,000 bytes mined with
+`blue_score` 0 was accepted by the online network and refused by every node
+that synced it later once blue scores pass 250, a 3-byte varint; a
+permanent split). The wire header writes `blue_score` as a fixed-width u64,
+so every copy measures the same, the same as with `blue_score` written as 0:
+one verdict per block id. Main's nodes measure exactly this
+(`Block::size_bytes`, PoWit section included), so the rule changes no
+verdict of theirs: no block they accepted becomes invalid and none they
+refused becomes valid. Heights are measured as carried: `accept_block`
+requires `height = max(parent DAG heights) + 1`, so every accepted copy
+carries the same value and the same PoWit section presence.
+
+`accept_block` checks the size rule of the block's verified header height
+(`block_rules::check_block_size_at`, the one size check of both regimes,
+also called by `Block::validate_structure_without_pow_at`,
+`check_block_hardened_at` and the template self-check), and every ingress
+path checks it before (no proof of work is spent on a block that is too
+large). Templates budget with the measure of their own height, the PoWit
+section and the witness-share coinbase outputs on top of the transactions.
+Vectors: `size/*` in `reference/block_vectors.json` (`wire_size` recorded
+for every block); the `size/wire-exactly-1000000-blue-score-*/pre` and
+`size/wire-1000001-bincode-below-blue-score-*/pre` cases are the same block
+ids as `size/wire-exactly-1000000/pre` (valid) and
+`size/wire-1000001-bincode-below/pre` (`block-size`) carrying `blue_score` 0
+and `u64::MAX`, with the same verdicts (`node/tests/fix_wire_metadata.rs`
+replays the finding end to end).
 
 ### Parent list (B2-T10, DAG-12)
 
@@ -1659,7 +1921,29 @@ accepted elsewhere. At start-up, before the applied chain is reconnected,
 `accept::recheck_stored_blocks_under_hardening` checks every stored block at
 header height >= the activation (computed from the DAG; no body is read when
 there is none) against the context-free rules above, once per activation
-height (meta key `hardening_block_rules_checked`, u64 LE). A failure the
+height (meta key `hardening_block_rules_checked`, u64 LE). The recheck runs
+at the first start of a binary with these rules, before any block is accepted,
+so every candidate was stored by a binary without them. A candidate whose body
+is gone (a pre-upgrade binary pruned it, keeping its undo record) cannot be
+read, and is disqualified conservatively, like an id-committed failure
+(re-audit B2-T1): that binary checked the LEGACY header root against the body
+before storing the block, so its id commits to a legacy root that no body
+can match under the tagged rule, and no upgraded node ever accepted it. It
+used to be counted as unchecked while the recheck still recorded itself as
+done, so a pruned legacy block stayed valid and could become the best valid
+tip once its unpruned descendants were disqualified (Bitcoin Core likewise
+never trusts blocks connected without a newly activated deployment's checks:
+`NeedsRedownload` requires them to be validated again). The recheck runs
+again whenever the recorded activation height differs from the binary's (a
+switch between builds with different activation heights), when the candidates
+can include blocks this node accepted under the rules and pruned since. So
+pruning writes, in the batch that deletes a body, a marker (CF_META key
+`hardened_body/<hash>`) when that body passed every context-free rule above as
+if active; these rules depend only on the block's own height, so the marker
+holds for every activation at or below it. A body-less candidate with the
+marker stays valid; one without it is disqualified as above. If the recheck itself
+fails (a storage error), nothing is recorded and the node refuses to start,
+so it never stores a block before the recheck has completed. A failure the
 block id commits to (legacy or wrong header root, coinbase format, a 64-byte
 transaction, the commitment's tag, height or parents, or any failure of a body
 whose witness root matches) disqualifies the block and EVERY block that

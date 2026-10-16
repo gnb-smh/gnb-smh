@@ -416,6 +416,63 @@ fn block_size_limit_is_inclusive_under_both_measures() {
     }
 }
 
+/// Re-audit B1-T0 / B2-T8: the block id does not commit to `blue_score`, and
+/// the node replaces the received value before it stores and serves a body
+/// (POW-8). The size verdict of a block id must therefore be the same for
+/// every `blue_score` a copy can carry (under the audit's bincode measure a
+/// block of exactly `MAX_BLOCK_SIZE` bytes with `blue_score` 0 was "too
+/// large" with 251 or more, a 3-, 5- or 9-byte varint). This chain measures
+/// the wire encoding in both regimes, where it is a fixed-width u64.
+#[test]
+fn size_verdict_does_not_depend_on_the_uncommitted_blue_score() {
+    let scores = [0u64, 1, 250, 251, 65_535, 65_536, 70_000, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX];
+    for activation in [activation::NEVER, 0] {
+        let at = block_of_size(MAX_BLOCK_SIZE, 1, activation);
+        let over = block_of_size(MAX_BLOCK_SIZE + 1, 1, activation);
+        for &bs in &scores {
+            let (mut a, mut o) = (at.clone(), over.clone());
+            a.blue_score = bs;
+            o.blue_score = bs;
+            assert_eq!(a.block_hash(), at.block_hash(), "the id does not commit to blue_score");
+            assert_eq!(a.validate_structure_without_pow_at(activation), Ok(()), "activation {activation}, blue_score {bs}");
+            assert_eq!(o.validate_structure_without_pow_at(activation), Err("block too large"),
+                "activation {activation}, blue_score {bs}");
+            assert_eq!(block_rules::check_block_size_at(&a, activation), Ok(()));
+            assert_eq!(block_rules::check_block_size_at(&o, activation), Err("block too large"));
+        }
+    }
+}
+
+/// `legacy_block_size` (the measure below the activation) is the length of
+/// the wire encoding, `to_wire_bytes().len()`, whatever the `blue_score` (the
+/// same as with it written as 0), the PoWit section included from
+/// `powit_height()` (main's 45c9c97: what this chain's nodes measure), and
+/// equal to the hardened measure `wire_size()`.
+#[test]
+fn legacy_block_size_is_the_wire_length_whatever_the_blue_score() {
+    // The PoWit activation of this test binary (`powit_pow_tests`).
+    let powit = 1u64 << 40;
+    super::set_powit_height_override(powit).expect("one PoWit height per test binary");
+    for (height, n_shielded) in [(1u64, 0usize), (300, 2), (70_000, 1), (powit - 1, 0), (powit, 1)] {
+        let mut b = valid_block(height, vec![[2; 32], [3; 32]], 20, vec![spend_tx(4, &[1_000, 2_000])], activation::NEVER);
+        b.shielded_transactions = (0..n_shielded).map(|i| shielded(i as u8, 2, 1, 50)).collect();
+        let mut zero = b.clone();
+        zero.blue_score = 0;
+        let len0 = zero.to_wire_bytes().len();
+        let mut section = Vec::new();
+        b.powit.write_wire(&mut section);
+        let without_powit = len0 - if height >= powit { section.len() } else { 0 };
+        assert_eq!(height >= powit, len0 > without_powit, "the PoWit section is counted from powit_height");
+        for bs in [0u64, 1, 250, 251, 0xFFFF, 0x1_0000, 0xFFFF_FFFF, 0x1_0000_0000, u64::MAX] {
+            b.blue_score = bs;
+            assert_eq!(block_rules::legacy_block_size(&b), len0, "height {height}, blue_score {bs}");
+            assert_eq!(b.to_wire_bytes().len(), len0);
+            assert_eq!(block_rules::block_size_for_rules(&b, false), len0);
+            assert_eq!(block_rules::block_size_for_rules(&b, true), len0);
+        }
+    }
+}
+
 #[test]
 fn size_bytes_is_the_wire_length() {
     let b = valid_block(3, vec![[1; 32]], 20, vec![spend_tx(1, &[1_000])], activation::NEVER);

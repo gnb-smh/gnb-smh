@@ -1555,24 +1555,41 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             .collect();
                         let total: u64 = utxos.iter().map(|(_, _, o)| o.value).fold(0u64, u64::saturating_add);
                         // R3: `value` is a satoshi amount → decimal string.
-                        // An output of a coinbase also carries the coinbase's
-                        // height: it is spendable only from height
-                        // coinbase_height + COINBASE_MATURITY, and a wallet
-                        // that cannot tell selected immature coinbase outputs
-                        // and built transactions the node refuses
-                        // (test/functional/wallet_coinbase_maturity.py).
-                        let list: Vec<Value> = utxos.iter().map(|(txid, idx, out)| {
+                        // An output of a coinbase also carries a
+                        // `coinbase_height`: it is spendable in the next
+                        // block (getdaginfo `next_block_height`) iff
+                        // next_block_height - coinbase_height >=
+                        // COINBASE_MATURITY, and a wallet that cannot tell
+                        // selected immature coinbase outputs and built
+                        // transactions the node refuses
+                        // (test/functional/wallet_coinbase_maturity.py). From
+                        // the activation the value encodes the selected-chain
+                        // depth at the next block (re-audit B1-T14,
+                        // `admission::coinbase_height_for_wallets`). A height
+                        // that cannot be read fails the call (never "not a
+                        // coinbase", re-audit B1-T12).
+                        let next_block_height = {
+                            let dag = state.dag.read();
+                            crate::mempool::admission::pool_next_height(&dag, &state.store, &state.mempool)
+                        };
+                        let rows: Result<Vec<Value>, crate::storage::StorageError> = utxos.iter().map(|(txid, idx, out)| {
                             let mut row = json!({
                                 "txid": hex::encode(txid), "index": idx,
                                 "value": out.value.to_string(), "script_pubkey": hex::encode(&out.script_pubkey),
                             });
-                            let coinbase_height = <[u8; 32]>::try_from(txid.as_slice()).ok()
-                                .and_then(|t| state.store.get_coinbase_height(&t).ok().flatten());
-                            if let Some(h) = coinbase_height {
-                                row["coinbase_height"] = json!(h);
+                            if let Ok(t) = <[u8; 32]>::try_from(txid.as_slice()) {
+                                let h = crate::mempool::admission::coinbase_height_for_wallets(
+                                    &state.store, &t, next_block_height)?;
+                                if let Some(h) = h {
+                                    row["coinbase_height"] = json!(h);
+                                }
                             }
-                            row
+                            Ok(row)
                         }).collect();
+                        let list = match rows {
+                            Ok(l) => l,
+                            Err(e) => return storage_err_response(&e),
+                        };
                         json!({
                             "address":    addr,
                             "utxo_count": list.len(),
@@ -1867,9 +1884,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // MAX_FUTURE_SECS ahead of the validator's clock.
                 "min_time":             tmpl.parent_timestamp,
                 // Size accounting: the whole block, measured as the consensus
-                // rule measures it at this height (`size_rule`: bincode
-                // `Block::size_bytes` before the activation, the wire encoding
-                // `Block::to_wire_bytes` from it), must stay <= max_block_size;
+                // rule measures it at this height (`chain_size_rule`: the wire
+                // encoding `Block::to_wire_bytes` at every height on this
+                // chain, `block_rules::legacy_block_size` below the
+                // activation, whose fixed-width blue_score no copy of a block
+                // id can change, re-audit B1-T0), must stay <= max_block_size;
                 // the listed transactions leave coinbase_reserve bytes for the
                 // WHOLE coinbase (in the same measure), which is what
                 // max_coinbase_extra_bytes is derived from.

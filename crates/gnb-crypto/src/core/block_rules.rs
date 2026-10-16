@@ -25,7 +25,7 @@
 //!   block's wtxids). The block id commits to it through header ->
 //!   merkle_root -> coinbase txid (a coinbase txid covers its `script_sig`).
 //! * **Block size (VAL-12)**: `MAX_BLOCK_SIZE` is measured on the canonical
-//!   wire encoding (`Block::wire_size`), the encoding fee rates use.
+//!   wire encoding in both regimes ([`check_block_size_at`], B1-T0 / B2-T8).
 //! * **Distinct parents (B2-T10)**: the header lists each parent once
 //!   ([`check_parents_distinct`]).
 //!
@@ -331,16 +331,49 @@ pub fn check_coinbase_commitment(block: &Block) -> Result<(), &'static str> {
     Ok(())
 }
 
-// ── Block size (VAL-12) ──────────────────────────────────────────────────────
+// ── Block size (VAL-12; re-audit B1-T0 / B2-T8) ─────────────────────────────
+
+/// The pre-activation `MAX_BLOCK_SIZE` measure: the length of the block's
+/// wire encoding, `Block::size_bytes()` (`to_wire_bytes().len()`, the PoWit
+/// section included from `powit_height()`): the measure this chain's nodes
+/// apply at every height, never a bincode encoding (the audit's VAL-12
+/// measured bincode below its activation; this chain never did).
+///
+/// It does not depend on the uncommitted `blue_score` (re-audit B1-T0 /
+/// B2-T8): the wire header writes it as a fixed-width u64, so every copy of
+/// a block id (the one gossiped with any value, the one a node stores and
+/// serves with the value derived from the parents, POW-8) measures the same,
+/// the same as with `blue_score` written as 0. `height` is measured as
+/// carried: `accept_block` requires it to equal `max(parent DAG heights) +
+/// 1`, so every accepted copy carries the same value (and the same PoWit
+/// section presence). docs/CONSENSUS.md, "Block size (VAL-12)";
+/// `reference/gnb_validity.py` (`check_structure`).
+pub fn legacy_block_size(block: &Block) -> usize {
+    block.size_bytes()
+}
 
 /// The size `MAX_BLOCK_SIZE` is compared with: the canonical wire encoding
-/// when `hardened`, `Block::size_bytes` (the wire encoding on this chain) otherwise.
+/// (`Block::wire_size`, every field fixed-width or committed, the PoWit
+/// section counted) when `hardened`, [`legacy_block_size`] otherwise. On
+/// this chain both are the length of `to_wire_bytes()`; neither depends on
+/// the uncommitted `blue_score`.
 pub fn block_size_for_rules(block: &Block, hardened: bool) -> usize {
     if hardened {
         block.wire_size()
     } else {
-        block.size_bytes()
+        legacy_block_size(block)
     }
+}
+
+/// The `MAX_BLOCK_SIZE` rule for a block at its header height under
+/// `activation_height`: the ONE size check of `Block::validate_structure`,
+/// `check_block_hardened_at` (at/after the activation), `accept_block` and
+/// the template self-check.
+pub fn check_block_size_at(block: &Block, activation_height: u64) -> Result<(), &'static str> {
+    if block_size_for_rules(block, rules_active_at(block.height, activation_height)) > super::MAX_BLOCK_SIZE {
+        return Err("block too large");
+    }
+    Ok(())
 }
 
 // ── Pow limit (POW-3) ────────────────────────────────────────────────────────
@@ -385,9 +418,7 @@ pub fn check_block_hardened_at(block: &Block, activation_height: u64) -> Result<
     if !rules_active_at(block.height, activation_height) {
         return Ok(());
     }
-    if block.wire_size() > super::MAX_BLOCK_SIZE {
-        return Err("block too large");
-    }
+    check_block_size_at(block, activation_height)?;
     if !block.validate_merkle_at(activation_height) {
         return Err("invalid merkle root");
     }

@@ -484,7 +484,7 @@ fn val3_same_block_coinbase_spend_on_the_reorg_path() {
         let x = mine(same_block_coinbase_spend(&n, &k, gh, b"fork".to_vec()), |_| true);
         n.store.put_block(&x).unwrap();
         let plan = ReorgPlan { lca: gh, to_rollback: vec![m1.block_hash()], to_apply: vec![x.block_hash()] };
-        let validate = |v: &dyn UtxoView, b: &Block| pipeline::validate_block_in_view(v, b);
+        let validate = |v: &dyn UtxoView, b: &Block| pipeline::validate_block_in_view(v, b).map_err(reorg::ValidationFailure::Invalid);
         let none = |_: &Storage, _: &mut rocksdb::WriteBatch| -> Result<(), String> { Ok(()) };
         let res = reorg::connect_plan(&n.store, &plan, &ConnectHooks { validate: &validate, stage_extra: &none });
         if ok {
@@ -1191,6 +1191,15 @@ fn id_committed_failures_are_still_persisted_on_both_sides_of_the_activation() {
     }
 }
 
+/// The verdict of a classified connect failure (a read failure of the view
+/// is no verdict: re-audit B1-T12).
+fn verdict_of(r: Result<(), pipeline::ConnectFailure>) -> pipeline::BlockInvalidity {
+    match r.expect_err("a verdict") {
+        pipeline::ConnectFailure::Invalid(b) => b,
+        pipeline::ConnectFailure::Storage(m) => panic!("no verdict (storage): {m}"),
+    }
+}
+
 /// The classification behind the pipeline, on `validate_block_in_view`'s
 /// own terms: the same signature failure is witness-dependent below the
 /// activation and id-committed at/after it; the verdict is unchanged.
@@ -1214,15 +1223,15 @@ fn connect_failures_are_classified_by_what_the_block_id_commits_to() {
     let mut b = raw_block(&n, vec![gh], txs);
     b.header.merkle_root = b.body_merkle_root_at(activation::NEVER);
     let view: &Storage = &n.store;
-    let below = pipeline::validate_block_in_view_classified_at(view, &b, activation::NEVER).unwrap_err();
+    let below = verdict_of(pipeline::validate_block_in_view_classified_at(view, &b, activation::NEVER));
     assert!(below.witness_dependent && below.reason.contains("invalid signature"), "{below:?}");
-    let at = pipeline::validate_block_in_view_classified_at(view, &b, 1).unwrap_err();
+    let at = verdict_of(pipeline::validate_block_in_view_classified_at(view, &b, 1));
     assert!(!at.witness_dependent && at.reason.contains("invalid signature"), "{at:?}");
     assert_eq!(pipeline::validate_block_in_view_at(view, &b, activation::NEVER).unwrap_err(), below.reason);
     // An over-claiming coinbase is id-committed on both sides.
     let mut over = raw_block(&n, vec![gh], vec![coinbase("over", subsidy(1) + 1, vec![0x9F; 20])]);
     over.header.merkle_root = over.body_merkle_root_at(activation::NEVER);
-    let e = pipeline::validate_block_in_view_classified_at(view, &over, activation::NEVER).unwrap_err();
+    let e = verdict_of(pipeline::validate_block_in_view_classified_at(view, &over, activation::NEVER));
     assert!(!e.witness_dependent, "{e:?}");
 }
 
@@ -1232,10 +1241,11 @@ fn connect_failures_are_classified_by_what_the_block_id_commits_to() {
 /// witness framing), so the witness-dependent set is exactly a malformed
 /// `script_sig`, a public key that does not hash to the prevout, an invalid
 /// signature (a version-3 transaction included: it is verified with sighash
-/// v2 there) and the size-based minimum fee. At/after the activation every
-/// failure (the version rule, a non-canonical witness, a sighash-v3
-/// signature, the minimum fee) is id-committed. The verdict is
-/// `validate_block_in_view_at`'s on both sides.
+/// v2 there) and the size-based minimum fee above the floor no witness can
+/// lower (re-audit B1-T13: a fee below that floor, here 0, is id-committed).
+/// At/after the activation every failure (the version rule, a non-canonical
+/// witness, a sighash-v3 signature, the minimum fee) is id-committed. The
+/// verdict is `validate_block_in_view_at`'s on both sides.
 #[test]
 fn transaction_rule_failures_are_classified_on_both_sides_of_the_activation() {
     let genesis = mk_genesis(unix_now() - 10_000);
@@ -1266,7 +1276,9 @@ fn transaction_rule_failures_are_classified_on_both_sides_of_the_activation() {
         ("another key's witness", signed_spend(&other, &ins, pay(4_900_000)), BELOW, "pubkey mismatch", true),
         ("v1 signature byte flipped", mutate(&v1, &|ss| ss[100] ^= 1), BELOW, "invalid signature", true),
         ("version 3 below the activation", v3.clone(), BELOW, "invalid signature", true),
-        ("v1 fee below the minimum", signed_spend(&k, &ins, pay(5_000_000)), BELOW, "below consensus minimum", true),
+        ("v1 fee above the floor, below the size-based minimum", signed_spend(&k, &ins, pay(4_988_000)), BELOW,
+         "below consensus minimum", true),
+        ("v1 fee of 0, below the floor", signed_spend(&k, &ins, pay(5_000_000)), BELOW, "below consensus minimum", false),
         ("version 1 at the activation", v1.clone(), 1, "bad-txns-version", false),
         ("non-canonical witness", mutate(&v3, &|ss| ss.extend_from_slice(&[0, 1, 2])), 1, "non-canonical", false),
         ("v3 signature byte flipped", mutate(&v3, &|ss| ss[100] ^= 1), 1, "invalid signature", false),
@@ -1279,9 +1291,11 @@ fn transaction_rule_failures_are_classified_on_both_sides_of_the_activation() {
         pipeline::validate_block_in_view_classified_at(view, &b, act).expect("valid on its side");
     }
     for (label, tx, act, fragment, witness_dependent) in cases {
-        let mut b = raw_block(&n, vec![gh], vec![coinbase("p1p2", subsidy(1) + 100_000, vec![0x9E; 20]), tx]);
+        // The coinbase claims the subsidy alone (valid whatever the fee), so
+        // the transaction's failure is the block's.
+        let mut b = raw_block(&n, vec![gh], vec![coinbase("p1p2", subsidy(1), vec![0x9E; 20]), tx]);
         b.header.merkle_root = b.body_merkle_root_at(act);
-        let e = pipeline::validate_block_in_view_classified_at(view, &b, act).unwrap_err();
+        let e = verdict_of(pipeline::validate_block_in_view_classified_at(view, &b, act));
         assert!(e.reason.contains(fragment), "{label}: {e:?}");
         assert_eq!(e.witness_dependent, witness_dependent, "{label}: {e:?}");
         assert_eq!(pipeline::validate_block_in_view_at(view, &b, act).unwrap_err(), e.reason, "{label}");
@@ -1426,6 +1440,187 @@ fn stored_blocks_failing_the_hardening_rules_are_disqualified_at_startup() {
     assert_eq!(applied_tip(&n), Some(blk2.block_hash()));
     let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::miner_coinbase_reserve(&miner_spk)).unwrap();
     assert_eq!(tmpl.parents, vec![blk2.block_hash()]);
+}
+
+/// Re-audit B2-T1: a pre-upgrade binary ran past the activation A and
+/// PRUNED the body of a legacy block P it applied at height A (pruning keeps
+/// the undo record). The start-up recheck cannot read P's body; it used to
+/// count P as "unchecked" and still record the recheck as done, so P stayed a
+/// valid block forever: once its legacy child PC (body kept) was
+/// disqualified, P became the best valid tip and the node stayed applied on a
+/// block every upgraded node rejects. A block at or above the activation that
+/// a pre-upgrade binary stored has a legacy header root (that binary checks
+/// the legacy root against the body before storing it), so P is disqualified
+/// conservatively, with every descendant, and the applied chain rolls back
+/// through the pruned body (Bitcoin Core: blocks connected without a newly
+/// activated deployment's checks are never trusted, `NeedsRedownload`).
+#[test]
+fn pruned_legacy_blocks_above_the_activation_are_disqualified_at_startup() {
+    const A: u64 = 3;
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let (mut n, m1, m2, p, pc) = {
+        let _old = activation::scoped_override(activation::NEVER);
+        let n = node_with(&genesis, &[]);
+        let m1 = build(&n, vec![gh], vec![coinbase("b2t1-m1", subsidy(1), vec![0xE1; 20])]);
+        accept(&n, &m1).unwrap();
+        let m2 = build(&n, vec![m1.block_hash()], vec![coinbase("b2t1-m2", subsidy(2), vec![0xE2; 20])]);
+        accept(&n, &m2).unwrap();
+        let p = build(&n, vec![m2.block_hash()], vec![coinbase("b2t1-legacy-P", subsidy(3), vec![0xE3; 20])]);
+        accept(&n, &p).expect("old binary: a legacy block at height A is valid");
+        let pc = build(&n, vec![p.block_hash()], vec![coinbase("b2t1-legacy-PC", subsidy(4), vec![0xE4; 20])]);
+        accept(&n, &pc).unwrap();
+        assert_eq!(applied_tip(&n), Some(pc.block_hash()));
+        (n, m1, m2, p, pc)
+    };
+    // The old binary pruned P's body: `prune_blocks_below` deletes the
+    // selected-chain bodies up to P (keeping undo and pruned-body records);
+    // the honest blocks' bodies are put back (on a real node they are far
+    // above the pruning depth), so only P's is gone.
+    n.store.prune_blocks_below(A + 1).unwrap();
+    for b in [&genesis, &m1, &m2] {
+        n.store.put_block_body(b).unwrap();
+    }
+    assert!(n.store.get_block(&p.block_hash()).unwrap().is_none());
+    assert!(n.store.get_block(&pc.block_hash()).unwrap().is_some());
+    assert!(n.store.get_undo_data(&p.block_hash()).unwrap().is_some());
+
+    let _new = activation::scoped_override(A);
+    restart(&mut n);
+    for (b, what) in [(&p, "pruned P"), (&pc, "P's child")] {
+        let d = n.dag.read();
+        assert!(d.is_invalid(&b.block_hash()) && d.is_invalid_all_edges(&b.block_hash()), "{what}");
+    }
+    let reason = n.store.invalid_block_reason(&p.block_hash()).unwrap().expect("a persisted mark");
+    assert!(reason.starts_with(pipeline::HARDENING_RECHECK_REASON), "{reason}");
+    assert_eq!(n.store.get_meta(pipeline::HARDENING_RECHECK_META).unwrap(), Some(A.to_le_bytes().to_vec()));
+    assert_eq!(sel_tip(&n), Some(m2.block_hash()));
+    assert_eq!(applied_tip(&n), Some(m2.block_hash()), "rolled back through the pruned body");
+    assert!(n.store.get_utxo(&p.transactions[0].txid(), 0).unwrap().is_none());
+    let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
+    assert_eq!((tmpl.parents.clone(), tmpl.height), (vec![m2.block_hash()], A));
+
+    // The marks survive another restart (the recheck does not run again).
+    restart(&mut n);
+    assert!(n.dag.read().is_invalid_all_edges(&p.block_hash()));
+    assert_eq!(applied_tip(&n), Some(m2.block_hash()));
+}
+
+/// Re-audit B2-T1 follow-up (review): the recheck runs again whenever the
+/// recorded activation differs from the binary's, i.e. after a switch between
+/// builds with different activation heights (LOW -> HIGH -> LOW). Blocks the
+/// LOW build accepted under the hardening rules and pruned since have no body
+/// at the second LOW recheck; they must stay valid (their bodies passed the
+/// rules when they were pruned: `Storage::has_hardened_body_marker`), or the
+/// node disqualifies the valid chain and forks itself off for good.
+#[test]
+fn a_recheck_rerun_after_an_activation_switch_keeps_pruned_checked_blocks() {
+    const LOW: u64 = 2;
+    const HIGH: u64 = 1_000;
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let low = activation::scoped_override(LOW);
+    let mut n = node_with(&genesis, &[]);
+    restart(&mut n);
+    let meta = |n: &Node| n.store.get_meta(pipeline::HARDENING_RECHECK_META).unwrap();
+    assert_eq!(meta(&n), Some(LOW.to_le_bytes().to_vec()), "the LOW build's first start");
+    let mut chain = Vec::new();
+    let mut parent = genesis.block_hash();
+    for i in 1..=5u64 {
+        let b = build(&n, vec![parent], vec![coinbase(&format!("b2t1-switch-{i}"), subsidy(i), vec![0xD0 + i as u8; 20])]);
+        accept(&n, &b).expect("a tagged-root block above LOW");
+        parent = b.block_hash();
+        chain.push(b);
+    }
+    // The LOW build prunes heights 0..=3 (2 and 3 are at or above LOW).
+    n.store.prune_blocks_below(4).unwrap();
+    for b in &chain[1..3] {
+        assert!(b.height >= LOW);
+        assert!(n.store.get_block(&b.block_hash()).unwrap().is_none(), "pruned");
+        assert!(n.store.has_hardened_body_marker(&b.block_hash()).unwrap(), "checked before pruning");
+    }
+    drop(low);
+    {
+        let _high = activation::scoped_override(HIGH);
+        restart(&mut n);
+        assert_eq!(meta(&n), Some(HIGH.to_le_bytes().to_vec()), "the HIGH build ran once");
+    }
+    let _low = activation::scoped_override(LOW);
+    restart(&mut n);
+    assert_eq!(meta(&n), Some(LOW.to_le_bytes().to_vec()), "the recheck ran again at LOW");
+    for b in &chain {
+        assert!(!n.dag.read().is_invalid(&b.block_hash()), "h={} stays valid", b.height);
+        assert_eq!(n.store.invalid_block_reason(&b.block_hash()).unwrap(), None, "h={}", b.height);
+    }
+    let tip = chain.last().unwrap().block_hash();
+    assert_eq!((sel_tip(&n), applied_tip(&n)), (Some(tip), Some(tip)));
+}
+
+/// Integration (R1a x R4): R4's pruning removes EVERY body below the cursor
+/// (audit B1-T17), merged and fork-loser bodies too, while R1a's start-up
+/// recheck considers every DAG block at or above the activation, on the
+/// selected chain or not. A recheck that runs again after an activation
+/// switch (LOW -> HIGH -> LOW) must find the hardened-body marker for those
+/// bodies as well: a merged block disqualified for a missing body would take
+/// every block that merged it, the whole valid chain above it, along.
+#[test]
+fn a_recheck_rerun_keeps_pruned_merged_and_fork_loser_blocks() {
+    const LOW: u64 = 2;
+    const HIGH: u64 = 1_000;
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let low = activation::scoped_override(LOW);
+    let mut n = node_with(&genesis, &[]);
+    restart(&mut n);
+    let cb = |tag: &str, h: u64| coinbase(&format!("r1a-r4-{tag}"), subsidy(h), vec![0xC0 ^ h as u8; 20]);
+    let b1 = build(&n, vec![genesis.block_hash()], vec![cb("b1", 1)]);
+    accept(&n, &b1).unwrap();
+    let b2 = build(&n, vec![b1.block_hash()], vec![cb("b2", 2)]);
+    accept(&n, &b2).unwrap();
+    // S2: merged by B3. F2: a fork-loser nobody merges.
+    let s2 = build(&n, vec![b1.block_hash()], vec![cb("s2", 2)]);
+    accept(&n, &s2).unwrap();
+    let f2 = build(&n, vec![b1.block_hash()], vec![cb("f2", 2)]);
+    accept(&n, &f2).unwrap();
+    let b3 = build(&n, vec![b2.block_hash(), s2.block_hash()], vec![cb("b3", 3)]);
+    accept(&n, &b3).unwrap();
+    let b4 = build(&n, vec![b3.block_hash()], vec![cb("b4", 4)]);
+    accept(&n, &b4).unwrap();
+    let b5 = build(&n, vec![b4.block_hash()], vec![cb("b5", 5)]);
+    accept(&n, &b5).unwrap();
+    let tip = b5.block_hash();
+    assert_eq!(applied_tip(&n), Some(tip));
+    let (off_chain, merged) = {
+        let d = n.dag.read();
+        let merged = if d.get_block_data(&b3.block_hash()).unwrap().selected_parent == Some(b2.block_hash()) {
+            s2.block_hash()
+        } else {
+            b2.block_hash()
+        };
+        (vec![merged, f2.block_hash()], merged)
+    };
+    assert!(n.store.get_undo_data(&merged).unwrap().is_none(), "the merged block is not applied");
+
+    // G, B1, B2, S2, F2 and B3 (DAG heights 0..3): R4 prunes them all.
+    assert_eq!(n.store.prune_blocks_below(4).unwrap(), 6);
+    for b in [&b2, &s2, &f2, &b3] {
+        assert!(b.height >= LOW);
+        assert!(n.store.get_block(&b.block_hash()).unwrap().is_none(), "pruned");
+        assert!(n.store.has_hardened_body_marker(&b.block_hash()).unwrap(),
+            "h={} checked before pruning (applied or not)", b.height);
+    }
+    drop(low);
+    {
+        let _high = activation::scoped_override(HIGH);
+        restart(&mut n);
+    }
+    let _low = activation::scoped_override(LOW);
+    restart(&mut n);
+    assert_eq!(n.store.get_meta(pipeline::HARDENING_RECHECK_META).unwrap(), Some(LOW.to_le_bytes().to_vec()),
+        "the recheck ran again at LOW");
+    for h in off_chain.iter().copied().chain([b2.block_hash(), b3.block_hash(), b4.block_hash(), tip]) {
+        assert!(!n.dag.read().is_invalid(&h), "{} stays valid", hex::encode(&h[..4]));
+        assert_eq!(n.store.invalid_block_reason(&h).unwrap(), None);
+    }
+    assert_eq!((sel_tip(&n), applied_tip(&n)), (Some(tip), Some(tip)));
 }
 
 /// P1 x P2: the template's parent predicate (a stored body must pass the

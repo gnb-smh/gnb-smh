@@ -1714,7 +1714,7 @@ impl Sim {
         self.pruned_rollbacks += plan.to_rollback.iter()
             .filter(|h| !self.store.has_block_body(h).unwrap())
             .count();
-        let validate = |_: &dyn UtxoView, _: &Block| -> Result<(), String> { Ok(()) };
+        let validate = |_: &dyn UtxoView, _: &Block| -> Result<(), reorg::ValidationFailure> { Ok(()) };
         let stage = |st: &Storage, b: &mut rocksdb::WriteBatch| -> Result<(), String> {
             st.stage_meta(b, "tip_hash", &new_tip).map_err(|e| e.to_string())
         };

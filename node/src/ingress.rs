@@ -1579,7 +1579,10 @@ pub fn work_admission(lb: u128, threshold: u128, chain_above: u128, merge_lb: u1
 /// used to be persisted and re-served verbatim. Replace it with the value
 /// derived from the block's VERIFIED parents before the block is stored.
 /// (`height` needs no rewrite: `accept_block` rejects any block whose height
-/// differs from max(parent height) + 1.)
+/// differs from max(parent height) + 1.) `accept_block` itself makes the same
+/// replacement for every caller (re-audit B1-T0: `submitblock` skipped this
+/// helper), so the calls on the ingress paths are defence in depth; RPC
+/// `submitblock` uses it to relay the bytes it stores.
 pub fn normalize_wire_metadata(block: &mut core::Block, dag: &Arc<RwLock<GhostDAG>>) {
     let d = dag.read();
     block.blue_score = derived_blue_score(
@@ -1769,9 +1772,11 @@ pub const MAX_BODY_REFETCH: usize = 4_096;
 /// The other bodies are requested as these arrive or are given up on.
 pub const MAX_BODY_PULLS_IN_FLIGHT: usize = crate::network::MAX_PENDING_PULLS / 4;
 
-/// The blocks in the DAG that wait for a body (`GhostDAG::body_pending_blocks`
-/// — the one record of wanted bodies, see `accept::awaits_body`) and are not
-/// already being fetched through `parent_fetch`, as many as keep the bodies
+/// The blocks in the DAG whose body is wanted (`GhostDAG::wanted_body_blocks`:
+/// they wait for a body and a chain through them can still become the best
+/// one, or an operator override asked for it, re-audit B1-T13; see
+/// `accept::awaits_body`) and are not already being fetched through
+/// `parent_fetch`, as many as keep the bodies
 /// being fetched at once within `limit` (those already tracked count). The
 /// ONE request path for wanted bodies, whatever made them wanted (a
 /// witness-dependent rejection, a connect or an operator override that needs
@@ -1785,12 +1790,13 @@ pub fn awaited_bodies_to_request(
     parent_fetch: &ParentFetchTracker,
     limit: usize,
 ) -> Vec<BlockHash> {
-    let (in_flight, fresh): (Vec<BlockHash>, Vec<BlockHash>) = dag.body_pending_blocks().into_iter()
+    let (in_flight, fresh): (Vec<BlockHash>, Vec<BlockHash>) = dag.wanted_body_blocks().into_iter()
         .partition(|h| parent_fetch.is_awaited(h));
     take_rotated(fresh, limit.saturating_sub(in_flight.len()))
 }
 
-/// The blocks waiting for a body that the periodic orphan sweep chases
+/// The blocks whose body is wanted (`GhostDAG::wanted_body_blocks`) that the
+/// periodic orphan sweep chases
 /// (`ParentFetchTracker::sweep` retries each with backoff and forgets every
 /// tracked hash NOT in its chased list): those already being fetched — at
 /// most `limit`, so they keep their retry schedule — then not-yet-tracked
@@ -1802,7 +1808,7 @@ pub fn awaited_bodies_to_chase(
     parent_fetch: &ParentFetchTracker,
     limit: usize,
 ) -> Vec<BlockHash> {
-    let (mut in_flight, fresh): (Vec<BlockHash>, Vec<BlockHash>) = dag.body_pending_blocks().into_iter()
+    let (mut in_flight, fresh): (Vec<BlockHash>, Vec<BlockHash>) = dag.wanted_body_blocks().into_iter()
         .partition(|h| parent_fetch.is_awaited(h));
     in_flight.truncate(limit);
     let room = limit - in_flight.len();
