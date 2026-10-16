@@ -2514,8 +2514,10 @@ impl GhostDAG {
         if self.body_requested.contains(hash) {
             return true;
         }
-        let best = self.selected_tip().map(|t| self.order_key(&t));
-        self.chain_through_can_win(hash, best.as_ref())
+        let Some(height) = self.store.get(hash).map(|d| d.height) else {
+            return false;
+        };
+        self.wanted_pending(height).0.contains(hash)
     }
 
     /// Every block whose body is wanted now
@@ -2526,48 +2528,110 @@ impl GhostDAG {
         if self.body_pending.is_empty() {
             return Vec::new();
         }
-        let best = self.selected_tip().map(|t| self.order_key(&t));
+        let min_height = self.body_pending.keys()
+            .filter_map(|h| self.store.get(h).map(|d| d.height))
+            .min()
+            .unwrap_or(0);
+        let (wanted, _) = self.wanted_pending(min_height);
         let mut v: Vec<BlockHash> = self.body_pending.keys()
-            .filter(|h| self.body_requested.contains(*h) || self.chain_through_can_win(h, best.as_ref()))
+            .filter(|h| self.body_requested.contains(*h) || wanted.contains(*h))
             .copied()
             .collect();
         v.sort_unstable();
         v
     }
 
-    /// True iff `root` or one of its selected-chain descendants orders above
-    /// `best` (the selected tip's key; `None`: no selected tip, anything can
-    /// win), following selected-parent edges only and never through a
-    /// persistent disqualification root (that chain is invalid whatever body
-    /// `root` gets). Stops at the first such block; otherwise visits the
-    /// selected-chain subtree of `root` once.
-    fn chain_through_can_win(&self, root: &BlockHash, best: Option<&(u128, u64, BlockHash)>) -> bool {
-        if self.is_invalid_persistently(root) {
-            return false;
-        }
-        let Some(best) = best else {
-            return true;
-        };
-        let mut stack = vec![*root];
-        let mut seen: HashSet<BlockHash> = HashSet::new();
-        while let Some(h) = stack.pop() {
-            if !seen.insert(h) {
-                continue;
-            }
-            if self.order_key(&h) > *best {
-                return true;
-            }
-            if let Some(children) = self.store.children.get(&h) {
-                for c in children {
-                    let on_chain = self.store.get(c).is_some_and(|d| d.selected_parent == Some(h));
-                    let dead = self.invalid_roots.contains(c) || self.invalid_all_edges.contains(c);
-                    if on_chain && !dead {
-                        stack.push(*c);
+    /// The body-pending blocks at DAG height >= `min_dag_height` on whose
+    /// selected chain lies a block ordering above the selected tip, with no
+    /// disqualification root (or all-edges block) strictly between them and
+    /// no persistent disqualification of their own (the relation
+    /// [`is_body_wanted`](Self::is_body_wanted) describes), and the number of
+    /// blocks visited to find them.
+    ///
+    /// One memoised pass (review of re-audit B1-T13: a selected-subtree DFS
+    /// per pending block cost O(pending x depth) under the DAG read lock,
+    /// twice per processed block, while a pruned node follows a deep reorg).
+    /// blue_work strictly increases along every parent -> child edge (the
+    /// selected parent has the greatest blue_work of the parents and a block
+    /// adds its own non-zero work), so every block ordering above the
+    /// selected tip is reached from a tip that does through blocks that also
+    /// do: those are the seeds. Each seed's selected-parent chain is then
+    /// walked toward genesis, stopping after a disqualification root (a
+    /// chain through it is invalid whatever body the blocks below get), at a
+    /// block already reached, or below `min_dag_height` (DAG heights strictly
+    /// decrease along it), so every block is visited at most once.
+    fn wanted_pending(&self, min_dag_height: u64) -> (HashSet<BlockHash>, usize) {
+        let mut visits = 0usize;
+        let mut reached: HashSet<BlockHash> = HashSet::new();
+        match self.selected_tip().map(|t| self.order_key(&t)) {
+            // No selected tip: any chain can win.
+            None => reached.extend(self.body_pending.keys().copied()),
+            Some(best) => {
+                let mut seeds = Vec::new();
+                let mut seen: HashSet<BlockHash> = HashSet::new();
+                let mut stack: Vec<BlockHash> = self.store.tips.iter()
+                    .filter(|t| self.order_key(t) > best)
+                    .copied()
+                    .collect();
+                while let Some(h) = stack.pop() {
+                    if !seen.insert(h) {
+                        continue;
+                    }
+                    visits += 1;
+                    seeds.push(h);
+                    if let Some(d) = self.store.get(&h) {
+                        stack.extend(d.parents.iter().filter(|p| !seen.contains(*p) && self.order_key(p) > best));
+                    }
+                }
+                for seed in seeds {
+                    let mut x = seed;
+                    while let Some(d) = self.store.get(&x) {
+                        if d.height < min_dag_height || !reached.insert(x) {
+                            break;
+                        }
+                        visits += 1;
+                        if self.invalid_roots.contains(&x) || self.invalid_all_edges.contains(&x) {
+                            break;
+                        }
+                        match d.selected_parent {
+                            Some(p) => x = p,
+                            None => break,
+                        }
                     }
                 }
             }
         }
-        false
+        // `is_invalid_persistently`, memoised along the shared chains.
+        let mut persistent: HashMap<BlockHash, bool> = HashMap::new();
+        let mut wanted = HashSet::new();
+        for h in self.body_pending.keys().filter(|h| reached.contains(*h)) {
+            let mut path = Vec::new();
+            let mut cur = *h;
+            let verdict = loop {
+                if let Some(&v) = persistent.get(&cur) {
+                    break v;
+                }
+                visits += 1;
+                if !self.invalid.contains(&cur) {
+                    break false;
+                }
+                path.push(cur);
+                if self.invalid_roots.contains(&cur) || self.invalid_all_edges.contains(&cur) {
+                    break true;
+                }
+                match self.store.get(&cur).and_then(|d| d.selected_parent) {
+                    Some(sp) => cur = sp,
+                    None => break false,
+                }
+            };
+            for p in path {
+                persistent.insert(p, verdict);
+            }
+            if !verdict {
+                wanted.insert(*h);
+            }
+        }
+        (wanted, visits)
     }
 
     /// Every block waiting for a body, sorted.
@@ -3079,6 +3143,133 @@ mod tests {
         assert_eq!(CORRECTED_COLORING_ACTIVATION_HEIGHT, 0);
         assert!(matches!(dag.effective_coloring(0), ColoringMode::Fast));
         assert!(matches!(dag.effective_coloring(1), ColoringMode::Fast));
+    }
+
+    /// The pre-review wanted-body relation (re-audit B1-T13): a DFS over the
+    /// selected-chain subtree of each pending block. Kept as the oracle of
+    /// `wanted_pending`; returns the wanted set and the blocks it visited.
+    fn wanted_by_subtree_dfs(dag: &GhostDAG) -> (Vec<BlockHash>, usize) {
+        let best = dag.selected_tip().map(|t| dag.order_key(&t));
+        let mut visits = 0usize;
+        let mut out = Vec::new();
+        for root in dag.body_pending.keys() {
+            if dag.is_invalid_persistently(root) {
+                continue;
+            }
+            let Some(best) = best else { out.push(*root); continue };
+            let mut stack = vec![*root];
+            let mut seen: HashSet<BlockHash> = HashSet::new();
+            let mut wins = false;
+            while let Some(h) = stack.pop() {
+                if !seen.insert(h) {
+                    continue;
+                }
+                visits += 1;
+                if dag.order_key(&h) > best {
+                    wins = true;
+                    break;
+                }
+                for c in dag.store.children.get(&h).into_iter().flatten() {
+                    let on_chain = dag.store.get(c).is_some_and(|d| d.selected_parent == Some(h));
+                    let dead = dag.invalid_roots.contains(c) || dag.invalid_all_edges.contains(c);
+                    if on_chain && !dead {
+                        stack.push(*c);
+                    }
+                }
+            }
+            if wins {
+                out.push(*root);
+            }
+        }
+        out.sort_unstable();
+        (out, visits)
+    }
+
+    /// Review of re-audit B1-T13 (cost): a pruned node following a deep
+    /// reorg waits for many bodies of the heavier branch at once. The wanted
+    /// set is computed in one memoised pass (each block visited at most a
+    /// small constant number of times), not one selected-subtree DFS per
+    /// pending block (O(pending x depth), under the DAG read lock, twice per
+    /// processed block); it equals the DFS relation, also with persistent
+    /// disqualification roots on and below the heavy branch.
+    #[test]
+    fn wanted_body_set_is_one_memoised_pass_over_the_pending_branch() {
+        let id = |tag: u8, i: u32| {
+            let mut x = [0u8; 32];
+            x[0] = tag;
+            x[1..5].copy_from_slice(&i.to_le_bytes());
+            x
+        };
+        // genesis - 20 common blocks - B (600) | A (700); the node waits for
+        // the bodies of A's first 500 blocks (pruned): A is disqualified in
+        // memory, the selected tip is B's, and only A's last 100 blocks order
+        // above it.
+        // With `side`, a 700-block branch S leaves A at a[100].
+        let fixture = |side: bool| {
+            let mut dag = GhostDAG::with_k(3);
+            let g = id(0, 0);
+            dag.add_genesis(g, 1_000);
+            let mut ts = 1_000u64;
+            let mut chain = |dag: &mut GhostDAG, tag: u8, from: BlockHash, len: u32| -> Vec<BlockHash> {
+                let mut v = Vec::new();
+                let mut parent = from;
+                for i in 1..=len {
+                    ts += 1;
+                    let h = id(tag, i);
+                    dag.add_block(h, vec![parent], ts, 1_000).unwrap();
+                    v.push(h);
+                    parent = h;
+                }
+                v
+            };
+            let common = chain(&mut dag, 1, g, 20);
+            let fork = *common.last().unwrap();
+            let b = chain(&mut dag, 2, fork, 600);
+            let a = chain(&mut dag, 3, fork, 700);
+            if side {
+                chain(&mut dag, 4, a[100], 700);
+            }
+            for h in &a[..500] {
+                dag.mark_body_pending(*h, None);
+            }
+            (dag, a, b)
+        };
+        let (dag, a, b) = fixture(false);
+        assert_eq!(dag.selected_tip(), Some(*b.last().unwrap()));
+        let min = dag.store.get(&a[0]).unwrap().height;
+        let (wanted, visits) = dag.wanted_pending(min);
+        let mut wanted: Vec<BlockHash> = wanted.into_iter().collect();
+        wanted.sort_unstable();
+        let (oracle, oracle_visits) = wanted_by_subtree_dfs(&dag);
+        let mut all: Vec<BlockHash> = a[..500].to_vec();
+        all.sort_unstable();
+        assert_eq!(wanted, all, "every pending block of the heavier branch is wanted");
+        assert_eq!(wanted, oracle);
+        assert_eq!(dag.wanted_body_blocks(), oracle);
+        assert!(a[..500].iter().all(|h| dag.is_body_wanted(h)));
+        // 700 blocks on the branch: seeds (100) + walk (600) + memoised
+        // persistence checks (500 + 1). The per-block DFS visits ~175,000.
+        assert!(visits <= 3 * 700, "visits {visits}");
+        assert!(oracle_visits > 100_000, "oracle visits {oracle_visits}");
+
+        // A persistent root between the pending blocks and the blocks above
+        // the tip makes none of them wanted. With a heavy side branch S
+        // leaving A at a[100], a persistent root at a[300] leaves wanted
+        // exactly a[0..=100] (through S); a[101..300] have no winning chain
+        // and a[300..500] are disqualified for good.
+        let (mut cut, _, _) = fixture(false);
+        cut.mark_invalid(a[550]);
+        assert_eq!(cut.wanted_body_blocks(), wanted_by_subtree_dfs(&cut).0);
+        assert!(cut.wanted_body_blocks().is_empty());
+        let (mut cut, _, _) = fixture(true);
+        cut.mark_invalid(a[300]);
+        let w = cut.wanted_body_blocks();
+        assert_eq!(w, wanted_by_subtree_dfs(&cut).0);
+        let mut expect: Vec<BlockHash> = a[..=100].to_vec();
+        expect.sort_unstable();
+        assert_eq!(w, expect);
+        assert!(cut.is_body_wanted(&a[10]) && cut.is_body_wanted(&a[100]));
+        assert!(!cut.is_body_wanted(&a[101]) && !cut.is_body_wanted(&a[300]) && !cut.is_body_wanted(&a[301]));
     }
 
     #[test]
