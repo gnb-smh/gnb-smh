@@ -1,0 +1,184 @@
+{
+  "package": "CRY-7 address core (text codec only)",
+  "base_revision": "7d6a67eafa93cf7935ecedb50d601486aca4cff7",
+  "final_source_revision": "4b32fb6e7f3b6166b36bf9d09a221b5843f39efb",
+  "host": "macOS-26.6.2-x86_64-i386-64bit",
+  "machine": "x86_64",
+  "toolchain": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: x86_64-apple-darwin\nrelease: 1.94.1\nLLVM version: 21.1.8\n",
+  "environment": {
+    "CARGO_PROFILE_DEV_CODEGEN_UNITS": "79",
+    "CARGO_PROFILE_TEST_CODEGEN_UNITS": "79",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_BUILD_JOBS": "2",
+    "CARGO_TARGET_DIR": "/private/tmp/gnb-r4-target-address-core"
+  },
+  "source_sha256": {
+    "crates/gnb-crypto/src/address.rs": "782e47b573b26c6fbc7b3c3967f51b6de05429fed76d8bfe390e5f9b723c45a2",
+    "crates/gnb-crypto/src/address/bech32m.rs": "a3347cdaaa359d4822aeddb669a297a12bf01209e86dfd8d668f797dd253873d",
+    "crates/gnb-crypto/tests/address_v2.rs": "02e1772e7001592f45f730a774a502dee747a01bf55fc30fd5a86f7dcf2a4302",
+    "crates/gnb-crypto/tests/address_v2_render.rs": "5fe268343159d71695c7f3686e50290f2dbaed0381b3dbe76dd68a65c3f869d3",
+    "crates/gnb-crypto/examples/address_v2_oracle.rs": "bb903638c425d87f607d6e245359b6abde3698e77a693064762ebc265efdaef1",
+    "node/fuzz/fuzz_targets/address_parse.rs": "028d382586a521bae5cf42375d1886386c5cb6d7d51b6b4357c03b754275770c"
+  },
+  "logs": [
+    {
+      "name": "initial_runtime_gap",
+      "path": "/private/tmp/gnb-r4-address-core-red.log",
+      "sha256": "99d7b6a4966a8a68a3c77d8317b0c729340d4bdddce2057a01c0d85dc5df6d7f",
+      "exit": 101,
+      "source_revision": "40c321b52595f351adf8b860e1f49865ded7ad88",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--test",
+        "address_v2"
+      ],
+      "passed": 1,
+      "failed": 3,
+      "ignored": 0
+    },
+    {
+      "name": "full_sandbox_environment_failure",
+      "path": "/private/tmp/gnb-r4-address-core-full-green.log",
+      "sha256": "c0dbfcd1fc233dd8464cd9bdca8b46f88689b5799c7c4c467338839791023529",
+      "exit": 101,
+      "source_revision": "cf40773d514b9f41662f3bb9f2dac7c3e6532d44",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline"
+      ],
+      "passed": 438,
+      "failed": 3,
+      "ignored": 1
+    },
+    {
+      "name": "same_full_suite_with_local_sockets",
+      "path": "/private/tmp/gnb-r4-address-core-full-services-retry.log",
+      "sha256": "efbce8bb86f465b95d687aba16980765ce5f5938ed3c83b2db668120505b628a",
+      "exit": 0,
+      "source_revision": "cf40773d514b9f41662f3bb9f2dac7c3e6532d44",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline"
+      ],
+      "passed": 478,
+      "failed": 0,
+      "ignored": 4
+    },
+    {
+      "name": "diagnostic_runtime_gap",
+      "path": "/private/tmp/gnb-r4-address-core-diagnostic-red.log",
+      "sha256": "aa519a5e7deb4edabf08ad029902eeb3c90dadad6dc328b5f131e0aa8acc9b09",
+      "exit": 101,
+      "source_revision": "cf40773 production plus the final diagnostic test",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--test",
+        "address_v2_render",
+        "v2_hash_lengths_report_encoding_failure_not_character_counts"
+      ],
+      "passed": 0,
+      "failed": 1,
+      "ignored": 0
+    },
+    {
+      "name": "final_focused",
+      "path": "/private/tmp/gnb-r4-address-core-final-focused-green.log",
+      "sha256": "842fd6ccbc532853f06be6c5dc530f7fae805013be6d56a908cc6e0c5248d766",
+      "exit": 0,
+      "source_revision": "4b32fb6e7f3b6166b36bf9d09a221b5843f39efb",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--test",
+        "address_v2",
+        "--test",
+        "address_v2_render"
+      ],
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "final_full_with_local_sockets",
+      "path": "/private/tmp/gnb-r4-address-core-final-full.log",
+      "sha256": "8ef2e375f09053ed2e0f42a0c4b4cd66d6f18e8fb4864244bf539b5c161e21d2",
+      "exit": 0,
+      "source_revision": "4b32fb6e7f3b6166b36bf9d09a221b5843f39efb",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline"
+      ],
+      "passed": 479,
+      "failed": 0,
+      "ignored": 4
+    }
+  ],
+  "sandbox_failure": "Three pre-existing wallet::http_rpc tests failed bind with EPERM at http_rpc.rs:476; exact rerun outside sandbox passed without source changes. Original failure is retained.",
+  "diagnostic_gap": "Only the displayed error classification for malformed decoded hash lengths changed; acceptance/rejection did not. Final diagnostic test bytes were already present in the runtime-red run.",
+  "reversal_manifest": {
+    "path": "docs/security/round-4/address-core-reversals.json",
+    "sha256": "cab8625b6200dcb125ec55d43c184bbbc5cf80858e5187fa94371617a55db9bb",
+    "runs": 8,
+    "production_only_failures": 5,
+    "all_bytes_restored": true
+  },
+  "differential": {
+    "corpus_sha256": "26c1d23ebeb765961bcab1930f0555b9c54252e750d7be139b713191d8d0ee1c",
+    "divergences": 0,
+    "python_oracle_sha256": "6d0c511b1c61845a3e096a5e742745947b8286b181a395ab6d3103671722c2a9",
+    "requests": 630,
+    "rust_binary_sha256": "8e974449c26311c6407445178d5997f752e129ee551a0f8cef465037fd782308",
+    "reference_revision": "a8e8b78",
+    "source_revision": "4b32fb6e7f3b6166b36bf9d09a221b5843f39efb",
+    "exit": 0,
+    "log": "/private/tmp/gnb-r4-address-core-differential-final.log",
+    "log_sha256": "f3ef54d2ebb38425cf102899bc367b355e721b34b864e7084c3872e6abe6c766",
+    "command": [
+      "python3",
+      "reference/address_v2_differential.py",
+      "/private/tmp/gnb-r4-target-address-core/debug/examples/address_v2_oracle"
+    ],
+    "scope": "Independent Python v2 codec; Rust adapter calls actual public destination_script without prefilter. Separate Rust golden tests cover legacy."
+  },
+  "pending": [
+    "Independent three-lens review",
+    "Dedicated node/fuzz workspace typecheck and fuzz execution",
+    "RPC/CLI/WASM/browser/index integration",
+    "Canonical wallet WASM rebuild and pin",
+    "Release CI and multiplatform verification"
+  ],
+  "claims_not_made": [
+    "No full CRY-7 closure across all frontends",
+    "No consensus rule change or activation",
+    "No authentication from the public checksum",
+    "No numeric security score or Bitcoin superiority"
+  ]
+}

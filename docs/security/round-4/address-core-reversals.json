@@ -1,0 +1,211 @@
+{
+  "base": "7d6a67eafa93cf7935ecedb50d601486aca4cff7",
+  "source_commit": "4b32fb6e7f3b6166b36bf9d09a221b5843f39efb",
+  "source_sha256": {
+    "crates/gnb-crypto/src/address.rs": "782e47b573b26c6fbc7b3c3967f51b6de05429fed76d8bfe390e5f9b723c45a2",
+    "crates/gnb-crypto/src/address/bech32m.rs": "a3347cdaaa359d4822aeddb669a297a12bf01209e86dfd8d668f797dd253873d",
+    "crates/gnb-crypto/tests/address_v2.rs": "02e1772e7001592f45f730a774a502dee747a01bf55fc30fd5a86f7dcf2a4302",
+    "crates/gnb-crypto/tests/address_v2_render.rs": "5fe268343159d71695c7f3686e50290f2dbaed0381b3dbe76dd68a65c3f869d3"
+  },
+  "inline_test_sha256": {
+    "crates/gnb-crypto/src/address.rs": "090194fbbecd80317b6e88c4b8935817f14551f7c8e280159374dee734f46ca5",
+    "crates/gnb-crypto/src/address/bech32m.rs": "72ab9a37e8dbb7195d4e9030a32e4cfefe84dfd9b0ca2c4b611b03edcc1e07c2"
+  },
+  "base_address_sha256": "e1f66d9237997f43c7b5aafa61c081c3fd109396f8eaca5f147c6a63c9c96122",
+  "replay_driver_sha256": "7ef2bb946d439052124cc8dcbb47870f00a636a2bd1bc78c25a9752b5b9619b7",
+  "target": "/private/tmp/gnb-r4-target-address-core",
+  "codegen_units": 79,
+  "runs": [
+    {
+      "name": "baseline-production",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--test",
+        "address_v2"
+      ],
+      "exit": 101,
+      "duration_seconds": 9.634,
+      "log": "/private/tmp/gnb-r4-address-core-reversals/baseline-production.log",
+      "log_sha256": "e54e0966c30bbd8cf46d6b285981e56e53922565dec6f2a54c436999c5b3704f",
+      "production_sha256": {
+        "crates/gnb-crypto/src/address.rs": "2653134d28826e57e511c4abd677d674a004c32a7abab61028aace7b058e83e4",
+        "crates/gnb-crypto/src/address/bech32m.rs": "48995c05a2713e297f865ad5eb96d090281b23c24e5d16fb0da4379a121374c4"
+      },
+      "passed": 1,
+      "failed": 3
+    },
+    {
+      "name": "baseline-restored",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--test",
+        "address_v2"
+      ],
+      "exit": 0,
+      "duration_seconds": 9.254,
+      "log": "/private/tmp/gnb-r4-address-core-reversals/baseline-restored.log",
+      "log_sha256": "5a4706eb0e3da57fbdb5df5d16bb372c062a4303a12a00226094296916450c71",
+      "production_sha256": {
+        "crates/gnb-crypto/src/address.rs": "58788717b220c5192fb795ad5e7edb5bc57aec457ced920aae0dadef57e3d7c3",
+        "crates/gnb-crypto/src/address/bech32m.rs": "48995c05a2713e297f865ad5eb96d090281b23c24e5d16fb0da4379a121374c4"
+      },
+      "passed": 4,
+      "failed": 0
+    },
+    {
+      "name": "checksum-guard",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--lib",
+        "address::bech32m::tests"
+      ],
+      "exit": 101,
+      "duration_seconds": 15.718,
+      "log": "/private/tmp/gnb-r4-address-core-reversals/checksum-guard.log",
+      "log_sha256": "b2587aea24133a971726e229a9443ef62f335f48c334b0314c85639f54ec6442",
+      "production_sha256": {
+        "crates/gnb-crypto/src/address.rs": "58788717b220c5192fb795ad5e7edb5bc57aec457ced920aae0dadef57e3d7c3",
+        "crates/gnb-crypto/src/address/bech32m.rs": "a3713cce4743502be155fcbf1185a691f7ac7922ebf7cdf1d34dd2b75e84c288"
+      },
+      "passed": 2,
+      "failed": 2
+    },
+    {
+      "name": "padding-guard",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--lib",
+        "address::bech32m::tests"
+      ],
+      "exit": 101,
+      "duration_seconds": 14.87,
+      "log": "/private/tmp/gnb-r4-address-core-reversals/padding-guard.log",
+      "log_sha256": "fa178f05c85718215ed5826758ccf4c0eae8f47726787a19f9c4acbe052b62ff",
+      "production_sha256": {
+        "crates/gnb-crypto/src/address.rs": "58788717b220c5192fb795ad5e7edb5bc57aec457ced920aae0dadef57e3d7c3",
+        "crates/gnb-crypto/src/address/bech32m.rs": "4e2e93a996d177c8cadb7a7da6a573c7c4c8d586f1dc021ffaa325353fd2c284"
+      },
+      "passed": 3,
+      "failed": 1
+    },
+    {
+      "name": "case-guard",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--lib",
+        "address::bech32m::tests"
+      ],
+      "exit": 101,
+      "duration_seconds": 15.014,
+      "log": "/private/tmp/gnb-r4-address-core-reversals/case-guard.log",
+      "log_sha256": "081dd38d4bd1ac5bf3de3c0518c9543206a77c8de555501001eb079a90f07384",
+      "production_sha256": {
+        "crates/gnb-crypto/src/address.rs": "58788717b220c5192fb795ad5e7edb5bc57aec457ced920aae0dadef57e3d7c3",
+        "crates/gnb-crypto/src/address/bech32m.rs": "a5922aaa4608797f3b82836822292e7faa1c2eb87778a5d3110ad582bd797228"
+      },
+      "passed": 3,
+      "failed": 1
+    },
+    {
+      "name": "length-diagnostic",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--test",
+        "address_v2_render",
+        "v2_hash_lengths_report_encoding_failure_not_character_counts"
+      ],
+      "exit": 101,
+      "duration_seconds": 9.523,
+      "log": "/private/tmp/gnb-r4-address-core-reversals/length-diagnostic.log",
+      "log_sha256": "143c32abed1cba1977fbab8c2809d084d58437f7067e98952fa09d0cf0c2c725",
+      "production_sha256": {
+        "crates/gnb-crypto/src/address.rs": "58788717b220c5192fb795ad5e7edb5bc57aec457ced920aae0dadef57e3d7c3",
+        "crates/gnb-crypto/src/address/bech32m.rs": "6d0e20ca180dbbbda0e696ce05c4a406bc13668a028e61d5ca2f4525bc0703de"
+      },
+      "passed": 0,
+      "failed": 1
+    },
+    {
+      "name": "guards-restored",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--lib",
+        "address::bech32m::tests"
+      ],
+      "exit": 0,
+      "duration_seconds": 15.907,
+      "log": "/private/tmp/gnb-r4-address-core-reversals/guards-restored.log",
+      "log_sha256": "6d262f4d60c5d7417a23213d62c4d7e0c418aeb52d4d8bc999d72a286534cbd1",
+      "production_sha256": {
+        "crates/gnb-crypto/src/address.rs": "58788717b220c5192fb795ad5e7edb5bc57aec457ced920aae0dadef57e3d7c3",
+        "crates/gnb-crypto/src/address/bech32m.rs": "48995c05a2713e297f865ad5eb96d090281b23c24e5d16fb0da4379a121374c4"
+      },
+      "passed": 4,
+      "failed": 0
+    },
+    {
+      "name": "render-restored",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--test",
+        "address_v2_render"
+      ],
+      "exit": 0,
+      "duration_seconds": 11.35,
+      "log": "/private/tmp/gnb-r4-address-core-reversals/render-restored.log",
+      "log_sha256": "9a1ecf0118145ceecd8ce6f9b7c95feb44b43492083ab3f458ae5c68832350b3",
+      "production_sha256": {
+        "crates/gnb-crypto/src/address.rs": "58788717b220c5192fb795ad5e7edb5bc57aec457ced920aae0dadef57e3d7c3",
+        "crates/gnb-crypto/src/address/bech32m.rs": "48995c05a2713e297f865ad5eb96d090281b23c24e5d16fb0da4379a121374c4"
+      },
+      "passed": 3,
+      "failed": 0
+    }
+  ],
+  "restored_sha256": {
+    "crates/gnb-crypto/src/address.rs": "782e47b573b26c6fbc7b3c3967f51b6de05429fed76d8bfe390e5f9b723c45a2",
+    "crates/gnb-crypto/src/address/bech32m.rs": "a3347cdaaa359d4822aeddb669a297a12bf01209e86dfd8d668f797dd253873d",
+    "crates/gnb-crypto/tests/address_v2.rs": "02e1772e7001592f45f730a774a502dee747a01bf55fc30fd5a86f7dcf2a4302",
+    "crates/gnb-crypto/tests/address_v2_render.rs": "5fe268343159d71695c7f3686e50290f2dbaed0381b3dbe76dd68a65c3f869d3"
+  }
+}
