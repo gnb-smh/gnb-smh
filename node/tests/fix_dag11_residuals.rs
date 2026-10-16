@@ -217,11 +217,44 @@ fn a_failed_commit_keeps_the_reachability_delta_of_a_reindex() {
     }
     assert_eq!(persisted_reach(&n), memory_reach(&n), "consistent before the fault");
     let trigger = empty_child(&n, tip, "reindex");
+    // The test proves something only if inserting the trigger reindexes the
+    // NODE's index (a delta of more than the block and its parent): a dry
+    // run on a copy loaded from disk, which equals the node's index (checked
+    // just above), must reindex. If `reindex_depth` ever drifts from the
+    // node's labelling, this fails instead of passing vacuously.
+    {
+        let mut probe = GhostDAG::with_default_k();
+        probe.load_persisted_validated(n.store.load_all_dag_data().unwrap(), n.store.load_all_integrity_hashes().unwrap())
+            .unwrap();
+        probe.reach_load_records(&n.store.load_all_reachability().unwrap(), n.store.get_reachability_root().unwrap())
+            .unwrap();
+        let _ = probe.reach_take_delta(); // loading is not a change
+        let work = gnb::pow::work_from_bits(trigger.header.bits);
+        probe.add_block(trigger.block_hash(), trigger.header.parents.clone(), trigger.header.timestamp, work).unwrap();
+        let ups = probe.reach_peek_delta().0.len();
+        assert!(ups > 2, "inserting the trigger must reindex the node's index (delta of {ups} record(s))");
+    }
     n.store.inject_batch_failures(1);
     let err = accept(&n, &trigger).unwrap_err();
     assert!(err.contains("injected batch failure"), "{err}");
     assert!(!n.dag.read().has_block(&trigger.block_hash()), "insertion rolled back");
     assert_eq!(applied_tip(&n), Some(tip));
+    // The failed commit's reindex delta is still pending, not lost with the
+    // batch: every record whose in-memory state differs from disk (the
+    // removed leaf's parent and the records the reindex moved, which keep
+    // their new intervals in memory) is in the pending delta. With the delta
+    // drained while staging, only the parent (re-marked by the rollback)
+    // was.
+    {
+        let (disk, mem) = (persisted_reach(&n), memory_reach(&n));
+        let stale: std::collections::HashSet<BlockHash> =
+            mem.iter().filter(|(h, r)| disk.get(*h) != Some(r)).map(|(h, _)| *h).collect();
+        let pending: std::collections::HashSet<BlockHash> =
+            n.dag.read().reach_peek_delta().0.into_iter().map(|(h, _)| h).collect();
+        assert!(stale.len() >= 2, "the reindex moved a record besides the parent ({} stale)", stale.len());
+        assert!(stale.is_subset(&pending),
+            "{} of {} stale record(s) are no longer pending", stale.difference(&pending).count(), stale.len());
+    }
     // The block arrives again and commits.
     accept(&n, &trigger).unwrap();
     assert_eq!(applied_tip(&n), Some(trigger.block_hash()));
