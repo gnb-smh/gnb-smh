@@ -16,6 +16,9 @@
 //!   timelocks — absolute `after` against `locktime`, relative `older`
 //!   against the spent output's confirmation height — and a policy-tree
 //!   spend (one revealed branch) is valid only from `core::powit_height()`.
+//!   From the second hardening height (`activation::hardening2_*`, PF-4)
+//!   the revealed policy or branch must not name one key twice in its raw
+//!   and enveloped encodings (`policy::SpendPolicy::check_key_identities`).
 //!   The policy's keys and signatures are checked with every other input
 //!   script (`core::sighash::verify_input_signatures`);
 //! * BIP30: no transaction may create an outpoint that is still unspent, and
@@ -93,6 +96,14 @@ pub fn check_policy_spends_with_confirmations(
             return Err(format!("policy-tree spend before activation at input {}", i));
         }
         let pol = w.policy();
+        // PF-4 (second hardening upgrade): the revealed policy (or branch)
+        // must not name one key twice in its two encodings (raw and
+        // enveloped, `policy::key_identity`); under sighash v3 one signer
+        // would fill both slots. Below the height: unchanged.
+        if core::activation::hardening2_active_at(height) && pol.check_key_identities().is_err() {
+            return Err(format!(
+                "input {}: the revealed policy names the same key twice (raw and enveloped encodings)", i));
+        }
         if pol.after != 0 && tx.locktime < pol.after {
             return Err(format!("input {}: absolute timelock: locktime {} < {}", i, tx.locktime, pol.after));
         }

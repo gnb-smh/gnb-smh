@@ -473,8 +473,9 @@ The schedule is defined in `crates/gnb-crypto/src/core/activation.rs`, and the
 node derives it from its chain id (`--testnet`). A process with no chain id
 set, such as a unit or integration test, follows the mainnet schedule. Tests
 choose a regime explicitly with `GhostDAG::with_k_and_activation(k, h)` or
-`activation::scoped_override(h)`. Later rule changes should reuse the same
-height and module. The rules, and the height each one compares with the
+`activation::scoped_override(h)`. The Phase-5 audit's rule changes use the
+second hardening height of the same module ("Second hardening activation"
+below). The rules, and the height each one compares with the
 activation height:
 
 | Rules | Findings | Height compared | Specified in |
@@ -533,6 +534,75 @@ the wire encoding (`Block::size_bytes`, the PoWit section included from
 `powit_height()`), unchanged: it does not read the uncommitted
 `blue_score`, which the audit's bincode measure did (re-audit B1-T0 /
 B2-T8, "Block size (VAL-12)").
+
+### Second hardening activation (hardening 2)
+
+The Phase-5 audit (2026-10-16) fixes that change verdicts activate at a
+second height, with the same API suffixed `2` / `_v2` in
+`crates/gnb-crypto/src/core/activation.rs` (`hardening2_activation_height`,
+`hardening2_active_at`, `scoped_override_v2`). It is at or above the first
+upgrade's height on every network.
+
+| Network | Second hardening activation height |
+| --- | --- |
+| mainnet | not scheduled (`MAINNET_HARDENING2_ACTIVATION_HEIGHT` = `NEVER`; the owner sets it at release) |
+| testnet | 0 (from genesis) |
+| regtest | 0 (from genesis) |
+
+| Rules | Findings | Height compared | Specified in |
+| --- | --- | --- | --- |
+| A revealed spend policy (or policy-tree branch) may not name one key twice in its raw and enveloped encodings | PF-4 | `B.height` of the containing block (mempool and templates: the next block's height) | "Spend-policy key identity (PF-4)" |
+
+#### Spend-policy key identity (PF-4)
+
+A policy key (`core::policy`, `docs/MULTISIG.md`) is a hybrid ML-DSA-65 ‖
+Falcon-1024 public key in one of two encodings, told apart by exact length
+(`crypto::public_key_suite`): enveloped, `B1 0C 01 00 ‖ mldsa_pk(1,952) ‖
+falcon_pk(1,793)` (3,749 bytes), or raw, `mldsa_pk ‖ falcon_pk` (3,745
+bytes, genesis carry-over keys). Its identity is its enveloped encoding:
+
+```text
+key_identity(k) = k                   if len(k) = 3,749
+                = B1 0C 01 00 ‖ k     if len(k) = 3,745
+```
+
+Every height: the keys of a policy are pairwise distinct as byte strings
+(`SpendPolicy::decode`). With sighash v3 (`crypto::verify_bound`) a
+signature verifies under either encoding of its key and does not bind which,
+so a policy listing one key raw AND enveloped let one signer fill both
+slots: a "2-of-2" or "2-of-3" whose participants saw distinct keys was
+spendable by that signer alone (Phase-5 finding PF-4).
+
+From the second hardening height: a policy spend in a block at header height
+`B.height >= hardening2_activation_height` (mempool admission and templates:
+at the next block's height) is invalid if the revealed policy, or the
+revealed branch of a policy tree, has two keys `i != j` with
+`key_identity(k_i) = key_identity(k_j)`. The rule reads the witness, so like
+the other policy-spend rules its failure is witness-dependent (a block whose
+id does not commit to its witnesses is not disqualified for it). Below the
+height the verdict is unchanged. The rule is
+`blockval::check_policy_spends_with_confirmations`, the one function block
+connect, reorg connect, mempool admission and the template self-check call;
+the check is `SpendPolicy::check_key_identities`.
+
+Outputs locked to such a policy become unspendable from the height, the
+behaviour of a new script version that admits one encoding per key (Bitcoin
+Core: compressed-only keys in segwit v0 standardness, BIP340 x-only keys in
+tapscript; miniscript refuses duplicate keys). Tools never create one:
+`SpendPolicy::new` (wallets, `gnb-cli policyaddress`, the bridge vault
+`Vault::create`, whose signer/recovery overlap check also compares
+identities) refuses two keys with one identity at every height.
+
+Vectors (`core::policy::tests::key_identity_vectors_and_the_twin_encoding_policy`):
+for the hybrid key derived from seed `0x42 × 32`
+(`crypto::generate_keypair_from_seed`), `SHA3-256(key_identity(raw)) =
+SHA3-256(enveloped) =
+2aeeb67335c518247b6a7c92dbe857f3a72e7806609a2c179ce87aa95de2ccd8`, and the
+2-of-2 policy `[raw, enveloped]` (after 0, older 0), which decodes at every
+height and is refused from hardening 2, hashes to
+`f27d1c6e16aaa5eda18ef3372bd38e56397f8f857b62f8cdaa82d34742dbaf6f`. Both
+regimes and the attack are tested end to end in
+`node/tests/fix_pf4_policy_key_identity.rs`.
 
 ### Selected parent and fork choice
 

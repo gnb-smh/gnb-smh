@@ -57,7 +57,10 @@ impl Vault {
         let s = recovery.len();
         let release = SpendPolicy::new(k, signers, 0, 0).map_err(|e| format!("release branch: {e}"))?;
         let recover = SpendPolicy::new(r, recovery, 0, older).map_err(|e| format!("recovery branch: {e}"))?;
-        if release.pubkeys.iter().any(|p| recover.pubkeys.contains(p)) {
+        // PF-4: compare key identities (a raw and an enveloped encoding of
+        // one key are the same signer), not bytes.
+        let recovery_ids: Vec<_> = recover.pubkeys.iter().map(|p| crate::core::policy::key_identity(p)).collect();
+        if release.pubkeys.iter().any(|p| recovery_ids.contains(&crate::core::policy::key_identity(p))) {
             return Err("a key may not be both a signer and a recovery key".into());
         }
         let tree = PolicyTree::new(vec![release, recover]).map_err(|e| format!("tree: {e}"))?;

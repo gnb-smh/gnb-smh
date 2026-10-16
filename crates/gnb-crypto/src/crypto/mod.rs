@@ -372,7 +372,7 @@ fn parse_envelope_or_legacy(b: &[u8]) -> (u16, &[u8]) {
 /// length, both fixed. An ENVELOPED pubkey of the same suite is always
 /// exactly `SUITE_HEADER_LEN` bytes LONGER, so length alone disambiguates
 /// legacy-vs-enveloped with no ambiguity — see [`parse_pubkey_envelope_or_legacy`].
-fn legacy_hybrid_pubkey_len() -> usize {
+pub(crate) fn legacy_hybrid_pubkey_len() -> usize {
     MLDSA_PUBKEY_LEN.saturating_add(falcon::pubkey_len())
 }
 
