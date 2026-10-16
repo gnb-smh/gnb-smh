@@ -71,10 +71,11 @@ impl Builder {
             blue_score: height,
             height,
             shielded_transactions: Vec::new(),
+            powit: Default::default(),
         };
         commit_block(&mut b);
         if register {
-            self.dag.add_block(b.block_hash(), parents, b.header.timestamp, pow::work_from_bits(bits))
+            self.dag.add_block(b.block_hash(), parents, b.header.timestamp, pow::block_work(bits, height))
                 .expect("builder DAG accepts the block");
         }
         b
@@ -296,7 +297,7 @@ fn pow3_submitblock_is_subject_to_the_minimum_chain_work_only() {
     let mined = b.empty(vec![honest.last().unwrap().block_hash()], "mined");
     assert_eq!(ingress::submitted_block_admission(&d, &mined, 0), Ok(()));
     let deep = b.empty(vec![honest[10].block_hash()], "deep-fork");
-    let lb = ingress::block_work_lower_bound(&d, &deep.header.parents, deep.header.bits).unwrap();
+    let lb = ingress::block_work_lower_bound(&d, &deep.header.parents, deep.header.bits, deep.height).unwrap();
     assert!(lb < ingress::anti_dos_work_threshold(&d), "below the gossip window");
     assert_eq!(ingress::submitted_block_admission(&d, &deep, 0), Ok(()), "a heavier chain's replay starts here");
     let e = ingress::submitted_block_admission(&d, &mined, tip_work(&x) + 2 * w).unwrap_err();
@@ -362,7 +363,7 @@ fn b1t5_scenario(invalid_voucher: bool, act: u64) -> (usize, bool, BlockOutcome,
     let tip = honest.last().unwrap().block_hash();
     let y = b.empty(vec![honest[299].block_hash()], "gateway");
     let z = b.chain(y.block_hash(), 60, "z");
-    let lb_y = ingress::block_work_lower_bound(&x.dag.read(), &y.header.parents, y.header.bits).unwrap();
+    let lb_y = ingress::block_work_lower_bound(&x.dag.read(), &y.header.parents, y.header.bits, y.height).unwrap();
     assert!(lb_y + 60 * w < threshold, "the fork's chain cannot come within the window");
     let mut core = BlockIngress::new().with_minimum_chain_work(0);
     for blk in &z {
@@ -857,8 +858,12 @@ fn net4_evicted_tracker_entries_are_reported_for_reset() {
 // B1-T19: the transaction verification budget
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// A funded node and `n` distinct 1-input transactions of ~399 kB (39
-/// outputs of a 9,999-byte script each) with a corrupted signature.
+/// A funded node and `n` distinct 1-input transactions of ~399 kB (13,450
+/// pubkey-hash outputs: this chain admits only its two output kinds,
+/// `core::policy::output_kind`, before any signature is checked — the merge
+/// of the mainnet line refused the 9,999-byte scripts this fixture used, so
+/// those frames never reached the signature step) with a corrupted
+/// signature.
 fn big_junk(n: usize) -> (Node, Vec<Transaction>) {
     let genesis = mk_genesis(unix_now() - 10_000);
     let k = key();
@@ -869,7 +874,12 @@ fn big_junk(n: usize) -> (Node, Vec<Transaction>) {
     }).collect();
     let node = node_with(&genesis, &funds);
     let txs = funds.iter().enumerate().map(|(i, f)| {
-        let outputs: Vec<_> = (0..39u8).map(|j| out(1_000, &vec![j ^ (i as u8); 9_999])).collect();
+        let outputs: Vec<_> = (0..13_450u32).map(|j| {
+            let mut spk = [0u8; core::policy::PKH_SPK_LEN];
+            spk[..4].copy_from_slice(&j.to_le_bytes());
+            spk[4] = i as u8;
+            out(1_000, &spk)
+        }).collect();
         let mut tx = signed_spend(&k, &[(f.0, 0)], outputs);
         tx.inputs[0].script_sig[10] ^= 0xFF;
         tx

@@ -91,3 +91,7 @@ crates/coherence-prover/program/elf/
 !os/boot-harness/fixtures/*.log
 !.claude/workflows/
 /genesis/bloch-g3-carryover.tsv
+
+# cargo-fuzz output (crash inputs are uploaded by CI, not committed)
+node/fuzz/artifacts/
+node/fuzz/coverage/

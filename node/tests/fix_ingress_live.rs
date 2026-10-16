@@ -8,7 +8,9 @@
 //! * B1-T19 — a transaction flood cannot delay or drop blocks: gossip
 //!   transactions have their own channel and consumer
 //!   (`NetworkNode::attach_tx_ingest`); the control (one shared channel, as
-//!   before) shows the block stuck behind the flood.
+//!   before) shows the block stuck behind the flood. PoWit items (the
+//!   transaction topic's other kind, merged from the mainnet line) take the
+//!   same channel: a flood of them does not delay blocks either.
 //!
 //! Blocks are a harness payload (`SimPayload`, as in `fix_net_live.rs`);
 //! the stand-in validator's verdicts go through the node's real penalty
@@ -234,7 +236,8 @@ async fn spawn_tx_flooded_validator(bootstrap_peers: Vec<String>, split: bool) -
                     apply(&dag, &block_data);
                     GossipVerdict::Accept
                 }
-                NetworkMessage::NewTransaction { .. } => {
+                // Transactions and PoWit items (the transaction topic): slow.
+                NetworkMessage::NewTransaction { .. } | NetworkMessage::NewPowitItem { .. } => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     GossipVerdict::Ignore
                 }
@@ -341,6 +344,13 @@ async fn live_control_relayed_invalid_blocks_are_charged_once_penalties_are_in_f
 /// frames arrive in order on its connection: what the attacker could delay
 /// was everyone else's blocks.)
 async fn tx_flood_scenario(split: bool) -> Option<Duration> {
+    flood_scenario(split, false).await
+}
+
+/// [`tx_flood_scenario`] with a flood of transactions or (`powit`) of PoWit
+/// items — witness shares, which travel on the transaction topic and cost
+/// the real node a GnB-SMH v3 evaluation each.
+async fn flood_scenario(split: bool, powit: bool) -> Option<Duration> {
     let v = spawn_tx_flooded_validator(vec![], split).await;
     let a = spawn_legacy(vec![full_addr(&v)]).await;
     let d = spawn_legacy(vec![full_addr(&v)]).await;
@@ -350,7 +360,12 @@ async fn tx_flood_scenario(split: bool) -> Option<Duration> {
     for i in 0..1_500u32 {
         let mut txid = [0x7Au8; 32];
         txid[..4].copy_from_slice(&i.to_le_bytes());
-        a.outbound_tx.send(NetworkMessage::NewTransaction { txid, tx_data: vec![0xEE; 256] }).await.unwrap();
+        let frame = if powit {
+            NetworkMessage::NewPowitItem { id: txid, kind: 1, data: vec![0xEE; 256] }
+        } else {
+            NetworkMessage::NewTransaction { txid, tx_data: vec![0xEE; 256] }
+        };
+        a.outbound_tx.send(frame).await.unwrap();
     }
     // Let the backlog build (A's frames arrive faster than V judges them).
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -382,4 +397,17 @@ async fn live_control_shared_channel_delays_blocks_behind_a_tx_flood() {
     let latency = tx_flood_scenario(false).await;
     println!("honest block latency during a transaction flood (shared channel): {latency:?}");
     assert!(latency.is_none_or(|l| l >= Duration::from_secs(3)), "control: the block waits behind the flood: {latency:?}");
+}
+
+/// The same for PoWit items (merged from the mainnet line, where they were
+/// verified inline on the block processor): they reach the transaction
+/// ingest, never the block channel (`network::goes_to_tx_ingest`), so a
+/// flood of junk shares cannot delay D's block. Fails if PoWit items are
+/// delivered to the block channel again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_powit_flood_does_not_delay_blocks() {
+    init_log();
+    let latency = flood_scenario(true, true).await;
+    println!("honest block latency during a PoWit item flood (own channel): {latency:?}");
+    assert!(latency.is_some_and(|l| l < Duration::from_secs(2)), "{latency:?}");
 }

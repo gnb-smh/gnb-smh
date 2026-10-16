@@ -30,7 +30,9 @@ use pex_validator::{
     PEX_BATCH_LIMIT, KNOWN_PEERS_CAP,
 };
 
-use crate::transport::upgrade::KyberConfig;
+use std::sync::Arc;
+use crate::transport::identity::{PeerPins, PqIdentity};
+use crate::transport::upgrade::PqConfig;
 
 pub const TOPIC_BLOCKS: &str = "gnb/blocks/1";
 pub const TOPIC_TXS:    &str = "gnb/txs/1";
@@ -262,7 +264,10 @@ pub fn gossip_disposition(msg: &NetworkMessage, validator_attached: bool, claim_
         // MEM-5 / NET-2 / NET-4 (audit): transactions are judged by the
         // processor (shared admission, signatures last, per-connection budget —
         // `mempool::relay`) BEFORE gossipsub relays them, exactly like blocks.
-        NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. } => {
+        // PoWit items (shares, attestations, equivocation proofs) are relayed
+        // like transactions: only once the processor admitted them.
+        NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. }
+        | NetworkMessage::NewPowitItem { .. } => {
             if validator_attached { DeliverDeferred } else { Deliver(GossipVerdict::Accept) }
         }
         // Tip claims: consumed locally (author-attributed), never relayed —
@@ -289,9 +294,11 @@ enum IngestSink {
     Legacy(mpsc::Sender<NetworkMessage>),
     /// Validated consumer: frames with origin; verdicts come back. B1-T19:
     /// with `txs` attached ([`NetworkNode::attach_tx_ingest`]) gossip
-    /// transactions go to their own channel (and their own consumer), so a
-    /// transaction flood can neither fill the block channel (a full channel
-    /// drops frames) nor queue block work behind transaction work.
+    /// transactions — and PoWit items, which travel on the transaction topic
+    /// and cost a GnB-SMH v3 evaluation or a KES signature check each — go
+    /// to their own channel (and their own consumer), so a flood of either
+    /// can neither fill the block channel (a full channel drops frames) nor
+    /// queue block work behind its own.
     Validated { main: mpsc::Sender<Inbound>, txs: Option<mpsc::Sender<Inbound>> },
 }
 
@@ -304,12 +311,20 @@ impl IngestSink {
         let kind = msg.kind_name();
         match self {
             IngestSink::Legacy(tx) => forward_to_processor(tx, msg, kind, source),
-            IngestSink::Validated { txs: Some(txs), .. } if matches!(msg, NetworkMessage::NewTransaction { .. }) => {
+            IngestSink::Validated { txs: Some(txs), .. } if goes_to_tx_ingest(&msg) => {
                 forward_to_processor(txs, Inbound { msg, origin }, kind, source)
             }
             IngestSink::Validated { main, .. } => forward_to_processor(main, Inbound { msg, origin }, kind, source),
         }
     }
+}
+
+/// B1-T19: the frames a validated consumer with a transaction ingest
+/// ([`NetworkNode::attach_tx_ingest`]) receives there instead of on the block
+/// channel: gossip transactions and PoWit items (both on the transaction
+/// topic, both judged by the transaction relay task).
+pub fn goes_to_tx_ingest(msg: &NetworkMessage) -> bool {
+    matches!(msg, NetworkMessage::NewTransaction { .. } | NetworkMessage::NewPowitItem { .. })
 }
 
 /// B1-T7 / NET-4 residual (Phase 4): may a wire violation (oversized,
@@ -411,6 +426,10 @@ pub enum NetworkMessage {
         timestamp:  u64,
     },
     VersionAck,
+    /// PoWit item (witness share, attestation or equivocation proof), relayed
+    /// like a transaction: only after the node validated it. Appended last so
+    /// older peers decode it as malformed (ignored), never as another variant.
+    NewPowitItem { id: [u8; 32], kind: u8, data: Vec<u8> },
 }
 
 
@@ -433,6 +452,7 @@ impl NetworkMessage {
         match self {
             NetworkMessage::NewBlock { .. } => "NewBlock",
             NetworkMessage::NewTransaction { .. } => "NewTransaction",
+            NetworkMessage::NewPowitItem { .. } => "NewPowitItem",
             NetworkMessage::PeerTip { .. } => "PeerTip",
             NetworkMessage::PeerExchange { .. } => "PeerExchange",
             NetworkMessage::PeerRequest => "PeerRequest",
@@ -510,6 +530,9 @@ pub const MAX_WIRE_LOCATOR: usize = 64;
 pub const MAX_WIRE_GETHEADERS_LIMIT: u32 = 2000;
 /// Max user_agent length in a Version handshake.
 pub const MAX_WIRE_USER_AGENT_LEN: usize = 128;
+/// Largest PoWit gossip item: an equivocation proof (two attestations, each
+/// with an 8 KiB key and signature bound) fits well inside.
+pub const MAX_WIRE_POWIT_ITEM: usize = 40 * 1024;
 /// Max peer_id string length in a PeerTip (base58 libp2p PeerIds are ~52 chars).
 pub const MAX_WIRE_PEER_ID_LEN: usize = 128;
 
@@ -609,7 +632,8 @@ pub fn decode_wire_message(data: &[u8]) -> Result<NetworkMessage, WireDecodeErro
     match bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {
         Ok(canonical) if canonical == data => Ok(msg),
         _ => Err(WireDecodeError::NonCanonical {
-            relayable: matches!(msg, NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. }),
+            relayable: matches!(msg, NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. }
+                                     | NetworkMessage::NewPowitItem { .. }),
         }),
     }
 }
@@ -639,6 +663,14 @@ fn validate_wire_bounds(msg: &NetworkMessage) -> Result<(), WireDecodeError> {
         NetworkMessage::NewTransaction { tx_data, .. } => {
             if tx_data.len() > MAX_WIRE_BYTES {
                 return Err(Bounds("tx_data larger than MAX_WIRE_BYTES"));
+            }
+        }
+        NetworkMessage::NewPowitItem { data, kind, .. } => {
+            if data.len() > MAX_WIRE_POWIT_ITEM {
+                return Err(Bounds("PoWit item larger than MAX_WIRE_POWIT_ITEM"));
+            }
+            if !(1..=3).contains(kind) {
+                return Err(Bounds("unknown PoWit item kind"));
             }
         }
         NetworkMessage::PeerTip { peer_id, .. } => {
@@ -1085,9 +1117,14 @@ pub struct NetworkNode {
     pub peer_id: PeerId,
     pub config:  NetworkConfig,
     local_key:   identity::Keypair,
+    /// Hybrid ML-DSA-65 ‖ Falcon-1024 transport identity.
+    pq_identity: Arc<PqIdentity>,
+    /// Per-peer PQ key pins (trust on first use).
+    pq_pins:     Arc<PeerPins>,
     control_rx:  Option<mpsc::Receiver<NetworkControl>>,
     peer_events: Option<mpsc::Sender<PeerEvent>>,
-    /// B1-T19: gossip transactions go here instead of the block channel.
+    /// B1-T19: gossip transactions and PoWit items go here instead of the
+    /// block channel.
     tx_ingest:   Option<mpsc::Sender<Inbound>>,
     /// NET-2 residual: remote addresses of connected peers (shared with the
     /// processor's proof-of-work budgets).
@@ -1105,15 +1142,22 @@ impl NetworkNode {
         let local_key = load_or_create_identity(&key_path)?;
         let peer_id   = PeerId::from(local_key.public());
         info!("P2P identity: {} ({})", peer_id, key_path.display());
+        let pq_path = config.data_dir.join("p2p_pq_identity.bin");
+        let pq_identity = Arc::new(PqIdentity::load_or_create(&pq_path)
+            .map_err(NetworkError::StartFailed)?);
+        info!("P2P PQ identity fingerprint: {}", hex::encode(pq_identity.fingerprint()));
+        let pq_pins = Arc::new(PeerPins::load(&config.data_dir.join("p2p_pq_pins.json"))
+            .map_err(NetworkError::StartFailed)?);
         Ok(Self {
-            peer_id, config, local_key, control_rx: None, peer_events: None, tx_ingest: None,
+            peer_id, config, local_key, pq_identity, pq_pins, control_rx: None, peer_events: None, tx_ingest: None,
             peer_addrs: discourage::PeerAddrs::new(),
             penalty_activation: crate::core::activation::hardening_activation_height(),
         })
     }
 
-    /// B1-T19: deliver gossip `NewTransaction` frames on `tx` (their own
-    /// consumer) instead of the block channel of [`Self::run_validated`].
+    /// B1-T19: deliver gossip `NewTransaction` and `NewPowitItem` frames
+    /// ([`goes_to_tx_ingest`]) on `tx` (their own consumer) instead of the
+    /// block channel of [`Self::run_validated`].
     pub fn attach_tx_ingest(&mut self, tx: mpsc::Sender<Inbound>) {
         self.tx_ingest = Some(tx);
     }
@@ -1302,19 +1346,21 @@ impl NetworkNode {
         let enable_mdns = self.config.enable_mdns;
         let archive = self.config.archive;
 
+        let (pq_tcp, pins_tcp) = (self.pq_identity.clone(), self.pq_pins.clone());
+        let (pq_ws, pins_ws) = (self.pq_identity.clone(), self.pq_pins.clone());
         let mut swarm = SwarmBuilder::with_existing_identity(self.local_key.clone())
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),
-                |keys: &identity::Keypair| -> Result<KyberConfig, std::convert::Infallible> {
-                    Ok(KyberConfig::new(keys))
+                move |keys: &identity::Keypair| -> Result<PqConfig, std::convert::Infallible> {
+                    Ok(PqConfig::new(keys, pq_tcp, pins_tcp))
                 },
                 yamux_config,
             )
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?
             .with_websocket(
-                |keys: &identity::Keypair| -> Result<KyberConfig, std::convert::Infallible> {
-                    Ok(KyberConfig::new(keys))
+                move |keys: &identity::Keypair| -> Result<PqConfig, std::convert::Infallible> {
+                    Ok(PqConfig::new(keys, pq_ws, pins_ws))
                 },
                 yamux_config,
             )
@@ -2080,7 +2126,8 @@ impl NetworkNode {
                     }
                     let (topic, topic_name) = match &msg {
                         NetworkMessage::NewBlock { .. }        => (block_t.clone(), "blocks"),
-                        NetworkMessage::NewTransaction { .. }  => (tx_t.clone(),    "txs"),
+                        NetworkMessage::NewTransaction { .. }
+                        | NetworkMessage::NewPowitItem { .. }  => (tx_t.clone(),    "txs"),
                         _                                      => (sync_t.clone(),  "sync"),
                     };
                     if let Ok(data) = bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {
@@ -3866,5 +3913,27 @@ mod tests {
         assert_eq!(start.elapsed(), HEARTBEAT_PERIOD);
         hb.tick().await;
         assert_eq!(start.elapsed(), 2 * HEARTBEAT_PERIOD);
+    }
+
+    /// B1-T19 (PoWit): transactions and PoWit items (the transaction topic's
+    /// two message kinds) go to the transaction ingest; blocks and
+    /// everything else stay on the block channel. A wire violation in a
+    /// PoWit frame (an oversized item, an unknown kind) goes through the
+    /// same rollout-gated classifier as every frame (`classify_gated`).
+    #[test]
+    fn powit_items_and_transactions_go_to_the_tx_ingest() {
+        assert!(goes_to_tx_ingest(&NetworkMessage::NewTransaction { txid: [1; 32], tx_data: vec![] }));
+        assert!(goes_to_tx_ingest(&NetworkMessage::NewPowitItem { id: [2; 32], kind: 1, data: vec![0; 8] }));
+        assert!(!goes_to_tx_ingest(&NetworkMessage::NewBlock { block_hash: [3; 32], block_data: vec![], height: 1, blue_score: 1 }));
+        assert!(!goes_to_tx_ingest(&NetworkMessage::GetTips));
+
+        let oversized = bincode::serde::encode_to_vec(
+            &NetworkMessage::NewPowitItem { id: [2; 32], kind: 1, data: vec![0; MAX_WIRE_POWIT_ITEM + 1] },
+            bincode::config::standard()).unwrap();
+        let p = PeerId::random();
+        let mut t = WirePenaltyTracker::new();
+        assert!(matches!(t.classify_gated(p, &oversized, false), WireReaction::IgnoreMalformed(_)),
+            "before the activation a relayed violation is refused, not charged");
+        assert!(matches!(t.classify_gated(p, &oversized, true), WireReaction::Penalize { .. }));
     }
 }

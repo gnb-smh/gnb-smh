@@ -134,9 +134,12 @@ scheduler (`pow::verifier`): at most half the logical CPUs (1 to 4)
 evaluations at a time on the blocking thread pool, a queue bounded
 globally, per delivering peer and per network group, and a budget of
 failed evaluations per peer and per network group (a valid proof is
-refunded). The processor resumes the block when its result arrives (the
-proof is then in `validate_pow`'s cache, so `accept_block` does not
-evaluate it again). A gossip frame whose block waited in the queue longer
+refunded). The evaluation is `Block::validate_pow`, whose algorithm follows
+the header height: GnB-SMH v1 (64 MiB) below the PoW + PoWit activation
+(`core::powit_height()`), v3 (4 MiB) from it — results are keyed by block id
+and height for that reason. The processor resumes the block when its result
+arrives (the proof is then in `validate_pow`'s cache, so `accept_block` does
+not evaluate it again). A gossip frame whose block waited in the queue longer
 than gossipsub keeps it is answered `Ignore` unevaluated; every queued
 frame gets exactly one verdict. See "Anti-DoS work rule" below for the
 budgets and for who is charged.
@@ -560,7 +563,10 @@ bound of B's blue work:
    along an evicted path is used instead (it chains through any number of
    evictions, so a linear fork deeper than every store still proves its work).
    Each orphan passed the orphan bits floor (the target a child of the
-   selected tip would carry now, eased 16-fold and capped at the pow limit of
+   selected tip would carry now — re-expressed in the orphan's own GnB-SMH
+   algorithm when the two heights straddle the v1 -> v3 switch, v3 targets
+   being 2^`POW_V3_DIFFICULTY_SHIFT` harder for equal work
+   (`ingress::reference_for_height`) — eased 16-fold and capped at the pow limit of
    the height the orphan claims — the limit its own proof of work is checked
    against: the genesis target at/after the hardening activation, the legacy
    limit below it, see "Pow limit (POW-3)" — so the pre-activation blocks of
@@ -626,11 +632,16 @@ Bitcoin Core's defences, adapted (`ingress::unrequested_block_admission`):
   `--minimumchainwork <hex>`. While the selected tip's blue work is below it
   the node is in initial block download: it latches the IBD state (the
   miner stays paused) and processes no block it did not ask for, unless that
-  block's own bound reaches the minimum. Mainnet's value is 0 today: the
-  repository carries no chain data newer than the genesis block (no
-  checkpoint, header or chain-work figure), and a value the real chain does
-  not reach would stop every new node from syncing; docs/RUNNING.md gives the
-  release step that raises it.
+  block's own bound reaches the minimum. Mainnet's value is
+  `core::MIN_CHAIN_WORK`, the one release constant that also turns finality,
+  the reorg depth cap and pruning on (`core::finality_active`), 0 today: the
+  newest chain data the repository carries is the reading of
+  docs/MAINNET-READINESS.md §1 (one node, 14 Oct 2026), whose proposed value
+  is a release decision not yet taken, and a value the real chain does not
+  reach would stop every new node from syncing; docs/RUNNING.md gives the
+  release step that raises it. Block work bounds (`lb`, the announced work
+  of orphans) count each block as `accept_block` adds it to the DAG,
+  `core::block_work`: normalised across the GnB-SMH v1 -> v3 switch.
 - **Unrequested blocks** (Core's `AcceptBlock`, `!fRequested`): a block that
   is neither the answer to one of this node's directed pulls nor a block it
   has an outstanding request for (whoever delivers it) is processed only if
@@ -739,6 +750,34 @@ zero-cost invalid blocks per libp2p identity, identities being free; now
 identities and addresses inside one /16 share eight evaluations, and an
 author that delivers one invalid block of its own is disconnected and its
 address discouraged.
+
+**PoWit gossip** (`NewPowitItem`: witness shares, attestations, equivocation
+proofs; `ingress::PowitIngress`). Merged from the mainnet line, where each
+item was verified with `powit::admit_item` awaited inline on the block
+processor, unbudgeted — a share's proof is a GnB-SMH v3 evaluation (4 MiB,
+~90 ms), an attestation a KES signature check, both free to fake — and an
+item whose claimed id did not match was `Reject`ed whoever delivered it.
+Now the items, which travel on the transaction topic, are delivered to the
+transaction relay task (`network::goes_to_tx_ingest`), never to the block
+processor. The claimed id and the item's encoding are checked first
+(`ingress::powit_item_precheck`); verification then runs on the blocking
+pool through a proof-of-work scheduler of its own
+(`pow::verifier::PowLimits::powit_items`: half the block pool's workers, at
+least one; a queue of 256, 32 per peer, 64 per network group; budgets of
+failed verifications of 16 per peer, one per 5 s, and 32 per group, one per
+2 s; a stale queued item is answered `Ignore` unverified). An admitted item
+is relayed and refunded. A context-free fault — wrong id, malformed item,
+invalid share proof (or bits, target or payout that the share's attested
+block contradicts), invalid witness signature, an equivocation proof that
+does not verify (`ingress::powit_admit_error_fault`): what no release that
+knows `NewPowitItem` relays, since they all admit an item before relaying
+it — keeps its charge and is penalised through `ingress::block_penalty`,
+the block gate above (its author when it delivered the item itself; a relay
+only once penalties are in force). A refusal that depends on this node's
+chain or state (a share for a block that is not on its selected chain or is
+outside the share window, an attestation from another justified checkpoint
+or by a key outside the witness set, a full pool) is refunded and answered
+`Ignore`, never penalised.
 
 ## Transaction signatures (sighash v2 and v3, hardening activation)
 

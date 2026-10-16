@@ -131,7 +131,12 @@ blocks of every peer behind it (and fill the shared channel, dropping
 blocks). `node/tests/fix_ingress_live.rs::live_tx_flood_does_not_delay_blocks`
 (one attacker floods 1,500 frames, an honest peer's block arrives within a
 fraction of a second) and its control on a shared channel (the block does not
-arrive within 5 s).
+arrive within 5 s). PoWit items (witness shares, attestations, equivocation
+proofs), the transaction topic's other message, take the same channel and
+task (`network::goes_to_tx_ingest`); their verification runs off the task on
+a bounded, budgeted pool of its own (`ingress::PowitIngress`, docs/CONSENSUS.md
+"PoWit gossip"), so neither blocks nor transactions wait behind it
+(`fix_ingress_live.rs::live_powit_flood_does_not_delay_blocks`).
 
 ## 3. Orphan transactions
 

@@ -58,6 +58,7 @@ use crate::consensus::{BlockHash, GhostDAG};
 use crate::core;
 use crate::mempool::Mempool;
 use crate::network::GossipVerdict;
+use crate::pow::verifier::{PowJob, PowLimits, PowScheduler, PowSource, StartNext};
 use crate::rpc::NodeState;
 use crate::storage::Storage;
 use crate::sync::parent_fetch::ParentFetchTracker;
@@ -209,6 +210,35 @@ pub fn orphan_floor_from(reference: &[u8; 32], orphan_height: u64) -> [u8; 32] {
     ease_target(reference, ORPHAN_WORK_FLOOR_SHIFT, orphan_height)
 }
 
+/// The reference target ([`reference_target`], computed for the tip's next
+/// height `ref_height`) re-expressed for a block at `height`: across the
+/// GnB-SMH v1 -> v3 switch (`core::powit_height()`) honest v3 targets are
+/// `2^POW_V3_DIFFICULTY_SHIFT` times harder than v1 targets of the same work
+/// (`core::adjust_bits_for_algo`; `core::block_work` divides their work by
+/// the same factor). Without this a v1-height orphan judged against a v3
+/// reference (a fork that branches below the switch) would meet a floor four
+/// times stricter in work, and a v3 orphan against a v1 reference one four
+/// times more lenient. Equal algorithms: unchanged.
+pub fn reference_for_height(reference: &[u8; 32], ref_height: u64, height: u64) -> [u8; 32] {
+    reference_for_height_with(reference, ref_height, height, core::powit_height())
+}
+
+/// [`reference_for_height`] for an explicit v3 activation height (testable).
+pub fn reference_for_height_with(reference: &[u8; 32], ref_height: u64, height: u64, v3_activation: u64) -> [u8; 32] {
+    use primitive_types::U256;
+    let shift = core::POW_V3_DIFFICULTY_SHIFT as usize;
+    match (core::pow_algo_with(ref_height, v3_activation), core::pow_algo_with(height, v3_activation)) {
+        (gnb_smh::Algo::V3, gnb_smh::Algo::V1) => {
+            let t = U256::from_big_endian(reference);
+            if t.leading_zeros() < shift as u32 { [0xFF; 32] } else { (t << shift).to_big_endian() }
+        }
+        (gnb_smh::Algo::V1, gnb_smh::Algo::V3) => {
+            (U256::from_big_endian(reference) >> shift).max(U256::one()).to_big_endian()
+        }
+        _ => *reference,
+    }
+}
+
 /// `target(bits) <= floor`. Malformed bits never meet any floor. Cheap: no
 /// proof-of-work evaluation.
 pub fn bits_meet_floor(bits: u32, floor: &[u8; 32]) -> bool {
@@ -237,16 +267,22 @@ pub fn bits_meet_floor(bits: u32, floor: &[u8; 32]) -> bool {
 /// recent block of the real chain, below which a node considers itself in
 /// initial block download (Bitcoin Core's `nMinimumChainWork`).
 ///
-/// 0: the repository carries no chain data newer than the genesis block (no
-/// checkpoint, no block header, no chain-work figure — `genesis/` holds only
-/// the carryover snapshot), and a value that the real chain does not reach
-/// would stop every new node from syncing. The release process raises it
-/// (docs/RUNNING.md, "Minimum chain work"): before each release, read the
-/// `blue_work` of the selected-chain block about two weeks below the tip
-/// from several independent nodes (`getblock`/`getdaginfo`), check they
-/// agree, and set it here. Operators can set it at run time with
+/// It IS `core::MIN_CHAIN_WORK`, the one constant a release raises: the same
+/// value turns finality, the reorg depth cap and pruning on
+/// (`core::finality_active`), so the two node-local uses can never disagree.
+/// Still 0: the newest chain data the repository carries is the reading in
+/// docs/MAINNET-READINESS.md §1 (14 Oct 2026, tip height 8,302, blue work
+/// 7,782,451, one node), whose proposed release value (7,000,000) is marked
+/// there as a release decision not yet taken; a value that the real chain
+/// does not reach would stop every new node from syncing. The release
+/// process raises it (docs/RUNNING.md, "Minimum chain work"): before each
+/// release, read the `tip_blue_work` of the selected-chain block about a
+/// week below the tip from several independent nodes (`getdaginfo`), check
+/// they agree, and set `core::MIN_CHAIN_WORK` to it, rounded down. Blue work
+/// is continuous across the GnB-SMH v1 -> v3 switch (`core::block_work`), so
+/// readings from either side compare. Operators can set it at run time with
 /// `--minimumchainwork`.
-pub const MAINNET_MINIMUM_CHAIN_WORK: u128 = 0;
+pub const MAINNET_MINIMUM_CHAIN_WORK: u128 = core::MIN_CHAIN_WORK;
 /// Testnet: 0 (a public test network is reset at will; no requirement).
 pub const TESTNET_MINIMUM_CHAIN_WORK: u128 = 0;
 /// Regtest: 0 (Bitcoin Core's regtest value).
@@ -368,7 +404,7 @@ pub fn unrequested_block_admission(
 /// anonymously is cheap below the hardening activation. A block with an
 /// unknown parent passes here and is refused by `accept_block`.
 pub fn submitted_block_admission(dag: &GhostDAG, block: &core::Block, min_chain_work: u128) -> Result<(), String> {
-    let Some(lb) = block_work_lower_bound(dag, &block.header.parents, block.header.bits) else {
+    let Some(lb) = block_work_lower_bound(dag, &block.header.parents, block.header.bits, block.height) else {
         return Ok(());
     };
     if lb < min_chain_work {
@@ -898,10 +934,12 @@ pub const REMEMBERED_KEYS_PER_ORPHAN: usize = 8;
 /// remembered store (it then pays with its own entries).
 pub const REMEMBERED_PEER_SHARE: usize = 4;
 
-/// Proof-of-work work a block's header claims (its bits; checked against the
-/// proof before an orphan is buffered).
+/// Proof-of-work work a block's header claims (its bits at its claimed
+/// height, normalised across the GnB-SMH v1 -> v3 switch as `accept_block`
+/// counts it, `core::block_work`; checked against the proof before an orphan
+/// is buffered — the proof's algorithm follows the same height).
 fn header_work(block: &core::Block) -> u128 {
-    core::bits_to_work(block.header.bits)
+    core::block_work(block.header.bits, block.height)
 }
 
 impl Default for OrphanPool {
@@ -1477,16 +1515,21 @@ pub fn anti_dos_work_threshold(dag: &GhostDAG) -> u128 {
     cur.and_then(|h| dag.get_block_data(&h)).map(|d| d.blue_work).unwrap_or(0)
 }
 
-/// A lower bound on the blue work a block with these parents and `bits`
-/// gets: the largest parent blue work plus its own work. Exact before the
-/// hardening activation (the selected parent IS the parent of largest blue
-/// work); after it the merged blues only add. `None` if a parent is unknown.
-pub fn block_work_lower_bound(dag: &GhostDAG, parents: &[BlockHash], bits: u32) -> Option<u128> {
+/// A lower bound on the blue work a block at header height `height` with
+/// these parents and `bits` gets: the largest parent blue work plus its own
+/// work. Exact before the hardening activation (the selected parent IS the
+/// parent of largest blue work); after it the merged blues only add. `None`
+/// if a parent is unknown. The block's own work is `core::block_work` (what
+/// `accept_block` adds to the DAG): GnB-SMH v3 blocks, from
+/// `core::powit_height()`, are normalised by `POW_V3_DIFFICULTY_SHIFT`, so
+/// `bits_to_work` would overstate a v3 block's work fourfold and the bound
+/// would not be one.
+pub fn block_work_lower_bound(dag: &GhostDAG, parents: &[BlockHash], bits: u32, height: u64) -> Option<u128> {
     let mut best = 0u128;
     for p in parents {
         best = best.max(dag.get_block_data(p)?.blue_work);
     }
-    Some(best.saturating_add(core::bits_to_work(bits)))
+    Some(best.saturating_add(core::block_work(bits, height)))
 }
 
 /// Verdict of the POW-3 anti-DoS work rule on a block whose parents are all
@@ -1601,7 +1644,7 @@ pub fn process_orphans(
 ) -> Vec<[u8; 32]> {
     let mut gate = |pool: &OrphanPool, block: &core::Block, hash: &[u8; 32], d: &GhostDAG| {
         let threshold = anti_dos_work_threshold(d);
-        let lb = block_work_lower_bound(d, &block.header.parents, block.header.bits).unwrap_or(0);
+        let lb = block_work_lower_bound(d, &block.header.parents, block.header.bits, block.height).unwrap_or(0);
         let above = if lb >= threshold { 0 } else { pool.announced_work_capped(hash, threshold - lb) };
         match work_admission(lb, threshold, above, 0) {
             WorkAdmission::LowWork => Err(DropReason::LowWork),
@@ -1998,7 +2041,7 @@ fn work_rule(
             t
         }
     };
-    let lb = block_work_lower_bound(dag, &block.header.parents, block.header.bits).unwrap_or(0);
+    let lb = block_work_lower_bound(dag, &block.header.parents, block.header.bits, block.height).unwrap_or(0);
     let (chain_above, merge_lb) = if lb >= threshold {
         (0, 0)
     } else {
@@ -2208,7 +2251,7 @@ impl BlockIngress {
             let d = ctx.dag.read();
             let tip_h = d.selected_tip().and_then(|t| d.get_block_data(&t).map(|x| x.height)).unwrap_or(0);
             let missing: Vec<[u8; 32]> = block.header.parents.iter().filter(|p| !d.has_block(p)).copied().collect();
-            let lb = block_work_lower_bound(&d, &block.header.parents, block.header.bits);
+            let lb = block_work_lower_bound(&d, &block.header.parents, block.header.bits, block.height);
             // POW-3 (Phase 4): the unrequested-block rule, before anything
             // that costs more than a few DAG lookups.
             if !self.is_requested(&hash, solicited) {
@@ -2239,7 +2282,9 @@ impl BlockIngress {
             // the proof is evaluated.
             // The cap is the pow limit of the height the orphan claims (the
             // one its proof is checked against), not the tip's next height.
-            let reference = self.reference(tip_h, now_unix);
+            // Across the GnB-SMH v1 -> v3 switch the reference is first
+            // re-expressed in the orphan's own algorithm (equal work).
+            let reference = reference_for_height(&self.reference(tip_h, now_unix), tip_h.saturating_add(1), block.height);
             let floor = orphan_floor_from(&reference, block.height);
             if !bits_meet_floor(block.header.bits, &floor) {
                 return Gated::Done(BlockOutcome::Dropped(DropReason::OrphanBelowFloor));
@@ -2423,6 +2468,211 @@ impl BlockIngress {
     }
 }
 
+// ── PoWit gossip (`NewPowitItem`): bounds and rollout-gated penalties ────────
+//
+// The PoWit relay merged from the mainnet line judged every gossiped witness
+// share, attestation and equivocation proof with `powit::admit_item` awaited
+// INLINE on the block processor, unbudgeted: a share's proof is a GnB-SMH v3
+// evaluation (4 MiB, ~90 ms), an attestation a KES signature check, both free
+// to fake, so a flood of junk items stalled block processing (the NET-2
+// residual on the new topic), and an item whose claimed id did not match was
+// `Reject`ed whoever delivered it (the B1-T7 question). Now:
+//
+// * PoWit items travel on the transaction topic and are delivered to the
+//   transaction relay task (`NetworkNode::attach_tx_ingest`, B1-T19), never
+//   to the block processor;
+// * cheap, context-free checks first ([`powit_item_precheck`]: the claimed id
+//   is the item's id, the data is exactly one well-formed item of its kind);
+// * verification runs on the blocking pool through a proof-of-work scheduler
+//   of its own (`pow::verifier`, [`PowLimits::powit_items`]): bounded
+//   concurrency in its own worker slots, a queue bounded globally, per
+//   delivering peer and per network group, failed verifications charged to
+//   the peer's and its group's budgets (refunded when the item is admitted
+//   or fails only for context); an item still queued when its frame left
+//   gossipsub's cache is answered `Ignore` unevaluated;
+// * a context-free fault (id mismatch, malformed item, invalid share proof,
+//   invalid witness signature, invalid equivocation proof — what no release
+//   that knows `NewPowitItem` relays: they all admit an item before relaying
+//   it) is penalised through the block gate, [`block_penalty`]: its author
+//   when it delivered the frame itself (misbehaving: disconnect and address
+//   discouragement, `Ignore` to gossipsub), a relay only once penalties are
+//   in force ([`block_penalties_in_force`]); a fault that depends on this
+//   node's chain (a share for a block not on its selected chain or outside
+//   the window, an attestation from another justified checkpoint or by a key
+//   outside the witness set, a full pool) is `Ignore`, never penalised.
+
+/// The context-free checks of a gossiped PoWit item, before any
+/// verification is queued: the claimed id is `powit::item_id(kind, data)` and
+/// `data` decodes as exactly one item of `kind` (no trailing bytes). Cheap:
+/// one SHA3 over at most `MAX_WIRE_POWIT_ITEM` bytes and a bounded decode.
+pub fn powit_item_precheck(claimed: &[u8; 32], kind: u8, data: &[u8]) -> Result<(), String> {
+    if crate::powit::item_id(kind, data) != *claimed {
+        return Err("PoWit item id does not match its content".into());
+    }
+    let mut cur = std::io::Cursor::new(data);
+    match kind {
+        crate::powit::ITEM_SHARE => core::witness_share::WitnessShare::read_wire(&mut cur).map(|_| ()),
+        crate::powit::ITEM_ATTESTATION => core::powit::Attestation::read_wire(&mut cur).map(|_| ()),
+        crate::powit::ITEM_EVIDENCE => core::powit::Equivocation::read_wire(&mut cur).map(|_| ()),
+        k => Err(format!("unknown PoWit item kind {k}")),
+    }
+    .map_err(|e| format!("malformed PoWit item: {e}"))?;
+    if cur.position() as usize != data.len() {
+        return Err("malformed PoWit item: trailing bytes".into());
+    }
+    Ok(())
+}
+
+/// `powit::check_share`'s refusal of a share that pays an invalid script.
+pub const POWIT_SHARE_BAD_PAYOUT: &str = "witness share pays an invalid script";
+/// `powit::PowitPool::admit_attestation`'s refusal of a bad signature.
+pub const POWIT_BAD_ATTESTATION_SIGNATURE: &str = "invalid attestation signature";
+
+/// The fault class of a `powit::admit_item` refusal of an item of `kind`
+/// that passed [`powit_item_precheck`]: `Some(ContextFree)` when no honest
+/// node produces or relays it — an invalid share proof (or bits, target or
+/// payout that the share's own attested block contradicts), an invalid
+/// attestation signature, an equivocation proof that does not verify (its
+/// check uses only the network's constants); `None` when it depends on this
+/// node's chain or state (stale, another branch, witness set, pool full,
+/// storage) — never penalised. Unknown wording is `None` (fail safe).
+pub fn powit_admit_error_fault(kind: u8, err: &str) -> Option<BlockFault> {
+    use core::witness_share::ShareError;
+    let context_free = match kind {
+        crate::powit::ITEM_SHARE => {
+            err == POWIT_SHARE_BAD_PAYOUT
+                || [ShareError::InsufficientWork, ShareError::WrongBits, ShareError::BadTarget, ShareError::PayoutTooLong]
+                    .iter()
+                    .any(|e| err == e.to_string())
+        }
+        crate::powit::ITEM_ATTESTATION => err == POWIT_BAD_ATTESTATION_SIGNATURE,
+        crate::powit::ITEM_EVIDENCE => err.starts_with("equivocation: "),
+        _ => false,
+    };
+    context_free.then_some(BlockFault::ContextFree)
+}
+
+/// A gossiped PoWit item waiting for (or under) verification.
+#[derive(Debug)]
+pub struct PowitItem {
+    pub kind:          u8,
+    pub data:          Vec<u8>,
+    pub origin:        crate::network::InboundOrigin,
+    /// The delivering peer authored the frame (B1-T7).
+    pub self_authored: bool,
+}
+
+/// A PoWit verification job (see [`PowitIngress`]).
+pub type PowitJob = PowJob<PowitItem>;
+
+/// What to report for a PoWit frame now.
+#[derive(Debug)]
+pub struct PowitVerdict {
+    pub origin:  crate::network::InboundOrigin,
+    pub penalty: BlockPenalty,
+}
+
+/// The transaction relay task's PoWit gossip core (see the section comment):
+/// cheap checks, then a bounded, budgeted verification queue.
+pub struct PowitIngress {
+    sched: PowScheduler<PowitItem>,
+}
+
+impl Default for PowitIngress {
+    fn default() -> Self {
+        Self::new(PowLimits::powit_items())
+    }
+}
+
+impl PowitIngress {
+    pub fn new(limits: PowLimits) -> Self {
+        Self { sched: PowScheduler::new(limits) }
+    }
+
+    /// The scheduler (counters, tests).
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn scheduler(&self) -> &PowScheduler<PowitItem> {
+        &self.sched
+    }
+
+    /// A gossiped `NewPowitItem { id: claimed, kind, data }` delivered with
+    /// `origin` by `source`. `Some`: report this now (a context-free fault,
+    /// charged to the deliverer's budget and penalised through
+    /// [`block_penalty`]; or `Ignore` for a frame the queue refused). `None`:
+    /// queued; its verdict comes from [`Self::complete`] or
+    /// [`Self::start_next`] (expired).
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_item(
+        &mut self,
+        claimed: [u8; 32],
+        kind: u8,
+        data: Vec<u8>,
+        origin: crate::network::InboundOrigin,
+        source: PowSource,
+        penalties_in_force: bool,
+        now: Instant,
+    ) -> Option<PowitVerdict> {
+        let self_authored = origin.delivered_by_author();
+        if let Err(e) = powit_item_precheck(&claimed, kind, &data) {
+            debug!("PoWit item {} refused before verification: {}", hex::encode(&claimed[..8]), e);
+            let _ = self.sched.charge(&source, now);
+            let penalty = block_penalty(GossipVerdict::Reject, BlockFault::ContextFree, self_authored, penalties_in_force);
+            return Some(PowitVerdict { origin, penalty });
+        }
+        let job = PowJob {
+            id: claimed,
+            height: 0,
+            source,
+            solicited: false,
+            received_at: origin.received_at().unwrap_or(now),
+            payload: PowitItem { kind, data, origin, self_authored },
+        };
+        match self.sched.submit(job, now) {
+            Ok(()) => None,
+            Err((refusal, job)) => {
+                debug!("PoWit item {} not verified: queue refused it ({:?})", hex::encode(&claimed[..8]), refusal);
+                Some(PowitVerdict { origin: job.payload.origin, penalty: plain_penalty(GossipVerdict::Ignore) })
+            }
+        }
+    }
+
+    /// The next job a worker slot is free for (see
+    /// [`PowScheduler::start_next`]): `Start` — verify it (`powit::admit_item`)
+    /// on the blocking pool and pass the result to [`Self::complete`];
+    /// `Expired` — answer its frame `Ignore` unverified.
+    pub fn start_next(&mut self, now: Instant) -> StartNext<PowitItem> {
+        self.sched.start_next(now)
+    }
+
+    /// The result of a started job (`powit::admit_item`): frees its worker
+    /// slot, refunds the budget charge unless the item failed for a
+    /// context-free fault, and returns what to report for its frame
+    /// (`Accept` for an admitted item: relayed).
+    pub fn complete(&mut self, job: PowitJob, result: &Result<(), String>, penalties_in_force: bool, now: Instant) -> PowitVerdict {
+        let fault = match result {
+            Ok(()) => None,
+            Err(e) => powit_admit_error_fault(job.payload.kind, e),
+        };
+        // `valid` = no context-free failure: the charge is refunded.
+        self.sched.complete(job.outcome(fault.is_none()), now);
+        let penalty = match (result, fault) {
+            (Ok(()), _) => plain_penalty(GossipVerdict::Accept),
+            (Err(_), Some(f)) => block_penalty(GossipVerdict::Reject, f, job.payload.self_authored, penalties_in_force),
+            (Err(_), None) => plain_penalty(GossipVerdict::Ignore),
+        };
+        PowitVerdict { origin: job.payload.origin, penalty }
+    }
+
+    /// Housekeeping of the budget maps.
+    pub fn gc_at(&mut self, now: Instant) {
+        self.sched.gc_at(now);
+    }
+}
+
+fn plain_penalty(gossip: GossipVerdict) -> BlockPenalty {
+    BlockPenalty { gossip, misbehaving: false }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2441,6 +2691,7 @@ mod tests {
             blue_score: 0,
             height: 0,
             shielded_transactions: vec![],
+            powit: Default::default(),
         }
     }
 
@@ -2482,6 +2733,37 @@ mod tests {
         assert_eq!(verdict_for_block_decode_error("tx[0] parse: non-canonical varint: 12 encoded with the 0xFD form"),
             GossipVerdict::Ignore);
         assert_eq!(verdict_for_block_decode_error("trailing bytes in block body: parsed 5 of 7"), GossipVerdict::Reject);
+    }
+
+    /// PoW v3: the orphan floor's reference is re-expressed in the orphan's
+    /// algorithm across the GnB-SMH v1 -> v3 switch (equal work,
+    /// `core::adjust_bits_for_algo` / `core::block_work`); same algorithm on
+    /// both sides: unchanged.
+    #[test]
+    fn floor_reference_follows_the_pow_algorithm_switch() {
+        use primitive_types::U256;
+        const V3: u64 = 10_000;
+        let reference = core::bits_to_target(0x1d00_ffff);
+        let r = U256::from_big_endian(&reference);
+        let s = core::POW_V3_DIFFICULTY_SHIFT as usize;
+        assert_eq!(reference_for_height_with(&reference, V3 + 5, V3 + 1, V3), reference, "v3 / v3");
+        assert_eq!(reference_for_height_with(&reference, 7, 6, V3), reference, "v1 / v1");
+        // v3 reference (tip past the switch), v1 orphan (a fork below it):
+        // the v1 target of equal work is 2^shift times easier.
+        assert_eq!(U256::from_big_endian(&reference_for_height_with(&reference, V3 + 5, V3 - 1, V3)), r << s);
+        // v1 reference, v3 orphan: 2^shift times harder.
+        assert_eq!(U256::from_big_endian(&reference_for_height_with(&reference, V3 - 1, V3, V3)), r >> s);
+        // A v1 orphan whose bits are 4x easier than the v3 reference passes
+        // the floor derived from the re-expressed reference, as a v3 orphan
+        // of the same work passes the v3 floor.
+        let v1_equal_work = core::target_to_bits(&(r << s).to_big_endian());
+        let floor = ease_target_to(&reference_for_height_with(&reference, V3 + 5, V3 - 1, V3),
+            ORPHAN_WORK_FLOOR_SHIFT, &[0xFF; 32]);
+        assert!(bits_meet_floor(v1_equal_work, &floor));
+        let floor_unadjusted = ease_target_to(&reference, ORPHAN_WORK_FLOOR_SHIFT, &[0xFF; 32]);
+        let v1_16x = core::target_to_bits(&(r << (s + ORPHAN_WORK_FLOOR_SHIFT as usize)).to_big_endian());
+        assert!(bits_meet_floor(v1_16x, &floor) && !bits_meet_floor(v1_16x, &floor_unadjusted),
+            "16x below the reference in work: passes only with the re-expressed reference");
     }
 
     #[test]
@@ -2650,9 +2932,21 @@ mod tests {
         assert_eq!(anti_dos_work_threshold(&dag), 0, "chain shorter than the window");
         let (dag, chain) = chain_dag(ANTI_DOS_WINDOW_BLOCKS + 40, 10);
         assert_eq!(anti_dos_work_threshold(&dag), 400, "block 40 carries 40 x 10");
-        assert_eq!(block_work_lower_bound(&dag, &[chain[40], chain[7]], core::POW_LIMIT_BITS),
+        assert_eq!(block_work_lower_bound(&dag, &[chain[40], chain[7]], core::POW_LIMIT_BITS, 41),
             Some(400 + core::bits_to_work(core::POW_LIMIT_BITS)));
-        assert_eq!(block_work_lower_bound(&dag, &[[0xEE; 32]], core::POW_LIMIT_BITS), None);
+        assert_eq!(block_work_lower_bound(&dag, &[[0xEE; 32]], core::POW_LIMIT_BITS, 41), None);
+        // From the GnB-SMH v3 switch a block's own work is normalised exactly
+        // as `accept_block` adds it to the DAG (`core::block_work`): the
+        // bound must not count a v3 block's bits fourfold.
+        let v3 = core::powit_height();
+        if v3 != u64::MAX {
+            let bits = core::POW_LIMIT_BITS;
+            assert_eq!(block_work_lower_bound(&dag, &[chain[40]], bits, v3),
+                Some(400 + core::block_work(bits, v3)));
+            assert_eq!(core::block_work(bits, v3), core::bits_to_work(bits) >> core::POW_V3_DIFFICULTY_SHIFT);
+            assert_eq!(block_work_lower_bound(&dag, &[chain[40]], bits, v3 - 1),
+                Some(400 + core::bits_to_work(bits)), "below the switch: v1 work");
+        }
     }
 
     #[test]
@@ -2912,7 +3206,8 @@ mod tests {
         assert!(parse_minimum_chain_work(&format!("1{}", "0".repeat(32))).is_err(), "above 128 bits");
         assert!(parse_minimum_chain_work("").is_err());
         assert!(parse_minimum_chain_work("12g").is_err());
-        assert_eq!(MAINNET_MINIMUM_CHAIN_WORK, 0, "no chain data in the repository (docs/RUNNING.md)");
+        assert_eq!(MAINNET_MINIMUM_CHAIN_WORK, core::MIN_CHAIN_WORK,
+            "one release constant for the IBD rules and finality (docs/RUNNING.md)");
     }
 
     /// POW-3 (Phase 4): Bitcoin Core's unrequested-block rule.
@@ -2929,5 +3224,144 @@ mod tests {
         assert_eq!(unrequested_block_admission(None, 1_000, 100, 90), Err(BelowMinimumChainWork));
         assert_eq!(unrequested_block_admission(Some(101), 1_000, 100, 90), Err(BelowMinimumChainWork));
         assert_eq!(unrequested_block_admission(Some(1_000), 1_000, 999, 990), Ok(()));
+    }
+
+    // ── PoWit gossip ─────────────────────────────────────────────────────
+
+    fn gossip_from(delivering: PeerId, author: Option<PeerId>, at: Instant) -> crate::network::InboundOrigin {
+        crate::network::InboundOrigin::Gossip { propagation_source: delivering, author, pending: None, received_at: at }
+    }
+
+    fn share_frame(nonce: u64) -> ([u8; 32], u8, Vec<u8>) {
+        let s = core::witness_share::WitnessShare {
+            attested: [7; 32], witness: [9; 20], payout: vec![0x51], bits: core::POW_LIMIT_BITS, nonce,
+        };
+        crate::powit::share_item(&s)
+    }
+
+    /// PoWit gossip: the context-free checks before any verification bind
+    /// the claimed id to the content and the content to exactly one item of
+    /// its kind.
+    #[test]
+    fn powit_item_precheck_binds_the_id_and_the_encoding() {
+        use crate::powit::{item_id, ITEM_ATTESTATION, ITEM_SHARE};
+        let (id, kind, data) = share_frame(1);
+        assert_eq!(kind, ITEM_SHARE);
+        assert_eq!(powit_item_precheck(&id, kind, &data), Ok(()));
+        assert!(powit_item_precheck(&[0; 32], kind, &data).unwrap_err().contains("id does not match"));
+        let mut long = data.clone();
+        long.push(0);
+        assert!(powit_item_precheck(&item_id(kind, &long), kind, &long).unwrap_err().contains("trailing bytes"));
+        let short = &data[..data.len() - 1];
+        assert!(powit_item_precheck(&item_id(kind, short), kind, short).unwrap_err().contains("malformed"));
+        assert!(powit_item_precheck(&item_id(ITEM_ATTESTATION, &data), ITEM_ATTESTATION, &data).is_err(),
+            "a share's bytes are no attestation");
+        assert!(powit_item_precheck(&item_id(9, &data), 9, &data).is_err());
+    }
+
+    /// PoWit gossip: only refusals no honest node produces or relays are
+    /// context-free (penalised through the block gate); anything that
+    /// depends on this node's chain or state is not.
+    #[test]
+    fn powit_refusals_are_classified() {
+        use crate::powit::{ITEM_ATTESTATION, ITEM_EVIDENCE, ITEM_SHARE};
+        use crate::core::witness_share::ShareError;
+        let cf = Some(BlockFault::ContextFree);
+        for e in [ShareError::InsufficientWork, ShareError::WrongBits, ShareError::BadTarget, ShareError::PayoutTooLong] {
+            assert_eq!(powit_admit_error_fault(ITEM_SHARE, &e.to_string()), cf, "{e}");
+        }
+        assert_eq!(powit_admit_error_fault(ITEM_SHARE, POWIT_SHARE_BAD_PAYOUT), cf);
+        for e in ["witness share attests a block that is not on this selected chain",
+                  "witness share attests a block outside the share window",
+                  "witness share already included on this chain",
+                  "share pool full", "no tip", "PoWit not active",
+                  "storage: attested block body missing"] {
+            assert_eq!(powit_admit_error_fault(ITEM_SHARE, e), None, "{e}");
+        }
+        assert_eq!(powit_admit_error_fault(ITEM_SHARE, &ShareError::WrongAttestedBlock.to_string()), None,
+            "the attested body is read by its id: a mismatch is local");
+        assert_eq!(powit_admit_error_fault(ITEM_ATTESTATION, POWIT_BAD_ATTESTATION_SIGNATURE), cf);
+        for e in ["attestation source is not the tip's justified checkpoint", "attester is not in the witness set",
+                  "attestation pool full", "PoWit not active at the tip"] {
+            assert_eq!(powit_admit_error_fault(ITEM_ATTESTATION, e), None, "{e}");
+        }
+        assert_eq!(powit_admit_error_fault(ITEM_EVIDENCE, "equivocation: invalid signature"), cf);
+        assert_eq!(powit_admit_error_fault(ITEM_EVIDENCE, "equivocation: links do not conflict"), cf);
+        assert_eq!(powit_admit_error_fault(ITEM_SHARE, POWIT_BAD_ATTESTATION_SIGNATURE), None, "per kind");
+        // The literals are the ones `powit` returns: a reworded refusal would
+        // silently stop being penalised.
+        let src = include_str!("powit.rs");
+        assert!(src.contains(&format!("\"{POWIT_SHARE_BAD_PAYOUT}\"")));
+        assert!(src.contains(&format!("\"{POWIT_BAD_ATTESTATION_SIGNATURE}\"")));
+    }
+
+    /// PoWit gossip core: a context-free fault is charged to the deliverer
+    /// and penalised through the block gate (B1-T7: a relay only once
+    /// penalties are in force; an author that delivered it itself is
+    /// misbehaving); a well-formed item is queued and verified off the
+    /// caller, its charge refunded when it is admitted or refused for
+    /// context; failed proofs consume the deliverer's budget until its items
+    /// are refused unverified; a stale queued item is expired unverified.
+    #[test]
+    fn powit_ingress_budgets_and_gated_penalties() {
+        use crate::network::GossipVerdict::{Accept, Ignore, Reject};
+        use crate::pow::verifier::StartNext;
+        let t0 = Instant::now();
+        let limits = PowLimits {
+            workers: 1, max_queued: 8, max_queued_per_peer: 4, max_queued_per_group: 8, max_queued_solicited: 0,
+            peer_burst: 3, peer_refill_per_sec: 0.0, group_burst: 100, group_refill_per_sec: 0.0,
+            verdict_ttl: Duration::from_secs(10), results_cap: 1,
+        };
+        let mut p = PowitIngress::new(limits);
+        let (relay, author) = (PeerId::random(), PeerId::random());
+        let src = |peer: PeerId| PowSource { peer: Some(peer), group: None };
+        let plain = |gossip| BlockPenalty { gossip, misbehaving: false };
+        let (_, kind, data) = share_frame(1);
+
+        // A wrong id: relayed before the activation — Ignore, nobody
+        // misbehaves; delivered by its author — misbehaving (Ignore to
+        // gossipsub); relayed once penalties are in force — Reject.
+        let v = p.on_item([0; 32], kind, data.clone(), gossip_from(relay, Some(author), t0), src(relay), false, t0).unwrap();
+        assert_eq!(v.penalty, plain(Ignore));
+        let v = p.on_item([0; 32], kind, data.clone(), gossip_from(author, Some(author), t0), src(author), false, t0).unwrap();
+        assert_eq!(v.penalty, BlockPenalty { gossip: Ignore, misbehaving: true });
+        let v = p.on_item([0; 32], kind, data, gossip_from(relay, Some(author), t0), src(relay), true, t0).unwrap();
+        assert_eq!(v.penalty, BlockPenalty { gossip: Reject, misbehaving: true });
+        // `relay` has spent 2 of its 3 tokens.
+
+        let verify = |p: &mut PowitIngress, n: u64, result: Result<(), String>| {
+            let (id, kind, data) = share_frame(n);
+            assert!(p.on_item(id, kind, data, gossip_from(relay, Some(author), t0), src(relay), false, t0).is_none(), "queued");
+            let StartNext::Start(job) = p.start_next(t0) else { panic!("a free worker") };
+            assert_eq!(job.id, id);
+            p.complete(job, &result, false, t0).penalty
+        };
+        // Admitted: Accept (relayed), refunded.
+        assert_eq!(verify(&mut p, 2, Ok(())), plain(Accept));
+        // Refused for context: Ignore, refunded.
+        assert_eq!(verify(&mut p, 3, Err("witness share attests a block outside the share window".into())), plain(Ignore));
+        // A failed proof, relayed before the activation: Ignore, not
+        // misbehaving — but it spends the last token.
+        assert_eq!(verify(&mut p, 4, Err(core::witness_share::ShareError::InsufficientWork.to_string())), plain(Ignore));
+        let (id, kind, data) = share_frame(5);
+        let v = p.on_item(id, kind, data, gossip_from(relay, Some(author), t0), src(relay), false, t0)
+            .expect("budget spent: refused unverified");
+        assert_eq!(v.penalty, plain(Ignore));
+        assert_eq!(p.scheduler().queued(), 0);
+        assert_eq!(p.scheduler().stats().invalid, 1);
+
+        // Another peer is unaffected; with the one worker busy its next
+        // item waits, and is expired unverified once its frame is stale.
+        let other = PeerId::random();
+        let (a, ka, da) = share_frame(6);
+        let (b, kb, db) = share_frame(7);
+        assert!(p.on_item(a, ka, da, gossip_from(other, Some(other), t0), src(other), false, t0).is_none());
+        assert!(p.on_item(b, kb, db, gossip_from(other, Some(other), t0), src(other), false, t0).is_none());
+        let StartNext::Start(job) = p.start_next(t0) else { panic!() };
+        assert!(matches!(p.start_next(t0), StartNext::Idle), "one worker");
+        let late = t0 + Duration::from_secs(11);
+        assert_eq!(p.complete(job, &Ok(()), false, late).penalty, plain(Accept));
+        let StartNext::Expired(stale) = p.start_next(late) else { panic!("stale: expired, not verified") };
+        assert_eq!(stale.id, b);
     }
 }

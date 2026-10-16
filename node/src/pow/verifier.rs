@@ -1,7 +1,10 @@
 //! NET-2 residual (Phase 4): proof-of-work evaluations OFF the message
 //! processor, under budgets.
 //!
-//! A GnB-SMH evaluation costs 64 MiB and most of a second of CPU. The audit
+//! A GnB-SMH evaluation costs 64 MiB and most of a second of CPU (v1; from
+//! `core::powit_height()` blocks use GnB-SMH v3, 4 MiB and ~90 ms, still the
+//! dearest check of a block; `Block::validate_pow` picks the algorithm from
+//! the header height, which is why results are keyed by it). The audit
 //! found it still ran inline on the single message-processor task, so a
 //! block that costs its sender nothing (our tip as parent with the expected
 //! bits and a junk nonce, or an orphan whose bits meet the floor) forced an
@@ -39,7 +42,13 @@
 //!   pow limit of the block's height, which the block id does not commit: a
 //!   copy re-framed with another height must not poison the honest block's
 //!   result (review finding; `gnb_crypto`'s own proof cache keeps only
-//!   successes for the same reason).
+//!   successes for the same reason). Across the GnB-SMH v1 -> v3 switch the
+//!   height also selects the algorithm.
+//!
+//! The same scheduler, with its own instance and limits
+//! ([`PowLimits::powit_items`]), bounds the verification of gossiped PoWit
+//! items (`ingress::PowitIngress`): a witness share's proof is a GnB-SMH v3
+//! evaluation, an attestation a KES signature check, both free to fake.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -52,7 +61,8 @@ use crate::network::ratelimit::TokenBuckets;
 /// Bounds of a [`PowScheduler`].
 #[derive(Clone, Copy, Debug)]
 pub struct PowLimits {
-    /// Evaluations running at once (each holds 64 MiB).
+    /// Evaluations running at once (each holds a scratchpad: 64 MiB for
+    /// GnB-SMH v1, 4 MiB for v3).
     pub workers:              usize,
     /// Gossip jobs queued (not running), in total.
     pub max_queued:           usize,
@@ -97,9 +107,51 @@ impl Default for PowLimits {
 }
 
 /// Half the logical CPUs, at least 1 and at most 4 (each evaluation holds a
-/// 64 MiB scratchpad; the miner and the rest of the node need the others).
+/// 64 MiB (v1) or 4 MiB (v3) scratchpad; the miner and the rest of the node
+/// need the others).
 pub fn default_workers() -> usize {
     std::thread::available_parallelism().map(|n| n.get() / 2).unwrap_or(1).clamp(1, 4)
+}
+
+impl PowLimits {
+    /// Limits for gossiped PoWit items (`ingress::PowitIngress`): a witness
+    /// share's proof is one GnB-SMH v3 evaluation (4 MiB, ~90 ms), an
+    /// attestation or an equivocation proof one or two KES signature checks.
+    /// Honest traffic is about one share every two seconds network-wide
+    /// (`SHARE_TARGET_SHIFT` = 4: sixteen per 30 s block) plus the witness
+    /// set's attestations once per checkpoint, and honest relays forward only
+    /// items they admitted, so failures are rare and budgets can be small;
+    /// queues are deeper than for blocks (a burst of shares, each item at
+    /// most `MAX_WIRE_POWIT_ITEM` = 40 KiB). Workers: half the block pool's,
+    /// at least one — their own slots, so a PoWit flood never takes a block
+    /// proof's.
+    pub fn powit_items() -> Self {
+        Self {
+            workers: (default_workers() / 2).max(1),
+            max_queued: 256,
+            max_queued_solicited: 0,
+            max_queued_per_peer: 32,
+            max_queued_per_group: 64,
+            peer_burst: 16,
+            peer_refill_per_sec: 1.0 / 5.0,
+            group_burst: 32,
+            group_refill_per_sec: 1.0 / 2.0,
+            verdict_ttl: crate::mempool::relay::DEFERRED_VERDICT_TTL,
+            results_cap: 1,
+        }
+    }
+}
+
+/// The proof-of-work check a block job runs on a worker: decode the frame
+/// and evaluate `Block::validate_pow`, whose algorithm follows the header
+/// height (GnB-SMH v1 below `core::powit_height()`, v3 from it) and whose
+/// target is judged against that height's pow limit. A frame that does not
+/// decode, or a panic, is `false`.
+pub fn evaluate_block_frame(block_data: &[u8]) -> bool {
+    std::panic::catch_unwind(|| {
+        crate::core::Block::from_wire_bytes(block_data).map(|b| b.validate_pow()).unwrap_or(false)
+    })
+    .unwrap_or(false)
 }
 
 /// Bound on tracked budget keys (far above the connection limit).
@@ -582,6 +634,54 @@ mod tests {
             s.complete(j.outcome(false), t0);
         }
         assert_eq!(s.submit(job(60, src(a, 1), false, t0), t0).unwrap_err().0, PowRefusal::PeerBudget);
+    }
+
+    /// PoW v3: a block job's evaluation (`evaluate_block_frame`, what the
+    /// processor's workers run) follows the header height — a block at the
+    /// GnB-SMH v3 height is judged with v3, and the same header framed one
+    /// height lower is judged with v1 (a v3 proof is not a v1 proof). Hence
+    /// the (id, height) result key.
+    #[test]
+    fn block_evaluation_follows_the_pow_algorithm_of_the_height() {
+        use crate::core;
+        let v3 = core::powit_height();
+        if v3 == u64::MAX || v3 == 0 {
+            return; // no switch on this network
+        }
+        let mut block = core::genesis_block();
+        // A target one in eight hashes meets (the pow limit itself is met by
+        // almost every hash, so it cannot tell the algorithms apart).
+        let target = primitive_types::U256::one() << 253usize;
+        block.header.bits = core::target_to_bits(&target.to_big_endian());
+        block.height = v3;
+        assert_eq!(core::pow_algo(v3), gnb_smh::Algo::V3);
+        let pre = block.header.pow_preimage();
+        // A nonce that is a valid v3 proof but not a valid v1 proof (about
+        // 8 v3 and 1.1 v1 evaluations).
+        let mut start = 0u64;
+        let mut tries = 0;
+        let nonce = loop {
+            let n = crate::pow::mine_parallel(&pre, block.header.bits, v3, start, 256, 2, None)
+                .expect("a 1-in-8 target within 512 attempts");
+            if !crate::pow::verify(&pre, n, block.header.bits, v3 - 1) {
+                break n;
+            }
+            tries += 1;
+            assert!(tries < 32, "v1 met a 1-in-8 target 32 times in a row");
+            start = n.wrapping_add(1);
+        };
+        block.header.nonce = nonce;
+        let mut v1_framed = block.clone();
+        v1_framed.height = v3 - 1;
+        assert_eq!(v1_framed.block_hash(), block.block_hash(), "the id does not commit the height");
+        // The v1 framing first: `validate_pow`'s own cache remembers a valid
+        // proof by block id alone (sound for acceptance, which binds the
+        // height to the parents the id commits before using the proof), so
+        // after the v3 success it would answer for this copy too — one more
+        // reason the scheduler keys its results by (id, height).
+        assert!(!evaluate_block_frame(&v1_framed.to_wire_bytes()), "judged with v1 one height lower");
+        assert!(evaluate_block_frame(&block.to_wire_bytes()), "v3 proof at a v3 height");
+        assert!(!evaluate_block_frame(b"not a block"));
     }
 
     /// Review finding (NET-2): the result is remembered per (id, height): an

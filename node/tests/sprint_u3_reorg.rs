@@ -78,7 +78,7 @@ fn mk_block(height: u64, transactions: Vec<Transaction>) -> Block {
         transactions,
         blue_score: height,
         height,
-        shielded_transactions: Vec::new(),
+        shielded_transactions: Vec::new(), powit: Default::default(),
     }
 }
 
@@ -287,7 +287,7 @@ fn compute_reorg_plan_no_common_ancestor_returns_none() {
 #[test]
 fn apply_block_utxo_mutations_creates_utxos_and_undo_record() {
     let (_tmp, store) = mk_storage();
-    let cb = mk_coinbase(0xA1, 500_000_000, 1);
+    let cb = mk_coinbase(0xA1, 100_000_000, 1);
     let cb_txid = cb.txid();
     let block = mk_block(1, vec![cb]);
     let block_hash = block.block_hash();
@@ -315,7 +315,7 @@ fn apply_then_rollback_via_public_primitive_round_trip() {
     // mirroring U.2's apply_rollback_apply_rollback_is_stable but going
     // through the public reorg::apply primitive rather than the test helper.
     let (_tmp, store) = mk_storage();
-    let cb = mk_coinbase(0xA2, 500_000_000, 1);
+    let cb = mk_coinbase(0xA2, 100_000_000, 1);
     let cb_txid = cb.txid();
     let block = mk_block(1, vec![cb]);
     let block_hash = block.block_hash();
@@ -347,7 +347,7 @@ fn setup_two_forks_storage_and_plan() -> (TempDir, Storage, Mempool, ReorgPlan) 
     let mempool = Mempool::new();
 
     // Block A1 — coinbase paying addr 0xA1. Will be rolled back.
-    let cb_a1 = mk_coinbase(0xA1, 500_000_000, 1);
+    let cb_a1 = mk_coinbase(0xA1, 100_000_000, 1);
     let block_a1 = mk_block(1, vec![cb_a1]);
     let a1_hash = block_a1.block_hash();
     store.put_block(&block_a1).unwrap();
@@ -355,7 +355,7 @@ fn setup_two_forks_storage_and_plan() -> (TempDir, Storage, Mempool, ReorgPlan) 
 
     // Block B1 — coinbase paying addr 0xB1. Will be applied. Uses a different
     // nonce via height+1 trick so block_hash differs from A1.
-    let mut block_b1 = mk_block(1, vec![mk_coinbase(0xB1, 500_000_000, 1)]);
+    let mut block_b1 = mk_block(1, vec![mk_coinbase(0xB1, 100_000_000, 1)]);
     block_b1.header.nonce = 999;  // force different block_hash from A1
     let b1_hash = block_b1.block_hash();
     store.put_block(&block_b1).unwrap();
@@ -376,8 +376,8 @@ fn execute_reorg_updates_utxo_set_to_new_chain() {
 
     // Compute expected txids via the same helpers the fixture used, so we
     // don't have to reconstruct Transaction bodies manually.
-    let a1_cb_txid = mk_coinbase(0xA1, 500_000_000, 1).txid();
-    let b1_cb_txid = mk_coinbase(0xB1, 500_000_000, 1).txid();
+    let a1_cb_txid = mk_coinbase(0xA1, 100_000_000, 1).txid();
+    let b1_cb_txid = mk_coinbase(0xB1, 100_000_000, 1).txid();
 
     assert!(store.get_utxo(&a1_cb_txid, 0).unwrap().is_some(),
         "sanity: A1 coinbase UTXO exists pre-reorg");
@@ -428,7 +428,7 @@ fn execute_reorg_reinjects_non_coinbase_tx_when_still_valid() {
         "sanity: U spent by fork A");
 
     // Fork B: coinbase only, does not touch U.
-    let cb_b = mk_coinbase(0xB1, 500_000_000, 1);
+    let cb_b = mk_coinbase(0xB1, 100_000_000, 1);
     let mut block_b = mk_block(1, vec![cb_b]);
     block_b.header.nonce = 999;
     let b_hash = block_b.block_hash();
@@ -465,7 +465,7 @@ fn execute_reorg_discards_tx_whose_inputs_are_gone() {
     let mempool = Mempool::new();
 
     // Fork A with two txs: coinbase creates C_A0, second tx spends it.
-    let cb_a = mk_coinbase(0xA1, 500_000_000, 1);
+    let cb_a = mk_coinbase(0xA1, 100_000_000, 1);
     let cb_a_txid = cb_a.txid();
     let spend_ca0 = mk_spend_tx(cb_a_txid, 0, 0xCC, 100_000_000, 0x02);
     let spend_ca0_txid = spend_ca0.txid();
@@ -482,7 +482,7 @@ fn execute_reorg_discards_tx_whose_inputs_are_gone() {
     apply_block_utxo_mutations(&store, &block_a).unwrap();
 
     // Fork B: entirely different coinbase.
-    let cb_b = mk_coinbase(0xB1, 500_000_000, 1);
+    let cb_b = mk_coinbase(0xB1, 100_000_000, 1);
     let mut block_b = mk_block(1, vec![cb_b]);
     block_b.header.nonce = 999;
     let b_hash = block_b.block_hash();

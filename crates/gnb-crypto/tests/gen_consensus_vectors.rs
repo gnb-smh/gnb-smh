@@ -38,16 +38,30 @@ use sha3::{Digest, Sha3_256};
 
 const DUST_THRESHOLD: u64 = 546;
 const COINBASE_MATURITY: u64 = 100;
-const MAX_SUPPLY_SAT: u64 = 1_000_000_000_000_000;
+const MAX_SUPPLY_SAT: u64 = 1_250_000_000_000_000;
 const MIN_TX_FEE_SAT: u64 = 10_000;
 const MIN_FEE_RATE_SAT_PER_KB: u64 = 2_000;
 const INITIAL_SUBSIDY_SAT: u64 = 107_020_547;
 const HALVING_INTERVAL: u64 = 4_204_800;
 const MAX_BLOCK_SIZE: usize = 1_000_000;
-const MAX_SCRIPT_LEN: usize = 10_000;
+/// `script_sig` cap of the wire parser: the largest policy witness
+/// (`core::MAX_SCRIPT_SIG_LEN`, a 7-of-7 multisig spend).
+const MAX_SCRIPT_SIG_LEN: usize = 114_834;
+/// `script_pubkey` cap of the wire parser.
+const MAX_SCRIPT_PUBKEY_LEN: usize = 10_000;
 const POW_LIMIT_BITS: u32 = 0x2100_FFFF;
 const GENESIS_BITS: u32 = 0x1F0E_9036;
-const GENESIS_TIMESTAMP: u64 = 1_791_429_092;
+const GENESIS_TIMESTAMP: u64 = 1_791_685_648;
+/// Mainnet PoW + PoWit activation (`core::POWIT_HEIGHT_MAINNET`): from it the
+/// body root covers the PoWit section and the coinbase pays the miner's
+/// share of the subsidy (`witness_share::split_subsidy`).
+const POWIT_HEIGHT: u64 = 10_000;
+/// From this height up to the hardening activation the coinbase script_sig
+/// ends with `|wc:` and the witness root (`core::WITNESS_COMMITMENT_HEIGHT`).
+const WITNESS_COMMITMENT_HEIGHT: u64 = 5_000;
+const WITNESS_POOL_BPS: u64 = 2_000;
+const MAX_SHARES_PER_BLOCK: u64 = 16;
+const INCLUSION_BONUS_BPS: u64 = 1_000;
 
 fn min_fee(wire_size: usize) -> u64 {
     MIN_TX_FEE_SAT.max((wire_size as u64 * MIN_FEE_RATE_SAT_PER_KB).div_ceil(1000))
@@ -58,6 +72,19 @@ fn subsidy(height: u64) -> u64 {
         return 0;
     }
     INITIAL_SUBSIDY_SAT >> (height / HALVING_INTERVAL)
+}
+
+/// The most a coinbase at `height` may pay the miner before fees, with no
+/// witness shares: the whole subsidy below POWIT_HEIGHT, the subsidy minus
+/// the witness pool from it.
+fn miner_subsidy(height: u64) -> u64 {
+    let s = subsidy(height);
+    if height < POWIT_HEIGHT {
+        return s;
+    }
+    let pool = s * WITNESS_POOL_BPS / 10_000;
+    let _ = (MAX_SHARES_PER_BLOCK, INCLUSION_BONUS_BPS); // shares only add (bonus x shares)
+    s - pool
 }
 
 /// The explicit activation height of most cases, and the heights either side.
@@ -637,14 +664,23 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         sign_all(&mut tx, &[ka, ka], &outs_of(&[&p0, &p1]), r.how(), ChainId::Mainnet, &l);
         c.valid("struct/same-txid-different-vouts", r, "Two outputs of one transaction spent together: distinct outpoints.", vec![p0, p1], &tx);
 
+        let h = r.height() as u32;
         let l = format!("struct/locktime/{}", r.tag());
         let (tx, p) = simple_with(ka, r, &l, |t| {
-            t.locktime = u32::MAX;
+            t.locktime = h;
             t.inputs[0].sequence = 0;
         });
-        c.valid("struct/locktime-and-sequence-not-enforced", r,
-            "locktime = 2^32-1 and sequence = 0: GnB has no lock-time or relative-lock-time rule (the fields are only signed).",
+        c.valid("struct/locktime-equal-to-the-height", r,
+            "locktime = the block height and sequence = 0: a transaction is final in a block at height >= locktime (sequence carries no rule).",
             vec![p], &tx);
+        let l = format!("struct/locktime-above/{}", r.tag());
+        let (tx, p) = simple_with(ka, r, &l, |t| t.locktime = h + 1);
+        c.invalid("struct/locktime-above-the-height", r,
+            "locktime = the block height + 1: not final in this block (locktime is a block height, every height).",
+            vec![p], &tx, "non-final");
+        let l = format!("struct/locktime-max/{}", r.tag());
+        let (tx, p) = simple_with(ka, r, &l, |t| t.locktime = u32::MAX);
+        c.invalid("struct/locktime-u32-max", r, "locktime = 2^32-1: never final.", vec![p], &tx, "non-final");
     }
     {
         let l = "struct/null-prevout-second-input";
@@ -686,13 +722,13 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
             c.push_full(id, desc, ChainId::Mainnet, ACT, Pre.height(), vec![p.clone()], bytes, Some("decode"), Policy::Reject("decode"));
         }
 
-        // A script_sig of 10,001 bytes and an output script of 10,001 bytes.
+        // A script_sig one byte above its cap and an output script of 10,001 bytes.
         let mut long_ss = tx.clone();
-        long_ss.inputs[0].script_sig.resize(MAX_SCRIPT_LEN + 1, 0);
-        c.push_full("decode/script-sig-10001-bytes", "A script_sig one byte above the 10,000-byte cap (the signature, then zero padding).",
+        long_ss.inputs[0].script_sig.resize(MAX_SCRIPT_SIG_LEN + 1, 0);
+        c.push_full("decode/script-sig-above-the-cap", "A script_sig one byte above the 114,834-byte cap (the largest policy witness; the signature, then zero padding).",
             ChainId::Mainnet, ACT, Pre.height(), vec![p.clone()], long_ss.to_wire_bytes(true), Some("decode"), Policy::Reject("decode"));
         let mut long_spk = tx.clone();
-        long_spk.outputs[0].script_pubkey = vec![0x51; MAX_SCRIPT_LEN + 1];
+        long_spk.outputs[0].script_pubkey = vec![0x51; MAX_SCRIPT_PUBKEY_LEN + 1];
         c.push_full("decode/script-pubkey-10001-bytes", "An output script one byte above the 10,000-byte cap.",
             ChainId::Mainnet, ACT, Pre.height(), vec![p.clone()], long_spk.to_wire_bytes(true), Some("decode"), Policy::Reject("decode"));
     }
@@ -700,20 +736,23 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         let l = format!("size/script-sig-10000/{}", r.tag());
         let (tx, p) = simple(ka, r, &l);
         let mut padded = tx.clone();
-        padded.inputs[0].script_sig.resize(MAX_SCRIPT_LEN, 0);
+        padded.inputs[0].script_sig.resize(10_000, 0);
         let (err, pol) = match r {
-            Pre => (None, Policy::Reject(Pre.witness_refusal())),
+            // This chain's v2 framing is exact: the padding is malformed.
+            Pre => (Some("witness-malformed"), Policy::Reject(Pre.witness_refusal())),
             // Admission's witness check refuses it with the consensus
             // canonical-witness rule (version 3 at/after the activation).
             Post => (Some("witness-non-canonical"), Policy::Reject(Post.witness_refusal())),
         };
         c.push("size/script-sig-10000-bytes", r,
-            "A valid signature followed by zero padding up to exactly 10,000 script_sig bytes: the lenient framing ignores the padding below the activation; the canonical witness rule refuses it from the activation.",
+            "A valid signature followed by zero padding up to 10,000 script_sig bytes: the exact framing refuses the padding (below the activation as malformed, from it as a non-canonical witness).",
             vec![p], &padded, err, pol);
 
         let l = format!("size/script-pubkey-10000/{}", r.tag());
-        let (tx, p) = simple_with(ka, r, &l, |t| t.outputs[0].script_pubkey = vec![0x51; MAX_SCRIPT_LEN]);
-        c.valid("size/script-pubkey-10000-bytes", r, "An output script of exactly 10,000 bytes (the cap). The fee covers the size.", vec![p], &tx);
+        let (tx, p) = simple_with(ka, r, &l, |t| t.outputs[0].script_pubkey = vec![0x51; MAX_SCRIPT_PUBKEY_LEN]);
+        c.invalid("size/script-pubkey-10000-bytes", r,
+            "An output script of exactly 10,000 bytes (the parser cap): it decodes, but only a 20-byte key hash or a 33-byte spend policy may be created.",
+            vec![p], &tx, "bad-output-script");
 
         let l = format!("size/300-outputs/{}", r.tag());
         let p = fund(&l, 400 * FUND, &ka.spk());
@@ -833,8 +872,8 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         });
         let mut padded = tx.clone();
         padded.inputs[0].script_sig.extend_from_slice(&[0u8; 50]);
-        c.invalid_refused(l, Pre, "Fee exactly the minimum of the unpadded transaction; 50 padding bytes after the public key raise the wire size, so the fee is below the minimum (the fee rule counts witness bytes). The mempool refuses the padded witness first (non-standard).",
-            vec![p], &padded, "min-fee", "non-standard-witness");
+        c.invalid_refused(l, Pre, "Fee exactly the minimum of the unpadded transaction, then 50 padding bytes after the public key: this chain's exact v2 framing refuses the padding itself (before the fee rule, which also counts witness bytes). The mempool refuses the padded witness first (non-standard).",
+            vec![p], &padded, "witness-malformed", "non-standard-witness");
     }
 
     // ── Coinbase maturity ───────────────────────────────────────────────────
@@ -866,9 +905,9 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         let mut tx = unsigned(r.version(), &[&p], vec![pay(cb_value - 100_000, &l)]);
         sign_all(&mut tx, &[ka], &[p.out()], r.how(), ChainId::Mainnet, &l);
         match r {
-            Pre => c.push("maturity/same-block-coinbase", r,
-                "Spends output 0 of the coinbase of its own block (the wrapper coinbase pays the prevout). Valid below the activation (historical: the in-block coinbase was never looked up for maturity); mempool admission cannot see an unconfirmed coinbase.",
-                vec![p], &tx, None, Policy::Reject("missing-input")),
+            Pre => c.invalid_refused("maturity/same-block-coinbase", r,
+                "Spends output 0 of the coinbase of its own block (the wrapper coinbase pays the prevout): invalid at every height on this chain. Mempool admission cannot see an unconfirmed coinbase (missing input).",
+                vec![p], &tx, "same-block-coinbase", "missing-input"),
             Post => c.invalid_refused("maturity/same-block-coinbase", r,
                 "Spends output 0 of the coinbase of its own block: invalid from the activation (VAL-3). Mempool admission cannot see an unconfirmed coinbase (missing input).",
                 vec![p], &tx, "same-block-coinbase", "missing-input"),
@@ -1246,9 +1285,14 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         let t = r.tag();
         let pre = r == Pre;
         let nsw = r.witness_refusal();
-        let lenient_ok = |c: &mut TxCases, id: &str, desc: &str, p: Prev, tx: &Transaction| {
+        // Below the activation this chain's v2 rule decides (`pre_class`:
+        // None = consensus-valid); from it the canonical witness rule.
+        let lenient_ok = |c: &mut TxCases, id: &str, desc: &str, p: Prev, tx: &Transaction, pre_class: Option<&'static str>| {
             if pre {
-                c.push(id, r, desc, vec![p], tx, None, Policy::Reject(nsw));
+                match pre_class {
+                    None => c.push(id, r, desc, vec![p], tx, None, Policy::Reject(nsw)),
+                    Some(cls) => c.invalid_refused(id, r, desc, vec![p], tx, cls, nsw),
+                }
             } else {
                 c.invalid(id, r, desc, vec![p], tx, "witness-non-canonical");
             }
@@ -1258,20 +1302,20 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         let mut ss = tx.inputs[0].script_sig.clone();
         ss.push(0);
         lenient_ok(&mut c, "witness/one-trailing-byte",
-            "One byte after the public key. Below the activation the lenient framing ignores it (consensus-valid, non-standard); from the activation the framing must be exact.",
-            p, &with_ss(&tx, 0, ss));
+            "One byte after the public key: this chain's framing is exact at every height (malformed below the activation, not canonical from it).",
+            p, &with_ss(&tx, 0, ss), Some("witness-malformed"));
 
         let (tx, p) = simple(ka, r, &format!("wit/trailing-1000/{t}"));
         let mut ss = tx.inputs[0].script_sig.clone();
         ss.extend_from_slice(&[0xEE; 1000]);
-        lenient_ok(&mut c, "witness/1000-trailing-bytes", "1,000 bytes after the public key (the fee still covers the larger size).", p, &with_ss(&tx, 0, ss));
+        lenient_ok(&mut c, "witness/1000-trailing-bytes", "1,000 bytes after the public key (the fee still covers the larger size): refused by the exact framing.", p, &with_ss(&tx, 0, ss), Some("witness-malformed"));
 
         let (tx, p) = simple(ka, r, &format!("wit/raw-sig/{t}"));
         let (sig, pk) = witness(&tx, 0);
         assert_ne!(sig[4..6], [0xB1, 0x0C], "a raw signature must not look enveloped");
         lenient_ok(&mut c, "witness/signature-without-envelope",
-            "The signature without its 4-byte suite envelope: read as hybrid below the activation; the envelope is mandatory from it.",
-            p, &with_ss(&tx, 0, script_sig(&sig[4..], &pk)));
+            "The signature without its 4-byte suite envelope: read as hybrid below the activation (carried-over raw signatures stay valid); the envelope is mandatory from it.",
+            p, &with_ss(&tx, 0, script_sig(&sig[4..], &pk)), None);
 
         let (tx, p) = simple(ka, r, &format!("wit/padded-falcon/{t}"));
         let (sig, pk) = witness(&tx, 0);
@@ -1280,8 +1324,8 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         assert!(flen < crypto::falcon::padded_signature_len(), "the compact Falcon signature must be shorter than the padded form");
         padded.resize(4 + MLDSA_SIG + crypto::falcon::padded_signature_len(), 0);
         lenient_ok(&mut c, "witness/falcon-zero-padded-1280",
-            "The Falcon half in the alternate 1,280-byte zero-padded form (same signature): accepted by the historical verifier; only the compact form is canonical.",
-            p, &with_ss(&tx, 0, script_sig(&padded, &pk)));
+            "The Falcon half in the alternate 1,280-byte zero-padded form (same signature): only the compact form verifies on this chain (`crypto::verify_canonical` below the activation, the canonical witness rule from it).",
+            p, &with_ss(&tx, 0, script_sig(&padded, &pk)), Some("bad-signature"));
 
         let (tx, p) = simple(ka, r, &format!("wit/falcon-extra-byte/{t}"));
         let (mut sig, pk) = witness(&tx, 0);
@@ -1317,9 +1361,9 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         let mut ss = script_sig(&sig, &pk);
         let at = 4 + sig.len();
         ss[at..at + 4].copy_from_slice(&((pk.len() - 1) as u32).to_le_bytes());
-        let cls_pk = if pre { "pubkey-mismatch" } else { "witness-non-canonical" };
+        let cls_pk = if pre { "witness-malformed" } else { "witness-non-canonical" };
         c.invalid_refused("witness/pk-length-one-short", r,
-            "pk_len one byte short: the lenient framing reads a truncated key (whose hash does not match the coin) and ignores the last byte; the exact framing refuses the trailing byte first.",
+            "pk_len one byte short: the key's last byte is left over after the framing, which the exact framing refuses at every height.",
             vec![p], &with_ss(&tx, 0, ss), cls_pk, nsw);
     }
 
@@ -1342,9 +1386,9 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         let (tx, p) = simple_with(ka, Pre, &format!("{l}/pre"), |t| t.version = 3);
         let mut ss = tx.inputs[0].script_sig.clone();
         ss.push(0);
-        c.push(l, Pre,
-            "Version 3 signed over sighash v2 with one byte after the public key, below the activation: version 3 is verified there with sighash v2 and the lenient framing, which ignores the byte (consensus-valid). Mempool admission refuses the non-canonical witness as relay policy (before its version policy): below the activation the canonical witness is not a consensus rule for any version.",
-            vec![p], &with_ss(&tx, 0, ss), None, Policy::Reject("non-standard-witness"));
+        c.invalid_refused(l, Pre,
+            "Version 3 signed over sighash v2 with one byte after the public key, below the activation: version 3 is verified there with sighash v2 and this chain's exact v2 framing, which refuses the byte (malformed). Mempool admission refuses the non-canonical witness as relay policy (before its version policy): below the activation the canonical witness is not a consensus rule for any version.",
+            vec![p], &with_ss(&tx, 0, ss), "witness-malformed", "non-standard-witness");
     }
 
     // ── 64-byte transactions (VAL-10) ───────────────────────────────────────
@@ -1355,15 +1399,15 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
             let mut tx = unsigned(r.version(), &[&p], vec![TxOutput { value: PAY, script_pubkey: vec![0x51; spk_len] }]);
             sign_all(&mut tx, &[ka], &[p.out()], r.how(), ChainId::Mainnet, &l);
             assert_eq!(tx.wire_size(false), 59 + spk_len);
-            let desc = format!("One input, one output with a {spk_len}-byte script: the txid preimage (no script_sig) is {} bytes.", 59 + spk_len);
+            let desc = format!("One input, one output with a {spk_len}-byte script: the txid preimage (no script_sig) is {} bytes. On this chain no output may carry such a script (only 20-byte key hashes and 33-byte policies), so a 64-byte transaction cannot be valid at any height.", 59 + spk_len);
             if spk_len == 5 && r == Post {
-                c.invalid(id, r, &format!("{desc} Invalid from the activation (VAL-10)."), vec![p], &tx, "tx-64-bytes");
+                c.invalid(id, r, &format!("{desc} From the activation the context-free 64-byte rule (VAL-10) refuses it first."), vec![p], &tx, "tx-64-bytes");
             } else {
-                c.valid(id, r, &desc, vec![p], &tx);
+                c.invalid(id, r, &desc, vec![p], &tx, "bad-output-script");
             }
         }
     }
-    for (h, err, pol) in [(MAINNET_ACT - 1, None, Policy::Accept), (MAINNET_ACT, Some("tx-64-bytes"), Policy::Reject("tx-64-bytes"))] {
+    for (h, err, pol) in [(MAINNET_ACT - 1, Some("bad-output-script"), Policy::Reject("bad-output-script")), (MAINNET_ACT, Some("tx-64-bytes"), Policy::Reject("tx-64-bytes"))] {
         let r = if h >= MAINNET_ACT { Post } else { Pre };
         let l = format!("tx64/mainnet-boundary/{h}");
         let p = fund(&l, FUND, &ka.spk());
@@ -1379,9 +1423,9 @@ fn tx_cases(k: &Keys) -> Vec<TxCase> {
         let (tx, p) = simple(ka, r, &l);
         let stale = Prev { txid: tx.txid(), vout: 0, amount: 777, spk: dest("bip30/stale"), coinbase_height: None, block_coinbase: false };
         match r {
-            Pre => c.push("bip30/output-overwrites-an-unspent-coin", r,
-                "An unspent coin already sits at this transaction's output 0 (models a coin created before). Below the activation the output overwrites it (historical). The mempool refuses it: the coin's txid, this transaction's, is already confirmed.",
-                vec![p, stale], &tx, None, Policy::Reject("already-confirmed")),
+            Pre => c.invalid_refused("bip30/output-overwrites-an-unspent-coin", r,
+                "An unspent coin already sits at this transaction's output 0 (models a coin created before): invalid at every height on this chain (BIP30). The mempool refuses it as already confirmed (the coin's txid is this transaction's).",
+                vec![p, stale], &tx, "bip30", "already-confirmed"),
             Post => c.invalid_refused("bip30/output-overwrites-an-unspent-coin", r,
                 "An unspent coin already sits at this transaction's output 0: invalid from the activation (VAL-2, BIP30). The mempool refuses it as already confirmed (the coin's txid is this transaction's).",
                 vec![p, stale], &tx, "bip30", "already-confirmed"),
@@ -1479,7 +1523,10 @@ fn constants_json() -> J {
         ("initial_subsidy_sat", J::N(INITIAL_SUBSIDY_SAT)),
         ("halving_interval", J::N(HALVING_INTERVAL)),
         ("max_block_size", J::N(MAX_BLOCK_SIZE as u64)),
-        ("max_script_len", J::N(MAX_SCRIPT_LEN as u64)),
+        ("max_script_sig_len", J::N(MAX_SCRIPT_SIG_LEN as u64)),
+        ("max_script_pubkey_len", J::N(MAX_SCRIPT_PUBKEY_LEN as u64)),
+        ("powit_height", J::N(POWIT_HEIGHT)),
+        ("witness_commitment_height", J::N(WITNESS_COMMITMENT_HEIGHT)),
         ("pow_limit_bits", J::N(POW_LIMIT_BITS as u64)),
         ("hardened_pow_limit_bits", J::N(GENESIS_BITS as u64)),
         ("wrapper_coinbase_script_sig", hx(WRAPPER_COINBASE_SCRIPT_SIG)),
@@ -1563,6 +1610,7 @@ fn raw_block(height: u64, activation: u64, parents: Vec<[u8; 32]>, txs: Vec<Tran
         blue_score: height,
         height,
         shielded_transactions: vec![],
+        powit: Default::default(),
     }
 }
 
@@ -1573,8 +1621,23 @@ fn seal(b: &mut Block, activation: u64) {
         let c = block_rules::expected_coinbase_commitment(b);
         let extra = std::mem::take(&mut b.transactions[0].inputs[0].script_sig);
         b.transactions[0].inputs[0].script_sig = block_rules::coinbase_script_sig(&c, &extra);
+    } else if b.height >= WITNESS_COMMITMENT_HEIGHT && !b.transactions.is_empty() {
+        append_wc_suffix(b);
     }
     reroot(b, activation);
+}
+
+/// `|wc:` followed by the legacy (SHA-256d, last node duplicated) Merkle
+/// root of [32 zero bytes, wtxid(tx_1), ...], appended to the coinbase
+/// script_sig (this chain's witness commitment from WITNESS_COMMITMENT_HEIGHT
+/// below the activation).
+fn append_wc_suffix(b: &mut Block) {
+    let mut ids: Vec<[u8; 32]> = vec![[0; 32]];
+    ids.extend(b.transactions[1..].iter().map(Transaction::wtxid));
+    let root = block_rules::legacy_merkle_root(&ids);
+    let ss = &mut b.transactions[0].inputs[0].script_sig;
+    ss.extend_from_slice(b"|wc:");
+    ss.extend_from_slice(&root.0);
 }
 
 fn reroot(b: &mut Block, activation: u64) {
@@ -1640,6 +1703,12 @@ fn mine_from(b: &Block, from: u64) -> u64 {
 /// `mine_from(.., 0)`, about 4,500 evaluations expected). A change to the
 /// block's header moves the search on from here.
 const GENESIS_BITS_NONCE_HINT: u64 = 4_440;
+
+/// The bincode-2 "standard" size of a block (a filler target only: no rule
+/// of this chain measures it).
+fn bincode_size(b: &Block) -> usize {
+    bincode::serde::encode_to_vec(b, bincode::config::standard()).expect("encode").len()
+}
 
 struct BlockCases {
     cases: Vec<BlockCase>,
@@ -1819,21 +1888,21 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         sign_all(&mut t64, &[ka], &[p64.out()], r.how(), ChainId::Mainnet, &l("tx64"));
         let mut b = raw_block(h, ACT, one_parent(), vec![coinbase(subsidy(h) + 100_000, &l("tx64"), b""), t64]);
         seal(&mut b, ACT);
-        c.push("tx64/64-byte-transaction-in-block", r, "A transaction whose txid preimage is exactly 64 bytes (VAL-10: invalid from the activation).",
-            b, vec![p64], if r == Pre { None } else { Some("tx-64-bytes") });
+        c.push("tx64/64-byte-transaction-in-block", r, "A transaction whose txid preimage is exactly 64 bytes: its 5-byte output script is not an output kind of this chain (connect time); from the activation the context-free 64-byte rule (VAL-10) refuses it first.",
+            b, vec![p64], Some(if r == Pre { "bad-output-script" } else { "tx-64-bytes" }));
 
         // BIP30.
         let stale = Prev { txid: tx.txid(), vout: 0, amount: 777, spk: dest("bip30/stale"), coinbase_height: None, block_coinbase: false };
         let mut b = raw_block(h, ACT, one_parent(), vec![coinbase(subsidy(h) + 100_000, &l("bip30-tx"), b""), tx.clone()]);
         seal(&mut b, ACT);
         c.push("bip30/transaction-output-overwrites-an-unspent-coin", r,
-            "An unspent coin already sits at the spend's output 0 in the parent state. Below the activation the output overwrites it (historical); from it the block is invalid (VAL-2).",
-            b, vec![p.clone(), stale], if r == Pre { None } else { Some("bip30") });
+            "An unspent coin already sits at the spend's output 0 in the parent state: invalid at every height on this chain (BIP30).",
+            b, vec![p.clone(), stale], Some("bip30"));
         let mut b = raw_block(h, ACT, one_parent(), vec![coinbase(subsidy(h), &l("bip30-cb"), b"")]);
         seal(&mut b, ACT);
         let stale_cb = Prev { txid: b.transactions[0].txid(), vout: 0, amount: 777, spk: dest("bip30/stale-cb"), coinbase_height: Some(h - 500), block_coinbase: false };
         c.push("bip30/coinbase-overwrites-an-unspent-coin", r,
-            "An unspent coin already sits at the coinbase's output 0 (a repeated coinbase txid).", b, vec![stale_cb], if r == Pre { None } else { Some("bip30") });
+            "An unspent coin already sits at the coinbase's output 0 (a repeated coinbase txid): invalid at every height on this chain (BIP30).", b, vec![stale_cb], Some("bip30"));
 
         // Version rule inside a block.
         let (tv, pv) = block_spend(ka, if r == Pre { Post } else { Pre }, &l("wrong-version"), FUND);
@@ -1855,8 +1924,8 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         let mut padded = base.clone();
         padded.transactions[1].inputs[0].script_sig.extend_from_slice(&[0u8; 16]);
         c.push("witness/padded-witness-same-block-id", r,
-            "The coinbase-and-spend block with 16 zero bytes appended to the spend's script_sig: same txids, same header. Below the activation the lenient framing accepts it (the fee still covers the size); from it the witness commitment no longer matches.",
-            padded, vec![p.clone()], if r == Pre { None } else { Some("witness-commitment") });
+            "The coinbase-and-spend block with 16 zero bytes appended to the spend's script_sig: same txids, same header. Below the activation this chain's exact v2 framing refuses the padded witness (connect time); from it the witness commitment no longer matches.",
+            padded, vec![p.clone()], Some(if r == Pre { "witness-malformed" } else { "witness-commitment" }));
     }
 
     // ── Coinbase commitment (from the activation) ───────────────────────────
@@ -1918,17 +1987,17 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         reroot(&mut b, ACT);
         c.push("commitment/witness-root-over-txids", r, "The witness root computed over txids instead of wtxids.", b, vec![p.clone()], Some("witness-commitment"));
 
-        // Miner bytes up to the 10,000-byte script_sig cap.
+        // Miner bytes up to the script_sig cap (114,834 bytes).
         let prefix_len = format!("gnb-block-vectors/{}/", l("max-extra")).len();
-        let mut b = raw_block(h, ACT, one_parent(), vec![coinbase(subsidy(h), &l("max-extra"), &vec![0x42; MAX_SCRIPT_LEN - 80 - prefix_len])]);
+        let mut b = raw_block(h, ACT, one_parent(), vec![coinbase(subsidy(h), &l("max-extra"), &vec![0x42; MAX_SCRIPT_SIG_LEN - 80 - prefix_len])]);
         seal(&mut b, ACT);
-        assert_eq!(b.transactions[0].inputs[0].script_sig.len(), MAX_SCRIPT_LEN);
-        c.push("commitment/script-sig-at-the-10000-byte-cap", r, "The commitment followed by miner bytes up to exactly 10,000 script_sig bytes.", b.clone(), vec![], None);
+        assert_eq!(b.transactions[0].inputs[0].script_sig.len(), MAX_SCRIPT_SIG_LEN);
+        c.push("commitment/script-sig-at-the-cap", r, "The commitment followed by miner bytes up to exactly 114,834 script_sig bytes (the cap).", b.clone(), vec![], None);
         let mut over = b.clone();
         over.transactions[0].inputs[0].script_sig.push(0x42);
         reroot(&mut over, ACT);
         let bytes = over.to_wire_bytes();
-        c.push_full("commitment/script-sig-above-the-cap/post".into(), "One miner byte more: a 10,001-byte script_sig does not decode.", ACT, over, vec![], Some("decode"), "full", Pow::Skip);
+        c.push_full("commitment/script-sig-above-the-cap/post".into(), "One miner byte more: a 114,835-byte script_sig does not decode.", ACT, over, vec![], Some("decode"), "full", Pow::Skip);
         c.cases.last_mut().unwrap().raw = Some(bytes);
 
         // The commitment is not required (and not checked) below the activation.
@@ -1939,12 +2008,32 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         c.push("commitment/wrong-commitment-ignored-below-the-activation", Pre, "A coinbase script_sig that looks like a commitment with the wrong height, parents and root: free-form below the activation.", b, vec![], None);
 
         // The mainnet boundary.
-        for (hh, err) in [(MAINNET_ACT - 1, None), (MAINNET_ACT, Some("cb-commitment-missing"))] {
-            let mut b = raw_block(hh, MAINNET_ACT, one_parent(), vec![coinbase(subsidy(hh), &format!("block/commitment/mainnet-{hh}"), b"")]);
+        for (hh, err) in [(MAINNET_ACT - 1, Some("witness-commitment-suffix")), (MAINNET_ACT, Some("cb-commitment-missing"))] {
+            let mut b = raw_block(hh, MAINNET_ACT, one_parent(), vec![coinbase(miner_subsidy(hh), &format!("block/commitment/mainnet-{hh}"), b"")]);
             b.header.merkle_root = b.body_merkle_root_at(MAINNET_ACT);
             c.push_full(format!("commitment/no-commitment-at-mainnet-height-{hh}"),
-                &format!("A legacy coinbase (no commitment) with the root of the height's regime, at height {hh} under the mainnet schedule."),
+                &format!("A coinbase with no commitment at all (paying the miner's PoWit share of the subsidy, v2 body root), at height {hh} under the mainnet schedule: below the activation the `|wc:` witness commitment is missing; from it the 80-byte commitment."),
                 MAINNET_ACT, b, vec![], err, "full", Pow::Skip);
+        }
+        {
+            let hh = MAINNET_ACT - 1;
+            let (tx, p) = block_spend(ka, Pre, "block/commitment/mainnet-wc/spend", FUND);
+            let mut b = raw_block(hh, MAINNET_ACT, one_parent(), vec![coinbase(miner_subsidy(hh) + 100_000, "block/commitment/mainnet-wc", b""), tx]);
+            seal(&mut b, MAINNET_ACT);
+            c.push_full("commitment/wc-suffix-at-mainnet-height-109999".into(),
+                "Height 109,999 under the mainnet schedule (PoWit active, below the activation): the coinbase pays the miner's share + the fee and its script_sig ends with `|wc:` and the witness root.",
+                MAINNET_ACT, b.clone(), vec![p.clone()], None, "full", Pow::Skip);
+            let mut over = b.clone();
+            over.transactions[0].outputs[0].value += 1;
+            reroot(&mut over, MAINNET_ACT);
+            c.push_full("coinbase/powit-miner-share-plus-one-at-mainnet-height-109999".into(),
+                "The same block with the coinbase claiming one base unit above the miner's share + fee: from the PoWit height the witness pool (20% of the subsidy) is not the miner's.",
+                MAINNET_ACT, over, vec![p.clone()], Some("coinbase-value"), "full", Pow::Skip);
+            let mut stale = b.clone();
+            stale.transactions[1].inputs[0].script_sig.extend_from_slice(&[0u8; 8]);
+            c.push_full("commitment/wc-suffix-stale-witness-at-mainnet-height-109999".into(),
+                "The same block with 8 bytes appended to the spend's witness: same txids and header root, but the `|wc:` commitment no longer matches the witnesses.",
+                MAINNET_ACT, stale, vec![p], Some("witness-commitment-suffix"), "full", Pow::Skip);
         }
 
         // 256 parents (the cap) are committed; 257 do not decode.
@@ -2001,7 +2090,7 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
 
     // ── Same-block coinbase spend (VAL-3) ───────────────────────────────────
     for (r, scope, err, desc) in [
-        (Pre, "full", None, "The block's spend spends output 0 of the block's OWN coinbase: valid below the activation (historical)."),
+        (Pre, "full", Some("same-block-coinbase"), "The block's spend spends output 0 of the block's OWN coinbase: invalid at every height on this chain."),
         (Post, "connect", Some("same-block-coinbase"), "The same spend at the activation height, evaluated by the connect-time rule alone (scope `connect`): invalid (VAL-3)."),
         (Post, "full", Some("witness-commitment"), "The same spend at the activation height through every rule: such a block cannot carry a valid commitment (the commitment covers the spend's wtxid, which covers the coinbase txid, which covers the commitment), so the commitment check rejects it first."),
     ] {
@@ -2031,14 +2120,15 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
 
     // ── Halving boundary (post-activation regime) ───────────────────────────
     for (hh, value, err) in [
-        (HALVING_INTERVAL - 1, INITIAL_SUBSIDY_SAT, None),
-        (HALVING_INTERVAL, INITIAL_SUBSIDY_SAT, Some("coinbase-value")),
-        (HALVING_INTERVAL, INITIAL_SUBSIDY_SAT >> 1, None),
+        (HALVING_INTERVAL - 1, miner_subsidy(HALVING_INTERVAL - 1), None),
+        (HALVING_INTERVAL, miner_subsidy(HALVING_INTERVAL - 1), Some("coinbase-value")),
+        (HALVING_INTERVAL, miner_subsidy(HALVING_INTERVAL), None),
     ] {
         let mut b = raw_block(hh, ACT, vec![parent("p1")], vec![coinbase(value, &format!("block/halving/{hh}/{value}"), b"")]);
         seal(&mut b, ACT);
         c.push_full(format!("coinbase/halving/height-{hh}-claims-{value}"),
-            &format!("The subsidy halves at height 4,204,800 ({} -> {}); this coinbase claims {value} at height {hh}.", INITIAL_SUBSIDY_SAT, INITIAL_SUBSIDY_SAT >> 1),
+            &format!("The subsidy halves at height 4,204,800 ({} -> {}); with PoWit the miner's share (no witness shares) is the subsidy minus its 20% witness pool ({} -> {}); this coinbase claims {value} at height {hh}.",
+                INITIAL_SUBSIDY_SAT, INITIAL_SUBSIDY_SAT >> 1, miner_subsidy(HALVING_INTERVAL - 1), miner_subsidy(HALVING_INTERVAL)),
             ACT, b, vec![], err, "full", Pow::Skip);
     }
 
@@ -2063,7 +2153,7 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         ("pow/exponent-out-of-range-bits", ACT, ACT - 1, 0x2300_0001, Pow::Limit, Some("bad-bits"), "bits with exponent 0x23: the target does not fit 256 bits."),
         ("pow/mantissa-overflow-bits", ACT, ACT - 1, 0x2201_0000, Pow::Limit, Some("bad-bits"), "bits 0x22010000: the target is 2^264."),
     ] {
-        let mut b = raw_block(hh, act, vec![parent("p1")], vec![coinbase(subsidy(hh), &format!("block/{id}"), b"")]);
+        let mut b = raw_block(hh, act, vec![parent("p1")], vec![coinbase(miner_subsidy(hh), &format!("block/{id}"), b"")]);
         b.header.bits = bits;
         seal(&mut b, act);
         if pow == Pow::Full {
@@ -2097,23 +2187,24 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
             ACT, bad, vec![], Some("bad-pow"), "full", Pow::Full);
     }
 
-    // ── Block size (VAL-12): bincode below the activation, wire from it ─────
+    // ── Block size: the wire encoding at every height on this chain ─────────
     // Filler: one signed transaction with many identical outputs. 546-unit
     // outputs are 29 wire bytes but 24 bincode bytes; 5,000,000,000-unit
-    // outputs are 29 wire bytes but 30 bincode bytes.
+    // outputs are 29 wire bytes but 30 bincode bytes. (The audit's VAL-12
+    // measured bincode below the activation; this chain never did.)
     for (id, r, value, target_wire, target_bincode, err) in [
         ("size/wire-1000001-bincode-below", Post, DUST_THRESHOLD, Some(MAX_BLOCK_SIZE + 1), None, Some("block-size")),
-        ("size/wire-1000001-bincode-below", Pre, DUST_THRESHOLD, Some(MAX_BLOCK_SIZE + 1), None, None),
+        ("size/wire-1000001-bincode-below", Pre, DUST_THRESHOLD, Some(MAX_BLOCK_SIZE + 1), None, Some("block-size")),
         ("size/wire-exactly-1000000", Post, DUST_THRESHOLD, Some(MAX_BLOCK_SIZE), None, None),
-        ("size/bincode-1000001-wire-below", Pre, 5_000_000_000, None, Some(MAX_BLOCK_SIZE + 1), Some("block-size")),
+        ("size/wire-exactly-1000000", Pre, DUST_THRESHOLD, Some(MAX_BLOCK_SIZE), None, None),
+        ("size/bincode-1000001-wire-below", Pre, 5_000_000_000, None, Some(MAX_BLOCK_SIZE + 1), None),
         ("size/bincode-1000001-wire-below", Post, 5_000_000_000, None, Some(MAX_BLOCK_SIZE + 1), None),
-        ("size/bincode-exactly-1000000", Pre, 5_000_000_000, None, Some(MAX_BLOCK_SIZE), None),
     ] {
         let h = r.height();
         let l = format!("block/{id}/{}", r.tag());
         let unit_wire = 29usize;
         let unit = if value == DUST_THRESHOLD { 29 } else { 30 }; // in the measure that matters
-        let measure = |b: &Block| if target_wire.is_some() { b.wire_size() } else { b.size_bytes() };
+        let measure = |b: &Block| if target_wire.is_some() { b.wire_size() } else { bincode_size(b) };
         let want = target_wire.or(target_bincode).unwrap();
         // The coin pays every output and a 4,000,000 fee (above the minimum).
         let p = fund(&l, 40_000 * value + 4_000_000, &ka.spk());
@@ -2150,10 +2241,10 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         match (target_wire, target_bincode) {
             (Some(w), None) => {
                 assert_eq!(b.wire_size(), w);
-                assert!(b.size_bytes() < MAX_BLOCK_SIZE);
+                assert!(bincode_size(&b) < MAX_BLOCK_SIZE);
             }
             (None, Some(bc)) => {
-                assert_eq!(b.size_bytes(), bc);
+                assert_eq!(bincode_size(&b), bc);
                 assert!(b.wire_size() < MAX_BLOCK_SIZE);
             }
             _ => unreachable!(),
@@ -2171,8 +2262,8 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         let start = bytes.windows(unit.len()).position(|w| w == unit.as_slice()).expect("filler output in the encoding");
         assert!(bytes[start..start + n * unit.len()].chunks(unit.len()).all(|ch| ch == unit.as_slice()));
         let desc = format!(
-            "A coinbase and one signed transaction with {n} outputs of {value}: wire size {}, bincode size {}. The limit (1,000,000) is measured on bincode below the activation and on the wire encoding from it (VAL-12).",
-            b.wire_size(), b.size_bytes()
+            "A coinbase and one signed transaction with {n} outputs of {value}: wire size {}, bincode size {}. The limit (1,000,000) is measured on the wire encoding at every height (bincode is no consensus measure on this chain).",
+            b.wire_size(), bincode_size(&b)
         );
         c.push(id, r, &desc, b, vec![p], err);
         c.cases.last_mut().unwrap().rle = Some((start, unit.len(), n));
@@ -2207,7 +2298,6 @@ fn block_case_json(case: &BlockCase) -> J {
             ("parents_commitment", hx(&block_rules::parents_commitment(&b.header.parents))),
             ("subsidy", dec(core::tokenomics::block_subsidy_sat(b.height))),
             ("wire_size", J::N(b.wire_size() as u64)),
-            ("bincode_size", J::N(b.size_bytes() as u64)),
         ])
     } else {
         J::Null
