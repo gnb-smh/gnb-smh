@@ -300,14 +300,101 @@ impl std::error::Error for IntegrityError {}
 /// order of `select_parent` and `selected_tip`.
 type TipKey = (u128, u64, BlockHash);
 
+/// The GhostDAG data of every stored block (`DagStore::data`).
+///
+/// Audit B1-T3 / B2-T5 (review): every whole-store iteration (`iter`,
+/// `keys`, `values`, a `for` loop over `&map`) adds the number of stored
+/// blocks to [`BlockDataMap::scanned`], which `GhostDAG::query_visits`
+/// includes. So the served-request work test notices any remotely
+/// triggerable path that scans the DAG — e.g. the old `ordered_hashes_from`,
+/// which walked every entry and counted only what it returned — whatever
+/// that path counts itself. Point reads (`get`, `contains_key`, `[h]`) are
+/// not counted. Not consensus state.
+#[derive(Default)]
+pub struct BlockDataMap {
+    map: HashMap<BlockHash, GhostdagData>,
+    scanned: std::sync::atomic::AtomicU64,
+}
+
+impl BlockDataMap {
+    fn note_scan(&self) {
+        self.scanned.fetch_add(self.map.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Entries walked by whole-store iterations so far (monotonic).
+    pub fn scanned(&self) -> u64 {
+        self.scanned.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn get(&self, hash: &BlockHash) -> Option<&GhostdagData> {
+        self.map.get(hash)
+    }
+
+    pub fn contains_key(&self, hash: &BlockHash) -> bool {
+        self.map.contains_key(hash)
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Every entry (counted in [`Self::scanned`]).
+    pub fn iter(&self) -> std::collections::hash_map::Iter<'_, BlockHash, GhostdagData> {
+        self.note_scan();
+        self.map.iter()
+    }
+
+    /// Every stored hash (counted in [`Self::scanned`]).
+    pub fn keys(&self) -> std::collections::hash_map::Keys<'_, BlockHash, GhostdagData> {
+        self.note_scan();
+        self.map.keys()
+    }
+
+    /// Every entry's data (counted in [`Self::scanned`]).
+    pub fn values(&self) -> std::collections::hash_map::Values<'_, BlockHash, GhostdagData> {
+        self.note_scan();
+        self.map.values()
+    }
+
+    fn insert(&mut self, hash: BlockHash, data: GhostdagData) -> Option<GhostdagData> {
+        self.map.insert(hash, data)
+    }
+
+    fn remove(&mut self, hash: &BlockHash) -> Option<GhostdagData> {
+        self.map.remove(hash)
+    }
+}
+
+impl std::ops::Index<&BlockHash> for BlockDataMap {
+    type Output = GhostdagData;
+
+    fn index(&self, hash: &BlockHash) -> &GhostdagData {
+        &self.map[hash]
+    }
+}
+
+impl<'a> IntoIterator for &'a BlockDataMap {
+    type Item = (&'a BlockHash, &'a GhostdagData);
+    type IntoIter = std::collections::hash_map::Iter<'a, BlockHash, GhostdagData>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// In-memory DAG — production would use RocksDB for this
 ///
 /// `data`, `children` and `tips` are read by tests and tools; they are only
 /// ever MUTATED through [`DagStore::insert`], [`DagStore::remove_leaf`] and
 /// [`DagStore::set_tips`], which keep the two ordered indexes below in step.
 pub struct DagStore {
-    /// GhostDAG data per block
-    pub data: HashMap<BlockHash, GhostdagData>,
+    /// GhostDAG data per block (whole-store iterations are counted,
+    /// [`BlockDataMap`])
+    pub data: BlockDataMap,
     /// Children index: block → set of blocks that reference it as parent
     pub children: HashMap<BlockHash, HashSet<BlockHash>>,
     /// Current tips (leaf blocks with no children)
@@ -335,7 +422,7 @@ impl Default for DagStore {
 impl DagStore {
     pub fn new() -> Self {
         Self {
-            data: HashMap::new(),
+            data: BlockDataMap::default(),
             children: HashMap::new(),
             tips: HashSet::new(),
             genesis: None,
@@ -874,8 +961,9 @@ pub struct GhostDAG {
     /// Instrumentation, never consensus state: DAG entries touched by the
     /// read queries that peers can trigger remotely (`/gnb/sync/1` serving:
     /// `selected_chain`, `ordered_hashes_from`, `tips_for_peers`) and by
-    /// `selected_tip`. Regression tests (audit B1-T3 / B2-T5) assert that the
-    /// per-request count does not grow with the DAG size.
+    /// `selected_tip`; `query_visits()` adds every whole-store iteration
+    /// (`BlockDataMap::scanned`). Regression tests (audit B1-T3 / B2-T5)
+    /// assert that the per-request count does not grow with the DAG size.
     query_visits: std::sync::atomic::AtomicU64,
 }
 
@@ -917,7 +1005,7 @@ impl GhostDAG {
     /// (see the `query_visits` field). Monotonic; tests take differences.
     #[allow(dead_code)] // library API and tests; the node binary compiles this module too
     pub fn query_visits(&self) -> u64 {
-        self.query_visits.load(std::sync::atomic::Ordering::Relaxed)
+        self.query_visits.load(std::sync::atomic::Ordering::Relaxed) + self.store.data.scanned()
     }
 
     fn note_visits(&self, n: u64) {
