@@ -1959,6 +1959,28 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         c.push_full("structure/257-parents/post".into(), "257 parents: the header decoder refuses more than 256.", ACT, b257, vec![], Some("decode"), "full", Pow::Skip);
         c.cases.last_mut().unwrap().raw = Some(bytes);
 
+        // A repeated parent (audit B2-T10): valid below the activation, invalid
+        // from it. The commitment covers the list as written, so the repeat is
+        // the only fault. (A parent in the past of another parent needs DAG
+        // context: reference/ghostdag_vectors.json, parents/redundant-ancestor.)
+        for r in [Pre, Post] {
+            let hh = r.height();
+            let mut b = raw_block(hh, ACT, vec![parent("p1"), parent("p2"), parent("p1")],
+                vec![coinbase(subsidy(hh), &format!("block/parents/duplicate/{}", r.tag()), b"")]);
+            seal(&mut b, ACT);
+            c.push("parents/duplicate", r,
+                "The header lists parent p1 twice (p1, p2, p1); from the activation the coinbase commitment covers that list. Valid below the activation (the DAG treats the list as a set), invalid from it.",
+                b, vec![], if r == Pre { None } else { Some("duplicate-parent") });
+        }
+        for (hh, err) in [(MAINNET_ACT - 1, None), (MAINNET_ACT, Some("duplicate-parent"))] {
+            let mut b = raw_block(hh, MAINNET_ACT, vec![parent("p1"), parent("p1")],
+                vec![coinbase(subsidy(hh), &format!("block/parents/duplicate/mainnet-{hh}"), b"")]);
+            seal(&mut b, MAINNET_ACT);
+            c.push_full(format!("parents/duplicate-at-mainnet-height-{hh}"),
+                &format!("Parent p1 listed twice at height {hh} under the mainnet schedule (activation 110,000)."),
+                MAINNET_ACT, b, vec![], err, "full", Pow::Skip);
+        }
+
         // Minimal varints only (docs/CONSENSUS.md, "Wire encoding"), in both
         // regimes: a valid block's bytes with one one-byte varint written in
         // the 3-byte form `FD v 00`. The block id and the decoded contents

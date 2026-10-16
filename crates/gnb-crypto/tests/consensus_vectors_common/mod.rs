@@ -297,7 +297,7 @@ pub fn pow_limit(block: &Block, activation: u64) -> Result<(), &'static str> {
 /// `value-out-of-range` is context-free on the output side only
 /// ([`outputs_out_of_range`]); every other class is connect-time.
 pub const CONTEXT_FREE_CLASSES: &[&str] = &[
-    "decode", "too-many-parents", "block-size", "bad-merkle-root", "coinbase-format", "tx-64-bytes",
+    "decode", "too-many-parents", "duplicate-parent", "block-size", "bad-merkle-root", "coinbase-format", "tx-64-bytes",
     "cb-commitment-missing", "cb-commitment-tag", "cb-height", "cb-parents", "witness-commitment",
     "duplicate-tx", "dust", "pow-limit", "bad-bits", "bad-pow", "canonical-limit",
 ];
@@ -398,6 +398,8 @@ pub fn classify(reason: &str) -> &'static str {
         "block-size"
     } else if has("too many parents") {
         "too-many-parents"
+    } else if has("duplicate parent") {
+        "duplicate-parent"
     } else if has("coinbase commitment missing") {
         "cb-commitment-missing"
     } else if has("bad coinbase commitment tag") {

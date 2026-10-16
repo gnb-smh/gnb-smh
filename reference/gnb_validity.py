@@ -510,6 +510,8 @@ def check_structure(b: Block, activation: int) -> None:
     if not b.txs or not b.txs[0].is_coinbase() or any(t.is_coinbase() for t in b.txs[1:]):
         raise Invalid("coinbase-format")
     if hardened:
+        if len(set(b.header.parents)) != len(b.header.parents):  # audit B2-T10
+            raise Invalid("duplicate-parent")
         if any(mk.is_forbidden_64(t) for t in b.txs):
             raise Invalid("tx-64-bytes")
         reason = mk.check_coinbase_commitment(b.height, b.header.parents, b.txs)

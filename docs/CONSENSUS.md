@@ -164,8 +164,8 @@ POW-9):
 3. `bits == expected_bits(parents, height)`;
 4. timestamp bounds;
 5. at/after the hardening activation: the context-free block rules (wire
-   size, tagged Merkle root, no 64-byte transaction, coinbase commitment),
-   before the block is stored;
+   size, tagged Merkle root, each parent listed once, no 64-byte
+   transaction, coinbase commitment), before the block is stored;
 6. GnB-SMH proof (64 MiB, cached by block id);
 7. transactions (version rule, witnesses and signatures as specified in
    "Transaction signatures" below, double spends, coinbase maturity at the
@@ -173,7 +173,8 @@ POW-9):
    activation BIP30 and no same-block coinbase spend), coinbase value.
 
 Structural checks (size, merkle root, coinbase shape, duplicates, dust, and
-at/after the activation the 64-byte rule and the coinbase commitment) run
+at/after the activation distinct parents, the 64-byte rule and the coinbase
+commitment) run
 before `accept_block` on every ingress path.
 
 ## Wire encoding (all heights)
@@ -322,6 +323,7 @@ activation height:
 | No overwrite of an unspent coin (BIP30) | VAL-2 | `B.height` | same |
 | No spend of the same block's coinbase | VAL-3 | `B.height` | same |
 | `MAX_BLOCK_SIZE` measured on the wire encoding | VAL-12 | `B.height` | same |
+| Each parent listed once | B2-T10 (DAG-12) | `B.height` | same, "Parent list" |
 | Pow limit = genesis target | POW-3 | `B.height` (the height `expected_bits` is computed for) | same |
 
 A GhostDAG rule applies to block B iff `height(B) >= activation`, where
@@ -1192,6 +1194,62 @@ the encoding transaction fee rates and the minimum fee use, so witness bytes
 count as they do for fees. Before the activation it is compared with the
 bincode encoding `Block::size_bytes`, as before. Templates budget with the
 measure of their own height.
+
+### Parent list (B2-T10, DAG-12)
+
+`header.parents` is a list of 32-byte block ids, encoded as `varint(n) ‖ n ×
+id` ("Wire encoding"). The rules, at every height unless stated:
+
+- **Count**: `1 ≤ n ≤ MAX_PARENTS = 256` for every block but the genesis
+  (which has none). A header with more than 256 parents does not decode.
+- **Known**: every listed parent must be in the DAG; a block with an unknown
+  parent waits as an orphan until it is (never accepted before).
+- **Order**: free. The list as written is committed by the block id (it is
+  part of `pow_preimage`) and, from the activation, by the coinbase parents
+  commitment ("Coinbase commitment", which covers header order: a reordered
+  list is another commitment). Nothing else depends on the order: the
+  selected parent is the maximum of a total order (`(blue_work, blue_score,
+  id)`), and the mergeset and the coloring depend only on the set of
+  parents.
+- **Repeated parent**: below the activation a parent may be listed more
+  than once; the DAG treats the list as a set, so `[X, Y, X]` has exactly
+  the GhostDAG data of `[X, Y]` (only the stored parent list differs). At and
+  after the activation (`B.height`, the block-rule predicate of "Which
+  height") a header that lists any id twice is invalid: `duplicate parent`
+  (`block_rules::check_parents_distinct`, run by `check_hardened_body`, so by
+  `Block::validate_structure` on every ingress path, by `accept_block`
+  before the block is stored, and by the start-up recheck of blocks a
+  pre-upgrade binary stored, which disqualifies such a block with its id).
+  Why: a repeated parent is never useful (it changes no GhostDAG data), it
+  only adds a second header (and block id) for the same DAG position and
+  spends the parent budget, and Kaspa, whose post-activation rules GnB
+  follows, rejects it; a second implementation following Kaspa would
+  otherwise split from GnB on such a block. Every producer lists each parent
+  once (`GhostDAG::select_parents_for_template` takes distinct tips; the
+  template self-check runs the rule), on both sides of the boundary
+  (`node/tests/fix_b2t10_parent_list.rs`).
+- **Redundant parent** (a parent in the past of another listed parent): valid
+  at every height. It is never the selected parent (its blue work is below
+  that of the parent it is an ancestor of: blue work strictly grows along
+  every parent edge) and adds nothing to the mergeset (it is already in that
+  parent's past). It does count in the header height below. GnB does not
+  forbid it, unlike Kaspa: the check needs a reachability query per pair of
+  parents at header validation, a DAG-context rule rather than a
+  context-free one, and no producer emits one (template parents are tips,
+  which are never ancestors of each other). Forbidding it later would be a
+  new activation.
+- **Header height**: `B.height = 1 + max(p.height for p in parents)`, where
+  `p.height` is the DAG height `GhostdagData::height` of the listed parent
+  (the selected-parent chain length), over EVERY listed parent: a repeated
+  parent does not change it; a redundant parent can raise it (a parent with
+  a larger DAG height than the parent it is an ancestor of, which DAG-8
+  allows), and with it the height-gated rules, the expected bits and the
+  coinbase maturity of B.
+
+Vectors: `reference/block_vectors.json` `parents/duplicate/*` and
+`parents/duplicate-at-mainnet-height-*`; `reference/ghostdag_vectors.json`
+`parents/duplicate` and `parents/redundant-ancestor` (the GhostDAG data of
+both shapes and their header heights, `node/tests/ghostdag_vectors.rs`).
 
 ### Pow limit (POW-3)
 

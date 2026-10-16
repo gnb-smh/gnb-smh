@@ -81,6 +81,12 @@ fn node_ghostdag_matches_the_reference_vectors() {
             assert_eq!(merged, order, "{what}: blues and reds partition the ordered mergeset");
             assert_eq!(d.blue_score, num::<u64>(&e["blue_score"]), "{what}: blue score");
             assert_eq!(d.blue_work, num::<u128>(&e["blue_work"]), "{what}: blue work");
+            // Audit B2-T10: the header rule from the activation.
+            let dup = e["duplicate_parents"].as_bool().unwrap();
+            assert_eq!(
+                gnb::core::block_rules::check_parents_distinct(&d.parents).is_err(), dup,
+                "{what}: repeated-parent verdict"
+            );
             blocks += 1;
         }
         if let Some(alt) = case.get("alternative_reading") {

@@ -1456,6 +1456,13 @@ pub fn classify_stored_block(b: &core::Block, activation_height: u64) -> StoredB
         Ok(()) => return StoredBlockCheck::Valid,
         Err(e) => e,
     };
+    // A repeated parent (B2-T10) is in the header: every body of this id
+    // fails.
+    if block_rules::rules_active_at(b.height, activation_height)
+        && block_rules::check_parents_distinct(&b.header.parents).is_err()
+    {
+        return StoredBlockCheck::IdCommitted(reason);
+    }
     if !b.validate_merkle_at(activation_height) {
         // The header root is not the tagged root of these txids. If it is
         // their LEGACY root, the id commits to a legacy-format block, which
