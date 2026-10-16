@@ -342,9 +342,9 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
     }
 
     /// Drop a pull for good. Its NotFound charges are refunded only when it
-    /// ran out of peers or attempts and every peer asked answered NotFound
-    /// (the announcer's own NotFound included: nobody had the block, the
-    /// answers were true); a timeout or a broken
+    /// ran out of peers or attempts and every peer asked other than the
+    /// announcer answered NotFound (nobody had the block: the answers were
+    /// true); a timeout or a broken
     /// answer among them, an expiry or an eviction refunds nothing. A block
     /// announced by a still-connected peer that was asked for it (and
     /// answered Busy) and that nobody served costs that announcer one
