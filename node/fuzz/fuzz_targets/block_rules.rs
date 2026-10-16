@@ -22,7 +22,7 @@
 mod common;
 
 use common::*;
-use gnb_crypto::core::{activation, block_rules as br, Block, Transaction, TxInput, MAX_BLOCK_SIZE};
+use gnb_crypto::core::{activation, block_rules as br, powit_height, Block, Transaction, TxInput, MAX_BLOCK_SIZE};
 use libfuzzer_sys::fuzz_target;
 use sha3::{Digest, Sha3_256};
 
@@ -80,35 +80,53 @@ fn check_id_list(inp: &mut Input) {
     }
 }
 
-/// The reference header root of `b` in the regime `hardened`.
+/// The reference header root of `b` in the regime `hardened`: from
+/// `powit_height()` the v2 body root (transparent, shielded and PoWit
+/// sections, always); below it the transaction root, or the v1 body root
+/// when the block carries shielded transactions.
 fn ref_body_root(b: &Block, hardened: bool) -> [u8; 32] {
     let ids: Vec<[u8; 32]> = b.transactions.iter().map(ref_txid).collect();
     let tx_root = if hardened { ref_tagged_root(&ids) } else { ref_legacy_root(&ids) };
+    if b.height >= powit_height() {
+        let mut c = Sha3_256::new();
+        c.update(b"gnb:block:body:v2");
+        c.update(tx_root);
+        c.update(ref_shielded_root(b));
+        c.update(ref_powit_root(&b.powit));
+        return c.finalize().into();
+    }
     if b.shielded_transactions.is_empty() {
         return tx_root;
     }
+    let mut c = Sha3_256::new();
+    c.update(b"gnb:block:body:v1");
+    c.update(tx_root);
+    c.update(ref_shielded_root(b));
+    c.finalize().into()
+}
+
+/// The shielded section's root (also over an empty list).
+fn ref_shielded_root(b: &Block) -> [u8; 32] {
     let mut sh = Sha3_256::new();
     sh.update(b"gnb:block:shielded:v1");
     for s in &b.shielded_transactions {
         // The shielded encoding is the block wire encoding of one entry:
-        // re-encode a block holding only it and cut the fixed prefix.
+        // re-encode a block holding only it and cut the fixed prefix (and
+        // the PoWit section, were height 0 at or above `powit_height()`).
         let lone = Block {
             header: b.header.clone(),
             transactions: vec![],
             blue_score: 0,
             height: 0,
             shielded_transactions: vec![s.clone()],
+            powit: Default::default(),
         };
         let enc = ref_block_wire(&lone);
         let prefix = ref_header_wire(&lone.header, 0, 0).len() + 1 + 1; // tx count 0, shielded count 1
-        sh.update(sha3(&enc[prefix..]));
+        let suffix = if lone.height >= powit_height() { ref_powit_wire(&lone.powit).len() } else { 0 };
+        sh.update(sha3(&enc[prefix..enc.len() - suffix]));
     }
-    let sh_root: [u8; 32] = sh.finalize().into();
-    let mut c = Sha3_256::new();
-    c.update(b"gnb:block:body:v1");
-    c.update(tx_root);
-    c.update(sh_root);
-    c.finalize().into()
+    sh.finalize().into()
 }
 
 /// Reference verdict of `check_coinbase_commitment`: which field (if any)

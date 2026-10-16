@@ -11,8 +11,10 @@
 
 use gnb::network::{
     decode_wire_message, NetworkMessage, MAX_WIRE_ADDRS, MAX_WIRE_ADDR_LEN, MAX_WIRE_BYTES, MAX_WIRE_GETHEADERS_LIMIT,
-    MAX_WIRE_LOCATOR, MAX_WIRE_PEER_ID_LEN, MAX_WIRE_SYNC_ENTRIES, MAX_WIRE_TIPS, MAX_WIRE_USER_AGENT_LEN,
+    MAX_WIRE_LOCATOR, MAX_WIRE_PEER_ID_LEN, MAX_WIRE_POWIT_ITEM, MAX_WIRE_SYNC_ENTRIES, MAX_WIRE_TIPS,
+    MAX_WIRE_USER_AGENT_LEN,
 };
+use gnb::powit::{ITEM_ATTESTATION, ITEM_EVIDENCE, ITEM_SHARE};
 use libfuzzer_sys::fuzz_target;
 
 fn in_bounds(m: &NetworkMessage) -> bool {
@@ -20,6 +22,10 @@ fn in_bounds(m: &NetworkMessage) -> bool {
     match m {
         NetworkMessage::NewBlock { block_data, .. } => block_data.len() <= MAX_WIRE_BYTES,
         NetworkMessage::NewTransaction { tx_data, .. } => tx_data.len() <= MAX_WIRE_BYTES,
+        // PoWit gossip: one witness share, attestation or equivocation proof.
+        NetworkMessage::NewPowitItem { kind, data, .. } => {
+            matches!(*kind, ITEM_SHARE | ITEM_ATTESTATION | ITEM_EVIDENCE) && data.len() <= MAX_WIRE_POWIT_ITEM
+        }
         NetworkMessage::PeerTip { peer_id, .. } => peer_id.len() <= MAX_WIRE_PEER_ID_LEN,
         NetworkMessage::PeerExchange { peers } => addrs(peers),
         NetworkMessage::PeerCount { addresses, .. } => addrs(addresses),
