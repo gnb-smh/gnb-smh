@@ -199,6 +199,27 @@ async fn address_frontends_malformed_inputs_remain_invalid() {
     }
 }
 
+// Additional coverage found during diff review, after the shared parser fix.
+// The old validateaddress trimmed repeated prefixes and claimed these strings
+// valid, while the verbose validator and actual destination parser refused.
+#[tokio::test]
+async fn address_frontends_validators_reject_repeated_legacy_prefix() {
+    use crate::address::{Address, Network};
+    let (_tmp, state) = address_frontends_state();
+    let address = Address::from_hash([42; 20], Network::Mainnet).to_string();
+    assert_eq!(dispatch("validateaddress", Some(&json!([address])), &state).await["isvalid"], true);
+    let mut accepted = Vec::new();
+    for malformed in [format!("gnb1q{address}"), format!("gnb1qgnb1q{address}")] {
+        assert!(Address::parse(&malformed).is_err());
+        assert_eq!(dispatch("validateaddressverbose", Some(&json!([malformed])), &state).await["valid"], false);
+        let result = dispatch("validateaddress", Some(&json!([malformed])), &state).await;
+        if result["isvalid"] != false || result["checksum"] != false {
+            accepted.push(result);
+        }
+    }
+    assert!(accepted.is_empty(), "duplicate-prefix strings accepted by shadow parser: {accepted:?}");
+}
+
 // Chain ID is process-global and immutable. Run the testnet matrix in its
 // own test-harness process instead of changing other tests' consensus context.
 #[test]
