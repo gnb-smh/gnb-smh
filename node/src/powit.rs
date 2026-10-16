@@ -1068,9 +1068,29 @@ pub fn update_finalized(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage) {
 /// it resumes a stopped move. A no-op when `tip` has no PoWit state or its
 /// state finalized nothing beyond the activation checkpoint; never moves the
 /// pin back (`GhostDAG::set_finalized`).
+///
+/// Also a no-op while `tip`'s chain has less work than the node's minimum
+/// chain work (`ingress::minimum_chain_work()`: `core::MIN_CHAIN_WORK` or
+/// `--minimumchainwork`; PoWit audit finding 3, node-local part): a cheap
+/// fork carries its own witness set (W comes from the fork's own shares), so
+/// its finality proves nothing until its work does. Below the minimum the
+/// node keeps following the most work at any depth, as Bitcoin Core treats
+/// a chain below `nMinimumChainWork` (initial block download: nothing about
+/// it is trusted); the pin is taken once the chain reaches the minimum. The
+/// start-up restore goes through here too, so it applies the same gate.
 pub fn pin_finalized_of(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage, tip: &Hash) {
+    pin_finalized_with(dag, store, tip, crate::ingress::minimum_chain_work());
+}
+
+/// [`pin_finalized_of`] against an explicit minimum chain work.
+pub fn pin_finalized_with(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage, tip: &Hash, min_chain_work: u128) {
     let fin = {
         let d = dag.read();
+        let enough_work = d.get_block_data(tip)
+            .is_some_and(|bd| core::finality_active_with(bd.blue_work, min_chain_work));
+        if !enough_work {
+            return;
+        }
         load_state(store, tip)
             .filter(|st| st.finalized.height > st.activation)
             .and_then(|st| d.get_block_data(&st.finalized.hash).map(|bd| (st.finalized.hash, bd.height)))

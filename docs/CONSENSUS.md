@@ -552,7 +552,11 @@ witness set has finalized pins fork choice: a block whose selected-parent
 chain does not pass through it is never selected, nor offered as a template
 parent (`GhostDAG::set_finalized`; docs/DESIGN-pow-powit.md). It restricts
 which blocks are selectable, never a block's GhostDAG data (selected parent,
-coloring, blue work). The
+coloring, blue work). A node takes or advances the pin only while the chain
+whose state finalized it has at least the node's minimum chain work
+(node-local, "Minimum chain work and unrequested blocks" below): a cheap fork
+carries its own witness set, so its finality pins nothing while the node may
+still be syncing a low-work chain. The
 former 1,000-block `MAX_REORG_DEPTH` and the `finalized_height` gate compared
 a fork with the node's own history, so nodes that received the same blocks in
 different orders could end on different chains. As in Bitcoin Core (no depth
@@ -922,7 +926,9 @@ Bitcoin Core's defences, adapted (`ingress::unrequested_block_admission`):
   miner stays paused) and processes no block it did not ask for, unless that
   block's own bound reaches the minimum. Mainnet's value is
   `core::MIN_CHAIN_WORK`, the one release constant that also turns finality,
-  the reorg depth cap and pruning on (`core::finality_active`), 0 today: the
+  the reorg depth cap and pruning on (`core::finality_active`), and below
+  which no PoWit finality pin is taken or restored
+  (`powit::pin_finalized_of`, PoWit audit finding 3), 0 today: the
   newest chain data the repository carries is the reading of
   docs/MAINNET-READINESS.md §1 (one node, 14 Oct 2026), whose proposed value
   is a release decision not yet taken, and a value the real chain does not
