@@ -26,7 +26,7 @@ def main():
     parts = {
         "cli": ("node/src/bin/gnb-cli.rs", ["cargo", "test", "-p", "gnb", "--test", "descriptor_cli", "--locked", "--offline", "--", "--nocapture"], "running 7 tests", "6 failed"),
         "rpc": ("node/src/rpc/mod.rs", ["cargo", "test", "-p", "gnb", "--lib", "descriptor_rpc", "--locked", "--offline", "--", "--nocapture"], "running 5 tests", "4 failed"),
-        "js": ("site/wallet/core.js", [args.node, "--test", "site/tests/wallet-descriptor.test.mjs"], "# tests 5", "# fail 4"),
+        "js": ("site/wallet/core.js", [args.node, "--test", "site/tests/wallet-descriptor.test.mjs"], "# tests 7", "# fail 6"),
     }
     chosen = list(parts) if args.part == "all" else [args.part]
     old_files = {}

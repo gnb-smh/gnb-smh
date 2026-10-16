@@ -77,3 +77,38 @@ test("descriptor pool preserves raw/enveloped identity and refuses malformed imp
   assert.throws(() => core.descriptor({ action: "import", network: "mainnet", bundle: pool.bundle.replace('"network":"mainnet"', '"network":"mainnet","network":"mainnet"') }), /duplicate/i);
   assert.throws(() => core.descriptor({ action: "inspect", network: "mainnet", descriptor: pool.entries[0].descriptor.slice(0, -1) + "!" }), /checksum|descriptor/i);
 });
+
+test("descriptor rejects an own toJSON hook before it can wipe an active session", async () => {
+  const core = await coreInstance();
+  const wallet = core.create();
+  let error;
+  try {
+    try {
+      core.descriptor({ action: "pool", network: "mainnet", public_keys: [wallet.public_key],
+        toJSON() { return { op: "wipe" }; } });
+    } catch (e) { error = e; }
+    assert.equal(core.address(), wallet.address, "public descriptor call must retain the signing session");
+    assert.match(error?.message ?? "", /toJSON|field/i);
+  } finally { core.wipe(); }
+});
+
+test("descriptor ignores inherited toJSON dispatch redirection without changing legacy bindings", async () => {
+  const core = await coreInstance();
+  const wallet = core.create();
+  const previous = Object.getOwnPropertyDescriptor(Object.prototype, "toJSON");
+  try {
+    try {
+      Object.defineProperty(Object.prototype, "toJSON", {
+        configurable: true, value() { return { op: "wipe" }; },
+      });
+      // Nested values may fail validation under a poisoned prototype; they
+      // must never redirect the top-level public operation to session wipe.
+      try { core.descriptor({ action: "pool", network: "mainnet", public_keys: [wallet.public_key] }); }
+      catch (error) { assert.ok(error instanceof Error); }
+    } finally {
+      if (previous) Object.defineProperty(Object.prototype, "toJSON", previous);
+      else delete Object.prototype.toJSON;
+    }
+    assert.equal(core.address(), wallet.address);
+  } finally { core.wipe(); }
+});
