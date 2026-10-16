@@ -93,8 +93,8 @@ expect_passed() { # <min passed> <command...>
 # runs until the CI job times out (the miri jobs of the merge commit 299a718
 # were still in their host step after 115 minutes). Each Miri
 # command therefore gets a wall-clock bound of SANITIZER_MIRI_TIMEOUT seconds
-# (default 1800, about six times the slowest command, the gnb-crypto
-# selection) and fails with the remedy. timeout(1) signals its whole process
+# (default 1800, about four times the slowest command, gnb-smh with its
+# v1/v2/v3 vectors, about 7 minutes) and fails with the remedy. timeout(1) signals its whole process
 # group, so the interpreted test process stops too.
 miri_timeout=${SANITIZER_MIRI_TIMEOUT:-1800}
 with_miri_timeout() { # <command...>
