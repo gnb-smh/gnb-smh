@@ -571,7 +571,8 @@ fn do_send(params: &[&str], target: &RpcTarget, stated_network: Option<gnb::addr
     drop(password);
 
     checked_destination(to_address, &keypair.address).unwrap_or_else(|message| die(message));
-    let to = gnb::address::Address::parse(to_address).unwrap_or_else(|_| die("invalid destination address"));
+    let to = keypair.network().and_then(|n| gnb::address::Address::parse_for_network(to_address, n).map_err(|e| e.to_string()))
+        .unwrap_or_else(|_| die("invalid destination address"));
 
     // Fetch UTXOs (bounded), verify the selected ones against their
     // transactions (WAL-1), build and sign under the fee guard.
@@ -944,10 +945,15 @@ fn checked_payment_sats(value: &str) -> Result<u64, &'static str> {
     Ok(satoshis)
 }
 
+/// CRY-7: the destination must be an address of the wallet's own network
+/// (the wallet address is authenticated by its keystore), decoded with
+/// `Address::parse_for_network`, never network-agnostically.
 fn checked_destination(destination: &str, source: &str) -> Result<String, &'static str> {
-    let destination = gnb::address::Address::parse(destination).map_err(|_| "invalid destination address")?;
     let source = gnb::address::Address::parse(source).map_err(|_| "invalid wallet address")?;
-    if destination.network() != source.network() { return Err("destination address network differs from wallet"); }
+    let destination = gnb::address::Address::parse_for_network(destination, source.network()).map_err(|e| match e {
+        gnb::address::AddressError::WrongNetwork { .. } => "destination address network differs from wallet",
+        _ => "invalid destination address",
+    })?;
     Ok(hex::encode(destination.hash()))
 }
 

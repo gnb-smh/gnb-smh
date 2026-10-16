@@ -110,6 +110,17 @@ impl PolicyAddress {
         }
         Ok(Self { hash, network })
     }
+
+    /// [`Self::parse`] requiring the address to belong to `network` (CRY-7).
+    /// The checksum already commits to the prefix, so only a well-formed
+    /// address of the other network reaches the comparison.
+    pub fn parse_for_network(s: &str, network: Network) -> Result<Self, AddressError> {
+        let address = Self::parse(s)?;
+        if address.network != network {
+            return Err(AddressError::WrongNetwork { expected: network, got: address.network });
+        }
+        Ok(address)
+    }
 }
 
 impl std::fmt::Display for PolicyAddress {
@@ -132,6 +143,21 @@ pub fn destination_script(s: &str) -> Result<(Network, Vec<u8>), AddressError> {
     Ok((a.network(), a.hash().to_vec()))
 }
 
+/// [`destination_script`] of an address that must belong to `network`
+/// (CRY-7): the output script, or [`AddressError::WrongNetwork`] for a
+/// well-formed address of the other network. Every consumer that knows its
+/// chain (the node's RPC, wallets, the policy and vault tools) decodes
+/// through this or [`Address::parse_for_network`], as Bitcoin Core decodes
+/// every address with the chain parameters of the running network
+/// (`DecodeDestination`), never network-agnostically.
+pub fn destination_script_for_network(s: &str, network: Network) -> Result<Vec<u8>, AddressError> {
+    let (got, script) = destination_script(s)?;
+    if got != network {
+        return Err(AddressError::WrongNetwork { expected: network, got });
+    }
+    Ok(script)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -145,6 +171,22 @@ impl Network {
         match self {
             Network::Mainnet => MAINNET_PREFIX,
             Network::Testnet => TESTNET_PREFIX,
+        }
+    }
+
+    /// The network of a chain id (inverse of `ChainId::for_network`).
+    pub const fn for_chain(id: crate::core::ChainId) -> Network {
+        match id {
+            crate::core::ChainId::Mainnet => Network::Mainnet,
+            crate::core::ChainId::Testnet => Network::Testnet,
+        }
+    }
+
+    /// Lower-case name: "mainnet" or "testnet".
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Network::Mainnet => "mainnet",
+            Network::Testnet => "testnet",
         }
     }
 }
@@ -180,6 +222,12 @@ impl Address {
     /// addresses (bloch1q... / bloch1t...) name the same owner — the checksum
     /// covers only the hash — and are accepted as their GnB equivalent.
     /// Validates: prefix, hex format, length, and checksum.
+    ///
+    /// Syntax only, for EITHER network: the checksum does not cover the
+    /// prefix, so the other network's prefix on the same hash parses too.
+    /// Code that knows its chain (anything that pays, answers for, or
+    /// indexes an address of one chain) must use [`Self::parse_for_network`]
+    /// or [`destination_script_for_network`] instead (CRY-7).
     pub fn parse(s: &str) -> Result<Self, AddressError> {
         let normalized = normalize_legacy_address(s);
         let s = normalized.as_str();
@@ -394,6 +442,29 @@ mod tests {
         let mut bad = s.clone().into_bytes();
         bad[10] = if bad[10] == b'0' { b'1' } else { b'0' };
         assert!(PolicyAddress::parse(std::str::from_utf8(&bad).unwrap()).is_err());
+    }
+
+    /// CRY-7: the network-bound decoders accept exactly their own network,
+    /// for single-key and policy addresses alike.
+    #[test]
+    fn destination_script_for_network_refuses_the_other_network() {
+        use crate::core::policy::SpendPolicy;
+        let single = |n| Address::from_hash([3u8; 20], n).to_string();
+        assert_eq!(destination_script_for_network(&single(Network::Mainnet), Network::Mainnet), Ok(vec![3u8; 20]));
+        assert_eq!(destination_script_for_network(&single(Network::Testnet), Network::Mainnet),
+                   Err(AddressError::WrongNetwork { expected: Network::Mainnet, got: Network::Testnet }));
+        let keys: Vec<Vec<u8>> = (0..2).map(|_| crate::crypto::generate_keypair().0).collect();
+        let p = SpendPolicy::new(1, keys, 0, 0).unwrap();
+        let policy = |n| PolicyAddress::from_policy(&p, n).to_string();
+        assert_eq!(destination_script_for_network(&policy(Network::Testnet), Network::Testnet), Ok(p.script_pubkey()));
+        assert_eq!(destination_script_for_network(&policy(Network::Testnet), Network::Mainnet),
+                   Err(AddressError::WrongNetwork { expected: Network::Mainnet, got: Network::Testnet }));
+        assert_eq!(PolicyAddress::parse_for_network(&policy(Network::Mainnet), Network::Testnet),
+                   Err(AddressError::WrongNetwork { expected: Network::Testnet, got: Network::Mainnet }));
+        assert!(destination_script_for_network("gnb1zzz", Network::Mainnet).is_err());
+        for n in [Network::Mainnet, Network::Testnet] {
+            assert_eq!(Network::for_chain(crate::core::ChainId::for_network(n)), n);
+        }
     }
 
     #[test]

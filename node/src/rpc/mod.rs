@@ -1489,9 +1489,9 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
             // B1-T11: one read of the holder aggregate (was a walk of every
             // UTXO of the address, ~426,000 for the carryover address).
-            let addr_bytes = parse_address(addr).and_then(|b| <[u8; 20]>::try_from(b).ok());
+            let addr_bytes = parse_address(addr);
             match addr_bytes {
-                Some(ab) => match state.store.address_balance(&ab, &state.cancel) {
+                Ok(ab) => match state.store.address_balance(&ab, &state.cancel) {
                     // R3 (docs/specs/BLOCH-RPC-V4.md): satoshi amounts are
                     // decimal STRINGS on the wire — V4's supply exceeds both
                     // i64::MAX and JS Number.MAX_SAFE_INTEGER. Display-only
@@ -1504,7 +1504,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     }),
                     Err(e) => storage_err_response(&e),
                 },
-                None => json!({ "error": "invalid address" }),
+                Err(e) => json!({ "error": e }),
             }
         }
 
@@ -1546,9 +1546,9 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // script) address. The address index is keyed by the FULL script,
             // so the lookup must use all of it (a 20-byte prefix never matches
             // a policy entry); results are still filtered on the full script.
-            let script = crate::address::destination_script(addr).ok().map(|(_, spk)| spk);
+            let script = node_destination_script(addr);
             match script {
-                Some(spk) => match state.store.get_utxos_for_address_limited(&spk, limit) {
+                Ok(spk) => match state.store.get_utxos_for_address_limited(&spk, limit) {
                     Ok((utxos, truncated)) => {
                         let utxos: Vec<_> = utxos.into_iter()
                             .filter(|(_, _, o)| o.script_pubkey == spk)
@@ -1602,7 +1602,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     },
                     Err(e) => storage_err_response(&e),
                 },
-                None => json!({ "error": "invalid address" }),
+                Err(e) => json!({ "error": e }),
             }
         }
 
@@ -1673,33 +1673,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         // ── Phase 2: validateaddress ─────────────────────────────────
         "validateaddress" => {
             let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
-            let is_mainnet = addr.starts_with(MAINNET_PREFIX);
-            let is_testnet = addr.starts_with(TESTNET_PREFIX);
-            let valid_prefix = is_mainnet || is_testnet;
-            let stripped = addr.trim_start_matches(MAINNET_PREFIX).trim_start_matches(TESTNET_PREFIX);
-            // Expect 40 hex (20-byte hash) + 8 hex (4-byte checksum) = 48 hex chars
-            let valid_len = stripped.len() == 48;
-            let valid_hex = hex::decode(stripped).is_ok();
-
-            // Verify checksum
-            let valid_checksum = if valid_prefix && valid_len && valid_hex {
-                let bytes = hex::decode(stripped).unwrap_or_default();
-                let payload = &bytes[..20];
-                use sha3::{Sha3_256, Digest};
-                let inner = Sha3_256::digest(payload);
-                let outer = Sha3_256::digest(inner);
-                &outer[..4] == &bytes[20..24]
-            } else {
-                false
-            };
-
-            let is_valid = valid_prefix && valid_len && valid_hex && valid_checksum;
-            json!({
-                "address":    addr,
-                "isvalid":    is_valid,
-                "network":    if is_mainnet { "mainnet" } else if is_testnet { "testnet" } else { "unknown" },
-                "checksum":   valid_checksum,
-            })
+            validate_address(addr)
         }
 
         // ── Phase 2: estimatefee ─────────────────────────────────────
@@ -2048,13 +2022,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
             let addr_bytes = parse_address(addr);
             match addr_bytes {
-                Some(ab) => {
-                    let mut addr_hash = [0u8; 20];
-                    if ab.len() >= 20 {
-                        addr_hash.copy_from_slice(&ab[..20]);
-                    } else {
-                        return json!({ "error": "invalid address (too short)" });
-                    }
+                Ok(addr_hash) => {
                     match state.store.query_address_history(&addr_hash, start_height, end_height, limit, offset) {
                         Ok(entries) => {
                             let tip = selected_tip_height(&state);
@@ -2110,7 +2078,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         Err(e) => storage_err_response(&e),
                     }
                 }
-                None => json!({ "error": "invalid address" }),
+                Err(e) => json!({ "error": e }),
             }
         }
 
@@ -2294,12 +2262,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let addr_bytes = match parse_address(addr_str) {
-                Some(b) if b.len() == 20 => b,
-                _ => return json!({ "error": "invalid address" }),
+            let addr_hash = match parse_address(addr_str) {
+                Ok(h) => h,
+                Err(e) => return json!({ "error": e }),
             };
-            let mut addr_hash = [0u8; 20];
-            addr_hash.copy_from_slice(&addr_bytes);
 
             match crate::analytics::address_info(&state.store, &state.mempool, addr_str, &addr_hash) {
                 Ok(info) => json!({
@@ -2384,18 +2350,22 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            match crate::address::Address::parse(addr_str) {
+            // CRY-7: valid only for this node's network.
+            match crate::address::Address::parse_for_network(addr_str, node_network()) {
                 Ok(a) => json!({
                     "valid":    true,
                     "address":  addr_str,
-                    "network":  if a.is_mainnet() { "mainnet" } else { "testnet" },
+                    "network":  a.network().name(),
                     "hash_hex": hex::encode(a.hash()),
-                    "prefix":   if a.is_mainnet() { crate::core::MAINNET_PREFIX } else { crate::core::TESTNET_PREFIX },
+                    "prefix":   a.network().prefix(),
                 }),
                 Err(e) => json!({
                     "valid":   false,
                     "address": addr_str,
-                    "reason":  format!("{}", e),
+                    "reason":  match e {
+                        crate::address::AddressError::WrongNetwork { .. } => address_error_text(&e),
+                        e => format!("{}", e),
+                    },
                 }),
             }
         }
@@ -2479,13 +2449,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
             let addr_bytes = parse_address(addr);
             match addr_bytes {
-                Some(ab) => {
-                    let mut addr_hash = [0u8; 20];
-                    if ab.len() >= 20 {
-                        addr_hash.copy_from_slice(&ab[..20]);
-                    } else {
-                        return json!({ "error": "invalid address" });
-                    }
+                Ok(addr_hash) => {
                     // NET-12: streamed and cancellable (heavy method).
                     match state.store.balance_at_height_cancellable(&addr_hash, height, &state.cancel) {
                         Ok((balance, _)) => {
@@ -2505,7 +2469,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         Err(e) => storage_err_response(&e),
                     }
                 }
-                None => json!({ "error": "invalid address" }),
+                Err(e) => json!({ "error": e }),
             }
         }
 
@@ -2526,16 +2490,93 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Parse a gnb1q/gnb1t address to 20-byte pubkey hash
-/// Sprint K: Checksum-validated address parsing.
-/// Delegates to `Address::parse()` from Sprint A — enforces full 54-char
-/// checksummed format (gnb1q + 20-byte hash + 4-byte checksum, hex-encoded).
-/// Rejects the legacy 46-char checksum-less form that the previous implementation
-/// silently accepted.
-fn parse_address(addr: &str) -> Option<Vec<u8>> {
-    crate::address::Address::parse(addr)
-        .ok()
-        .map(|a| a.hash().to_vec())
+/// `validateaddress`: whether `addr` is an address this node accepts.
+///
+/// `isvalid` is true only for a well-formed single-key (`gnb1q`/`gnb1t`) or
+/// policy (`gnb1m`/`gnb1n`) address of THIS node's network (CRY-7; Bitcoin
+/// Core's `validateaddress` likewise decodes with the running chain's
+/// parameters and answers `isvalid: false` with an `error` for another
+/// chain's address). `network` names the network the prefix denotes
+/// ("unknown" without a known prefix), `checksum` whether the checksum is
+/// right whatever the network, `type` is "pubkeyhash" or "policy", and an
+/// invalid address carries `error`.
+fn validate_address(addr: &str) -> Value {
+    use crate::address::{Address, AddressError, PolicyAddress, POLICY_MAINNET_PREFIX, POLICY_TESTNET_PREFIX};
+    let policy = addr.starts_with(POLICY_MAINNET_PREFIX) || addr.starts_with(POLICY_TESTNET_PREFIX);
+    let parsed = if policy {
+        PolicyAddress::parse(addr).map(|a| a.network())
+    } else {
+        Address::parse(addr).map(|a| a.network())
+    };
+    // Bloch `bloch1q…` / `bloch1t…` forms name the same key (Address::parse).
+    let canonical = crate::address::normalize_legacy_address(addr);
+    let prefix_network = if canonical.starts_with(MAINNET_PREFIX) || canonical.starts_with(POLICY_MAINNET_PREFIX) {
+        "mainnet"
+    } else if canonical.starts_with(TESTNET_PREFIX) || canonical.starts_with(POLICY_TESTNET_PREFIX) {
+        "testnet"
+    } else {
+        "unknown"
+    };
+    let checksum = parsed.is_ok();
+    let verdict = parsed.and_then(|got| {
+        let expected = node_network();
+        if got == expected { Ok(()) } else { Err(AddressError::WrongNetwork { expected, got }) }
+    });
+    let mut out = json!({
+        "address":  addr,
+        "isvalid":  verdict.is_ok(),
+        "network":  prefix_network,
+        "checksum": checksum,
+        "type":     if policy { "policy" } else { "pubkeyhash" },
+    });
+    if let Err(e) = verdict {
+        out["error"] = json!(match e {
+            AddressError::WrongNetwork { .. } => address_error_text(&e),
+            e => e.to_string(),
+        });
+    }
+    out
+}
+
+/// The network this node serves (from its chain id, set once at startup).
+pub(crate) fn node_network() -> crate::address::Network {
+    crate::address::Network::for_chain(crate::core::node_chain_id())
+}
+
+/// The RPC error text of an address that could not be decoded for this
+/// node: names both networks when it is a well-formed address of the other
+/// one, "invalid address" otherwise.
+fn address_error_text(e: &crate::address::AddressError) -> String {
+    match e {
+        crate::address::AddressError::WrongNetwork { expected, got } => format!(
+            "invalid address: it is a {} address and this node is on {} (network mismatch)",
+            got.name(), expected.name()),
+        _ => "invalid address".into(),
+    }
+}
+
+/// Parse a gnb1q/gnb1t address of THIS node's network to its 20-byte key
+/// hash. Sprint K: checksum-validated (`Address::parse`: full 54-char form;
+/// the legacy 46-char checksum-less form is refused).
+///
+/// CRY-7: the checksum covers only the hash, so the other network's prefix
+/// on the same hash is well-formed; every address-taking method decodes
+/// through this function (or [`node_destination_script`]), which refuses
+/// it, as Bitcoin Core decodes every address with the running chain's
+/// parameters (`DecodeDestination`). Before, `getbalance`, `getutxos`,
+/// `validateaddress` and the history methods answered for a `gnb1t…`
+/// address on a mainnet node as if it were `gnb1q…`.
+fn parse_address(addr: &str) -> Result<[u8; 20], String> {
+    crate::address::Address::parse_for_network(addr, node_network())
+        .map(|a| *a.hash())
+        .map_err(|e| address_error_text(&e))
+}
+
+/// Output script of a single-key or policy address of this node's network
+/// (CRY-7, see [`parse_address`]).
+fn node_destination_script(addr: &str) -> Result<Vec<u8>, String> {
+    crate::address::destination_script_for_network(addr, node_network())
+        .map_err(|e| address_error_text(&e))
 }
 
 /// Format a transaction for JSON output
@@ -4204,6 +4245,74 @@ mod audit_2026_10_rpc_tests {
             assert_eq!(r["tip_height"], 5 + extra as u64);
         }
         assert!(work[1] <= work[0] + 4, "getdaginfo work grew with the chain: {work:?}");
+    }
+
+    /// CRY-7 remainder: a single-key address's checksum covers only the
+    /// 20-byte hash, so `gnb1q…` and `gnb1t…` forms of one hash both passed
+    /// `Address::parse`, and every address-taking RPC answered for the
+    /// other network's address as if it were this node's: `validateaddress`
+    /// said `isvalid: true`, `getbalance` / `getutxos` returned this chain's
+    /// coins for it. Like Bitcoin Core's `DecodeDestination` (which decodes
+    /// with the node's chain parameters only), every method now accepts only
+    /// addresses of the node's own network.
+    #[tokio::test]
+    async fn cry7_address_rpcs_refuse_the_other_networks_prefix() {
+        use crate::address::{Address, Network, PolicyAddress};
+        let (_tmp, state) = state_with_chain(3);
+        let (own, other) = match crate::core::node_chain_id() {
+            crate::core::ChainId::Testnet => (Network::Testnet, Network::Mainnet),
+            crate::core::ChainId::Mainnet => (Network::Mainnet, Network::Testnet),
+        };
+        state.store.put_utxo(&[1; 32], 0, &TxOutput { value: 5_000, script_pubkey: vec![4; 20] }).unwrap();
+        let mine = Address::from_hash([4; 20], own).to_string();
+        let swapped = Address::from_hash([4; 20], other).to_string();
+        assert_eq!(&mine[5..], &swapped[5..], "same hash and checksum, other prefix");
+
+        // The node's own network: answered.
+        let r = dispatch("getbalance", Some(&json!([mine])), &state).await;
+        assert_eq!(r["satoshis"], "5000", "{r}");
+        let r = dispatch("getutxos", Some(&json!([mine])), &state).await;
+        assert_eq!(r["returned"], 1, "{r}");
+        let r = dispatch("validateaddress", Some(&json!([mine])), &state).await;
+        assert_eq!((r["isvalid"].as_bool(), r["checksum"].as_bool()), (Some(true), Some(true)), "{r}");
+        let r = dispatch("validateaddressverbose", Some(&json!([mine])), &state).await;
+        assert_eq!(r["valid"], true, "{r}");
+
+        // The other network's prefix on the same hash: refused everywhere.
+        for (method, params) in [
+            ("getbalance", json!([swapped])),
+            ("getutxos", json!([swapped])),
+            ("getaddressinfo", json!([swapped])),
+            ("getaddresshistory", json!([swapped])),
+            ("listtransactions", json!([swapped])),
+            ("getaddressbalance_at_height", json!([swapped, 1])),
+        ] {
+            let r = dispatch(method, Some(&params), &state).await;
+            let err = r["error"].as_str().unwrap_or_else(|| panic!("{method} answered {r}"));
+            assert!(err.contains("network"), "{method}: {err}");
+        }
+        let r = dispatch("validateaddress", Some(&json!([swapped])), &state).await;
+        assert_eq!(r["isvalid"], false, "{r}");
+        assert_eq!(r["checksum"], true, "the checksum itself is fine; the network is not");
+        assert!(r["error"].as_str().is_some_and(|e| e.contains("network")), "{r}");
+        let r = dispatch("validateaddressverbose", Some(&json!([swapped])), &state).await;
+        assert_eq!(r["valid"], false, "{r}");
+        assert!(r["reason"].as_str().is_some_and(|e| e.contains("network")), "{r}");
+
+        // Policy addresses commit to their network in the checksum; the
+        // other network's well-formed policy address is refused as well.
+        let keys: Vec<Vec<u8>> = (0..2).map(|_| crate::crypto::generate_keypair().0).collect();
+        let policy = crate::core::policy::SpendPolicy::new(1, keys, 0, 0).unwrap();
+        let own_policy = PolicyAddress::from_policy(&policy, own).to_string();
+        let other_policy = PolicyAddress::from_policy(&policy, other).to_string();
+        let r = dispatch("getutxos", Some(&json!([own_policy])), &state).await;
+        assert_eq!(r["returned"], 0, "{r}");
+        let r = dispatch("getutxos", Some(&json!([other_policy])), &state).await;
+        assert!(r["error"].as_str().is_some_and(|e| e.contains("network")), "{r}");
+        let r = dispatch("validateaddress", Some(&json!([own_policy])), &state).await;
+        assert_eq!((r["isvalid"].as_bool(), r["type"].as_str()), (Some(true), Some("policy")), "{r}");
+        let r = dispatch("validateaddress", Some(&json!([other_policy])), &state).await;
+        assert_eq!(r["isvalid"], false, "{r}");
     }
 }
 
