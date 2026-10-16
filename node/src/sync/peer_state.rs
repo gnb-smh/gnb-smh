@@ -199,6 +199,22 @@ impl PeerStateTable {
             .unwrap_or(0)
     }
 
+    /// B1-T6: up to `max` connected peers whose fresh claim (within
+    /// [`CLAIM_TTL`]) is above `score`, highest claim first: the peers a
+    /// GetHeaders from `score` is best sent to. Claims are clamped
+    /// announcements, so this only orders peers; it is never trusted.
+    pub fn claiming_above(&self, score: u64, now: Instant, max: usize) -> Vec<PeerId> {
+        let g = self.inner.read();
+        let mut v: Vec<(u64, PeerId)> = g
+            .iter()
+            .filter(|(_, s)| s.connected && s.announced_blue_score > score)
+            .filter(|(_, s)| s.claimed_at.is_some_and(|t| now.saturating_duration_since(t) < CLAIM_TTL))
+            .map(|(p, s)| (s.announced_blue_score, *p))
+            .collect();
+        v.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.to_bytes().cmp(&b.1.to_bytes())));
+        v.into_iter().take(max).map(|(_, p)| p).collect()
+    }
+
     pub fn connected_count(&self) -> usize {
         self.inner.read().values().filter(|s| s.connected).count()
     }
