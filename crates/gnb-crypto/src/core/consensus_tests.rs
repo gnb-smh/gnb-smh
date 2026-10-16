@@ -287,6 +287,76 @@ fn expected_bits_are_always_canonical() {
     }
 }
 
+// ── The real-ASERT test seam (re-audit POW-5) ────────────────────────────────
+//
+// The node's real-ASERT tests (node/tests/fix_pow_real_asert*.rs) hold
+// `scoped_real_expected_bits()` to lift the `test-pow-limit` pin on their
+// thread. If the seam leaked or ignored its scope, those tests would check
+// the pinned pow limit (and every other node test the real rule) without
+// failing for that reason, so the scope itself is pinned here. These tests
+// run with and without the feature; the mutation gate runs them without it.
+
+/// The pin is lifted on the calling thread exactly while a guard is held.
+#[test]
+fn real_expected_bits_scope_lifts_the_pin_until_the_guard_drops() {
+    assert!(pow_limit_pinned_on_this_thread(), "pinned outside any scope");
+    let guard = scoped_real_expected_bits();
+    assert!(!pow_limit_pinned_on_this_thread(), "lifted inside the scope");
+    drop(guard);
+    assert!(pow_limit_pinned_on_this_thread(), "pinned again once the guard drops");
+}
+
+/// Each guard restores the mode it found: dropping an inner guard keeps the
+/// outer scope's real rule.
+#[test]
+fn real_expected_bits_scopes_nest() {
+    let outer = scoped_real_expected_bits();
+    let inner = scoped_real_expected_bits();
+    assert!(!pow_limit_pinned_on_this_thread());
+    drop(inner);
+    assert!(!pow_limit_pinned_on_this_thread(), "the outer guard still holds");
+    drop(outer);
+    assert!(pow_limit_pinned_on_this_thread());
+}
+
+/// A panic inside the scope (a failed assertion) drops the guard while
+/// unwinding, and the scope belongs to its thread: another thread stays
+/// pinned.
+#[test]
+fn real_expected_bits_scope_unwinds_and_is_per_thread() {
+    let unwound = std::panic::catch_unwind(|| {
+        let _real = scoped_real_expected_bits();
+        assert!(!pow_limit_pinned_on_this_thread());
+        // No panic hook: the test output stays quiet.
+        std::panic::resume_unwind(Box::new("inside the scope"));
+    });
+    assert!(unwound.is_err());
+    assert!(pow_limit_pinned_on_this_thread(), "the guard dropped while unwinding");
+    let _real = scoped_real_expected_bits();
+    let other = std::thread::spawn(pow_limit_pinned_on_this_thread).join().unwrap();
+    assert!(other, "another thread keeps the pin");
+    assert!(!pow_limit_pinned_on_this_thread());
+}
+
+/// `expected_bits` itself: with `test-pow-limit` the pinned pow limit
+/// outside the scope and the real ASERT bits inside it; without the feature
+/// the real rule either way.
+#[test]
+fn expected_bits_follows_the_real_expected_bits_scope() {
+    let (ts, height) = (GENESIS_TIMESTAMP, 1);
+    let real = expected_bits_at(ts, height, activation::hardening_activation_height()).unwrap();
+    let pinned = target_to_bits(&bits_to_target(POW_LIMIT_BITS));
+    assert_eq!(real, GENESIS_BITS);
+    assert_ne!(real, pinned, "the two modes must be told apart");
+    let outside = if TEST_POW_LIMIT { pinned } else { real };
+    assert_eq!(expected_bits(ts, height).unwrap(), outside);
+    {
+        let _real = scoped_real_expected_bits();
+        assert_eq!(expected_bits(ts, height).unwrap(), real);
+    }
+    assert_eq!(expected_bits(ts, height).unwrap(), outside);
+}
+
 // ── Coinbase, dust, duplicates, timestamps, fees, maturity ───────────────────
 
 #[test]
