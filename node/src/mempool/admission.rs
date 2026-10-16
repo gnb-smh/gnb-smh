@@ -117,6 +117,10 @@ pub struct AdmissionPolicy {
     /// when the block was mined); at/after it the input scripts are verified
     /// anyway, since the block may have been mined below it under v2. The
     /// version rule and policy at `next_block_height` apply either way.
+    /// `false` also selects the re-admission insert (audit B1-T20, Core's
+    /// `bypass_limits`): no rolling-minimum check and no per-transaction
+    /// trim (the caller trims once), but a transaction the trim would evict
+    /// at once is refused (`Mempool::would_only_trim`).
     pub check_signatures: bool,
     /// Consult and update the recent-rejects filter.
     pub use_reject_filter: bool,
@@ -750,9 +754,18 @@ pub fn check_transaction_gated(
             "fee {} below minimum relay rate ({} sat/byte for {} bytes)", fee, MIN_RELAY_FEE_RATE, size)));
     }
     if let Some(mp) = mempool {
-        if !mp.meets_rolling_min(fee, size) {
+        if policy.check_signatures {
+            if !mp.meets_rolling_min(fee, size) {
+                return Err(AdmissionError::LowFee(format!(
+                    "fee {} below the mempool's rolling minimum ({} sat/byte)", fee, mp.rolling_min_fee_rate())));
+            }
+        } else if mp.would_only_trim(fee, size) {
+            // Re-admission after a reorg (B1-T20, Bitcoin Core's
+            // `MaybeUpdateMempoolForReorg`): the rolling minimum (relay
+            // policy) does not apply to a transaction that was mined, but
+            // one the pool's final trim would evict at once is not inserted.
             return Err(AdmissionError::LowFee(format!(
-                "fee {} below the mempool's rolling minimum ({} sat/byte)", fee, mp.rolling_min_fee_rate())));
+                "the pool is full and fee {} for {} bytes does not beat its cheapest package", fee, size)));
         }
         // MEM-6: replacement rules (when it conflicts) and chain limits,
         // still before any signature work.
@@ -841,7 +854,13 @@ pub fn admit_gated(
         core::check_coinbase_maturity(&tx, current, |t| store.get_coinbase_height(t).ok().flatten())
             .map_err(AdmissionError::Immature)?;
     }
-    mempool.add_with_replacement(tx, fee).map_err(from_mempool_error)
+    if policy.check_signatures {
+        mempool.add_with_replacement(tx, fee).map_err(from_mempool_error)
+    } else {
+        // Re-admission (B1-T20): no per-transaction trim; the caller
+        // (`reorg::reinject_disconnected`) trims once after the batch.
+        mempool.add_readmitted(tx, fee).map_err(from_mempool_error)
+    }
 }
 
 /// Parent txids of `tx` that are neither confirmed (an unspent output in

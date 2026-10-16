@@ -216,6 +216,20 @@ coinbase commitment covers exactly the listed transactions in that order.
   normally a verified-signature cache hit), pooled transactions that spent
   their outputs become their children again, and the whole pool is
   re-validated against the new UTXO set plus the pool.
+  At most 20 MB of them are considered (Bitcoin Core's
+  `MAX_DISCONNECTED_TX_POOL_BYTES`, `reorg::MAX_DISCONNECTED_TX_POOL_BYTES`,
+  measured with `Transaction::actual_size`): the transactions of the OLDEST
+  disconnected blocks, in block order. Beyond the budget the most recently
+  confirmed ones are dropped, as in Core, so no kept transaction misses a
+  parent; dropped ones must be rebroadcast (the node logs the truncation).
+  Re-admission follows Core's `MaybeUpdateMempoolForReorg`: the rolling
+  minimum fee rate (relay policy) does not apply to a transaction that was
+  mined; the pool is not trimmed after each one but once, at the end (Core's
+  `LimitMempoolSize`), so it keeps the best-paying packages of the pooled and
+  the re-added transactions; and a transaction the final trim would evict at
+  once (the pool is full and it pays no more than the cheapest pooled
+  package) is not inserted at all. The orphan-transaction bookkeeping reads
+  the moved blocks back within the same budget.
   Exception: a disconnected block whose body this node had pruned is rolled
   back from its undo record alone, so its transactions are not available to
   re-admit. They leave the pool's view (and the orphan-transaction

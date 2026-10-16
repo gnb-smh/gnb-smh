@@ -80,6 +80,12 @@ fn hash32(bytes: &[u8], what: &str) -> Result<[u8; 32], String> {
     <[u8; 32]>::try_from(bytes).map_err(|_| format!("{what} is not 32 bytes"))
 }
 
+/// Whether a shielded undo record is persisted for `block` (it is applied
+/// and carried shielded transactions), without decoding it.
+pub fn has_undo(store: &Storage, block: &[u8; 32]) -> Result<bool, String> {
+    Ok(store.get_shielded(&hash_key(UNDO_PREFIX, block)).map_err(|e| e.to_string())?.is_some())
+}
+
 /// The undo record persisted for `block`, if any.
 pub fn read_undo(store: &Storage, block: &[u8; 32]) -> Result<Option<BlockUndo>, String> {
     store.get_shielded(&hash_key(UNDO_PREFIX, block))

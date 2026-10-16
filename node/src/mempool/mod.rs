@@ -55,7 +55,9 @@ pub mod orphanage;
 /// Validated gossip relay of transactions (audit MEM-5 / NET-2 / NET-4).
 pub mod relay;
 
-const MAX_MEMPOOL_SIZE: usize = 50_000;
+/// Maximum number of pooled transactions (count cap; see also
+/// [`MAX_MEMPOOL_BYTES`]).
+pub const MAX_MEMPOOL_SIZE: usize = 50_000;
 
 /// Audit MEM-3: a transaction that has not been mined within this many
 /// seconds is dropped (Bitcoin Core's default `-mempoolexpiry` is 336 h; GnB
@@ -95,7 +97,7 @@ pub const MAX_REPLACEMENT_EVICTIONS: usize = 100;
 /// this caps actual memory. 300 MiB is a conservative default — it must be
 /// tuned against real block sizes and load-tested (not yet done). Eviction
 /// enforces BOTH this and MAX_MEMPOOL_SIZE.
-const MAX_MEMPOOL_BYTES: usize = 300 * 1024 * 1024;
+pub const MAX_MEMPOOL_BYTES: usize = 300 * 1024 * 1024;
 
 /// SECURITY (audit L2): minimum relay fee rate in satoshis per serialized byte.
 /// Rejects free / dust-rate transactions that would otherwise let an actor with
@@ -542,17 +544,72 @@ impl Mempool {
     /// in-pool parents/children) and trims the pool to its count and byte
     /// caps by evicting the lowest descendant-score package.
     pub fn add(&self, tx: Transaction, fee: u64) -> Result<[u8; 32], MempoolError> {
-        self.add_inner(tx, fee, false).map(|o| o.txid)
+        self.add_inner(tx, fee, false, false).map(|o| o.txid)
     }
 
     /// [`Self::add`] with full-RBF: conflicting pool transactions are
     /// replaced when the replacement rules hold (see the module docs),
     /// otherwise [`MempoolError::Replacement`].
     pub fn add_with_replacement(&self, tx: Transaction, fee: u64) -> Result<AddOutcome, MempoolError> {
-        self.add_inner(tx, fee, true)
+        self.add_inner(tx, fee, true, false)
     }
 
-    fn add_inner(&self, tx: Transaction, fee: u64, allow_replacement: bool) -> Result<AddOutcome, MempoolError> {
+    /// Audit B1-T20: re-admission of a transaction from a disconnected block
+    /// (`reorg::reinject_disconnected`): [`Self::add_with_replacement`]
+    /// WITHOUT trimming the pool to its caps (Bitcoin Core re-adds reorged
+    /// transactions with `bypass_limits`, then trims once with
+    /// `LimitMempoolSize`). The caller must call [`Self::trim_to_size`] after
+    /// the batch; the pool can exceed its caps by at most the re-admitted
+    /// transactions in between (`reorg::MAX_DISCONNECTED_TX_POOL_BYTES`).
+    pub fn add_readmitted(&self, tx: Transaction, fee: u64) -> Result<AddOutcome, MempoolError> {
+        self.add_inner(tx, fee, true, true)
+    }
+
+    /// True iff the pool holds at least [`MAX_MEMPOOL_SIZE`] transactions or
+    /// [`MAX_MEMPOOL_BYTES`] bytes.
+    pub fn is_full(&self) -> bool {
+        let g = self.inner.read();
+        g.txs.len() >= MAX_MEMPOOL_SIZE || g.total_bytes >= MAX_MEMPOOL_BYTES
+    }
+
+    /// Audit B1-T20: whether inserting a new transaction paying `fee` for
+    /// `size` bytes (no in-pool descendants yet) could only be undone by the
+    /// next trim: the pool is full and the transaction's fee rate does not
+    /// exceed the lowest descendant score in the pool (the first package
+    /// [`Self::trim_to_size`] evicts). Re-admission skips such a transaction
+    /// instead of inserting it and trimming it straight back out.
+    pub fn would_only_trim(&self, fee: u64, size: usize) -> bool {
+        let g = self.inner.read();
+        if g.txs.len() < MAX_MEMPOOL_SIZE && g.total_bytes.saturating_add(size) <= MAX_MEMPOOL_BYTES {
+            return false;
+        }
+        match g.evict_index.keys().next() {
+            Some(lowest) => fee_rate_key(fee, size) <= *lowest,
+            None => false,
+        }
+    }
+
+    /// Evict the lowest descendant-score packages until the pool is within
+    /// [`MAX_MEMPOOL_SIZE`] and [`MAX_MEMPOOL_BYTES`] (Bitcoin Core's
+    /// `TrimToSize`); every eviction raises the rolling minimum fee rate.
+    /// Returns the number of transactions evicted.
+    pub fn trim_to_size(&self) -> usize {
+        let mut g = self.inner.write();
+        let mut evicted = 0usize;
+        while g.txs.len() > MAX_MEMPOOL_SIZE || g.total_bytes > MAX_MEMPOOL_BYTES {
+            let Some((key, victim)) = g.evict_index.iter().next()
+                .and_then(|(k, set)| set.iter().next().map(|t| (*k, *t)))
+            else { break };
+            let package = g.with_descendants(std::iter::once(victim));
+            self.raise_rolling_min(key.0);
+            evicted += g.remove_set(&package).len();
+        }
+        evicted
+    }
+
+    fn add_inner(&self, tx: Transaction, fee: u64, allow_replacement: bool, bypass_limits: bool)
+        -> Result<AddOutcome, MempoolError>
+    {
         // P1 (roadmap §2): additive instrumentation span.
         let _span = tracing::debug_span!("mempool.add", fee).entered();
         let txid = tx.txid();
@@ -636,7 +693,7 @@ impl Mempool {
         // (Bitcoin Core's TrimToSize semantics: the pool never keeps a worse
         // package at the expense of a better one).
         let mut evicted_for_space = 0usize;
-        while g.txs.len() > MAX_MEMPOOL_SIZE || g.total_bytes > MAX_MEMPOOL_BYTES {
+        while !bypass_limits && (g.txs.len() > MAX_MEMPOOL_SIZE || g.total_bytes > MAX_MEMPOOL_BYTES) {
             let Some((key, victim)) = g.evict_index.iter().next()
                 .and_then(|(k, set)| set.iter().next().map(|t| (*k, *t)))
             else { break };

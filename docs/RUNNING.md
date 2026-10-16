@@ -182,17 +182,32 @@ name (parameter: the block hash in hex). They are never served to an
 anonymous caller: they need the configured API key (`--rpc-api-key` /
 `--rpc-api-key-file`) or a trusted caller (`--rpc-trust-loopback`).
 
+A pruned node (the default; `--archive` keeps every block body) deletes, in
+steps of 1,000 blocks, the bodies of ALL blocks more than 10,000 DAG heights
+below its tip: the blocks of its chain and also merged, fork and unsolicited
+blocks (Bitcoin Core prunes stale blocks with the rest). It keeps every undo
+record, and for each pruned block of its chain the few index keys a rollback
+needs, so a reorg of any depth still works. A body it fetches back because a
+heavier chain needs it is kept until that chain is connected. The first
+pruning after an upgrade from a release before the 2026-10 phase-4 fixes
+indexes the stored bodies by height once (one pass over the block bodies).
+
 On a pruned node (the default; not `--archive`) the chain to move to may
 contain blocks whose bodies were pruned: for example, `invalidateblock` on the
 first block of a fork the node followed in a reorg deeper than the pruning
 depth, or `reconsiderblock` after an `invalidateblock` that rolled the node
-back through pruned blocks. The call then changes nothing and returns an error
-saying how many block bodies it is re-fetching from the peers (at most 4,096
+back through pruned blocks. The call then returns an error saying how many
+block bodies it is re-fetching from the peers (at most 4,096
 per call, nearest the new tip first; the node keeps at most 1,024 body
 requests in flight and sends the next ones as bodies arrive, so the transfer
 never crowds out its other block requests). Repeat the same call once they have
 arrived (a few seconds to minutes, depending on the count); each retry
-requests the next missing bodies, until the call succeeds. Ordinary block
+requests the next missing bodies, until the call succeeds. A chain move
+commits in steps of at most 16 blocks, each one atomic, so this error (or a
+storage error) can come after some steps were already written, the mark
+included: the node then sits on a consistent intermediate block, builds no
+block template until the move completes, and finishes the move on the
+retried call, with the next block or at the next start. Ordinary block
 acceptance needs no retry: when a heavier chain needs pruned bodies, the node
 accepts its blocks, fetches the bodies and moves to it once they are back.
 The transactions of blocks rolled back from pruned bodies cannot be put back
@@ -224,7 +239,14 @@ from an archival node's data dir). This includes a data dir last written by a
 release from before blocks carried undo records: its applied blocks cannot be
 rolled back, so the state is rebuilt (an archival node) or resynced (a pruned
 node). Data dirs written by this release cannot
-produce the footprint: every chain move is committed in one atomic batch.
+produce the footprint: every chain move is committed in atomic chunks of at
+most 16 blocks, each together with its undo records, the tip pointer and the
+shielded state (Bitcoin Core's `ActivateBestChain` steps through a reorg the
+same way), so the memory a reorg needs does not grow with its depth and a
+crash in the middle of a long reorg leaves a consistent intermediate chain
+state that the next start continues from (with the PoWit finality pin
+restored from it first). An interrupted rebuild likewise
+resumes from its last committed chunk.
 
 ## Upgrading and downgrading
 
@@ -236,6 +258,14 @@ RocksDB refuses that open (`Invalid argument: Column families not opened:
 shielded`), so the earlier release stops at start-up. To downgrade, restore a
 copy of the data directory taken before the upgrade (with the node stopped)
 or resynchronize from a new data directory.
+
+The first block a node accepts after upgrading to a release with the
+reindex-root reachability layout (2026-10 phase-4 fixes, audit DAG-7)
+re-lays out the reachability index once, from genesis, and writes every
+record of it with that block (one pass over the index; later blocks rewrite
+only the few records a reindex touches). The index is a cache: an earlier
+release reads the new records (it ignores the reindex-root trailer of the
+genesis record) and keeps answering exactly.
 
 ## Wallet keystores (audit CRY-7)
 

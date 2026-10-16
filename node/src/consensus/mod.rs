@@ -73,6 +73,29 @@ pub const MERGE_DEPTH: u64 = 360;
 pub mod reachability;
 use reachability::ReachabilityStore;
 
+thread_local! {
+    static COMPUTE_BLOCK_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BLOCK_DATA_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of per-block GhostDAG record lookups (`DagStore::get`, behind
+/// `GhostDAG::get_block_data`) on the calling thread since it started.
+/// Every walk over the DAG's records goes through it, whatever the walking
+/// code, so cost tests bound it (audit B1-T16: planning a chain move reads
+/// O(move) records, not the chain back to genesis). No effect on behaviour.
+#[allow(dead_code)] // tests only; the node binary compiles this module too
+pub fn block_data_lookups() -> u64 {
+    BLOCK_DATA_LOOKUPS.with(|c| c.get())
+}
+
+/// Number of full GhostDAG block computations (`compute_block`: mergeset,
+/// coloring, merge-depth check) run on the calling thread since it started.
+/// Instrumentation for cost tests (audit B1-T15); no effect on behaviour.
+#[allow(dead_code)] // tests only; the node binary compiles this module too
+pub fn compute_block_calls() -> u64 {
+    COMPUTE_BLOCK_CALLS.with(|c| c.get())
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 pub type BlockHash = [u8; 32];
@@ -319,6 +342,7 @@ impl DagStore {
     }
 
     pub fn get(&self, hash: &BlockHash) -> Option<&GhostdagData> {
+        BLOCK_DATA_LOOKUPS.with(|c| c.set(c.get().wrapping_add(1)));
         self.data.get(hash)
     }
 
@@ -789,6 +813,11 @@ pub struct GhostDAG {
     /// of the bodies already rejected for this id (most recent last, at most
     /// [`MAX_REJECTED_BODIES`]), so the same bad body is refused cheaply.
     body_pending: HashMap<BlockHash, Vec<[u8; 32]>>,
+    /// Cache, never consensus state (audit DAG-7): the heaviest block seen by
+    /// `(blue_work, blue_score, hash)`, validity ignored — the selected-tip
+    /// hint that moves the reachability index's reindex root
+    /// (`ReachabilityStore::hint_virtual_selected_parent`).
+    reach_hint: Option<BlockHash>,
 }
 
 /// Rejected-body witness roots remembered per body-pending block.
@@ -822,6 +851,7 @@ impl GhostDAG {
             invalid_all_edges_roots: HashSet::new(),
             invalid_all_edges: HashSet::new(),
             body_pending: HashMap::new(),
+            reach_hint: None,
         }
     }
 
@@ -997,6 +1027,7 @@ impl GhostDAG {
     /// (every block dirty) so the caller can flush a full snapshot.
     pub fn rebuild_reachability_from_store(&mut self) -> Result<usize, String> {
         self.reach = ReachabilityStore::new();
+        self.reach_hint = None;
         let order = self.topological_order()?;
         for h in &order {
             let d = self.store.get(h).ok_or_else(|| {
@@ -1011,9 +1042,38 @@ impl GhostDAG {
                 let mut mergeset = d.mergeset_blues.clone();
                 mergeset.extend_from_slice(&d.mergeset_reds);
                 self.reach.add_block(*h, &sp, &mergeset);
+                // The replay moves the reindex root along, as live insertion
+                // does (DAG-7).
+                self.advance_reach_hint(*h);
             }
         }
         Ok(order.len())
+    }
+
+    /// Audit DAG-7: after `new` was added to the index, move the reindex root
+    /// if `new` is the heaviest block seen (the selected-tip hint). Pure
+    /// performance: no answer of the index depends on it.
+    fn advance_reach_hint(&mut self, new: BlockHash) {
+        if !self.maintains_reachability_index() || !self.reach.has(&new) {
+            return;
+        }
+        let current = match self.reach_hint.filter(|h| self.store.has(h) && self.reach.has(h)) {
+            Some(h) => h,
+            // After a restart: the heaviest tip so far.
+            None => match self.store.tips.iter().copied()
+                .filter(|t| self.reach.has(t))
+                .max_by_key(|t| self.order_key(t))
+            {
+                Some(t) => t,
+                None => new,
+            },
+        };
+        let hint = if self.order_key(&new) > self.order_key(&current) { new } else { current };
+        let moved = self.reach_hint != Some(hint);
+        self.reach_hint = Some(hint);
+        if moved {
+            self.reach.hint_virtual_selected_parent(&hint);
+        }
     }
 
     /// Kahn topological sort of the in-memory DAG: every parent strictly
@@ -1332,6 +1392,8 @@ impl GhostDAG {
 
         let result = data.clone();
         self.store.insert(hash, data);
+        // DAG-7: keep the reachability index's reindex root behind the tip.
+        self.advance_reach_hint(hash);
         // DAG-1: a block whose selected parent is chain-disqualified is
         // itself disqualified (its UTXO context does not exist). It still
         // enters the DAG so other blocks can merge it deterministically.
@@ -1358,6 +1420,7 @@ impl GhostDAG {
         timestamp: u64,
         work: u128,
     ) -> Result<ComputedBlock, ConsensusError> {
+        COMPUTE_BLOCK_CALLS.with(|c| c.set(c.get().wrapping_add(1)));
         if parents.is_empty() {
             return Err(ConsensusError::NoParents);
         }
@@ -1506,6 +1569,9 @@ impl GhostDAG {
         self.invalid_all_edges_roots.remove(hash);
         self.invalid_all_edges.remove(hash);
         self.body_pending.remove(hash);
+        if self.reach_hint == Some(*hash) {
+            self.reach_hint = None;
+        }
         // Exact inverse of `DagStore::insert`: drop the child edge from each
         // parent; a parent becomes a tip again iff it is still stored and now
         // has no children at all.
@@ -2204,6 +2270,38 @@ impl GhostDAG {
         Ok(())
     }
 
+    /// Audit B1-T15: a predicate telling whether a candidate template parent
+    /// can be merged at all by a block whose selected parent is `sp` (at or
+    /// above the hardening activation): it must be the LOWEST possible
+    /// merge-depth root of such a block, or in its future. The lowest root is
+    /// the one of a block with no mergeset blue
+    /// (`blue_score = sp.blue_score + 1`); any actual block's root is at or
+    /// above it on `sp`'s chain, so a
+    /// candidate below it is below the actual root too. Such a candidate is
+    /// red (it is in the anticone of every chain block from the root to `sp`,
+    /// far more than k blues) and, when it is a tip, nothing kosherizes it (a
+    /// tip is in no block's past): every parent set containing it fails
+    /// [`check_merge_depth`](Self::check_merge_depth). Its whole branch is
+    /// below the root (an ancestor above the root would put it in the root's
+    /// future), so no block can merge it again after the activation; it stays
+    /// in the DAG and in the valid tips (chain selection is unaffected) but
+    /// is never offered as a template parent again (Kaspa filters virtual
+    /// parent candidates the same way). Always true below the activation or
+    /// while `sp`'s chain is shallower than `MERGE_DEPTH`. O(MERGE_DEPTH) once,
+    /// then one reachability query per candidate.
+    fn mergeable_below(&self, sp: &BlockHash, use_index: bool) -> impl Fn(&BlockHash) -> bool + '_ {
+        let sp_data = self.store.get(sp);
+        let hardened = sp_data.is_some_and(|d| self.is_hardened_at(d.height + 1));
+        let root = match (hardened, sp_data) {
+            (true, Some(d)) => self.merge_depth_root(sp, d.blue_score + 1),
+            _ => None,
+        };
+        move |c: &BlockHash| match root {
+            None => true,
+            Some(r) => *c == r || self.dag_ancestor(&r, c, use_index && self.reach.has(c)),
+        }
+    }
+
     /// Parents for a block template (audit DAG-2 / DAG-7).
     ///
     /// Returns at most `max_parents` of `candidates` (normally the bodied tips)
@@ -2245,12 +2343,18 @@ impl GhostDAG {
         let budget = MERGESET_SIZE_LIMIT.min(MAX_MERGESET_SIZE - 1);
         let mut chosen = vec![sp];
         let mut merged: HashSet<BlockHash> = HashSet::new();
+        let mergeable = self.mergeable_below(&sp, use_index);
         for c in cands.iter().skip(1) {
             if chosen.len() >= max_parents {
                 break;
             }
             if merged.contains(c) || self.dag_ancestor(c, &sp, use_index) {
                 continue; // adds nothing to the mergeset
+            }
+            // B1-T15: a candidate below the merge-depth root can only be a
+            // red nothing kosherizes; skip it before any mergeset work.
+            if !mergeable(c) {
+                continue;
             }
             // The blocks `c` would add to the mergeset, bounded by the budget.
             let mut added: Vec<BlockHash> = Vec::new();
@@ -2277,9 +2381,13 @@ impl GhostDAG {
             chosen.push(*c);
         }
 
-        // Drop parents responsible for merge-depth violations, re-checking
-        // with the consensus code until the template is valid. Each round
-        // removes at least one parent; the selected parent alone always is.
+        // Check the result with the consensus code (one `compute_block`
+        // normally: the candidates that can never be merged were skipped
+        // above). A violation can remain only through the coloring (a red
+        // above the lowest root that ends below the actual root, or below
+        // it and not kosherized): drop the parents responsible and check
+        // again. Each round removes at least one parent; the selected parent
+        // alone always is valid.
         loop {
             match self.compute_block(&chosen, 0, 0) {
                 Ok(_) => break,
@@ -2771,17 +2879,30 @@ impl GhostDAG {
     /// valid ancestor (see `best_bodied_tip`). Shared by the internal miner
     /// and `getblocktemplate` so both stay under `core::MAX_PARENTS`.
     ///
-    /// At or above the hardening activation the candidates go through
+    /// The candidates go through
     /// [`select_parents_for_template`](Self::select_parents_for_template), so
-    /// the template also respects `MAX_MERGESET_SIZE` and the merge-depth
-    /// rule; below it the result is the plain capped list, as before.
+    /// the template respects `MERGESET_SIZE_LIMIT` at every height and, at or
+    /// above the hardening activation, the merge-depth rule.
+    ///
+    /// Audit B1-T15: the selected parent is found first (the heaviest valid
+    /// tip with a body); then a tip that can never be merged by a block on it
+    /// (its whole branch below the merge-depth root, `mergeable_below`) is
+    /// dropped BEFORE its body is looked up (`has_body` reads storage) and
+    /// before any mergeset work, so such tips cost one reachability query
+    /// each per template instead of a stored-body lookup and a full
+    /// `compute_block`. Pre-activation the candidate list is unchanged.
     pub fn template_parents<F: Fn(&BlockHash) -> bool>(&self, max: usize, has_body: F) -> Vec<BlockHash> {
-        let cands: Vec<BlockHash> = self.valid_tips().into_iter()
-            .filter(|h| has_body(h))
-            .collect();
-        if cands.is_empty() {
+        let mut tips = self.valid_tips();
+        tips.sort_by_key(|h| std::cmp::Reverse(self.order_key(h)));
+        let Some(pos) = tips.iter().position(&has_body) else {
             return self.best_bodied_tip(has_body).into_iter().collect();
-        }
+        };
+        let sp = tips[pos];
+        let use_index = self.maintains_reachability_index() && self.reach.has(&sp);
+        let mergeable = self.mergeable_below(&sp, use_index);
+        let cands: Vec<BlockHash> = std::iter::once(sp)
+            .chain(tips[pos + 1..].iter().copied().filter(|h| mergeable(h) && has_body(h)))
+            .collect();
         self.select_parents_for_template(&cands, max.max(1))
     }
 
