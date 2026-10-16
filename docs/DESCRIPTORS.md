@@ -194,6 +194,7 @@ does not establish full consensus equivalence or a fuzzing volume claim.
 python3 reference/descriptor_test.py
 python3 reference/descriptor_vectors.py --check
 python3 reference/descriptor_differential.py /path/to/prebuilt/descriptor_oracle
+python3 reference/descriptor_differential.py /path/to/prebuilt/descriptor_oracle --generated 128 --seed 0x474e424435
 ```
 
 The JSON-lines oracles accept one public request per line and return
@@ -203,3 +204,14 @@ Rejection text is not compared; accepted responses are compared in full.
 The differential driver first checks request and response pins, then compares
 the Python reference with the prebuilt Rust oracle. It does not build Rust or
 inspect Rust source.
+
+In addition to the pinned corpus, the differential driver defaults to 128
+generated requests from seed `0x474e424435`. [descriptor_generated.py](../reference/descriptor_generated.py)
+varies synthetic key bytes, raw/enveloped forms, key/branch order, threshold,
+timelocks, networks and all three descriptor kinds. It generates valid public
+byte substitutions and pool roundtrips, and invalid checksums, network choices,
+grammar and duplicate JSON fields by construction. `--generated 0` selects
+only pinned cases; 0–4096 generated requests are supported. The output reports
+the separate counts, seed and SHA256 of the generated request stream. This is
+a deterministic generated comparison campaign, not a coverage-guided fuzz run,
+nor a claim of 10^7 cases or complete consensus coverage.

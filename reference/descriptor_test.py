@@ -130,6 +130,16 @@ class DescriptorTests(unittest.TestCase):
         result = d.oracle_line('{"network":"mainnet","network":"testnet","action":"pool","public_keys":[]}')
         self.assertEqual(result, {"ok": False})
 
+    def test_generated_campaign_is_seeded_and_verdicts_are_by_construction(self):
+        import descriptor_generated as generated
+        rows = list(generated.cases(24))
+        self.assertEqual(rows, list(generated.cases(24)))
+        self.assertNotEqual(rows, list(generated.cases(24, seed=generated.DEFAULT_SEED + 1)))
+        self.assertEqual(len(rows), 24)
+        for name, line, accepted in rows:
+            with self.subTest(name=name):
+                self.assertEqual(d.oracle_line(line)["ok"], accepted)
+
 
 if __name__ == "__main__":
     unittest.main()
