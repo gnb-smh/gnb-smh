@@ -1130,7 +1130,10 @@ pub fn work_admission(lb: u128, threshold: u128, chain_above: u128, merge_lb: u1
 /// used to be persisted and re-served verbatim. Replace it with the value
 /// derived from the block's VERIFIED parents before the block is stored.
 /// (`height` needs no rewrite: `accept_block` rejects any block whose height
-/// differs from max(parent height) + 1.)
+/// differs from max(parent height) + 1.) `accept_block` itself makes the same
+/// replacement for every caller (re-audit B1-T0: `submitblock` skipped this
+/// helper), so the calls on the ingress paths are defence in depth; RPC
+/// `submitblock` uses it to relay the bytes it stores.
 pub fn normalize_wire_metadata(block: &mut core::Block, dag: &Arc<RwLock<GhostDAG>>) {
     let d = dag.read();
     block.blue_score = derived_blue_score(

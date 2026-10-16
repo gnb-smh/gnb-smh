@@ -290,7 +290,8 @@ input's coin is not in `prevouts`). The Python check recomputes them with
       or "block_parts": [ { "hex", "repeat" } ]   concatenation of each part repeated (1 MB blocks)
     "expected": { "verdict", "error_class" },
     "derived":  null (undecodable) | { "block_hash", "txids", "legacy_merkle_root", "tagged_merkle_root",
-                "witness_root", "parents_commitment", "subsidy", "wire_size", "bincode_size" }
+                "witness_root", "parents_commitment", "subsidy", "wire_size", "bincode_size",
+                "legacy_size" }
   } ]
 }
 ```
@@ -358,7 +359,7 @@ from in `consensus_vectors_common::classify`):
 | `bad-signature` | a signature does not verify under the digest and binding of the regime | `invalid signature` |
 | `inputs-below-outputs` | outputs exceed inputs | `inputs ... < outputs ...` |
 | `min-fee` | fee below `max(10,000, ceil(wire size x 2,000 / 1,000))` | `below consensus minimum` |
-| `block-size` | above 1,000,000 bytes: bincode below the activation, wire encoding from it (VAL-12) | `block too large` |
+| `block-size` | above 1,000,000 bytes: below the activation bincode with the uncommitted `blue_score` written as 0 (`legacy_size`, re-audit B1-T0), the wire encoding from it (VAL-12) | `block too large` |
 | `bad-merkle-root` | the header root is not the regime's root (legacy below, tagged from the activation) | `invalid merkle root` |
 | `duplicate-tx` | the same txid twice (CVE-2012-2459) | `duplicate transaction in block` |
 | `cb-commitment-missing`, `cb-commitment-tag`, `cb-height`, `cb-parents`, `witness-commitment` | the 80-byte coinbase commitment: shorter than 80 bytes, wrong tag, wrong height, wrong parent list, wrong witness root (VAL-2, CRY-1) | `coinbase commitment missing`, `bad coinbase commitment tag`, `bad-cb-height`, `bad coinbase parents commitment`, `bad witness commitment` |
@@ -407,7 +408,7 @@ Transactions (187: 98 pre-activation, 89 post-activation; 66 valid; 182 on mainn
 | `tx64/` | 8 | 63 / 64 / 65-byte txid preimages in both regimes; the mainnet boundary |
 | `bip30/` | 2 | an output on an unspent coin's outpoint (valid pre, invalid post) |
 
-Blocks (102: 42 pre-activation, 60 post-activation; 34 valid):
+Blocks (106: 46 pre-activation, 60 post-activation; 36 valid):
 
 | Area | Cases | What |
 | --- | --- | --- |
@@ -418,7 +419,7 @@ Blocks (102: 42 pre-activation, 60 post-activation; 34 valid):
 | `commitment/`, `structure/` | 17 | two parents; script_sig of 79 bytes; bad tag; height + 1 and big-endian; parents reordered and dropped; witness root zero, over txids, and with the coinbase's own wtxid; 10,000-byte script_sig (valid) and one byte more (decode); a wrong commitment ignored pre; the mainnet boundary; 256 parents (valid) and 257 (decode) |
 | `same-block-coinbase/` | 3 | valid pre; `connect` scope post; `full` scope post (the commitment cannot match) |
 | `pow/` | 13 | the GnB-SMH proof at the genesis target: a mined nonce (valid) and a failing nonce (`bad-pow`), post; 0x2100ffff evaluated pre (limit only), refused post; the genesis target exactly and one unit above, in both regimes; the mainnet boundary; four malformed bits |
-| `size/` | 6 | 1 MB blocks: wire 1,000,001 with bincode below (valid pre, invalid post), wire exactly 1,000,000 (valid post), bincode 1,000,001 with wire below (invalid pre, valid post), bincode exactly 1,000,000 (valid pre) |
+| `size/` | 10 | 1 MB blocks: wire 1,000,001 with bincode below (valid pre, invalid post), wire exactly 1,000,000 (valid post), bincode measure 1,000,001 with wire below (invalid pre, valid post), bincode measure exactly 1,000,000 (valid pre; its plain bincode length with `blue_score` 999 is 1,000,002); the last two again under the same block id with `blue_score` 0 and `u64::MAX` (`*-blue-score-0/pre`, `*-blue-score-max/pre`): same verdicts (re-audit B1-T0 / B2-T8) |
 | `value/`, `maturity/`, `sig/`, `tx64/`, `bip30/`, `version/`, `witness/` | 18 | the transaction rules inside a block: dust, the block-wide output total above `MAX_SUPPLY_SAT` with every transaction in range (VAL-11), an immature spend, a bad signature, a 64-byte transaction, BIP30 on a spend's and on the coinbase's output, the version rule, a padded witness under the same block id (valid pre, witness commitment post) |
 
 `crates/gnb-crypto/tests/consensus_vectors.rs::vector_coverage` fails if a
@@ -565,6 +566,24 @@ version 1 at it.
   generator also refuses to record `witness-non-canonical` as the refusal
   class of anything but a version-3 transaction at/after the activation. No
   other case changed; `block_vectors.json` is unchanged.
+
+- **Re-audit B1-T0 / B2-T8 (phase 4): the pre-activation size measure.**
+  Below the activation the block size is now measured on bincode with the
+  uncommitted `blue_score` written as 0 (`block_rules::legacy_block_size`;
+  Python `legacy_block_size`), recorded for every block as the new derived
+  field `legacy_size` (`bincode_size` stays the plain bincode length). The
+  generator's bincode-targeted size cases are built on that measure, so
+  `size/bincode-1000001-wire-below/pre` (`block-size`) and `/post` (valid)
+  and `size/bincode-exactly-1000000/pre` (valid) got new filler counts
+  (their old blocks measured 999,999 / 1,000,000 with `blue_score` 999
+  counted as 3 bytes: under the new measure the first would have been
+  valid). Four cases are new: those two pre-activation block ids carrying
+  `blue_score` 0 and `u64::MAX` (`*-blue-score-0/pre`, `*-blue-score-max/pre`),
+  with the verdict of the original. Checked by mutation: measuring the
+  carried `blue_score` again fails the gnb-crypto runner on every
+  `legacy_size` and on the verdicts of `size/bincode-exactly-1000000/pre` and
+  `size/bincode-exactly-1000000-blue-score-max/pre`. No transaction case and
+  no other block verdict changed.
 
 ## Findings while building the vectors
 

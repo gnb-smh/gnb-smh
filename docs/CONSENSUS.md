@@ -111,7 +111,9 @@ obtain from a future timestamp to about 6%.
 4. timestamp bounds;
 5. at/after the hardening activation: the context-free block rules (wire
    size, tagged Merkle root, no 64-byte transaction, coinbase commitment),
-   before the block is stored;
+   and at every height the block-size limit of the block's verified height
+   in the measure of the regime (see "Block size (VAL-12)"), before the
+   block is stored;
 6. GnB-SMH proof (64 MiB, cached by block id);
 7. transactions (version rule, witnesses and signatures as specified in
    "Transaction signatures" below, double spends, coinbase maturity at the
@@ -119,8 +121,16 @@ obtain from a future timestamp to about 6%.
    activation BIP30 and no same-block coinbase spend), coinbase value.
 
 Structural checks (size, merkle root, coinbase shape, duplicates, dust, and
-at/after the activation the 64-byte rule and the coinbase commitment) run
-before `accept_block` on every ingress path.
+at/after the activation the 64-byte rule and the coinbase commitment) also
+run before `accept_block` on every ingress path, on the height the block
+claims, so no proof of work is spent on a block that fails them.
+
+The `blue_score` a block carries on the wire is not committed by its id and
+no rule reads it. `accept_block` stores the body with the value derived from
+its parents (`max(parent blue_score) + 1`), whichever path delivered it
+(gossip, directed sync, orphan drain, body re-fetch, `submitblock`, the
+miner), so every node stores, serves and relays the same bytes for one block
+id (POW-8; re-audit B1-T0).
 
 ## Wire encoding (all heights)
 
@@ -168,7 +178,8 @@ minimal varints the bytes a transaction consumes are its canonical length).
 Every encoder in the code base (`write_varint`, used by the node, its miner
 and templates, the wallets and the WASM wallet core) writes only minimal
 varints (`core::wire_canonical_tests::varint_minimality_boundaries`), and the
-node stores blocks as `to_wire_bytes()` and serves those bytes to sync
+node stores blocks as `to_wire_bytes()` (with the `blue_score` derived from
+the parents, see "Acceptance order") and serves those bytes to sync
 requests and gossip. An external miner that assembles a block from
 `getblocktemplate` must write the transaction count and the coinbase's
 varints minimally, as Bitcoin's CompactSize writers do: `submitblock` refuses
@@ -304,6 +315,12 @@ pre-activation rule named with it (the block and transaction rules state their
 own pre-activation behaviour in their sections). That pre-activation behaviour is proven
 bit-identical to the code that produced the existing chain by
 `node/tests/fix_ghostdag_preactivation_identity.rs`.
+
+One pre-activation rule changed at every height, because the old behaviour
+did not give one verdict per block id (nodes could disagree on the same
+block, a split): the bincode block-size measure writes the uncommitted
+`blue_score` as 0 (re-audit B1-T0 / B2-T8). It is the deterministic rule
+that keeps every block any release accepted valid ("Block size (VAL-12)").
 
 ### Selected parent and fork choice
 
@@ -1112,9 +1129,68 @@ block is connected, and it is then immature.
 From the activation, `MAX_BLOCK_SIZE = 1,000,000` bytes is compared with the
 canonical wire encoding `Block::to_wire_bytes` (`Block::wire_size`). That is
 the encoding transaction fee rates and the minimum fee use, so witness bytes
-count as they do for fees. Before the activation it is compared with the
-bincode encoding `Block::size_bytes`, as before. Templates budget with the
-measure of their own height.
+count as they do for fees. Every field of it is fixed-width or covered by
+the block id, except the fixed 8 bytes of `blue_score`.
+
+Before the activation it is compared with the bincode encoding of the
+node's `Block` struct (bincode 2, "standard" configuration) with the
+`blue_score` field written as 0, whatever value the block carries
+(`block_rules::legacy_block_size`; `reference/gnb_validity.py`,
+`legacy_block_size`):
+
+```text
+legacy_size(B) = bv(version) + bv(n_parents) + 32*n_parents + 32            // header: parents, merkle_root
+               + bv(timestamp) + bv(bits) + bv(nonce)
+               + bv(n_tx) + Σ txb(tx)                                       // transactions, block order
+               + bv(0)                                                      // blue_score, ALWAYS written as 0
+               + bv(height)                                                 // the header height
+               + bv(n_shielded) + Σ shielded                                // none is valid today
+txb(tx)        = bv(version) + bv(n_in) + Σ [ 32 + bv(prev_index) + bv(len(script_sig)) + script_sig + bv(sequence) ]
+               + bv(n_out) + Σ [ bv(value) + bv(len(script_pubkey)) + script_pubkey ] + bv(locktime)
+bv(v)          = 1 byte v                if v <= 250
+               = 0xFB ‖ u16le(v)         if v <= 0xFFFF
+               = 0xFC ‖ u32le(v)         if v <= 0xFFFFFFFF
+               = 0xFD ‖ u64le(v)         otherwise
+```
+
+That is `Block::size_bytes()` of the block with `blue_score = 0`, i.e. the
+plain bincode length minus 0, 2, 4 or 8 bytes. Why `blue_score` is not
+measured as carried (re-audit B1-T0 / B2-T8): the block id does not commit
+to it (POW-8), and the node replaces the received value with the one
+derived from the block's parents (`max(parent blue_score) + 1`) before it
+stores, serves or relays the body. The rule used to read the received
+value, so one block id could be within the limit in the copy gossip
+delivered and over it in the copy every upgraded node served: a block of
+exactly 1,000,000 bytes mined with `blue_score` 0 was accepted by the online
+network and refused ("block too large") by every node that synced it later
+once blue scores pass 250 (a 3-byte varint), a permanent split. Releases
+before this rule therefore did not give one verdict per block id. The rule
+chosen is the deterministic one that keeps every block any release accepted
+valid: such a copy had `size_bytes() <= 1,000,000` with some `blue_score`,
+and 0 has the shortest encoding, so its measure is no larger. The
+alternative (measuring the derived value, by normalizing before the
+structure check) would make upgraded nodes refuse a copy that older
+releases accepted. A release with the old measure still decides a block
+within 8 bytes of the limit by the copy it receives; honest producers never
+come that close (templates budget the framing with every varint at its
+widest encoding). Heights are measured as carried: `accept_block` requires
+`height = max(parent DAG heights) + 1`, so every accepted copy carries the
+same value.
+
+`accept_block` checks the size rule of the block's verified header height
+(`block_rules::check_block_size_at`, the one size check of both regimes,
+also called by `Block::validate_structure_without_pow_at`,
+`check_block_hardened_at` and the template self-check), and every ingress
+path checks it before (no proof of work is spent on a block that is too
+large). Templates budget with the measure of their own height.
+Vectors: `size/*` in `reference/block_vectors.json`, which records both the
+plain `bincode_size` and the measure (`legacy_size`) of every block; the
+`size/bincode-exactly-1000000-blue-score-*/pre` and
+`size/bincode-1000001-wire-below-blue-score-*/pre` cases are the same block
+ids as `size/bincode-exactly-1000000/pre` (valid) and
+`size/bincode-1000001-wire-below/pre` (`block-size`) carrying `blue_score` 0
+and `u64::MAX`, with the same verdicts
+(`node/tests/fix_wire_metadata.rs` replays the finding end to end).
 
 ### Pow limit (POW-3)
 

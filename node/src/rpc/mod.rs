@@ -1582,9 +1582,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // MAX_FUTURE_SECS ahead of the validator's clock.
                 "min_time":             tmpl.parent_timestamp,
                 // Size accounting: the whole block, measured as the consensus
-                // rule measures it at this height (`size_rule`: bincode
-                // `Block::size_bytes` before the activation, the wire encoding
-                // `Block::to_wire_bytes` from it), must stay <= max_block_size;
+                // rule measures it at this height (`size_rule`: bincode before
+                // the activation, with the uncommitted blue_score written as
+                // 0 (`block_rules::legacy_block_size`, re-audit B1-T0), the
+                // wire encoding `Block::to_wire_bytes` from it), must stay
+                // <= max_block_size;
                 // the listed transactions leave coinbase_reserve bytes for the
                 // WHOLE coinbase (in the same measure), which is what
                 // max_coinbase_extra_bytes is derived from.

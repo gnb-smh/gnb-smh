@@ -2100,7 +2100,10 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
     // ── Block size (VAL-12): bincode below the activation, wire from it ─────
     // Filler: one signed transaction with many identical outputs. 546-unit
     // outputs are 29 wire bytes but 24 bincode bytes; 5,000,000,000-unit
-    // outputs are 29 wire bytes but 30 bincode bytes.
+    // outputs are 29 wire bytes but 30 bincode bytes. The bincode measure is
+    // `block_rules::legacy_block_size`: the uncommitted blue_score written
+    // as 0 (re-audit B1-T0 / B2-T8); these blocks carry blue_score = height
+    // (999, a 3-byte varint), so their plain bincode length is 2 more.
     for (id, r, value, target_wire, target_bincode, err) in [
         ("size/wire-1000001-bincode-below", Post, DUST_THRESHOLD, Some(MAX_BLOCK_SIZE + 1), None, Some("block-size")),
         ("size/wire-1000001-bincode-below", Pre, DUST_THRESHOLD, Some(MAX_BLOCK_SIZE + 1), None, None),
@@ -2113,7 +2116,7 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         let l = format!("block/{id}/{}", r.tag());
         let unit_wire = 29usize;
         let unit = if value == DUST_THRESHOLD { 29 } else { 30 }; // in the measure that matters
-        let measure = |b: &Block| if target_wire.is_some() { b.wire_size() } else { b.size_bytes() };
+        let measure = |b: &Block| if target_wire.is_some() { b.wire_size() } else { block_rules::legacy_block_size(b) };
         let want = target_wire.or(target_bincode).unwrap();
         // The coin pays every output and a 4,000,000 fee (above the minimum).
         let p = fund(&l, 40_000 * value + 4_000_000, &ka.spk());
@@ -2153,7 +2156,8 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
                 assert!(b.size_bytes() < MAX_BLOCK_SIZE);
             }
             (None, Some(bc)) => {
-                assert_eq!(b.size_bytes(), bc);
+                assert_eq!(block_rules::legacy_block_size(&b), bc);
+                assert_eq!(b.size_bytes(), bc + 2, "blue_score 999: a 3-byte varint");
                 assert!(b.wire_size() < MAX_BLOCK_SIZE);
             }
             _ => unreachable!(),
@@ -2171,11 +2175,31 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         let start = bytes.windows(unit.len()).position(|w| w == unit.as_slice()).expect("filler output in the encoding");
         assert!(bytes[start..start + n * unit.len()].chunks(unit.len()).all(|ch| ch == unit.as_slice()));
         let desc = format!(
-            "A coinbase and one signed transaction with {n} outputs of {value}: wire size {}, bincode size {}. The limit (1,000,000) is measured on bincode below the activation and on the wire encoding from it (VAL-12).",
-            b.wire_size(), b.size_bytes()
+            "A coinbase and one signed transaction with {n} outputs of {value}: wire size {}, bincode size {} with its blue_score {}, {} with blue_score written as 0. The limit (1,000,000) is measured below the activation on bincode with blue_score written as 0 (the block id does not commit to blue_score, re-audit B1-T0), and on the wire encoding from the activation (VAL-12).",
+            b.wire_size(), b.size_bytes(), b.blue_score, block_rules::legacy_block_size(&b)
         );
-        c.push(id, r, &desc, b, vec![p], err);
-        c.cases.last_mut().unwrap().rle = Some((start, unit.len(), n));
+        let rle = Some((start, unit.len(), n));
+        c.push(id, r, &desc, b.clone(), vec![p.clone()], err);
+        c.cases.last_mut().unwrap().rle = rle;
+        // Re-audit B1-T0 / B2-T8: the same block id with other blue_score
+        // values (the field is not committed, and a node stores and serves
+        // the value derived from the parents): the bincode verdict is the
+        // same for every copy. The run of outputs starts at the same offset
+        // (the wire header writes blue_score as 8 bytes).
+        if target_bincode.is_some() && r == Pre {
+            for (tag, blue) in [("blue-score-0", 0u64), ("blue-score-max", u64::MAX)] {
+                let mut copy = b.clone();
+                copy.blue_score = blue;
+                assert_eq!(copy.block_hash(), b.block_hash());
+                assert_eq!(copy.to_wire_bytes()[start..start + n * unit.len()], bytes[start..start + n * unit.len()]);
+                let desc = format!(
+                    "The block of {id}/pre (same block id) carrying blue_score {blue}: bincode size {}, {} with blue_score written as 0. The verdict is that of every other copy of the id (re-audit B1-T0 / B2-T8).",
+                    copy.size_bytes(), block_rules::legacy_block_size(&copy)
+                );
+                c.push_full(format!("{id}-{tag}/pre"), &desc, ACT, copy, vec![p.clone()], err, "full", Pow::Skip);
+                c.cases.last_mut().unwrap().rle = rle;
+            }
+        }
     }
 
     c.cases
@@ -2208,6 +2232,7 @@ fn block_case_json(case: &BlockCase) -> J {
             ("subsidy", dec(core::tokenomics::block_subsidy_sat(b.height))),
             ("wire_size", J::N(b.wire_size() as u64)),
             ("bincode_size", J::N(b.size_bytes() as u64)),
+            ("legacy_size", J::N(block_rules::legacy_block_size(b) as u64)),
         ])
     } else {
         J::Null

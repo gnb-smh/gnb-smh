@@ -1278,12 +1278,12 @@ impl Block {
     }
 
     /// [`Block::validate_structure_without_pow`] for an explicit activation
-    /// height. Below the activation it is exactly the pre-activation check
-    /// (bincode size, legacy Merkle root).
+    /// height. Below the activation: bincode size (`legacy_block_size`: the
+    /// uncommitted blue_score measured as 0, B1-T0), legacy Merkle root.
     pub fn validate_structure_without_pow_at(&self, activation_height: u64) -> Result<(), &'static str> {
         let hardened = block_rules::rules_active_at(self.height, activation_height);
         if self.header.parents.len() > MAX_PARENTS   { return Err("too many parents"); }
-        if block_rules::block_size_for_rules(self, hardened) > MAX_BLOCK_SIZE { return Err("block too large"); }
+        block_rules::check_block_size_at(self, activation_height)?; // VAL-12; B1-T0: never the wire blue_score
         if !self.validate_merkle_at(activation_height) { return Err("invalid merkle root"); }
         if !self.validate_coinbase_format()           { return Err("invalid coinbase format"); }
         if hardened {

@@ -29,12 +29,15 @@
 //! in sync, each cap at and one past its value.
 //!
 //! Block SIZE (`MAX_BLOCK_SIZE`) is not measured here. Below the hardening
-//! activation the consensus rule is `Block::size_bytes()` (bincode); at and
-//! after it the canonical wire encoding `Block::wire_size()`, the encoding
-//! fee rates use (`super::block_rules::block_size_for_rules`, audit VAL-12
-//! residual). Both are checked by `Block::validate_structure`, the wire
-//! measure also by `accept_block`, and every producer (miner template,
-//! `getblocktemplate`) budgets with the measure of the template's height.
+//! activation the consensus rule is bincode with the uncommitted
+//! `blue_score` written as 0 (`super::block_rules::legacy_block_size`,
+//! re-audit B1-T0); at and after it the canonical wire encoding
+//! `Block::wire_size()`, the encoding fee rates use
+//! (`super::block_rules::block_size_for_rules`, audit VAL-12 residual). Both
+//! are checked by `block_rules::check_block_size_at`, called by
+//! `Block::validate_structure` (which `accept_block` runs at the verified
+//! height), and every producer (miner template, `getblocktemplate`) budgets
+//! with the measure of the template's height.
 
 use super::{tokenomics, Block, Transaction, MAX_PARENTS};
 

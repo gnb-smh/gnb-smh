@@ -338,6 +338,59 @@ fn block_size_limit_is_inclusive_under_both_measures() {
     }
 }
 
+/// Re-audit B1-T0 / B2-T8: the block id does not commit to `blue_score`, and
+/// the node replaces the received value before it stores and serves a body
+/// (POW-8). The size verdict of a block id must therefore be the same for
+/// every `blue_score` a copy can carry: below the activation a block of
+/// exactly `MAX_BLOCK_SIZE` bytes with `blue_score` 0 used to be "too large"
+/// with 251 or more (a 3-, 5- or 9-byte varint), so the copy every node
+/// served after normalization was refused by every node that synced it.
+#[test]
+fn size_verdict_does_not_depend_on_the_uncommitted_blue_score() {
+    let scores = [0u64, 1, 250, 251, 65_535, 65_536, 70_000, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX];
+    for activation in [activation::NEVER, 0] {
+        let at = block_of_size(MAX_BLOCK_SIZE, 1, activation);
+        let over = block_of_size(MAX_BLOCK_SIZE + 1, 1, activation);
+        for &bs in &scores {
+            let (mut a, mut o) = (at.clone(), over.clone());
+            a.blue_score = bs;
+            o.blue_score = bs;
+            assert_eq!(a.block_hash(), at.block_hash(), "the id does not commit to blue_score");
+            assert_eq!(a.validate_structure_without_pow_at(activation), Ok(()), "activation {activation}, blue_score {bs}");
+            assert_eq!(o.validate_structure_without_pow_at(activation), Err("block too large"),
+                "activation {activation}, blue_score {bs}");
+        }
+    }
+}
+
+/// `legacy_block_size` is exactly the bincode length of the block with its
+/// `blue_score` set to 0 (every other field as carried, shielded
+/// transactions and the height included), so it differs from
+/// `size_bytes` by the width of the `blue_score` varint minus one.
+#[test]
+fn legacy_block_size_is_the_bincode_length_with_blue_score_zero() {
+    let width = |v: u64| match v {
+        0..=250 => 1,
+        251..=0xFFFF => 3,
+        0x1_0000..=0xFFFF_FFFF => 5,
+        _ => 9,
+    };
+    for (height, n_shielded) in [(1u64, 0usize), (300, 2), (70_000, 1), (u32::MAX as u64 + 7, 0)] {
+        let mut b = valid_block(height, vec![[2; 32], [3; 32]], 20, vec![spend_tx(4, &[1_000, 2_000])], activation::NEVER);
+        b.shielded_transactions = (0..n_shielded).map(|i| shielded(i as u8, 2, 1, 50)).collect();
+        for bs in [0u64, 1, 250, 251, 0xFFFF, 0x1_0000, 0xFFFF_FFFF, 0x1_0000_0000, u64::MAX] {
+            b.blue_score = bs;
+            let mut zero = b.clone();
+            zero.blue_score = 0;
+            let len0 = bincode::serde::encode_to_vec(&zero, bincode::config::standard()).unwrap().len();
+            assert_eq!(block_rules::legacy_block_size(&b), len0, "height {height}, blue_score {bs}");
+            assert_eq!(b.size_bytes() - block_rules::legacy_block_size(&b), width(bs) - 1, "blue_score {bs}");
+            assert_eq!(block_rules::block_size_for_rules(&b, false), len0);
+            assert_eq!(block_rules::block_size_for_rules(&b, true), b.wire_size());
+        }
+    }
+}
+
 #[test]
 fn size_bytes_is_the_bincode_length() {
     let b = valid_block(3, vec![[1; 32]], 20, vec![spend_tx(1, &[1_000])], activation::NEVER);

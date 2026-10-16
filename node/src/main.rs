@@ -2108,8 +2108,13 @@ fn make_rpc_submit_block_cb(
     otx:        mpsc::Sender<network::NetworkMessage>,
     tip_tx:     broadcast::Sender<tip::TipChanged>,
 ) -> Arc<rpc::SubmitBlockFn> {
-    Arc::new(move |block: core::Block| -> Result<String, String> {
+    Arc::new(move |mut block: core::Block| -> Result<String, String> {
         let block_hash = block.block_hash();
+        // POW-8 / re-audit B1-T0: the submitter's `blue_score` is not
+        // committed by the block id. Replace it with the value derived from
+        // the parents, as `accept_block` does before storing the body, so the
+        // bytes relayed below are the bytes this node stores and serves.
+        ingress::normalize_wire_metadata(&mut block, &dag);
         // A block waiting for a body (witness-dependent failure of its
         // previous body) is not a duplicate: this copy is re-evaluated.
         if accept::is_known_block(&dag, &store, &block_hash) {
@@ -2939,6 +2944,35 @@ mod external_submission_tests {
         let err = (node.rpc_cb())(bad).unwrap_err();
         assert!(err.contains("structural validation"), "rpc: {}", err);
         assert_eq!(node.dag.read().block_count(), 1, "DAG must contain only genesis");
+    }
+
+    /// POW-8 challenge (1) / re-audit B1-T0: `submitblock` decodes the
+    /// submitter's wire `blue_score`, which the block id does not commit to.
+    /// The node stores, serves and relays the value derived from the
+    /// block's parents, never the submitted one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpc_submit_stores_and_relays_the_derived_blue_score() {
+        let genesis = mk_genesis(unix_now());
+        let mut node = node_with_genesis(&genesis);
+        let mut forged = mk_child(&node, &genesis, true);
+        let id = forged.block_hash();
+        forged.blue_score = u64::MAX;
+        assert_eq!(forged.block_hash(), id, "the id does not commit to blue_score");
+        (node.rpc_cb())(forged).expect("accepted");
+        let stored = node.store.get_block(&id).unwrap().expect("stored");
+        assert_eq!(stored.blue_score, 1, "stored with the derived blue score");
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), node._orx.recv())
+            .await.expect("relayed").expect("channel open");
+        match msg {
+            network::NetworkMessage::NewBlock { block_hash, blue_score, block_data, .. } => {
+                assert_eq!(block_hash, id);
+                assert_eq!(blue_score, 1, "announced with the derived blue score");
+                let relayed = core::Block::from_wire_bytes(&block_data).expect("canonical");
+                assert_eq!(relayed.blue_score, 1, "relayed bytes carry the derived blue score");
+                assert_eq!(block_data, stored.to_wire_bytes(), "the relayed bytes are the stored bytes");
+            }
+            other => panic!("expected NewBlock, got {:?}", std::mem::discriminant(&other)),
+        }
     }
 
     /// Positive control: a genuinely mined block (GnB-SMH proof, binding

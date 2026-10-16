@@ -227,6 +227,7 @@ def check_block_vectors(chk: Checker) -> int:
         chk.eq(cid, "subsidy", int(d["subsidy"]), gv.subsidy(b.height))
         chk.eq(cid, "wire_size", d["wire_size"], len(raw))
         chk.eq(cid, "bincode_size", d["bincode_size"], gv.block_bincode_size(b))
+        chk.eq(cid, "legacy_size", d["legacy_size"], gv.legacy_block_size(b))
 
         view = view_of(case["prevouts"])
         got, _ = verdict_of(lambda out: gv.validate_block(b, view, act, case["scope"], case["pow"], out))

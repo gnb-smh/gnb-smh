@@ -13,13 +13,17 @@
 //! height = max parent DAG height + 1, expected ASERT bits, timestamp, at/after
 //! the hardening activation the context-free block rules of
 //! `core::block_rules` (wire size, tagged Merkle root, 64-byte transactions,
-//! coinbase height / parents / witness commitment), proof of work, and the
+//! coinbase height / parents / witness commitment), the block-size limit of
+//! the verified height in the measure of the regime, proof of work, and the
 //! context-free consensus checks (canonical-encoding limits, MoneyRange; the
 //! structural checks run in `validate_structure` before this function). A
 //! failure here is context-free, so every node rejects the block and it is
 //! never stored. A block that passes is inserted into GhostDAG and
 //! its body is stored — fork-losers included — WITHOUT validating its
-//! transactions against the current tip's UTXO set.
+//! transactions against the current tip's UTXO set. The stored body carries
+//! the `blue_score` derived from the block's parents (max parent blue score
+//! + 1), never the uncommitted wire value (POW-8, re-audit B1-T0), so every
+//! node stores and serves the same bytes for one block id.
 //!
 //! **Connection**: the applied UTXO set always corresponds to the selected-
 //! parent chain of the best (highest blue_work, blue_score, hash) block that is
@@ -1127,6 +1131,28 @@ pub fn accept_block_tracking(
         v
     };
 
+    // ── POW-8 / re-audit B1-T0: the wire blue_score is not committed by the
+    //    block id. Replace it HERE, with the value derived from the verified
+    //    parents, so every caller (gossip, directed sync, orphan drain, body
+    //    restore, `submitblock`, the miner) stores and serves the same body
+    //    for one id and no peer-chosen value is ever persisted. No consensus
+    //    rule reads it (the pre-activation size measure writes it as 0,
+    //    `core::block_rules::legacy_block_size`; the wire size has it at a
+    //    fixed width), so this changes no verdict.
+    let derived_blue_score = {
+        let d = dag.read();
+        crate::ingress::derived_blue_score(
+            block.header.parents.iter().filter_map(|p| d.get_block_data(p).map(|x| x.blue_score)),
+        )
+    };
+    let normalized;
+    let block: &core::Block = if block.blue_score == derived_blue_score {
+        block
+    } else {
+        normalized = core::Block { blue_score: derived_blue_score, ..block.clone() };
+        &normalized
+    };
+
     // ── FIX VULN-02: header height = max parent DAG height + 1 ───────
     let expected_height = parent_data.iter().map(|(h, _)| *h).max().unwrap_or(0) + 1;
     if block.height != expected_height || height != expected_height {
@@ -1163,6 +1189,14 @@ pub fn accept_block_tracking(
     //    a trace, and the honest copy of that id is still accepted later. A
     //    no-op below the activation.
     core::block_rules::check_block_hardened_at(block, core::activation::hardening_activation_height())
+        .map_err(|e| format!("consensus rejection: {}", e))?;
+    // ── The block-size limit at the VERIFIED header height, in the measure
+    //    of the regime (`block_rules::check_block_size_at`: the wire size
+    //    from the activation; below it bincode with the uncommitted
+    //    blue_score written as 0, re-audit B1-T0). Every ingress path checked
+    //    it on the claimed height; checking it here too means no caller can
+    //    store a block over the limit.
+    core::block_rules::check_block_size_at(block, core::activation::hardening_activation_height())
         .map_err(|e| format!("consensus rejection: {}", e))?;
 
     // ── Proof of work (expensive: 64 MiB GnB-SMH, cached by block id) ─

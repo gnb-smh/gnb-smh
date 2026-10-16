@@ -245,13 +245,32 @@ def tx_bincode(tx: mk.Tx) -> bytes:
     return out + v(tx.locktime)
 
 
-def block_bincode_size(b: Block) -> int:
+def block_bincode_size(b: Block, blue_score: int | None = None) -> int:
+    """Length of the bincode-2 "standard" encoding of the node's `Block`
+    struct (`Block::size_bytes`), with `blue_score` written as the given
+    value (default: the value the block carries)."""
     v = sh.bincode_varint
     h = b.header
     n = len(v(h.version)) + len(v(len(h.parents))) + 32 * len(h.parents) + 32
     n += len(v(h.timestamp)) + len(v(h.bits)) + len(v(h.nonce))
     n += len(v(len(b.txs))) + sum(len(tx_bincode(t)) for t in b.txs)
-    return n + len(v(b.blue_score)) + len(v(b.height)) + len(v(0))
+    bs = b.blue_score if blue_score is None else blue_score
+    return n + len(v(bs)) + len(v(b.height)) + len(v(0))
+
+
+# The value the pre-activation size measure writes for `blue_score`.
+LEGACY_SIZE_BLUE_SCORE = 0
+
+
+def legacy_block_size(b: Block) -> int:
+    """The MAX_BLOCK_SIZE measure below the hardening activation
+    (docs/CONSENSUS.md, "Block size (VAL-12)"): the bincode length with
+    `blue_score` written as 0, whatever the copy carries. The block id does
+    not commit to `blue_score` and the node stores and serves the value
+    derived from the parents, so the measure must not read it (re-audit
+    B1-T0 / B2-T8); 0 has the shortest encoding, so no block accepted under
+    the old measure (any carried value) is too large under this one."""
+    return block_bincode_size(b, LEGACY_SIZE_BLUE_SCORE)
 
 
 # ── Witnesses and signature encodings ───────────────────────────────────────
@@ -502,7 +521,7 @@ def check_structure(b: Block, activation: int) -> None:
     hardened = block_rules_active(b.height, activation)
     if len(b.header.parents) > MAX_PARENTS:
         raise Invalid("too-many-parents")
-    size = len(b.wire()) if hardened else block_bincode_size(b)
+    size = len(b.wire()) if hardened else legacy_block_size(b)
     if size > MAX_BLOCK_SIZE:
         raise Invalid("block-size")
     if merkle_root_at(b, activation) != b.header.merkle_root:

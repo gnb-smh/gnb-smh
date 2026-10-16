@@ -25,7 +25,11 @@
 //!   block's wtxids). The block id commits to it through header ->
 //!   merkle_root -> coinbase txid (a coinbase txid covers its `script_sig`).
 //! * **Block size (VAL-12)**: `MAX_BLOCK_SIZE` is measured on the canonical
-//!   wire encoding (`Block::wire_size`), the encoding fee rates use.
+//!   wire encoding (`Block::wire_size`), the encoding fee rates use. Below the
+//!   activation the measure is [`legacy_block_size`] (bincode with the
+//!   uncommitted `blue_score` written as 0, re-audit B1-T0 / B2-T8): that
+//!   pre-activation rule is defined here too, [`check_block_size_at`] being
+//!   the one size check of both regimes.
 //!
 //! In-context rules live in the node's `validate_block_in_view` (BIP30
 //! no-overwrite, no spend of the same block's coinbase) and the pow limit in
@@ -329,16 +333,75 @@ pub fn check_coinbase_commitment(block: &Block) -> Result<(), &'static str> {
     Ok(())
 }
 
-// ── Block size (VAL-12) ──────────────────────────────────────────────────────
+// ── Block size (VAL-12; re-audit B1-T0 / B2-T8) ─────────────────────────────
+
+/// The value of `Block::blue_score` the pre-activation size measure writes,
+/// whatever the block carries: 0, whose bincode varint (1 byte) is the
+/// shortest any value has.
+pub const LEGACY_SIZE_BLUE_SCORE: u64 = 0;
+
+/// The pre-activation `MAX_BLOCK_SIZE` measure: the length of the bincode-2
+/// "standard" encoding of the block (`Block::size_bytes`) with its
+/// `blue_score` field written as [`LEGACY_SIZE_BLUE_SCORE`] (0).
+///
+/// Why not the block's own `blue_score` (re-audit B1-T0 / B2-T8): the block
+/// id does not commit to it, its bincode varint takes 1, 3, 5 or 9 bytes, and
+/// the node replaces the received value with the one derived from the
+/// block's parents before it stores and serves the body (POW-8). Measuring
+/// the received value let one block id be within the limit in the copy that
+/// was gossiped and over it in the copy every upgraded node serves, so a
+/// block the online network accepted was rejected by every node that synced
+/// it later, permanently. Every copy any release ever accepted had
+/// `size_bytes() <= MAX_BLOCK_SIZE` with SOME `blue_score`, and this measure
+/// is never larger than that (0 has the shortest encoding), so no block any
+/// release accepted becomes invalid; and the verdict is now the same for
+/// every copy of a block id. `height` is measured as carried: `accept_block`
+/// requires it to equal `max(parent DAG heights) + 1`, so every accepted copy
+/// carries the same value. docs/CONSENSUS.md, "Block size (VAL-12)";
+/// `reference/gnb_validity.py` (`legacy_block_size`).
+pub fn legacy_block_size(block: &Block) -> usize {
+    // The field order and types of `Block`'s serde derive, with
+    // `blue_score` replaced: bincode writes a borrowed slice exactly like the
+    // `Vec` it borrows from.
+    #[derive(serde::Serialize)]
+    struct Measured<'a> {
+        header: &'a super::BlockHeader,
+        transactions: &'a [Transaction],
+        blue_score: u64,
+        height: u64,
+        shielded_transactions: &'a [coherence_core::ShieldedTx],
+    }
+    let m = Measured {
+        header: &block.header,
+        transactions: &block.transactions,
+        blue_score: LEGACY_SIZE_BLUE_SCORE,
+        height: block.height,
+        shielded_transactions: &block.shielded_transactions,
+    };
+    bincode::serde::encode_to_vec(&m, bincode::config::standard()).map(|v| v.len()).unwrap_or(usize::MAX)
+}
 
 /// The size `MAX_BLOCK_SIZE` is compared with: the canonical wire encoding
-/// when `hardened`, bincode (`Block::size_bytes`) otherwise.
+/// (`Block::wire_size`, every field fixed-width or committed) when
+/// `hardened`, [`legacy_block_size`] otherwise. Neither depends on the
+/// uncommitted `blue_score`.
 pub fn block_size_for_rules(block: &Block, hardened: bool) -> usize {
     if hardened {
         block.wire_size()
     } else {
-        block.size_bytes()
+        legacy_block_size(block)
     }
+}
+
+/// The `MAX_BLOCK_SIZE` rule for a block at its header height under
+/// `activation_height`: the ONE size check of `Block::validate_structure`,
+/// `check_block_hardened_at` (at/after the activation), `accept_block` and
+/// the template self-check.
+pub fn check_block_size_at(block: &Block, activation_height: u64) -> Result<(), &'static str> {
+    if block_size_for_rules(block, rules_active_at(block.height, activation_height)) > super::MAX_BLOCK_SIZE {
+        return Err("block too large");
+    }
+    Ok(())
 }
 
 // ── Pow limit (POW-3) ────────────────────────────────────────────────────────
@@ -382,9 +445,7 @@ pub fn check_block_hardened_at(block: &Block, activation_height: u64) -> Result<
     if !rules_active_at(block.height, activation_height) {
         return Ok(());
     }
-    if block.wire_size() > super::MAX_BLOCK_SIZE {
-        return Err("block too large");
-    }
+    check_block_size_at(block, activation_height)?;
     if !block.validate_merkle_at(activation_height) {
         return Err("invalid merkle root");
     }

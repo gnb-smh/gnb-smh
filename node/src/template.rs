@@ -12,8 +12,9 @@
 //!   before children (child-pays-for-parent, audit MEM-6 —
 //!   `mempool::select_packages`; without in-pool chains this is highest fee
 //!   rate first), under a BYTE budget measured exactly as the consensus rule
-//!   measures AT THE TEMPLATE'S HEIGHT (bincode `Block::size_bytes` below the
-//!   hardening activation, the canonical wire encoding `Block::wire_size`
+//!   measures AT THE TEMPLATE'S HEIGHT (below the hardening activation the
+//!   bincode measure `block_rules::legacy_block_size`, which writes the
+//!   uncommitted `blue_score` as 0; the canonical wire encoding `Block::wire_size`
 //!   at/after it, audit VAL-12 — package sizes and fee rates use the same
 //!   measure): the budget is `MAX_BLOCK_SIZE` minus an upper bound of the
 //!   header and block framing (every varint at its maximum width) minus a
@@ -238,8 +239,10 @@ fn framing_upper_bound(parents: &[BlockHash], hardened: bool) -> usize {
         height: u64::MAX,
         shielded_transactions: Vec::new(),
     };
-    // + 9: the transaction-count varint grows from 1 byte (empty) to at most 9.
-    empty.size_bytes().saturating_add(9)
+    // The rule's own measure (`legacy_block_size`: blue_score written as 0,
+    // re-audit B1-T0). + 9: the transaction-count varint grows from 1 byte
+    // (empty) to at most 9.
+    core::block_rules::legacy_block_size(&empty).saturating_add(9)
 }
 
 /// The node's own coinbase for `height` paying `value` to `script_pubkey`.

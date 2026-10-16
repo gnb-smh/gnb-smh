@@ -220,6 +220,7 @@ fn block_vectors_core() {
         rep.expect(&c.id, "subsidy", d["subsidy"].as_str().unwrap(), &core::tokenomics::block_subsidy_sat(block.height).to_string());
         rep.expect(&c.id, "wire_size", &d["wire_size"].to_string(), &block.wire_size().to_string());
         rep.expect(&c.id, "bincode_size", &d["bincode_size"].to_string(), &block.size_bytes().to_string());
+        rep.expect(&c.id, "legacy_size", &d["legacy_size"].to_string(), &block_rules::legacy_block_size(&block).to_string());
 
         if c.scope == "connect" {
             connect_deferred += 1; // connect-time rules only: node runner
