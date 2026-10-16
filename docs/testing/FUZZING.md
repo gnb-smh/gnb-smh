@@ -23,7 +23,7 @@ assertion failure, which libFuzzer reports as a crash like any panic.
 | `block_parse` | `Block::from_wire_bytes` | no panic; decode/encode is a fixed point |
 | `header_parse` | `BlockHeader::from_wire_bytes` | no panic; fixed point; a trailing byte is refused |
 | `netmsg_decode` | `network::decode_wire_message` (gossip frames) | no panic; an accepted frame obeys every field bound (restated in the target) and is the canonical encoding of its message (one frame per message: gossipsub message ids are SHA-256 of the frame) |
-| `handshake_decode` | transport `HandshakeInit` / `HandshakeResp` decode | no panic (16 KiB limit, bincode standard configuration, as `read_msg`) |
+| `handshake_decode` | live transport handshake `upgrade::HandshakeInitLp` / `HandshakeRespLp` decode (until the re-audit, NET-17, it decoded the same-layout types of a never-used ML-DSA handshake, since removed; the corpus is unchanged) | no panic (16 KiB limit, bincode standard configuration, as `read_msg`) |
 | `pow_decode` | compact bits, chain work, ASERT (`gnb_smh::difficulty`) | no panic; bits round down and are stable; work monotone; ASERT equals an independent U512 implementation of aserti3-2d |
 | `pow_verify` | GnB-SMH on small scratchpads, `crypto::verify` | no panic; strict `out < target`; malformed bits never validate; the hybrid verifier returns a bool on arbitrary keys and signatures |
 | `merkle_path` | `coherence_core::verify_path` | no panic; wrong-length paths and indices above the tree depth never verify |

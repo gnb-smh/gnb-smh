@@ -4,11 +4,13 @@
 //! `BlockHeader::from_wire_bytes`) consume bytes straight off the P2P wire and
 //! the RPC surface — fully attacker-controlled. The consensus rule is
 //! "malformed ⇒ `Err`, never a panic": a panic on a crafted buffer is a remote
-//! DoS. This is the always-on, stable-Rust floor for that invariant.
-//! (Audit NET-17: there are no libFuzzer targets in this tree — only the seed
-//! corpora under `node/fuzz/corpus/`, replayed by `parser_corpus_floor.rs`.
-//! An earlier version of this header referenced
-//! `fuzz/fuzz_targets/{tx_parse,block_parse}.rs`, which do not exist.)
+//! DoS. This is the always-on, stable-Rust floor for that invariant; the
+//! coverage-guided fuzzing of the same decoders is done by the libFuzzer
+//! targets `node/fuzz/fuzz_targets/{tx_parse,block_parse,header_parse}.rs`
+//! (cargo-fuzz, nightly; docs/testing/FUZZING.md), whose seed corpora under
+//! `node/fuzz/corpus/` `parser_corpus_floor.rs` replays on stable.
+//! (Audit NET-17, corrected again in the re-audit: an earlier version of this
+//! header said those targets did not exist.)
 //!
 //! Style matches `gnb-crypto`'s `crypto::kat` fuzz tests: a deterministic
 //! SplitMix64 stream (reproducible failures) driven through

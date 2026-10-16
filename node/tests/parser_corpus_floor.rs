@@ -28,7 +28,7 @@ use gnb::coherence::ShieldedTx;
 use gnb::core::{Block, BlockHeader, Transaction, TxInput, TxOutput};
 use gnb::mempool::Mempool;
 use gnb::network::{NetworkMessage, SyncEntry};
-use gnb::transport::{HandshakeInit, HandshakeResp};
+use gnb::transport::upgrade::{HandshakeInitLp, HandshakeRespLp};
 
 // ── deterministic PRNG ────────────────────────────────────────────────────────
 
@@ -171,23 +171,24 @@ fn rand_netmsg(r: &mut Rng) -> Vec<u8> {
 }
 
 fn rand_handshake_init(r: &mut Rng) -> Vec<u8> {
-    let init = HandshakeInit {
+    // The LIVE handshake message (`transport::upgrade::read_msg` decodes it).
+    let init = HandshakeInitLp {
         version: 1,
         kyber_pk: r.bytes_rand(0, 64),
-        identity_pk: r.bytes_rand(0, 64),
+        identity_pk_proto: r.bytes_rand(0, 64),
         nonce: r.arr32(),
         signature: r.bytes_rand(0, 64),
     };
-    bincode::serde::encode_to_vec(&init, bincfg()).expect("encode HandshakeInit")
+    bincode::serde::encode_to_vec(&init, bincfg()).expect("encode HandshakeInitLp")
 }
 
 fn rand_handshake_resp(r: &mut Rng) -> Vec<u8> {
-    let resp = HandshakeResp {
+    let resp = HandshakeRespLp {
         ciphertext: r.bytes_rand(0, 64),
-        identity_pk: r.bytes_rand(0, 64),
+        identity_pk_proto: r.bytes_rand(0, 64),
         signature: r.bytes_rand(0, 64),
     };
-    bincode::serde::encode_to_vec(&resp, bincfg()).expect("encode HandshakeResp")
+    bincode::serde::encode_to_vec(&resp, bincfg()).expect("encode HandshakeRespLp")
 }
 
 /// A valid `pow_decode` seed: exactly `N = 256` signed bytes in [-2, 2].
@@ -334,8 +335,8 @@ fn floor_netmsg_decode_no_panic() {
 #[test]
 fn floor_handshake_decode_no_panic() {
     assert_no_panic("handshake_decode", rand_handshake_init, |d| {
-        let _ = bincode::serde::decode_from_slice::<HandshakeInit, _>(d, bincfg());
-        let _ = bincode::serde::decode_from_slice::<HandshakeResp, _>(d, bincfg());
+        let _ = bincode::serde::decode_from_slice::<HandshakeInitLp, _>(d, bincfg());
+        let _ = bincode::serde::decode_from_slice::<HandshakeRespLp, _>(d, bincfg());
     });
 }
 

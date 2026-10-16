@@ -2,11 +2,15 @@
 //!
 //! # Scope
 //!
-//! This module implements hardened cryptographic primitives for a
-//! post-quantum secure channel: an authenticated Kyber-768 (round 3,
-//! PQClean via `pqcrypto-kyber` 0.8.1) + ML-DSA-65 handshake, followed
-//! by a ChaCha20-Poly1305 stream cipher with monotonic nonce counters
-//! and domain-separated key schedule.
+//! The live P2P transport is the libp2p security upgrade in
+//! [`upgrade`]: an ephemeral **Kyber-768** key exchange authenticated by the
+//! node's **libp2p identity key (Ed25519)**, followed by a
+//! ChaCha20-Poly1305 stream ([`stream::KyberStream`]). This module holds
+//! the pieces that upgrade is built from: the protocol constants and HKDF
+//! labels, the one-directional AEAD stream halves ([`TxStream`] /
+//! [`RxStream`]) with monotonic nonce counters, and the reference encoding
+//! of the length-prefixed frame format ([`frame_seal`] / [`frame_open`]:
+//! `KyberStream` writes the same format, and its tests decode it with them).
 //!
 //! M-4 (audit): the KEM here is **Kyber-768, NOT ML-KEM-768 / NIST
 //! FIPS 203**. The two schemes are not the same thing and are **NOT
@@ -15,70 +19,28 @@
 //! but round-3 Kyber additionally hashes the ciphertext into the
 //! shared secret during encapsulation, which ML-KEM (finalized as
 //! FIPS 203) does not; a node built against `pqcrypto-mlkem` cannot
-//! complete a handshake with this one. This doc comment previously
-//! called the KEM "ML-KEM-768" and its constants "(FIPS 203)" — see the
-//! corrected constant docs below — which was simply wrong: `pqcrypto-kyber`
-//! wraps PQClean's `kyber768`, a distinct (and, since FIPS 203 finalized,
-//! superseded) implementation; PQClean ships ML-KEM separately, wrapped by
-//! the different crate `pqcrypto-mlkem`. Migrating to `pqcrypto-mlkem` is a
+//! complete a handshake with this one. `pqcrypto-kyber` wraps PQClean's
+//! `kyber768`, a distinct (and, since FIPS 203 finalized, superseded)
+//! implementation; PQClean ships ML-KEM separately, wrapped by the
+//! different crate `pqcrypto-mlkem`. Migrating to `pqcrypto-mlkem` is a
 //! wire-breaking flag day, not a rename, and is not scheduled by anything in
 //! this tree.
 //!
-//! **Status:** the handshake primitives BELOW (`Initiator` /
-//! `PendingResponder` / `SessionConfirm`, ML-DSA-65-authenticated) are
-//! DEAD CODE outside this module's own tests — nothing in the tree
-//! constructs them (`grep -rn 'Initiator::new\|PendingResponder::' src/`
-//! outside this file returns nothing). The libp2p transport that is
-//! ACTUALLY wired in (`transport::upgrade`, which this crate's `network`
-//! module uses) authenticates peers with the **libp2p identity key
-//! (Ed25519)**, not ML-DSA-65 — `upgrade.rs` documents this correctly;
-//! this module's header did not, which is corrected here. Kept for
-//! reference / possible future replacement of the Ed25519 peer-identity
-//! authentication with a PQ one; not on any live path. Sprint A2's actual
-//! libp2p `InboundConnectionUpgrade` / `OutboundConnectionUpgrade`
-//! implementation lives in `transport::upgrade`.
+//! NET-17 (audit, re-audit): this module used to also carry a second,
+//! ML-DSA-65-authenticated handshake (`Initiator` / `PendingResponder` /
+//! `SessionConfirm`) that nothing in the node ever used — peers have always
+//! been authenticated by their Ed25519 libp2p identity, never by ML-DSA. That
+//! dead code was removed so no reader takes it for the transport (git history
+//! keeps it). Peer authentication is therefore classical (Ed25519);
+//! post-quantum protection covers the session KEYS (Kyber), not the peer
+//! identities. ML-DSA-65 ‖ Falcon-1024 signatures are used at the consensus
+//! layer (transactions, blocks), which is orthogonal to this transport.
 //!
-//! Keeping primitives separate from transport integration lets us
-//! audit, test, and fuzz the cryptographic core in isolation.
+//! # Security properties claimed (of the primitives here)
 //!
-//! # Protocol overview
-//!
-//! Authenticated handshake in 1.5 round-trips:
-//!
-//! ```text
-//!   INITIATOR                                    RESPONDER
-//!   gen ephemeral Kyber keypair (sk, pk)
-//!   t1 = H(MAGIC || v || pk || id_pk_i || nonce)
-//!   sig_i = MLDSA_sign(id_sk_i, t1)
-//!   ──── HandshakeInit { pk, id_pk_i, nonce, sig_i } ──>
-//!                                                verify sig_i w/ id_pk_i
-//!                                                (ss, ct) = Kyber_enc(pk)
-//!                                                t2 = H(t1 || ct || id_pk_r)
-//!                                                sig_r = MLDSA_sign(id_sk_r, t2)
-//!                                                derive session keys (ss, t2)
-//!   <─── HandshakeResp { ct, id_pk_r, sig_r } ────
-//!   verify sig_r w/ id_pk_r
-//!   ss = Kyber_dec(sk, ct)
-//!   derive session keys (ss, t2)
-//!   confirm_i = HMAC(k_conf, t2 || "i")
-//!   ────── SessionConfirm { confirm_i } ──────>
-//!                                                verify confirm_i
-//!                                                confirm_r = HMAC(k_conf, t2 || "r")
-//!   <───── SessionConfirm { confirm_r } ─────
-//!   verify confirm_r
-//!   [session established]
-//! ```
-//!
-//! # Security properties claimed
-//!
-//! - PQ confidentiality of session keys: Kyber768 KEM
-//! - PQ authentication of peer identities: ML-DSA-65 signatures
-//! - Forward secrecy w.r.t. identity keys: ephemeral Kyber keypair per session
-//! - Replay protection of handshakes: 32-byte initiator nonce, transcript-bound
-//! - Transcript integrity: SHA3-256 over all handshake fields
 //! - Session nonce non-reuse: u64 monotonic counter; refuses to overflow
 //! - In-session replay/reorder: rx counter must advance monotonically
-//! - Constant-time confirmation check via subtle::ConstantTimeEq
+//! - Frame length bound into the AEAD (truncation is detected)
 //!
 //! # Security properties NOT claimed
 //!
@@ -86,25 +48,13 @@
 //!   upstream reference code Dec 2023; this crate may or may not track it).
 //! - Post-compromise security within a session (no ratcheting).
 //! - Traffic analysis resistance (no padding; message sizes leak).
+//! - Post-quantum peer AUTHENTICATION (identities are Ed25519).
 //! - Formal proof of handshake security. No third-party audit.
 
 pub mod stream;
 pub mod upgrade;
 
-use pqcrypto_kyber::kyber768;
-#[allow(unused_imports)]
-use pqcrypto_traits::kem::{PublicKey, SharedSecret, Ciphertext};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, aead::{Aead, KeyInit, Payload}};
-use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use sha3::{Sha3_256, Digest};
-use subtle::ConstantTimeEq;
-use rand::RngCore;
-use zeroize::{Zeroize, ZeroizeOnDrop};
-use serde::{Serialize, Deserialize};
-
-use crate::crypto;
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -118,8 +68,6 @@ pub const DOMAIN_MAGIC: &[u8] = b"BLOCH-PQ-v1-handshake";
 pub const LABEL_I2R: &[u8] = b"BLOCH-PQ-v1 i->r stream";
 /// HKDF label for the responder→initiator stream key.
 pub const LABEL_R2I: &[u8] = b"BLOCH-PQ-v1 r->i stream";
-/// HKDF label for the session confirmation key.
-pub const LABEL_CONFIRM: &[u8] = b"BLOCH-PQ-v1 confirm";
 
 /// Kyber768 public key size.
 ///
@@ -133,13 +81,6 @@ pub const KYBER768_PK_SIZE: usize = 1184;
 /// Kyber768 ciphertext size. Same FIPS-203 caveat as [`KYBER768_PK_SIZE`]:
 /// this is round-3 Kyber's ciphertext, not ML-KEM's.
 pub const KYBER768_CT_SIZE: usize = 1088;
-/// Peer-identity public-key size. Sprint B6b: identity signatures now use the
-/// hybrid ML-DSA-65 ‖ Falcon-1024 scheme (via `crypto::sign`/`verify`), so the
-/// identity pubkey is the hybrid pubkey (ML-DSA 1952 ‖ Falcon 1793 = 3745).
-pub const MLDSA65_PK_SIZE: usize = crate::core::PUBKEY_SIZE;
-/// Hybrid identity signature size (upper bound; Falcon is variable). Not
-/// length-checked on the handshake path — `crypto::verify` validates it.
-pub const MLDSA65_SIG_SIZE: usize = crate::core::SIG_SIZE;
 
 /// Size of stream cipher keys (ChaCha20-Poly1305: 256 bits).
 pub const STREAM_KEY_SIZE: usize = 32;
@@ -152,334 +93,6 @@ pub const TAG_SIZE: usize = 16;
 pub const HANDSHAKE_NONCE_SIZE: usize = 32;
 /// Transcript hash size (SHA3-256).
 pub const TRANSCRIPT_SIZE: usize = 32;
-/// Confirmation MAC size (HMAC-SHA256 truncated).
-pub const CONFIRM_MAC_SIZE: usize = 32;
-
-// ── Wire messages ───────────────────────────────────────────────────────────
-//
-// M-4 (audit): everything below in this module — `HandshakeInit`,
-// `HandshakeResp`, `SessionConfirm`, `Initiator`, `InitiatorCompleted`,
-// `PendingResponder` — is UNUSED outside this module's own `#[cfg(test)]`
-// code. The libp2p transport actually wired into the node
-// (`transport::upgrade`) implements its own Kyber-768 handshake
-// authenticated by the libp2p Ed25519 identity key, not this ML-DSA-65
-// path. Kept for reference / a possible future PQ peer-identity scheme;
-// deliberately not deleted (it is exercised by tests and a correct,
-// working reference implementation), but it must not be read as "the"
-// transport — see the module doc comment at the top of this file.
-
-/// Initiator's first message. UNUSED outside this module's own tests — see
-/// the "Wire messages" section banner above.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HandshakeInit {
-    pub version:     u8,
-    pub kyber_pk:    Vec<u8>,
-    pub identity_pk: Vec<u8>,
-    pub nonce:       [u8; HANDSHAKE_NONCE_SIZE],
-    pub signature:   Vec<u8>,
-}
-
-/// Responder's reply.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HandshakeResp {
-    pub ciphertext:  Vec<u8>,
-    pub identity_pk: Vec<u8>,
-    pub signature:   Vec<u8>,
-}
-
-/// Session confirmation: each party sends after key derivation, verifies
-/// the other's, then declares the session established.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SessionConfirm {
-    pub mac: [u8; CONFIRM_MAC_SIZE],
-}
-
-// ── Transcript hashing ──────────────────────────────────────────────────────
-
-/// t1 = SHA3-256(MAGIC || v || kyber_pk || id_pk_i || nonce)
-fn transcript_t1(
-    version:  u8,
-    kyber_pk: &[u8],
-    id_pk_i:  &[u8],
-    nonce:    &[u8; HANDSHAKE_NONCE_SIZE],
-) -> [u8; TRANSCRIPT_SIZE] {
-    let mut h = Sha3_256::new();
-    h.update(DOMAIN_MAGIC);
-    h.update([version]);
-    h.update(kyber_pk);
-    h.update(id_pk_i);
-    h.update(nonce);
-    h.finalize().into()
-}
-
-/// t2 = SHA3-256(t1 || ciphertext || id_pk_r)
-fn transcript_t2(
-    t1:         &[u8; TRANSCRIPT_SIZE],
-    ciphertext: &[u8],
-    id_pk_r:    &[u8],
-) -> [u8; TRANSCRIPT_SIZE] {
-    let mut h = Sha3_256::new();
-    h.update(t1);
-    h.update(ciphertext);
-    h.update(id_pk_r);
-    h.finalize().into()
-}
-
-// ── Key derivation ──────────────────────────────────────────────────────────
-
-/// Derive (i→r key, r→i key, confirmation key) from Kyber shared secret.
-/// Uses HKDF-SHA256 with t2 as salt to bind keys to the full transcript,
-/// and distinct labels to ensure domain separation.
-fn derive_session_keys(
-    shared_secret: &[u8],
-    t2:            &[u8; TRANSCRIPT_SIZE],
-) -> (
-    [u8; STREAM_KEY_SIZE],
-    [u8; STREAM_KEY_SIZE],
-    [u8; STREAM_KEY_SIZE],
-) {
-    let hkdf = Hkdf::<Sha256>::new(Some(t2), shared_secret);
-    let mut k_i2r  = [0u8; STREAM_KEY_SIZE];
-    let mut k_r2i  = [0u8; STREAM_KEY_SIZE];
-    let mut k_conf = [0u8; STREAM_KEY_SIZE];
-    hkdf.expand(LABEL_I2R,     &mut k_i2r).expect("HKDF expand i2r");
-    hkdf.expand(LABEL_R2I,     &mut k_r2i).expect("HKDF expand r2i");
-    hkdf.expand(LABEL_CONFIRM, &mut k_conf).expect("HKDF expand confirm");
-    (k_i2r, k_r2i, k_conf)
-}
-
-/// HMAC-SHA256(confirm_key, t2 || role), truncated to CONFIRM_MAC_SIZE.
-fn confirm_mac(
-    confirm_key: &[u8; STREAM_KEY_SIZE],
-    t2:          &[u8; TRANSCRIPT_SIZE],
-    role:        &[u8],
-) -> [u8; CONFIRM_MAC_SIZE] {
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(confirm_key).expect("HMAC any key size");
-    mac.update(t2);
-    mac.update(role);
-    let out = mac.finalize().into_bytes();
-    let mut result = [0u8; CONFIRM_MAC_SIZE];
-    result.copy_from_slice(&out[..CONFIRM_MAC_SIZE]);
-    result
-}
-
-// ── Session keys (zeroized on drop) ─────────────────────────────────────────
-
-/// Completed session state. Drops zeroize both keys.
-#[derive(Zeroize, ZeroizeOnDrop)]
-pub struct SessionKeys {
-    pub tx_key: [u8; STREAM_KEY_SIZE],
-    pub rx_key: [u8; STREAM_KEY_SIZE],
-    #[zeroize(skip)]
-    pub is_initiator: bool,
-}
-
-// ── Initiator ───────────────────────────────────────────────────────────────
-
-/// State held by the initiator between `begin()` and `finish()`.
-pub struct Initiator {
-    kyber_sk:    kyber768::SecretKey,
-    /// Transcript hash t1, needed to re-derive t2 in finish().
-    t1:          [u8; TRANSCRIPT_SIZE],
-}
-
-/// Result of `Initiator::finish()`: session keys + the material needed to
-/// verify the responder's confirmation MAC.
-pub struct InitiatorCompleted {
-    pub keys:        SessionKeys,
-    pub my_confirm:  SessionConfirm,
-    /// The derived confirmation key — caller uses this to verify the
-    /// responder's confirmation message when it arrives.
-    pub confirm_key: [u8; STREAM_KEY_SIZE],
-    pub t2:          [u8; TRANSCRIPT_SIZE],
-}
-
-impl Initiator {
-    /// Begin a new handshake. Generates an ephemeral Kyber keypair and
-    /// returns the init message to send + state to continue with.
-    pub fn begin(
-        identity_sk: &[u8],
-        identity_pk: &[u8],
-    ) -> Result<(Self, HandshakeInit), TransportError> {
-        if identity_pk.len() != MLDSA65_PK_SIZE {
-            return Err(TransportError::InvalidPublicKey);
-        }
-
-        let (kpk, ksk) = kyber768::keypair();
-        let kyber_pk = kpk.as_bytes().to_vec();
-
-        let mut nonce = [0u8; HANDSHAKE_NONCE_SIZE];
-        rand::rng().fill_bytes(&mut nonce);
-
-        let t1 = transcript_t1(PQ_PROTOCOL_VERSION, &kyber_pk, identity_pk, &nonce);
-
-        let signature = crypto::sign(identity_sk, &t1)
-            .map_err(|_| TransportError::SigningFailed)?;
-
-        let msg = HandshakeInit {
-            version:     PQ_PROTOCOL_VERSION,
-            kyber_pk,
-            identity_pk: identity_pk.to_vec(),
-            nonce,
-            signature,
-        };
-        let state = Initiator { kyber_sk: ksk, t1 };
-        Ok((state, msg))
-    }
-
-    /// Process the responder's reply. Completes Kyber decapsulation,
-    /// derives session keys, and prepares our confirmation MAC.
-    ///
-    /// `pin` — optional identity pinning. If Some(pk), the responder's
-    /// identity_pk must match `pk` (constant-time compare). Useful when
-    /// the initiator has out-of-band knowledge of who it should be talking
-    /// to; prevents silent MITM where an attacker has their own valid
-    /// identity. If None, any well-formed identity is accepted.
-    pub fn finish(
-        self,
-        resp: &HandshakeResp,
-        pin:  Option<&[u8]>,
-    ) -> Result<InitiatorCompleted, TransportError> {
-        // Structural sanity.
-        if resp.ciphertext.len() != KYBER768_CT_SIZE {
-            return Err(TransportError::InvalidCiphertext);
-        }
-        if resp.identity_pk.len() != MLDSA65_PK_SIZE {
-            return Err(TransportError::InvalidPublicKey);
-        }
-
-        // Pinning (constant-time compare to avoid identity-guessing timing).
-        if let Some(expected) = pin {
-            if !bool::from(resp.identity_pk.ct_eq(expected)) {
-                return Err(TransportError::IdentityMismatch);
-            }
-        }
-
-        // Compute t2 and verify responder's signature.
-        let t2 = transcript_t2(&self.t1, &resp.ciphertext, &resp.identity_pk);
-        if !crypto::verify(&resp.identity_pk, &t2, &resp.signature) {
-            return Err(TransportError::BadResponderSignature);
-        }
-
-        // Kyber decapsulate.
-        let ct = kyber768::Ciphertext::from_bytes(&resp.ciphertext)
-            .map_err(|_| TransportError::InvalidCiphertext)?;
-        let ss = kyber768::decapsulate(&ct, &self.kyber_sk);
-
-        let (k_i2r, k_r2i, k_conf) = derive_session_keys(ss.as_bytes(), &t2);
-        let my_confirm = confirm_mac(&k_conf, &t2, b"i");
-
-        let keys = SessionKeys {
-            tx_key: k_i2r,
-            rx_key: k_r2i,
-            is_initiator: true,
-        };
-
-        Ok(InitiatorCompleted {
-            keys,
-            my_confirm: SessionConfirm { mac: my_confirm },
-            confirm_key: k_conf,
-            t2,
-        })
-    }
-}
-
-// ── Responder ───────────────────────────────────────────────────────────────
-
-/// Intermediate state on the responder's side: has derived session keys
-/// but is awaiting the initiator's confirmation before exposing them.
-pub struct PendingResponder {
-    confirm_key: [u8; STREAM_KEY_SIZE],
-    t2:          [u8; TRANSCRIPT_SIZE],
-    keys:        Option<SessionKeys>,
-}
-
-impl PendingResponder {
-    /// Process the initiator's init message. Verifies the signature,
-    /// performs Kyber encapsulation, derives keys, signs t2.
-    pub fn respond(
-        init:        &HandshakeInit,
-        identity_sk: &[u8],
-        identity_pk: &[u8],
-    ) -> Result<(Self, HandshakeResp), TransportError> {
-        if init.version != PQ_PROTOCOL_VERSION {
-            return Err(TransportError::UnsupportedVersion(init.version));
-        }
-        if init.kyber_pk.len() != KYBER768_PK_SIZE {
-            return Err(TransportError::InvalidPublicKey);
-        }
-        if init.identity_pk.len() != MLDSA65_PK_SIZE {
-            return Err(TransportError::InvalidPublicKey);
-        }
-        if identity_pk.len() != MLDSA65_PK_SIZE {
-            return Err(TransportError::InvalidPublicKey);
-        }
-
-        // Recompute t1 and verify initiator's signature.
-        let t1 = transcript_t1(init.version, &init.kyber_pk, &init.identity_pk, &init.nonce);
-        if !crypto::verify(&init.identity_pk, &t1, &init.signature) {
-            return Err(TransportError::BadInitiatorSignature);
-        }
-
-        // Kyber encapsulate against the initiator's ephemeral pk.
-        let kpk = kyber768::PublicKey::from_bytes(&init.kyber_pk)
-            .map_err(|_| TransportError::InvalidPublicKey)?;
-        let (ss, ct) = kyber768::encapsulate(&kpk);
-        let ciphertext = ct.as_bytes().to_vec();
-
-        let t2 = transcript_t2(&t1, &ciphertext, identity_pk);
-        let signature = crypto::sign(identity_sk, &t2)
-            .map_err(|_| TransportError::SigningFailed)?;
-
-        let (k_i2r, k_r2i, k_conf) = derive_session_keys(ss.as_bytes(), &t2);
-
-        let keys = SessionKeys {
-            // Responder perspective: receives i→r, sends r→i.
-            rx_key:       k_i2r,
-            tx_key:       k_r2i,
-            is_initiator: false,
-        };
-        let resp = HandshakeResp {
-            ciphertext,
-            identity_pk: identity_pk.to_vec(),
-            signature,
-        };
-        Ok((Self { confirm_key: k_conf, t2, keys: Some(keys) }, resp))
-    }
-
-    /// Verify the initiator's confirmation MAC. On success, yield the
-    /// session keys and our confirmation to send back.
-    pub fn accept_confirmation(
-        mut self,
-        initiator_confirm: &SessionConfirm,
-    ) -> Result<(SessionKeys, SessionConfirm), TransportError> {
-        let expected = confirm_mac(&self.confirm_key, &self.t2, b"i");
-        if !bool::from(expected.ct_eq(&initiator_confirm.mac)) {
-            return Err(TransportError::BadConfirmation);
-        }
-        let my_confirm = confirm_mac(&self.confirm_key, &self.t2, b"r");
-        let keys = self.keys.take().ok_or(TransportError::StateError)?;
-        Ok((keys, SessionConfirm { mac: my_confirm }))
-    }
-}
-
-impl SessionKeys {
-    /// Verify the responder's confirmation MAC (called by the initiator
-    /// after it receives the responder's confirm). Uses the confirm_key
-    /// and t2 stashed in InitiatorCompleted.
-    pub fn verify_responder_confirmation(
-        confirm_key:       &[u8; STREAM_KEY_SIZE],
-        t2:                &[u8; TRANSCRIPT_SIZE],
-        responder_confirm: &SessionConfirm,
-    ) -> Result<(), TransportError> {
-        let expected = confirm_mac(confirm_key, t2, b"r");
-        if !bool::from(expected.ct_eq(&responder_confirm.mac)) {
-            return Err(TransportError::BadConfirmation);
-        }
-        Ok(())
-    }
-}
 
 // ── Stream cipher ───────────────────────────────────────────────────────────
 
@@ -593,15 +206,6 @@ pub fn frame_open(rx: &mut RxStream, buf: &[u8]) -> Result<(usize, Vec<u8>), Tra
 pub enum TransportError {
     #[error("encryption failed")]                                     EncryptFailed,
     #[error("decryption failed (bad key, tag, or counter)")]          DecryptFailed,
-    #[error("invalid ciphertext structure")]                          InvalidCiphertext,
-    #[error("invalid public key")]                                    InvalidPublicKey,
-    #[error("signing failed (bad identity secret key)")]              SigningFailed,
-    #[error("bad initiator signature on handshake init")]             BadInitiatorSignature,
-    #[error("bad responder signature on handshake resp")]             BadResponderSignature,
-    #[error("bad session confirmation MAC")]                          BadConfirmation,
-    #[error("responder identity does not match pinned value")]        IdentityMismatch,
-    #[error("unsupported protocol version: {0}")]                     UnsupportedVersion(u8),
     #[error("stream nonce counter exhausted")]                        CounterExhausted,
     #[error("incomplete frame (need more bytes)")]                    IncompleteFrame,
-    #[error("internal state error")]                                  StateError,
 }

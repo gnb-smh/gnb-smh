@@ -82,26 +82,33 @@ pub const KYBER_PROTOCOL_ID: &str = "/gnb/kyber/1.0.0";
 /// Kyber768 pk (1184) + libp2p pubkey (~42 bytes for Ed25519, more for RSA)
 /// + nonce (32) + sig (64 for Ed25519, more for others) + bincode overhead.
 /// 16 KiB leaves huge headroom and rejects absurd messages.
-const MAX_HANDSHAKE_MSG_SIZE: u32 = 16 * 1024;
+pub const MAX_HANDSHAKE_MSG_SIZE: u32 = 16 * 1024;
 
 // ── Wire messages ───────────────────────────────────────────────────────────
+//
+// Public so the `handshake_decode` fuzz target and the parser corpus floor
+// (node/tests/parser_corpus_floor.rs) decode exactly these types, the ones
+// `read_msg` decodes off the wire (NET-17: they used to fuzz the removed,
+// never-used ML-DSA handshake types instead).
 
+/// The dialer's handshake message (decoded by `read_msg`).
 #[derive(Serialize, Deserialize)]
-struct HandshakeInitLp {
-    version:             u8,
-    kyber_pk:            Vec<u8>,
+pub struct HandshakeInitLp {
+    pub version:             u8,
+    pub kyber_pk:            Vec<u8>,
     /// libp2p `PublicKey::encode_protobuf()` bytes.
-    identity_pk_proto:   Vec<u8>,
-    nonce:               [u8; HANDSHAKE_NONCE_SIZE],
+    pub identity_pk_proto:   Vec<u8>,
+    pub nonce:               [u8; HANDSHAKE_NONCE_SIZE],
     /// libp2p signature over transcript hash t1.
-    signature:           Vec<u8>,
+    pub signature:           Vec<u8>,
 }
 
+/// The listener's handshake answer (decoded by `read_msg`).
 #[derive(Serialize, Deserialize)]
-struct HandshakeRespLp {
-    ciphertext:          Vec<u8>,
-    identity_pk_proto:   Vec<u8>,
-    signature:           Vec<u8>,
+pub struct HandshakeRespLp {
+    pub ciphertext:          Vec<u8>,
+    pub identity_pk_proto:   Vec<u8>,
+    pub signature:           Vec<u8>,
 }
 
 // ── Config ──────────────────────────────────────────────────────────────────
