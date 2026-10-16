@@ -1,8 +1,11 @@
 //! Seed corpora of the cargo-fuzz targets added by the 2026-10 hardening
 //! (`fuzz/fuzz_targets/{block_rules, sighash, witness_parse, wire_roundtrip,
-//! undo_decode, keystore_decode, address_parse, sync_rr_codec, accept_dag}`)
-//! and of `header_parse` (an original target `parser_corpus_floor.rs` does
-//! not seed), and their stable-Rust floor.
+//! undo_decode, keystore_decode, address_parse, sync_rr_codec, accept_dag}`),
+//! of `header_parse` (an original target `parser_corpus_floor.rs` does not
+//! seed) and of the six targets of the relaunched mainnet line
+//! (`sync_decode, pq_handshake_decode, block_validate, tx_validate,
+//! policy_witness_decode, script_sig_verify`, which arrived without a
+//! corpus), and their stable-Rust floor.
 //!
 //! * `GNB_WRITE_FUZZ_SEEDS=1 cargo test -p gnb --test fuzz_seed_corpus`
 //!   (re)writes the generated seeds `fuzz/corpus/<target>/seed_*`.
@@ -17,23 +20,30 @@
 //! target's source), followed by the payload: real encodings (blocks valid
 //! under the hardening rules, canonical witnesses with genuine signatures,
 //! undo records, key files, sync frames, addresses) so the fuzzer starts
-//! from the accepting paths instead of having to discover them.
+//! from the accepting paths instead of having to discover them. The six
+//! mainnet-line targets read no mode byte: their seeds are the raw bytes of
+//! their entry point.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use gnb::address::{Address, Network};
+use gnb::blockval::{validate_block_transactions, validate_tx_inputs, SpendContext};
+use gnb::core::policy::{PolicyWitness, SpendPolicy};
 use gnb::core::{
-    activation, block_rules, Block, BlockHeader, MerkleRoot, Transaction, TxInput, TxOutput, UndoData, UndoEntry,
+    activation, block_rules, Block, BlockHeader, ChainId, MerkleRoot, Transaction, TxInput, TxOutput, UndoData,
+    UndoEntry,
 };
 use gnb::crypto;
 use gnb::network::sync_rr::{decode_request, decode_response, encode_frame, SyncRequest, SyncResponse};
 use gnb::network::SyncEntry;
+use gnb::transport::upgrade::{Finish, Init, Resp};
 use sha3::{Digest, Sha3_256};
 
 struct Rng(u64);
@@ -198,8 +208,123 @@ fn keyfile_v1_json(secret: &[u8], public: &[u8], password: &str) -> Vec<u8> {
     .unwrap()
 }
 
-/// Every generated seed, by target.
+/// Value of every output in `tx_validate`'s UTXO view (`SPENT_VALUE` in
+/// `fuzz_targets/tx_validate.rs`; keep the two equal). The target's seeds are
+/// signed against it, so they pass every rule
+/// (`mainnet_line_seeds_reach_their_entry_points`).
+const TX_VALIDATE_SPENT_VALUE: u64 = 1_000 * gnb::core::tokenomics::SAT_PER_GNB;
+
+/// `tx_validate`'s verdict on `tx` (the target's view and context): every
+/// input spends `value` paid to the key its single-key witness reveals, or
+/// to the policy its policy witness reveals (the target's `spk_for`), in a
+/// block at height 10,000,000 whose spent outputs confirmed at height 0.
+fn tx_validate_verdict(tx: &Transaction, value: u64) -> Result<u64, String> {
+    let view: Vec<TxOutput> = tx
+        .inputs
+        .iter()
+        .map(|i| {
+            let script_pubkey = if let Some((_, pk)) = Transaction::parse_script_sig(&i.script_sig) {
+                Sha3_256::digest(&pk)[..20].to_vec()
+            } else if let Ok(w) = PolicyWitness::decode(&i.script_sig) {
+                w.policy.script_pubkey()
+            } else {
+                vec![0u8; 20]
+            };
+            TxOutput { value, script_pubkey }
+        })
+        .collect();
+    let utxo = |t: &[u8; 32], i: u32| -> Result<Option<TxOutput>, String> {
+        Ok(tx.inputs.iter().zip(&view).find(|(x, _)| x.prev_txid == *t && x.prev_index == i).map(|(_, o)| o.clone()))
+    };
+    let confirm = |_: &[u8; 32]| -> Result<Option<u64>, String> { Ok(Some(0)) };
+    validate_tx_inputs(tx, &utxo, None, &SpendContext { height: 10_000_000, confirm_height: &confirm })
+}
+
+/// `block_validate`'s path: structure, then the transaction rules against an
+/// empty UTXO view (`None` when the structure is refused).
+fn block_validate_verdict(b: &Block) -> Option<Result<u64, gnb::blockval::BlockTxError>> {
+    b.validate_structure_cheap().ok()?;
+    let utxo = |_: &[u8; 32], _: u32| Ok(None);
+    let coinbase = |_: &[u8; 32]| Ok(None);
+    let confirm = |_: &[u8; 32]| Ok(None);
+    Some(validate_block_transactions(b, &utxo, &coinbase, &confirm))
+}
+
+/// A version-3 mainnet spend of `n_inputs` outputs of `pk`, every input
+/// signed (sighash v3, seeded signing RNG) against `tx_validate`'s view.
+fn tx_validate_spend(pk: &[u8], sk: &[u8], n_inputs: u8, tag: u8) -> Transaction {
+    let mut tx = Transaction {
+        version: 3,
+        inputs: (0..n_inputs)
+            .map(|i| TxInput { prev_txid: [tag.wrapping_add(i); 32], prev_index: i as u32, script_sig: vec![], sequence: u32::MAX })
+            .collect(),
+        outputs: vec![
+            TxOutput { value: 4_900_000, script_pubkey: vec![tag; 20] },
+            TxOutput { value: 600, script_pubkey: Sha3_256::digest(pk)[..20].to_vec() },
+        ],
+        locktime: 0,
+    };
+    let spent: Vec<TxOutput> = tx.inputs.iter().map(|_| TxOutput { value: TX_VALIDATE_SPENT_VALUE, script_pubkey: Sha3_256::digest(pk)[..20].to_vec() }).collect();
+    let suite = crypto::public_key_suite(pk).unwrap();
+    for i in 0..tx.inputs.len() {
+        let d = tx.sighash_v3(&spent, i, suite, ChainId::Mainnet).unwrap();
+        let seed = [tag.wrapping_add(0x80).wrapping_add(i as u8); 32];
+        let sig = pqcrypto_internals::with_seeded_rng_scope(&seed, || crypto::sign_bound(sk, &d)).unwrap();
+        tx.inputs[i].script_sig = Transaction::build_script_sig(&sig, pk);
+    }
+    tx
+}
+
+/// A version-3 mainnet spend of a `policy` output, signed by key `idx`
+/// (`signer`) against `tx_validate`'s view.
+fn tx_validate_policy_spend(policy: &SpendPolicy, idx: u8, signer: (&[u8], &[u8])) -> Transaction {
+    let mut tx = Transaction {
+        version: 3,
+        inputs: vec![TxInput { prev_txid: [0x61; 32], prev_index: 3, script_sig: vec![], sequence: u32::MAX }],
+        outputs: vec![TxOutput { value: 4_900_000, script_pubkey: vec![0x62; 20] }],
+        locktime: policy.after,
+    };
+    let spent = [TxOutput { value: TX_VALIDATE_SPENT_VALUE, script_pubkey: policy.script_pubkey() }];
+    let suite = crypto::public_key_suite(signer.0).unwrap();
+    let d = tx.sighash_v3(&spent, 0, suite, ChainId::Mainnet).unwrap();
+    let sig = pqcrypto_internals::with_seeded_rng_scope(&[0x63; 32], || crypto::sign_bound(signer.1, &d)).unwrap();
+    tx.inputs[0].script_sig = PolicyWitness { policy: policy.clone(), signatures: vec![(idx, sig)] }.encode();
+    tx
+}
+
+/// A block that passes `validate_structure_cheap` on mainnet (the fuzz
+/// process's chain) BELOW the hardening activation: the legacy (or, from
+/// `powit_height()`, the v2 body) header root for the mainnet activation, and
+/// from `WITNESS_COMMITMENT_HEIGHT` the coinbase's suffix witness commitment.
+fn mainnet_legacy_rules_block(height: u64, parents: Vec<[u8; 32]>, txs: Vec<Transaction>) -> Block {
+    let act = activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
+    assert!(height < act);
+    let mut all = vec![coinbase(format!("gnb:h{height}:seed").into_bytes(), 1)];
+    all.extend(txs);
+    let mut b = Block {
+        header: BlockHeader { version: 1, parents, merkle_root: MerkleRoot::ZERO, timestamp: 1_750_000_000 + height, bits: 0x2100_FFFF, nonce: 7 },
+        transactions: all,
+        blue_score: height,
+        height,
+        shielded_transactions: vec![],
+        powit: Default::default(),
+    };
+    if height >= gnb::core::WITNESS_COMMITMENT_HEIGHT {
+        let c = b.witness_commitment();
+        b.transactions[0].inputs[0].script_sig.extend_from_slice(&c);
+    }
+    b.header.merkle_root = b.body_merkle_root_at(act);
+    b
+}
+
+/// Every generated seed, by target (built once per test process: key
+/// generation and signing are the slow part).
 fn seeds() -> BTreeMap<&'static str, Vec<Vec<u8>>> {
+    static SEEDS: OnceLock<BTreeMap<&'static str, Vec<Vec<u8>>>> = OnceLock::new();
+    SEEDS.get_or_init(generate_seeds).clone()
+}
+
+fn generate_seeds() -> BTreeMap<&'static str, Vec<Vec<u8>>> {
     let mut r = Rng(0x5EED_F022_2026_1015);
     let (pk, sk) = keypair();
     let mut m: BTreeMap<&'static str, Vec<Vec<u8>>> = BTreeMap::new();
@@ -384,6 +509,105 @@ fn seeds() -> BTreeMap<&'static str, Vec<Vec<u8>>> {
     d.push(wrong_bits(0, 3));
     d.push(wrong_bits(1, 0x48));
     m.insert("accept_dag", d);
+
+    // ── The six targets of the relaunched mainnet line (raw entry-point
+    // bytes, no mode byte). Their own key pairs and Rng stream, so the seeds
+    // above do not move.
+    let (pk2, sk2) = crypto::generate_keypair_from_seed(&[0x3Du8; 64]).expect("seeded keygen");
+    let (pk3, _) = crypto::generate_keypair_from_seed(&[0x3Eu8; 64]).expect("seeded keygen");
+    let mut rm = Rng(0x0005_1EED_4A17_2026);
+
+    // sync_decode: the /gnb/sync/1 frames of sync_rr_codec (every request and
+    // response variant) and a truncated one.
+    let mut sd = frames.clone();
+    sd.push(frames[6][..frames[6].len() - 1].to_vec());
+    m.insert("sync_decode", sd);
+
+    // pq_handshake_decode: Init / Resp / Finish of /gnb/pq/2.0.0 with the
+    // live field sizes (ML-KEM-768 key 1,184 B and ciphertext 1,088 B, the
+    // 36-byte protobuf of an ed25519 key, a hybrid key and signature).
+    let (hybrid_sig, _) = Transaction::parse_script_sig(&spend_a.inputs[0].script_sig).expect("canonical witness");
+    let cfg = bincode::config::standard();
+    let init = Init { version: 2, mlkem_pk: rm.bytes(1184), x25519_pk: rm.arr32(), ed_pk: rm.bytes(36), pq_pk: pk.clone(), nonce: rm.arr32() };
+    let resp = Resp {
+        mlkem_ct: rm.bytes(1088),
+        x25519_pk: rm.arr32(),
+        ed_pk: rm.bytes(36),
+        pq_pk: pk2.clone(),
+        nonce: rm.arr32(),
+        ed_sig: rm.bytes(64),
+        pq_sig: hybrid_sig.clone(),
+    };
+    let finish = Finish { ed_sig: rm.bytes(64), pq_sig: hybrid_sig.clone() };
+    let init = bincode::serde::encode_to_vec(&init, cfg).unwrap();
+    let resp = bincode::serde::encode_to_vec(&resp, cfg).unwrap();
+    let finish = bincode::serde::encode_to_vec(&finish, cfg).unwrap();
+    m.insert("pq_handshake_decode", vec![init.clone(), resp, finish, init[..init.len() / 2].to_vec()]);
+
+    // script_sig_verify: single-key witnesses: a genuine canonical one, the
+    // same with a trailing byte (refused), small and empty framings, and a
+    // huge declared length.
+    let genuine = spend_a.inputs[0].script_sig.clone();
+    let mut padded = genuine.clone();
+    padded.push(0);
+    m.insert("script_sig_verify", vec![
+        genuine,
+        padded,
+        Transaction::build_script_sig(&[1, 2, 3], &[4, 5]),
+        Transaction::build_script_sig(&[], &[]),
+        vec![0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0],
+    ]);
+
+    // tx_validate: transaction wire bytes signed against the target's view
+    // (accepted by every rule: one input, two inputs, a 1-of-2 policy with
+    // timelocks), a spend signed for another amount (invalid signature), a
+    // coinbase, and a version-1 transaction (refused after the activation).
+    let policy = SpendPolicy::new(1, vec![pk.clone(), pk2.clone()], 100, 144).expect("1-of-2 policy");
+    let policy_spend = tx_validate_policy_spend(&policy, 1, (&pk2, &sk2));
+    m.insert("tx_validate", vec![
+        tx_validate_spend(&pk, &sk, 1, 0x41).to_wire_bytes(true),
+        tx_validate_spend(&pk, &sk, 2, 0x51).to_wire_bytes(true),
+        policy_spend.to_wire_bytes(true),
+        spend_a.to_wire_bytes(true),
+        coinbase(b"gnb:h7:seed".to_vec(), 1).to_wire_bytes(true),
+        sixty_four.to_wire_bytes(true),
+    ]);
+
+    // policy_witness_decode: policy witnesses and policies in their canonical
+    // encodings (1-of-2 signed, 2-of-3 with timelocks and two signatures), a
+    // trailing byte, a wrong version.
+    let two_of_three = SpendPolicy::new(2, vec![pk.clone(), pk2.clone(), pk3], 0, 6).expect("2-of-3 policy");
+    let w23 = PolicyWitness { policy: two_of_three.clone(), signatures: vec![(0, hybrid_sig.clone()), (2, rm.bytes(64))] }.encode();
+    let mut w12_padded = policy_spend.inputs[0].script_sig.clone();
+    w12_padded.push(0);
+    let mut bad_version = two_of_three.encode();
+    bad_version[0] = 2;
+    m.insert("policy_witness_decode", vec![
+        policy_spend.inputs[0].script_sig.clone(),
+        w23,
+        policy.encode(),
+        two_of_three.encode(),
+        w12_padded,
+        bad_version,
+    ]);
+
+    // block_validate: block wire bytes that pass validate_structure_cheap on
+    // mainnet: coinbase only, spends of missing outputs, a 64-byte
+    // transaction (legal below the activation), the suffix witness
+    // commitment (from height 5,000), the PoWit section and v2 body root
+    // (from height 10,000), the hardened rules (coinbase commitment, tagged
+    // root, from 17,500), and the shielded legacy block.
+    let act = activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
+    m.insert("block_validate", vec![
+        mainnet_legacy_rules_block(1, vec![[0x71; 32]], vec![]).to_wire_bytes(),
+        mainnet_legacy_rules_block(5, vec![[0x72; 32], [0x73; 32]], vec![spend_a.clone(), spend_b.clone()]).to_wire_bytes(),
+        mainnet_legacy_rules_block(2, vec![[0x74; 32]], vec![sixty_four.clone()]).to_wire_bytes(),
+        mainnet_legacy_rules_block(5_000, vec![[0x75; 32]], vec![spend_b.clone()]).to_wire_bytes(),
+        mainnet_legacy_rules_block(10_000, vec![[0x76; 32], [0x77; 32]], vec![]).to_wire_bytes(),
+        hardened_block(act, vec![[0x78; 32]], vec![]).to_wire_bytes(),
+        hardened_block(act + 1, vec![[0x79; 32], [0x7A; 32]], vec![spend_a.clone()]).to_wire_bytes(),
+        legacy.to_wire_bytes(),
+    ]);
     m
 }
 
@@ -492,4 +716,95 @@ fn keystore_seeds_open() {
     let blocks = &seeds()["block_rules"];
     let hard = Block::from_wire_bytes(&blocks[3][9..]).unwrap();
     assert_eq!(block_rules::check_block_hardened_at(&hard, 0), Ok(()), "hardened block seed is valid");
+}
+
+/// The six mainnet-line targets over their whole corpus (what each target
+/// does with the bytes, its own assertions included): no panic.
+#[test]
+fn corpus_floor_mainnet_line_targets() {
+    floor("sync_decode", |d| {
+        let _ = decode_request(d);
+        let _ = decode_response(d);
+    });
+    floor("pq_handshake_decode", |d| {
+        let cfg = bincode::config::standard();
+        let _ = bincode::serde::decode_from_slice::<Init, _>(d, cfg);
+        let _ = bincode::serde::decode_from_slice::<Resp, _>(d, cfg);
+        let _ = bincode::serde::decode_from_slice::<Finish, _>(d, cfg);
+    });
+    floor("script_sig_verify", |d| {
+        if let Some((sig, pk)) = Transaction::parse_script_sig(d) {
+            assert_eq!(Transaction::build_script_sig(&sig, &pk), d, "parse must be exact");
+            let _ = crypto::verify_canonical(&pk, b"fuzz-sighash-32-bytes-0000000000", &sig);
+        }
+    });
+    floor("policy_witness_decode", |d| {
+        if let Ok(w) = PolicyWitness::decode(d) {
+            assert_eq!(w.encode(), d, "accepted witness must be canonical");
+        }
+        if let Ok(p) = SpendPolicy::decode(d) {
+            assert_eq!(p.encode(), d, "accepted policy must be canonical");
+        }
+    });
+    floor("block_validate", |d| {
+        if let Ok(b) = Block::from_wire_bytes(d) {
+            let _ = block_validate_verdict(&b);
+        }
+    });
+    floor("tx_validate", |d| {
+        if let Ok(tx) = Transaction::from_wire_bytes(d) {
+            let _ = tx_validate_verdict(&tx, TX_VALIDATE_SPENT_VALUE);
+        }
+    });
+}
+
+/// The seeds of the six mainnet-line targets start on their accepting paths:
+/// the signed `tx_validate` seeds pass every rule of the target (so mutations
+/// reach witness, policy and signature verification), every `block_validate`
+/// seed passes the structural checks the target gates on, and the encodings
+/// of the decoder targets decode.
+#[test]
+fn mainnet_line_seeds_reach_their_entry_points() {
+    let s = seeds();
+
+    let txs: Vec<Transaction> = s["tx_validate"].iter().map(|d| Transaction::from_wire_bytes(d).unwrap()).collect();
+    for (i, tx) in txs[..3].iter().enumerate() {
+        assert!(tx_validate_verdict(tx, TX_VALIDATE_SPENT_VALUE).is_ok(), "tx_validate seed {i}: {:?}", tx_validate_verdict(tx, TX_VALIDATE_SPENT_VALUE));
+        // The view the target used before (outputs worth u64::MAX / 4, over
+        // MAX_SUPPLY_SAT) refused every transaction at its first input.
+        let old = tx_validate_verdict(tx, u64::MAX / 4).unwrap_err();
+        assert!(old.starts_with("input overflow"), "{old}");
+    }
+    let err = tx_validate_verdict(&txs[3], TX_VALIDATE_SPENT_VALUE).unwrap_err();
+    assert!(err.contains("invalid signature"), "a spend signed for another amount: {err}");
+
+    for (i, d) in s["block_validate"].iter().enumerate() {
+        let b = Block::from_wire_bytes(d).unwrap();
+        assert!(block_validate_verdict(&b).is_some(), "block_validate seed {i} (height {}): {:?}", b.height, b.validate_structure_cheap());
+    }
+    let coinbase_only = Block::from_wire_bytes(&s["block_validate"][0]).unwrap();
+    assert!(matches!(block_validate_verdict(&coinbase_only), Some(Ok(0))));
+
+    let p = &s["policy_witness_decode"];
+    assert_eq!(PolicyWitness::decode(&p[0]).unwrap().encode(), p[0]);
+    assert_eq!(PolicyWitness::decode(&p[1]).unwrap().encode(), p[1]);
+    assert_eq!(SpendPolicy::decode(&p[2]).unwrap().encode(), p[2]);
+    assert_eq!(SpendPolicy::decode(&p[3]).unwrap().encode(), p[3]);
+    assert!(PolicyWitness::decode(&p[4]).is_err());
+    assert!(SpendPolicy::decode(&p[5]).is_err());
+
+    let cfg = bincode::config::standard();
+    let h = &s["pq_handshake_decode"];
+    assert!(bincode::serde::decode_from_slice::<Init, _>(&h[0], cfg).is_ok());
+    assert!(bincode::serde::decode_from_slice::<Resp, _>(&h[1], cfg).is_ok());
+    assert!(bincode::serde::decode_from_slice::<Finish, _>(&h[2], cfg).is_ok());
+
+    let f = &s["sync_decode"];
+    for d in &f[..f.len() - 1] {
+        assert!(decode_request(d).is_ok() || decode_response(d).is_ok());
+    }
+
+    let w = &s["script_sig_verify"];
+    assert!(Transaction::parse_script_sig(&w[0]).is_some());
+    assert!(Transaction::parse_script_sig(&w[1]).is_none(), "trailing byte");
 }

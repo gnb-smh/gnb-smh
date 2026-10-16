@@ -1,14 +1,18 @@
-//! Witness (`script_sig`) parsing: the historical lenient framing
-//! (`parse_script_sig`, `parse_script_sig_borrowed`), the canonical framing of
-//! the hardening activation (`parse_script_sig_exact`, CRY-1) and the
-//! canonical-witness rule (`core::sighash::canonical_witness`).
+//! Witness (`script_sig`) parsing: the single-key framing
+//! (`parse_script_sig`, `parse_script_sig_borrowed`, `parse_script_sig_exact`)
+//! and the canonical-witness rule (`core::sighash::canonical_witness`).
+//!
+//! On this chain the framing is exact at every height (cc5c450: a
+//! single-key `script_sig` is exactly `len|sig|len|pk`, no trailing bytes):
+//! the historical lenient parse (trailing bytes ignored) is gone, and
+//! `parse_script_sig_borrowed` / `parse_script_sig` are the exact parser.
 //!
 //! * The three parsers equal a straightforward reference parser of
-//!   `[u32 LE sig_len][sig][u32 LE pk_len][pk]` (lenient: trailing bytes
-//!   ignored; exact: none allowed), and the owned parser equals the borrowed.
-//! * Round trips: `build_script_sig(sig, pk)` is a prefix of every accepted
-//!   input, and the exact parser accepts it back as `(sig, pk)`; one byte more
-//!   is refused by the exact parser and ignored by the lenient one.
+//!   `[u32 LE sig_len][sig][u32 LE pk_len][pk]` that refuses trailing bytes,
+//!   and the owned parser equals the borrowed.
+//! * Round trips: every accepted input is exactly `build_script_sig(sig, pk)`
+//!   of what it parsed to; one byte more is refused by every parser (and so by
+//!   the sighash v2 witness rule).
 //! * `canonical_witness` accepts exactly the exact framing with a canonical
 //!   signature encoding; `check_input_witnesses` agrees with both rules.
 //! * Inputs with the "real signature" bit start from a genuine canonical
@@ -67,14 +71,16 @@ fn check(s: &[u8]) {
     let borrowed = Transaction::parse_script_sig_borrowed(s);
     let exact = Transaction::parse_script_sig_exact(s);
     let owned = Transaction::parse_script_sig(s);
-    assert_eq!(borrowed, r.map(|(a, b, _)| (a, b)), "lenient parser differs from the reference");
-    assert_eq!(exact, r.filter(|x| x.2 == s.len()).map(|(a, b, _)| (a, b)), "exact parser differs from the reference");
+    let reference = r.filter(|x| x.2 == s.len()).map(|(a, b, _)| (a, b));
+    assert_eq!(exact, reference, "exact parser differs from the reference");
+    assert_eq!(borrowed, exact, "borrowed parser differs from the exact one (one framing at every height)");
     assert_eq!(owned, borrowed.map(|(a, b)| (a.to_vec(), b.to_vec())), "owned and borrowed parsers differ");
-    if let Some((sig, pk)) = borrowed {
-        let built = Transaction::build_script_sig(sig, pk);
-        assert!(s.starts_with(&built), "the parsed witness is not a prefix of the input");
-        assert_eq!(exact.is_some(), built.len() == s.len());
-        assert_eq!(Transaction::parse_script_sig_exact(&built), Some((sig, pk)), "exact round trip");
+    if let Some((sig, pk)) = exact {
+        assert_eq!(Transaction::build_script_sig(sig, pk), s, "an accepted witness is not its own encoding");
+    }
+    if let Some((_, _, used)) = r {
+        // A well-framed witness followed by trailing bytes: refused.
+        assert_eq!(exact.is_some(), used == s.len(), "trailing bytes accepted");
     }
     let canonical = canonical_witness(s);
     match &canonical {
@@ -124,7 +130,8 @@ fuzz_target!(|data: &[u8]| {
             s.extend_from_slice(&tail);
             if !tail.is_empty() {
                 assert_eq!(Transaction::parse_script_sig_exact(&s), None, "trailing bytes accepted");
-                assert_eq!(Transaction::parse_script_sig_borrowed(&s), Some((&sig[..], &pk[..])));
+                assert_eq!(Transaction::parse_script_sig_borrowed(&s), None, "trailing bytes accepted (borrowed)");
+                assert_eq!(Transaction::parse_script_sig(&s), None, "trailing bytes accepted (owned)");
             }
             check(&s);
         }
