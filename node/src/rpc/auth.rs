@@ -578,8 +578,7 @@ pub fn forwarded_client(headers: &axum::http::HeaderMap, client_header: &str) ->
     let client = match client_header {
         "x-forwarded-for" => values()
             .flat_map(|v| v.split(','))
-            .filter(|s| !s.trim().is_empty())
-            .next_back()
+            .rfind(|s| !s.trim().is_empty())
             .and_then(parse_forwarded_addr),
         "forwarded" => values()
             .flat_map(|v| v.split(','))
