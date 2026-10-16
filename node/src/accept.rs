@@ -1126,12 +1126,14 @@ impl ChainMove {
     }
 
     /// Blocks added to the applied chain and still on it, in connect order.
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
     pub fn connected(&self) -> Vec<BlockHash> {
         self.delta.connected()
     }
 
     /// Blocks removed from the applied chain that were on it before the first
     /// recorded move, in disconnect order (tip first).
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
     pub fn disconnected(&self) -> Vec<BlockHash> {
         self.delta.disconnected()
     }

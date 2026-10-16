@@ -331,7 +331,7 @@ impl Storage {
             };
             batch.put_cf(&cf_m, body_index_key(height, &hash), []);
             rows += 1;
-            if rows % 4096 == 0 {
+            if rows.is_multiple_of(4096) {
                 self.db.write(std::mem::take(&mut batch)).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
             }
         }
@@ -473,7 +473,7 @@ impl Storage {
         let cf_b = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
         let cf_m = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
         let mut batch = rocksdb::WriteBatch::default();
-        batch.put_cf(&cf_b, &hash, &block.to_wire_bytes());
+        batch.put_cf(&cf_b, hash, block.to_wire_bytes());
         batch.put_cf(&cf_m, body_index_key(prune_height, &hash), []);
         let written = self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()));
         self.forget_body_verdict(&hash);

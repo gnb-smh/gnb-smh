@@ -283,6 +283,7 @@ impl ReachabilityStore {
     /// Nodes visited by reindexing (subtree counting and interval
     /// assignment) since this index was created: the cost tests of audit
     /// DAG-7 compare it before and after an insertion.
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
     pub fn reindex_work(&self) -> u64 {
         self.work.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -299,6 +300,7 @@ impl ReachabilityStore {
 
     /// The current reindex root (`None` until the index is managed by the
     /// reindex-root scheme).
+    #[allow(dead_code)] // tests and diagnostics; the node binary compiles this module too
     pub fn reindex_root(&self) -> Option<BlockHash> {
         self.reindex_root
     }

@@ -67,6 +67,7 @@ fn note_chain_step() {
 /// ([`find_lca`], [`compute_connect_plan`], [`compute_reorg_plan`]) on the
 /// calling thread since it started. Tests read it to prove that planning a
 /// move costs O(move), not O(chain) (audit B1-T16).
+#[allow(dead_code)] // tests only; the node binary compiles this module too
 pub fn chain_walk_steps() -> u64 {
     CHAIN_WALK_STEPS.with(|c| c.get())
 }
@@ -85,12 +86,14 @@ pub mod fault_injection {
     /// Simulated memory limit: a [`super::connect_plan`] call that stages
     /// more than `limit` blocks fails as if the process had run out of
     /// memory before its commit (nothing is written).
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
     pub fn set_max_blocks_per_commit(limit: Option<usize>) {
         MAX_BLOCKS.with(|c| c.set(limit));
     }
 
     /// Simulated crash: after `n` more successful commits on this thread,
     /// every later [`super::connect_plan`] call fails before writing.
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
     pub fn fail_after_commits(n: Option<usize>) {
         COMMITS_LEFT.with(|c| c.set(n));
     }
@@ -151,11 +154,6 @@ pub struct ReorgPlan {
 }
 
 impl ReorgPlan {
-    /// The applied tip the plan starts from.
-    pub fn start(&self) -> BlockHash {
-        self.to_rollback.first().copied().unwrap_or(self.lca)
-    }
-
     /// The applied tip the plan ends at.
     pub fn target(&self) -> BlockHash {
         self.to_apply.last().copied().unwrap_or(self.lca)
@@ -164,7 +162,8 @@ impl ReorgPlan {
     /// Audit B2-T0: the plan as consecutive sub-plans of at most `max`
     /// blocks each (rollback chunks first, tip-first, then apply chunks,
     /// LCA-first). Each sub-plan starts at the tip the previous one ends at,
-    /// and ends at a block of the selected chain of `start()` or `target()`,
+    /// and ends at a block of the selected chain of the starting tip (the
+    /// first block of `to_rollback`, or `lca`) or of `target()`,
     /// so committing them one by one passes through consistent applied tips
     /// only (a rollback sub-plan's `lca` is the block it ends at).
     pub fn chunks(&self, max: usize) -> Vec<ReorgPlan> {
@@ -1193,14 +1192,6 @@ impl OrderedHashes {
         true
     }
 
-    fn len(&self) -> usize {
-        self.live.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.live.is_empty()
-    }
-
     fn to_vec(&self) -> Vec<BlockHash> {
         self.order.iter().enumerate()
             .filter(|(i, x)| self.live.get(*x) == Some(i))
@@ -1241,11 +1232,6 @@ impl ChainDelta {
         }
     }
 
-    /// No block was added to or removed from the applied chain (net).
-    pub fn is_empty(&self) -> bool {
-        self.connected.is_empty() && self.disconnected.is_empty() && self.disconnected_pruned.is_empty()
-    }
-
     /// Blocks added and still on the applied chain, in connect order.
     pub fn connected(&self) -> Vec<BlockHash> {
         self.connected.to_vec()
@@ -1255,11 +1241,6 @@ impl ChainDelta {
     /// before the first recorded move, in disconnect order (tip first).
     pub fn disconnected(&self) -> Vec<BlockHash> {
         self.disconnected.to_vec()
-    }
-
-    /// Number of blocks rolled back (net), pruned bodies included.
-    pub fn rolled_back(&self) -> usize {
-        self.disconnected.len() + self.disconnected_pruned.len()
     }
 
     /// The net effect as one [`ConnectOutcome`].

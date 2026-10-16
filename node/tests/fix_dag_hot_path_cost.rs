@@ -53,7 +53,7 @@ fn hardened_chain(n: u64) -> (GhostDAG, Vec<BlockHash>) {
 #[test]
 fn b1_t15_unmergeable_tips_cost_no_compute_block() {
     const N: u64 = 1_000;
-    assert!(N > 2 * MERGE_DEPTH, "the deep tips are below the merge-depth root");
+    const { assert!(N > 2 * MERGE_DEPTH, "the deep tips are below the merge-depth root") };
     let (mut dag, chain) = hardened_chain(N);
     for j in 1..=178u64 {
         dag.add_block(hx(2, j), vec![chain[j as usize]], N + j, 1_000).unwrap();

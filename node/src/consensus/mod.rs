@@ -80,6 +80,7 @@ thread_local! {
 /// Number of full GhostDAG block computations (`compute_block`: mergeset,
 /// coloring, merge-depth check) run on the calling thread since it started.
 /// Instrumentation for cost tests (audit B1-T15); no effect on behaviour.
+#[allow(dead_code)] // tests only; the node binary compiles this module too
 pub fn compute_block_calls() -> u64 {
     COMPUTE_BLOCK_CALLS.with(|c| c.get())
 }
@@ -2238,8 +2239,9 @@ impl GhostDAG {
     /// can be merged at all by a block whose selected parent is `sp` (at or
     /// above the hardening activation): it must be the LOWEST possible
     /// merge-depth root of such a block, or in its future. The lowest root is
-    /// the one of a block with no mergeset blue (`blue_score = sp.blue_score
-    /// + 1`); any actual block's root is at or above it on `sp`'s chain, so a
+    /// the one of a block with no mergeset blue
+    /// (`blue_score = sp.blue_score + 1`); any actual block's root is at or
+    /// above it on `sp`'s chain, so a
     /// candidate below it is below the actual root too. Such a candidate is
     /// red (it is in the anticone of every chain block from the root to `sp`,
     /// far more than k blues) and, when it is a tip, nothing kosherizes it (a
@@ -2812,7 +2814,7 @@ impl GhostDAG {
     pub fn template_parents<F: Fn(&BlockHash) -> bool>(&self, max: usize, has_body: F) -> Vec<BlockHash> {
         let mut tips = self.valid_tips();
         tips.sort_by_key(|h| std::cmp::Reverse(self.order_key(h)));
-        let Some(pos) = tips.iter().position(|h| has_body(h)) else {
+        let Some(pos) = tips.iter().position(&has_body) else {
             return self.best_bodied_tip(has_body).into_iter().collect();
         };
         let sp = tips[pos];

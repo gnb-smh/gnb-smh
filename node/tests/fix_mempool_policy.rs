@@ -1409,7 +1409,6 @@ fn orphan_bookkeeping_follows_the_applied_chain_only() {
         accept_block_tracking(b, b.block_hash(), b.height, &n.dag, &n.store, &n.mempool, &n.node_state,
             Some(&n.tip_tx), &n.shielded, m)
     };
-    let hashes = |v: &[Block]| v.iter().map(|b| b.block_hash()).collect::<Vec<_>>();
 
     // The applied chain G -> A1 -> A2; an extension is reported as such.
     let a1 = empty_child(&n, gh, "a1");
@@ -1466,8 +1465,8 @@ fn orphan_bookkeeping_follows_the_applied_chain_only() {
 
     // A plan undone by a later one cancels out.
     let mut m = ChainMove::default();
-    m.record(&reorg::ConnectOutcome { connected: hashes(&[a1.clone(), a2.clone()]), ..Default::default() });
-    m.record(&reorg::ConnectOutcome { disconnected: hashes(&[a2.clone()]), connected: hashes(&[f2.clone()]), ..Default::default() });
+    m.record(&reorg::ConnectOutcome { connected: vec![a1.block_hash(), a2.block_hash()], ..Default::default() });
+    m.record(&reorg::ConnectOutcome { disconnected: vec![a2.block_hash()], connected: vec![f2.block_hash()], ..Default::default() });
     assert_eq!(m.connected(), vec![a1.block_hash(), f2.block_hash()]);
     assert!(m.disconnected().is_empty());
     // DAG-6: a block rolled back from its undo record alone (body pruned)
