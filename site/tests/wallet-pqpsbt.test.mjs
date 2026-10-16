@@ -14,7 +14,7 @@ const activation = Number(readFileSync(new URL("../../crates/gnb-crypto/src/core
 function u32(n) { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; }
 function u64(n) { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; }
 
-function unsignedSpend(publicKeys) {
+function unsignedSpend(publicKeys, { input = 5_000_000n, payment = 1_000_000n, change = 3_950_000n } = {}) {
   // Independent fixture encoding of the existing policy and transaction formats.
   const keys = publicKeys.map((k) => Buffer.from(k, "hex"));
   const policy = Buffer.concat([Buffer.from([1, 2, 3]),
@@ -23,11 +23,34 @@ function unsignedSpend(publicKeys) {
     createHash("sha3-256").update("GNB-POLICY-v1").update(policy).digest()]);
   const tx = Buffer.concat([u32(3), Buffer.from([1]), Buffer.alloc(32, 0x11),
     u32(0), Buffer.from([0]), u32(0xffffffff), Buffer.from([2]),
-    u64(1_000_000), Buffer.from([20]), Buffer.alloc(20, 0x22),
-    u64(3_950_000), Buffer.from([script.length]), script, u32(0)]);
+    u64(payment), Buffer.from([20]), Buffer.alloc(20, 0x22),
+    u64(change), Buffer.from([script.length]), script, u32(0)]);
   return JSON.stringify({ network: "mainnet", policy: policy.toString("hex"),
-    tx: tx.toString("hex"), signatures: [{}], amounts: ["5000000"] });
+    tx: tx.toString("hex"), signatures: [{}], amounts: [String(input)] });
 }
+
+test("WASM refuses signing amounts and fees outside known consensus bounds", async (t) => {
+  const previousFetch = globalThis.fetch;
+  const cores = [];
+  try {
+    globalThis.fetch = async () => new Response(wasm);
+    for (let i = 0; i < 3; i++) cores.push(await loadCore("/wallet/gnb_wallet.wasm", pin));
+    const keys = cores.map((c) => c.create().public_key);
+    const cases = [
+      { name: "zero fee", values: { change: 4_000_000n }, maxFee: "0", error: /fee|minimum/i },
+      { name: "amount exceeds monetary cap", values: {
+        input: 1_250_000_004_000_001n, payment: 1_250_000_000_000_001n,
+      }, maxFee: "50000", error: /money|range|MAX_SUPPLY/i },
+    ];
+    for (const item of cases) await t.test(item.name, () => {
+      const packet = cores[0].pqpsbt({ action: "create", spend_json: unsignedSpend(keys, item.values) }).hex;
+      assert.throws(() => cores[0].signPqPsbt(packet, "mainnet", activation, item.maxFee), item.error);
+    });
+  } finally {
+    for (const core of cores) core.wipe();
+    globalThis.fetch = previousFetch;
+  }
+});
 
 test("pinned WASM supports a 2-of-3 PQ-PSBT exchange with no network during signing", async () => {
   const previousFetch = globalThis.fetch;

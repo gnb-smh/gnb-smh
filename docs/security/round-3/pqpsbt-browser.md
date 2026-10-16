@@ -71,6 +71,16 @@ The provisional macOS WASM hash is
 it is retained outside git for evidence and is not the final release pin.
 The final core revisions require another build and test run.
 
+Independent review then found missing fee and monetary-range checks in the
+signer/finalizer. Two new browser subtests were run against the preserved
+provisional binary before its correction. Both failed with `Missing expected
+exception`, while the original complete 2-of-3 positive control passed
+(`/private/tmp/gnb-pqpsbt-browser-money-red.log`, exit 1). The cases use zero
+fee and values above `MAX_SUPPLY_SAT`; they generate real signatures inside
+WASM and do not broadcast a transaction. A final rebuilt binary must pass
+both refusals as well as the positive flow. This extends the test file beyond
+the earlier recorded SHA; its final hash will be recorded after integration.
+
 The CI YAML parses locally. Its artifact upload and unchanged comparison
 gate still require execution on GitHub. Three review lenses, final Linux
 rebuild/repin and full integration/CI remain required. No numerical score is
