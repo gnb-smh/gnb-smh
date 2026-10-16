@@ -11,6 +11,8 @@
 //! - Mining here is a plain CPU search: one 64 MiB scratchpad per thread,
 //!   disjoint nonce ranges, cooperative stop flag.
 
+pub mod verifier;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 

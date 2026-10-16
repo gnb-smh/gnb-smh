@@ -5,6 +5,7 @@
 //! FIX #6: Peer memory (known_peers.json).
 //! Sprint P: PEX hardening (rate limit, address validation, known_peers cap).
 
+pub mod discourage;
 pub mod pex_validator;
 pub mod ratelimit;
 pub mod sync_rr;
@@ -133,6 +134,14 @@ pub enum NetworkControl {
     /// invalid). The network loop applies one application-score penalty, as
     /// for a wire violation (decaying, shared with the wire tracker).
     PenalizePeer(PeerId),
+    /// NET-2 residual / B1-T7 (Phase 4): `peer` sent data no honest node
+    /// sends (a block frame it authored with an invalid proof of work, an
+    /// invalid structure or contextually invalid header, or one whose bits
+    /// fail the orphan floor — see `ingress::block_penalty`). Bitcoin Core's
+    /// `Misbehaving`: the network loop disconnects it and discourages its
+    /// address (`discourage::Discouraged`), so a fresh identity from the
+    /// same address is not accepted either.
+    Misbehaving(PeerId),
 }
 
 /// Peer lifecycle notices from the network loop to the message processor
@@ -266,22 +275,48 @@ pub fn gossip_disposition(msg: &NetworkMessage, validator_attached: bool, claim_
 enum IngestSink {
     /// Legacy consumer: bare messages, no verdicts expected.
     Legacy(mpsc::Sender<NetworkMessage>),
-    /// Validated consumer: frames with origin; verdicts come back.
-    Validated(mpsc::Sender<Inbound>),
+    /// Validated consumer: frames with origin; verdicts come back. B1-T19:
+    /// with `txs` attached ([`NetworkNode::attach_tx_ingest`]) gossip
+    /// transactions go to their own channel (and their own consumer), so a
+    /// transaction flood can neither fill the block channel (a full channel
+    /// drops frames) nor queue block work behind transaction work.
+    Validated { main: mpsc::Sender<Inbound>, txs: Option<mpsc::Sender<Inbound>> },
 }
 
 impl IngestSink {
     fn validator_attached(&self) -> bool {
-        matches!(self, IngestSink::Validated(_))
+        matches!(self, IngestSink::Validated { .. })
     }
 
     fn deliver(&self, msg: NetworkMessage, origin: InboundOrigin, source: &str) -> bool {
         let kind = msg.kind_name();
         match self {
             IngestSink::Legacy(tx) => forward_to_processor(tx, msg, kind, source),
-            IngestSink::Validated(tx) => forward_to_processor(tx, Inbound { msg, origin }, kind, source),
+            IngestSink::Validated { txs: Some(txs), .. } if matches!(msg, NetworkMessage::NewTransaction { .. }) => {
+                forward_to_processor(txs, Inbound { msg, origin }, kind, source)
+            }
+            IngestSink::Validated { main, .. } => forward_to_processor(main, Inbound { msg, origin }, kind, source),
         }
     }
+}
+
+/// B1-T7 / NET-4 residual (Phase 4): may a wire violation (oversized,
+/// bounds-violating, padded or non-canonical frame) be charged to the peer
+/// that delivered it? Releases older than the validated relay (NET-2)
+/// forward every frame unvalidated and follow the chain until the hardening
+/// activation block, so a violation can reach us through an honest older
+/// relay: it is charged only if the delivering peer AUTHORED the frame
+/// (`self_authored`: gossipsub's signed source is the propagation source),
+/// or once the chain contains the activation block (`penalties_in_force`,
+/// `ingress::block_penalties_in_force`; every release since NET-2 refuses
+/// such a frame instead of forwarding it). Returns `(charge, reject)`:
+/// whether to apply the application-score penalty to the delivering peer,
+/// and whether to report `Reject` to gossipsub — only when no honest relay
+/// can have forwarded a duplicate (gossipsub charges every peer that
+/// delivered one); a self-authored violation before that is answered
+/// `Ignore` and charged to its author alone.
+pub fn wire_violation_penalty(self_authored: bool, penalties_in_force: bool) -> (bool, bool) {
+    (self_authored || penalties_in_force, penalties_in_force)
 }
 
 // ── Messages ──────────────────────────────────────────────────────────────────
@@ -675,6 +710,9 @@ pub enum WireReaction {
 pub struct WirePenaltyTracker {
     /// peer -> (score, last decay step, last penalty)
     penalties: std::collections::HashMap<PeerId, (f64, std::time::Instant, std::time::Instant)>,
+    /// Peers forgotten to make room, whose gossipsub application score the
+    /// network loop must reset ([`Self::take_evicted`]).
+    evicted: Vec<PeerId>,
 }
 
 impl Default for WirePenaltyTracker {
@@ -685,7 +723,7 @@ impl Default for WirePenaltyTracker {
 
 impl WirePenaltyTracker {
     pub fn new() -> Self {
-        Self { penalties: std::collections::HashMap::new() }
+        Self { penalties: std::collections::HashMap::new(), evicted: Vec::new() }
     }
 
     /// Decode an untrusted gossip frame and decide the reaction. This is the
@@ -699,15 +737,31 @@ impl WirePenaltyTracker {
     ///   - plain-malformed frames and non-canonical frames of a relayable
     ///     message (`NewBlock`, `NewTransaction`) are ignored (version skew:
     ///     an older release accepts and relays the latter).
+    #[allow(dead_code)] // tests only (the network loop uses `classify_gated`); the node binary compiles this module too
     pub fn classify(&mut self, peer: PeerId, data: &[u8]) -> WireReaction {
+        self.classify_gated(peer, data, true)
+    }
+
+    /// [`Self::classify`] with the B1-T7 penalty gate
+    /// ([`wire_violation_penalty`]): with `charge = false` a protocol
+    /// violation is refused like a malformed frame (`IgnoreMalformed`, never
+    /// forwarded) and nothing is recorded against `peer`.
+    pub fn classify_gated(&mut self, peer: PeerId, data: &[u8], charge: bool) -> WireReaction {
         match decode_wire_message(data) {
             Ok(msg) => WireReaction::Accept(msg),
-            Err(e) if e.is_protocol_violation() => {
+            Err(e) if e.is_protocol_violation() && charge => {
                 let score = self.record_violation(peer);
                 WireReaction::Penalize { error: e, score }
             }
             Err(e) => WireReaction::IgnoreMalformed(format!("{:?}", e)),
         }
+    }
+
+    /// Peers the bounded map forgot to make room since the last call
+    /// (NET-4 residual): their gossipsub application score must be reset, or
+    /// it would stay at its last value forever.
+    pub fn take_evicted(&mut self) -> Vec<PeerId> {
+        std::mem::take(&mut self.evicted)
     }
 
     /// H-R3-4: apply one [`WIRE_VIOLATION_PENALTY`] to `peer` and return its
@@ -737,6 +791,10 @@ impl WirePenaltyTracker {
                 .map(|(p, _)| *p);
             if let Some(v) = victim {
                 self.penalties.remove(&v);
+                if self.evicted.len() >= WIRE_PENALTY_TRACK_CAP {
+                    self.evicted.remove(0);
+                }
+                self.evicted.push(v);
             }
         }
         let e = self.penalties.entry(peer).or_insert((0.0, now, now));
@@ -1017,6 +1075,15 @@ pub struct NetworkNode {
     local_key:   identity::Keypair,
     control_rx:  Option<mpsc::Receiver<NetworkControl>>,
     peer_events: Option<mpsc::Sender<PeerEvent>>,
+    /// B1-T19: gossip transactions go here instead of the block channel.
+    tx_ingest:   Option<mpsc::Sender<Inbound>>,
+    /// NET-2 residual: remote addresses of connected peers (shared with the
+    /// processor's proof-of-work budgets).
+    peer_addrs:  discourage::PeerAddrs,
+    /// B1-T7: the hardening activation height whose block, once on the
+    /// selected chain, puts wire-violation penalties in force for relayed
+    /// frames (`wire_violation_penalty`).
+    penalty_activation: u64,
 }
 
 impl NetworkNode {
@@ -1026,7 +1093,30 @@ impl NetworkNode {
         let local_key = load_or_create_identity(&key_path)?;
         let peer_id   = PeerId::from(local_key.public());
         info!("P2P identity: {} ({})", peer_id, key_path.display());
-        Ok(Self { peer_id, config, local_key, control_rx: None, peer_events: None })
+        Ok(Self {
+            peer_id, config, local_key, control_rx: None, peer_events: None, tx_ingest: None,
+            peer_addrs: discourage::PeerAddrs::new(),
+            penalty_activation: crate::core::activation::hardening_activation_height(),
+        })
+    }
+
+    /// B1-T19: deliver gossip `NewTransaction` frames on `tx` (their own
+    /// consumer) instead of the block channel of [`Self::run_validated`].
+    pub fn attach_tx_ingest(&mut self, tx: mpsc::Sender<Inbound>) {
+        self.tx_ingest = Some(tx);
+    }
+
+    /// The remote addresses of connected peers, kept current by the running
+    /// network loop.
+    pub fn peer_addrs(&self) -> discourage::PeerAddrs {
+        self.peer_addrs.clone()
+    }
+
+    /// Use `activation` instead of the process-wide hardening activation
+    /// height for the wire-violation penalty gate (tests).
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn set_penalty_activation(&mut self, activation: u64) {
+        self.penalty_activation = activation;
     }
 
     /// Accept [`NetworkControl`] requests from the processor on `rx`.
@@ -1077,7 +1167,7 @@ impl NetworkNode {
     /// relayed (they expire from gossipsub's message cache).
     #[allow(clippy::too_many_arguments)]
     pub async fn run_validated(
-        self,
+        mut self,
         inbound_tx:     mpsc::Sender<Inbound>,
         verdict_rx:     mpsc::Receiver<GossipValidation>,
         outbound_rx:    mpsc::Receiver<NetworkMessage>,
@@ -1086,7 +1176,8 @@ impl NetworkNode {
         store:          std::sync::Arc<crate::storage::Storage>,
         listen_report:  Option<mpsc::UnboundedSender<Multiaddr>>,
     ) -> Result<(), NetworkError> {
-        self.run_inner(IngestSink::Validated(inbound_tx), Some(verdict_rx), outbound_rx, dag, peer_state, store, listen_report)
+        let txs = self.tx_ingest.take();
+        self.run_inner(IngestSink::Validated { main: inbound_tx, txs }, Some(verdict_rx), outbound_rx, dag, peer_state, store, listen_report)
             .await
     }
 
@@ -1318,6 +1409,13 @@ impl NetworkNode {
         // C1 / NET-4 / NET-8: cumulative, decaying, bounded app-score
         // penalties for wire-violating peers.
         let mut wire_tracker = WirePenaltyTracker::new();
+        // NET-2 residual: addresses discouraged after a peer misbehaved, and
+        // the operator-configured peers that are never discouraged.
+        let mut discouraged = discourage::Discouraged::new();
+        let manual_peers: HashSet<PeerId> = sync_rr::explicit_peer_ids(&self.config.bootstrap_peers);
+        // Peers whose connections were refused at a discouraged address (not
+        // counted; their `ConnectionClosed` events are skipped).
+        let mut refused_peers: HashSet<PeerId> = HashSet::new();
         // MEM-5 / MEM-6: processor → network penalties (optional).
         let mut control_rx = self.control_rx.take();
 
@@ -1408,18 +1506,41 @@ impl NetworkNode {
                         SwarmEvent::Behaviour(BlochBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message_id, message })) => {
                             // C1: bounded decode (4 MiB frame/read limit, per-field
                             // bounds, NET-7: no trailing bytes).
-                            let reaction = wire_tracker.classify(propagation_source, &message.data);
+                            // B1-T7 / NET-4 residual: a violation is charged to the
+                            // delivering peer only if it authored the frame, or
+                            // once no release that forwards unvalidated frames
+                            // follows the chain (`wire_violation_penalty`).
+                            let self_authored = message.source == Some(propagation_source);
+                            let in_force = {
+                                let d = dag.read();
+                                let tip_h = d.selected_tip().and_then(|t| d.get_block_data(&t).map(|x| x.height)).unwrap_or(0);
+                                crate::ingress::block_penalties_in_force(tip_h, self.penalty_activation)
+                            };
+                            let (charge, reject) = wire_violation_penalty(self_authored, in_force);
+                            let reaction = wire_tracker.classify_gated(propagation_source, &message.data, charge);
+                            // A peer the bounded tracker forgot keeps no stale
+                            // application score (NET-4 residual).
+                            for p in wire_tracker.take_evicted() {
+                                swarm.behaviour_mut().gossipsub.set_application_score(&p, 0.0);
+                            }
                             let msg = match reaction {
                                 WireReaction::Penalize { error, score } => {
                                     // Oversized / bounds-violating / padded frames can't
-                                    // come from a compliant node. NET-2/NET-4: Reject it,
-                                    // so gossipsub's P4 penalty hits the DELIVERING peer
-                                    // (its author: honest nodes never relay invalid
-                                    // frames now) and it is never forwarded.
+                                    // come from a compliant node. NET-2/NET-4: the
+                                    // DELIVERING peer is charged (application score) and
+                                    // the frame is never forwarded; gossipsub's P4 penalty
+                                    // (`Reject`, which also hits every peer that sent a
+                                    // duplicate) only when no honest relay can have
+                                    // forwarded one.
                                     swarm.behaviour_mut().gossipsub
                                         .set_application_score(&propagation_source, score);
+                                    let acceptance = if reject {
+                                        gossipsub::MessageAcceptance::Reject
+                                    } else {
+                                        gossipsub::MessageAcceptance::Ignore
+                                    };
                                     swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                                        &message_id, &propagation_source, gossipsub::MessageAcceptance::Reject);
+                                        &message_id, &propagation_source, acceptance);
                                     warn!("wire violation from {}: {:?} (app score → {})",
                                         propagation_source, error, score);
                                     continue;
@@ -1539,6 +1660,25 @@ impl NetworkNode {
                             }
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
+                            // NET-2 residual: Bitcoin Core does not take connections
+                            // from (nor make them to) discouraged addresses; a fresh
+                            // identity from a discouraged address buys nothing.
+                            // Operator-configured peers are exempt (Core's `noban`).
+                            if let Some(ip) = discourage::ip_of(endpoint.get_remote_address()) {
+                                if discouraged.is_discouraged(ip, Instant::now()) && !manual_peers.contains(&peer_id) {
+                                    info!("✗ {} at a discouraged address: disconnecting", peer_id);
+                                    let _ = swarm.disconnect_peer_id(peer_id);
+                                    // Never counted: its closing connections must not
+                                    // be uncounted either (a peer already counted
+                                    // through an earlier connection is closed through
+                                    // the normal path).
+                                    if num_established.get() == 1 {
+                                        refused_peers.insert(peer_id);
+                                    }
+                                    continue;
+                                }
+                                self.peer_addrs.insert(peer_id, ip);
+                            }
                             info!("✓ connected: {}", peer_id);
                             // DO NOT call gossipsub.add_explicit_peer() here: explicit
                             // peers are excluded from the mesh (libp2p-gossipsub
@@ -1660,7 +1800,18 @@ impl NetworkNode {
                             }
                         }
                         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                            // A connection refused at a discouraged address was never
+                            // counted nor announced: nothing to undo.
+                            if refused_peers.contains(&peer_id) {
+                                if num_established == 0 {
+                                    refused_peers.remove(&peer_id);
+                                }
+                                continue;
+                            }
                             info!("✗ disconnected: {}", peer_id);
+                            if num_established == 0 {
+                                self.peer_addrs.remove(&peer_id);
+                            }
                             if let Some(count) = peer_count_after_disconnect(peer_count, num_established) {
                                 peer_count = count;
                                 crate::metrics::set_peer_count(peer_count as i64);
@@ -1870,7 +2021,23 @@ impl NetworkNode {
                         Some(NetworkControl::PenalizePeer(peer)) => {
                             let score = wire_tracker.record_violation(peer);
                             swarm.behaviour_mut().gossipsub.set_application_score(&peer, score);
+                            for p in wire_tracker.take_evicted() {
+                                swarm.behaviour_mut().gossipsub.set_application_score(&p, 0.0);
+                            }
                             warn!("invalid orphan transaction from {} (app score → {})", peer, score);
+                        }
+                        // NET-2 residual: Bitcoin Core's `Misbehaving` —
+                        // disconnect and discourage the address (never a
+                        // local one, never an operator-configured peer).
+                        Some(NetworkControl::Misbehaving(peer)) => {
+                            let ip = self.peer_addrs.get(&peer);
+                            let discouraged_now = !manual_peers.contains(&peer)
+                                && ip.is_some_and(|ip| discouraged.discourage(ip, Instant::now()));
+                            warn!("peer {} misbehaved (invalid block data); disconnecting{}", peer,
+                                if discouraged_now { " and discouraging its address" } else { "" });
+                            if !manual_peers.contains(&peer) {
+                                let _ = swarm.disconnect_peer_id(peer);
+                            }
                         }
                         None => control_rx = None,
                     }
@@ -1955,6 +2122,10 @@ impl NetworkNode {
                     for (p, score) in wire_tracker.decay_tick_at(now) {
                         swarm.behaviour_mut().gossipsub.set_application_score(&p, score);
                     }
+                    for p in wire_tracker.take_evicted() {
+                        swarm.behaviour_mut().gossipsub.set_application_score(&p, 0.0);
+                    }
+                    discouraged.gc_at(now);
 
                     // FIX v0.5.1: Re-subscribe every 30s (idempotent; restores a
                     // mesh that peer scoring silently dropped).

@@ -83,8 +83,17 @@ async fn learn_addr(mut addr_rx: mpsc::UnboundedReceiver<libp2p::Multiaddr>) -> 
 
 /// A node on the legacy `run()` path (blocks relayed on decode).
 async fn spawn_node(bootstrap_peers: Vec<String>) -> Harness {
+    spawn_node_with(bootstrap_peers, None).await
+}
+
+/// [`spawn_node`] with the B1-T7 penalty gate's activation height set
+/// (`Some(0)`: penalties for relayed wire violations in force from genesis).
+async fn spawn_node_with(bootstrap_peers: Vec<String>, penalty_activation: Option<u64>) -> Harness {
     let dir = tempfile::tempdir().expect("tempdir");
-    let node = NetworkNode::new(config(&dir, bootstrap_peers)).expect("NetworkNode::new");
+    let mut node = NetworkNode::new(config(&dir, bootstrap_peers)).expect("NetworkNode::new");
+    if let Some(a) = penalty_activation {
+        node.set_penalty_activation(a);
+    }
     let peer_id = node.peer_id;
     let dag = Arc::new(RwLock::new(GhostDAG::with_k(3)));
     dag.write().add_genesis(GENESIS, 0);
@@ -236,11 +245,21 @@ async fn live_relay_forwards_only_validated_blocks() {
 /// NET-4 (live): A, C, D each connected only to hub B. A's bounds-violating
 /// frames are rejected at B and never relayed, so honest C never charges
 /// honest relay B for them and D's later block still reaches C through B.
+///
+/// Phase 4 (NET-4 residual): the re-audit found this test passed with the
+/// fix reverted — the violations were sent 700 ms apart, so only the first
+/// reached C before C pruned B from its mesh, and B stayed at the gossip
+/// threshold. They now go out in one burst (all within one heartbeat), and C
+/// charges relayed violations (`set_penalty_activation(0)`: penalties in
+/// force, as on a chain past the hardening activation — before it, B1-T7's
+/// gate would spare the relay anyway). With `validate_messages()` removed
+/// from the gossipsub configuration, B forwards all five, C graylists B and
+/// D's block never arrives (verified in the Phase-4 worktree).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_relayed_violations_do_not_cut_honest_relay() {
     init_log();
     let b = spawn_node(vec![]).await;
-    let c = spawn_node(vec![full_addr(&b)]).await;
+    let c = spawn_node_with(vec![full_addr(&b)], Some(0)).await;
     let d = spawn_node(vec![full_addr(&b)]).await;
     let a = spawn_node(vec![full_addr(&b)]).await;
     tokio::time::sleep(Duration::from_secs(12)).await;
@@ -259,7 +278,6 @@ async fn live_relayed_violations_do_not_cut_honest_relay() {
             })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(700)).await;
     }
     tokio::time::sleep(Duration::from_secs(5)).await;
 
