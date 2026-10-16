@@ -123,8 +123,9 @@ async fn address_frontends_v2_aliases_keep_existing_index_identity() {
     assert_eq!(dispatch("getaddresscount", None, &state).await["addresses_with_balance"], 1);
     let script = [vec![crate::core::policy::POLICY_TAG], vec![44; 32]].concat();
     let policy = PolicyAddress::from_script(&script, Network::Mainnet).unwrap();
+    let policy_legacy = policy.to_string();
     state.store.put_utxo(&[45; 32], 0, &TxOutput { value: 23_456, script_pubkey: script }).unwrap();
-    let old = dispatch("getutxos", Some(&json!([policy.to_string()])), &state).await;
+    let old = dispatch("getutxos", Some(&json!([policy_legacy])), &state).await;
     let new = dispatch("getutxos", Some(&json!([POLICY_V2_MAIN_44])), &state).await;
     assert_eq!(new["satoshis"], "23456", "{new}");
     assert_eq!(old["utxos"], new["utxos"]);
@@ -132,7 +133,7 @@ async fn address_frontends_v2_aliases_keep_existing_index_identity() {
     // The existing holder/history APIs are single-key only. A policy alias
     // must not be truncated into a 20-byte identity by accepting v2.
     for method in ["getbalance", "getaddressinfo", "getaddresshistory", "listtransactions", "getaddressbalance_at_height"] {
-        for input in [policy.to_string().as_str(), POLICY_V2_MAIN_44] {
+        for input in [policy_legacy.as_str(), POLICY_V2_MAIN_44] {
             let before = state.store.storage_reads();
             assert_eq!(dispatch(method, Some(&json!([input])), &state).await["error"], "invalid address");
             assert_eq!(state.store.storage_reads() - before, 0);
