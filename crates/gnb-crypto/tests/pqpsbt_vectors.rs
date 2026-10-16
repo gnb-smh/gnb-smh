@@ -63,6 +63,27 @@ fn pqpsbt_independent_vectors_match_exact_bytes_and_verdicts() {
     eprintln!("PQ-PSBT independent vectors: {count} identical verdicts");
 }
 
+// The injected conversion models the actual pointer cast on either target.
+// The generator below calls this same arithmetic with its real usize width.
+fn mutation_index_narrowed(seed: u64, len: usize, narrow: fn(u64) -> u64) -> usize {
+    // Reduce while still u64; the bounded result fits either pointer width.
+    narrow(seed % len as u64) as usize
+}
+fn mutation_index(seed: u64, len: usize) -> usize {
+    mutation_index_narrowed(seed, len, |n| (n as usize) as u64)
+}
+
+#[test]
+fn pqpsbt_mutation_offsets_are_independent_of_pointer_width() {
+    for seed in [0x474e4250534254, u64::MAX, 0x100000001] {
+        for len in [97, 4093, 8_388_608] {
+            let offset32 = mutation_index_narrowed(seed, len, |n| u64::from(n as u32));
+            let offset64 = mutation_index_narrowed(seed, len, |n| n);
+            assert_eq!(offset32, offset64, "seed={seed}, len={len}");
+        }
+    }
+}
+
 #[test]
 fn pqpsbt_seeded_binary_mutations_differential_with_python() {
     use std::io::Write;
@@ -80,16 +101,16 @@ fn pqpsbt_seeded_binary_mutations_differential_with_python() {
         match i % 8 {
             0 => {} // Positive controls prevent agreement on reject-all.
             1 => bytes.push((seed & 255) as u8),
-            2 => bytes.truncate(seed as usize % bytes.len()),
+            2 => bytes.truncate(mutation_index(seed, bytes.len())),
             3 => {
-                let index = seed as usize % bytes.len();
+                let index = mutation_index(seed, bytes.len());
                 bytes[index] ^= 1 << (seed % 8);
             }
             4 => bytes[8..10].copy_from_slice(&2u16.to_le_bytes()),
             5 => bytes[10] = (seed % 4) as u8,
             6 => bytes[11..15].copy_from_slice(&(seed as u32).to_le_bytes()),
             _ => {
-                let index = seed as usize % bytes.len();
+                let index = mutation_index(seed, bytes.len());
                 bytes[index] = 0;
             }
         }

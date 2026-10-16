@@ -528,6 +528,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "key generation, signing and verification run the PQClean ML-DSA-65 and Falcon-1024 C code, which Miri cannot execute")]
     fn pqpsbt_wasm_roles_sign_in_session_and_reject_bad_context() {
         use gnb_crypto::core::policy::SpendPolicy;
         use gnb_crypto::wallet::{policy_spend::PolicySpend, pqpsbt::PqPsbt};

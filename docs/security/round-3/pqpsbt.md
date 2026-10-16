@@ -194,3 +194,51 @@ relative input age; the online frontend owns those node observations. The
 finalizer keeps the existing PolicySpend choice of the threshold lowest-index
 signers common to every input. RPC scheduling, node-backed policysign, browser
 wrappers and canonical WASM build/pins are separate integration packages.
+
+## Independent review findings and correction
+
+Independent review subsequently found missing pure transaction checks and
+non-atomic growth at the binary limit. Seven native regression tests were
+added before changing production: all seven failed by assertion while nine
+existing controls passed (`review-findings-red.log`). They demonstrate an
+input above MoneyRange, output above MoneyRange, separate input/output sums
+above MoneyRange, zero fee reaching a signing callback, a fully signed
+transaction whose exact fee is rejected by `core::check_min_fee` nevertheless
+finalizing, and signing a maximum-size document successfully while making it
+unserializable. These are findings in the new implementation, not claims
+against the original baseline. Review classified the finalizer validity gap
+as a medium issue; no rating improvement is inferred from discovering it.
+
+The shared review now calls `core::limits::check_tx_money_range` and
+`core::limits::money_add`, and rejects fees below `MIN_TX_FEE_SAT` before any
+signing callback. No witness-size estimate is used in preflight. Finalization
+calls the existing `core::check_min_fee` with the actual final transaction
+and reviewed fee. The signed candidate is validated in full before replacing
+the original document; failure leaves the original bytes unchanged. No
+transaction is automatically rewritten. Decoder acceptance remains structural
+u64 with the same independently generated vectors; MoneyRange and the fee
+checks belong to review/sign/finalize, not the interchange parser.
+
+The fixes passed 17 focused core tests. In the measured finalizer fixture,
+fee 10,000 sat was refused against a 41,082-sat shared minimum for the actual
+20,541-byte witness transaction (Falcon sizes may vary across runs). At the
+binary limit, nine signing callbacks complete, then candidate validation
+returns an error and preserves the original serializable document byte for
+byte. The codec differential remains unchanged.
+
+Two test-infrastructure findings were also reproduced. The mutation driver
+narrowed the PRNG state before modulo, producing offsets 41 and 89 for
+32/64-bit conversion models (seed 20,070,770,068,898,388; length 97). Both
+models exercise the same arithmetic as the generator; reducing in u64 before
+conversion now agrees across widths. This is a deterministic arithmetic
+model test, not a claimed native i686 execution.
+
+The new WASM host signing test cannot run in Miri because it calls PQClean
+C. Actual native Miri execution failed at
+`PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair`; the same narrow `cfg_attr(miri,
+ignore = ...)` used by existing FFI tests was then added. Native Miri's WASM
+library suite passes four tests and skips five explicitly unsupported FFI
+cases. Native and real-WASM signing tests remain mandatory. The i686 Miri
+attempt stopped before test execution because `i686-linux-gnu-gcc` is absent
+on this macOS host; that is a setup limitation, not runtime reproduction or
+an i686 green claim.

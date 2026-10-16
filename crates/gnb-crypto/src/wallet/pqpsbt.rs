@@ -285,18 +285,15 @@ impl PqPsbt {
         if self.spend.tx.version == 1 && verified != self.inputs.len() {
             return Err("v1 signing requires every complete previous transaction".into());
         }
+        // BIP174 signer checks include the transaction's basic validity.
+        // Reuse the node's MoneyRange helpers; u64-only structural decoding
+        // remains available to the updater and independent codec reference.
+        let total_outputs = core::limits::check_tx_money_range(&self.spend.tx)?;
         let total_inputs = self
             .inputs
             .iter()
-            .try_fold(0u64, |s, i| s.checked_add(i.prevout.value))
-            .ok_or("input total overflows")?;
-        let total_outputs = self
-            .spend
-            .tx
-            .outputs
-            .iter()
-            .try_fold(0u64, |s, o| s.checked_add(o.value))
-            .ok_or("output total overflows")?;
+            .try_fold(0u64, |s, i| core::limits::money_add(s, i.prevout.value))
+            .map_err(|e| format!("input total: {e}"))?;
         let fee = total_inputs
             .checked_sub(total_outputs)
             .ok_or("outputs exceed inputs")?;
@@ -308,6 +305,11 @@ impl PqPsbt {
                 "fee {fee} exceeds explicit ceiling {}",
                 context.max_fee
             ));
+        }
+        // This floor is independent of eventual witness size. Check the
+        // exact shared minimum only once the final witness exists below.
+        if fee < core::tokenomics::MIN_TX_FEE_SAT {
+            return Err("fee below absolute consensus minimum".into());
         }
         let script = self.spend.locking_script();
         let change = self
@@ -371,17 +373,25 @@ impl PqPsbt {
                 None => sign(digest, version),
             }
         })?;
-        self.spend = next;
+        let candidate = Self {
+            spend: next,
+            inputs: self.inputs.clone(),
+        };
+        // Partial signatures themselves consume the document's byte budget.
+        // Commit atomically only if the whole candidate can still be encoded.
+        candidate.validate()?;
+        *self = candidate;
         Ok(index)
     }
 
     pub fn finalize(&self, context: &SignContext) -> Result<Finalized, String> {
-        self.review(context)?;
+        let review = self.review(context)?;
         self.verify_partials()?;
         let tx = self.spend.finalize()?;
         if tx.wire_size(true) > MAX_TX_BYTES {
             return Err("final transaction exceeds size limit".into());
         }
+        core::check_min_fee(&tx, review.fee)?;
         let prevouts: Vec<_> = self.inputs.iter().map(|i| i.prevout.clone()).collect();
         let activation =
             core::activation::hardening_activation_height_for_signer(self.spend.chain_id());
@@ -1345,9 +1355,8 @@ mod tests {
         assert!(p.combine(&other).is_err());
     }
 
-    #[test]
-    fn pqpsbt_binary_limit_preserves_equivalent_bounded_json() {
-        let (_, mut p, _) = fixture();
+    fn binary_limit_fixture() -> (Vec<Keypair>, PqPsbt) {
+        let (keys, mut p, _) = fixture();
         let original = strict_tx(p.inputs[0].previous_tx.as_ref().unwrap()).unwrap();
         p.inputs = vec![p.inputs[0].clone(); 9];
         p.spend.amounts = vec![5_000_000; 9];
@@ -1380,6 +1389,12 @@ mod tests {
             remaining -= add;
         }
         assert_eq!(remaining, 0);
+        (keys, p)
+    }
+
+    #[test]
+    fn pqpsbt_binary_limit_preserves_equivalent_bounded_json() {
+        let (_, p) = binary_limit_fixture();
         assert_eq!(p.to_bytes().unwrap().len(), MAX_BYTES - 1);
         let text = p.to_json().unwrap();
         assert!(
@@ -1488,5 +1503,155 @@ mod tests {
             .is_err());
         assert_eq!(calls.get(), 2);
         assert_eq!(p.to_bytes().unwrap(), before);
+    }
+    fn v3_review_fixture() -> (Vec<Keypair>, PqPsbt, SignContext) {
+        let (keys, mut p, mut context) = fixture();
+        p.spend.target_height(17_500).unwrap();
+        p.inputs[0].previous_tx = None;
+        context.next_height = 17_500;
+        context.max_fee = u64::MAX;
+        (keys, p, context)
+    }
+
+    fn check_no_callback(mut p: PqPsbt, context: SignContext, key: &Keypair) -> String {
+        p.validate().unwrap(); // Codec remains structural u64, by contract.
+        let calls = std::cell::Cell::new(0);
+        let result = p.sign(&context, &key.public_key, |d, v| {
+            calls.set(calls.get() + 1);
+            key.sign_tx_digest(d, v)
+        });
+        assert_eq!(
+            calls.get(),
+            0,
+            "invalid preflight data reached the secret callback"
+        );
+        result.unwrap_err()
+    }
+
+    #[test]
+    fn pqpsbt_review_rejects_input_above_money_range_before_callback() {
+        let (keys, mut p, context) = v3_review_fixture();
+        p.inputs[0].prevout.value = core::tokenomics::MAX_SUPPLY_SAT + 1;
+        p.spend.amounts[0] = p.inputs[0].prevout.value;
+        assert!(check_no_callback(p, context, &keys[0]).contains("input"));
+    }
+
+    #[test]
+    fn pqpsbt_review_rejects_output_above_money_range_before_callback() {
+        let (keys, mut p, context) = v3_review_fixture();
+        p.inputs[0].prevout.value = core::tokenomics::MAX_SUPPLY_SAT + 50_001;
+        p.spend.amounts[0] = p.inputs[0].prevout.value;
+        p.spend.tx.outputs = vec![TxOutput {
+            value: core::tokenomics::MAX_SUPPLY_SAT + 1,
+            script_pubkey: vec![9; 20],
+        }];
+        assert!(check_no_callback(p, context, &keys[0]).contains("output"));
+    }
+
+    #[test]
+    fn pqpsbt_review_rejects_input_sum_above_money_range_before_callback() {
+        let (keys, mut p, context) = v3_review_fixture();
+        let value = core::tokenomics::MAX_SUPPLY_SAT / 2 + 1;
+        p.inputs[0].prevout.value = value;
+        p.inputs.push(p.inputs[0].clone());
+        p.spend.amounts = vec![value; 2];
+        p.spend.signatures.push(BTreeMap::new());
+        let mut input = p.spend.tx.inputs[0].clone();
+        input.prev_index = 1;
+        p.spend.tx.inputs.push(input);
+        assert!(check_no_callback(p, context, &keys[0]).contains("input total"));
+    }
+
+    #[test]
+    fn pqpsbt_review_rejects_output_sum_above_money_range_before_callback() {
+        let (keys, mut p, context) = v3_review_fixture();
+        let value = core::tokenomics::MAX_SUPPLY_SAT / 2 + 1;
+        p.inputs[0].prevout.value = value;
+        p.inputs.push(p.inputs[0].clone());
+        p.spend.amounts = vec![value; 2];
+        p.spend.signatures.push(BTreeMap::new());
+        let mut input = p.spend.tx.inputs[0].clone();
+        input.prev_index = 1;
+        p.spend.tx.inputs.push(input);
+        p.spend.tx.outputs = vec![
+            TxOutput {
+                value,
+                script_pubkey: vec![9; 20]
+            };
+            2
+        ];
+        assert!(check_no_callback(p, context, &keys[0]).contains("output total"));
+    }
+
+    #[test]
+    fn pqpsbt_review_rejects_fee_below_absolute_minimum_before_callback() {
+        let (keys, mut p, context) = v3_review_fixture();
+        p.spend.tx.outputs = vec![TxOutput {
+            value: 5_000_000,
+            script_pubkey: vec![9; 20],
+        }];
+        assert!(check_no_callback(p, context, &keys[0]).contains("minimum"));
+    }
+
+    #[test]
+    fn pqpsbt_finalizer_rechecks_exact_consensus_minimum_with_real_witness() {
+        let (keys, mut p, context) = v3_review_fixture();
+        let fee = core::tokenomics::MIN_TX_FEE_SAT;
+        p.spend.tx.outputs = vec![TxOutput {
+            value: 5_000_000 - fee,
+            script_pubkey: vec![9; 20],
+        }];
+        for key in [&keys[0], &keys[2]] {
+            p.sign(&context, &key.public_key, |d, v| key.sign_tx_digest(d, v))
+                .unwrap();
+        }
+        let transaction = p.spend.finalize().unwrap();
+        eprintln!(
+            "exact fee check: fee={fee}, bytes={}, minimum={}",
+            transaction.wire_size(true),
+            core::tokenomics::min_tx_fee_sat(transaction.wire_size(true))
+        );
+        assert!(
+            core::check_min_fee(&transaction, fee).is_err(),
+            "fixture must fail shared consensus minimum"
+        );
+        assert!(
+            p.finalize(&context).is_err(),
+            "finalized a transaction below its exact consensus fee"
+        );
+    }
+
+    #[test]
+    fn pqpsbt_signing_at_binary_limit_fails_atomically() {
+        let (keys, mut p) = binary_limit_fixture();
+        p.spend.target_height(17_500).unwrap();
+        let context = SignContext {
+            network: Network::Mainnet,
+            next_height: 17_500,
+            max_fee: 50_000_000,
+        };
+        let before = p.to_bytes().unwrap();
+        let calls = std::cell::Cell::new(0);
+        let result = p.sign(&context, &keys[0].public_key, |d, v| {
+            calls.set(calls.get() + 1);
+            keys[0].sign_tx_digest(d, v)
+        });
+        let after = p.to_bytes();
+        eprintln!(
+            "binary-limit signing: callbacks={}, result_ok={}, serializable={}, state_unchanged={}",
+            calls.get(),
+            result.is_ok(),
+            after.is_ok(),
+            after.as_ref().is_ok_and(|bytes| bytes == &before)
+        );
+        assert!(
+            result.is_err(),
+            "signing accepted a candidate beyond the binary byte limit"
+        );
+        assert_eq!(
+            after.unwrap(),
+            before,
+            "failed signing must preserve the whole document"
+        );
     }
 }
