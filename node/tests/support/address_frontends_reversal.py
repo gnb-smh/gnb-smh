@@ -51,20 +51,27 @@ def main():
             result = subprocess.run(command, cwd=root, env=env, stdout=stream, stderr=subprocess.STDOUT)
         return {"exit_code": result.returncode, "log": str(path), "sha256": digest(path.read_bytes())}
 
-    try:
-        for name, data in original.items():
-            (root / name).write_bytes(data)
-        manifest["reversed"] = run("reversed")
-    finally:
-        for name, data in fixed.items():
-            (root / name).write_bytes(data)
-        manifest["production_restored_exactly"] = all((root / name).read_bytes() == data for name, data in fixed.items())
-        manifest["tests_unchanged"] = all((root / name).read_bytes() == data for name, data in test_bytes.items())
-        (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    guard = b"if network != expected {"
+    assert fixed["node/src/rpc/mod.rs"].count(guard) == 1
+    no_guard = dict(fixed)
+    no_guard["node/src/rpc/mod.rs"] = no_guard["node/src/rpc/mod.rs"].replace(guard, b"if false {")
+    manifest["reversals"] = {}
+    for label, replacement in [("network_guard", no_guard), ("baseline_rpc", original)]:
+        try:
+            for name, data in replacement.items():
+                (root / name).write_bytes(data)
+            manifest["reversals"][label] = run(label)
+        finally:
+            for name, data in fixed.items():
+                (root / name).write_bytes(data)
+            manifest["production_restored_exactly"] = all((root / name).read_bytes() == data for name, data in fixed.items())
+            manifest["tests_unchanged"] = all((root / name).read_bytes() == data for name, data in test_bytes.items())
+            (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     manifest["restored"] = run("restored")
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    assert manifest["reversed"]["exit_code"] != 0, "reversal did not fail"
-    assert "test result: FAILED" in (output / "reversed.log").read_text(), "reversal did not reach runtime assertions"
+    for label, result in manifest["reversals"].items():
+        assert result["exit_code"] != 0, f"{label}: reversal did not fail"
+        assert "test result: FAILED" in Path(result["log"]).read_text(), f"{label}: reversal did not reach runtime assertions"
     assert manifest["restored"]["exit_code"] == 0, "restored tests failed"
     print(json.dumps(manifest, indent=2))
 

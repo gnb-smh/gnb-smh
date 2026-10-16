@@ -63,9 +63,15 @@ async fn address_frontends_validators_refuse_wrong_network() {
     let mut failures = Vec::new();
     for (method, field) in [("validateaddress", "isvalid"), ("validateaddressverbose", "valid")] {
         assert_eq!(dispatch(method, Some(&json!([main])), &state).await[field], true);
-        let result = dispatch(method, Some(&json!([other])), &state).await;
-        if result[field] != false || result["reason"] != "address is for Testnet, expected Mainnet" {
-            failures.push(format!("{method}: {result}"));
+        for input in [other.as_str(), ADDRESS_V2_TEST_42, POLICY_V2_TEST_44] {
+            let result = dispatch(method, Some(&json!([input])), &state).await;
+            if result[field] != false || result["reason"] != "address is for Testnet, expected Mainnet" {
+                failures.push(format!("{method}: {result}"));
+            }
+            assert!(result.get("canonical_address").is_none());
+            assert!(result.get("bech32m").is_none());
+            assert_eq!(result["network"], "testnet");
+            if method == "validateaddress" { assert_eq!(result["checksum"], true); }
         }
     }
     assert!(failures.is_empty(), "wrong-network validation:\n{}", failures.join("\n"));
@@ -138,6 +144,12 @@ async fn address_frontends_v2_aliases_keep_existing_index_identity() {
             assert_eq!(dispatch(method, Some(&json!([input])), &state).await["error"], "invalid address");
             assert_eq!(state.store.storage_reads() - before, 0);
         }
+    }
+    for method in ["getbalance", "getaddressinfo", "getaddresshistory", "listtransactions", "getaddressbalance_at_height"] {
+        let before = state.store.storage_reads();
+        assert_eq!(dispatch(method, Some(&json!([ADDRESS_V2_TEST_42])), &state).await["error"],
+            "address is for Testnet, expected Mainnet");
+        assert_eq!(state.store.storage_reads() - before, 0);
     }
     for other in [ADDRESS_V2_TEST_42, POLICY_V2_TEST_44] {
         let before = state.store.storage_reads();
@@ -212,20 +224,32 @@ fn address_frontends_testnet_rpc_isolated() {
         state.store.put_utxo(&[43; 32], 0, &TxOutput { value: 12_345, script_pubkey: vec![42; 20] }).unwrap();
         let mut failures = Vec::new();
         for method in ["getbalance", "getutxos", "getaddressinfo", "getaddresshistory", "listtransactions", "getaddressbalance_at_height"] {
-            let positive = dispatch(method, Some(&json!([address])), &state).await;
-            assert!(positive.get("error").is_none(), "testnet positive {method}: {positive}");
-            let before = state.store.storage_reads();
-            let result = dispatch(method, Some(&json!([other])), &state).await;
-            let reads = state.store.storage_reads() - before;
-            if result["error"] != "address is for Mainnet, expected Testnet" || reads != 0 {
-                failures.push(format!("{method}: {result}; storage reads {reads}"));
+            for input in [address.as_str(), ADDRESS_V2_TEST_42] {
+                let positive = dispatch(method, Some(&json!([input])), &state).await;
+                assert!(positive.get("error").is_none(), "testnet positive {method}: {positive}");
+            }
+            for input in [other.as_str(), ADDRESS_V2_MAIN_42] {
+                let before = state.store.storage_reads();
+                let result = dispatch(method, Some(&json!([input])), &state).await;
+                let reads = state.store.storage_reads() - before;
+                if result["error"] != "address is for Mainnet, expected Testnet" || reads != 0 {
+                    failures.push(format!("{method}: {result}; storage reads {reads}"));
+                }
             }
         }
         for (method, field) in [("validateaddress", "isvalid"), ("validateaddressverbose", "valid")] {
-            assert_eq!(dispatch(method, Some(&json!([address])), &state).await[field], true);
-            let result = dispatch(method, Some(&json!([other])), &state).await;
-            if result[field] != false || result["reason"] != "address is for Mainnet, expected Testnet" {
-                failures.push(format!("{method}: {result}"));
+            for input in [address.as_str(), ADDRESS_V2_TEST_42, POLICY_V2_TEST_44] {
+                let result = dispatch(method, Some(&json!([input])), &state).await;
+                assert_eq!(result[field], true, "{method}: {result}");
+                assert_eq!(result["network"], "testnet");
+            }
+            for input in [other.as_str(), ADDRESS_V2_MAIN_42, POLICY_V2_MAIN_44] {
+                let result = dispatch(method, Some(&json!([input])), &state).await;
+                if result[field] != false || result["reason"] != "address is for Mainnet, expected Testnet" {
+                    failures.push(format!("{method}: {result}"));
+                }
+                assert!(result.get("canonical_address").is_none());
+                assert!(result.get("bech32m").is_none());
             }
         }
         assert!(failures.is_empty(), "testnet matrix:\n{}", failures.join("\n"));

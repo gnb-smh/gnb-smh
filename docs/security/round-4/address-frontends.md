@@ -45,3 +45,43 @@ on the node's network. Existing CLI `validateaddress` reaches the first method.
 No consensus, activation, wallet persistence, core, Python, WASM or browser
 source is owned by this package. Previously blocked PoWit, R7 and witness tasks
 are excluded.
+
+## Runtime reproduction and implementation
+
+The unchanged production baseline plus test harness at
+`23237fff9531cba78461fd4a6b6c2d748564ad2c` produced 2 passing controls and 6
+runtime RPC failures (`address_frontends` filter, exit 101). Correct-network
+queries, legacy alias identity and malformed inputs are positive controls.
+All six single-key queries accepted the other network; `getutxos` also accepted
+the other network's policy address and selected-input lookup. The latter read
+storage 6 times and returned a UTXO rather than rejecting the network. The
+isolated testnet process reproduced the reverse direction. The old validator
+accepted the other network, the basic validator rejected an otherwise supported
+Bloch alias, and the v2/explicit conversion feature was absent.
+
+This is a mismatch with the requested new RPC policy, **not** a demonstrated
+consensus defect or signing bypass: `docs/RUNNING.md` documented the old
+cross-network read behavior. The baseline CLI suite passed 15 existing tests,
+including its network protections; only the 2 new v2 destination tests failed
+at runtime with invalid-address errors. A legacy CLI network bypass was not
+reproduced and no CLI production logic changed.
+
+After those executions this branch imported core commits `40c321b`, `cf40773`
+and `4b32fb6` (local cherry-picks `4f8ec88`, `2557286`, `606cbb6`). The RPC
+implementation uses one network check for queries and both validators. It
+checks `getutxos` before snapshot storage reads and retains the full policy
+script as the index key. Balance/history APIs remain single-key only. The
+validators expose `canonical_address` and `bech32m` without changing `address`
+echoing, normal address generation or persistent data. Their validity field
+means validity for the node's network; `checksum` remains syntactic.
+
+Focused RPC tests passed 8/8 and the complete CLI unit binary passed 17/17.
+The RPC matrix was then strengthened with wrong-network v2 variants on both
+networks. Production-only reversal and independent reviews are still pending;
+these focused results do not stand in for the integrated node suite or CI.
+
+Scope limits: RPC tests exercise the real dispatcher with storage fixtures and
+a separate process for testnet. CLI tests exercise its actual destination
+helpers; they do not claim a new live TTY/keystore signing journey. Policy
+balances/history and default v2 generation are not added. No score is assigned
+by this package's implementer.
