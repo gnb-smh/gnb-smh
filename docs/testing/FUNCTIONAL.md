@@ -238,10 +238,12 @@ types the password at the prompt, exactly as a user would:
 | `p2p_invalid_blocks_txs.py` | 3 | Invalid transactions (malformed, coinbase, duplicate input, missing input, outputs above inputs, dust, version 1, forged signature, conflicts under full-RBF: one at T's fee rate fails the replacement rules before any signature work, one paying more fails the signature check; duplicate) and invalid blocks (malformed, bad / legacy Merkle root, every coinbase-commitment defect, no / two coinbases, duplicate tx, undecodable or unexpected bits, wrong height, unknown parent, timestamps, coinbase over-claim, two coinbase outputs, a confirmed tx again: BIP30) are rejected with the right reason and never move the tip. None of them is delivered to the observer node: checked on its receipt trace (every gossiped block is logged at info, every gossiped transaction with the debug target `gnb_gossip_rx_tx`), not on its storage, since the observer would drop most of them itself; the trace does show the valid transaction and blocks node0 relays. |
 | `feature_activation_testnet.py` | 2 | Testnet activation 0: the template announces the hardened rules at height 1; the pre-activation block format, and each half of the change alone, is rejected at height 1; the hardened block is accepted; blocks from the internal miner satisfy the rules, checked in Python. |
 
-The whole suite takes about 75 s with two jobs (plus about 100 s once to
-build the cached chain); no test takes more than about 25 s. CI (`.github/workflows/ci.yml`, job `functional`) builds the test
-binaries, runs the harness unit tests and runs `test_runner.py --ci --jobs 2 --timeout 300`, uploading the logs
-of failed tests.
+Runtime depends on the host, cached chain and scenario. The runner reports
+each scenario's duration and the total; the [round 2 execution record](../security/round-2/validation.md)
+includes a Linux baseline run of 249 seconds, with the longest scenario at
+146 seconds. CI (`.github/workflows/ci.yml`, job `functional`) builds the test
+binaries, runs the harness unit tests and runs
+`test_runner.py --ci --jobs 2 --timeout 300`, uploading the logs of failed tests.
 
 ## Behaviour the tests rely on (and document)
 
