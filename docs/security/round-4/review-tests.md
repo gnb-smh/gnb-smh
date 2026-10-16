@@ -271,3 +271,41 @@ replay uses reachable baseline `887bd0b`, already checked byte-identical to
 the historical baseline. This is verification of the committed job and replay
 configuration, not a claim that the final CI run has finished. Full integration,
 JS integrity repinning and canonical Linux WASM gates remain required.
+
+## Final secondary-test follow-up
+
+Both evidence improvements above are closed in `7e01bf5` / `47df8f8`
+(integrated as `caebe30` / `f064157`). I imported those commits and confirmed
+that `main.js` and `core.js` are unchanged from the production reviewed at
+`8be30ee`. The strengthened tests record `planAttempts` and `payAttempts`
+before calling the actual WASM. Invalid height and immature-only cases assert
+zero attempts; controls assert one attempt of each. Wrong-network and invalid
+previous-transaction cases explicitly assert a refused attempted call, avoiding
+the earlier ambiguity between zero attempts and zero successful returns.
+
+My independent focused execution of the strengthened
+`wallet-secondary.test.mjs` passed **16/16**, with no skips. Log
+`/private/tmp/gnb-r4-review-tests-wallet-attempts.log`, SHA-256
+`e08a6a1fd71bbecf1543d51e2ad72eb600b874d292f517f70044d3fd53ace741`.
+I verified all four new reversal logs against
+`wallet-secondary-attempt-reversals.json`, including the final test hash
+`9f14e304ff234b684eaa156f048307f601760b8796784d44a1ffd98ba90ed889` and unchanged
+production hashes. Payment, create and open reversals remain **7/9, 13/3,
+11/5** (passed/failed); restoration passes **16/0**. I also rechecked the four
+original reversal logs: their original hashes remain intact.
+
+The replay now requires `--output`, creates a new directory before reading or
+changing production, refuses existing paths, and writes its manifest only to
+that directory. I independently invoked its preflight with missing `--output`
+and with an existing directory containing a sentinel. It returned exits **2**
+and **1**, preserved the sentinel, and left production, tests and both
+versioned manifests byte-identical. Result record
+`/private/tmp/gnb-r4-review-tests-replay-preflight.json`, SHA-256
+`ae7506aaed05bc068786584fc6a1658c9051534129ed6707e136482e4e3c6500`.
+I did not repeat the mutation executions; the fresh focused run and verified
+archived reversals are separate evidence.
+
+There are no remaining requested test-strength follow-ups from this lens for
+the reviewed package. This disposition retains all scope limits above and is
+conditional on the complete native suite, final CI and artifact-integrity
+gates; it assigns no numerical score or project-wide security conclusion.
