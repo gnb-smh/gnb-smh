@@ -3,8 +3,8 @@ use gnb_crypto::wallet::descriptor::{public_request, request_from_json};
 
 #[test]
 fn descriptor_seed_corpus_accepts_controls_and_refuses_invalid_requests() {
-    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fuzz/corpus/descriptor_json");
+    let directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/descriptor_json");
     let (mut accepted, mut rejected) = (0, 0);
     for entry in std::fs::read_dir(directory).unwrap() {
         let entry = entry.unwrap();

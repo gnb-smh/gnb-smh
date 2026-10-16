@@ -17,15 +17,23 @@ fn check_info(info: &Value) {
     };
     let descriptor = info["descriptor"].as_str().unwrap();
     assert_eq!(
-        public_request(&json!({"action":"inspect","network":network,"descriptor":descriptor})).unwrap(),
+        public_request(&json!({"action":"inspect","network":network,"descriptor":descriptor}))
+            .unwrap(),
         *info
     );
-    assert!(public_request(&json!({"action":"inspect","network":other,"descriptor":descriptor})).is_err());
+    assert!(
+        public_request(&json!({"action":"inspect","network":other,"descriptor":descriptor}))
+            .is_err()
+    );
 }
 
 fuzz_target!(|data: &[u8]| {
-    let Ok(request) = request_from_json(data) else { return };
-    let Ok(result) = public_request(&request) else { return };
+    let Ok(request) = request_from_json(data) else {
+        return;
+    };
+    let Ok(result) = public_request(&request) else {
+        return;
+    };
     if result.get("descriptor").is_some() {
         check_info(&result);
     } else {
@@ -35,7 +43,10 @@ fuzz_target!(|data: &[u8]| {
             check_info(info);
         }
         assert_eq!(
-            public_request(&json!({"action":"import","network":request["network"],"bundle":result["bundle"]})).unwrap(),
+            public_request(
+                &json!({"action":"import","network":request["network"],"bundle":result["bundle"]})
+            )
+            .unwrap(),
             result
         );
     }
