@@ -526,7 +526,11 @@ impl PowitPool {
         let view = load_state(store, &tip).map(|st| Arc::new(TipWitnesses::of(tip, tip_h, &st, &p)));
         let mut g = self.inner.lock();
         g.prune_to(view.as_deref(), tip_h, &p);
-        g.followed = Some(tip);
+        // An activated tip whose state is not readable yet is retried on the
+        // next use rather than followed as "no PoWit" until the next tip.
+        if view.is_some() || !core::powit_active(tip_h) {
+            g.followed = Some(tip);
+        }
         g.view = view.clone();
         view
     }

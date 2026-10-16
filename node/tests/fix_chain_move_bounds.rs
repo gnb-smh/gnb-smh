@@ -452,6 +452,12 @@ struct FinalityFixture {
 }
 
 fn finality_fixture() -> FinalityFixture {
+    // The pin is taken only at or above the node's minimum chain work
+    // (`powit::pin_finalized_of`); these few-block chains test the chunked
+    // move, not that gate (fix_powit_finality_min_work.rs), so this binary
+    // runs with 0 whatever the mainnet `core::MIN_CHAIN_WORK` becomes.
+    let _ = gnb::ingress::set_minimum_chain_work(0);
+    assert_eq!(gnb::ingress::minimum_chain_work(), 0);
     let genesis = mk_genesis(unix_now() - 100_000);
     let gh = genesis.block_hash();
     let mut b = Builder::new(&genesis);
