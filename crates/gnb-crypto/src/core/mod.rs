@@ -1197,9 +1197,18 @@ impl Block {
             + 32 + 8 + 4 + 8 + 8 + 8;
         let txs: usize = self.transactions.iter().map(|t| t.wire_size(true)).sum();
         let shielded: usize = self.shielded_transactions.iter().map(shielded_tx_wire_size).sum();
+        // The PoWit section is part of the encoding from `powit_height()`.
+        let powit = if powit_active(self.height) {
+            let mut v = Vec::new();
+            self.powit.write_wire(&mut v);
+            v.len()
+        } else {
+            0
+        };
         header
             + varint_len(self.transactions.len() as u64) + txs
             + varint_len(self.shielded_transactions.len() as u64) + shielded
+            + powit
     }
 
     /// Strict inverse of `to_wire_bytes`: trailing bytes and non-minimal
@@ -2788,6 +2797,11 @@ mod hardening_core_tests {
         });
         assert_eq!(b.wire_size(), b.to_wire_bytes().len());
         assert_eq!(genesis_block().wire_size(), genesis_block().to_wire_bytes().len());
+        // From powit_height the encoding carries the PoWit section.
+        let mut p = genesis_block();
+        p.height = u64::MAX;
+        assert!(powit_active(p.height));
+        assert_eq!(p.wire_size(), p.to_wire_bytes().len());
     }
 
     /// The 6-field record layout written before the extension existed.
