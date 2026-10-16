@@ -70,10 +70,19 @@ fn connect_core(c: &TxVector, tx: &Transaction, chain: ChainId, act: u64, expect
     if matches!(expected, "bip30" | "same-block-coinbase") {
         return Connect::Deferred;
     }
-    // Coinbase maturity at the block height; the view's coinbase heights.
-    let maturity = core::check_coinbase_maturity(tx, c.height, |txid| {
-        c.prevouts.iter().find(|p| !p.block_coinbase && p.txid == *txid).and_then(|p| p.coinbase_height)
-    });
+    // Coinbase maturity: below the activation the block's header height and
+    // the coinbases' header heights; from it the block's DAG height and the
+    // DAG heights of the coinbases' blocks (re-audit B1-T14).
+    let hardened = block_rules::rules_active_at(c.height, act);
+    let maturity = if hardened {
+        core::check_coinbase_maturity(tx, c.dag_height, |txid| {
+            c.prevouts.iter().find(|p| !p.block_coinbase && p.txid == *txid).and_then(|p| p.coinbase_dag_height)
+        })
+    } else {
+        core::check_coinbase_maturity(tx, c.height, |txid| {
+            c.prevouts.iter().find(|p| !p.block_coinbase && p.txid == *txid).and_then(|p| p.coinbase_height)
+        })
+    };
     if let Err(e) = maturity {
         return fail(e);
     }
@@ -84,7 +93,6 @@ fn connect_core(c: &TxVector, tx: &Transaction, chain: ChainId, act: u64, expect
     }
     // Below the activation the block's own coinbase outputs are spendable
     // in the block (at/after it VAL-3 rejected the spend above).
-    let hardened = block_rules::rules_active_at(c.height, act);
     let mut spent = Vec::with_capacity(tx.inputs.len());
     let mut total_in = 0u64;
     for inp in &tx.inputs {

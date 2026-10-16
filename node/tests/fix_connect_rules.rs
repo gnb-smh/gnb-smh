@@ -369,3 +369,142 @@ fn wanted_bodies_are_bounded_by_the_best_chain() {
     assert_eq!(wanted(&n), vec![f.block_hash()]);
     assert!(gnb::accept::awaits_body(&n.dag, &n.store, &f.block_hash()));
 }
+
+// ── B1-T14: coinbase maturity counts selected-chain blocks from the activation
+
+/// A store holding one coin (output 0, 5,000,000) of the coinbase of block
+/// C (header height `cb_header`, DAG height `cb_dag`: its coinbase-height
+/// row, its tx-index row and its DAG record, as a node applies it), and the
+/// DAG records of two blocks a spending block S lists as parents: `sel`
+/// (DAG height `sel_dag`, the heavier: S's selected parent, the applied tip)
+/// and `side` (DAG height `side_dag`, lighter). S's header height is
+/// `max(sel_dag, side_dag) + 1`, its DAG height `sel_dag + 1`.
+struct MaturityFixture {
+    _tmp: tempfile::TempDir,
+    store: gnb::storage::Storage,
+    coin: ([u8; 32], u32, TxOutput),
+    parents: Vec<gnb::consensus::BlockHash>,
+    header_height: u64,
+}
+
+fn maturity_fixture(k: &Key, cb_header: u64, cb_dag: u64, sel_dag: u64, side_dag: u64) -> MaturityFixture {
+    use gnb::consensus::GhostdagData;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = gnb::storage::Storage::open(&tmp.path().join("db")).unwrap();
+    let record = |height: u64, blue_work: u128| {
+        let mut d = GhostdagData::genesis();
+        d.height = height;
+        d.blue_score = height;
+        d.blue_work = blue_work;
+        d
+    };
+    let (c, sel, side) = ([0xC1u8; 32], [0xC2u8; 32], [0xC3u8; 32]);
+    let cb_txid = [0xCBu8; 32];
+    let coin = (cb_txid, 0u32, out(5_000_000, &k.spk));
+    store.put_dag_data(&c, &record(cb_dag, 10)).unwrap();
+    store.put_dag_data(&sel, &record(sel_dag, 1_000_000)).unwrap();
+    store.put_dag_data(&side, &record(side_dag, 1)).unwrap();
+    store.put_tx_index(&cb_txid, &c, cb_header).unwrap();
+    store.put_utxo(&coin.0, coin.1, &coin.2).unwrap();
+    store.put_coinbase_info(&cb_txid, cb_header).unwrap();
+    store.put_meta("tip_hash", &sel).unwrap();
+    MaturityFixture { _tmp: tmp, store, coin, parents: vec![sel, side], header_height: sel_dag.max(side_dag) + 1 }
+}
+
+/// A block S on `f`'s two parents spending `f`'s coin, signed under the
+/// calling thread's activation height.
+fn maturity_spend(k: &Key, f: &MaturityFixture) -> (core::Block, Transaction) {
+    let h = f.header_height;
+    let spend = signed_spend_at(k, &[(f.coin.0, f.coin.1)], std::slice::from_ref(&f.coin.2),
+        vec![out(4_900_000, &[0x9A; 20])], h);
+    let block = core::Block {
+        header: core::BlockHeader {
+            version: 1, parents: f.parents.clone(), merkle_root: core::MerkleRoot::ZERO,
+            timestamp: 0, bits: 0, nonce: 0,
+        },
+        transactions: vec![coinbase("t14", subsidy(h) + 100_000, vec![0xC4; 20]), spend.clone()],
+        blue_score: h,
+        height: h,
+        shielded_transactions: vec![],
+    };
+    (block, spend)
+}
+
+/// B1-T14: the header height is `max(parent DAG heights) + 1`, so a block
+/// that merges a long, light side tip has a header height far above its
+/// position on its selected chain, and its selected-chain descendants repeat
+/// lower header heights. Maturity compared header heights, so such a block
+/// could spend a coinbase with a handful of confirmations (case "merge").
+/// From the activation the rule counts selected-chain blocks: the spending
+/// block's DAG height minus the DAG height of the coinbase's block (Bitcoin
+/// Core compares chain positions). Below the activation the header-height
+/// rule is kept exactly, in both directions (case "inflated coinbase
+/// header": a coinbase whose own block merged a high tip is immature longer
+/// under it). Mempool admission (and so the templates, which re-check
+/// through it) follows the same rule for the next block on the applied tip.
+#[test]
+fn coinbase_maturity_counts_selected_chain_blocks_from_the_activation() {
+    let k = key();
+    // (case, C header, C DAG, sel DAG, side DAG, valid below, valid from the activation)
+    let cases = [
+        ("merge: header depth 100, 10 selected-chain blocks", 1, 1, 10, 100, true, false),
+        ("100 selected-chain blocks", 1, 1, 100, 5, true, true),
+        ("99 selected-chain blocks", 1, 1, 99, 5, false, false),
+        ("inflated coinbase header: header depth 51, 100 selected-chain blocks", 50, 1, 100, 5, false, true),
+    ];
+    for (what, cb_header, cb_dag, sel_dag, side_dag, below, from) in cases {
+        let f = maturity_fixture(&k, cb_header, cb_dag, sel_dag, side_dag);
+        let view: &gnb::storage::Storage = &f.store;
+        for (act, valid) in [(activation::NEVER, below), (1, from)] {
+            let _g = activation::scoped_override(act);
+            let (b, spend) = maturity_spend(&k, &f);
+            let connect = gnb::accept::validate_block_in_view_classified_at(view, &b, act);
+            match (&connect, valid) {
+                (Ok(()), true) => {}
+                (Err(gnb::accept::ConnectFailure::Invalid(e)), false) => {
+                    assert!(e.reason.contains("coinbase maturity"), "{what} (act {act}): {e:?}");
+                    assert!(!e.witness_dependent, "{what}");
+                }
+                _ => panic!("{what} (activation {act}): expected valid={valid}, got {connect:?}"),
+            }
+            let adm = admission::check_transaction(&f.store, None, &spend, &AdmissionPolicy::relay(f.header_height));
+            match (&adm, valid) {
+                (Ok(_), true) => {}
+                (Err(admission::AdmissionError::Immature(_)), false) => {}
+                _ => panic!("{what} (activation {act}): admission expected valid={valid}, got {adm:?}"),
+            }
+        }
+    }
+}
+
+/// B1-T14, producers: the template self-check
+/// (`admission::coinbase_maturity_for_next_block`, also mempool admission and
+/// the post-connect revalidation) and the `getutxos` value the wallets compare
+/// (`admission::coinbase_height_for_wallets`: spendable in the next block iff
+/// `next_block_height - coinbase_height >= COINBASE_MATURITY`) follow the
+/// rule in force for the next block's header height: header heights for a
+/// next block at H-1 (H the activation), selected-chain depth at H.
+#[test]
+fn producers_follow_the_maturity_rule_of_the_next_block_height() {
+    let k = key();
+    // Applied tip at DAG height 10 (the next block's selected parent), a
+    // side tip at DAG height 100: a next block merging both has header
+    // height 101 and DAG height 11; the coinbase is at height 1.
+    let (cb_header, cb_dag, sel_dag, side_dag) = (1, 1, 10, 100);
+    let f = maturity_fixture(&k, cb_header, cb_dag, sel_dag, side_dag);
+    let next = f.header_height;
+    for (activation_h, mature) in [(next + 1, true), (next, false)] {
+        let _g = activation::scoped_override(activation_h);
+        let (_, spend) = maturity_spend(&k, &f);
+        let verdict = admission::coinbase_maturity_for_next_block(&f.store, &spend, next).unwrap();
+        assert_eq!(verdict.is_ok(), mature, "activation {activation_h}: template self-check {verdict:?}");
+        let reported = admission::coinbase_height_for_wallets(&f.store, &f.coin.0, next).unwrap().expect("a coinbase");
+        assert_eq!(next.saturating_sub(reported) >= core::COINBASE_MATURITY, mature,
+            "activation {activation_h}: the wallets' comparison with coinbase_height {reported}");
+        let expected = if mature { cb_header } else { next - (sel_dag + 1 - cb_dag) };
+        assert_eq!(reported, expected, "activation {activation_h}");
+    }
+    // A transaction spending no coinbase reports no coinbase height.
+    let _g = activation::scoped_override(next);
+    assert_eq!(admission::coinbase_height_for_wallets(&f.store, &[0x77; 32], next).unwrap(), None);
+}

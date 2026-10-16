@@ -386,7 +386,13 @@ def signature_suite(ss: bytes) -> int:
 @dataclass
 class View:
     utxos: dict = field(default_factory=dict)          # (txid, vout) -> mk.TxOut
-    coinbase_heights: dict = field(default_factory=dict)  # txid -> height
+    coinbase_heights: dict = field(default_factory=dict)  # txid -> header height of its block
+    # txid -> DAG height of the coinbase's block, where it differs from its
+    # header height (re-audit B1-T14).
+    coinbase_dag_heights: dict = field(default_factory=dict)
+    # The DAG height of the block being evaluated / of the next block (its
+    # selected parent's plus one), when it differs from its header height.
+    dag_height: "int | None" = None
     # The transaction index: every coin's creating txid (mempool admission
     # refuses a transaction that is already confirmed).
     confirmed_txids: set = field(default_factory=set)
@@ -445,6 +451,28 @@ def check_input_scripts(tx: mk.Tx, prevouts: list, height: int, activation: int,
         out.signatures.append((tx, i, rule, prevouts))
 
 
+def check_maturity(tx: mk.Tx, view: View, height: int, activation: int) -> None:
+    """Coinbase maturity (`accept::check_coinbase_maturity_in_view`;
+    docs/CONSENSUS.md "Coinbase maturity"), for a block at header height
+    `height` (0 skips it). A spend of an output of a coinbase needs a depth
+    of at least COINBASE_MATURITY. Below the activation the depth is the
+    spending block's header height minus the coinbase block's header height;
+    from it (re-audit B1-T14) the spending block's DAG height minus the
+    coinbase block's DAG height: its selected-chain confirmations."""
+    if height == 0:
+        return
+    hardened = block_rules_active(height, activation)
+    spend = (view.dag_height if view.dag_height is not None else height) if hardened else height
+    for i in tx.inputs:
+        cbh = view.coinbase_heights.get(i.prev_txid)
+        if cbh is None:
+            continue
+        if hardened:
+            cbh = view.coinbase_dag_heights.get(i.prev_txid, cbh)
+        if max(0, spend - cbh) < COINBASE_MATURITY:
+            raise Invalid("immature-coinbase")
+
+
 def connect_tx_committed(tx: mk.Tx, view: View, earlier: dict, spent_in_block: set, height: int,
                          activation: int, same_block_coinbase) -> tuple:
     """`check_tx_in_view_committed`: the checks of one non-coinbase
@@ -452,11 +480,7 @@ def connect_tx_committed(tx: mk.Tx, view: View, earlier: dict, spent_in_block: s
     commits to; returns (fee, prevouts)."""
     if same_block_coinbase is not None and any(i.prev_txid == same_block_coinbase for i in tx.inputs):
         raise Invalid("same-block-coinbase")
-    if height != 0:
-        for i in tx.inputs:
-            cbh = view.coinbase_heights.get(i.prev_txid)
-            if cbh is not None and max(0, height - cbh) < COINBASE_MATURITY:
-                raise Invalid("immature-coinbase")
+    check_maturity(tx, view, height, activation)
     local = set()
     prevouts = []
     total_in = 0
@@ -681,11 +705,7 @@ def admission(tx: mk.Tx, view: View, height: int, activation: int, out: Outcome)
             raise Invalid("missing-input")
         total_in = money_add(total_in, coin.value)
         prevouts.append(coin)
-    if height != 0:
-        for i in tx.inputs:
-            cbh = view.coinbase_heights.get(i.prev_txid)
-            if cbh is not None and max(0, height - cbh) < COINBASE_MATURITY:
-                raise Invalid("immature-coinbase")
+    check_maturity(tx, view, height, activation)
     total_out = tx_money_range(tx)
     if total_in < total_out:
         raise Invalid("inputs-below-outputs")

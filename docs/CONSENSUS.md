@@ -309,6 +309,7 @@ activation height:
 | Coinbase commitment: header height (BIP34), parent list, witness root | VAL-2, CRY-1 | `B.height` | same |
 | No overwrite of an unspent coin (BIP30) | VAL-2 | `B.height` | same |
 | No spend of the same block's coinbase | VAL-3 | `B.height` | same |
+| Coinbase maturity counts selected-chain blocks (DAG heights) instead of header heights | re-audit B1-T14 | `B.height` (the regime); the depth itself compares `GhostdagData::height` | "Coinbase maturity" |
 | `MAX_BLOCK_SIZE` measured on the wire encoding | VAL-12 | `B.height` | same |
 | Pow limit = genesis target | POW-3 | `B.height` (the height `expected_bits` is computed for) | same |
 
@@ -1206,6 +1207,56 @@ commitment: the commitment covers the spend's wtxid, which covers the coinbase
 txid, which covers the commitment. Mempool admission and templates never
 produce such a spend, because a coinbase can be referenced only after its
 block is connected, and it is then immature.
+
+### Coinbase maturity (re-audit B1-T14)
+
+An output of the coinbase of block C may be spent by a transaction of block B
+only if `depth(B, C) >= COINBASE_MATURITY` (100). C is always on B's selected
+chain: only selected-chain blocks are applied, and the coinbase-height row of
+a coinbase exists exactly while its block is applied.
+
+- Below the activation (`B.height < activation`): `depth = B.height -
+  C.height`, both HEADER heights (saturating at 0; the coinbase-height row
+  stores `C.height`). This is the historical rule, kept exactly. A header
+  height is `max(parent DAG heights) + 1`, so it is not a position on the
+  selected chain: a B that merges a long, light side tip sits far above its
+  selected-chain position, and B can then spend a coinbase with fewer than
+  100 selected-chain confirmations (and, symmetrically, a coinbase whose own
+  block merged such a tip stays immature longer).
+- From the activation (`B.height >= activation`, the block-rule predicate):
+  `depth = dag_height(B) - dag_height(C)` (saturating at 0), where
+  `dag_height` is `GhostdagData::height` (selected parent's + 1). `dag_height(B)`
+  is computed from B's parents' DAG records: the parent GhostDAG selects
+  (greatest `(blue_work, blue_score, hash)`) plus one. `dag_height(C)` is the
+  DAG record of the block the transaction index names for the coinbase txid.
+  This is the number of selected-chain blocks from C's child to B inclusive,
+  as Bitcoin Core's `nSpendHeight - coin.nHeight` counts active-chain blocks.
+
+One function decides, `accept::check_coinbase_maturity_in_view`, for the
+connect path (extension, reorg, start-up: `validate_block_in_view`), the fork
+state check (`reorg::validate_fork_block_state`), mempool admission and the
+post-connect revalidation, and the template self-check
+(`admission::coinbase_maturity_for_next_block`). For a block not yet built
+the regime is that of the node's next block height, and `dag_height(B)` is
+the applied tip's DAG height + 1 (the template's selected parent is the
+applied tip). A read failure of any of these rows is a storage error, never
+"not a coinbase" (re-audit B1-T12).
+
+Wallets: `getutxos` reports, for a coinbase output, a `coinbase_height` such
+that the wallets' unchanged comparison `next_block_height - coinbase_height >=
+COINBASE_MATURITY` (`next_block_height` from `getdaginfo`) applies the rule in
+force for the next block: below the activation the header height of C; from
+it `next_block_height - depth(next block, C)`
+(`admission::coinbase_height_for_wallets`). The CLI wallet and the WASM wallet
+therefore need no change.
+
+Vectors: `maturity/merge-header-depth-100-dag-depth-10/{pre,post}` (valid
+below, immature from the activation) and
+`maturity/inflated-coinbase-header-dag-depth-100/{pre,post}` (immature below,
+valid from it) in `reference/tx_vectors.json`. A case's optional `dag_height`
+is the evaluation block's DAG height and a prevout's optional
+`coinbase_dag_height` the DAG height of the coinbase's block; when absent
+they equal `height` and `coinbase_height` (a linear chain).
 
 ### Block size (VAL-12)
 

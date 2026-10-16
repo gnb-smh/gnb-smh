@@ -385,32 +385,126 @@ impl TxFailure {
     }
 }
 
-/// Coinbase maturity of `tx` for a block at `maturity_height` (`0` skips
-/// it), reading coinbase heights from `view`. A read failure is a
-/// [`TxFailure::Storage`], never "not a coinbase" (re-audit B1-T12: the
-/// lookup used `.ok().flatten()`, so a failed read skipped the check).
-fn check_maturity_in_view(tx: &core::Transaction, view: &dyn UtxoView, maturity_height: u64) -> Result<(), TxFailure> {
-    let mut read_error = None;
-    let verdict = core::check_coinbase_maturity(tx, maturity_height, |txid| {
-        view.view_coinbase_height(txid).unwrap_or_else(|e| {
-            read_error.get_or_insert(e);
-            None
-        })
-    });
-    if let Some(e) = read_error {
-        return Err(TxFailure::Storage(e));
+/// Which heights the coinbase-maturity rule compares (re-audit B1-T14;
+/// docs/CONSENSUS.md, "Coinbase maturity"). A spend of an output of the
+/// coinbase of block C by a transaction of block B needs a depth of at least
+/// `core::COINBASE_MATURITY` (100):
+#[derive(Clone, Copy)]
+pub enum MaturityRule<'a> {
+    /// No maturity check (the single-transaction helpers' `0`).
+    Skip,
+    /// Below the hardening activation (B's header height below it): depth =
+    /// B's HEADER height (the value given) minus C's header height (the
+    /// coinbase-height row). Header heights are `max(parent DAG heights) +
+    /// 1`, so this is not a count of confirmations: a B that merges a long
+    /// side tip sits higher than its selected-chain position. Kept exactly.
+    HeaderHeights(u64),
+    /// From the activation: depth = B's DAG height (its position on its
+    /// selected chain, from the closure, called at most once and only when
+    /// an input spends a coinbase) minus C's DAG height (through the tx
+    /// index and C's DAG record): the number of selected-chain blocks from
+    /// C's child to B, B included. C lies on B's selected chain (only
+    /// selected-chain blocks are applied), so this counts confirmations,
+    /// like Bitcoin Core's `nSpendHeight - coin.nHeight`.
+    SelectedChainDepth(&'a dyn Fn() -> Result<u64, ViewError>),
+}
+
+/// The DAG height of the block that created the coinbase `txid`, `None`
+/// when `txid` is not a coinbase of the applied chain (no coinbase-height
+/// row). A coinbase whose tx-index row or block DAG record cannot be found
+/// is an inconsistent index: an error (no verdict), never "not a coinbase".
+pub fn coinbase_dag_height(view: &dyn UtxoView, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
+    if view.view_coinbase_height(txid)?.is_none() {
+        return Ok(None);
     }
-    verdict.map_err(TxFailure::from)
+    let block = view.view_tx_block(txid)?.ok_or_else(|| ViewError(format!(
+        "coinbase {} has no tx-index row", hex::encode(&txid[..8]))))?;
+    let data = view.view_dag_data(&block)?.ok_or_else(|| ViewError(format!(
+        "block {} of coinbase {} has no DAG record", hex::encode(&block[..8]), hex::encode(&txid[..8]))))?;
+    Ok(Some(data.height))
+}
+
+/// The DAG height of `block` (`GhostdagData::height`): its selected
+/// parent's plus one. The selected parent is the parent of greatest
+/// `(blue_work, blue_score, hash)` (`GhostDAG::select_parent`), read from the
+/// parents' persisted DAG records (every parent is persisted before a block
+/// on it is connected). A missing record is an error (no verdict).
+pub fn block_dag_height(view: &dyn UtxoView, block: &core::Block) -> Result<u64, ViewError> {
+    let mut best: Option<((u128, u64, BlockHash), u64)> = None;
+    for p in &block.header.parents {
+        let d = view.view_dag_data(p)?.ok_or_else(|| ViewError(format!(
+            "parent {} of block {} has no DAG record", hex::encode(&p[..8]), hex::encode(&block.block_hash()[..8]))))?;
+        let key = (d.blue_work, d.blue_score, *p);
+        if best.as_ref().is_none_or(|(k, _)| key > *k) {
+            best = Some((key, d.height));
+        }
+    }
+    best.map(|(_, h)| h + 1).ok_or_else(|| ViewError("a block without parents has no selected parent".into()))
+}
+
+/// THE coinbase-maturity rule (re-audit B1-T14), shared by the connect path
+/// (extension, reorg, start-up: [`validate_block_in_view`]), mempool
+/// admission and revalidation, and the template self-check
+/// (`admission::coinbase_maturity_for_next_block`). `Ok(Err(reason))`: an
+/// input spends an immature coinbase; `Err`: a read failure of the view,
+/// never "not a coinbase" (re-audit B1-T12).
+pub fn check_coinbase_maturity_in_view(
+    tx: &core::Transaction,
+    view: &dyn UtxoView,
+    rule: MaturityRule<'_>,
+) -> Result<Result<(), String>, ViewError> {
+    match rule {
+        MaturityRule::Skip => Ok(Ok(())),
+        MaturityRule::HeaderHeights(height) => {
+            let mut read_error = None;
+            let verdict = core::check_coinbase_maturity(tx, height, |txid| {
+                view.view_coinbase_height(txid).unwrap_or_else(|e| {
+                    read_error.get_or_insert(e);
+                    None
+                })
+            });
+            match read_error {
+                Some(e) => Err(e),
+                None => Ok(verdict),
+            }
+        }
+        MaturityRule::SelectedChainDepth(spend_dag_height) => {
+            let mut spend: Option<u64> = None;
+            for (i, inp) in tx.inputs.iter().enumerate() {
+                let Some(cb) = coinbase_dag_height(view, &inp.prev_txid)? else {
+                    continue;
+                };
+                let s = match spend {
+                    Some(s) => s,
+                    None => *spend.insert(spend_dag_height()?),
+                };
+                let depth = s.saturating_sub(cb);
+                if depth < core::COINBASE_MATURITY {
+                    return Ok(Err(format!(
+                        "coinbase maturity: input {} references a coinbase at DAG height {}, only {} \
+                         selected-chain confirmations at DAG height {} (need {})",
+                        i, cb, depth, s, core::COINBASE_MATURITY
+                    )));
+                }
+            }
+            Ok(Ok(()))
+        }
+    }
+}
+
+/// [`check_coinbase_maturity_in_view`] as a transaction-level failure.
+fn check_maturity_in_view(tx: &core::Transaction, view: &dyn UtxoView, rule: MaturityRule<'_>) -> Result<(), TxFailure> {
+    check_coinbase_maturity_in_view(tx, view, rule)?.map_err(TxFailure::from)
 }
 
 /// The id-committed checks of `tx` (a non-coinbase transaction of a block
 /// at header height `block_height`) against `view` plus the outputs of the
 /// transactions STRICTLY BEFORE it in the block (`earlier`): everything
-/// [`check_tx_inputs_committed`] checks, coinbase maturity at
-/// `maturity_height` (the block path passes `block_height`; `0` skips the
-/// maturity check) and, when `same_block_coinbase` is `Some` (hardening
-/// rules, audit VAL-3), no input spending that coinbase's outputs. Returns
-/// what the witness checks ([`check_tx_witnesses`]) need.
+/// [`check_tx_inputs_committed`] checks, coinbase maturity under `maturity`
+/// (the block path passes the rule of its regime, [`MaturityRule`]) and,
+/// when `same_block_coinbase` is `Some` (hardening rules, audit VAL-3), no
+/// input spending that coinbase's outputs. Returns what the witness checks
+/// ([`check_tx_witnesses`]) need.
 #[allow(clippy::too_many_arguments)]
 fn check_tx_in_view_committed(
     tx: &core::Transaction,
@@ -418,7 +512,7 @@ fn check_tx_in_view_committed(
     earlier: &HashMap<([u8; 32], u32), core::TxOutput>,
     spent_in_block: &mut HashSet<([u8; 32], u32)>,
     block_height: u64,
-    maturity_height: u64,
+    maturity: MaturityRule<'_>,
     same_block_coinbase: Option<&[u8; 32]>,
     activation_height: u64,
 ) -> Result<CommittedTx, TxFailure> {
@@ -430,7 +524,7 @@ fn check_tx_in_view_committed(
             ).into());
         }
     }
-    check_maturity_in_view(tx, view, maturity_height)?;
+    check_maturity_in_view(tx, view, maturity)?;
     let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, ViewError> {
         if let Some(out) = earlier.get(&(*txid, idx)) {
             return Ok(Some(out.clone()));
@@ -449,12 +543,12 @@ fn validate_tx_in_view(
     earlier: &HashMap<([u8; 32], u32), core::TxOutput>,
     spent_in_block: &mut HashSet<([u8; 32], u32)>,
     block_height: u64,
-    maturity_height: u64,
+    maturity: MaturityRule<'_>,
     same_block_coinbase: Option<&[u8; 32]>,
     activation_height: u64,
 ) -> Result<u64, TxFailure> {
     let committed = check_tx_in_view_committed(
-        tx, view, earlier, spent_in_block, block_height, maturity_height, same_block_coinbase, activation_height,
+        tx, view, earlier, spent_in_block, block_height, maturity, same_block_coinbase, activation_height,
     )?;
     check_tx_witnesses(tx, &committed, block_height, activation_height)?;
     Ok(committed.fee)
@@ -566,13 +660,29 @@ pub fn validate_block_in_view_classified_at(
     let mut spent_in_block: HashSet<([u8; 32], u32)> = HashSet::new();
     let mut earlier: HashMap<([u8; 32], u32), core::TxOutput> = HashMap::new();
     let mut total_fees: u64 = 0;
+    // Coinbase maturity (re-audit B1-T14): header heights below the
+    // activation, selected-chain depth from it (the block's DAG height read
+    // once, and only if a transaction spends a coinbase).
+    let spend_dag = std::cell::OnceCell::new();
+    let spend_dag_height = || -> Result<u64, ViewError> {
+        if let Some(h) = spend_dag.get() {
+            return Ok(*h);
+        }
+        let h = block_dag_height(view, block)?;
+        Ok(*spend_dag.get_or_init(|| h))
+    };
+    let maturity = if hardened {
+        MaturityRule::SelectedChainDepth(&spend_dag_height)
+    } else {
+        MaturityRule::HeaderHeights(height)
+    };
     // Pass 1: the id-committed checks of every transaction, then the
     // coinbase value (the fees are id-committed: input and output values).
     let mut checked: Vec<(&core::Transaction, CommittedTx)> = Vec::with_capacity(block.transactions.len());
     for (i, tx) in block.transactions.iter().enumerate() {
         if i > 0 {
             let c = check_tx_in_view_committed(
-                tx, view, &earlier, &mut spent_in_block, height, height, same_block_coinbase.as_ref(),
+                tx, view, &earlier, &mut spent_in_block, height, maturity, same_block_coinbase.as_ref(),
                 activation_height,
             ).map_err(|f| f.into_connect(hardened))?;
             total_fees = core::limits::money_add(total_fees, c.fee)
@@ -2868,8 +2978,12 @@ pub fn validate_tx_in_block(
 /// transaction: the transaction rules (version 3 / sighash v3 / canonical
 /// witnesses, `core::sighash`), BIP30 for `tx`'s outputs (audit VAL-2) and
 /// no spend of the block's own coinbase (audit VAL-3). `current_height` is
-/// used ONLY for coinbase maturity (`0` skips it; the connect path uses
-/// `block.height`). Unlike the connect path this checks one transaction, so
+/// used ONLY for coinbase maturity (`0` skips it). Below the activation it
+/// is the header height maturity compares (the connect path uses
+/// `block.height`); from the activation maturity counts the block's own
+/// selected-chain position (its DAG height from its parents' DAG records,
+/// [`MaturityRule::SelectedChainDepth`], re-audit B1-T14) and any non-zero
+/// `current_height` only switches it on. Unlike the connect path this checks one transaction, so
 /// the block-level rules (BIP30 of the other transactions, the coinbase
 /// value) are the caller's.
 pub fn validate_tx_in_block_with_maturity(
@@ -2899,8 +3013,18 @@ pub fn validate_tx_in_block_with_maturity(
             t.outputs.iter().enumerate().map(move |(i, o)| ((txid, i as u32), o.clone()))
         })
         .collect();
+    // Coinbase maturity: off for `current_height == 0`; otherwise the rule
+    // of the block's regime, as on the connect path (below the activation
+    // the header height `current_height`; from it the block's own
+    // selected-chain position, re-audit B1-T14).
+    let spend_dag_height = || block_dag_height(view, block);
+    let maturity = match (current_height, hardened) {
+        (0, _) => MaturityRule::Skip,
+        (_, true) => MaturityRule::SelectedChainDepth(&spend_dag_height),
+        (h, false) => MaturityRule::HeaderHeights(h),
+    };
     validate_tx_in_view(
-        tx, view, &earlier, spent_in_block, block.height, current_height, same_block_coinbase.as_ref(),
+        tx, view, &earlier, spent_in_block, block.height, maturity, same_block_coinbase.as_ref(),
         activation_height,
     )
     .map_err(TxFailure::into_message)

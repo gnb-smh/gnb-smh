@@ -65,6 +65,8 @@ def view_of(prevouts: list) -> gv.View:
         v.confirmed_txids.add(txid)
         if p["coinbase_height"] is not None:
             v.coinbase_heights[txid] = int(p["coinbase_height"])
+        if p.get("coinbase_dag_height") is not None:
+            v.coinbase_dag_heights[txid] = int(p["coinbase_dag_height"])
     return v
 
 
@@ -167,6 +169,8 @@ def check_tx_vectors(chk: Checker) -> int:
 
         # Consensus.
         view = view_of(case["prevouts"])
+        if case.get("dag_height") is not None:
+            view.dag_height = int(case["dag_height"])
         block = wrapper_block(tx, height, case["prevouts"], wrapper_ss)
 
         def consensus(out):

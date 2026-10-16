@@ -38,7 +38,7 @@ What the vectors do NOT pin:
 
 | What | Where |
 | --- | --- |
-| Transaction vectors (189 cases) | `reference/tx_vectors.json` |
+| Transaction vectors (193 cases) | `reference/tx_vectors.json` |
 | Block vectors (110 cases) | `reference/block_vectors.json` |
 | Generator (deterministic Rust, seeded keys and signatures) | `crates/gnb-crypto/tests/gen_consensus_vectors.rs` |
 | Runner through gnb-crypto (real pow limit, explicit chain ids) | `crates/gnb-crypto/tests/consensus_vectors.rs` |
@@ -151,11 +151,14 @@ cases in a child process of its own test binary.
     "activation_height":  "1000",
     "activation_source":  "explicit" | "schedule",
     "height":             "999",                 header height of the evaluation block
+    "dag_height":         "909",                 optional: its DAG height (default: height)
     "regime":             "pre-activation" | "post-activation",
     "prevouts": [ {                              the UTXO view, exactly
        "txid", "vout", "amount" (decimal), "script_pubkey",
        "is_coinbase", "coinbase_height" (decimal or null),
-       "source": "utxo" | "block-coinbase" } ],
+       "source": "utxo" | "block-coinbase",
+       "coinbase_dag_height" (optional decimal: the DAG height of the
+                              coinbase's block; default: coinbase_height) } ],
     "tx":                 wire hex (Transaction::to_wire_bytes(true)),
     "expected": { "verdict": "valid" | "invalid", "error_class": null | class },
     "policy":   { "verdict": "accept" | "reject", "error_class": null (accept) | class (reject) },
@@ -396,7 +399,7 @@ Policy classes (`policy.error_class` of a refused case; the
 
 ## Coverage
 
-Transactions (189: 99 pre-activation, 90 post-activation; 66 valid; 184 on mainnet, 5 on testnet):
+Transactions (193: 101 pre-activation, 92 post-activation; 68 valid; 188 on mainnet, 5 on testnet):
 
 | Area | Cases | What |
 | --- | --- | --- |
@@ -405,7 +408,7 @@ Transactions (189: 99 pre-activation, 90 post-activation; 66 valid; 184 on mainn
 | `decode/` | 8 | truncated, trailing byte, non-minimal varint, empty, input / output count above the cap, 10,001-byte script_sig and script_pubkey |
 | `size/` | 6 | a 10,000-byte script_sig (lenient padding: valid pre, non-canonical post), a 10,000-byte output script, 300 outputs |
 | `value/`, `fee/`, `dust/` | 31 | MoneyRange of outputs, output sums, `u64::MAX`, the `MAX_SUPPLY_SAT` boundary, prevout amounts and sums; inputs below outputs; zero fee; zero fee with a bad signature (`min-fee`: the fee floor is checked before the witness rules, re-audit B1-T13); fee exactly the minimum and one below (fixed point over the variable Falcon length); witness padding raising the minimum; dust 1 / 545 / 546; zero-value outputs |
-| `maturity/` | 12 | depth 100 / 99 / 0 (a parallel block's coinbase) / negative, a second immature input, a carry-over coin at height 1, the block's own coinbase (valid pre, `same-block-coinbase` post) |
+| `maturity/` | 16 | depth 100 / 99 / 0 (a parallel block's coinbase) / negative, a second immature input, a carry-over coin at height 1, the block's own coinbase (valid pre, `same-block-coinbase` post); header depth vs selected-chain depth (re-audit B1-T14: a block merging a side tip, header depth 100 and DAG depth 10, valid pre / immature post; a coinbase whose block merged a side tip, header depth 51 and DAG depth 100, immature pre / valid post) |
 | `version/` | 18 | versions 0, 1, 2, 3, 4, 2^32-1 in both regimes; version 3 over the wrong digest in each regime; the mainnet boundary; never-activated |
 | `sig/` | 26 | wrong amount and wrong script (v2 does not commit: valid; v3 does: invalid), another input's amount, wrong input index, the v2 out-of-range marker quirk, testnet signature on mainnet, components swapped between inputs, component ids swapped, legacy binding over a v3 digest and bound binding over a v2 digest, a digest with another suite id, tampered ML-DSA and Falcon nonce bytes, another key's signature, a key that does not hash to the coin, a bad second input |
 | `net/` | 5 | testnet-signed on testnet (both regimes), mainnet-signed on testnet, the testnet schedule (activation 0, `schedule`) |
@@ -467,6 +470,7 @@ build):
 | --- | --- | --- |
 | dust threshold off by one (546 is dust) | both | `dust/output-546/*`, `value/output-u64-max/*` (its second output is 546), the 1 MB blocks of 546-unit outputs |
 | coinbase maturity off by one (depth 99 accepted) | node | `maturity/depth-99/*` (consensus and mempool), `maturity/immature-coinbase-spend-in-block/*` |
+| maturity by header heights from the activation (B1-T14 reverted), or by DAG heights below it | node, gnb-crypto runner, Python | `maturity/merge-header-depth-100-dag-depth-10/*`, `maturity/inflated-coinbase-header-dag-depth-100/*` (consensus and mempool) |
 | VAL-3 removed (same-block coinbase) | node | `maturity/same-block-coinbase/post`, `same-block-coinbase/post/connect` |
 | 64-byte rule measured with script_sig | both | gnb-crypto: the recorded txid preimage size of 175 cases; node: `tx64/64-byte-transaction/post`, `tx64/mainnet-boundary/110000`, `tx64/64-byte-transaction-in-block/post` |
 | version 2 accepted from the activation | both | `version/v2-sighash-v2/post` |

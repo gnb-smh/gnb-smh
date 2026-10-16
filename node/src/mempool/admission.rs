@@ -758,28 +758,71 @@ pub fn check_transaction_gated(
     Ok(fee)
 }
 
-/// Coinbase maturity of `tx` for the block at `next_block_height` (`0`
-/// skips it), with the coinbase heights read from `store`: `Ok(Err(reason))`
-/// when an input spends an immature coinbase, `Err` when a height could not
-/// be read. A failed read is never "not a coinbase" (re-audit B1-T12: the
-/// lookups used `.ok().flatten()`, which skipped the check). Shared by
-/// admission, the post-connect revalidation and the template self-check.
+/// Coinbase maturity of `tx` for the next block, at header height
+/// `next_block_height` (`0` skips it), under the connect path's own rule
+/// (`accept::check_coinbase_maturity_in_view`, re-audit B1-T14): below the
+/// activation header heights, from it the selected-chain depth, the next
+/// block being a child of the applied tip (its selected parent: the
+/// template's first parent is the applied tip, whose UTXO set the template's
+/// transactions are checked against). `Ok(Err(reason))` when an input spends
+/// an immature coinbase, `Err` when a height could not be read. A failed
+/// read is never "not a coinbase" (re-audit B1-T12: the lookups used
+/// `.ok().flatten()`, which skipped the check). Shared by admission, the
+/// post-connect revalidation and the template self-check.
 pub fn coinbase_maturity_for_next_block(
     store: &Storage,
     tx: &Transaction,
     next_block_height: u64,
 ) -> Result<Result<(), String>, crate::storage::StorageError> {
-    let mut read_error = None;
-    let verdict = core::check_coinbase_maturity(tx, next_block_height, |t| {
-        store.get_coinbase_height(t).unwrap_or_else(|e| {
-            read_error.get_or_insert(e);
-            None
-        })
-    });
-    match read_error {
-        Some(e) => Err(e),
-        None => Ok(verdict),
+    use crate::accept::{check_coinbase_maturity_in_view, MaturityRule};
+    let next_dag_height = || next_block_dag_height(store);
+    let rule = if next_block_height == 0 {
+        MaturityRule::Skip
+    } else if core::block_rules::rules_active_at(next_block_height, activation_height()) {
+        MaturityRule::SelectedChainDepth(&next_dag_height)
+    } else {
+        MaturityRule::HeaderHeights(next_block_height)
+    };
+    check_coinbase_maturity_in_view(tx, store, rule)
+        .map_err(|e| crate::storage::StorageError::ReadFailed(e.0))
+}
+
+/// The DAG height of the next block: the applied tip's (`tip_hash`, its DAG
+/// record) plus one.
+fn next_block_dag_height(store: &Storage) -> Result<u64, crate::reorg::ViewError> {
+    use crate::reorg::{UtxoView, ViewError};
+    let tip = store.get_meta("tip_hash").map_err(|e| ViewError(e.to_string()))?
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        .ok_or_else(|| ViewError("no applied tip pointer".into()))?;
+    let data = store.view_dag_data(&tip)?
+        .ok_or_else(|| ViewError(format!("applied tip {} has no DAG record", hex::encode(&tip[..8]))))?;
+    Ok(data.height + 1)
+}
+
+/// The `coinbase_height` `getutxos` reports for an output of the coinbase
+/// `txid` (`None`: not a coinbase), for wallets, which treat such an output
+/// as spendable in the next block iff `next_block_height - coinbase_height
+/// >= COINBASE_MATURITY` (`wallet::send::utxo_row_spendable_at`,
+/// `next_block_height` from `getdaginfo`): below the activation (of the next
+/// block) the header height of the coinbase's block, as before; from it
+/// `next_block_height` minus the coinbase's selected-chain depth at the next
+/// block (re-audit B1-T14), so the same comparison applies the rule in
+/// force. Both values are for the same next block.
+pub fn coinbase_height_for_wallets(
+    store: &Storage,
+    txid: &[u8; 32],
+    next_block_height: u64,
+) -> Result<Option<u64>, crate::storage::StorageError> {
+    use crate::reorg::UtxoView;
+    let read = |e: crate::reorg::ViewError| crate::storage::StorageError::ReadFailed(e.0);
+    if next_block_height == 0 || !core::block_rules::rules_active_at(next_block_height, activation_height()) {
+        return store.view_coinbase_height(txid).map_err(read);
     }
+    let Some(cb) = crate::accept::coinbase_dag_height(store, txid).map_err(read)? else {
+        return Ok(None);
+    };
+    let depth = next_block_dag_height(store).map_err(read)?.saturating_sub(cb);
+    Ok(Some(next_block_height.saturating_sub(depth)))
 }
 
 /// Check and insert `tx` into `mempool`. On success returns the txid.

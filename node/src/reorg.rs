@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::consensus::{BlockHash, GhostDAG};
+use crate::consensus::{BlockHash, GhostDAG, GhostdagData};
 use crate::core::{Block, Transaction, TxOutput, UndoData, UndoEntry};
 use crate::mempool::Mempool;
 use crate::storage::Storage;
@@ -435,7 +435,15 @@ impl std::fmt::Display for ViewError {
 /// "absent".
 pub trait UtxoView {
     fn view_utxo(&self, txid: &[u8; 32], index: u32) -> Result<Option<TxOutput>, ViewError>;
+    /// The HEADER height of the block whose coinbase `txid` is (the
+    /// coinbase-height row), `None` for any other txid.
     fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError>;
+    /// The block that holds `txid` on the applied chain (the tx-index row,
+    /// written by every connect together with the transaction's coins).
+    fn view_tx_block(&self, txid: &[u8; 32]) -> Result<Option<BlockHash>, ViewError>;
+    /// The persisted GhostDAG record of `block` (blocks are persisted when
+    /// accepted, before any later block is connected on them).
+    fn view_dag_data(&self, block: &BlockHash) -> Result<Option<GhostdagData>, ViewError>;
 }
 
 impl UtxoView for Storage {
@@ -445,6 +453,12 @@ impl UtxoView for Storage {
     fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
         self.get_coinbase_height(txid).map_err(|e| ViewError(e.to_string()))
     }
+    fn view_tx_block(&self, txid: &[u8; 32]) -> Result<Option<BlockHash>, ViewError> {
+        self.get_tx_location(txid).map(|l| l.map(|(b, _)| b)).map_err(|e| ViewError(e.to_string()))
+    }
+    fn view_dag_data(&self, block: &BlockHash) -> Result<Option<GhostdagData>, ViewError> {
+        self.get_dag_data(block).map_err(|e| ViewError(e.to_string()))
+    }
 }
 
 impl<'a> UtxoView for ReorgBatch<'a> {
@@ -453,6 +467,18 @@ impl<'a> UtxoView for ReorgBatch<'a> {
     }
     fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
         self.get_coinbase_height(txid).map_err(ViewError)
+    }
+    fn view_tx_block(&self, txid: &[u8; 32]) -> Result<Option<BlockHash>, ViewError> {
+        self.get_tx_location(txid).map(|l| l.map(|(b, _)| b)).map_err(ViewError)
+    }
+    fn view_dag_data(&self, block: &BlockHash) -> Result<Option<GhostdagData>, ViewError> {
+        // DAG records are never staged by a connect plan: every block of the
+        // plan was persisted when it was accepted, except the trigger, whose
+        // record is staged in the same batch and never read here (maturity
+        // reads the DAG records of a block's PARENTS and of the blocks whose
+        // coinbases it spends, all accepted before it; no block spends its
+        // own coinbase from the activation, VAL-3).
+        self.store.get_dag_data(block).map_err(|e| ViewError(e.to_string()))
     }
 }
 
@@ -910,17 +936,18 @@ pub fn validate_fork_block_state(batch: &dyn UtxoView, block: &Block) -> Result<
             if in_sum < out_sum {
                 return Err(format!("value violation: inputs {} < outputs {}", in_sum, out_sum).into());
             }
-            let mut read_error = None;
-            let maturity = crate::core::check_coinbase_maturity(tx, block.height, |t| {
-                batch.view_coinbase_height(t).unwrap_or_else(|e| {
-                    read_error.get_or_insert(e);
-                    None
-                })
-            });
-            if let Some(e) = read_error {
-                return Err(e.into());
-            }
-            maturity?;
+            // The connect path's own maturity rule (re-audit B1-T14):
+            // header heights below the activation, selected-chain depth
+            // from it.
+            let spend_dag_height = || crate::accept::block_dag_height(batch, block);
+            let rule = if crate::core::block_rules::rules_active_at(
+                block.height, crate::core::activation::hardening_activation_height(),
+            ) {
+                crate::accept::MaturityRule::SelectedChainDepth(&spend_dag_height)
+            } else {
+                crate::accept::MaturityRule::HeaderHeights(block.height)
+            };
+            crate::accept::check_coinbase_maturity_in_view(tx, batch, rule)??;
         }
         for (j, out) in tx.outputs.iter().enumerate() {
             let op = (txid, j as u32);

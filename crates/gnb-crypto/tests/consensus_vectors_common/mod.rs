@@ -67,6 +67,11 @@ pub struct Prevout {
     pub amount: u64,
     pub script_pubkey: Vec<u8>,
     pub coinbase_height: Option<u64>,
+    /// The DAG height of the block holding that coinbase (`coinbase_dag_height`
+    /// in the vectors when it differs; otherwise its header height
+    /// `coinbase_height`). From the activation maturity compares DAG heights
+    /// (re-audit B1-T14).
+    pub coinbase_dag_height: Option<u64>,
     /// Output 0 of the evaluation block's own coinbase (never in the view).
     pub block_coinbase: bool,
 }
@@ -89,6 +94,12 @@ fn prevouts_of(v: &Value) -> Vec<Prevout> {
             amount: u64_of(&p["amount"]),
             script_pubkey: bytes_of(&p["script_pubkey"]),
             coinbase_height,
+            coinbase_dag_height: if p["coinbase_dag_height"].is_null() {
+                coinbase_height
+            } else {
+                assert!(coinbase_height.is_some(), "only a coinbase prevout has a coinbase DAG height");
+                Some(u64_of(&p["coinbase_dag_height"]))
+            },
             block_coinbase: source == "block-coinbase",
         }
     }).collect()
@@ -115,6 +126,10 @@ pub struct TxVector {
     /// The activation height is the network's schedule (`activation_source`).
     pub schedule: bool,
     pub height: u64,
+    /// The DAG height of the evaluation block (its selected parent's plus
+    /// one): `dag_height` in the vectors when it differs, otherwise `height`
+    /// (re-audit B1-T14).
+    pub dag_height: u64,
     pub prevouts: Vec<Prevout>,
     pub bytes: Vec<u8>,
     /// `None`: valid.
@@ -140,6 +155,7 @@ pub fn load_tx_vectors() -> TxVectors {
         activation: u64_of(&c["activation_height"]),
         schedule: schedule_of(&c["activation_source"]),
         height: u64_of(&c["height"]),
+        dag_height: if c["dag_height"].is_null() { u64_of(&c["height"]) } else { u64_of(&c["dag_height"]) },
         prevouts: prevouts_of(&c["prevouts"]),
         bytes: bytes_of(&c["tx"]),
         error: expected_of(&c["expected"]),
