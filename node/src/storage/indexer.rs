@@ -19,6 +19,12 @@ use crate::core::Transaction;
 
 pub const CF_ADDR_TX_HISTORY: &str = "addr_tx_history";
 
+/// B1-T11: largest offset an address-history page may skip (one index step
+/// per skipped entry). Deeper pages use the opaque cursor a page returns
+/// (`next_cursor`), which costs nothing to resume from. The explorer API
+/// (deploy/explorer-api: HISTORY_OFFSET) accepts exactly this range.
+pub const MAX_HISTORY_OFFSET: usize = 10_000;
+
 // Entry size: 32 (txid) + 1 (direction) + 8 (amount) = 41 bytes
 pub const ENTRY_SIZE: usize = 41;
 pub const DIR_IN: u8 = 0;

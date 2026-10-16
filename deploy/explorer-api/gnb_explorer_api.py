@@ -11,7 +11,7 @@ node's localhost JSON-RPC. Responses are cached briefly. Every request must
 carry the shared secret in X-GnB-Key (set by the Cloudflare Worker), so the
 origin is not an open public API. Standard library only.
 
-Hardening (audit WAL-2, WAL-4, NET-12):
+Hardening (audit WAL-2, WAL-4, NET-12, B1-T10, B2-T4):
   * binds 127.0.0.1 by default: expose it through a Cloudflare Tunnel, or
     terminate TLS here (GNB_API_TLS_CERT/KEY) behind the Cloudflare-only
     firewall of firewall-cloudflare.sh; see README.md;
@@ -21,7 +21,22 @@ Hardening (audit WAL-2, WAL-4, NET-12):
     connections are refused immediately instead of spawning threads;
   * requests are rate-limited per ORIGINAL client: the X-GnB-Client-IP header
     the Worker sets from CF-Connecting-IP (trusted only on requests that carry
-    the shared key), else the peer address.
+    the shared key), else the peer address, aggregated to the client's
+    allocation (IPv4 /32, IPv6 /64, as the node's own RPC limiter does), so
+    rotating source addresses inside one /64 does not mint new clients;
+  * a full limiter table evicts its least recently seen client in O(1); it
+    never refuses a new client because the table is full (the previous
+    limiter refused EVERY new client for the rest of the minute once 50,000
+    were tracked, and rebuilt its table under its lock on each refusal);
+  * only well-formed requests (known method, valid parameters) are counted
+    and forwarded: anything else is answered before it can occupy a limiter
+    slot or reach the node;
+  * broadcasts also share one API-wide budget of transaction bytes per minute
+    (GNB_API_POST_BYTES_PER_MIN): every forwarded transaction costs the node
+    signature verification roughly in proportion to its size, so the
+    verification work the API can ask of the node is bounded whatever the
+    number of client addresses (the node also applies its own budget to
+    anonymous sendrawtransaction calls, docs/RUNNING.md).
 
 Environment:
     GNB_RPC_URL              node JSON-RPC (default http://127.0.0.1:17210/)
@@ -35,11 +50,16 @@ Environment:
     GNB_API_MAX_CONNECTIONS  concurrent connections (default 64)
     GNB_API_RATE_PER_MIN     GET requests per client per minute (default 240)
     GNB_API_POST_PER_MIN     broadcasts per client per minute (default 6)
+    GNB_API_POST_BYTES_PER_MIN  transaction bytes forwarded per minute, all
+                             clients together (default 2000000)
+    GNB_API_MAX_CLIENTS      clients tracked per limiter (default 50000)
     GNB_CARRYOVER            uncompressed Bloch Genesis-3 carryover TSV (optional)
 """
 
+import collections
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -95,6 +115,17 @@ U32 = _int(0, 2**32 - 1)
 PAGE = _int(1, 100)
 OFFSET = _int(0, 10**9)
 RICH_OFFSET = _int(0, 10_000)
+# B1-T11: the node pages an address's history newest first with a reverse
+# iterator; an offset costs one index step per skipped entry, so the node caps
+# it (storage::indexer::MAX_HISTORY_OFFSET, the same value). Deeper pages use
+# the opaque cursor the node returns as `next_cursor` (16 bytes, hex).
+HISTORY_OFFSET = _int(0, 10_000)
+CURSOR = _re(re.compile(r"^[0-9a-f]{32}$"), "32-char lowercase hex cursor")
+# B2-T3: the web wallet widens a truncated 50-row UTXO window to this many rows
+# when immature coinbase outputs took part of it (site/wallet/core.js
+# UTXO_WIDE_WINDOW; the tests keep the two equal). Far below the node's own
+# cap (gnb_crypto::wallet::send::GETUTXOS_MAX_ROWS = 10,000).
+GETUTXOS_MAX = 1000
 
 # method -> (list of parameter checkers, cache seconds)
 ALLOWED = {
@@ -115,9 +146,11 @@ ALLOWED = {
     # WAL-1: raw bytes of a previous transaction, hashed by the wallet.
     "getrawtransaction":       ([HASH], 60),
     "getdagwindow":            ([_int(1, 300)], 3),
-    "getaddresshistory":       ([ADDRESS, PAGE, OFFSET], 5),
+    # B1-T11: O(limit) on the node (history counter + reverse iterator).
+    "getaddresshistory":       ([ADDRESS, PAGE, HISTORY_OFFSET, CURSOR], 5),
+    # B1-T11: O(1) on the node (holder aggregate).
     "getbalance":              ([ADDRESS], 5),
-    "getutxos":                ([ADDRESS, _int(1, 50)], 2),
+    "getutxos":                ([ADDRESS, _int(1, GETUTXOS_MAX)], 2),
     # NET-12: served from the node's incremental holder index; the node
     # serves offsets up to analytics::MAX_RICHLIST_OFFSET = 10,000.
     "getrichlist":             ([PAGE, RICH_OFFSET], 60),
@@ -163,35 +196,94 @@ def cached(key, ttl, fn):
     return value
 
 
-# ── per-client rate limiting (WAL-4) ────────────────────────────────────────
+# ── per-client rate limiting (WAL-4, B1-T10, B2-T4) ─────────────────────────
+
+def client_key(text):
+    """The rate-limit identity of a client address: an IPv4 address as is
+    (/32), an IPv6 address by its /64 network, the standard allocation of one
+    customer, so the 2^64 addresses of one /64 are one client (the node's own
+    RPC limiter does the same, node/src/rpc/auth.rs M-2). An IPv4-mapped IPv6
+    address is its IPv4 address. Text that is not an IP address (never sent
+    by Cloudflare) is its own key."""
+    try:
+        ip = ipaddress.ip_address(text.strip())
+    except ValueError:
+        return text
+    if ip.version == 6:
+        if ip.ipv4_mapped is not None:
+            return str(ip.ipv4_mapped)
+        return str(ipaddress.IPv6Network((int(ip) >> 64 << 64, 64)))
+    return str(ip)
+
 
 class RateLimiter:
-    """Fixed-window counter per client and bucket, bounded in size."""
+    """At most `per_min` requests per client key and fixed one-minute window.
 
-    def __init__(self, per_min, max_clients=50_000):
+    The table holds at most `max_clients` keys in least-recently-seen order.
+    A new key arriving while it is full evicts the least recently seen one:
+    O(1) under the lock, and it never refuses the new client. An evicted
+    client only starts a fresh window when it returns, so eviction never
+    refuses anyone, and a client that stays in the table keeps its count.
+    Windows roll over lazily per key: there is no pruning pass at all."""
+
+    def __init__(self, per_min, max_clients=None):
         self.per_min = per_min
-        self.max_clients = max_clients
-        self.windows = {}
+        self.max_clients = max_clients or int(os.environ.get("GNB_API_MAX_CLIENTS", "50000"))
+        self.windows = collections.OrderedDict()
+        self.evictions = 0
         self.lock = threading.Lock()
 
-    def allow(self, client):
-        now = int(time.monotonic() // 60)
+    def allow(self, client, now=None):
+        minute = int((time.monotonic() if now is None else now) // 60)
         with self.lock:
-            window, n = self.windows.get(client, (now, 0))
-            if window != now:
-                window, n = now, 0
-            if n >= self.per_min:
-                return False
-            if client not in self.windows and len(self.windows) >= self.max_clients:
-                self.windows = {k: v for k, v in self.windows.items() if v[0] == now}
+            entry = self.windows.get(client)
+            if entry is None:
                 if len(self.windows) >= self.max_clients:
-                    return False
+                    self.windows.popitem(last=False)
+                    self.evictions += 1
+                window, n = minute, 0
+            else:
+                window, n = entry
+                if window != minute:
+                    window, n = minute, 0
+                self.windows.move_to_end(client)
+            if n >= self.per_min:
+                self.windows[client] = (window, n)
+                return False
             self.windows[client] = (window, n + 1)
+            return True
+
+
+class ByteBudget:
+    """Token bucket of `per_min` bytes per minute shared by every client
+    (B1-T10). Each forwarded transaction costs the node signature
+    verification roughly in proportion to its size (one hybrid input is
+    about 8.6 kB), so this bounds the verification work the API can ask of
+    the node per minute, however many client addresses send it."""
+
+    def __init__(self, per_min):
+        self.capacity = float(per_min)
+        self.tokens = float(per_min)
+        self.rate = per_min / 60.0
+        self.last = time.monotonic()
+        self.lock = threading.Lock()
+
+    def take(self, n, now=None):
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            self.tokens = min(self.capacity, self.tokens + max(0.0, now - self.last) * self.rate)
+            self.last = now
+            if n > self.tokens:
+                return False
+            self.tokens -= n
             return True
 
 
 GET_LIMIT = RateLimiter(int(os.environ.get("GNB_API_RATE_PER_MIN", "240")))
 POST_LIMIT = RateLimiter(int(os.environ.get("GNB_API_POST_PER_MIN", "6")))
+POST_BYTES = ByteBudget(int(os.environ.get("GNB_API_POST_BYTES_PER_MIN", "2000000")))
+
+RATE_LIMITED = {"error": "rate limit exceeded; retry in a minute"}
 
 
 # ── carryover share per address ─────────────────────────────────────────────
@@ -281,30 +373,40 @@ class Handler(BaseHTTPRequestHandler):
             hashlib.sha256(key).digest(), hashlib.sha256(API_KEY).digest())
 
     def client(self):
-        """The original client: the Worker's X-GnB-Client-IP (only trusted on
-        authorized requests), else CF-Connecting-IP, else the peer address."""
+        """The original client's rate-limit key: the Worker's X-GnB-Client-IP
+        (only trusted on authorized requests), else CF-Connecting-IP, else
+        the peer address, aggregated by `client_key` (IPv6 /64)."""
         for header in ("x-gnb-client-ip", "cf-connecting-ip"):
             v = self.headers.get(header, "").strip()
             if v and IP_TEXT.match(v):
-                return v
-        return self.client_address[0]
+                return client_key(v)
+        return client_key(self.client_address[0])
+
+    def over_limit(self, limiter):
+        """Count this (already validated) request; True when over the limit."""
+        return not limiter.allow(self.client())
 
     def do_GET(self):
         if not self.authorized():
             return self.send(403, {"error": "forbidden"})
-        if not GET_LIMIT.allow(self.client()):
-            return self.send(429, {"error": "rate limit exceeded; retry in a minute"})
         url = urllib.parse.urlsplit(self.path)
         parts = [p for p in url.path.split("/") if p]
         if len(parts) < 2 or parts[0] != "v1":
             return self.send(404, {"error": "not found"})
         name = parts[1]
+        # B1-T10: every request is validated before it is counted, so
+        # malformed or unknown ones (cheap 404/400 answers, never forwarded)
+        # cannot occupy limiter slots.
         try:
-            if name == "health":
+            if name == "health" and len(parts) == 2:
+                if self.over_limit(GET_LIMIT):
+                    return self.send(429, RATE_LIMITED)
                 r = rpc("getblockcount", [])
                 return self.send(200, {"ok": "result" in r, "blocks": r.get("result")})
             if name == "carryover" and len(parts) == 3:
                 ADDRESS(parts[2])
+                if self.over_limit(GET_LIMIT):
+                    return self.send(429, RATE_LIMITED)
                 return self.send(200, carryover_of(parts[2]), 300)
             if name not in ALLOWED or len(parts) != 2:
                 return self.send(404, {"error": "unknown method"})
@@ -316,6 +418,8 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(params, list) or len(params) > len(checkers):
                 raise ValueError("params must be a JSON array")
             params = [check(v) for check, v in zip(checkers, params)]
+            if self.over_limit(GET_LIMIT):
+                return self.send(429, RATE_LIMITED)
             ck = name + json.dumps(params)
             result = cached(ck, ttl, lambda: rpc(name, params))
             return self.send(200 if "result" in result else 404, result, ttl)
@@ -335,8 +439,8 @@ class PostHandler(Handler):
             return self.send(403, {"error": "forbidden"})
         if urllib.parse.urlsplit(self.path).path != "/v1/sendrawtransaction":
             return self.send(404, {"error": "not found"})
-        if not POST_LIMIT.allow(self.client()):
-            return self.send(429, {"error": "rate limit exceeded; retry in a minute"})
+        if self.over_limit(POST_LIMIT):
+            return self.send(429, RATE_LIMITED)
         try:
             n = int(self.headers.get("content-length", "0"))
             if not 0 < n <= MAX_TX_HEX + 64:
@@ -345,6 +449,9 @@ class PostHandler(Handler):
             raw = doc.get("hex") if isinstance(doc, dict) else None
             if not isinstance(raw, str) or not raw or len(raw) > MAX_TX_HEX or len(raw) % 2 or not HEXTX.match(raw):
                 raise ValueError("hex-encoded transaction expected")
+            # B1-T10: the API-wide verification budget, in transaction bytes.
+            if not POST_BYTES.take(len(raw) // 2):
+                return self.send(429, {"error": "broadcast budget exhausted; retry shortly"})
             r = rpc("sendrawtransaction", [raw])
             return self.send(200 if "result" in r else 400, r)
         except (ValueError, json.JSONDecodeError) as e:
