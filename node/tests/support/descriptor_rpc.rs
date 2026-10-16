@@ -21,8 +21,8 @@ async fn descriptor_rpc_matrix(network: &str) {
         assert_eq!(info["network"], network);
         assert_eq!(info["requires_policy_tree_activation"], kind == "tree");
         let script = hex::decode(info["script_pubkey"].as_str().unwrap()).unwrap();
-        assert_eq!(crate::address::parse_destination(info["address"].as_str().unwrap()).unwrap().1, script);
-        assert_eq!(crate::address::parse_destination(info["bech32m"].as_str().unwrap()).unwrap().1, script);
+        assert_eq!(parse_rpc_destination(info["address"].as_str().unwrap()).unwrap(), script);
+        assert_eq!(parse_rpc_destination(info["bech32m"].as_str().unwrap()).unwrap(), script);
         assert_eq!(dispatch("deriveaddresses", Some(&json!([descriptor])), &state).await, json!([info["address"]]));
         assert_eq!(state.store.storage_reads() - before, 0, "public descriptors must not query storage");
     }
