@@ -184,6 +184,18 @@ impl InboundOrigin {
         matches!(self, InboundOrigin::Directed { .. })
     }
 
+    /// B1-T7: the delivering peer authored the frame (gossipsub's signed
+    /// source is the propagation source), or sent it as the answer to our own
+    /// pull. Who a refused block frame is charged to follows this
+    /// (`ingress::block_penalty`).
+    pub fn delivered_by_author(&self) -> bool {
+        match self {
+            InboundOrigin::Gossip { propagation_source, author, .. } => *author == Some(*propagation_source),
+            InboundOrigin::Directed { .. } => true,
+            InboundOrigin::Local => false,
+        }
+    }
+
     /// The remote peer responsible for this frame: the directed responder or
     /// the gossip neighbour that delivered it.
     pub fn peer(&self) -> Option<PeerId> {

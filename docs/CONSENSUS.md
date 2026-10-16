@@ -514,10 +514,10 @@ work rule:
   buffered orphan whose last missing parent was just inserted, after the
   work rule admitted it again with its parents known (Phase 4, B1-T5: the
   orphan passed only the bits floor and its proof of work to be buffered);
-  by the RPC `submitblock`, after the same work threshold and the minimum
-  chain work (Phase 4, POW-3: it used to bypass the rule, like Bitcoin
-  Core's, but a deep-fork block here can be nearly free and the RPC can be
-  reachable anonymously); and by the built-in miner. Every call checks the
+  by the RPC `submitblock`, after the minimum chain work (Phase 4, POW-3;
+  not the tip-relative work threshold, like Bitcoin Core's `submitblock`, so
+  an operator can feed the node a heavier chain that forks deep below its
+  tip); and by the built-in miner. Every call checks the
   header height, the exact ASERT bits, the timestamp and the proof of work
   before insertion.
 
@@ -578,7 +578,10 @@ bound of B's blue work:
    latest parent's and at most 600 s ahead); its height is below the
    hardening activation; and its own bound (largest parent blue work, `lb(B)`
    for B, + its work) reaches `T`. Every such admission is charged to one
-   budget (4, then one per 30 s). Before Phase 4 the bound came from the
+   budget (4, then one per 30 s), once, when B is about to be stored with
+   its proof known valid (charged before the proof, a block whose proof the
+   PoW workers evaluated was charged twice, and junk-nonce candidates spent
+   it). Before Phase 4 the bound came from the
    self-declared parents and bits of any orphan above B, directly or through
    other orphans, unchecked: one orphan listing the tip and a low-work block
    (even one stamped before its parents, so never valid) got that block
@@ -640,10 +643,16 @@ Bitcoin Core's defences, adapted (`ingress::unrequested_block_admission`):
   unrequested orphan is buffered only outside initial block download; one
   claiming a height more than 1,000 above the tip is dropped before decoding
   (`ingress::unsolicited_height_too_far_ahead`).
-- **`submitblock`**: refused below the minimum chain work and below the
-  anti-DoS threshold `T` (`ingress::submitted_block_admission`, before the
-  proof of work). A miner on this node's templates, or a pool's recent stale
-  block, always passes.
+- **`submitblock`**: refused below the minimum chain work
+  (`ingress::submitted_block_admission`, before the proof of work). The
+  tip-relative threshold `T` is not applied, as Bitcoin Core's `submitblock`
+  (`ProcessNewBlock` with `force_processing`) skips its anti-DoS checks: the
+  RPC is how an operator replays the heavier chain to a node that sat on a
+  minority branch (a partition or an eclipse), and that chain's first blocks
+  above a deep fork point are, judged one at a time, below `T` (a review of
+  an earlier Phase-4 version, which applied `T`, found such a replay refused
+  block by block). A deep-fork block is cheap below the activation, so a
+  public RPC should run with `--rpc-require-auth-for-writes`.
 
 What remains: with the mainnet minimum at 0, a node that is behind but not
 below the minimum is protected only by the rules relative to its tip, so a
@@ -684,7 +693,18 @@ peer that sent it). So:
   (`ingress::block_penalties_in_force`, the transaction relay's gate);
 - a relayed frame with a contextual fault (height, bits, timestamp,
   coinbase) or below the orphan floor (a function of the node's own tip and
-  clock) is never charged to the relay.
+  clock) is never charged to the relay; an orphan below the floor that
+  answers this node's own pull is dropped without any charge
+  (`ingress::orphan_floor_penalty`: the node asked for it, and an old block
+  of an era with far easier bits fails the floor honestly).
+
+Before the activation a frame signed by a throwaway author key and delivered
+by another connection is a relayed frame: an attacker that signs each
+invalid block with a fresh key is never disconnected or discouraged for it
+(an honest legacy relay cannot be told apart from it), and is limited only
+by the per-peer and per-network-group proof-of-work budgets below.
+Discouragement before the activation covers self-signed gossip and answers
+to this node's pulls.
 
 Wire violations (oversized, bounds-violating, padded or non-canonical
 frames, which releases older than NET-2 forward) follow the same rule
@@ -702,17 +722,23 @@ fresh libp2p identity from the same address buys nothing. Local addresses
 (loopback) and operator-configured peers (`--peer`) are never discouraged.
 
 **Proof-of-work budgets** (`pow::verifier`, see "Acceptance order"): every
-evaluation is charged to the delivering peer (4, refilled one per 60 s) and
-to its network group (IPv4 /16, IPv6 /32: 8, one per 30 s) and refunded when
-the proof is valid, so only failed proofs — and orphans whose bits fail the
-floor, which are charged one evaluation — consume them; a gossip block from
-a peer or group whose budget is spent, or when the queue is full (64 gossip
-blocks, 4 per peer, 8 per group; answers to this node's own pulls have their
-own bound of 1,024 and go first), is answered `Ignore` unevaluated. The
-audit measured about three zero-cost invalid blocks per libp2p identity,
-identities being free; now identities and addresses inside one /16 share
-eight evaluations, and an author that delivers one invalid block is
-disconnected and its address discouraged.
+gossip evaluation is charged to the delivering peer (4, refilled one per
+60 s) and to its network group (IPv4 /16, IPv6 /32: 8, one per 30 s) and
+refunded when the proof is valid, so only failed proofs — and gossip orphans
+whose bits fail the floor, which are charged one evaluation — consume them;
+a gossip block from a peer or group whose budget is spent, or when the queue
+is full (64 gossip blocks, 4 per peer, 8 per group), is answered `Ignore`
+unevaluated. Answers to this node's own pulls are not charged up front (sync
+keeps up to 16 pulls in flight per peer, answered faster than proofs are
+evaluated): they have their own queue bound of 1,024, go first, and are
+charged to the peer and its group only when the proof is invalid (the peer
+is then also disconnected and discouraged). Results are remembered by block
+id and header height (the pow limit a proof is judged against depends on the
+height, which the id does not commit). The audit measured about three
+zero-cost invalid blocks per libp2p identity, identities being free; now
+identities and addresses inside one /16 share eight evaluations, and an
+author that delivers one invalid block of its own is disconnected and its
+address discouraged.
 
 ## Transaction signatures (sighash v2 and v3, hardening activation)
 

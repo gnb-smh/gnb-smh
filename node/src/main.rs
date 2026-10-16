@@ -1263,7 +1263,7 @@ async fn main() {
                 // frame is resubmitted below; the ingress core now knows its
                 // proof (`KnownPow`).
                 Some(done) = pow_done_rx.recv() => {
-                    pow_sched.complete(done.id, &done.source, done.valid);
+                    pow_sched.complete(done.outcome, std::time::Instant::now());
                     done.inbound
                 }
                 // DAG-6: an operator override made bodies wait for one.
@@ -1442,11 +1442,7 @@ async fn main() {
                     let tip_h = selected_tip_height(&dag2);
                     // B1-T7: the delivering peer authored the frame (nobody
                     // relayed it), or sent it as the answer to our own pull.
-                    let self_authored = match &origin {
-                        network::InboundOrigin::Gossip { propagation_source, author, .. } => *author == Some(*propagation_source),
-                        network::InboundOrigin::Directed { .. } => true,
-                        network::InboundOrigin::Local => false,
-                    };
+                    let self_authored = origin.delivered_by_author();
                     let in_force = ingress::block_penalties_in_force(tip_h, activation);
                     let penalty = |base: network::GossipVerdict, fault: ingress::BlockFault| {
                         ingress::block_penalty(base, fault, self_authored, in_force)
@@ -1555,15 +1551,18 @@ async fn main() {
                             ingress::BlockOutcome::Dropped(ingress::DropReason::OrphanBelowFloor) => {
                                 // NET-2 residual: no honest miner publishes an
                                 // orphan 16 times easier than a block at our
-                                // tip. Its decoding and hashing are charged to
-                                // the deliverer's proof-of-work budget; its
-                                // author, if it delivered it itself, is treated
-                                // as misbehaving (a relay never is: an older
-                                // release forwards orphans that meet ITS floor).
-                                let _ = pow_sched.charge(&pow_source, now);
+                                // tip (`ingress::orphan_floor_penalty`: gossip
+                                // is charged to the deliverer's proof-of-work
+                                // budget, its author penalised if it delivered
+                                // it itself; an answer to our own pull is only
+                                // dropped).
+                                let (p, charge) = ingress::orphan_floor_penalty(origin.is_solicited(), self_authored, in_force);
+                                if charge {
+                                    let _ = pow_sched.charge(&pow_source, now);
+                                }
                                 debug!("orphan {} h={} below the anti-DoS floor (tip h={})",
                                     hex::encode(&block_hash[..8]), height, tip_h);
-                                BlockStep::Verdict(penalty(network::GossipVerdict::Reject, ingress::BlockFault::Context))
+                                BlockStep::Verdict(p)
                             }
                             ingress::BlockOutcome::Dropped(reason) => {
                                 debug!("block {} h={} dropped before PoW: {:?} (tip h={})",
@@ -1664,6 +1663,7 @@ async fn main() {
                             // delivering peer and its network group.
                             let job = pow::verifier::PowJob {
                                 id: block_hash,
+                                height,
                                 source: pow_source,
                                 solicited: origin.is_solicited(),
                                 received_at: origin.received_at().unwrap_or(now),
@@ -2319,12 +2319,11 @@ fn make_rpc_submit_block_cb(
             }
             return Err("duplicate block".to_string());
         }
-        // POW-3 (Phase 4): the minimum chain work and the anti-DoS work rule
-        // apply to submitted blocks too (`ingress::submitted_block_admission`,
-        // DAG lookups only, before the proof of work): a local miner's blocks
-        // extend the tip and always pass; the RPC is reachable anonymously
-        // under `--rpc-public` without `--rpc-require-auth-for-writes`, and a
-        // near-free deep-fork block used to bypass the rule here.
+        // POW-3 (Phase 4): the minimum chain work applies to submitted blocks
+        // too (`ingress::submitted_block_admission`, DAG lookups only, before
+        // the proof of work); the tip-relative anti-DoS work rule does not,
+        // so an operator can replay a heavier chain that forks deep below the
+        // tip (Bitcoin Core's `submitblock`).
         ingress::submitted_block_admission(&dag.read(), &block, ingress::minimum_chain_work())?;
         block.validate_structure()
             .map_err(|e| format!("structural validation: {}", e))?;
@@ -2574,9 +2573,7 @@ enum BlockStep {
 struct PowDone {
     /// The block's frame, resubmitted to the ingress core.
     inbound: network::Inbound,
-    id:      [u8; 32],
-    source:  pow::verifier::PowSource,
-    valid:   bool,
+    outcome: pow::verifier::PowOutcome,
 }
 
 /// NET-2 residual: the processor's proof-of-work gate — the result of an
@@ -2585,8 +2582,8 @@ struct PowDone {
 struct KnownPow<'a>(&'a pow::verifier::PowScheduler<network::Inbound>);
 
 impl ingress::PowGate for KnownPow<'_> {
-    fn check(&mut self, _block: &core::Block, hash: &[u8; 32]) -> ingress::PowCheck {
-        match self.0.known(hash) {
+    fn check(&mut self, block: &core::Block, hash: &[u8; 32]) -> ingress::PowCheck {
+        match self.0.known(hash, block.height) {
             Some(true) => ingress::PowCheck::Valid,
             Some(false) => ingress::PowCheck::Invalid,
             None => ingress::PowCheck::Deferred,
@@ -2621,20 +2618,11 @@ fn dispatch_pow(
                             .unwrap_or(false),
                         _ => false,
                     }).unwrap_or(false);
-                    let _ = done.send(PowDone { inbound: job.payload, id: job.id, source: job.source, valid });
+                    let outcome = job.outcome(valid);
+                    let _ = done.send(PowDone { inbound: job.payload, outcome });
                 });
             }
         }
-    }
-}
-
-/// B1-T7: the delivering peer authored the frame (gossipsub's signed source
-/// is the propagation source), or sent it as the answer to our own pull.
-fn self_authored(origin: &network::InboundOrigin) -> bool {
-    match origin {
-        network::InboundOrigin::Gossip { propagation_source, author, .. } => *author == Some(*propagation_source),
-        network::InboundOrigin::Directed { .. } => true,
-        network::InboundOrigin::Local => false,
     }
 }
 
@@ -2659,7 +2647,7 @@ fn settle_block_verdicts(
         let p = match fate {
             ingress::OrphanFate::Accepted => ingress::BlockPenalty { gossip: network::GossipVerdict::Accept, misbehaving: false },
             ingress::OrphanFate::Rejected(e) => ingress::block_penalty(
-                ingress::verdict_for_accept_error(&e), ingress::accept_error_fault(&e), self_authored(&origin), in_force),
+                ingress::verdict_for_accept_error(&e), ingress::accept_error_fault(&e), origin.delivered_by_author(), in_force),
             ingress::OrphanFate::Dropped => ingress::BlockPenalty { gossip: network::GossipVerdict::Ignore, misbehaving: false },
         };
         report_verdict(vtx, &origin, p.gossip);

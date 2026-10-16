@@ -355,18 +355,18 @@ pub fn unrequested_block_admission(
     }
 }
 
-/// POW-3 (Phase 4): the work requirements of a block submitted over RPC
+/// POW-3 (Phase 4): the work requirement of a block submitted over RPC
 /// (`submitblock`), checked before its proof of work: its chain work bound
 /// must reach the minimum chain work (a node in initial block download has
-/// no use for a block on its stale tip) and the anti-DoS work threshold
-/// ([`anti_dos_work_threshold`]: within 360 selected-chain blocks of work of
-/// the tip). Bitcoin Core's `submitblock` bypasses its anti-DoS checks, but
-/// every Bitcoin block costs real work; here a block on a deep fork can be
-/// nearly free (absolute-schedule ASERT below the hardening activation),
-/// and the RPC is reachable anonymously when it is public without
-/// `--rpc-require-auth-for-writes`. A miner working on this node's
-/// templates (or a pool's stale block) is always within the window. A block
-/// with an unknown parent passes here and is refused by `accept_block`.
+/// no use for a block on a chain below it). The tip-relative anti-DoS work
+/// rule is NOT applied (review finding): like Bitcoin Core's `submitblock`
+/// (`ProcessNewBlock` with `force_processing`), the RPC is how an operator
+/// feeds a node the heavier chain after a long partition or an eclipse, and
+/// that chain's first blocks above the fork point are, judged one at a
+/// time, below the window. A public RPC should require authentication for
+/// writes (`--rpc-require-auth-for-writes`): a deep-fork block submitted
+/// anonymously is cheap below the hardening activation. A block with an
+/// unknown parent passes here and is refused by `accept_block`.
 pub fn submitted_block_admission(dag: &GhostDAG, block: &core::Block, min_chain_work: u128) -> Result<(), String> {
     let Some(lb) = block_work_lower_bound(dag, &block.header.parents, block.header.bits) else {
         return Ok(());
@@ -375,12 +375,6 @@ pub fn submitted_block_admission(dag: &GhostDAG, block: &core::Block, min_chain_
         return Err(format!(
             "block rejected: its chain work (at least {lb:#x}) is below the minimum chain work {min_chain_work:#x} \
              (this node is in initial block download)"));
-    }
-    let threshold = anti_dos_work_threshold(dag);
-    if lb < threshold {
-        return Err(format!(
-            "block rejected: its chain cannot come within {ANTI_DOS_WINDOW_BLOCKS} selected-chain blocks of work \
-             of the tip (anti-DoS work rule, docs/CONSENSUS.md)"));
     }
     Ok(())
 }
@@ -589,6 +583,24 @@ pub fn block_penalty(base: GossipVerdict, fault: BlockFault, self_authored: bool
         GossipVerdict::Reject if self_authored => BlockPenalty { gossip: GossipVerdict::Ignore, misbehaving: true },
         GossipVerdict::Reject => BlockPenalty { gossip: GossipVerdict::Ignore, misbehaving: false },
         v => BlockPenalty { gossip: v, misbehaving: false },
+    }
+}
+
+/// NET-2 residual: what to do about an orphan whose bits fail the anti-DoS
+/// floor ([`DropReason::OrphanBelowFloor`]). Returns the penalty and whether
+/// its decoding and hashing are charged to the deliverer's proof-of-work
+/// budget. Gossip: charged, and its author, if it delivered the frame
+/// itself, is treated as misbehaving (a relay never is: an older release
+/// forwards orphans that meet ITS floor). An answer to this node's own pull
+/// is dropped with no charge and no penalty (review finding): the floor is a
+/// function of this node's tip and clock, and the node asked for the block
+/// (an old block of an era whose difficulty was far easier can fail it
+/// honestly).
+pub fn orphan_floor_penalty(solicited: bool, self_authored: bool, penalties_in_force: bool) -> (BlockPenalty, bool) {
+    if solicited {
+        (BlockPenalty { gossip: GossipVerdict::Ignore, misbehaving: false }, false)
+    } else {
+        (block_penalty(GossipVerdict::Reject, BlockFault::Context, self_authored, penalties_in_force), true)
     }
 }
 
@@ -1959,11 +1971,13 @@ impl Default for BlockIngress {
 }
 
 /// The POW-3 work rule (see [`BlockIngress::work_check`]) on the core's
-/// parts, so the orphan drain can apply it while it holds the pool.
+/// parts, so the orphan drain can apply it while it holds the pool. With
+/// `budget` `None` a merge-backed admission is classified but not charged:
+/// the caller charges it once the block's proof is known valid.
 #[allow(clippy::too_many_arguments)]
 fn work_rule(
     orphans:         &OrphanPool,
-    budget:          &mut DeepBackfillBudget,
+    budget:          Option<&mut DeepBackfillBudget>,
     threshold_cache: &mut Option<(BlockHash, u128)>,
     low_work:        &mut LowWorkCache,
     block:           &core::Block,
@@ -2004,7 +2018,7 @@ fn work_rule(
         // B1-T5: every merge-backed admission is rationed (one voucher costs
         // one full block of work at the tip; the budget bounds how many
         // low-work blocks such vouchers can get stored).
-        WorkAdmission::MergeBacked if !budget.allow_at(now) => Err(DropReason::DeepBudgetExhausted),
+        WorkAdmission::MergeBacked if budget.is_some_and(|b| !b.allow_at(now)) => Err(DropReason::DeepBudgetExhausted),
         ok => Ok(ok),
     }
 }
@@ -2117,7 +2131,7 @@ impl BlockIngress {
         now_unix: u64,
         dag: &GhostDAG,
     ) -> Result<WorkAdmission, DropReason> {
-        work_rule(&self.orphans, &mut self.deep_budget, &mut self.threshold_cache, &mut self.low_work,
+        work_rule(&self.orphans, Some(&mut self.deep_budget), &mut self.threshold_cache, &mut self.low_work,
             block, hash, now, now_unix, dag)
     }
 
@@ -2259,9 +2273,11 @@ impl BlockIngress {
             // All parents known: POW-3 work rule before any expensive step.
             let (admission, pre_pow_ok) = {
                 let d = ctx.dag.read();
-                // `work_check` takes the read guard's target; the budget is
-                // updated under it (no DAG write happens here).
-                let a = match self.work_check_at(&block, &hash, now, now_unix, &d) {
+                // The work rule on the read guard's DAG; a merge-backed
+                // admission is charged below, once its proof is known valid.
+                let a = match work_rule(&self.orphans, None, &mut self.threshold_cache, &mut self.low_work,
+                    &block, &hash, now, now_unix, &d)
+                {
                     Ok(a) => a,
                     Err(r) => return Gated::Done(BlockOutcome::Dropped(r)),
                 };
@@ -2283,6 +2299,14 @@ impl BlockIngress {
                         });
                     }
                     PowCheck::Deferred => return Gated::PowPending(Box::new(block)),
+                }
+                // B1-T5 (review finding): the merge-backed ration is spent
+                // once, when the block is about to be stored with a valid
+                // proof. Spent before the proof it was charged twice (the
+                // first pass, then the resubmission once the PoW worker is
+                // done) and junk-nonce candidates drained it for free.
+                if admission == WorkAdmission::MergeBacked && !self.deep_budget.allow_at(now) {
+                    return Gated::Done(BlockOutcome::Dropped(DropReason::DeepBudgetExhausted));
                 }
             }
             normalize_wire_metadata(&mut block, ctx.dag);
@@ -2387,7 +2411,7 @@ impl BlockIngress {
     fn drain_orphans_at(&mut self, accepted: [u8; 32], now: Instant, now_unix: u64, ctx: &AcceptCtx) -> Vec<[u8; 32]> {
         let Self { orphans, deep_budget, threshold_cache, low_work, chain, .. } = self;
         let mut gate = |pool: &OrphanPool, block: &core::Block, hash: &[u8; 32], d: &GhostDAG| {
-            work_rule(pool, deep_budget, threshold_cache, low_work, block, hash, now, now_unix, d)
+            work_rule(pool, Some(&mut *deep_budget), threshold_cache, low_work, block, hash, now, now_unix, d)
         };
         let mut events = OrphanBlockEvents::default();
         process_orphans_gated(accepted, orphans, ctx, chain, &mut gate, &mut events);

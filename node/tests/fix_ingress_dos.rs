@@ -272,13 +272,16 @@ fn pow3_unrequested_blocks_must_come_near_the_tip() {
     assert!(matches!(gossip(&mut core, &x, &too_far), BlockOutcome::Dropped(DropReason::UnrequestedLowWork)));
 }
 
-/// POW-3: RPC `submitblock` used to bypass the work rule (by design,
-/// docs/CONSENSUS.md) and is anonymous under `--rpc-public` without
-/// `--rpc-require-auth-for-writes`. Now a submitted block must reach the
-/// minimum chain work and come within the anti-DoS window; a local miner's
-/// block (a child of the tip) always passes.
+/// POW-3: `submitblock` is subject to the minimum chain work (a node in
+/// initial block download refuses a block on a chain below it), and NOT to
+/// the tip-relative anti-DoS window (review finding: a version that applied
+/// it refused, block by block, an operator's replay of a heavier chain that
+/// forks more than 360 blocks below the tip; Bitcoin Core's `submitblock`
+/// skips its anti-DoS checks too). The first block above the deep fork
+/// point, which the window used to refuse, passes. The handler in main.rs
+/// calls this function; that call itself has no test.
 #[test]
-fn pow3_submitblock_is_subject_to_the_minimum_chain_work_and_the_work_rule() {
+fn pow3_submitblock_is_subject_to_the_minimum_chain_work_only() {
     let genesis = mk_genesis(unix_now() - 50_000);
     let gh = genesis.block_hash();
     let mut b = Builder::new(&genesis);
@@ -289,8 +292,9 @@ fn pow3_submitblock_is_subject_to_the_minimum_chain_work_and_the_work_rule() {
     let mined = b.empty(vec![honest.last().unwrap().block_hash()], "mined");
     assert_eq!(ingress::submitted_block_admission(&d, &mined, 0), Ok(()));
     let deep = b.empty(vec![honest[10].block_hash()], "deep-fork");
-    let e = ingress::submitted_block_admission(&d, &deep, 0).unwrap_err();
-    assert!(e.contains("anti-DoS work rule"), "{e}");
+    let lb = ingress::block_work_lower_bound(&d, &deep.header.parents, deep.header.bits).unwrap();
+    assert!(lb < ingress::anti_dos_work_threshold(&d), "below the gossip window");
+    assert_eq!(ingress::submitted_block_admission(&d, &deep, 0), Ok(()), "a heavier chain's replay starts here");
     let e = ingress::submitted_block_admission(&d, &mined, tip_work(&x) + 2 * w).unwrap_err();
     assert!(e.contains("minimum chain work"), "{e}");
     let mut orphan = mined.clone();
@@ -441,6 +445,50 @@ fn b1t5_every_merge_backed_admission_is_rationed() {
                 assert_eq!(admitted, ingress::DEEP_BACKFILL_BURST as usize, "only after the burst");
             }
             other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(admitted, ingress::DEEP_BACKFILL_BURST as usize);
+}
+
+/// B1-T5 (review finding): a merge-backed block is charged to the ration
+/// once, after its proof is known valid. The node's gate defers the proof
+/// (`Gated::PowPending`) and resubmits the block when the worker is done;
+/// the ration used to be spent on both passes, so the burst of 4 admitted
+/// only 2 such blocks (the third was dropped `DeepBudgetExhausted` after its
+/// evaluation was paid). Now 4 are admitted, and the fifth is still handed
+/// to the PoW workers (no token spent before the proof) and refused on
+/// resubmission.
+#[test]
+fn b1t5_merge_backed_ration_is_spent_once_after_the_proof() {
+    let _a = core::activation::scoped_override(core::activation::NEVER);
+    let genesis = mk_genesis(unix_now() - 50_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let honest = b.chain(gh, 800, "mb");
+    let x = node_on(&genesis, &honest);
+    let mut core = BlockIngress::new().with_minimum_chain_work(0);
+    let mut gate = RecordingGate { asked: Vec::new(), known: Default::default() };
+    let mut tip = honest.last().unwrap().block_hash();
+    let mut admitted = 0;
+    for i in 0..(ingress::DEEP_BACKFILL_BURST as usize + 1) {
+        let deep = b.empty(vec![honest[300 + i].block_hash()], &format!("deep{i}"));
+        let merger = b.empty(vec![tip, deep.block_hash()], &format!("merger{i}"));
+        assert!(matches!(pulled(&mut core, &x, &merger), BlockOutcome::Buffered { .. }));
+        let go = |core: &mut BlockIngress, gate: &mut RecordingGate| {
+            core.handle_block_gated(deep.clone(), deep.block_hash(), 1_000, Some(PeerId::random()), true,
+                Instant::now(), unix_now(), &ctx(&x), gate)
+        };
+        assert!(matches!(go(&mut core, &mut gate), Gated::PowPending(_)), "deep{i}: proof deferred, nothing spent");
+        gate.known.insert(deep.block_hash(), true);
+        match go(&mut core, &mut gate) {
+            Gated::Done(BlockOutcome::Processed { admission: WorkAdmission::MergeBacked, result: Ok(_), .. }) => {
+                tip = merger.block_hash();
+                admitted += 1;
+            }
+            Gated::Done(BlockOutcome::Dropped(DropReason::DeepBudgetExhausted)) => {
+                assert_eq!(admitted, ingress::DEEP_BACKFILL_BURST as usize, "deep{i}: only after the burst");
+            }
+            other => panic!("deep{i}: {other:?}"),
         }
     }
     assert_eq!(admitted, ingress::DEEP_BACKFILL_BURST as usize);
@@ -657,7 +705,7 @@ fn net2_evaluations_are_budgeted_per_peer_and_network_group() {
             StartNext::Start(j) => {
                 assert!(s.in_flight() <= 2);
                 *evaluated += 1;
-                s.complete(j.id, &j.source, valid);
+                s.complete(j.outcome(valid), t0);
             }
             StartNext::Expired(_) => panic!("not stale"),
             StartNext::Idle => break,
@@ -669,7 +717,7 @@ fn net2_evaluations_are_budgeted_per_peer_and_network_group() {
             n += 1;
             let mut id = [0u8; 32];
             id[..4].copy_from_slice(&n.to_le_bytes());
-            let _ = s.submit(PowJob { id, source, solicited: false, received_at: t0, payload: n }, t0);
+            let _ = s.submit(PowJob { id, height: 1, source, solicited: false, received_at: t0, payload: n }, t0);
             run_all(&mut s, false, &mut evaluated);
         }
     }
@@ -679,16 +727,50 @@ fn net2_evaluations_are_budgeted_per_peer_and_network_group() {
     for i in 0..20u32 {
         let mut id = [0xEE; 32];
         id[..4].copy_from_slice(&i.to_le_bytes());
-        s.submit(PowJob { id, source: honest, solicited: false, received_at: t0, payload: i }, t0)
+        s.submit(PowJob { id, height: 1, source: honest, solicited: false, received_at: t0, payload: i }, t0)
             .expect("valid proofs are refunded");
         run_all(&mut s, true, &mut evaluated);
     }
     // A stale gossip job is not evaluated.
     let other = PowSource { peer: Some(PeerId::random()), group: group_of(90, 2) };
-    s.submit(PowJob { id: [0xAA; 32], source: other, solicited: false, received_at: t0, payload: 0 }, t0).unwrap();
+    s.submit(PowJob { id: [0xAA; 32], height: 1, source: other, solicited: false, received_at: t0, payload: 0 }, t0).unwrap();
     assert!(matches!(s.start_next(t0 + Duration::from_secs(11)), StartNext::Expired(_)));
-    assert_eq!(s.submit(PowJob { id: [0xAB; 32], source: PowSource { peer: Some(PeerId::random()), group: group_of(45, 77) },
+    assert_eq!(s.submit(PowJob { id: [0xAB; 32], height: 1, source: PowSource { peer: Some(PeerId::random()), group: group_of(45, 77) },
         solicited: false, received_at: t0, payload: 0 }, t0).unwrap_err().0, PowRefusal::GroupBudget);
+}
+
+/// NET-2 (review finding): an orphan below the floor is charged to a
+/// gossip deliverer's budget and, if it authored the frame, treated as
+/// misbehaving; an answer to this node's own pull (which the processor
+/// treats as authored by its sender) is only dropped — the floor depends on
+/// this node's tip and clock, and the node asked for the block. Pre-fix the
+/// processor applied the gossip penalty to pull answers too, disconnecting
+/// and discouraging an honest sync peer for 24 h.
+#[test]
+fn net2_floor_failure_penalises_gossip_authors_never_pull_answers() {
+    use GossipVerdict::*;
+    let p = |gossip, misbehaving| BlockPenalty { gossip, misbehaving };
+    let a = PeerId::random();
+    let r = PeerId::random();
+    let gossip_from = |author: PeerId, via: PeerId| gnb::network::InboundOrigin::Gossip {
+        propagation_source: via, author: Some(author), pending: None, received_at: Instant::now(),
+    };
+    let pull = gnb::network::InboundOrigin::Directed { peer: a };
+    assert!(gossip_from(a, a).delivered_by_author());
+    assert!(!gossip_from(a, r).delivered_by_author());
+    assert!(pull.delivered_by_author());
+    assert!(!gnb::network::InboundOrigin::Local.delivered_by_author());
+    for in_force in [false, true] {
+        for origin in [gossip_from(a, a), gossip_from(a, r), pull.clone()] {
+            let (pen, charge) = ingress::orphan_floor_penalty(origin.is_solicited(), origin.delivered_by_author(), in_force);
+            if origin.is_solicited() {
+                assert_eq!((pen, charge), (p(Ignore, false), false), "a pull answer is only dropped");
+            } else {
+                assert!(charge, "gossip is charged to the budget");
+                assert_eq!(pen, p(Ignore, origin.delivered_by_author()), "never Reject: a contextual fault");
+            }
+        }
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
