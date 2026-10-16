@@ -37,6 +37,13 @@ Implementation choices that refine the design below:
   refuses any double or surround vote, across restarts and reorgs.
 - **Node finality.** The node never reorganises below the height of the block
   its tip's chain finalized (`finalized_height`), in addition to the depth rule.
+  (As implemented now: there is no depth rule, audit DAG-6, and the pin is
+  `GhostDAG::set_finalized` from the applied tip's witness set. The pin does
+  not read `MIN_CHAIN_WORK`: a node in initial block download that an
+  eclipsing peer fed a cheap chain past the PoWit height can pin that
+  chain's checkpoint. The minimum chain work keeps such a chain from being
+  mined on or advertised, docs/CONSENSUS.md; gating the pin on it is a
+  separate change.)
 
 Parameters (`core::powit::MAINNET_PARAMS` / `TESTNET_PARAMS`):
 

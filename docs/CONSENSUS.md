@@ -919,17 +919,33 @@ Bitcoin Core's defences, adapted (`ingress::unrequested_block_admission`):
   `ingress::MAINNET_MINIMUM_CHAIN_WORK` (testnet and regtest: 0), or
   `--minimumchainwork <hex>`. While the selected tip's blue work is below it
   the node is in initial block download: it latches the IBD state (the
-  miner stays paused) and processes no block it did not ask for, unless that
-  block's own bound reaches the minimum. Mainnet's value is
-  `core::MIN_CHAIN_WORK`, the one release constant that also turns finality,
-  the reorg depth cap and pruning on (`core::finality_active`), 0 today: the
-  newest chain data the repository carries is the reading of
-  docs/MAINNET-READINESS.md §1 (one node, 14 Oct 2026), whose proposed value
-  is a release decision not yet taken, and a value the real chain does not
-  reach would stop every new node from syncing; docs/RUNNING.md gives the
-  release step that raises it. Block work bounds (`lb`, the announced work
-  of orphans) count each block as `accept_block` adds it to the DAG,
-  `core::block_work`: normalised across the GnB-SMH v1 -> v3 switch.
+  miner stays paused, stalled sync or not) and processes no block it did
+  not ask for, unless that block's own bound reaches the minimum. Mainnet's
+  value is `core::MIN_CHAIN_WORK` = 7,000,000, derived from the mainnet
+  reading of docs/MAINNET-READINESS.md §1 (tip height 8,302, blue work
+  7,782,451, 14 Oct 2026; 10% below it, and far below the tip of the
+  release); docs/RUNNING.md gives the release step that raises it. Its unit
+  is the selected tip's blue work, the sum of `core::block_work`: a block's
+  `bits_to_work` (the genesis target 4,500, the pre-activation pow limit
+  1), divided by 4 for GnB-SMH v3 blocks, whose target is 4 times harder,
+  so the sum is continuous across the v1 -> v3 switch (below the hardening
+  activation the selected chain's blocks, from it the merged blues too).
+  Block work bounds (`lb`, the announced work of orphans) count each block
+  as `accept_block` adds it to the DAG. The minimum is not consensus: no
+  block's validity, GhostDAG data or the heaviest-chain choice among the
+  blocks a node holds reads it, so nodes with other values (an override, a
+  release without it) reach the same verdicts on the same blocks.
+- **Below the minimum, no chain of record**: blocks the node requested are
+  processed below the minimum (as in Core), so an eclipsing peer that
+  answers its pulls can make a cheap chain its selected tip (no header chain
+  with proofs tells the node a chain's work before it downloads it, as
+  Core's headers presync does). While the tip is below the minimum the node
+  therefore mines nothing and `getblocktemplate` refuses
+  (`ingress::ibd_template_refusal`), a witness node neither attests
+  checkpoints nor mines shares, and GetTips / GetHeaders are answered
+  empty (`network::serve::serve_sync_request`; Core ignores `getheaders` in
+  initial block download), so such a chain is neither mined on nor
+  advertised to peers; blocks it stores are still served by GetBlock.
 - **Unrequested blocks** (Core's `AcceptBlock`, `!fRequested`): a block that
   is neither the answer to one of this node's directed pulls nor a block it
   has an outstanding request for (whoever delivers it) is processed only if
@@ -953,16 +969,23 @@ Bitcoin Core's defences, adapted (`ingress::unrequested_block_admission`):
   block by block). A deep-fork block is cheap below the activation, so a
   public RPC should run with `--rpc-require-auth-for-writes`.
 
-What remains: with the mainnet minimum at 0, a node that is behind but not
-below the minimum is protected only by the rules relative to its tip, so a
-block A as above and its cheap children (each costing one evaluation) are
-processed — at most at the rate the attacker evaluates proofs, and within
-the per-peer and per-network-group proof-of-work budgets below; raising the
-minimum at each release closes this for every node that has not reached it.
-Blocks this node requested (IBD pulls answered by an attacker's header list)
-are not checked against the minimum: that needs a header chain with proofs
-(Core's headers presync), which the sync protocol (`/gnb/sync/1`
-`Headers`: ids and claimed scores only) does not carry.
+What remains: a node that is behind but above the minimum is protected
+only by the rules relative to its tip, so a block A as above and its cheap
+children (each costing one evaluation) are processed — at most at the rate
+the attacker evaluates proofs, and within the per-peer and per-network-group
+proof-of-work budgets below; raising the minimum at each release closes
+this for every node that has not reached it. Blocks this node requested
+(IBD pulls answered by an attacker's header list) are not checked against
+the minimum: that needs a header chain with proofs (Core's headers
+presync), which the sync protocol (`/gnb/sync/1` `Headers`: ids and claimed
+scores only) does not carry. Such a chain can become the selected tip of an
+eclipsed node below the minimum, but not its chain of record (above): it is
+neither mined on nor advertised, and the node stays in initial block
+download, so it moves to the real chain when that chain's blocks arrive
+(the heavier chain wins at any depth), unless a PoWit finalized checkpoint
+of the cheap chain pins its fork choice: a chain past the PoWit height can
+carry one, and the pin does not read the minimum chain work here
+(docs/DESIGN-pow-powit.md, "Node finality").
 
 ### Gossip penalties and proof-of-work budgets (node-local policy, not consensus)
 
