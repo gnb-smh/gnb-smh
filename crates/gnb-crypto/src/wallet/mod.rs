@@ -976,18 +976,22 @@ impl Keypair {
     /// 32-byte tx sighash / disclosure digest / PoS signing root. Pair with
     /// [`Self::verify_message_on`] (or [`Self::verify_message`]).
     ///
-    /// CRY-8: new signatures use the chain-bound v2 domain
+    /// CRY-8: signatures use the chain-bound v2 domain
     /// ([`crypto::signed_message_digest_v2`]) with the chain of this
     /// keypair's network, so they do not carry over between GnB mainnet,
-    /// GnB testnet and Bloch (which share keys). Verifiers still accept v1.
+    /// GnB testnet and Bloch (which share keys). Verifiers accept only v2 of
+    /// the chain they check, unless a caller explicitly opts into the legacy
+    /// v1 domain ([`Self::verify_message_allowing_legacy_v1`]).
     pub fn sign_message(&self, message: &[u8]) -> Result<Vec<u8>, String> {
         let chain = crate::core::ChainId::for_network(self.network()?);
         let digest = crypto::signed_message_digest_v2(chain, message);
         self.sign(&digest)
     }
 
-    /// Sign under the legacy v1 message domain (no chain id). Only for
-    /// interoperability with verifiers that predate v2.
+    /// Sign under the legacy v1 message domain (no chain id), which Bloch
+    /// signers still use. Only for interoperability with verifiers that
+    /// predate v2: a v1 signature proves nothing about which chain it was
+    /// meant for, and no default GnB verifier accepts it (CRY-8).
     pub fn sign_message_v1(&self, message: &[u8]) -> Result<Vec<u8>, String> {
         let digest = crypto::signed_message_digest(message);
         self.sign(&digest)
@@ -1002,9 +1006,10 @@ impl Keypair {
             || crypto::verify(pk, digest, sig)
     }
 
-    /// Message digests a verifier for `network` accepts: v2 for that chain,
-    /// then the legacy v1 domain.
-    fn message_digests(network: Option<Network>, message: &[u8]) -> Vec<[u8; 32]> {
+    /// Message digests a verifier accepts: the v2 digest of `network`'s
+    /// chain (of either GnB chain for `None`) and, only with `legacy_v1`, the
+    /// chain-less v1 digest.
+    fn message_digests(network: Option<Network>, message: &[u8], legacy_v1: bool) -> Vec<[u8; 32]> {
         use crate::core::ChainId;
         let mut digests = match network {
             Some(n) => vec![crypto::signed_message_digest_v2(ChainId::for_network(n), message)],
@@ -1013,37 +1018,51 @@ impl Keypair {
                 crypto::signed_message_digest_v2(ChainId::Testnet, message),
             ],
         };
-        digests.push(crypto::signed_message_digest(message));
+        if legacy_v1 {
+            digests.push(crypto::signed_message_digest(message));
+        }
         digests
     }
 
     /// Verify a signature produced by [`Self::sign_message`] over `message`
-    /// under public key `pk` while preserving historical wallet compatibility.
+    /// under public key `pk` (compatible key and signature encodings).
     ///
-    /// Accepts a v2 signature for EITHER GnB chain and a legacy v1 signature;
-    /// callers that know the chain should use [`Self::verify_message_on`].
+    /// Accepts a v2 signature for EITHER GnB chain, never a chain-less v1
+    /// one (CRY-8: a Bloch v1 signature verified as a GnB proof); callers
+    /// that know the chain should use [`Self::verify_message_on`].
     pub fn verify_message(pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
-        Self::message_digests(None, message).iter().any(|d| Self::verify_digest_compat(pk, d, sig))
+        Self::message_digests(None, message, false).iter().any(|d| Self::verify_digest_compat(pk, d, sig))
     }
 
-    /// Verify a message signature for a specific network: a v2 signature
-    /// must name that network's chain id; legacy v1 signatures (no chain id)
-    /// are still accepted.
+    /// Verify a message signature for a specific network: the v2 signature
+    /// must name that network's chain id. Legacy v1 signatures (no chain id)
+    /// are refused (CRY-8).
     pub fn verify_message_on(network: Network, pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
-        Self::message_digests(Some(network), message).iter().any(|d| Self::verify_digest_compat(pk, d, sig))
+        Self::message_digests(Some(network), message, false).iter().any(|d| Self::verify_digest_compat(pk, d, sig))
+    }
+
+    /// Explicit legacy mode (CRY-8): like [`Self::verify_message_on`] (or
+    /// [`Self::verify_message`] for `None`), but ALSO accepts a chain-less
+    /// v1 signature. A v1 signature binds no network: one made on Bloch, on
+    /// GnB mainnet or on GnB testnet verifies here for all of them, so a
+    /// caller must only use this to check old v1 records whose meaning does
+    /// not depend on the chain. Never used by any default verifier.
+    pub fn verify_message_allowing_legacy_v1(network: Option<Network>, pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
+        Self::message_digests(network, message, true).iter().any(|d| Self::verify_digest_compat(pk, d, sig))
     }
 
     /// Verify a newly-issued wallet message using the strict modern policy.
     /// Both objects must carry suite envelopes and the signature encoding must
-    /// be canonical; legacy raw and mixed-format records are rejected.
+    /// be canonical; legacy raw and mixed-format records, and v1 signatures,
+    /// are rejected.
     pub fn verify_message_canonical(pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
-        Self::message_digests(None, message).iter()
+        Self::message_digests(None, message, false).iter()
             .any(|d| crypto::verify_enveloped_canonical(pk, d, sig))
     }
 
     /// [`Self::verify_message_canonical`] for a specific network.
     pub fn verify_message_canonical_on(network: Network, pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
-        Self::message_digests(Some(network), message).iter()
+        Self::message_digests(Some(network), message, false).iter()
             .any(|d| crypto::verify_enveloped_canonical(pk, d, sig))
     }
 
@@ -2874,18 +2893,38 @@ mod audit_2026_10_wallet_fixes {
         assert!(err.contains("guard"), "{err}");
     }
 
-    /// CRY-8: message signatures are chain-bound (v2) and v1 still verifies.
+    /// CRY-8: message signatures are chain-bound (v2), and a chain-less v1
+    /// signature (what Bloch signers still produce, with the same keys) is
+    /// accepted by no default verifier and never by a canonical one: it used
+    /// to verify as a GnB mainnet AND testnet proof. Only the explicit legacy
+    /// mode accepts it.
     #[test]
-    fn message_signatures_are_chain_bound_and_v1_still_verifies() {
+    fn message_signatures_are_chain_bound_and_v1_needs_the_legacy_flag() {
         let kp = generate_keypair(false);
+        let pk = &kp.public_key;
         let sig = kp.sign_message(b"hello").unwrap();
-        assert!(Keypair::verify_message_on(Network::Mainnet, &kp.public_key, b"hello", &sig));
-        assert!(!Keypair::verify_message_on(Network::Testnet, &kp.public_key, b"hello", &sig));
-        assert!(Keypair::verify_message_canonical_on(Network::Mainnet, &kp.public_key, b"hello", &sig));
-        assert!(!crypto::verify(&kp.public_key, &crypto::signed_message_digest(b"hello"), &sig));
+        assert!(Keypair::verify_message_on(Network::Mainnet, pk, b"hello", &sig));
+        assert!(!Keypair::verify_message_on(Network::Testnet, pk, b"hello", &sig));
+        assert!(Keypair::verify_message_canonical_on(Network::Mainnet, pk, b"hello", &sig));
+        assert!(Keypair::verify_message(pk, b"hello", &sig));
+        assert!(!crypto::verify(pk, &crypto::signed_message_digest(b"hello"), &sig));
+
+        // A Bloch / v1 signature over the same message with the same key.
         let v1 = kp.sign_message_v1(b"hello").unwrap();
-        assert!(Keypair::verify_message_on(Network::Testnet, &kp.public_key, b"hello", &v1));
-        assert!(Keypair::verify_message(&kp.public_key, b"hello", &v1));
+        assert!(crypto::verify(pk, &crypto::signed_message_digest(b"hello"), &v1), "fixture: a genuine v1 signature");
+        for n in [Network::Mainnet, Network::Testnet] {
+            assert!(!Keypair::verify_message_on(n, pk, b"hello", &v1), "v1 accepted as a {n:?} proof");
+            assert!(!Keypair::verify_message_canonical_on(n, pk, b"hello", &v1));
+        }
+        assert!(!Keypair::verify_message(pk, b"hello", &v1));
+        assert!(!Keypair::verify_message_canonical(pk, b"hello", &v1));
+        // Explicit legacy mode only.
+        assert!(Keypair::verify_message_allowing_legacy_v1(Some(Network::Mainnet), pk, b"hello", &v1));
+        assert!(Keypair::verify_message_allowing_legacy_v1(None, pk, b"hello", &v1));
+        assert!(Keypair::verify_message_allowing_legacy_v1(Some(Network::Mainnet), pk, b"hello", &sig));
+        assert!(!Keypair::verify_message_allowing_legacy_v1(Some(Network::Testnet), pk, b"hello", &sig),
+            "the legacy mode still binds a v2 signature to its chain");
+        assert!(!Keypair::verify_message_allowing_legacy_v1(None, pk, b"other", &v1));
     }
 
     /// CRY-5 through the wallet: a corrupted Falcon secret never signs.
