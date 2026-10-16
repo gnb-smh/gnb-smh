@@ -10,7 +10,7 @@
 #                                        (gcc + libubsan)
 #   sh scripts/sanitizers.sh ubsan-noavx2
 #                                        the UBSan ML-DSA tests on an emulated CPU without AVX2
-#                                        (qemu-user), so the CLEAN ML-DSA C code runs
+#                                        (qemu-user): no ML-DSA verdict may depend on the CPU
 #   sh scripts/sanitizers.sh ubsan-noavx2-full
 #                                        every gnb-crypto lib and integration test on that CPU
 #                                        (about 10 minutes; CI runs it nightly)
@@ -151,26 +151,35 @@ ubsan_test_bin() {
     | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1
 }
 
-# On an AVX2 machine pqcrypto-mldsa dispatches ML-DSA to its AVX2 code at run
-# time, so the ubsan and asan modes never execute the clean ML-DSA C code that
-# non-AVX2 x86_64 nodes run and that is compiled into the wasm32 wallet.
-# qemu's Nehalem model has no AVX2: is_x86_feature_detected!("avx2") is false
-# there and the same UBSan binaries take the clean path.
+# The asan and ubsan modes run on the CI runner's AVX2 CPU. pqcrypto-mldsa is
+# built without its avx2/neon features (crates/gnb-crypto/Cargo.toml), so every
+# build runs the clean ML-DSA C code; with the AVX2 code linked, verification
+# was dispatched on the CPU at run time and the verdict depended on it
+# (Wycheproof tcId 161 refused on AVX2 CPUs, accepted on others:
+# docs/testing/SANITIZERS.md, F6). qemu's Nehalem model has no AVX2
+# (is_x86_feature_detected!("avx2") is false there), so running the same UBSan
+# binaries there runs the clean C code under UBSan on a CPU without AVX2 and
+# gives the verdict tests a second CPU: a CPU-dependent verdict fails one of
+# the two runs.
 ubsan_noavx2() {
   ubsan_env
   lib=$(ubsan_test_bin --lib)
   acvp=$(ubsan_test_bin --test acvp_mldsa)
-  for b in "$lib" "$acvp"; do
+  wycheproof=$(ubsan_test_bin --test wycheproof_mldsa65)
+  for b in "$lib" "$acvp" "$wycheproof"; do
     [ -x "$b" ] || { echo "sanitizers: missing UBSan test binary '$b'" >&2; exit 1; }
   done
   cd crates/gnb-crypto # where cargo runs this crate's tests
   # Hybrid ML-DSA-65 + Falcon-1024 key generation, signing, verification and
-  # KATs (crypto::), the wallet code that signs transactions with it, and the
-  # official ACVP ML-DSA-65 vectors: about 35 s under emulation (all 280 lib
-  # tests: ~10 min, mostly keystore KDFs with no ML-DSA in them).
-  expect_passed 63 qemu-x86_64 -cpu Nehalem "$lib" \
+  # KATs (crypto::, with the FIPS 204 UseHint verdicts of
+  # crypto::mldsa_one_verdict), the wallet code that signs transactions with
+  # it, the official ACVP and the Wycheproof ML-DSA-65 vectors: about a minute
+  # under emulation (all lib tests: ~10 min, mostly keystore KDFs with no
+  # ML-DSA in them).
+  expect_passed 67 qemu-x86_64 -cpu Nehalem "$lib" \
     crypto:: wallet::payment:: wallet::legacy_sign_tests:: wallet::sighash_v3_signers::
   expect_passed 3 qemu-x86_64 -cpu Nehalem "$acvp"
+  expect_passed 2 qemu-x86_64 -cpu Nehalem "$wycheproof"
 }
 
 # Runs each test binary to completion on the Nehalem CPU; stops at the first

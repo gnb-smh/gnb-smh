@@ -22,6 +22,13 @@
   110,000 (version 0.1.0) and splits the same way: upgrade it too. (Version
   0.1.1 builds of the hardening branch activate at 25,800 and carry the
   pre-relaunch genesis: they do not follow this chain at all.)
+- Independently of the activation height, this release makes ML-DSA-65
+  verification the same on every CPU (`docs/CONSENSUS.md`, "ML-DSA-65
+  verification"). Earlier builds verified with PQClean's AVX2 code on x86_64
+  CPUs with AVX2 and with its portable code everywhere else, and the two give
+  opposite verdicts on signatures anyone can craft (Wycheproof tcId 161), so
+  a crafted spend can split AVX2 nodes from the others at any height. Upgrade
+  every node, whatever its CPU.
 - Check the upgrade on each node: `getnetworkinfo` reports `version` 0.1.2
   and `hardening_activation_height` 17500, and `getdaginfo` the same height
   and `hardening_active` for `next_block_height`. A node reporting another
