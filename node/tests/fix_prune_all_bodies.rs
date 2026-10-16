@@ -138,6 +138,34 @@ fn b1_t17_a_re_stored_body_is_pruned_by_its_current_index_row_only() {
     let x = b.block(vec![gh], "x");
     let y = b.block(vec![gh], "y");
     let z = b.block(vec![gh], "z");
+    let w = b.block(vec![gh], "w");
+    let v = b.block(vec![gh], "v");
+    let rows_of = |hashes: &[BlockHash]| {
+        let db = n.store.db();
+        let cf = db.cf_handle("meta").unwrap();
+        db.prefix_iterator_cf(cf, b"body_h")
+            .map(|kv| kv.unwrap().0.to_vec())
+            .take_while(|k| k.starts_with(b"body_h"))
+            .filter(|k| hashes.iter().any(|h| k.ends_with(h)))
+            .count()
+    };
+
+    // A deletion removes the body's rows at once (forward and reverse).
+    n.store.put_block_body_at(&w, 5).unwrap();
+    assert_eq!(rows_of(&[w.block_hash()]), 2);
+    n.store.delete_block_body(&w.block_hash()).unwrap();
+    assert_eq!(rows_of(&[w.block_hash()]), 0, "no index row outlives a deleted body");
+    // A stale forward row (none can be written any more; this models one
+    // left at a lower height) is ignored by pruning: the current row decides.
+    n.store.put_block_body_at(&v, 50).unwrap();
+    {
+        let db = n.store.db();
+        let cf = db.cf_handle("meta").unwrap();
+        let mut k = gnb::storage::BODY_INDEX_PREFIX.to_vec();
+        k.extend_from_slice(&3u64.to_be_bytes());
+        k.extend_from_slice(&v.block_hash());
+        db.put_cf(cf, k, []).unwrap();
+    }
 
     // Deleted, then re-stored higher: the old row goes with the deletion.
     n.store.put_block_body_at(&x, 5).unwrap();
@@ -146,28 +174,23 @@ fn b1_t17_a_re_stored_body_is_pruned_by_its_current_index_row_only() {
     // Re-stored higher without a deletion: the write moves the row.
     n.store.put_block_body_at(&y, 5).unwrap();
     n.store.put_block_body_at(&y, 50).unwrap();
+    assert_eq!(rows_of(&[y.block_hash()]), 2, "one forward row (moved to 50) and its reverse row");
     // Re-stored LOWER: the latest write decides.
     n.store.put_block_body_at(&z, 50).unwrap();
     n.store.put_block_body_at(&z, 5).unwrap();
 
     n.store.prune_blocks_below(6).unwrap();
+    assert!(n.store.has_block_body(&v.block_hash()).unwrap(), "a stale row does not prune the body");
+    assert_eq!(rows_of(&[v.block_hash()]), 2, "the stale row is dropped, the current one kept");
     assert!(n.store.has_block_body(&x.block_hash()).unwrap(), "no stale row prunes the re-stored body");
     assert!(n.store.has_block_body(&y.block_hash()).unwrap(), "the row moved with the second write");
     assert!(!n.store.has_block_body(&z.block_hash()).unwrap(), "indexed at 5 by its last write");
     n.store.prune_blocks_below(51).unwrap();
-    for h in [x.block_hash(), y.block_hash()] {
+    for h in [x.block_hash(), y.block_hash(), v.block_hash()] {
         assert!(!n.store.has_block_body(&h).unwrap(), "pruned once the cursor passes its current row");
     }
-    let rows = {
-        let db = n.store.db();
-        let cf = db.cf_handle("meta").unwrap();
-        db.prefix_iterator_cf(cf, b"body_h")
-            .map(|kv| kv.unwrap().0.to_vec())
-            .take_while(|k| k.starts_with(b"body_h"))
-            .filter(|k| [x.block_hash(), y.block_hash(), z.block_hash()].iter().any(|h| k.ends_with(h)))
-            .count()
-    };
-    assert_eq!(rows, 0, "no index row (forward or reverse) outlives its body");
+    assert_eq!(rows_of(&[x.block_hash(), y.block_hash(), z.block_hash(), v.block_hash()]), 0,
+        "no index row (forward or reverse) outlives its body");
 }
 
 /// Review finding on B1-T17, through the acceptance pipeline: a body the
