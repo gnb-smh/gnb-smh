@@ -7,6 +7,11 @@ and `/private/tmp/gnb-r4-target-review-paths`; no production edits were made
 by this reviewer. This is a bounded address-format review, not an audit of
 the entire wallet or a claim that the round is ready for deployment.
 
+**Current local status:** the follow-up review below supersedes the initial
+open statuses. R4-PATH-1, R4-PATH-2 and the related R4-PATH-5 opening variant
+are corrected by `8be30ee` in the exercised paths; R4-PATH-4 is corrected by
+`04b9348`. Integration, reversal evidence and CI are separate delivery gates.
+
 ## Findings
 
 ### R4-PATH-1 — medium, open: secondary wallet cannot review a payment
@@ -121,3 +126,78 @@ These local records do not replace a permanent failing regression test.
 
 No numerical score is assigned. The open UI findings and the pending oracle
 follow-up prevent an unconditional path-coverage approval at this revision.
+
+## Follow-up review: secondary wallet and oracle
+
+Reviewed test-first commit `f330d6e`, production correction `8be30ee`, oracle
+correction `04b9348` and its evidence `27b22d4`. These were applied only in
+the reviewer's own worktree (local reviewed head `4c749a3`); the implementer's
+live reversal worktree was not read or changed. No production modification
+was authored by this reviewer.
+
+**R4-PATH-1: corrected locally.** `main.js:297` requires a positive, exact,
+safe-integer `getdaginfo.next_block_height`; it does not infer that value from
+the tip. `main.js:342` rechecks maturity, plans the selected inputs, fetches
+the version-1 previous transactions and passes the same height/data to real
+WASM signing. The actual Review callbacks pass for both legacy and v2
+recipients at H-1=17499 and H=17500. The supplied tip height deliberately
+disagrees, making a tip-based substitute observable. Missing/malformed height,
+lookup failure, immature-only rows, another-network recipients and invalid
+provided previous bytes do not reach a successful payment/confirmation.
+
+Unavailable version-1 previous transactions remain explicitly unverified.
+The actual review markup shows this status, disables confirmation, and the
+handler itself refuses a click without the acknowledgement. The tests call
+that handler directly as well as the disabled DOM button; neither triggers
+the broadcast adapter. This is the existing disclosed-unverified-input policy,
+not proof of chain unspentness or authenticity of an unavailable transaction.
+
+**R4-PATH-2: corrected locally.** `core.js:81` forwards the boolean testnet
+selection to the existing Rust implementation. Real testnet creation returns
+`gnb1t`, downloads an encrypted keystore and reopens to the same identity.
+The mainnet default still returns a 24-word recovery phrase and preserves
+keystore/phrase recovery. Testnet uses the existing random-key path without
+a recovery phrase; no testnet phrase capability is claimed.
+
+**R4-PATH-5: medium related opening variant, corrected locally.** The old
+wrapper also ignored an explicit expected network during `open`, and the
+secondary gate omitted it. `core.js:75` now forwards only an explicit supported
+network, while `main.js:227` selects the node's network. The real testnet gate
+refuses the synthetic mainnet keystore; the mainnet gate accepts that keystore,
+and the testnet gate accepts its own testnet keystore. Mistyped create/open
+arguments are refused without replacing the existing session. The package's
+test-first baseline records the former wrong-network acceptance; this review
+independently ran the corrected real-WASM rejection and positive controls.
+
+The combined secondary-wallet, address-WASM and web suites passed **29/29**
+(16 secondary journey cases, 6 address-WASM cases, 7 routing cases), zero
+skips. They execute real controllers and WASM with a small DOM/API adapter,
+not a full browser or live node. An additional independent testnet Review
+callback used a newly created testnet key, a v2 testnet recipient and string
+`next_block_height: "1"` with an inconsistent tip 999. It produced version 3
+with committed amounts, called only `getdaginfo`, and made zero broadcasts.
+No external network request or broadcast was made in these checks.
+
+**R4-PATH-4: corrected locally.** The oracle now rejects unknown request fields
+and treats an absent/null expected network identically. Five oracle unit tests
+passed in a separate `gnb-crypto` invocation. A freshly rebuilt CGU109 example
+compared **672 requests**, including 42 envelope cases, with **zero differences**.
+Its SHA-256 is
+`45ce573c1b943f28c2aaa93f04589aa7ed58b47f48dbab7a12c032b921cfa857`.
+The original 502-vector address corpus is unchanged. This is bounded
+differential evidence, not continuous fuzzing or proof beyond the corpus.
+
+| Follow-up artifact | SHA-256 |
+| --- | --- |
+| `/private/tmp/gnb-r4-review-paths-secondary-green.log` | `1d577d48716f07f99e50b5de41259311d6e917dcf20dd20714613888352ddbd0` |
+| `/private/tmp/gnb-r4-review-paths-oracle-followup.log` | `8e57dc46a0e1367738e16d6cd098cb62c09b0c7b9fe3acb2ef2e868e4f1b97e4` |
+| `/private/tmp/gnb-r4-review-paths-oracle-followup-differential.log` | `5a31a531f3cd4a2ba85856ec797971d91084410a5d72192e25479e7d349a9b8b` |
+| `/private/tmp/gnb-r4-review-secondary-testnet.mjs` | `4f4f017e8fa530dd11a9b093fbe8250eeddde762ec9677a2bfc6fb6be1eb9327` |
+| `/private/tmp/gnb-r4-review-secondary-testnet.log` | `4810dbec7545ac4884f986a8d5fdf547bde6602509413dca78c0562dc48154e0` |
+
+No further blocking path defect was found within this bounded follow-up.
+This closes the identified local caller/codec mismatches for lens 2, subject
+to unchanged final code, the package's production-only reversals and integrated
+validation. The primary wallet's separate tip-height fallback and legacy-only
+bridge UI were not changed or approved by this follow-up. No global readiness,
+CI-green or numerical-score assertion is made.
