@@ -1,0 +1,104 @@
+{
+  "revision": "299389adc0348cb945e80f8730a885232bd3e255",
+  "test_sha256": "b1b14da2f2b804a4921e8837c5c0611f71acac3e35b09ab43e637c6754c7bb0e",
+  "results": [
+    {
+      "name": "final-control",
+      "command": [
+        "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+        "--test",
+        "/Users/tiagobulhoes/worktrees/gnb-r4-address-browser/site/tests/address-v2-wasm.test.mjs"
+      ],
+      "exit_code": 0,
+      "seconds": 3.41,
+      "log_sha256": "d75d9606856677a5b4747bacef35d9cbc22157af5327d32fb00f344954f98e82",
+      "passed": 6,
+      "failed": 0
+    },
+    {
+      "name": "without-format-build",
+      "command": [
+        "scripts/build-wallet-wasm.sh"
+      ],
+      "exit_code": 0,
+      "seconds": 7.65,
+      "log_sha256": "ab9688542f2bc10e1c9fa9f73cd2fb30cb1185fe49fb2913872a374399ecb19e"
+    },
+    {
+      "name": "without-rust-format",
+      "command": [
+        "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+        "--test",
+        "/Users/tiagobulhoes/worktrees/gnb-r4-address-browser/site/tests/address-v2-wasm.test.mjs"
+      ],
+      "exit_code": 1,
+      "seconds": 2.66,
+      "log_sha256": "811b09988e310ddfe3759c053d43b354d8a07412156f4018dafd26d3764eb581",
+      "passed": 5,
+      "failed": 1
+    },
+    {
+      "name": "restored-rust-build",
+      "command": [
+        "scripts/build-wallet-wasm.sh"
+      ],
+      "exit_code": 0,
+      "seconds": 5.94,
+      "log_sha256": "850a7961eaf6d5bed32c50e5f84965fdd7ffd88a50a634f8c4bf0e5db798df58"
+    },
+    {
+      "name": "restored-rust",
+      "command": [
+        "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+        "--test",
+        "/Users/tiagobulhoes/worktrees/gnb-r4-address-browser/site/tests/address-v2-wasm.test.mjs"
+      ],
+      "exit_code": 0,
+      "seconds": 2.53,
+      "log_sha256": "10f36de2c6e131750d564f970e4160f12b08dd7e2771ab9b70ca4fc00efdd387",
+      "passed": 6,
+      "failed": 0
+    },
+    {
+      "name": "without-js-format",
+      "command": [
+        "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+        "--test",
+        "/Users/tiagobulhoes/worktrees/gnb-r4-address-browser/site/tests/address-v2-wasm.test.mjs"
+      ],
+      "exit_code": 1,
+      "seconds": 2.5,
+      "log_sha256": "7a89fa75622323f1b8dc96efeb30cc5a51fabdcd711fec82234e599fc9114c0e",
+      "passed": 5,
+      "failed": 1
+    },
+    {
+      "name": "without-alternate-pin",
+      "command": [
+        "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+        "--test",
+        "/Users/tiagobulhoes/worktrees/gnb-r4-address-browser/site/tests/address-v2-wasm.test.mjs"
+      ],
+      "exit_code": 1,
+      "seconds": 2.56,
+      "log_sha256": "dd567f6afc038ed30946ab8f375ed2ab4dfcdf98d077aacaec205ea69ffa4e87",
+      "passed": 5,
+      "failed": 1
+    },
+    {
+      "name": "restored-final",
+      "command": [
+        "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+        "--test",
+        "/Users/tiagobulhoes/worktrees/gnb-r4-address-browser/site/tests/address-v2-wasm.test.mjs"
+      ],
+      "exit_code": 0,
+      "seconds": 2.63,
+      "log_sha256": "c3c79abb2ca5770d48df56e808f3f449201aef0f0fa82c94f52f91d3f4016eac",
+      "passed": 6,
+      "failed": 0
+    }
+  ],
+  "restored": true,
+  "tests_unchanged": true
+}
