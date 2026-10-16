@@ -276,6 +276,11 @@ export function addressPage(addrIn, h, carry, page, per) {
   const items = arr(h.items);
   const off = raw(`style="opacity:.4;pointer-events:none"`);
   const inCarry = carry && carry.in_carryover === true;
+  // B1-T11: "Older" follows the page's cursor; "Newer" uses the offset form,
+  // which the node serves up to max_offset (deeper: back to the newest page).
+  const cursor = typeof h.next_cursor === "string" && /^[0-9a-f]{32}$/.test(h.next_cursor) ? h.next_cursor : null;
+  const maxOffset = numOr(h.max_offset, (n) => n, 10000);
+  const newer = page === 0 ? off : (page - 1) * per <= maxOffset ? html`href="#/address/${addr}/${page - 1}"` : html`href="#/address/${addr}"`;
   return html`<div class="pagehead"><span class="eyebrow">Address</span><h1 class="amount" style="font-family:var(--f-display)">${gnb(h.balance)}</h1><div class="hash">${addr}${copyBtn(addr)}</div></div>
   <div class="grid2">
    <section class="card"><div class="kv">
@@ -292,8 +297,8 @@ export function addressPage(addrIn, h, carry, page, per) {
   ${items.length ? html`<div class="tablewrap"><table><thead><tr><th class="num">Height</th><th>Transaction</th><th>Direction</th><th class="num">Amount</th></tr></thead><tbody>
    ${items.map((i) => { const incoming = i.direction === "in"; return html`<tr><td class="num mono">${int(i.height)}</td><td>${link.tx(i.txid)}</td><td>${incoming ? "received" : "sent"}</td><td class="num amount ${incoming ? "pos" : "neg"}">${incoming ? "+" : "−"}${gnb(i.amount)}</td></tr>`; })}
   </tbody></table></div><div class="pager"><span>page ${page + 1} of ${pages}</span>
-   <a class="btn ghost" ${page ? html`href="#/address/${addr}/${page - 1}"` : off}>← Newer</a>
-   <a class="btn ghost" ${page + 1 < pages ? html`href="#/address/${addr}/${page + 1}"` : off}>Older →</a></div>`
+   <a class="btn ghost" ${newer}>← Newer</a>
+   <a class="btn ghost" ${cursor ? html`href="#/address/${addr}/${page + 1}/${cursor}"` : page + 1 < pages ? html`href="#/address/${addr}/${page + 1}"` : off}>Older →</a></div>`
    : html`<div class="empty">${inCarry ? "No on-chain movements yet; the balance comes from the genesis carryover." : "No movements yet."}</div>`}</section>`;
 }
 
