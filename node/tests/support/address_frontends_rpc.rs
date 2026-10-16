@@ -78,3 +78,48 @@ async fn address_frontends_validators_share_legacy_alias_parser() {
         assert_eq!(dispatch(method, Some(&json!([bloch])), &state).await[field], true, "{method} must use the already accepted alias parser");
     }
 }
+
+// Chain ID is process-global and immutable. Run the testnet matrix in its
+// own test-harness process instead of changing other tests' consensus context.
+#[test]
+fn address_frontends_testnet_rpc_isolated() {
+    const CHILD_ENV: &str = "GNB_R4_ADDRESS_TESTNET_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "rpc::audit_2026_10_rpc_tests::address_frontends_testnet_rpc_isolated", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output().expect("run isolated testnet test");
+        assert!(output.status.success(), "testnet child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    crate::core::set_node_chain_id(crate::core::ChainId::Testnet).unwrap();
+    assert_eq!(crate::core::node_chain_id(), crate::core::ChainId::Testnet);
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        use crate::address::{Address, Network};
+        let (_tmp, state) = state_with_chain(1);
+        let address = Address::from_hash([42; 20], Network::Testnet).to_string();
+        let other = Address::from_hash([42; 20], Network::Mainnet).to_string();
+        state.store.put_utxo(&[43; 32], 0, &TxOutput { value: 12_345, script_pubkey: vec![42; 20] }).unwrap();
+        let mut failures = Vec::new();
+        for method in ["getbalance", "getutxos", "getaddressinfo", "getaddresshistory", "listtransactions", "getaddressbalance_at_height"] {
+            let positive = dispatch(method, Some(&json!([address])), &state).await;
+            assert!(positive.get("error").is_none(), "testnet positive {method}: {positive}");
+            let before = state.store.storage_reads();
+            let result = dispatch(method, Some(&json!([other])), &state).await;
+            let reads = state.store.storage_reads() - before;
+            if result["error"] != "address is for Mainnet, expected Testnet" || reads != 0 {
+                failures.push(format!("{method}: {result}; storage reads {reads}"));
+            }
+        }
+        for (method, field) in [("validateaddress", "isvalid"), ("validateaddressverbose", "valid")] {
+            assert_eq!(dispatch(method, Some(&json!([address])), &state).await[field], true);
+            let result = dispatch(method, Some(&json!([other])), &state).await;
+            if result[field] != false || result["reason"] != "address is for Mainnet, expected Testnet" {
+                failures.push(format!("{method}: {result}"));
+            }
+        }
+        assert!(failures.is_empty(), "testnet matrix:\n{}", failures.join("\n"));
+    });
+}
