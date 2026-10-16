@@ -39,7 +39,9 @@ block afterwards is relayed at once.
 Not reachable here: a target above the pow limit (POW-9, POW-3). The test
 build pins every target, and the pow limit, to 0x2100ffff, the largest
 target compact bits can encode; any easier `bits` fails to decode first
-(the vector above). The Rust tests cover the limit itself
+(the vector above; since B2-T11 it is refused by the expected-bits check,
+which submitblock runs before the proof of work). The Rust tests cover the
+limit itself
 (`validate_pow_enforces_the_height_pow_limit`).
 """
 
@@ -211,7 +213,9 @@ class InvalidBlocksTxsTest(GnbTestFramework):
         self.block_rejected(b, "duplicate transaction")
         b = block_from_template(tmpl, spk)
         b.bits = 0x2200FFFF  # undecodable compact bits (mantissa overflow); not POW-9, see the docstring
-        self.block_rejected(b, "invalid PoW", search_nonce=False)
+        # B2-T11: submitblock checks the expected bits (cheap) before the
+        # proof of work, as gossip ingress does, so the refusal names the bits.
+        self.block_rejected(b, "invalid difficulty", search_nonce=False)
 
         self.log.info("contextually invalid blocks are refused")
         b = block_from_template(tmpl, spk)
