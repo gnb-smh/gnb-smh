@@ -539,10 +539,9 @@ fn cli_network(testnet: bool) -> crate::address::Network {
 fn show_recovery_phrase(phrase: &crate::wallet::SeedPhrase) {
     println!("  {}RECOVERY PHRASE — write these 24 words down, offline:{}", BOLD, RESET);
     println!();
-    for (row, chunk) in phrase.words().chunks(4).enumerate() {
-        let line: Vec<String> = chunk.iter().enumerate()
-            .map(|(j, w)| format!("{:2}. {:<10}", row * 4 + j + 1, w)).collect();
-        println!("  {}", line.join(" "));
+    // CRY-4: one wiping buffer, written straight to the terminal.
+    if let Err(e) = crate::wallet::print_phrase_grid(&phrase.words(), "  ") {
+        err(&format!("cannot print the recovery phrase: {e}"));
     }
     println!();
     println!("  {}Anyone with these words controls the funds. They are not stored.{}", MUTED, RESET);

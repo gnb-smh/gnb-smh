@@ -48,7 +48,7 @@ pub mod disclosure;
 pub mod payment;
 pub mod send;
 
-pub use seed::{SeedPhrase, SeedVersion};
+pub use seed::{SeedPhrase, SeedVersion, phrase_grid, print_phrase_grid};
 pub use payment::{
     BuiltPayment, FeeChoice, FeePolicy, PaymentOptions, PrevTxs, DUST_THRESHOLD_SATS,
     MAX_STANDARD_TX_BYTES,

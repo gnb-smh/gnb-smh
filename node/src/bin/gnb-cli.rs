@@ -505,12 +505,13 @@ fn do_newseed(output_path: &str, testnet: bool) {
     let use_passphrase = read_password("Optional passphrase (press Enter to skip): ");
     let passphrase = if use_passphrase.is_empty() { None } else { Some(use_passphrase.as_str()) };
 
-    let wallet = match gnb::hd_wallet::HdWallet::create(&password, passphrase, testnet) {
+    // CRY-4: the wallet does not keep the phrase; `create` hands it over
+    // once, it is printed from one wiping buffer and wiped when dropped.
+    let (wallet, phrase) = match gnb::hd_wallet::HdWallet::create(&password, passphrase, testnet) {
         Ok(w) => w,
         Err(e) => { eprintln!("Failed to create wallet: {}", e); process::exit(1); }
     };
 
-    let mnemonic_str = zeroize::Zeroizing::new(wallet.mnemonic.to_string());
     let first_addr = wallet.addresses[0].1.address.clone();
 
     let path = std::path::Path::new(output_path);
@@ -524,13 +525,12 @@ fn do_newseed(output_path: &str, testnet: bool) {
     println!("  BACKUP YOUR MNEMONIC PHRASE (24 words)");
     println!("══════════════════════════════════════════════════════════════");
     println!();
-    let words: Vec<&str> = mnemonic_str.split_whitespace().collect();
-    for (i, chunk) in words.chunks(4).enumerate() {
-        let line: Vec<String> = chunk.iter().enumerate().map(|(j, w)| {
-            format!("{:2}. {:<10}", i * 4 + j + 1, w)
-        }).collect();
-        println!("  {}", line.join(" "));
+    let words: Vec<&str> = phrase.words().collect();
+    if let Err(e) = gnb::wallet::print_phrase_grid(&words, "  ") {
+        die(&format!("cannot print the mnemonic: {e}"));
     }
+    drop(words);
+    drop(phrase);
     println!();
     println!("══════════════════════════════════════════════════════════════");
     println!();
@@ -714,11 +714,11 @@ fn do_new_wallet(output_path: &str, testnet: bool, random_key: bool) {
         println!();
         println!("RECOVERY PHRASE (24 words). Write them down offline; anyone with them controls the funds:");
         println!();
-        for (row, chunk) in phrase.words().chunks(4).enumerate() {
-            let line: Vec<String> = chunk.iter().enumerate()
-                .map(|(j, w)| format!("{:2}. {:<10}", row * 4 + j + 1, w)).collect();
-            println!("  {}", line.join(" "));
+        // CRY-4: one wiping buffer, written straight to the terminal.
+        if let Err(e) = gnb::wallet::print_phrase_grid(&phrase.words(), "  ") {
+            die(&format!("cannot print the recovery phrase: {e}"));
         }
+        drop(phrase);
         println!();
         if !gnb::wallet::send::confirm("I have written the 24 words down") {
             die("aborted: no wallet file was written");

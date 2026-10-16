@@ -139,10 +139,14 @@ impl Drop for BorrowedKeypairPayload<'_> {
 // ── HD Wallet type ───────────────────────────────────────────────────────────
 
 pub struct HdWallet {
-    pub mnemonic: Mnemonic,
+    /// The mnemonic encrypted under `master_key`, exactly as the wallet file
+    /// stores it (`save` writes it back). CRY-4: the plaintext phrase is not
+    /// kept for the wallet's lifetime: `create` hands it to the caller once
+    /// (to show it for backup), `recover` and `load` drop it as soon as the
+    /// seed and the master key are derived and the file is authenticated.
+    mnemonic_crypto: KeystoreCrypto,
     // SECURITY (A4 lows): never read outside this module — no legitimate
-    // external consumer needs the raw derived encryption key (unlike
-    // `mnemonic`, which `gnb-cli` displays to the user for backup).
+    // external consumer needs the raw derived encryption key.
     master_key: Vec<u8>,      // derived from mnemonic + passphrase + password
     /// BIP39 seed (mnemonic + passphrase). Master seed for key DERIVATION —
     /// no password in it, so the mnemonic alone recovers the keys.
@@ -205,12 +209,15 @@ impl Drop for HdWallet {
 
 impl HdWallet {
 
-    /// Create a new HD wallet: generates a 24-word mnemonic and the first keypair.
+    /// Create a new HD wallet: generates a 24-word mnemonic and the first
+    /// keypair. Returns the wallet and the mnemonic, which the wallet does not
+    /// keep (CRY-4): show it to the user for backup and drop it (it wipes
+    /// itself on drop).
     pub fn create(
         password: &str,
         passphrase: Option<&str>,
         testnet: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, Mnemonic), String> {
         // Generate 256-bit entropy (24 words)
         let entropy = fresh_hd_entropy();
         let mnemonic = Mnemonic::from_entropy(&entropy[..])
@@ -226,16 +233,17 @@ impl HdWallet {
         let mut seed = hd_seed_owner(&mnemonic, passphrase.unwrap_or(""));
         let kp = derive_at(&seed, 0, testnet)?;
         let network = if testnet { "testnet" } else { "mainnet" }.to_string();
+        let mnemonic_crypto = encrypt_mnemonic_for_save(&master_key, &mnemonic)?;
 
-        Ok(HdWallet {
-            mnemonic,
+        Ok((HdWallet {
+            mnemonic_crypto,
             addresses: vec![(0, kp, "primary".to_string())],
             imported: BTreeSet::new(),
             network,
             file_version: WALLET_VERSION,
             seed: std::mem::take(&mut *seed),
             master_key: std::mem::take(&mut *master_key),
-        })
+        }, mnemonic))
     }
 
     /// Recover a wallet from the mnemonic ALONE — no wallet file needed.
@@ -264,9 +272,11 @@ impl HdWallet {
             let label = if index == 0 { "primary".to_string() } else { format!("address-{}", index) };
             addresses.push((index, derive_at(&seed, index, testnet)?, label));
         }
+        let mnemonic_crypto = encrypt_mnemonic_for_save(&master_key, &mnemonic)?;
+        drop(mnemonic);
 
         Ok(HdWallet {
-            mnemonic,
+            mnemonic_crypto,
             addresses,
             imported: BTreeSet::new(),
             network: if testnet { "testnet" } else { "mainnet" }.to_string(),
@@ -353,7 +363,7 @@ impl HdWallet {
         // Encrypt the mnemonic inside a private ownership boundary so its
         // zeroizing plaintext JSON is dropped before the per-address loop and
         // final wallet-file write below.
-        let mnemonic_crypto = encrypt_mnemonic_for_save(&self.master_key, &self.mnemonic)?;
+        let mnemonic_crypto = self.mnemonic_crypto.clone();
 
         // Encrypt each keypair with master_key
         let mut addresses = Vec::new();
@@ -485,6 +495,9 @@ impl HdWallet {
         let mut addresses = Vec::with_capacity(wallet.addresses.len());
         let mut imported = BTreeSet::new();
         let mut seed = hd_seed_owner(&mnemonic, passphrase.unwrap_or(""));
+        // CRY-4: the seed and master key are derived and the file is
+        // authenticated: the phrase is not kept.
+        drop(mnemonic);
         for mut addr in wallet.addresses {
             // Bloch wallet files record bloch1q/bloch1t addresses: same key.
             addr.address = crate::address::normalize_legacy_address(&addr.address);
@@ -522,7 +535,8 @@ impl HdWallet {
         // was derived under `wallet.version`'s salt, so `save()` must write
         // that SAME version back, not the current `WALLET_VERSION`.
         Ok(HdWallet {
-            mnemonic, addresses, imported,
+            mnemonic_crypto: wallet.mnemonic_crypto,
+            addresses, imported,
             network: wallet.network,
             file_version: wallet.version,
             seed: std::mem::take(&mut *seed),
@@ -1405,8 +1419,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join("hd-wallet.json");
 
-        let w = HdWallet::create("test-password-12345!", Some("my-passphrase"), true).unwrap();
-        let mnemonic = w.mnemonic.to_string();
+        let (w, phrase) = HdWallet::create("test-password-12345!", Some("my-passphrase"), true).unwrap();
+        let mnemonic = phrase.to_string();
+        drop(phrase);
         let addr0 = w.addresses[0].1.address.clone();
         w.save(&tmp).unwrap();
 
@@ -1417,7 +1432,10 @@ mod tests {
         assert_eq!(exact.addresses[0].1.address, addr0);
         let loaded = HdWallet::load(&tmp, &mnemonic, Some("my-passphrase"), "test-password-12345!").unwrap();
         assert_eq!(loaded.addresses[0].1.address, addr0);
-        assert_eq!(loaded.mnemonic.to_string(), mnemonic);
+        // CRY-4: the loaded wallet keeps only the encrypted mnemonic, and a
+        // re-save of it still opens with the phrase.
+        loaded.save(&tmp).unwrap();
+        assert!(HdWallet::load(&tmp, &mnemonic, Some("my-passphrase"), "test-password-12345!").is_ok());
 
         // Wrong password fails
         let bad = HdWallet::load(&tmp, &mnemonic, Some("my-passphrase"), "wrong-password!");
@@ -1432,7 +1450,7 @@ mod tests {
 
     #[test]
     fn new_address_increments_index() {
-        let mut w = HdWallet::create("test-password-12345!", None, true).unwrap();
+        let (mut w, _) = HdWallet::create("test-password-12345!", None, true).unwrap();
         assert_eq!(w.addresses.len(), 1);
         w.new_address("savings").unwrap();
         w.new_address("business").unwrap();
@@ -1446,10 +1464,10 @@ mod tests {
     /// and this could only pass by a 2^-256 accident.
     #[test]
     fn same_mnemonic_reproduces_same_addresses() {
-        let mut w = HdWallet::create("test-password-12345!", Some("pp"), true).unwrap();
+        let (mut w, phrase) = HdWallet::create("test-password-12345!", Some("pp"), true).unwrap();
         w.new_address("savings").unwrap();
         w.new_address("business").unwrap();
-        let mnemonic = w.mnemonic.to_string();
+        let mnemonic = phrase.to_string();
         let originals: Vec<String> = w.addresses.iter().map(|(_, kp, _)| kp.address.clone()).collect();
         assert_eq!(originals.len(), 3);
 
@@ -1481,14 +1499,14 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         // Build a wallet whose key is OS-random, exactly like a pre-v3 file.
-        let mut w = HdWallet::create("test-password-12345!", None, true).unwrap();
+        let (mut w, phrase) = HdWallet::create("test-password-12345!", None, true).unwrap();
         let random_kp = crate::wallet::generate_keypair(true);
         let random_addr = random_kp.address.clone();
         w.import_keypair(random_kp, "legacy").unwrap();
         assert!(w.is_derived(0));
         assert!(!w.is_derived(1), "an imported key is not seed-derived");
         w.save(&tmp).unwrap();
-        let mnemonic = w.mnemonic.to_string();
+        let mnemonic = phrase.to_string();
 
         // Strip the v3-only fields to make it a genuine v2-shaped file.
         let json = std::fs::read_to_string(&tmp).unwrap();
@@ -1787,7 +1805,8 @@ mod audit_wallet_boundaries {
         let seed = mnemonic.to_seed("").to_vec();
         let key = derive_at(&seed, u32::MAX, true).unwrap();
         let address = key.address.clone();
-        let mut wallet = HdWallet { mnemonic, master_key:vec![0;32], seed,
+        let mnemonic_crypto = encrypt_mnemonic_for_save(&[0; 32], &mnemonic).unwrap();
+        let mut wallet = HdWallet { mnemonic_crypto, master_key:vec![0;32], seed,
             addresses:vec![(u32::MAX,key,"last".into())], imported:BTreeSet::new(),
             network:"testnet".into(), file_version:WALLET_VERSION };
         assert!(wallet.new_address("overflow").err().unwrap().contains("exhausted"));
@@ -1807,7 +1826,8 @@ mod audit_wallet_boundaries {
     fn empty_wallet_state_is_refused_without_synthesizing_index_one() {
         let mnemonic = Mnemonic::from_entropy(&[42;32]).unwrap();
         let seed = mnemonic.to_seed("").to_vec();
-        let mut wallet = HdWallet { mnemonic, master_key:vec![0;32], seed,
+        let mnemonic_crypto = encrypt_mnemonic_for_save(&[0; 32], &mnemonic).unwrap();
+        let mut wallet = HdWallet { mnemonic_crypto, master_key:vec![0;32], seed,
             addresses:Vec::new(), imported:BTreeSet::new(),
             network:"testnet".into(), file_version:WALLET_VERSION };
 

@@ -99,9 +99,93 @@ fn wipe_secret_fields(req: &mut Value) {
 
 /// Dispatch one request and wipe its secret fields (CRY-4).
 pub fn handle_owned(mut req: Value) -> Result<Value, String> {
-    let out = handle(&req);
-    wipe_secret_fields(&mut req);
+    dispatch_wiping(&mut req)
+}
+
+/// [`handle`], then wipe the request's secret fields in place.
+fn dispatch_wiping(req: &mut Value) -> Result<Value, String> {
+    let out = handle(req);
+    wipe_secret_fields(req);
     out
+}
+
+/// Overwrite every string of `v` (recursively) in place. A response can
+/// carry a secret (`create` returns the new recovery phrase as `words`): once
+/// it has been serialised into the output buffer, the `Value` copy is wiped
+/// before it is dropped (CRY-4).
+fn wipe_value(v: &mut Value) {
+    match v {
+        Value::String(text) => text.zeroize(),
+        Value::Array(items) => items.iter_mut().for_each(wipe_value),
+        Value::Object(map) => map.values_mut().for_each(wipe_value),
+        _ => {}
+    }
+}
+
+/// Serialise `v` into one buffer of exactly its length: the size is counted
+/// first, so the buffer is allocated once and never grows (each growth of a
+/// `Vec` frees an unwiped copy of what it held), and the boxed slice needs
+/// no shrinking reallocation either (CRY-4).
+fn serialize_exact(v: &Value) -> Box<[u8]> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut count = Count(0);
+    // Serialising a `Value` cannot fail.
+    let _ = serde_json::to_writer(&mut count, v);
+    let mut buf = Vec::with_capacity(count.0.max(1));
+    let _ = serde_json::to_writer(&mut buf, v);
+    if buf.len() != buf.capacity() {
+        // Never taken (exact capacity, or the 1-byte minimum for an empty
+        // value): copy into an exact allocation and wipe the original.
+        let exact: Box<[u8]> = buf.as_slice().into();
+        buf.zeroize();
+        return exact;
+    }
+    buf.into_boxed_slice()
+}
+
+/// The whole of [`gnb_call`] on safe types: parse the request, dispatch it,
+/// wipe the request's secret fields, serialise the response into one exact
+/// buffer, then wipe every string of the response `Value` (CRY-4). The
+/// returned buffer is the only copy left; the page frees it through
+/// `gnb_free`, which wipes it.
+pub fn call_bytes(input: &[u8]) -> Box<[u8]> {
+    let mut req = serde_json::from_slice::<Value>(input);
+    let mut out = match &mut req {
+        Ok(req) => match dispatch_wiping(req) {
+            Ok(v) => json!({ "ok": v }),
+            Err(e) => json!({ "error": e }),
+        },
+        Err(e) => json!({ "error": format!("bad request: {e}") }),
+    };
+    let bytes = serialize_exact(&out);
+    wipe_value(&mut out);
+    #[cfg(test)]
+    observe_wiped(req.as_ref().ok(), &out);
+    bytes
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: called by [`call_bytes`] with the request and the response
+    /// `Value`s as they are when `call_bytes` drops them.
+    static WIPE_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(Option<&Value>, &Value)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_wiped(req: Option<&Value>, out: &Value) {
+    WIPE_OBSERVER.with(|o| {
+        if let Some(f) = o.borrow_mut().as_mut() {
+            f(req, out);
+        }
+    });
 }
 
 /// Dispatch one request. Pure Rust, testable on the host.
@@ -341,14 +425,13 @@ pub unsafe extern "C" fn gnb_free(ptr: *mut u8, len: usize) {
 #[no_mangle]
 pub unsafe extern "C" fn gnb_call(ptr: *const u8, len: usize) -> u64 {
     let input = std::slice::from_raw_parts(ptr, len);
-    let out = match serde_json::from_slice::<Value>(input) {
-        Ok(req) => match handle_owned(req) {
-            Ok(v) => json!({ "ok": v }),
-            Err(e) => json!({ "error": e }),
-        },
-        Err(e) => json!({ "error": format!("bad request: {e}") }),
-    };
-    let bytes = out.to_string().into_bytes().into_boxed_slice();
+    // CRY-4: `call_bytes` wipes the request's secrets and the response
+    // `Value`, and returns the response in one exact buffer (no reallocation
+    // copies); `gnb_free` wipes that buffer when the page frees it. (The
+    // previous `out.to_string().into_bytes().into_boxed_slice()` freed
+    // unwiped copies while growing and shrinking, and dropped the response
+    // `Value` with the new recovery phrase in it.)
+    let bytes = call_bytes(input);
     let n = bytes.len();
     let p = Box::into_raw(bytes) as *mut u8;
     ((p as u64) << 32) | n as u64
@@ -359,10 +442,14 @@ mod tests {
     use super::*;
     use gnb_crypto::core::{Transaction, TxInput};
 
+    /// The session is process-global: tests that change it take this lock.
+    static SESSION_TESTS: Mutex<()> = Mutex::new(());
+
     // The session is process-global: keep every flow in one test.
     #[test]
     #[cfg_attr(miri, ignore = "key generation, signing and verification run the PQClean ML-DSA-65 and Falcon-1024 C code, which Miri cannot execute")]
     fn create_export_open_roundtrip_and_pay() {
+        let _session = SESSION_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let created = handle(&json!({"op": "create"})).unwrap();
         let addr = created["address"].as_str().unwrap().to_string();
         // WAL-7: phrase-backed by default, and the phrase restores the key.
@@ -551,6 +638,17 @@ mod tests {
         assert!(bad["error"].as_str().unwrap().starts_with("bad request: "), "{bad}");
         // Empty request: gnb_alloc(0) still returns a freeable buffer.
         assert!(call_through_abi(b"")["error"].as_str().unwrap().starts_with("bad request: "));
+        // CRY-4 through the real ABI: the request's secret fields are wiped
+        // by the time gnb_call drops them.
+        let seen: std::rc::Rc<std::cell::RefCell<Vec<Value>>> = Default::default();
+        let sink = seen.clone();
+        WIPE_OBSERVER.with(|o| *o.borrow_mut() = Some(Box::new(move |req, _| {
+            sink.borrow_mut().extend(req.cloned());
+        })));
+        call(json!({"op": "minfee", "size": 1, "password": "hunter2-hunter2", "words": "a b"}));
+        WIPE_OBSERVER.with(|o| *o.borrow_mut() = None);
+        assert_eq!(seen.borrow()[0]["password"], "");
+        assert_eq!(seen.borrow()[0]["words"], "");
     }
 
     /// CRY-7: `open` opens a keystore of the network the page states
@@ -572,6 +670,66 @@ mod tests {
         assert_eq!(opened.address, testnet_key.address);
         assert!(open_keypair(&json!({"json": ks, "password": "x", "network": "regtest"}))
             .unwrap_err().contains("unknown network"));
+    }
+
+    /// CRY-4: exactly what `gnb_call` does — `call_bytes` — leaves no secret
+    /// in the request or response `Value`s it drops: the password and phrase
+    /// fields of a request are wiped, and so is the new recovery phrase in
+    /// the `create` response once it is serialised into the output buffer
+    /// (which the page frees through the wiping `gnb_free`). Fails if
+    /// `call_bytes` stops wiping either side.
+    #[test]
+    #[cfg_attr(miri, ignore = "create runs the PQClean keygen")]
+    fn gnb_call_path_wipes_request_and_response_secrets() {
+        let _session = SESSION_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let seen: std::rc::Rc<std::cell::RefCell<Vec<(Option<Value>, Value)>>> = Default::default();
+        let sink = seen.clone();
+        WIPE_OBSERVER.with(|o| *o.borrow_mut() = Some(Box::new(move |req, out| {
+            sink.borrow_mut().push((req.cloned(), out.clone()));
+        })));
+
+        let out = call_bytes(br#"{"op":"minfee","size":10,"password":"hunter2-hunter2","words":"alpha beta"}"#);
+        assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["ok"]["fee"], tokenomics::MIN_TX_FEE_SAT.to_string());
+        let out = call_bytes(br#"{"op":"create"}"#);
+        let created: Value = serde_json::from_slice(&out).unwrap();
+        let words = created["ok"]["words"].as_str().unwrap().to_string();
+        assert_eq!(words.split(' ').count(), 24, "the page still receives the phrase");
+        WIPE_OBSERVER.with(|o| *o.borrow_mut() = None);
+        handle(&json!({"op": "wipe"})).unwrap();
+
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 2);
+        let (req, _) = &seen[0];
+        let req = req.as_ref().unwrap();
+        assert_eq!((req["password"].as_str(), req["words"].as_str()), (Some(""), Some("")),
+            "request secrets wiped: {req}");
+        let (_, resp) = &seen[1];
+        assert!(resp["ok"]["words"] == "", "the phrase in the response Value must be wiped");
+        fn all_strings_empty(v: &Value) -> bool {
+            match v {
+                Value::String(s) => s.is_empty(),
+                Value::Array(a) => a.iter().all(all_strings_empty),
+                Value::Object(m) => m.values().all(all_strings_empty),
+                _ => true,
+            }
+        }
+        assert!(all_strings_empty(resp), "every string of the response Value must be wiped");
+        assert!(!String::from_utf8_lossy(&out).is_empty());
+    }
+
+    /// CRY-4: `gnb_call` is `call_bytes` behind the C ABI (the 32-bit ABI
+    /// test exercises it end to end on i686), and a response is serialised
+    /// into exactly its own length.
+    #[test]
+    fn gnb_call_delegates_to_the_wiping_path() {
+        let src = include_str!("lib.rs");
+        let body = &src[src.find("pub unsafe extern \"C\" fn gnb_call(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let code: String = body.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+        assert!(code.contains("call_bytes(input)"), "gnb_call must go through call_bytes");
+        assert!(!code.contains("to_string()") && !code.contains("handle("), "{code}");
+        let v = json!({"ok": {"words": "ab \"c\" \u{e9}", "n": [1, 2, {"x": null}]}});
+        assert_eq!(&*serialize_exact(&v), serde_json::to_vec(&v).unwrap().as_slice());
     }
 
     #[test]
