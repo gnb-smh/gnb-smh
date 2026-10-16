@@ -159,3 +159,34 @@ The test source was inspected to confirm both literal comparisons. The original
 `differential.log` is intentionally preserved as the first-run evidence. These
 Rust commands were executed by the core engineer, not rerun by this reference
 engineer. Final integrated CI and independent-review gates remain pending.
+
+## Final core contract clarification (8cdb075)
+
+This documentation-only follow-up checked the existing implementation at
+`8cdb075d4dabb4f478a2f7624eb2b5f316baadab` and its core brief. It changed only
+this brief and `docs/PQ-PSBT.md`; the Python codec, vectors, tests and CI step
+are unchanged. No tests, reproductions or probes were executed in this
+follow-up. Earlier execution counts above describe their recorded runs and
+are not new validation of this core commit.
+
+Structural decoding remains checked u64. Contextual review additionally
+uses the shared `core::limits::check_tx_money_range` and
+`core::limits::money_add` helpers, then enforces the caller's absolute fee
+ceiling and the 10,000-satoshi `MIN_TX_FEE_SAT` floor before signing callbacks.
+Finalization uses the actual completed transaction with `core::check_min_fee`;
+the pre-signing floor is not an estimate or guarantee of that final minimum.
+Signing validates the complete signed candidate before committing it, leaving
+the original document unchanged if a callback or candidate validation fails.
+This atomicity does not undo callbacks that already ran.
+
+Finalization retains the existing choice of the threshold lowest-indexed
+signers common to every input. It does not support arbitrary different
+threshold sets per input, prove current UTXO state, maturity or relative age,
+or guarantee mempool admission. The 1,000,000-byte format transaction bound
+and default 400 KiB relay limit are separate; no relay rule was changed.
+
+The additional excessive-witness reproduction task was rejected by automatic
+approval review for possible cybersecurity risk. It was not investigated,
+rerun or reformulated in this follow-up. That front and its second review
+lens remain incomplete. The separate candidate-atomicity correction must not
+be reported as closing that open acceptance item.

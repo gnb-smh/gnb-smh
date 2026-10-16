@@ -156,7 +156,10 @@ input sum must cover the output sum. This wallet codec does not additionally
 apply the consensus `MAX_SUPPLY_SAT` bound; structural acceptance, including
 a vector with the exact u64 maximum, is not a consensus-validity verdict.
 The fee is the exact input sum minus output sum, with no floating-point
-conversion.
+conversion. Contextual review applies the existing shared MoneyRange checks:
+`core::limits::check_tx_money_range` for outputs and
+`core::limits::money_add` for input amounts and their sum. The structural
+codec's u64 acceptance does not bypass those signing/finalization checks.
 
 A supplied previous transaction is checked for either spending transaction
 version. Its existing GnB transaction ID must equal the outpoint's 32 bytes,
@@ -175,18 +178,35 @@ unspentness offline. Network, next block height and absolute maximum fee are
 explicit trusted caller inputs to signing/review, not assertions supplied by
 the document. Existing activation checks reject v1 at hardening without
 rewriting a partially signed transaction's version. The absolute fee ceiling
-has no minimum-fee exception. Online signing additionally checks each UTXO
-against the configured node and displays inputs, outputs, fee and change.
+has no minimum-fee exception. Review also requires at least 10,000 satoshis
+(`MIN_TX_FEE_SAT`) before invoking a signing callback. This floor does not
+estimate witness size: finalization applies `core::check_min_fee` to the
+actual finalized transaction and reviewed fee, so its required minimum may
+be higher. Online signing additionally checks each UTXO against the configured
+node and displays inputs, outputs, fee and change.
 
 A creator builds the unsigned document; an updater adds missing public data;
 a signer validates all inputs before invoking a signing callback; a combiner
 requires the same transaction/context and rejects conflicting metadata or
-signatures; a finalizer verifies enough signatures for the threshold; an
-extractor emits the finalized transaction. Derivation paths/fingerprints are
-hints, not proofs of ownership or change. There is no importable `verified`
-or `unspent` field. The Python reference implements encoding, decoding and
-structural consistency only; it implements none of these signing operations
-and never calls a PQ verifier.
+signatures; a finalizer verifies the required signatures and final witness;
+an extractor emits the finalized transaction. Signing builds a candidate and
+validates the complete resulting document before replacing the original.
+Callback or candidate-validation failure leaves the original document
+unchanged; callbacks may already have run before candidate validation fails.
+
+Finalization inherits `PolicySpend`'s restriction to the threshold
+lowest-indexed signers common to **every** input. Separate threshold-sized
+sets on different inputs do not suffice without that common signer set.
+Static finalization does not establish current UTXO existence/unspentness,
+coinbase maturity or relative input age, and does not guarantee mempool
+admission. The format's 1,000,000-byte transaction limit and the node's default
+400 KiB relay limit are distinct bounds; format acceptance is not relay
+admission, and this package changes no relay rule.
+
+Derivation paths/fingerprints are hints, not proofs of ownership or change.
+There is no importable `verified` or `unspent` field. The Python reference
+implements encoding, decoding and structural consistency only; it implements
+none of these signing operations and never calls a PQ verifier.
 
 ## Equivalent JSON
 
