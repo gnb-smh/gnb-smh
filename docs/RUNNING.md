@@ -171,12 +171,19 @@ or resynchronize from a new data directory.
 Every front end writes keystore **v3**, which authenticates the network and
 the address in the AES-GCM associated data. Older **v2** files, from Bloch
 or from GnB before the fix, authenticate neither: editing `gnb1q…` to
-`gnb1t…` in a v2 file still loads the key for the other network. The CLIs
-therefore unlock a v2 keystore for spending (`gnb-cli send`) or signing
-(`gnb-wallet send` / `sign`) only when the network is stated with `--mainnet`
-or `--testnet`. The stored address must be a valid address of that network
-and match the decrypted key, and the file's `network` field must not name the
-other network. The file is then rewritten as v3 under the same password,
+`gnb1t…` (and the `network` field) in a v2 file used to load the key for the
+other network. Every path that opens a keystore therefore authenticates the
+network (re-audit CRY-7): a v3 file proves its own; a v2 file opens only for
+a network the caller states, on every path, not only for spending:
+`gnb-cli send`, `keyinfo` and `importfounder` (`--mainnet` / `--testnet`),
+`gnb-wallet send`, `sign`, `address` and `pubkey` (same flags), the web
+wallet's `open` (the page states mainnet), and the library
+(`Keypair::from_encrypted_bytes_on` / `load_encrypted_on`;
+`from_encrypted_bytes` / `load_encrypted` open v3 files only). The stored
+address must be a valid address of that network and match the decrypted
+key, and the file's `network` field must not name the other network; an HD
+wallet refuses to import a key of the other network. When it is unlocked
+for spending or signing, a v2 file is then rewritten as v3 under the same password,
 but only once the command went ahead: after the send was checked and
 confirmed (`send`) or the message was signed (`sign`); an aborted command
 leaves the v2 file as it was. Before the rewrite the original v2 file is
@@ -193,3 +200,32 @@ calls are `Keypair::unlock_for_spending` (verify in memory, then
 once) and, for front ends without a filesystem,
 `Keypair::unlock_for_spending_bytes` (a front end that stores the v3 JSON
 must also keep, or offer for download, the original v2 bytes).
+
+### Address checksum and the network (CRY-7)
+
+A GnB address is `gnb1q` (mainnet) or `gnb1t` (testnet) followed by the hex
+of the 20-byte key hash and a 4-byte checksum, `SHA3-256(SHA3-256(hash))[..4]`.
+The checksum does not cover the prefix, so `gnb1q…` and `gnb1t…` forms of one
+hash both pass `Address::parse`. A new address version whose checksum commits
+to the network (bech32m-style) was evaluated and is **not** introduced:
+
+- it could only be emitted where every consumer parses it, and they do not:
+  every released GnB wallet and node, the Bloch wallets that share these keys,
+  the explorer and its API (`^gnb1[qt][0-9a-f]{48}$`), the Cloudflare Worker's
+  path filter and third-party integrations would all reject it, so a payment
+  to a new-format address from any of them fails;
+- parsing both forms while emitting only the old one adds nothing: the old
+  form would stay the one users copy;
+- the risk it would remove is already closed where it matters: every payment
+  path compares the destination's network with the wallet's own network,
+  which is authenticated (keystore v3, keyfile v1, or the network the caller
+  states for a v2 file): `TxBuilder::build_payment`, `Wallet` payments,
+  `gnb-cli send`, `gnb-wallet send` and the web wallet's `pay` refuse a
+  destination of the other network, and the node's `--miner-address` uses
+  `Address::parse_for_network`. A prefix typo therefore fails before anything
+  is signed, and a transaction signed for one chain is invalid on the other
+  (the chain id is in every sighash).
+
+Read-only RPC methods (`getbalance`, `getutxos`, `validateaddress`) accept
+either prefix for the same hash; `validateaddress` reports the prefix's
+network.

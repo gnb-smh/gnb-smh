@@ -10,7 +10,12 @@
 //! Requests: `{"op": ...}` with
 //!
 //! ```text
-//! open {json, password}       unlock a keystore (v3/v2, `bloch1q…` accepted for v2; then v1)
+//! open {json, password, network?}
+//!                             unlock a keystore (v3/v2, `bloch1q…` accepted for v2; then v1)
+//!                             of `network` ("mainnet", the default, or "testnet"):
+//!                             v3 and v1 must authenticate that network, a v2 file
+//!                             (which authenticates none) must record an address of it
+//!                             (CRY-7)
 //! create {mnemonic?}          new mainnet key from the WASI CSPRNG (browser crypto).
 //!                             By default (`mnemonic` absent or true) the key is
 //!                             derived from a fresh 24-word phrase, returned ONCE as
@@ -103,15 +108,7 @@ pub fn handle_owned(mut req: Value) -> Result<Value, String> {
 pub fn handle(req: &Value) -> Result<Value, String> {
     match s(req, "op")? {
         "open" => {
-            let raw = s(req, "json")?.as_bytes();
-            let pw = secret(req, "password")?;
-            let kp = match Keypair::from_encrypted_bytes(raw, &pw) {
-                Ok(kp) => kp,
-                Err(e2) => match Wallet::from_encrypted_bytes(raw, &pw) {
-                    Ok(w) => w.into_keypair(),
-                    Err(e1) => return Err(format!("could not open the wallet: {e2} / {e1}")),
-                },
-            };
+            let kp = open_keypair(req)?;
             let out = json!({ "address": kp.address, "public_key": hex::encode(&kp.public_key) });
             set_session(kp);
             Ok(out)
@@ -210,6 +207,39 @@ pub fn handle(req: &Value) -> Result<Value, String> {
         }
         other => Err(format!("unknown op `{other}`")),
     }
+}
+
+/// The key of an `open` request (CRY-7): the page states the network it
+/// serves (the web wallet is a mainnet wallet; default "mainnet"). A keystore
+/// v3 or keyfile v1 authenticates its own network, which must be this one; a
+/// v2 file authenticates nothing and opens only as a key of this network
+/// (`Keypair::from_encrypted_bytes_on`). `pay` then trusts the session key's
+/// network.
+fn open_keypair(req: &Value) -> Result<Keypair, String> {
+    let raw = s(req, "json")?.as_bytes();
+    let pw = secret(req, "password")?;
+    let network = parse_network(req)?;
+    match Keypair::from_encrypted_bytes_on(raw, &pw, network) {
+        Ok(kp) => Ok(kp),
+        Err(e2) => match Wallet::from_encrypted_bytes(raw, &pw) {
+            Ok(w) if w.network() == network => Ok(w.into_keypair()),
+            Ok(_) => Err(format!("could not open the wallet: it is not a {} wallet", network_name(network))),
+            Err(e1) => Err(format!("could not open the wallet: {e2} / {e1}")),
+        },
+    }
+}
+
+/// `network` of an `open` request: "mainnet" (the default) or "testnet".
+fn parse_network(req: &Value) -> Result<Network, String> {
+    match req.get("network").and_then(Value::as_str).unwrap_or("mainnet") {
+        "mainnet" => Ok(Network::Mainnet),
+        "testnet" => Ok(Network::Testnet),
+        other => Err(format!("unknown network `{other}`")),
+    }
+}
+
+fn network_name(n: Network) -> &'static str {
+    if n == Network::Testnet { "testnet" } else { "mainnet" }
 }
 
 fn parse_amount(req: &Value, k: &str) -> Result<u64, String> {
@@ -521,6 +551,27 @@ mod tests {
         assert!(bad["error"].as_str().unwrap().starts_with("bad request: "), "{bad}");
         // Empty request: gnb_alloc(0) still returns a freeable buffer.
         assert!(call_through_abi(b"")["error"].as_str().unwrap().starts_with("bad request: "));
+    }
+
+    /// CRY-7: `open` opens a keystore of the network the page states
+    /// (default mainnet) and refuses one of the other network, so `pay`,
+    /// which trusts the session key's network, never runs on a key of the
+    /// wrong network. (v2 files: gnb-crypto's
+    /// `every_open_path_authenticates_the_network`.)
+    #[test]
+    #[cfg_attr(miri, ignore = "keystore encryption runs Argon2 and the PQClean keygen")]
+    fn open_authenticates_the_network() {
+        // `open_keypair` is the `open` op without the session (the session
+        // is process-global: the round-trip test owns it).
+        let testnet_key = gnb_crypto::wallet::generate_keypair(true);
+        let ks = testnet_key.to_encrypted_json("Correct-Horse-9-battery").unwrap();
+        let err = open_keypair(&json!({"json": ks, "password": "Correct-Horse-9-battery"})).unwrap_err();
+        assert!(err.contains("mainnet was requested"), "{err}");
+        let opened = open_keypair(&json!({"json": ks, "password": "Correct-Horse-9-battery",
+            "network": "testnet"})).unwrap();
+        assert_eq!(opened.address, testnet_key.address);
+        assert!(open_keypair(&json!({"json": ks, "password": "x", "network": "regtest"}))
+            .unwrap_err().contains("unknown network"));
     }
 
     #[test]

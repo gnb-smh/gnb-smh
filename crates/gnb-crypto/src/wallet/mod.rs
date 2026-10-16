@@ -1163,27 +1163,68 @@ impl Keypair {
         serde_json::to_string_pretty(&ks).map_err(|e| e.to_string())
     }
 
+    /// Open a keystore file whose format authenticates its network
+    /// (keystore v3). A v2 file is refused: open it with
+    /// [`Self::load_encrypted_on`] and the network it belongs to (CRY-7).
     pub fn load_encrypted(path: &Path, password: &str) -> Result<Self, String> {
         Self::load_encrypted_with_file_limit(path, password, crate::util::DEFAULT_WALLET_FILE_LIMIT)
     }
 
-    /// Explicit bounded recovery override for authentic large keystores (maximum 512 MiB).
+    /// Open a keystore file of `network`: a v3 file must be that network's
+    /// (authenticated); a v2 file, which authenticates nothing, must record an
+    /// address of that network (prefix and checksum) and must not name the
+    /// other network (CRY-7).
+    pub fn load_encrypted_on(path: &Path, password: &str, network: Network) -> Result<Self, String> {
+        let bytes = crate::util::read_wallet_file(path, crate::util::DEFAULT_WALLET_FILE_LIMIT)
+            .map_err(|e| e.to_string())?;
+        Self::from_encrypted_bytes_on(&bytes, password, network)
+    }
+
+    /// Explicit bounded recovery override for authentic large keystores
+    /// (maximum 512 MiB). Same network rule as [`Self::load_encrypted`].
     pub fn load_encrypted_with_file_limit(path: &Path, password: &str, max_bytes: usize) -> Result<Self, String> {
         let bytes = crate::util::read_wallet_file(path, max_bytes).map_err(|e| e.to_string())?;
         Self::from_encrypted_bytes(&bytes, password)
     }
 
-    /// Open keystore v2 or v3 JSON bytes (no filesystem). Same checks as
-    /// `load_encrypted`; inputs above the default wallet file limit are refused.
+    /// [`Self::load_encrypted_with_file_limit`] for a stated network
+    /// ([`Self::load_encrypted_on`]).
+    pub fn load_encrypted_with_file_limit_on(path: &Path, password: &str, max_bytes: usize, network: Network)
+        -> Result<Self, String>
+    {
+        let bytes = crate::util::read_wallet_file(path, max_bytes).map_err(|e| e.to_string())?;
+        Self::from_encrypted_bytes_on(&bytes, password, network)
+    }
+
+    /// Open keystore v3 JSON bytes (no filesystem); inputs above the default
+    /// wallet file limit are refused.
     ///
-    /// Residual risk (CRY-7, documented): a v2 file authenticates neither its
-    /// `network` field nor its address prefix, and the address checksum does
-    /// not cover the prefix, so editing `gnb1q…` to `gnb1t…` in a v2 file still
-    /// loads the key for the other network here. Spending paths therefore use
-    /// [`Self::load_for_spending`], which makes the caller state the network
-    /// for a v2 file, verifies the stored address against it and rewrites the
-    /// file as v3.
+    /// CRY-7 (re-audit): every open path authenticates the network. A v3
+    /// file authenticates its network and address (AEAD associated data). A
+    /// v2 file authenticates neither, and the address checksum does not cover
+    /// the prefix, so editing `gnb1q…` to `gnb1t…` (and its `network` field)
+    /// loaded the key for the other network on every path that did not use
+    /// the spending unlock (the web wallet's `open`, `gnb-cli import-founder`
+    /// and `keyinfo`). A v2 file is therefore refused here, before any key
+    /// derivation; [`Self::from_encrypted_bytes_on`] opens it for a network
+    /// the caller states.
     pub fn from_encrypted_bytes(bytes: &[u8], password: &str) -> Result<Self, String> {
+        Self::open_keystore_bytes(bytes, password, None)
+    }
+
+    /// Open keystore v2 or v3 JSON bytes for `network`: a v3 file must be
+    /// that network's (authenticated); a v2 file must record an address of
+    /// that network (prefix and checksum, checked before any key derivation)
+    /// whose public key it holds, and must not name the other network in its
+    /// `network` field. Nothing is rewritten ([`Self::load_for_spending`]
+    /// also migrates a v2 file to v3).
+    pub fn from_encrypted_bytes_on(bytes: &[u8], password: &str, network: Network) -> Result<Self, String> {
+        Self::open_keystore_bytes(bytes, password, Some(network))
+    }
+
+    /// The one keystore decoder (v2 / v3) behind every open path; `stated`
+    /// is the network the caller expects (required for v2, CRY-7).
+    fn open_keystore_bytes(bytes: &[u8], password: &str, stated: Option<Network>) -> Result<Self, String> {
         if bytes.len() > crate::util::DEFAULT_WALLET_FILE_LIMIT {
             return Err("keystore exceeds the wallet file size limit".into());
         }
@@ -1191,6 +1232,7 @@ impl Keypair {
         if ks.version != LEGACY_KEYSTORE_VERSION_V2 && ks.version != KEYSTORE_VERSION_V3 {
             return Err("unsupported keystore version".into());
         }
+        let name = |n: Network| if n == Network::Testnet { "testnet" } else { "mainnet" };
         // v3: the AAD binds version, network and address. Both cleartext
         // fields must be canonical and agree before they are authenticated.
         let aad = if ks.version == KEYSTORE_VERSION_V3 {
@@ -1204,8 +1246,30 @@ impl Keypair {
             if address.to_string() != ks.address {
                 return Err("keystore v3 address is not in canonical GnB form".into());
             }
+            if let Some(stated) = stated {
+                if stated != network {
+                    return Err(format!(
+                        "keystore is a {} key (authenticated) but {} was requested",
+                        name(network), name(stated)));
+                }
+            }
             keystore_v3_aad(&ks.network, &ks.address)
         } else {
+            // v2 authenticates nothing: the network comes from the caller,
+            // and the cleartext fields must agree with it (the address is
+            // also bound to the decrypted public key below).
+            let stated = stated.ok_or_else(|| {
+                "keystore v2 does not authenticate its network: state the network (mainnet or \
+                 testnet) to open it (Keypair::from_encrypted_bytes_on / load_encrypted_on)".to_string()
+            })?;
+            let address = crate::address::normalize_legacy_address(&ks.address);
+            Address::parse_for_network(&address, stated).map_err(|e| format!(
+                "keystore v2 address {} is not a {} address: {e}", address, name(stated)))?;
+            let other = name(if stated == Network::Testnet { Network::Mainnet } else { Network::Testnet });
+            if ks.network == other {
+                return Err(format!(
+                    "keystore v2 records network {:?} but {} was requested", ks.network, name(stated)));
+            }
             Vec::new()
         };
 
@@ -1328,34 +1392,13 @@ impl Keypair {
         -> Result<(Self, Option<String>), String>
     {
         let header: EncryptedKeystore = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-        let kp = Self::from_encrypted_bytes(bytes, password)?;
-        let actual = kp.network()?;
-        let name = |n: Network| if n == Network::Testnet { "testnet" } else { "mainnet" };
+        // The shared decoder applies the network rules (CRY-7): a v3 key must
+        // be of the stated network, a v2 file needs one.
+        let kp = Self::open_keystore_bytes(bytes, password, network)?;
         match header.version {
-            KEYSTORE_VERSION_V3 => {
-                if let Some(stated) = network {
-                    if stated != actual {
-                        return Err(format!(
-                            "keystore is a {} key (authenticated) but {} was requested",
-                            name(actual), name(stated)));
-                    }
-                }
-                Ok((kp, None))
-            }
+            KEYSTORE_VERSION_V3 => Ok((kp, None)),
             LEGACY_KEYSTORE_VERSION_V2 => {
-                let stated = network.ok_or_else(|| {
-                    "keystore v2 does not authenticate its network: state the network (mainnet or \
-                     testnet) to unlock it for spending; it is then rewritten as keystore v3"
-                        .to_string()
-                })?;
-                Address::parse_for_network(&kp.address, stated).map_err(|e| format!(
-                    "keystore v2 address {} is not a {} address: {e}", kp.address, name(stated)))?;
-                let other = name(if stated == Network::Testnet { Network::Mainnet } else { Network::Testnet });
-                if header.network == other {
-                    return Err(format!(
-                        "keystore v2 records network {:?} but {} was requested; refusing to migrate",
-                        header.network, name(stated)));
-                }
+                let stated = network.ok_or("keystore v2 needs a stated network")?;
                 let json = kp.to_encrypted_json_with_policy(password, KEYSTORE_VERSION_V3, false)?;
                 let check = Self::from_encrypted_bytes(json.as_bytes(), password)?;
                 if check.private_key != kp.private_key || check.public_key != kp.public_key
@@ -1891,7 +1934,9 @@ mod legacy_keystore_tests {
         for (kdf_params, expected) in cases {
             let keystore = EncryptedKeystore {
                 version: 2,
-                address: "unused".into(),
+                // CRY-7: a v2 file opens for a stated network, and its
+                // address must belong to it (checked before the KDF bounds).
+                address: Address::from_hash([0x77; 20], Network::Mainnet).to_string(),
                 network: "mainnet".into(),
                 crypto: KeystoreCrypto {
                     cipher: "aes-256-gcm".into(),
@@ -1908,7 +1953,7 @@ mod legacy_keystore_tests {
             let bytes = serde_json::to_vec(&keystore).unwrap();
             std::fs::write(&path, &bytes).unwrap();
             assert_eq!(
-                Keypair::load_encrypted_with_file_limit(&path, password, bytes.len())
+                Keypair::load_encrypted_with_file_limit_on(&path, password, bytes.len(), Network::Mainnet)
                     .unwrap_err(),
                 expected
             );
@@ -1944,7 +1989,7 @@ mod legacy_keystore_tests {
         };
         let bytes = serde_json::to_vec(&keystore).unwrap();
         std::fs::write(&path, &bytes).unwrap();
-        let loaded = Keypair::load_encrypted_with_file_limit(&path, password, bytes.len())
+        let loaded = Keypair::load_encrypted_with_file_limit_on(&path, password, bytes.len(), Network::Mainnet)
             .unwrap();
         assert_eq!(loaded.private_key, keypair.private_key);
         assert_eq!(loaded.public_key, keypair.public_key);
@@ -1998,10 +2043,11 @@ mod legacy_keystore_tests {
         let load = |keystore: &EncryptedKeystore| {
             let bytes = serde_json::to_vec(keystore).unwrap();
             std::fs::write(&path, &bytes).unwrap();
-            Keypair::load_encrypted_with_file_limit(
+            Keypair::load_encrypted_with_file_limit_on(
                 &path,
                 password,
                 bytes.len(),
+                Network::Mainnet,
             )
         };
 
@@ -2582,7 +2628,9 @@ mod bloch_keystore_compat_tests {
         let body = kp.address.strip_prefix(crate::core::MAINNET_PREFIX).unwrap();
         let bloch_path = dir.join("bloch.json");
         std::fs::write(&bloch_path, json.replace(&kp.address, &format!("bloch1q{body}"))).unwrap();
-        let loaded = Keypair::load_encrypted(&bloch_path, "correct horse battery 9!").unwrap();
+        // CRY-7: a v2 file opens for a stated network only.
+        assert!(Keypair::load_encrypted(&bloch_path, "correct horse battery 9!").is_err());
+        let loaded = Keypair::load_encrypted_on(&bloch_path, "correct horse battery 9!", Network::Mainnet).unwrap();
         assert_eq!(loaded.address, kp.address);
         assert_eq!(loaded.public_key, kp.public_key);
 
@@ -2591,7 +2639,7 @@ mod bloch_keystore_compat_tests {
         other.push(if last == '0' { '1' } else { '0' });
         let bad_path = dir.join("bad.json");
         std::fs::write(&bad_path, json.replace(&kp.address, &format!("bloch1q{other}"))).unwrap();
-        assert!(Keypair::load_encrypted(&bad_path, "correct horse battery 9!").is_err());
+        assert!(Keypair::load_encrypted_on(&bad_path, "correct horse battery 9!", Network::Mainnet).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2643,14 +2691,17 @@ mod audit_2026_10_wallet_fixes {
         assert!(Keypair::from_encrypted_bytes(downgraded.as_bytes(), PW).is_err());
     }
 
-    /// v2 keystores keep loading (documented residual risk: unauthenticated).
+    /// v2 keystores keep loading, for the network the caller states (CRY-7:
+    /// a v2 file authenticates no network, so none is taken from it).
     #[test]
-    fn keystore_v2_still_loads() {
+    fn keystore_v2_loads_for_its_stated_network() {
         let kp = generate_keypair(true);
         let json = kp.to_encrypted_json_version(PW, LEGACY_KEYSTORE_VERSION_V2).unwrap();
-        let loaded = Keypair::from_encrypted_bytes(json.as_bytes(), PW).unwrap();
+        assert!(Keypair::from_encrypted_bytes(json.as_bytes(), PW).is_err());
+        let loaded = Keypair::from_encrypted_bytes_on(json.as_bytes(), PW, Network::Testnet).unwrap();
         assert_eq!(loaded.address, kp.address);
         assert_eq!(loaded.network().unwrap(), Network::Testnet);
+        assert!(Keypair::from_encrypted_bytes_on(json.as_bytes(), PW, Network::Mainnet).is_err());
     }
 
     fn temp_keystore(tag: &str, contents: &str) -> std::path::PathBuf {
@@ -2737,6 +2788,44 @@ mod audit_2026_10_wallet_fixes {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// CRY-7 (re-audit): EVERY open path authenticates the network, not
+    /// only the spending unlock. A v2 file authenticates neither its
+    /// `network` field nor its address prefix: with both edited to testnet
+    /// (the checksum does not cover the prefix), `from_encrypted_bytes` /
+    /// `load_encrypted` (the web wallet's `open`, `gnb-cli import-founder`
+    /// and `keyinfo`) loaded a mainnet key as a testnet key. A v2 file now
+    /// opens only for a stated network; v3 files authenticate their own.
+    #[test]
+    fn every_open_path_authenticates_the_network() {
+        let kp = generate_keypair(false); // mainnet
+        let v2 = kp.to_encrypted_json_version(PW, LEGACY_KEYSTORE_VERSION_V2).unwrap();
+        let flipped = format!("gnb1t{}", &kp.address[5..]);
+        let forged = v2.replace(&kp.address, &flipped).replace("\"network\": \"mainnet\"", "\"network\": \"testnet\"");
+        assert!(forged.contains(&flipped) && forged.contains("\"testnet\""), "fixture");
+        for bytes in [v2.as_bytes(), forged.as_bytes()] {
+            let err = Keypair::from_encrypted_bytes(bytes, PW).unwrap_err();
+            assert!(err.contains("state the network"), "{err}");
+            let path = temp_keystore("open", std::str::from_utf8(bytes).unwrap());
+            assert!(Keypair::load_encrypted(&path, PW).unwrap_err().contains("state the network"));
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+        // The owner's network opens the genuine file, never the forged one.
+        let opened = Keypair::from_encrypted_bytes_on(v2.as_bytes(), PW, Network::Mainnet).unwrap();
+        assert_eq!((opened.address.as_str(), opened.network().unwrap()), (kp.address.as_str(), Network::Mainnet));
+        assert!(Keypair::from_encrypted_bytes_on(forged.as_bytes(), PW, Network::Mainnet).is_err());
+        assert!(Keypair::from_encrypted_bytes_on(v2.as_bytes(), PW, Network::Testnet).is_err());
+        let path = temp_keystore("open-on", &v2);
+        assert_eq!(Keypair::load_encrypted_on(&path, PW, Network::Mainnet).unwrap().address, kp.address);
+        assert!(Keypair::load_encrypted_on(&path, PW, Network::Testnet).is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        // v3 authenticates its network: opens without a stated network, and
+        // refuses another stated network.
+        let v3 = kp.to_encrypted_json(PW).unwrap();
+        assert_eq!(Keypair::from_encrypted_bytes(v3.as_bytes(), PW).unwrap().address, kp.address);
+        assert!(Keypair::from_encrypted_bytes_on(v3.as_bytes(), PW, Network::Mainnet).is_ok());
+        assert!(Keypair::from_encrypted_bytes_on(v3.as_bytes(), PW, Network::Testnet).is_err());
+    }
+
     /// Bloch v2 keystores (bloch1q… addresses) migrate under their GnB
     /// address; a v2 password below today's policy is kept (not refused).
     #[test]
@@ -2787,7 +2876,7 @@ mod audit_2026_10_wallet_fixes {
         #[cfg(unix)]
         assert_eq!(mode_of(&first), 0o600);
         // The backup still opens as the v2 keystore it was.
-        let reopened = Keypair::from_encrypted_bytes(&std::fs::read(&first).unwrap(), PW).unwrap();
+        let reopened = Keypair::from_encrypted_bytes_on(&std::fs::read(&first).unwrap(), PW, Network::Mainnet).unwrap();
         assert_eq!(reopened.address, kp.address);
 
         // The same v2 file migrated again (e.g. restored from the backup):

@@ -311,6 +311,11 @@ impl HdWallet {
         if crypto::address_from_pubkey(&keypair.public_key, testnet) != keypair.address {
             return Err("imported keypair public key does not match address".into());
         }
+        // CRY-7: a key of the other network never joins this wallet (its
+        // address and the chain id it signs for would be the other chain's).
+        if testnet != (self.network == "testnet") {
+            return Err(format!("imported keypair is not a {} key", self.network));
+        }
         // CRY-5: `sign_message` now verifies its own output under the public
         // key, so a key pair that does not match fails here already.
         let proof = keypair.sign_message(IMPORT_KEY_AUTH_CHALLENGE)
@@ -2337,5 +2342,21 @@ mod audit_wallet_boundaries {
         wallet.try_import_keypair(raw_legacy, "valid-legacy-raw").unwrap();
         assert_eq!(wallet.addresses.len(), 3);
         assert!(wallet.imported.contains(&2));
+    }
+
+    /// CRY-7: a key of the other network is never imported (gnb-cli
+    /// import-founder opens the founder keystore for a stated network, and
+    /// the HD wallet's own network must agree).
+    #[test]
+    fn import_refuses_a_key_of_the_other_network() {
+        let mut wallet = HdWallet::recover(
+            &Mnemonic::from_entropy(&[44;32]).unwrap().to_string(),
+            None, "fixture-password", true, 1,
+        ).unwrap();
+        let mainnet_key = derive_at(&wallet.seed, 5, false).unwrap();
+        assert_eq!(wallet.try_import_keypair(mainnet_key, "other-network").unwrap_err(),
+            "imported keypair is not a testnet key");
+        assert_eq!(wallet.addresses.len(), 1);
+        assert!(wallet.imported.is_empty());
     }
 }

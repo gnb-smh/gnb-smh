@@ -174,18 +174,31 @@ fn main() {
             require_params(params, 1, "keyinfo <wallet.json>");
             let pw = read_password("Wallet password: ");
             let path = std::path::Path::new(params[0]);
-            match gnb::wallet::Keypair::load_encrypted(path, &pw) {
+            // CRY-7: a v2 keystore opens only for the network stated with
+            // --mainnet / --testnet (v3 authenticates its own).
+            match open_keystore(path, &pw, stated_network) {
                 Ok(kp) => {
                     let pk = &kp.public_key; let sk = &kp.private_key;
-                    let suite = |b: &[u8]| -> String {
-                        if b.len() >= 4 && b[0]==0xB1 && b[1]==0x0C {
-                            format!("enveloped suite 0x{:04x}", u16::from_le_bytes([b[2],b[3]]))
-                        } else { "RAW (no envelope)".into() }
+                    // B2-T2: encodings are told apart by exact length, never by
+                    // the first bytes (a raw key starts with random bytes).
+                    let suite = gnb::crypto::public_key_suite(pk);
+                    let pk_form = match suite {
+                        Some(_) if pk.len() == 3_745 => "RAW hybrid (pre-envelope)".to_string(),
+                        Some(s) => format!("enveloped suite 0x{s:04x}"),
+                        None => "UNKNOWN encoding".to_string(),
+                    };
+                    let sk_form = match suite {
+                        Some(1) if sk.len() == 6_337 => "RAW hybrid (pre-envelope)",
+                        Some(1) if sk.len() == 6_341 => "enveloped suite 0x0001",
+                        Some(2) if sk.len() == 4_032 => "RAW ML-DSA-65",
+                        Some(2) if sk.len() == 4_036 => "enveloped suite 0x0002",
+                        _ => "does not match the public key's suite",
                     };
                     println!("address:      {}", kp.address);
-                    println!("pubkey  len:  {}  ({})", pk.len(), suite(pk));
-                    println!("privkey len:  {}  ({})", sk.len(), suite(sk));
-                    println!("expected: hybrid pk=3749 sk=4032+falcon(~2300); mldsa-only pk=1956 sk=4036");
+                    println!("pubkey  len:  {}  ({})", pk.len(), pk_form);
+                    println!("privkey len:  {}  ({})", sk.len(), sk_form);
+                    println!("expected: hybrid pk=3745 raw / 3749 enveloped, sk=6337 raw / 6341 enveloped; \
+                              mldsa-only pk=1956 sk=4036");
                 }
                 Err(e) => { eprintln!("load failed: {}", e); process::exit(1); }
             }
@@ -228,7 +241,7 @@ fn main() {
 
         "importfounder" | "import-founder" => {
             require_params(params, 2, "importfounder <wallet-hd.json> <founder.json>");
-            do_import_founder(params[0], params[1], allow_large_hd_wallet);
+            do_import_founder(params[0], params[1], allow_large_hd_wallet, stated_network);
             return;
         }
 
@@ -631,13 +644,21 @@ fn do_list_addresses(wallet_path: &str, allow_large_hd_wallet: bool) {
     println!("Total: {} address(es)", wallet.addresses.len());
 }
 
-fn do_import_founder(hd_wallet_path: &str, founder_path: &str, allow_large_hd_wallet: bool) {
+fn do_import_founder(
+    hd_wallet_path: &str,
+    founder_path: &str,
+    allow_large_hd_wallet: bool,
+    stated_network: Option<gnb::address::Network>,
+) {
     println!("Importing founder.json into HD wallet...");
     println!();
 
     let founder_password = read_password("founder.json password: ");
     let founder_path_p = std::path::Path::new(founder_path);
-    let founder_kp = match gnb::wallet::Keypair::load_encrypted(founder_path_p, &founder_password) {
+    // CRY-7: a v2 founder keystore authenticates no network: it opens only
+    // for the network stated with --mainnet / --testnet; the HD wallet then
+    // refuses a key of the other network (HdWallet::try_import_keypair).
+    let founder_kp = match open_keystore(founder_path_p, &founder_password, stated_network) {
         Ok(kp) => kp,
         Err(e) => { eprintln!("Failed to load founder.json: {}", e); process::exit(1); }
     };
@@ -741,6 +762,21 @@ fn do_restore_wallet(output_path: &str, testnet: bool) {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Open a keystore without spending it (CRY-7): v3 authenticates its own
+/// network (which must be the stated one, if any); a v2 file opens only for a
+/// stated network.
+fn open_keystore(
+    path: &std::path::Path,
+    password: &str,
+    network: Option<gnb::address::Network>,
+) -> Result<gnb::wallet::Keypair, String> {
+    match network {
+        Some(n) => gnb::wallet::Keypair::load_encrypted_on(path, password, n),
+        None => gnb::wallet::Keypair::load_encrypted(path, password)
+            .map_err(|e| format!("{e} (pass --mainnet or --testnet for a v2 keystore)")),
+    }
+}
 
 /// CRY-4: passwords and mnemonics are read into wiping storage.
 fn read_password(prompt: &str) -> zeroize::Zeroizing<String> {
@@ -883,11 +919,14 @@ fn print_usage() {
                                            private CA or self-signed certificate)
     --allow-large-hd-wallet                Trusted-backup recovery (up to 512 MiB)
     --testnet                              New wallets are testnet (newwallet,
-                                           restorewallet, newseed); for send: the
-                                           keystore must be a testnet key
-    --mainnet                              For send: the keystore must be a mainnet
-                                           key. A v2 keystore needs --mainnet or
-                                           --testnet and is rewritten as v3 (CRY-7)
+                                           restorewallet, newseed); for send,
+                                           keyinfo, importfounder: the keystore
+                                           must be a testnet key
+    --mainnet                              For send, keyinfo, importfounder: the
+                                           keystore must be a mainnet key. A v2
+                                           keystore (which authenticates no
+                                           network) opens only with --mainnet or
+                                           --testnet; send rewrites it as v3 (CRY-7)
     GNB_RPC_API_KEY=<key>                  Sent over https to any host; over plain
                                            http only to loopback (or SSH tunnel)
     --help                                 This message

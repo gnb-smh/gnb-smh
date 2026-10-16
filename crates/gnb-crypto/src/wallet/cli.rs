@@ -242,12 +242,12 @@ pub fn main() {
         }
 
         Cmd::Address { keystore } => {
-            let kp = load_kp(&keystore);
+            let kp = load_kp(&keystore, stated_network(cli.testnet, cli.mainnet));
             println!("  {}", amber(&kp.address));
         }
 
         Cmd::Pubkey { keystore } => {
-            let kp = load_kp(&keystore);
+            let kp = load_kp(&keystore, stated_network(cli.testnet, cli.mainnet));
             let hex = hex::encode(&kp.public_key);
             // Public-key export must include every byte for native script hashing.
             println!("{hex}");
@@ -629,13 +629,19 @@ fn finish_keystore_migration(pending: Option<crate::wallet::PendingKeystoreMigra
     }
 }
 
-fn load_kp(path: &PathBuf) -> crate::wallet::Keypair {
+/// Open a keystore without spending (CRY-7): a v3 file authenticates its
+/// network (and must be the stated one, if any); a v2 file opens only for
+/// the network stated with --mainnet / --testnet.
+fn load_kp(path: &PathBuf, network: Option<crate::address::Network>) -> crate::wallet::Keypair {
     let pw = prompt_password(&format!("  {}password:{} ", MUTED, RESET));
-    let loaded = crate::wallet::Keypair::load_encrypted(path, &pw);
+    let loaded = match network {
+        Some(n) => crate::wallet::Keypair::load_encrypted_on(path, &pw, n),
+        None => crate::wallet::Keypair::load_encrypted(path, &pw),
+    };
     drop(pw);
     match loaded {
         Ok(kp) => { ok("keystore decrypted"); println!(); kp }
-        Err(e) => { err(&format!("Load failed: {}", e)) }
+        Err(e) => { err(&format!("Load failed: {e} (pass --mainnet or --testnet for a v2 keystore)")) }
     }
 }
 
