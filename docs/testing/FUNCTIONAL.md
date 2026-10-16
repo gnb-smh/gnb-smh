@@ -60,9 +60,11 @@ timestamp, the template's bits, the ingress orphan floor as
 `BlockIngress::handle_block` computes it from the selected tip's height) are exercised with
 the real ASERT rule by `node/tests/fix_pow_real_asert.rs` (re-audit POW-5):
 the test-only seam `core::scoped_real_expected_bits()`, compiled only with
-this feature, makes `expected_bits` compute the real rule on the calling
-thread, and the tests reject bits computed for the wrong height or parent
-timestamp. The GnB-SMH v3 switch (`core::adjust_bits_for_algo`: from
+this feature or in gnb-crypto's own unit tests (which pin its scope: the
+pin is lifted on the calling thread while the guard is held and restored
+when it drops, also when unwinding), makes `expected_bits` compute the real rule on
+the calling thread, and the tests reject bits computed for the wrong height
+or parent timestamp. The GnB-SMH v3 switch (`core::adjust_bits_for_algo`: from
 `powit_height()`, 10,000 on mainnet, the ASERT target is 4x harder) is
 covered twice: at the mainnet height for the rule and the ingress reference
 (`expected_bits_switch_to_v3_at_the_mainnet_powit_height`), and at the call

@@ -43,7 +43,7 @@ outside this measurement.
 | `crates/gnb-crypto/src/core/activation.rs` | all | — |
 | `crates/gnb-crypto/src/core/tokenomics.rs` | all | — |
 | `crates/gnb-crypto/src/core/carryover.rs` | all | — |
-| `crates/gnb-crypto/src/core/mod.rs` | every consensus function: chain id, size constants, difficulty wrappers and `expected_bits*`, ASERT parameters, `validate_pow` and the pow-limit checks, the proof cache, coinbase format/value, Merkle roots, txid/wtxid, wire encodings and parsers, size measures (`wire_size`, `size_bytes`), `parse_script_sig*`, `check_coinbase_maturity`, `check_min_fee`, the structural checks, `UndoData` encoding, `Transaction::actual_size` (the pre-activation size of one transaction: the node's mempool admission and the miner's coinbase reserve use it) | the pre-signing fee estimators and output statistics (`Transaction::estimate_size`, `calc_fee`, `estimate_fee`, `total_output`, `unique_output_addresses`: used by the wallet and the advisory `estimatefee` RPC, never by validation, mempool admission or the block template), the human-facing difficulty float (`difficulty_from_bits`, `difficulty_to_target`, `u256_to_f64`: RPC/explorer display), `Debug`/`Display` of `MerkleRoot`, the node's integration-test fixture `Block::test_only_assume_pow_valid` (compiled only with the `test-pow-limit` feature, which these runs never enable, so its mutants would not even be compiled; it inserts through `PowCache::insert`, which is in scope) |
+| `crates/gnb-crypto/src/core/mod.rs` | every consensus function: chain id, size constants, difficulty wrappers and `expected_bits*`, ASERT parameters, `validate_pow` and the pow-limit checks, the proof cache, coinbase format/value, Merkle roots, txid/wtxid, wire encodings and parsers, size measures (`wire_size`, `size_bytes`), `parse_script_sig*`, `check_coinbase_maturity`, `check_min_fee`, the structural checks, `UndoData` encoding, `Transaction::actual_size` (the pre-activation size of one transaction: the node's mempool admission and the miner's coinbase reserve use it), the node tests' real-ASERT seam (`scoped_real_expected_bits`, its guard and `pow_limit_pinned_on_this_thread`, re-audit POW-5: compiled with `cfg(test)` as well as with `test-pow-limit`, so this crate's own tests build and test it) | the pre-signing fee estimators and output statistics (`Transaction::estimate_size`, `calc_fee`, `estimate_fee`, `total_output`, `unique_output_addresses`: used by the wallet and the advisory `estimatefee` RPC, never by validation, mempool admission or the block template), the human-facing difficulty float (`difficulty_from_bits`, `difficulty_to_target`, `u256_to_f64`: RPC/explorer display), `Debug`/`Display` of `MerkleRoot`, the node's integration-test fixture `Block::test_only_assume_pow_valid` (compiled only with the `test-pow-limit` feature, which these runs never enable, so its mutants would not even be compiled; it inserts through `PowCache::insert`, which is in scope) |
 
 The scope, the exclusions and the equivalent mutants are encoded once, in
 `.cargo/mutants.toml` (`examine_globs`, `exclude_re`), which every run below
@@ -361,6 +361,31 @@ job filters of mutants.yml below.
   the ANSI colours of `CARGO_TERM_COLOR=always` (fixed in `7df48b4`); at
   `7df48b4` the job passed.
 
+  On the hardening PR (gnb-smh#6) the job reported 5 survivors in
+  `core/mod.rs`, all in the node tests' real-ASERT seam (re-audit POW-5):
+  `delete !` in `expected_bits`, `test_real_expected_bits -> true` and
+  `-> false`, `RealExpectedBitsGuard::drop -> ()` and
+  `scoped_real_expected_bits -> Default::default()`. The seam was compiled
+  only with `test-pow-limit`, which these runs never enable, so its mutants
+  were never compiled and every one passed. It is now compiled with
+  `cfg(test)` too. The pin's condition moved into
+  `pow_limit_pinned_on_this_thread`, so `expected_bits` keeps only the
+  feature-gated `if`, which has no operator to mutate, and
+  `consensus_tests` tests the scope directly. Each of
+  `real_expected_bits_scope_lifts_the_pin_until_the_guard_drops`,
+  `real_expected_bits_scopes_nest` and
+  `real_expected_bits_scope_unwinds_and_is_per_thread` fails, without the
+  feature, against each of `pow_limit_pinned_on_this_thread -> true`,
+  `-> false`, its `delete !` and `RealExpectedBitsGuard::drop -> ()`;
+  `scoped_real_expected_bits -> Default::default()` is unviable (the guard
+  has no `Default`). `expected_bits_follows_the_real_expected_bits_scope`
+  checks `expected_bits` itself (with the feature, the pinned pow limit
+  outside the scope and the real ASERT bits inside; without it, the real
+  rule either way); in a `test-pow-limit` build it fails against those four
+  mutants and against a negated `if` in `expected_bits`. Checked with the
+  gate on the PR's diff, limited to `expected_bits` and the seam
+  (`--re`, `-j 1`): 7 mutants, 6 caught, 1 unviable, exit 0.
+
 The gate was checked locally both ways: with the exclusions it passes on the
 mutants of `lane16` and `target_to_bits` (27 caught, the 6 equivalent ones
 not run) and of `min_tx_fee_sat` (3 caught, E5 not run); on the `b6a2976`
@@ -387,7 +412,12 @@ change that re-checks the scope.
 2. If some input distinguishes the mutant from the original code, add a test
    that checks that behaviour (an exact boundary, a byte layout, a reference
    value) and confirm it fails against the mutant:
-   `cargo mutants -p <crate> --re '^<mutant name>$'`.
+   `cargo mutants -p <crate> --re '^<mutant name>$'`. Code compiled only
+   under a feature these runs never enable (such as `test-pow-limit`) is
+   never compiled into the mutated tests, so every mutant in it survives:
+   compile it with `cfg(test)` as well and test it (the POW-5 seam), or, if
+   it is a fixture of another crate's tests, exclude it from the scope
+   (`Block::test_only_assume_pow_valid`).
 3. Only if no input can distinguish it, add a row to the equivalent-mutant
    table above with the argument, an `exclude_re` entry inside the
    equivalent-mutant block of `.cargo/mutants.toml` that matches that mutant
