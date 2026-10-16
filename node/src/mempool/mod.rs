@@ -897,6 +897,19 @@ impl Mempool {
     /// wire encoding — the unit of the consensus minimum fee. The median rate
     /// of the pool, never below the consensus minimum rate
     /// (`MIN_FEE_RATE_SAT_PER_KB`) nor the rolling minimum.
+    /// Fee rates (sat per 1,000 wire bytes) of the pooled transactions,
+    /// ascending (B1-T21: the advanced estimate's tiers are rates, applied to
+    /// the caller's transaction size).
+    pub fn fee_rates_per_kb(&self) -> Vec<u64> {
+        let g = self.inner.read();
+        let mut rates: Vec<u64> = g.txs.values().map(|e| {
+            let wire = e.tx.to_wire_bytes(true).len().max(1) as u64;
+            e.fee.saturating_mul(1000) / wire
+        }).collect();
+        rates.sort_unstable();
+        rates
+    }
+
     pub fn estimate_fee_rate_per_kb(&self) -> u64 {
         let floor = crate::core::tokenomics::MIN_FEE_RATE_SAT_PER_KB
             .max(self.rolling_min_fee_rate().saturating_mul(1000));

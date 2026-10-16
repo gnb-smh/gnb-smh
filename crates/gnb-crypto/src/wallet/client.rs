@@ -133,11 +133,7 @@ impl WalletClient {
     /// V4 wire and numbers on the G3 wire; both are read.
     pub async fn estimate_fee(&self) -> Result<FeeEstimate, WalletError> {
         let response = self.call("estimatefeeadvanced", json!([])).await?;
-        Ok(FeeEstimate {
-            next_block: response.get("next_block_sats").and_then(super::sat_u64).unwrap_or(10_000),
-            medium:     response.get("medium_priority").and_then(super::sat_u64).unwrap_or(5_000),
-            slow:       response.get("slow_priority").and_then(super::sat_u64).unwrap_or(1_000),
-        })
+        Ok(fee_estimate_from_response(&response))
     }
 
     /// Height of the next block: the node's `getdaginfo` `next_block_height`
@@ -432,6 +428,21 @@ pub struct FeeEstimate {
     pub slow:       u64,
 }
 
+/// The node's `estimatefeeadvanced` answer as a [`FeeEstimate`] (B1-T21 /
+/// MEM-6). Missing fields fall back to, and every value is floored at, the
+/// consensus minimum fee: the fallbacks were 10,000 / 5,000 / 1,000 sat, and
+/// a node from before the fix reports 5,000 / 1,000 sat on a quiet pool,
+/// both below the 10,000-sat minimum every node enforces.
+pub fn fee_estimate_from_response(response: &Value) -> FeeEstimate {
+    let min = crate::core::tokenomics::MIN_TX_FEE_SAT;
+    let field = |k: &str| response.get(k).and_then(super::sat_u64).unwrap_or(min).max(min);
+    FeeEstimate {
+        next_block: field("next_block_sats"),
+        medium:     field("medium_priority"),
+        slow:       field("slow_priority"),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum FeePreference {
     NextBlock,
@@ -493,6 +504,24 @@ mod tests {
         let s2 = TxStatus::Final { confirmations: 100 };
         assert!(matches!(s1, TxStatus::Confirmed { confirmations: 5 }));
         assert!(matches!(s2, TxStatus::Final { confirmations: 100 }));
+    }
+
+    /// B1-T21 / MEM-6: the client never reports a fee below the consensus
+    /// minimum, whatever (or whether) the node answers.
+    #[test]
+    fn fee_estimate_is_floored_at_the_consensus_minimum() {
+        let min = crate::core::tokenomics::MIN_TX_FEE_SAT;
+        // A node from before the fix, on a quiet pool.
+        let old = fee_estimate_from_response(&json!({
+            "next_block_sats": "10000", "medium_priority": "5000", "slow_priority": "1000"}));
+        assert_eq!((old.next_block, old.medium, old.slow), (min, min, min));
+        // Fields missing: the consensus minimum, not 5,000 / 1,000.
+        let none = fee_estimate_from_response(&json!({}));
+        assert_eq!((none.next_block, none.medium, none.slow), (min, min, min));
+        // Real values above the floor are kept (G3 numbers or V4 strings).
+        let busy = fee_estimate_from_response(&json!({
+            "next_block_sats": 90_000, "medium_priority": "40000", "slow_priority": "17200"}));
+        assert_eq!((busy.next_block, busy.medium, busy.slow), (90_000, 40_000, 17_200));
     }
 
     #[test]

@@ -1894,8 +1894,27 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             }
         }
 
+        // B1-T21 / MEM-6: `[n_inputs=1, n_outputs=2]`. Every field is the
+        // ABSOLUTE fee of a transaction of that shape (`tx_bytes`), from fee
+        // rates, never below `min_tx_fee_sat(tx_bytes)` or the rolling
+        // minimum (`analytics::estimate_fee_advanced`).
         "estimatefeeadvanced" => {
-            let fee = crate::analytics::estimate_fee_advanced(&state.mempool);
+            let count = |i: usize, default: u64| -> Result<usize, Value> {
+                match params.and_then(|p| p.get(i)) {
+                    None | Some(Value::Null) => Ok(default as usize),
+                    Some(v) => match v.as_u64() {
+                        Some(n) if n <= crate::analytics::FEE_ESTIMATE_MAX_IO => Ok(n as usize),
+                        _ => Err(json!({ "error": format!(
+                            "params: [n_inputs, n_outputs], integers in [0, {}]",
+                            crate::analytics::FEE_ESTIMATE_MAX_IO) })),
+                    },
+                }
+            };
+            let (n_in, n_out) = match (count(0, 1), count(1, 2)) {
+                (Ok(i), Ok(o)) => (i, o),
+                (Err(e), _) | (_, Err(e)) => return e,
+            };
+            let fee = crate::analytics::estimate_fee_advanced(&state.mempool, Transaction::estimate_size(n_in, n_out));
             json!({
                 // R3: satoshi amounts → decimal strings.
                 "next_block_sats":  fee.next_block_sats.to_string(),
@@ -1904,6 +1923,17 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 "mempool_median":   fee.mempool_median.to_string(),
                 "mempool_size":     fee.mempool_size,
                 "recommended_gnb": format!("{:.8}", fee.medium_priority as f64 / 1e8),
+                "tx_bytes":         fee.tx_bytes,
+                "inputs":           n_in,
+                "outputs":          n_out,
+                "min_fee_sat":      crate::core::tokenomics::min_tx_fee_sat(fee.tx_bytes).to_string(),
+                "feerate_sat_per_kb": {
+                    "floor":      fee.floor_rate_per_kb.to_string(),
+                    "medium":     fee.medium_rate_per_kb.to_string(),
+                    "next_block": fee.next_block_rate_per_kb.to_string(),
+                },
+                "note": "absolute fees for a transaction of tx_bytes wire bytes (params [n_inputs, n_outputs], default [1, 2]); \
+                         none below the consensus minimum for that size or the mempool's rolling minimum",
             })
         }
 
@@ -3017,6 +3047,58 @@ mod audit_2026_10_rpc_tests {
         assert!(r.get("error").is_none(), "{r}");
         assert_eq!(r["sample_size"], 10, "computed, not served from a cached failure: {r}");
         assert_eq!(r["p50_secs"], 60);
+    }
+
+    /// B1-T21 / MEM-6: `estimatefeeadvanced` never recommends a fee the
+    /// network refuses. On a quiet pool it answered 5,000 sat (medium,
+    /// `recommended_gnb`) and 1,000 sat (slow) against the 10,000-sat
+    /// consensus minimum, and it ignored the transaction size (a 47-input
+    /// payment needs about 800,000 sat). Every field is now an absolute fee
+    /// for the stated size, from the fee-rate estimate, floored at
+    /// `min_tx_fee_sat(size)` and the rolling minimum.
+    #[tokio::test]
+    async fn estimatefeeadvanced_never_recommends_less_than_the_consensus_minimum() {
+        use crate::core::tokenomics::{min_tx_fee_sat, MIN_TX_FEE_SAT};
+        let (_tmp, state) = state_with_chain(1);
+        let sat = |v: &Value, k: &str| -> u64 { v[k].as_str().unwrap_or_else(|| panic!("{k}: {v}")).parse().unwrap() };
+        let fields = ["next_block_sats", "medium_priority", "slow_priority", "mempool_median"];
+        let typical = Transaction::estimate_size(1, 2);
+        let r = dispatch("estimatefeeadvanced", None, &state).await;
+        for k in fields {
+            assert!(sat(&r, k) >= min_tx_fee_sat(typical).max(MIN_TX_FEE_SAT), "{k}: {r}");
+        }
+        let recommended: f64 = r["recommended_gnb"].as_str().unwrap().parse().unwrap();
+        assert!(recommended * 1e8 >= MIN_TX_FEE_SAT as f64 - 0.5, "{r}");
+        // Size-aware: a 47-input, 2-output payment.
+        let big = Transaction::estimate_size(47, 2);
+        let r = dispatch("estimatefeeadvanced", Some(&json!([47, 2])), &state).await;
+        assert_eq!(r["tx_bytes"], big);
+        for k in fields {
+            assert!(sat(&r, k) >= min_tx_fee_sat(big), "{k}: {r}");
+        }
+        assert!(sat(&r, "next_block_sats") >= sat(&r, "medium_priority"));
+        assert!(sat(&r, "medium_priority") >= sat(&r, "slow_priority"));
+        // Absurd sizes are refused, not overflowed.
+        let r = dispatch("estimatefeeadvanced", Some(&json!([u64::MAX, 2])), &state).await;
+        assert!(r["error"].is_string(), "{r}");
+
+        // A busy pool paying 100 sat/byte: the tiers follow its rates.
+        for i in 0..4u8 {
+            let tx = Transaction {
+                version: 1,
+                inputs: vec![TxInput { prev_txid: [0x60 + i; 32], prev_index: 0, script_sig: vec![1; 100], sequence: 0 }],
+                outputs: vec![TxOutput { value: 50_000, script_pubkey: vec![2; 20] }],
+                locktime: 0,
+            };
+            let fee = tx.to_wire_bytes(true).len() as u64 * 100;
+            state.mempool.add(tx, fee).expect("pool accepts the fixture");
+        }
+        let r = dispatch("estimatefeeadvanced", None, &state).await;
+        assert_eq!(r["mempool_size"], 4);
+        let medium_rate: u64 = r["feerate_sat_per_kb"]["medium"].as_str().unwrap().parse().unwrap();
+        assert!((99_000..=100_000).contains(&medium_rate), "{r}");
+        assert!(sat(&r, "medium_priority") >= (typical as u64 * medium_rate).div_ceil(1000));
+        assert_eq!(sat(&r, "slow_priority"), min_tx_fee_sat(typical), "slow pays the floor");
     }
 
     /// MEM-6: `getmempoolinfo` reports the relay policy in force.
