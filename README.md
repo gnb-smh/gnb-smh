@@ -5,9 +5,16 @@ Prebuilt binaries of the GnB full node (`gnb`) and command-line wallet
 
 | Version | Tag | Platform | Archive | Archive SHA-256 |
 |---|---|---|---|---|
-| 0.1.2 (f06b7f8) — **current** | `release-f06b7f8` | Linux x86-64 | [0.1.2-f06b7f8/gnb-0.1.2-f06b7f8-linux-x86_64.tar.gz](0.1.2-f06b7f8/gnb-0.1.2-f06b7f8-linux-x86_64.tar.gz) | `831229731f34668105a41a3f8d5cc4bcaf9019a81666c590ec8e4941495a1b1b` |
+| 0.1.2 (2848dcf) — **current** | `release-2848dcf` | Linux x86-64 | [0.1.2-2848dcf/gnb-0.1.2-2848dcf-linux-x86_64.tar.gz](0.1.2-2848dcf/gnb-0.1.2-2848dcf-linux-x86_64.tar.gz) | `12c1d91523090de4c8df95152c65fe87876b5e457a9219f6a71b35ca6fd7e002` |
+| 0.1.2 (f06b7f8) — superseded | `release-f06b7f8` | Linux x86-64 | [0.1.2-f06b7f8/gnb-0.1.2-f06b7f8-linux-x86_64.tar.gz](0.1.2-f06b7f8/gnb-0.1.2-f06b7f8-linux-x86_64.tar.gz) | `831229731f34668105a41a3f8d5cc4bcaf9019a81666c590ec8e4941495a1b1b` |
 | 0.1.2 (7b02dcc) — superseded | `release-7b02dcc` | Linux x86-64 | [0.1.2-7b02dcc/gnb-0.1.2-7b02dcc-linux-x86_64.tar.gz](0.1.2-7b02dcc/gnb-0.1.2-7b02dcc-linux-x86_64.tar.gz) | `2fa02699c13129076d9c3499022e1472c68ca70e787f03a765aa22749e65c9b5` |
 | 0.1.2 (1a0ba40) — superseded | `v0.1.2` (node source = 1a0ba40) | Linux x86-64 | [0.1.2/gnb-0.1.2-1a0ba40-linux-x86_64.tar.gz](0.1.2/gnb-0.1.2-1a0ba40-linux-x86_64.tar.gz) | `74d27db5b11103f3712f4b5f8f02e38a7b476f68e1f532fd4683f8a104a0e151` |
+
+Binaries inside 0.1.2-2848dcf (`0.1.2-2848dcf/SHA256SUMS`), adds optional
+Bech32m (v2) addresses and PQ-PSBT signing (security round 4):
+
+- `gnb` `a9385c56c58af0c70a5c771fbe77ea0986a021079832b8a6e886ad16dba7a6d0`
+- `gnb-cli` `2197f846dc790dc10038aef521c3c6c1047823a60074a94e57e24169dfcecf2a`
 
 Binaries inside 0.1.2-f06b7f8 (`0.1.2-f06b7f8/SHA256SUMS`), adds bounded
 pre-authentication RPC work (security round 1):
@@ -36,7 +43,7 @@ Also on https://gnb-smh.com/downloads/.
 Verify:
 
 ```
-sha256sum gnb-0.1.2-f06b7f8-linux-x86_64.tar.gz
-tar xzf gnb-0.1.2-f06b7f8-linux-x86_64.tar.gz
-cd gnb-0.1.2-f06b7f8-linux-x86_64 && sha256sum -c SHA256SUMS
+sha256sum gnb-0.1.2-2848dcf-linux-x86_64.tar.gz
+tar xzf gnb-0.1.2-2848dcf-linux-x86_64.tar.gz
+cd gnb-0.1.2-2848dcf-linux-x86_64 && sha256sum -c SHA256SUMS
 ```
