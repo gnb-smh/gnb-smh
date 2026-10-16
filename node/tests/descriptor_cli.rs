@@ -64,3 +64,74 @@ fn descriptor_cli_public_pool_roundtrip_preserves_order_and_never_overwrites() {
     assert!(!refused.status.success());
     assert_eq!(std::fs::read_to_string(&pool).unwrap(), saved);
 }
+
+#[test]
+fn descriptor_cli_refuses_missing_network_extra_arguments_and_invalid_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("body.txt");
+    std::fs::write(&input, body("mainnet")).unwrap();
+    // Positive control makes failures attributable to the variants below.
+    ok(run(&["descriptor", "create", input.to_str().unwrap(), "--mainnet"]));
+    for args in [
+        vec!["descriptor", "create", input.to_str().unwrap()],
+        vec!["descriptor", "create", input.to_str().unwrap(), "--mainnet", "extra"],
+        vec!["descriptor", "create", input.to_str().unwrap(), "--mainnet", "--testnet"],
+        vec!["descriptor", "unknown", input.to_str().unwrap(), "--mainnet"],
+        vec!["descriptor", "create", tmp.path().to_str().unwrap(), "--mainnet"],
+    ] {
+        assert!(!run(&args).status.success(), "accepted {args:?}");
+    }
+    std::fs::write(&input, [0xff, 0xfe]).unwrap();
+    let out = run(&["descriptor", "create", input.to_str().unwrap(), "--mainnet"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("UTF-8"));
+    std::fs::write(&input, vec![b' '; 262_145]).unwrap();
+    let out = run(&["descriptor", "create", input.to_str().unwrap(), "--mainnet"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("exceeds"));
+    std::fs::write(&input, vec![b' '; 1_048_577]).unwrap();
+    for operation in ["import", "export", "pool"] {
+        let output = tmp.path().join("must-not-create.json");
+        let mut args = vec!["descriptor", operation, input.to_str().unwrap(), "--mainnet"];
+        if operation != "import" { args.push(output.to_str().unwrap()); }
+        let out = run(&args);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("exceeds"));
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn descriptor_cli_import_rejects_duplicate_fields_and_other_network() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("body.txt");
+    std::fs::write(&input, body("mainnet")).unwrap();
+    let created = ok(run(&["descriptor", "create", input.to_str().unwrap(), "--mainnet"]));
+    let descriptor = created["descriptor"].as_str().unwrap();
+    let pool = tmp.path().join("pool.json");
+    std::fs::write(&pool, json!({"format":"gnb-watch-only-v1", "network":"mainnet", "descriptors":[descriptor]}).to_string()).unwrap();
+    assert_eq!(ok(run(&["descriptor", "import", pool.to_str().unwrap(), "--mainnet"]))["count"], 1);
+    assert!(!run(&["descriptor", "import", pool.to_str().unwrap(), "--testnet"]).status.success());
+    let duplicate = format!("{{\"format\":\"gnb-watch-only-v1\",\"network\":\"mainnet\",\"network\":\"mainnet\",\"descriptors\":[{}]}}", serde_json::to_string(descriptor).unwrap());
+    std::fs::write(&pool, duplicate).unwrap();
+    let out = run(&["descriptor", "import", pool.to_str().unwrap(), "--mainnet"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("duplicate"));
+}
+
+#[cfg(unix)]
+#[test]
+fn descriptor_cli_export_refuses_existing_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("keys.json");
+    let target = tmp.path().join("keep.txt");
+    let link = tmp.path().join("pool.json");
+    std::fs::write(&input, json!(["42".repeat(3745)]).to_string()).unwrap();
+    std::fs::write(&target, "keep exactly").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let positive = tmp.path().join("control.json");
+    ok(run(&["descriptor", "pool", input.to_str().unwrap(), positive.to_str().unwrap(), "--mainnet"]));
+    assert!(!run(&["descriptor", "pool", input.to_str().unwrap(), link.to_str().unwrap(), "--mainnet"]).status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep exactly");
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+}
