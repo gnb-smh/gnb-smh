@@ -179,18 +179,22 @@ As a client the node:
   most 8 peers, with a growing delay from the third attempt on (250 ms
   doubling, at most 4 s), and drops it after 10 minutes or once every
   connected peer has answered it;
-- ranks a peer down for a "not found" to one of its own requests (taken
-  back when every peer asked answered "not found" and the request ran out
-  of peers or attempts), never for a "not found" to a block another peer
-  announced (that announcer is ranked down instead when nobody serves the
-  block), for an empty header answer after claiming to be ahead, and for
-  each Busy back-off after the first two in a row without a useful answer;
-  a peer that keeps answering uselessly is asked only when no better peer
-  could take the request at all;
+- ranks a peer down for a "not found" to one of its own requests or to a
+  block that a peer it dialed announced (taken back when every peer asked
+  answered "not found" and the request ran out of peers or attempts); for
+  a "not found" to a block that a peer which connected to it announced
+  (the announcement may be made up) only once a peer it dialed serves that
+  block; the announcing peer for its own "not found", or when it answered
+  Busy for the block and nobody served it; a peer for an empty header
+  answer after claiming to be ahead, and for each Busy back-off after the
+  first two in a row without a useful answer. A peer that keeps answering
+  uselessly is asked only when no better peer could take the request at
+  all;
 - sends a header request first to up to 4 peers that recently claimed to
-  be ahead (in an order keyed by a per-node secret, peers it dialed first);
-  a shorter answer than asked from one of them is used and the request also
-  goes to the next of them;
+  be ahead, one after the other: peers it dialed first, then in an order
+  keyed by a per-node secret (never by the size of the claim or by peer
+  id); a shorter answer than asked from one of them is used and the request
+  also goes to the next of them;
 - keeps each peer's cooldown, scores and rotation slot when it disconnects
   (up to 1,024 peers), so reconnecting does not clear a stall cooldown
   (60 s, doubling for repeat offenders up to 16 minutes);

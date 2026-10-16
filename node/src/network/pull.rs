@@ -24,14 +24,18 @@
 //!   left to ask, or after [`MAX_PULL_AGE`]. Busy is back-pressure: it
 //!   neither uses an attempt nor excludes the peer, but a peer that answers
 //!   only Busy ranks down (`sync_rr::FREE_BUSY_EPISODES`).
-//! * NotFound for one of the node's own pulls counts against the answering
-//!   peer (it ranks down); the charge is refunded when every peer asked
-//!   answered NotFound and the pull ran out of peers or attempts (nobody had
-//!   the block: the answers were true). NotFound for a block another peer
-//!   announced costs the answering peer nothing (it may truly not have it):
-//!   the announcer pays one useless answer when nobody serves the block.
-//!   Only a NotFound from a peer we dialed is delivered (it may count toward
-//!   abandoning a frontier tip: free inbound identities cannot abandon one).
+//! * NotFound for one of the node's own pulls, or for a block a peer we
+//!   dialed announced, counts against the answering peer at once (it ranks
+//!   down); the charge is refunded when every peer asked answered NotFound
+//!   (the announcer excepted) and the pull ran out of peers or attempts
+//!   (nobody had the block: the answers were true). NotFound for a block an
+//!   identity that connected to us announced (free, and the announcement is
+//!   unverified: it may be made up) counts against the answering peer only
+//!   once a peer we dialed serves that block. The announcer pays one useless
+//!   answer for its own NotFound, or when it was asked (Busy) and nobody
+//!   served the block. Only a NotFound from a peer we dialed is delivered (it
+//!   may count toward abandoning a frontier tip: free inbound identities
+//!   cannot abandon one).
 //! * A GetHeaders answered short (fewer entries than asked, none at all
 //!   included) by a peer that claimed to be ahead is delivered and also
 //!   asked of the next such peer: one claimer cannot hold header sync back.
@@ -131,14 +135,20 @@ struct PendingPull {
     pinned: bool,
     /// Peers that answered or failed it: never asked again.
     tried: Vec<PeerId>,
-    /// Peers charged for a NotFound to this (local) pull: refunded when
-    /// every peer asked answered NotFound and the pull is dropped.
+    /// Peers charged for a NotFound to this pull (the node's own, or
+    /// announced by a peer we dialed): refunded when every peer asked
+    /// answered NotFound and the pull is dropped.
     not_found: Vec<PeerId>,
     /// `source` connected to us (counted in
     /// [`MAX_PENDING_INBOUND_ATTRIBUTED`]).
     inbound_source: bool,
     /// `source` already paid for this pull (its own NotFound).
     source_charged: bool,
+    /// `source` was asked for it and answered Busy.
+    source_asked: bool,
+    /// Peers that answered NotFound for a block an inbound `source`
+    /// announced: charged only once a peer we dialed serves it.
+    doubted: Vec<PeerId>,
     attempts: u8,
     not_before: Instant,
     created: Instant,
@@ -291,6 +301,8 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
             not_found: Vec::new(),
             inbound_source,
             source_charged: false,
+            source_asked: false,
+            doubted: Vec::new(),
             attempts: 0,
             not_before: now,
             created: now,
@@ -331,19 +343,21 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
 
     /// Drop a pull for good. Its NotFound charges are refunded only when it
     /// ran out of peers or attempts and every peer asked answered NotFound
-    /// (nobody had the block: the answers were true); a timeout or a broken
+    /// (the announcer's own NotFound included: nobody had the block, the
+    /// answers were true); a timeout or a broken
     /// answer among them, an expiry or an eviction refunds nothing. A block
-    /// announced by a still-connected peer that nobody served costs that
-    /// announcer one useless answer (unless its own NotFound already did),
-    /// except on eviction.
+    /// announced by a still-connected peer that was asked for it (and
+    /// answered Busy) and that nobody served costs that announcer one
+    /// useless answer (unless its own NotFound already did), except on
+    /// eviction.
     fn drop_pull(&mut self, p: PendingPull, now: Instant, kind: DropKind) {
         debug!("directed pull [{}] dropped ({kind:?}) after {} attempt(s)", p.req.kind_name(), p.attempts);
-        if kind == DropKind::NobodyServed && p.tried.iter().all(|t| p.not_found.contains(t)) {
+        if kind == DropKind::NobodyServed && p.tried.iter().all(|t| p.not_found.contains(t) || p.source == Some(*t)) {
             for peer in &p.not_found {
                 self.selector.refund_useless(peer, now, 1.0);
             }
         }
-        if kind != DropKind::Evicted && !p.source_charged {
+        if kind != DropKind::Evicted && p.source_asked && !p.source_charged {
             if let Some(s) = p.source.filter(|s| self.selector.is_connected(s)) {
                 self.selector.charge_useless(&s, now, 1.0);
             }
@@ -384,6 +398,8 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
             not_found: Vec::new(),
             inbound_source: false,
             source_charged: false,
+            source_asked: false,
+            doubted: Vec::new(),
             attempts: 0,
             not_before: now,
             created: now,
@@ -479,6 +495,9 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
             // NET-5: back-pressure, not an offence; no attempt used, and the
             // peer may be asked again after its short back-off.
             self.selector.on_busy(&peer, now);
+            if p.source == Some(peer) {
+                p.source_asked = true;
+            }
             if p.pinned {
                 self.release(&p);
             } else {
@@ -495,18 +514,27 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
         match resp {
             SyncResponse::BlockNotFound { .. } => {
                 match p.source {
-                    // B1-T6 review: a block another peer announced. This
-                    // peer may truly not have it: no charge (the announcer
-                    // pays if nobody serves it, `drop_pull`). Charging it
-                    // let an attacker announce made-up blocks and turn every
-                    // honest peer into a poor one with their true NotFounds.
-                    Some(s) if s != peer => self.selector.on_closed(&peer),
-                    Some(_) => {
+                    Some(s) if s == peer => {
                         // The announcer itself cannot serve what it announced.
                         self.selector.on_useless(&peer, now, 1.0);
                         p.source_charged = true;
                     }
-                    None => {
+                    // B1-T6 review: a block an identity that connected to us
+                    // announced, which may be made up. Charged only once a
+                    // peer we dialed serves the block (below); the announcer
+                    // pays if nobody does (`drop_pull`). Charging at once let
+                    // an attacker announce made-up blocks and turn every
+                    // honest peer into a poor one with their true NotFounds;
+                    // never charging let free NotFound identities use up the
+                    // attempts of pulls an honest peer announced.
+                    Some(_) if p.inbound_source => {
+                        self.selector.on_closed(&peer);
+                        p.doubted.push(peer);
+                    }
+                    // The node's own pull, or a block a peer we dialed
+                    // announced (headers-first IBD): charged at once,
+                    // refunded if nobody had the block (`drop_pull`).
+                    _ => {
                         self.selector.on_useless(&peer, now, 1.0);
                         p.not_found.push(peer);
                     }
@@ -540,6 +568,14 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
             }
             _ => {
                 self.selector.on_success(&peer);
+                // The block exists and a peer we chose served it: the
+                // NotFounds it got for another peer's announcement were
+                // useless answers after all.
+                if matches!(resp, SyncResponse::Block { .. }) && self.selector.is_outbound(&peer) {
+                    for d in &p.doubted {
+                        self.selector.charge_useless(d, now, 1.0);
+                    }
+                }
                 self.release(&p);
                 ResponseAction { deliver: true, violation: None }
             }

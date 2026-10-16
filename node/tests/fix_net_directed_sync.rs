@@ -394,43 +394,129 @@ fn inbound_identities_cannot_fill_the_pull_queue() {
     assert_eq!(s.enqueue(get_block(7_000_000), Some(late), &[late], t0), Enqueued::Refused);
 }
 
-/// Review of B1-T6: a NotFound for a block ANOTHER peer announced costs the
-/// answering peer nothing (it may truly not have it); the announcer pays
-/// when nobody serves the block. Before, an attacker's made-up announcements
-/// were answered NotFound by every honest peer, and each answer ranked that
-/// honest peer down until all of them were poor peers.
+/// Review of B1-T6: a NotFound for a block an identity that connected to
+/// us announced (free, unverified: it may be made up) costs the answering
+/// peer nothing for now; the announcer pays one useless answer when it
+/// cannot serve the block itself. For a block a peer we dialed announced,
+/// the NotFounds count at once and are refunded when nobody had it (the
+/// announcer's own NotFound included). Before, an attacker's made-up
+/// announcements were answered NotFound by every honest peer, and each
+/// answer ranked that honest peer down until all of them were poor peers.
 #[test]
 fn not_found_for_a_block_another_peer_announced_is_charged_to_the_announcer() {
-    let t0 = Instant::now();
-    let (mut s, p) = scheduler(3, t0);
-    let announcer = p[0];
-    let mut id = 0;
-    s.on_misbehaving(&announcer, t0); // on cooldown: the pull goes to the others
-    s.enqueue(get_block(42), Some(announcer), &[announcer], t0);
-    let mut now = t0;
-    for _ in 0..2 {
-        let sent = drain(&mut s, now, &mut id);
-        let (peer, rid, _) = sent[0].clone();
-        assert_ne!(peer, announcer);
-        s.on_response(rid, peer, &SyncResponse::BlockNotFound { block_hash: h(42) }, now);
-        assert_eq!(s.selector().penalty(&peer, now), 0.0, "a true NotFound for another peer's announcement was charged");
-        now += Duration::from_millis(10);
-    }
-    // Then the announcer itself says NotFound: it pays, and the pull is dropped.
-    let mut rid = None;
-    for step in 0..40 {
-        let t = t0 + Duration::from_secs(61 + 15 * step);
-        if let Some((peer, r, _)) = drain(&mut s, t, &mut id).first().cloned() {
-            assert_eq!(peer, announcer);
-            rid = Some((r, t));
-            break;
+    for announcer_dialed in [false, true] {
+        let t0 = Instant::now();
+        let mut s: PullScheduler<u64> = PullScheduler::new(HashSet::new());
+        let announcer = PeerId::random();
+        let others = [PeerId::random(), PeerId::random()];
+        s.on_connect(announcer, announcer_dialed, t0);
+        for o in &others {
+            s.on_connect(*o, true, t0);
+        }
+        let mut id = 0;
+        s.on_misbehaving(&announcer, t0); // on cooldown: the pull goes to the others
+        s.enqueue(get_block(42), Some(announcer), &[announcer], t0);
+        let mut now = t0;
+        for _ in 0..2 {
+            let sent = drain(&mut s, now, &mut id);
+            let (peer, rid, _) = sent[0].clone();
+            assert_ne!(peer, announcer);
+            s.on_response(rid, peer, &SyncResponse::BlockNotFound { block_hash: h(42) }, now);
+            let charged = s.selector().penalty(&peer, now);
+            if announcer_dialed {
+                assert!((charged - 1.0).abs() < 1e-9, "a NotFound for a dialed peer's announcement counts at once: {charged}");
+            } else {
+                assert_eq!(charged, 0.0, "a true NotFound for an inbound identity's announcement was charged");
+            }
+            now += Duration::from_millis(10);
+        }
+        // Then the announcer itself says NotFound: it pays, and the pull is dropped.
+        let mut rid = None;
+        for step in 0..40 {
+            let t = t0 + Duration::from_secs(61 + 15 * step);
+            if let Some((peer, r, _)) = drain(&mut s, t, &mut id).first().cloned() {
+                assert_eq!(peer, announcer);
+                rid = Some((r, t));
+                break;
+            }
+        }
+        let (r, t) = rid.expect("the pull went back to its announcer once its cooldown ended");
+        let before = s.selector().penalty(&announcer, t);
+        s.on_response(r, announcer, &SyncResponse::BlockNotFound { block_hash: h(42) }, t);
+        drain(&mut s, t, &mut id);
+        assert_eq!(s.dropped(), 1);
+        let paid = s.selector().penalty(&announcer, t) - before;
+        assert!((paid - 1.0).abs() < 1e-9, "the announcer paid {paid} for its unservable announcement (one useless answer)");
+        for other in &others {
+            assert_eq!(s.selector().penalty(other, t), 0.0, "a true NotFound stayed charged (dialed announcer: {announcer_dialed})");
         }
     }
-    let (r, t) = rid.expect("the pull went back to its announcer once its cooldown ended");
-    s.on_response(r, announcer, &SyncResponse::BlockNotFound { block_hash: h(42) }, t);
-    drain(&mut s, t, &mut id);
-    assert_eq!(s.dropped(), 1);
-    assert!(s.selector().penalty(&announcer, t) > 0.0, "the announcer did not pay for its unservable announcement");
+}
+
+/// Review of B1-T6 (follow-up): a NotFound for a block an identity that
+/// connected to us announced is not free either. It is held against the
+/// answering peer once a peer we dialed serves the block (it existed: the
+/// answer was useless), never when only the announcing identity "serves"
+/// it (it may have announced a made-up block and answer with a made-up
+/// body). Never charging such NotFounds (nor those for a dialed peer's
+/// announcement, which count at once) let eight free NotFound identities use
+/// up the attempts of most pulls an honest peer announced
+/// (`announced_pulls_resist_fast_not_found_liars`).
+#[test]
+fn not_found_to_an_announced_block_counts_once_a_dialed_peer_serves_it() {
+    let t0 = Instant::now();
+    let mut id = 0;
+    let serve = |s: &mut PullScheduler<u64>, sent: Vec<(PeerId, u64, SyncRequest)>| {
+        for (peer, rid, req) in sent {
+            let SyncRequest::GetBlock { block_hash } = req else { panic!("{req:?}") };
+            s.on_response(rid, peer, &SyncResponse::Block { block_hash, blue_score: 1, height: 1, block_data: vec![1] }, t0);
+        }
+    };
+
+    // A block an inbound identity announced, then served by a peer we dialed.
+    let mut s: PullScheduler<u64> = PullScheduler::new(HashSet::new());
+    let (announcer, liar, dialed) = (PeerId::random(), PeerId::random(), PeerId::random());
+    s.on_connect(announcer, false, t0);
+    s.on_connect(liar, false, t0);
+    s.on_connect(dialed, true, t0);
+    s.on_misbehaving(&announcer, t0); // backing off: not asked for a while
+    // The dialed peer is busy with the node's own pulls.
+    for i in 0..MAX_INFLIGHT_PER_PEER {
+        s.enqueue(get_block(1_000 + i), None, &[dialed], t0);
+    }
+    let busy = drain(&mut s, t0, &mut id);
+    assert_eq!(busy.len(), MAX_INFLIGHT_PER_PEER as usize);
+    assert!(busy.iter().all(|(p, _, _)| *p == dialed));
+    s.enqueue(get_block(42), Some(announcer), &[announcer], t0);
+    let (to, rid, _) = drain(&mut s, t0, &mut id)[0].clone();
+    assert_eq!(to, liar);
+    s.on_response(rid, liar, &SyncResponse::BlockNotFound { block_hash: h(42) }, t0);
+    assert_eq!(s.selector().penalty(&liar, t0), 0.0, "not charged before the block turns out to exist");
+    assert!(drain(&mut s, t0, &mut id).is_empty(), "nobody free to ask");
+    serve(&mut s, busy);
+    let (to, rid, _) = drain(&mut s, t0, &mut id)[0].clone();
+    assert_eq!(to, dialed);
+    s.on_response(rid, dialed, &block(42), t0);
+    assert!((s.selector().penalty(&liar, t0) - 1.0).abs() < 1e-9, "the NotFound was not held against the liar");
+    assert_eq!(s.selector().penalty(&dialed, t0), 0.0);
+
+    // A block an inbound identity announced and "serves" itself.
+    let mut s: PullScheduler<u64> = PullScheduler::new(HashSet::new());
+    let (attacker, honest) = (PeerId::random(), PeerId::random());
+    s.on_connect(attacker, false, t0);
+    s.on_connect(honest, true, t0);
+    s.enqueue(get_block(43), Some(attacker), &[attacker], t0);
+    let (to, rid, _) = drain(&mut s, t0, &mut id)[0].clone();
+    assert_eq!(to, attacker, "the announcer is asked first");
+    s.on_response(rid, attacker, &SyncResponse::Busy, t0);
+    let (to, rid, _) = drain(&mut s, t0, &mut id)[0].clone();
+    assert_eq!(to, honest, "the announcer is backing off: the other peer is asked");
+    s.on_response(rid, honest, &SyncResponse::BlockNotFound { block_hash: h(43) }, t0);
+    let t = t0 + Duration::from_secs(3);
+    let (to, rid, _) = drain(&mut s, t, &mut id)[0].clone();
+    assert_eq!(to, attacker);
+    s.on_response(rid, attacker, &block(43), t);
+    assert_eq!(s.selector().penalty(&honest, t), 0.0, "a made-up announcement got an honest NotFound charged");
 }
 
 /// Review of B1-T6: a NotFound charge on the node's own pull is refunded
@@ -585,6 +671,18 @@ struct Outcome {
     phantoms: u64,
 }
 
+/// How the simulated node's pulls are queued.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Feed {
+    /// The node's own pulls, no hint.
+    Local,
+    /// The node's own pulls, each naming an honest server as having it.
+    Hinted,
+    /// Pulls announced by an honest server's Headers answer (headers-first
+    /// IBD: `NetworkControl::Fetch`), attributed to it and hinted to it.
+    Announced,
+}
+
 /// `n` GetBlock pulls of blocks every honest server has, from a node
 /// connected (outbound) to `honest` honest servers (latency
 /// `honest_latency`, the node's own per-requester rate limit: 64 burst, then
@@ -593,6 +691,11 @@ struct Outcome {
 /// its 4th violation (the network loop's misbehaviour threshold). Runs until
 /// every pull completed, nothing is left, or `limit` simulated time.
 fn simulate(n: u32, honest: usize, honest_latency: Duration, attackers: &[(Role, Duration)], hinted: bool) -> Outcome {
+    simulate_feed(n, honest, honest_latency, attackers, if hinted { Feed::Hinted } else { Feed::Local })
+}
+
+/// [`simulate`] with the pulls queued as `feed` says.
+fn simulate_feed(n: u32, honest: usize, honest_latency: Duration, attackers: &[(Role, Duration)], feed: Feed) -> Outcome {
     let limit = Duration::from_secs(600);
     let t0 = Instant::now();
     let me = PeerId::random();
@@ -614,8 +717,13 @@ fn simulate(n: u32, honest: usize, honest_latency: Duration, attackers: &[(Role,
     let mut phantoms = 0u64;
     let mut next_feed = Duration::ZERO;
     for i in 0..n {
-        let hints = if hinted { vec![peers[i as usize % honest].id] } else { vec![] };
-        assert_eq!(s.enqueue(get_block(i), None, &hints, t0), Enqueued::Queued);
+        let announcer = peers[i as usize % honest].id;
+        let (source, hints) = match feed {
+            Feed::Local => (None, vec![]),
+            Feed::Hinted => (None, vec![announcer]),
+            Feed::Announced => (Some(announcer), vec![announcer]),
+        };
+        assert_eq!(s.enqueue(get_block(i), source, &hints, t0), Enqueued::Queued);
     }
     let mut queue: BinaryHeap<Reverse<(Duration, u64)>> = BinaryHeap::new();
     let mut events: HashMap<u64, Ev> = HashMap::new();
@@ -796,6 +904,30 @@ fn hinted_pulls_bypass_the_fast_liar() {
     let o = simulate(2_000, 4, HONEST, &[(Role::NotFoundLiar, FAST)], true);
     assert_all_honest_pulls_complete(&o, 2_000, 1);
     assert!(o.to_attackers * 10 < o.sent, "the liar received {} of {} requests", o.to_attackers, o.sent);
+}
+
+/// Pulls announced by honest servers (headers-first IBD: each attributed to
+/// the server whose Headers answer named it) against fast NotFound liars:
+/// a liar's NotFound for a block another peer announced must still rank the
+/// liar down once the block turns out to exist (another peer serves it), or
+/// enough free identities use up every pull's attempts while the announcer
+/// is busy, and the honest announcer is blamed for the drops.
+#[test]
+fn announced_pulls_resist_fast_not_found_liars() {
+    let runs: Vec<(usize, usize, u32, Outcome)> = [(4usize, 3usize), (4, 8), (1, 8)]
+        .into_iter()
+        .map(|(honest, liars)| {
+            let n = 500 * honest as u32;
+            let attackers = vec![(Role::NotFoundLiar, FAST); liars];
+            let o = simulate_feed(n, honest, HONEST, &attackers, Feed::Announced);
+            eprintln!("{honest} honest, {liars} liars: {o:?}");
+            (honest, liars, n, o)
+        })
+        .collect();
+    for (honest, liars, n, o) in &runs {
+        assert_all_honest_pulls_complete(o, *n, *liars);
+        assert!(o.to_attackers <= 16 * liars, "the liars kept getting pulls ({honest} honest, {liars} liars): {o:?}");
+    }
 }
 
 /// Review of B1-T6: one free identity announces 64 made-up blocks every

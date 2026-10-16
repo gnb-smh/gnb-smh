@@ -989,10 +989,15 @@ fn penalty_rank(p: f64) -> u32 {
 /// 1. peers in good standing (penalty below [`POOR_PEER_PENALTY`]);
 /// 2. the peers the pull names as having the block (the peer whose answer
 ///    announced it — Bitcoin Core downloads a block from a peer whose headers
-///    chain contains it);
-/// 3. a lower penalty class: useless answers (NotFound to the node's own
-///    pull, an empty answer from a peer that claimed more, an announced block
-///    nobody served, each Busy episode after [`FREE_BUSY_EPISODES`] in a row)
+///    chain contains it), in the pull's order (a GetHeaders names the peers
+///    we dialed first, then the others in a per-node secret order:
+///    `PullScheduler::enqueue`, `PeerStateTable::claiming_above`);
+/// 3. a lower penalty class: useless answers (NotFound — at once for the
+///    node's own pull or a block a dialed peer announced, for a block an
+///    inbound identity announced only once a dialed peer serves it —, an
+///    empty answer from a peer that claimed more, an announced block the
+///    announcer could not serve, each Busy episode after
+///    [`FREE_BUSY_EPISODES`] in a row)
 ///    and twice the stall score (timeouts,
 ///    violations), both decaying with [`SCORE_HALF_LIFE`] — so a peer that
 ///    answers fast with nothing, which always has the fewest pulls in flight,
@@ -1081,7 +1086,9 @@ impl PullPeerSelector {
             let penalty = s.penalty_at(now);
             (
                 penalty >= POOR_PEER_PENALTY,
-                !prefer.contains(p),
+                // B1-T6 review: the hint order, not PeerId bytes (anyone can
+                // grind those), decides between named peers.
+                prefer.iter().position(|q| q == p).unwrap_or(usize::MAX),
                 penalty_rank(penalty),
                 s.in_flight,
                 s.last_selected,
