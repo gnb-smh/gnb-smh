@@ -4,7 +4,9 @@ use serde_json::json;
 // Public shape fixture accepted by the existing policy predicate; no secret
 // key or claim of spendability is associated with these deterministic bytes.
 fn key(byte: u8) -> String {
-    hex::encode(vec![byte; 3749])
+    let bytes = vec![byte; 3745];
+    assert!(gnb_crypto::crypto::is_hybrid_public_key(&bytes));
+    hex::encode(bytes)
 }
 
 #[test]
