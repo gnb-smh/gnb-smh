@@ -3,6 +3,8 @@
 pub mod indexer;
 /// Audit NET-12: explorer aggregates maintained in the UTXO write batches.
 pub mod aggregates;
+// Audit VAL-11: the UTXO-set supply audit (`gettxoutsetinfo`).
+pub mod utxo_audit;
 
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, IteratorMode};
 use std::path::Path;

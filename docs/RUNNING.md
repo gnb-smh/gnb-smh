@@ -90,6 +90,52 @@ and red blocks they merge, `avg_dag_block_interval_secs`);
 storage failure behind any of these methods is answered with the generic
 `STORAGE_ERROR` response; the detail only goes to the node's log.
 
+### Supply audit: `gettxoutsetinfo` (audit VAL-11)
+
+`gettxoutsetinfo` is the counterpart of Bitcoin Core's method of the same
+name. It reads the whole UTXO set and every undo record in one RocksDB
+snapshot (a block connected meanwhile is wholly in the answer or not at all)
+and answers:
+
+| Field | Meaning |
+|---|---|
+| `height`, `bestblock` | the applied tip and its chain position |
+| `txouts`, `total_amount_sat` | unspent outputs and their total |
+| `hash_serialized` | SHA3-256 of the UTXO rows in key order (domain `gnb/utxo-set/v1`; each row `u32 LE len ‖ key ‖ u32 LE len ‖ value`). Two nodes with the same set report the same hash; compare it across nodes at the same `bestblock` |
+| `applied_blocks`, `chain_ok` | blocks with an undo record (the connected chain, genesis excluded), and whether that is exactly `height` |
+| `expected.carryover_sat` | the genesis ledger (the verified Bloch carryover) |
+| `expected.subsidy_sat` | the subsidy of every connected block, at the header height its coinbase was checked against |
+| `expected.max_supply_sat` | carryover + subsidy: the most the set may hold |
+| `expected.schedule_issued_sat` | `issued_through_sat(height)`, the schedule through the tip's position, an upper bound of `subsidy_sat` |
+| `unclaimed_sat` | `max_supply_sat - total_amount_sat`, `null` when the set holds more |
+| `supply_ok` | the set holds no more than `max_supply_sat` and every row decodes |
+| `aggregates` | the scan's count and total over address (20-byte) scripts against the aggregates the node keeps in the same write batches as the UTXO set |
+| `ok` | all of the above hold |
+
+`unclaimed_sat` is value that can never be spent, and is expected to be
+positive and to grow: a miner that claims less than subsidy plus fees burns
+the difference (consensus allows it); before the hardening activation a
+transaction that recreated an existing outpoint replaced the older coin
+(BIP30, audit VAL-2); and value that enters the shielded pool leaves the
+transparent set (no shielded transaction is valid while the pool is
+inactive). Fees are not issuance: they move value from transaction outputs
+to the coinbase. Outputs paying unspendable scripts (the genesis coinbase
+creates none) stay in the set and in the total, as in Core. A total above
+`max_supply_sat` (`supply_ok: false`) means inflation or a corrupted set; an
+aggregates mismatch with the supply bound intact means a UTXO row changed
+outside the node (disk corruption, an edited data dir). Either way stop the
+node and resync from a fresh `--data-dir` (or an archival node's data dir):
+the node has no `-reindex-chainstate` yet, and the start-up rebuild of
+"Chain-state check at start-up" only runs when it finds an interrupted
+commit.
+
+The method is in the heavy class (one computation at a time; a result is
+cached for 30 s per applied tip, so a block connected or disconnected since
+is never answered from the cache, and `bestblock` says which chain it
+describes) and is
+cancelled at the RPC deadline (25 s inside the 30 s request timeout),
+answering `{"error":"cancelled"}`; it never blocks block acceptance.
+
 The node serves plain HTTP. To reach a remote node, put a TLS reverse proxy in
 front of its RPC port or use an SSH tunnel
 (`ssh -L 17210:127.0.0.1:17210 host`). Both CLI wallets speak HTTPS (audit

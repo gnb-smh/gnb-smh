@@ -237,6 +237,9 @@ const HEAVY_READ_METHODS: &[&str] = &[
     // block body, and additionally share the single-flight TTL cache.
     "getdifficultyhistory",
     "getblocktimepercentiles",
+    // VAL-11: the UTXO-set supply audit scans the whole UTXO set and every
+    // undo record (cancellable, like Core's gettxoutsetinfo).
+    "gettxoutsetinfo",
     // L-8 (audit): `getblocktemplate` is bounded the same way (cache +
     // single flight) but through its OWN gate (`AppState::template_gate`,
     // `gated_dispatch`): sharing this one's single scan permit answered a
@@ -257,7 +260,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getdagwindow", "getaddresshistory", "getrichlist", "gethashrate", "getdifficultyhistory",
     "getblocktimepercentiles", "gettxstatus", "getaddressinfo", "estimatefeeadvanced",
     "getmempoolstats", "validateaddressverbose", "gettxsbyblock", "getaddressbalance_at_height",
-    "getattestation", "invalidateblock", "reconsiderblock",
+    "getattestation", "invalidateblock", "reconsiderblock", "gettxoutsetinfo",
 ];
 
 /// Longest method-name prefix written to a log line (NET-13).
@@ -683,6 +686,39 @@ fn stats_err_response(e: &crate::analytics::StatsError) -> Value {
     }
 }
 
+/// `gettxoutsetinfo` (audit VAL-11): the supply audit as JSON; amounts are
+/// decimal strings of base units (they can exceed 2^53).
+fn utxo_audit_json(a: &crate::storage::utxo_audit::UtxoSetAudit) -> Value {
+    json!({
+        "height":               a.height,
+        "bestblock":            a.best_block.map(hex::encode),
+        "txouts":               a.txouts,
+        "total_amount_sat":     a.total_sat.to_string(),
+        "hash_serialized":      hex::encode(a.hash_serialized),
+        "hash_type":            "sha3-256 over the UTXO rows in key order, domain gnb/utxo-set/v1",
+        "undecodable_txouts":   a.undecodable,
+        "applied_blocks":       a.applied_blocks,
+        "chain_ok":             a.chain_ok(),
+        "expected": {
+            "carryover_sat":        a.carryover_sat.to_string(),
+            "subsidy_sat":          a.subsidy_sat.to_string(),
+            "max_supply_sat":       a.max_supply_sat().to_string(),
+            "schedule_issued_sat":  a.schedule_issued_sat.to_string(),
+        },
+        "unclaimed_sat":        a.unclaimed_sat().map(|u| u.to_string()),
+        "supply_ok":            a.supply_ok(),
+        "aggregates": {
+            "scan_txouts":          a.holder_txouts,
+            "scan_amount_sat":      a.holder_total_sat.to_string(),
+            "maintained_txouts":    a.maintained.map(|m| m.0),
+            "maintained_amount_sat": a.maintained.map(|m| m.1.to_string()),
+            "ok":                   a.aggregates_ok(),
+        },
+        "ok":                   a.ok(),
+        "note": "max_supply_sat = carryover + the subsidy of every applied block; unclaimed_sat = max_supply_sat - total_amount_sat is unspendable value (unclaimed rewards, coins overwritten before the hardening activation, the shielded pool), never negative unless the set holds value that was not issued; aggregates compares the scan with the maintained address aggregates. See docs/RUNNING.md",
+    })
+}
+
 /// Height of the selected tip — the number a confirmation count is relative to.
 ///
 /// # Why this exists as a function
@@ -779,6 +815,14 @@ fn gated_dispatch<F: FnOnce() -> Value>(method: &str, params: Option<&Value>, st
     if method == "getblocktemplate" {
         state.template_gate.run_keyed(template_cache_key(params, state), f,
             |template| template_result_key(params, template))
+    } else if method == "gettxoutsetinfo" {
+        // VAL-11: the supply audit shares the heavy gate (single flight, TTL
+        // cache) but is keyed by the applied tip it describes, looked up by
+        // the tip now and stored by the result's `bestblock`: an answer is
+        // never served after a block was connected or disconnected.
+        let key = |tip: Option<&str>| format!("gettxoutsetinfo|{}", tip.unwrap_or("-"));
+        let now = state.store.get_meta("tip_hash").ok().flatten().map(hex::encode);
+        state.heavy_gate.run_keyed(key(now.as_deref()), f, move |v| Some(key(v["bestblock"].as_str())))
     } else if HeavyGate::is_heavy(method) {
         let key = format!("{}|{}", method, params.map(|p| p.to_string()).unwrap_or_default());
         state.heavy_gate.run(key, f)
@@ -1762,6 +1806,17 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 "min_fee_rate_sat_per_kb": t::MIN_FEE_RATE_SAT_PER_KB.to_string(),
                 "min_tx_fee_sat":          t::MIN_TX_FEE_SAT.to_string(),
             })
+        }
+
+        // VAL-11: Bitcoin Core's gettxoutsetinfo — the UTXO set (count,
+        // total, hash) against the issuance, over one snapshot. Heavy class
+        // (single flight + TTL cache) and cancellable at the deadline.
+        "gettxoutsetinfo" => {
+            match state.store.utxo_set_audit(crate::core::carryover::CARRYOVER_CONVERTED_TOTAL_SAT, &state.cancel) {
+                Ok(a) => utxo_audit_json(&a),
+                Err(StorageError::ReadFailed(m)) if m == "cancelled" => json!({ "error": "cancelled" }),
+                Err(e) => storage_err_response(&e),
+            }
         }
 
         // ═════════════════════════════════════════════════════════════════════════════
@@ -3017,6 +3072,62 @@ mod audit_2026_10_rpc_tests {
         assert!(r.get("error").is_none(), "{r}");
         assert_eq!(r["sample_size"], 10, "computed, not served from a cached failure: {r}");
         assert_eq!(r["p50_secs"], 60);
+    }
+
+    /// VAL-11: `gettxoutsetinfo` reports the UTXO set against the issuance:
+    /// count, total, hash, the expected supply, and agreement with the
+    /// maintained aggregates; a cancelled request is an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn val11_gettxoutsetinfo_reports_the_supply_audit() {
+        let (_tmp, state) = state_with_chain(3);
+        state.store.ensure_aggregates().unwrap();
+        state.store.put_utxo(&[7u8; 32], 0, &TxOutput { value: 1_000, script_pubkey: vec![1; 20] }).unwrap();
+        let carry = crate::core::carryover::CARRYOVER_CONVERTED_TOTAL_SAT;
+        let r = dispatch("gettxoutsetinfo", None, &state).await;
+        assert!(r.get("error").is_none(), "{r}");
+        assert_eq!(r["txouts"], 1);
+        assert_eq!(r["total_amount_sat"], "1000");
+        assert_eq!(r["expected"]["carryover_sat"], carry.to_string());
+        assert_eq!(r["expected"]["subsidy_sat"], "0", "no undo record: no applied block");
+        assert_eq!(r["unclaimed_sat"], (carry - 1_000).to_string());
+        assert_eq!(r["supply_ok"], true);
+        assert_eq!(r["hash_serialized"], hex::encode(state.store.utxo_set_digest().unwrap()));
+        assert_eq!(r["aggregates"]["ok"], true, "{r}");
+        assert_eq!(r["ok"], true);
+        // The same row rewritten outside the node (value 1000 -> 5000):
+        // the aggregates no longer agree and the hash changes.
+        let mut key = [7u8; 32].to_vec();
+        key.extend_from_slice(&0u32.to_le_bytes());
+        let forged = bincode::serde::encode_to_vec(
+            TxOutput { value: 5_000, script_pubkey: vec![1; 20] }, bincode::config::standard()).unwrap();
+        let cf = state.store.db().cf_handle("utxo").unwrap();
+        state.store.db().put_cf(cf, &key, forged).unwrap();
+        let r2 = dispatch("gettxoutsetinfo", None, &state).await;
+        assert_eq!(r2["total_amount_sat"], "5000");
+        assert_eq!(r2["aggregates"]["ok"], false, "{r2}");
+        assert_eq!(r2["ok"], false);
+        assert_ne!(r2["hash_serialized"], r["hash_serialized"]);
+        let mut cancelled = state.clone();
+        cancelled.cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        assert_eq!(dispatch("gettxoutsetinfo", None, &cancelled).await["error"], "cancelled");
+        assert!(HeavyGate::is_heavy("gettxoutsetinfo"));
+    }
+
+    /// VAL-11: the heavy gate's cache never answers `gettxoutsetinfo` for a
+    /// tip other than the applied one (a method|params key served the
+    /// previous block's audit for 30 s after a block was connected).
+    #[test]
+    fn val11_gettxoutsetinfo_cache_follows_the_applied_tip() {
+        let (_tmp, state) = state_with_chain(1);
+        let run = |tip: [u8; 32], n: u32| gated_dispatch("gettxoutsetinfo", None, &state,
+            || json!({ "bestblock": hex::encode(tip), "n": n }));
+        state.store.put_meta("tip_hash", &[1u8; 32]).unwrap();
+        assert_eq!(run([1; 32], 1)["n"], 1);
+        assert_eq!(run([1; 32], 2)["n"], 1, "same tip: served from the cache");
+        state.store.put_meta("tip_hash", &[2u8; 32]).unwrap();
+        assert_eq!(run([2; 32], 3)["n"], 3, "a new tip is never answered from the cache");
+        state.store.put_meta("tip_hash", &[1u8; 32]).unwrap();
+        assert_eq!(run([1; 32], 4)["n"], 1, "back on the first tip (a reorg): its own answer");
     }
 
     /// MEM-6: `getmempoolinfo` reports the relay policy in force.
