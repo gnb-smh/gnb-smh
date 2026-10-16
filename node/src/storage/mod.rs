@@ -87,8 +87,23 @@ pub const CHAIN_INDEX_VERSION_META: &str = "chain_index_version";
 /// Layout of CF_HEIGHT, CF_TIMESTAMPS and the address history: 2 = keyed by
 /// the selected-chain position (DAG height, audit DAG-8); 1 = keyed by the
 /// header height (earlier releases, migrated at start-up by
-/// [`Storage::migrate_chain_indexes`]).
+/// [`Storage::rebuild_chain_indexes`]).
 pub const CHAIN_INDEX_VERSION: u32 = 2;
+
+/// What [`Storage::rebuild_chain_indexes`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChainIndexRebuild {
+    /// Selected-chain blocks indexed (the genesis included).
+    pub blocks: usize,
+    /// Address-history rows written.
+    pub rows: usize,
+    /// Rows of pruned blocks that could not be kept (overwritten or lost by
+    /// an earlier release, or not attributable to a block).
+    pub lost: usize,
+    /// Inputs of bodied blocks whose spent output their undo record does not
+    /// hold (a block without one): no spend row is written for them.
+    pub unresolved: usize,
+}
 
 /// Selected-chain index rows, from the top, that
 /// [`Storage::stored_chain_network`] reads at most.
@@ -719,6 +734,9 @@ impl Storage {
     }
 
     /// O(k) UTXO lookup via address index (was O(n) full UTXO scan)
+    /// UTXOs paying exactly `address_bytes`, the FULL script_pubkey (20-byte
+    /// key hash or 33-byte policy script): the index key is
+    /// `script ‖ txid ‖ index`, so a shorter prefix finds nothing.
     pub fn get_utxos_for_address(&self, address_bytes: &[u8]) -> Result<Vec<(Vec<u8>, u32, TxOutput)>, StorageError> {
         if address_bytes.len() < 20 {
             return Ok(vec![]);
@@ -964,6 +982,26 @@ impl Storage {
         reach_upserts: &[(BlockHash, Vec<u8>)],
         reach_removals: &[BlockHash],
     ) -> Result<[u8; 32], StorageError> {
+        let mut batch = rocksdb::WriteBatch::default();
+        let integrity = self.stage_dag_entry(&mut batch, hash, data, reach_upserts, reach_removals)?;
+        self.db.write(batch)
+            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        Ok(integrity)
+    }
+
+    /// Stage a block's CF_DAG entry, its integrity link and a reachability
+    /// delta into `batch`, so a caller can commit them together with the
+    /// chain-state change of the same block (one atomic write: a crash can
+    /// never leave the UTXO set applied for a block CF_DAG does not know).
+    /// The selected parent's integrity hash must already be committed.
+    pub fn stage_dag_entry(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        hash: &BlockHash,
+        data: &GhostdagData,
+        reach_upserts: &[(BlockHash, Vec<u8>)],
+        reach_removals: &[BlockHash],
+    ) -> Result<[u8; 32], StorageError> {
         let parent_integrity: [u8; 32] = match &data.selected_parent {
             Some(sp) => self.get_integrity_hash(sp)?.unwrap_or([0u8; 32]),
             None     => [0u8; 32],
@@ -977,7 +1015,6 @@ impl Storage {
         let cf_reach = self.db.cf_handle(CF_REACHABILITY)
             .ok_or(StorageError::CfNotFound(CF_REACHABILITY.into()))?;
 
-        let mut batch = rocksdb::WriteBatch::default();
         batch.put_cf(&cf_dag, hash, &encode(data)?);
         batch.put_cf(&cf_int, hash, &integrity);
         for (h, rec) in reach_upserts {
@@ -986,8 +1023,6 @@ impl Storage {
         for h in reach_removals {
             batch.delete_cf(&cf_reach, h);
         }
-        self.db.write(batch)
-            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         Ok(integrity)
     }
 
@@ -1190,29 +1225,36 @@ impl Storage {
         Ok(self.get_block(hash)?.filter(|b| b.header.parents.is_empty()).map(|_| 0))
     }
 
-    /// Migrate the selected-chain indexes to the position layout (audit
+    /// Rebuild the selected-chain indexes in the position layout (audit
     /// DAG-8, [`CHAIN_INDEX_VERSION`] 2) in ONE batch, given the applied
     /// selected chain as `(hash, position, timestamp)` from the genesis up.
-    /// Releases before it keyed CF_HEIGHT, CF_TIMESTAMPS and the address
+    /// The one rebuild path: the start-up migration of a data dir of an
+    /// earlier release (`accept::migrate_chain_indexes`) and the operator's
+    /// `--reindex-addresses` (`accept::reindex_chain_indexes`) both run it.
+    /// Releases before DAG-8 keyed CF_HEIGHT, CF_TIMESTAMPS and the address
     /// history by header height, where two chain blocks could share a row
-    /// (the later one's replaced the earlier one's). Every row of the three
-    /// column families is deleted and rewritten from the chain: the height
-    /// and timestamp rows for every chain block, the address-history rows of
-    /// every block whose body is stored from the body and its undo record
-    /// (exactly what a connect writes), and those of a pruned block by moving
-    /// the rows its pruned-body record names to its position, when the stored
-    /// row still belongs to it (a row an earlier release overwrote with
-    /// another block's cannot be recovered without the body); the record is
-    /// rewritten with the new keys so a later rollback deletes the right
-    /// rows. A body pruned by a release before audit DAG-6 left its rows but
-    /// no record: those rows are attributed to their block through the
-    /// transaction index (the row's txid), moved to its position, and a
+    /// (the later one's replaced the earlier one's), wrote rows for blocks
+    /// that never joined the chain (fork siblings, on arrival), and lost the
+    /// spend rows of blocks a reorg rolled back and re-applied. Every row of
+    /// the three column families is deleted and rewritten from the chain: the
+    /// height and timestamp rows for every chain block, the address-history
+    /// rows of every block whose body is stored from the body and its undo
+    /// record (exactly what a connect writes: the undo record holds every
+    /// output the block spent, genesis-ledger outputs included, so no
+    /// snapshot is needed to resolve a spend), and those of a pruned block by
+    /// moving the rows its pruned-body record names to its position, when the
+    /// stored row still belongs to it (a row an earlier release overwrote
+    /// with another block's, or lost, cannot be recovered without the body);
+    /// the record is rewritten with the new keys so a later rollback deletes
+    /// the right rows. A body pruned by a release before audit DAG-6 left its
+    /// rows but no record: those rows are attributed to their block through
+    /// the transaction index (the row's txid), moved to its position, and a
     /// record naming them is written (its `had_shielded` from the shielded
     /// undo record, the rule `ShieldedPool::stage_plan` applies to a missing
     /// record), so neither the history nor a later rollback loses them. A
     /// row of such a block that cannot be attributed is counted as lost.
-    /// Returns `(chain blocks, address rows written, rows lost)`.
-    pub fn migrate_chain_indexes(&self, chain: &[(BlockHash, u64, u64)]) -> Result<(usize, usize, usize), StorageError> {
+    /// Idempotent on a data dir already in the position layout.
+    pub fn rebuild_chain_indexes(&self, chain: &[(BlockHash, u64, u64)]) -> Result<ChainIndexRebuild, StorageError> {
         let cf_ai = self.db.cf_handle(CF_ADDR_TX_HISTORY)
             .ok_or(StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
         let cf_undo = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
@@ -1252,7 +1294,7 @@ impl Storage {
                 }
             }
         }
-        let mut written = 0usize;
+        let (mut written, mut unresolved) = (0usize, 0usize);
         let mut record_keys: std::collections::HashMap<BlockHash, Vec<Vec<u8>>> = std::collections::HashMap::new();
         for (block, key, value) in rekeyed {
             batch.put_cf(&cf_ai, &key, &value);
@@ -1277,6 +1319,14 @@ impl Storage {
                         .get_undo_data(hash)?
                         .map(|u| u.spent_utxos.into_iter().map(|e| ((e.prev_txid, e.prev_index), e.output)).collect())
                         .unwrap_or_default();
+                    // An input its undo record does not hold (a block
+                    // without one) has no spend row: a rollback could not
+                    // delete it either.
+                    unresolved += body.transactions.iter()
+                        .filter(|tx| !tx.is_coinbase())
+                        .flat_map(|tx| tx.inputs.iter())
+                        .filter(|i| !spent.contains_key(&(i.prev_txid, i.prev_index)))
+                        .count();
                     written += indexer::addr_history_keys(&body, *position, &spent).len();
                     self.stage_chain_index(&mut batch, &body, *position, &spent)?;
                 }
@@ -1309,7 +1359,7 @@ impl Storage {
         let cf_meta = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
         batch.put_cf(&cf_meta, CHAIN_INDEX_VERSION_META.as_bytes(), CHAIN_INDEX_VERSION.to_le_bytes());
         self.write_batch(batch)?;
-        Ok((chain.len(), written, lost))
+        Ok(ChainIndexRebuild { blocks: chain.len(), rows: written, lost, unresolved })
     }
 
     /// The layout version of the selected-chain indexes: 1 (header height,
@@ -1646,8 +1696,15 @@ impl Storage {
     /// hardening activation). Below it a mainnet block follows the
     /// pre-activation rules (legacy Merkle root, free-form coinbase) and a
     /// testnet block the hardening rules (testnet activates them at 0),
-    /// which exclude each other (docs/CONSENSUS.md, "Networks"), so
-    /// `block_rules::check_block_hardened_at(block, 0)` tells them apart.
+    /// which exclude each other (docs/CONSENSUS.md, "Networks"). The
+    /// hardened body rules (`block_rules::check_hardened_body`: the coinbase
+    /// commitment, which no mainnet coinbase carries below the activation)
+    /// tell them apart; the Merkle root does not: from a network's PoWit
+    /// height the body root is the v2 commitment, and which heights that
+    /// covers is the RUNNING node's PoWit height (mainnet 10,000, testnet
+    /// off or `--powit-height`), not the stored chain's, so a testnet block
+    /// above 10,000 checked by a mainnet process failed it and read as
+    /// mainnet.
     /// `None`: no such block (a dir holding only the genesis, or whose
     /// recent bodies are all at or above the activation or pruned); the
     /// running network is then adopted. Pruning keeps the bodies of the
@@ -1662,7 +1719,7 @@ impl Storage {
             if block.height == 0 || block.height >= MAINNET_HARDENING_ACTIVATION_HEIGHT {
                 continue;
             }
-            let chain = match crate::core::block_rules::check_block_hardened_at(&block, 0) {
+            let chain = match crate::core::block_rules::check_hardened_body(&block) {
                 Ok(()) => crate::core::ChainId::Testnet,
                 Err(_) => crate::core::ChainId::Mainnet,
             };
@@ -2153,6 +2210,24 @@ mod sprint_f_tests {
         assert!(s.check_chain_marker(main).unwrap_err().contains("<2 bytes>"));
     }
 
+    /// Policy outputs (33-byte scripts) are found by their full script, and
+    /// a key-hash script that shares their first 20 bytes never mixes in.
+    #[test]
+    fn utxos_for_address_finds_policy_scripts() {
+        let (_tmp, s) = mk_storage();
+        let mut policy = vec![0x02u8];
+        policy.extend_from_slice(&[0x55u8; 32]);
+        let key_hash = policy[..20].to_vec();
+        s.put_utxo(&[1u8; 32], 0, &TxOutput { value: 7, script_pubkey: policy.clone() }).unwrap();
+        s.put_utxo(&[2u8; 32], 1, &TxOutput { value: 9, script_pubkey: key_hash.clone() }).unwrap();
+        let p = s.get_utxos_for_address(&policy).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].1, p[0].2.value), (0, 7));
+        let k = s.get_utxos_for_address(&key_hash).unwrap();
+        assert_eq!(k.len(), 1);
+        assert_eq!((k[0].1, k[0].2.value), (1, 9));
+    }
+
     #[test]
     fn key_value_encoding_roundtrip() {
         let addr = dummy_addr(0x42);
@@ -2374,6 +2449,7 @@ impl Storage {
     pub fn ingest_carryover(
         &self,
         snap: &crate::core::carryover::VerifiedCarryover,
+        locked: &[crate::core::vesting::Tranche],
     ) -> Result<u64, StorageError> {
         let _agg = self.agg_lock();
         let mut deltas = aggregates::HolderDeltas::default();
@@ -2383,17 +2459,23 @@ impl Storage {
             }
             deltas.add(&u.output);
         }
+        for t in locked {
+            if let Some(prev) = self.get_utxo(&t.txid, t.vout)? {
+                deltas.remove(&prev);
+            }
+            deltas.add(&t.output);
+        }
         let mut batch = rocksdb::WriteBatch::default();
-        self.stage_carryover(&mut batch, snap)?;
+        self.stage_carryover(&mut batch, snap, locked)?;
         // NET-12: holder aggregates in the same batch.
         self.stage_holder_deltas(&mut batch, &deltas)?;
         self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
-        Ok(snap.utxos.len() as u64)
+        Ok((snap.utxos.len() + locked.len()) as u64)
     }
 
     /// Stage exactly the UTXO rows [`ingest_carryover`](Self::ingest_carryover)
-    /// writes (the carryover UTXOs, their address-index rows and the
-    /// `carryover_sha3` marker) into a caller-owned batch, WITHOUT the NET-12
+    /// writes (the carryover UTXOs, the locked vesting tranches, their
+    /// address-index rows and the `carryover_sha3` / `vesting_sha3` markers) into a caller-owned batch, WITHOUT the NET-12
     /// holder aggregates: `ingest_carryover` stages those itself, and the
     /// chain-state rebuild (audit DAG-11), which uses this to restore the
     /// genesis state, recomputes every aggregate once it has reconnected the
@@ -2402,6 +2484,7 @@ impl Storage {
         &self,
         batch: &mut rocksdb::WriteBatch,
         snap: &crate::core::carryover::VerifiedCarryover,
+        locked: &[crate::core::vesting::Tranche],
     ) -> Result<(), StorageError> {
         let cf_utxo = self.db.cf_handle(CF_UTXO)
             .ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
@@ -2413,7 +2496,14 @@ impl Storage {
             batch.put_cf(&cf_utxo, utxo_key(&u.txid, u.vout), encode(&u.output)?);
             batch.put_cf(&cf_ai, addr_utxo_key(&u.output.script_pubkey, &u.txid, u.vout), [0u8; 0]);
         }
+        // Locked team and founder tranches (core::vesting), same batch: the
+        // genesis ledger lands complete or not at all.
+        for t in locked {
+            batch.put_cf(&cf_utxo, utxo_key(&t.txid, t.vout), encode(&t.output)?);
+            batch.put_cf(&cf_ai, addr_utxo_key(&t.output.script_pubkey, &t.txid, t.vout), [0u8; 0]);
+        }
         batch.put_cf(&cf_meta, b"carryover_sha3", snap.sha3);
+        batch.put_cf(&cf_meta, b"vesting_sha3", crate::core::vesting::VESTING_SPEC_SHA3);
         Ok(())
     }
 }

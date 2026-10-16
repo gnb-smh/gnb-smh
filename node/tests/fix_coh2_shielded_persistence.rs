@@ -57,6 +57,7 @@ fn stored_block(store: &Storage, parent: Hash, height: u64, nonce: u64, shielded
         blue_score: height,
         height,
         shielded_transactions: shielded,
+        powit: Default::default(),
     };
     store.put_block_body(&b).unwrap();
     b.block_hash()

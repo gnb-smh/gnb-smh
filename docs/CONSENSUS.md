@@ -6,7 +6,7 @@
 BlockHeader { version u32, parents [hash32], merkle_root hash32, timestamp u64, bits u32, nonce u64 }
 
 pow_preimage = version u32le | n_parents u32le | parents | merkle_root | timestamp u64le | bits u32le
-pow          = GnB-SMH-v1(header = pow_preimage, nonce)          // 32 bytes
+pow          = GnB-SMH(height)(header = pow_preimage, nonce)     // 32 bytes; v1, v3 from the PoWit height
 valid       <=> be256(pow) < target(bits)
 block_hash   = SHA3-256("GNB-BLOCK-ID-v1" | pow_preimage | nonce u64le)
 ```
@@ -15,7 +15,13 @@ GnB-SMH v1 is specified in `crates/gnb-smh/README.md`; the Python file in
 `crates/gnb-smh/reference/` is normative and the Rust crate reproduces its
 vectors byte for byte. One evaluation costs 64 MiB and about 0.5 s on one core
 of a current x86-64 or Apple CPU (`smh-bench verify 19`). Verified block ids are
-cached, so a block's proof is evaluated once per node.
+cached, so a block's proof is evaluated once per node. From the PoWit height
+(`core::pow_algo(height)`; mainnet 10,000, testnet off unless
+`--powit-height`) the function is GnB-SMH v3 (`crates/gnb-smh/src/v3.rs`, a
+4 MiB Argon2d-style fill), and the expected bits are the ASERT bits with the
+target lowered by `POW_V3_DIFFICULTY_SHIFT` (2) and re-encoded with
+`target_to_bits` (`core::adjust_bits_for_algo`); see "Chain work" for the
+matching work normalisation and docs/DESIGN-pow-powit.md.
 
 `bits` is the Bitcoin compact encoding. Malformed encodings never validate.
 The easiest allowed target is `POW_LIMIT_BITS = 0x2100ffff` below the
@@ -31,8 +37,10 @@ semantics (`try_bits_to_target` decodes `0x21007fff` and `0x207fff00` to the
 same target), and `Block::validate_pow` refuses the non-canonical one before
 any evaluation. The rule changes no verdict: every block must also carry
 `bits == expected_bits(parents, height)`, checked before the proof, and
-`expected_bits` is a `target_to_bits` output, which is always canonical
-(`expected_bits_are_always_canonical`). Like Bitcoin Core, whose consensus
+`expected_bits` is a `target_to_bits` output, which is always canonical,
+on both sides of the v3 switch (`expected_bits_are_always_canonical`). A
+witness share's `bits` must equal its attested block's
+(`witness_share::verify_share`), so they are canonical too. Like Bitcoin Core, whose consensus
 compares `nBits` with the expected value as a u32, GnB never relied on
 decoding to reject a non-canonical header; the explicit check only makes
 that independent of the equality check. Vector:
@@ -102,7 +110,11 @@ Each block contributes
 work(target) = max(floor((2^128 - 1) / (floor(target / 2^128) + 1)), 1),   work(0) = 0
 ```
 
-to blue work (`gnb_smh::difficulty::work`, u128). This approximates
+to blue work (`gnb_smh::difficulty::work`, u128); a GnB-SMH v3 block (from
+the PoWit height, mainnet 10,000) contributes `work(target) >>
+POW_V3_DIFFICULTY_SHIFT` (2), the factor its target is lowered by, so
+cumulative work is continuous across the switch (`core::block_work(bits,
+height)`, the one function every place that adds a block's work calls). This approximates
 2^256 / target: it never exceeds floor(2^256 / target) or Bitcoin Core's
 floor(2^256 / (target + 1)), is monotone in the target, saturates at
 2^128 - 1 for targets below 2^128, and is within one part in 2^64 of the
@@ -116,12 +128,13 @@ obtain from a future timestamp to about 6%.
 ## Networks (mainnet and testnet)
 
 Mainnet and testnet share the genesis block (`core::genesis_block()`, the
-same id `837f7d5c…`), so they also share the ASERT anchor (the genesis time
-and target) and the carryover genesis ledger. They differ in the chain id
-(`ChainId`: mainnet `0x474E0001`, testnet `0x474E0002`, set with
-`--testnet`) and in the hardening activation height derived from it
-(mainnet 110,000, testnet 0). Consequences, and what separates them (audit
-POW-9):
+same id `a63fd2c1…`), so they also share the ASERT anchor (the genesis time
+and target) and the genesis ledger (the carryover and the locked team and
+founder allocations). They differ in the chain id (`ChainId`: mainnet
+`0x474E0001`, testnet `0x474E0002`, set with `--testnet`), in the hardening
+activation height derived from it (mainnet 110,000, testnet 0) and in the
+PoWit height (GnB-SMH v3 and PoWit: mainnet 10,000; testnet off unless
+`--powit-height`). Consequences, and what separates them (audit POW-9):
 
 - **Transactions cannot be replayed across networks.** Every signature digest
   commits to the chain id: sighash v2 and v3 both hash `chain_id u32 LE`
@@ -129,7 +142,11 @@ POW-9):
   signature never verifies on testnet and vice versa, below and after the
   activation (`core::chain_id_tests::cross_chain_id_replay_is_rejected`;
   vectors `net/*` in `tx_vectors.json`). A transaction is replayable only
-  where its digest is, i.e. on its own network.
+  where its digest is, i.e. on its own network. Policy (multisig, timelock)
+  spends sign the same digests. PoWit's own signatures are bound too: a
+  witness attestation signs `attestation_message(chain_id, source, target)`,
+  so it never verifies on the other network even for the same checkpoints,
+  and a witness share commits to a block id of its network.
 - **Blocks cannot be valid on both networks**, but only because their rules
   differ, not because a block names its network. A block above the genesis
   at header height h < 110,000 follows the pre-activation rules on mainnet
@@ -143,8 +160,9 @@ POW-9):
   own gossip topics, directed-sync protocol and identify protocol version
   (`network::chain_separation`; mainnet keeps `gnb/blocks/1`,
   `gnb/txs/1`, `gnb/sync/1`, `/gnb/sync/1` and `/gnb/1.0.0`, testnet uses
-  `gnb-testnet/...`), so neither network subscribes to, pulls from or serves
-  the other's frames, and a peer that identifies with another network's
+  `gnb-testnet/...`; PoWit items travel on the transaction topic), so
+  neither network subscribes to, pulls from or serves the other's frames,
+  and a peer that identifies with another network's
   protocol version is disconnected (`node/tests/fix_pow9_network_separation.rs`).
   A dialed address enters the tried table (`known_peers`) only after a
   same-network identify, as Core marks an address good only after the
@@ -155,9 +173,13 @@ POW-9):
   network refuses it (`Storage::check_chain_marker`; docs/RUNNING.md). A
   data dir without the marker (from an earlier release) that holds chain
   blocks is marked only for the network its blocks follow: the first stored
-  body among the highest chain-index rows at header height 1..109,999 passes
-  `check_block_hardened_at(block, 0)` on testnet and fails it on mainnet
-  (`Storage::stored_chain_network`); a node of the other network is refused.
+  body among the highest chain-index rows at header height 1..109,999
+  carries the hardened coinbase commitment and passes the hardened body
+  rules (`block_rules::check_hardened_body`) on testnet and fails them on
+  mainnet (`Storage::stored_chain_network`); a node of the other network is
+  refused. The Merkle root is not used: from a network's PoWit height the
+  body root is the v2 commitment, and which heights that covers depends on
+  the running node's PoWit height, not on the stored chain's.
 
 ## Acceptance order
 
@@ -381,7 +403,13 @@ own selected-chain context. Blocks that fail connect-time validation, and
 every block whose selected-parent chain passes through one, are disqualified
 and never selected.
 
-There is no reorg-depth limit and no finality checkpoint (audit DAG-6). The
+There is no reorg-depth limit and no depth-based finality (audit DAG-6).
+From the PoWit height (mainnet 10,000) the checkpoint the applied chain's
+witness set has finalized pins fork choice: a block whose selected-parent
+chain does not pass through it is never selected, nor offered as a template
+parent (`GhostDAG::set_finalized`; docs/DESIGN-pow-powit.md). It restricts
+which blocks are selectable, never a block's GhostDAG data (selected parent,
+coloring, blue work). The
 former 1,000-block `MAX_REORG_DEPTH` and the `finalized_height` gate compared
 a fork with the node's own history, so nodes that received the same blocks in
 different orders could end on different chains. As in Bitcoin Core (no depth
@@ -440,7 +468,7 @@ requests the next (at most 4,096) of those bodies and asks to be retried.
 blue_work(genesis) = 0
 blue_work(B)       = blue_work(sp) + Σ work(m) for m in mergeset_blues(B) + work(B)   // at/after activation
 blue_work(B)       = blue_work(sp) + work(B)                                          // before activation
-work(B)            = work_from_bits(B.bits)
+work(B)            = block_work(B.bits, B.height)   // "Chain work": v3 blocks >> 2
 ```
 
 After activation, `blue_work(B)` is the total work of `blue(B) ∪ {B}`.
@@ -497,14 +525,18 @@ Before activation the old walk is used. It never counts selected-chain blocks
 below the selected parent, and it restarts older blues' anticone counts at 0,
 so it can color blue a block with more than k blues in its anticone.
 
-### Mergeset size and merge depth (after activation)
+### Mergeset size and merge depth
 
-- `|mergeset(B)| + 1 ≤ MAX_MERGESET_SIZE = 180`. The "+ 1" counts the
-  selected parent, as Kaspa does. 180 is Kaspa's production limit. With
-  k = 10, at most 11 entries are blue, which leaves room for a post-partition
-  merge and bounds one block's coloring to 179 candidates. A larger mergeset
-  is rejected with `MergesetTooLarge` before any coloring work.
-- Merge depth: let R be the highest selected-chain block of B with
+- `|mergeset(B)| ≤ MERGESET_SIZE_LIMIT = 64`, at every height: blocks merged
+  besides the selected parent. This chain's rule since before the
+  2026-10-14 reset; it is tighter than the audit's hardened bound
+  (`|mergeset(B)| + 1 ≤ MAX_MERGESET_SIZE = 180`, Kaspa's production limit),
+  so it is the one limit on both sides of the activation. With k = 10 at
+  most 10 merged blocks are blue, and one block's coloring is bounded to 64
+  candidates. A larger mergeset is rejected with `MergesetTooLarge` before
+  any coloring work, and nothing is inserted (vector case
+  `mergeset/size-limit` in `reference/ghostdag_vectors.json`).
+- Merge depth (at/after the activation): let R be the highest selected-chain block of B with
   `blue_score(R) ≤ blue_score(B) - MERGE_DEPTH`, where `MERGE_DEPTH = 360`
   (3 hours at 30 s). Every red in B's
   mergeset must be R itself, in the future of R, or in the past of a blue in
@@ -516,8 +548,8 @@ A rejected block is not inserted. Since `MAX_PARENTS` (256) exceeds the
 mergeset limit, block templates must choose parents with
 `GhostDAG::select_parents_for_template(&bodied_tips, MAX_PARENTS)`. It puts the
 selected parent first, adds the other tips by decreasing blue work while the
-mergeset fits, and drops tips that would break the merge depth. Before
-activation it returns the heaviest `MAX_PARENTS` tips.
+mergeset fits `MERGESET_SIZE_LIMIT`, and drops tips that would break the
+merge depth; the budgeted selection runs on both sides of the activation.
 
 ### Ledger semantics: selected-chain-only
 

@@ -38,8 +38,11 @@
 
 use super::{tokenomics, Block, Transaction, MAX_PARENTS};
 
-/// Maximum `script_sig` length (wire parser cap).
-pub const MAX_SCRIPT_SIG_SIZE: usize = 10_000;
+/// Maximum `script_sig` length (wire parser cap, `core::MAX_SCRIPT_SIG_LEN`):
+/// the largest policy witness (7-of-7 multisig, `core::policy`), so every
+/// policy output stays spendable (a 10,000-byte cap made the 2-of-3 team
+/// vesting unspendable, review F1).
+pub const MAX_SCRIPT_SIG_SIZE: usize = super::MAX_SCRIPT_SIG_LEN;
 /// Maximum `script_pubkey` length (wire parser cap).
 pub const MAX_SCRIPT_PUBKEY_SIZE: usize = 10_000;
 /// Maximum inputs per transaction (wire parser cap).
@@ -194,6 +197,7 @@ mod tests {
             },
             transactions: txs,
             blue_score: 1, height: 1, shielded_transactions: vec![],
+            powit: Default::default(),
         }
     }
 
@@ -324,12 +328,13 @@ mod tests {
         }
     }
 
-    /// VAL-12 regression: an in-process block with a 12.6 kB script_sig (the
-    /// audit PoC shape) is refused by the consensus helper; a block that passes
-    /// the helper always round-trips through its wire encoding.
+    /// VAL-12 regression: an in-process block with a script_sig one byte
+    /// over the parser cap (the audit PoC shape, scaled to this chain's
+    /// policy-witness cap) is refused by the consensus helper; a block that
+    /// passes the helper always round-trips through its wire encoding.
     #[test]
     fn oversized_script_block_is_refused_and_valid_block_round_trips() {
-        let bad = block_with(vec![tx(12_600, 20, 1_000)]);
+        let bad = block_with(vec![tx(MAX_SCRIPT_SIG_SIZE + 1, 20, 1_000)]);
         assert!(check_block_context_free(&bad).is_err());
         assert!(Block::from_wire_bytes(&bad.to_wire_bytes()).is_err(),
             "the parser refuses it too: such a block could never be read back");
@@ -454,7 +459,7 @@ mod tests {
     #[test]
     fn context_free_check_runs_both_rules() {
         let mut b = block_with(vec![tx(1, 20, tokenomics::MAX_SUPPLY_SAT + 1)]);
-        assert_eq!(check_block_context_free(&b), Err("tx[0]: output 0 value 1000000000000001 exceeds MAX_SUPPLY_SAT".into()));
+        assert_eq!(check_block_context_free(&b), Err(format!("tx[0]: output 0 value {} exceeds MAX_SUPPLY_SAT", tokenomics::MAX_SUPPLY_SAT + 1)));
         b.transactions[0].outputs[0].value = 1;
         assert_eq!(check_block_context_free(&b), Ok(()));
         b.header.parents = vec![[1; 32]; MAX_PARENTS + 1];

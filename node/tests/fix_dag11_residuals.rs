@@ -229,7 +229,7 @@ fn a_failed_commit_keeps_the_reachability_delta_of_a_reindex() {
         probe.reach_load_records(&n.store.load_all_reachability().unwrap(), n.store.get_reachability_root().unwrap())
             .unwrap();
         let _ = probe.reach_take_delta(); // loading is not a change
-        let work = gnb::pow::work_from_bits(trigger.header.bits);
+        let work = gnb::pow::block_work(trigger.header.bits, trigger.height);
         probe.add_block(trigger.block_hash(), trigger.header.parents.clone(), trigger.header.timestamp, work).unwrap();
         let ups = probe.reach_peek_delta().0.len();
         assert!(ups > 2, "inserting the trigger must reindex the node's index (delta of {ups} record(s))");
@@ -293,7 +293,7 @@ fn accept_plans_from_the_applied_tip_after_a_failed_reconnect() {
     // F2's DAG record and body are on disk but it was never connected.
     let f2 = empty_child(&n, f1.block_hash(), "f2");
     {
-        let work = gnb::pow::work_from_bits(f2.header.bits);
+        let work = gnb::pow::block_work(f2.header.bits, f2.height);
         n.dag.write().add_block(f2.block_hash(), f2.header.parents.clone(), f2.header.timestamp, work).unwrap();
         let data = n.dag.read().get_block_data(&f2.block_hash()).cloned().unwrap();
         n.store.put_block_body(&f2).unwrap();
@@ -329,4 +329,30 @@ fn accept_plans_from_the_applied_tip_after_a_failed_reconnect() {
     }
     assert!(n.store.get_utxo(&a1.transactions[0].txid(), 0).unwrap().is_none(), "A1 rolled back");
     let _: &Block = &f3;
+}
+
+/// The repair recomputes a record from the stored header with the work
+/// `accept_block` inserted the block with: `core::block_work`, normalised
+/// across the GnB-SMH v1 -> v3 switch (the PoWit height, mainnet 10,000).
+/// With the raw `work_from_bits` a recomputed v3 block would carry four
+/// times its work, and the repaired DAG another blue work (and possibly
+/// another selected chain) than every other node's.
+#[test]
+fn the_repair_recomputes_with_the_normalised_block_work() {
+    use gnb::core::{BlockHeader, MerkleRoot};
+    let bits = gnb::core::GENESIS_BITS;
+    for (height, v3) in [(gnb::core::POWIT_HEIGHT_MAINNET - 1, false), (gnb::core::POWIT_HEIGHT_MAINNET, true)] {
+        let b = Block {
+            header: BlockHeader { version: 1, parents: vec![[7; 32]], merkle_root: MerkleRoot::default(), timestamp: 5, bits, nonce: 0 },
+            transactions: vec![],
+            blue_score: height,
+            height,
+            shielded_transactions: Vec::new(),
+            powit: Default::default(),
+        };
+        let h = accept::repair_header(&b);
+        assert_eq!(h.work, gnb::pow::block_work(bits, height), "height {height}");
+        assert_eq!(h.work != gnb::pow::work_from_bits(bits), v3, "height {height}");
+        assert_eq!((h.parents, h.timestamp), (vec![[7; 32]], 5));
+    }
 }

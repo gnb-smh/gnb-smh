@@ -30,7 +30,8 @@ use gnb::network::{
     gossipsub_config_builder, yamux_config, NetworkMessage, GOSSIP_MAX_CONTROL_BYTES, GOSSIP_MAX_CONTROL_IDS,
     GOSSIP_PEER_DEFAULT_CONTROL_BYTES, TOPIC_BLOCKS, TOPIC_TXS,
 };
-use gnb::transport::upgrade::KyberConfig;
+use gnb::transport::identity::{PeerPins, PqIdentity};
+use gnb::transport::upgrade::PqConfig;
 use libp2p::gossipsub::{self, IdentTopic, MessageAcceptance, MessageAuthenticity};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{identity, tcp, Multiaddr, PeerId, SwarmBuilder};
@@ -85,11 +86,13 @@ async fn spawn(limits: Limits, via: Option<PeerId>) -> Peer {
         .max_control_message_size(limits.control_bytes)
         .validation_mode(gossipsub::ValidationMode::Anonymous);
     let cfg = builder.build().expect("gossipsub config");
+    let pq = Arc::new(PqIdentity::generate().expect("PQ identity"));
+    let pins = Arc::new(PeerPins::in_memory());
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
-            |keys: &identity::Keypair| -> Result<KyberConfig, Infallible> { Ok(KyberConfig::new(keys)) },
+            move |keys: &identity::Keypair| -> Result<PqConfig, Infallible> { Ok(PqConfig::new(keys, pq, pins)) },
             yamux_config,
         )
         .expect("tcp")

@@ -24,9 +24,18 @@ already queued, whatever its id. `candidate_order(..., reading="min-id")`
 computes the other reading (always the lowest ready id) only so the vectors
 can show that the two differ; it is not GnB's rule.
 
-Not modeled here: the pre-activation coloring (mainnet below 110,000) and
-the merge-depth bound (MERGE_DEPTH = 360 blue score). The mergeset-size
-limit is.
+Not modeled here: the pre-activation coloring (mainnet below 110,000), the
+merge-depth bound (MERGE_DEPTH = 360 blue score) and the PoWit finalized
+checkpoint (from the PoWit height; it restricts which tips fork choice may
+select, `GhostDAG::set_finalized`, never a block's GhostDAG data). The
+mergeset-size limit is: at most MERGESET_SIZE_LIMIT = 64 blocks merged
+besides the selected parent, at every height (this chain's rule, tighter
+than the audit's hardened `MAX_MERGESET_SIZE - 1` = 179, so the one limit on
+both sides of the activation).
+
+Each block's `work` is given: the node derives it from the header,
+`core::block_work(bits, height)` (GnB-SMH v3 blocks, from the PoWit height,
+count `work_from_bits(bits) >> POW_V3_DIFFICULTY_SHIFT`).
 
 `gen_ghostdag_vectors.py` writes `ghostdag_vectors.json` from this file;
 `node/tests/ghostdag_vectors.rs` checks the node's GhostDAG against it.
@@ -36,7 +45,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 K = 10
-MAX_MERGESET_SIZE = 180  # blocks, the selected parent included
+MERGESET_SIZE_LIMIT = 64  # blocks merged besides the selected parent, every height
 
 
 class MergesetTooLarge(Exception):
@@ -102,9 +111,9 @@ class Dag:
         for p in parents:
             past_b |= self.past(p)
         mergeset = past_b - self.past(sp) - {sp}
-        if len(mergeset) + 1 > MAX_MERGESET_SIZE:
+        if len(mergeset) > MERGESET_SIZE_LIMIT:
             del self.parents[h], self.work[h]
-            raise MergesetTooLarge(len(mergeset) + 1)
+            raise MergesetTooLarge(len(mergeset))
         order = candidate_order(mergeset, self.parents, reading)
         blue = set(spd.blue_set) | {sp}
         blues, reds = [], []

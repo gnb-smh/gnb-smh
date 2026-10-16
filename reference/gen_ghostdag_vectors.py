@@ -12,7 +12,10 @@ asserts the property each case exists for:
   repeated parent and a parent that is an ancestor of another parent do to
   the GhostDAG data (nothing) and to the header height (a redundant parent
   can raise it), and the header verdict of a repeated parent in both
-  regimes.
+  regimes;
+* mergeset/size-limit: a block merging MERGESET_SIZE_LIMIT (64) blocks
+  besides its selected parent is accepted, one merging 65 is refused
+  (`MergesetTooLarge`, nothing inserted).
 
 `node/tests/ghostdag_vectors.rs` builds every case with the node's
 `GhostDAG` and compares; CI regenerates this file and diffs it.
@@ -28,6 +31,16 @@ HERE = pathlib.Path(__file__).resolve().parent
 
 def bid(first: int, second: int = 0) -> bytes:
     return bytes([first, second]) + bytes(30)
+
+
+def refused_json(h: bytes, parents: list) -> dict:
+    """A block the rules refuse: it is not inserted."""
+    return {
+        "id": h.hex(),
+        "parents": [p.hex() for p in parents],
+        "work": "1",
+        "expected": {"error": "mergeset-too-large"},
+    }
 
 
 def block_json(dag: g.Dag, h: bytes) -> dict:
@@ -51,14 +64,19 @@ def block_json(dag: g.Dag, h: bytes) -> dict:
     }
 
 
-def case(cid: str, description: str, dag: g.Dag, order: list, extra: dict | None = None) -> dict:
+def case(cid: str, description: str, dag: g.Dag, order: list, extra: dict | None = None,
+         refused: dict | None = None) -> dict:
+    """`order`: the inserted blocks, genesis first. `refused` maps a block
+    of `order` that the rules refuse to its parents (it is listed there, in
+    insertion order, but not in the DAG)."""
+    refused = refused or {}
     out = {
         "id": cid,
         "description": description,
         "k": dag.k,
         "activation_height": "0",
         "genesis": order[0].hex(),
-        "blocks": [block_json(dag, h) for h in order[1:]],
+        "blocks": [refused_json(h, refused[h]) if h in refused else block_json(dag, h) for h in order[1:]],
     }
     if extra:
         out.update(extra)
@@ -176,6 +194,36 @@ def redundant_case() -> dict:
     )
 
 
+def size_limit_case() -> dict:
+    """The mergeset-size limit, at every height: 66 children of G; OK lists
+    65 of them (its selected parent and 64 merged), BIG all 66 (65 merged)."""
+    dag = g.Dag(k=10)
+    G = bid(0x00, 0x47)
+    S = [bid(0x20, i) for i in range(1, g.MERGESET_SIZE_LIMIT + 3)]
+    dag.add_genesis(G)
+    for i, s in enumerate(S):
+        dag.add_block(s, [G], 2 if i == 0 else 1)  # S[0] is the heaviest: everyone's selected parent
+    BIG, OK = bid(0xBF), bid(0xB6)
+    try:
+        dag.add_block(BIG, S, 1)
+        raise AssertionError("a mergeset of 65 must be refused")
+    except g.MergesetTooLarge as e:
+        assert e.args[0] == g.MERGESET_SIZE_LIMIT + 1
+    assert BIG not in dag.data and BIG not in dag.parents
+    d = dag.add_block(OK, S[:g.MERGESET_SIZE_LIMIT + 1], 1)
+    assert d.selected_parent == S[0] and len(d.mergeset_order) == g.MERGESET_SIZE_LIMIT
+    assert len(d.blues) == dag.k and len(d.reds) == g.MERGESET_SIZE_LIMIT - dag.k
+    return case(
+        "mergeset/size-limit",
+        "The mergeset-size limit, this chain's rule at every height: at most 64 blocks merged besides "
+        "the selected parent (MERGESET_SIZE_LIMIT; tighter than the audit's hardened MAX_MERGESET_SIZE "
+        "- 1 = 179). S1..S66 are children of G, S1 the heaviest. BIG lists all 66 (65 merged): refused "
+        "with MergesetTooLarge and not inserted. OK lists S1..S65 (64 merged): accepted; with k = 10, "
+        "10 of the 64 are blue.",
+        dag, [G] + S + [BIG, OK], refused={BIG: S},
+    )
+
+
 def build() -> dict:
     return {
         "format": "gnb-ghostdag-vectors/1",
@@ -183,10 +231,11 @@ def build() -> dict:
                        "(reference/gnb_ghostdag.py; docs/CONSENSUS.md, \"Coloring\" and \"Parent list\"). "
                        "Blocks are inserted in the listed order; ids are 32-byte hex; works, heights, "
                        "scores and blue works are decimal strings. `mergeset_order` is the normative "
-                       "candidate order (FIFO Kahn, ids ascending among the blocks a step makes ready).",
+                       "candidate order (FIFO Kahn, ids ascending among the blocks a step makes ready). "
+                       "A block whose `expected` is an `error` is refused and not inserted.",
         "generator": "reference/gen_ghostdag_vectors.py",
-        "constants": {"k": g.K, "max_mergeset_size": g.MAX_MERGESET_SIZE},
-        "cases": [order_case(), duplicate_case(), redundant_case()],
+        "constants": {"k": g.K, "mergeset_size_limit": g.MERGESET_SIZE_LIMIT},
+        "cases": [order_case(), duplicate_case(), redundant_case(), size_limit_case()],
     }
 
 

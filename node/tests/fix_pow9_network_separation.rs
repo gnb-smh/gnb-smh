@@ -301,6 +301,59 @@ fn an_unmarked_data_dir_is_marked_only_for_the_network_its_blocks_follow() {
         let err = n.store.check_chain_marker(main).unwrap_err();
         assert!(err.contains("no chain id marker") && err.contains("hardened"), "{err}");
         assert_eq!(n.store.get_meta(Storage::CHAIN_ID_META).unwrap(), None);
+
+        // A testnet block above the mainnet PoWit height (10,000). Testnet's
+        // PoWit height is its own (off, or --powit-height), so the block has
+        // the testnet body root (the tagged transaction root, no PoWit
+        // section); this process runs mainnet's PoWit height and expects the
+        // v2 body root there, so the Merkle check fails it. The network is
+        // still told by the hardened coinbase commitment (it read as mainnet
+        // when the inference checked the Merkle root).
+        use gnb::core::{block_rules, Block, BlockHeader, MerkleRoot};
+        let high = gnb::core::POWIT_HEIGHT_MAINNET + 50;
+        let mut hb = Block {
+            header: BlockHeader {
+                version: 1, parents: vec![b2.block_hash()], merkle_root: MerkleRoot::default(),
+                timestamp: b2.header.timestamp + 1, bits: b2.header.bits, nonce: 0,
+            },
+            transactions: vec![fix_common::coinbase("high", 1, vec![0x33; 20])],
+            blue_score: high,
+            height: high,
+            shielded_transactions: Vec::new(),
+            powit: Default::default(),
+        };
+        let c = block_rules::expected_coinbase_commitment(&hb);
+        let input = &mut hb.transactions[0].inputs[0];
+        input.script_sig = block_rules::coinbase_script_sig(&c, &std::mem::take(&mut input.script_sig));
+        hb.header.merkle_root = block_rules::tx_merkle_root(&hb.transactions, true);
+        assert!(gnb::core::powit_active(high) && !hb.validate_merkle_at(0),
+            "this process expects the PoWit v2 body root at that height");
+        assert_eq!(block_rules::check_hardened_body(&hb), Ok(()));
+        n.store.put_block_body(&hb).unwrap();
+        let mut batch = rocksdb::WriteBatch::default();
+        n.store.stage_chain_position(&mut batch, 3, &hb.block_hash(), hb.header.timestamp).unwrap();
+        n.store.write_batch(batch).unwrap();
+        assert_eq!(n.store.stored_chain_network().unwrap(), Some((ChainId::Testnet, hb.block_hash(), high)));
+        assert!(n.store.check_chain_marker(main).is_err(), "still refused to a mainnet node");
         assert_eq!(n.store.check_chain_marker(test), Ok(true));
     }
+}
+
+/// PoWit (from the mainnet PoWit height) adds signed messages of its own: a
+/// witness attestation signs a digest bound to the chain id, so an
+/// attestation for one network never verifies on the other, even for the
+/// same checkpoint pair (the shared genesis is one). Witness shares commit
+/// to a block id of the attested network, and PoWit items travel on that
+/// network's own transaction topic (`chain_separation::chain_protocols`).
+#[test]
+fn powit_attestations_are_bound_to_the_chain_id() {
+    use gnb::core::powit::{attestation_message, Checkpoint};
+    let genesis = gnb::core::genesis_block().block_hash();
+    let source = Checkpoint { height: 0, hash: genesis };
+    let target = Checkpoint { height: 10_000, hash: [0x7A; 32] };
+    assert_ne!(attestation_message(ChainId::Mainnet, &source, &target),
+               attestation_message(ChainId::Testnet, &source, &target));
+    let (m, t) = (gnb::network::chain_separation::chain_protocols(ChainId::Mainnet),
+                  gnb::network::chain_separation::chain_protocols(ChainId::Testnet));
+    assert_ne!(m.txs_topic, t.txs_topic, "NewPowitItem is gossiped on the transaction topic");
 }

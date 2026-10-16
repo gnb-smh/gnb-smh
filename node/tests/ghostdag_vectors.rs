@@ -7,9 +7,11 @@
 //! blue set differs between GnB's FIFO Kahn order and the other reading of
 //! the old wording ("lower hash first" among ready blocks); the node must
 //! produce the FIFO result, and the vector records the other reading's
-//! result so this test also proves the case discriminates.
+//! result so this test also proves the case discriminates. The case
+//! `mergeset/size-limit` pins this chain's mergeset-size limit
+//! (`MERGESET_SIZE_LIMIT`, 64 merged blocks at every height).
 
-use gnb::consensus::{BlockHash, GhostDAG};
+use gnb::consensus::{BlockHash, ConsensusError, GhostDAG};
 use serde_json::Value;
 
 const VECTORS: &str = include_str!("../../reference/ghostdag_vectors.json");
@@ -30,15 +32,34 @@ where
     v.as_str().expect("decimal string").parse().expect("number")
 }
 
-/// Build one case with the node's GhostDAG; returns the DAG.
+/// A block the vectors expect the rules to refuse (`expected.error`).
+fn refused(b: &Value) -> Option<&str> {
+    b["expected"].get("error").and_then(Value::as_str)
+}
+
+/// Build one case with the node's GhostDAG; returns the DAG. A block the
+/// vectors expect to be refused must be refused, with the expected error and
+/// without inserting anything.
 fn build(case: &Value) -> GhostDAG {
     let k: usize = case["k"].as_u64().unwrap() as usize;
     let act: u64 = num(&case["activation_height"]);
     let mut dag = GhostDAG::with_k_and_activation(k, act);
     dag.add_genesis(id(&case["genesis"]), 0);
     for (i, b) in case["blocks"].as_array().unwrap().iter().enumerate() {
-        dag.add_block(id(&b["id"]), ids(&b["parents"]), i as u64 + 1, num(&b["work"]))
-            .unwrap_or_else(|e| panic!("[{}] add_block {}: {e}", case["id"], b["id"]));
+        let res = dag.add_block(id(&b["id"]), ids(&b["parents"]), i as u64 + 1, num(&b["work"]));
+        match refused(b) {
+            None => {
+                res.unwrap_or_else(|e| panic!("[{}] add_block {}: {e}", case["id"], b["id"]));
+            }
+            Some("mergeset-too-large") => {
+                let count = dag.block_count();
+                assert!(matches!(res, Err(ConsensusError::MergesetTooLarge { .. })),
+                    "[{}] block {} must be refused: {:?}", case["id"], b["id"], res.map(|d| d.height));
+                assert_eq!(dag.block_count(), count, "[{}] nothing inserted", case["id"]);
+                assert!(dag.get_block_data(&id(&b["id"])).is_none());
+            }
+            Some(other) => panic!("[{}] unknown expected error {other}", case["id"]),
+        }
     }
     dag
 }
@@ -48,17 +69,24 @@ fn node_ghostdag_matches_the_reference_vectors() {
     let doc: Value = serde_json::from_str(VECTORS).unwrap();
     assert_eq!(doc["format"], "gnb-ghostdag-vectors/1");
     assert_eq!(doc["constants"]["k"].as_u64(), Some(gnb::core::GHOSTDAG_K as u64));
+    // The limit the node applies at every height: this chain's
+    // MERGESET_SIZE_LIMIT, tighter than the audit's MAX_MERGESET_SIZE - 1.
     assert_eq!(
-        doc["constants"]["max_mergeset_size"].as_u64(),
-        Some(gnb::consensus::MAX_MERGESET_SIZE as u64)
+        doc["constants"]["mergeset_size_limit"].as_u64(),
+        Some(gnb::consensus::MERGESET_SIZE_LIMIT.min(gnb::consensus::MAX_MERGESET_SIZE - 1) as u64)
     );
     let cases = doc["cases"].as_array().unwrap();
-    assert!(cases.len() >= 3);
+    assert!(cases.len() >= 4);
     let mut blocks = 0;
+    let mut refusals = 0;
     for case in cases {
         let cid = case["id"].as_str().unwrap();
         let dag = build(case);
         for b in case["blocks"].as_array().unwrap() {
+            if refused(b).is_some() {
+                refusals += 1; // checked by `build`
+                continue;
+            }
             let h = id(&b["id"]);
             let e = &b["expected"];
             let d = dag.get_block_data(&h).unwrap();
@@ -102,4 +130,5 @@ fn node_ghostdag_matches_the_reference_vectors() {
         }
     }
     assert!(blocks >= 25, "{blocks} blocks checked");
+    assert!(refusals >= 1, "the mergeset-size limit is exercised");
 }

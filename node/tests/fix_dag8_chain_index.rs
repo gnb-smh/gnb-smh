@@ -392,3 +392,79 @@ fn the_migration_indexes_the_chain_reconciliation_leaves_applied() {
     assert!(rows([0xB1; 20]).iter().any(|e| e.txid == cb(&b1) && e.height == 1), "B1's history at position 1");
     assert!(rows([0xB2; 20]).is_empty(), "B2 rolled back");
 }
+
+/// Every row of the three selected-chain index column families.
+fn index_rows(n: &Node) -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+    let db = n.store.db();
+    let mut out = Vec::new();
+    for cf in ["height", "timestamps", "addr_tx_history"] {
+        let h = db.cf_handle(cf).unwrap();
+        for r in db.iterator_cf(&h, rocksdb::IteratorMode::Start) {
+            let (k, v) = r.unwrap();
+            out.push((cf, k.to_vec(), v.to_vec()));
+        }
+    }
+    out
+}
+
+/// `--reindex-addresses` (main's d400bd0, "keep spends in the address
+/// history across reorgs") is the DAG-8 rebuild, not a second layout: on a
+/// chain with pruned blocks and a spend of a genesis-ledger output (an
+/// outpoint no transaction creates), a history that lost its spend rows (the
+/// reorg bug of earlier releases) and holds rows keyed by header height and
+/// rows of a block off the chain is rebuilt to exactly what the connects
+/// wrote, keyed by chain position, the spends resolved from the undo
+/// records (no carryover snapshot), the pruned blocks' rows kept. Running it
+/// again changes nothing.
+#[test]
+fn reindex_addresses_rebuilds_exactly_what_the_connects_wrote() {
+    use gnb::storage::indexer::{make_key, make_value, parse_value, with_position, DIR_IN, DIR_OUT};
+    let _g = activation::scoped_override(0);
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let k = key();
+    let fund = ([0x61; 32], 0u32, out(4_000_000, &k.spk));
+    let n = node_with(&genesis, std::slice::from_ref(&fund));
+    // As main() at first boot: the genesis coinbase is in the tx index (the
+    // rebuild keeps a pruned block's row only if the row's txid is its own).
+    for tx in &genesis.transactions {
+        n.store.put_tx_index(&tx.txid(), &genesis.block_hash(), 0).unwrap();
+    }
+    let (s, b, _c, d, ms) = dag8_shape(&n, [0xD0; 20]);
+    let spend = signed_spend_at(&k, &[(fund.0, fund.1)], std::slice::from_ref(&fund.2),
+        vec![out(3_000_000, &ADDR), out(900_000, &k.spk)], 6);
+    let e = mk_block(&n, vec![d.block_hash()],
+        vec![coinbase("e", gnb::core::tokenomics::block_subsidy_sat(6) + 100_000, ADDR.to_vec()), spend.clone()]);
+    accept(&n, &e).unwrap();
+    assert_eq!(applied_tip(&n), Some(e.block_hash()));
+    assert_eq!(n.store.prune_blocks_below(4).unwrap(), 4, "G, a P, S and B pruned");
+    let k_addr: [u8; 20] = k.spk[..20].try_into().unwrap();
+    let spent_row = make_key(&k_addr, dag_height(&n, &e.block_hash()), 1, 0x8000_0000);
+    let connected = index_rows(&n);
+    assert!(connected.iter().any(|(cf, key, v)| *cf == "addr_tx_history" && *key == spent_row
+        && parse_value(v) == Some((spend.txid(), DIR_IN, 4_000_000))), "the connect wrote the genesis-ledger spend");
+
+    // Damage, as earlier releases left it: every spend row gone, B's row
+    // also at its header height (5), a row of M1 (off the chain).
+    {
+        let db = n.store.db();
+        let cf = db.cf_handle("addr_tx_history").unwrap();
+        for (_, key, v) in connected.iter().filter(|(c, _, _)| *c == "addr_tx_history") {
+            if parse_value(v).map(|(_, dir, _)| dir) == Some(DIR_IN) {
+                db.delete_cf(&cf, key).unwrap();
+            }
+        }
+        let b_row = make_key(&ADDR, 3, 0, 0);
+        db.put_cf(&cf, with_position(&b_row, b.height), make_value(&cb(&b), DIR_OUT, 1)).unwrap();
+        db.put_cf(&cf, make_key(&[0xEE; 20], 1, 0, 0), make_value(&cb(&ms[0]), DIR_OUT, 1)).unwrap();
+    }
+    assert_ne!(index_rows(&n), connected);
+
+    let r = accept::reindex_chain_indexes(&n.dag, &n.store).unwrap();
+    assert_eq!((r.blocks, r.lost, r.unresolved), (7, 0, 0), "G, P, S, B, C, D, E; {r:?}");
+    assert_eq!(index_rows(&n), connected, "exactly what the connects wrote");
+    assert_eq!(n.store.chain_index_version().unwrap(), gnb::storage::CHAIN_INDEX_VERSION);
+    assert_index_is_the_chain(&n, "reindexed");
+    assert!(history(&n).iter().any(|(pos, t)| *t == cb(&s) && *pos == 2), "pruned S's row kept");
+    assert_eq!(accept::reindex_chain_indexes(&n.dag, &n.store).unwrap(), r);
+    assert_eq!(index_rows(&n), connected, "idempotent");
+}

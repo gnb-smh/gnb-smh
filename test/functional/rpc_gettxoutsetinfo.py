@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """gettxoutsetinfo: the UTXO set against the issuance (audit VAL-11).
 
-* On the cached chain (genesis carryover + mined blocks) the set holds no
-  more than carryover + the subsidy of every connected block, there is one
-  undo record per chain position, and the scan agrees with the aggregates
-  the node maintains.
+* On the cached chain (genesis ledger + mined blocks) the set holds no
+  more than the genesis ledger (carryover + locked team and founder
+  allocations) + the subsidy of every connected block, there is one undo
+  record per chain position, and the scan agrees with the aggregates the
+  node maintains.
 * A payment and the block that confirms it (its coinbase claims subsidy +
   fee) leave the unclaimed amount unchanged: fees are not issuance.
 * A block whose coinbase claims 1,234 sat less than allowed raises the
@@ -36,7 +37,7 @@ class GetTxOutSetInfoTest(GnbTestFramework):
         assert_equal((info["undo_off_chain"], info["chain_without_undo"]), (0, 0))
         assert_equal(info["undecodable_txouts"], 0)
         exp = info["expected"]
-        issued = int(exp["carryover_sat"]) + int(exp["subsidy_sat"])
+        issued = int(exp["carryover_sat"]) + int(exp["locked_sat"]) + int(exp["subsidy_sat"])
         assert_equal(int(exp["max_supply_sat"]), issued)
         assert_equal(int(info["total_amount_sat"]) + int(info["unclaimed_sat"]), issued)
         assert_true(int(exp["subsidy_sat"]) <= int(exp["schedule_issued_sat"]), str(exp))
@@ -54,6 +55,8 @@ class GetTxOutSetInfoTest(GnbTestFramework):
         start = self.audit(n0)
         self.same_set(start, self.audit(n1))
         assert_true(start["txouts"] > 0 and int(start["expected"]["carryover_sat"]) > 0, str(start))
+        # 2 x 1,250,000 GNB in 72 timelocked tranches (core::vesting).
+        assert_equal(int(start["expected"]["locked_sat"]), 2 * 1_250_000 * 10**8)
 
         self.log.info("a payment and its block: fees move value, unclaimed is unchanged")
         n1.cli_send(self.wallet_copy(), PAYEE, "3")

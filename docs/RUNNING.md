@@ -29,7 +29,9 @@ data dir belongs to chain id ...". A data dir from an earlier release has no
 marker yet; it is not simply marked for the network that opens it first:
 when it holds chain blocks, the node reads their network from the blocks
 (below height 110,000 a mainnet block follows the pre-activation rules and a
-testnet block the hardening rules, which exclude each other) and refuses to
+testnet block the hardening rules, which exclude each other: only a testnet
+coinbase carries the hardened coinbase commitment, whatever either network's
+PoWit height) and refuses to
 start on the other network with "this data dir has no chain id marker yet,
 but its block ... belongs to chain id ...". A testnet data dir from before
 testnet's hardening reads as mainnet-shaped: its blocks fail the testnet
@@ -92,7 +94,16 @@ record existed, from the rows themselves (each attributed to its block
 through the transaction index; a record naming them is written so that a
 later reorg deletes them). A row that an earlier release had overwritten
 with another block's, or that cannot be attributed to a block, cannot be
-recovered and is reported as lost.
+recovered and is reported as lost. The rebuild also drops the rows earlier
+releases wrote for blocks that never joined the chain and restores the spend
+rows of bodied blocks that a reorg had deleted (each block's undo record
+holds the outputs it spent). `--reindex-addresses` runs the same rebuild on
+demand at start-up, after reconciliation, over the applied chain ("address
+history rebuilt: N blocks, R rows, U unresolved inputs"); it needs no
+`--carryover-snapshot`, since spends of genesis-ledger outputs are resolved
+from the undo records too. The rows are always exactly what connecting the
+block writes, keyed by chain position, so the migration and the flag can
+never produce two layouts.
 
 The explorer statistics (`getchainstats`, `gethashrate`, `getrichlist`,
 `getsupplydistribution`, `getaddresscount`) are served from aggregates the
@@ -124,9 +135,10 @@ and answers:
 | `txouts`, `total_amount_sat` | unspent outputs and their total |
 | `hash_serialized` | SHA3-256 of the UTXO rows in key order (domain `gnb/utxo-set/v1`; each row `u32 LE len ‖ key ‖ u32 LE len ‖ value`). Two nodes with the same set report the same hash; compare it across nodes at the same `bestblock` |
 | `applied_blocks`, `undo_off_chain`, `chain_without_undo`, `chain_ok` | blocks with an undo record (the connected chain, genesis excluded); of those, the ones not on the selected chain of `bestblock` (a stale record, whose subsidy would inflate `max_supply_sat`); the blocks of that chain without a record (their subsidy is missing from it; a chain whose walk stops at a missing DAG record counts one more); `chain_ok` when the records are exactly that chain (both counts 0 and `applied_blocks` = `height`) |
-| `expected.carryover_sat` | the genesis ledger (the verified Bloch carryover) |
+| `expected.carryover_sat` | the genesis ledger's verified Bloch carryover |
+| `expected.locked_sat` | the genesis ledger's locked team and founder allocations (2 × 1,250,000 GNB in 72 timelocked policy outputs, `core::vesting`; in the set whether unlocked or not) |
 | `expected.subsidy_sat` | the subsidy of every connected block, at the header height its coinbase was checked against |
-| `expected.max_supply_sat` | carryover + subsidy: the most the set may hold |
+| `expected.max_supply_sat` | carryover + locked + subsidy: the most the set may hold |
 | `expected.schedule_issued_sat` | `issued_through_sat(height)`, the schedule through the tip's position, an upper bound of `subsidy_sat` |
 | `unclaimed_sat` | `max_supply_sat - total_amount_sat`, `null` when the set holds more |
 | `supply_ok` | the set holds no more than `max_supply_sat` and every row decodes |
@@ -134,14 +146,20 @@ and answers:
 | `ok` | all of the above hold |
 
 `unclaimed_sat` is value that can never be spent, and is expected to be
-positive and to grow: a miner that claims less than subsidy plus fees burns
-the difference (consensus allows it); before the hardening activation a
-transaction that recreated an existing outpoint replaced the older coin
-(BIP30, audit VAL-2); and value that enters the shielded pool leaves the
-transparent set (no shielded transaction is valid while the pool is
-inactive). Fees are not issuance: they move value from transaction outputs
-to the coinbase. Outputs paying unspendable scripts (the genesis coinbase
-creates none) stay in the set and in the total, as in Core. A total above
+positive and to grow: a miner that claims less than its allowance burns the
+difference (consensus allows it); from the PoWit activation (mainnet height
+10,000) 20% of each subsidy is reserved for 16 witness-share slots, and the
+slots a block leaves empty, with the rounding of the split, are never issued
+(`witness_share::split_subsidy`; the shares that are paid are coinbase
+outputs like the miner's, in the total); and value that enters the shielded
+pool leaves the transparent set (no shielded transaction is valid while the
+pool is inactive). No coin is ever overwritten: BIP30 is enforced at every
+height. Fees are not issuance: they move value from transaction outputs to
+the coinbase, and the proof of work (GnB-SMH v3 from the PoWit activation)
+does not change the subsidy. Outputs paying unspendable scripts (the genesis
+coinbase creates none) stay in the set and in the total, as in Core. Policy
+outputs (multisig, timelocks, the locked tranches) are in the total but not
+in `aggregates`, which counts address (20-byte) scripts only. A total above
 `max_supply_sat` (`supply_ok: false`) means inflation or a corrupted set; an
 aggregates mismatch with the supply bound intact means a UTXO row changed
 outside the node (disk corruption, an edited data dir). Either way stop the
