@@ -172,10 +172,13 @@ pub fn call_bytes(input: &[u8]) -> Box<[u8]> {
 }
 
 #[cfg(test)]
+type WipeObserver = Box<dyn FnMut(Option<&Value>, &Value)>;
+
+#[cfg(test)]
 thread_local! {
     /// Test hook: called by [`call_bytes`] with the request and the response
     /// `Value`s as they are when `call_bytes` drops them.
-    static WIPE_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(Option<&Value>, &Value)>>> =
+    static WIPE_OBSERVER: std::cell::RefCell<Option<WipeObserver>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -682,7 +685,8 @@ mod tests {
     #[cfg_attr(miri, ignore = "create runs the PQClean keygen")]
     fn gnb_call_path_wipes_request_and_response_secrets() {
         let _session = SESSION_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let seen: std::rc::Rc<std::cell::RefCell<Vec<(Option<Value>, Value)>>> = Default::default();
+        type Seen = std::rc::Rc<std::cell::RefCell<Vec<(Option<Value>, Value)>>>;
+        let seen: Seen = Default::default();
         let sink = seen.clone();
         WIPE_OBSERVER.with(|o| *o.borrow_mut() = Some(Box::new(move |req, out| {
             sink.borrow_mut().push((req.cloned(), out.clone()));
