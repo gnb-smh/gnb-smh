@@ -155,9 +155,16 @@ Block proofs of work (GnB-SMH v1, 64 MiB, below the PoW + PoWit activation;
 v3, 4 MiB, from it) are evaluated on a bounded pool of threads (half the
 logical CPUs, 1 to 4), each peer and each network group (IPv4 /16, IPv6 /32)
 with a small budget of failed evaluations. A peer that delivers a block it
-authored that fails validation is disconnected and its address (IPv4
-address, IPv6 /64) refused for 24 hours; loopback addresses and `--peer`
-peers are exempt. The set is in memory (a restart clears it).
+authored that fails validation is disconnected, and both its identity and
+its address (IPv4 address, IPv6 /64) are refused for 24 hours; loopback
+addresses are never refused (only disconnected) and `--peer` peers are
+exempt. The same happens to a peer whose misbehaviour score (one shared
+decaying score: wire violations, gossip frames proven invalid, directed
+answers that break the request/response contract) crosses its threshold.
+The sets are in memory (a restart clears them). The connection manager
+(below) dials no discouraged address, and a peer connected from an address
+discouraged since (another identity there misbehaved) is the first inbound
+peer evicted when the slots are full.
 
 Gossiped PoWit items (witness shares, attestations, equivocation proofs) are
 verified with transactions, never on the block path, on their own bounded
@@ -165,6 +172,138 @@ pool (half the block pool, at least one thread) with their own per-peer and
 per-network-group budgets of failed verifications; an item whose id or
 encoding is wrong, or whose share proof or witness signature is invalid,
 counts against its sender like an invalid block.
+
+## Peers and connections
+
+Connection management follows Bitcoin Core's `CConnman` / `addrman` design
+(audit NET-11, re-audit B1-T8 and B1-T9); the code is in
+`node/src/network/{connmgr,addrbook,gossip_gate,pex_validator}.rs`.
+
+Settings:
+
+- `--peer <multiaddr>` (repeatable): a manual connection (Core's
+  `-addnode`). It is dialed at start-up and re-dialed every 30 s while it is
+  not connected (an entry without `/p2p/<id>` is re-dialed while no manual
+  connection is up). It never uses an automatic outbound slot. A host name is
+  resolved by the node; like an IP literal given here, it may resolve to a
+  private or loopback address (docker / LAN setups) whatever
+  `--allow-private-peers` says, but never into an invalid range (unspecified,
+  multicast, documentation, link-local such as 169.254.169.254, …). The
+  30 s re-dial resolves names on a separate task (at most 10 s per lookup),
+  so a configured host that is down or slow to resolve never stalls the
+  node's network loop.
+- `--dns-seed <host[:port]>` (repeatable, opt-in): resolved at start-up and
+  dialed as manual connections. Answers that are not routable public
+  addresses are ignored unless `--allow-private-peers` is set.
+- `--max-peers <n>` (default 50): the INBOUND slots. Outbound slots come on
+  top of them and cannot be used by inbound connections.
+- `--allow-private-peers`: dev/test only. Accepts loopback, RFC 1918, CGNAT,
+  ULA and link-local IPv6 addresses in the address tables.
+- `--enable-mdns`: zero-config LAN discovery (off by default).
+
+Outbound connections. The node keeps 8 full-relay and 2 block-relay-only
+outbound connections (Core's 8 + 2), whatever the inbound count, and opens
+at most one automatic outbound connection per second to fill a free slot
+(full-relay slots first, then block-relay-only). Addresses come from the
+address tables, half the time from the tried table and half from the new
+table; at most one automatic outbound peer per netgroup (an IPv4 /16, an
+IPv6 /32; an IPv6 literal that embeds an IPv4 — `::ffff:a.b.c.d`, 6to4,
+Teredo, NAT64 — counts as that IPv4's /16); an address tried in the last 10
+minutes is not tried again. Small-network fallback (not in Core, which
+relies on seeds; this network ships with none): when neither table holds a
+candidate outside the netgroups already used, a full-relay slot may take a
+peer in a used netgroup, up to 4 automatic outbound peers per netgroup, so
+nodes hosted in one /16 still connect to each other after a restart.
+Block-relay-only slots never relax the one-per-netgroup rule.
+
+Inbound connections. When a new inbound connection finds the `--max-peers`
+slots full, an existing inbound peer is evicted, chosen as Core's
+`SelectNodeToEvict` does: the peers in 4 netgroups picked by a secret key,
+the 8 lowest-latency peers (libp2p ping), the 4 that most recently delivered
+a new transaction, the 4 that most recently delivered a new block, and the
+longest-connected half of the rest are protected; among the rest, a peer
+connected from an address discouraged since it connected (see "Initial sync
+and minimum chain work" above) is evicted first (Core's `m_prefer_evict`);
+otherwise the most recently connected peer of the netgroup with the most
+remaining peers is evicted.
+With fewer than 21 inbound peers everyone is protected and the newcomer is
+refused. At the transport level a node accepts `--max-peers` + 1 inbound
+connections (the extra one is the newcomer under evaluation), at most 2
+connections per peer, and `max(2 × max-peers, max-peers + 32)` connections in
+all.
+
+Address tables. Peer exchange (`GetPeers` over `/gnb/sync/1`) carries IP
+literals only — host names are refused, and so is any address that is not a
+routable public address once an embedded IPv4 is taken into account (so
+`/ip6/::ffff:127.0.0.1/…` is refused like `/ip4/127.0.0.1/…`). A received
+address goes into the in-memory **new** table (1,024 slots: 64 buckets of
+16); a successful outbound connection moves it to the **tried** table
+(1,000 slots: 125 buckets of 8), saved every minute as `known_peers.json`,
+once the peer's identify shows it runs this node's network (audit POW-9; a
+peer of the other network is disconnected, its addresses leave the tables
+and it is not dialed again during the run).
+Bucket and slot are chosen by a keyed hash (a secret derived from the node's
+P2P identity key, never sent anywhere), as in Core's addrman: the addresses
+one peer's netgroup sends can only reach 4 of the 64 new buckets, and one
+netgroup can hold at most 16 tried entries. A full tried bucket never evicts
+on the spot: the occupant is tested first by a feeler connection and kept if
+it answers (Core's test-before-evict); it is also kept, and the newcomer
+dropped, if its feeler fails but it connected successfully in the last 4
+hours (Core's `ADDRMAN_REPLACEMENT`; entries loaded from `known_peers.json`
+count as successful at start-up). Addresses are read only from the answer to
+the node's own `GetPeers`; a `Peers` answer to any other request is ignored. The node asks for addresses only on
+its outbound full-relay and manual connections and answers only inbound
+peers, once per connection, from a sample of the tried table cached for 21
+to 27 hours (Core's getaddr cache), so asking repeatedly reveals no more of
+the table. 20 addresses per answer and 100 per 5 minutes per answering peer
+are read.
+
+Feelers. While every outbound slot is full, the node opens a short-lived
+"feeler" connection about every 2 minutes (exponentially distributed): to a
+tried-table occupant awaiting a collision test, else to a random new-table
+address. A feeler carries no gossip and none of the node's requests, and is
+closed about a second after it is established (once the remote has finished
+its side of the connection setup, as Core waits for the version handshake);
+a new-table address that answered moves to the tried table.
+
+Block-relay-only connections and anchors. The 2 block-relay-only
+connections carry no gossip at all (no transactions, no addresses, no block
+announcements): gossipsub never sees them, so they cannot be found through
+transaction or address relay. The node learns blocks over them by polling
+the peer's frontier (`GetTips` every 30 s) and pulling what it lacks. Their
+addresses are saved in `anchors.json` (at most 2) whenever that set changes;
+at start-up the file is read once, deleted, and its peers are re-dialed
+first as block-relay-only connections (Core's `anchors.dat`). Nothing the
+node publishes crosses a block-relay-only connection (the remote treats it
+as an ordinary inbound peer without gossip and does not poll us), so these
+peers are left out of the peer count the node reports (RPC `peers`, and the
+miner's wait-for-peers check): a node connected only to its anchors does not
+mine as if it were on the network.
+
+External address. A peer-reported observed address becomes the node's
+advertised address only when peers in 3 different netgroups report it.
+
+Differences from Bitcoin Core, by design or not yet done: no AS-map (netgroups
+are IP prefixes); no Tor / I2P / CJDNS networks, so no protection quota for
+them; the new table is not persisted and a new-table address is dropped once
+dialed (no attempt counters); an occupied keyed slot probes to the next free
+slot of the same bucket (bucket bounds unchanged; avoids losing addresses to
+collisions at this table size); block-relay-only peers do not push blocks to
+us (we poll them every 30 s); no extra rotating block-relay-only peer or
+stale-tip extra outbound connection; anchors are written when the set
+changes rather than at shutdown (the node has no orderly network shutdown).
+
+Block-relay-only connections carry no PoWit items either: witness shares,
+attestations and equivocation proofs (`NewPowitItem`) are gossiped on the
+transaction topic, and gossipsub never sees those connections. A PoWit item
+accepted from a peer does not count as a novel transaction for the inbound
+eviction protection (Core protects for novel blocks and transactions only).
+
+Transaction privacy: transactions are gossiped from the node that creates
+them; the origin IP is not hidden (the unused Dandelion++ sketch was removed,
+NET-17). The P2P transport (`/gnb/pq/2.0.0`, `docs/P2P.md`) authenticates
+each peer with its Ed25519 libp2p key and its hybrid ML-DSA-65 ‖ Falcon-1024
+key, and derives session keys from ML-KEM-768 and X25519.
 
 ## Genesis
 

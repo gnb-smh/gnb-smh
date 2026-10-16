@@ -8,8 +8,10 @@
 //!   with monotonic nonce counters (replay and reorder rejected) and
 //!   length-prefixed framing whose length is bound into the AEAD.
 //!
-//! The round-3 Kyber handshake that used to live here (never wired into the
-//! network) was removed together with the `pqcrypto-kyber` dependency.
+//! The round-3 Kyber handshake that used to live here (`Initiator` /
+//! `PendingResponder` / `SessionConfirm`, ML-DSA-65 authenticated; never wired
+//! into the network, audit NET-17) was removed together with the
+//! `pqcrypto-kyber` dependency.
 
 pub mod identity;
 pub mod stream;

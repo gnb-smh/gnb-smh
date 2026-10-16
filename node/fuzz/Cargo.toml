@@ -17,7 +17,7 @@
 #   block_parse       Block::from_wire_bytes (+ idempotence)
 #   header_parse      BlockHeader::from_wire_bytes (+ idempotence)
 #   netmsg_decode     gnb::network::decode_wire_message (gossip frames)
-#   handshake_decode  transport handshake messages (HandshakeInit / HandshakeResp)
+#   handshake_decode  transport handshake messages (upgrade::Init / Resp / Finish)
 #   pow_decode        compact bits <-> target, chain work, ASERT (vs a U512 oracle)
 #   pow_verify        GnB-SMH output vs target (small scratchpad), hybrid signature verify
 #   merkle_path       coherence_core::verify_path

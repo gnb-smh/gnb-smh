@@ -83,7 +83,8 @@ const NONCE_SIZE: usize = 32;
 
 /// Defensive bound on one handshake message. The largest (`Resp`) carries an
 /// ML-KEM ciphertext, a PQ public key and a PQ signature: about 9.7 KB.
-const MAX_HANDSHAKE_MSG_SIZE: u32 = 32 * 1024;
+/// Public so the `handshake_decode` fuzz target applies the same bound.
+pub const MAX_HANDSHAKE_MSG_SIZE: u32 = 32 * 1024;
 
 // ── Wire messages ───────────────────────────────────────────────────────────
 

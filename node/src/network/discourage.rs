@@ -42,14 +42,21 @@ pub const DISCOURAGE_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AddrKey([u8; 9]);
 
-/// A network group: an IPv4 /16 or an IPv6 /32 (with IPv4-mapped IPv6
-/// addresses mapped to their IPv4 group).
+/// A network group: an IPv4 /16 or an IPv6 /32 (an IPv6 address that
+/// embeds an IPv4 address counts as that IPv4 address, see [`canonical`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NetGroup([u8; 5]);
 
+/// The address keys and groups are computed from: an IPv6 literal that
+/// embeds an IPv4 address (IPv4-mapped / -compatible, SIIT, NAT64, 6to4,
+/// Teredo: `pex_validator::embedded_ipv4`, package R3's B1-T8
+/// normalisation, the one the connection manager's netgroups use) is that
+/// IPv4 address. Otherwise a misbehaving peer behind a 6to4 relay would
+/// rotate through 65,536 /64s of its /48, or a Teredo client through the
+/// server's prefix, each a fresh discouragement key and budget group.
 fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V6(v6) => super::pex_validator::embedded_ipv4(&v6).map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
         v4 => v4,
     }
 }
@@ -96,9 +103,14 @@ pub fn ip_of(addr: &Multiaddr) -> Option<IpAddr> {
 }
 
 /// Bitcoin Core's `IsLocal` (loopback, unspecified): such peers are
-/// disconnected but never discouraged.
+/// disconnected but never discouraged. Judged on the address itself
+/// (IPv4-mapped loopback included), never on an IPv4 address a transition
+/// prefix claims to embed (a 6to4 `2002:7f00:1::` peer is not local).
 pub fn is_local(ip: IpAddr) -> bool {
-    let ip = canonical(ip);
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    };
     ip.is_loopback() || ip.is_unspecified()
 }
 
@@ -224,6 +236,16 @@ mod tests {
         assert_eq!(net_group(v6a), net_group(v6c), "IPv6: /32");
         let mapped = IpAddr::V6(Ipv4Addr::new(45, 77, 1, 2).to_ipv6_mapped());
         assert_eq!(addr_key(mapped), addr_key(a), "IPv4-mapped IPv6 is the IPv4 address");
+        // R3 (B1-T8) normalisation: every transition format is the IPv4
+        // address it embeds, for the key and the group alike (a 6to4 /48
+        // holds 65,536 /64s, each otherwise a fresh key).
+        for embedded in ["2002:2d4d:102::1", "2002:2d4d:102:ffff::9", "64:ff9b::2d4d:102", "::ffff:0:2d4d:102"] {
+            let e: IpAddr = embedded.parse().unwrap();
+            assert_eq!(addr_key(e), addr_key(a), "{embedded} is 45.77.1.2");
+            assert_eq!(net_group(e), net_group(a), "{embedded} is in 45.77/16");
+        }
+        let six_to_four_loopback: IpAddr = "2002:7f00:1::1".parse().unwrap();
+        assert!(!is_local(six_to_four_loopback), "a transition prefix never makes a peer local");
         let ma: Multiaddr = "/ip4/45.77.1.2/tcp/17110".parse().unwrap();
         assert_eq!(ip_of(&ma), Some(a));
         assert!(is_local(IpAddr::V4(Ipv4Addr::LOCALHOST)) && is_local(IpAddr::V6(Ipv6Addr::LOCALHOST)));

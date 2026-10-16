@@ -38,7 +38,6 @@ mod attestation;  // L3 attestation (referenced by rpc)
 // (in-memory journal, mempool, snapshots) serves the library and its tests.
 #[allow(dead_code)]
 mod coherence;    // Coherence C2 shielded pool
-mod dandelion;    // Coherence P3 Dandelion++ tx-relay privacy
 mod tip;
 mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer
 mod ingress;      // audit fixes: block-ingress / orphan / IBD-latch policy

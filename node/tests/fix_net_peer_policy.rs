@@ -5,7 +5,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use gnb::network::pex_validator::{netgroup, AddrBook, PexRateLimiter, PexStats, NEW_PER_NETGROUP, PEX_BATCH_LIMIT};
+use gnb::network::connmgr::{select_outbound_candidate, ConnKind};
+use gnb::network::pex_validator::{netgroup, AddrBook, PexRateLimiter, PexStats, TriedTable, NEW_PER_NETGROUP, PEX_BATCH_LIMIT};
 use gnb::network::sync_rr::{
     check_nonempty_frame, decode_response, encode_frame, is_sync_protocol_violation, select_pull_peer,
     PeerSync, PullPeerSelector, SyncRequestLimiter, SyncResponse, MAX_INFLIGHT_PER_PEER,
@@ -240,10 +241,12 @@ fn frontier_state_is_bounded() {
 // ── NET-11 ───────────────────────────────────────────────────────────────────
 
 /// NET-11: peer-exchange addresses only ever enter the bounded address table
-/// (nothing here can dial), capped per message, per author and per /16.
+/// (nothing here can dial), capped per message, per author and per /16. (The
+/// table is keyed since the NET-11 residual fix; a fixed key keeps the
+/// bucket layout, hence the counts, deterministic.)
 #[test]
 fn pex_addresses_go_to_a_diverse_bounded_table() {
-    let mut book = AddrBook::new();
+    let mut book = AddrBook::with_key([7u8; 32]);
     let mut lim = PexRateLimiter::new();
     let mut stats = PexStats::new();
     let me = PeerId::random();
@@ -252,17 +255,24 @@ fn pex_addresses_go_to_a_diverse_bounded_table() {
     let same_group: Vec<String> = (0..20u8)
         .map(|i| format!("/ip4/45.77.{}.1/tcp/17110/p2p/{}", i, PeerId::random()))
         .collect();
-    let added = ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, &same_group, false, &me, &HashSet::new());
+    let added = ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, "ip4:1.1", &same_group, false, &me, |_| false);
     assert_eq!(added, NEW_PER_NETGROUP, "one /16 fills at most NEW_PER_NETGROUP slots");
-    // A dial batch takes at most one address per netgroup.
-    let batch = book.take_dial_candidates(4, |_| false);
-    assert_eq!(batch.len(), 1);
-    assert_eq!(netgroup(&batch[0]), netgroup(&same_group[0]));
+    // Outbound selection takes at most one address per netgroup: once that
+    // /16 holds an automatic outbound peer, a block-relay-only slot finds no
+    // further candidate in it (the production selection; the old batch
+    // dialer `take_dial_candidates` is gone).
+    let tried = TriedTable::with_key([7u8; 32]);
+    let mut rng = rand::rng();
+    let first = select_outbound_candidate(&mut rng, &tried, &book, ConnKind::BlockRelayOnly, &HashMap::new(), |_| true)
+        .expect("one candidate");
+    assert_eq!(netgroup(&first), netgroup(&same_group[0]));
+    let used: HashMap<String, usize> = [(netgroup(&first).unwrap(), 1)].into_iter().collect();
+    assert_eq!(select_outbound_candidate(&mut rng, &tried, &book, ConnKind::BlockRelayOnly, &used, |_| true), None);
     // Oversized message: batch-capped.
     let many: Vec<String> = (0..100u8)
         .map(|i| format!("/ip4/{}.9.1.1/tcp/17110/p2p/{}", 20 + i, PeerId::random()))
         .collect();
     let other_author = PeerId::random();
-    let added = ingest_pex_addresses(&mut book, &mut lim, &mut stats, other_author, &many, false, &me, &HashSet::new());
+    let added = ingest_pex_addresses(&mut book, &mut lim, &mut stats, other_author, "ip4:2.2", &many, false, &me, |_| false);
     assert_eq!(added, PEX_BATCH_LIMIT);
 }

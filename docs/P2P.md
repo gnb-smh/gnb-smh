@@ -80,16 +80,26 @@ relayed only after its proof verified, an orphan only once it connects.
 
 ## Peers and addresses
 
-- The node keeps trying to hold 8 connections it dialed itself; inbound
-  connections can fill the peer limit, but discovery and dialing continue
-  until those 8 outbound peers exist.
-- The known-address table holds at most 8 addresses per IPv4 /16 (IPv6 /32)
-  and 1,000 in total, so one address range cannot fill it.
+Connection management follows Bitcoin Core (details: `docs/RUNNING.md`,
+"Peers and connections"):
+
+- 8 full-relay and 2 block-relay-only outbound connections are kept whatever
+  the inbound count; inbound connections never use those slots.
+- When the inbound slots are full, an inbound peer is evicted as Core's
+  `SelectNodeToEvict` chooses (netgroup diversity, low latency, novel blocks
+  and transactions, uptime are protected; the youngest peer of the largest
+  netgroup goes).
+- Block-relay-only connections carry no gossip at all (no transactions, PoWit
+  items, addresses or block announcements); blocks are polled over them.
+  They are saved as anchors (`anchors.json`) and re-dialed first after a
+  restart.
+- Feeler connections test new-table addresses about every 2 minutes.
+- Addresses live in keyed new and tried tables (Core's addrman with a secret
+  key derived from the node's identity), learned only from answers to the
+  node's own `GetPeers`; peer exchange carries public IP literals only (host
+  names and IPv6 forms embedding a private IPv4 are refused).
 - Sync requests are rate limited per peer; peers whose budget has refilled
   are forgotten, so the limiter never locks new peers out.
-
-Not yet: a full new/tried address manager with feeler connections, anchors
-across restarts, and inbound eviction by peer quality.
 
 ## Mempool policy
 

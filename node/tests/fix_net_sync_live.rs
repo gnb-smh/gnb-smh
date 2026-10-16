@@ -3,8 +3,9 @@
 //! transport (TCP + `PqConfig` + the node's yamux settings) but answers
 //! and requests whatever it likes.
 //!
-//! * B1-T2 / NET-10: the node sends every new peer GetPeers and GetTips. The
-//!   attacker answers both with 2,000 made-up headers. Those answers used to
+//! * B1-T2 / NET-10: the node sends every new peer GetTips (and GetPeers
+//!   when it dialed the peer: package R3, Core's getaddr rule). The
+//!   attacker answers with 2,000 made-up headers. Those answers used to
 //!   reach the processor as solicited data (2,000 GetBlocks each) and nothing
 //!   ever disconnected the peer. Now they are protocol violations: nothing
 //!   is delivered, and at the misbehaviour threshold (shared with the gossip
@@ -224,24 +225,34 @@ async fn wrong_variant_answers_are_not_delivered_and_the_offender_is_disconnecte
     let mut a = attacker_swarm(false);
     connect(&mut a, &v).await;
 
-    // Answer everything the victim asks (GetPeers and GetTips on connect)
-    // with 2,000 made-up headers.
-    let mut answered = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while answered < 2 && tokio::time::Instant::now() < deadline {
+    // Answer everything the victim asks on connect with 2,000 made-up
+    // headers. The attacker dialed, so the victim asks for its tips only:
+    // package R3 sends GetPeers to outbound full-relay and manual peers
+    // only (Core's getaddr rule), never to an inbound connection.
+    let mut asked = Vec::new();
+    let mut deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
         if let Ok(SwarmEvent::Behaviour(request_response::Event::Message {
-            message: request_response::Message::Request { channel, .. },
+            message: request_response::Message::Request { request, channel, .. },
             ..
-        })) = tokio::time::timeout(Duration::from_millis(500), a.select_next_some()).await
+        })) = tokio::time::timeout(Duration::from_millis(250), a.select_next_some()).await
         {
             let _ = a.behaviour_mut().send_response(channel, junk_headers());
-            answered += 1;
+            let tips = matches!(request, Out::Request(SyncRequest::GetTips));
+            asked.push(request);
+            if tips {
+                // A GetPeers sent with it would arrive at about the same time.
+                deadline = deadline.min(tokio::time::Instant::now() + Duration::from_millis(1_500));
+            }
         }
     }
-    assert_eq!(answered, 2, "the victim asks a new peer for its peers and its tips");
+    assert!(
+        matches!(asked.as_slice(), [Out::Request(SyncRequest::GetTips)]),
+        "the victim asks a new inbound peer for its tips only: {asked:?}"
+    );
 
-    // Two more violations: request frames no honest node sends.
-    for _ in 0..2 {
+    // Three more violations: request frames no honest node sends.
+    for _ in 0..3 {
         a.behaviour_mut().send_request(&v.id, Out::Raw(vec![0xFF; 64]));
     }
     let closed = tokio::time::timeout(Duration::from_secs(10), async {
@@ -257,7 +268,7 @@ async fn wrong_variant_answers_are_not_delivered_and_the_offender_is_disconnecte
     assert!(closed.is_ok(), "four protocol violations did not disconnect the peer");
     assert!(
         !v.directed.lock().contains(&"Headers"),
-        "made-up Headers answers to GetPeers / GetTips reached the processor: {:?}",
+        "made-up Headers answers to GetTips reached the processor: {:?}",
         v.directed.lock()
     );
 
