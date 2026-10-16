@@ -1411,6 +1411,70 @@ fn stored_blocks_failing_the_hardening_rules_are_disqualified_at_startup() {
     assert_eq!(tmpl.parents, vec![blk2.block_hash()]);
 }
 
+/// Re-audit B2-T1: a pre-upgrade binary ran past the activation A and
+/// PRUNED the body of a legacy block P it applied at height A (pruning keeps
+/// the undo record). The start-up recheck cannot read P's body; it used to
+/// count P as "unchecked" and still record the recheck as done, so P stayed a
+/// valid block forever: once its legacy child PC (body kept) was
+/// disqualified, P became the best valid tip and the node stayed applied on a
+/// block every upgraded node rejects. A block at or above the activation that
+/// a pre-upgrade binary stored has a legacy header root (that binary checks
+/// the legacy root against the body before storing it), so P is disqualified
+/// conservatively, with every descendant, and the applied chain rolls back
+/// through the pruned body (Bitcoin Core: blocks connected without a newly
+/// activated deployment's checks are never trusted, `NeedsRedownload`).
+#[test]
+fn pruned_legacy_blocks_above_the_activation_are_disqualified_at_startup() {
+    const A: u64 = 3;
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let (mut n, m1, m2, p, pc) = {
+        let _old = activation::scoped_override(activation::NEVER);
+        let n = node_with(&genesis, &[]);
+        let m1 = build(&n, vec![gh], vec![coinbase("b2t1-m1", subsidy(1), vec![0xE1; 20])]);
+        accept(&n, &m1).unwrap();
+        let m2 = build(&n, vec![m1.block_hash()], vec![coinbase("b2t1-m2", subsidy(2), vec![0xE2; 20])]);
+        accept(&n, &m2).unwrap();
+        let p = build(&n, vec![m2.block_hash()], vec![coinbase("b2t1-legacy-P", subsidy(3), vec![0xE3; 20])]);
+        accept(&n, &p).expect("old binary: a legacy block at height A is valid");
+        let pc = build(&n, vec![p.block_hash()], vec![coinbase("b2t1-legacy-PC", subsidy(4), vec![0xE4; 20])]);
+        accept(&n, &pc).unwrap();
+        assert_eq!(applied_tip(&n), Some(pc.block_hash()));
+        (n, m1, m2, p, pc)
+    };
+    // The old binary pruned P's body: `prune_blocks_below` deletes the
+    // selected-chain bodies up to P (keeping undo and pruned-body records);
+    // the honest blocks' bodies are put back (on a real node they are far
+    // above the pruning depth), so only P's is gone.
+    n.store.prune_blocks_below(A + 1).unwrap();
+    for b in [&genesis, &m1, &m2] {
+        n.store.put_block_body(b).unwrap();
+    }
+    assert!(n.store.get_block(&p.block_hash()).unwrap().is_none());
+    assert!(n.store.get_block(&pc.block_hash()).unwrap().is_some());
+    assert!(n.store.get_undo_data(&p.block_hash()).unwrap().is_some());
+
+    let _new = activation::scoped_override(A);
+    restart(&mut n);
+    for (b, what) in [(&p, "pruned P"), (&pc, "P's child")] {
+        let d = n.dag.read();
+        assert!(d.is_invalid(&b.block_hash()) && d.is_invalid_all_edges(&b.block_hash()), "{what}");
+    }
+    let reason = n.store.invalid_block_reason(&p.block_hash()).unwrap().expect("a persisted mark");
+    assert!(reason.starts_with(pipeline::HARDENING_RECHECK_REASON), "{reason}");
+    assert_eq!(n.store.get_meta(pipeline::HARDENING_RECHECK_META).unwrap(), Some(A.to_le_bytes().to_vec()));
+    assert_eq!(sel_tip(&n), Some(m2.block_hash()));
+    assert_eq!(applied_tip(&n), Some(m2.block_hash()), "rolled back through the pruned body");
+    assert!(n.store.get_utxo(&p.transactions[0].txid(), 0).unwrap().is_none());
+    let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
+    assert_eq!((tmpl.parents.clone(), tmpl.height), (vec![m2.block_hash()], A));
+
+    // The marks survive another restart (the recheck does not run again).
+    restart(&mut n);
+    assert!(n.dag.read().is_invalid_all_edges(&p.block_hash()));
+    assert_eq!(applied_tip(&n), Some(m2.block_hash()));
+}
+
 /// P1 x P2: the template's parent predicate (a stored body must pass the
 /// hardening block rules of its height, defense in depth behind the start-up
 /// recheck) lives in `template::template_parents_and_height`, the ONE source

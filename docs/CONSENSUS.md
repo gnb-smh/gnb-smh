@@ -1370,7 +1370,21 @@ accepted elsewhere. At start-up, before the applied chain is reconnected,
 `accept::recheck_stored_blocks_under_hardening` checks every stored block at
 header height >= the activation (computed from the DAG; no body is read when
 there is none) against the context-free rules above, once per activation
-height (meta key `hardening_block_rules_checked`, u64 LE). A failure the
+height (meta key `hardening_block_rules_checked`, u64 LE). The recheck runs
+at the first start of a binary with these rules, before any block is accepted,
+so every candidate was stored by a binary without them. A candidate whose body
+is gone (a pre-upgrade binary pruned it, keeping its undo record) cannot be
+read, and is disqualified conservatively, like an id-committed failure
+(re-audit B2-T1): that binary checked the LEGACY header root against the body
+before storing the block, so its id commits to a legacy root that no body
+can match under the tagged rule, and no upgraded node ever accepted it. It
+used to be counted as unchecked while the recheck still recorded itself as
+done, so a pruned legacy block stayed valid and could become the best valid
+tip once its unpruned descendants were disqualified (Bitcoin Core likewise
+never trusts blocks connected without a newly activated deployment's checks:
+`NeedsRedownload` requires them to be validated again). If the recheck itself
+fails (a storage error), nothing is recorded and the node refuses to start,
+so it never stores a block before the recheck has completed. A failure the
 block id commits to (legacy or wrong header root, coinbase format, a 64-byte
 transaction, the commitment's tag, height or parents, or any failure of a body
 whose witness root matches) disqualifies the block and EVERY block that

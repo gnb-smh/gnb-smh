@@ -1798,9 +1798,16 @@ pub struct RecheckReport {
     pub disqualified: Vec<BlockHash>,
     /// Blocks whose body was dropped to wait for another one.
     pub bodies_dropped: Vec<BlockHash>,
-    /// Candidates without a stored body (pruned): not checkable.
-    pub unchecked: usize,
+    /// Of `disqualified`, the candidates without a stored body (pruned by
+    /// the pre-upgrade binary), disqualified conservatively (re-audit B2-T1).
+    pub disqualified_without_body: usize,
 }
+
+/// Prefix of the error [`reconcile_on_startup`] returns when the hardening
+/// recheck could not complete (a storage error): nothing was recorded, and
+/// the node must not start (re-audit B2-T1), so it never stores a block
+/// before the recheck has run to completion.
+pub const HARDENING_RECHECK_FAILED: &str = "hardening recheck of stored blocks failed";
 
 /// Recheck the blocks a PRE-UPGRADE binary may have stored at a header
 /// height at or above the hardening activation against the context-free
@@ -1818,6 +1825,19 @@ pub struct RecheckReport {
 /// same reach. A block whose only failure is its witness root (only this
 /// body is wrong) is not disqualified: an unapplied one drops its body and
 /// waits for another (`GhostDAG::mark_body_pending`).
+///
+/// A candidate whose body is gone (the pre-upgrade binary pruned it) is
+/// disqualified conservatively, like an id-committed failure (re-audit
+/// B2-T1). The recheck runs at the first start of a binary with these rules,
+/// before any block is accepted ([`reconcile_on_startup`] refuses to go on
+/// when it fails), so every candidate was stored by a binary without them,
+/// which checked the LEGACY header root against the body before storing it:
+/// the id commits to a legacy root no body can match under the tagged rule,
+/// and no upgraded node ever accepted the block. Counting it as unchecked
+/// while recording the recheck as done left such a block valid forever (once
+/// its unpruned descendants were disqualified it became the best valid tip).
+/// Bitcoin Core likewise never trusts blocks connected without a newly
+/// activated deployment's checks (`NeedsRedownload`).
 ///
 /// Runs once per activation height (meta key [`HARDENING_RECHECK_META`]);
 /// it reads no body when no stored block is at or above the activation (a
@@ -1843,7 +1863,17 @@ pub fn recheck_stored_blocks_under_hardening(
         let body = match store.get_block(&h).map_err(|e| e.to_string())? {
             Some(b) => b,
             None => {
-                report.unchecked += 1;
+                let marked = dag.write().mark_invalid_all_edges(h);
+                error!(
+                    "stored block {} at or above the hardening activation has no body (pruned by a \
+                     pre-upgrade binary): disqualified with {} descendant(s)",
+                    hex::encode(&h[..8]), marked.len().saturating_sub(1)
+                );
+                store.stage_invalid_block(&mut batch, &h, &format!(
+                    "{}: no stored body to check (pruned by a pre-upgrade binary)", HARDENING_RECHECK_REASON
+                )).map_err(|e| e.to_string())?;
+                report.disqualified.push(h);
+                report.disqualified_without_body += 1;
                 continue;
             }
         };
@@ -1884,10 +1914,11 @@ pub fn recheck_stored_blocks_under_hardening(
     store.stage_meta(&mut batch, HARDENING_RECHECK_META, &activation_height.to_le_bytes())
         .map_err(|e| e.to_string())?;
     store.write_batch(batch).map_err(|e| e.to_string())?;
-    if !report.disqualified.is_empty() || !report.bodies_dropped.is_empty() || report.unchecked > 0 {
+    if !report.disqualified.is_empty() || !report.bodies_dropped.is_empty() {
         warn!(
-            "hardening recheck at activation {}: {} checked, {} disqualified, {} bodies dropped, {} without a body",
-            activation_height, report.checked, report.disqualified.len(), report.bodies_dropped.len(), report.unchecked
+            "hardening recheck at activation {}: {} checked, {} disqualified ({} without a body), {} bodies dropped",
+            activation_height, report.checked, report.disqualified.len(), report.disqualified_without_body,
+            report.bodies_dropped.len()
         );
     }
     Ok(report)
@@ -1936,15 +1967,13 @@ pub fn reconcile_on_startup(
 ) -> Result<(), String> {
     let _guard = store.acceptance_lock();
     ensure_invalid_set_loaded(dag, store);
-    let recheck = match recheck_stored_blocks_under_hardening(
+    // Re-audit B2-T1: a recheck that cannot complete records nothing, and
+    // the node must not accept a block before it has (a block the upgraded
+    // binary stored and later pruned would otherwise reach a later recheck
+    // and be disqualified as a legacy one): refuse to start.
+    let recheck = recheck_stored_blocks_under_hardening(
         dag, store, core::activation::hardening_activation_height(),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            error!("reconcile: hardening recheck of stored blocks failed: {}", e);
-            RecheckReport::default()
-        }
-    };
+    ).map_err(|e| format!("{}: {}", HARDENING_RECHECK_FAILED, e))?;
 
     // NET-12: a database written before the explorer aggregates existed gets
     // them built once, from scratch (later connects keep them current in the

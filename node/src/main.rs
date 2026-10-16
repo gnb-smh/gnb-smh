@@ -856,6 +856,12 @@ async fn main() {
     // (`accept::check_chain_state`), so the check never misfires on a state
     // step 2 repairs.
     if let Err(e) = accept::reconcile_on_startup(&dag, &store, &shielded) {
+        // Re-audit B2-T1: the hardening recheck of stored blocks must
+        // complete before any block is accepted.
+        if e.starts_with(accept::HARDENING_RECHECK_FAILED) {
+            error!("{e}. Refusing to start.");
+            std::process::exit(1);
+        }
         // DAG-11 residual: the footprint of the pre-fix NON-atomic extension
         // commit (UTXO effects without an undo record), which reconciliation
         // cannot repair, makes it refuse; rebuild the chain state from the
