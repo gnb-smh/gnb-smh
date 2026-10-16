@@ -326,8 +326,8 @@ holds, whatever their arrival order and however deep the fork. What bounds
 merging objectively is the merge depth below, a function of each block's
 past. Reorgs deeper than 1,000 selected-chain blocks are logged and counted
 (`gnb_deep_reorgs_total`), never refused. Undo records are kept for every
-connected block and a pruned body leaves a rollback record, so a reorg of
-any depth also works on a pruned node. A move is
+connected block and a pruned body of an applied block leaves a rollback
+record, so a reorg of any depth also works on a pruned node. A move is
 committed in atomic chunks of at most `reorg::MAX_BLOCKS_PER_COMMIT` (16)
 blocks, each with the tip pointer at its end (node-local; Bitcoin Core's
 `ActivateBestChain` steps the same way): its memory is bounded by one chunk,

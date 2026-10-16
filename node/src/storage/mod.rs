@@ -90,6 +90,27 @@ pub fn pruned_body_key(hash: &BlockHash) -> Vec<u8> {
     k
 }
 
+/// CF_META key prefix of the body height index (audit B1-T17):
+/// `body_h/` ‖ height (u64 BE) ‖ block hash → empty, one row per stored
+/// body, whatever the block's place in the DAG. `Storage::prune_blocks_below`
+/// range-scans it, so EVERY body below the pruning height is pruned — merged,
+/// fork-loser and junk bodies included (Bitcoin Core prunes whole block
+/// files, stale blocks with the rest) — in O(bodies pruned), never by
+/// walking all heights from 0.
+pub const BODY_INDEX_PREFIX: &[u8] = b"body_h/";
+
+/// CF_META key: `[1]` once every stored body has a body-index row (set on a
+/// fresh database, or by the one-time backfill of an older one).
+const BODY_INDEX_READY_KEY: &str = "body_index_v1";
+
+fn body_index_key(height: u64, hash: &BlockHash) -> Vec<u8> {
+    let mut k = Vec::with_capacity(BODY_INDEX_PREFIX.len() + 40);
+    k.extend_from_slice(BODY_INDEX_PREFIX);
+    k.extend_from_slice(&height.to_be_bytes());
+    k.extend_from_slice(hash);
+    k
+}
+
 /// What disconnecting a selected-chain block needs from its body, kept when
 /// the body is pruned (audit DAG-6): the UTXO effects are reversed from the
 /// undo record, which is never pruned; the address-history rows to delete and
@@ -268,7 +289,58 @@ impl Storage {
             .map_err(|e| StorageError::OpenFailed(e.to_string()))?;
         let store = Self::with_db(db);
         store.init_aggregates_marker()?;
+        store.init_body_index_marker()?;
         Ok(store)
+    }
+
+    /// B1-T17: a database without any body has a complete (empty) body
+    /// index; an older one is backfilled by [`Self::ensure_body_index`].
+    fn init_body_index_marker(&self) -> Result<(), StorageError> {
+        if self.get_meta(BODY_INDEX_READY_KEY)?.is_some() {
+            return Ok(());
+        }
+        let cf = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
+        if self.db.iterator_cf(&cf, IteratorMode::Start).next().is_none() {
+            self.put_meta(BODY_INDEX_READY_KEY, &[1u8])?;
+        }
+        Ok(())
+    }
+
+    /// B1-T17: give every stored body a body-index row (one-time migration
+    /// of a database written before the index existed): its height is the
+    /// DAG height of its CF_DAG record, else its header height (never below
+    /// the DAG height, so a body is never pruned above the pruning cursor).
+    /// Returns the number of rows written (0 when the index was complete).
+    pub fn ensure_body_index(&self) -> Result<usize, StorageError> {
+        if self.get_meta(BODY_INDEX_READY_KEY)?.is_some() {
+            return Ok(0);
+        }
+        let cf_b = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
+        let cf_m = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        let mut rows = 0usize;
+        let mut batch = rocksdb::WriteBatch::default();
+        for item in self.db.iterator_cf(&cf_b, IteratorMode::Start) {
+            let (k, v) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            let Ok(hash) = <BlockHash>::try_from(k.as_ref()) else { continue };
+            let height = match self.get_dag_data(&hash)? {
+                Some(d) => d.height,
+                None => match Block::from_wire_bytes(&v) {
+                    Ok(b) => b.height,
+                    Err(_) => 0, // undecodable: pruned at the first opportunity
+                },
+            };
+            batch.put_cf(&cf_m, body_index_key(height, &hash), []);
+            rows += 1;
+            if rows % 4096 == 0 {
+                self.db.write(std::mem::take(&mut batch)).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+            }
+        }
+        batch.put_cf(&cf_m, BODY_INDEX_READY_KEY.as_bytes(), [1u8]);
+        self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+        if rows > 0 {
+            log::info!("body index (B1-T17): {} stored bodies indexed by height for pruning", rows);
+        }
+        Ok(rows)
     }
 
     /// Open an existing snapshot **read-only**. RocksDB is opened with
@@ -345,6 +417,9 @@ impl Storage {
         batch.put_cf(&cf_b, &hash, &block.to_wire_bytes());
         batch.put_cf(&cf_h, &block.height.to_be_bytes(), &hash);
         batch.put_cf(&cf_t, &block.height.to_be_bytes(), &block.header.timestamp.to_le_bytes());
+        // B1-T17: body-index row (header height, never below the DAG height).
+        let cf_m = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        batch.put_cf(&cf_m, body_index_key(block.height, &hash), []);
 
         // Sprint F: index address touches for each tx in this block. These were
         // previously best-effort (errors ignored). Folding them into the same
@@ -377,11 +452,30 @@ impl Storage {
     /// chain indexes in the atomic connect batch (`stage_chain_index`) only for
     /// blocks that join the selected chain — so a fork-loser or a refused block
     /// can no longer overwrite `getblockhash`'s answer or the pruning cursor.
+    ///
+    /// Audit B1-T17: the body is indexed for pruning at its header height
+    /// (never below its DAG height); the acceptance pipeline uses
+    /// [`Self::put_block_body_at`] with the height it chose.
     pub fn put_block_body(&self, block: &Block) -> Result<(), StorageError> {
+        self.put_block_body_at(block, block.height)
+    }
+
+    /// [`Self::put_block_body`] indexed for pruning at `prune_height` (audit
+    /// B1-T17): the body is pruned once the pruning cursor
+    /// (`pruned_height`) passes `prune_height`. The caller passes the
+    /// block's DAG height, or a greater height to keep a body longer (a body
+    /// the node fetched back for a reorg, `accept::accept_block`); never a
+    /// smaller one (`accept::awaits_body` relies on "a block whose DAG height
+    /// is at or above the cursor was never pruned"). Body and index row are
+    /// written in one batch.
+    pub fn put_block_body_at(&self, block: &Block, prune_height: u64) -> Result<(), StorageError> {
         let hash = block.block_hash();
         let cf_b = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
-        let written = self.db.put_cf(&cf_b, &hash, &block.to_wire_bytes())
-            .map_err(|e| StorageError::WriteFailed(e.to_string()));
+        let cf_m = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&cf_b, &hash, &block.to_wire_bytes());
+        batch.put_cf(&cf_m, body_index_key(prune_height, &hash), []);
+        let written = self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()));
         self.forget_body_verdict(&hash);
         written
     }
@@ -1575,59 +1669,81 @@ impl Storage {
     /// Removes: full block data from CF_BLOCKS (saves ~90% of storage).
     /// Returns number of blocks pruned.
     ///
+    /// Audit B1-T17: EVERY stored body indexed below `below_height` is pruned
+    /// — selected-chain, merged, fork-loser and junk bodies alike (Bitcoin
+    /// Core prunes whole block files, stale blocks included) — found through
+    /// the body height index ([`BODY_INDEX_PREFIX`], O(bodies pruned); the
+    /// previous version looked up the selected-chain height index for every
+    /// height from 0, O(height) per call, and never found a non-selected
+    /// body). A database written before the index existed is backfilled first
+    /// ([`Self::ensure_body_index`]).
+    ///
     /// Audit DAG-6: a reorg of ANY depth must be able to disconnect a pruned
     /// block (there is no reorg-depth limit). The UTXO effects come back from
     /// the undo record, which is never pruned; what the rollback still needed
     /// from the body — the address-history keys to un-index and whether the
     /// block carried shielded transactions — is recorded here, in the same
-    /// batch as the body deletion, as a [`PrunedBodyRecord`].
+    /// batch as the body deletion, as a [`PrunedBodyRecord`] — only for a
+    /// block that HAS an undo record (it is applied): a block that is not
+    /// applied is never rolled back, and if its chain becomes the best its
+    /// body is fetched again (`accept::awaits_body`).
     pub fn prune_blocks_below(&self, below_height: u64) -> Result<usize, StorageError> {
+        self.ensure_body_index()?;
         let cf_blocks = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
-        let cf_height = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
         let cf_undo = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
-        let mut pruned = 0usize;
-
-        for h in 0..below_height {
-            let key = h.to_be_bytes();
-            let Some(hash_bytes) = self.db.get_cf(&cf_height, key)
-                .map_err(|e| StorageError::ReadFailed(e.to_string()))?
-            else { continue };
-            let Ok(hash) = <BlockHash>::try_from(hash_bytes.as_slice()) else { continue };
-            // Only prune if block data exists
-            let raw = match self.db.get_cf(&cf_blocks, hash)
-                .map_err(|e| StorageError::ReadFailed(e.to_string()))?
-            {
-                Some(raw) => raw,
-                None => continue,
-            };
-            let mut batch = rocksdb::WriteBatch::default();
-            batch.delete_cf(&cf_blocks, hash);
-            match Block::from_wire_bytes(&raw) {
-                Ok(body) => {
-                    let spent: std::collections::HashMap<([u8; 32], u32), TxOutput> = self
-                        .get_undo_data(&hash)?
-                        .map(|u| u.spent_utxos.into_iter()
-                            .map(|e| ((e.prev_txid, e.prev_index), e.output))
-                            .collect())
-                        .unwrap_or_default();
-                    let rec = PrunedBodyRecord {
-                        height: body.height,
-                        had_shielded: !body.shielded_transactions.is_empty(),
-                        addr_history_keys: indexer::addr_history_keys(&body, &spent),
-                    };
-                    batch.put_cf(&cf_undo, pruned_body_key(&hash), encode(&rec)?);
-                }
-                Err(e) => log::warn!(
-                    "prune: body of {} does not decode ({}); pruned without a rollback record",
-                    hex::encode(&hash[..8]), e
-                ),
+        let cf_meta = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        let end = body_index_key(below_height, &[0u8; 32]);
+        let mut rows: Vec<(Vec<u8>, BlockHash)> = Vec::new();
+        let iter = self.db.iterator_cf(&cf_meta,
+            IteratorMode::From(BODY_INDEX_PREFIX, rocksdb::Direction::Forward));
+        for item in iter {
+            let (k, _) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            if !k.starts_with(BODY_INDEX_PREFIX) || k.as_ref() >= end.as_slice() {
+                break;
             }
-            self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
-            self.forget_body_verdict(&hash);
-            pruned += 1;
+            if let Ok(hash) = <BlockHash>::try_from(&k[BODY_INDEX_PREFIX.len() + 8..]) {
+                rows.push((k.to_vec(), hash));
+            }
         }
 
-        if pruned > 0 {
+        let mut pruned = 0usize;
+        for (key, hash) in rows {
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.delete_cf(&cf_meta, &key);
+            let raw = self.db.get_cf(&cf_blocks, hash).map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            if let Some(raw) = raw {
+                batch.delete_cf(&cf_blocks, hash);
+                if self.has_undo_data(&hash)? {
+                    match Block::from_wire_bytes(&raw) {
+                        Ok(body) => {
+                            let spent: std::collections::HashMap<([u8; 32], u32), TxOutput> = self
+                                .get_undo_data(&hash)?
+                                .map(|u| u.spent_utxos.into_iter()
+                                    .map(|e| ((e.prev_txid, e.prev_index), e.output))
+                                    .collect())
+                                .unwrap_or_default();
+                            let rec = PrunedBodyRecord {
+                                height: body.height,
+                                had_shielded: !body.shielded_transactions.is_empty(),
+                                addr_history_keys: indexer::addr_history_keys(&body, &spent),
+                            };
+                            batch.put_cf(&cf_undo, pruned_body_key(&hash), encode(&rec)?);
+                        }
+                        Err(e) => log::warn!(
+                            "prune: body of {} does not decode ({}); pruned without a rollback record",
+                            hex::encode(&hash[..8]), e
+                        ),
+                    }
+                }
+                pruned += 1;
+            }
+            // (A row without a body — deleted or pruned under another
+            // height — only loses its row.)
+            self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+            self.forget_body_verdict(&hash);
+        }
+
+        if pruned > 0 && below_height > self.pruned_height() {
             self.put_meta("pruned_height", &below_height.to_le_bytes())?;
         }
         Ok(pruned)

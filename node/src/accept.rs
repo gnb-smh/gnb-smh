@@ -202,9 +202,10 @@ pub fn awaits_body_in(d: &consensus::GhostDAG, store: &storage::Storage, hash: &
         Some(data) if !data.parents.is_empty() => data.height,
         _ => return false, // unknown, or the genesis
     };
-    // Pruning removes bodies by HEADER height, which is >= the DAG height:
-    // a block whose DAG height is at or above the pruning cursor was never
-    // pruned.
+    // Pruning removes a body once the cursor passes the height it was
+    // indexed at, which is never below the block's DAG height (B1-T17,
+    // `Storage::put_block_body_at`): a block whose DAG height is at or above
+    // the pruning cursor was never pruned.
     dag_height >= store.pruned_height() && matches!(store.has_block_body(hash), Ok(false))
 }
 
@@ -1347,15 +1348,28 @@ pub fn accept_block_tracking(
     if replacing {
         // Same id (header, txids, coinbase), different witness bytes: store
         // this body and let the blocks that waited for it compete again.
-        store.put_block_body(block).map_err(|e| e.to_string())?;
+        // B1-T17: a body the node wanted back (a reorg needs it) is indexed
+        // for pruning at the selected tip's height, not its own, so it is
+        // not pruned again before the chain through it connects (Bitcoin
+        // Core prunes by block file, and a re-downloaded block lands in a
+        // recent file).
+        let prune_height = {
+            let d = dag.read();
+            let own = d.get_block_data(&block_hash).map(|x| x.height).unwrap_or(block.height);
+            let tip = d.selected_tip().and_then(|t| d.get_block_data(&t)).map(|x| x.height).unwrap_or(0);
+            own.max(tip)
+        };
+        store.put_block_body_at(block, prune_height).map_err(|e| e.to_string())?;
         dag.write().clear_body_pending(&block_hash);
         info!("block {} h={}: new body stored for a block that waited for one; re-evaluating",
             hex::encode(&block_hash[..8]), block.height);
     } else {
         let work = pow::work_from_bits(block.header.bits);
-        dag.write().add_block(block_hash, block.header.parents.clone(), block.header.timestamp, work)
+        let data = dag.write().add_block(block_hash, block.header.parents.clone(), block.header.timestamp, work)
             .map_err(|e| format!("consensus rejection: {}", e))?;
-        if let Err(e) = store.put_block_body(block) {
+        // B1-T17: every body is indexed for pruning at its DAG height,
+        // whatever its place in the DAG (selected chain, merged, fork-loser).
+        if let Err(e) = store.put_block_body_at(block, data.height) {
             dag.write().remove_block(&block_hash);
             return Err(e.to_string());
         }
@@ -1525,8 +1539,10 @@ pub fn accept_block_tracking(
 
     // ── Prune old block bodies ───────────────────────────────────────
     // Bodies only: undo records are kept for every connected block and a
-    // rollback record is written for each pruned body, so a reorg of any
-    // depth still works on a pruned node (DAG-6).
+    // rollback record is written for each pruned APPLIED body, so a reorg of
+    // any depth still works on a pruned node (DAG-6). Every stored body below
+    // the pruning height goes — merged, fork-loser and junk bodies too
+    // (B1-T17, `Storage::prune_blocks_below`).
     if ARCHIVE_MODE.load(std::sync::atomic::Ordering::Relaxed) {
         if tip_height % 10_000 == 0 {
             info!("archival mode: retaining ALL block bodies (h={}); pruning disabled", tip_height);

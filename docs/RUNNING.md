@@ -111,6 +111,16 @@ name (parameter: the block hash in hex). They are never served to an
 anonymous caller: they need the configured API key (`--rpc-api-key` /
 `--rpc-api-key-file`) or a trusted caller (`--rpc-trust-loopback`).
 
+A pruned node (the default; `--archive` keeps every block body) deletes, in
+steps of 1,000 blocks, the bodies of ALL blocks more than 10,000 DAG heights
+below its tip: the blocks of its chain and also merged, fork and unsolicited
+blocks (Bitcoin Core prunes stale blocks with the rest). It keeps every undo
+record, and for each pruned block of its chain the few index keys a rollback
+needs, so a reorg of any depth still works. A body it fetches back because a
+heavier chain needs it is kept until that chain is connected. The first
+pruning after an upgrade from a release before the 2026-10 phase-4 fixes
+indexes the stored bodies by height once (one pass over the block bodies).
+
 On a pruned node (the default; not `--archive`) the chain to move to may
 contain blocks whose bodies were pruned: for example, `invalidateblock` on the
 first block of a fork the node followed in a reorg deeper than the pruning
