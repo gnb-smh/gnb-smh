@@ -18,6 +18,10 @@ semantics remain unchanged.
 - [Offline CLI, RPC and browser usage](../../DESCRIPTORS-USAGE.md)
 - [Integration brief](integration-brief.md) and [live baseline receipt](functional-baseline.json)
 - [Core brief](core-brief.md), [reference brief](reference-brief.md)
+- [Integrated validation receipt](integrated-validation.json), [live restoration result](functional-final.json)
+- [Independent scorecard](scorecard.md) and reviews of [identity](review-verdict.md),
+  [entry paths](review-paths.md) and [test strength](review-tests.md)
+- [Canonical Linux artifact provenance](wasm-linux-build.json)
 
 The runtime baseline first passes an existing address/balance control and then
 fails on the missing descriptor operation. The live-node reproduction is
@@ -37,3 +41,13 @@ bridge findings remain open. Component passes do not close their causes.
 No implementer assigns a numerical score or claims superiority to Bitcoin Core.
 External independent audit and a bug-bounty program remain required before a
 relaunch or bridge deployment.
+
+Local integration completed: node 1,790 passed / zero failed / eight ignored;
+separate crypto 490 / zero / four; WASM host 13 / zero / zero; canonical Linux
+browser artifact 74 / zero / zero. These are executed-test totals, not distinct
+functional scenarios. The complete functional run is **14 passed / one failed**
+of fifteen: inherited R1-FUNC-1 (`EADDRINUSE` when reconnecting after a partition)
+remains open. The new descriptor scenario passed in 5.1 seconds in that run.
+The local functional gate is therefore not green. CI on another platform does
+not erase this failure, and subsequent passes of other inherited failing tests
+do not establish their causes or close those findings.
