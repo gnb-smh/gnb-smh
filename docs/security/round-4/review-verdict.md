@@ -235,3 +235,78 @@ Follow-up evidence SHA-256:
 - `/private/tmp/gnb-r4-review-verdict-secondary-confirm.log` — `64f29adacd06be01676b6017c9859323de4426ee5f8d3ee6fe66792cae266538`.
 - `/private/tmp/gnb-r4-review-verdict-create-callback.mjs` — `de3dbe542889f15fb09a54267af2c717b7188966154a114a6232f7f8a93dd05c`.
 - `/private/tmp/gnb-r4-review-verdict-create-callback.log` — `a046f8495c72af930c6c2731b2f6a4d323b1929b5dc3b31f31413720a2dda0af`.
+
+## Secondary-wallet correction review
+
+Reviewed the frozen test-first package `f330d6e` and correction `8be30ee`
+(local cherry-picks `a19005e` / `3e4d740` on this review branch), not the
+implementer's temporary reversal state. The production diff changes only
+`site/wallet/main.js` and `site/wallet/core.js`; Rust consensus, signing and
+WASM bytes are unchanged by this correction. I did not edit production.
+
+**R4-PATH-1 resolved in the secondary payment workflow.** The actual Review
+callback now obtains `getdaginfo.next_block_height`, validates it as a positive
+safe integer, and uses that exact height for maturity selection, planning and
+payment. Failed/missing/malformed height data produces no plan or signature;
+it does not infer a height from the tip. Selected v1 previous transactions
+are fetched and passed to the real core. Invalid supplied bytes are refused;
+unavailable records remain visibly unverified. The confirmation starts
+disabled and its handler separately refuses to proceed without the explicit
+acknowledgement. Mainnet H-1/H tests exercise the actual callback and real
+WASM for both legacy and v2 recipients, with verified inputs and no broadcast.
+
+**R4-PATH-2 resolved for explicit testnet creation.** The wrapper forwards a
+strict boolean `testnet` argument. Actual secondary create/download/open
+callbacks produce and recover the same testnet identity. Mainnet remains the
+default, including its 24 recovery words and keystore/phrase round trips.
+The existing Rust testnet path generates a random key backed up by its
+keystore; this review does not claim testnet recovery-phrase support.
+
+**Related open-network variant resolved.** The secondary open callback states
+the selected node network; the shared wrapper validates and forwards it.
+A mainnet keystore is rejected under explicit testnet context by both the
+wrapper and actual gate journey. Correct-network opening still succeeds.
+This reaches the existing authenticated network check in Rust rather than
+relabeling a decrypted key. Invalid network/create argument types fail before
+changing the current session. The primary caller's default remains mainnet.
+
+Independent executions (Node 22.23.3, all local and synthetic):
+
+- `node --test site/tests/wallet-secondary.test.mjs`: **16 passed, exit 0**.
+  Includes positive fixture controls, actual H-1/H callbacks, wrong-network
+  refusal, absent/invalid next height, maturity boundary and malformed
+  coinbase metadata, missing/invalid previous transactions, acknowledgement,
+  creation and authenticated reopening.
+- `node --test site/tests/address-v2-web-paths.test.mjs
+  site/tests/address-v2-wasm.test.mjs`: **13 passed, exit 0**. This checks the
+  existing address/watch/payment behavior against the shared wrapper change.
+- Three additional reviewer variants: **3 passed, exit 0**. An exact decimal
+  string height is normalized correctly; a one-satoshi discrepancy between a
+  supplied previous transaction and the claimed UTXO value refuses signing;
+  a real testnet key at height 1 produces v3 for both testnet representations
+  and refuses a mainnet recipient. These run the same real secondary callback
+  with ordinary local chain fixtures, not a live node or browser.
+
+The first run of the additional variants had 18 passes and one failed
+assertion: my error-message regex omitted the actual message's words
+`refusing to sign`. Production already refused that mismatched value and
+created no payment. I corrected only the temporary test's wording assertion
+and reran the three reviewer variants. Both logs are preserved; this was not
+an additional production defect or a failed production correction.
+
+No broadcast was performed; generated keys and keystores were confined to
+local fixtures and not logged. The DOM adapter is not a full browser. The
+primary wallet's separate height-fallback behavior, bridge workflows and
+live-node synchronization are outside this correction review. Final SRI
+refresh, canonical Linux WASM/CI, integrated native suites and the other
+review lenses remain required. Those delivery gates are not implied by the
+local closure of these specific findings. No score or consensus activation
+change is asserted.
+
+Correction-review evidence SHA-256:
+
+- `/private/tmp/gnb-r4-review-verdict-secondary-fixed.log` — `4f2b4b5dc282aeb1ad7e83bd76970a34545259e88343969d3e9afec96ca3018e`.
+- `/private/tmp/gnb-r4-review-verdict-address-followup.log` — `978e961e896940ff4d6cadc370ae224db8a7e492e48f0916ce4cd97baae3c1e9`.
+- `/private/tmp/gnb-r4-review-verdict-secondary-variants.mjs` — `deb9754572bb0e0e723996f4257cba216caae4f591c5b8630ac48abf685f3fbe`.
+- `/private/tmp/gnb-r4-review-verdict-secondary-variants.log` — `9a5a60057ac021a0d49bf20734b75cea922fc6bc162366aa18d124090c787f14`.
+- `/private/tmp/gnb-r4-review-verdict-secondary-variants-fixed.log` — `5a2d8dc21e31de6a7e9af7beea3f85eeb6d6c64b0ab79f522c75574789a42703`.
