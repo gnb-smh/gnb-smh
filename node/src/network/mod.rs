@@ -5,6 +5,14 @@
 //! FIX #6: Peer memory (known_peers.json).
 //! Sprint P: PEX hardening (rate limit, address validation, known_peers cap).
 
+// NET-11 / B1-T9 connection management. Parts of their API serve the
+// library's tests and embedders only, not the binary.
+#[allow(dead_code)]
+pub mod addrbook;
+#[allow(dead_code)]
+pub mod connmgr;
+#[allow(dead_code)]
+pub mod gossip_gate;
 pub mod pex_validator;
 pub mod ratelimit;
 pub mod sync_rr;
@@ -23,9 +31,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use sha2::{Sha256, Digest};
 
+use connmgr::{ConnKind, ConnManager, DialIntent, OutboundAction};
 use pex_validator::{
-    PexRateLimiter, PexStats, AddrBook,
-    is_valid_public_multiaddr, is_lan_multiaddr, enforce_cap, prune_invalid, add_tried, addr_peer_id,
+    PexRateLimiter, PexStats, AddrBook, TriedInsert, TriedTable,
+    is_valid_public_multiaddr, is_lan_multiaddr, is_acceptable_ip, enforce_cap, prune_invalid, addr_peer_id,
+    netgroup, normalize_peer_addr,
     PEX_BATCH_LIMIT, KNOWN_PEERS_CAP,
 };
 
@@ -867,7 +877,10 @@ impl Default for NetworkConfig {
 // `BlochBehaviourEvent`.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct BlochBehaviour {
-    gossipsub: gossipsub::Behaviour,
+    // NET-11 (d): gossipsub behind a per-peer gate, so block-relay-only
+    // connections carry no gossip at all (see `gossip_gate`). Every other
+    // call goes to the wrapped gossipsub behaviour (`Deref`).
+    gossipsub: gossip_gate::GossipGate,
     // Toggle: mDNS is present only when `--enable-mdns` is set (off by default).
     // Disabled → the hickory-proto mDNS parser is never exercised (RUSTSEC-2026-0118/0119).
     mdns:      libp2p::swarm::behaviour::toggle::Toggle<mdns::tokio::Behaviour>,
@@ -881,8 +894,14 @@ struct BlochBehaviour {
     // previously only an app-side counter checked in the PEX/mDNS dial paths,
     // so inbound connection floods / eclipse setup were NOT bounded by libp2p.
     // This behaviour rejects connections at the transport layer once the caps
-    // are hit, matching max_peers.
+    // are hit (B1-T9 / NET-11: inbound gets `max_peers` + 1 slots — the extra
+    // one lets a newcomer in so the connection manager can EVICT an
+    // unprotected inbound peer instead of refusing everyone once full — and
+    // the swarm-wide cap leaves room for every outbound slot).
     connection_limits: libp2p::connection_limits::Behaviour,
+    // NET-11 (a): latency measurement for the inbound eviction protection of
+    // low-latency peers (Core's minimum ping time). Never closes connections.
+    ping: libp2p::ping::Behaviour,
 }
 
 // ── Node ──────────────────────────────────────────────────────────────────────
@@ -921,6 +940,30 @@ struct BlochBehaviour {
 /// connection, so the churn only fully stops once both endpoints run this
 /// build.
 const MAX_YAMUX_STREAMS: usize = 4096;
+
+/// The swarm-level connection caps for `max_peers` inbound slots (B1-T9 /
+/// NET-11 a):
+///
+/// * established INCOMING: `max_peers + 1` — one transient slot over the
+///   inbound budget, so a newcomer reaches the connection manager, which then
+///   evicts an unprotected inbound peer (Core's `AttemptToEvictConnection`)
+///   or closes the newcomer; the manager keeps inbound at `max_peers`;
+/// * established total: room for every inbound slot PLUS every outbound slot
+///   ([`connmgr::OUTBOUND_CONNECTION_HEADROOM`]): inbound connections can
+///   never use the connections outbound dialing needs;
+/// * at most 2 connections per peer (a simultaneous dial in both directions;
+///   one identity cannot hold many inbound connections);
+/// * pending caps blunt half-open connection floods.
+pub fn swarm_connection_limits(max_peers: usize) -> libp2p::connection_limits::ConnectionLimits {
+    let max = max_peers as u32;
+    let total = max_peers.saturating_mul(2).max(max_peers + connmgr::OUTBOUND_CONNECTION_HEADROOM) as u32;
+    libp2p::connection_limits::ConnectionLimits::default()
+        .with_max_established(Some(total))
+        .with_max_established_incoming(Some(max.saturating_add(1)))
+        .with_max_established_per_peer(Some(2))
+        .with_max_pending_incoming(Some(max.max(1)))
+        .with_max_pending_outgoing(Some(max.max(connmgr::OUTBOUND_CONNECTION_HEADROOM as u32)))
+}
 
 /// Builder for the swarm's yamux config — passed to `with_tcp` /
 /// `with_websocket` in place of `yamux::Config::default` (the builder accepts
@@ -1017,6 +1060,10 @@ pub struct NetworkNode {
     local_key:   identity::Keypair,
     control_rx:  Option<mpsc::Receiver<NetworkControl>>,
     peer_events: Option<mpsc::Sender<PeerEvent>>,
+    /// (full-relay, block-relay-only) automatic outbound slot targets.
+    outbound_targets: (usize, usize),
+    /// Mean interval between feeler connections.
+    feeler_interval: Duration,
 }
 
 impl NetworkNode {
@@ -1026,7 +1073,26 @@ impl NetworkNode {
         let local_key = load_or_create_identity(&key_path)?;
         let peer_id   = PeerId::from(local_key.public());
         info!("P2P identity: {} ({})", peer_id, key_path.display());
-        Ok(Self { peer_id, config, local_key, control_rx: None, peer_events: None })
+        Ok(Self {
+            peer_id, config, local_key, control_rx: None, peer_events: None,
+            outbound_targets: (connmgr::OUTBOUND_FULL_RELAY_TARGET, connmgr::BLOCK_RELAY_ONLY_TARGET),
+            feeler_interval: connmgr::FEELER_INTERVAL,
+        })
+    }
+
+    /// Override the automatic outbound slot targets (defaults: Bitcoin
+    /// Core's 8 full-relay + 2 block-relay-only). For tests and experiments;
+    /// operators have no reason to change them.
+    #[allow(dead_code)] // library / test knob; the binary keeps the defaults
+    pub fn set_outbound_targets(&mut self, full_relay: usize, block_relay_only: usize) {
+        self.outbound_targets = (full_relay, block_relay_only);
+    }
+
+    /// Override the mean feeler interval (default: Core's 2 minutes). For
+    /// tests.
+    #[allow(dead_code)] // library / test knob; the binary keeps the default
+    pub fn set_feeler_interval(&mut self, mean: Duration) {
+        self.feeler_interval = mean;
     }
 
     /// Accept [`NetworkControl`] requests from the processor on `rx`.
@@ -1236,24 +1302,14 @@ impl NetworkNode {
                     identify::Config::new("/gnb/1.0.0".into(), key.public())
                         .with_agent_version(sync_rr::agent_version(archive)),
                 );
-                // Cap connections at the swarm layer to match max_peers. We
-                // allow 2× established total for churn/reconnect headroom, but
-                // hold established-INCOMING to max_peers so an attacker can't
-                // fill every slot with inbound dials. Pending caps blunt
-                // half-open connection floods.
-                let max = max_peers as u32;
-                let limits = libp2p::connection_limits::ConnectionLimits::default()
-                    .with_max_established(Some(max.saturating_mul(2)))
-                    .with_max_established_incoming(Some(max))
-                    .with_max_pending_incoming(Some(max))
-                    .with_max_pending_outgoing(Some(max.max(1)));
-                let connection_limits = libp2p::connection_limits::Behaviour::new(limits);
+                let connection_limits = libp2p::connection_limits::Behaviour::new(swarm_connection_limits(max_peers));
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(BlochBehaviour {
-                    gossipsub: gs,
+                    gossipsub: gossip_gate::GossipGate::new(gs),
                     mdns,
                     identify,
                     sync_rr: sync_rr::new_behaviour(),
                     connection_limits,
+                    ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::new()),
                 })
             })
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?
@@ -1292,10 +1348,22 @@ impl NetworkNode {
             }
         }
 
-        // FIX #6: Load saved peers and dial them
+        // NET-11 (e): the per-node secret that keys address-table bucketing
+        // and the eviction netgroup order (Core's nKey), derived from the
+        // identity key so the persisted tried table keeps its layout.
+        let addr_key = match self.local_key.to_protobuf_encoding() {
+            Ok(bytes) => addrbook::derive_key(&bytes),
+            Err(_) => addrbook::random_key(),
+        };
+
+        // FIX #6 / NET-11: the persisted known peers are the keyed "tried"
+        // table (addresses we connected to outbound). They are no longer all
+        // dialed at start-up: the connection manager selects from the tables
+        // to fill its outbound slots (B1-T9).
         let peers_path = self.config.data_dir.join("known_peers.json");
         let mut known_peers = load_known_peers(&peers_path);
-        // Sprint P: drop any legacy pollution that doesn't pass the new validator.
+        // Sprint P / B1-T8: drop any entry that doesn't pass the validator
+        // (legacy pollution, host names, re-spelled private IPs).
         let pruned = prune_invalid(&mut known_peers, self.config.allow_private_peers);
         if pruned > 0 {
             info!("known_peers: pruned {} invalid entries on load (Sprint P)", pruned);
@@ -1305,15 +1373,38 @@ impl NetworkNode {
         if evicted > 0 {
             info!("known_peers: evicted {} entries to enforce cap", evicted);
         }
+        let mut tried = TriedTable::load(addr_key, known_peers.iter().filter_map(|a| normalize_peer_addr(a)));
 
         // Sprint P / NET-11: PEX hardening state. Rate limits are keyed by the
         // AUTHOR of the addresses (the peer that answered our GetPeers), and
-        // received addresses only ever enter `addr_book` — they are dialed
-        // later, a few per tick, never straight from a message.
+        // received addresses only ever enter the keyed new table `addr_book`.
         let mut pex_limiter = PexRateLimiter::new();
         let mut pex_stats   = PexStats::new();
-        let mut addr_book   = AddrBook::new();
+        let mut addr_book   = AddrBook::with_key(addr_key);
         let allow_private   = self.config.allow_private_peers;
+
+        // B1-T9 / NET-11 (a)-(d): connection manager (outbound slots apart
+        // from inbound, eviction, feelers, block-relay-only peers, anchors).
+        let mut conn_mgr = ConnManager::new(addr_key, self.config.max_peers);
+        conn_mgr.set_targets(self.outbound_targets.0, self.outbound_targets.1);
+        let anchors_path = self.config.data_dir.join(connmgr::ANCHORS_FILE);
+        let mut anchors: std::collections::VecDeque<String> =
+            connmgr::read_anchors(&anchors_path, allow_private).into_iter().collect();
+        if !anchors.is_empty() {
+            info!("anchors: {} block-relay-only peer(s) from the last run", anchors.len());
+        }
+        let mut feeler = {
+            use rand::Rng;
+            connmgr::FeelerSchedule::new(std::time::Instant::now(), self.feeler_interval, rand::rng().random())
+        };
+        // Core's cached getaddr answer (anti-scraping): one sample of the tried
+        // table per GETADDR_CACHE_LIFETIME.
+        let mut getaddr_cache = GetAddrCache::default();
+        // NET-11 (a): kind of each gossip frame awaiting a processor verdict
+        // (an Accept = a novel block / transaction from that peer).
+        let mut novel_kinds: std::collections::HashMap<gossipsub::MessageId, bool> = std::collections::HashMap::new();
+        // NET-11 (c): established feeler connections and when to close them.
+        let mut feelers_closing: Vec<(libp2p::swarm::ConnectionId, std::time::Instant)> = Vec::new();
 
         // C1 / NET-4 / NET-8: cumulative, decaying, bounded app-score
         // penalties for wire-violating peers.
@@ -1329,39 +1420,48 @@ impl NetworkNode {
         let mut claim_limiter: ratelimit::TokenBuckets<PeerId> =
             ratelimit::TokenBuckets::new(CLAIM_BURST, CLAIM_REFILL_PER_SEC, CLAIM_LIMITER_TRACK_CAP);
 
-        // Add hardcoded default seeds
-        let mut all_seeds: Vec<String> = crate::core::DEFAULT_SEEDS.iter().map(|s| s.to_string()).collect();
+        // Start-up dials: the shipped seeds, the DNS seeds' answers and the
+        // configured `--peer`s, as MANUAL connections (Core's -addnode /
+        // -seednode: they never use the automatic outbound slots).
+        let mut manual: Vec<Multiaddr> = Vec::new();
+        for p in crate::core::DEFAULT_SEEDS.iter().map(|s| s.to_string()).chain(self.config.bootstrap_peers.iter().cloned()) {
+            // Operator-configured: a host name is resolved; its answer may be
+            // private (docker / LAN setups) but never an invalid range.
+            if let Some(addr) = resolve_dial_addr(&p, true).await {
+                manual.push(addr);
+            }
+        }
         // DNS seeds (opt-in, non-privileged): resolve each hostname's A/AAAA
-        // records into peer multiaddrs (Bitcoin-style cold-start).
+        // records into peer multiaddrs (Bitcoin-style cold-start). B1-T8: the
+        // answers are third-party data and are screened like learned
+        // addresses (Core's addrman refuses unroutable seed results).
         for host in self.config.dns_seeds.iter() {
             let hp = if host.contains(':') { host.clone() } else { format!("{host}:17110") };
             match tokio::net::lookup_host(hp).await {
                 Ok(addrs) => {
                     for sa in addrs {
+                        if !is_acceptable_ip(sa.ip(), allow_private) {
+                            warn!("dns-seed {} answered a non-routable address {}; ignored", host, sa.ip());
+                            continue;
+                        }
                         let ma = match sa.ip() {
                             std::net::IpAddr::V4(v4) => format!("/ip4/{}/tcp/{}", v4, sa.port()),
                             std::net::IpAddr::V6(v6) => format!("/ip6/{}/tcp/{}", v6, sa.port()),
                         };
                         info!("dns-seed {} → {}", host, ma);
-                        all_seeds.push(ma);
+                        if let Ok(addr) = ma.parse() {
+                            manual.push(addr);
+                        }
                     }
                 }
                 Err(e) => warn!("dns-seed {}: resolve failed: {}", host, e),
             }
         }
-        // Add CLI bootstrap peers + known peers
-        all_seeds.extend(self.config.bootstrap_peers.iter().cloned());
-        all_seeds.extend(known_peers.iter().cloned());
-        // Deduplicate
-        all_seeds.sort();
-        all_seeds.dedup();
-
-        for p in all_seeds.iter() {
-            let resolved = resolve_multiaddr(p).await;
-            if let Ok(addr) = resolved.parse::<Multiaddr>() {
-                info!("dialing: {}", resolved);
-                let _ = swarm.dial(addr);
-            }
+        manual.sort();
+        manual.dedup();
+        for addr in manual {
+            info!("dialing: {}", addr);
+            dial_with_intent(&mut swarm, &mut conn_mgr, addr, DialIntent::manual());
         }
 
         let peer_id_str = self.peer_id.to_string();
@@ -1369,11 +1469,12 @@ impl NetworkNode {
 
         // AUDIT (external-address poisoning): a peer-reported identify
         // `observed_addr` is only a CANDIDATE; it is confirmed as our external
-        // address only when EXTERNAL_ADDR_QUORUM distinct peers report it.
+        // address only when peers in EXTERNAL_ADDR_QUORUM distinct NETGROUPS
+        // report it (NET-11 residual: identities are free, netgroups are not).
         const EXTERNAL_ADDR_QUORUM: usize = 3;
         const OBSERVED_ADDR_CAP: usize = 64;
         const MDNS_DIAL_LIMIT: usize = 8; // max LAN peers auto-dialed per mDNS event
-        let mut observed_by: std::collections::HashMap<Multiaddr, std::collections::HashSet<PeerId>> =
+        let mut observed_by: std::collections::HashMap<Multiaddr, std::collections::HashSet<String>> =
             std::collections::HashMap::new();
 
         // NET-5 / NET-9: directed pulls go through a rotating, stall-aware
@@ -1397,9 +1498,11 @@ impl NetworkNode {
         // NET-5/NET-9: re-try queued pulls (cooldowns expire, slots free up).
         let mut pull_tick = tokio::time::interval(PULL_RETRY_TICK);
         pull_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // NET-11: dial a few PEX-learned addresses per tick, from the table.
-        let mut pex_dial = tokio::time::interval(PEX_DIAL_TICK);
-        pex_dial.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // B1-T9 / NET-11: open at most one automatic outbound connection per
+        // tick, from the address tables, whenever an outbound slot is free
+        // (Core's ThreadOpenConnections loop).
+        let mut outbound_tick = tokio::time::interval(OUTBOUND_TICK);
+        outbound_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -1517,6 +1620,9 @@ impl NetworkNode {
                             let source = InboundOrigin::Gossip { propagation_source, author, pending: None, received_at: now };
                             match gossip_disposition(&msg, sink.validator_attached(), claim_ok) {
                                 GossipDisposition::DeliverDeferred => {
+                                    // NET-11 (a): remember the frame kind; the
+                                    // processor's Accept marks a novel block / tx.
+                                    note_pending_kind(&mut novel_kinds, &message_id, matches!(msg, NetworkMessage::NewBlock { .. }));
                                     let origin = InboundOrigin::Gossip {
                                         propagation_source, author, pending: Some(message_id.clone()), received_at: now,
                                     };
@@ -1538,42 +1644,86 @@ impl NetworkNode {
                                 }
                             }
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
-                            info!("✓ connected: {}", peer_id);
-                            // DO NOT call gossipsub.add_explicit_peer() here: explicit
-                            // peers are excluded from the mesh (libp2p-gossipsub
-                            // behaviour.rs), which once made the mesh unbuildable.
-                            let first_connection = num_established.get() == 1;
-                            // The count is of distinct peers, not connections, and the
-                            // processor (RPC `peers`, the miner's has-peers check) sees
-                            // it at once, not at the next 30 s heartbeat.
-                            if let Some(count) = peer_count_after_connect(peer_count, num_established.get()) {
-                                peer_count = count;
-                                crate::metrics::set_peer_count(peer_count as i64);
-                                sink.deliver(NetworkMessage::PeerCount {
-                                    count: peer_count, addresses: known_peers.iter().cloned().collect(),
-                                }, InboundOrigin::Local, "connect");
-                            }
-                            peer_state.on_connect(peer_id, Instant::now());
-                            selector.on_connect(peer_id);
+                        SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+                            let now = Instant::now();
+                            // B1-T9 / NET-11: classify the connection (inbound, or the
+                            // outbound kind it was dialed for).
+                            let est = conn_mgr.on_established(
+                                connection_id, peer_id, endpoint.is_dialer(), endpoint.get_remote_address(), now);
                             // PROPAGAÇÃO-CHURN fix: persist only the canonical form of
                             // a DIALED address (the Listener's send_back_addr is an
-                            // ephemeral socket). NET-11: confirmed addresses enter
-                            // the netgroup-capped "tried" table.
-                            let addr_to_remember = match &endpoint {
-                                libp2p::core::ConnectedPoint::Dialer { address, .. } => {
-                                    Some(canonical_peer_addr(address, &peer_id))
-                                }
-                                libp2p::core::ConnectedPoint::Listener { .. } => None,
-                            };
-                            if let Some(addr_str) = addr_to_remember {
+                            // ephemeral socket). NET-11: an address we connected to
+                            // outbound enters the keyed "tried" table (Core's Good);
+                            // a full bucket queues a test-before-evict collision.
+                            if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                                let addr_str = canonical_peer_addr(address, &peer_id);
                                 addr_book.remove(&addr_str);
                                 if is_valid_public_multiaddr(&addr_str, allow_private) {
-                                    add_tried(&mut known_peers, addr_str);
+                                    if let TriedInsert::Collision { existing } = tried.insert(&addr_str, now) {
+                                        debug!("tried table: {} collides with {}; the occupant will be tested",
+                                            truncate_utf8(&addr_str, 60), truncate_utf8(&existing, 60));
+                                    }
                                 } else {
                                     debug!("not adding peer to known_peers (validator rejected): {}",
                                         truncate_utf8(&addr_str, 80));
                                 }
+                            }
+                            // NET-11 (c): a feeler only tests reachability. Its success
+                            // keeps a tried occupant (test-before-evict) or promotes a
+                            // new-table address (above). It carries no gossip (gated)
+                            // and none of our protocol traffic, and is closed after
+                            // connmgr::FEELER_LINGER — as Core closes a feeler once the
+                            // handshake is complete: closing at once cut the remote's
+                            // side of the connection setup short.
+                            if est.kind == ConnKind::Feeler {
+                                if let Some(i) = &est.intent {
+                                    if let (Some(newcomer), Some(occupant)) = (&i.collision_newcomer, &i.addr) {
+                                        tried.resolve_collision(newcomer, occupant, true);
+                                    }
+                                }
+                                debug!("feeler to {} succeeded; closing it shortly", peer_id);
+                                feelers_closing.push((connection_id, now + connmgr::FEELER_LINGER));
+                                continue;
+                            }
+                            // NET-11 (a): inbound slots full → evict an unprotected
+                            // inbound peer (Core's AttemptToEvictConnection), or refuse
+                            // the newcomer when every inbound peer is protected.
+                            if est.kind == ConnKind::Inbound && conn_mgr.inbound_over_capacity() {
+                                // A second connection of an already-connected peer
+                                // is just closed: it must not evict someone else.
+                                let victim = if est.new_peer { conn_mgr.eviction_victim(&peer_id) } else { None };
+                                match victim {
+                                    Some(victim) => {
+                                        info!("inbound slots full: evicting {} to admit {}", victim, peer_id);
+                                        let _ = swarm.disconnect_peer_id(victim);
+                                    }
+                                    None => {
+                                        info!("inbound slots full and every inbound peer protected: refusing {}", peer_id);
+                                        swarm.close_connection(connection_id);
+                                        continue;
+                                    }
+                                }
+                            }
+                            info!("✓ connected: {}", peer_id);
+                            // DO NOT call gossipsub.add_explicit_peer() here: explicit
+                            // peers are excluded from the mesh (libp2p-gossipsub
+                            // behaviour.rs), which once made the mesh unbuildable.
+                            let first_connection = est.new_peer;
+                            // The count is of distinct peers, not connections, and the
+                            // processor (RPC `peers`, the miner's has-peers check) sees
+                            // it at once, not at the next 30 s heartbeat.
+                            if conn_mgr.peer_count() != peer_count {
+                                peer_count = conn_mgr.peer_count();
+                                crate::metrics::set_peer_count(peer_count as i64);
+                                sink.deliver(NetworkMessage::PeerCount {
+                                    count: peer_count, addresses: tried.addresses(),
+                                }, InboundOrigin::Local, "connect");
+                            }
+                            peer_state.on_connect(peer_id, now);
+                            selector.on_connect(peer_id);
+                            // NET-11 (b): a new block-relay-only peer is an anchor.
+                            if first_connection && est.kind == ConnKind::BlockRelayOnly {
+                                connmgr::write_anchors(&anchors_path, &conn_mgr.anchors());
                             }
                             // Version handshake + tip announce with FRESH DAG values.
                             let (v_score, v_height) = {
@@ -1602,17 +1752,21 @@ impl NetworkNode {
                             }
                             // M-10: directed PEX request to the peer that just
                             // connected (one requester, one answer). Not retried on
-                            // other peers if it fails.
-                            let now = Instant::now();
-                            let req_id = swarm.behaviour_mut().sync_rr
-                                .send_request(&peer_id, sync_rr::SyncRequest::GetPeers);
-                            selector.on_sent(peer_id, now);
-                            inflight_pull.insert(req_id, (PendingPull {
-                                msg: NetworkMessage::PeerRequest,
-                                req: sync_rr::SyncRequest::GetPeers,
-                                attempts: MAX_PULL_ATTEMPTS,
-                                tried: vec![peer_id],
-                            }, peer_id));
+                            // other peers if it fails. NET-11: only to outbound
+                            // full-relay and manual peers, as Core sends getaddr
+                            // (inbound peers would answer nothing; block-relay-only
+                            // connections carry no address relay).
+                            if est.kind.sends_getaddr() {
+                                let req_id = swarm.behaviour_mut().sync_rr
+                                    .send_request(&peer_id, sync_rr::SyncRequest::GetPeers);
+                                selector.on_sent(peer_id, now);
+                                inflight_pull.insert(req_id, (PendingPull {
+                                    msg: NetworkMessage::PeerRequest,
+                                    req: sync_rr::SyncRequest::GetPeers,
+                                    attempts: MAX_PULL_ATTEMPTS,
+                                    tried: vec![peer_id],
+                                }, peer_id));
+                            }
                             // Directed frontier exchange with the new peer: its tips,
                             // asked of IT. The gossip announcements above reach a
                             // second peer connecting within the same second as
@@ -1659,18 +1813,27 @@ impl NetworkNode {
                                 }
                             }
                         }
-                        SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                        SwarmEvent::ConnectionClosed { peer_id, connection_id, .. } => {
+                            let closed = conn_mgr.on_closed(connection_id, peer_id);
+                            if closed.kind == Some(ConnKind::Feeler) {
+                                continue;
+                            }
                             info!("✗ disconnected: {}", peer_id);
-                            if let Some(count) = peer_count_after_disconnect(peer_count, num_established) {
-                                peer_count = count;
-                                crate::metrics::set_peer_count(peer_count as i64);
-                                sink.deliver(NetworkMessage::PeerCount {
-                                    count: peer_count, addresses: known_peers.iter().cloned().collect(),
-                                }, InboundOrigin::Local, "disconnect");
+                            if let Some(gone) = closed.peer_gone {
+                                if conn_mgr.peer_count() != peer_count {
+                                    peer_count = conn_mgr.peer_count();
+                                    crate::metrics::set_peer_count(peer_count as i64);
+                                    sink.deliver(NetworkMessage::PeerCount {
+                                        count: peer_count, addresses: tried.addresses(),
+                                    }, InboundOrigin::Local, "disconnect");
+                                }
                                 peer_state.on_disconnect(&peer_id);
                                 selector.on_disconnect(&peer_id);
                                 if let Some(tx) = &self.peer_events {
                                     let _ = tx.try_send(PeerEvent::Disconnected(peer_id));
+                                }
+                                if gone.role == ConnKind::BlockRelayOnly {
+                                    connmgr::write_anchors(&anchors_path, &conn_mgr.anchors());
                                 }
                             }
                         }
@@ -1680,10 +1843,33 @@ impl NetworkNode {
                                 let _ = report.send(address.clone());
                             }
                         }
-                        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                            warn!("dial failed{}: {}",
-                                peer_id.map(|p| format!(" to {}", p)).unwrap_or_default(),
-                                error);
+                        SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
+                            let intent = conn_mgr.on_dial_failed(connection_id);
+                            match intent.as_ref().map(|i| i.kind) {
+                                // Feelers and automatic dials fail routinely
+                                // (that is what feelers find out).
+                                Some(ConnKind::Feeler | ConnKind::OutboundFullRelay | ConnKind::BlockRelayOnly) => {
+                                    debug!("{:?} dial failed{}: {}", intent.as_ref().map(|i| i.kind),
+                                        peer_id.map(|p| format!(" to {}", p)).unwrap_or_default(), error);
+                                }
+                                _ => warn!("dial failed{}: {}",
+                                    peer_id.map(|p| format!(" to {}", p)).unwrap_or_default(),
+                                    error),
+                            }
+                            if let Some(i) = intent {
+                                // NET-11 (c): test-before-evict — an unreachable tried
+                                // occupant is replaced by the newcomer it blocked.
+                                if let (ConnKind::Feeler, Some(newcomer), Some(occupant)) = (i.kind, &i.collision_newcomer, &i.addr) {
+                                    tried.resolve_collision(newcomer, occupant, false);
+                                }
+                                // A failed block-relay-only / feeler dial: its peer's
+                                // future connections carry gossip again.
+                                if let (ConnKind::BlockRelayOnly | ConnKind::Feeler, Some(p)) = (i.kind, i.peer) {
+                                    if !swarm.is_connected(&p) {
+                                        swarm.behaviour_mut().gossipsub.ungate_peer(&p);
+                                    }
+                                }
+                            }
                         }
                         SwarmEvent::IncomingConnectionError { error, .. } => {
                             warn!("incoming failed: {}", error);
@@ -1701,7 +1887,7 @@ impl NetworkNode {
                                     continue;
                                 }
                                 info!("mDNS discovered (LAN): {} at {}", peer_id, addr);
-                                if swarm.dial(addr).is_ok() { dialed += 1; }
+                                if dial_with_intent(&mut swarm, &mut conn_mgr, addr, DialIntent::manual()) { dialed += 1; }
                             }
                         }
                         SwarmEvent::Behaviour(BlochBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
@@ -1713,22 +1899,29 @@ impl NetworkNode {
                         // is advertised). Peer listen addrs are NOT persisted.
                         SwarmEvent::Behaviour(BlochBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                             let cand = canonical_peer_addr(&info.observed_addr, &self.peer_id);
-                            if is_valid_public_multiaddr(&cand, allow_private)
-                                && (observed_by.len() < OBSERVED_ADDR_CAP
-                                    || observed_by.contains_key(&info.observed_addr))
-                            {
+                            // A voter counts once per NETGROUP of its connection.
+                            let voter_group = conn_mgr.peer(&peer_id).map(|i| i.netgroup.clone());
+                            if let Some(voter_group) = voter_group.filter(|_| {
+                                is_valid_public_multiaddr(&cand, allow_private)
+                                    && (observed_by.len() < OBSERVED_ADDR_CAP
+                                        || observed_by.contains_key(&info.observed_addr))
+                            }) {
                                 let voters = observed_by.entry(info.observed_addr.clone()).or_default();
                                 let was_below = voters.len() < EXTERNAL_ADDR_QUORUM;
-                                voters.insert(peer_id);
+                                voters.insert(voter_group);
                                 if was_below && voters.len() >= EXTERNAL_ADDR_QUORUM {
                                     swarm.add_external_address(info.observed_addr.clone());
-                                    info!("external address confirmed by {} peers: {}",
+                                    info!("external address confirmed by peers in {} netgroups: {}",
                                         EXTERNAL_ADDR_QUORUM, info.observed_addr);
                                 }
                             }
                             if let Some(arch) = sync_rr::parse_archival_agent(&info.agent_version) {
                                 debug!("peer {} self-declares archival={} (not used for pull selection)", peer_id, arch);
                             }
+                        }
+                        // NET-11 (a): latency for the eviction protection.
+                        SwarmEvent::Behaviour(BlochBehaviourEvent::Ping(libp2p::ping::Event { peer, result: Ok(rtt), .. })) => {
+                            conn_mgr.on_ping(&peer, rtt);
                         }
                         // ── Announce-then-pull: directed IBD sync ────────────
                         SwarmEvent::Behaviour(BlochBehaviourEvent::SyncRr(ev)) => match ev {
@@ -1741,9 +1934,19 @@ impl NetworkNode {
                                         debug!("sync_rr: rate-limited request from {} → Busy", peer);
                                         sync_rr::SyncResponse::Busy
                                     } else if matches!(request, sync_rr::SyncRequest::GetPeers) {
-                                        let external: Vec<Multiaddr> =
-                                            swarm.external_addresses().cloned().collect();
-                                        serve_get_peers(&known_peers, &external, &self.peer_id, allow_private)
+                                        // NET-11: answered for INBOUND peers only, once
+                                        // per connection, from a sample cached for about
+                                        // a day (Core: getaddr from outbound peers is
+                                        // ignored; m_addr_response_caches). Anyone else
+                                        // gets an empty, well-formed answer.
+                                        if conn_mgr.take_getaddr_answer(&peer) {
+                                            let external: Vec<Multiaddr> =
+                                                swarm.external_addresses().cloned().collect();
+                                            let sample = getaddr_cache.sample(Instant::now(), &tried, allow_private);
+                                            serve_get_peers(&sample, &external, &self.peer_id, allow_private)
+                                        } else {
+                                            sync_rr::SyncResponse::Peers { peers: Vec::new() }
+                                        }
                                     } else {
                                         serve_sync_request(&dag, &store, &request)
                                     };
@@ -1766,9 +1969,14 @@ impl NetworkNode {
                                                 // NET-11: solicited addresses go to the
                                                 // table, rate-limited per author; never
                                                 // dialed from here.
+                                                // NET-11 (e): bucketed by the answering
+                                                // peer's netgroup (Core's addr source).
+                                                let source_group = conn_mgr.peer(&peer)
+                                                    .map(|i| i.netgroup.clone()).unwrap_or_default();
                                                 ingest_pex_addresses(
                                                     &mut addr_book, &mut pex_limiter, &mut pex_stats,
-                                                    peer, &peers, allow_private, &self.peer_id, &known_peers,
+                                                    peer, &source_group, &peers, allow_private, &self.peer_id,
+                                                    |a| tried.contains(a),
                                                 );
                                                 pex_stats.set_distinct_peers(pex_limiter.tracked_peer_count());
                                             }
@@ -1852,6 +2060,16 @@ impl NetworkNode {
                 v = recv_verdict(&mut verdict_rx) => {
                     match v {
                         Some(v) => {
+                            // NET-11 (a): an accepted frame was a novel block / tx.
+                            if let Some(is_block) = novel_kinds.remove(&v.message_id) {
+                                if v.verdict == GossipVerdict::Accept {
+                                    if is_block {
+                                        conn_mgr.on_novel_block(&v.propagation_source, Instant::now());
+                                    } else {
+                                        conn_mgr.on_novel_tx(&v.propagation_source, Instant::now());
+                                    }
+                                }
+                            }
                             let relayed = swarm.behaviour_mut().gossipsub.report_message_validation_result(
                                 &v.message_id, &v.propagation_source, v.verdict.into());
                             if !relayed && v.verdict == GossipVerdict::Accept {
@@ -1915,32 +2133,33 @@ impl NetworkNode {
                     drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, Instant::now());
                 }
 
-                // NET-11: dial from the address table, never from a message —
-                // a few per tick, at most one per netgroup, only below target.
-                _ = pex_dial.tick() => {
-                    if peer_count < self.config.max_peers {
-                        let want = if peer_count < PEX_LOW_PEER_THRESHOLD { PEX_DIALS_WHEN_LOW } else { 1 };
-                        let me = self.peer_id;
-                        let cands = addr_book.take_dial_candidates(want, |a| {
-                            known_peers.contains(a)
-                                || addr_peer_id(a).is_none_or(|p| p == me || swarm.is_connected(&p))
-                        });
-                        for a in cands {
-                            if let Ok(addr) = a.parse::<libp2p::Multiaddr>() {
-                                info!("PEX dial (from table): {}", truncate_utf8(&a, 60));
-                                let _ = swarm.dial(addr);
-                                pex_stats.record_accept(1);
-                            }
+                // B1-T9 / NET-11: keep the OUTBOUND slots full from the address
+                // tables — never from a message, never limited by inbound
+                // connections (Core's ThreadOpenConnections, one attempt per tick).
+                _ = outbound_tick.tick() => {
+                    let now = Instant::now();
+                    feelers_closing.retain(|(c, at)| {
+                        if now < *at {
+                            return true;
                         }
-                    }
+                        swarm.close_connection(*c);
+                        false
+                    });
+                    open_next_outbound(
+                        &mut swarm, &mut conn_mgr, &mut tried, &mut addr_book, &mut anchors, &mut feeler,
+                        &self.peer_id, allow_private, now,
+                    );
                 }
 
                 _ = heartbeat.tick() => {
                     let now = Instant::now();
                     let current_height = dag.read().block_count() as u64;
                     info!("peers: {} | height: {}", peer_count, current_height);
-                    let addrs: Vec<String> = known_peers.iter().cloned().collect();
-                    sink.deliver(NetworkMessage::PeerCount { count: peer_count, addresses: addrs }, InboundOrigin::Local, "heartbeat");
+                    sink.deliver(NetworkMessage::PeerCount { count: peer_count, addresses: tried.addresses() }, InboundOrigin::Local, "heartbeat");
+                    // Frames never answered must not pin the map at its cap.
+                    if novel_kinds.len() >= NOVEL_KINDS_CAP {
+                        novel_kinds.clear();
+                    }
 
                     // Sprint P: emit aggregated PEX stats (every 60s, only if activity)
                     if let Some(line) = pex_stats.tick() {
@@ -1968,19 +2187,37 @@ impl NetworkNode {
                         warn!("tx mesh empty: {} peers but 0 in tx-mesh — re-subscribing", peer_count);
                     }
 
-                    if peer_count == 0 {
-                        for p in self.config.bootstrap_peers.iter() {
-                            let resolved = resolve_multiaddr(p).await;
-                            if let Ok(addr) = resolved.parse::<libp2p::Multiaddr>() {
-                                info!("reconnecting: {}", resolved);
-                                let _ = swarm.dial(addr);
-                            }
+                    // B1-T9: configured peers are re-dialed whenever they are
+                    // not connected (Core keeps -addnode peers connected), not
+                    // only when the node has no peer at all — inbound
+                    // connections used to stop this for good. An entry without
+                    // a peer id cannot be matched to a connection and is
+                    // re-dialed when no manual connection is up.
+                    let manual_up = conn_mgr.count(ConnKind::Manual) + conn_mgr.pending_count(ConnKind::Manual);
+                    for p in self.config.bootstrap_peers.iter() {
+                        let wanted = match addr_peer_id(p) {
+                            Some(id) => id != self.peer_id && !swarm.is_connected(&id) && !conn_mgr.is_dialing(&id),
+                            None => manual_up == 0,
+                        };
+                        if !wanted {
+                            continue;
+                        }
+                        if let Some(addr) = resolve_dial_addr(p, true).await {
+                            info!("reconnecting: {}", addr);
+                            dial_with_intent(&mut swarm, &mut conn_mgr, addr, DialIntent::manual());
                         }
                     }
+                    // NET-11 (d): block-relay-only peers carry no gossip; their
+                    // frontier is polled (then pulled block by block).
+                    for p in conn_mgr.block_relay_peers() {
+                        send_directed_pull(&mut swarm, &mut selector, &mut inflight_pull, p,
+                            NetworkMessage::GetTips, now);
+                    }
+                    drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, now);
                 }
 
                 _ = save_peers.tick() => {
-                    save_known_peers(&peers_path, &known_peers);
+                    save_known_peers(&peers_path, &tried.to_set());
                 }
 
                 // Sprint CC: periodic tip announcement for IBD recovery (60s).
@@ -2032,10 +2269,14 @@ pub const MAX_PENDING_PULLS: usize = 4096;
 pub const MAX_PULL_ATTEMPTS: u8 = 3;
 /// How often queued pulls are retried.
 const PULL_RETRY_TICK: Duration = Duration::from_millis(250);
-/// NET-11: PEX dial cadence and batch sizes.
-const PEX_DIAL_TICK: Duration = Duration::from_secs(10);
-const PEX_LOW_PEER_THRESHOLD: usize = 4;
-const PEX_DIALS_WHEN_LOW: usize = 4;
+/// B1-T9 / NET-11: cadence of the outbound connection loop: at most one
+/// automatic outbound dial per tick (Core's ThreadOpenConnections loops every
+/// 500 ms, one connection attempt at a time).
+const OUTBOUND_TICK: Duration = Duration::from_secs(1);
+/// NET-11 (a): bound on the gossip frames whose kind is remembered while their
+/// verdict is pending (cleared on overflow; the processor answers every
+/// pending frame within seconds).
+const NOVEL_KINDS_CAP: usize = 8192;
 /// NET-6: per-author tip-claim rate limit (burst, refill/sec, tracked authors).
 const CLAIM_BURST: u32 = 16;
 const CLAIM_REFILL_PER_SEC: f64 = 0.2;
@@ -2076,6 +2317,8 @@ pub const GOSSIP_RX_TX_LOG_TARGET: &str = "gnb_gossip_rx_tx";
 /// Period of the network heartbeat (peer count, housekeeping, re-subscribe,
 /// bootstrap re-dial with no peers).
 const HEARTBEAT_PERIOD: Duration = Duration::from_secs(30);
+// The heartbeat polls the block-relay-only peers' frontiers (NET-11 d).
+const _: () = assert!(HEARTBEAT_PERIOD.as_secs() == connmgr::BLOCK_RELAY_POLL_INTERVAL.as_secs());
 
 /// The network heartbeat timer. Its first tick comes after one period, not
 /// at once: at start-up no connection is established yet, so an immediate
@@ -2085,20 +2328,193 @@ fn new_heartbeat() -> tokio::time::Interval {
     tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT_PERIOD, HEARTBEAT_PERIOD)
 }
 
-/// The distinct-peer count after a connection to a peer is established
-/// (`num_established`: that peer's connections, this one included), or
-/// `None` when it is unchanged: only a peer's first connection counts. The
-/// count (RPC `peers`, the miner's has-peers check) used to count
-/// connections, so a peer dialed twice counted twice.
-fn peer_count_after_connect(count: usize, num_established: u32) -> Option<usize> {
-    (num_established == 1).then(|| count.saturating_add(1))
+/// Remember whether a gossip frame awaiting the processor's verdict is a block
+/// (`true`) or a transaction (NET-11 a: an `Accept` marks the delivering peer
+/// as a source of novel blocks / transactions, which protects it from
+/// inbound eviction).
+fn note_pending_kind(map: &mut std::collections::HashMap<gossipsub::MessageId, bool>, id: &gossipsub::MessageId, is_block: bool) {
+    if map.len() < NOVEL_KINDS_CAP {
+        map.insert(id.clone(), is_block);
+    }
 }
 
-/// The distinct-peer count after a connection to a peer is closed
-/// (`num_established`: that peer's connections still open), or `None` when
-/// it is unchanged: only a peer's last connection closing counts.
-fn peer_count_after_disconnect(count: usize, num_established: u32) -> Option<usize> {
-    (num_established == 0).then(|| count.saturating_sub(1))
+/// Dial `addr` for `intent`, registering the dial with the connection manager
+/// under its connection id (so the established connection gets its kind).
+/// An address with a `/p2p/<id>` is dialed only if that peer is neither
+/// connected nor being dialed. Returns whether the dial was started.
+fn dial_with_intent(
+    swarm:    &mut libp2p::Swarm<BlochBehaviour>,
+    conn_mgr: &mut ConnManager,
+    addr:     Multiaddr,
+    mut intent: DialIntent,
+) -> bool {
+    use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+    let peer = addr.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::P2p(id) => Some(id),
+        _ => None,
+    });
+    let opts = match peer {
+        Some(id) => DialOpts::peer_id(id)
+            .addresses(vec![addr])
+            .condition(PeerCondition::DisconnectedAndNotDialing)
+            .build(),
+        None => DialOpts::unknown_peer_id().address(addr).build(),
+    };
+    intent.peer = intent.peer.or(peer);
+    let id = opts.connection_id();
+    conn_mgr.register_dial(id, intent);
+    match swarm.dial(opts) {
+        Ok(()) => true,
+        Err(e) => {
+            let failed = conn_mgr.on_dial_failed(id);
+            if let Some(DialIntent { kind: ConnKind::BlockRelayOnly | ConnKind::Feeler, peer: Some(p), .. }) = failed {
+                if !swarm.is_connected(&p) {
+                    swarm.behaviour_mut().gossipsub.ungate_peer(&p);
+                }
+            }
+            debug!("dial not started: {}", e);
+            false
+        }
+    }
+}
+
+/// One step of the outbound connection loop (B1-T9 / NET-11, Core's
+/// `ThreadOpenConnections`): decide what the next automatic outbound
+/// connection is for ([`connmgr::next_outbound_action`]: anchors, full-relay
+/// slots, block-relay-only slots, feelers), pick an address and dial it.
+///
+/// * full-relay / block-relay-only: a random entry of the tried or the new
+///   table (50/50, as Core's `Select`), outside the netgroups of the current
+///   automatic outbound peers, not connected, not ourselves, not tried in the
+///   last `addrbook::RETRY_INTERVAL`;
+/// * anchor: the next anchor from the last run, as block-relay-only;
+/// * feeler: the occupant of a queued tried collision first
+///   (test-before-evict), else a random new-table address.
+///
+/// A new-table address leaves the table when it is dialed (a success moves it
+/// to the tried table, a failure drops it).
+#[allow(clippy::too_many_arguments)]
+fn open_next_outbound(
+    swarm:         &mut libp2p::Swarm<BlochBehaviour>,
+    conn_mgr:      &mut ConnManager,
+    tried:         &mut TriedTable,
+    addr_book:     &mut AddrBook,
+    anchors:       &mut std::collections::VecDeque<String>,
+    feeler:        &mut connmgr::FeelerSchedule,
+    me:            &PeerId,
+    allow_private: bool,
+    now:           std::time::Instant,
+) {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let feeler_u: f64 = rng.random();
+    let action = connmgr::next_outbound_action(
+        conn_mgr.full_relay_slots_used(),
+        conn_mgr.full_relay_target(),
+        conn_mgr.block_relay_slots_used(),
+        conn_mgr.block_relay_target(),
+        !anchors.is_empty(),
+        || feeler.poll(now, feeler_u),
+    );
+    let reachable = |a: &str, conn_mgr: &ConnManager, swarm: &libp2p::Swarm<BlochBehaviour>| -> bool {
+        is_valid_public_multiaddr(a, allow_private)
+            && addr_peer_id(a).is_some_and(|p| p != *me && !swarm.is_connected(&p) && !conn_mgr.is_dialing(&p))
+    };
+    let (kind, pick, collision_newcomer) = match action {
+        OutboundAction::Idle => return,
+        OutboundAction::Anchor => {
+            // Core skips an anchor in the netgroup of a current outbound peer.
+            let groups = conn_mgr.outbound_groups();
+            let mut pick = None;
+            while let Some(a) = anchors.pop_front() {
+                if reachable(&a, conn_mgr, swarm) && netgroup(&a).is_some_and(|g| !groups.contains(&g)) {
+                    pick = Some(a);
+                    break;
+                }
+            }
+            (ConnKind::BlockRelayOnly, pick, None)
+        }
+        OutboundAction::FullRelay | OutboundAction::BlockRelay => {
+            let kind = if action == OutboundAction::FullRelay { ConnKind::OutboundFullRelay } else { ConnKind::BlockRelayOnly };
+            let groups = conn_mgr.outbound_groups();
+            let ok = |a: &str| {
+                reachable(a, conn_mgr, swarm)
+                    && netgroup(a).is_some_and(|g| !groups.contains(&g))
+                    && !tried.recently_tried(a, now)
+            };
+            let pick = if rng.random_bool(0.5) {
+                tried.select(&mut rng, ok).or_else(|| addr_book.select(&mut rng, ok))
+            } else {
+                addr_book.select(&mut rng, ok).or_else(|| tried.select(&mut rng, ok))
+            };
+            (kind, pick, None)
+        }
+        OutboundAction::Feeler => match tried.pending_collision(now) {
+            Some((newcomer, occupant)) if reachable(&occupant, conn_mgr, swarm) => (ConnKind::Feeler, Some(occupant), Some(newcomer)),
+            Some((newcomer, occupant)) => {
+                // The occupant is connected right now: it is reachable.
+                tried.resolve_collision(&newcomer, &occupant, true);
+                return;
+            }
+            None => (ConnKind::Feeler, addr_book.select(&mut rng, |a| reachable(a, conn_mgr, swarm)), None),
+        },
+    };
+    let Some(a) = pick else { return };
+    addr_book.remove(&a);
+    tried.mark_attempt(&a, now);
+    let Ok(ma) = a.parse::<Multiaddr>() else { return };
+    let peer = addr_peer_id(&a);
+    if matches!(kind, ConnKind::BlockRelayOnly | ConnKind::Feeler) {
+        if let Some(p) = peer {
+            // NET-11 (c)/(d): gate BEFORE dialing, so gossipsub never sees
+            // a block-relay-only or feeler connection.
+            swarm.behaviour_mut().gossipsub.gate_peer(p);
+        }
+    }
+    debug!("outbound {:?} dial: {}", kind, truncate_utf8(&a, 80));
+    let group = netgroup(&a);
+    dial_with_intent(swarm, conn_mgr, ma, DialIntent { kind, addr: Some(a), peer, group, collision_newcomer });
+}
+
+/// Core's cached `getaddr` answer (`m_addr_response_caches`): the sample of
+/// the tried table served to inbound peers is recomputed only about once a
+/// day (21-27 h), so reconnecting and asking again reveals nothing more of
+/// the table. While the cached sample is not full and the table has grown,
+/// it is refreshed at most every [`GETADDR_CACHE_GROW_REFRESH`] (a young
+/// node would otherwise serve its near-empty start-up table for a day).
+#[derive(Default)]
+struct GetAddrCache {
+    sample: Vec<String>,
+    built_at: Option<std::time::Instant>,
+    expires: Option<std::time::Instant>,
+}
+
+/// Minimum lifetime of the cached `GetPeers` sample (Core: 21 h + up to 6 h).
+const GETADDR_CACHE_LIFETIME: Duration = Duration::from_secs(21 * 3600);
+const GETADDR_CACHE_JITTER: Duration = Duration::from_secs(6 * 3600);
+const GETADDR_CACHE_GROW_REFRESH: Duration = Duration::from_secs(600);
+
+impl GetAddrCache {
+    fn sample(&mut self, now: std::time::Instant, tried: &TriedTable, allow_private: bool) -> Vec<String> {
+        use rand::seq::SliceRandom;
+        use rand::Rng;
+        let expired = self.expires.is_none_or(|t| now >= t);
+        let growing = self.sample.len() < PEX_RESPONSE_SAMPLE_SIZE
+            && tried.len() > self.sample.len()
+            && self.built_at.is_some_and(|b| now.saturating_duration_since(b) >= GETADDR_CACHE_GROW_REFRESH);
+        if expired || growing {
+            let mut all: Vec<String> = tried.addresses().into_iter()
+                .filter(|a| is_valid_public_multiaddr(a, allow_private))
+                .collect();
+            all.shuffle(&mut rand::rng());
+            all.truncate(PEX_RESPONSE_SAMPLE_SIZE);
+            self.sample = all;
+            self.built_at = Some(now);
+            let jitter = GETADDR_CACHE_JITTER.mul_f64(rand::rng().random::<f64>());
+            self.expires = Some(now + GETADDR_CACHE_LIFETIME + jitter);
+        }
+        self.sample.clone()
+    }
 }
 
 /// Whether a tip claim, clamped to `claimed` (blue score), is worth a directed
@@ -2201,19 +2617,25 @@ async fn recv_verdict(rx: &mut Option<mpsc::Receiver<GossipValidation>>) -> Opti
 
 /// NET-11: admit peer-exchange addresses from `author` (the peer that answered
 /// OUR GetPeers) into the unverified address table. Rate-limited per author,
-/// batch-capped, validated, never our own id, never already-known entries.
-/// Nothing is dialed here — the network loop dials from the table, a few
-/// per tick. Returns how many addresses entered the table.
+/// batch-capped, validated, never our own id, never already-known entries
+/// (`known`: the tried table). B1-T8: every address is normalised (an
+/// IPv4-mapped / -compatible IPv6 literal becomes its `/ip4/` form) before it
+/// is validated, so a re-spelled private address cannot pass. NET-11 (e): the
+/// entry is bucketed by `source_group`, the netgroup of `author`'s
+/// connection (Core's addr source). Nothing is dialed here — the connection
+/// manager selects from the tables. Returns how many addresses entered the
+/// table.
 #[allow(clippy::too_many_arguments)]
 pub fn ingest_pex_addresses(
     book:          &mut AddrBook,
     limiter:       &mut PexRateLimiter,
     stats:         &mut PexStats,
     author:        PeerId,
+    source_group:  &str,
     peers:         &[String],
     allow_private: bool,
     self_peer:     &PeerId,
-    known:         &HashSet<String>,
+    known:         impl Fn(&str) -> bool,
 ) -> usize {
     let original_len = peers.len();
     let admitted = limiter.admit(author, original_len);
@@ -2228,21 +2650,23 @@ pub fn ingest_pex_addresses(
         }
     }
     let mut added = 0usize;
-    for addr_str in peers.iter().take(admitted) {
-        if !is_valid_public_multiaddr(addr_str, allow_private) {
-            if is_valid_public_multiaddr(addr_str, true) {
+    for raw in peers.iter().take(admitted) {
+        let addr_str = normalize_peer_addr(raw).unwrap_or_else(|| raw.clone());
+        if !is_valid_public_multiaddr(&addr_str, allow_private) {
+            if is_valid_public_multiaddr(&addr_str, true) {
                 stats.record_private(1);
             } else {
                 stats.record_invalid(1);
             }
             // H4: addr_str is attacker-controlled; UTF-8-safe truncation.
-            debug!("PEX rejected: {}", truncate_utf8(addr_str, 80));
+            debug!("PEX rejected: {}", truncate_utf8(raw, 80));
             continue;
         }
-        if known.contains(addr_str) || addr_peer_id(addr_str).is_some_and(|p| p == *self_peer) {
+        if known(&addr_str) || addr_peer_id(&addr_str).is_some_and(|p| p == *self_peer) {
             continue;
         }
-        if book.add(addr_str) {
+        if book.add_from(&addr_str, source_group) {
+            stats.record_accept(1);
             added += 1;
         }
     }
@@ -2359,62 +2783,64 @@ async fn poll_swarm(
 
 
 
-/// Resolve a `/dns4/...` multiaddr to a `/ip4/...` form using async DNS.
+/// Turn an OPERATOR-configured address (`--peer`, the shipped seeds) into a
+/// dialable multiaddr: a leading `/dns`, `/dns4` or `/dns6` host name of a
+/// plain-TCP address is resolved here (the swarm's TCP transport has no DNS
+/// layer), and the first answer of the right family that
+/// [`is_acceptable_ip`]`(ip, allow_private)` accepts replaces it — B1-T8: a
+/// name never resolves into an invalid range (unspecified, multicast,
+/// documentation, link-local / cloud metadata …), and with `allow_private =
+/// false` not into a loopback or private one either. Websocket addresses keep
+/// their name (the websocket transport resolves it itself, and `wss` needs it
+/// for TLS). `None`: unparseable, or no acceptable answer.
 ///
-/// Audit M-11 fix: this function was previously synchronous, calling
-/// `std::net::ToSocketAddrs::to_socket_addrs` — a blocking C library
-/// call that can stall the caller for the full DNS timeout (seconds)
-/// on an unreachable nameserver. Every caller lives inside the
-/// libp2p swarm event loop in `Swarm::run`; blocking the loop stalls
-/// gossipsub propagation, connection events, and outbound dials for
-/// every other peer. On a network with even one slow DNS seed this
-/// was a periodic latency spike visible to the whole node.
+/// Learned addresses never come here: the address tables accept IP literals
+/// only.
 ///
-/// Now uses `tokio::net::lookup_host`, which runs the lookup on the
-/// blocking thread pool instead of holding the async executor. The
-/// public API is now `async`; all three callers are inside async
-/// code already, so the `.await` points add no new complexity.
-///
-/// Audit L-3 concern (silent fallback) is preserved: warn logs fire
-/// on DNS failure and on no-IPv4-records, both paths still return
-/// the unresolved multiaddr so upstream `parse::<Multiaddr>()` can
-/// decide whether to dial.
-async fn resolve_multiaddr(addr: &str) -> String {
-    if !addr.contains("/dns4/") { return addr.to_string(); }
-    let parts: Vec<&str> = addr.splitn(2, "/dns4/").collect();
-    if parts.len() < 2 { return addr.to_string(); }
-    let rest = parts[1];
-    let mut iter = rest.splitn(3, '/');
-    let host = iter.next().unwrap_or("");
-    let _ = iter.next();
-    let remainder = iter.next().unwrap_or("");
-
+/// Audit M-11 fix: the lookup is async (`tokio::net::lookup_host`, on the
+/// blocking pool), so a slow resolver never stalls the swarm event loop.
+/// Audit L-3: every failure is logged.
+async fn resolve_dial_addr(addr: &str, allow_private: bool) -> Option<Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+    let ma: Multiaddr = addr.parse().ok()?;
+    let mut parts: Vec<Protocol<'static>> = ma.iter().map(|p| p.acquire()).collect();
+    let (host, want_v4, want_v6) = match parts.first()? {
+        Protocol::Dns(h) => (h.to_string(), true, true),
+        Protocol::Dns4(h) => (h.to_string(), true, false),
+        Protocol::Dns6(h) => (h.to_string(), false, true),
+        _ => return Some(ma),
+    };
+    if parts.iter().any(|p| matches!(p, Protocol::Ws(_) | Protocol::Wss(_))) {
+        return Some(ma);
+    }
     match tokio::net::lookup_host(format!("{}:0", host)).await {
-        Ok(addrs) => {
-            if let Some(sa) = addrs.into_iter().find(|a| a.is_ipv4()) {
-                let ip = sa.ip();
-                let tcp_rest: Vec<&str> = remainder.splitn(2, '/').collect();
-                let port = tcp_rest.first().unwrap_or(&"");
-                let p2p = tcp_rest.get(1).map(|s| format!("/{}", s)).unwrap_or_default();
-                return format!("/ip4/{}/tcp/{}{}", ip, port, p2p);
+        Ok(answers) => {
+            let mut answers: Vec<std::net::IpAddr> = answers.map(|sa| sa.ip()).collect();
+            // IPv4 first for `/dns` (Core prefers what it can reach).
+            answers.sort_by_key(|ip| !ip.is_ipv4());
+            for ip in answers {
+                let family_ok = (ip.is_ipv4() && want_v4) || (ip.is_ipv6() && want_v6);
+                if !family_ok {
+                    continue;
+                }
+                if !is_acceptable_ip(ip, allow_private) {
+                    warn!("resolve: {} → {} is not an acceptable peer address; skipped", host, ip);
+                    continue;
+                }
+                parts[0] = match ip {
+                    std::net::IpAddr::V4(v4) => Protocol::Ip4(v4),
+                    std::net::IpAddr::V6(v6) => Protocol::Ip6(v6),
+                };
+                return Some(parts.into_iter().collect());
             }
-            // Audit L-3: DNS returned records but none were IPv4.
-            warn!(
-                "resolve_multiaddr: DNS for host '{}' returned no IPv4 records; \
-                 falling back to the unresolved multiaddr. Dial may fail.",
-                host,
-            );
+            warn!("resolve: no acceptable address for '{}'; not dialing {}", host, addr);
+            None
         }
         Err(e) => {
-            // Audit L-3: DNS resolution itself failed.
-            warn!(
-                "resolve_multiaddr: DNS lookup for host '{}' failed: {}. \
-                 Falling back to the unresolved multiaddr; dial may fail.",
-                host, e,
-            );
+            warn!("resolve: DNS lookup for '{}' failed: {}; not dialing {}", host, e, addr);
+            None
         }
     }
-    addr.to_string()
 }
 
 /// PROPAGAÇÃO-CHURN fix (2026-08-09): the ONE canonical string form of a
@@ -2553,7 +2979,7 @@ const PEX_RESPONSE_SAMPLE_SIZE: usize = 30;
 /// only the transport and the "return everything" -> "return a sample"
 /// change are new.
 fn serve_get_peers(
-    known_peers:     &std::collections::HashSet<String>,
+    known_peers:     &[String],
     external_addrs:  &[Multiaddr],
     self_peer_id:    &PeerId,
     allow_private:   bool,
@@ -2665,7 +3091,7 @@ mod tests {
     /// before this fix, the (gossip-broadcast) answer was the WHOLE table.
     #[test]
     fn get_peers_response_is_bounded_even_with_a_large_table() {
-        let known: std::collections::HashSet<String> = (0..500)
+        let known: Vec<String> = (0..500)
             .map(|i| format!("/ip4/10.0.{}.{}/tcp/17110/p2p/{}", i / 256, i % 256, PeerId::random()))
             .collect();
         let resp = serve_get_peers(&known, &[], &PeerId::random(), true);
@@ -2684,10 +3110,10 @@ mod tests {
     /// invalid/filtered entries) without padding or fabrication.
     #[test]
     fn get_peers_response_returns_all_of_a_small_table() {
-        let known: std::collections::HashSet<String> = [
+        let known: Vec<String> = vec![
             format!("/ip4/45.76.1.1/tcp/17110/p2p/{}", PeerId::random()),
             format!("/ip4/45.76.2.2/tcp/17110/p2p/{}", PeerId::random()),
-        ].into_iter().collect();
+        ];
         let resp = serve_get_peers(&known, &[], &PeerId::random(), true);
         match resp {
             sync_rr::SyncResponse::Peers { peers } => assert_eq!(peers.len(), 2),
@@ -2699,7 +3125,7 @@ mod tests {
     /// node is a seed), de-duplicated against `known_peers`.
     #[test]
     fn get_peers_response_includes_self_external_address() {
-        let known: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let known: Vec<String> = Vec::new();
         let self_id = PeerId::random();
         let ext: Multiaddr = "/ip4/1.2.3.4/tcp/17110".parse().unwrap();
         let resp = serve_get_peers(&known, std::slice::from_ref(&ext), &self_id, true);
@@ -2710,6 +3136,37 @@ mod tests {
             }
             other => panic!("expected Peers, got {:?}", other),
         }
+    }
+
+    /// NET-11 (Core's addr response cache): the GetPeers sample is computed
+    /// once and served unchanged until it expires (21-27 h), so asking again
+    /// (from a new connection, a new identity) reveals nothing more of the
+    /// tried table; it is refreshed early only while it is not full and the
+    /// table has grown.
+    #[test]
+    fn get_peers_sample_is_cached_against_scraping() {
+        let now = std::time::Instant::now();
+        let mut tried = TriedTable::with_key(addrbook::random_key());
+        for i in 0..200u32 {
+            tried.insert(&format!("/ip4/{}.{}.1.1/tcp/17110/p2p/{}", 20 + i / 100, i % 100, PeerId::random()), now);
+        }
+        let mut cache = GetAddrCache::default();
+        let first = cache.sample(now, &tried, false);
+        assert_eq!(first.len(), PEX_RESPONSE_SAMPLE_SIZE);
+        for k in 1..50u64 {
+            assert_eq!(cache.sample(now + Duration::from_secs(k * 600), &tried, false), first, "same sample within its lifetime");
+        }
+        let later = now + GETADDR_CACHE_LIFETIME + GETADDR_CACHE_JITTER;
+        assert_ne!(cache.sample(later, &tried, false), first, "a fresh sample after expiry");
+
+        // A young node's near-empty sample grows with its table.
+        let mut small = TriedTable::with_key(addrbook::random_key());
+        let mut cache = GetAddrCache::default();
+        small.insert(&format!("/ip4/45.1.1.1/tcp/17110/p2p/{}", PeerId::random()), now);
+        assert_eq!(cache.sample(now, &small, false).len(), 1);
+        small.insert(&format!("/ip4/46.1.1.1/tcp/17110/p2p/{}", PeerId::random()), now);
+        assert_eq!(cache.sample(now + Duration::from_secs(60), &small, false).len(), 1, "not before the refresh delay");
+        assert_eq!(cache.sample(now + GETADDR_CACHE_GROW_REFRESH, &small, false).len(), 2);
     }
 
     // ── M-9 regressions: announced blue_score clamp ─────────────────────────
@@ -2794,54 +3251,55 @@ mod tests {
     #[tokio::test]
     async fn resolve_multiaddr_passes_through_ip4_unchanged() {
         let input = "/ip4/80.78.28.142/tcp/17110/p2p/12D3KooWQfXJzXRG7t4r1hQVHfijHsuMZ22ecAUD3YGhMvjvDbQp";
-        let out = resolve_multiaddr(input).await;
-        assert_eq!(out, input);
+        let out = resolve_dial_addr(input, false).await;
+        assert_eq!(out, Some(input.parse().unwrap()));
     }
 
-    /// Degenerate edge case: a string that happens to not contain
-    /// "/dns4/" at all should short-circuit immediately, no DNS lookup.
+    /// Unparseable input is not dialed (it used to be returned verbatim and
+    /// then fail to parse); IP literals pass through.
     #[tokio::test]
     async fn resolve_multiaddr_passes_through_empty_and_garbage() {
-        assert_eq!(resolve_multiaddr("").await, "");
-        assert_eq!(resolve_multiaddr("garbage").await, "garbage");
-        assert_eq!(resolve_multiaddr("/ip6/::1/tcp/1").await, "/ip6/::1/tcp/1");
+        assert_eq!(resolve_dial_addr("", true).await, None);
+        assert_eq!(resolve_dial_addr("garbage", true).await, None);
+        assert_eq!(resolve_dial_addr("/ip6/::1/tcp/1", true).await, Some("/ip6/::1/tcp/1".parse().unwrap()));
     }
 
-    /// If `/dns4/` appears but the address is malformed enough that
-    /// the `splitn(2, "/dns4/")` returns fewer than 2 parts, the
-    /// function must fall back to returning the input verbatim.
-    /// (Today this branch is actually unreachable because splitn(2)
-    /// on a string that CONTAINS "/dns4/" always yields 2 parts, but
-    /// the guard is in place and we pin it here in case the parser
-    /// is ever restructured.)
+    /// Malformed `/dns4/` input must never panic.
     #[tokio::test]
     async fn resolve_multiaddr_never_panics_on_weird_input() {
-        // These call into the DNS path but with a host that won't
-        // resolve to anything useful. The function must still return
-        // a String — never panic.
-        let weird = "/dns4/";
-        let _ = resolve_multiaddr(weird).await;
-        // If we got here, no panic.
+        let _ = resolve_dial_addr("/dns4/", true).await;
+        let _ = resolve_dial_addr("/dns4/x/tcp", false).await;
+        let _ = resolve_dial_addr("/dns6/", false).await;
     }
 
-    /// M-11 core property: the function is `async`. A synchronous
-    /// version would block the libp2p event loop. We don't assert on
-    /// timing (brittle in CI), but we do assert the shape: the return
-    /// value only materializes after `.await`, which is only true for
-    /// an async function.
-    ///
-    /// This is a compile-time check more than a runtime one — if
-    /// someone regresses `resolve_multiaddr` to a sync function, this
-    /// test fails to compile.
+    /// M-11 core property: the function is `async` (a synchronous lookup
+    /// would block the libp2p event loop). Compile-time guard: if the
+    /// signature regresses to a sync fn, `.await` stops compiling.
     #[tokio::test]
     async fn resolve_multiaddr_is_async() {
-        // Cannot call an async fn without `.await`, so if the fn
-        // signature regresses to `fn resolve_multiaddr(...) -> String`
-        // the `.await` here becomes a compile error on "method `await`
-        // does not exist on String". That is exactly the guard we want.
-        let future = resolve_multiaddr("/ip4/127.0.0.1/tcp/1");
+        let future = resolve_dial_addr("/ip4/127.0.0.1/tcp/1", true);
         let out = future.await;
-        assert_eq!(out, "/ip4/127.0.0.1/tcp/1");
+        assert_eq!(out, Some("/ip4/127.0.0.1/tcp/1".parse().unwrap()));
+    }
+
+    /// B1-T8: a host name never resolves into an address the node would not
+    /// dial — `localhost` (127.0.0.1) is refused unless private addresses are
+    /// allowed; with them it is resolved, the rest of the address kept.
+    /// Before the fix every `/dns4` name was turned into whatever IPv4 it
+    /// resolved to, unfiltered (and known peers could hold names).
+    #[tokio::test]
+    async fn resolved_host_names_are_screened_like_learned_addresses() {
+        let id = PeerId::random();
+        let named = format!("/dns4/localhost/tcp/17110/p2p/{id}");
+        assert_eq!(resolve_dial_addr(&named, false).await, None, "a name resolving to loopback is refused");
+        assert_eq!(
+            resolve_dial_addr(&named, true).await,
+            Some(format!("/ip4/127.0.0.1/tcp/17110/p2p/{id}").parse().unwrap()),
+            "allowed in dev mode, and only the host part changes"
+        );
+        // Websocket addresses keep their name (the ws transport resolves it).
+        let ws = format!("/dns4/localhost/tcp/17111/ws/p2p/{id}");
+        assert_eq!(resolve_dial_addr(&ws, false).await, Some(ws.parse().unwrap()));
     }
 
     // ─── Sprint CC regression: dynamic PeerTip construction ──────────────
@@ -3530,12 +3988,12 @@ mod tests {
         let author = PeerId::random();
         let mut peers: Vec<String> = (0..30u8).map(|i| format!("/ip4/45.{}.1.1/tcp/17110/p2p/{}", i, PeerId::random())).collect();
         peers.push(format!("/ip4/45.200.1.1/tcp/17110/p2p/{}", me)); // ourselves
-        let added = ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, &peers, false, &me, &HashSet::new());
+        let added = ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, "ip4:9.9", &peers, false, &me, |_| false);
         assert_eq!(added, PEX_BATCH_LIMIT, "batch-capped per message");
         assert_eq!(book.len(), PEX_BATCH_LIMIT);
         // The same author is rate-limited across messages.
         for _ in 0..10 {
-            ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, &peers, false, &me, &HashSet::new());
+            ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, "ip4:9.9", &peers, false, &me, |_| false);
         }
         assert!(book.len() <= pex_validator::PEX_MAX_PER_WINDOW);
     }
@@ -3645,29 +4103,44 @@ mod tests {
 
     // ── Peer count and heartbeat ────────────────────────────────────────────
 
-    /// The peer count is of distinct peers: a second connection to a peer
-    /// (both ends dialing, a re-dial) does not count, closing one of two
+    /// The peer count is of distinct peers (`ConnManager::peer_count`): a
+    /// second connection to a peer does not count, closing one of two
     /// connections does not uncount, closing the last one does. Counting
     /// connections reported a peer dialed twice as two peers.
     #[test]
     fn peer_count_counts_distinct_peers_not_connections() {
-        // Peer P connects twice, Q once: 2 peers.
-        let mut count = 0usize;
-        for n in [1u32, 2, 1] {
-            if let Some(c) = peer_count_after_connect(count, n) {
-                count = c;
-            }
-        }
-        assert_eq!(count, 2);
-        assert_eq!(peer_count_after_connect(count, 2), None, "a second connection to a peer");
-        // One of P's two connections closes: P is still connected.
-        assert_eq!(peer_count_after_disconnect(count, 1), None);
-        // P's last connection closes, then Q's.
-        count = peer_count_after_disconnect(count, 0).unwrap();
-        assert_eq!(count, 1);
-        count = peer_count_after_disconnect(count, 0).unwrap();
-        assert_eq!(count, 0);
-        assert_eq!(peer_count_after_disconnect(0, 0), Some(0), "never below zero");
+        let now = Instant::now();
+        let mut m = ConnManager::new(addrbook::random_key(), 8);
+        let (p, q) = (PeerId::random(), PeerId::random());
+        let a: Multiaddr = "/ip4/80.1.1.1/tcp/1".parse().unwrap();
+        let c = libp2p::swarm::ConnectionId::new_unchecked;
+        m.on_established(c(1), p, false, &a, now);
+        m.on_established(c(2), p, false, &a, now);
+        m.on_established(c(3), q, false, &a, now);
+        assert_eq!(m.peer_count(), 2);
+        m.on_closed(c(1), p);
+        assert_eq!(m.peer_count(), 2, "P is still connected");
+        m.on_closed(c(2), p);
+        assert_eq!(m.peer_count(), 1);
+        m.on_closed(c(3), q);
+        assert_eq!(m.peer_count(), 0);
+        m.on_closed(c(3), q);
+        assert_eq!(m.peer_count(), 0, "never below zero");
+    }
+
+    /// B1-T9 / NET-11 (a): the swarm caps leave inbound one transient slot
+    /// over `max_peers` (so the connection manager can evict instead of the
+    /// transport refusing) and room for every outbound slot on top.
+    #[test]
+    fn swarm_caps_reserve_outbound_room_and_one_eviction_slot() {
+        // The limits type has no getters; its Debug form names every field.
+        let dbg = format!("{:?}", swarm_connection_limits(50));
+        assert!(dbg.contains("max_established_incoming: Some(51)"), "{dbg}");
+        assert!(dbg.contains("max_established_total: Some(100)"), "{dbg}");
+        assert!(dbg.contains("max_established_per_peer: Some(2)"), "{dbg}");
+        let dbg = format!("{:?}", swarm_connection_limits(8));
+        assert!(dbg.contains("max_established_incoming: Some(9)"), "{dbg}");
+        assert!(dbg.contains(&format!("max_established_total: Some({})", 8 + connmgr::OUTBOUND_CONNECTION_HEADROOM)), "{dbg}");
     }
 
     /// The heartbeat's first tick comes one period after start-up, not at

@@ -203,7 +203,9 @@ of failed tests.
   (`peer_count_counts_distinct_peers_not_connections`). The network
   heartbeat's first tick comes 30 s after start-up, so start-up does not
   re-dial the bootstrap peers it has just dialed
-  (`heartbeat_first_tick_is_one_period_after_start`).
+  (`heartbeat_first_tick_is_one_period_after_start`). From then on every
+  heartbeat re-dials each `--peer` that is not connected, whatever else is
+  connected (re-audit B1-T9: it used to happen only with no peer at all).
 - A disqualified block stays in the DAG and in `getdaginfo.tips` (DAG-1), but
   is never selected, never offered as a parent and never relayed.
 - The mempool is not persisted across restarts.

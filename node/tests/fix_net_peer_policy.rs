@@ -240,10 +240,12 @@ fn frontier_state_is_bounded() {
 // ── NET-11 ───────────────────────────────────────────────────────────────────
 
 /// NET-11: peer-exchange addresses only ever enter the bounded address table
-/// (nothing here can dial), capped per message, per author and per /16.
+/// (nothing here can dial), capped per message, per author and per /16. (The
+/// table is keyed since the NET-11 residual fix; a fixed key keeps the
+/// bucket layout, hence the counts, deterministic.)
 #[test]
 fn pex_addresses_go_to_a_diverse_bounded_table() {
-    let mut book = AddrBook::new();
+    let mut book = AddrBook::with_key([7u8; 32]);
     let mut lim = PexRateLimiter::new();
     let mut stats = PexStats::new();
     let me = PeerId::random();
@@ -252,7 +254,7 @@ fn pex_addresses_go_to_a_diverse_bounded_table() {
     let same_group: Vec<String> = (0..20u8)
         .map(|i| format!("/ip4/45.77.{}.1/tcp/17110/p2p/{}", i, PeerId::random()))
         .collect();
-    let added = ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, &same_group, false, &me, &HashSet::new());
+    let added = ingest_pex_addresses(&mut book, &mut lim, &mut stats, author, "ip4:1.1", &same_group, false, &me, |_| false);
     assert_eq!(added, NEW_PER_NETGROUP, "one /16 fills at most NEW_PER_NETGROUP slots");
     // A dial batch takes at most one address per netgroup.
     let batch = book.take_dial_candidates(4, |_| false);
@@ -263,6 +265,6 @@ fn pex_addresses_go_to_a_diverse_bounded_table() {
         .map(|i| format!("/ip4/{}.9.1.1/tcp/17110/p2p/{}", 20 + i, PeerId::random()))
         .collect();
     let other_author = PeerId::random();
-    let added = ingest_pex_addresses(&mut book, &mut lim, &mut stats, other_author, &many, false, &me, &HashSet::new());
+    let added = ingest_pex_addresses(&mut book, &mut lim, &mut stats, other_author, "ip4:2.2", &many, false, &me, |_| false);
     assert_eq!(added, PEX_BATCH_LIMIT);
 }

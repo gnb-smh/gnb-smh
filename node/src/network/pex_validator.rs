@@ -19,16 +19,24 @@
 //!
 //! 5. **Reflection / eclipse via PEX (audit NET-11):** received addresses are
 //!    NEVER dialed directly from the message that carried them. They go into
-//!    a bounded, netgroup-diverse "new" table ([`AddrBook`]); the network loop
-//!    dials a few of them per tick, one per /16 at most, only while it is
-//!    below its peer target. Rate limits are keyed by the AUTHOR of the
-//!    message, and the persisted known-peers ("tried") table keeps at most
-//!    [`TRIED_PER_NETGROUP`] entries per /16.
+//!    a bounded, keyed, netgroup-bucketed "new" table ([`AddrBook`],
+//!    `network::addrbook`); the connection manager dials from the tables to
+//!    keep its OUTBOUND slots full (never limited by inbound connections,
+//!    B1-T9), one outbound peer per netgroup. Rate limits are keyed by the
+//!    AUTHOR of the message, and a successful outbound connection moves the
+//!    address to the persisted, keyed "tried" table ([`TriedTable`]).
+//!
+//! 6. **Host-name and re-spelled-IP bypass (re-audit B1-T8):** PEX carries
+//!    IP literals only (no `/dns*` names) and every IPv6 literal that embeds
+//!    an IPv4 is judged — routability and netgroup — on that IPv4
+//!    ([`classify_ip`], [`netgroup`]).
 
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
+
+pub use super::addrbook::{AddrBook, TriedInsert, TriedTable};
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -50,27 +58,39 @@ pub const PEX_STATS_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// NET-11: bound on the number of authors the PEX rate limiter tracks.
 pub const PEX_LIMITER_TRACK_CAP: usize = 4096;
 
-/// NET-11: capacity of the in-memory "new" (unverified) address table.
+/// NET-11: capacity of the in-memory "new" (unverified) address table
+/// (`addrbook::NEW_BUCKET_COUNT` × `addrbook::BUCKET_SIZE`).
 pub const NEW_TABLE_CAP: usize = 1024;
-/// NET-11: at most this many "new" addresses per netgroup (/16, /32 v6, DNS name).
+/// NET-11: at most this many "new" addresses per netgroup (see [`netgroup`]).
 pub const NEW_PER_NETGROUP: usize = 8;
-/// NET-11: at most this many persisted ("tried") known peers per netgroup.
+/// NET-11: at most this many persisted ("tried") known peers per netgroup:
+/// a netgroup maps to `addrbook::TRIED_BUCKETS_PER_GROUP` tried buckets of
+/// `addrbook::BUCKET_SIZE` slots.
 pub const TRIED_PER_NETGROUP: usize = 16;
 
 // ── Address validation ───────────────────────────────────────────────────────
 
-/// Checks whether a string multiaddr is acceptable as a PEX suggestion
-/// or a known_peers entry.
+/// Checks whether a string multiaddr is acceptable as a PEX suggestion, a
+/// known-peers ("tried") entry, an anchor, or an address we advertise.
 ///
-/// Rules:
-/// - Must parse as a valid libp2p Multiaddr
-/// - Must contain /tcp/ (we don't PEX QUIC/WebTransport yet)
-/// - Must end in exactly ONE /p2p/<peer_id> component (need to know who
-///   we're dialing — and the canonical form has the peer id LAST, once)
-/// - Must fit MAX_WIRE_ADDR_LEN (an entry the wire bound forbids can never
-///   be exchanged, and carrying it in a PeerExchange graylists the sender)
-/// - IP must not be loopback, link-local, or unspecified
-/// - When `allow_private=false`: rejects RFC1918 (private networks)
+/// Rules (B1-T8, modelled on Bitcoin Core's addrman, which stores only IP
+/// addresses and screens them with `CNetAddr::IsRoutable`):
+/// - exactly `/ip4|ip6/<ip>/tcp/<port ≠ 0>[/ws|/wss]/p2p/<peer id>`: one
+///   IP literal first, TCP, an optional websocket layer, and exactly ONE
+///   trailing `/p2p/<peer_id>` (we must know who we dial; the canonical form
+///   has the id LAST, once);
+/// - NO host names (`/dns`, `/dns4`, `/dns6`): a name is not an address — it
+///   resolves to whatever its owner wants at dial time (a loopback or private
+///   IP included), and every attacker sub-domain used to be its own netgroup,
+///   which defeated every per-netgroup cap. Operator-configured names
+///   (`--peer`, `--dns-seed`) are resolved by the node, never learned;
+/// - the IP must be routable ([`classify_ip`]), judged on the IPv4 an IPv6
+///   literal embeds (IPv4-mapped / -compatible, SIIT, NAT64, 6to4, Teredo),
+///   so `::ffff:127.0.0.1` is refused like `127.0.0.1`;
+/// - loopback / private / CGNAT / ULA / link-local-v6 only with
+///   `allow_private` (dev/test mode);
+/// - must fit MAX_WIRE_ADDR_LEN (an entry the wire bound forbids can never
+///   be exchanged, and carrying it in a PeerExchange graylists the sender).
 ///
 /// PROPAGAÇÃO-CHURN fix (2026-08-09): the single-final-P2p and length rules
 /// are what let `prune_invalid` self-heal a poisoned known_peers.json at
@@ -85,35 +105,174 @@ pub fn is_valid_public_multiaddr(addr: &str, allow_private: bool) -> bool {
         Ok(m) => m,
         Err(_) => return false,
     };
-
-    let mut has_tcp = false;
-    let mut p2p_count = 0usize;
-    let mut last_is_p2p = false;
-    let mut ip_ok = false;
-
-    for proto in ma.iter() {
-        last_is_p2p = matches!(proto, Protocol::P2p(_));
-        match proto {
-            Protocol::Ip4(ip) => {
-                ip_ok = is_acceptable_ipv4(&ip, allow_private);
-                if !ip_ok { return false; }
-            }
-            Protocol::Ip6(ip) => {
-                ip_ok = is_acceptable_ipv6(&ip, allow_private);
-                if !ip_ok { return false; }
-            }
-            Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) => {
-                // DNS names are opaque here — accept as IP-proxy.
-                // Worst case, resolution fails at dial time.
-                ip_ok = true;
-            }
-            Protocol::Tcp(_) => has_tcp = true,
-            Protocol::P2p(_) => p2p_count += 1,
-            _ => {}
-        }
+    let parts: Vec<Protocol<'_>> = ma.iter().collect();
+    let ip_ok = match parts.first() {
+        Some(Protocol::Ip4(ip)) => is_acceptable_ip(IpAddr::V4(*ip), allow_private),
+        Some(Protocol::Ip6(ip)) => is_acceptable_ip(IpAddr::V6(*ip), allow_private),
+        // Host names and anything else are refused.
+        _ => false,
+    };
+    if !ip_ok {
+        return false;
     }
+    match parts.get(1) {
+        Some(Protocol::Tcp(port)) if *port != 0 => {}
+        _ => return false,
+    }
+    matches!(&parts[2..], [Protocol::P2p(_)] | [Protocol::Ws(_) | Protocol::Wss(_), Protocol::P2p(_)])
+}
 
-    ip_ok && has_tcp && p2p_count == 1 && last_is_p2p
+/// Routability class of an IP address (B1-T8; Bitcoin Core's
+/// `CNetAddr::IsRoutable` and friends). An IPv6 literal that embeds an IPv4
+/// address is classified by that IPv4 ([`embedded_ipv4`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpClass {
+    /// A globally routable unicast address.
+    Public,
+    /// Loopback, RFC 1918, CGNAT (100.64/10), ULA (fc00::/7), site-local or
+    /// link-local IPv6: reachable only on a local network; accepted only with
+    /// `--allow-private-peers` (dev/test mode).
+    Private,
+    /// Never a peer: unspecified, broadcast, multicast, reserved,
+    /// documentation, benchmarking, IPv4 link-local (cloud metadata lives at
+    /// 169.254.169.254), ORCHID, discard-only, NAT64 local-use.
+    Invalid,
+}
+
+/// The IPv4 address an IPv6 literal embeds, for the transition formats whose
+/// traffic ends up at that IPv4 address (Bitcoin Core's `CNetAddr` handles
+/// the same set: RFC 4291 IPv4-mapped and IPv4-compatible, RFC 6145 SIIT,
+/// RFC 6052 NAT64 well-known prefix, RFC 3964 6to4, RFC 4380 Teredo).
+/// `None` for a native IPv6 address (and for `::` / `::1`).
+pub fn embedded_ipv4(ip: &Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = ip.segments();
+    let tail = Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
+    // ::ffff:a.b.c.d (IPv4-mapped)
+    if s[..5] == [0, 0, 0, 0, 0] && s[5] == 0xffff {
+        return Some(tail);
+    }
+    // ::ffff:0:a.b.c.d (SIIT, RFC 6145)
+    if s[..4] == [0, 0, 0, 0] && s[4] == 0xffff && s[5] == 0 {
+        return Some(tail);
+    }
+    // ::a.b.c.d (IPv4-compatible, deprecated) — not :: or ::1.
+    if s[..6] == [0, 0, 0, 0, 0, 0] && (s[6] != 0 || s[7] > 1) {
+        return Some(tail);
+    }
+    // 64:ff9b::a.b.c.d (NAT64 well-known prefix, RFC 6052)
+    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return Some(tail);
+    }
+    // 2002:AABB:CCDD::/48 (6to4, RFC 3964)
+    if s[0] == 0x2002 {
+        return Some(Ipv4Addr::new((s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8));
+    }
+    // 2001:0::/32 (Teredo, RFC 4380): the client's IPv4 is the bit-inverted
+    // last 32 bits.
+    if s[0] == 0x2001 && s[1] == 0 {
+        let x = !(((s[6] as u32) << 16) | s[7] as u32);
+        return Some(Ipv4Addr::from(x));
+    }
+    None
+}
+
+fn classify_ipv4(ip: &Ipv4Addr) -> IpClass {
+    let o = ip.octets();
+    if o[0] == 0                       // 0.0.0.0/8 "this network"
+        || ip.is_broadcast()           // 255.255.255.255
+        || ip.is_multicast()           // 224.0.0.0/4
+        || o[0] >= 240                 // 240.0.0.0/4 reserved
+        || ip.is_documentation()       // 192.0.2/24, 198.51.100/24, 203.0.113/24
+        || ip.is_link_local()          // 169.254.0.0/16 (cloud metadata)
+        || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15 benchmarking (RFC 2544)
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF protocol assignments
+    {
+        return IpClass::Invalid;
+    }
+    if ip.is_loopback()                // 127.0.0.0/8
+        || ip.is_private()             // 10/8, 172.16/12, 192.168/16
+        || (o[0] == 100 && (o[1] & 0xc0) == 0x40) // 100.64.0.0/10 CGNAT
+    {
+        return IpClass::Private;
+    }
+    IpClass::Public
+}
+
+fn classify_ipv6(ip: &Ipv6Addr) -> IpClass {
+    let s = ip.segments();
+    if ip.is_unspecified() || ip.is_multicast() {
+        return IpClass::Invalid;
+    }
+    if ip.is_loopback() {
+        return IpClass::Private;
+    }
+    let special_2001 = s[0] == 0x2001
+        && (s[1] == 0x0db8                         // 2001:db8::/32 documentation (RFC 3849)
+            || (s[1] & 0xfff0) == 0x10             // 2001:10::/28 ORCHID (RFC 4843)
+            || (s[1] & 0xfff0) == 0x20             // 2001:20::/28 ORCHIDv2 (RFC 7343)
+            || (s[1] == 0x0002 && s[2] == 0));     // 2001:2::/48 benchmarking (RFC 5180)
+    if special_2001
+        || (s[0] == 0x0100 && s[1..4] == [0, 0, 0])   // 100::/64 discard-only (RFC 6666)
+        || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001) // 64:ff9b:1::/48 NAT64 local-use
+    {
+        return IpClass::Invalid;
+    }
+    if let Some(v4) = embedded_ipv4(ip) {
+        return classify_ipv4(&v4);
+    }
+    if (s[0] & 0xfe00) == 0xfc00                     // fc00::/7 ULA
+        || (s[0] & 0xffc0) == 0xfe80                 // fe80::/10 link-local
+        || (s[0] & 0xffc0) == 0xfec0                 // fec0::/10 site-local (deprecated)
+    {
+        return IpClass::Private;
+    }
+    IpClass::Public
+}
+
+/// B1-T8: routability class of `ip` (see [`IpClass`]).
+pub fn classify_ip(ip: IpAddr) -> IpClass {
+    match ip {
+        IpAddr::V4(v4) => classify_ipv4(&v4),
+        IpAddr::V6(v6) => classify_ipv6(&v6),
+    }
+}
+
+/// B1-T8: whether `ip` may be dialed / stored: public, or private with
+/// `allow_private` (dev/test mode). Never the [`IpClass::Invalid`] classes.
+pub fn is_acceptable_ip(ip: IpAddr, allow_private: bool) -> bool {
+    match classify_ip(ip) {
+        IpClass::Public => true,
+        IpClass::Private => allow_private,
+        IpClass::Invalid => false,
+    }
+}
+
+/// B1-T8: the canonical spelling of a peer address: an IPv4-mapped or
+/// IPv4-compatible IPv6 literal (which denotes the IPv4 host itself) is
+/// rewritten as `/ip4/…`, so the same host can never sit in the tables twice
+/// under two spellings. Other addresses are returned unchanged. `None` for an
+/// unparseable string.
+pub fn normalize_peer_addr(addr: &str) -> Option<String> {
+    let ma: Multiaddr = addr.parse().ok()?;
+    let mut changed = false;
+    let out: Multiaddr = ma
+        .iter()
+        .map(|p| match p {
+            Protocol::Ip6(ip6) => {
+                let s = ip6.segments();
+                let mapped_or_compat = s[..5] == [0, 0, 0, 0, 0] && (s[5] == 0xffff || (s[5] == 0 && (s[6] != 0 || s[7] > 1)));
+                match embedded_ipv4(&ip6) {
+                    Some(v4) if mapped_or_compat => {
+                        changed = true;
+                        Protocol::Ip4(v4)
+                    }
+                    _ => Protocol::Ip6(ip6),
+                }
+            }
+            other => other,
+        })
+        .collect();
+    Some(if changed { out.to_string() } else { addr.to_string() })
 }
 
 /// Whether a multiaddr points at a LAN (private / loopback / link-local) IP.
@@ -136,40 +295,6 @@ pub fn is_lan_multiaddr(addr: &Multiaddr) -> bool {
         }
     }
     false
-}
-
-fn is_acceptable_ipv4(ip: &Ipv4Addr, allow_private: bool) -> bool {
-    // Always reject these, regardless of allow_private
-    if ip.is_unspecified()      { return false; } // 0.0.0.0
-    if ip.is_broadcast()        { return false; } // 255.255.255.255
-    if ip.is_multicast()        { return false; } // 224.0.0.0/4
-    if ip.is_documentation()    { return false; } // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
-    if ip.is_link_local()       { return false; } // 169.254.0.0/16
-
-    // Reject private networks unless explicitly allowed (dev/test mode)
-    if !allow_private {
-        if ip.is_loopback()     { return false; } // 127.0.0.0/8
-        if ip.is_private()      { return false; } // 10.x, 172.16-31.x, 192.168.x
-        // 100.64.0.0/10 (CGNAT) — stdlib doesn't have this
-        let o = ip.octets();
-        if o[0] == 100 && (o[1] & 0xc0) == 0x40 { return false; }
-    }
-    true
-}
-
-fn is_acceptable_ipv6(ip: &Ipv6Addr, allow_private: bool) -> bool {
-    if ip.is_unspecified()   { return false; } // ::
-    if ip.is_multicast()     { return false; } // ff00::/8
-
-    if !allow_private {
-        if ip.is_loopback()  { return false; } // ::1
-        // ULA (Unique Local Address) fc00::/7
-        let seg = ip.segments();
-        if (seg[0] & 0xfe00) == 0xfc00 { return false; }
-        // Link-local fe80::/10
-        if (seg[0] & 0xffc0) == 0xfe80 { return false; }
-    }
-    true
 }
 
 // ── Rate limiter ─────────────────────────────────────────────────────────────
@@ -341,52 +466,52 @@ pub fn enforce_cap(peers: &mut std::collections::HashSet<String>) -> usize {
     initial - peers.len()
 }
 
-/// NET-11: insert a CONFIRMED (dialed and connected) address into the
-/// persisted known-peers table, keeping at most [`TRIED_PER_NETGROUP`]
-/// entries per netgroup (an older entry of the same group makes room) and the
-/// global [`KNOWN_PEERS_CAP`]. Returns `true` if the address is now present.
-pub fn add_tried(peers: &mut std::collections::HashSet<String>, addr: String) -> bool {
-    if peers.contains(&addr) {
-        return true;
-    }
-    let group = netgroup(&addr).unwrap_or_default();
-    let same: Vec<String> = peers
-        .iter()
-        .filter(|a| netgroup(a).unwrap_or_default() == group)
-        .cloned()
-        .collect();
-    if same.len() >= TRIED_PER_NETGROUP {
-        if let Some(v) = same.into_iter().min() {
-            peers.remove(&v);
-        }
-    }
-    peers.insert(addr.clone());
-    enforce_cap(peers);
-    peers.contains(&addr)
-}
-
-/// NET-11: the "netgroup" of an address string — the bucket used for
-/// diversity limits. IPv4: the /16; IPv6: the /32; DNS: the host name.
-/// `None` for unparseable strings.
+/// NET-11 / B1-T8: the "netgroup" of an address string (with or without a
+/// `/p2p/` suffix) — the bucket used for every diversity rule: address-table
+/// bucketing, the per-netgroup caps, outbound diversity and inbound eviction
+/// (Bitcoin Core's `NetGroupManager::GetGroup`).
+///
+/// * public IPv4: the /16 (`ip4:a.b`);
+/// * an IPv6 literal that embeds an IPv4 ([`embedded_ipv4`]): the /16 of that
+///   IPv4, so re-spelling one /16 as `::ffff:…`, 6to4, NAT64 or Teredo lands
+///   in the same group;
+/// * other public IPv6: the /32 (`ip6:xxxx:xxxx`);
+/// * loopback / private / link-local (only ever accepted with
+///   `--allow-private-peers`, or seen as the source of an inbound
+///   connection): the full IP (`local:<ip>`) — these ranges have no
+///   meaningful routing prefix (Core lumps them into one "unroutable" group;
+///   one group per IP keeps a LAN or proxy source as ONE group without
+///   collapsing a whole LAN into one);
+/// * host names and unparseable strings: `None` (a name has no netgroup —
+///   that was the B1-T8 bypass — and no table accepts it).
 pub fn netgroup(addr: &str) -> Option<String> {
     let ma: Multiaddr = addr.parse().ok()?;
-    for proto in ma.iter() {
-        match proto {
-            Protocol::Ip4(ip) => {
-                let o = ip.octets();
-                return Some(format!("ip4:{}.{}", o[0], o[1]));
-            }
-            Protocol::Ip6(ip) => {
+    netgroup_of(&ma)
+}
+
+/// [`netgroup`] of a parsed multiaddr (its FIRST component must be the IP).
+pub fn netgroup_of(ma: &Multiaddr) -> Option<String> {
+    match ma.iter().next()? {
+        Protocol::Ip4(ip) => Some(ipv4_group(&ip)),
+        Protocol::Ip6(ip) => Some(match embedded_ipv4(&ip) {
+            Some(v4) => ipv4_group(&v4),
+            None if classify_ipv6(&ip) == IpClass::Public => {
                 let s = ip.segments();
-                return Some(format!("ip6:{:x}:{:x}", s[0], s[1]));
+                format!("ip6:{:x}:{:x}", s[0], s[1])
             }
-            Protocol::Dns(h) | Protocol::Dns4(h) | Protocol::Dns6(h) => {
-                return Some(format!("dns:{}", h.to_ascii_lowercase()));
-            }
-            _ => {}
-        }
+            None => format!("local:{ip}"),
+        }),
+        _ => None,
     }
-    None
+}
+
+fn ipv4_group(ip: &Ipv4Addr) -> String {
+    if classify_ipv4(ip) == IpClass::Public {
+        let o = ip.octets();
+        format!("ip4:{}.{}", o[0], o[1])
+    } else {
+        format!("local:{ip}")
+    }
 }
 
 /// The `/p2p/<peer id>` of an address string, if any.
@@ -396,109 +521,6 @@ pub fn addr_peer_id(addr: &str) -> Option<PeerId> {
         Protocol::P2p(id) => Some(id),
         _ => None,
     })
-}
-
-/// NET-11: the bounded, netgroup-diverse table of UNVERIFIED addresses learned
-/// from peer exchange. Nothing here is persisted and nothing is dialed on
-/// receipt: the network loop pulls a few candidates per tick with
-/// [`AddrBook::take_dial_candidates`] (at most one per netgroup per batch).
-/// A successful outbound connection promotes the address to the persisted
-/// "tried" table ([`add_tried`]).
-#[derive(Default, Debug)]
-pub struct AddrBook {
-    /// address -> (netgroup, insertion sequence)
-    entries: HashMap<String, (String, u64)>,
-    per_group: HashMap<String, usize>,
-    seq: u64,
-}
-
-impl AddrBook {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub fn contains(&self, addr: &str) -> bool {
-        self.entries.contains_key(addr)
-    }
-
-    /// Add one validated candidate. Returns `true` if it was inserted. A full
-    /// netgroup refuses the newcomer; a full table evicts its OLDEST entry
-    /// from the largest netgroup.
-    pub fn add(&mut self, addr: &str) -> bool {
-        if self.entries.contains_key(addr) {
-            return false;
-        }
-        let Some(group) = netgroup(addr) else { return false };
-        if self.per_group.get(&group).copied().unwrap_or(0) >= NEW_PER_NETGROUP {
-            return false;
-        }
-        if self.entries.len() >= NEW_TABLE_CAP {
-            let biggest = self.per_group.iter().max_by_key(|(_, n)| **n).map(|(g, _)| g.clone());
-            let victim = biggest.and_then(|g| {
-                self.entries
-                    .iter()
-                    .filter(|(_, (eg, _))| *eg == g)
-                    .min_by_key(|(_, (_, seq))| *seq)
-                    .map(|(a, _)| a.clone())
-            });
-            match victim {
-                Some(v) => self.remove(&v),
-                None => return false,
-            }
-        }
-        self.seq = self.seq.wrapping_add(1);
-        *self.per_group.entry(group.clone()).or_insert(0) += 1;
-        self.entries.insert(addr.to_string(), (group, self.seq));
-        true
-    }
-
-    pub fn remove(&mut self, addr: &str) {
-        if let Some((g, _)) = self.entries.remove(addr) {
-            if let Some(n) = self.per_group.get_mut(&g) {
-                *n = n.saturating_sub(1);
-                if *n == 0 {
-                    self.per_group.remove(&g);
-                }
-            }
-        }
-    }
-
-    /// Remove and return up to `n` dial candidates, oldest first, at most one
-    /// per netgroup. Entries for which `skip` returns true (already connected,
-    /// already known, ourselves) are dropped from the table as well — there is
-    /// no reason to dial them later either.
-    pub fn take_dial_candidates<F: Fn(&str) -> bool>(&mut self, n: usize, skip: F) -> Vec<String> {
-        let mut ordered: Vec<(&String, &(String, u64))> = self.entries.iter().collect();
-        ordered.sort_by_key(|(_, (_, seq))| *seq);
-        let mut groups_used = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        let mut stale = Vec::new();
-        for (addr, (group, _)) in ordered {
-            if out.len() >= n {
-                break;
-            }
-            if skip(addr) {
-                stale.push(addr.clone());
-                continue;
-            }
-            if !groups_used.insert(group.clone()) {
-                continue;
-            }
-            out.push(addr.clone());
-        }
-        for a in out.iter().chain(stale.iter()) {
-            self.remove(a);
-        }
-        out
-    }
 }
 
 /// One-time cleanup at startup: drop entries that fail the new validator.
@@ -560,16 +582,65 @@ mod tests {
         }
     }
 
-    /// NET-11: tried table keeps at most TRIED_PER_NETGROUP per /16.
+    /// NET-11: tried table keeps at most TRIED_PER_NETGROUP per /16 (now the
+    /// keyed TriedTable: a netgroup reaches TRIED_BUCKETS_PER_GROUP buckets).
     #[test]
     fn tried_table_netgroup_cap() {
-        let mut tried = std::collections::HashSet::new();
+        let now = Instant::now();
+        let mut tried = TriedTable::with_key(super::super::addrbook::random_key());
         for i in 0..50u8 {
-            add_tried(&mut tried, addr(&format!("45.77.{}.1", i)));
+            tried.insert(&addr(&format!("45.77.{}.1", i)), now);
         }
-        assert_eq!(tried.len(), TRIED_PER_NETGROUP);
-        assert!(add_tried(&mut tried, addr("80.1.1.1")));
-        assert_eq!(tried.len(), TRIED_PER_NETGROUP + 1);
+        assert!(tried.len() <= TRIED_PER_NETGROUP);
+        let before = tried.len();
+        assert!((0..4u8).any(|i| tried.insert(&addr(&format!("{}.1.1.1", 80 + i)), now) == TriedInsert::Inserted));
+        assert_eq!(tried.len(), before + 1);
+    }
+
+    /// B1-T8: routability is judged on the IPv4 an IPv6 literal embeds, and
+    /// mapped / compatible forms are canonicalised to `/ip4/`.
+    #[test]
+    fn embedded_ipv4_classification_and_normalisation() {
+        let v6 = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        assert_eq!(embedded_ipv4(&v6("::ffff:10.0.0.1")), Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(embedded_ipv4(&v6("::10.0.0.1")), Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(embedded_ipv4(&v6("::ffff:0:10.0.0.1")), Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(embedded_ipv4(&v6("64:ff9b::a00:1")), Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(embedded_ipv4(&v6("2002:a00:1::")), Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(embedded_ipv4(&v6("2001:0:4136:e378:8000:63bf:f5ff:fffe")), Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(embedded_ipv4(&v6("::1")), None);
+        assert_eq!(embedded_ipv4(&v6("::")), None);
+        assert_eq!(embedded_ipv4(&v6("2606:4700:4700::1111")), None);
+        for (ip, class) in [
+            ("8.8.8.8", IpClass::Public),
+            ("10.1.2.3", IpClass::Private),
+            ("100.100.1.1", IpClass::Private),
+            ("127.0.0.1", IpClass::Private),
+            ("169.254.169.254", IpClass::Invalid),
+            ("0.1.2.3", IpClass::Invalid),
+            ("240.0.0.1", IpClass::Invalid),
+            ("198.18.0.1", IpClass::Invalid),
+            ("192.0.0.8", IpClass::Invalid),
+            ("::ffff:169.254.169.254", IpClass::Invalid),
+            ("::ffff:8.8.8.8", IpClass::Public),
+            ("::ffff:127.0.0.1", IpClass::Private),
+            ("fd00::1", IpClass::Private),
+            ("fec0::1", IpClass::Private),
+            ("100::1", IpClass::Invalid),
+            ("2001:db8::1", IpClass::Invalid),
+            ("64:ff9b:1::1", IpClass::Invalid),
+            ("2606:4700:4700::1111", IpClass::Public),
+        ] {
+            assert_eq!(classify_ip(ip.parse().unwrap()), class, "{ip}");
+        }
+        let id = PeerId::random();
+        assert_eq!(
+            normalize_peer_addr(&format!("/ip6/::ffff:45.77.1.2/tcp/1/p2p/{id}")),
+            Some(format!("/ip4/45.77.1.2/tcp/1/p2p/{id}"))
+        );
+        let native = format!("/ip6/2606:4700:4700::1111/tcp/1/p2p/{id}");
+        assert_eq!(normalize_peer_addr(&native), Some(native.clone()));
+        assert_eq!(normalize_peer_addr("garbage"), None);
     }
 
     /// NET-11: cap enforcement evicts from the most represented netgroup.

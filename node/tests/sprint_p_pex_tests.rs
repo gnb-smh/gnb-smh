@@ -33,16 +33,25 @@ mod sprint_p_tests {
 
     #[test]
     fn accepts_valid_public_ipv6() {
-        let addr = format!("/ip6/2001:db8::1/tcp/17110/p2p/{}", sample_peer_id());
-        // 2001:db8::/32 is actually documentation range in real RFC but stdlib
-        // doesn't flag it — this test proves is_valid_public_multiaddr accepts it.
+        let addr = format!("/ip6/2606:4700:4700::1111/tcp/17110/p2p/{}", sample_peer_id());
         assert!(is_valid_public_multiaddr(&addr, false));
+        // B1-T8: 2001:db8::/32 is the IPv6 documentation range (RFC 3849),
+        // never routable (Core's IsRFC3849) — refused like the IPv4
+        // documentation ranges. This test used to assert it was accepted.
+        let doc = format!("/ip6/2001:db8::1/tcp/17110/p2p/{}", sample_peer_id());
+        assert!(!is_valid_public_multiaddr(&doc, false));
     }
 
+    /// B1-T8: peer exchange carries IP literals only. A host name used to be
+    /// accepted (each name its own netgroup, resolved to any IP at dial time);
+    /// this test used to assert that acceptance.
     #[test]
-    fn accepts_dns_addresses() {
-        let addr = format!("/dns4/seed.entanglementlayer.com/tcp/17110/p2p/{}", sample_peer_id());
-        assert!(is_valid_public_multiaddr(&addr, false));
+    fn rejects_dns_addresses() {
+        for proto in ["dns", "dns4", "dns6"] {
+            let addr = format!("/{proto}/seed.entanglementlayer.com/tcp/17110/p2p/{}", sample_peer_id());
+            assert!(!is_valid_public_multiaddr(&addr, false), "{addr}");
+            assert!(!is_valid_public_multiaddr(&addr, true), "{addr}");
+        }
     }
 
     // ─────────────────────────────────────────────────────────
