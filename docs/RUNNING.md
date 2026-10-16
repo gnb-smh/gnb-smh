@@ -908,6 +908,24 @@ Policy addresses (multisig / timelocks: `gnb1m` mainnet, `gnb1n` testnet,
 checksum is `SHA3-256(SHA3-256(prefix ‖ hash))[..4]`, so the other network's
 prefix on the same hash fails to parse.
 
-Read-only RPC methods (`getbalance`, `getutxos`, `validateaddress`) accept
-either prefix for the same hash; `validateaddress` reports the prefix's
-network.
+Address RPCs now require the node's selected network, including read-only
+queries. A mainnet node rejects a valid testnet address, and conversely, before
+querying address storage. This is local RPC policy; it changes no transaction
+or block rule. The previous read-only behavior accepted either network prefix.
+
+`validateaddress` (`gnb-cli validateaddress ADDRESS`) and
+`validateaddressverbose` use the shared address parser for legacy GnB, legacy
+Bloch single-key aliases and optional v2 Bech32m addresses. `isvalid` / `valid`
+means valid **for this node's network**. They retain `network` as the recognized
+address network; `validateaddress.checksum` describes syntactic validation, so
+a valid address of the other network has `checksum: true`, `isvalid: false`
+and a `reason`. Successful results additionally return `canonical_address`
+(the existing legacy GnB string) and `bech32m` (the optional network-bound v2
+string). The `address` field continues to echo the supplied string. Conversion
+fields are absent on failure. Default address generation and persisted wallet
+strings are unchanged.
+
+Equivalent encodings query the same existing hash or full-script index; they
+do not create additional balances. `getutxos` accepts both single-key and
+policy addresses. The existing balance, holder and history APIs remain
+single-key only and reject policy addresses in either encoding.

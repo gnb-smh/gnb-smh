@@ -1,4 +1,5 @@
 // GnB Explorer: one module, hash routes, read-only /api. No inline script (CSP).
+import { isAddress, canonicalAddress } from "../assets/safe.js";
 import { api, scriptToAddress, gnb, short, ago, esc } from "../shared/gnb.js";
 
 const $ = (s) => document.querySelector(s);
@@ -301,6 +302,7 @@ async function tx(id) {
 }
 
 async function address(a) {
+  a = await canonicalAddress(a, api);
   setTab("");
   const testnet = a.startsWith("gnb1t") || a.startsWith("gnb1n");
   const policy = a.startsWith("gnb1m") || a.startsWith("gnb1n");
@@ -339,10 +341,12 @@ async function route() {
 
 $("#search").onsubmit = async (ev) => {
   ev.preventDefault();
-  const q = $("#q").value.trim().toLowerCase();
+  const input = $("#q").value.trim();
+  // Preserve legacy/hex search casing without normalizing mixed-case Bech32m.
+  const q = /^(?:[0-9a-f]{64}|(?:gnb|bloch)1[qt][0-9a-f]{48}|gnb1[mn][0-9a-f]{72})$/i.test(input) ? input.toLowerCase() : input;
   if (!q) return;
   if (/^\d+$/.test(q)) location.hash = `#/block/${q}`;
-  else if (/^gnb1[qtmn][0-9a-f]+$/.test(q)) location.hash = `#/address/${q}`;
+  else if (isAddress(q)) location.hash = `#/address/${q}`;
   else if (/^[0-9a-f]{64}$/.test(q)) {
     try { await api("getblock", [q, false]); location.hash = `#/block/${q}`; }
     catch { location.hash = `#/tx/${q}`; }

@@ -1547,9 +1547,9 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
             // B1-T11: one read of the holder aggregate (was a walk of every
             // UTXO of the address, ~426,000 for the carryover address).
-            let addr_bytes = parse_address(addr).and_then(|b| <[u8; 20]>::try_from(b).ok());
+            let addr_bytes = parse_address(addr);
             match addr_bytes {
-                Some(ab) => match state.store.address_balance(&ab, &state.cancel) {
+                Ok(ab) => match state.store.address_balance(&ab, &state.cancel) {
                     // R3 (docs/specs/BLOCH-RPC-V4.md): satoshi amounts are
                     // decimal STRINGS on the wire — V4's supply exceeds both
                     // i64::MAX and JS Number.MAX_SAFE_INTEGER. Display-only
@@ -1562,7 +1562,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     }),
                     Err(e) => storage_err_response(&e),
                 },
-                None => json!({ "error": "invalid address" }),
+                Err(error) => json!({ "error": error }),
             }
         }
 
@@ -1604,13 +1604,17 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 Ok(s) => s,
                 Err(error) => return json!({"error":error}),
             };
+            let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            let spk = match parse_rpc_destination(addr) {
+                Ok(script) => script,
+                Err(error) => return json!({"error":error}),
+            };
             let snapshot = if selected.is_some() {
                 match policy_rpc_snapshot(state) {
                     Ok(s) => Some(s),
                     Err(error) => return error,
                 }
             } else { None };
-            let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
             // Optional 2nd param: max UTXOs to return. A wallet with hundreds of
             // thousands of UTXOs (e.g. the carry-over founder set) otherwise serializes
             // a multi-MB response that overflows clients; a spender only needs enough
@@ -1632,9 +1636,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // script) address. The address index is keyed by the FULL script,
             // so the lookup must use all of it (a 20-byte prefix never matches
             // a policy entry); results are still filtered on the full script.
-            let script = crate::address::destination_script(addr).ok().map(|(_, spk)| spk);
-            match script {
-                Some(spk) => match state.store.get_utxos_for_address_limited(&spk, limit) {
+            match state.store.get_utxos_for_address_limited(&spk, limit) {
                     Ok((utxos, truncated)) => {
                         let utxos: Vec<_> = utxos.into_iter()
                             .filter(|(_, _, o)| o.script_pubkey == spk)
@@ -1706,8 +1708,6 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         result
                     },
                     Err(e) => storage_err_response(&e),
-                },
-                None => json!({ "error": "invalid address" }),
             }
         }
 
@@ -1778,33 +1778,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         // ── Phase 2: validateaddress ─────────────────────────────────
         "validateaddress" => {
             let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
-            let is_mainnet = addr.starts_with(MAINNET_PREFIX);
-            let is_testnet = addr.starts_with(TESTNET_PREFIX);
-            let valid_prefix = is_mainnet || is_testnet;
-            let stripped = addr.trim_start_matches(MAINNET_PREFIX).trim_start_matches(TESTNET_PREFIX);
-            // Expect 40 hex (20-byte hash) + 8 hex (4-byte checksum) = 48 hex chars
-            let valid_len = stripped.len() == 48;
-            let valid_hex = hex::decode(stripped).is_ok();
-
-            // Verify checksum
-            let valid_checksum = if valid_prefix && valid_len && valid_hex {
-                let bytes = hex::decode(stripped).unwrap_or_default();
-                let payload = &bytes[..20];
-                use sha3::{Sha3_256, Digest};
-                let inner = Sha3_256::digest(payload);
-                let outer = Sha3_256::digest(inner);
-                &outer[..4] == &bytes[20..24]
-            } else {
-                false
-            };
-
-            let is_valid = valid_prefix && valid_len && valid_hex && valid_checksum;
-            json!({
-                "address":    addr,
-                "isvalid":    is_valid,
-                "network":    if is_mainnet { "mainnet" } else if is_testnet { "testnet" } else { "unknown" },
-                "checksum":   valid_checksum,
-            })
+            validate_rpc_address(addr, false)
         }
 
         // ── Phase 2: estimatefee ─────────────────────────────────────
@@ -2168,13 +2142,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
             let addr_bytes = parse_address(addr);
             match addr_bytes {
-                Some(ab) => {
-                    let mut addr_hash = [0u8; 20];
-                    if ab.len() >= 20 {
-                        addr_hash.copy_from_slice(&ab[..20]);
-                    } else {
-                        return json!({ "error": "invalid address (too short)" });
-                    }
+                Ok(addr_hash) => {
                     match state.store.query_address_history(&addr_hash, start_height, end_height, limit, offset) {
                         Ok(entries) => {
                             let tip = selected_tip_height(&state);
@@ -2230,7 +2198,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         Err(e) => storage_err_response(&e),
                     }
                 }
-                None => json!({ "error": "invalid address" }),
+                Err(error) => json!({ "error": error }),
             }
         }
 
@@ -2414,12 +2382,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let addr_bytes = match parse_address(addr_str) {
-                Some(b) if b.len() == 20 => b,
-                _ => return json!({ "error": "invalid address" }),
+            let addr_hash = match parse_address(addr_str) {
+                Ok(hash) => hash,
+                Err(error) => return json!({ "error": error }),
             };
-            let mut addr_hash = [0u8; 20];
-            addr_hash.copy_from_slice(&addr_bytes);
 
             match crate::analytics::address_info(&state.store, &state.mempool, addr_str, &addr_hash) {
                 Ok(info) => json!({
@@ -2504,20 +2470,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            match crate::address::Address::parse(addr_str) {
-                Ok(a) => json!({
-                    "valid":    true,
-                    "address":  addr_str,
-                    "network":  if a.is_mainnet() { "mainnet" } else { "testnet" },
-                    "hash_hex": hex::encode(a.hash()),
-                    "prefix":   if a.is_mainnet() { crate::core::MAINNET_PREFIX } else { crate::core::TESTNET_PREFIX },
-                }),
-                Err(e) => json!({
-                    "valid":   false,
-                    "address": addr_str,
-                    "reason":  format!("{}", e),
-                }),
-            }
+            validate_rpc_address(addr_str, true)
         }
 
         // ── End of Sprint B additions ──────────────────────────────────────
@@ -2599,13 +2552,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
             let addr_bytes = parse_address(addr);
             match addr_bytes {
-                Some(ab) => {
-                    let mut addr_hash = [0u8; 20];
-                    if ab.len() >= 20 {
-                        addr_hash.copy_from_slice(&ab[..20]);
-                    } else {
-                        return json!({ "error": "invalid address" });
-                    }
+                Ok(addr_hash) => {
                     // NET-12: streamed and cancellable (heavy method).
                     match state.store.balance_at_height_cancellable(&addr_hash, height, &state.cancel) {
                         Ok((balance, _)) => {
@@ -2625,7 +2572,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         Err(e) => storage_err_response(&e),
                     }
                 }
-                None => json!({ "error": "invalid address" }),
+                Err(error) => json!({ "error": error }),
             }
         }
 
@@ -2646,16 +2593,94 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Parse a gnb1q/gnb1t address to 20-byte pubkey hash
-/// Sprint K: Checksum-validated address parsing.
-/// Delegates to `Address::parse()` from Sprint A — enforces full 54-char
-/// checksummed format (gnb1q + 20-byte hash + 4-byte checksum, hex-encoded).
-/// Rejects the legacy 46-char checksum-less form that the previous implementation
-/// silently accepted.
-fn parse_address(addr: &str) -> Option<Vec<u8>> {
-    crate::address::Address::parse(addr)
-        .ok()
-        .map(|a| a.hash().to_vec())
+fn rpc_address_network() -> crate::address::Network {
+    match crate::core::node_chain_id() {
+        crate::core::ChainId::Mainnet => crate::address::Network::Mainnet,
+        crate::core::ChainId::Testnet => crate::address::Network::Testnet,
+    }
+}
+
+/// Local RPC policy, not a transaction or block rule. All address entry
+/// points use the same check before querying this chain's indices.
+/// Modeled on Bitcoin Core v30.0 DecodeDestination / IsValidDestinationString:
+/// the decoder checks prefixes and HRPs against the selected chain parameters.
+/// https://github.com/bitcoin/bitcoin/blob/v30.0/src/key_io.cpp#L76-L128
+fn require_rpc_address_network(network: crate::address::Network) -> Result<(), crate::address::AddressError> {
+    let expected = rpc_address_network();
+    if network != expected {
+        return Err(crate::address::AddressError::WrongNetwork { expected, got: network });
+    }
+    Ok(())
+}
+
+fn address_query_error(error: crate::address::AddressError) -> String {
+    match error {
+        crate::address::AddressError::WrongNetwork { .. } => error.to_string(),
+        _ => "invalid address".into(),
+    }
+}
+
+/// The legacy holder/history index is keyed by a single-key hash, never the
+/// textual encoding. Policy scripts remain outside these 20-byte indices.
+fn parse_address(addr: &str) -> Result<[u8; 20], String> {
+    let address = crate::address::Address::parse(addr).map_err(address_query_error)?;
+    require_rpc_address_network(address.network()).map_err(address_query_error)?;
+    Ok(*address.hash())
+}
+
+/// UTXO indices use the full output script, including the policy tag/hash.
+fn parse_rpc_destination(addr: &str) -> Result<Vec<u8>, String> {
+    let (network, script) = crate::address::destination_script(addr).map_err(address_query_error)?;
+    require_rpc_address_network(network).map_err(address_query_error)?;
+    Ok(script)
+}
+
+/// `valid`/`isvalid` means usable on this node's network. `checksum` remains
+/// syntactic: a well-formed address for the other network has checksum=true,
+/// validity=false and a reason. Conversion fields are only emitted on success.
+fn validate_rpc_address(addr: &str, verbose: bool) -> Value {
+    use crate::address::{Address, Network, PolicyAddress};
+    let field = if verbose { "valid" } else { "isvalid" };
+    let mut result = json!({ "address": addr });
+    result[field] = json!(false);
+    let (network, script) = match crate::address::destination_script(addr) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            result["reason"] = json!(error.to_string());
+            if !verbose {
+                // Preserve the legacy malformed-address network hint.
+                result["network"] = json!(if addr.starts_with(MAINNET_PREFIX) { "mainnet" }
+                    else if addr.starts_with(TESTNET_PREFIX) { "testnet" } else { "unknown" });
+                result["checksum"] = json!(false);
+            }
+            return result;
+        }
+    };
+    result["network"] = json!(match network { Network::Mainnet => "mainnet", Network::Testnet => "testnet" });
+    if !verbose { result["checksum"] = json!(true); }
+    if let Err(error) = require_rpc_address_network(network) {
+        result["reason"] = json!(error.to_string());
+        return result;
+    }
+    let (canonical, bech32m, hash, prefix) = if let Ok(hash) = <[u8; 20]>::try_from(script.as_slice()) {
+        let address = Address::from_hash(hash, network);
+        (address.to_string(), address.to_bech32m(), hex::encode(hash), network.prefix())
+    } else if let Some(address) = PolicyAddress::from_script(&script, network) {
+        (address.to_string(), address.to_bech32m(), hex::encode(&script[1..]),
+            match network { Network::Mainnet => crate::address::POLICY_MAINNET_PREFIX,
+                Network::Testnet => crate::address::POLICY_TESTNET_PREFIX })
+    } else {
+        result["reason"] = json!("unsupported address script");
+        return result;
+    };
+    result[field] = json!(true);
+    result["canonical_address"] = json!(canonical);
+    result["bech32m"] = json!(bech32m);
+    if verbose {
+        result["hash_hex"] = json!(hash);
+        result["prefix"] = json!(prefix);
+    }
+    result
 }
 
 /// Format a transaction for JSON output
@@ -3186,6 +3211,7 @@ mod h_r3_5_tests {
 #[cfg(test)]
 mod audit_2026_10_rpc_tests {
     include!("../../tests/support/pqpsbt_rpc_unit.rs");
+    include!("../../tests/support/address_frontends_rpc.rs");
     use super::*;
     use crate::core::{Block, BlockHeader, MerkleRoot, TxInput, TxOutput};
     use tempfile::TempDir;

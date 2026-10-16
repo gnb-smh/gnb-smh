@@ -1,0 +1,45 @@
+{
+  "source_commit": "04b9348cecca54df6230e101701ee740d72eb6b5",
+  "source_sha256": "9bbf6135714193c3ec9330c3db414f0d690207c8490a4094d4142fe38cc07152",
+  "production_sha256": "0ccd2da48fd2b9b83ea32cdd293973283a7f81464d1618e3b0e5d51bb81d175f",
+  "baseline_production_sha256": "bb903638c425d87f607d6e245359b6abde3698e77a693064762ebc265efdaef1",
+  "tests_sha256": "65d98de3c82acab3c3328e472d11b9397e5a83681ff7c44e8a7d7f6631285396",
+  "driver_sha256": "5e3cbfeb8f6b8d8b9303455cff5d3bdd229d4497df249f75e5d90477f5b2aac1",
+  "codegen_units": 79,
+  "target": "/private/tmp/gnb-r4-target-address-core",
+  "runs": [
+    {
+      "name": "adapter-reverted",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--example",
+        "address_v2_oracle"
+      ],
+      "exit": 101,
+      "log": "/private/tmp/gnb-r4-address-oracle-reversal/adapter-reverted.log",
+      "log_sha256": "549d203fb12b55192b5ed8f34c03ab5b19b9b17860abe55b0dde2660cca907bb"
+    },
+    {
+      "name": "adapter-restored",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--example",
+        "address_v2_oracle"
+      ],
+      "exit": 0,
+      "log": "/private/tmp/gnb-r4-address-oracle-reversal/adapter-restored.log",
+      "log_sha256": "eb74ca5a4a6e8873a6b666b910d1d183e719594b7c63be80cc954f2a18cec453"
+    }
+  ],
+  "restored_sha256": "9bbf6135714193c3ec9330c3db414f0d690207c8490a4094d4142fe38cc07152"
+}

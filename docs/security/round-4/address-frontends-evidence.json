@@ -1,0 +1,173 @@
+{
+  "scope": "CRY-7 / technology 4.5 node RPC and CLI address frontends; no consensus change",
+  "base": "7d6a67eafa93cf7935ecedb50d601486aca4cff7",
+  "test_only_baseline_snapshot": "23237fff9531cba78461fd4a6b6c2d748564ad2c",
+  "production_revision": "f127d6b56566cbbf2e86cf44f343b7a543830f59",
+  "final_test_revision": "29945743f005d1e8d97333d181e06429e82a2765",
+  "core_imports": [
+    {
+      "original": "40c321b",
+      "local": "4f8ec88"
+    },
+    {
+      "original": "cf40773",
+      "local": "2557286"
+    },
+    {
+      "original": "4b32fb6",
+      "local": "606cbb6"
+    }
+  ],
+  "environment": {
+    "CARGO_TARGET_DIR": "/private/tmp/gnb-r4-target-address-frontends",
+    "CARGO_BUILD_JOBS": "2",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_PROFILE_DEV_CODEGEN_UNITS": "83",
+    "CARGO_PROFILE_TEST_CODEGEN_UNITS": "83"
+  },
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "commands": {
+    "rpc": [
+      "cargo",
+      "test",
+      "-p",
+      "gnb",
+      "--lib",
+      "address_frontends",
+      "--locked",
+      "--offline",
+      "--",
+      "--nocapture"
+    ],
+    "cli": [
+      "cargo",
+      "test",
+      "-p",
+      "gnb",
+      "--bin",
+      "gnb-cli",
+      "--locked",
+      "--offline",
+      "--",
+      "--nocapture"
+    ]
+  },
+  "baseline_source_hashes": {
+    "node/src/rpc/mod.rs": "1d8c90d599add3713ea3bf2f395479e32725ed6c871f8f1585227779be7cdcae",
+    "node/src/rpc/explorer.rs": "8458a96c79f5718c5af0e05b94e372e1839fc2c2160b5bea273b739dc2e512b6",
+    "node/src/bin/gnb-cli.rs": "6502deac9f33c9cd6e8f733a76eda513994298503e6b4883ca2e3008bd8f2f7a",
+    "node/tests/support/address_frontends_rpc.rs": "fc4b5f902827c7c62ae154640b30ac32440a28ff8376807c1bbcc20fe33a6d21",
+    "node/tests/support/address_frontends_cli.rs": "1557e8aa74fde915e1e9236fd318c1bc0d78648f53c85dab569894464bfb9124"
+  },
+  "initial_reproduction": {
+    "rpc": {
+      "path": "/private/tmp/gnb-r4-address-frontends-red.log",
+      "sha256": "b6f3e6d56eaa060d5159da1ce41aabc9d6e95675f571cb66c4eeb5c5ba90d29d",
+      "exit_code": 101,
+      "passed": 2,
+      "failed": 6
+    },
+    "cli": {
+      "path": "/private/tmp/gnb-r4-address-frontends-cli-red.log",
+      "sha256": "3e4ee9754079e8e6f95bb1c94fe8f12d15b6ae78619aed8f59c3800e4052ac86",
+      "exit_code": 101,
+      "passed": 15,
+      "failed": 2
+    },
+    "ordering": "Both runtime failures completed before importing the v2 core or editing RPC production. Tests and fixture controls were added while native dependencies compiled; the baseline snapshot was recorded after the RPC run."
+  },
+  "green": {
+    "rpc": {
+      "path": "/private/tmp/gnb-r4-address-frontends-final-reversal/restored.log",
+      "sha256": "68a534b995a4cf943c97237ac2b0e0e1a54b00dd83412d2ae6e609c547f4f349",
+      "exit_code": 0,
+      "passed": 9,
+      "failed": 0
+    },
+    "cli": {
+      "path": "/private/tmp/gnb-r4-address-frontends-cli-green.log",
+      "sha256": "12cd02fb39171251bc9771a46f2aeb02cb93b46a0ffe1f96ff3ea20b1a20b608",
+      "exit_code": 0,
+      "passed": 17,
+      "failed": 0
+    },
+    "cli_provenance": "CLI production and CLI tests are unchanged between this run and final_test_revision; RPC production matches production_revision."
+  },
+  "reversal": {
+    "driver": "node/tests/support/address_frontends_reversal.py",
+    "driver_sha256": "38baeb4e833cbe2767be1a3e0b464c2672a0e55cfd457a52bb5e0b076935a536",
+    "manifest_sha256": "e0ee5fb307bb032cc9d633cdbbf48a25d1d9b9c2493a5e26ecb5ef700af501a2",
+    "manifest": {
+      "revision": "29945743f005d1e8d97333d181e06429e82a2765",
+      "baseline": "23237fff9531cba78461fd4a6b6c2d748564ad2c",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb",
+        "--lib",
+        "address_frontends",
+        "--locked",
+        "--offline",
+        "--",
+        "--nocapture"
+      ],
+      "production": {
+        "node/src/rpc/mod.rs": {
+          "fixed_sha256": "1106ffc2dbfe8786a274f6de33f861fc6dafaf2d800ae7ec63c51ae1f1688d7b",
+          "baseline_sha256": "1d8c90d599add3713ea3bf2f395479e32725ed6c871f8f1585227779be7cdcae"
+        },
+        "node/src/rpc/explorer.rs": {
+          "fixed_sha256": "fb50cbae10ee1c7de690810bf53bd9cfd9218e78630a9caac41ef116d18dedd4",
+          "baseline_sha256": "8458a96c79f5718c5af0e05b94e372e1839fc2c2160b5bea273b739dc2e512b6"
+        }
+      },
+      "tests": {
+        "node/tests/support/address_frontends_rpc.rs": "262cd9fd6e6bfcff27c3c0d2bc839ac2adfb9da24c5fbd2baeb323f2439ceb1f",
+        "node/tests/support/address_frontends_cli.rs": "1557e8aa74fde915e1e9236fd318c1bc0d78648f53c85dab569894464bfb9124"
+      },
+      "reversals": {
+        "network_guard": {
+          "exit_code": 101,
+          "log": "/private/tmp/gnb-r4-address-frontends-final-reversal/network_guard.log",
+          "sha256": "929a92d705070e711c05dd319438783e0e721926aa1d66fad5219c53367c7cfb"
+        },
+        "baseline_rpc": {
+          "exit_code": 101,
+          "log": "/private/tmp/gnb-r4-address-frontends-final-reversal/baseline_rpc.log",
+          "sha256": "5b96a41bdf2cd31952f170d1e920b62bd1bb200509fefab4d75d9db190462b76"
+        }
+      },
+      "production_restored_exactly": true,
+      "tests_unchanged": true,
+      "restored": {
+        "exit_code": 0,
+        "log": "/private/tmp/gnb-r4-address-frontends-final-reversal/restored.log",
+        "sha256": "68a534b995a4cf943c97237ac2b0e0e1a54b00dd83412d2ae6e609c547f4f349"
+      }
+    },
+    "network_guard_counts": {
+      "passed": 5,
+      "failed": 4
+    },
+    "baseline_rpc_counts": {
+      "passed": 2,
+      "failed": 7
+    }
+  },
+  "additional_variant": {
+    "test": "address_frontends_validators_reject_repeated_legacy_prefix",
+    "status": "reproduced against isolated baseline RPC production; rejected after exact restoration",
+    "ordering": "Coverage added after the shared-parser fix during review. No further production change was made. Not claimed as a separate reproduce-before-fix implementation.",
+    "inputs": "Two or three consecutive gnb1q prefixes followed by the ordinary hash/checksum fixture; at most 63 ASCII bytes."
+  },
+  "limits": [
+    "Independent reviews pending at handoff.",
+    "Full integrated node suite, CI and WASM rebuild are coordinator-owned and not claimed by this package.",
+    "CLI tests call actual destination helpers; no new live TTY/keystore signing journey is claimed.",
+    "Policy holder/history queries remain unsupported in both encodings.",
+    "No numeric score assigned."
+  ]
+}

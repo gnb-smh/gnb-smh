@@ -320,9 +320,19 @@ pub fn handle(req: &Value) -> Result<Value, String> {
             *s = None;
             Ok(json!({ "locked": true }))
         }
-        "normalize" => Address::parse(s(req, "address")?.trim())
-            .map(|a| json!({ "address": a.to_string() }))
-            .map_err(|e| format!("invalid address: {e:?}")),
+        "normalize" => {
+            let address = Address::parse(s(req, "address")?.trim())
+                .map_err(|e| format!("invalid address: {e:?}"))?;
+            // Formatting is opt-in. Default output keeps existing wallet and
+            // carryover identities stable; BIP350 HRPs bind v2 to the network.
+            let formatted = match req.get("format") {
+                None => address.to_string(),
+                Some(Value::String(format)) if format == "legacy" => address.to_string(),
+                Some(Value::String(format)) if format == "bech32m" => address.to_bech32m(),
+                _ => return Err("unsupported address format; expected legacy or bech32m".into()),
+            };
+            Ok(json!({ "address": formatted }))
+        }
         "minfee" => {
             let size = req.get("size").and_then(Value::as_u64).ok_or("missing `size`")?;
             // CRY-8: `as usize` wrapped modulo 2^32 on wasm32 and quoted the

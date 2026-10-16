@@ -1,0 +1,101 @@
+{
+  "baseline": "70ca8a2",
+  "fixed_commit": "7e01bf575c0343981f214d3786e7c0675f4b5d4e",
+  "fixed_production_sha256": {
+    "site/wallet/main.js": "5697d316cff4640dca0c070279383ca88104d415b99ff4415c363f7fbe830dc7",
+    "site/wallet/core.js": "31a42a252fe09f671f6c9b8675034fa14e83ca6ee369f854682c6a0d66e40891"
+  },
+  "records": [
+    {
+      "case": "payment",
+      "production_files_reverted": [
+        "site/wallet/main.js"
+      ],
+      "command": [
+        "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+        "--test",
+        "site/tests/wallet-secondary.test.mjs"
+      ],
+      "exit_code": 1,
+      "tests_sha256": "9f14e304ff234b684eaa156f048307f601760b8796784d44a1ffd98ba90ed889",
+      "log": "/private/tmp/gnb-r4-wallet-secondary-attempt-replay-20261016/payment.log",
+      "log_sha256": "a056ccadec13a68f8495bab8b490ea710cd940790b3fe865a98e2a3acee12b15",
+      "pass": 7,
+      "fail": 9,
+      "failed_tests": [
+        "secondary payment review signs legacy at H-1 using the node's next_block_height",
+        "secondary payment review signs v2 at H-1 using the node's next_block_height",
+        "secondary payment review signs legacy at H using the node's next_block_height",
+        "secondary payment review signs v2 at H using the node's next_block_height",
+        "secondary review requires next_block_height, and never signs after a failed or malformed height response",
+        "secondary review rejects a destination on another network",
+        "secondary review rechecks coinbase maturity at the current next height",
+        "secondary review makes missing previous values visible and requires explicit acknowledgement before confirmation",
+        "secondary review refuses supplied previous transaction bytes that do not verify"
+      ]
+    },
+    {
+      "case": "create",
+      "production_files_reverted": [
+        "site/wallet/core.js"
+      ],
+      "command": [
+        "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+        "--test",
+        "site/tests/wallet-secondary.test.mjs"
+      ],
+      "exit_code": 1,
+      "tests_sha256": "9f14e304ff234b684eaa156f048307f601760b8796784d44a1ffd98ba90ed889",
+      "log": "/private/tmp/gnb-r4-wallet-secondary-attempt-replay-20261016/create.log",
+      "log_sha256": "d6fd7cbbfcd81bbedb956ca6b2ab290fbd1215a2371327267a60b132d77cb11b",
+      "pass": 13,
+      "fail": 3,
+      "failed_tests": [
+        "explicit testnet creation uses the Rust testnet path",
+        "explicit network arguments reject mistyped values before changing a session",
+        "secondary testnet create/download/open journey keeps the same testnet identity"
+      ]
+    },
+    {
+      "case": "open",
+      "production_files_reverted": [
+        "site/wallet/core.js",
+        "site/wallet/main.js"
+      ],
+      "command": [
+        "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+        "--test",
+        "site/tests/wallet-secondary.test.mjs"
+      ],
+      "exit_code": 1,
+      "tests_sha256": "9f14e304ff234b684eaa156f048307f601760b8796784d44a1ffd98ba90ed889",
+      "log": "/private/tmp/gnb-r4-wallet-secondary-attempt-replay-20261016/open.log",
+      "log_sha256": "1832c4aad5a290090066bc5a441ba4bd3ab923a54a06cfbaabb4cc0673aacfd9",
+      "pass": 11,
+      "fail": 5,
+      "failed_tests": [
+        "explicit testnet creation uses the Rust testnet path",
+        "opening a keystore respects an explicit expected network",
+        "explicit network arguments reject mistyped values before changing a session",
+        "secondary testnet create/download/open journey keeps the same testnet identity",
+        "secondary opening selects the node network instead of silently opening a mainnet key on testnet"
+      ]
+    },
+    {
+      "case": "restored",
+      "production_files_reverted": [],
+      "command": [
+        "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+        "--test",
+        "site/tests/wallet-secondary.test.mjs"
+      ],
+      "exit_code": 0,
+      "tests_sha256": "9f14e304ff234b684eaa156f048307f601760b8796784d44a1ffd98ba90ed889",
+      "log": "/private/tmp/gnb-r4-wallet-secondary-attempt-replay-20261016/restored.log",
+      "log_sha256": "22ff6bed47f3d306405ecf4b35046a5e0ca48397c4be7d38d06108740127863a",
+      "pass": 16,
+      "fail": 0,
+      "failed_tests": []
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build the browser wallet core (crates/gnb-wallet-wasm) for wasm32-wasip1,
 # copy it to site/wallet/gnb_wallet.wasm, pin its SHA-256 in
-# site/wallet/app.js (WASM_SHA256, checked by loadCore before instantiation)
+# both served wallet entry points (checked by loadCore before instantiation)
 # and refresh the Subresource Integrity hashes of the site's scripts.
 #
 # Needs: the rustup target wasm32-wasip1 and a wasi-sdk (clang with the wasm32
@@ -32,13 +32,16 @@ fi
 sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
 sri() { printf 'sha384-%s' "$(openssl dgst -sha384 -binary "$1" | openssl base64 -A)"; }
 
-# 1. Pin the wasm hash in app.js.
+# 1. Pin the same wasm hash in both served wallet entry points.
 WASM_HASH=$(sha256 site/wallet/gnb_wallet.wasm)
-sed "s/^const WASM_SHA256 = \"[0-9a-f]*\";/const WASM_SHA256 = \"$WASM_HASH\";/" \
-  site/wallet/app.js > site/wallet/app.js.tmp
-mv site/wallet/app.js.tmp site/wallet/app.js
-grep -q "^const WASM_SHA256 = \"$WASM_HASH\";" site/wallet/app.js \
-  || { echo "could not pin WASM_SHA256 in site/wallet/app.js" >&2; exit 1; }
+pin_entry() { # <path> <constant>
+  sed "s/^const $2 = \"[0-9a-f]*\";/const $2 = \"$WASM_HASH\";/" "$1" > "$1.tmp"
+  mv "$1.tmp" "$1"
+  grep -q "^const $2 = \"$WASM_HASH\";" "$1" \
+    || { echo "could not pin $2 in $1" >&2; exit 1; }
+}
+pin_entry site/wallet/app.js WASM_SHA256
+pin_entry site/wallet/main.js CORE_SHA256
 
 # 2. Refresh integrity="..." on every <script src> / <link rel=modulepreload>
 #    that names one of these files (after step 1: app.js changed).
@@ -57,4 +60,4 @@ for page in site/wallet.html site/explorer.html site/index.html site/brand.html;
   set_sri "$page" /assets/explorer-views.js site/assets/explorer-views.js
 done
 
-echo "gnb_wallet.wasm sha256 $WASM_HASH (pinned in site/wallet/app.js)"
+echo "gnb_wallet.wasm sha256 $WASM_HASH (pinned in both wallet entry points)"

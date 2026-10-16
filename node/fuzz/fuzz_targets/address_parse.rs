@@ -2,17 +2,21 @@
 //! `parse_for_network`, `FromStr`, `Display`): RPC parameters, the
 //! `--miner-address` flag, wallet recipients and keystore files.
 //!
-//! * `parse` returns exactly the verdict (value or error kind) of an
+//! * For legacy inputs, `parse` returns exactly the verdict (value or error kind) of an
 //!   independent parser written from the format: prefix `gnb1q` / `gnb1t`
 //!   (or the Bloch `bloch1q` / `bloch1t` alias), 48 hex digits of
 //!   `hash(20) || SHA3-256(SHA3-256(hash))[..4]`.
 //! * An accepted string's canonical form (`to_string`) parses to the same
-//!   address and differs from the input only by hex case and the Bloch alias;
+//!   address. Legacy input differs only by hex case and the Bloch alias;
+//!   v2 input matches the explicit Bech32m renderer, ignoring uniform case.
 //!   `parse_for_network` accepts it for its own network only (CRY-7).
 //! * Generated addresses round-trip; changing any one hex digit of the
 //!   payload to another value is refused with `BadChecksum`; swapping the
 //!   prefix keeps the hash and changes the network (the documented residual:
 //!   the checksum does not cover the prefix).
+//! * V2 strings retain parsing/network/round-trip invariants and reject one
+//!   changed character or a network-prefix swap. The independent v2 verdict
+//!   comparison is the Python differential corpus, not this legacy reference.
 #![no_main]
 
 mod common;
@@ -67,6 +71,7 @@ fn copy_err(e: &AddressError) -> AddressError {
         AddressError::BadPrefix => AddressError::BadPrefix,
         AddressError::BadLength { got, expected } => AddressError::BadLength { got: *got, expected: *expected },
         AddressError::BadHex => AddressError::BadHex,
+        AddressError::BadEncoding => AddressError::BadEncoding,
         AddressError::BadChecksum => AddressError::BadChecksum,
         AddressError::WrongNetwork { expected, got } => AddressError::WrongNetwork { expected: *expected, got: *got },
     }
@@ -78,13 +83,21 @@ fn check_str(s: &str) {
         Ok(a) => Ok((*a.hash(), a.network())),
         Err(e) => Err(format!("{e:?}")),
     };
-    assert_eq!(lib, ref_parse(s).map_err(|e| format!("{e:?}")), "parse differs from the reference");
+    let is_v2 = s.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("gnb1z"))
+        || s.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("tgnb1z"));
+    if !is_v2 {
+        assert_eq!(lib, ref_parse(s).map_err(|e| format!("{e:?}")), "legacy parse differs from the reference");
+    }
     assert_eq!(s.parse::<Address>(), got, "FromStr differs from parse");
     match got {
         Ok(a) => {
             let canon = a.to_string();
             assert_eq!(Address::parse(&canon), Ok(a), "canonical form does not round-trip");
-            assert!(canon.eq_ignore_ascii_case(&normalize_legacy_address(s)), "canonical form differs beyond case/alias");
+            if is_v2 {
+                assert!(a.to_bech32m().eq_ignore_ascii_case(s), "v2 form differs beyond case");
+            } else {
+                assert!(canon.eq_ignore_ascii_case(&normalize_legacy_address(s)), "legacy form differs beyond case/alias");
+            }
             assert!(canon.starts_with(a.network().prefix()));
             assert_eq!(Address::parse_for_network(s, a.network()), Ok(a));
             assert_eq!(
@@ -117,6 +130,17 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(s.len(), 5 + 48);
     assert_eq!(Address::parse(&s), Ok(a));
     check_str(&s);
+    let v2 = a.to_bech32m();
+    check_str(&v2);
+    check_str(&v2.to_ascii_uppercase());
+    let swapped_v2 = if net == Network::Mainnet { format!("t{v2}") } else { v2[1..].to_owned() };
+    assert!(Address::parse(&swapped_v2).is_err(), "v2 checksum did not bind the network");
+    let mut changed_v2 = v2.as_bytes().to_vec();
+    let position = inp.below(changed_v2.len());
+    changed_v2[position] = if changed_v2[position] == b'q' { b'p' } else { b'q' };
+    let changed_v2 = String::from_utf8(changed_v2).unwrap();
+    assert!(Address::parse(&changed_v2).is_err(), "v2 single-character change accepted");
+    check_str(&changed_v2);
     assert_eq!(Address::from_pubkey(&inp.var_bytes(64), net).network(), net);
 
     // One hex digit of the payload changed to another value.

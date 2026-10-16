@@ -13,11 +13,11 @@
 // next block reach the core: an immature coinbase output is neither counted as
 // spendable nor offered to the core (core.js splitByMaturity).
 import { loadCore, spendableWindow, splitByMaturity, getutxosFetcher, COINBASE_MATURITY, UTXO_WINDOW, UTXO_WIDE_WINDOW } from "/wallet/core.js";
-import { html, raw, isAddress, isHex64, num, sats } from "/assets/safe.js";
+import { html, raw, isAddress, watchAddress, isHex64, num, sats } from "/assets/safe.js";
 
 // SHA-256 of /wallet/gnb_wallet.wasm. Written by scripts/build-wallet-wasm.sh
 // and checked by `node --test site/tests/`; loadCore refuses any other binary.
-const WASM_SHA256 = "4571dbc61ed91468fc8841f60af55fc0a9a49065d82ffb00391f44007075e3a7";
+const WASM_SHA256 = "f184981b63377d286dabd792d375e2f2daaa337d27c7a50bb64c96d5f3d4b0d5";
 
 const SAT = 100000000n;
 // UTXO_WINDOW / UTXO_WIDE_WINDOW (core.js): rows asked of getutxos, the same
@@ -406,9 +406,9 @@ function paintBackup(pane = document.getElementById("pane")) {
 
 // Shareable watch links: /wallet#watch/<address>
 async function boot() {
-  const m = location.hash.match(/^#watch\/(gnb1[qt][0-9a-f]{48}|bloch1[qt][0-9a-f]{48})$/);
-  if (m) {
-    try { const c = await getCore(); return enter("watch", c.normalize(m[1])); } catch {}
+  const address = watchAddress(location.hash);
+  if (address) {
+    try { const c = await getCore(); return enter("watch", c.normalize(address)); } catch {}
   }
   renderGate();
 }
