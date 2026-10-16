@@ -80,3 +80,22 @@ async fn descriptor_rpc_existing_validation_positive_control() {
     let address = crate::address::Address::from_hash([42;20], crate::address::Network::Mainnet).to_string();
     assert_eq!(dispatch("validateaddress", Some(&json!([address])), &state).await["isvalid"], true);
 }
+
+#[tokio::test]
+async fn descriptor_rpc_router_obeys_existing_read_auth_policy() {
+    let (_tmp, mut state) = state_with_chain(1);
+    let descriptor = &descriptor_rpc_fixtures("mainnet")[0].1;
+    for method in ["getdescriptorinfo", "deriveaddresses"] {
+        let (status, response) = post_raw(&state, "127.0.0.1:5000", &[], rpc_body(method, json!([descriptor]))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(response.get("error").is_none(), "{method}: {response}");
+        if method == "getdescriptorinfo" { assert_eq!(response["result"]["kind"], "pkh"); }
+        else { assert_eq!(response["result"].as_array().unwrap().len(), 1); }
+    }
+    state.require_auth_for_reads = true;
+    state.api_key = Some("descriptor-operator".into());
+    for method in ["getdescriptorinfo", "deriveaddresses"] {
+        let (status, _) = post_raw(&state, "127.0.0.1:5000", &[], rpc_body(method, json!([descriptor]))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+}
