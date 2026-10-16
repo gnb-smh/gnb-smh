@@ -472,7 +472,7 @@ fn val3_same_block_coinbase_spend_on_the_reorg_path() {
         let x = mine(same_block_coinbase_spend(&n, &k, gh, b"fork".to_vec()), |_| true);
         n.store.put_block(&x).unwrap();
         let plan = ReorgPlan { lca: gh, to_rollback: vec![m1.block_hash()], to_apply: vec![x.block_hash()] };
-        let validate = |v: &dyn UtxoView, b: &Block| pipeline::validate_block_in_view(v, b);
+        let validate = |v: &dyn UtxoView, b: &Block| pipeline::validate_block_in_view(v, b).map_err(reorg::ValidationFailure::Invalid);
         let none = |_: &Storage, _: &mut rocksdb::WriteBatch| -> Result<(), String> { Ok(()) };
         let res = reorg::connect_plan(&n.store, &plan, &ConnectHooks { validate: &validate, stage_extra: &none });
         if ok {
@@ -1160,6 +1160,15 @@ fn id_committed_failures_are_still_persisted_on_both_sides_of_the_activation() {
     }
 }
 
+/// The verdict of a classified connect failure (a read failure of the view
+/// is no verdict: re-audit B1-T12).
+fn verdict_of(r: Result<(), pipeline::ConnectFailure>) -> pipeline::BlockInvalidity {
+    match r.expect_err("a verdict") {
+        pipeline::ConnectFailure::Invalid(b) => b,
+        pipeline::ConnectFailure::Storage(m) => panic!("no verdict (storage): {m}"),
+    }
+}
+
 /// The classification behind the pipeline, on `validate_block_in_view`'s
 /// own terms: the same signature failure is witness-dependent below the
 /// activation and id-committed at/after it; the verdict is unchanged.
@@ -1183,15 +1192,15 @@ fn connect_failures_are_classified_by_what_the_block_id_commits_to() {
     let mut b = raw_block(&n, vec![gh], txs);
     b.header.merkle_root = b.body_merkle_root_at(activation::NEVER);
     let view: &Storage = &n.store;
-    let below = pipeline::validate_block_in_view_classified_at(view, &b, activation::NEVER).unwrap_err();
+    let below = verdict_of(pipeline::validate_block_in_view_classified_at(view, &b, activation::NEVER));
     assert!(below.witness_dependent && below.reason.contains("invalid signature"), "{below:?}");
-    let at = pipeline::validate_block_in_view_classified_at(view, &b, 1).unwrap_err();
+    let at = verdict_of(pipeline::validate_block_in_view_classified_at(view, &b, 1));
     assert!(!at.witness_dependent && at.reason.contains("invalid signature"), "{at:?}");
     assert_eq!(pipeline::validate_block_in_view_at(view, &b, activation::NEVER).unwrap_err(), below.reason);
     // An over-claiming coinbase is id-committed on both sides.
     let mut over = raw_block(&n, vec![gh], vec![coinbase("over", subsidy(1) + 1, vec![0x9F; 20])]);
     over.header.merkle_root = over.body_merkle_root_at(activation::NEVER);
-    let e = pipeline::validate_block_in_view_classified_at(view, &over, activation::NEVER).unwrap_err();
+    let e = verdict_of(pipeline::validate_block_in_view_classified_at(view, &over, activation::NEVER));
     assert!(!e.witness_dependent, "{e:?}");
 }
 
@@ -1250,7 +1259,7 @@ fn transaction_rule_failures_are_classified_on_both_sides_of_the_activation() {
     for (label, tx, act, fragment, witness_dependent) in cases {
         let mut b = raw_block(&n, vec![gh], vec![coinbase("p1p2", subsidy(1) + 100_000, vec![0x9E; 20]), tx]);
         b.header.merkle_root = b.body_merkle_root_at(act);
-        let e = pipeline::validate_block_in_view_classified_at(view, &b, act).unwrap_err();
+        let e = verdict_of(pipeline::validate_block_in_view_classified_at(view, &b, act));
         assert!(e.reason.contains(fragment), "{label}: {e:?}");
         assert_eq!(e.witness_dependent, witness_dependent, "{label}: {e:?}");
         assert_eq!(pipeline::validate_block_in_view_at(view, &b, act).unwrap_err(), e.reason, "{label}");

@@ -713,9 +713,9 @@ pub fn check_transaction_gated(
     }
 
     // Coinbase maturity at the next block's height (MEM-4).
-    core::check_coinbase_maturity(tx, policy.next_block_height, |t| {
-        store.get_coinbase_height(t).ok().flatten()
-    }).map_err(AdmissionError::Immature)?;
+    coinbase_maturity_for_next_block(store, tx, policy.next_block_height)
+        .map_err(|e| AdmissionError::Pool(format!("storage: {}", e)))?
+        .map_err(AdmissionError::Immature)?;
 
     // Value + fees.
     let total_out = core::limits::check_tx_money_range(tx).map_err(AdmissionError::Rejected)?;
@@ -756,6 +756,30 @@ pub fn check_transaction_gated(
         verify_input_scripts_gated_at(tx, &prevouts, policy.next_block_height, activation_height(), gate)?;
     }
     Ok(fee)
+}
+
+/// Coinbase maturity of `tx` for the block at `next_block_height` (`0`
+/// skips it), with the coinbase heights read from `store`: `Ok(Err(reason))`
+/// when an input spends an immature coinbase, `Err` when a height could not
+/// be read. A failed read is never "not a coinbase" (re-audit B1-T12: the
+/// lookups used `.ok().flatten()`, which skipped the check). Shared by
+/// admission, the post-connect revalidation and the template self-check.
+pub fn coinbase_maturity_for_next_block(
+    store: &Storage,
+    tx: &Transaction,
+    next_block_height: u64,
+) -> Result<Result<(), String>, crate::storage::StorageError> {
+    let mut read_error = None;
+    let verdict = core::check_coinbase_maturity(tx, next_block_height, |t| {
+        store.get_coinbase_height(t).unwrap_or_else(|e| {
+            read_error.get_or_insert(e);
+            None
+        })
+    });
+    match read_error {
+        Some(e) => Err(e),
+        None => Ok(verdict),
+    }
 }
 
 /// Check and insert `tx` into `mempool`. On success returns the txid.
@@ -818,7 +842,8 @@ pub fn admit_gated(
     if current != 0 && current != policy.next_block_height {
         check_tx_for_next_block(&tx, current).map_err(|e| AdmissionError::NonStandard(format!(
             "{e} (the next block moved to height {current} while the transaction was being checked)")))?;
-        core::check_coinbase_maturity(&tx, current, |t| store.get_coinbase_height(t).ok().flatten())
+        coinbase_maturity_for_next_block(store, &tx, current)
+            .map_err(|e| AdmissionError::Pool(format!("storage: {}", e)))?
             .map_err(AdmissionError::Immature)?;
     }
     mempool.add_with_replacement(tx, fee).map_err(from_mempool_error)

@@ -553,7 +553,10 @@ fn self_check(
             .map_err(TemplateReject::Evict)?;
         prevouts.push(out);
     }
-    core::check_coinbase_maturity(tx, height, |t| store.get_coinbase_height(t).ok().flatten())
+    // A height that cannot be read is no verdict: skip, never evict, and
+    // never treat the input as "not a coinbase" (re-audit B1-T12).
+    admission::coinbase_maturity_for_next_block(store, tx, height)
+        .map_err(|_| TemplateReject::Skip)?
         .map_err(TemplateReject::Evict)?;
     let total_out = core::limits::check_tx_money_range(tx).map_err(TemplateReject::Evict)?;
     if total_in < total_out {

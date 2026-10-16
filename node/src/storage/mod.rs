@@ -1271,13 +1271,18 @@ impl Storage {
     }
 
     /// Get the height at which a coinbase transaction was created.
-    /// Returns None if the txid is not a coinbase.
+    /// Returns None if the txid is not a coinbase. A row that is not exactly
+    /// 8 bytes is corrupted, an error: reading it as "not a coinbase" skipped
+    /// the coinbase-maturity check (re-audit B1-T12).
     pub fn get_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, StorageError> {
         self.note_reads(1);
         let cf = self.db.cf_handle(CF_COINBASE).ok_or(StorageError::CfNotFound(CF_COINBASE.into()))?;
         match self.db.get_cf(&cf, txid).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
-            Some(d) if d.len() == 8 => Ok(Some(u64::from_le_bytes(d[..8].try_into().unwrap()))),
-            _ => Ok(None),
+            Some(d) => <[u8; 8]>::try_from(d.as_slice()).map(|b| Some(u64::from_le_bytes(b))).map_err(|_| {
+                StorageError::DeserializeFailed(format!(
+                    "coinbase-height row of {} has {} bytes (expected 8)", hex::encode(&txid[..8]), d.len()))
+            }),
+            None => Ok(None),
         }
     }
 

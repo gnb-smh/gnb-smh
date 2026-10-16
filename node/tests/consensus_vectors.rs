@@ -184,7 +184,7 @@ fn run_tx_vectors(network: &str) -> usize {
         let cf = tx_context_free(&block, act).map_err(|e| classify(&e).to_string());
         rep.expect(&c.id, "context-free rules", &context_free_expectation(&expected, &block, max_supply), &verdict(&cf));
         let got = cf.and_then(|()| {
-            accept::validate_block_in_view_classified(&store, &block).map_err(|e| classify(&e.reason).to_string())
+            accept::validate_block_in_view_classified(&store, &block).map_err(|e| classify(&e.into_message()).to_string())
         });
         rep.expect(&c.id, "consensus", &expected, &verdict(&got));
 
@@ -281,7 +281,7 @@ fn block_vectors() {
             assert_eq!(c.scope, "connect", "{}", c.id);
         }
         let (_tmp, store) = store_with(&c.prevouts);
-        let got = accept::validate_block_in_view_classified(&store, &block).map_err(|e| classify(&e.reason).to_string());
+        let got = accept::validate_block_in_view_classified(&store, &block).map_err(|e| classify(&e.into_message()).to_string());
         rep.expect(&c.id, "block", &expected, &verdict(&got));
     }
     rep.finish("block vectors (node)");

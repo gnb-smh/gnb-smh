@@ -1083,6 +1083,17 @@ every other failure. Relay-policy verdicts (`non-standard-version`, a
 non-canonical witness or a suite 0x0002 key below the activation) are not
 block-validity rules and never reach this classification.
 
+A failure to READ the node's own UTXO view while a block is validated (an
+I/O error, a corrupted or undecodable row, a coin row without its index
+row) is neither: it is no verdict at all, at every height (re-audit
+B1-T12). The connect is abandoned before anything is written, nothing is
+marked or persisted, the triggering block is rolled back out of the DAG,
+and the block is validated again when it is next received or the node
+restarts. A coinbase-height row that cannot be read is never taken for "not
+a coinbase" (which skipped the maturity rule). Bitcoin Core draws the same
+line: a coins-database read error aborts the node
+(`CCoinsViewErrorCatcher`), it is never cached as an invalid block.
+
 An id-committed failure disqualifies the block and its selected-chain
 descendants and is persisted (`invalid_block/<id>`), as before. A
 witness-dependent failure does not: the stored body is deleted (so it is no

@@ -43,7 +43,11 @@
 //! old tip is kept when nothing better is valid. A disqualified block is never
 //! selected, applied or offered as a template parent, and a new block whose
 //! selected parent is disqualified is disqualified on arrival. `accept_block`
-//! reports such blocks as rejected (`Err`).
+//! reports such blocks as rejected (`Err`). A failure to READ the UTXO view
+//! (`reorg::ViewError`: I/O error, corrupted row) is no verdict
+//! ([`ConnectFailure::Storage`]): nothing is marked or persisted, the connect
+//! fails as a storage failure and the trigger is rolled back (re-audit
+//! B1-T12).
 //!
 //! **Witness-dependent failures below the hardening activation**: there the
 //! block id does not commit to non-coinbase `script_sig` bytes, so a relay
@@ -134,7 +138,7 @@ use crate::consensus::{self, BlockHash};
 use crate::core;
 use crate::mempool::{self, admission};
 use crate::pow;
-use crate::reorg::{self, ConnectError, ConnectHooks, ConnectOutcome, UtxoView};
+use crate::reorg::{self, ConnectError, ConnectHooks, ConnectOutcome, UtxoView, ValidationFailure, ViewError};
 use crate::rpc;
 use crate::storage;
 use crate::tip;
@@ -289,18 +293,100 @@ pub struct BlockInvalidity {
     pub witness_dependent: bool,
 }
 
-/// A transaction-level rejection; `witness` = it depends on the
-/// transaction's `script_sig` bytes (see [`BlockInvalidity`]).
+/// Why connect-time validation did not pass: a verdict on the block, or no
+/// verdict at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectFailure {
+    /// The block is invalid in its own selected-chain context (classified,
+    /// see [`BlockInvalidity`]).
+    Invalid(BlockInvalidity),
+    /// The UTXO view could not be read (`reorg::ViewError`: I/O error,
+    /// corrupted row, inconsistent index). NOT a verdict: nothing is marked
+    /// or persisted, the connect fails as a storage failure and the block is
+    /// validated again later (re-audit B1-T12; Bitcoin Core aborts on a
+    /// coins-database read error instead of caching BLOCK_FAILED_VALID).
+    Storage(String),
+}
+
+impl ConnectFailure {
+    /// The verdict, when this is one.
+    pub fn invalidity(&self) -> Option<&BlockInvalidity> {
+        match self {
+            ConnectFailure::Invalid(b) => Some(b),
+            ConnectFailure::Storage(_) => None,
+        }
+    }
+
+    /// One line for the string-typed library API: the verdict's reason, or
+    /// the read failure (never mistaken for a rule: it says so).
+    pub fn into_message(self) -> String {
+        match self {
+            ConnectFailure::Invalid(b) => b.reason,
+            ConnectFailure::Storage(m) => format!("storage read failed, no verdict: {m}"),
+        }
+    }
+}
+
+/// A transaction-level failure: a verdict (`witness` = it depends on the
+/// transaction's `script_sig` bytes, see [`BlockInvalidity`]) or a read
+/// failure of the view, which is no verdict (re-audit B1-T12: a read error
+/// used to convert into an id-committed verdict through `From<String>`).
 #[derive(Debug)]
-struct TxFailure {
-    reason: String,
-    witness: bool,
+enum TxFailure {
+    Invalid { reason: String, witness: bool },
+    Storage(ViewError),
 }
 
 impl From<String> for TxFailure {
     fn from(reason: String) -> Self {
-        Self { reason, witness: false }
+        TxFailure::Invalid { reason, witness: false }
     }
+}
+
+impl From<ViewError> for TxFailure {
+    fn from(e: ViewError) -> Self {
+        TxFailure::Storage(e)
+    }
+}
+
+impl TxFailure {
+    fn witness(reason: String) -> Self {
+        TxFailure::Invalid { reason, witness: true }
+    }
+
+    /// Classified at a block subject (`hardened`) or not to the hardening
+    /// rules: at/after the activation the witness commitment fixed the body,
+    /// so no failure is witness-dependent there.
+    fn into_connect(self, hardened: bool) -> ConnectFailure {
+        match self {
+            TxFailure::Invalid { reason, witness } => {
+                ConnectFailure::Invalid(BlockInvalidity { reason, witness_dependent: witness && !hardened })
+            }
+            TxFailure::Storage(e) => ConnectFailure::Storage(e.0),
+        }
+    }
+
+    fn into_message(self) -> String {
+        self.into_connect(true).into_message()
+    }
+}
+
+/// Coinbase maturity of `tx` for a block at `maturity_height` (`0` skips
+/// it), reading coinbase heights from `view`. A read failure is a
+/// [`TxFailure::Storage`], never "not a coinbase" (re-audit B1-T12: the
+/// lookup used `.ok().flatten()`, so a failed read skipped the check).
+fn check_maturity_in_view(tx: &core::Transaction, view: &dyn UtxoView, maturity_height: u64) -> Result<(), TxFailure> {
+    let mut read_error = None;
+    let verdict = core::check_coinbase_maturity(tx, maturity_height, |txid| {
+        view.view_coinbase_height(txid).unwrap_or_else(|e| {
+            read_error.get_or_insert(e);
+            None
+        })
+    });
+    if let Some(e) = read_error {
+        return Err(TxFailure::Storage(e));
+    }
+    verdict.map_err(TxFailure::from)
 }
 
 /// Validate `tx` (a non-coinbase transaction of a block at header height
@@ -330,10 +416,8 @@ fn validate_tx_in_view(
             ).into());
         }
     }
-    core::check_coinbase_maturity(tx, maturity_height, |txid| {
-        view.view_coinbase_height(txid).ok().flatten()
-    })?;
-    let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, String> {
+    check_maturity_in_view(tx, view, maturity_height)?;
+    let lookup = |txid: &[u8; 32], idx: u32| -> Result<Option<core::TxOutput>, ViewError> {
         if let Some(out) = earlier.get(&(*txid, idx)) {
             return Ok(Some(out.clone()));
         }
@@ -347,14 +431,14 @@ fn validate_tx_in_view(
 /// that is unspent in `view` (the parent's state). The block path checks every
 /// transaction of the block, the coinbase included, before validating any;
 /// [`validate_tx_in_block_with_maturity`] checks the transaction it validates.
-fn check_no_unspent_overwrite(view: &dyn UtxoView, tx: &core::Transaction) -> Result<(), String> {
+fn check_no_unspent_overwrite(view: &dyn UtxoView, tx: &core::Transaction) -> Result<(), TxFailure> {
     let txid = tx.txid();
     for j in 0..tx.outputs.len() as u32 {
         if view.view_utxo(&txid, j)?.is_some() {
             return Err(format!(
                 "BIP30: output {}:{} would overwrite an unspent coin",
                 hex::encode(&txid[..8]), j
-            ));
+            ).into());
         }
     }
     Ok(())
@@ -402,14 +486,16 @@ pub fn validate_block_in_view_at(
     block: &core::Block,
     activation_height: u64,
 ) -> Result<(), String> {
-    validate_block_in_view_classified_at(view, block, activation_height).map_err(|e| e.reason)
+    validate_block_in_view_classified_at(view, block, activation_height).map_err(ConnectFailure::into_message)
 }
 
 /// [`validate_block_in_view`] with the failure classified (see
 /// [`BlockInvalidity`]): the acceptance pipeline uses the class to decide
 /// whether the block id is disqualified (persisted) or only this body is
-/// dropped. The verdict (`Ok` / `Err`) is exactly `validate_block_in_view`'s.
-pub fn validate_block_in_view_classified(view: &dyn UtxoView, block: &core::Block) -> Result<(), BlockInvalidity> {
+/// dropped, and a read failure of the view ([`ConnectFailure::Storage`]) is
+/// no verdict at all. The verdict (`Ok` / `Err`) is exactly
+/// `validate_block_in_view`'s.
+pub fn validate_block_in_view_classified(view: &dyn UtxoView, block: &core::Block) -> Result<(), ConnectFailure> {
     validate_block_in_view_classified_at(view, block, core::activation::hardening_activation_height())
 }
 
@@ -418,13 +504,13 @@ pub fn validate_block_in_view_classified_at(
     view: &dyn UtxoView,
     block: &core::Block,
     activation_height: u64,
-) -> Result<(), BlockInvalidity> {
-    let committed = |reason: String| BlockInvalidity { reason, witness_dependent: false };
+) -> Result<(), ConnectFailure> {
+    let committed = |reason: String| ConnectFailure::Invalid(BlockInvalidity { reason, witness_dependent: false });
     let height = block.height;
     let hardened = core::block_rules::rules_active_at(height, activation_height);
     if hardened {
         for tx in &block.transactions {
-            check_no_unspent_overwrite(view, tx).map_err(committed)?;
+            check_no_unspent_overwrite(view, tx).map_err(|f| f.into_connect(hardened))?;
         }
     }
     let same_block_coinbase = if hardened {
@@ -440,11 +526,7 @@ pub fn validate_block_in_view_classified_at(
             let fee = validate_tx_in_view(
                 tx, view, &earlier, &mut spent_in_block, height, height, same_block_coinbase.as_ref(),
                 activation_height,
-            ).map_err(|f| BlockInvalidity {
-                reason: f.reason,
-                // At/after the activation the witness commitment fixed the body.
-                witness_dependent: f.witness && !hardened,
-            })?;
+            ).map_err(|f| f.into_connect(hardened))?;
             total_fees = core::limits::money_add(total_fees, fee)
                 .map_err(|e| committed(format!("block fee sum: {}", e)))?;
         }
@@ -594,7 +676,9 @@ pub fn revalidate_mempool(store: &storage::Storage, mempool: &mempool::Mempool, 
                 None => return false,
             }
         }
-        if core::check_coinbase_maturity(&e.tx, next_height, |t| store.get_coinbase_height(t).ok().flatten()).is_err() {
+        // Immature, or a height that cannot be read (never "not a
+        // coinbase", re-audit B1-T12): not minable now.
+        if !matches!(admission::coinbase_maturity_for_next_block(store, &e.tx, next_height), Ok(Ok(()))) {
             return false;
         }
         match core::limits::check_tx_money_range(&e.tx) {
@@ -799,14 +883,21 @@ fn resolve_best_chain(
         // The validator reports, beside the verdict, whether the failure
         // depends on witness bytes (block id, witness root of the body).
         let witness_failure: std::cell::Cell<Option<(BlockHash, [u8; 32])>> = std::cell::Cell::new(None);
-        let validate = |view: &dyn UtxoView, b: &core::Block| -> Result<(), String> {
+        let validate = |view: &dyn UtxoView, b: &core::Block| -> Result<(), ValidationFailure> {
             match validate_block_in_view_classified(view, b) {
                 Ok(()) => Ok(()),
-                Err(e) => {
+                Err(ConnectFailure::Invalid(e)) => {
                     witness_failure.set(e.witness_dependent.then(|| {
                         (b.block_hash(), core::block_rules::witness_root(&b.transactions).0)
                     }));
-                    Err(e.reason)
+                    Err(ValidationFailure::Invalid(e.reason))
+                }
+                // No verdict (re-audit B1-T12): `connect_plan` fails as a
+                // storage failure, nothing is marked, the caller rolls its
+                // trigger back.
+                Err(ConnectFailure::Storage(m)) => {
+                    witness_failure.set(None);
+                    Err(ValidationFailure::Storage(m))
                 }
             }
         };
@@ -1746,7 +1837,7 @@ pub fn reconcile_on_startup(
         let staged_shielded = shielded.write().stage_retip(store, &to_rollback, back_to)
             .map_err(|e| format!("reconcile rollback: {e}"))?;
         let plan = reorg::ReorgPlan { lca: back_to, to_rollback, to_apply: vec![] };
-        let validate = |_: &dyn UtxoView, _: &core::Block| -> Result<(), String> { Ok(()) };
+        let validate = |_: &dyn UtxoView, _: &core::Block| -> Result<(), ValidationFailure> { Ok(()) };
         let stage_extra = |st: &storage::Storage, batch: &mut rocksdb::WriteBatch| -> Result<(), String> {
             st.stage_meta(batch, "tip_hash", &back_to).map_err(|e| e.to_string())?;
             staged_shielded.stage_into(st, batch)
@@ -2514,14 +2605,17 @@ pub fn validate_tx_inputs(
     spent_set:    Option<&mut HashSet<([u8; 32], u32)>>,
     block_height: u64,
 ) -> Result<u64, String> {
+    // A lookup error is a read failure, reported as such (no verdict).
+    let lookup = |txid: &[u8; 32], idx: u32| utxo_lookup(txid, idx).map_err(ViewError);
     validate_tx_inputs_classified(
-        tx, utxo_lookup, spent_set, block_height, core::activation::hardening_activation_height(),
+        tx, &lookup, spent_set, block_height, core::activation::hardening_activation_height(),
     )
-    .map_err(|f| f.reason)
+    .map_err(TxFailure::into_message)
 }
 
-/// Prevout lookup used by the input validation: `Ok(None)` = not found.
-type UtxoLookup<'a> = dyn Fn(&[u8; 32], u32) -> Result<Option<core::TxOutput>, String> + 'a;
+/// Prevout lookup used by the input validation: `Ok(None)` = not found, a
+/// read failure is a [`ViewError`] (no verdict, re-audit B1-T12).
+type UtxoLookup<'a> = dyn Fn(&[u8; 32], u32) -> Result<Option<core::TxOutput>, ViewError> + 'a;
 
 /// [`validate_tx_inputs`] with the failure classified and an explicit
 /// hardening activation height: script failures (the `script_sig` must
@@ -2538,7 +2632,7 @@ fn validate_tx_inputs_classified(
     block_height: u64,
     activation_height: u64,
 ) -> Result<u64, TxFailure> {
-    let witness = |reason: String| TxFailure { reason, witness: true };
+    let witness = TxFailure::witness;
     let mut total_in = 0u64;
 
     // C-R3-2: the intra-tx duplicate-outpoint check is UNCONDITIONAL.
@@ -2664,7 +2758,7 @@ pub fn validate_tx_in_block_with_maturity(
     let hardened = core::block_rules::rules_active_at(block.height, activation_height);
     let view: &storage::Storage = store;
     if hardened {
-        check_no_unspent_overwrite(view, tx)?;
+        check_no_unspent_overwrite(view, tx).map_err(TxFailure::into_message)?;
     }
     let same_block_coinbase = if hardened { block.transactions.first().map(|cb| cb.txid()) } else { None };
     let earlier: HashMap<([u8; 32], u32), core::TxOutput> = block.transactions[..cutoff]
@@ -2679,7 +2773,7 @@ pub fn validate_tx_in_block_with_maturity(
         tx, view, &earlier, spent_in_block, block.height, current_height, same_block_coinbase.as_ref(),
         activation_height,
     )
-    .map_err(|f| f.reason)
+    .map_err(TxFailure::into_message)
 }
 
 /// Standalone tx validation (no mempool context): the shared admission rules
