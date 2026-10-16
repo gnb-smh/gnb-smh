@@ -1,6 +1,7 @@
 //! The hardening block rules of `core::block_rules` (audit VAL-2, VAL-10,
-//! VAL-12, CRY-1) against independent implementations written from the
-//! specification (`common`), on two kinds of input selected by the first byte:
+//! VAL-12, CRY-1, re-audit B2-T10) against independent implementations
+//! written from the specification (`common`), on two kinds of input selected
+//! by the first byte:
 //!
 //! * an id list: the tagged Merkle root equals an RFC 6962-style recursive
 //!   reference, the legacy root equals Bitcoin's in-place `ComputeMerkleRoot`,
@@ -10,10 +11,13 @@
 //! * a block decoded from untrusted wire bytes (the attacker's path): wire
 //!   size, txids, wtxids, header roots, witness root, parents commitment and
 //!   the 80-byte coinbase commitment equal the references; the 64-byte rule
-//!   fires exactly on a 64-byte txid preimage; the coinbase-commitment verdict
-//!   equals a reference parser of the commitment; no check panics. Then the
-//!   block is REPAIRED with the references (coinbase shape, commitment, root)
-//!   so the library must accept it unless a transaction is 64 bytes, and one
+//!   fires exactly on a 64-byte txid preimage; the distinct-parents rule
+//!   fires exactly on a repeated parent id; the coinbase-commitment verdict
+//!   equals a reference parser of the commitment, and the body verdict
+//!   (parents, then 64-byte, then commitment) the reference order; no check
+//!   panics. Then the block is REPAIRED with the references (coinbase shape,
+//!   each parent listed once, commitment, root) so the library must accept
+//!   it unless a transaction is 64 bytes or the block is too large, and one
 //!   input-chosen field the commitment covers is altered: the library must
 //!   reject it (and must keep accepting when only the miner's extra bytes
 //!   change with the root recomputed).
@@ -155,6 +159,12 @@ fn ref_commitment_verdict(b: &Block) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Reference of the distinct-parents rule (B2-T10, docs/CONSENSUS.md "Parent
+/// list"): no id appears twice in the header's parent list.
+fn ref_parents_distinct(parents: &[[u8; 32]]) -> bool {
+    parents.iter().enumerate().all(|(i, p)| !parents[..i].contains(p))
+}
+
 fn lib_commitment_kind(r: Result<(), &'static str>) -> Result<(), &'static str> {
     r.map_err(|e| {
         if e.contains("invalid coinbase format") {
@@ -218,10 +228,23 @@ fn check_block(b: &Block) {
     );
     assert_eq!(lib_commitment_kind(br::check_coinbase_commitment(b)), ref_commitment_verdict(b), "commitment verdict");
 
+    // B2-T10: from the activation a header lists each parent once. The body
+    // rules run in the specified order: parents, the 64-byte rule, then the
+    // coinbase commitment.
+    let distinct = ref_parents_distinct(&b.header.parents);
+    assert_eq!(br::check_parents_distinct(&b.header.parents).is_ok(), distinct, "distinct-parents rule");
+    let body = br::check_hardened_body(b);
+    if !distinct {
+        assert_eq!(body, Err("duplicate parent"), "body verdict (repeated parent)");
+    } else if b.transactions.iter().any(|t| ref_tx_wire(t, ref_is_coinbase(t)).len() == 64) {
+        assert!(body.unwrap_err().starts_with("64-byte"), "body verdict (64-byte transaction)");
+    } else {
+        assert_eq!(lib_commitment_kind(body), ref_commitment_verdict(b), "body verdict (commitment)");
+    }
+
     // The full context-free checks never panic; below the activation they are
     // a no-op, and the genesis height is never subject to them.
     let _ = br::check_block_hardened_at(b, 0);
-    let _ = br::check_hardened_body(b);
     let _ = b.validate_structure_without_pow_at(0);
     let _ = b.validate_structure_without_pow_at(activation::NEVER);
     if !ref_active(b.height, activation::NEVER) {
@@ -250,6 +273,15 @@ fn check_repaired(b: &Block, ctl: &mut Input) {
         }
     }
     r.height = r.height.max(1);
+    // B2-T10: each parent listed once (first occurrences, in order).
+    let mut seen: Vec<[u8; 32]> = Vec::with_capacity(r.header.parents.len());
+    r.header.parents.retain(|p| {
+        if seen.contains(p) {
+            return false;
+        }
+        seen.push(*p);
+        true
+    });
     let commit = |r: &mut Block, extra: &[u8]| {
         let mut ss = ref_commitment(r.height, &r.header.parents, &r.transactions).to_vec();
         ss.extend_from_slice(extra);
