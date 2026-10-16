@@ -226,17 +226,22 @@ fn th_finish(th_r: &[u8; 32]) -> [u8; 32] {
 }
 
 /// Session keys from both shared secrets, salted with the transcript.
+/// CRY-4: retain non-Copy cleaning owners from HKDF expansion through stream
+/// drop. This follows the cleanup-before-free principle in Bitcoin Core v29.0
+/// `secure_allocator::deallocate`:
+/// https://github.com/bitcoin/bitcoin/blob/v29.0/src/support/allocators/secure.h#L34-L39
+/// `Zeroizing` does not lock pages or erase every compiler-created copy.
 fn derive_keys(ss_mlkem: &[u8], ss_x25519: &[u8; 32], th_r: &[u8; 32])
-    -> ([u8; STREAM_KEY_SIZE], [u8; STREAM_KEY_SIZE])
+    -> (Zeroizing<[u8; STREAM_KEY_SIZE]>, Zeroizing<[u8; STREAM_KEY_SIZE]>)
 {
     let mut ikm = Zeroizing::new(Vec::with_capacity(ss_mlkem.len() + 32));
     ikm.extend_from_slice(ss_mlkem);
     ikm.extend_from_slice(ss_x25519);
     let hk = Hkdf::<Sha256>::new(Some(th_r), &ikm);
-    let mut k_i2r = [0u8; STREAM_KEY_SIZE];
-    let mut k_r2i = [0u8; STREAM_KEY_SIZE];
-    hk.expand(LABEL_I2R, &mut k_i2r).expect("HKDF output length is valid");
-    hk.expand(LABEL_R2I, &mut k_r2i).expect("HKDF output length is valid");
+    let mut k_i2r = Zeroizing::new([0u8; STREAM_KEY_SIZE]);
+    let mut k_r2i = Zeroizing::new([0u8; STREAM_KEY_SIZE]);
+    hk.expand(LABEL_I2R, k_i2r.as_mut()).expect("HKDF output length is valid");
+    hk.expand(LABEL_R2I, k_r2i.as_mut()).expect("HKDF output length is valid");
     (k_i2r, k_r2i)
 }
 
@@ -360,7 +365,7 @@ where
             write_msg(&mut socket, &Finish { ed_sig, pq_sig }).await?;
 
             let (k_i2r, k_r2i) = derive_keys(ss_m.as_bytes(), &ss_x, &th_r);
-            Ok((peer_id, KyberStream::new(socket, TxStream::new(k_i2r), RxStream::new(k_r2i))))
+            Ok((peer_id, KyberStream::new(socket, TxStream::from_owned_key(k_i2r), RxStream::from_owned_key(k_r2i))))
         })
     }
 }
@@ -421,7 +426,86 @@ where
             self.pins.check_and_pin(&peer_id, fingerprint(&init.pq_pk)).map_err(PqUpgradeError::Pin)?;
 
             let (k_i2r, k_r2i) = derive_keys(ss_m.as_bytes(), &ss_x, &th_r);
-            Ok((peer_id, KyberStream::new(socket, TxStream::new(k_r2i), RxStream::new(k_i2r))))
+            Ok((peer_id, KyberStream::new(socket, TxStream::from_owned_key(k_r2i), RxStream::from_owned_key(k_i2r))))
         })
+    }
+}
+
+#[cfg(test)]
+mod key_ownership_tests {
+    use super::*;
+    use zeroize::Zeroize;
+
+    // Independent one-block HKDF-SHA256 fixture: Python stdlib hmac/hashlib,
+    // extract(salt=[0x33;32], ikm=[0x11;32] || [0x22;32]), then expand each
+    // literal direction label with counter byte 0x01. No production helper
+    // generated these expected bytes.
+    const I2R: [u8; STREAM_KEY_SIZE] = [
+        0x4c, 0xa4, 0xd1, 0x00, 0x6a, 0xe9, 0xb1, 0x25,
+        0x87, 0x74, 0x21, 0xbc, 0x76, 0x32, 0x27, 0x4e,
+        0xa4, 0x69, 0xc9, 0x7c, 0xeb, 0x75, 0xf4, 0x1c,
+        0x18, 0xc0, 0xe6, 0xed, 0x39, 0x29, 0xa2, 0xb1,
+    ];
+    const R2I: [u8; STREAM_KEY_SIZE] = [
+        0xef, 0xd7, 0xe8, 0x91, 0x04, 0x9e, 0xae, 0x42,
+        0xa4, 0xf3, 0x74, 0xf1, 0x2c, 0x1e, 0xc0, 0x0e,
+        0xad, 0xe6, 0x34, 0x4b, 0xbd, 0x2a, 0xe0, 0x78,
+        0x05, 0xe7, 0x63, 0xab, 0x59, 0x49, 0xec, 0xc9,
+    ];
+
+    #[test]
+    fn derived_keys_preserve_fixed_hkdf_vector_and_direction() {
+        let (i2r, r2i) = derive_keys(&[0x11; 32], &[0x22; 32], &[0x33; 32]);
+        assert_eq!(i2r.as_slice(), I2R);
+        assert_eq!(r2i.as_slice(), R2I);
+        assert_ne!(i2r.as_slice(), r2i.as_slice());
+    }
+
+    #[test]
+    fn derived_keys_require_drop_cleanup() {
+        fn needs_drop<T>(_: &T) -> bool { std::mem::needs_drop::<T>() }
+        let (i2r, r2i) = derive_keys(&[0x11; 32], &[0x22; 32], &[0x33; 32]);
+        let cleanup = (needs_drop(&i2r), needs_drop(&r2i));
+        assert_eq!(cleanup, (true, true), "both derived keys need cleaning owners");
+    }
+
+    #[test]
+    fn derived_keys_can_be_wiped_while_alive() {
+        let (mut i2r, mut r2i) = derive_keys(&[0x11; 32], &[0x22; 32], &[0x33; 32]);
+        i2r.zeroize();
+        assert_eq!(i2r.as_slice(), [0; STREAM_KEY_SIZE]);
+        assert_eq!(r2i.as_slice(), R2I, "the other owner remains independent");
+        r2i.zeroize();
+        assert_eq!(r2i.as_slice(), [0; STREAM_KEY_SIZE]);
+    }
+
+    #[test]
+    fn session_key_owners_are_not_copy() {
+        // A Copy type would have both candidates, making `_` ambiguous at
+        // compile time. Guard the exact protected key type and stream owners;
+        // derived_keys_require_drop_cleanup separately checks actual results.
+        trait AmbiguousIfCopy<A> { fn check() {} }
+        impl<T> AmbiguousIfCopy<()> for T {}
+        impl<T: Copy> AmbiguousIfCopy<u8> for T {}
+        let _ = <Zeroizing<[u8; STREAM_KEY_SIZE]> as AmbiguousIfCopy<_>>::check;
+        let _ = <TxStream as AmbiguousIfCopy<_>>::check;
+        let _ = <RxStream as AmbiguousIfCopy<_>>::check;
+    }
+
+    #[test]
+    fn stream_owners_wipe_keys_and_counters_while_alive() {
+        // Keep exercising the public array-taking compatibility constructors.
+        let mut tx = TxStream::new(I2R);
+        let mut rx = RxStream::new(I2R);
+        let ciphertext = tx.seal(b"synthetic payload", b"fixed aad").unwrap();
+        assert_eq!(rx.open(&ciphertext, b"fixed aad").unwrap(), b"synthetic payload");
+        assert_eq!((tx.counter(), rx.counter()), (1, 1));
+        tx.zeroize();
+        assert_eq!(tx.key.as_slice(), [0; STREAM_KEY_SIZE]);
+        assert_eq!(tx.counter(), 0);
+        assert_eq!(rx.key.as_slice(), I2R);
+        rx.zeroize();
+        assert_eq!(rx.key.as_slice(), [0; STREAM_KEY_SIZE]);
+        assert_eq!(rx.counter(), 0);
     }
 }

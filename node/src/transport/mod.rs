@@ -18,7 +18,7 @@ pub mod stream;
 pub mod upgrade;
 
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, aead::{Aead, KeyInit, Payload}};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -34,12 +34,17 @@ pub const TAG_SIZE: usize = 16;
 /// Sender half of a one-directional cipher stream. The key is wiped on drop.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct TxStream {
-    key:     [u8; STREAM_KEY_SIZE],
+    key:     Zeroizing<[u8; STREAM_KEY_SIZE]>,
     counter: u64,
 }
 
 impl TxStream {
     pub fn new(key: [u8; STREAM_KEY_SIZE]) -> Self {
+        Self::from_owned_key(Zeroizing::new(key))
+    }
+
+    // Move the derived key's cleaning owner directly into the stream.
+    fn from_owned_key(key: Zeroizing<[u8; STREAM_KEY_SIZE]>) -> Self {
         Self { key, counter: 0 }
     }
 
@@ -50,7 +55,7 @@ impl TxStream {
             return Err(TransportError::CounterExhausted);
         }
         let nonce = counter_to_nonce(self.counter);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(self.key.as_ref()));
         let ct = cipher.encrypt(
             Nonce::from_slice(&nonce),
             Payload { msg: plaintext, aad },
@@ -66,12 +71,17 @@ impl TxStream {
 /// The key is wiped on drop.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct RxStream {
-    key:          [u8; STREAM_KEY_SIZE],
+    key:          Zeroizing<[u8; STREAM_KEY_SIZE]>,
     next_counter: u64,
 }
 
 impl RxStream {
     pub fn new(key: [u8; STREAM_KEY_SIZE]) -> Self {
+        Self::from_owned_key(Zeroizing::new(key))
+    }
+
+    // Move the derived key's cleaning owner directly into the stream.
+    fn from_owned_key(key: Zeroizing<[u8; STREAM_KEY_SIZE]>) -> Self {
         Self { key, next_counter: 0 }
     }
 
@@ -80,7 +90,7 @@ impl RxStream {
             return Err(TransportError::CounterExhausted);
         }
         let nonce = counter_to_nonce(self.next_counter);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(self.key.as_ref()));
         let pt = cipher.decrypt(
             Nonce::from_slice(&nonce),
             Payload { msg: ciphertext, aad },
