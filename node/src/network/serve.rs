@@ -41,9 +41,10 @@ use super::sync_rr::{self, SyncRequest, SyncResponse};
 use super::{SyncEntry, MAX_WIRE_GETHEADERS_LIMIT, MAX_WIRE_TIPS};
 
 /// Bytes of unwritten answers one peer may have before its requests are
-/// answered Busy. Room for a full block (`MAX_BLOCK_SIZE`, 1 MB) and a
-/// maximal GetHeaders answer several times over; Bitcoin Core's default
-/// `-maxsendbuffer` is 1000 kB.
+/// answered Busy. Room for a full block (`MAX_BLOCK_SIZE`, 1 MB, plus its
+/// PoWit section from the activation: at most 16 shares, 32 attestations
+/// and 4 equivocation proofs) and a maximal GetHeaders answer several times
+/// over; Bitcoin Core's default `-maxsendbuffer` is 1000 kB.
 pub const PER_PEER_SEND_BUDGET: usize = 4 * 1024 * 1024;
 /// Bytes of unwritten answers all peers together may have.
 pub const GLOBAL_SEND_BUDGET: usize = 64 * 1024 * 1024;
@@ -286,16 +287,18 @@ impl<R, C> Drop for ServeQueue<R, C> {
 /// and tips in the DAG. Every answer costs O(log n + limit):
 ///
 /// * GetBlock: the stored bytes as they are (the canonical
-///   `Block::to_wire_bytes` encoding every write path stores; Bitcoin Core
-///   likewise sends a stored block's raw bytes), with `blue_score` / `height`
+///   `Block::to_wire_bytes` encoding every write path stores, the PoWit
+///   section included from the activation; Bitcoin Core likewise sends a
+///   stored block's raw bytes), with `blue_score` / `height`
 ///   read from its header; `BlockNotFound` when pruned or unknown (the
 ///   requester tries another peer).
 /// * GetHeaders: at most `min(limit, MAX_WIRE_GETHEADERS_LIMIT)` entries
 ///   from the (blue_score, hash) index, with the DAG read lock held only to
 ///   copy them.
 /// * GetTips: `GhostDAG::tips_for_peers(MAX_WIRE_TIPS)` — the selected tip
-///   and the best valid tips by blue work, never a chain-disqualified one
-///   (B2-T7: every leaf used to be sent, and requesters refused more than
+///   and the best valid tips by blue work, never one that is
+///   chain-disqualified or off the PoWit finalized chain (B2-T7: every leaf
+///   used to be sent, and requesters refused more than
 ///   MAX_WIRE_TIPS). The locator is empty: no release reads it, and building
 ///   it walked the whole selected chain.
 ///

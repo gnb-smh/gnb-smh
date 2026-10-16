@@ -57,7 +57,7 @@ RPC_URL = os.environ.get("GNB_RPC_URL", "http://127.0.0.1:17210/")
 API_KEY = b""
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-ADDR = re.compile(r"^gnb1[qt][0-9a-f]{48}$")
+ADDR = re.compile(r"^(gnb1[qt][0-9a-f]{48}|gnb1[mn][0-9a-f]{72})$")
 IP_TEXT = re.compile(r"^[0-9a-fA-F:.]{2,45}$")
 
 
@@ -90,11 +90,17 @@ def _re(rx, what):
 
 
 HASH = _re(HEX64, "64-char lowercase hex")
-ADDRESS = _re(ADDR, "gnb1q/gnb1t address")
+ADDRESS = _re(ADDR, "gnb1q/gnb1t/gnb1m/gnb1n address")
 U32 = _int(0, 2**32 - 1)
 PAGE = _int(1, 100)
 OFFSET = _int(0, 10**9)
 RICH_OFFSET = _int(0, 10_000)
+
+
+def BOOL(v):
+    if not isinstance(v, bool):
+        raise ValueError("true or false expected")
+    return v
 
 # method -> (list of parameter checkers, cache seconds)
 ALLOWED = {
@@ -117,7 +123,12 @@ ALLOWED = {
     "getdagwindow":            ([_int(1, 300)], 3),
     "getaddresshistory":       ([ADDRESS, PAGE, OFFSET], 5),
     "getbalance":              ([ADDRESS], 5),
-    "getutxos":                ([ADDRESS, _int(1, 50)], 2),
+    "getutxos":                ([ADDRESS, _int(1, 500)], 2),
+    "getpowitinfo":            ([], 3),
+    "getblock":                ([HASH, BOOL], 10),
+    "getblockhash":            ([U32], 5),
+    "gettransaction":          ([HASH], 5),
+    "gettxstatus":             ([HASH], 3),
     # NET-12: served from the node's incremental holder index; the node
     # serves offsets up to analytics::MAX_RICHLIST_OFFSET = 10,000.
     "getrichlist":             ([PAGE, RICH_OFFSET], 60),

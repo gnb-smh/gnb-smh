@@ -130,6 +130,7 @@ pub fn mk_genesis(ts: u64) -> Block {
         },
         transactions: vec![coinbase("genesis", 0, vec![0u8; 20])],
         blue_score: 0, height: 0, shielded_transactions: Vec::new(),
+        powit: Default::default(),
     }
 }
 
@@ -222,6 +223,7 @@ pub fn mk_block_where(
         blue_score: height,
         height,
         shielded_transactions: Vec::new(),
+        powit: Default::default(),
     };
     commit_block(&mut b);
     loop {

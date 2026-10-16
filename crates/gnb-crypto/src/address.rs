@@ -33,6 +33,105 @@ pub fn normalize_legacy_address(s: &str) -> String {
     }
 }
 
+// ── Policy addresses (multisig / timelocks, core::policy) ─────────────────────
+
+/// Prefix of a mainnet policy address.
+pub const POLICY_MAINNET_PREFIX: &str = "gnb1m";
+/// Prefix of a testnet policy address.
+pub const POLICY_TESTNET_PREFIX: &str = "gnb1n";
+
+/// Address of a spend policy: `prefix ‖ hex(hash32 ‖ checksum4)`, where the
+/// checksum is `SHA3-256(SHA3-256(prefix ‖ hash))[..4]` — it covers the
+/// network prefix, so a mainnet policy address cannot be mistyped into a
+/// valid testnet one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PolicyAddress {
+    hash: [u8; 32],
+    network: Network,
+}
+
+impl PolicyAddress {
+    pub fn from_policy(policy: &crate::core::policy::SpendPolicy, network: Network) -> Self {
+        Self { hash: policy.hash(), network }
+    }
+
+    /// Address of any policy output script (`0x02 ‖ hash`), e.g. a policy tree.
+    pub fn from_script(script: &[u8], network: Network) -> Option<Self> {
+        if script.len() != crate::core::policy::POLICY_SPK_LEN || script[0] != crate::core::policy::POLICY_TAG {
+            return None;
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&script[1..]);
+        Some(Self { hash, network })
+    }
+
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    /// The 33-byte output script (`0x02 ‖ hash`).
+    pub fn script_pubkey(&self) -> Vec<u8> {
+        let mut s = vec![crate::core::policy::POLICY_TAG];
+        s.extend_from_slice(&self.hash);
+        s
+    }
+
+    fn prefix(network: Network) -> &'static str {
+        match network {
+            Network::Mainnet => POLICY_MAINNET_PREFIX,
+            Network::Testnet => POLICY_TESTNET_PREFIX,
+        }
+    }
+
+    fn checksum(network: Network, hash: &[u8; 32]) -> [u8; 4] {
+        let mut h = Sha3_256::new();
+        h.update(Self::prefix(network).as_bytes());
+        h.update(hash);
+        let outer = Sha3_256::digest(h.finalize());
+        [outer[0], outer[1], outer[2], outer[3]]
+    }
+
+    pub fn parse(s: &str) -> Result<Self, AddressError> {
+        let (network, payload) = if let Some(rest) = s.strip_prefix(POLICY_MAINNET_PREFIX) {
+            (Network::Mainnet, rest)
+        } else if let Some(rest) = s.strip_prefix(POLICY_TESTNET_PREFIX) {
+            (Network::Testnet, rest)
+        } else {
+            return Err(AddressError::BadPrefix);
+        };
+        if payload.len() != 72 {
+            return Err(AddressError::BadLength { got: payload.len(), expected: 72 });
+        }
+        let bytes = hex::decode(payload).map_err(|_| AddressError::BadHex)?;
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&bytes[..32]);
+        if bytes[32..36] != Self::checksum(network, &hash) {
+            return Err(AddressError::BadChecksum);
+        }
+        Ok(Self { hash, network })
+    }
+}
+
+impl std::fmt::Display for PolicyAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut payload = self.hash.to_vec();
+        payload.extend_from_slice(&Self::checksum(self.network, &self.hash));
+        write!(f, "{}{}", Self::prefix(self.network), hex::encode(payload))
+    }
+}
+
+/// Parse any payable address — single-key (`gnb1q…`/`gnb1t…`, Bloch forms
+/// accepted) or policy (`gnb1m…`/`gnb1n…`) — into its network and output
+/// script.
+pub fn destination_script(s: &str) -> Result<(Network, Vec<u8>), AddressError> {
+    if s.starts_with(POLICY_MAINNET_PREFIX) || s.starts_with(POLICY_TESTNET_PREFIX) {
+        let a = PolicyAddress::parse(s)?;
+        return Ok((a.network(), a.script_pubkey()));
+    }
+    let a = Address::parse(s)?;
+    Ok((a.network(), a.hash().to_vec()))
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -276,5 +375,31 @@ mod tests {
         let addr = Address::parse(s).unwrap();
         assert!(addr.is_mainnet());
         assert_eq!(addr.to_string(), s);
+    }
+
+    #[test]
+    fn policy_address_roundtrips_and_binds_the_network() {
+        use crate::core::policy::SpendPolicy;
+        let keys: Vec<Vec<u8>> = (0..2).map(|_| crate::crypto::generate_keypair().0).collect();
+        let p = SpendPolicy::new(2, keys, 0, 0).unwrap();
+        let main = PolicyAddress::from_policy(&p, Network::Mainnet);
+        let s = main.to_string();
+        assert!(s.starts_with("gnb1m") && s.len() == 5 + 72);
+        assert_eq!(PolicyAddress::parse(&s).unwrap(), main);
+        assert_eq!(destination_script(&s).unwrap(), (Network::Mainnet, p.script_pubkey()));
+        // Same hash and checksum under the testnet prefix: refused.
+        let swapped = s.replacen("gnb1m", "gnb1n", 1);
+        assert_eq!(PolicyAddress::parse(&swapped), Err(AddressError::BadChecksum));
+        // One flipped hex digit: refused.
+        let mut bad = s.clone().into_bytes();
+        bad[10] = if bad[10] == b'0' { b'1' } else { b'0' };
+        assert!(PolicyAddress::parse(std::str::from_utf8(&bad).unwrap()).is_err());
+    }
+
+    #[test]
+    fn destination_script_accepts_single_key_addresses() {
+        let a = Address::from_hash([7u8; 20], Network::Testnet);
+        assert_eq!(destination_script(&a.to_string()).unwrap(), (Network::Testnet, vec![7u8; 20]));
+        assert!(destination_script("gnb1zzz").is_err());
     }
 }

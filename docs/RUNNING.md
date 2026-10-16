@@ -212,17 +212,19 @@ As a client the node:
 As a server it answers on two background workers (not on the network
 event loop), each answer costing O(log n + limit) whatever the size of the
 DAG; requests wait in a bounded queue (32 per peer, 512 in all) served
-round-robin across peers. Per peer it answers at most 64 block requests in
-a burst then 8 per second, 16 header requests then 2 per second, 8 tips
+round-robin across peers. Per peer it answers at most 128 block requests in
+a burst then 24 per second, 16 header requests then 2 per second, 8 tips
 requests then one per 2 s, 4 address requests then one per 10 s, and 256
 requests per second in all; a peer whose unwritten answers reach 4 MiB, or
 all peers' 64 MiB, gets Busy without the answer being computed. Peers that
 connected to the node share only 48 MiB of that: the last 16 MiB is kept
 for peers it dialed and `--peer` peers. An answer
 not written within 15 s is dropped, and a connection keeps at most 64
-directed-sync streams open. Blocks are sent as stored. The tips answer is
-the selected tip and the best other valid tips by blue work, at most 256,
-never a chain-disqualified block; releases before this one sent every DAG
+directed-sync streams open. Blocks are sent as stored (from the PoWit
+activation with their PoWit section). The tips answer is the selected tip
+and the best other valid tips by blue work, at most 256, never a
+chain-disqualified block nor one whose chain misses the PoWit finalized
+checkpoint; releases before this one sent every DAG
 leaf, which upgraded requesters refuse without penalty. `getdaginfo` no
 longer walks the selected chain.
 

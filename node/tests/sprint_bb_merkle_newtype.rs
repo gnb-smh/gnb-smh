@@ -136,7 +136,7 @@ fn pow_hash_matches_hand_computed_reference() {
     reference.extend_from_slice(&0x1d00ffffu32.to_le_bytes());
     assert_eq!(header.pow_preimage(), reference);
 
-    assert_eq!(header.pow_hash(), gnb_smh::hash(&reference, 42));
+    assert_eq!(header.pow_hash(0), gnb_smh::hash(&reference, 42));
 }
 
 // ─── Type-safety spot check ────────────────────────────────────────────────

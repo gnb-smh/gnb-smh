@@ -138,6 +138,79 @@ fn main() {
             ("decoderawtransaction", serde_json::json!([params[0]]))
         }
 
+        "submitpowit" => {
+            require_params(params, 2, "submitpowit <kind 1|2|3> <hex>");
+            let kind: u64 = params[0].parse().unwrap_or(0);
+            ("submitpowititem", serde_json::json!([kind, params[1]]))
+        }
+        // Create a forward-secure PoWit witness key (KES). Password from
+        // GNB_WALLET_PASSWORD or a prompt; the seed never leaves the file
+        // unencrypted.
+        "witnesskeygen" => {
+            require_params(params, 1, "witnesskeygen <out.json> [depth=12]");
+            let depth: u8 = params.get(1).and_then(|d| d.parse().ok()).unwrap_or(gnb::core::kes::DEFAULT_DEPTH);
+            let pw = std::env::var("GNB_WALLET_PASSWORD").unwrap_or_else(|_| {
+                let a = read_password("Set witness key password: ");
+                let b = read_password("Confirm: ");
+                if *a != *b { eprintln!("Passwords don't match."); process::exit(1); }
+                a.as_str().to_owned()
+            });
+            let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+            rand::fill(&mut seed[..]);
+            let total = 1u64 << depth;
+            eprintln!("Generating {} epoch keys (hybrid ML-DSA-65 + Falcon-1024)...", total);
+            let signer = gnb::core::kes::KesSigner::generate(depth, *seed, |i| {
+                if i % 256 == 0 || i == total { eprint!("\r  {}/{}", i, total); }
+            }).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            eprintln!();
+            let file = gnb::core::kes::KesKeyFile::seal(&signer, &pw)
+                .unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            file.save(std::path::Path::new(params[0])).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            println!("Witness key saved: {}", params[0]);
+            println!("Witness id:        {}", hex::encode(signer.public().witness_id()));
+            println!("Epochs:            {} (depth {})", total, depth);
+            println!("Back up ONLY this file. Older copies of it can sign past epochs.");
+            return;
+        }
+        // Sign a PoWit link with a KES witness key and print the attestation
+        // hex (kind 2). For operators and tests: unlike the node's witness duty
+        // this does not consult a vote record, and it evolves the key file.
+        "powitattest" => {
+            require_params(params, 6,
+                "powitattest <witness-key.json> <mainnet|testnet> <src_slot> <src_hash> <tgt_slot> <tgt_hash> [activation]");
+            let pw = std::env::var("GNB_WALLET_PASSWORD").unwrap_or_else(|_| read_password("Witness key password: ").as_str().to_owned());
+            let path = std::path::Path::new(params[0]);
+            let file = gnb::core::kes::KesKeyFile::load(path).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            let mut signer = file.open(&pw).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            let chain = if params[1] == "testnet" { gnb::core::ChainId::Testnet } else { gnb::core::ChainId::Mainnet };
+            let cp = |slot: &str, h: &str| -> gnb::core::powit::Checkpoint {
+                let mut hash = [0u8; 32];
+                let b = hex::decode(h).unwrap_or_default();
+                if b.len() != 32 { eprintln!("hash must be 32 bytes hex"); process::exit(1); }
+                hash.copy_from_slice(&b);
+                gnb::core::powit::Checkpoint { height: slot.parse().unwrap_or(0), hash }
+            };
+            let (src, tgt) = (cp(params[2], params[3]), cp(params[4], params[5]));
+            let act: u64 = params.get(6).and_then(|a| a.parse().ok()).unwrap_or(0);
+            let p = gnb::core::powit::params_for(chain);
+            if tgt.height < act { eprintln!("target below activation"); process::exit(1); }
+            let e = p.epoch(act, tgt.height);
+            if e > signer.epoch() {
+                signer.evolve_to(e).unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
+                gnb::core::kes::KesKeyFile::seal(&signer, &pw).and_then(|f| f.save(path))
+                    .unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
+            } else if e < signer.epoch() {
+                eprintln!("epoch {} already erased (key is at {}): forward security", e, signer.epoch());
+                process::exit(1);
+            }
+            let att = gnb::core::powit::Attestation::sign(chain, src, tgt, &signer)
+                .unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
+            println!("{}", hex::encode(att.to_wire_bytes()));
+            return;
+        }
+        "getpowitinfo" | "powit" => {
+            ("getpowitinfo", serde_json::Value::Null)
+        }
         "getdaginfo" | "dag" => {
             ("getdaginfo", serde_json::Value::Null)
         }
@@ -166,6 +239,71 @@ fn main() {
         "send" => {
             require_params(params, 3, "send <wallet.json> <to_address> <amount_gnb> [--fee auto|GNB] [--max-fee GNB] [--yes] [--allow-unverified-inputs]");
             do_send(params, &rpc_target, stated_network);
+            return;
+        }
+
+        // ── Multisig / timelock policies (core::policy) ────────────
+        "pubkey" => {
+            require_params(params, 1, "pubkey <wallet.json>");
+            let kp = load_keypair(params[0]);
+            println!("{}", hex::encode(&kp.public_key));
+            return;
+        }
+        "policyaddress" => {
+            require_params(params, 2, POLICY_ADDRESS_USAGE);
+            do_policy_address(params);
+            return;
+        }
+        "policyspend" => {
+            require_params(params, 3, POLICY_SPEND_USAGE);
+            do_policy_spend(params);
+            return;
+        }
+        "policysign" => {
+            require_params(params, 2, "policysign <spend.json> <wallet.json>");
+            do_policy_sign(params);
+            return;
+        }
+        "policysend" => {
+            require_params(params, 1, "policysend <spend.json>");
+            do_policy_send(params, &rpc_target);
+            return;
+        }
+
+        // ── Bloch bridge vault (docs/SIDECHAIN-BLOCH.md) ──────────────
+        "vaultcreate" => {
+            require_params(params, 1, VAULT_CREATE_USAGE);
+            do_vault_create(params);
+            return;
+        }
+        "vaultlock" => {
+            require_params(params, 4, "vaultlock <wallet.json> <vault.json> <amount GNB> <0xL2address> [--fee GNB]");
+            do_vault_lock(params, &rpc_target);
+            return;
+        }
+        "vaultchecklock" => {
+            require_params(params, 2, "vaultchecklock <vault.json> <txid> [--min-conf N] [--min-amount SATS] [--finalized]");
+            do_vault_check_lock(params, &rpc_target);
+            return;
+        }
+        "vaultrelease" => {
+            require_params(params, 4, "vaultrelease <vault.json> <burn_id hex> <gnb1 recipient> <burn amount SATS> --utxo TXID:VOUT:SATS ... --out spend.json");
+            do_vault_release(params);
+            return;
+        }
+        "vaultcheckrelease" => {
+            require_params(params, 5, "vaultcheckrelease <vault.json> <spend.json> <burn_id hex> <gnb1 recipient> <burn amount SATS>");
+            do_vault_check_release(params, &rpc_target);
+            return;
+        }
+        "vaultrecover" => {
+            require_params(params, 3, "vaultrecover <vault.json> <gnb1 destination> <amount GNB> --utxo TXID:VOUT:SATS ... --out spend.json");
+            do_vault_recover(params);
+            return;
+        }
+        "vaultutxos" => {
+            require_params(params, 1, "vaultutxos <vault.json>");
+            do_vault_utxos(params, &rpc_target);
             return;
         }
 
@@ -775,6 +913,374 @@ fn checked_destination(destination: &str, source: &str) -> Result<String, &'stat
 fn parse_send_utxos(rows: &[serde_json::Value]) -> Result<Vec<(Vec<u8>, u32, gnb::core::TxOutput)>, String> {
     Ok(gnb::wallet::send::parse_utxo_rows(&serde_json::json!({ "utxos": rows }))?
         .into_iter().map(|u| (u.txid.to_vec(), u.index, u.output)).collect())
+}
+
+const POLICY_ADDRESS_USAGE: &str =
+    "policyaddress <m> <pubkey-hex|file>... [--after HEIGHT] [--older BLOCKS] [--testnet]";
+const POLICY_SPEND_USAGE: &str =
+    "policyspend <policy-hex|file> <to_address> <amount_gnb> --utxo TXID:VOUT:SATS [--utxo ...] \
+     [--fee 0.0005] [--locktime HEIGHT] [--next-height N] --out spend.json";
+
+fn load_keypair(path: &str) -> gnb::wallet::Keypair {
+    let password = read_password("Wallet password: ");
+    let p = std::path::Path::new(path);
+    match gnb::wallet::Keypair::load_encrypted(p, &password) {
+        Ok(kp) => kp,
+        Err(e2) => match gnb::wallet::Wallet::load_encrypted(p, &password) {
+            Ok(w) => w.into_keypair(),
+            Err(e1) => die(&format!("Failed to load wallet: {} (keystore v2) / {} (keyfile v1)", e2, e1)),
+        },
+    }
+}
+
+/// A hex argument, or the trimmed contents of a file holding the hex.
+fn hex_arg(arg: &str) -> Vec<u8> {
+    let text = if std::path::Path::new(arg).is_file() {
+        std::fs::read_to_string(arg).unwrap_or_else(|e| die(&format!("read {}: {}", arg, e)))
+    } else {
+        arg.to_string()
+    };
+    hex::decode(text.trim()).unwrap_or_else(|_| die(&format!("not hex (or a file of hex): {}", arg)))
+}
+
+fn flag_value<'a>(params: &[&'a str], flag: &str) -> Option<&'a str> {
+    params.windows(2).find(|w| w[0] == flag).map(|w| w[1])
+}
+
+fn do_policy_address(params: &[&str]) {
+    let m: u8 = params[0].parse().unwrap_or_else(|_| die("m must be a number"));
+    let mut keys = Vec::new();
+    let mut i = 1;
+    while i < params.len() {
+        match params[i] {
+            "--after" | "--older" => i += 2,
+            "--testnet" => i += 1,
+            k => { keys.push(hex_arg(k)); i += 1; }
+        }
+    }
+    let after: u32 = flag_value(params, "--after").map(|v| v.parse().unwrap_or_else(|_| die("--after: height"))).unwrap_or(0);
+    let older: u32 = flag_value(params, "--older").map(|v| v.parse().unwrap_or_else(|_| die("--older: blocks"))).unwrap_or(0);
+    let network = if params.contains(&"--testnet") { gnb::address::Network::Testnet } else { gnb::address::Network::Mainnet };
+    let policy = gnb::core::policy::SpendPolicy::new(m, keys, after, older)
+        .unwrap_or_else(|e| die(&format!("invalid policy: {}", e)));
+    println!("address: {}", gnb::address::PolicyAddress::from_policy(&policy, network));
+    println!("policy:  {}", hex::encode(policy.encode()));
+    println!("{}-of-{}{}{}", policy.threshold, policy.pubkeys.len(),
+        if after > 0 { format!(", spendable from height {}", after) } else { String::new() },
+        if older > 0 { format!(", each deposit spendable {} blocks after it confirms", older) } else { String::new() });
+    println!("Keep the policy hex: it is needed to spend, and the address alone does not reveal it.");
+}
+
+fn do_policy_spend(params: &[&str]) {
+    let policy = gnb::core::policy::SpendPolicy::decode(&hex_arg(params[0]))
+        .unwrap_or_else(|e| die(&format!("invalid policy: {}", e)));
+    let (network, to_script) = gnb::address::destination_script(params[1])
+        .unwrap_or_else(|_| die("invalid destination address"));
+    let amount = bloch_to_sats(params[2]);
+    let fee = gnb::wallet::parse_bloch_satoshis(flag_value(params, "--fee").unwrap_or("0.0005"))
+        .unwrap_or_else(|m| die(m));
+    let locktime: u32 = flag_value(params, "--locktime")
+        .map(|v| v.parse().unwrap_or_else(|_| die("--locktime: height"))).unwrap_or(policy.after);
+    let out = flag_value(params, "--out").unwrap_or_else(|| die("--out spend.json is required"));
+    let inputs: Vec<([u8; 32], u32, u64)> = params.windows(2).filter(|w| w[0] == "--utxo").map(|w| {
+        let parts: Vec<&str> = w[1].split(':').collect();
+        if parts.len() != 3 { die("--utxo must be TXID:VOUT:SATS"); }
+        let txid: [u8; 32] = hex::decode(parts[0]).ok().and_then(|v| v.try_into().ok())
+            .unwrap_or_else(|| die("--utxo: TXID must be 32-byte hex"));
+        (txid,
+         parts[1].parse().unwrap_or_else(|_| die("--utxo: VOUT")),
+         parts[2].parse().unwrap_or_else(|_| die("--utxo: SATS")))
+    }).collect();
+    let mut spend = gnb::wallet::policy_spend::PolicySpend::new(network, policy, &inputs, to_script, amount, fee, locktime)
+        .unwrap_or_else(|e| die(&e));
+    apply_next_height(&mut spend, params);
+    std::fs::write(out, spend.to_json().unwrap_or_else(|e| die(&e)))
+        .unwrap_or_else(|e| die(&format!("write {}: {}", out, e)));
+    let input_total: u64 = inputs.iter().map(|i| i.2).sum();
+    println!("Unsigned spend written to {}", out);
+    println!("Pays {} GNB to {}; fee {} GNB; needs {} signature(s)",
+        amount as f64 / 1e8, params[1], (input_total - spend.outputs_total()) as f64 / 1e8, spend.policy.threshold);
+}
+
+fn print_spend_summary(spend: &gnb::wallet::policy_spend::PolicySpend) {
+    println!("Network:  {:?}", spend.network);
+    for (i, o) in spend.tx.outputs.iter().enumerate() {
+        let kind = if o.script_pubkey == spend.locking_script() { " (change, back to the policy)" } else { "" };
+        println!("Output {}: {} GNB → script {}{}", i, o.value as f64 / 1e8, hex::encode(&o.script_pubkey), kind);
+    }
+    println!("Locktime: {}", spend.tx.locktime);
+    println!("Signed by keys {:?} of {}-of-{}", spend.signers(), spend.policy.threshold, spend.policy.pubkeys.len());
+}
+
+fn do_policy_sign(params: &[&str]) {
+    let text = std::fs::read_to_string(params[0]).unwrap_or_else(|e| die(&format!("read {}: {}", params[0], e)));
+    let mut spend = gnb::wallet::policy_spend::PolicySpend::from_json(&text).unwrap_or_else(|e| die(&e));
+    print_spend_summary(&spend);
+    println!("Check the outputs above before signing.");
+    let kp = load_keypair(params[1]);
+    // Sighash v2 (version 1) or v3 (version 3, from the hardening
+    // activation): the spend file fixes which.
+    let idx = spend.sign_digest(&kp.public_key, |d, v| kp.sign_tx_digest(d, v)).unwrap_or_else(|e| die(&e));
+    std::fs::write(params[0], spend.to_json().unwrap_or_else(|e| die(&e)))
+        .unwrap_or_else(|e| die(&format!("write {}: {}", params[0], e)));
+    println!("Signed as key {}; {} of {} signatures present.", idx, spend.signers().len(), spend.policy.threshold);
+}
+
+fn do_policy_send(params: &[&str], target: &RpcTarget) {
+    let text = std::fs::read_to_string(params[0]).unwrap_or_else(|e| die(&format!("read {}: {}", params[0], e)));
+    let spend = gnb::wallet::policy_spend::PolicySpend::from_json(&text).unwrap_or_else(|e| die(&e));
+    print_spend_summary(&spend);
+    let tx = spend.finalize().unwrap_or_else(|e| die(&e));
+    let raw = hex::encode(tx.to_wire_bytes(true));
+    println!("TXID: {}", hex::encode(tx.txid()));
+    match rpc_call(target, "sendrawtransaction", &serde_json::json!([raw])) {
+        Ok(result) => {
+            if let Some(err) = result.get("error").and_then(|e| e.as_str()) {
+                die(&format!("Broadcast rejected: {}", err));
+            }
+            println!("Broadcast OK");
+        }
+        Err(e) => die(&format!("Broadcast failed: {}", e)),
+    }
+}
+
+// ── Bloch bridge vault ──────────────────────────────────────────────────────
+
+const VAULT_CREATE_USAGE: &str = "vaultcreate <out.json> --release K <signer keys...> --recovery R <cold keys...> --older BLOCKS [--testnet]";
+
+fn load_vault(path: &str) -> gnb::bridge::Vault {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("read {}: {}", path, e)));
+    let v: gnb::bridge::Vault = serde_json::from_str(&text).unwrap_or_else(|e| die(&format!("vault file: {}", e)));
+    v.tree().unwrap_or_else(|e| die(&e));
+    v
+}
+
+fn utxo_args(params: &[&str]) -> Vec<([u8; 32], u32, u64)> {
+    params.windows(2).filter(|w| w[0] == "--utxo").map(|w| {
+        let parts: Vec<&str> = w[1].split(':').collect();
+        if parts.len() != 3 { die("--utxo must be TXID:VOUT:SATS"); }
+        let txid: [u8; 32] = hex::decode(parts[0]).ok().and_then(|v| v.try_into().ok())
+            .unwrap_or_else(|| die("--utxo: TXID must be 32-byte hex"));
+        (txid, parts[1].parse().unwrap_or_else(|_| die("--utxo: VOUT")),
+         parts[2].parse().unwrap_or_else(|_| die("--utxo: SATS")))
+    }).collect()
+}
+
+fn do_vault_create(params: &[&str]) {
+    let out = params[0];
+    let network = if params.contains(&"--testnet") { gnb::address::Network::Testnet } else { gnb::address::Network::Mainnet };
+    let section = |flag: &str| -> (u8, Vec<Vec<u8>>) {
+        let start = params.iter().position(|p| *p == flag).unwrap_or_else(|| die(VAULT_CREATE_USAGE));
+        let t: u8 = params.get(start + 1).and_then(|v| v.parse().ok()).unwrap_or_else(|| die(VAULT_CREATE_USAGE));
+        let keys = params[start + 2..].iter().take_while(|p| !p.starts_with("--")).map(|k| hex_arg(k)).collect();
+        (t, keys)
+    };
+    let (k, signers) = section("--release");
+    let (r, cold) = section("--recovery");
+    let older: u32 = flag_value(params, "--older").and_then(|v| v.parse().ok()).unwrap_or_else(|| die(VAULT_CREATE_USAGE));
+    let v = gnb::bridge::Vault::create(network, k, signers, r, cold, older).unwrap_or_else(|e| die(&e));
+    std::fs::write(out, serde_json::to_string_pretty(&v).unwrap()).unwrap_or_else(|e| die(&format!("write {}: {}", out, e)));
+    println!("Vault written to {}", out);
+    println!("Address:  {}", v.address);
+    println!("Release:  {}-of-{} signer keys, no timelock", v.release_threshold, v.signers);
+    println!("Recovery: {}-of-{} cold keys, {} blocks after each deposit", v.recovery_threshold, v.recovery_keys, v.recovery_older);
+    println!("Publish this file once; signers and users check the address against it.");
+}
+
+fn do_vault_lock(params: &[&str], target: &RpcTarget) {
+    let vault = load_vault(params[1]);
+    let amount = bloch_to_sats(params[2]);
+    let l2: [u8; 20] = hex::decode(params[3].trim_start_matches("0x")).ok().and_then(|v| v.try_into().ok())
+        .unwrap_or_else(|| die("L2 address must be 0x + 40 hex digits"));
+    let fee = gnb::wallet::parse_bloch_satoshis(flag_value(params, "--fee").unwrap_or("0.0005")).unwrap_or_else(|m| die(m));
+    let keypair = load_keypair(params[0]);
+    let utxos = rpc_call(target, "getutxos", &serde_json::json!([keypair.address, 50]))
+        .unwrap_or_else(|e| die(&format!("RPC: {}", e)));
+    // Only outputs spendable in the next block (mature coinbase outputs).
+    let next_height = next_block_height(target);
+    let available: Vec<(Vec<u8>, u32, gnb::core::TxOutput)> =
+        gnb::wallet::send::spendable_utxo_rows(&utxos, next_height)
+            .unwrap_or_else(|m| die(&m)).0
+            .into_iter().map(|u| (u.txid.to_vec(), u.index, u.output)).collect();
+    let outputs = gnb::bridge::lock_outputs(&vault.script().unwrap(), amount, l2);
+    let mut fee = fee;
+    let mut tx = None;
+    for _ in 0..16 {
+        let built = gnb::wallet::TxBuilder::build_outputs(&keypair, &available, outputs.clone(), fee, next_height)
+            .unwrap_or_else(|e| die(&e));
+        let min = gnb::core::tokenomics::min_tx_fee_sat(built.to_wire_bytes(true).len());
+        if fee >= min { tx = Some(built); break; }
+        fee = fee.max(min);
+    }
+    let tx = tx.unwrap_or_else(|| die("could not settle the fee"));
+    // Self-check: the transaction parses back as a lock of this vault.
+    let lock = gnb::bridge::parse_lock(&tx.outputs, &vault.script().unwrap(), 0).unwrap_or_else(|e| die(&e));
+    let raw = hex::encode(tx.to_wire_bytes(true));
+    let res = rpc_call(target, "sendrawtransaction", &serde_json::json!([raw]))
+        .unwrap_or_else(|e| die(&format!("broadcast: {}", e)));
+    if let Some(e) = res.get("error").and_then(|e| e.as_str()) { die(&format!("broadcast rejected: {}", e)); }
+    println!("{}", serde_json::json!({
+        "lock_txid": hex::encode(tx.txid()), "lock_vout": 0, "amount": lock.amount.to_string(),
+        "l2_recipient": format!("0x{}", hex::encode(lock.l2_recipient)), "fee": fee.to_string(),
+    }));
+}
+
+/// Read a transaction from the node: (outputs, block_height, confirmations).
+fn fetch_tx(target: &RpcTarget, txid: &str) -> Result<(Vec<gnb::core::TxOutput>, u64, u64, String), String> {
+    let r = rpc_call(target, "gettransaction", &serde_json::json!([txid]))?;
+    if let Some(e) = r.get("error").and_then(|e| e.as_str()) { return Err(e.to_string()); }
+    let outs = r["transaction"]["outputs"].as_array().ok_or("no outputs")?.iter().map(|o| {
+        Ok(gnb::core::TxOutput {
+            value: o["value"].as_str().ok_or("value")?.parse::<u64>().map_err(|e| e.to_string())?,
+            script_pubkey: hex::decode(o["script_pubkey"].as_str().ok_or("script")?).map_err(|e| e.to_string())?,
+        })
+    }).collect::<Result<Vec<_>, String>>()?;
+    Ok((outs, r["block_height"].as_u64().unwrap_or(0), r["confirmations"].as_u64().unwrap_or(0),
+        r["block_hash"].as_str().unwrap_or("").to_string()))
+}
+
+fn do_vault_check_lock(params: &[&str], target: &RpcTarget) {
+    let vault = load_vault(params[0]);
+    let txid = params[1];
+    let min_conf: u64 = flag_value(params, "--min-conf").and_then(|v| v.parse().ok()).unwrap_or(1000);
+    let min_amount: u64 = flag_value(params, "--min-amount").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let want_final = params.contains(&"--finalized");
+    let verdict = (|| -> Result<serde_json::Value, String> {
+        let (outs, height, conf, block_hash) = fetch_tx(target, txid)?;
+        let lock = gnb::bridge::parse_lock(&outs, &vault.script()?, min_amount)?;
+        let deep = if want_final {
+            let p = rpc_call(target, "getpowitinfo", &serde_json::Value::Null)?;
+            let fh = p["finalized"]["block_height"].as_u64().ok_or("PoWit finality not available")?;
+            height <= fh
+        } else {
+            conf >= min_conf
+        };
+        Ok(serde_json::json!({
+            "ok": deep, "reason": if deep { "" } else { "not deep enough yet" },
+            "lock_txid": txid, "lock_vout": 0, "amount": lock.amount.to_string(),
+            "l2_recipient": format!("0x{}", hex::encode(lock.l2_recipient)),
+            "block_hash": block_hash, "block_height": height, "confirmations": conf,
+        }))
+    })();
+    match verdict {
+        Ok(v) => println!("{}", v),
+        Err(e) => println!("{}", serde_json::json!({ "ok": false, "reason": e, "lock_txid": txid })),
+    }
+}
+
+fn burn_id_arg(s: &str) -> [u8; 32] {
+    hex::decode(s.trim_start_matches("0x")).ok().and_then(|v| v.try_into().ok())
+        .unwrap_or_else(|| die("burn id must be 32-byte hex"))
+}
+
+fn do_vault_release(params: &[&str]) {
+    let vault = load_vault(params[0]);
+    let burn = burn_id_arg(params[1]);
+    let (network, recipient) = gnb::address::destination_script(params[2]).unwrap_or_else(|_| die("invalid recipient"));
+    let burn_amount: u64 = params[3].parse().unwrap_or_else(|_| die("burn amount in base units"));
+    let out = flag_value(params, "--out").unwrap_or_else(|| die("--out spend.json is required"));
+    let inputs = utxo_args(params);
+    let tree = vault.tree().unwrap_or_else(|e| die(&e));
+    // The vault pays exactly the burned amount: payout = burn - marker - fee.
+    // Learn the fee with a probe, then build the real spend with it.
+    let build = |payout: u64, fee: u64| gnb::wallet::policy_spend::PolicySpend::new_branch(
+        network, tree.clone(), gnb::bridge::RELEASE_BRANCH, &inputs,
+        gnb::bridge::release_outputs(&recipient, payout, &burn), fee, 0);
+    let probe_payout = burn_amount.checked_sub(gnb::bridge::MARKER_VALUE + 1).unwrap_or_else(|| die("burn too small"));
+    let probe = build(probe_payout, 0).unwrap_or_else(|e| die(&e));
+    // The probe's change returns to the vault, so inputs − outputs is its fee.
+    let in_total: u64 = inputs.iter().map(|i| i.2).sum();
+    let fee = in_total.saturating_sub(probe.outputs_total());
+    let payout = burn_amount.checked_sub(gnb::bridge::MARKER_VALUE + fee).unwrap_or_else(|| die("burn smaller than marker + fee"));
+    let mut spend = build(payout, fee).unwrap_or_else(|e| die(&e));
+    apply_next_height(&mut spend, params);
+    let check = gnb::bridge::check_release(&spend.tx.outputs,
+        &inputs.iter().map(|i| (i.2, vault.script().unwrap())).collect::<Vec<_>>(),
+        &vault.script().unwrap(), &recipient, burn_amount, &burn);
+    if let Err(e) = check { die(&format!("built release fails its own check: {}", e)); }
+    std::fs::write(out, spend.to_json().unwrap_or_else(|e| die(&e))).unwrap_or_else(|e| die(&format!("write {}: {}", out, e)));
+    println!("Unsigned release written to {} (payout {} sats, fee {} sats, needs {} signatures)",
+        out, payout, fee, spend.policy.threshold);
+}
+
+fn do_vault_check_release(params: &[&str], target: &RpcTarget) {
+    let vault = load_vault(params[0]);
+    let text = std::fs::read_to_string(params[1]).unwrap_or_else(|e| die(&format!("read {}: {}", params[1], e)));
+    let spend = gnb::wallet::policy_spend::PolicySpend::from_json(&text).unwrap_or_else(|e| die(&e));
+    let burn = burn_id_arg(params[2]);
+    let verdict = (|| -> Result<serde_json::Value, String> {
+        let (_, recipient) = gnb::address::destination_script(params[3]).map_err(|_| "invalid recipient")?;
+        let burn_amount: u64 = params[4].parse().map_err(|_| "burn amount")?;
+        if spend.tree.as_ref().map(|(_, b)| *b) != Some(gnb::bridge::RELEASE_BRANCH)
+            || spend.locking_script() != vault.script()? {
+            return Err("not a release-branch spend of this vault".into());
+        }
+        // Inputs as the signer's own node sees them.
+        let mut inputs = Vec::new();
+        for inp in &spend.tx.inputs {
+            let (outs, _, _, _) = fetch_tx(target, &hex::encode(inp.prev_txid))?;
+            let o = outs.get(inp.prev_index as usize).ok_or("input index out of range")?;
+            inputs.push((o.value, o.script_pubkey.clone()));
+        }
+        let fee = gnb::bridge::check_release(&spend.tx.outputs, &inputs, &vault.script()?, &recipient, burn_amount, &burn)?;
+        // Anti-replay: no output with this burn's marker may already exist.
+        let marker = gnb::bridge::release_marker(&burn);
+        let marker_addr = gnb::crypto::address_from_hash(&marker, vault.network() == gnb::address::Network::Testnet);
+        let seen = rpc_call(target, "getutxos", &serde_json::json!([marker_addr, 1]))?;
+        if seen.get("utxos").and_then(|u| u.as_array()).is_some_and(|a| !a.is_empty()) {
+            return Err("a release for this burn already exists on chain".into());
+        }
+        Ok(serde_json::json!({ "ok": true, "fee": fee.to_string(), "burn_marker": marker_addr }))
+    })();
+    match verdict {
+        Ok(v) => println!("{}", v),
+        Err(e) => println!("{}", serde_json::json!({ "ok": false, "reason": e })),
+    }
+}
+
+fn do_vault_recover(params: &[&str]) {
+    let vault = load_vault(params[0]);
+    let (network, dest) = gnb::address::destination_script(params[1]).unwrap_or_else(|_| die("invalid destination"));
+    let amount = bloch_to_sats(params[2]);
+    let out = flag_value(params, "--out").unwrap_or_else(|| die("--out spend.json is required"));
+    let spend = gnb::wallet::policy_spend::PolicySpend::new_branch(network, vault.tree().unwrap_or_else(|e| die(&e)),
+        gnb::bridge::RECOVERY_BRANCH, &utxo_args(params),
+        vec![gnb::core::TxOutput { value: amount, script_pubkey: dest }], 0, 0).unwrap_or_else(|e| die(&e));
+    let mut spend = spend;
+    apply_next_height(&mut spend, params);
+    std::fs::write(out, spend.to_json().unwrap_or_else(|e| die(&e))).unwrap_or_else(|e| die(&format!("write {}: {}", out, e)));
+    println!("Unsigned recovery written to {}: valid only {} blocks after each input confirmed; needs {} cold signature(s)",
+        out, vault.recovery_older, spend.policy.threshold);
+}
+
+fn do_vault_utxos(params: &[&str], target: &RpcTarget) {
+    let vault = load_vault(params[0]);
+    let r = rpc_call(target, "getutxos", &serde_json::json!([vault.address, 500]))
+        .unwrap_or_else(|e| die(&format!("RPC: {}", e)));
+    println!("{}", r);
+}
+
+/// `--next-height N` (the node's getdaginfo `next_block_height`) gives an
+/// offline spend the transaction version of that block: 3 / sighash v3
+/// at/after the hardening activation, 1 / sighash v2 below it. Without the
+/// flag the spend is version 1, valid only below the activation.
+fn apply_next_height(spend: &mut gnb::wallet::policy_spend::PolicySpend, params: &[&str]) {
+    if let Some(h) = flag_value(params, "--next-height") {
+        let h: u64 = h.parse().unwrap_or_else(|_| die("--next-height: block height"));
+        spend.target_height(h).unwrap_or_else(|e| die(&e));
+    } else {
+        eprintln!("note: no --next-height given; the spend is version 1 (sighash v2), valid only below \
+                   the hardening activation height {}",
+                  gnb::core::activation::hardening_activation_height_for_signer(spend.chain_id()));
+    }
+}
+
+/// The node's next block height (getdaginfo `next_block_height`).
+fn next_block_height(target: &RpcTarget) -> u64 {
+    let info = rpc_call(target, "getdaginfo", &serde_json::Value::Null)
+        .unwrap_or_else(|e| die(&format!("RPC: {}", e)));
+    info.get("next_block_height").and_then(|v| v.as_u64())
+        .unwrap_or_else(|| die("the node did not report next_block_height"))
 }
 
 fn require_params(params: &[&str], min: usize, usage: &str) {

@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use gnb::consensus::{BlockHash, ConsensusError, GhostDAG, MAX_MERGESET_SIZE};
+use gnb::consensus::{BlockHash, ConsensusError, GhostDAG, MERGESET_SIZE_LIMIT};
 use gnb::core::activation::NEVER;
 use gnb::core::GHOSTDAG_K;
 
@@ -85,15 +85,17 @@ fn profile(label: &str, activation: u64) {
             d.mergeset_blues.len() + d.mergeset_reds.len(), d.mergeset_blues.len(), d.mergeset_reds.len()),
         Err(e) => format!("rejected: {e}"),
     };
-    if hardened {
-        if side as usize >= MAX_MERGESET_SIZE {
-            assert_eq!(res.unwrap_err(), ConsensusError::MergesetTooLarge { limit: MAX_MERGESET_SIZE });
-        } else if n >= gnb::consensus::MERGE_DEPTH {
+    // This chain's mergeset limit (64, selected parent excluded) holds on
+    // both sides of the activation.
+    if side as usize > MERGESET_SIZE_LIMIT {
+        assert_eq!(res.unwrap_err(), ConsensusError::MergesetTooLarge { limit: MERGESET_SIZE_LIMIT });
+    } else if hardened {
+        if n >= gnb::consensus::MERGE_DEPTH {
             // Forked at genesis, below the merge-depth root.
             assert!(matches!(res, Err(ConsensusError::MergeDepthViolation { .. })));
         }
     } else {
-        let d = res.expect("pre-activation: no mergeset limit");
+        let d = res.expect("pre-activation: within the mergeset limit");
         assert_eq!(d.mergeset_blues.len() + d.mergeset_reds.len(), side as usize);
     }
 
@@ -102,7 +104,7 @@ fn profile(label: &str, activation: u64) {
     let mut max_merge = String::from("n/a");
     if hardened && n > 400 {
         let mut sc = chain[(n - 200) as usize];
-        for j in 0..(MAX_MERGESET_SIZE as u64 - 1) {
+        for j in 0..(MERGESET_SIZE_LIMIT as u64) {
             let h = hx(7, j);
             dag.add_block(h, vec![sc], 1, 1).unwrap();
             sc = h;
@@ -110,7 +112,7 @@ fn profile(label: &str, activation: u64) {
         let t = Instant::now();
         let d = dag.add_block(hx(8, 0), vec![chain[n as usize], sc], n + 1, 1).expect("maximal mergeset accepted");
         max_merge = format!("{:.2?} (blues {}, reds {})", t.elapsed(), d.mergeset_blues.len(), d.mergeset_reds.len());
-        assert_eq!(1 + d.mergeset_blues.len() + d.mergeset_reds.len(), MAX_MERGESET_SIZE);
+        assert_eq!(d.mergeset_blues.len() + d.mergeset_reds.len(), MERGESET_SIZE_LIMIT);
     }
 
     println!(
@@ -178,6 +180,7 @@ fn dag7_residual_deep_inserts_are_bounded_by_the_work_rule() {
                     timestamp: j, bits: POW_LIMIT_BITS, nonce: j,
                 },
                 transactions: vec![], blue_score: 0, height: 1, shielded_transactions: vec![],
+                powit: Default::default(),
             };
             (b.block_hash(), b)
         })
@@ -221,6 +224,7 @@ fn dag7_residual_deep_inserts_are_bounded_by_the_work_rule() {
             timestamp: n + 1, bits: POW_LIMIT_BITS, nonce: 0,
         },
         transactions: vec![], blue_score: 0, height: n + 1, shielded_transactions: vec![],
+        powit: Default::default(),
     };
     assert!(core.work_check(&child, &child.block_hash(), n, Instant::now(), &after).is_ok());
 

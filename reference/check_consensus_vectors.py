@@ -104,7 +104,10 @@ def check_constants(chk: Checker, c: dict) -> None:
     chk.eq("constants", "initial subsidy", gv.INITIAL_SUBSIDY_SAT, c["initial_subsidy_sat"])
     chk.eq("constants", "halving interval", gv.HALVING_INTERVAL, c["halving_interval"])
     chk.eq("constants", "max block size", gv.MAX_BLOCK_SIZE, c["max_block_size"])
-    chk.eq("constants", "max script", gv.MAX_SCRIPT_LEN, c["max_script_len"])
+    chk.eq("constants", "max script_sig", gv.MAX_SCRIPT_SIG_LEN, c["max_script_sig_len"])
+    chk.eq("constants", "max script_pubkey", gv.MAX_SCRIPT_PUBKEY_LEN, c["max_script_pubkey_len"])
+    chk.eq("constants", "powit height", gv.POWIT_HEIGHT, c["powit_height"])
+    chk.eq("constants", "witness commitment height", gv.WITNESS_COMMITMENT_HEIGHT, c["witness_commitment_height"])
     chk.eq("constants", "pow limit", gv.POW_LIMIT_BITS, c["pow_limit_bits"])
     chk.eq("constants", "hardened pow limit", gv.HARDENED_POW_LIMIT_BITS, c["hardened_pow_limit_bits"])
 
@@ -226,7 +229,6 @@ def check_block_vectors(chk: Checker) -> int:
         chk.eq(cid, "parents_commitment", d["parents_commitment"], mk.parents_commitment(b.header.parents).hex())
         chk.eq(cid, "subsidy", int(d["subsidy"]), gv.subsidy(b.height))
         chk.eq(cid, "wire_size", d["wire_size"], len(raw))
-        chk.eq(cid, "bincode_size", d["bincode_size"], gv.block_bincode_size(b))
 
         view = view_of(case["prevouts"])
         got, _ = verdict_of(lambda out: gv.validate_block(b, view, act, case["scope"], case["pow"], out))

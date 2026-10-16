@@ -326,7 +326,7 @@ impl RrCodec for BlochSyncCodec {
         T: AsyncRead + Unpin + Send,
     {
         let buf = read_raw_frame(io, MAX_FRAME).await?;
-        decode_response(&buf)
+        response_from_frame(&buf)
     }
 
     async fn write_request<T>(
@@ -557,6 +557,22 @@ pub fn decode_request(buf: &[u8]) -> io::Result<SyncRequest> {
     Ok(req)
 }
 
+/// A response frame as read off a substream. An empty one is a request the
+/// peer did not serve (its sync rate limiter dropped it, or it shut down):
+/// not a protocol violation. It is reported as a plain I/O failure, which is
+/// never penalized, so an honest peer is not graylisted for pacing us; the
+/// pull is retried. Anything else must decode and pass the bounds. (On the
+/// codec path `read_raw_frame` already reports an empty frame as
+/// `UnexpectedEof`, `check_nonempty_frame`; a server of this release answers
+/// `Busy` instead of dropping a request, NET-5.)
+pub fn response_from_frame(buf: &[u8]) -> io::Result<SyncResponse> {
+    if buf.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::ConnectionAborted,
+                                  "empty sync response (request not served)"));
+    }
+    decode_response(buf)
+}
+
 /// Decode + bounds-validate an inbound [`SyncResponse`]. Without this, a
 /// malicious peer answering our `GetHeaders` could return ~123,000
 /// `SyncEntry`s in one 4 MiB frame instead of the `MAX_WIRE_SYNC_ENTRIES`
@@ -710,13 +726,14 @@ pub const MAX_CONCURRENT_SYNC_STREAMS: usize = 64;
 // not eat into another.
 
 /// GetBlock bucket capacity (burst allowance) per peer.
-pub const SYNC_BUCKET_CAPACITY: u32 = 64;
-/// GetBlock refill rate per peer, tokens/second. At capacity 64 this allows a
-/// burst of 64 immediately, then a sustained 8 req/s — comfortably above what
-/// one honest IBD follower asks of one peer (at most `MAX_INFLIGHT_PER_PEER`
-/// in flight, spread over its peers) while bounding what a single hostile
-/// identity can sustain against us.
-const SYNC_BUCKET_REFILL_PER_SEC: u32 = 8;
+pub const SYNC_BUCKET_CAPACITY: u32 = 128;
+/// GetBlock refill rate per peer, tokens/second. At capacity 128 this allows
+/// a burst of 128 immediately, then a sustained 24 req/s. Measured on the
+/// mainnet line: at 8 req/s a fresh node pulling one block per request
+/// synced ~2 blocks/s. Each GetBlock is one bounded store read of stored
+/// bytes, and the send budgets (`network::serve`) bound what a peer that
+/// does not read can make the node hold.
+const SYNC_BUCKET_REFILL_PER_SEC: u32 = 24;
 /// GetHeaders per peer: burst 16, then 2/s. An honest follower asks one
 /// GetHeaders per 500-block batch it has fetched, per 30 s nudge and per
 /// tip claim it acts on.
@@ -2095,5 +2112,13 @@ mod tests {
             futures::executor::block_on(BlochSyncCodec.write_response(&SYNC_PROTOCOL, &mut out, resp.clone())).unwrap();
             assert_eq!(out.into_inner(), encode_frame(&resp).unwrap(), "len {len}");
         }
+    }
+
+    /// A peer that did not serve a request (empty frame) is not a protocol
+    /// violator; a truncated or garbage frame still is.
+    #[test]
+    fn unserved_request_is_not_a_wire_violation() {
+        assert_eq!(response_from_frame(&[]).unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(response_from_frame(&[0xFF; 3]).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -108,6 +108,7 @@ fn hardened_block(height: u64, parents: Vec<[u8; 32]>, txs: Vec<Transaction>) ->
         blue_score: height,
         height,
         shielded_transactions: vec![],
+        powit: Default::default(),
     };
     let c = block_rules::expected_coinbase_commitment(&b);
     let extra = std::mem::take(&mut b.transactions[0].inputs[0].script_sig);
@@ -136,6 +137,7 @@ fn legacy_block(r: &mut Rng) -> Block {
             proof: r.bytes(40),
             binding_sig: r.bytes(16),
         }],
+        powit: Default::default(),
     };
     b.header.merkle_root = b.body_merkle_root_at(activation::NEVER);
     b

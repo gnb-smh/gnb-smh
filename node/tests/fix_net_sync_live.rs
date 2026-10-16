@@ -1,6 +1,6 @@
 //! Live Phase 4 (package R2a) regressions: a real `NetworkNode` on loopback
 //! against a hand-built libp2p peer that speaks `/gnb/sync/1` with the node's
-//! transport (TCP + `KyberConfig` + the node's yamux settings) but answers
+//! transport (TCP + `PqConfig` + the node's yamux settings) but answers
 //! and requests whatever it likes.
 //!
 //! * B1-T2 / NET-10: the node sends every new peer GetPeers and GetTips. The
@@ -30,7 +30,8 @@ use gnb::network::{
     NetworkNode, SyncEntry,
 };
 use gnb::sync::peer_state::PeerStateTable;
-use gnb::transport::upgrade::KyberConfig;
+use gnb::transport::identity::{PeerPins, PqIdentity};
+use gnb::transport::upgrade::PqConfig;
 use libp2p::request_response::{self, Codec, ProtocolSupport};
 use libp2p::swarm::{Swarm, SwarmEvent};
 use libp2p::{identity, tcp, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
@@ -101,11 +102,13 @@ impl Codec for AttackCodec {
 type Attacker = Swarm<request_response::Behaviour<AttackCodec>>;
 
 fn attacker_swarm(never_read: bool) -> Attacker {
+    let pq = Arc::new(PqIdentity::generate().expect("PQ identity"));
+    let pins = Arc::new(PeerPins::in_memory());
     SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
-            |keys: &identity::Keypair| -> Result<KyberConfig, Infallible> { Ok(KyberConfig::new(keys)) },
+            move |keys: &identity::Keypair| -> Result<PqConfig, Infallible> { Ok(PqConfig::new(keys, pq, pins)) },
             yamux_config,
         )
         .expect("tcp")
@@ -299,6 +302,7 @@ fn big_block(size: usize) -> Block {
         blue_score: 1,
         height: 1,
         shielded_transactions: Vec::new(),
+        powit: Default::default(),
     }
 }
 

@@ -32,7 +32,9 @@ use pex_validator::{
     PEX_BATCH_LIMIT, KNOWN_PEERS_CAP,
 };
 
-use crate::transport::upgrade::KyberConfig;
+use std::sync::Arc;
+use crate::transport::identity::{PeerPins, PqIdentity};
+use crate::transport::upgrade::PqConfig;
 
 pub const TOPIC_BLOCKS: &str = "gnb/blocks/1";
 pub const TOPIC_TXS:    &str = "gnb/txs/1";
@@ -264,7 +266,10 @@ pub fn gossip_disposition(msg: &NetworkMessage, validator_attached: bool, claim_
         // MEM-5 / NET-2 / NET-4 (audit): transactions are judged by the
         // processor (shared admission, signatures last, per-connection budget —
         // `mempool::relay`) BEFORE gossipsub relays them, exactly like blocks.
-        NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. } => {
+        // PoWit items (shares, attestations, equivocation proofs) are relayed
+        // like transactions: only once the processor admitted them.
+        NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. }
+        | NetworkMessage::NewPowitItem { .. } => {
             if validator_attached { DeliverDeferred } else { Deliver(GossipVerdict::Accept) }
         }
         // Tip claims: consumed locally (author-attributed), never relayed —
@@ -387,6 +392,10 @@ pub enum NetworkMessage {
         timestamp:  u64,
     },
     VersionAck,
+    /// PoWit item (witness share, attestation or equivocation proof), relayed
+    /// like a transaction: only after the node validated it. Appended last so
+    /// older peers decode it as malformed (ignored), never as another variant.
+    NewPowitItem { id: [u8; 32], kind: u8, data: Vec<u8> },
 }
 
 
@@ -409,6 +418,7 @@ impl NetworkMessage {
         match self {
             NetworkMessage::NewBlock { .. } => "NewBlock",
             NetworkMessage::NewTransaction { .. } => "NewTransaction",
+            NetworkMessage::NewPowitItem { .. } => "NewPowitItem",
             NetworkMessage::PeerTip { .. } => "PeerTip",
             NetworkMessage::PeerExchange { .. } => "PeerExchange",
             NetworkMessage::PeerRequest => "PeerRequest",
@@ -486,6 +496,9 @@ pub const MAX_WIRE_LOCATOR: usize = 64;
 pub const MAX_WIRE_GETHEADERS_LIMIT: u32 = 2000;
 /// Max user_agent length in a Version handshake.
 pub const MAX_WIRE_USER_AGENT_LEN: usize = 128;
+/// Largest PoWit gossip item: an equivocation proof (two attestations, each
+/// with an 8 KiB key and signature bound) fits well inside.
+pub const MAX_WIRE_POWIT_ITEM: usize = 40 * 1024;
 /// Max peer_id string length in a PeerTip (base58 libp2p PeerIds are ~52 chars).
 pub const MAX_WIRE_PEER_ID_LEN: usize = 128;
 
@@ -585,7 +598,8 @@ pub fn decode_wire_message(data: &[u8]) -> Result<NetworkMessage, WireDecodeErro
     match bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {
         Ok(canonical) if canonical == data => Ok(msg),
         _ => Err(WireDecodeError::NonCanonical {
-            relayable: matches!(msg, NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. }),
+            relayable: matches!(msg, NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. }
+                                     | NetworkMessage::NewPowitItem { .. }),
         }),
     }
 }
@@ -615,6 +629,14 @@ fn validate_wire_bounds(msg: &NetworkMessage) -> Result<(), WireDecodeError> {
         NetworkMessage::NewTransaction { tx_data, .. } => {
             if tx_data.len() > MAX_WIRE_BYTES {
                 return Err(Bounds("tx_data larger than MAX_WIRE_BYTES"));
+            }
+        }
+        NetworkMessage::NewPowitItem { data, kind, .. } => {
+            if data.len() > MAX_WIRE_POWIT_ITEM {
+                return Err(Bounds("PoWit item larger than MAX_WIRE_POWIT_ITEM"));
+            }
+            if !(1..=3).contains(kind) {
+                return Err(Bounds("unknown PoWit item kind"));
             }
         }
         NetworkMessage::PeerTip { peer_id, .. } => {
@@ -1043,6 +1065,10 @@ pub struct NetworkNode {
     pub peer_id: PeerId,
     pub config:  NetworkConfig,
     local_key:   identity::Keypair,
+    /// Hybrid ML-DSA-65 ‖ Falcon-1024 transport identity.
+    pq_identity: Arc<PqIdentity>,
+    /// Per-peer PQ key pins (trust on first use).
+    pq_pins:     Arc<PeerPins>,
     control_rx:  Option<mpsc::Receiver<NetworkControl>>,
     peer_events: Option<mpsc::Sender<PeerEvent>>,
 }
@@ -1054,7 +1080,13 @@ impl NetworkNode {
         let local_key = load_or_create_identity(&key_path)?;
         let peer_id   = PeerId::from(local_key.public());
         info!("P2P identity: {} ({})", peer_id, key_path.display());
-        Ok(Self { peer_id, config, local_key, control_rx: None, peer_events: None })
+        let pq_path = config.data_dir.join("p2p_pq_identity.bin");
+        let pq_identity = Arc::new(PqIdentity::load_or_create(&pq_path)
+            .map_err(NetworkError::StartFailed)?);
+        info!("P2P PQ identity fingerprint: {}", hex::encode(pq_identity.fingerprint()));
+        let pq_pins = Arc::new(PeerPins::load(&config.data_dir.join("p2p_pq_pins.json"))
+            .map_err(NetworkError::StartFailed)?);
+        Ok(Self { peer_id, config, local_key, pq_identity, pq_pins, control_rx: None, peer_events: None })
     }
 
     /// Accept [`NetworkControl`] requests from the processor on `rx`.
@@ -1227,19 +1259,21 @@ impl NetworkNode {
         let enable_mdns = self.config.enable_mdns;
         let archive = self.config.archive;
 
+        let (pq_tcp, pins_tcp) = (self.pq_identity.clone(), self.pq_pins.clone());
+        let (pq_ws, pins_ws) = (self.pq_identity.clone(), self.pq_pins.clone());
         let mut swarm = SwarmBuilder::with_existing_identity(self.local_key.clone())
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),
-                |keys: &identity::Keypair| -> Result<KyberConfig, std::convert::Infallible> {
-                    Ok(KyberConfig::new(keys))
+                move |keys: &identity::Keypair| -> Result<PqConfig, std::convert::Infallible> {
+                    Ok(PqConfig::new(keys, pq_tcp, pins_tcp))
                 },
                 yamux_config,
             )
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?
             .with_websocket(
-                |keys: &identity::Keypair| -> Result<KyberConfig, std::convert::Infallible> {
-                    Ok(KyberConfig::new(keys))
+                move |keys: &identity::Keypair| -> Result<PqConfig, std::convert::Infallible> {
+                    Ok(PqConfig::new(keys, pq_ws, pins_ws))
                 },
                 yamux_config,
             )
@@ -2030,7 +2064,8 @@ impl NetworkNode {
                     }
                     let (topic, topic_name) = match &msg {
                         NetworkMessage::NewBlock { .. }        => (block_t.clone(), "blocks"),
-                        NetworkMessage::NewTransaction { .. }  => (tx_t.clone(),    "txs"),
+                        NetworkMessage::NewTransaction { .. }
+                        | NetworkMessage::NewPowitItem { .. }  => (tx_t.clone(),    "txs"),
                         _                                      => (sync_t.clone(),  "sync"),
                     };
                     if let Ok(data) = bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {
@@ -3830,6 +3865,103 @@ mod tests {
         }
         assert!(work[1] <= work[0] + 8, "per-request work grew with the DAG: {work:?}");
         assert!(work[1] < 1_000, "per-request work is not O(log n + limit): {work:?}");
+    }
+
+    /// PoWit finality (the mainnet line's checkpoint, `GhostDAG::set_finalized`):
+    /// with the checkpoint a fixed distance below the tip, serving GetTips
+    /// still does not grow with the DAG (the finality walk is bounded by
+    /// that distance and shared by the tips), and a tip that forks below the
+    /// checkpoint is not advertised: it can never be selected or merged by a
+    /// template, so advertising it only made every requester fetch it.
+    #[test]
+    fn get_tips_with_a_finalized_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::storage::Storage::open(&dir.path().join("db")).unwrap());
+        let mut work = Vec::new();
+        for n in [300u32, 3_000] {
+            let mut d = chain_dag(n);
+            // A stale sibling of block 1, far below the checkpoint.
+            d.add_block(hh(1_000_000), vec![hh(0)], 1, 1).unwrap();
+            // Another tip, off block n - 10 (above the checkpoint).
+            d.add_block(hh(2_000_000), vec![hh(n - 10)], u64::from(n), 1).unwrap();
+            d.set_finalized(hh(n - 50), u64::from(n - 50));
+            let dag = std::sync::Arc::new(parking_lot::RwLock::new(d));
+            let before = dag.read().query_visits();
+            let resp = served(&dag, &store, sync_rr::SyncRequest::GetTips);
+            work.push(dag.read().query_visits() - before);
+            let back = sync_rr::decode_response(&sync_rr::encode_frame(&resp).unwrap()).expect("decodes at the requester");
+            let sync_rr::SyncResponse::Tips { tips, .. } = back else { panic!("expected Tips") };
+            assert_eq!(tips.iter().map(|t| t.hash).collect::<Vec<_>>(), vec![hh(n), hh(2_000_000)]);
+        }
+        assert!(work[1] <= work[0] + 4, "GetTips work grew with the DAG under finality: {work:?}");
+        assert!(work[0] < 100, "GetTips is not O(log n + limit + finality distance): {work:?}");
+    }
+
+    /// Blocks from the PoWit activation carry the PoWit section in their
+    /// wire encoding (the mainnet line's 45c9c97: `Block::wire_size` counts
+    /// it). GetBlock serves the stored bytes as they are (B2-T6); the frame
+    /// written must be byte-identical to the one the old path (decode the
+    /// stored block, encode it again) produced, be charged its exact length,
+    /// and decode at the requester to the same block, PoWit section included.
+    #[test]
+    fn powit_blocks_are_served_as_their_exact_stored_frames() {
+        use crate::core::{powit::PowitBody, witness_share::WitnessShare, Block, BlockHeader, MerkleRoot, Transaction, TxInput, TxOutput};
+        use libp2p::request_response::Codec as _;
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::storage::Storage::open(&dir.path().join("db")).unwrap());
+        let dag = std::sync::Arc::new(parking_lot::RwLock::new(crate::consensus::GhostDAG::with_k(10)));
+        let activation = crate::core::powit_height();
+        for height in [activation - 1, activation, activation + 7] {
+            let powit = PowitBody {
+                shares: (0..3u8)
+                    .map(|i| WitnessShare { attested: [i; 32], witness: [0x44; 20], payout: vec![0x76; 25], bits: 0x1f00_ffff, nonce: u64::from(i) << 40 })
+                    .collect(),
+                attestations: Vec::new(),
+                evidence: Vec::new(),
+            };
+            let txs = vec![Transaction {
+                version: 1,
+                inputs: vec![TxInput { prev_txid: [0; 32], prev_index: u32::MAX, script_sig: height.to_le_bytes().to_vec(), sequence: u32::MAX }],
+                outputs: vec![TxOutput { value: 50, script_pubkey: vec![0xCD; 20] }],
+                locktime: 0,
+            }];
+            let block = Block {
+                header: BlockHeader { version: 1, parents: vec![[0x11; 32]], merkle_root: MerkleRoot::ZERO, timestamp: 1_000 + height, bits: 0x2100_ffff, nonce: 9 },
+                transactions: txs,
+                blue_score: height + 3,
+                height,
+                shielded_transactions: Vec::new(),
+                powit,
+            };
+            let active = crate::core::powit_active(height);
+            assert_eq!(block.wire_size(), block.to_wire_bytes().len(), "h {height}");
+            store.put_block_body(&block).unwrap();
+            let hash = block.block_hash();
+            let req = sync_rr::SyncRequest::GetBlock { block_hash: hash };
+            let resp = served(&dag, &store, req.clone());
+            // The old serving path: decode the stored block, encode it again.
+            let old = sync_rr::SyncResponse::Block {
+                block_hash: hash,
+                blue_score: block.blue_score,
+                height,
+                block_data: store.get_block(&hash).unwrap().unwrap().to_wire_bytes(),
+            };
+            assert_eq!(resp, old, "h {height}: stored bytes differ from the re-encoding");
+            let mut out = futures::io::Cursor::new(Vec::new());
+            futures::executor::block_on(sync_rr::BlochSyncCodec.write_response(&sync_rr::SYNC_PROTOCOL, &mut out, resp.clone()))
+                .unwrap();
+            let frame = out.into_inner();
+            assert_eq!(frame, sync_rr::encode_frame(&old).unwrap(), "h {height}: frame");
+            assert_eq!(serve::charge_for(&resp), frame.len(), "h {height}: charge");
+            // The requester.
+            let back = sync_rr::decode_response(&frame).expect("decodes");
+            sync_rr::check_response(&req, &back).expect("bound to its request");
+            let sync_rr::SyncResponse::Block { block_data, .. } = back else { panic!("expected Block") };
+            let got = Block::from_wire_bytes(&block_data).expect("block decodes");
+            assert_eq!(got.block_hash(), hash);
+            assert_eq!(got.powit, if active { block.powit.clone() } else { PowitBody::default() }, "h {height}");
+            assert_eq!(block_data.len(), block.wire_size());
+        }
     }
 
     /// The heartbeat's first tick comes one period after start-up, not at
