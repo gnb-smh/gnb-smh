@@ -29,6 +29,7 @@
 #   undo_decode       UndoData stored encoding (legacy and extended)
 #   keystore_decode   keyfile v1/v2 and keystore v2/v3 JSON parse + decrypt (fast KDF)
 #   address_parse     Address::parse / parse_for_network vs a reference parser
+#   descriptor_json   Public descriptor requests, canonical pool round trips and network isolation
 #   sync_rr_codec     /gnb/sync/1 frames and the libp2p codec (bounds, canonicality, read cap)
 #   accept_dag        accept_block on small DAGs: arrival-order independence
 #   sync_decode       /gnb/sync/1 decode_request / decode_response
@@ -101,6 +102,13 @@ pqcrypto-internals = { path = "../../crates/pqcrypto-internals" }
 [profile.release]
 debug = 1
 overflow-checks = true
+
+[[bin]]
+name = "descriptor_json"
+path = "fuzz_targets/descriptor_json.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "tx_parse"

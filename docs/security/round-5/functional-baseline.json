@@ -1,8 +1,6 @@
 {
   "schema": 1,
   "test_commit": "80bdfb5",
-  "baseline_source": "366e75fb90ace89db3434ce935b7c9de3582c13c",
-  "baseline_tree_equals_r5_base": true,
   "exit_code": 1,
   "positive_control": "getbalance on descriptor address returns zero",
   "failure": "getdescriptorinfo: unknown method: \"getdescriptorinfo\" (code=None, http=200)",
@@ -23,5 +21,8 @@
       "path": "/private/tmp/gnb-security-target-r4-integration/debug/gnb-cli",
       "sha256": "7555d4e3c970f6bc1bae0a0c4f87b29fce9623b4aa06cee3568f50c2ae3cf47f"
     }
-  }
+  },
+  "baseline_driver_start_revision": "2cb99803160b51d6d428f2c5be26a3b3b88e2ce7",
+  "baseline_manifest": "/private/tmp/gnb-r4-integration/results.json",
+  "production_equivalence": "Diff of driver-start revision to R5 base changes address oracle, WASM wrapper and node test support only; no node/CLI or gnb-crypto library production source differs. The saved binary run is not relabeled as a later-head build."
 }

@@ -50,6 +50,18 @@ reference implementation of their own:
 | `policy_witness_decode` | `PolicyWitness::decode`, `SpendPolicy::decode` | no panic; an accepted witness or policy re-encodes to the same bytes; a witness fits `MAX_SCRIPT_SIG_LEN` |
 | `script_sig_verify` | `Transaction::parse_script_sig`, `crypto::verify_canonical` | no panic; an accepted witness is exactly `build_script_sig` of its parts |
 
+Round 5 adds `descriptor_json`, exercising the strict public descriptor JSON
+parser and shared wallet API. Accepted descriptions must inspect identically;
+pool export/import must preserve the complete result; another requested network
+must be refused. Its twelve public JSON seeds (eight acceptance controls, four
+rejections) are replayed on stable by `node/tests/descriptor_seed_corpus.rs`.
+They are selected from `reference/descriptor_vectors.py`; no private keys are
+included. The separate CI step `reference/descriptor_differential.py` compares
+complete Rust/Python responses, including a deterministic generated campaign.
+Round trips alone are not evidence of independent script or checksum equality.
+The reusable fuzz workflow discovers this target from Cargo.toml; a configured
+target does not establish that a campaign has completed.
+
 The seed corpora of eight of the nine original targets are generated (and
 replayed on stable Rust) by `node/tests/parser_corpus_floor.rs`; those of
 `header_parse`, of the nine targets added in October 2026 and of the six
