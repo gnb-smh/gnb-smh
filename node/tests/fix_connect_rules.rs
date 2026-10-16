@@ -184,6 +184,31 @@ fn undo_capture_read_failure_fails_the_connect() {
     assert!(n.store.get_undo_data(&b.block_hash()).unwrap().is_none(), "no undo record written");
 }
 
+/// B1-T12 (review): the legacy direct apply
+/// (`reorg::apply_block_utxo_mutations`) captures each spent coin before
+/// `Storage::delete_utxo`, which deletes a row it cannot decode WITHOUT
+/// failing. With the capture skipping a failed read (`if let Ok(Some(..))`,
+/// the code before B1-T12) the apply wrote an undo record without the coin
+/// (a rollback could never restore it) and returned Ok. It must fail and
+/// write no undo record. (The connect batch's capture, guarded by
+/// `undo_capture_read_failure_fails_the_connect`, is followed by a deletion
+/// that re-reads the row through the same overlay read and fails with the
+/// same error, so a skip there is not observable without fault injection.)
+#[test]
+fn direct_apply_undo_capture_read_failure_fails_the_apply() {
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let fund = ([0xC4u8; 32], 0u32, out(5_000_000, &k.spk));
+    let n = node_with(&genesis, std::slice::from_ref(&fund));
+    let tx = signed_spend(&k, &[(fund.0, 0)], vec![out(4_900_000, &[0x9A; 20])]);
+    let b = mk_block(&n, vec![gh], vec![coinbase("t12-direct", core::tokenomics::block_subsidy_sat(1) + 100_000, vec![0x9B; 20]), tx]);
+    corrupt_row(&n, "utxo", &utxo_row_key(&fund.0, 0), &[0xFF, 0xFF, 0xFF]);
+    let err = gnb::reorg::apply_block_utxo_mutations(&n.store, &b).expect_err("the spent coin cannot be captured");
+    assert!(err.contains("get_utxo failed"), "{err}");
+    assert!(n.store.get_undo_data(&b.block_hash()).unwrap().is_none(), "no undo record written");
+}
+
 /// B1-T12: a coinbase-height row that cannot be read must never look like
 /// "not a coinbase". Before the fix (`.ok().flatten()`, and a row of the
 /// wrong length read as absent) the maturity check was skipped and a block
@@ -507,4 +532,57 @@ fn producers_follow_the_maturity_rule_of_the_next_block_height() {
     // A transaction spending no coinbase reports no coinbase height.
     let _g = activation::scoped_override(next);
     assert_eq!(admission::coinbase_height_for_wallets(&f.store, &[0x77; 32], next).unwrap(), None);
+}
+
+/// B1-T14 (review), the template self-check call site
+/// (`template::build_block_template` -> `self_check`): from the activation, a
+/// pooled spend of a coinbase that is 100 selected-chain blocks deep but only
+/// 51 header heights deep (case "inflated coinbase header") is mature for
+/// the next block. Admission accepts it, and the template must include it:
+/// a template still comparing header heights would evict it from the
+/// mempool at every template, so this node would never mine it.
+#[test]
+fn template_includes_a_spend_mature_by_selected_chain_depth_from_the_activation() {
+    let k = key();
+    let f = maturity_fixture(&k, 50, 1, 100, 5);
+    let next = f.header_height;
+    assert_eq!(next, 101);
+    let _g = activation::scoped_override(1);
+    // The template's DAG: a chain whose tip, at DAG height 100 (so the next
+    // header height is 101), has a body stored that passes the hardening
+    // block rules (an eligible template parent).
+    let mut d = gnb::consensus::GhostDAG::with_default_k();
+    let id = |i: u32| {
+        let mut x = [0x7Du8; 32];
+        x[..4].copy_from_slice(&i.to_le_bytes());
+        x
+    };
+    d.add_genesis(id(0), 1_000);
+    for i in 1..100u32 {
+        d.add_block(id(i), vec![id(i - 1)], 1_000 + i as u64, 1).unwrap();
+    }
+    let mut tip = core::Block {
+        header: core::BlockHeader {
+            version: 1, parents: vec![id(99)], merkle_root: core::MerkleRoot::ZERO,
+            timestamp: 1_100, bits: core::GENESIS_BITS, nonce: 0,
+        },
+        transactions: vec![coinbase("t14-template-tip", subsidy(100), vec![0xC9; 20])],
+        blue_score: 100,
+        height: 100,
+        shielded_transactions: vec![],
+    };
+    commit_block(&mut tip);
+    f.store.put_block_body(&tip).unwrap();
+    d.add_block(tip.block_hash(), vec![id(99)], 1_100, 1).unwrap();
+    let dag = std::sync::Arc::new(parking_lot::RwLock::new(d));
+
+    let (_, spend) = maturity_spend(&k, &f);
+    let mempool = gnb::mempool::Mempool::new();
+    let txid = admission::admit(&f.store, &mempool, spend.clone(), &AdmissionPolicy::relay(next))
+        .expect("mature by selected-chain depth: admitted");
+    let tmpl = template::build_block_template(&dag, &f.store, &mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
+    assert_eq!(tmpl.height, next);
+    assert!(tmpl.transactions.iter().any(|(t, _)| t.txid() == txid), "the template includes the spend");
+    assert_eq!(tmpl.evicted, 0);
+    assert!(mempool.get_tx(&txid).is_some(), "not evicted");
 }
