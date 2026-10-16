@@ -1313,6 +1313,16 @@ pub enum BlockOutcome {
     /// root not rejected before) and is stored, so the chain through it can
     /// be connected again (it is, once nothing else is missing).
     BodyRestored,
+    /// A wanted body (the answer to a directed pull of a block that waits
+    /// for one) was not stored: `accept_block`'s error, or "body not stored".
+    /// Judged like a first arrival's rejection (`verdict_for_accept_error`):
+    /// a body rejected for a witness-dependent reason, already rejected, or
+    /// lost to a node-local storage error says nothing about the peer that
+    /// served it (below the activation the block id does not commit to
+    /// non-coinbase `script_sig` bytes, so an honest peer may hold a
+    /// malleated copy). Only a failure the block id commits to (proof of
+    /// work, bits, height, timestamp, coinbase) is a `Reject`.
+    BodyRefused(String),
     /// Dropped before any proof-of-work evaluation.
     Dropped(DropReason),
     /// Context-free invalid (structure, or an orphan's proof of work).
@@ -1620,8 +1630,8 @@ impl BlockIngress {
             && !ctx.dag.read().is_body_pending(&hash);
         match result {
             _ if restored => BlockOutcome::BodyRestored,
-            Err(e) => BlockOutcome::Invalid(e),
-            Ok(_) => BlockOutcome::Invalid("body not stored".into()),
+            Err(e) => BlockOutcome::BodyRefused(e),
+            Ok(_) => BlockOutcome::BodyRefused("body not stored".into()),
         }
     }
 

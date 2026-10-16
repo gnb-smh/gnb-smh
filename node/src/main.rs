@@ -1345,6 +1345,15 @@ async fn main() {
                                 warn!("block {} rejected ({})", hex::encode(&block_hash[..8]), reason);
                                 network::GossipVerdict::Reject
                             }
+                            ingress::BlockOutcome::BodyRefused(reason) => {
+                                // B1-T2 review: a Reject here penalizes the
+                                // peer that served the body
+                                // (`directed_block_penalty`): only for what
+                                // the block id commits to.
+                                warn!("wanted body of block {} h={} not stored: {}",
+                                    hex::encode(&block_hash[..8]), height, reason);
+                                ingress::verdict_for_accept_error(&reason)
+                            }
                             ingress::BlockOutcome::Buffered { request, evidence, evicted } => {
                                 if evicted > 0 {
                                     debug!("orphan pool full: evicted {} oldest orphan(s)", evicted);

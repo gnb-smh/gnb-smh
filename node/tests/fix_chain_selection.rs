@@ -563,7 +563,11 @@ fn dag6_restored_body_is_bound_to_the_dag_height() {
     forged.height = 0;
     assert_eq!(forged.block_hash(), a10.block_hash(), "the id does not commit the height");
     match feed(&mut core, &f.x, &forged) {
-        BlockOutcome::Invalid(e) => assert!(e.contains("invalid height") && e.contains("expected h=10"), "{e}"),
+        BlockOutcome::BodyRefused(e) => {
+            assert!(e.contains("invalid height") && e.contains("expected h=10"), "{e}");
+            // No honest server sends a wrong height: its sender is penalized.
+            assert_eq!(ingress::verdict_for_accept_error(&e), gnb::network::GossipVerdict::Reject);
+        }
         other => panic!("a body with a forged height must be refused: {other:?}"),
     }
     assert!(accept::awaits_body(&f.x.dag, &f.x.store, &a10.block_hash()), "still wanted");
@@ -881,10 +885,29 @@ fn merge_witness_rejected_body_is_refetched_through_the_ingress_core() {
     assert_eq!(tip_meta(&n), gh);
     // Only the answer to the node's own pull is taken as a body.
     assert!(matches!(feed_as(&mut core, &n, &honest, None, false, honest.to_wire_bytes().len()), BlockOutcome::Known));
+    // B1-T2 review: neither the same rejected body nor another malleated
+    // one is held against the peer that served it (an honest peer may store
+    // a malleated copy: merged blocks are never tx-validated), so the
+    // directed-answer penalty (`directed_block_penalty`) never fires for it.
+    // Both used to be `Invalid`, which the processor maps to Reject.
     match feed(&mut core, &n, &bad) {
-        BlockOutcome::Invalid(e) => assert!(e.contains("already rejected"), "{e}"),
+        BlockOutcome::BodyRefused(e) => {
+            assert!(e.contains("already rejected"), "{e}");
+            assert_eq!(ingress::verdict_for_accept_error(&e), gnb::network::GossipVerdict::Ignore);
+        }
         other => panic!("the same rejected body again: {other:?}"),
     }
+    let mut other_bad = honest.clone();
+    other_bad.transactions[1].inputs[0].script_sig[120] ^= 0x01;
+    assert_eq!(other_bad.block_hash(), id);
+    match feed(&mut core, &n, &other_bad) {
+        BlockOutcome::BodyRefused(e) => {
+            assert!(e.contains("body rejected"), "{e}");
+            assert_eq!(ingress::verdict_for_accept_error(&e), gnb::network::GossipVerdict::Ignore, "{e}");
+        }
+        other => panic!("another malleated body: {other:?}"),
+    }
+    assert!(accept::awaits_body(&n.dag, &n.store, &id), "still waiting for a body");
     assert!(matches!(feed(&mut core, &n, &honest), BlockOutcome::BodyRestored));
     assert_eq!(tip_meta(&n), id);
     assert!(!accept::awaits_body(&n.dag, &n.store, &id));
@@ -1502,7 +1525,7 @@ fn sync_tip_first_with(
             }
             BlockOutcome::Dropped(r) => drops.push((h, r)),
             BlockOutcome::Known | BlockOutcome::PoolRefused | BlockOutcome::BodyRestored => {}
-            BlockOutcome::Invalid(e) => panic!("invalid: {e}"),
+            BlockOutcome::Invalid(e) | BlockOutcome::BodyRefused(e) => panic!("invalid: {e}"),
         }
         between(core);
     }
