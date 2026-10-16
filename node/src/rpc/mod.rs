@@ -698,6 +698,8 @@ fn utxo_audit_json(a: &crate::storage::utxo_audit::UtxoSetAudit) -> Value {
         "hash_type":            "sha3-256 over the UTXO rows in key order, domain gnb/utxo-set/v1",
         "undecodable_txouts":   a.undecodable,
         "applied_blocks":       a.applied_blocks,
+        "undo_off_chain":       a.undo_off_chain,
+        "chain_without_undo":   a.chain_without_undo,
         "chain_ok":             a.chain_ok(),
         "expected": {
             "carryover_sat":        a.carryover_sat.to_string(),

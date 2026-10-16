@@ -123,7 +123,7 @@ and answers:
 | `height`, `bestblock` | the applied tip and its chain position |
 | `txouts`, `total_amount_sat` | unspent outputs and their total |
 | `hash_serialized` | SHA3-256 of the UTXO rows in key order (domain `gnb/utxo-set/v1`; each row `u32 LE len ‖ key ‖ u32 LE len ‖ value`). Two nodes with the same set report the same hash; compare it across nodes at the same `bestblock` |
-| `applied_blocks`, `chain_ok` | blocks with an undo record (the connected chain, genesis excluded), and whether that is exactly `height` |
+| `applied_blocks`, `undo_off_chain`, `chain_without_undo`, `chain_ok` | blocks with an undo record (the connected chain, genesis excluded); of those, the ones not on the selected chain of `bestblock` (a stale record, whose subsidy would inflate `max_supply_sat`); the blocks of that chain without a record (their subsidy is missing from it; a chain whose walk stops at a missing DAG record counts one more); `chain_ok` when the records are exactly that chain (both counts 0 and `applied_blocks` = `height`) |
 | `expected.carryover_sat` | the genesis ledger (the verified Bloch carryover) |
 | `expected.subsidy_sat` | the subsidy of every connected block, at the header height its coinbase was checked against |
 | `expected.max_supply_sat` | carryover + subsidy: the most the set may hold |

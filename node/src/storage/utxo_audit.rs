@@ -14,7 +14,9 @@
 //! The applied chain is the set of blocks that hold an undo record (every
 //! connected block keeps one, pruned or not; the genesis has none and pays
 //! nothing), and `B.height` is the header height its undo record stores: the
-//! height its subsidy was computed for. `unclaimed` is permanently
+//! height its subsidy was computed for. That set must be exactly the
+//! selected chain of the applied tip, which the audit checks by walking it
+//! (`chain_ok`). `unclaimed` is permanently
 //! unspendable value: rewards miners did not claim (a coinbase below subsidy +
 //! fees), coins replaced by an output with the same outpoint before the
 //! hardening activation (BIP30, audit VAL-2), and value moved into the
@@ -62,6 +64,14 @@ pub struct UtxoSetAudit {
     pub carryover_sat: u64,
     /// Blocks of the applied chain (undo records).
     pub applied_blocks: u64,
+    /// Undo records of blocks that are not on the selected chain of
+    /// `best_block` (a stale record: its issuance is counted in
+    /// `subsidy_sat` although the block is not applied).
+    pub undo_off_chain: u64,
+    /// Blocks of that chain (genesis excluded) without an undo record (their
+    /// issuance is missing from `subsidy_sat`), counting a chain the walk
+    /// could not finish (a DAG record missing below the tip) as one more.
+    pub chain_without_undo: u64,
     /// Σ block_subsidy(header height) over the applied chain.
     pub subsidy_sat: u128,
     /// The issuance schedule through the tip's position,
@@ -100,10 +110,13 @@ impl UtxoSetAudit {
         self.maintained.map(|m| m == (self.holder_txouts, self.holder_total_sat))
     }
 
-    /// One undo record per position of the applied chain (genesis excluded):
-    /// no block's issuance is missing from, or counted twice in, the bound.
+    /// The undo records are exactly the blocks of the selected chain of the
+    /// applied tip (genesis excluded): every record's block is on that chain
+    /// and every chain block has one, so no block's issuance is missing from,
+    /// or counted twice in, the bound (a membership check, not a count: a
+    /// stale record and a missing one cancel out in the count).
     pub fn chain_ok(&self) -> bool {
-        self.applied_blocks == self.height
+        self.applied_blocks == self.height && self.undo_off_chain == 0 && self.chain_without_undo == 0
     }
 
     /// Every check that can run passed (the subsidy sum is also within the
@@ -167,18 +180,57 @@ impl Storage {
         }
 
         let (mut applied_blocks, mut subsidy) = (0u64, 0u128);
+        let mut undo_blocks: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         for (i, item) in snap.iterator_cf(cf_undo, IteratorMode::Start).enumerate() {
             if (i as u64).is_multiple_of(CANCEL_STRIDE) && cancel.load(Ordering::Relaxed) {
                 return Err(aggregates::cancelled());
             }
             let (k, v) = item.map_err(read)?;
-            if k.len() != 32 {
+            let Ok(block) = <[u8; 32]>::try_from(k.as_ref()) else {
                 continue; // pruned-body records share the column family
-            }
+            };
             let undo = crate::core::UndoData::from_bytes(&v).map_err(StorageError::DeserializeFailed)?;
             applied_blocks += 1;
             subsidy += tokenomics::block_subsidy_sat(undo.block_height) as u128;
+            undo_blocks.insert(block);
         }
+
+        // Membership: walk the selected chain of the applied tip (CF_DAG
+        // selected parents, same snapshot) down to the genesis; every block
+        // on it but the genesis must hold an undo record, and no record may
+        // be left over.
+        let mut chain_without_undo = 0u64;
+        let mut on_chain = 0u64;
+        let mut cur = best_block;
+        let mut steps = 0u64;
+        while let Some(h) = cur {
+            if steps.is_multiple_of(CANCEL_STRIDE) && cancel.load(Ordering::Relaxed) {
+                return Err(aggregates::cancelled());
+            }
+            steps += 1;
+            if steps > height + 1 {
+                // Longer than the tip's position: corrupted selected parents.
+                chain_without_undo += 1;
+                break;
+            }
+            let Some(raw) = snap.get_cf(cf_dag, h).map_err(read)? else {
+                chain_without_undo += 1; // the walk cannot reach the genesis
+                break;
+            };
+            let data = decode::<GhostdagData>(&raw)?;
+            match data.selected_parent {
+                None => break, // the genesis: pays nothing, holds no record
+                Some(parent) => {
+                    if undo_blocks.contains(&h) {
+                        on_chain += 1;
+                    } else {
+                        chain_without_undo += 1;
+                    }
+                    cur = Some(parent);
+                }
+            }
+        }
+        let undo_off_chain = applied_blocks - on_chain;
 
         let ready = snap.get_cf(cf_meta, aggregates::K_VERSION).map_err(read)?
             .is_some_and(|v| v.as_slice() == aggregates::AGG_VERSION.to_le_bytes());
@@ -200,6 +252,8 @@ impl Storage {
             undecodable,
             carryover_sat,
             applied_blocks,
+            undo_off_chain,
+            chain_without_undo,
             subsidy_sat: subsidy,
             schedule_issued_sat: tokenomics::issued_through_sat(height),
             holder_txouts,

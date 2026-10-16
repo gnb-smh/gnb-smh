@@ -227,7 +227,35 @@ fn an_undo_record_off_the_chain_fails_the_audit() {
     db.put_cf(cf, [0xEE; 32], rec).unwrap();
     let a = audit(&n, CARRY);
     assert_eq!(a.applied_blocks, 4);
+    assert_eq!((a.undo_off_chain, a.chain_without_undo), (1, 0));
     assert!(!a.chain_ok() && !a.ok());
+}
+
+/// A stale undo record (a rolled-back block whose delete was lost) together
+/// with a missing one (an applied block's record gone): the count still
+/// equals the height, so a count check passed and the bound summed the
+/// stale block's subsidy in place of the applied block's. The audit now
+/// checks that the records are exactly the selected chain of the tip.
+#[test]
+fn a_stale_and_a_missing_undo_record_do_not_cancel_out() {
+    let _g = activation::scoped_override(0);
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let k = key();
+    let n = node_with(&genesis, &funds(&k));
+    n.store.ensure_aggregates().unwrap();
+    let blocks = mine_three(&n, &k);
+    let good = audit(&n, CARRY);
+    assert!(good.chain_ok() && good.ok(), "{good:?}");
+    assert_eq!((good.undo_off_chain, good.chain_without_undo), (0, 0));
+    let db = n.store.db();
+    let cf = db.cf_handle("undo").unwrap();
+    let rec = db.get_cf(cf, blocks[1].block_hash()).unwrap().unwrap();
+    db.delete_cf(cf, blocks[1].block_hash()).unwrap();
+    db.put_cf(cf, [0xEE; 32], rec).unwrap();
+    let a = audit(&n, CARRY);
+    assert_eq!(a.applied_blocks, a.height, "the count alone cannot tell");
+    assert_eq!((a.undo_off_chain, a.chain_without_undo), (1, 1));
+    assert!(!a.chain_ok() && !a.ok(), "{a:?}");
 }
 
 /// The scan stops when its request is cancelled (the RPC deadline).

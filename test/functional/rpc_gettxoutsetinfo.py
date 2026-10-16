@@ -33,6 +33,7 @@ class GetTxOutSetInfoTest(GnbTestFramework):
         assert_equal(info["bestblock"], node.tip())
         assert_equal(info["height"], node.height())
         assert_equal(info["applied_blocks"], info["height"])
+        assert_equal((info["undo_off_chain"], info["chain_without_undo"]), (0, 0))
         assert_equal(info["undecodable_txouts"], 0)
         exp = info["expected"]
         issued = int(exp["carryover_sat"]) + int(exp["subsidy_sat"])
