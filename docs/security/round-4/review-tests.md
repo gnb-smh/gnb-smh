@@ -38,7 +38,9 @@ was not used because this review did not rebuild Rust.
    containing only the delivered branch may not have that object. Integrated
    commit `ce61d7e` provides the equivalent test-only RPC production snapshot;
    use it in the replay command while retaining the original ID as historical
-   provenance. This does not invalidate the locally verified log evidence.
+   provenance. I confirmed byte equality of `node/src/rpc/mod.rs` and
+   `node/src/rpc/explorer.rs` between those two commits. This does not
+   invalidate the locally verified log evidence.
 
 4. **JSON oracle envelope coverage — follow-up pending.** The 630-request
    comparison at the initial snapshot covers the 502 address cases and 128
@@ -90,6 +92,11 @@ not approval of the broader program or a numerical score.
   `0ecdd9a`: 3 runtime failures, 3 restored/control runs with 6/6 tests, and
   2 successful script builds. Its test-file hash matches this review snapshot.
   I did not rerun the Rust or WASM rebuild reversals independently.
+- All current core source/test files named by the core evidence and reversal
+  manifests match their recorded hashes. The two final RPC production files
+  and the RPC/CLI test files likewise match the frontend reversal manifest.
+  This connects those archived test runs to the files reviewed here; the
+  pending oracle follow-up will require its own updated provenance.
 
 ## Independent focused execution
 
