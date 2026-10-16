@@ -57,6 +57,22 @@ Transaction relay and mempool policy (unconfirmed chains, child-pays-for-parent
 templates, full-RBF, orphan transactions): `docs/MEMPOOL.md`;
 `getmempoolinfo` reports the parameters in force.
 
+Heights in `getblockhash`, `getblockbyheight`, `getrecentblocks`,
+`getblock` given a number, the address history (`listtransactions`'
+`block_height`, `getaddressbalance_at_height`) and the pruning cursor
+(`pruned_height`) are positions on the applied selected chain: the DAG
+height, 0 for the genesis and one more per selected-parent step (audit DAG-8),
+like Bitcoin Core's active-chain heights. `getblockhash N` names exactly one
+block, the selected-chain block at position N. A block's header height
+(`getblock`'s `height`, the height its difficulty and coinbase commitment
+use) can be larger than its position when it merges a parent with a greater
+DAG height; header heights can repeat along the selected chain, which is why
+the indexes are not keyed by them. A data dir from an earlier release (keyed
+by header height, where two chain blocks could share a row) is migrated once
+at start-up (log line "DAG-8: selected-chain indexes migrated …"); a
+pruned block's address-history row that an earlier release had overwritten
+with another block's cannot be recovered and is reported as lost.
+
 The explorer statistics (`getchainstats`, `gethashrate`, `getrichlist`,
 `getsupplydistribution`, `getaddresscount`) are served from aggregates the
 node keeps in the same write batches as its UTXO set. A data directory

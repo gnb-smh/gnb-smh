@@ -571,6 +571,10 @@ async fn main() {
         store.put_block(&genesis).expect("store genesis");
         store.put_meta("genesis_hash", &hash).expect("meta genesis_hash");
         store.put_meta("tip_hash", &hash).expect("meta tip_hash");
+        // Audit DAG-8: a new data dir starts with the position-keyed chain
+        // indexes (no migration at its first reconciliation).
+        store.put_meta(storage::CHAIN_INDEX_VERSION_META, &storage::CHAIN_INDEX_VERSION.to_le_bytes())
+            .expect("meta chain_index_version");
         store.put_meta("current_bits", &core::GENESIS_BITS.to_le_bytes())
             .expect("meta current_bits");
         dag.write().add_genesis(hash, genesis.header.timestamp);

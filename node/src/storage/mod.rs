@@ -78,6 +78,16 @@ pub fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, StorageErro
 /// `(txid, block_hash)`: one CF_TX_INDEX row (`Storage::tx_index_entries`).
 pub type TxIndexEntry = ([u8; 32], [u8; 32]);
 
+/// CF_META key of the selected-chain index layout version
+/// ([`Storage::chain_index_version`]).
+pub const CHAIN_INDEX_VERSION_META: &str = "chain_index_version";
+
+/// Layout of CF_HEIGHT, CF_TIMESTAMPS and the address history: 2 = keyed by
+/// the selected-chain position (DAG height, audit DAG-8); 1 = keyed by the
+/// header height (earlier releases, migrated at start-up by
+/// [`Storage::migrate_chain_indexes`]).
+pub const CHAIN_INDEX_VERSION: u32 = 2;
+
 /// CF_UNDO key prefix of a [`PrunedBodyRecord`]. Undo records are keyed by
 /// the bare 32-byte block hash; these keys are longer, so
 /// `Storage::undo_block_hashes` never mistakes one for an undo record.
@@ -101,7 +111,7 @@ pub struct PrunedBodyRecord {
     /// The block carried shielded transactions.
     pub had_shielded: bool,
     /// Every CF_ADDR_TX_HISTORY key the block's connect wrote
-    /// (`indexer::addr_history_keys`).
+    /// (`indexer::addr_history_keys`, keyed by the block's chain position).
     pub addr_history_keys: Vec<Vec<u8>>,
 }
 
@@ -1080,22 +1090,30 @@ impl Storage {
     }
 
     /// Stage the SELECTED-CHAIN indexes of a block being connected (DAG-12):
-    /// height→hash, height→timestamp and the address-history rows. Input rows
-    /// resolve the spent output through `spent` (the block's undo capture), so
-    /// they are byte-identical to what `rollback_block` later un-indexes.
+    /// position→hash, position→timestamp and the address-history rows. Input
+    /// rows resolve the spent output through `spent` (the block's undo
+    /// capture), so they are byte-identical to what a rollback un-indexes.
+    ///
+    /// `position` is the block's place on the selected chain, its DAG height
+    /// (`GhostdagData::height`: 0 for the genesis, + 1 per selected-parent
+    /// edge), NOT its header height (audit DAG-8): header heights repeat and
+    /// decrease along the selected chain, so rows keyed by them collided, a
+    /// later block overwrote an earlier one's and disconnecting it deleted a
+    /// row of a block still on the chain. Positions are unique along the
+    /// selected chain, like Bitcoin Core's active-chain heights
+    /// ([`CHAIN_INDEX_VERSION`]).
     pub fn stage_chain_index(
         &self,
         batch: &mut rocksdb::WriteBatch,
         block: &Block,
+        position: u64,
         spent: &std::collections::HashMap<([u8; 32], u32), TxOutput>,
     ) -> Result<(), StorageError> {
         let hash = block.block_hash();
-        let cf_h = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
-        let cf_t = self.db.cf_handle(CF_TIMESTAMPS).ok_or(StorageError::CfNotFound(CF_TIMESTAMPS.into()))?;
+        self.stage_chain_position(batch, position, &hash, block.header.timestamp)?;
         let cf_ai = self.db.cf_handle(CF_ADDR_TX_HISTORY)
             .ok_or(StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
-        batch.put_cf(&cf_h, &block.height.to_be_bytes(), &hash);
-        batch.put_cf(&cf_t, &block.height.to_be_bytes(), &block.header.timestamp.to_le_bytes());
+        let position_key = position;
         for (tx_idx, tx) in block.transactions.iter().enumerate() {
             let txid = tx.txid();
             for (vout, out) in tx.outputs.iter().enumerate() {
@@ -1103,7 +1121,7 @@ impl Storage {
                     let mut addr = [0u8; 20];
                     addr.copy_from_slice(&out.script_pubkey[..20]);
                     batch.put_cf(&cf_ai,
-                        indexer::make_key(&addr, block.height, tx_idx as u32, vout as u32),
+                        indexer::make_key(&addr, position_key, tx_idx as u32, vout as u32),
                         indexer::make_value(&txid, indexer::DIR_OUT, out.value));
                 }
             }
@@ -1114,7 +1132,7 @@ impl Storage {
                             let mut addr = [0u8; 20];
                             addr.copy_from_slice(&prev.script_pubkey[..20]);
                             batch.put_cf(&cf_ai,
-                                indexer::make_key(&addr, block.height, tx_idx as u32, 0x8000_0000 | vin as u32),
+                                indexer::make_key(&addr, position_key, tx_idx as u32, 0x8000_0000 | vin as u32),
                                 indexer::make_value(&txid, indexer::DIR_IN, prev.value));
                         }
                     }
@@ -1124,29 +1142,124 @@ impl Storage {
         Ok(())
     }
 
-    /// Stage removal of a disconnected block's height→hash / height→timestamp
-    /// rows, but only where they still point at this block (a block connected
-    /// later in the same batch overwrites them in batch order). Address-history
-    /// rows are un-indexed by the rollback staging itself.
-    pub fn stage_chain_unindex(&self, batch: &mut rocksdb::WriteBatch, block: &Block)
+    /// Stage the position→hash and position→timestamp rows of a
+    /// selected-chain block (see [`Storage::stage_chain_index`]).
+    pub fn stage_chain_position(&self, batch: &mut rocksdb::WriteBatch, position: u64, hash: &BlockHash, timestamp: u64)
         -> Result<(), StorageError>
     {
-        self.stage_chain_unindex_at(batch, block.height, &block.block_hash())
+        let cf_h = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
+        let cf_t = self.db.cf_handle(CF_TIMESTAMPS).ok_or(StorageError::CfNotFound(CF_TIMESTAMPS.into()))?;
+        batch.put_cf(&cf_h, position.to_be_bytes(), hash);
+        batch.put_cf(&cf_t, position.to_be_bytes(), timestamp.to_le_bytes());
+        Ok(())
     }
 
-    /// [`stage_chain_unindex`](Self::stage_chain_unindex) from a height and a
-    /// hash alone, for a block whose body was pruned (both come from its undo
-    /// record), so a reorg of any depth can disconnect it (audit DAG-6).
-    pub fn stage_chain_unindex_at(&self, batch: &mut rocksdb::WriteBatch, height: u64, hash: &BlockHash)
+    /// Stage removal of a disconnected block's position→hash /
+    /// position→timestamp rows at its selected-chain `position` (its DAG
+    /// height), but only where they point at this block. Positions are
+    /// unique along the selected chain (DAG-8), so the row is the block's
+    /// own; the check guards against a caller passing another position.
+    /// Address-history rows are un-indexed by the rollback staging itself.
+    /// Works from the position and hash alone, so a block whose body was
+    /// pruned can be disconnected by a reorg of any depth (audit DAG-6).
+    pub fn stage_chain_unindex_at(&self, batch: &mut rocksdb::WriteBatch, position: u64, hash: &BlockHash)
         -> Result<(), StorageError>
     {
-        if self.get_block_hash_at_height(height)? == Some(*hash) {
+        if self.get_block_hash_at_height(position)? == Some(*hash) {
             let cf_h = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
             let cf_t = self.db.cf_handle(CF_TIMESTAMPS).ok_or(StorageError::CfNotFound(CF_TIMESTAMPS.into()))?;
-            batch.delete_cf(&cf_h, height.to_be_bytes());
-            batch.delete_cf(&cf_t, height.to_be_bytes());
+            batch.delete_cf(&cf_h, position.to_be_bytes());
+            batch.delete_cf(&cf_t, position.to_be_bytes());
         }
         Ok(())
+    }
+
+    /// The selected-chain position (DAG height) of `hash` from its CF_DAG
+    /// record; a block without one is the genesis iff its stored header has
+    /// no parents (fixture stores that never wrote the genesis record).
+    pub fn chain_position(&self, hash: &BlockHash) -> Result<Option<u64>, StorageError> {
+        if let Some(d) = self.get_dag_data(hash)? {
+            return Ok(Some(d.height));
+        }
+        Ok(self.get_block(hash)?.filter(|b| b.header.parents.is_empty()).map(|_| 0))
+    }
+
+    /// Migrate the selected-chain indexes to the position layout (audit
+    /// DAG-8, [`CHAIN_INDEX_VERSION`] 2) in ONE batch, given the applied
+    /// selected chain as `(hash, position, timestamp)` from the genesis up.
+    /// Releases before it keyed CF_HEIGHT, CF_TIMESTAMPS and the address
+    /// history by header height, where two chain blocks could share a row
+    /// (the later one's replaced the earlier one's). Every row of the three
+    /// column families is deleted and rewritten from the chain: the height
+    /// and timestamp rows for every chain block, the address-history rows of
+    /// every block whose body is stored from the body and its undo record
+    /// (exactly what a connect writes), and those of a pruned block by moving
+    /// the rows its pruned-body record names to its position, when the stored
+    /// row still belongs to it (a row an earlier release overwrote with
+    /// another block's cannot be recovered without the body); the record is
+    /// rewritten with the new keys so a later rollback deletes the right
+    /// rows. Returns `(chain blocks, address rows written, rows lost)`.
+    pub fn migrate_chain_indexes(&self, chain: &[(BlockHash, u64, u64)]) -> Result<(usize, usize, usize), StorageError> {
+        let cf_ai = self.db.cf_handle(CF_ADDR_TX_HISTORY)
+            .ok_or(StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
+        let cf_undo = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        for name in [CF_HEIGHT, CF_TIMESTAMPS, CF_ADDR_TX_HISTORY] {
+            let cf = self.db.cf_handle(name).ok_or(StorageError::CfNotFound(name.into()))?;
+            for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+                let (k, _) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+                batch.delete_cf(&cf, &k);
+            }
+        }
+        let (mut written, mut lost) = (0usize, 0usize);
+        for (hash, position, timestamp) in chain {
+            match self.get_block(hash)? {
+                Some(body) => {
+                    let spent: std::collections::HashMap<([u8; 32], u32), TxOutput> = self
+                        .get_undo_data(hash)?
+                        .map(|u| u.spent_utxos.into_iter().map(|e| ((e.prev_txid, e.prev_index), e.output)).collect())
+                        .unwrap_or_default();
+                    written += indexer::addr_history_keys(&body, *position, &spent).len();
+                    self.stage_chain_index(&mut batch, &body, *position, &spent)?;
+                }
+                None => {
+                    self.stage_chain_position(&mut batch, *position, hash, *timestamp)?;
+                    if let Some(mut rec) = self.get_pruned_body_record(hash)? {
+                        let mut keys = Vec::with_capacity(rec.addr_history_keys.len());
+                        for old in &rec.addr_history_keys {
+                            let value = self.db.get_cf(&cf_ai, old).map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+                            let owned = value.as_deref()
+                                .and_then(indexer::parse_value)
+                                .map(|(txid, _, _)| self.get_tx_location(&txid).ok().flatten().map(|(b, _)| b) == Some(*hash))
+                                .unwrap_or(false);
+                            let new = indexer::with_position(old, *position);
+                            match (owned, value) {
+                                (true, Some(v)) => {
+                                    batch.put_cf(&cf_ai, &new, &v);
+                                    written += 1;
+                                }
+                                _ => lost += 1,
+                            }
+                            keys.push(new);
+                        }
+                        rec.addr_history_keys = keys;
+                        batch.put_cf(&cf_undo, pruned_body_key(hash), encode(&rec)?);
+                    }
+                }
+            }
+        }
+        let cf_meta = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        batch.put_cf(&cf_meta, CHAIN_INDEX_VERSION_META.as_bytes(), CHAIN_INDEX_VERSION.to_le_bytes());
+        self.write_batch(batch)?;
+        Ok((chain.len(), written, lost))
+    }
+
+    /// The layout version of the selected-chain indexes: 1 (header height,
+    /// releases before audit DAG-8) when the key is absent.
+    pub fn chain_index_version(&self) -> Result<u32, StorageError> {
+        Ok(self.get_meta(CHAIN_INDEX_VERSION_META)?
+            .and_then(|b| <[u8; 4]>::try_from(b.as_slice()).ok().map(u32::from_le_bytes))
+            .unwrap_or(1))
     }
 
     // ── Shielded-pool state (audit COH-2; key layout in coherence::persist) ──
@@ -1650,7 +1763,8 @@ impl Storage {
 
     // ── Pruning ─────────────────────────────────────────────────────────
 
-    /// Prune block bodies below `below_height`.
+    /// Prune the bodies of the selected-chain blocks at positions (DAG
+    /// heights, audit DAG-8) below `below_height`.
     /// Keeps: height→hash mapping, DAG data, TX index, UTXO set, undo records.
     /// Removes: full block data from CF_BLOCKS (saves ~90% of storage).
     /// Returns number of blocks pruned.
@@ -1693,7 +1807,7 @@ impl Storage {
                     let rec = PrunedBodyRecord {
                         height: body.height,
                         had_shielded: !body.shielded_transactions.is_empty(),
-                        addr_history_keys: indexer::addr_history_keys(&body, &spent),
+                        addr_history_keys: indexer::addr_history_keys(&body, h, &spent),
                     };
                     batch.put_cf(&cf_undo, pruned_body_key(&hash), encode(&rec)?);
                 }

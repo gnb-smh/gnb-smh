@@ -202,9 +202,10 @@ pub fn awaits_body_in(d: &consensus::GhostDAG, store: &storage::Storage, hash: &
         Some(data) if !data.parents.is_empty() => data.height,
         _ => return false, // unknown, or the genesis
     };
-    // Pruning removes bodies by HEADER height, which is >= the DAG height:
-    // a block whose DAG height is at or above the pruning cursor was never
-    // pruned.
+    // Pruning removes the bodies of selected-chain blocks by chain position
+    // (DAG height, audit DAG-8; releases before it pruned by header height,
+    // which is >= the DAG height): a block whose DAG height is at or above
+    // the pruning cursor was never pruned.
     dag_height >= store.pruned_height() && matches!(store.has_block_body(hash), Ok(false))
 }
 
@@ -1680,6 +1681,9 @@ pub fn reconcile_on_startup(
 ) -> Result<(), String> {
     let _guard = store.acceptance_lock();
     ensure_invalid_set_loaded(dag, store);
+    // DAG-8: a data dir written before the selected-chain indexes were keyed
+    // by chain position is migrated before anything moves the chain.
+    migrate_chain_indexes(dag, store)?;
     let recheck = match recheck_stored_blocks_under_hardening(
         dag, store, core::activation::hardening_activation_height(),
     ) {
@@ -1820,6 +1824,52 @@ pub fn reconcile_on_startup(
         }
     }
     Ok(())
+}
+
+// ── Selected-chain index layout (DAG-8) ──────────────────────────────────────
+
+/// Migrate the selected-chain indexes (CF_HEIGHT, CF_TIMESTAMPS, address
+/// history) of a data dir written before audit DAG-8 from header-height keys
+/// to selected-chain positions (DAG heights), once: a versioned schema step
+/// (`storage::CHAIN_INDEX_VERSION`). Run by [`reconcile_on_startup`] before
+/// anything moves the chain. The applied chain is the selected-parent chain
+/// of the tip pointer (or, when the DAG does not know it, of the heaviest DAG
+/// block holding an undo record, as reconciliation's step 2 decides).
+/// Returns whether it migrated.
+pub fn migrate_chain_indexes(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+) -> Result<bool, String> {
+    if store.chain_index_version().map_err(|e| e.to_string())? == storage::CHAIN_INDEX_VERSION {
+        return Ok(false);
+    }
+    let chain: Vec<(BlockHash, u64, u64)> = {
+        let d = dag.read();
+        let tip = store.get_meta("tip_hash").map_err(|e| e.to_string())?
+            .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+            .filter(|t| d.has_block(t))
+            .or_else(|| {
+                let undo = store.undo_block_hashes().ok()?;
+                let recorded: Vec<BlockHash> = undo.into_iter().filter(|h| d.has_block(h)).collect();
+                d.heaviest_among(&recorded)
+            })
+            .or(d.store.genesis);
+        let mut out = Vec::new();
+        let mut cur = tip;
+        while let Some(h) = cur {
+            let Some(data) = d.get_block_data(&h) else { break };
+            out.push((h, data.height, data.timestamp));
+            cur = data.selected_parent;
+        }
+        out.reverse();
+        out
+    };
+    let (blocks, rows, lost) = store.migrate_chain_indexes(&chain).map_err(|e| e.to_string())?;
+    warn!("DAG-8: selected-chain indexes migrated to chain positions: {blocks} block(s), {rows} address-history \
+           row(s){}", if lost > 0 {
+               format!(", {lost} row(s) of pruned blocks not recoverable (overwritten by an earlier release)")
+           } else { String::new() });
+    Ok(true)
 }
 
 // ── Start-up DAG load and repair (DAG-11 residual) ───────────────────────────
@@ -2105,7 +2155,7 @@ pub fn rebuild_chain_state(
     let cleared_rows = store.stage_clear_chain_state(&mut batch).map_err(|e| e.to_string())?;
     seed(store, &mut batch)?;
     if let Some(gb) = store.get_block(&genesis).map_err(|e| e.to_string())? {
-        store.stage_chain_index(&mut batch, &gb, &HashMap::new()).map_err(|e| e.to_string())?;
+        store.stage_chain_index(&mut batch, &gb, 0, &HashMap::new()).map_err(|e| e.to_string())?;
     }
     for (h, _) in &drop {
         store.stage_clear_invalid_block(&mut batch, h).map_err(|e| e.to_string())?;

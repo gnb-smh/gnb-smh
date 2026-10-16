@@ -217,7 +217,8 @@ fn disconnect_through_pruned_bodies_uses_the_pruned_record_and_the_undo() {
     let mut batch = rocksdb::WriteBatch::default();
     for h in [f.genesis, b1, b2, b3] {
         let blk = f.store.get_block(&h).unwrap().unwrap();
-        f.store.stage_chain_index(&mut batch, &blk, &std::collections::HashMap::new()).unwrap();
+        // A linear chain: each block's position is its header height.
+        f.store.stage_chain_index(&mut batch, &blk, blk.height, &std::collections::HashMap::new()).unwrap();
     }
     f.store.write_batch(batch).unwrap();
     assert_eq!(f.store.prune_blocks_below(3).unwrap(), 3, "genesis, b1 and b2 pruned");

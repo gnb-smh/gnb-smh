@@ -702,6 +702,7 @@ fn rollback_block_batched(
     batch: &mut ReorgBatch,
     block: &Block,
     block_hash: &BlockHash,
+    position: u64,
 ) -> Result<(), String> {
     let undo = undo_for_rollback(batch.store, block_hash)?;
 
@@ -713,14 +714,14 @@ fn rollback_block_batched(
 
     // 1. Un-index addr_tx_history: exactly the keys `stage_chain_index`
     //    wrote (`indexer::addr_history_keys`, the single definition).
-    for key in crate::storage::indexer::addr_history_keys(block, &spent_lookup) {
+    for key in crate::storage::indexer::addr_history_keys(block, position, &spent_lookup) {
         batch.delete_addr_history_key(&key)?;
     }
 
     rollback_undo_effects(batch, &undo, block_hash)?;
 
-    // 7. Selected-chain height/timestamp index rows (DAG-12).
-    batch.store.stage_chain_unindex(&mut batch.batch, block)
+    // 7. Selected-chain position/timestamp index rows (DAG-12, DAG-8).
+    batch.store.stage_chain_unindex_at(&mut batch.batch, position, block_hash)
         .map_err(|e| format!("rollback: chain unindex failed: {}", e))?;
 
     // 8. NET-12: the block leaves the connected chain.
@@ -740,6 +741,7 @@ fn rollback_block_batched(
 fn rollback_pruned_block_batched(
     batch: &mut ReorgBatch,
     block_hash: &BlockHash,
+    position: u64,
 ) -> Result<(), String> {
     let undo = undo_for_rollback(batch.store, block_hash)?;
     match batch.store.get_pruned_body_record(block_hash)
@@ -758,7 +760,7 @@ fn rollback_pruned_block_batched(
         ),
     }
     rollback_undo_effects(batch, &undo, block_hash)?;
-    batch.store.stage_chain_unindex_at(&mut batch.batch, undo.block_height, block_hash)
+    batch.store.stage_chain_unindex_at(&mut batch.batch, position, block_hash)
         .map_err(|e| format!("rollback: chain unindex failed: {}", e))?;
     // NET-12: the block leaves the connected chain, exactly as on the bodied
     // path (its transaction count is the undo record's tx-index key count).
@@ -771,6 +773,7 @@ fn rollback_pruned_block_batched(
 fn apply_block_utxo_mutations_batched(
     batch: &mut ReorgBatch,
     block: &Block,
+    position: u64,
 ) -> Result<(), String> {
     let block_hash = block.block_hash();
     let mut undo = UndoData::new(block_hash, block.height);
@@ -782,7 +785,7 @@ fn apply_block_utxo_mutations_batched(
         let spent: HashMap<([u8; 32], u32), TxOutput> = undo.spent_utxos.iter()
             .map(|e| ((e.prev_txid, e.prev_index), e.output.clone()))
             .collect();
-        batch.store.stage_chain_index(&mut batch.batch, block, &spent)
+        batch.store.stage_chain_index(&mut batch.batch, block, position, &spent)
             .map_err(|e| format!("apply: chain index failed: {}", e))
     };
 
@@ -1044,16 +1047,47 @@ pub fn connect_plan(
         )));
     }
 
+    // Selected-chain positions (DAG heights) of the moved blocks, for the
+    // chain indexes (audit DAG-8): the plan walks selected-parent edges from
+    // the LCA, so the j-th block of `to_rollback` (tip-first) sits at
+    // lca + len - j and the i-th of `to_apply` at lca + 1 + i.
+    // A node always has the LCA's DAG record (the genesis record is written
+    // at first boot, every applied block's with its connect); only a store
+    // that never wrote one (bare storage fixtures) lacks it, and then each
+    // block's own DAG record, else its header height, is used.
+    let lca_position = store.chain_position(&plan.lca)
+        .map_err(|e| ConnectError::Failed(e.to_string()))?;
+    if lca_position.is_none() {
+        log::warn!("connect: no DAG record for the LCA {}; chain-index positions fall back to each block's \
+                    own record", hex::encode(&plan.lca[..8]));
+    }
+    let own_position = |hash: &BlockHash, header_height: u64| -> Result<u64, ConnectError> {
+        Ok(store.chain_position(hash).map_err(|e| ConnectError::Failed(e.to_string()))?.unwrap_or(header_height))
+    };
+    let rollback_position = |j: usize, hash: &BlockHash, header_height: u64| -> Result<u64, ConnectError> {
+        match lca_position {
+            Some(p) => Ok(p + (plan.to_rollback.len() - j) as u64),
+            None => own_position(hash, header_height),
+        }
+    };
+    let apply_position = |i: usize, hash: &BlockHash, header_height: u64| -> Result<u64, ConnectError> {
+        match lca_position {
+            Some(p) => Ok(p + 1 + i as u64),
+            None => own_position(hash, header_height),
+        }
+    };
+
     let mut batch = ReorgBatch::new(store).map_err(ConnectError::Failed)?;
     let mut outcome = ConnectOutcome::default();
 
-    for hash in &plan.to_rollback {
+    for (j, hash) in plan.to_rollback.iter().enumerate() {
         let body = store.get_block(hash)
             .map_err(|e| ConnectError::Failed(format!(
                 "execute_reorg: get_block on rollback target failed: {}", e)))?;
         match body {
             Some(block) => {
-                rollback_block_batched(&mut batch, &block, hash)
+                let position = rollback_position(j, hash, block.height)?;
+                rollback_block_batched(&mut batch, &block, hash, position)
                     .map_err(|e| ConnectError::Failed(format!(
                         "execute_reorg: rollback failed at h={} (reorg aborted, no storage mutation committed): {}",
                         block.height, e
@@ -1061,7 +1095,9 @@ pub fn connect_plan(
                 outcome.disconnected.push(block);
             }
             None => {
-                rollback_pruned_block_batched(&mut batch, hash)
+                let header_height = store.get_undo_data(hash).ok().flatten().map(|u| u.block_height).unwrap_or(0);
+                let position = rollback_position(j, hash, header_height)?;
+                rollback_pruned_block_batched(&mut batch, hash, position)
                     .map_err(|e| ConnectError::Failed(format!(
                         "execute_reorg: rollback of pruned block {}.. failed (reorg aborted, no storage \
                          mutation committed): {}",
@@ -1072,7 +1108,7 @@ pub fn connect_plan(
         }
     }
 
-    for hash in &plan.to_apply {
+    for (i, hash) in plan.to_apply.iter().enumerate() {
         let block = store.get_block(hash)
             .map_err(|e| ConnectError::Failed(format!(
                 "execute_reorg: get_block on apply target failed: {}", e)))?
@@ -1085,7 +1121,8 @@ pub fn connect_plan(
             );
             return Err(ConnectError::Invalid { block: *hash, height: block.height, reason });
         }
-        apply_block_utxo_mutations_batched(&mut batch, &block)
+        let position = apply_position(i, hash, block.height)?;
+        apply_block_utxo_mutations_batched(&mut batch, &block, position)
             .map_err(|e| ConnectError::Failed(format!(
                 "execute_reorg: batched apply failed at h={}: {}", block.height, e)))?;
         outcome.connected.push(block);

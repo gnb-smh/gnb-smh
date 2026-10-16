@@ -7,10 +7,15 @@
 //! Key schema:   [20B addr_hash][8B height BE][4B tx_index BE][4B out_or_in_idx BE]
 //! Value schema: [32B txid][1B direction: 0=in, 1=out][8B amount_sats LE]
 //!
+//! `height` is the block's position on the selected chain, its DAG height
+//! (audit DAG-8; `Storage::stage_chain_index`), not its header height.
+//!
 //! Properties:
-//! - Append-only. Never modified after write, even on reorg (future work).
+//! - Written when a block joins the selected chain and deleted when it
+//!   leaves it, in the same atomic batch as the UTXO changes.
 //! - Height in BE so prefix-iteration returns chronological order.
-//! - Key is unique per (addr, height, tx, vout/vin) — no collisions.
+//! - Key is unique per (addr, position, tx, vout/vin): positions are unique
+//!   along the selected chain (header heights were not: DAG-8).
 //! - Prefix extractor of 20 bytes enables efficient address-scoped range scans.
 
 use rocksdb::{IteratorMode, ReadOptions};
@@ -65,6 +70,7 @@ pub fn make_key(addr_hash: &[u8; 20], height: u64, tx_index: u32, io_index: u32)
 /// pruned block exactly (audit DAG-6).
 pub fn addr_history_keys(
     block: &crate::core::Block,
+    position: u64,
     spent: &std::collections::HashMap<([u8; 32], u32), crate::core::TxOutput>,
 ) -> Vec<Vec<u8>> {
     let mut keys = Vec::new();
@@ -73,7 +79,7 @@ pub fn addr_history_keys(
             if out.script_pubkey.len() >= 20 {
                 let mut addr = [0u8; 20];
                 addr.copy_from_slice(&out.script_pubkey[..20]);
-                keys.push(make_key(&addr, block.height, tx_idx as u32, vout as u32));
+                keys.push(make_key(&addr, position, tx_idx as u32, vout as u32));
             }
         }
         if !tx.is_coinbase() {
@@ -82,13 +88,23 @@ pub fn addr_history_keys(
                     if prev.script_pubkey.len() >= 20 {
                         let mut addr = [0u8; 20];
                         addr.copy_from_slice(&prev.script_pubkey[..20]);
-                        keys.push(make_key(&addr, block.height, tx_idx as u32, 0x8000_0000 | vin as u32));
+                        keys.push(make_key(&addr, position, tx_idx as u32, 0x8000_0000 | vin as u32));
                     }
                 }
             }
         }
     }
     keys
+}
+
+/// `key` with its height field replaced by `position` (the chain-index
+/// migration of audit DAG-8). A malformed key is returned unchanged.
+pub fn with_position(key: &[u8], position: u64) -> Vec<u8> {
+    let mut k = key.to_vec();
+    if k.len() == 36 {
+        k[20..28].copy_from_slice(&position.to_be_bytes());
+    }
+    k
 }
 
 /// Compose the value bytes for a history entry.

@@ -278,6 +278,7 @@ fn accept_plans_from_the_applied_tip_after_a_failed_reconnect() {
     // The writes reconciliation makes before its reconnect happen once per
     // data dir; make them now so the injected fault hits the reconnect.
     n.store.ensure_aggregates().unwrap();
+    accept::migrate_chain_indexes(&n.dag, &n.store).unwrap();
     accept::recheck_stored_blocks_under_hardening(&n.dag, &n.store, gnb::core::activation::hardening_activation_height())
         .unwrap();
     n.store.inject_batch_failures(1);
