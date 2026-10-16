@@ -975,10 +975,9 @@ impl Transaction {
         // owned struct into an in-memory Vec cannot fail, so fail loud if it ever
         // does rather than degrade security.
         //
-        // The v1 body (the stripped-tx bincode blob, incl. the per-input marker)
-        // is unchanged; v2 only prepends the fixed 21-byte domain+version+chain-id
-        // prefix. All prefix fields are fixed-length and only the trailing bincode
-        // blob is variable, so simple concatenation is unambiguous.
+        // The fixed 21-byte domain+version+chain-id prefix precedes the body;
+        // only the trailing body is variable, so simple concatenation is
+        // unambiguous.
         //
         // v2 body: the stripped transaction in the hand-written wire format
         // (`to_wire_bytes(true)`), not a serde/bincode encoding, so no
@@ -1002,9 +1001,10 @@ impl Transaction {
         block_rules::legacy_merkle_root(&ids)
     }
 
-    /// Parse sig + pubkey out of script_sig (historical, lenient framing:
-    /// bytes after the public key are ignored). Owned copy of
-    /// [`Self::parse_script_sig_borrowed`].
+    /// Parse sig + pubkey out of script_sig: the exact framing, bytes after
+    /// the public key are refused (on this chain at every height since
+    /// cc5c450; the historical lenient framing that ignored them is gone).
+    /// Owned copy of [`Self::parse_script_sig_borrowed`].
     pub fn parse_script_sig(script_sig: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         Self::parse_script_sig_borrowed(script_sig).map(|(s, p)| (s.to_vec(), p.to_vec()))
     }
