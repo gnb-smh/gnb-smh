@@ -37,6 +37,7 @@ from test_framework.util import PortAllocator  # noqa: E402
 
 # Every functional test. Longest first, so parallel runs finish sooner.
 ALL_TESTS = [
+    "mining_full_template.py",
     "feature_partition_heal.py",
     "p2p_block_propagation.py",
     "feature_activation_testnet.py",
