@@ -34,7 +34,9 @@ Implementation choices that refine the design below:
 - **Witness node.** `--witness-wallet <gnb-cli wallet> --witness-password-file <f>`
   mines shares paying that key (`--share-threads`, default 2) and signs the
   newest checkpoint once it is a member, with a persistent vote record that
-  refuses any double or surround vote, across restarts and reorgs.
+  refuses any double or surround vote, across restarts and reorgs (written
+  durably; an unreadable record refuses to start; the highest signed source
+  and target heights are also kept beside the key file and enforced).
 - **Node finality.** The node never reorganises below the height of the block
   its tip's chain finalized (`finalized_height`), in addition to the depth rule.
 

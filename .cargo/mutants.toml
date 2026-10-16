@@ -33,7 +33,10 @@ examine_globs = [
 # node's integration-test fixture `Block::test_only_assume_pow_valid`, which is
 # compiled only with the `test-pow-limit` feature: these runs never enable
 # it, so its mutants are not even compiled and would be reported as missed.
-# (It inserts through `PowCache::insert`, which stays in scope.)
+# (It inserts through `PowCache::insert`, which stays in scope.) The node
+# tests' real-ASERT seam at the end of core/mod.rs (`scoped_real_expected_bits`,
+# re-audit POW-5) is not excluded: it is compiled with `cfg(test)` as well,
+# and core/consensus_tests.rs tests it.
 exclude_re = [
     "core/mod\\.rs:.* Transaction::(estimate_size|calc_fee|estimate_fee|total_output|unique_output_addresses)\\b",
     "core/mod\\.rs:.* (difficulty_from_bits|difficulty_to_target|u256_to_f64)\\b",

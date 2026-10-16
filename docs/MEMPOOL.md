@@ -108,9 +108,13 @@ without enough tokens gets `Ignore` and no signature is checked. A
 connection's bucket is dropped when it disconnects.
 
 The price (audit B1-T19, Phase 4; `relay::signature_gate_cost`,
-`relay::frame_cost`). A token pays for one input signature check or for
+`relay::frame_cost`). A token pays for one signature check or for
 64 KiB hashed or decoded (about the same time). Step 11 costs one token per
-input plus the bytes its digests hash: under sighash v2 (below the
+signature plus the bytes its digests hash. An input spending a policy output
+carries the policy's `m` signatures (up to 7), each verified, so it costs `m`
+(audit F5, `relay::input_signature_count`: the policy witness is decoded, not
+verified; any other input costs one; before F5 a 7-of-7 input cost one). The
+bytes: under sighash v2 (below the
 activation; mainnet's regime until height 17,500) every input clones,
 re-encodes and hashes the whole transaction, outputs included, so the bytes
 are inputs × size; under sighash v3 the transaction is hashed once into

@@ -2052,6 +2052,27 @@ async fn main() {
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
 
+    // ── PoWit pool upkeep, on EVERY node (PoWit audit finding 7) ──────────
+    // Each new tip: forget what it made stale (shares out of the window,
+    // expired or superseded attestations, proofs against barred keys) and
+    // refresh the pool's witness sets. Off the acceptance lock; the DAG read
+    // lock is held only to read the tip. (Every pool admission also follows
+    // the tip first, so a lagging task never leaves a stale pool in use.)
+    {
+        let (dag_p, store_p) = (dag.clone(), store.clone());
+        let mut tip_rx_p = tip_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match tip_rx_p.recv().await {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+                let (dag_b, store_b) = (dag_p.clone(), store_p.clone());
+                let _ = tokio::task::spawn_blocking(move || powit::pool().follow_selected_tip(&dag_b, &store_b)).await;
+            }
+        });
+    }
+
     // ── PoWit witness: share mining + checkpoint attestations ──────────────
     if let Some(key) = cli.witness_key.clone() {
         let Some(pw) = cli.witness_password_file.clone() else {
@@ -2070,7 +2091,7 @@ async fn main() {
         info!("🛡  PoWit witness key {} (activation {})", hex::encode(duty.key_id),
               match core::powit_height() { u64::MAX => "off".to_string(), h => h.to_string() });
 
-        // Duty loop: prune the pool, sign the newest checkpoint once, gossip
+        // Duty loop: follow the tip, sign the newest checkpoint once, gossip
         // equivocation proofs.
         {
             let (dag_w, store_w, otx_w, duty_w) = (dag.clone(), store.clone(), outbound_tx.clone(), duty.clone());
@@ -2469,6 +2490,27 @@ async fn main() {
     if cli.metrics {
         crate::metrics::install(metrics_state.clone());
     }
+
+    // Audit F1: Bitcoin Core's `AbortNode`. A block whose validation keeps
+    // ending without a verdict (the chain state cannot be read consistently)
+    // stops the node (`accept::NO_VERDICT_ABORT_AFTER`): acceptance and
+    // templates refuse at once, and the process exits here with the
+    // operator's message, under the acceptance lock (no chain move in
+    // flight; every commit is one atomic batch). A restart that meets the
+    // same failure refuses to start with it.
+    let store_for_abort = store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if let Some(reason) = store_for_abort.abort_reason() {
+                let _guard = store_for_abort.acceptance_lock();
+                error!("FATAL: stopping the node: {reason}");
+                eprintln!("❌ gnb stopped: {reason}");
+                std::process::exit(1);
+            }
+        }
+    });
 
     // Periodic sync of gauges from NodeState to Prometheus.
     // Runs every 5s. Cheap — just atomic reads + atomic gauge sets.
