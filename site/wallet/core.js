@@ -72,9 +72,16 @@ export async function loadCore(url, sha256Hex) {
     return out.ok;
   }
   return {
-    open: (json, password) => call({ op: "open", json, password }),
-    // WAL-7: phrase-backed by default; returns { address, public_key, words }.
-    create: () => call({ op: "create", mnemonic: true }),
+    open: (json, password, network = "mainnet") => {
+      if (network !== "mainnet" && network !== "testnet") throw new Error("unknown wallet network");
+      return call({ op: "open", json, password, network });
+    },
+    // WAL-7: mainnet remains phrase-backed by default. The existing Rust
+    // testnet path returns a random key backed up by its encrypted keystore.
+    create: (testnet = false) => {
+      if (typeof testnet !== "boolean") throw new Error("testnet must be a boolean");
+      return call({ op: "create", mnemonic: true, testnet });
+    },
     restore: (words) => call({ op: "restore", words }),
     exportKeystore: (password) => call({ op: "export", password }).keystore,
     // WAL-1: `nextHeight` is the node's getdaginfo next_block_height; it selects

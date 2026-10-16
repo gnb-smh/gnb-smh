@@ -167,6 +167,11 @@ test("secondary review rechecks coinbase maturity at the current next height", a
   assert.match(early.html, /No spendable outputs at the next block/);
   const mature = await review({ next: H, rows: [cb] });
   assert.equal(mature.paid.length, 1); assert.match(mature.html, /Confirm and send/);
+  const mixed = await review({ next: H - 1, rows: [{ ...cb, index: 1 }, funding.row] });
+  // Discard the immature row before even asking the core to plan the payment.
+  assert.equal(mixed.planned.length, 1);
+  assert.deepEqual(mixed.planned[0].args[0].map(row => row.index), [0]);
+  assert.equal(mixed.paid.length, 1);
   for (const coinbase_height of ["17400", -1, H]) {
     const rejected = await review({ rows: [{ ...funding.row, coinbase_height }] });
     assert.equal(rejected.paid.length, 0); assert.equal(rejected.planned.length, 0);
@@ -182,6 +187,7 @@ test("secondary review makes missing previous values visible and requires explic
     assert.match(r.html, /could not be checked against their transaction/);
     assert.equal(r.ui.get("#confirm").disabled, true);
     await r.ui.get("#confirm").click();
+    await r.ui.get("#confirm").handlers.click({ currentTarget: r.ui.get("#confirm") });
     assert.deepEqual(r.broadcasts, []);
     const accept = r.ui.get("#accept-unverified"); assert.ok(accept);
     await accept.change(true); assert.equal(r.ui.get("#confirm").disabled, false);
@@ -223,6 +229,16 @@ test("opening a keystore respects an explicit expected network", async () => {
     c.create(); const ks = c.exportKeystore(PASSWORD); c.wipe();
     assert.throws(() => c.open(ks, PASSWORD, "testnet"), /network|testnet/i);
     assert.match(c.open(ks, PASSWORD).address, /^gnb1q/);
+  } finally { c.wipe(); }
+});
+
+test("explicit network arguments reject mistyped values before changing a session", async () => {
+  const c = await actualCore();
+  try {
+    const created = c.create();
+    for (const value of ["testnet", 1, null, {}]) assert.throws(() => c.create(value), /boolean/);
+    for (const value of [true, 1, null, {}, "other"]) assert.throws(() => c.open("", PASSWORD, value), /network/);
+    assert.equal(c.address(), created.address);
   } finally { c.wipe(); }
 });
 
