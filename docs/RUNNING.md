@@ -31,6 +31,32 @@ the genesis proof of work and starts syncing. Later boots only need
 A node given `--peer`/`--dns-seed` waits until it has seen the network tip
 before it mines, so it never forks from genesis.
 
+## Initial sync and minimum chain work
+
+`--minimumchainwork <hex>` (Bitcoin Core's option of the same name) sets the
+blue work, in hexadecimal (at most 32 digits, `0x` optional), below which
+the node treats itself as in initial block download: it does not mine and
+processes no block it did not request unless that block's chain reaches the
+value (docs/CONSENSUS.md, "Minimum chain work and unrequested blocks"). The
+default is the network's `ingress::*_MINIMUM_CHAIN_WORK`, 0 on every network
+today. Set it to the blue work of a block you know is on the real chain (a
+trusted node's `getdaginfo` reports `tip_blue_work` in decimal; give it in
+hexadecimal) to protect a fresh sync; a value the network has not reached
+keeps the node syncing forever.
+
+Release step: before each mainnet release, set
+`ingress::MAINNET_MINIMUM_CHAIN_WORK` to the blue work of a selected-chain
+block a few thousand blocks below the tip at release time (Bitcoin Core sets
+`nMinimumChainWork` the same way), and confirm with a fresh sync from the
+seeds.
+
+Block proofs of work are evaluated on a bounded pool of threads (half the
+logical CPUs, 1 to 4), each peer and each network group (IPv4 /16, IPv6 /32)
+with a small budget of failed evaluations. A peer that delivers a block it
+authored that fails validation is disconnected and its address (IPv4
+address, IPv6 /64) refused for 24 hours; loopback addresses and `--peer`
+peers are exempt. The set is in memory (a restart clears it).
+
 ## Genesis
 
 `gnb-mine-genesis` recomputes the genesis nonce. It is only needed if the

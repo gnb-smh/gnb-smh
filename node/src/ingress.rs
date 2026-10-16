@@ -197,8 +197,16 @@ pub fn ease_target_to(target: &[u8; 32], shift: u32, limit: &[u8; 32]) -> [u8; 3
 /// chain and keep the node on the lighter chain (review of the P3 merge).
 /// The 16-fold easing of the reference still bounds how cheap any orphan can
 /// be.
+#[allow(dead_code)] // tests only (the ingress core uses `orphan_floor_from`); the node binary compiles this module too
 pub fn orphan_admission_floor(tip_h: u64, now_unix: u64, orphan_height: u64) -> [u8; 32] {
-    ease_target(&reference_target(tip_h, now_unix), ORPHAN_WORK_FLOOR_SHIFT, orphan_height)
+    orphan_floor_from(&reference_target(tip_h, now_unix), orphan_height)
+}
+
+/// [`orphan_admission_floor`] from a given reference target (the ingress
+/// core's: [`reference_target`], or the POW-4 test seam
+/// `BlockIngress::with_reference_target`).
+pub fn orphan_floor_from(reference: &[u8; 32], orphan_height: u64) -> [u8; 32] {
+    ease_target(reference, ORPHAN_WORK_FLOOR_SHIFT, orphan_height)
 }
 
 /// `target(bits) <= floor`. Malformed bits never meet any floor. Cheap: no
@@ -210,6 +218,173 @@ pub fn bits_meet_floor(bits: u32, floor: &[u8; 32]) -> bool {
     }
 }
 
+// ── POW-3 (Phase 4): minimum chain work and unrequested blocks ───────────────
+//
+// Bitcoin Core's defences for a node that is behind (initial block download,
+// or a node that was offline): `nMinimumChainWork` — the chain work of a
+// recent block of the real chain, raised at every release — and the
+// `AcceptBlock` rule for UNREQUESTED blocks (validation.cpp): a block nobody
+// asked for is processed only if it has at least the work of the tip, is not
+// too far ahead of it, and, while the node is below the minimum chain work,
+// only if its own chain work reaches it. GnB's anti-DoS work rule
+// (`work_admission`) is relative to the node's own tip, so on its own it does
+// not protect a node whose tip is far behind the network: an attacker mines
+// one block A on that tip stamped "now", and every child of A then has
+// near-minimum ASERT difficulty (absolute schedule) and the work rule's
+// threshold is the victim's own (low) tip work.
+
+/// Minimum chain work (blue work, `u128`) of mainnet: the blue work of a
+/// recent block of the real chain, below which a node considers itself in
+/// initial block download (Bitcoin Core's `nMinimumChainWork`).
+///
+/// 0: the repository carries no chain data newer than the genesis block (no
+/// checkpoint, no block header, no chain-work figure — `genesis/` holds only
+/// the carryover snapshot), and a value that the real chain does not reach
+/// would stop every new node from syncing. The release process raises it
+/// (docs/RUNNING.md, "Minimum chain work"): before each release, read the
+/// `blue_work` of the selected-chain block about two weeks below the tip
+/// from several independent nodes (`getblock`/`getdaginfo`), check they
+/// agree, and set it here. Operators can set it at run time with
+/// `--minimumchainwork`.
+pub const MAINNET_MINIMUM_CHAIN_WORK: u128 = 0;
+/// Testnet: 0 (a public test network is reset at will; no requirement).
+pub const TESTNET_MINIMUM_CHAIN_WORK: u128 = 0;
+/// Regtest: 0 (Bitcoin Core's regtest value).
+pub const REGTEST_MINIMUM_CHAIN_WORK: u128 = 0;
+
+/// The default minimum chain work of a network.
+pub const fn default_minimum_chain_work(net: core::activation::ActivationNetwork) -> u128 {
+    match net {
+        core::activation::ActivationNetwork::Mainnet => MAINNET_MINIMUM_CHAIN_WORK,
+        core::activation::ActivationNetwork::Testnet => TESTNET_MINIMUM_CHAIN_WORK,
+        core::activation::ActivationNetwork::Regtest => REGTEST_MINIMUM_CHAIN_WORK,
+    }
+}
+
+/// Parse a `--minimumchainwork` value: hexadecimal, as Bitcoin Core's
+/// `-minimumchainwork=<hex>` (an optional `0x` prefix, at most 32 hex digits
+/// once leading zeros are dropped: blue work is a `u128`).
+pub fn parse_minimum_chain_work(s: &str) -> Result<u128, String> {
+    let t = s.trim();
+    let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid minimum chain work {s:?}: expected a hexadecimal number"));
+    }
+    let digits = t.trim_start_matches('0');
+    if digits.len() > 32 {
+        return Err(format!("minimum chain work {s:?} exceeds the 128-bit blue work range"));
+    }
+    if digits.is_empty() {
+        return Ok(0);
+    }
+    u128::from_str_radix(digits, 16).map_err(|e| format!("invalid minimum chain work {s:?}: {e}"))
+}
+
+static MINIMUM_CHAIN_WORK: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+
+/// Set the process-wide minimum chain work once, at start-up (the node's
+/// `--minimumchainwork`, else the network default). Later calls are
+/// refused. Tests set it per ingress core instead
+/// ([`BlockIngress::with_minimum_chain_work`]).
+pub fn set_minimum_chain_work(w: u128) -> Result<(), u128> {
+    MINIMUM_CHAIN_WORK.set(w)
+}
+
+/// The process-wide minimum chain work: the value set at start-up, else the
+/// default of the node's network (mainnet when no chain id is set, as for
+/// the activation height).
+pub fn minimum_chain_work() -> u128 {
+    *MINIMUM_CHAIN_WORK.get().unwrap_or(&default_minimum_chain_work(core::node_chain_id().into()))
+}
+
+/// Blue work of the selected tip (0 for an empty DAG).
+pub fn tip_blue_work(dag: &GhostDAG) -> u128 {
+    dag.selected_tip().and_then(|t| dag.get_block_data(&t)).map(|d| d.blue_work).unwrap_or(0)
+}
+
+/// Bitcoin Core's first initial-block-download criterion: the selected tip
+/// has less blue work than the minimum chain work.
+#[allow(dead_code)] // tests only; the node binary compiles this module too
+pub fn below_minimum_chain_work(dag: &GhostDAG, min_chain_work: u128) -> bool {
+    tip_blue_work(dag) < min_chain_work
+}
+
+/// How far below the selected tip an UNREQUESTED block may branch, in
+/// selected-chain blocks: GhostDAG's k + 1. Bitcoin Core processes an
+/// unrequested block only if its chain work is at least the tip's; in a DAG,
+/// honest blocks mined concurrently (at most k of them in any honest block's
+/// anticone) carry slightly less, and [`block_work_lower_bound`] is a lower
+/// bound (after the hardening activation it omits the merged blues), so the
+/// comparison is with the selected-chain block k + 1 below the tip. A block
+/// branching deeper is processed only when this node asked for it (a parent
+/// of a buffered orphan, a frontier tip, an IBD pull).
+pub const UNREQUESTED_WINDOW_BLOCKS: u64 = core::GHOSTDAG_K as u64 + 1;
+
+/// The blue work of the selected-chain block `depth` blocks below the
+/// selected tip (0 while the chain is shorter). O(depth).
+pub fn selected_chain_work_below(dag: &GhostDAG, depth: u64) -> u128 {
+    let mut cur = dag.selected_tip();
+    for _ in 0..depth {
+        match cur.and_then(|h| dag.get_block_data(&h)).and_then(|d| d.selected_parent) {
+            Some(p) => cur = Some(p),
+            None => return 0,
+        }
+    }
+    cur.and_then(|h| dag.get_block_data(&h)).map(|d| d.blue_work).unwrap_or(0)
+}
+
+/// Verdict of the unrequested-block rule (Bitcoin Core's `AcceptBlock`
+/// `!fRequested` branch) on a block that arrived without being asked for.
+/// `lb` is the block's [`block_work_lower_bound`] (`None` when a parent is
+/// unknown: an orphan). Cheap: no proof of work, no storage.
+pub fn unrequested_block_admission(
+    lb: Option<u128>,
+    min_chain_work: u128,
+    tip_work: u128,
+    near_tip_work: u128,
+) -> Result<(), DropReason> {
+    match lb {
+        // While below the minimum chain work an unrequested orphan proves
+        // nothing (Core never stores a block whose header does not connect,
+        // and none at all on a low-work chain): the node syncs by pulls.
+        None if tip_work < min_chain_work => Err(DropReason::BelowMinimumChainWork),
+        None => Ok(()),
+        Some(lb) if lb < min_chain_work => Err(DropReason::BelowMinimumChainWork),
+        Some(lb) if lb < near_tip_work => Err(DropReason::UnrequestedLowWork),
+        Some(_) => Ok(()),
+    }
+}
+
+/// POW-3 (Phase 4): the work requirements of a block submitted over RPC
+/// (`submitblock`), checked before its proof of work: its chain work bound
+/// must reach the minimum chain work (a node in initial block download has
+/// no use for a block on its stale tip) and the anti-DoS work threshold
+/// ([`anti_dos_work_threshold`]: within 360 selected-chain blocks of work of
+/// the tip). Bitcoin Core's `submitblock` bypasses its anti-DoS checks, but
+/// every Bitcoin block costs real work; here a block on a deep fork can be
+/// nearly free (absolute-schedule ASERT below the hardening activation),
+/// and the RPC is reachable anonymously when it is public without
+/// `--rpc-require-auth-for-writes`. A miner working on this node's
+/// templates (or a pool's stale block) is always within the window. A block
+/// with an unknown parent passes here and is refused by `accept_block`.
+pub fn submitted_block_admission(dag: &GhostDAG, block: &core::Block, min_chain_work: u128) -> Result<(), String> {
+    let Some(lb) = block_work_lower_bound(dag, &block.header.parents, block.header.bits) else {
+        return Ok(());
+    };
+    if lb < min_chain_work {
+        return Err(format!(
+            "block rejected: its chain work (at least {lb:#x}) is below the minimum chain work {min_chain_work:#x} \
+             (this node is in initial block download)"));
+    }
+    let threshold = anti_dos_work_threshold(dag);
+    if lb < threshold {
+        return Err(format!(
+            "block rejected: its chain cannot come within {ANTI_DOS_WINDOW_BLOCKS} selected-chain blocks of work \
+             of the tip (anti-DoS work rule, docs/CONSENSUS.md)"));
+    }
+    Ok(())
+}
+
 // ── NET-6: work-backed IBD evidence ──────────────────────────────────────────
 
 /// A PoW-verified orphan counts as evidence that we are BEHIND (and may latch
@@ -218,9 +393,15 @@ pub fn bits_meet_floor(bits: u32, floor: &[u8; 32]) -> bool {
 /// and it claims a height more than `IBD_EXIT_LAG` above our tip. Its height
 /// is a claim, but a claim that cost a full block of work to make, and
 /// `accept_block` verifies it the moment its parents arrive.
+#[allow(dead_code)] // tests only (the ingress core uses `orphan_is_sync_evidence_from`); the node binary compiles this module too
 pub fn orphan_is_sync_evidence(bits: u32, claimed_height: u64, tip_h: u64, now_unix: u64) -> bool {
-    claimed_height > tip_h.saturating_add(crate::sync::IBD_EXIT_LAG)
-        && bits_meet_floor(bits, &reference_target(tip_h, now_unix))
+    orphan_is_sync_evidence_from(bits, claimed_height, tip_h, &reference_target(tip_h, now_unix))
+}
+
+/// [`orphan_is_sync_evidence`] against a given reference target (see
+/// [`orphan_floor_from`]).
+pub fn orphan_is_sync_evidence_from(bits: u32, claimed_height: u64, tip_h: u64, reference: &[u8; 32]) -> bool {
+    claimed_height > tip_h.saturating_add(crate::sync::IBD_EXIT_LAG) && bits_meet_floor(bits, reference)
 }
 
 /// NET-6: what the processor does with one (clamped) tip claim.
@@ -330,6 +511,199 @@ pub fn verdict_for_block_decode_error(err: &str) -> GossipVerdict {
         GossipVerdict::Ignore
     } else {
         GossipVerdict::Reject
+    }
+}
+
+// ── B1-T7 / NET-4 residual: who a refused block frame is charged to ──────────
+//
+// Gossipsub's `Reject` charges its invalid-message penalty (P4) to the peer
+// that delivered the frame AND to every peer that delivered a duplicate.
+// Releases older than the validated relay (NET-2) forward every frame before
+// validating it, and they follow the chain until the hardening activation
+// block (they reject it); releases older than this one (Phase 4) forward an
+// orphan once its bits meet THEIR floor and its proof is valid, before its
+// parents are known — at every height, since they accept the activation
+// block. Either can be an honest peer that delivers a frame this node
+// refuses, and penalizing it would let anyone get every upgraded node to cut
+// it off (B1-T7; the transaction relay has the same gate,
+// `mempool::relay::TxRelay::penalties_in_force`). Bitcoin Core never
+// punishes a peer for data that may be invalid only because of a recent rule
+// change (`BLOCK_RECENT_CONSENSUS_CHANGE`) and punishes the peer that SENT
+// the invalid data. So:
+//
+// * a frame the delivering peer AUTHORED (gossipsub's signed source is the
+//   propagation source: nobody relayed it) is always charged to it — as a
+//   misbehaviour (disconnect and address discouragement), with `Ignore` to
+//   gossipsub so that no relay that forwarded a duplicate is charged;
+// * a RELAYED frame is charged (`Reject`) only for a context-free fault —
+//   one every release on the chain checks before forwarding anything
+//   (decode, id / height binding, structure, proof of work) — and only once
+//   the chain contains the hardening activation block (no release that
+//   forwards unvalidated frames follows it);
+// * a relayed frame with a contextual fault (height, bits, timestamp,
+//   coinbase: what an older release's relayed orphan can carry), or one
+//   below the orphan floor (a function of the node's own tip and clock), is
+//   never charged to the relay.
+
+/// The class of fault of a refused block frame (see above).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockFault {
+    /// Decode, id / height binding, structure, proof of work.
+    ContextFree,
+    /// Needs the parents (height, bits, timestamp, coinbase), or the orphan
+    /// floor.
+    Context,
+}
+
+/// The fault class of an `accept_block` error (the proof of work is
+/// context-free; every other error [`verdict_for_accept_error`] rejects
+/// depends on the parents).
+pub fn accept_error_fault(err: &str) -> BlockFault {
+    if err.starts_with("consensus rejection: invalid GnB-SMH proof of work") {
+        BlockFault::ContextFree
+    } else {
+        BlockFault::Context
+    }
+}
+
+/// What to do about a refused gossip block frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockPenalty {
+    /// The verdict reported to gossipsub (`Reject` = P4 on the deliverer and
+    /// on every peer that delivered a duplicate).
+    pub gossip: GossipVerdict,
+    /// Treat the delivering peer as misbehaving (disconnect it and
+    /// discourage its address, `network::discourage`).
+    pub misbehaving: bool,
+}
+
+/// Penalty for a block frame whose verdict would be `base` (see the section
+/// comment above). `self_authored`: the frame's signed gossip author is the
+/// peer that delivered it. `penalties_in_force`:
+/// [`block_penalties_in_force`].
+pub fn block_penalty(base: GossipVerdict, fault: BlockFault, self_authored: bool, penalties_in_force: bool) -> BlockPenalty {
+    match base {
+        GossipVerdict::Reject if penalties_in_force && fault == BlockFault::ContextFree => {
+            BlockPenalty { gossip: GossipVerdict::Reject, misbehaving: true }
+        }
+        GossipVerdict::Reject if self_authored => BlockPenalty { gossip: GossipVerdict::Ignore, misbehaving: true },
+        GossipVerdict::Reject => BlockPenalty { gossip: GossipVerdict::Ignore, misbehaving: false },
+        v => BlockPenalty { gossip: v, misbehaving: false },
+    }
+}
+
+/// True iff the node's selected chain contains the hardening activation
+/// block (`tip_height >= activation`): from then on no release that forwards
+/// unvalidated frames follows the chain (the same gate as
+/// `mempool::relay::TxRelay::penalties_in_force`, whose next-block height is
+/// `tip_height + 1`).
+pub fn block_penalties_in_force(tip_height: u64, activation: u64) -> bool {
+    activation != core::activation::NEVER
+        && tip_height.saturating_add(1) >= crate::mempool::relay::default_penalty_height(activation)
+}
+
+// ── B1-T5: no relay of orphans before they connect ───────────────────────────
+
+/// How long a withheld orphan verdict stays useful, from the frame's arrival
+/// (gossipsub keeps an unvalidated frame for `GOSSIP_HISTORY_LENGTH`
+/// heartbeats; the same margin as the transaction relay's deferred verdicts).
+pub const DEFERRED_BLOCK_VERDICT_TTL: Duration = crate::mempool::relay::DEFERRED_VERDICT_TTL;
+
+/// Bound on withheld orphan verdicts.
+pub const MAX_DEFERRED_BLOCK_VERDICTS: usize = 1_024;
+
+/// What became of a buffered orphan whose gossip verdict was withheld.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OrphanFate {
+    /// Connected (`accept_block` accepted it): relay its frame.
+    Accepted,
+    /// `accept_block` refused it with this error.
+    Rejected(String),
+    /// The work rule refused it once its parents were known, or it left the
+    /// pool, or its frame expired: not relayed, not penalized.
+    Dropped,
+}
+
+/// B1-T5 / POW-4: the gossip verdicts of buffered orphans are WITHHELD
+/// until the orphan connects (as the transaction relay does for orphan
+/// transactions, MEM-6): an orphan has passed only the floor and its proof
+/// of work, and relaying it at once (`Accept` on buffering) let an attacker's
+/// floor-meeting orphans travel the whole network, charged at every hop to
+/// the honest relay that forwarded them. Keyed by block id, timed from the
+/// frame's arrival, bounded.
+#[derive(Debug)]
+pub struct DeferredBlockVerdicts<O> {
+    pending: HashMap<[u8; 32], (O, Instant)>,
+}
+
+impl<O> Default for DeferredBlockVerdicts<O> {
+    fn default() -> Self {
+        Self { pending: HashMap::new() }
+    }
+}
+
+impl<O> DeferredBlockVerdicts<O> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Withhold the verdict of the frame (received at `received_at`) that
+    /// carried the buffered orphan `hash`. Returns the origin back when it is
+    /// not stored (frame already too old, the same id already pending, or the
+    /// table full): the caller answers `Ignore`.
+    pub fn defer(&mut self, hash: [u8; 32], origin: O, received_at: Instant, now: Instant) -> Option<O> {
+        if now.saturating_duration_since(received_at) >= DEFERRED_BLOCK_VERDICT_TTL {
+            return Some(origin);
+        }
+        if self.pending.len() >= MAX_DEFERRED_BLOCK_VERDICTS {
+            self.pending.retain(|_, (_, at)| now.saturating_duration_since(*at) < DEFERRED_BLOCK_VERDICT_TTL);
+        }
+        if self.pending.len() >= MAX_DEFERRED_BLOCK_VERDICTS || self.pending.contains_key(&hash) {
+            return Some(origin);
+        }
+        self.pending.insert(hash, (origin, received_at));
+        None
+    }
+
+    /// Settle the withheld verdicts of the drained orphans in `ev`.
+    pub fn settle(&mut self, ev: &OrphanBlockEvents) -> Vec<(O, OrphanFate)> {
+        let mut out = Vec::new();
+        for h in &ev.accepted {
+            if let Some((o, _)) = self.pending.remove(h) {
+                out.push((o, OrphanFate::Accepted));
+            }
+        }
+        for (h, e) in &ev.rejected {
+            if let Some((o, _)) = self.pending.remove(h) {
+                out.push((o, OrphanFate::Rejected(e.clone())));
+            }
+        }
+        for (h, _) in &ev.refused {
+            if let Some((o, _)) = self.pending.remove(h) {
+                out.push((o, OrphanFate::Dropped));
+            }
+        }
+        out
+    }
+
+    /// Forget the verdicts whose frame expired or whose orphan is no longer
+    /// buffered (`still_buffered` false: evicted, given up): their origins,
+    /// to be answered `Ignore`.
+    pub fn prune(&mut self, still_buffered: impl Fn(&[u8; 32]) -> bool, now: Instant) -> Vec<O> {
+        let doomed: Vec<[u8; 32]> = self.pending.iter()
+            .filter(|(h, (_, at))| now.saturating_duration_since(*at) >= DEFERRED_BLOCK_VERDICT_TTL || !still_buffered(h))
+            .map(|(h, _)| *h)
+            .collect();
+        doomed.iter().filter_map(|h| self.pending.remove(h).map(|(o, _)| o)).collect()
     }
 }
 
@@ -927,67 +1301,87 @@ impl OrphanPool {
         memo.get(root).copied().unwrap_or(0)
     }
 
-    /// POW-3: the greatest lower bound on the blue work of any buffered
-    /// orphan that (directly or through other buffered orphans) waits on
-    /// `root`, assuming `root` connects with blue work at least `root_lb`.
-    /// An orphan's bound is the largest bound of its parents — a DAG block's
-    /// blue work, `root_lb` for `root`, a buffered orphan's own bound, 0 for
-    /// anything else — plus its header work: a block's blue work is at least
-    /// any parent's plus its own work, before and after the hardening
-    /// activation. O(orphans above `root` and their buffered ancestors).
-    pub fn best_waiter_lb(&self, root: &[u8; 32], root_lb: u128, dag: &crate::consensus::GhostDAG) -> u128 {
-        // Orphans above `root`.
-        let mut above: Vec<[u8; 32]> = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        let mut queue: VecDeque<[u8; 32]> = VecDeque::new();
-        queue.push_back(*root);
-        while let Some(h) = queue.pop_front() {
-            if let Some(ws) = self.waiting_for.get(&h) {
-                for w in ws {
-                    if self.entries.contains_key(w) && seen.insert(*w) {
-                        above.push(*w);
-                        queue.push_back(*w);
-                    }
-                }
-            }
-        }
-        // Their lower bounds, parents first (iterative, memoized).
-        let mut memo: HashMap<[u8; 32], u128> = HashMap::new();
-        memo.insert(*root, root_lb);
+    /// POW-3 / B1-T5: the greatest lower bound on the blue work of a buffered
+    /// orphan that VOUCHES for `root` — a block whose parents are all in the
+    /// DAG, `root_block`, being judged by the work rule with its own bound
+    /// `root_lb` — or 0 if none does.
+    ///
+    /// The audit (B1-T5) found that the bound used to be built from the
+    /// self-declared parents and bits of ANY orphan transitively above
+    /// `root`, none of them checked in context: one orphan listing our tip
+    /// and a low-work block as parents (even one that could never be valid,
+    /// stamped before its parents) got that block and, through the drain,
+    /// every orphan above it stored. A voucher now has to be checkable, and
+    /// checked, before it can make anything acceptable (as Bitcoin Core never
+    /// lets a header that fails `ContextualCheckBlockHeader` make another
+    /// block acceptable):
+    ///
+    /// * it waits on `root` DIRECTLY and every other parent is in the DAG
+    ///   (an orphan above other orphans cannot be checked yet);
+    /// * its header height is `max(parent DAG heights) + 1`, `root` counting
+    ///   with the height `accept_block` will require of it;
+    /// * its bits are the expected ASERT bits of its parent set and its
+    ///   timestamp is within the bounds `accept_block` enforces;
+    /// * it is below the hardening activation (`activation`): from the
+    ///   activation a block that merges a red below its merge-depth root is
+    ///   invalid, and a block whose own chain cannot come within the
+    ///   anti-DoS window (360 selected-chain blocks of work, `MERGE_DEPTH`) of
+    ///   the tip is below the merge-depth root of every block an honest miner
+    ///   builds on the tip — merging it is a `MergeDepthViolation`, so no
+    ///   valid block can vouch for it.
+    ///
+    /// Its proof of work was verified when it was buffered. The bound is the
+    /// largest parent blue work (`root_lb` for `root`) plus its header work.
+    /// O(direct waiters × parents).
+    #[allow(clippy::too_many_arguments)]
+    pub fn best_voucher_lb(
+        &self,
+        root: &[u8; 32],
+        root_block: &core::Block,
+        root_lb: u128,
+        dag: &crate::consensus::GhostDAG,
+        now_unix: u64,
+        activation: u64,
+    ) -> u128 {
+        let Some(waiters) = self.waiting_for.get(root) else { return 0 };
+        // The header height `accept_block` will require of `root`.
+        let root_height = root_block.header.parents.iter()
+            .filter_map(|p| dag.get_block_data(p).map(|d| d.height))
+            .max()
+            .map(|h| h.saturating_add(1));
+        let Some(root_height) = root_height.filter(|h| *h == root_block.height) else { return 0 };
         let mut best = 0u128;
-        for start in above {
-            // Depth-first, a node is computed once all its buffered parents
-            // are; `in_progress` guards against (impossible) cycles.
-            let mut stack: Vec<[u8; 32]> = vec![start];
-            let mut in_progress: HashSet<[u8; 32]> = HashSet::new();
-            while let Some(&h) = stack.last() {
-                if memo.contains_key(&h) {
-                    stack.pop();
-                    continue;
-                }
-                let Some(e) = self.entries.get(&h) else {
-                    memo.insert(h, dag.get_block_data(&h).map(|d| d.blue_work).unwrap_or(0));
-                    stack.pop();
-                    continue;
-                };
-                let pending: Vec<[u8; 32]> = e.block.header.parents.iter()
-                    .filter(|p| !memo.contains_key(*p) && self.entries.contains_key(*p) && !in_progress.contains(*p))
-                    .copied()
-                    .collect();
-                if pending.is_empty() || !in_progress.insert(h) {
-                    let base = e.block.header.parents.iter().map(|p| {
-                        memo.get(p).copied()
-                            .or_else(|| dag.get_block_data(p).map(|d| d.blue_work))
-                            .unwrap_or(0)
-                    }).max().unwrap_or(0);
-                    memo.insert(h, base.saturating_add(header_work(&e.block)));
-                    in_progress.remove(&h);
-                    stack.pop();
-                } else {
-                    stack.extend(pending);
-                }
+        'voucher: for w in waiters {
+            let Some(e) = self.entries.get(w) else { continue };
+            let b = &e.block;
+            if core::activation::is_active_at(b.height, activation) {
+                continue;
             }
-            best = best.max(memo.get(&start).copied().unwrap_or(0));
+            let (mut max_h, mut max_ts, mut max_bw) = (0u64, 0u64, 0u128);
+            for p in &b.header.parents {
+                let (h, ts, bw) = if p == root {
+                    (root_height, root_block.header.timestamp, root_lb)
+                } else {
+                    match dag.get_block_data(p) {
+                        Some(d) => (d.height, d.timestamp, d.blue_work),
+                        None => continue 'voucher,
+                    }
+                };
+                max_h = max_h.max(h);
+                max_ts = max_ts.max(ts);
+                max_bw = max_bw.max(bw);
+            }
+            if b.height != max_h.saturating_add(1) {
+                continue;
+            }
+            match crate::pow::expected_bits(max_ts, b.height) {
+                Ok(bits) if bits == b.header.bits => {}
+                _ => continue,
+            }
+            if b.header.timestamp < max_ts || b.header.timestamp > now_unix.saturating_add(core::MAX_FUTURE_SECS) {
+                continue;
+            }
+            best = best.max(max_bw.saturating_add(header_work(b)));
         }
         best
     }
@@ -1111,7 +1505,7 @@ pub enum WorkAdmission {
 /// The POW-3 decision from its inputs: `lb` = [`block_work_lower_bound`],
 /// `threshold` = [`anti_dos_work_threshold`], `chain_above` =
 /// [`OrphanPool::announced_work_above`], `merge_lb` =
-/// [`OrphanPool::best_waiter_lb`].
+/// [`OrphanPool::best_voucher_lb`].
 pub fn work_admission(lb: u128, threshold: u128, chain_above: u128, merge_lb: u128) -> WorkAdmission {
     if lb >= threshold {
         WorkAdmission::NearTip
@@ -1138,6 +1532,30 @@ pub fn normalize_wire_metadata(block: &mut core::Block, dag: &Arc<RwLock<GhostDA
     );
 }
 
+/// What happened to buffered orphans in the ingress core (for the gossip
+/// verdicts withheld while they were orphans, [`DeferredBlockVerdicts`]).
+#[derive(Debug, Default, Clone)]
+pub struct OrphanBlockEvents {
+    /// Drained orphans `accept_block` accepted.
+    pub accepted: Vec<[u8; 32]>,
+    /// Drained orphans `accept_block` rejected, with its error.
+    pub rejected: Vec<([u8; 32], String)>,
+    /// Drained orphans the work rule refused (B1-T5) — not stored.
+    pub refused: Vec<([u8; 32], DropReason)>,
+}
+
+impl OrphanBlockEvents {
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn is_empty(&self) -> bool {
+        self.accepted.is_empty() && self.rejected.is_empty() && self.refused.is_empty()
+    }
+}
+
+/// The work-rule gate the orphan drain calls for each orphan whose parents
+/// are all known, before `accept_block` (see [`process_orphans_gated`]).
+pub type DrainGate<'a> =
+    dyn FnMut(&OrphanPool, &core::Block, &[u8; 32], &GhostDAG) -> Result<WorkAdmission, DropReason> + 'a;
+
 /// After accepting a block, accept every buffered orphan that can now be
 /// connected, transitively. Returns the hashes accepted, in order; `chain`
 /// accumulates what they did to the applied chain (`accept::ChainMove`, for
@@ -1145,10 +1563,19 @@ pub fn normalize_wire_metadata(block: &mut core::Block, dag: &Arc<RwLock<GhostDA
 ///
 /// POW-3 / POW-4 (audit): ITERATIVE (a work queue), not recursive — an
 /// attacker-built chain of thousands of orphans used to recurse once per
-/// accepted orphan on a 2 MiB worker stack. Buffered orphans passed the
-/// anti-DoS floor and their proof of work to enter the pool, so they are not
-/// re-checked against the POW-3 work rule.
+/// accepted orphan on a 2 MiB worker stack
+/// (`fix_ingress_dos::drain_of_a_deep_orphan_chain_runs_on_a_small_stack`).
+///
+/// B1-T5: each orphan is judged by the work rule again once its parents are
+/// known: buffering only checked its bits against the orphan floor and its
+/// proof of work, and the block it waited on may have been admitted only
+/// because another orphan vouched for it — a low-work fork above such a block
+/// used to be stored whole. This function applies the rule without the
+/// ingress core's state (the orphan's own bound, or the orphans announced
+/// above it; never a voucher, which needs the merge-backed budget); the node
+/// uses [`BlockIngress::drain_orphans`], which applies the full rule.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // tests only; the node binary compiles this module too
 pub fn process_orphans(
     accepted_hash: [u8; 32],
     orphans:       &mut OrphanPool,
@@ -1160,41 +1587,72 @@ pub fn process_orphans(
     shielded:      &Arc<RwLock<ShieldedPool>>,
     chain:         &mut crate::accept::ChainMove,
 ) -> Vec<[u8; 32]> {
-    let mut accepted = Vec::new();
+    let mut gate = |pool: &OrphanPool, block: &core::Block, hash: &[u8; 32], d: &GhostDAG| {
+        let threshold = anti_dos_work_threshold(d);
+        let lb = block_work_lower_bound(d, &block.header.parents, block.header.bits).unwrap_or(0);
+        let above = if lb >= threshold { 0 } else { pool.announced_work_capped(hash, threshold - lb) };
+        match work_admission(lb, threshold, above, 0) {
+            WorkAdmission::LowWork => Err(DropReason::LowWork),
+            a => Ok(a),
+        }
+    };
+    let ctx = AcceptCtx { dag, store, mempool, node_state, tip_tx, shielded };
+    let mut events = OrphanBlockEvents::default();
+    process_orphans_gated(accepted_hash, orphans, &ctx, chain, &mut gate, &mut events);
+    events.accepted
+}
+
+/// [`process_orphans`] with the work-rule `gate`; records every drained
+/// orphan's outcome in `events`.
+pub fn process_orphans_gated(
+    accepted_hash: [u8; 32],
+    orphans:       &mut OrphanPool,
+    ctx:           &AcceptCtx,
+    chain:         &mut crate::accept::ChainMove,
+    gate:          &mut DrainGate<'_>,
+    events:        &mut OrphanBlockEvents,
+) {
     let mut queue: VecDeque<[u8; 32]> = VecDeque::new();
     queue.push_back(accepted_hash);
     while let Some(parent) = queue.pop_front() {
         for orphan_hash in orphans.take_waiters(&parent) {
-            let all_parents_present = orphans.get(&orphan_hash)
-                .map(|e| {
-                    let d = dag.read();
-                    e.block.header.parents.iter().all(|p| d.has_block(p))
-                })
-                .unwrap_or(false);
-            // Still waiting on another parent: it stays registered under that
-            // parent and is retried when it arrives.
-            if !all_parents_present { continue; }
-
-            if let Some(entry) = orphans.remove(&orphan_hash) {
-                let height = entry.height;
-                let mut block = entry.block;
-                normalize_wire_metadata(&mut block, dag);
-                match crate::accept::accept_block_tracking(&block, orphan_hash, height, dag, store, mempool,
-                                                           node_state, tip_tx, shielded, chain) {
-                    Ok(hash) => {
-                        info!("✓ orphan h={} accepted (pool={})", height, orphans.len());
-                        orphans.forget(&hash);
-                        accepted.push(hash);
-                        queue.push_back(hash);
-                    }
-                    Err(e) => {
-                        warn!("orphan h={} rejected: {}", height, e);
-                    }
+            let verdict = {
+                let Some(e) = orphans.get(&orphan_hash) else { continue };
+                let d = ctx.dag.read();
+                // Still waiting on another parent: it stays registered under
+                // that parent and is retried when it arrives.
+                if !e.block.header.parents.iter().all(|p| d.has_block(p)) {
+                    continue;
+                }
+                gate(orphans, &e.block, &orphan_hash, &d)
+            };
+            let Some(entry) = orphans.remove(&orphan_hash) else { continue };
+            let height = entry.height;
+            if let Err(reason) = verdict {
+                // Not stored. The orphans above it stay buffered (they still
+                // wait on it): if more work is announced above it, the orphan
+                // sweep requests it again and it is judged again.
+                debug!("orphan h={} refused by the work rule on drain: {:?}", height, reason);
+                events.refused.push((orphan_hash, reason));
+                continue;
+            }
+            let mut block = entry.block;
+            normalize_wire_metadata(&mut block, ctx.dag);
+            match crate::accept::accept_block_tracking(&block, orphan_hash, height, ctx.dag, ctx.store, ctx.mempool,
+                                                       ctx.node_state, ctx.tip_tx, ctx.shielded, chain) {
+                Ok(hash) => {
+                    info!("✓ orphan h={} accepted (pool={})", height, orphans.len());
+                    orphans.forget(&hash);
+                    events.accepted.push(hash);
+                    queue.push_back(hash);
+                }
+                Err(e) => {
+                    warn!("orphan h={} rejected: {}", height, e);
+                    events.rejected.push((orphan_hash, e));
                 }
             }
         }
     }
-    accepted
 }
 
 /// What the acceptance pipeline needs (the arguments `accept_block` takes
@@ -1220,9 +1678,25 @@ pub enum DropReason {
     OrphanBelowFloor,
     /// POW-3: a block whose chain cannot reach the anti-DoS work threshold.
     LowWork,
-    /// POW-3 / DAG-7: a deep merge-backed block while the deep-insertion
-    /// budget is exhausted (the orphan sweep re-requests it).
+    /// POW-3 / DAG-7 / B1-T5: a merge-backed block while the merge-backed
+    /// insertion budget is exhausted (the orphan sweep re-requests it).
     DeepBudgetExhausted,
+    /// POW-3 (Phase 4): an unrequested block while this node is below the
+    /// minimum chain work, or one whose own chain work does not reach it
+    /// (Bitcoin Core's `nMinimumChainWork` rule in `AcceptBlock`).
+    BelowMinimumChainWork,
+    /// POW-3 (Phase 4): an unrequested block whose chain work cannot come
+    /// within [`UNREQUESTED_WINDOW_BLOCKS`] of the selected tip (Core:
+    /// "don't process less-work chains" unless requested).
+    UnrequestedLowWork,
+    /// NET-2 residual (Phase 4): its proof of work would have to be
+    /// evaluated but the delivering peer's or its network group's
+    /// proof-of-work budget is spent, or the PoW queue is full
+    /// (`pow::verifier`). Not evaluated, not relayed, not penalized.
+    /// Returned by [`BlockIngress::handle_block`] only; the node answers a
+    /// refused proof-of-work job directly.
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    PowBusy,
 }
 
 /// At most this many pruned bodies are named by an operator override that
@@ -1336,12 +1810,117 @@ pub enum BlockOutcome {
     },
 }
 
+/// How [`BlockIngress::handle_block_gated`] gets a block's proof of work
+/// checked (NET-2 residual, Phase 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowCheck {
+    /// The proof is valid (evaluated now, or known from an earlier
+    /// evaluation; a valid proof is also in the PoW cache of `validate_pow`).
+    Valid,
+    /// The proof is invalid.
+    Invalid,
+    /// Not evaluated yet: the caller evaluates it OFF the message processor
+    /// (`pow::verifier`) and submits the block again once the result is
+    /// known.
+    Deferred,
+}
+
+/// Where the ingress core's proof-of-work evaluations happen. The core asks
+/// only after every cheap check passed (structure, the unrequested-block and
+/// minimum-chain-work rules, the orphan floor or the work rule, and for a
+/// block whose parents are known the header height, expected bits,
+/// timestamp and hardened block rules `accept_block` checks first).
+pub trait PowGate {
+    fn check(&mut self, block: &core::Block, hash: &[u8; 32]) -> PowCheck;
+}
+
+/// Evaluate inline (64 MiB GnB-SMH on the calling thread): tests and
+/// [`BlockIngress::handle_block`].
+#[allow(dead_code)] // tests only; the node binary compiles this module too
+pub struct InlinePow;
+
+impl PowGate for InlinePow {
+    fn check(&mut self, block: &core::Block, _hash: &[u8; 32]) -> PowCheck {
+        if block.validate_pow() { PowCheck::Valid } else { PowCheck::Invalid }
+    }
+}
+
+/// Outcome of [`BlockIngress::handle_block_gated`].
+#[derive(Debug)]
+pub enum Gated {
+    /// Fully handled.
+    Done(BlockOutcome),
+    /// Every cheap check passed and the gate deferred the proof of work: the
+    /// block is handed back, to be submitted again once its proof is known
+    /// (the node keeps the frame's bytes instead and decodes them again).
+    PowPending(#[allow(dead_code)] Box<core::Block>),
+}
+
+/// `accept_block`'s checks that come BEFORE its proof of work, for a block
+/// whose parents are all in the DAG (header height = max parent DAG height +
+/// 1, bits = expected ASERT bits of the parent set, timestamp bounds, the
+/// hardened block rules at the activation height): true iff they all pass.
+/// The node evaluates the 64 MiB proof only for such blocks; a block that
+/// fails one goes to `accept_block` directly, which refuses it with its own
+/// error before evaluating anything (one source of truth for the verdict).
+pub fn passes_pre_pow_checks(block: &core::Block, dag: &GhostDAG, activation: u64) -> bool {
+    if block.header.parents.is_empty() {
+        return false;
+    }
+    let (mut max_h, mut max_ts) = (0u64, 0u64);
+    for p in &block.header.parents {
+        match dag.get_block_data(p) {
+            Some(d) => {
+                max_h = max_h.max(d.height);
+                max_ts = max_ts.max(d.timestamp);
+            }
+            None => return false,
+        }
+    }
+    if block.height != max_h.saturating_add(1) {
+        return false;
+    }
+    match crate::pow::expected_bits(max_ts, block.height) {
+        Ok(bits) if bits == block.header.bits => {}
+        _ => return false,
+    }
+    block.validate_timestamp(max_ts).is_ok()
+        && core::block_rules::check_block_hardened_at(block, activation).is_ok()
+}
+
+/// Bounded FIFO cache of LowWork verdicts (see [`BlockIngress`]).
+#[derive(Default)]
+struct LowWorkCache {
+    seen:  HashMap<[u8; 32], LowWorkState>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl LowWorkCache {
+    fn hit(&self, hash: &[u8; 32], state: &LowWorkState) -> bool {
+        self.seen.get(hash) == Some(state)
+    }
+
+    fn note(&mut self, hash: [u8; 32], state: LowWorkState) {
+        if self.seen.insert(hash, state).is_none() {
+            self.order.push_back(hash);
+            while self.order.len() > LOW_WORK_CACHE_MAX {
+                if let Some(old) = self.order.pop_front() {
+                    self.seen.remove(&old);
+                }
+            }
+        }
+    }
+}
+
 /// The message processor's per-block core: everything it decides about an
 /// inbound block (decoded and bound to its id and height by the caller)
 /// before and around `accept_block`.
 pub struct BlockIngress {
     pub orphans:      OrphanPool,
     pub parent_fetch: ParentFetchTracker,
+    /// The merge-backed insertion budget (B1-T5: every merge-backed
+    /// admission is charged, not only those more than `CHECKPOINT_DEPTH`
+    /// below the tip).
     pub deep_budget:  DeepBackfillBudget,
     /// `(selected tip, anti_dos_work_threshold)` of the last work check: the
     /// threshold only changes when the selected tip does.
@@ -1350,12 +1929,22 @@ pub struct BlockIngress {
     /// in (orphan-pool generation, DAG size, selected tip). The verdict can
     /// only change with that state, so a re-sent refused block costs a map
     /// lookup, not another walk over the orphans above it. Bounded, FIFO.
-    low_work_seen:    HashMap<[u8; 32], LowWorkState>,
-    low_work_order:   VecDeque<[u8; 32]>,
+    low_work:         LowWorkCache,
+    /// POW-3 (Phase 4): the minimum chain work (see
+    /// [`MAINNET_MINIMUM_CHAIN_WORK`]).
+    min_chain_work:   u128,
+    /// POW-4 test seam: the reference target the orphan floor and the IBD
+    /// evidence derive from, instead of [`reference_target`] (node tests
+    /// build with `test-pow-limit`, under which the clock-derived reference is
+    /// the pow limit and the floor admits every decodable bits value).
+    reference_override: Option<[u8; 32]>,
     /// What the `accept_block` calls of this core did to the applied chain
     /// since the last [`BlockIngress::take_chain_move`] (audit MEM-6: the
     /// orphan-transaction bookkeeping runs after the gossip verdict).
     chain:            crate::accept::ChainMove,
+    /// What happened to drained orphans since the last
+    /// [`BlockIngress::take_orphan_events`] (their withheld gossip verdicts).
+    orphan_events:    OrphanBlockEvents,
 }
 
 type LowWorkState = (u64, usize, Option<BlockHash>);
@@ -1366,6 +1955,57 @@ pub const LOW_WORK_CACHE_MAX: usize = 4_096;
 impl Default for BlockIngress {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The POW-3 work rule (see [`BlockIngress::work_check`]) on the core's
+/// parts, so the orphan drain can apply it while it holds the pool.
+#[allow(clippy::too_many_arguments)]
+fn work_rule(
+    orphans:         &OrphanPool,
+    budget:          &mut DeepBackfillBudget,
+    threshold_cache: &mut Option<(BlockHash, u128)>,
+    low_work:        &mut LowWorkCache,
+    block:           &core::Block,
+    hash:            &[u8; 32],
+    now:             Instant,
+    now_unix:        u64,
+    dag:             &GhostDAG,
+) -> Result<WorkAdmission, DropReason> {
+    let state: LowWorkState = (orphans.generation(), dag.block_count(), dag.selected_tip());
+    if low_work.hit(hash, &state) {
+        return Err(DropReason::LowWork);
+    }
+    let threshold = match (dag.selected_tip(), *threshold_cache) {
+        (Some(tip), Some((cached_tip, t))) if tip == cached_tip => t,
+        (tip, _) => {
+            let t = anti_dos_work_threshold(dag);
+            *threshold_cache = tip.map(|h| (h, t));
+            t
+        }
+    };
+    let lb = block_work_lower_bound(dag, &block.header.parents, block.header.bits).unwrap_or(0);
+    let (chain_above, merge_lb) = if lb >= threshold {
+        (0, 0)
+    } else {
+        let chain_above = orphans.announced_work_capped(hash, threshold - lb);
+        if lb.saturating_add(chain_above) >= threshold {
+            (chain_above, 0) // ChainBacked: the merge bound is not needed
+        } else {
+            let act = core::activation::hardening_activation_height();
+            (chain_above, orphans.best_voucher_lb(hash, block, lb, dag, now_unix, act))
+        }
+    };
+    match work_admission(lb, threshold, chain_above, merge_lb) {
+        WorkAdmission::LowWork => {
+            low_work.note(*hash, state);
+            Err(DropReason::LowWork)
+        }
+        // B1-T5: every merge-backed admission is rationed (one voucher costs
+        // one full block of work at the tip; the budget bounds how many
+        // low-work blocks such vouchers can get stored).
+        WorkAdmission::MergeBacked if !budget.allow_at(now) => Err(DropReason::DeepBudgetExhausted),
+        ok => Ok(ok),
     }
 }
 
@@ -1380,10 +2020,43 @@ impl BlockIngress {
             parent_fetch: ParentFetchTracker::new(),
             deep_budget: DeepBackfillBudget::new(),
             threshold_cache: None,
-            low_work_seen: HashMap::new(),
-            low_work_order: VecDeque::new(),
+            low_work: LowWorkCache::default(),
+            min_chain_work: minimum_chain_work(),
+            reference_override: None,
             chain: crate::accept::ChainMove::default(),
+            orphan_events: OrphanBlockEvents::default(),
         }
+    }
+
+    /// Use `w` as the minimum chain work (default: the process-wide
+    /// [`minimum_chain_work`]).
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn with_minimum_chain_work(mut self, w: u128) -> Self {
+        self.min_chain_work = w;
+        self
+    }
+
+    /// The minimum chain work this core applies.
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn minimum_chain_work(&self) -> u128 {
+        self.min_chain_work
+    }
+
+    /// POW-4 test seam: derive the orphan floor and the IBD evidence from the
+    /// reference target `t` instead of the clock and the selected tip
+    /// ([`reference_target`]).
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn with_reference_target(mut self, t: [u8; 32]) -> Self {
+        self.reference_override = Some(t);
+        self
+    }
+
+    /// True while the selected tip has less blue work than the minimum chain
+    /// work (Bitcoin Core's initial block download; the node reads
+    /// [`minimum_chain_work`] in its IBD latch).
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn in_initial_download(&self, dag: &GhostDAG) -> bool {
+        below_minimum_chain_work(dag, self.min_chain_work)
     }
 
     /// What this core's `accept_block` calls did to the applied chain since
@@ -1392,82 +2065,114 @@ impl BlockIngress {
         std::mem::take(&mut self.chain)
     }
 
+    /// What happened to drained orphans since the last call (accepted,
+    /// rejected by `accept_block`, refused by the work rule).
+    pub fn take_orphan_events(&mut self) -> OrphanBlockEvents {
+        std::mem::take(&mut self.orphan_events)
+    }
+
     /// True iff some buffered orphan, an outstanding parent request or a
     /// remembered evicted orphan chain waits for `hash`.
     pub fn is_awaited(&self, hash: &[u8; 32]) -> bool {
         self.orphans.is_waited_on(hash) || self.parent_fetch.is_awaited(hash) || self.orphans.remembers(hash)
     }
 
-    fn note_low_work(&mut self, hash: [u8; 32], state: LowWorkState) {
-        if self.low_work_seen.insert(hash, state).is_none() {
-            self.low_work_order.push_back(hash);
-            while self.low_work_order.len() > LOW_WORK_CACHE_MAX {
-                if let Some(old) = self.low_work_order.pop_front() {
-                    self.low_work_seen.remove(&old);
-                }
-            }
-        }
+    /// True iff this node asked for `hash`: the block is the answer to one
+    /// of its directed pulls (`solicited`), or a request for it is
+    /// outstanding (whoever delivers it — Bitcoin Core's `IsBlockRequested`).
+    pub fn is_requested(&self, hash: &[u8; 32], solicited: bool) -> bool {
+        solicited || self.parent_fetch.is_awaited(hash)
     }
 
     /// The POW-3 work rule for a block whose parents are all known (cheap:
-    /// DAG lookups and the orphan pool, no proof of work).
+    /// DAG lookups and the orphan pool, no proof of work), at the wall-clock
+    /// time. `_tip_h` is no longer used: B1-T5 charges every merge-backed
+    /// admission to the budget, not only those more than `CHECKPOINT_DEPTH`
+    /// below the tip.
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
     pub fn work_check(
         &mut self,
         block: &core::Block,
         hash: &[u8; 32],
-        tip_h: u64,
+        _tip_h: u64,
         now: Instant,
         dag: &GhostDAG,
     ) -> Result<WorkAdmission, DropReason> {
-        let state: LowWorkState = (self.orphans.generation(), dag.block_count(), dag.selected_tip());
-        if self.low_work_seen.get(hash) == Some(&state) {
-            return Err(DropReason::LowWork);
-        }
-        let threshold = match (dag.selected_tip(), self.threshold_cache) {
-            (Some(tip), Some((cached_tip, t))) if tip == cached_tip => t,
-            (tip, _) => {
-                let t = anti_dos_work_threshold(dag);
-                self.threshold_cache = tip.map(|h| (h, t));
-                t
-            }
-        };
-        let lb = block_work_lower_bound(dag, &block.header.parents, block.header.bits).unwrap_or(0);
-        let (chain_above, merge_lb) = if lb >= threshold {
-            (0, 0)
-        } else {
-            let chain_above = self.orphans.announced_work_capped(hash, threshold - lb);
-            if lb.saturating_add(chain_above) >= threshold {
-                (chain_above, 0) // ChainBacked: the merge bound is not needed
-            } else {
-                (chain_above, self.orphans.best_waiter_lb(hash, lb, dag))
-            }
-        };
-        match work_admission(lb, threshold, chain_above, merge_lb) {
-            WorkAdmission::LowWork => {
-                self.note_low_work(*hash, state);
-                Err(DropReason::LowWork)
-            }
-            WorkAdmission::MergeBacked => {
-                if backfill_decision(block.height, tip_h, true) == BackfillDecision::AwaitedDeep
-                    && !self.deep_budget.allow_at(now)
-                {
-                    Err(DropReason::DeepBudgetExhausted)
-                } else {
-                    Ok(WorkAdmission::MergeBacked)
-                }
-            }
-            ok => Ok(ok),
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.work_check_at(block, hash, now, now_unix, dag)
+    }
+
+    /// [`Self::work_check`] at `now_unix`. B1-T5: a merge-backed admission
+    /// needs a voucher that passes its contextual checks
+    /// ([`OrphanPool::best_voucher_lb`]) and is charged to the merge-backed
+    /// budget.
+    pub fn work_check_at(
+        &mut self,
+        block: &core::Block,
+        hash: &[u8; 32],
+        now: Instant,
+        now_unix: u64,
+        dag: &GhostDAG,
+    ) -> Result<WorkAdmission, DropReason> {
+        work_rule(&self.orphans, &mut self.deep_budget, &mut self.threshold_cache, &mut self.low_work,
+            block, hash, now, now_unix, dag)
+    }
+
+    /// The reference target of the orphan floor and the IBD evidence.
+    fn reference(&self, tip_h: u64, now_unix: u64) -> [u8; 32] {
+        self.reference_override.unwrap_or_else(|| reference_target(tip_h, now_unix))
+    }
+
+    /// Handle one inbound block, evaluating its proof of work inline (see
+    /// [`Self::handle_block_gated`]). The node itself defers the proof to its
+    /// PoW workers (`handle_block_gated`); tests and the fuzz target use this.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn handle_block(
+        &mut self,
+        block: core::Block,
+        hash: [u8; 32],
+        wire_bytes: usize,
+        peer: Option<PeerId>,
+        solicited: bool,
+        now: Instant,
+        now_unix: u64,
+        ctx: &AcceptCtx,
+    ) -> BlockOutcome {
+        match self.handle_block_gated(block, hash, wire_bytes, peer, solicited, now, now_unix, ctx, &mut InlinePow) {
+            Gated::Done(o) => o,
+            // `InlinePow` never defers.
+            Gated::PowPending(_) => BlockOutcome::Dropped(DropReason::PowBusy),
         }
     }
 
-    /// Handle one inbound block. Cheapest checks first; the proof of work of
-    /// an orphan is evaluated only after its floor check, and that of a block
-    /// with known parents only inside `accept_block` (after height, expected
-    /// bits, timestamp), and only if the POW-3 work rule admitted it.
+    /// Handle one inbound block. Cheapest checks first:
+    ///
+    /// 1. already in the DAG (a wanted body, see [`Self::restore_body`]) or
+    ///    buffered: known;
+    /// 2. POW-3 (Phase 4), an UNREQUESTED block (gossip, not the answer to
+    ///    one of this node's pulls nor a block it has an outstanding request
+    ///    for): refused while the selected tip is below the minimum chain
+    ///    work (unless its own chain reaches it), and refused if its chain
+    ///    cannot come within [`UNREQUESTED_WINDOW_BLOCKS`] of the tip
+    ///    ([`unrequested_block_admission`], Bitcoin Core's `AcceptBlock`);
+    /// 3. structure without the proof of work;
+    /// 4. an orphan: the backfill-flood guard and the orphan floor; a block
+    ///    whose parents are known: the POW-3 work rule and the checks
+    ///    `accept_block` runs before its proof ([`passes_pre_pow_checks`]);
+    /// 5. the proof of work, through `pow` ([`PowGate`]: inline, or deferred
+    ///    to the bounded PoW worker pool of the node, which then submits the
+    ///    block again);
+    /// 6. the orphan pool, or `accept_block` and the orphan drain (which
+    ///    applies the work rule to each drained orphan, B1-T5).
+    ///
     /// `solicited`: the block is the answer to one of this node's directed
     /// pulls (`InboundOrigin::is_solicited`), not gossip.
     #[allow(clippy::too_many_arguments)]
-    pub fn handle_block(
+    pub fn handle_block_gated(
         &mut self,
         mut block: core::Block,
         hash: [u8; 32],
@@ -1477,26 +2182,34 @@ impl BlockIngress {
         now: Instant,
         now_unix: u64,
         ctx: &AcceptCtx,
-    ) -> BlockOutcome {
+        pow: &mut dyn PowGate,
+    ) -> Gated {
         if ctx.dag.read().has_block(&hash) {
-            return self.restore_body(block, hash, solicited, ctx);
+            return self.restore_body(block, hash, solicited, ctx, pow);
         }
         if self.orphans.contains(&hash) {
-            return BlockOutcome::Known;
+            return Gated::Done(BlockOutcome::Known);
         }
-        let tip_h = {
+        let (tip_h, missing, lb) = {
             let d = ctx.dag.read();
-            d.selected_tip().and_then(|t| d.get_block_data(&t).map(|x| x.height)).unwrap_or(0)
+            let tip_h = d.selected_tip().and_then(|t| d.get_block_data(&t).map(|x| x.height)).unwrap_or(0);
+            let missing: Vec<[u8; 32]> = block.header.parents.iter().filter(|p| !d.has_block(p)).copied().collect();
+            let lb = block_work_lower_bound(&d, &block.header.parents, block.header.bits);
+            // POW-3 (Phase 4): the unrequested-block rule, before anything
+            // that costs more than a few DAG lookups.
+            if !self.is_requested(&hash, solicited) {
+                let near_tip = selected_chain_work_below(&d, UNREQUESTED_WINDOW_BLOCKS);
+                if let Err(r) = unrequested_block_admission(lb, self.min_chain_work, tip_blue_work(&d), near_tip) {
+                    return Gated::Done(BlockOutcome::Dropped(r));
+                }
+            }
+            (tip_h, missing, lb)
         };
         // Cheap structural validation (merkle, coinbase format, duplicates,
         // dust, size, parent count) — NO PoW yet.
         if let Err(reason) = block.validate_structure_without_pow() {
-            return BlockOutcome::Invalid(reason.to_string());
+            return Gated::Done(BlockOutcome::Invalid(reason.to_string()));
         }
-        let missing: Vec<[u8; 32]> = {
-            let d = ctx.dag.read();
-            block.header.parents.iter().filter(|p| !d.has_block(p)).copied().collect()
-        };
 
         if !missing.is_empty() {
             // Orphan. Backfill-flood guard: a far-below-tip orphan nobody
@@ -1506,20 +2219,23 @@ impl BlockIngress {
             if backfill_decision(block.height, tip_h, self.is_awaited(&hash))
                 == BackfillDecision::DropUnsolicitedDeep
             {
-                return BlockOutcome::Dropped(DropReason::UnsolicitedDeepOrphan);
+                return Gated::Done(BlockOutcome::Dropped(DropReason::UnsolicitedDeepOrphan));
             }
             // NET-2 / POW-4: bits no easier than the anti-DoS floor BEFORE
             // the proof is evaluated.
             // The cap is the pow limit of the height the orphan claims (the
             // one its proof is checked against), not the tip's next height.
-            let floor = orphan_admission_floor(tip_h, now_unix, block.height);
+            let reference = self.reference(tip_h, now_unix);
+            let floor = orphan_floor_from(&reference, block.height);
             if !bits_meet_floor(block.header.bits, &floor) {
-                return BlockOutcome::Dropped(DropReason::OrphanBelowFloor);
+                return Gated::Done(BlockOutcome::Dropped(DropReason::OrphanBelowFloor));
             }
-            if !block.validate_pow() {
-                return BlockOutcome::Invalid("invalid PoW".into());
+            match pow.check(&block, &hash) {
+                PowCheck::Valid => {}
+                PowCheck::Invalid => return Gated::Done(BlockOutcome::Invalid("invalid PoW".into())),
+                PowCheck::Deferred => return Gated::PowPending(Box::new(block)),
             }
-            let evidence = orphan_is_sync_evidence(block.header.bits, block.height, tip_h, now_unix);
+            let evidence = orphan_is_sync_evidence_from(block.header.bits, block.height, tip_h, &reference);
             // Request each missing parent that nobody is waiting for and that
             // is not itself buffered (a deep gap fans out one level at a time).
             let fresh: Vec<[u8; 32]> = missing.iter()
@@ -1534,21 +2250,41 @@ impl BlockIngress {
                     }
                     debug!("orphan block h={} (missing {} parents), buffered (pool={} / {} bytes)",
                         height, missing.len(), self.orphans.len(), self.orphans.total_bytes());
-                    BlockOutcome::Buffered { request: fresh, evidence, evicted: evicted.len() }
+                    Gated::Done(BlockOutcome::Buffered { request: fresh, evidence, evicted: evicted.len() })
                 }
-                OrphanInsert::Duplicate | OrphanInsert::TooLarge => BlockOutcome::PoolRefused,
+                OrphanInsert::Duplicate | OrphanInsert::TooLarge => Gated::Done(BlockOutcome::PoolRefused),
             }
         } else {
+            let _ = lb;
             // All parents known: POW-3 work rule before any expensive step.
-            let admission = {
+            let (admission, pre_pow_ok) = {
                 let d = ctx.dag.read();
                 // `work_check` takes the read guard's target; the budget is
                 // updated under it (no DAG write happens here).
-                match self.work_check(&block, &hash, tip_h, now, &d) {
+                let a = match self.work_check_at(&block, &hash, now, now_unix, &d) {
                     Ok(a) => a,
-                    Err(r) => return BlockOutcome::Dropped(r),
-                }
+                    Err(r) => return Gated::Done(BlockOutcome::Dropped(r)),
+                };
+                (a, passes_pre_pow_checks(&block, &d, core::activation::hardening_activation_height()))
             };
+            // NET-2 residual: the proof is evaluated (inline, or on the PoW
+            // worker pool) only for a block that passes every check
+            // `accept_block` runs before it; one that does not is refused by
+            // `accept_block` below, before any evaluation.
+            if pre_pow_ok {
+                match pow.check(&block, &hash) {
+                    PowCheck::Valid => {}
+                    PowCheck::Invalid => {
+                        return Gated::Done(BlockOutcome::Processed {
+                            admission,
+                            result: Err("consensus rejection: invalid GnB-SMH proof of work".into()),
+                            drained: Vec::new(),
+                            missing_bodies: Vec::new(),
+                        });
+                    }
+                    PowCheck::Deferred => return Gated::PowPending(Box::new(block)),
+                }
+            }
             normalize_wire_metadata(&mut block, ctx.dag);
             let height = block.height;
             let result = crate::accept::accept_block_tracking(
@@ -1558,7 +2294,7 @@ impl BlockIngress {
             let drained = match &result {
                 Ok(h) => {
                     self.orphans.forget(h);
-                    self.drain_orphans(*h, ctx)
+                    self.drain_orphans_at(*h, now, now_unix, ctx)
                 }
                 Err(_) => Vec::new(),
             };
@@ -1567,7 +2303,7 @@ impl BlockIngress {
             // witness-dependent reason now wait for one; the caller requests
             // them (`awaited_bodies_to_request`, the one request path).
             let missing_bodies = awaited_bodies_to_request(&ctx.dag.read(), &self.parent_fetch, MAX_BODY_PULLS_IN_FLIGHT);
-            BlockOutcome::Processed { admission, result, drained, missing_bodies }
+            Gated::Done(BlockOutcome::Processed { admission, result, drained, missing_bodies })
         }
     }
 
@@ -1594,20 +2330,31 @@ impl BlockIngress {
         hash: [u8; 32],
         solicited: bool,
         ctx: &AcceptCtx,
-    ) -> BlockOutcome {
+        pow: &mut dyn PowGate,
+    ) -> Gated {
         if !solicited || !crate::accept::awaits_body(ctx.dag, ctx.store, &hash) {
-            return BlockOutcome::Known;
+            return Gated::Done(BlockOutcome::Known);
         }
         // Never for an applied block (it has an undo record).
         if ctx.store.has_undo_data(&hash).unwrap_or(true) {
-            return BlockOutcome::Known;
+            return Gated::Done(BlockOutcome::Known);
         }
         // Cheapest check first (no proof of work).
         if let Err(reason) = block.validate_structure_without_pow() {
-            return BlockOutcome::Invalid(reason.to_string());
+            return Gated::Done(BlockOutcome::Invalid(reason.to_string()));
         }
         // POW-8: the wire blue_score is replaced exactly as on acceptance.
         normalize_wire_metadata(&mut block, ctx.dag);
+        let pre_pow_ok = passes_pre_pow_checks(&block, &ctx.dag.read(), core::activation::hardening_activation_height());
+        if pre_pow_ok {
+            match pow.check(&block, &hash) {
+                PowCheck::Valid => {}
+                PowCheck::Invalid => {
+                    return Gated::Done(BlockOutcome::Invalid("consensus rejection: invalid GnB-SMH proof of work".into()));
+                }
+                PowCheck::Deferred => return Gated::PowPending(Box::new(block)),
+            }
+        }
         let height = block.height;
         let result = crate::accept::accept_block_tracking(
             &block, hash, height, ctx.dag, ctx.store, ctx.mempool, ctx.node_state,
@@ -1618,17 +2365,37 @@ impl BlockIngress {
         // `accept_block` reports as its error).
         let restored = ctx.store.has_block_body(&hash).unwrap_or(false)
             && !ctx.dag.read().is_body_pending(&hash);
-        match result {
+        Gated::Done(match result {
             _ if restored => BlockOutcome::BodyRestored,
             Err(e) => BlockOutcome::Invalid(e),
             Ok(_) => BlockOutcome::Invalid("body not stored".into()),
-        }
+        })
     }
 
-    /// [`process_orphans`] on this core's pool.
+    /// [`process_orphans_gated`] on this core's pool, with the full POW-3
+    /// work rule applied to each drained orphan (B1-T5). Returns the
+    /// accepted hashes; every drained orphan's outcome is also recorded for
+    /// [`Self::take_orphan_events`].
     pub fn drain_orphans(&mut self, accepted: [u8; 32], ctx: &AcceptCtx) -> Vec<[u8; 32]> {
-        process_orphans(accepted, &mut self.orphans, ctx.dag, ctx.store, ctx.mempool,
-                        ctx.node_state, ctx.tip_tx, ctx.shielded, &mut self.chain)
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.drain_orphans_at(accepted, Instant::now(), now_unix, ctx)
+    }
+
+    fn drain_orphans_at(&mut self, accepted: [u8; 32], now: Instant, now_unix: u64, ctx: &AcceptCtx) -> Vec<[u8; 32]> {
+        let Self { orphans, deep_budget, threshold_cache, low_work, chain, .. } = self;
+        let mut gate = |pool: &OrphanPool, block: &core::Block, hash: &[u8; 32], d: &GhostDAG| {
+            work_rule(pool, deep_budget, threshold_cache, low_work, block, hash, now, now_unix, d)
+        };
+        let mut events = OrphanBlockEvents::default();
+        process_orphans_gated(accepted, orphans, ctx, chain, &mut gate, &mut events);
+        let out = events.accepted.clone();
+        self.orphan_events.accepted.extend(events.accepted);
+        self.orphan_events.rejected.extend(events.rejected);
+        self.orphan_events.refused.extend(events.refused);
+        out
     }
 }
 
@@ -2052,8 +2819,8 @@ mod tests {
     }
 
     #[test]
-    fn best_waiter_lb_counts_known_parents_and_diamonds() {
-        let (dag, chain) = chain_dag(50, 10);
+    fn announced_work_counts_a_diamond_once() {
+        let (_dag, chain) = chain_dag(50, 10);
         let w = core::bits_to_work(core::POW_LIMIT_BITS);
         let x = h(1000);
         let mut pool = OrphanPool::default();
@@ -2062,10 +2829,81 @@ mod tests {
         pool.insert(h(1002), blk(vec![x], 2), 1, 1, None, false, &[x]);
         pool.insert(h(1003), blk(vec![h(1001), h(1002), chain[50]], 3), 2, 1, None, false, &[h(1001), h(1002)]);
         assert_eq!(pool.announced_work_above(&x), 3 * w, "a, b and c, each once (not the longest path)");
-        // Merge-backed: c's bound comes from the known chain[50] (500).
-        assert_eq!(pool.best_waiter_lb(&x, 7, &dag), 500 + w);
-        // With x's own bound high, the path through x dominates.
-        assert_eq!(pool.best_waiter_lb(&x, 10_000, &dag), 10_000 + 2 * w);
-        assert_eq!(pool.best_waiter_lb(&h(4242), 1, &dag), 0, "nobody waits on it");
+    }
+
+    /// B1-T5: only a DIRECT waiter whose every other parent is in the DAG
+    /// and whose header passes its contextual checks (height, expected bits,
+    /// timestamp; below the activation) vouches for a block. The transitive,
+    /// unchecked bound that replaced it let one orphan get a low-work fork
+    /// stored (`fix_ingress_dos`).
+    #[test]
+    fn only_checkable_direct_waiters_vouch() {
+        let (dag, chain) = chain_dag(50, 10);
+        let w = core::bits_to_work(core::POW_LIMIT_BITS);
+        let tip = chain[50];
+        let tip_ts = dag.get_block_data(&tip).unwrap().timestamp;
+        // The block under judgement: a child of chain[10] (DAG height 11).
+        let mut root = blk(vec![chain[10]], 77);
+        root.height = 11;
+        root.header.timestamp = 11;
+        let x = h(9_999);
+        let now = 1_000_000;
+        let voucher = |parents: Vec<[u8; 32]>, height: u64, ts: u64, tag: u64| {
+            let mut b = blk(parents, tag);
+            b.height = height;
+            b.header.timestamp = ts;
+            b
+        };
+        let act = core::activation::NEVER;
+        // A valid voucher: parents [tip, root], height 51, ts >= both.
+        let mut pool = OrphanPool::default();
+        pool.insert(h(1), voucher(vec![tip, x], 51, tip_ts, 1), 51, 1, None, false, &[x]);
+        assert_eq!(pool.best_voucher_lb(&x, &root, 3, &dag, now, act), 500 + w);
+        // ... not at/after the hardening activation (merge depth).
+        assert_eq!(pool.best_voucher_lb(&x, &root, 3, &dag, now, 0), 0);
+        // Wrong height, timestamp before a parent, or from the future: none.
+        for (height, ts) in [(52, tip_ts), (51, tip_ts - 1), (51, now + core::MAX_FUTURE_SECS + 1)] {
+            let mut p = OrphanPool::default();
+            p.insert(h(2), voucher(vec![tip, x], height, ts, 2), height, 1, None, false, &[x]);
+            assert_eq!(p.best_voucher_lb(&x, &root, 3, &dag, now, act), 0, "height {height} ts {ts}");
+        }
+        // Another parent still missing (an orphan above an orphan): none.
+        let mut p = OrphanPool::default();
+        p.insert(h(3), voucher(vec![tip, x, h(4_242)], 51, tip_ts, 3), 51, 1, None, false, &[x, h(4_242)]);
+        assert_eq!(p.best_voucher_lb(&x, &root, 3, &dag, now, act), 0);
+        // The block under judgement claiming a height its parents do not
+        // imply: nothing vouches for it.
+        let mut bad_root = root.clone();
+        bad_root.height = 12;
+        assert_eq!(pool.best_voucher_lb(&x, &bad_root, 3, &dag, now, act), 0);
+        assert_eq!(pool.best_voucher_lb(&h(4242), &root, 1, &dag, now, act), 0, "nobody waits on it");
+    }
+
+    #[test]
+    fn minimum_chain_work_parses_like_bitcoin_core() {
+        assert_eq!(parse_minimum_chain_work("0"), Ok(0));
+        assert_eq!(parse_minimum_chain_work("0x1f"), Ok(31));
+        assert_eq!(parse_minimum_chain_work("00000000000000000000000000000000000000000000000000000000000000ff"), Ok(255));
+        assert_eq!(parse_minimum_chain_work(&"f".repeat(32)), Ok(u128::MAX));
+        assert!(parse_minimum_chain_work(&format!("1{}", "0".repeat(32))).is_err(), "above 128 bits");
+        assert!(parse_minimum_chain_work("").is_err());
+        assert!(parse_minimum_chain_work("12g").is_err());
+        assert_eq!(MAINNET_MINIMUM_CHAIN_WORK, 0, "no chain data in the repository (docs/RUNNING.md)");
+    }
+
+    /// POW-3 (Phase 4): Bitcoin Core's unrequested-block rule.
+    #[test]
+    fn unrequested_block_rule() {
+        use DropReason::*;
+        // Not in IBD: an orphan may be buffered; a connectable block needs
+        // the near-tip work.
+        assert_eq!(unrequested_block_admission(None, 0, 100, 90), Ok(()));
+        assert_eq!(unrequested_block_admission(Some(90), 0, 100, 90), Ok(()));
+        assert_eq!(unrequested_block_admission(Some(89), 0, 100, 90), Err(UnrequestedLowWork));
+        // Below the minimum chain work: nothing, unless its own chain
+        // reaches it.
+        assert_eq!(unrequested_block_admission(None, 1_000, 100, 90), Err(BelowMinimumChainWork));
+        assert_eq!(unrequested_block_admission(Some(101), 1_000, 100, 90), Err(BelowMinimumChainWork));
+        assert_eq!(unrequested_block_admission(Some(1_000), 1_000, 999, 990), Ok(()));
     }
 }
