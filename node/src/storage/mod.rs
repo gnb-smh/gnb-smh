@@ -1684,9 +1684,10 @@ impl Storage {
     /// from the body — the address-history keys to un-index and whether the
     /// block carried shielded transactions — is recorded here, in the same
     /// batch as the body deletion, as a [`PrunedBodyRecord`] — only for a
-    /// block that HAS an undo record (it is applied): a block that is not
-    /// applied is never rolled back, and if its chain becomes the best its
-    /// body is fetched again (`accept::awaits_body`).
+    /// block that HAS an undo record, of the UTXO set or of the shielded pool
+    /// (it is applied; both are written with the block's connect): a block
+    /// that is not applied is never rolled back, and if its chain becomes the
+    /// best its body is fetched again (`accept::awaits_body`).
     pub fn prune_blocks_below(&self, below_height: u64) -> Result<usize, StorageError> {
         self.ensure_body_index()?;
         let cf_blocks = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
@@ -1713,7 +1714,9 @@ impl Storage {
             let raw = self.db.get_cf(&cf_blocks, hash).map_err(|e| StorageError::ReadFailed(e.to_string()))?;
             if let Some(raw) = raw {
                 batch.delete_cf(&cf_blocks, hash);
-                if self.has_undo_data(&hash)? {
+                let applied = self.has_undo_data(&hash)?
+                    || crate::coherence::persist::has_undo(self, &hash).map_err(StorageError::ReadFailed)?;
+                if applied {
                     match Block::from_wire_bytes(&raw) {
                         Ok(body) => {
                             let spent: std::collections::HashMap<([u8; 32], u32), TxOutput> = self
