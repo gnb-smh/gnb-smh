@@ -20,7 +20,7 @@
 //! active from height 3 (process-wide overrides, once per binary).
 
 use gnb::consensus::GhostDAG;
-use gnb::core::kes::{KesPublic, KesSigner};
+use gnb::core::kes::{KesKeyFile, KesPublic, KesSigner};
 use gnb::core::powit::{Attestation, Checkpoint, Equivocation, KeyId, PowitState, TESTNET_PARAMS};
 use gnb::core::{self, Block, BlockHeader, ChainId, MerkleRoot};
 use gnb::powit::{self, PowitPool};
@@ -398,4 +398,73 @@ fn the_pool_forgets_expired_attestations_when_the_tip_moves() {
     let (_, atts, _) = pool.snapshot();
     assert_eq!(atts.iter().map(|a| a.target.height).collect::<Vec<_>>(), vec![78],
         "53 expired at tip 80 (81 > 53 + 20)");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Finding 8: the witness's vote record
+// ═════════════════════════════════════════════════════════════════════════════
+
+const PASSWORD: &str = "correct horse battery staple 42";
+
+struct Witness {
+    dir: TempDir,
+}
+
+impl Witness {
+    fn new(k: &Key) -> Witness {
+        let dir = TempDir::new().unwrap();
+        KesKeyFile::seal(&k.signer.borrow(), PASSWORD).unwrap().save(&dir.path().join("witness.key")).unwrap();
+        std::fs::write(dir.path().join("pw"), format!("{PASSWORD}\n")).unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        Witness { dir }
+    }
+    fn load(&self) -> Result<powit::WitnessDuty, String> {
+        let d = self.dir.path();
+        powit::WitnessDuty::load(&d.join("witness.key"), &d.join("pw"), vec![0x51], &d.join("data"))
+    }
+    fn record(&self, k: &Key) -> std::path::PathBuf {
+        self.dir.path().join("data").join(format!("powit-votes-{}.json", hex::encode(k.id())))
+    }
+}
+
+/// A vote record that exists but does not parse was read as "no votes":
+/// the witness could sign anything again. It now refuses to load.
+#[test]
+fn a_corrupt_vote_record_refuses_to_sign() {
+    setup();
+    let k = Key::new(9);
+    let w = Witness::new(&k);
+    std::fs::write(w.record(&k), b"{ not json").unwrap();
+    let err = w.load().err().expect("a corrupt vote record is refused");
+    assert!(err.contains("vote record"), "{err}");
+}
+
+/// A witness signed slot 68 on chain A; its vote record is then lost (a
+/// failover onto a fresh data directory). After a reorg onto chain B, whose
+/// slot 68 is another block, it signed slot 68 again: a double vote that
+/// bars the key. The highest heights it signed are kept with the key and
+/// enforced, so it does not.
+#[test]
+fn a_reset_vote_record_cannot_cause_a_double_vote() {
+    let fx = Fx::new();
+    let k = Key::new(10);
+    let a = fx.chain(70, 60, 1);
+    let b = fx.chain(70, 60, 2);
+    assert_ne!(a.cp(68), b.cp(68));
+    fx.tip_state(&a, &[(k.id(), 1_000)]);
+    fx.tip_state(&b, &[(k.id(), 1_000)]);
+    let w = Witness::new(&k);
+
+    let duty = w.load().unwrap();
+    let first = duty.maybe_attest(&a.dag, &fx.store).unwrap().expect("signs slot 68 on A");
+    assert_eq!(first.target, a.cp(68));
+    drop(duty);
+    std::fs::remove_file(w.record(&k)).unwrap();
+
+    let duty = w.load().unwrap();
+    let second = duty.maybe_attest(&b.dag, &fx.store);
+    if let Ok(Some(att)) = &second {
+        let ev = Equivocation { a: first.clone(), b: att.clone() };
+        assert!(ev.verify(CHAIN, &TESTNET_PARAMS, ACT).is_err(), "signed a double vote after the reset");
+    }
 }

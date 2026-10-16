@@ -741,10 +741,80 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
 
 // ── Witness duty ─────────────────────────────────────────────────────────────
 
+/// Write `bytes` to `path` so that it survives a crash or a power loss:
+/// a temp file in the same directory, fsync'd, renamed over `path`, then the
+/// directory fsync'd (the rename itself is durable only then). Owner-only
+/// permissions (the KES key file holds the encrypted seed).
+fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let name = path.file_name().ok_or_else(|| format!("{}: not a file path", path.display()))?;
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let io = |what: &str, e: std::io::Error| format!("{what} {}: {e}", tmp.display());
+    let mut f = opts.open(&tmp).map_err(|e| io("create", e))?;
+    f.write_all(bytes).map_err(|e| io("write", e))?;
+    f.sync_all().map_err(|e| io("fsync", e))?;
+    drop(f);
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(dir).and_then(|d| d.sync_all())
+        .map_err(|e| format!("fsync directory {}: {e}", dir.display()))
+}
+
+/// Read a JSON file that may be absent (`None`), refusing one that exists but
+/// cannot be read or parsed: an unreadable vote record must never read as
+/// "no votes" (that re-opens every link the key signed).
+fn read_json_if_present<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> Result<Option<T>, String> {
+    match std::fs::read(path) {
+        Ok(b) => serde_json::from_slice(&b).map(Some).map_err(|e| format!(
+            "{what} {} is corrupt ({e}); refusing to sign: restore it from a backup (deleting it can make \
+             this key sign a double vote and be barred)", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{what} {} is unreadable ({e}); refusing to sign", path.display())),
+    }
+}
+
+/// The highest source and target heights a key ever signed (EIP-3076's
+/// minimal slashing protection): a link with a lower source or a target not
+/// above it is never signed, so no double or surround vote is possible even
+/// if the full record is lost. Kept in the record and, so that it moves with
+/// the key on a failover onto a fresh data directory, beside the key file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct HighWater {
+    source: u64,
+    target: u64,
+}
+
+impl HighWater {
+    fn of(signed: &[(Checkpoint, Checkpoint)]) -> Self {
+        signed.iter().fold(HighWater::default(), |h, (s, t)| h.max(&HighWater { source: s.height, target: t.height }))
+    }
+    fn max(self, o: &HighWater) -> Self {
+        HighWater { source: self.source.max(o.source), target: self.target.max(o.target) }
+    }
+    fn allows(&self, source: &Checkpoint, target: &Checkpoint) -> bool {
+        source.height >= self.source && target.height > self.target
+    }
+}
+
 /// A witness's forward-secure KES key, its payout script and its persistent
 /// vote record. The KES state evolves to each target's epoch (erasing every
 /// earlier seed, on disk first) before signing, and the record makes a double
-/// or surround vote impossible even across restarts and reorgs.
+/// or surround vote impossible even across restarts and reorgs. Both files
+/// are written durably (`write_durable`) before a signature is released; a
+/// record that exists but cannot be read refuses to load; the highest
+/// signed heights (`HighWater`) are enforced and kept beside the key too.
 pub struct WitnessDuty {
     pub key_id: KeyId,
     pub payout_script: Vec<u8>,
@@ -752,12 +822,15 @@ pub struct WitnessDuty {
     password: zeroize::Zeroizing<String>,
     signer: Mutex<gnb_crypto::core::kes::KesSigner>,
     record_path: PathBuf,
-    signed: Mutex<Vec<(Checkpoint, Checkpoint)>>,
+    highwater_path: PathBuf,
+    signed: Mutex<(Vec<(Checkpoint, Checkpoint)>, HighWater)>,
 }
 
 impl WitnessDuty {
     /// Load a KES witness key (`gnb-cli witnesskeygen`); the password is read
     /// from `password_file` (first line), never from the command line.
+    /// Refuses a vote record or high-water file that exists but cannot be
+    /// read (it would otherwise read as "never signed").
     pub fn load(key: &Path, password_file: &Path, payout_script: Vec<u8>, data_dir: &Path) -> Result<Self, String> {
         // CRY-4: the file's contents are wiped once the first line is copied.
         let pw = zeroize::Zeroizing::new(
@@ -767,8 +840,14 @@ impl WitnessDuty {
         let signer = file.open(&password)?;
         let key_id = signer.public().witness_id();
         let record_path = data_dir.join(format!("powit-votes-{}.json", hex::encode(key_id)));
-        let signed: Vec<(Checkpoint, Checkpoint)> = std::fs::read(&record_path).ok()
-            .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let mut hw_name = key.file_name().ok_or("witness key path has no file name")?.to_os_string();
+        hw_name.push(".votes-highwater.json");
+        let highwater_path = key.with_file_name(hw_name);
+        let signed: Vec<(Checkpoint, Checkpoint)> =
+            read_json_if_present(&record_path, "witness vote record")?.unwrap_or_default();
+        let beside_key: HighWater =
+            read_json_if_present(&highwater_path, "witness vote high-water file")?.unwrap_or_default();
+        let hw = HighWater::of(&signed).max(&beside_key);
         Ok(WitnessDuty {
             key_id,
             payout_script,
@@ -776,12 +855,14 @@ impl WitnessDuty {
             password,
             signer: Mutex::new(signer),
             record_path,
-            signed: Mutex::new(signed),
+            highwater_path,
+            signed: Mutex::new((signed, hw)),
         })
     }
 
     fn conflicts(&self, source: &Checkpoint, target: &Checkpoint) -> bool {
-        self.signed.lock().iter().any(|(s, t)| {
+        let g = self.signed.lock();
+        !g.1.allows(source, target) || g.0.iter().any(|(s, t)| {
             (t.height == target.height && t != target)
                 || (s.height < source.height && target.height < t.height)
                 || (source.height < s.height && t.height < target.height)
@@ -813,7 +894,7 @@ impl WitnessDuty {
         let Some(hash) = view.selected_at(slot) else { return Ok(None) };
         let target = Checkpoint { height: slot, hash };
         let source = st.justified;
-        if self.signed.lock().iter().any(|(s, t)| *s == source && *t == target) {
+        if self.signed.lock().0.iter().any(|(s, t)| *s == source && *t == target) {
             return Ok(None);
         }
         if self.conflicts(&source, &target) {
@@ -824,21 +905,25 @@ impl WitnessDuty {
             return Ok(None); // that epoch's leaf is gone: forward security
         }
         if te > signer.epoch() {
-            // Erase every earlier seed, ON DISK FIRST, then in memory.
+            // Erase every earlier seed, ON DISK FIRST (durably), then in memory.
             let mut next_state = gnb_crypto::core::kes::KesKeyFile::load(&self.key_path)?.open(&self.password)?;
             next_state.evolve_to(te)?;
-            gnb_crypto::core::kes::KesKeyFile::seal(&next_state, &self.password)?.save(&self.key_path)?;
+            let sealed = gnb_crypto::core::kes::KesKeyFile::seal(&next_state, &self.password)?;
+            let json = serde_json::to_vec_pretty(&sealed).map_err(|e| format!("kes save: {e}"))?;
+            write_durable(&self.key_path, &json).map_err(|e| format!("kes save: {e}"))?;
             *signer = next_state;
         }
         let att = Attestation::sign(core::node_chain_id(), source, target, &signer)?;
         {
             let mut g = self.signed.lock();
-            g.push((source, target));
-            let bytes = serde_json::to_vec(&*g).map_err(|e| e.to_string())?;
-            // Persist BEFORE releasing the signature.
-            let tmp = self.record_path.with_extension("json.tmp");
-            std::fs::write(&tmp, &bytes).map_err(|e| format!("witness vote record: {e}"))?;
-            std::fs::rename(&tmp, &self.record_path).map_err(|e| format!("witness vote record: {e}"))?;
+            g.0.push((source, target));
+            g.1 = g.1.max(&HighWater { source: source.height, target: target.height });
+            // Persist BEFORE releasing the signature: the record, then the
+            // high-water mark beside the key.
+            let bytes = serde_json::to_vec(&g.0).map_err(|e| e.to_string())?;
+            write_durable(&self.record_path, &bytes).map_err(|e| format!("witness vote record: {e}"))?;
+            let hw = serde_json::to_vec(&g.1).map_err(|e| e.to_string())?;
+            write_durable(&self.highwater_path, &hw).map_err(|e| format!("witness vote high-water file: {e}"))?;
         }
         Ok(Some(att))
     }
