@@ -43,6 +43,9 @@ test("v2 normalization output is explicit and legacy remains the default", async
   assert.equal(core.normalize(LEGACY_TEST, "bech32m"), V2_TEST);
   assert.equal(core.normalize(V2), LEGACY);
   assert.throws(() => core.normalize(LEGACY, "unknown-format"));
+  for (const invalid of [null, 2, {}, ["bech32m"]]) {
+    assert.throws(() => core.normalize(LEGACY, invalid), /format/);
+  }
 });
 
 test("both served wallet entry points load the pinned binary", async () => {

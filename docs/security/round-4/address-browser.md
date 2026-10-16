@@ -43,5 +43,23 @@ log `/private/tmp/gnb-r4-address-wasm-red.log`, exit 1, 1 pass/5 fail.
 The stale-pin finding is an availability defect, not evidence of accepting
 untrusted WASM. Its existing integrity check failed closed.
 
-Status: runtime baseline reproduced; implementation, final rebuild and
-independent reviews pending. No acceptance or score claim.
+The shared core codec was imported through `4b32fb6`. The WASM binding now
+accepts an explicit `legacy`/`bech32m` normalization format; absent format
+keeps legacy output. The JS wrapper forwards it. Payment uses the existing
+shared parser and network check with no signing or transaction-rule change.
+The build script repins both `app.js` and `main.js`.
+
+Local rebuild: `WASI_SDK=/private/tmp/gnb-r3-wasi-sdk-25
+CARGO_TARGET_DIR=/private/tmp/gnb-r4-target-address-browser
+scripts/build-wallet-wasm.sh`. Final local binary SHA-256:
+`f17b140c82a5b8325da5d60a7d864430954f328f2cd30bd1b2fd77a3527c16c1`.
+The focused test above passed **6/6**, including actual signed transactions
+independently decoded by Python at both heights and wrong-network refusal.
+Logs: `/private/tmp/gnb-r4-address-wasm-build-final.log` and
+`/private/tmp/gnb-r4-address-wasm-green.log`. This is a macOS artifact; the
+known R3 cross-host byte mismatch remains open, and final delivery requires
+the existing canonical Linux rebuild/comparison gate.
+
+Status: local focused implementation checks pass; production-only reversals,
+independent reviews, integrated suite and canonical CI rebuild remain pending.
+No acceptance or score claim.

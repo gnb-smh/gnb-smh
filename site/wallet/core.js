@@ -87,7 +87,7 @@ export async function loadCore(url, sha256Hex) {
     // signature commits to every spent value, so nothing needs fetching.
     pay: (utxos, to, amount, fee, nextHeight, prevtxs = {}) => call({ op: "pay", utxos, to, amount: String(amount), fee: String(fee), next_height: String(nextHeight), prevtxs }),
     address: () => call({ op: "address" }).address,
-    normalize: (address) => call({ op: "normalize", address }).address,
+    normalize: (address, format = "legacy") => call({ op: "normalize", address, format }).address,
     minFee: (size) => call({ op: "minfee", size }).fee,
     // BIP174-style public roles; the document remains a string so duplicate
     // JSON fields reach the strict shared parser. Caller-supplied `op` cannot
