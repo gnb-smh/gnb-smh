@@ -420,8 +420,6 @@ fn pipeline_persists_the_shielded_tip_with_the_utxo_tip_and_restart_reloads_it()
     assert_eq!(persisted(&n), Some(f4.block_hash()));
 }
 
-/// A block carrying shielded transactions is still rejected context-free
-/// (RejectAll), and leaves no shielded record behind.
 /// COH-2 challenge: the test above reads the persisted tip through
 /// `ShieldedPool::load`, which falls back to the UTXO tip when no shielded
 /// tip is stored, so it passed with the pipeline's shielded writes removed.
@@ -481,6 +479,8 @@ fn pipeline_writes_the_shielded_tip_and_version_rows_in_the_connect_batch() {
     assert_eq!(rows(&n), (Some(f2.block_hash().to_vec()), version), "written by the reconciliation's re-tip");
 }
 
+/// A block carrying shielded transactions is still rejected context-free
+/// (RejectAll), and leaves no shielded record behind.
 #[test]
 fn pipeline_rejects_shielded_blocks_under_reject_all() {
     let genesis = mk_genesis(unix_now() - 10_000);
