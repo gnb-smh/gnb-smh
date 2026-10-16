@@ -402,5 +402,24 @@
     "test_first": "4d83579",
     "fix": "2ba4c6a",
     "scope": "caller-owned JavaScript serialization hooks; does not establish remote execution or arbitrary getter protection; legacy bindings unchanged"
+  },
+  "test_binary_snapshot_provenance": {
+    "snapshot_directory": "/private/tmp/gnb-r5-descriptor-cache/bin-0d9ec5e6c3140463",
+    "snapshot_digest": "0d9ec5e6c3140463",
+    "binary_sha256": {
+      "gnb": "1fb378e6038ff0e2c8f4ad84ae6eb1f03781a6a434497aeeae6fdf37aedd4aba",
+      "gnb-cli": "950884a407aa73dc4e514896fa4af3d18c2f823ddb78999190057da9b462dd50"
+    },
+    "command": [
+      "/private/tmp/gnb-r5-descriptor-cache/bin-0d9ec5e6c3140463/gnb",
+      "--data-dir",
+      "/private/tmp/gnb-r5-frontends-guard-probe/d"
+    ],
+    "exit_code": 2,
+    "guard_message": "refuses to run on mainnet",
+    "data_directory_created": false,
+    "log_path": "/private/tmp/gnb-r5-frontends-test-build-guard.log",
+    "log_sha256": "62bebff69654ea116af87c755047b8e89befd36fd6b2fc94f19cc6a2360450e7",
+    "provenance": "Snapshot produced from CGU151 cargo-test artifacts before the coordinator started its additional explicit feature build. Cargo test enables gnb-crypto/test-pow-limit through node/Cargo.toml dev-dependencies."
   }
 }

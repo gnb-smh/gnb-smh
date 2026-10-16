@@ -9,6 +9,17 @@ Native builds used `codegen-units=151`, `debug=0`, `incremental=0`, two build
 jobs, and `/private/tmp/gnb-r5-target-descriptor-frontends`. `gnb-crypto` full
 tests and complete node/site integration are separate coordinator-owned gates.
 
+The CGU151 binaries produced by these `cargo test` commands **do enable the
+test PoW limit**: `node/Cargo.toml` declares `gnb-crypto/test-pow-limit` as a
+dev-dependency feature. Omitting `--features` from a test command does not prove
+that its resulting binaries lack that feature. The functional harness copied
+these artifacts into immutable snapshot `bin-0d9ec5e6c3140463` before a later,
+explicit feature build began. A separate probe of that snapshot exited with
+code 2 and `refuses to run on mainnet`, without creating its data directory.
+The receipt includes SHA-256 hashes of both snapshot binaries, unchanged across
+the probe. Functional results using that snapshot belong to the earlier
+artifacts, not the later explicit build.
+
 ## Reproduce before implementation
 
 Production at base `35ccd62` was preserved while CLI and RPC tests compiled.
