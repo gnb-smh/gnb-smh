@@ -527,6 +527,21 @@ impl ReachabilityStore {
         (upserts, deletes)
     }
 
+    /// Put a drained delta back after the write that should have persisted it
+    /// failed: every block it named is re-marked from its CURRENT in-memory
+    /// state (dirty if still indexed, tombstone if not), so the next drain
+    /// persists what memory now holds.
+    pub fn restore_persist_delta(&mut self, upserts: &[(BlockHash, Vec<u8>)], deletes: &[BlockHash]) {
+        for h in upserts.iter().map(|(h, _)| h).chain(deletes) {
+            if self.interval.contains_key(h) {
+                self.mark_dirty(*h);
+            } else {
+                self.dirty.remove(h);
+                self.tombstones.insert(*h);
+            }
+        }
+    }
+
     /// Snapshot the ENTIRE index as `(block_hash, encoded_record)` pairs, in
     /// hash-sorted order. Used to write a freshly-rebuilt index in one batch and
     /// by round-trip tests. Does not touch the dirty/tombstone tracking.

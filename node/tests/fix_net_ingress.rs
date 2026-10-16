@@ -57,6 +57,7 @@ fn block_with(parents: Vec<[u8; 32]>, bits: u32, nonce: u64, tag: u64, big: usiz
         blue_score: 1,
         height: 1,
         shielded_transactions: vec![],
+        powit: Default::default(),
     };
     b.header.merkle_root = b.body_merkle_root();
     b

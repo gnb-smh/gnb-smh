@@ -50,7 +50,7 @@ COINBASE_COMMITMENT_LEN = 80
 COINBASE_WTXID = bytes(32)
 FORBIDDEN_TXID_PREIMAGE_LEN = 64
 MAX_SCRIPT_SIG_SIZE = 10_000
-MAINNET_HARDENING_ACTIVATION_HEIGHT = 25_800  # activation.rs (110_000 before 2026-10-16)
+MAINNET_HARDENING_ACTIVATION_HEIGHT = 110_000
 ZERO32 = bytes(32)
 
 
@@ -201,6 +201,23 @@ def fold_coinbase_branch(coinbase_txid: bytes, branch: list, hardened: bool) -> 
 
 
 # ── Coinbase commitment ──────────────────────────────────────────────────────
+
+# From this height (core::POWIT_HEIGHT_MAINNET) the header root commits to the
+# v2 block body: the transaction root, the shielded section and the PoWit
+# section (`Block::body_merkle_root_at`). The reference blocks carry neither
+# shielded transactions nor PoWit items, so both sections are empty.
+POWIT_HEIGHT_MAINNET = 10_000
+_EMPTY_SHIELDED_ROOT = hashlib.sha3_256(b"gnb:block:shielded:v1").digest()
+_EMPTY_POWIT_ROOT = hashlib.sha3_256(b"GNB-POWIT-v1/body" + b"\x00\x00\x00").digest()
+
+
+def header_root(tx_root: bytes, height: int) -> bytes:
+    """The header Merkle root of a block at `height` whose transaction root
+    is `tx_root` (no shielded transactions, empty PoWit section)."""
+    if height < POWIT_HEIGHT_MAINNET:
+        return tx_root
+    return hashlib.sha3_256(b"gnb:block:body:v2" + tx_root + _EMPTY_SHIELDED_ROOT + _EMPTY_POWIT_ROOT).digest()
+
 
 def parents_commitment(parents: list) -> bytes:
     return tagged_hash(PARENTS_TAG, struct.pack("<I", len(parents)) + b"".join(parents))

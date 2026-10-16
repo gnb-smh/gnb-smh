@@ -53,7 +53,7 @@
 
 use sha3::{Digest, Sha3_256};
 
-use super::{activation, ChainId, Transaction, TxOutput};
+use super::{activation, policy, ChainId, Transaction, TxOutput};
 use crate::crypto;
 
 /// The only non-coinbase transaction version valid at/after the activation
@@ -392,6 +392,19 @@ pub fn check_input_witnesses<'a>(
     }
     let mut out = Vec::with_capacity(tx.inputs.len());
     for (i, (inp, prev)) in tx.inputs.iter().zip(prevouts).enumerate() {
+        // Spend of a policy output (`core::policy`, multisig and timelocks):
+        // the revealed policy must hash to the output. Its signatures are
+        // checked by `verify_input_signatures`; the witness slot carries the
+        // whole `script_sig` and an empty key.
+        if policy::output_kind(&prev.script_pubkey) == Some(policy::OutputKind::Policy) {
+            let w = policy::AnyPolicyWitness::decode(&inp.script_sig)
+                .map_err(|e| format!("malformed policy witness at input {}: {}", i, e))?;
+            if w.script_pubkey() != prev.script_pubkey {
+                return Err(format!("policy does not match the output at input {}", i));
+            }
+            out.push((inp.script_sig.as_slice(), &[][..]));
+            continue;
+        }
         let (sig, pk) = match version {
             SighashVersion::V2 => Transaction::parse_script_sig_borrowed(&inp.script_sig)
                 .ok_or_else(|| format!("malformed script_sig at input {}", i))?,
@@ -422,11 +435,30 @@ pub fn verify_input_signatures(
     if witnesses.len() != tx.inputs.len() {
         return Err(format!("{} witnesses for {} inputs", witnesses.len(), tx.inputs.len()));
     }
+    let is_policy = |i: usize| prevouts.get(i)
+        .is_some_and(|p| policy::output_kind(&p.script_pubkey) == Some(policy::OutputKind::Policy));
     match version {
         SighashVersion::V2 => {
             for (i, (sig, pk)) in witnesses.iter().enumerate() {
                 let sighash = tx.sighash(i, chain_id);
-                if !crypto::verify(pk, &sighash, sig) {
+                if is_policy(i) {
+                    // Exactly the listed keys sign, each in the strict
+                    // enveloped canonical form.
+                    let w = policy::AnyPolicyWitness::decode(sig)
+                        .map_err(|e| format!("malformed policy witness at input {}: {}", i, e))?;
+                    let pol = w.policy();
+                    for (idx, psig) in w.signatures() {
+                        let key = pol.pubkeys.get(*idx as usize)
+                            .ok_or_else(|| format!("policy key {} out of range at input {}", idx, i))?;
+                        if !crypto::verify_enveloped_canonical(key, &sighash, psig) {
+                            return Err(format!("invalid signature by policy key {} at input {}", idx, i));
+                        }
+                    }
+                    continue;
+                }
+                // Hybrid ML-DSA-65 ‖ Falcon-1024 signature, Falcon in its
+                // canonical compact encoding (one byte string per signature).
+                if !crypto::verify_canonical(pk, &sighash, sig) {
                     return Err(format!("invalid signature at input {}", i));
                 }
             }
@@ -434,6 +466,26 @@ pub fn verify_input_signatures(
         SighashVersion::V3 => {
             let pre = SighashV3Precomputed::new(tx, prevouts).map_err(|e| e.to_string())?;
             for (i, (sig, pk)) in witnesses.iter().enumerate() {
+                if is_policy(i) {
+                    let w = policy::AnyPolicyWitness::decode(sig)
+                        .map_err(|e| format!("malformed policy witness at input {}: {}", i, e))?;
+                    let pol = w.policy();
+                    for (idx, psig) in w.signatures() {
+                        let key = pol.pubkeys.get(*idx as usize)
+                            .ok_or_else(|| format!("policy key {} out of range at input {}", idx, i))?;
+                        if !crypto::is_canonical_signature_encoding(psig) {
+                            return Err(format!("non-canonical signature by policy key {} at input {}", idx, i));
+                        }
+                        let suite = crypto::split_envelope(psig)
+                            .map(|(s, _)| s)
+                            .ok_or_else(|| format!("input {i}: policy signature has no suite envelope"))?;
+                        let digest = pre.digest(i, suite, chain_id).map_err(|e| e.to_string())?;
+                        if !crypto::verify_bound(key, &digest, psig) {
+                            return Err(format!("invalid signature by policy key {} at input {}", idx, i));
+                        }
+                    }
+                    continue;
+                }
                 let suite = crypto::split_envelope(sig)
                     .map(|(s, _)| s)
                     .ok_or_else(|| format!("input {i}: signature has no suite envelope"))?;
@@ -619,9 +671,9 @@ mod tests {
         let mut trailing = w.clone();
         trailing.push(0);
         assert_eq!(Transaction::parse_script_sig_exact(&trailing), None);
-        // The historical parser ignores the trailing byte.
-        assert_eq!(Transaction::parse_script_sig(&trailing), Some((sig.clone(), pk.clone())));
-        assert_eq!(Transaction::parse_script_sig_borrowed(&trailing), Some((&sig[..], &pk[..])));
+        // This chain's v2 framing is exact too (consensus since cc5c450).
+        assert_eq!(Transaction::parse_script_sig(&trailing), None);
+        assert_eq!(Transaction::parse_script_sig_borrowed(&trailing), None);
         assert_eq!(Transaction::parse_script_sig_exact(&w[..w.len() - 1]), None);
         assert!(canonical_witness(&w).is_err(), "a non-enveloped signature is not canonical");
     }
@@ -749,10 +801,11 @@ mod tests {
         assert_eq!(tx.sighash_v2_checked(1, main), Ok(tx.sighash(1, main)));
         assert_ne!(tx.sighash(1, main), tx.sighash(0, main));
 
-        // A trailing byte after the public key is ignored below the activation.
+        // A trailing byte after the public key is invalid below the
+        // activation too (this chain's exact v2 framing).
         let mut t = tx.clone();
         t.inputs[1].script_sig.push(0);
-        assert_eq!(verify_tx_scripts(&t, &prev, main, h - 1, h), Ok(V2));
+        assert_eq!(verify_tx_scripts(&t, &prev, main, h - 1, h), Err("malformed script_sig at input 1".into()));
         // The same transaction is invalid at the activation (version 1).
         assert!(verify_tx_scripts(&tx, &prev, main, h, h).unwrap_err().starts_with("bad-txns-version"));
 

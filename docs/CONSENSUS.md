@@ -231,7 +231,7 @@ height cannot serve as the cut-off).
 k = 10. Blocks below the hardening activation height use the interval-index
 ("Fast") coloring, which is applied from genesis but does not count the whole
 selected chain in a candidate's anticone. From the activation height (mainnet
-25,800; testnet and regtest 0) the exact GHOSTDAG coloring, Kaspa blue work
+110,000; testnet and regtest 0) the exact GHOSTDAG coloring, Kaspa blue work
 and the mergeset limits below apply.
 
 ## GhostDAG rules, ledger semantics and the hardening activation
@@ -246,36 +246,38 @@ exactly, and their stored `GhostdagData` stays valid.
 
 | Network | Hardening activation height |
 | --- | --- |
-| mainnet | 25,800 (`MAINNET_HARDENING_ACTIVATION_HEIGHT`; about 2026-10-17 02:11 UTC) |
+| mainnet | 110,000 (`MAINNET_HARDENING_ACTIVATION_HEIGHT`) |
 | testnet | 0 (from genesis) |
 | regtest | 0 (from genesis) |
 
-The mainnet height was moved on 2026-10-16 from 110,000 (about 30 days after
-the release) to about one day after that decision. No mainnet node was
-reachable, so it was derived from the ASERT schedule `(time - genesis time) /
-30 s`, not from an observed tip. Genesis timestamp 1,791,429,092 (2026-10-08
-03:11:32 UTC), 30 s target spacing: on 2026-10-16 02:00 UTC the schedule
-height is about 22,897; one day is 2,880 blocks, about 25,777, rounded to
-25,800, whose scheduled time is 1,791,429,092 + 25,800 × 30 = 1,792,203,092
-(2026-10-17 02:11:32 UTC).
-
-The schedule bounds the real height only loosely. ASERT is anchored at the
-genesis block with a 2 h half-life, so at a steady network hashrate `H` the
-chain runs `240 × log2(H / H0)` blocks ahead of the schedule (behind it when
-negative), where `H0` ≈ 150 evaluations/s is the hashrate at which the genesis
-target (about 4,500 evaluations per block) gives 30 s blocks. At 16 × `H0`
-the activation arrives about 8 h before the scheduled time, at 128 × `H0`
-about 14 h before; the chain would already have been past 25,800 at the
-decision only above about 4,400 × `H0`. Below `H0` the chain lags the
-schedule, and from the activation the hardened pow limit (the genesis target,
-"Pow limit (POW-3)") stretches block times to about 30 s × `H0 / H` until the
-hashrate rises. Before the release, the mainnet tip (`getdaginfo`
-`tip_height`, `next_block_height`) and the current `bits` must be read from a
-node: the tip must be well below 25,800, else the height must be moved again
-before the chain reaches it; the observed block rate gives the real time of
-the activation; `bits` easier than `0x1f0e9036` means the post-activation
-slowdown above (`RUNNING.md`, "Hardening activation"). The rules switch at
-the height, whatever the time.
+The ASERT schedule bounds the real height only loosely. ASERT is anchored at
+the genesis block (`GENESIS_TIMESTAMP`, `GENESIS_BITS`) with 30 s spacing and
+a 2 h half-life, so the schedule height at time `t` is `(t - genesis time) /
+30 s`, and at a steady network hashrate `H` the chain runs `240 × log2(H /
+H0)` blocks ahead of the schedule (behind it when negative), where `H0` is the
+hashrate at which the scheduled target gives 30 s blocks. Below the PoWit
+height (GnB-SMH v1) that target is the genesis target, about 4,500
+evaluations per block: `H0` ≈ 150 v1 evaluations/s. From the PoWit height
+(mainnet 10,000) blocks use GnB-SMH v3 and `core::adjust_bits_for_algo`
+shifts the ASERT target right by `POW_V3_DIFFICULTY_SHIFT` = 2 bits (4 times
+harder; `DESIGN-pow-powit.md`), about 18,000 v3 evaluations per block on the
+schedule: `H0` ≈ 600 v3 evaluations/s. The shift is applied after ASERT, so
+the anchor and the schedule height are unchanged; only `H0` moves (a v3
+evaluation costs about a sixth of a v1 one, so the same hardware tracks the
+schedule at about two thirds of the v1 `H0`). Each doubling of `H` above `H0`
+brings the activation 240 blocks (2 h) before its scheduled time. Below `H0`
+the chain lags the schedule, and from the activation the hardened pow limit
+(the genesis target, "Pow limit (POW-3)", which clamps the ASERT target
+before the v3 shift, so a v3 block needs at least about 18,000 evaluations)
+stretches block times to about 30 s × `H0 / H` until the hashrate rises.
+Before the release, the mainnet tip (`getdaginfo` `tip_height`,
+`next_block_height`) and the current `bits` must be read from a node: the tip
+must be well below the activation height, else the height must be moved
+again before the chain reaches it; the observed block rate gives the real
+time of the activation; template `bits` easier than `0x1f03a40d` (the
+genesis target shifted for v3; `0x1f0e9036` below the PoWit height) mean the
+post-activation slowdown above (`RUNNING.md`, "Hardening activation"). The
+rules switch at the height, whatever the time.
 
 Every node and miner must run a release with this height before the chain
 reaches it (`RUNNING.md`, "Hardening activation"); a node with the old height
@@ -608,7 +610,7 @@ WAL-1), that its cost was quadratic in the transaction size (MEM-5), that a
 hybrid signature could be split into a valid ML-DSA-only signature (CRY-2),
 and that witnesses were malleable (CRY-1). The fixes below change validity, so
 the consensus parts take effect at the hardening activation height (mainnet
-25,800; testnet and regtest 0). The rules live in
+110,000; testnet and regtest 0). The rules live in
 `crates/gnb-crypto/src/core/sighash.rs`; the node applies them through one
 function, `mempool::admission::verify_input_scripts`, which block acceptance
 and connect (`accept::validate_tx_inputs`), reorg connect, the template
@@ -907,7 +909,7 @@ domain separation and no 64-byte rule (VAL-10), nothing committed to witness
 bytes (CRY-1), the block-size limit used a different encoding than fees
 (VAL-12), and the pow limit allowed blocks worth one evaluation (POW-3). The
 rules below take effect at the same hardening activation height as the
-GhostDAG rules (mainnet 25,800; testnet and regtest 0). The code is
+GhostDAG rules (mainnet 110,000; testnet and regtest 0). The code is
 `crates/gnb-crypto/src/core/block_rules.rs` and `validate_block_in_view` in
 `node/src/accept.rs`. The executable reference is `reference/gnb_merkle.py`
 (pow limit: `reference/gnb_difficulty.py`). The golden vectors in
@@ -1044,8 +1046,8 @@ activation ("Transaction signatures", "Witnesses"): with both rules there is
 exactly one valid block body per block id.
 
 **Below the activation (node-local, all heights of the old rules).** The
-blocks below the activation (up to 25,799 on mainnet) stay malleable forever,
-so a node must not let a mutated copy disqualify their ids. This is node policy,
+blocks below the activation (109,999 on mainnet) stay malleable forever, so a
+node must not let a mutated copy disqualify their ids. This is node policy,
 not a consensus rule: it changes no verdict, only what a node remembers. A
 connect-time failure of a block below the activation is classified by what it
 depends on (`accept::BlockInvalidity::witness_dependent`):

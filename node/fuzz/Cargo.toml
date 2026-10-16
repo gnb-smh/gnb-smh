@@ -221,3 +221,45 @@ path = "fuzz_targets/accept_dag.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "sync_decode"
+path = "fuzz_targets/sync_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pq_handshake_decode"
+path = "fuzz_targets/pq_handshake_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_validate"
+path = "fuzz_targets/block_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tx_validate"
+path = "fuzz_targets/tx_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_witness_decode"
+path = "fuzz_targets/policy_witness_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "script_sig_verify"
+path = "fuzz_targets/script_sig_verify.rs"
+test = false
+doc = false
+bench = false

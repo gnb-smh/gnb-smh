@@ -28,9 +28,13 @@ non-standard. `version_rule` vectors pin both.
 Sighash v2 (historical; must never change):
 
     preimage = "GNB-SIGHASH-v1\\0\\0" (16) || 0x01 || chain_id u32 LE || body
-    body     = bincode-2 "standard" encoding of the transaction with
+    body     = the hand-written WIRE encoding of the transaction (`wire`,
+               `Transaction::to_wire_bytes(true)`) with
                script_sig := "GNB_SIGHASH" on the signed input and
                script_sig := "" on every other input
+               (this chain since cc5c450: no consensus value depends on
+               serde/bincode; the bincode notes below describe the
+               pre-reset encoding and are kept for reference only)
     sighash  = SHA3-256(preimage)
 
     bincode-2 standard: structs are their fields in order; u8 is one byte;
@@ -81,7 +85,7 @@ CHAIN_MAINNET = 0x474E0001
 CHAIN_TESTNET = 0x474E0002
 
 SIGHASH_V2_DOMAIN = b"GNB-SIGHASH-v1\x00\x00"
-SIGHASH_V2_VERSION = 0x01
+SIGHASH_V2_VERSION = 0x02   # this chain: the wire-body v2 (cc5c450)
 SIGHASH_V2_MARKER = b"GNB_SIGHASH"
 
 SIGHASH_V3_DOMAIN = b"GNB-SIGHASH-v3\x00\x00"
@@ -189,15 +193,14 @@ def bincode_varint(v: int) -> bytes:
 
 
 def v2_body(tx: Tx, input_index: int) -> bytes:
-    out = bincode_varint(tx.version) + bincode_varint(len(tx.inputs))
+    out = u32(tx.version) + btc_varint(len(tx.inputs))
     for i, inp in enumerate(tx.inputs):
         ss = SIGHASH_V2_MARKER if i == input_index else b""
-        out += inp.prev_txid + bincode_varint(inp.prev_index)
-        out += bincode_varint(len(ss)) + ss + bincode_varint(inp.sequence)
-    out += bincode_varint(len(tx.outputs))
+        out += inp.prev_txid + u32(inp.prev_index) + btc_varint(len(ss)) + ss + u32(inp.sequence)
+    out += btc_varint(len(tx.outputs))
     for o in tx.outputs:
-        out += bincode_varint(o.value) + bincode_varint(len(o.script_pubkey)) + o.script_pubkey
-    return out + bincode_varint(tx.locktime)
+        out += u64(o.value) + btc_varint(len(o.script_pubkey)) + o.script_pubkey
+    return out + u32(tx.locktime)
 
 
 def v2_preimage(tx: Tx, input_index: int, chain_id: int) -> bytes:

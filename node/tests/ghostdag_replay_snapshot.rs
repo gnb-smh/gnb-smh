@@ -177,8 +177,8 @@ fn topo_sort(
 /// rules, and both the work recovery above and the on-disk comparison assume
 /// them (from the activation, `blue_work` also adds the mergeset blues' work),
 /// so the replay pins the old rules at every height (`activation::NEVER`)
-/// instead of taking the process-wide mainnet activation (25,800), which a
-/// long snapshot's chain passes. A snapshot of a chain mined past its hardening
+/// instead of taking the process-wide mainnet activation, which a long
+/// snapshot's chain may pass. A snapshot of a chain mined past its hardening
 /// activation is out of scope: its per-block work would have to come from the
 /// headers' bits, not from the `blue_work` difference.
 fn replay(

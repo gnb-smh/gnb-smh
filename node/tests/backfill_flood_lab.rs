@@ -53,10 +53,10 @@ fn h(salt: u8, i: u64) -> [u8; 32] {
 /// reachability mantido; coloração Legacy abaixo do gate, Fast acima).
 ///
 /// O incidente aconteceu sob as regras antigas (sem a ativação de hardening).
-/// A altura de ativação de mainnet (`MAINNET_HARDENING_ACTIVATION_HEIGHT`,
-/// 25.800) agora fica ABAIXO de TIP_HEIGHT, então o lab fixa a ativação em
-/// `NEVER` para continuar reproduzindo o incidente com as regras antigas em
-/// todas as alturas, como fazia quando a ativação era 110.000.
+/// A altura de ativação de mainnet (`MAINNET_HARDENING_ACTIVATION_HEIGHT`)
+/// pode ficar ABAIXO de TIP_HEIGHT, então o lab fixa a ativação em `NEVER`
+/// para reproduzir o incidente com as regras antigas em todas as alturas,
+/// qualquer que seja a altura de ativação.
 fn build_mainchain() -> (GhostDAG, Vec<[u8; 32]>) {
     let mut dag = GhostDAG::with_default_k().with_hardening_activation(activation::NEVER);
     let g = h(0, 0);
@@ -201,15 +201,21 @@ fn backfill_flood_lab() {
     // os N blocos do ramo — coloração Legacy com anticone×is_ancestor.
     println!("\n── A.3: bloco-merge (mergeset = ramo inteiro, zona Legacy) ──");
     let merge_parent_main = chain[12_200]; // h≈12.2k, ainda < 21430 ⇒ Legacy
+    // Since MERGESET_SIZE_LIMIT (64) this block is refused by consensus
+    // before any coloring work: the lab now measures the cost of the refusal.
     let t = Instant::now();
     let merge_block = h(7, 1);
-    dag.write()
-        .add_block(merge_block, vec![parent, merge_parent_main], 2_100_000, 1)
-        .expect("merge add_block");
+    let res = dag.write().add_block(merge_block, vec![parent, merge_parent_main], 2_100_000, 1);
     let cost_merge = t.elapsed();
+    assert!(
+        matches!(res, Err(gnb::consensus::ConsensusError::MergesetTooLarge { .. })),
+        "a merge of the whole side branch must be refused (mergeset limit)"
+    );
+    assert!(dag.read().get_block_data(&merge_block).is_none());
     println!(
-        "  UM bloco com mergeset≈{}: {:.2?}  (equivalente a {:.0}× um bloco de tip)",
+        "  UM bloco com mergeset≈{}: RECUSADO (limite {}) em {:.2?}  ({:.0}× um bloco de tip)",
         FLOOD_LEN,
+        gnb::consensus::MERGESET_SIZE_LIMIT,
         cost_merge,
         cost_merge.as_secs_f64() / cost_tip.as_secs_f64().max(1e-9)
     );

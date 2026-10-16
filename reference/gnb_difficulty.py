@@ -39,7 +39,7 @@ GhostDAG selected parent's), and `height` is max(parent heights) + 1.
 Pow limit (audit POW-3): for a block at header height `height` the clamp is
 `pow_limit_bits_at(height, activation_height)`: the genesis target
 (GENESIS_BITS) when 1 <= height and height >= activation_height (the
-hardening activation, mainnet 25,800), POW_LIMIT_BITS before.
+hardening activation, mainnet 110,000), POW_LIMIT_BITS before.
 """
 
 from __future__ import annotations
@@ -49,9 +49,14 @@ TARGET_SPACING = 30              # seconds
 HALFLIFE = 2 * 60 * 60           # seconds (240 blocks)
 POW_LIMIT_BITS = 0x2100FFFF
 HARDENED_POW_LIMIT_BITS = 0x1F0E9036   # = GENESIS_BITS (POW-3)
-MAINNET_HARDENING_ACTIVATION_HEIGHT = 25_800   # activation.rs (110_000 before 2026-10-16)
+MAINNET_HARDENING_ACTIVATION_HEIGHT = 110_000
 GENESIS_BITS = 0x1F0E9036
-GENESIS_TIMESTAMP = 1791429092
+GENESIS_TIMESTAMP = 1791685648
+# From this height the proof of work is GnB-SMH v3, whose targets are
+# 2^POW_V3_DIFFICULTY_SHIFT times harder than the ASERT schedule
+# (core::POWIT_HEIGHT_MAINNET, core::POW_V3_DIFFICULTY_SHIFT).
+POWIT_HEIGHT_MAINNET = 10_000
+POW_V3_DIFFICULTY_SHIFT = 2
 GENESIS_HEIGHT = 0
 
 U64_MAX = (1 << 64) - 1
@@ -240,13 +245,24 @@ def pow_limit_bits_at(height: int, activation_height: int) -> int:
     return POW_LIMIT_BITS
 
 
+def adjust_bits_for_algo(bits: int, height: int, powit_height: int = POWIT_HEIGHT_MAINNET) -> int:
+    """From `powit_height` (GnB-SMH v3) the target is the ASERT target
+    shifted right by POW_V3_DIFFICULTY_SHIFT bits (at least 1)."""
+    if height < powit_height:
+        return bits
+    return target_to_bits(max(bits_to_target(bits) >> POW_V3_DIFFICULTY_SHIFT, 1))
+
+
 def expected_bits(parents: list[tuple[int, int]],
-                  activation_height: int = MAINNET_HARDENING_ACTIVATION_HEIGHT) -> int:
+                  activation_height: int = MAINNET_HARDENING_ACTIVATION_HEIGHT,
+                  powit_height: int = POWIT_HEIGHT_MAINNET) -> int:
     """`bits` a GnB block with these parents must carry under the given
-    hardening activation height (mainnet by default). A parent timestamp
-    above i64::MAX is an error (the Rust code converts u64 -> i64)."""
+    hardening activation height and PoWit height (mainnet by default). A
+    parent timestamp above i64::MAX is an error (the Rust code converts
+    u64 -> i64)."""
     parent_time, height = difficulty_input(parents)
     if parent_time > I64_MAX:
         raise ValueError("parent timestamp out of range")
-    return asert_next_bits(parent_time, height,
+    bits = asert_next_bits(parent_time, height,
                            pow_limit_bits=pow_limit_bits_at(height, activation_height))
+    return adjust_bits_for_algo(bits, height, powit_height)

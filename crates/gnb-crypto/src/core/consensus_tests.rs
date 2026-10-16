@@ -41,6 +41,7 @@ fn valid_block(height: u64, parents: Vec<[u8; 32]>, cb_pad: usize, extra: Vec<Tr
         blue_score: height,
         height,
         shielded_transactions: vec![],
+        powit: Default::default(),
     };
     if block_rules::rules_active_at(height, activation) {
         let c = block_rules::expected_coinbase_commitment(&b);
@@ -150,12 +151,12 @@ fn genesis_header_digests_match_the_python_reference() {
     let g = genesis_block();
     assert_eq!(
         hex::encode(g.header.pow_preimage()),
-        "010000000000000094b268574daf887595bbd4f8211d3cb286361527979d38ff8b45e96fb6dca59ce409c76a0000000036900e1f"
+        "01000000000000006af2543ab67b047d3ef1d63c7141fd308cf9c8b96e223d8ce9ecdc1b7db8190d10f4ca6a0000000036900e1f"
     );
-    assert_eq!(hex::encode(g.header.dag_hash()), "d8c733fb1fa6d3063d7e7733d1bce4d14836659353b1fde1f1793b1da95b795d");
-    assert_eq!(hex::encode(g.block_hash()), "837f7d5c832ae28370cd52baa969528753f619be2a4dd07d814a1a986c4201cd");
-    let pow = g.header.pow_hash();
-    assert_eq!(hex::encode(pow), "000504fc749cbd9b6f48cad91423108c12df8b7c8154cf69191110f29c8554b2");
+    assert_eq!(hex::encode(g.header.dag_hash()), "4604d53d596a9d3f394d0d662e8dba94793f3c0b1abcf6ae1ef4a0ccced214fe");
+    assert_eq!(hex::encode(g.block_hash()), "a63fd2c124cf34312d2730609204dc3071b8924e24d54f938cf738968fb8f810");
+    let pow = g.header.pow_hash(0);
+    assert_eq!(hex::encode(pow), "00009bf116a2451ac6af9a11c2ff40808efe96abf4238feb084596826e516682");
     assert!(hash_meets_target(&pow, &bits_to_target(GENESIS_BITS)));
 }
 
@@ -327,8 +328,8 @@ fn block_size_limit_is_inclusive_under_both_measures() {
         assert_eq!(at.validate_structure_without_pow_at(activation), Ok(()), "hardened={hardened}");
         let over = block_of_size(MAX_BLOCK_SIZE + 1, 1, activation);
         assert_eq!(over.validate_structure_without_pow_at(activation), Err("block too large"), "hardened={hardened}");
-        // The two measures differ, so the regime decides.
-        assert_ne!(at.wire_size(), at.size_bytes());
+        // This chain measures both regimes on the wire encoding.
+        assert_eq!(at.wire_size(), at.size_bytes());
         assert_eq!(block_rules::block_size_for_rules(&at, true), at.wire_size());
         assert_eq!(block_rules::block_size_for_rules(&at, false), at.size_bytes());
         if hardened {
@@ -339,9 +340,9 @@ fn block_size_limit_is_inclusive_under_both_measures() {
 }
 
 #[test]
-fn size_bytes_is_the_bincode_length() {
+fn size_bytes_is_the_wire_length() {
     let b = valid_block(3, vec![[1; 32]], 20, vec![spend_tx(1, &[1_000])], activation::NEVER);
-    let len = bincode::serde::encode_to_vec(&b, bincode::config::standard()).unwrap().len();
+    let len = b.to_wire_bytes().len();
     assert_eq!(b.size_bytes(), len);
     assert!(len > 100);
 }
@@ -359,7 +360,8 @@ fn actual_size_is_the_bincode_length_that_size_bytes_sums() {
     let without = valid_block(3, vec![[1; 32]], 20, vec![spend_tx(1, &[1_000])], activation::NEVER);
     let mut with = without.clone();
     with.transactions.push(tx.clone());
-    assert_eq!(with.size_bytes(), without.size_bytes() + tx.actual_size());
+    // The block measure is the wire encoding on this chain.
+    assert_eq!(with.size_bytes(), without.size_bytes() + tx.wire_size(true));
 }
 
 #[test]
@@ -509,8 +511,9 @@ fn wire_parser_caps_are_exact() {
     assert_eq!(tx(cat(&[&ver, &v(100_000)])), "32-byte EOF");
     assert_eq!(tx(cat(&[&ver, &v(100_001)])), "implausible input count 100001");
     let input = cat(&[&ver, &v(1), &[0u8; 32], &[0u8; 4]]);
-    assert_eq!(tx(cat(&[&input, &v(10_000)])), "10000-byte EOF");
-    assert_eq!(tx(cat(&[&input, &v(10_001)])), "implausible script_sig length 10001");
+    let cap = MAX_SCRIPT_SIG_LEN as u64;
+    assert_eq!(tx(cat(&[&input, &v(cap)])), format!("{cap}-byte EOF"));
+    assert_eq!(tx(cat(&[&input, &v(cap + 1)])), format!("implausible script_sig length {}", cap + 1));
     let no_inputs = cat(&[&ver, &v(0)]);
     assert_eq!(tx(cat(&[&no_inputs, &v(100_000)])), "u64 EOF");
     assert_eq!(tx(cat(&[&no_inputs, &v(100_001)])), "implausible output count 100001");
@@ -571,10 +574,10 @@ fn script_sig_framing_boundaries() {
     let mut huge = w.clone();
     huge[..4].copy_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(Transaction::parse_script_sig_borrowed(&huge), None);
-    // Trailing bytes: kept by the lenient parser, refused by the exact one.
+    // Trailing bytes: refused by both (this chain's v2 framing is exact).
     let mut trailing = w.clone();
     trailing.extend_from_slice(&[0, 0]);
-    assert_eq!(Transaction::parse_script_sig_borrowed(&trailing), Some((&sig[..], &pk[..])));
+    assert_eq!(Transaction::parse_script_sig_borrowed(&trailing), None);
     assert_eq!(Transaction::parse_script_sig_exact(&trailing), None);
 }
 

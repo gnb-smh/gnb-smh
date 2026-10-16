@@ -8,12 +8,12 @@ pub struct MineResult {
     pub nonce: u64,
 }
 
-/// Mine `header` in place using all available cores (64 MiB per thread).
+/// Mine `header` (of a block at `height`) in place using all available cores.
 /// `max_attempts` applies per thread.
-pub fn mine_block(header: &mut BlockHeader, max_attempts: u64) -> MineResult {
+pub fn mine_block(header: &mut BlockHeader, height: u64, max_attempts: u64) -> MineResult {
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let preimage = header.pow_preimage();
-    match crate::pow::mine_parallel(&preimage, header.bits, header.nonce, max_attempts, threads, None) {
+    match crate::pow::mine_parallel(&preimage, header.bits, height, header.nonce, max_attempts, threads, None) {
         Some(nonce) => {
             header.nonce = nonce;
             info!("Block mined! nonce={} ({} threads)", nonce, threads);

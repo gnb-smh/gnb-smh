@@ -98,8 +98,8 @@ fn sighash_v2_pinned_digests() {
     assert_eq!(hex::encode(two.sighash(1, ChainId::Testnet)), PINNED_V2_TWO_TESTNET_INPUT1);
 }
 
-const PINNED_V2_ONE_MAINNET: &str = "211c6d375f6e50a58e09c9f3b914a3ea1fa38698d524ecabc745492e0141babf";
-const PINNED_V2_TWO_TESTNET_INPUT1: &str = "9861067cd575299db06a15ee93c68bedcf2e4c8de2d544dc1c586ac7d3813657";
+const PINNED_V2_ONE_MAINNET: &str = "bc7e7612ff9dd597dbaa8afaf53a6b89d2bea306d74f79a6dfb15e37d4e06382";
+const PINNED_V2_TWO_TESTNET_INPUT1: &str = "9c52fd5e362a485f17406a0c17777a4fc547a747eb3a14f1375fd9e6e7baf766";
 
 #[test]
 fn sighash_v3_matches_reference() {

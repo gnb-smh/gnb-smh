@@ -39,7 +39,7 @@ mod security_tests {
         block.header.nonce = 0;
 
         // PoW passes trivially because validate_pow checks the block's OWN bits
-        let hash = block.header.pow_hash();
+        let hash = block.header.pow_hash(block.height);
         let target = bits_to_target(block.header.bits);
         assert!(
             hash_meets_target(&hash, &target),
@@ -117,7 +117,7 @@ mod security_tests {
             transactions: vec![coinbase],
             blue_score:   0,
             height:       1,
-            shielded_transactions: Vec::new(),
+            shielded_transactions: Vec::new(), powit: Default::default(),
         };
 
         // Sanity: at real h=1, the coinbase passes validation (correct values)
@@ -321,7 +321,7 @@ mod security_tests {
             transactions: vec![coinbase],
             blue_score:   0,
             height,
-            shielded_transactions: Vec::new(),
+            shielded_transactions: Vec::new(), powit: Default::default(),
         };
 
         // Correct coinbase passes

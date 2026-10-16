@@ -101,7 +101,7 @@ fn header_with_a_non_minimal_parent_count_is_refused() {
         outputs: vec![TxOutput { value: 1, script_pubkey: vec![2; 20] }],
         locktime: 0,
     };
-    let b = Block { header: h, transactions: vec![tx], blue_score: 1, height: 1, shielded_transactions: vec![] };
+    let b = Block { header: h, transactions: vec![tx], blue_score: 1, height: 1, shielded_transactions: vec![], powit: Default::default() };
     let enc = b.to_wire_bytes();
     assert_eq!(Block::from_wire_bytes(&enc).unwrap().to_wire_bytes(), enc);
     let mut wide = enc[..4].to_vec();

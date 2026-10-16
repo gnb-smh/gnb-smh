@@ -49,7 +49,9 @@ fn hexs(b: &[u8]) -> String {
 /// (`node/src/accept.rs`: BIP30, the same-block coinbase rule of VAL-3,
 /// duplicate and missing inputs), not in gnb-crypto. This runner checks
 /// every rule before them and leaves the verdict to the node runner.
-const TX_DEFERRED_TO_NODE: &[&str] = &["bip30", "same-block-coinbase", "double-spend", "missing-input"];
+const TX_DEFERRED_TO_NODE: &[&str] = &[
+    "bip30", "same-block-coinbase", "double-spend", "missing-input", "non-final", "bad-output-script",
+];
 
 enum Connect {
     /// The verdict of the connect-time rules this runner can evaluate.
@@ -65,6 +67,11 @@ fn connect_core(c: &TxVector, tx: &Transaction, chain: ChainId, act: u64, expect
     let fail = |e: String| Connect::Decided(Err(classify(&e).to_string()));
     // BIP30 (checked for the whole block first) and VAL-3: accept.rs.
     if matches!(expected, "bip30" | "same-block-coinbase") {
+        return Connect::Deferred;
+    }
+    // This chain's locktime and output-kind rules (node/src/blockval.rs),
+    // evaluated after maturity once every prevout is found.
+    if matches!(expected, "non-final" | "bad-output-script") {
         return Connect::Deferred;
     }
     // Coinbase maturity at the block height; the view's coinbase heights.
@@ -219,7 +226,7 @@ fn block_vectors_core() {
         rep.expect(&c.id, "parents_commitment", d["parents_commitment"].as_str().unwrap(), &hexs(&block_rules::parents_commitment(&block.header.parents)));
         rep.expect(&c.id, "subsidy", d["subsidy"].as_str().unwrap(), &core::tokenomics::block_subsidy_sat(block.height).to_string());
         rep.expect(&c.id, "wire_size", &d["wire_size"].to_string(), &block.wire_size().to_string());
-        rep.expect(&c.id, "bincode_size", &d["bincode_size"].to_string(), &block.size_bytes().to_string());
+        rep.expect(&c.id, "wire_size is the encoding", &d["wire_size"].to_string(), &c.bytes.len().to_string());
 
         if c.scope == "connect" {
             connect_deferred += 1; // connect-time rules only: node runner
@@ -279,6 +286,7 @@ fn vector_coverage() {
         "decode", "coinbase-format", "tx-64-bytes", "dust", "value-out-of-range", "bip30", "same-block-coinbase",
         "immature-coinbase", "double-spend", "missing-input", "bad-version", "witness-malformed",
         "witness-non-canonical", "pubkey-mismatch", "bad-signature", "inputs-below-outputs", "min-fee",
+        "non-final", "bad-output-script",
     ] {
         assert!(has(&|c| c.error.as_deref() == Some(class)), "tx class {class} not covered");
     }
@@ -329,6 +337,7 @@ fn vector_coverage() {
         "decode", "bad-merkle-root", "coinbase-format", "tx-64-bytes", "cb-commitment-missing", "cb-commitment-tag",
         "cb-height", "cb-parents", "witness-commitment", "duplicate-tx", "block-size", "pow-limit", "bad-bits",
         "bad-pow", "value-out-of-range", "bip30", "coinbase-value", "coinbase-output-count", "same-block-coinbase",
+        "witness-commitment-suffix", "bad-output-script", "witness-malformed",
     ] {
         assert!(b.iter().any(|c| c.error.as_deref() == Some(class)), "block class {class} not covered");
     }
