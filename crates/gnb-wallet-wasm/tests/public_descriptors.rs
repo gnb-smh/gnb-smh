@@ -9,7 +9,8 @@ fn key(byte: u8) -> String {
 
 #[test]
 fn legacy_normalize_control_without_a_session() {
-    let address = "gnb1q0000000000000000000000000000000000000000";
+    let address = gnb_crypto::address::Address::from_hash([0; 20],
+        gnb_crypto::address::Network::Mainnet).to_string();
     assert_eq!(handle(&json!({"op":"normalize", "address":address})).unwrap(),
         json!({"address":address}));
 }
