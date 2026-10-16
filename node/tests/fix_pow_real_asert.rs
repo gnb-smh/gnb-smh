@@ -13,7 +13,9 @@
 //! `GENESIS_TIMESTAMP`, one second per block instead of 30) and a side tip
 //! is stamped 600 s later, so the targets are strictly between the two pow
 //! limits and a change of the height by one, or of the parent timestamp
-//! (the latest over ALL parents), changes the bits.
+//! (the latest over ALL parents), changes the bits. The ingress core runs
+//! with no minimum chain work (these chains are far below mainnet's, the
+//! default here, and an unrequested orphan is not buffered below it).
 
 mod fix_common;
 use fix_common::*;
@@ -171,7 +173,7 @@ fn ingress_orphan_floor_call_site_follows_the_real_asert_rule_of_the_tip() {
     let easier = core::target_to_bits(&floor_at(tip_h - 1));
     assert!(core::bits_to_target(easier) > floor);
 
-    let mut core_ = ingress::BlockIngress::new();
+    let mut core_ = ingress::BlockIngress::new().with_minimum_chain_work(0);
     let o = deliver(&mut core_, &orphan(easier, "pow5-orphan-easy"));
     assert!(matches!(o, ingress::BlockOutcome::Dropped(ingress::DropReason::OrphanBelowFloor)), "{o:?}");
     let o = deliver(&mut core_, &orphan(at_floor, "pow5-orphan-floor"));

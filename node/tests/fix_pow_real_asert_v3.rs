@@ -14,7 +14,9 @@
 //! Shape (as in `fix_pow_real_asert.rs`): G -> a -> b one second apart and a
 //! side tip c on G stamped 600 s after genesis; the next block, on [b, c], has
 //! header height 3 = [`POWIT`] (v3) and difficulty parent timestamp G0 + 600,
-//! while its selected parent b (height 2) is a v1 block.
+//! while its selected parent b (height 2) is a v1 block. The ingress core
+//! runs with no minimum chain work (these chains are far below mainnet's,
+//! the default here, and an unrequested orphan is not buffered below it).
 
 mod fix_common;
 use fix_common::*;
@@ -180,7 +182,7 @@ fn ingress_orphan_floor_uses_the_v3_target_of_the_tips_child() {
     let at_v1_floor = core::target_to_bits(&v1_floor);
     assert!(core::bits_to_target(at_v1_floor) > floor);
 
-    let mut core_ = ingress::BlockIngress::new();
+    let mut core_ = ingress::BlockIngress::new().with_minimum_chain_work(0);
     let o = deliver(&mut core_, &orphan(at_v1_floor, "pow5v3-orphan-v1"));
     assert!(matches!(o, ingress::BlockOutcome::Dropped(ingress::DropReason::OrphanBelowFloor)), "{o:?}");
     let o = deliver(&mut core_, &orphan(at_floor, "pow5v3-orphan-v3"));
