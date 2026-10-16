@@ -5,10 +5,16 @@ const ADDRESS_V2_TEST_42: &str = "tgnb1zq9g4z52329g4z52329g4z52329g4z5232ed3tuc"
 const POLICY_V2_MAIN_44: &str = "gnb1zp9skzctpv9skzctpv9skzctpv9skzctpv9skzctpv9skzctpv9skqamypv7";
 const POLICY_V2_TEST_44: &str = "tgnb1zp9skzctpv9skzctpv9skzctpv9skzctpv9skzctpv9skzctpv9skqzctyfu";
 
+fn address_frontends_state() -> (TempDir, AppState) {
+    let (tmp, state) = state_with_chain(1);
+    state.store.ensure_aggregates().unwrap();
+    (tmp, state)
+}
+
 #[tokio::test]
 async fn address_frontends_queries_reject_wrong_network_before_storage() {
     use crate::address::{Address, Network, PolicyAddress};
-    let (_tmp, state) = state_with_chain(1);
+    let (_tmp, state) = address_frontends_state();
     let main = Address::from_hash([42; 20], Network::Mainnet).to_string();
     let other = Address::from_hash([42; 20], Network::Testnet).to_string();
     state.store.put_utxo(&[43; 32], 0, &TxOutput { value: 12_345, script_pubkey: vec![42; 20] }).unwrap();
@@ -51,7 +57,7 @@ async fn address_frontends_queries_reject_wrong_network_before_storage() {
 #[tokio::test]
 async fn address_frontends_validators_refuse_wrong_network() {
     use crate::address::{Address, Network};
-    let (_tmp, state) = state_with_chain(1);
+    let (_tmp, state) = address_frontends_state();
     let main = Address::from_hash([42; 20], Network::Mainnet).to_string();
     let other = Address::from_hash([42; 20], Network::Testnet).to_string();
     let mut failures = Vec::new();
@@ -68,7 +74,7 @@ async fn address_frontends_validators_refuse_wrong_network() {
 #[tokio::test]
 async fn address_frontends_legacy_aliases_keep_one_index_identity() {
     use crate::address::{Address, Network};
-    let (_tmp, state) = state_with_chain(1);
+    let (_tmp, state) = address_frontends_state();
     let address = Address::from_hash([42; 20], Network::Mainnet).to_string();
     let bloch = address.replacen("gnb1q", "bloch1q", 1);
     state.store.put_utxo(&[43; 32], 0, &TxOutput { value: 12_345, script_pubkey: vec![42; 20] }).unwrap();
@@ -86,7 +92,7 @@ async fn address_frontends_legacy_aliases_keep_one_index_identity() {
 #[tokio::test]
 async fn address_frontends_validators_share_legacy_alias_parser() {
     use crate::address::{Address, Network};
-    let (_tmp, state) = state_with_chain(1);
+    let (_tmp, state) = address_frontends_state();
     let main = Address::from_hash([42; 20], Network::Mainnet).to_string();
     let bloch = main.replacen("gnb1q", "bloch1q", 1);
     assert!(Address::parse(&bloch).is_ok());
@@ -99,7 +105,7 @@ async fn address_frontends_validators_share_legacy_alias_parser() {
 #[tokio::test]
 async fn address_frontends_v2_aliases_keep_existing_index_identity() {
     use crate::address::{Address, Network, PolicyAddress};
-    let (_tmp, state) = state_with_chain(1);
+    let (_tmp, state) = address_frontends_state();
     let legacy = Address::from_hash([42; 20], Network::Mainnet).to_string();
     state.store.put_utxo(&[43; 32], 0, &TxOutput { value: 12_345, script_pubkey: vec![42; 20] }).unwrap();
     let tx = Transaction { version: 1, inputs: vec![],
@@ -134,7 +140,7 @@ async fn address_frontends_v2_aliases_keep_existing_index_identity() {
 #[tokio::test]
 async fn address_frontends_explicit_v2_conversion_preserves_legacy_default() {
     use crate::address::{Address, Network, PolicyAddress};
-    let (_tmp, state) = state_with_chain(1);
+    let (_tmp, state) = address_frontends_state();
     let single = Address::from_hash([42; 20], Network::Mainnet).to_string();
     let script = [vec![crate::core::policy::POLICY_TAG], vec![44; 32]].concat();
     let policy = PolicyAddress::from_script(&script, Network::Mainnet).unwrap().to_string();
@@ -155,7 +161,7 @@ async fn address_frontends_explicit_v2_conversion_preserves_legacy_default() {
 #[tokio::test]
 async fn address_frontends_malformed_inputs_remain_invalid() {
     use crate::address::{Address, Network};
-    let (_tmp, state) = state_with_chain(1);
+    let (_tmp, state) = address_frontends_state();
     let mut bad_checksum = Address::from_hash([42; 20], Network::Mainnet).to_string();
     let replacement = if bad_checksum.ends_with('0') { "1" } else { "0" };
     bad_checksum.replace_range(bad_checksum.len() - 1.., replacement);
@@ -190,7 +196,7 @@ fn address_frontends_testnet_rpc_isolated() {
     assert_eq!(crate::core::node_chain_id(), crate::core::ChainId::Testnet);
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         use crate::address::{Address, Network};
-        let (_tmp, state) = state_with_chain(1);
+        let (_tmp, state) = address_frontends_state();
         let address = Address::from_hash([42; 20], Network::Testnet).to_string();
         let other = Address::from_hash([42; 20], Network::Mainnet).to_string();
         state.store.put_utxo(&[43; 32], 0, &TxOutput { value: 12_345, script_pubkey: vec![42; 20] }).unwrap();
