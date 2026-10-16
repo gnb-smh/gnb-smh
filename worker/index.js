@@ -19,6 +19,13 @@
 //   this Worker first for all requests), stricter still under /wallet.
 // - WAL-4: the original client address (CF-Connecting-IP) is forwarded to the
 //   origin in X-GnB-Client-IP, so the explorer API can rate-limit per client.
+// - B2-R2-2: /api/sendrawtransaction accepts only same-origin browser
+//   requests (or non-browser clients, which send no Origin) with an
+//   application/json body, and its answers carry no CORS header. Before, any
+//   web page could make its visitors' browsers broadcast through this route
+//   with a CORS "simple request" (text/plain fetch in no-cors mode,
+//   sendBeacon, a form), so the per-client limit counted every visitor and
+//   never the attacker; see broadcastRefusal.
 const NAME = /^[a-z0-9]{2,40}$/;
 
 // Fixed edge TTLs (seconds). Anything not listed uses DEFAULT_TTL.
@@ -90,12 +97,48 @@ function originHeaders(request, env, extra = {}) {
   };
 }
 
+/**
+ * Why a broadcast request must be refused before it costs anything, as
+ * `[status, message]`, or null (B2-R2-2).
+ *
+ * A browser sends a cross-origin POST without asking first (no CORS
+ * preflight) only when it is a "simple request": its Content-Type is
+ * text/plain, application/x-www-form-urlencoded or multipart/form-data (or
+ * absent). Requiring application/json therefore forces every cross-origin
+ * browser broadcast through a preflight, which this route answers 405
+ * without CORS headers, so the browser never sends the POST. Independently,
+ * a request a browser marks as coming from another origin (Sec-Fetch-Site
+ * other than same-origin / none, or an Origin header that is not this
+ * host's) is refused: only the site's own pages (site/wallet/app.js,
+ * site/shared/gnb.js, both same-origin JSON fetches) and non-browser
+ * clients (CLI wallets, scripts: no Origin, no Sec-Fetch-Site) broadcast.
+ *
+ * Bitcoin Core's RPC has the same property by construction: it sends no
+ * CORS headers and needs HTTP authentication, so no third-party page can
+ * make a visitor's browser call sendrawtransaction.
+ */
+export function broadcastRefusal(request, url) {
+  const type = (request.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  if (type !== "application/json") return [415, "content-type must be application/json"];
+  const site = request.headers.get("sec-fetch-site");
+  if (site !== null && site !== "same-origin" && site !== "none") return [403, "cross-site broadcast refused"];
+  const origin = request.headers.get("origin");
+  if (origin !== null && origin !== url.origin) return [403, "cross-origin broadcast refused"];
+  return null;
+}
+
 // Signed transactions from the web wallet. The node re-validates everything;
-// this only bounds the size and shape.
+// this only bounds the size and shape and refuses cross-site requests. No
+// answer of this route carries access-control-allow-origin (B2-R2-2): a
+// third-party page can neither send a broadcast through a visitor's browser
+// nor read the result.
 async function broadcast(request, env, origins) {
-  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  const url = new URL(request.url);
+  if (request.method !== "POST") return broadcastJson({ error: "method not allowed" }, 405);
+  const refusal = broadcastRefusal(request, url);
+  if (refusal) return broadcastJson({ error: refusal[1] }, refusal[0]);
   const len = Number(request.headers.get("content-length") || "0");
-  if (!(len > 0 && len <= 820000)) return json({ error: "body size out of range" }, 413);
+  if (!(len > 0 && len <= 820000)) return broadcastJson({ error: "body size out of range" }, 413);
   const body = await request.text();
   let last = 502;
   for (const origin of origins) {
@@ -108,10 +151,15 @@ async function broadcast(request, env, origins) {
         signal: AbortSignal.timeout(20000),
       });
       if (r.status >= 500 || (r.status >= 300 && r.status < 400)) { last = 502; continue; }
-      return apiResponse(await r.text(), r.status, "no-store");
+      return apiResponse(await r.text(), r.status, "no-store", { cors: false });
     } catch (e) { last = 502; }
   }
-  return json({ error: "broadcast backend unavailable" }, last);
+  return broadcastJson({ error: "broadcast backend unavailable" }, last);
+}
+
+/** A broadcast-route answer: JSON, never cached, no CORS header. */
+function broadcastJson(doc, status) {
+  return apiResponse(JSON.stringify(doc), status, "no-store", { cors: false });
 }
 
 const HSTS = "max-age=31536000; includeSubDomains";
@@ -146,18 +194,19 @@ export function withSecurityHeaders(url, resp) {
   return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: h });
 }
 
-function apiResponse(body, status, cacheControl) {
-  return new Response(body, {
-    status,
-    headers: {
-      "content-type": "application/json",
-      "cache-control": cacheControl,
-      "access-control-allow-origin": "*",
-      "x-content-type-options": "nosniff",
-      "strict-transport-security": HSTS,
-      "content-security-policy": API_CSP,
-    },
-  });
+// Read answers keep `access-control-allow-origin: *` (the explorer data is
+// public and third-party explorers read it); broadcast answers never carry
+// it (B2-R2-2).
+function apiResponse(body, status, cacheControl, { cors = true } = {}) {
+  const headers = {
+    "content-type": "application/json",
+    "cache-control": cacheControl,
+    "x-content-type-options": "nosniff",
+    "strict-transport-security": HSTS,
+    "content-security-policy": API_CSP,
+  };
+  if (cors) headers["access-control-allow-origin"] = "*";
+  return new Response(body, { status, headers });
 }
 
 export function json(doc, status) {

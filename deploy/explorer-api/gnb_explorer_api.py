@@ -31,6 +31,10 @@ Hardening (audit WAL-2, WAL-4, NET-12, B1-T10, B2-T4):
   * only well-formed requests (known method, valid parameters) are counted
     and forwarded: anything else is answered before it can occupy a limiter
     slot or reach the node;
+  * broadcasts must be application/json and must not come from a browser
+    page of another site (re-audit B2-R2-2, broadcast_refusal): a
+    cross-site 'simple request' is refused before it is read, counted or
+    forwarded;
   * broadcasts also share one API-wide budget of transaction bytes per minute
     (GNB_API_POST_BYTES_PER_MIN): every forwarded transaction costs the node
     signature verification roughly in proportion to its size, so the
@@ -447,12 +451,38 @@ HEXTX = re.compile(r"^[0-9a-f]+$")
 MAX_TX_HEX = 2 * 400 * 1024
 
 
+def broadcast_refusal(headers):
+    """Why a broadcast must be refused before it is read, as (status,
+    message), or None (re-audit B2-R2-2).
+
+    Only an application/json body is accepted: text/plain, form and
+    multipart bodies are what a browser sends cross-site without a CORS
+    preflight (fetch in no-cors mode, sendBeacon, an HTML form), and parsing
+    them as JSON anyway let any web page broadcast through its visitors'
+    browsers. A request a browser marks as cross-site (Sec-Fetch-Site other
+    than same-origin / none) or that carries an Origin header is refused as
+    well: the Worker forwards neither header, and the API is not meant to be
+    called by a browser directly."""
+    ctype = (headers.get("content-type") or "").split(";")[0].strip().lower()
+    if ctype != "application/json":
+        return 415, "content-type must be application/json"
+    site = headers.get("sec-fetch-site")
+    if site is not None and site not in ("same-origin", "none"):
+        return 403, "cross-site broadcast refused"
+    if headers.get("origin") is not None:
+        return 403, "browser-origin broadcast refused"
+    return None
+
+
 class PostHandler(Handler):
     def do_POST(self):
         if not self.authorized():
             return self.send(403, {"error": "forbidden"})
         if urllib.parse.urlsplit(self.path).path != "/v1/sendrawtransaction":
             return self.send(404, {"error": "not found"})
+        refusal = broadcast_refusal(self.headers)
+        if refusal:
+            return self.send(refusal[0], {"error": refusal[1]})
         try:
             n = int(self.headers.get("content-length", "0"))
             if not 0 < n <= MAX_TX_HEX + 64:

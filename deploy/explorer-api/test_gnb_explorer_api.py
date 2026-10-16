@@ -239,6 +239,38 @@ class ExplorerApiTests(unittest.TestCase):
         tx = json.dumps({"hex": "ab" * 10})
         self.assertEqual([self.server.post("/v1/sendrawtransaction", tx, a)[0] for _ in range(3)], [200, 200, 429])
 
+    def test_broadcast_refuses_non_json_bodies_and_cross_site_requests(self):
+        """Re-audit B2-R2-2: the API parsed the body as JSON whatever its
+        content type, so a cross-site 'simple request' (text/plain, a form,
+        sendBeacon) relayed by a front end was broadcast and charged to the
+        visitor. Only application/json is accepted, a request a browser marks
+        as cross-site / foreign-origin is refused, and none of it reaches the
+        limiter or the node."""
+        calls = []
+        api.rpc = lambda method, params: calls.append(method) or {"result": {"txid": "00"}}
+        api.POST_LIMIT = api.RateLimiter(1000)
+        a = {"x-gnb-client-ip": "198.51.100.9"}
+        tx = json.dumps({"hex": "ab" * 10})
+        for headers in [
+            {"content-type": "text/plain;charset=UTF-8"},
+            {"content-type": "application/x-www-form-urlencoded"},
+            {"content-type": "multipart/form-data; boundary=x"},
+            {"content-type": ""},
+            {"content-type": "application/json", "origin": "https://evil.example"},
+            {"content-type": "application/json", "sec-fetch-site": "cross-site"},
+            {"content-type": "application/json", "sec-fetch-site": "same-site"},
+        ]:
+            status, doc = self.server.post("/v1/sendrawtransaction", tx, {**a, **headers})
+            self.assertIn(status, (403, 415), headers)
+            self.assertIn("error", doc)
+        self.assertEqual(calls, [], "nothing reached the node")
+        self.assertEqual(len(api.POST_LIMIT.windows), 0, "refusals use no limiter slot")
+        for headers in [{"content-type": "application/json"},
+                        {"content-type": "application/json; charset=utf-8"},
+                        {"content-type": "application/json", "sec-fetch-site": "same-origin"}]:
+            self.assertEqual(self.server.post("/v1/sendrawtransaction", tx, {**a, **headers})[0], 200, headers)
+        self.assertEqual(calls, ["sendrawtransaction"] * 3)
+
     def test_broadcast_verification_budget_is_api_wide(self):
         """Every broadcast costs the node signature verification; one byte
         budget for all clients bounds that work whatever the number of
