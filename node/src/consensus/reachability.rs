@@ -533,6 +533,39 @@ impl ReachabilityStore {
         (upserts, deletes)
     }
 
+    /// The pending durability delta WITHOUT draining it (audit DAG-11): what
+    /// [`take_persist_delta`](Self::take_persist_delta) would return. A caller
+    /// stages it into a batch and, once that batch has committed, calls
+    /// [`mark_persisted`](Self::mark_persisted). If the batch fails, nothing
+    /// is lost: the delta stays pending for the next successful write (a
+    /// drained delta used to be lost with the batch, leaving the stale
+    /// intervals of a reindex on disk).
+    pub fn peek_persist_delta(&self) -> (Vec<(BlockHash, Vec<u8>)>, Vec<BlockHash>) {
+        let mut dirty: Vec<BlockHash> = self.dirty.iter().copied().collect();
+        dirty.sort_unstable();
+        let upserts = dirty.into_iter().filter_map(|h| self.encode_record(&h).map(|r| (h, r))).collect();
+        let mut deletes: Vec<BlockHash> = self.tombstones.iter().copied().collect();
+        deletes.sort_unstable();
+        (upserts, deletes)
+    }
+
+    /// Clear the pending entries a committed batch wrote: an upserted record
+    /// stops being dirty only if its current encoding is still the one that
+    /// was written, a delete stops being pending only if the block is still
+    /// removed. Anything that changed since the peek stays pending.
+    pub fn mark_persisted(&mut self, upserts: &[(BlockHash, Vec<u8>)], deletes: &[BlockHash]) {
+        for (h, rec) in upserts {
+            if self.encode_record(h).as_deref() == Some(rec.as_slice()) {
+                self.dirty.remove(h);
+            }
+        }
+        for h in deletes {
+            if !self.interval.contains_key(h) {
+                self.tombstones.remove(h);
+            }
+        }
+    }
+
     /// Snapshot the ENTIRE index as `(block_hash, encoded_record)` pairs, in
     /// hash-sorted order. Used to write a freshly-rebuilt index in one batch and
     /// by round-trip tests. Does not touch the dirty/tombstone tracking.

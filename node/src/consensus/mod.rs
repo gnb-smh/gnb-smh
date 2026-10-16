@@ -243,9 +243,37 @@ pub struct LoadedIntegrity {
     pub fresh_map:     Option<std::collections::HashMap<BlockHash, [u8; 32]>>,
 }
 
-/// Errors that can be returned by `load_persisted_validated`. Every
-/// variant is, in the intended threat model, fatal: the caller should
-/// log loudly and exit rather than continue with an unverifiable DAG.
+/// The header fields a block's GhostDAG data are computed from (what
+/// `accept_block` passes to `add_block`): its parents, its timestamp and the
+/// work of its bits.
+#[derive(Debug, Clone)]
+pub struct StoredHeader {
+    pub parents: Vec<BlockHash>,
+    pub timestamp: u64,
+    pub work: u128,
+}
+
+/// Outcome of [`GhostDAG::load_persisted_repairing`] (audit DAG-11).
+#[derive(Debug, Default)]
+pub struct DagRepair {
+    /// Blocks loaded into the DAG.
+    pub blocks_loaded: usize,
+    /// Records kept as stored whose integrity link was re-derived.
+    pub relinked: Vec<BlockHash>,
+    /// Blocks whose GhostDAG data were recomputed from their stored header
+    /// (no record, or a record matching no integrity link), with the data.
+    pub recomputed: Vec<(BlockHash, GhostdagData)>,
+    /// Blocks not loaded (no header to recompute from, or an unloadable
+    /// parent), every descendant of one included.
+    pub dropped: Vec<BlockHash>,
+    /// The re-derived integrity hash of every loaded block.
+    pub integrity: HashMap<BlockHash, [u8; 32]>,
+}
+
+/// Errors that can be returned by `load_persisted_validated`. In the
+/// original threat model every variant was fatal; the start-up path now
+/// repairs the footprints a pre-fix binary left
+/// ([`GhostDAG::load_persisted_repairing`], audit DAG-11) instead of exiting.
 #[derive(Debug)]
 pub enum IntegrityError {
     /// Some blocks have integrity records and some don't. Ambiguous —
@@ -940,6 +968,20 @@ impl GhostDAG {
         self.reach.take_persist_delta()
     }
 
+    /// The pending reachability delta, NOT drained (audit DAG-11): stage it
+    /// with the block's CF_DAG record and call
+    /// [`reach_mark_persisted`](Self::reach_mark_persisted) once the batch has
+    /// committed; a batch that fails leaves it pending.
+    pub fn reach_peek_delta(&self) -> (Vec<(BlockHash, Vec<u8>)>, Vec<BlockHash>) {
+        self.reach.peek_persist_delta()
+    }
+
+    /// Clear what a committed batch wrote from the pending reachability delta
+    /// (see [`ReachabilityStore::mark_persisted`]).
+    pub fn reach_mark_persisted(&mut self, upserts: &[(BlockHash, Vec<u8>)], deletes: &[BlockHash]) {
+        self.reach.mark_persisted(upserts, deletes)
+    }
+
     /// The current reachability root (genesis), for persisting the meta tag.
     pub fn reach_root(&self) -> Option<BlockHash> {
         self.reach.root()
@@ -1240,6 +1282,190 @@ impl GhostDAG {
             self_healed:   self_heal,
             fresh_map:     if self_heal { Some(computed) } else { None },
         })
+    }
+
+    /// Load persisted entries whose integrity chain does NOT verify, repairing
+    /// what the pre-fix binary left behind (audit DAG-11), instead of refusing
+    /// to start. The pre-fix commit wrote a block's CF_DAG record and
+    /// integrity link with `.ok()`-ignored errors and zero-filled a missing
+    /// parent link, so a node that lost one DAG write kept running and stored
+    /// descendants chaining to a missing record or a zero link;
+    /// [`load_persisted_validated`](Self::load_persisted_validated) then fails
+    /// (`ParentNotLoaded`, `ChainMismatch`, `PartialCoverage`, `MissingEntry`).
+    ///
+    /// Blocks are processed in a topological order (parents first), and each
+    /// one's data is decided as follows:
+    ///
+    /// * the stored integrity matches the chain link re-derived from its
+    ///   selected parent: kept as is;
+    /// * otherwise, if the stored record is consistent with its OWN integrity
+    ///   hash (linked to the selected parent's STORED integrity, or to the
+    ///   pre-fix zero link), or has no integrity record at all: the stored
+    ///   data are kept and only the link is re-derived (`relinked`). The data
+    ///   were computed by the node when the block arrived; recomputing them
+    ///   could only disagree with the history the network holds;
+    /// * otherwise (no record: a lost write; or a record that matches no link:
+    ///   corrupted), the data are recomputed with the consensus code from the
+    ///   block's stored header (`header_of`), whose parents, timestamp and
+    ///   bits the proof of work commits to (`recomputed`);
+    /// * with no header to recompute from, or a parent that could not be
+    ///   loaded, the block and every block that descends from it are dropped
+    ///   (`dropped`): the node fetches them again from its peers.
+    ///
+    /// The DAG must be empty. The reachability index is rebuilt alongside;
+    /// the caller persists the repair (`Storage::stage_dag_repair`), which
+    /// also makes the next start rebuild the persisted index.
+    pub fn load_persisted_repairing<F>(
+        &mut self,
+        entries: Vec<(BlockHash, GhostdagData)>,
+        integrity_map: HashMap<BlockHash, [u8; 32]>,
+        header_of: F,
+    ) -> Result<DagRepair, String>
+    where
+        F: Fn(&BlockHash) -> Option<StoredHeader>,
+    {
+        if !self.store.data.is_empty() {
+            return Err("load_persisted_repairing needs an empty DAG".into());
+        }
+        let records: HashMap<BlockHash, GhostdagData> = entries.into_iter().collect();
+        // Blocks referenced as parents without a record (lost writes), and
+        // their own record-less ancestors, recoverable from their headers.
+        let mut headers: HashMap<BlockHash, StoredHeader> = HashMap::new();
+        let mut stack: Vec<BlockHash> = records.values()
+            .flat_map(|d| d.parents.iter().copied())
+            .filter(|p| !records.contains_key(p))
+            .collect();
+        while let Some(p) = stack.pop() {
+            if records.contains_key(&p) || headers.contains_key(&p) {
+                continue;
+            }
+            if let Some(h) = header_of(&p) {
+                stack.extend(h.parents.iter().copied().filter(|q| !records.contains_key(q)));
+                headers.insert(p, h);
+            }
+        }
+        // Kahn order over records ∪ recoverable headers (ties by id).
+        let parents_of = |h: &BlockHash| -> Vec<BlockHash> {
+            let ps = match records.get(h) {
+                Some(d) => d.parents.clone(),
+                None => headers.get(h).map(|x| x.parents.clone()).unwrap_or_default(),
+            };
+            let mut seen = HashSet::new();
+            ps.into_iter().filter(|p| seen.insert(*p)).collect()
+        };
+        let universe: Vec<BlockHash> = records.keys().chain(headers.keys()).copied().collect();
+        let known: HashSet<BlockHash> = universe.iter().copied().collect();
+        let mut indegree: HashMap<BlockHash, usize> = HashMap::new();
+        let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
+        for h in &universe {
+            let ps: Vec<BlockHash> = parents_of(h).into_iter().filter(|p| known.contains(p)).collect();
+            indegree.insert(*h, ps.len());
+            for p in ps {
+                children.entry(p).or_default().push(*h);
+            }
+        }
+        let mut ready: std::collections::BTreeSet<BlockHash> =
+            indegree.iter().filter(|(_, d)| **d == 0).map(|(h, _)| *h).collect();
+        let mut order = Vec::with_capacity(universe.len());
+        while let Some(h) = ready.pop_first() {
+            order.push(h);
+            for c in children.get(&h).cloned().unwrap_or_default() {
+                if let Some(d) = indegree.get_mut(&c) {
+                    *d -= 1;
+                    if *d == 0 {
+                        ready.insert(c);
+                    }
+                }
+            }
+        }
+
+        let mut rep = DagRepair::default();
+        self.reach = ReachabilityStore::new();
+        let index = self.maintains_reachability_index();
+        for h in order {
+            let parents = parents_of(&h);
+            if parents.iter().any(|p| !self.store.has(p)) {
+                rep.dropped.push(h);
+                continue;
+            }
+            let link = |sp: &Option<BlockHash>, integ: &HashMap<BlockHash, [u8; 32]>| -> Option<[u8; 32]> {
+                match sp {
+                    None => Some([0u8; 32]),
+                    Some(s) => integ.get(s).copied(),
+                }
+            };
+            let stored = records.get(&h);
+            let stored_int = integrity_map.get(&h);
+            let mut decided: Option<GhostdagData> = None;
+            if let Some(d) = stored {
+                let chained = link(&d.selected_parent, &rep.integrity)
+                    .map(|l| compute_integrity_hash(&h, d, &l));
+                if chained.is_some() && stored_int == chained.as_ref() {
+                    decided = Some(d.clone());
+                } else {
+                    let self_consistent = match stored_int {
+                        None => true,
+                        Some(si) => {
+                            *si == compute_integrity_hash(&h, d, &[0u8; 32])
+                                || link(&d.selected_parent, &integrity_map)
+                                    .is_some_and(|l| *si == compute_integrity_hash(&h, d, &l))
+                        }
+                    };
+                    let sp_loaded = d.selected_parent.is_none_or(|s| self.store.has(&s));
+                    if self_consistent && sp_loaded {
+                        rep.relinked.push(h);
+                        decided = Some(d.clone());
+                    }
+                }
+            }
+            let data = match decided {
+                Some(d) => d,
+                None => match header_of(&h) {
+                    Some(hdr) if hdr.parents.is_empty() => {
+                        let d = GhostdagData { timestamp: hdr.timestamp, ..GhostdagData::genesis() };
+                        rep.recomputed.push((h, d.clone()));
+                        d
+                    }
+                    Some(hdr) if hdr.parents.iter().all(|p| self.store.has(p)) => {
+                        match self.compute_block(&hdr.parents, hdr.timestamp, hdr.work) {
+                            Ok(c) => {
+                                rep.recomputed.push((h, c.data.clone()));
+                                c.data
+                            }
+                            Err(_) => {
+                                rep.dropped.push(h);
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {
+                        rep.dropped.push(h);
+                        continue;
+                    }
+                },
+            };
+            let parent_link = link(&data.selected_parent, &rep.integrity).unwrap_or([0u8; 32]);
+            rep.integrity.insert(h, compute_integrity_hash(&h, &data, &parent_link));
+            if index {
+                match data.selected_parent {
+                    None => self.reach.add_genesis(h),
+                    Some(sp) => {
+                        let mut mergeset = data.mergeset_blues.clone();
+                        mergeset.extend_from_slice(&data.mergeset_reds);
+                        self.reach.add_block(h, &sp, &mergeset);
+                    }
+                }
+            }
+            if data.parents.is_empty() {
+                self.store.genesis = Some(h);
+            }
+            self.store.insert(h, data);
+            rep.blocks_loaded += 1;
+        }
+        self.recompute_tips();
+        // The caller makes the next start rebuild the persisted index.
+        let _ = self.reach.take_persist_delta();
+        Ok(rep)
     }
 
     /// Add a new block and compute its full GhostDAG data.

@@ -145,6 +145,9 @@ pub struct Storage {
     /// NET-12: number of storage reads served (diagnostics; lets tests prove
     /// that an RPC's cost does not grow with the chain).
     reads: std::sync::atomic::AtomicU64,
+    /// Fault injection ([`Storage::inject_batch_failures`]): how many of the
+    /// next atomic batch commits fail. Always 0 outside tests.
+    injected_batch_failures: std::sync::atomic::AtomicU32,
 }
 
 /// Upper bound on the entries of the body-verdict memo. Reaching it clears
@@ -172,7 +175,19 @@ impl Storage {
             agg_lock: parking_lot::Mutex::new(()),
             agg_ready: std::sync::atomic::AtomicBool::new(false),
             reads: std::sync::atomic::AtomicU64::new(0),
+            injected_batch_failures: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    /// Fault injection for tests (audit DAG-11; in the spirit of Bitcoin
+    /// Core's `-dbcrashratio`): the next `n` atomic batch commits through
+    /// [`Storage::write_batch`] (every chain move, `reorg::connect_plan`, and
+    /// every DAG-record write of a block that does not move the chain) fail
+    /// with `StorageError::WriteFailed` and write nothing. The node never
+    /// calls it.
+    #[allow(dead_code)] // library API (tests)
+    pub fn inject_batch_failures(&self, n: u32) {
+        self.injected_batch_failures.store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[inline]
@@ -1013,6 +1028,36 @@ impl Storage {
         Ok(integrity)
     }
 
+    /// Stage the start-up repair of the DAG records (audit DAG-11,
+    /// `GhostDAG::load_persisted_repairing`): the recomputed CF_DAG records,
+    /// the re-derived CF_DAG_INTEGRITY link of every loaded block, and the
+    /// removal of the dropped blocks' CF_DAG, CF_DAG_INTEGRITY and
+    /// CF_REACHABILITY records. The reachability version tag is removed too,
+    /// so the start-up path rebuilds the persisted index from CF_DAG.
+    pub fn stage_dag_repair(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        recomputed: &[(BlockHash, GhostdagData)],
+        integrity: &std::collections::HashMap<BlockHash, [u8; 32]>,
+        dropped: &[BlockHash],
+    ) -> Result<(), StorageError> {
+        let cf = |n: &str| self.db.cf_handle(n).ok_or_else(|| StorageError::CfNotFound(n.into()));
+        let (cf_dag, cf_int, cf_reach, cf_meta) = (cf(CF_DAG)?, cf(CF_DAG_INTEGRITY)?, cf(CF_REACHABILITY)?, cf(CF_META)?);
+        for (h, d) in recomputed {
+            batch.put_cf(&cf_dag, h, &encode(d)?);
+        }
+        for (h, i) in integrity {
+            batch.put_cf(&cf_int, h, i);
+        }
+        for h in dropped {
+            batch.delete_cf(&cf_dag, h);
+            batch.delete_cf(&cf_int, h);
+            batch.delete_cf(&cf_reach, h);
+        }
+        batch.delete_cf(&cf_meta, b"reachability/meta/version");
+        Ok(())
+    }
+
     /// Stage a CF_META write.
     pub fn stage_meta(&self, batch: &mut rocksdb::WriteBatch, key: &str, value: &[u8])
         -> Result<(), StorageError>
@@ -1024,6 +1069,13 @@ impl Storage {
 
     /// Commit a caller-built batch atomically.
     pub fn write_batch(&self, batch: rocksdb::WriteBatch) -> Result<(), StorageError> {
+        use std::sync::atomic::Ordering;
+        if self.injected_batch_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(StorageError::WriteFailed("injected batch failure (test fault injection)".into()));
+        }
         self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))
     }
 

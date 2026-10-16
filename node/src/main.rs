@@ -625,62 +625,32 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        // Full DAG reconstruction from persisted data.
+        // Full DAG reconstruction from persisted data (accept::load_dag).
         //
-        // Sprint Y (M-2): load_persisted_validated verifies a hash-chain
-        // over GhostdagData before inserting into the in-memory DAG. If
-        // the database was written by a pre-Sprint-Y binary, the integrity
-        // CF will be empty — the loader self-heals by computing and
-        // returning a fresh map, which we persist immediately so the next
-        // boot validates strictly.
-        //
-        // Any mismatch is fatal: we log loudly and exit. The operator
-        // can then investigate disk integrity / provenance of the data
-        // directory before the node rejoins the network.
-        match store.load_all_dag_data() {
-            Ok(entries) if !entries.is_empty() => {
-                let _count = entries.len();
-                let integrity_map = store.load_all_integrity_hashes()
-                    .unwrap_or_else(|e| {
-                        warn!("failed to read CF_DAG_INTEGRITY ({}); \
-                              assuming pre-Sprint-Y DB, will self-heal", e);
-                        std::collections::HashMap::new()
-                    });
-
-                match dag.write().load_persisted_validated(entries, integrity_map) {
-                    Ok(loaded) => {
-                        if loaded.self_healed {
-                            warn!("CF_DAG_INTEGRITY was empty — self-healed \
-                                   {} integrity records. This is expected on \
-                                   first boot after Sprint Y upgrade. Subsequent \
-                                   boots will validate strictly.",
-                                  loaded.blocks_loaded);
-                            if let Some(fresh) = loaded.fresh_map {
-                                for (h, integrity) in &fresh {
-                                    if let Err(e) = store.put_integrity_hash(h, integrity) {
-                                        warn!("self-heal: failed to persist \
-                                               integrity for block {}: {}",
-                                              hex::encode(&h[..8]), e);
-                                    }
-                                }
-                            }
-                            info!("DAG loaded from disk (self-healed): {} blocks",
-                                  loaded.blocks_loaded);
-                        } else {
-                            info!("DAG loaded from disk (integrity verified): {} blocks",
-                                  loaded.blocks_loaded);
-                        }
-                    }
-                    Err(e) => {
-                        error!("GhostDAG integrity check FAILED: {}", e);
-                        error!("Refusing to continue with unverifiable DAG state.");
-                        error!("Investigate: disk corruption, targeted tampering, \
-                               or a partial restore from a mismatched backup.");
-                        std::process::exit(1);
-                    }
+        // Sprint Y (M-2): the integrity hash-chain over GhostdagData is
+        // verified before anything is inserted; a data dir from before the
+        // chain self-heals (the records are computed and written). Audit
+        // DAG-11: a chain that does not verify (the footprint of a pre-fix
+        // binary that lost a DAG write: a missing record, a zero-filled link)
+        // is repaired — records consistent with their own integrity hash
+        // relinked, missing or corrupted ones recomputed from the stored
+        // headers, the rest dropped and fetched again — instead of exiting
+        // with no remedy but a resync. Only a repair that would leave applied
+        // UTXO effects without their block refuses to start.
+        match accept::load_dag(&dag, &store) {
+            Ok(r) if r.blocks_loaded > 0 => {
+                if let Some(rep) = &r.repair {
+                    warn!("DAG loaded from disk after a repair: {} blocks ({} relinked, {} recomputed, {} dropped)",
+                          r.blocks_loaded, rep.relinked.len(), rep.recomputed.len(), rep.dropped.len());
+                } else if r.self_healed {
+                    warn!("CF_DAG_INTEGRITY was empty: {} integrity records computed and written \
+                           (first boot after the integrity chain); later boots validate strictly.",
+                          r.blocks_loaded);
+                } else {
+                    info!("DAG loaded from disk (integrity verified): {} blocks", r.blocks_loaded);
                 }
             }
-            _ => {
+            Ok(_) => {
                 // Fallback: at least load genesis
                 let gh = store.get_meta("genesis_hash").unwrap().unwrap();
                 let gh32: [u8;32] = gh.as_slice().try_into().unwrap_or([0u8;32]);
@@ -688,6 +658,11 @@ async fn main() {
                     dag.write().add_genesis(blk.block_hash(), blk.header.timestamp);
                     info!("Genesis loaded (fallback): {}", hex::encode(&gh));
                 }
+            }
+            Err(e) => {
+                error!("cannot load the GhostDAG state: {e}");
+                error!("Refusing to start.");
+                std::process::exit(1);
             }
         }
     }
@@ -881,7 +856,14 @@ async fn main() {
             }
         };
         if faults.is_empty() {
+            // Audit DAG-11: continuing would leave the best chain unconnected
+            // with nothing to retry it but the next block; like Bitcoin Core
+            // ("Failed to connect best block", an init error), refuse to start.
             error!("start-up chain-state reconciliation failed: {}", e);
+            error!("Refusing to start: the best valid chain cannot be connected. Fix the cause above \
+                    (disk space, permissions, storage errors) and restart; if it persists, rebuild with \
+                    --carryover-snapshot or resynchronize this data directory.");
+            std::process::exit(1);
         } else {
             for f in &faults {
                 error!("chain-state check: {}", f);
@@ -920,7 +902,8 @@ async fn main() {
                 }
             }
             if let Err(e) = accept::reconcile_on_startup(&dag, &store, &shielded) {
-                error!("start-up chain-state reconciliation failed after the rebuild: {}", e);
+                error!("start-up chain-state reconciliation failed after the rebuild: {}. Refusing to start.", e);
+                std::process::exit(1);
             }
         }
     }

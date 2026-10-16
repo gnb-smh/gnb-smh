@@ -633,7 +633,7 @@ impl<'a> ReorgBatch<'a> {
         self.store.stage_chain_totals(&mut self.batch, self.chain, &self.conn)
             .map_err(|e| format!("reorg batch: aggregates: {}", e))?;
         let ReorgBatch { store, batch, _agg, .. } = self;
-        let r = store.db().write(batch)
+        let r = store.write_batch(batch)
             .map_err(|e| format!("reorg batch: atomic commit failed: {}", e));
         drop(_agg);
         r

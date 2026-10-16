@@ -144,6 +144,28 @@ rules) before it is stored.
 
 ## Chain-state check at start-up
 
+Before anything else the node verifies the integrity chain over its stored
+GhostDAG records. A data dir written by a release from before the 2026-10
+audit fixes can fail it without any tampering: that release ignored a failed
+DAG write and zero-filled the missing parent link of the next block. The
+node then repairs the records instead of refusing to start (audit DAG-11): a
+record consistent with its own integrity hash is kept and relinked, a
+missing or corrupted record is recomputed from the stored block header with
+the consensus code, and a block that cannot be recomputed (its body is gone
+too) is dropped together with its descendants and fetched again from peers.
+The log says how many blocks were relinked, recomputed and dropped, and the
+next start verifies strictly. If a block that would be dropped is applied
+(on a pruned node, a lost record in the pruned range), the UTXO set cannot be
+repaired in place and the node refuses to start: resync from a fresh
+`--data-dir` (or an archival node's data dir).
+
+If start-up reconciliation cannot connect the best valid chain (a storage
+error), the node refuses to start ("Refusing to start: the best valid chain
+cannot be connected"), as Bitcoin Core does when it fails to connect the
+best block at init; fix the cause it names (disk space, permissions) and
+restart. Later acceptances always connect from the applied tip recorded on
+disk, so a move that failed once is retried by the next block.
+
 At every start the node checks its chain state for the footprint of an
 interrupted or failed commit written by releases before the 2026-10 audit
 fixes (UTXO effects of a block without its undo record), after the repairs the
