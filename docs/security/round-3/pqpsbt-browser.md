@@ -85,3 +85,35 @@ The CI YAML parses locally. Its artifact upload and unchanged comparison
 gate still require execution on GitHub. Three review lenses, final Linux
 rebuild/repin and full integration/CI remain required. No numerical score is
 assigned here.
+
+## Final-source Linux artifact and browser execution
+
+CI run `38931632695` rebuilt the core at
+`342e2f401415509cbb827a01ca0834b5c3b44351` through the full repository build
+script. Its pin comparison failed against the still-old committed binary,
+while the artifact-upload step preserved the newly built binary and manifest.
+The coordinator verified revision, host, target, Rust/SDK versions, SDK
+archive hash, lockfile hash, build-script hash and the actual binary hash.
+No compiled workspace/crate/vendor/toolchain source changed between that
+revision and integration at `582fbab`.
+
+The verified Linux binary was copied into the wallet and the repository
+script's `--pin-only` stage updated its pin and SRI. SHA-256:
+`4571dbc61ed91468fc8841f60af55fc0a9a49065d82ffb00391f44007075e3a7`.
+The exact CI [build manifest](wallet-wasm-build.json) is retained. This is a
+CI rebuild followed by an explicit maintainer repin, not a local macOS
+reproducibility claim. R3-BUILD-1 remains open.
+
+The final test file, SHA-256
+`17b842fcf104daa292b9e61f4f661da64ae687ca001b084d57839223afe4d753`,
+passed all four reported tests (two top-level tests and two subtests), with
+zero failures/skips: `/private/tmp/gnb-r3-browser-final-green.log`. This
+includes the two monetary refusals and the complete offline 2-of-3 flow.
+The final production-only binding reversal preserved that test and binary,
+failed at the absent `pqpsbt` operation, and passed all four after exact
+restoration. Snapshots/logs are in `/private/tmp/gnb-r3-browser-final-reversal`;
+the [manifest](wallet-browser-reversal.json) records their hashes.
+
+A fresh CI comparison against this new committed pin remains required.
+The incomplete review lens and other open findings recorded in the round
+scorecard are not closed by a passing browser test.
