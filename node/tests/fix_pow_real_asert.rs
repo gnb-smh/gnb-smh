@@ -119,3 +119,61 @@ fn orphan_floor_reference_target_is_the_real_asert_target_of_the_next_height() {
     assert!(next < core::Block::pow_limit_target_for_height(tip_h + 1), "not clamped");
     assert_eq!(ingress::reference_target(tip_h, now), next);
 }
+
+/// The ingress orphan work floor at its call site: `BlockIngress::handle_block`
+/// derives the floor from the SELECTED TIP's height (the reference is a
+/// child of the tip, `ingress::reference_target`) and caps it at the
+/// orphan's own claimed height. Under the real ASERT rule, with the node far
+/// enough ahead of the schedule that the 16-fold eased floor is below the
+/// pow limit, an orphan whose bits are exactly the floor is buffered, and
+/// one whose bits are the floor of the tip's parent height (easier) is
+/// dropped; computing the floor from the orphan's height or from tip + 1
+/// (harder floors) would drop the first, from tip - 1 would admit the second.
+#[test]
+fn ingress_orphan_floor_call_site_follows_the_real_asert_rule_of_the_tip() {
+    let (n, _b, _c) = two_tips();
+    let tip_h = n.dag.read().get_block_data(&sel_tip(&n).unwrap()).unwrap().height;
+    assert_eq!(tip_h, 2);
+    let orphan_h = tip_h + 60;
+    // Built (and sealed at the pinned bits) before the real rule is on.
+    let base = mk_block(&n, vec![sel_tip(&n).unwrap()],
+        vec![coinbase("pow5-orphan", core::tokenomics::block_subsidy_sat(orphan_h), vec![0xC7; 20])]);
+    let _real = core::scoped_real_expected_bits();
+    // `now` four ASERT half-lives before the schedule of the tip's child.
+    let now = G0 + 30 * (tip_h + 1) - 5 * core::ASERT_HALFLIFE_SECS as u64;
+    let floor_at = |h: u64| ingress::orphan_admission_floor(h, now, orphan_h);
+    let floor = floor_at(tip_h);
+    assert!(floor < core::Block::pow_limit_target_for_height(orphan_h), "not capped");
+    assert!(floor_at(orphan_h) < floor && floor_at(tip_h + 1) < floor && floor_at(tip_h - 1) > floor,
+        "the floor depends on the height it is computed for");
+
+    let orphan = |bits: u32, tag: &str| {
+        let mut o = base.clone();
+        o.transactions[0].inputs[0].script_sig = tag.as_bytes().to_vec();
+        o.header.parents = vec![[0x5A; 32]]; // unknown: an orphan
+        o.height = orphan_h;
+        o.blue_score = orphan_h;
+        o.header.bits = bits;
+        commit_block(&mut o);
+        o.test_only_assume_pow_valid();
+        o
+    };
+    let deliver = |core: &mut ingress::BlockIngress, b: &Block| {
+        let ctx = ingress::AcceptCtx {
+            dag: &n.dag, store: &n.store, mempool: &n.mempool, node_state: &n.node_state,
+            tip_tx: Some(&n.tip_tx), shielded: &n.shielded,
+        };
+        core.handle_block(b.clone(), b.block_hash(), b.to_wire_bytes().len(), None, false,
+            std::time::Instant::now(), now, &ctx)
+    };
+    let at_floor = core::target_to_bits(&floor);
+    assert!(core::bits_to_target(at_floor) <= floor && core::bits_to_target(at_floor) > floor_at(tip_h + 1));
+    let easier = core::target_to_bits(&floor_at(tip_h - 1));
+    assert!(core::bits_to_target(easier) > floor);
+
+    let mut core_ = ingress::BlockIngress::new();
+    let o = deliver(&mut core_, &orphan(easier, "pow5-orphan-easy"));
+    assert!(matches!(o, ingress::BlockOutcome::Dropped(ingress::DropReason::OrphanBelowFloor)), "{o:?}");
+    let o = deliver(&mut core_, &orphan(at_floor, "pow5-orphan-floor"));
+    assert!(matches!(o, ingress::BlockOutcome::Buffered { .. }), "{o:?}");
+}

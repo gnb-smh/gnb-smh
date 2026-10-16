@@ -56,7 +56,8 @@ every node still runs for every block.
 
 Because every node test (`cargo test -p gnb`) is built with the same feature,
 the node's own difficulty call sites (`accept_block`'s height and parent
-timestamp, the template's bits, the ingress orphan floor) are exercised with
+timestamp, the template's bits, the ingress orphan floor as
+`BlockIngress::handle_block` computes it from the selected tip's height) are exercised with
 the real ASERT rule by `node/tests/fix_pow_real_asert.rs` (re-audit POW-5):
 the test-only seam `core::scoped_real_expected_bits()`, compiled only with
 this feature, makes `expected_bits` compute the real rule on the calling
