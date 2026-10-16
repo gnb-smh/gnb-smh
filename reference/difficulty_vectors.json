@@ -8,7 +8,7 @@
   "genesis_timestamp": 1791685648,
   "genesis_height": 0,
   "hardened_pow_limit_bits": 521048118,
-  "mainnet_hardening_activation_height": 110000
+  "mainnet_hardening_activation_height": 17500
  },
  "compact": [
   {
@@ -4266,97 +4266,97 @@
  "hardening_pow_limit": [
   {
    "note": "far behind schedule (one year late)",
-   "activation_height": 110000,
-   "parent_time": 1826521588,
-   "height": 109999,
+   "activation_height": 17500,
+   "parent_time": 1823746588,
+   "height": 17499,
    "pow_limit_bits": 553713663,
    "bits": 541065152
   },
   {
    "note": "eight half-lives late",
-   "activation_height": 110000,
-   "parent_time": 1795043188,
-   "height": 109999,
+   "activation_height": 17500,
+   "parent_time": 1792268188,
+   "height": 17499,
    "pow_limit_bits": 553713663,
    "bits": 537109517
   },
   {
    "note": "on schedule",
-   "activation_height": 110000,
-   "parent_time": 1794985588,
-   "height": 109999,
+   "activation_height": 17500,
+   "parent_time": 1792210588,
+   "height": 17499,
    "pow_limit_bits": 553713663,
    "bits": 520332301
   },
   {
    "note": "ahead of schedule",
-   "activation_height": 110000,
-   "parent_time": 1794978388,
-   "height": 109999,
+   "activation_height": 17500,
+   "parent_time": 1792203388,
+   "height": 17499,
    "pow_limit_bits": 553713663,
    "bits": 520212998
   },
   {
    "note": "far behind schedule (one year late)",
-   "activation_height": 110000,
-   "parent_time": 1826521618,
-   "height": 110000,
+   "activation_height": 17500,
+   "parent_time": 1823746618,
+   "height": 17500,
    "pow_limit_bits": 521048118,
    "bits": 520332301
   },
   {
    "note": "eight half-lives late",
-   "activation_height": 110000,
-   "parent_time": 1795043218,
-   "height": 110000,
+   "activation_height": 17500,
+   "parent_time": 1792268218,
+   "height": 17500,
    "pow_limit_bits": 521048118,
    "bits": 520332301
   },
   {
    "note": "on schedule",
-   "activation_height": 110000,
-   "parent_time": 1794985618,
-   "height": 110000,
+   "activation_height": 17500,
+   "parent_time": 1792210618,
+   "height": 17500,
    "pow_limit_bits": 521048118,
    "bits": 520332301
   },
   {
    "note": "ahead of schedule",
-   "activation_height": 110000,
-   "parent_time": 1794978418,
-   "height": 110000,
+   "activation_height": 17500,
+   "parent_time": 1792203418,
+   "height": 17500,
    "pow_limit_bits": 521048118,
    "bits": 520212998
   },
   {
    "note": "far behind schedule (one year late)",
-   "activation_height": 110000,
-   "parent_time": 1826521648,
-   "height": 110001,
+   "activation_height": 17500,
+   "parent_time": 1823746648,
+   "height": 17501,
    "pow_limit_bits": 521048118,
    "bits": 520332301
   },
   {
    "note": "eight half-lives late",
-   "activation_height": 110000,
-   "parent_time": 1795043248,
-   "height": 110001,
+   "activation_height": 17500,
+   "parent_time": 1792268248,
+   "height": 17501,
    "pow_limit_bits": 521048118,
    "bits": 520332301
   },
   {
    "note": "on schedule",
-   "activation_height": 110000,
-   "parent_time": 1794985648,
-   "height": 110001,
+   "activation_height": 17500,
+   "parent_time": 1792210648,
+   "height": 17501,
    "pow_limit_bits": 521048118,
    "bits": 520332301
   },
   {
    "note": "ahead of schedule",
-   "activation_height": 110000,
-   "parent_time": 1794978448,
-   "height": 110001,
+   "activation_height": 17500,
+   "parent_time": 1792203448,
+   "height": 17501,
    "pow_limit_bits": 521048118,
    "bits": 520212998
   },

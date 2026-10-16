@@ -90,11 +90,12 @@ fn miner_subsidy(height: u64) -> u64 {
 /// The explicit activation height of most cases, and the heights either side.
 const ACT: u64 = 1_000;
 /// The networks' activation schedules (docs/CONSENSUS.md, "Activation"):
-/// this file's own copy of `activation::MAINNET_HARDENING_ACTIVATION_HEIGHT`.
-/// The `schedule` cases built from it (their ids and descriptions carry the
-/// height) pin the consensus constant: the runners take the height from the
-/// schedule, so they fail if the two disagree.
-const MAINNET_ACT: u64 = 110_000;
+/// this file's own copy of `activation::MAINNET_HARDENING_ACTIVATION_HEIGHT`
+/// (17,500 since 2026-10-16; 110,000 before). The `schedule` cases built
+/// from it (their ids and descriptions carry the height) pin the consensus
+/// constant: the runners take the height from the schedule, so they fail if
+/// the two disagree.
+const MAINNET_ACT: u64 = 17_500;
 const TESTNET_ACT: u64 = 0;
 const NEVER: u64 = u64::MAX;
 

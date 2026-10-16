@@ -39,7 +39,7 @@ GhostDAG selected parent's), and `height` is max(parent heights) + 1.
 Pow limit (audit POW-3): for a block at header height `height` the clamp is
 `pow_limit_bits_at(height, activation_height)`: the genesis target
 (GENESIS_BITS) when 1 <= height and height >= activation_height (the
-hardening activation, mainnet 110,000), POW_LIMIT_BITS before.
+hardening activation, mainnet 17,500), POW_LIMIT_BITS before.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ TARGET_SPACING = 30              # seconds
 HALFLIFE = 2 * 60 * 60           # seconds (240 blocks)
 POW_LIMIT_BITS = 0x2100FFFF
 HARDENED_POW_LIMIT_BITS = 0x1F0E9036   # = GENESIS_BITS (POW-3)
-MAINNET_HARDENING_ACTIVATION_HEIGHT = 110_000
+MAINNET_HARDENING_ACTIVATION_HEIGHT = 17_500   # activation.rs (110_000 before 2026-10-16)
 GENESIS_BITS = 0x1F0E9036
 GENESIS_TIMESTAMP = 1791685648
 # From this height the proof of work is GnB-SMH v3, whose targets are
