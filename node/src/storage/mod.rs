@@ -176,6 +176,29 @@ pub fn hardened_body_key(hash: &BlockHash) -> Vec<u8> {
     k
 }
 
+/// CF_META key prefix of the genesis-ledger index (audit F1):
+/// `genesis_ledger/` ‖ txid (empty value) for every txid of an output the
+/// genesis ledger holds (the Bloch carryover and the locked vesting tranches,
+/// `stage_carryover`). Those outputs are created by no transaction, so they
+/// have no tx-index row; their confirmation point is the genesis (header
+/// height 0, DAG height 0, chain position 0; docs/CONSENSUS.md, "Genesis
+/// ledger"), which `accept::confirmations_in_view` answers through
+/// `reorg::UtxoView::view_genesis_ledger`. CF_META is never cleared by a
+/// chain-state rebuild, which re-stages the rows with the ledger anyway.
+pub const GENESIS_LEDGER_PREFIX: &[u8] = b"genesis_ledger/";
+
+/// CF_META key: `[1]` once the genesis-ledger index is complete (written with
+/// the ledger, or by [`Storage::migrate_genesis_ledger_index`] for a data dir
+/// ingested before the index existed).
+pub const GENESIS_LEDGER_INDEX_META: &str = "genesis_ledger_index_v1";
+
+/// CF_META key of `txid`'s genesis-ledger row.
+pub fn genesis_ledger_key(txid: &[u8; 32]) -> Vec<u8> {
+    let mut k = GENESIS_LEDGER_PREFIX.to_vec();
+    k.extend_from_slice(txid);
+    k
+}
+
 /// What disconnecting a selected-chain block needs from its body, kept when
 /// the body is pruned (audit DAG-6): the UTXO effects are reversed from the
 /// undo record, which is never pruned; the address-history rows to delete and
@@ -234,6 +257,14 @@ pub struct Storage {
     /// Fault injection ([`Storage::inject_batch_failures`]): how many of the
     /// next atomic batch commits fail. Always 0 outside tests.
     injected_batch_failures: std::sync::atomic::AtomicU32,
+    /// Audit F1: consecutive validations of a block that ended without a
+    /// verdict (a read failure of the chain state, re-audit B1-T12), by
+    /// block (`accept`'s no-verdict guard). In memory only: never a mark.
+    no_verdicts: parking_lot::Mutex<std::collections::HashMap<[u8; 32], u32>>,
+    /// Audit F1: set when the node must stop (Bitcoin Core's `AbortNode`):
+    /// the reason, for the operator. Acceptance and templates refuse from
+    /// then on and the `gnb` binary exits.
+    abort_reason: parking_lot::Mutex<Option<String>>,
 }
 
 /// Upper bound on the entries of the body-verdict memo. Reaching it clears
@@ -262,7 +293,43 @@ impl Storage {
             agg_ready: std::sync::atomic::AtomicBool::new(false),
             reads: std::sync::atomic::AtomicU64::new(0),
             injected_batch_failures: std::sync::atomic::AtomicU32::new(0),
+            no_verdicts: Default::default(),
+            abort_reason: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Audit F1: record one more validation of `block` that ended without a
+    /// verdict; returns how many in a row (since its last validation that
+    /// reached one, [`Storage::clear_no_verdict`]).
+    pub fn note_no_verdict(&self, block: &[u8; 32]) -> u32 {
+        let mut m = self.no_verdicts.lock();
+        // Bounded: a guard against a flood of distinct failing blocks (the
+        // count only has to reach the abort threshold for one of them).
+        if m.len() >= 4096 && !m.contains_key(block) {
+            m.clear();
+        }
+        let n = m.entry(*block).or_insert(0);
+        *n = n.saturating_add(1);
+        *n
+    }
+
+    /// Audit F1: `block` was validated (a verdict was reached).
+    pub fn clear_no_verdict(&self, block: &[u8; 32]) {
+        let mut m = self.no_verdicts.lock();
+        if !m.is_empty() {
+            m.remove(block);
+        }
+    }
+
+    /// Audit F1: stop the node (Bitcoin Core's `AbortNode`): from now on
+    /// [`Storage::abort_reason`] reports `reason` (the first one is kept).
+    pub fn abort_node(&self, reason: String) {
+        self.abort_reason.lock().get_or_insert(reason);
+    }
+
+    /// Why the node was stopped ([`Storage::abort_node`]), if it was.
+    pub fn abort_reason(&self) -> Option<String> {
+        self.abort_reason.lock().clone()
     }
 
     /// Fault injection for tests (audit DAG-11; in the spirit of Bitcoin
@@ -2917,18 +2984,101 @@ impl Storage {
             .ok_or(StorageError::CfNotFound(CF_ADDR_UTXO.into()))?;
         let cf_meta = self.db.cf_handle(CF_META)
             .ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        // Audit F1: every txid of the ledger gets a genesis-ledger row (its
+        // confirmation point, the genesis), in the same batch.
         for u in &snap.utxos {
             batch.put_cf(&cf_utxo, utxo_key(&u.txid, u.vout), encode(&u.output)?);
             batch.put_cf(&cf_ai, addr_utxo_key(&u.output.script_pubkey, &u.txid, u.vout), [0u8; 0]);
+            batch.put_cf(&cf_meta, genesis_ledger_key(&u.txid), [0u8; 0]);
         }
         // Locked team and founder tranches (core::vesting), same batch: the
         // genesis ledger lands complete or not at all.
         for t in locked {
             batch.put_cf(&cf_utxo, utxo_key(&t.txid, t.vout), encode(&t.output)?);
             batch.put_cf(&cf_ai, addr_utxo_key(&t.output.script_pubkey, &t.txid, t.vout), [0u8; 0]);
+            batch.put_cf(&cf_meta, genesis_ledger_key(&t.txid), [0u8; 0]);
         }
         batch.put_cf(&cf_meta, b"carryover_sha3", snap.sha3);
         batch.put_cf(&cf_meta, b"vesting_sha3", crate::core::vesting::VESTING_SPEC_SHA3);
+        batch.put_cf(&cf_meta, GENESIS_LEDGER_INDEX_META.as_bytes(), [1u8]);
         Ok(())
+    }
+
+    /// Audit F1: whether `txid` is the txid of a genesis-ledger output (its
+    /// [`GENESIS_LEDGER_PREFIX`] row). Such an output has no tx-index row and
+    /// is confirmed at the genesis.
+    pub fn is_genesis_ledger_txid(&self, txid: &[u8; 32]) -> Result<bool, StorageError> {
+        self.note_reads(1);
+        let cf = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        Ok(self.db.get_pinned_cf(&cf, genesis_ledger_key(txid))
+            .map_err(|e| StorageError::ReadFailed(e.to_string()))?
+            .is_some())
+    }
+
+    /// Audit F1, start-up migration: give a data dir whose genesis ledger was
+    /// ingested before the genesis-ledger index existed its rows (one batch,
+    /// once; [`GENESIS_LEDGER_INDEX_META`]). Without the carryover snapshot
+    /// (not needed after first boot) the rows are recovered from the state:
+    ///
+    /// * the locked vesting tranches from the embedded specification
+    ///   (`core::vesting::genesis_tranches`, the one the `vesting_sha3`
+    ///   marker names), exactly, spent or not. They are the genesis ledger's
+    ///   only policy outputs, so the only ones whose confirmation point a
+    ///   rule reads (relative timelocks read policy outputs only, coinbase
+    ///   maturity coinbases only);
+    /// * the carryover (20-byte key-hash outputs, `core::carryover`): every
+    ///   key-hash output, unspent (CF_UTXO) or spent by an applied block (its
+    ///   undo record), whose txid has no tx-index row. Every transaction's
+    ///   outputs are written with its tx-index row in one batch, so on a
+    ///   consistent chain state these are exactly the carryover outputs.
+    ///
+    /// A store without the genesis-ledger markers (fixtures) is left alone.
+    /// Returns the number of txids recorded (`None`: nothing to do).
+    pub fn migrate_genesis_ledger_index(&self) -> Result<Option<usize>, StorageError> {
+        if self.get_meta(GENESIS_LEDGER_INDEX_META)?.is_some() {
+            return Ok(None);
+        }
+        let vesting = self.get_meta("vesting_sha3")?;
+        if vesting.is_none() && self.get_meta("carryover_sha3")?.is_none() {
+            return Ok(None);
+        }
+        let mut txids: std::collections::BTreeSet<[u8; 32]> = std::collections::BTreeSet::new();
+        if vesting.as_deref() == Some(&crate::core::vesting::VESTING_SPEC_SHA3[..]) {
+            let tranches = crate::core::vesting::genesis_tranches()
+                .map_err(|e| StorageError::DeserializeFailed(format!("vesting specification: {e}")))?;
+            txids.extend(tranches.iter().map(|t| t.txid));
+        }
+        let key_hash = |o: &TxOutput| crate::core::policy::output_kind(&o.script_pubkey)
+            == Some(crate::core::policy::OutputKind::PubkeyHash);
+        let cf_utxo = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
+        for item in self.db.iterator_cf(&cf_utxo, IteratorMode::Start) {
+            let (k, v) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            let Some(txid) = k.get(..32).and_then(|t| <[u8; 32]>::try_from(t).ok()) else { continue };
+            if txids.contains(&txid) {
+                continue;
+            }
+            let output: TxOutput = decode(&v)?;
+            if key_hash(&output) && self.get_tx_location(&txid)?.is_none() {
+                txids.insert(txid);
+            }
+        }
+        for block in self.undo_block_hashes()? {
+            let Some(undo) = self.get_undo_data(&block)? else { continue };
+            for e in &undo.spent_utxos {
+                if !txids.contains(&e.prev_txid) && key_hash(&e.output)
+                    && self.get_tx_location(&e.prev_txid)?.is_none()
+                {
+                    txids.insert(e.prev_txid);
+                }
+            }
+        }
+        let cf_meta = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        for t in &txids {
+            batch.put_cf(&cf_meta, genesis_ledger_key(t), [0u8; 0]);
+        }
+        batch.put_cf(&cf_meta, GENESIS_LEDGER_INDEX_META.as_bytes(), [1u8]);
+        self.write_batch(batch)?;
+        Ok(Some(txids.len()))
     }
 }

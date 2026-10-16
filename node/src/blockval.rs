@@ -12,12 +12,17 @@
 //!   (`core::policy::output_kind`: a 20-byte key hash or a 33-byte spend
 //!   policy); anything else would be an unspendable, unaccountable burn;
 //! * no output below the dust threshold;
-//! * a policy spend (multisig / timelocks, docs/MULTISIG.md) satisfies its
-//!   timelocks — absolute `after` against `locktime`, relative `older`
-//!   against the spent output's confirmation height — and a policy-tree
-//!   spend (one revealed branch) is valid only from `core::powit_height()`.
-//!   The policy's keys and signatures are checked with every other input
-//!   script (`core::sighash::verify_input_signatures`);
+//! * a policy spend (multisig / timelocks, docs/MULTISIG.md) reveals the
+//!   policy the spent output commits to — checked FIRST, before any field of
+//!   the revealed policy is read: a made-up policy is a witness failure, never
+//!   a timelock to evaluate or a confirmation height to look up (audit F1) —,
+//!   satisfies its timelocks — absolute `after` against `locktime`, relative
+//!   `older` against the spent output's confirmation point (a genesis-ledger
+//!   output is confirmed at the genesis, docs/CONSENSUS.md) — and a
+//!   policy-tree spend (one revealed branch) is valid only from
+//!   `core::powit_height()`. The policy's keys and signatures are checked
+//!   with every other input script (`core::sighash::verify_input_signatures`,
+//!   which checks the same hash again);
 //! * BIP30: no transaction may create an outpoint that is still unspent, and
 //!   no transaction may spend its own block's coinbase (both also hardening
 //!   rules of the audit, VAL-2 / VAL-3, and both on this chain from genesis).
@@ -77,6 +82,17 @@ pub fn check_policy_spends(
 /// header-height difference below the hardening activation, selected-chain
 /// depth from it, `accept::MaturityRule`). Absolute timelocks (`after`)
 /// compare `tx.locktime`, a header height, in both regimes.
+///
+/// The revealed policy (a v1 policy, or a tree branch with its Merkle path)
+/// must hash to the spent output before anything reads it (audit F1): the
+/// timelocks, the branch rule and the confirmation lookup apply only to the
+/// policy the output commits to. Before that order a made-up policy with
+/// `older != 0` made the lookup run for any spendable policy output, and an
+/// output with no tx-index row (the genesis ledger) answered "unknown", a
+/// read failure (no verdict) a free invalid transaction could put into any
+/// block. The verdict of a transaction is unchanged (every rule must pass,
+/// and `core::sighash::check_input_witnesses` rejects the same mismatch);
+/// only which failure is reported, and that a mismatch is never a lookup.
 pub fn check_policy_spends_with_confirmations(
     tx: &Transaction,
     prevouts: &[TxOutput],
@@ -89,6 +105,10 @@ pub fn check_policy_spends_with_confirmations(
         }
         let w = policy::AnyPolicyWitness::decode(&inp.script_sig)
             .map_err(|e| format!("malformed policy witness at input {}: {}", i, e))?;
+        // Same check and message as `core::sighash::check_input_witnesses`.
+        if w.script_pubkey() != prev.script_pubkey {
+            return Err(format!("policy does not match the output at input {}", i));
+        }
         if w.is_branch() && !core::powit_active(height) {
             return Err(format!("policy-tree spend before activation at input {}", i));
         }
@@ -243,6 +263,9 @@ pub fn validate_block_transactions(
         fn view_dag_data(&self, _: &[u8; 32]) -> Result<Option<crate::consensus::GhostdagData>, ViewError> {
             self.note(Err(NO_DAG.into()))
         }
+        // The caller's `confirm_height` answers every confirmation (a
+        // genesis-ledger output included, at height 0 if it knows it).
+        fn view_genesis_ledger(&self, _: &[u8; 32]) -> Result<bool, ViewError> { Ok(false) }
     }
     let view = View { utxo: utxo_lookup, coinbase: coinbase_height, confirm: confirm_height, error: Default::default() };
     let verdict = crate::accept::validate_block_in_view_classified(&view, block);
@@ -301,5 +324,32 @@ mod tests {
     fn only_the_defined_output_kinds_and_no_dust() {
         assert!(check_tx_context_free(&tx(0, vec![0; 21], 10_000), 5).unwrap_err().contains("unsupported"));
         assert!(check_tx_context_free(&tx(0, vec![0; 20], 1), 5).is_err());
+    }
+
+    /// Audit F1: the revealed policy is checked against the spent output
+    /// before any of its fields is read. A made-up policy with both
+    /// timelocks unsatisfiable is reported as the mismatch, and no
+    /// confirmation is looked up for it (the lookup panics here); the real
+    /// policy is judged by its timelocks, with the lookup.
+    #[test]
+    fn a_revealed_policy_is_checked_against_the_output_before_its_timelocks() {
+        let key = |_| crate::crypto::generate_keypair().0;
+        let real = policy::SpendPolicy::new(1, vec![key(0)], 0, 5).unwrap();
+        let fake = policy::SpendPolicy::new(1, vec![key(1)], 1_000, 7).unwrap();
+        let prev = TxOutput { value: 10_000, script_pubkey: real.script_pubkey() };
+        let spend = |p: &policy::SpendPolicy| {
+            let mut t = tx(0, vec![0; 20], 5_000);
+            t.inputs[0].script_sig = policy::PolicyWitness { policy: p.clone(), signatures: vec![(0, vec![1; 64])] }.encode();
+            t
+        };
+        let never = |_: &[u8; 32]| -> Result<Option<u64>, String> { panic!("no lookup for a made-up policy") };
+        let e = check_policy_spends_with_confirmations(&spend(&fake), &[prev.clone()], 10, &never).unwrap_err();
+        assert_eq!(e, "policy does not match the output at input 0");
+
+        let four = |_: &[u8; 32]| -> Result<Option<u64>, String> { Ok(Some(4)) };
+        let e = check_policy_spends_with_confirmations(&spend(&real), &[prev.clone()], 10, &four).unwrap_err();
+        assert!(e.contains("relative timelock: 4 confirmations < 5"), "{e}");
+        let five = |_: &[u8; 32]| -> Result<Option<u64>, String> { Ok(Some(5)) };
+        check_policy_spends_with_confirmations(&spend(&real), &[prev], 10, &five).unwrap();
     }
 }
