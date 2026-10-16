@@ -563,9 +563,13 @@ mod tests {
         assert!(book.add(&addr("80.1.1.1")), "another netgroup still has room");
     }
 
-    /// NET-11: the table is bounded and dial batches are netgroup-diverse.
+    /// NET-11: the table is bounded and the outbound picks made from it are
+    /// netgroup-diverse (through the production selection,
+    /// `connmgr::select_outbound_candidate`, with each pick's netgroup then
+    /// in use — the old batch dialer `take_dial_candidates` is gone).
     #[test]
     fn addr_book_is_bounded_and_dials_diverse_batches() {
+        use super::super::connmgr::{select_outbound_candidate, ConnKind};
         let mut book = AddrBook::new();
         for a in 0..=255u8 {
             for b in 0..8u8 {
@@ -573,12 +577,15 @@ mod tests {
             }
         }
         assert!(book.len() <= NEW_TABLE_CAP);
-        let batch = book.take_dial_candidates(10, |_| false);
-        assert_eq!(batch.len(), 10);
-        let groups: std::collections::HashSet<_> = batch.iter().map(|a| netgroup(a)).collect();
-        assert_eq!(groups.len(), 10, "one address per netgroup per batch");
-        for a in &batch {
-            assert!(!book.contains(a), "dialed candidates leave the new table");
+        let tried = TriedTable::with_key(super::super::addrbook::random_key());
+        let mut used: HashMap<String, usize> = HashMap::new();
+        let mut rng = rand::rng();
+        for _ in 0..10 {
+            let a = select_outbound_candidate(&mut rng, &tried, &book, ConnKind::OutboundFullRelay, &used, |_| true)
+                .expect("a candidate");
+            let g = netgroup(&a).unwrap();
+            assert!(!used.contains_key(&g), "one automatic outbound peer per netgroup");
+            used.insert(g, 1);
         }
     }
 

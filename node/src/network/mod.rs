@@ -877,6 +877,18 @@ impl Default for NetworkConfig {
 // `BlochBehaviourEvent`.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct BlochBehaviour {
+    // P0 (roadmap §1.3 / §4.1): swarm-level connection limits. `max_peers` was
+    // previously only an app-side counter checked in the PEX/mDNS dial paths,
+    // so inbound connection floods / eclipse setup were NOT bounded by libp2p.
+    // This behaviour rejects connections at the transport layer once the caps
+    // are hit (B1-T9 / NET-11: inbound gets `max_peers` + 1 slots — the extra
+    // one lets a newcomer in so the connection manager can EVICT an
+    // unprotected inbound peer instead of refusing everyone once full — and
+    // the swarm-wide cap leaves room for every outbound slot).
+    // FIRST field: the derive macro runs `handle_established_*` in field
+    // order, so a denial here happens before any other behaviour allocates
+    // per-connection state for the connection (NET-11 review).
+    connection_limits: libp2p::connection_limits::Behaviour,
     // NET-11 (d): gossipsub behind a per-peer gate, so block-relay-only
     // connections carry no gossip at all (see `gossip_gate`). Every other
     // call goes to the wrapped gossipsub behaviour (`Deref`).
@@ -890,15 +902,6 @@ struct BlochBehaviour {
     // is a directed request to ONE peer instead of a gossipsub broadcast to the
     // whole mesh (removes the O(peers) IBD amplification). See `sync_rr`.
     sync_rr:   sync_rr::Behaviour,
-    // P0 (roadmap §1.3 / §4.1): swarm-level connection limits. `max_peers` was
-    // previously only an app-side counter checked in the PEX/mDNS dial paths,
-    // so inbound connection floods / eclipse setup were NOT bounded by libp2p.
-    // This behaviour rejects connections at the transport layer once the caps
-    // are hit (B1-T9 / NET-11: inbound gets `max_peers` + 1 slots — the extra
-    // one lets a newcomer in so the connection manager can EVICT an
-    // unprotected inbound peer instead of refusing everyone once full — and
-    // the swarm-wide cap leaves room for every outbound slot).
-    connection_limits: libp2p::connection_limits::Behaviour,
     // NET-11 (a): latency measurement for the inbound eviction protection of
     // low-latency peers (Core's minimum ping time). Never closes connections.
     ping: libp2p::ping::Behaviour,
@@ -1064,6 +1067,8 @@ pub struct NetworkNode {
     outbound_targets: (usize, usize),
     /// Mean interval between feeler connections.
     feeler_interval: Duration,
+    /// Period of the block-relay-only frontier polls.
+    block_relay_poll_interval: Duration,
 }
 
 impl NetworkNode {
@@ -1077,6 +1082,7 @@ impl NetworkNode {
             peer_id, config, local_key, control_rx: None, peer_events: None,
             outbound_targets: (connmgr::OUTBOUND_FULL_RELAY_TARGET, connmgr::BLOCK_RELAY_ONLY_TARGET),
             feeler_interval: connmgr::FEELER_INTERVAL,
+            block_relay_poll_interval: connmgr::BLOCK_RELAY_POLL_INTERVAL,
         })
     }
 
@@ -1093,6 +1099,13 @@ impl NetworkNode {
     #[allow(dead_code)] // library / test knob; the binary keeps the default
     pub fn set_feeler_interval(&mut self, mean: Duration) {
         self.feeler_interval = mean;
+    }
+
+    /// Override the period of the block-relay-only frontier polls (default
+    /// `connmgr::BLOCK_RELAY_POLL_INTERVAL`). For tests.
+    #[allow(dead_code)] // library / test knob; the binary keeps the default
+    pub fn set_block_relay_poll_interval(&mut self, period: Duration) {
+        self.block_relay_poll_interval = period;
     }
 
     /// Accept [`NetworkControl`] requests from the processor on `rx`.
@@ -1503,6 +1516,12 @@ impl NetworkNode {
         // (Core's ThreadOpenConnections loop).
         let mut outbound_tick = tokio::time::interval(OUTBOUND_TICK);
         outbound_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // B1-T9 / M-11: heartbeat re-dials of configured peers resolve their
+        // host names on separate tasks, never inside this loop.
+        let (mut manual_resolver, mut manual_resolved_rx) = ManualResolver::new(MANUAL_RESOLVE_TIMEOUT);
+        let mut block_relay_poll = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.block_relay_poll_interval, self.block_relay_poll_interval);
+        block_relay_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -1678,7 +1697,7 @@ impl NetworkNode {
                             if est.kind == ConnKind::Feeler {
                                 if let Some(i) = &est.intent {
                                     if let (Some(newcomer), Some(occupant)) = (&i.collision_newcomer, &i.addr) {
-                                        tried.resolve_collision(newcomer, occupant, true);
+                                        tried.resolve_collision(newcomer, occupant, true, now);
                                     }
                                 }
                                 debug!("feeler to {} succeeded; closing it shortly", peer_id);
@@ -1711,9 +1730,12 @@ impl NetworkNode {
                             let first_connection = est.new_peer;
                             // The count is of distinct peers, not connections, and the
                             // processor (RPC `peers`, the miner's has-peers check) sees
-                            // it at once, not at the next 30 s heartbeat.
-                            if conn_mgr.peer_count() != peer_count {
-                                peer_count = conn_mgr.peer_count();
+                            // it at once, not at the next 30 s heartbeat. NET-11:
+                            // block-relay-only peers are left out — nothing we
+                            // publish crosses such a link, so a node holding only
+                            // anchors must not mine / relay as if connected.
+                            if conn_mgr.relay_peer_count() != peer_count {
+                                peer_count = conn_mgr.relay_peer_count();
                                 crate::metrics::set_peer_count(peer_count as i64);
                                 sink.deliver(NetworkMessage::PeerCount {
                                     count: peer_count, addresses: tried.addresses(),
@@ -1819,14 +1841,16 @@ impl NetworkNode {
                                 continue;
                             }
                             info!("✗ disconnected: {}", peer_id);
+                            // Checked even when the peer keeps another connection:
+                            // its role (block-relay-only or not) may have changed.
+                            if conn_mgr.relay_peer_count() != peer_count {
+                                peer_count = conn_mgr.relay_peer_count();
+                                crate::metrics::set_peer_count(peer_count as i64);
+                                sink.deliver(NetworkMessage::PeerCount {
+                                    count: peer_count, addresses: tried.addresses(),
+                                }, InboundOrigin::Local, "disconnect");
+                            }
                             if let Some(gone) = closed.peer_gone {
-                                if conn_mgr.peer_count() != peer_count {
-                                    peer_count = conn_mgr.peer_count();
-                                    crate::metrics::set_peer_count(peer_count as i64);
-                                    sink.deliver(NetworkMessage::PeerCount {
-                                        count: peer_count, addresses: tried.addresses(),
-                                    }, InboundOrigin::Local, "disconnect");
-                                }
                                 peer_state.on_disconnect(&peer_id);
                                 selector.on_disconnect(&peer_id);
                                 if let Some(tx) = &self.peer_events {
@@ -1860,7 +1884,7 @@ impl NetworkNode {
                                 // NET-11 (c): test-before-evict — an unreachable tried
                                 // occupant is replaced by the newcomer it blocked.
                                 if let (ConnKind::Feeler, Some(newcomer), Some(occupant)) = (i.kind, &i.collision_newcomer, &i.addr) {
-                                    tried.resolve_collision(newcomer, occupant, false);
+                                    tried.resolve_collision(newcomer, occupant, false, Instant::now());
                                 }
                                 // A failed block-relay-only / feeler dial: its peer's
                                 // future connections carry gossip again.
@@ -1958,6 +1982,10 @@ impl NetworkNode {
                                 libp2p::request_response::Message::Response { request_id, response } => {
                                     let now = Instant::now();
                                     let entry = inflight_pull.remove(&request_id);
+                                    // NET-11: a `Peers` answer counts only as the answer
+                                    // to OUR GetPeers sent to a peer we ask for addresses.
+                                    let asked_for_peers = solicited_peers_answer(
+                                        entry.as_ref().map(|(p, _)| &p.req), conn_mgr.role(&peer));
                                     // NET-5 / NET-9: selector bookkeeping, and Busy /
                                     // BlockNotFound send the pull to another peer
                                     // (`on_pull_response`); the processor still sees
@@ -1965,6 +1993,14 @@ impl NetworkNode {
                                     on_pull_response(entry, &response, peer, &mut selector, &mut pending_pulls, now);
                                     if !matches!(response, sync_rr::SyncResponse::Busy) {
                                         match response {
+                                            sync_rr::SyncResponse::Peers { peers } if !asked_for_peers => {
+                                                // NET-11: addresses answered to a GetTips /
+                                                // GetHeaders / … request (or by a
+                                                // block-relay-only / inbound peer) are a
+                                                // protocol violation, never table input.
+                                                debug!("sync_rr: unsolicited Peers answer ({} addresses) from {}; ignored",
+                                                    peers.len(), peer);
+                                            }
                                             sync_rr::SyncResponse::Peers { peers } => {
                                                 // NET-11: solicited addresses go to the
                                                 // table, rate-limited per author; never
@@ -2094,6 +2130,20 @@ impl NetworkNode {
                     }
                 }
 
+                // B1-T9: a configured peer's re-dial address, resolved off
+                // the loop by `manual_resolver` (heartbeat).
+                Some((p, addr)) = manual_resolved_rx.recv() => {
+                    manual_resolver.finished(&p);
+                    let still_wanted = match addr_peer_id(&p) {
+                        Some(id) => !swarm.is_connected(&id) && !conn_mgr.is_dialing(&id),
+                        None => conn_mgr.count(ConnKind::Manual) + conn_mgr.pending_count(ConnKind::Manual) == 0,
+                    };
+                    if let (Some(addr), true) = (addr, still_wanted) {
+                        info!("reconnecting: {}", addr);
+                        dial_with_intent(&mut swarm, &mut conn_mgr, addr, DialIntent::manual());
+                    }
+                }
+
                 Some(msg) = outbound_rx.recv() => {
                     // Announce-then-pull: IBD FETCH requests (GetBlock /
                     // GetHeaders / GetTips / PeerRequest) are DIRECTED to one
@@ -2202,13 +2252,22 @@ impl NetworkNode {
                         if !wanted {
                             continue;
                         }
-                        if let Some(addr) = resolve_dial_addr(p, true).await {
-                            info!("reconnecting: {}", addr);
-                            dial_with_intent(&mut swarm, &mut conn_mgr, addr, DialIntent::manual());
-                        }
+                        // Never awaited here: a host name's lookup (slow or
+                        // unreachable resolver, a seed that is down) runs on
+                        // its own task and the dial happens when the answer
+                        // arrives (`manual_resolved_rx` arm below), so the
+                        // swarm keeps being polled meanwhile (M-11).
+                        manual_resolver.request(p, |p| async move { resolve_dial_addr(&p, true).await });
                     }
-                    // NET-11 (d): block-relay-only peers carry no gossip; their
-                    // frontier is polled (then pulled block by block).
+                    drain_pulls(&mut swarm, &mut selector, &mut pending_pulls, &mut inflight_pull, now);
+                }
+
+                // NET-11 (d): block-relay-only peers carry no gossip; their
+                // frontier is polled (then pulled block by block) every
+                // BLOCK_RELAY_POLL_INTERVAL — the only way a block reaches us
+                // over such a connection after the connect-time GetTips.
+                _ = block_relay_poll.tick() => {
+                    let now = Instant::now();
                     for p in conn_mgr.block_relay_peers() {
                         send_directed_pull(&mut swarm, &mut selector, &mut inflight_pull, p,
                             NetworkMessage::GetTips, now);
@@ -2383,10 +2442,12 @@ fn dial_with_intent(
 /// connection is for ([`connmgr::next_outbound_action`]: anchors, full-relay
 /// slots, block-relay-only slots, feelers), pick an address and dial it.
 ///
-/// * full-relay / block-relay-only: a random entry of the tried or the new
-///   table (50/50, as Core's `Select`), outside the netgroups of the current
-///   automatic outbound peers, not connected, not ourselves, not tried in the
-///   last `addrbook::RETRY_INTERVAL`;
+/// * full-relay / block-relay-only: [`connmgr::select_outbound_candidate`]
+///   — a random entry of the tried or the new table (50/50, as Core's
+///   `Select`), outside the netgroups of the current automatic outbound
+///   peers (full-relay: the small-network fallback when no such entry
+///   exists), not connected, not ourselves, not tried in the last
+///   `addrbook::RETRY_INTERVAL`;
 /// * anchor: the next anchor from the last run, as block-relay-only;
 /// * feeler: the occupant of a queued tried collision first
 ///   (test-before-evict), else a random new-table address.
@@ -2436,24 +2497,16 @@ fn open_next_outbound(
         }
         OutboundAction::FullRelay | OutboundAction::BlockRelay => {
             let kind = if action == OutboundAction::FullRelay { ConnKind::OutboundFullRelay } else { ConnKind::BlockRelayOnly };
-            let groups = conn_mgr.outbound_groups();
-            let ok = |a: &str| {
-                reachable(a, conn_mgr, swarm)
-                    && netgroup(a).is_some_and(|g| !groups.contains(&g))
-                    && !tried.recently_tried(a, now)
-            };
-            let pick = if rng.random_bool(0.5) {
-                tried.select(&mut rng, ok).or_else(|| addr_book.select(&mut rng, ok))
-            } else {
-                addr_book.select(&mut rng, ok).or_else(|| tried.select(&mut rng, ok))
-            };
+            let group_counts = conn_mgr.outbound_group_counts();
+            let eligible = |a: &str| reachable(a, conn_mgr, swarm) && !tried.recently_tried(a, now);
+            let pick = connmgr::select_outbound_candidate(&mut rng, tried, addr_book, kind, &group_counts, eligible);
             (kind, pick, None)
         }
         OutboundAction::Feeler => match tried.pending_collision(now) {
             Some((newcomer, occupant)) if reachable(&occupant, conn_mgr, swarm) => (ConnKind::Feeler, Some(occupant), Some(newcomer)),
             Some((newcomer, occupant)) => {
                 // The occupant is connected right now: it is reachable.
-                tried.resolve_collision(&newcomer, &occupant, true);
+                tried.resolve_collision(&newcomer, &occupant, true, now);
                 return;
             }
             None => (ConnKind::Feeler, addr_book.select(&mut rng, |a| reachable(a, conn_mgr, swarm)), None),
@@ -2474,6 +2527,65 @@ fn open_next_outbound(
     debug!("outbound {:?} dial: {}", kind, truncate_utf8(&a, 80));
     let group = netgroup(&a);
     dial_with_intent(swarm, conn_mgr, ma, DialIntent { kind, addr: Some(a), peer, group, collision_newcomer });
+}
+
+/// Longest a heartbeat re-dial lookup of a configured host name may take.
+const MANUAL_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// B1-T9 / M-11: resolution of configured (`--peer`) addresses for the
+/// heartbeat re-dials, OFF the network loop. Since B1-T9 every configured
+/// peer that is not connected is re-dialed each heartbeat (not only with no
+/// peer at all); awaiting its DNS lookup inline froze the whole swarm loop
+/// (gossip, eviction, pulls, sync answers) for as long as the resolver took
+/// whenever a configured host was down or its DNS slow. Each lookup now runs
+/// on its own task, bounded by a timeout, at most one per address at a time;
+/// the answer comes back over a channel the loop reads.
+struct ManualResolver {
+    in_flight: HashSet<String>,
+    timeout: Duration,
+    tx: mpsc::UnboundedSender<(String, Option<Multiaddr>)>,
+}
+
+impl ManualResolver {
+    fn new(timeout: Duration) -> (Self, mpsc::UnboundedReceiver<(String, Option<Multiaddr>)>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self { in_flight: HashSet::new(), timeout, tx }, rx)
+    }
+
+    /// Start resolving `addr` with `resolve` on a spawned task and return at
+    /// once; `false` (nothing started) while a lookup of `addr` is running.
+    /// The result, `None` on failure or timeout, arrives on the receiver.
+    fn request<F, Fut>(&mut self, addr: &str, resolve: F) -> bool
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Option<Multiaddr>> + Send + 'static,
+    {
+        if !self.in_flight.insert(addr.to_string()) {
+            return false;
+        }
+        let (tx, timeout, key) = (self.tx.clone(), self.timeout, addr.to_string());
+        let lookup = resolve(addr.to_string());
+        tokio::spawn(async move {
+            let out = tokio::time::timeout(timeout, lookup).await.ok().flatten();
+            let _ = tx.send((key, out));
+        });
+        true
+    }
+
+    /// The lookup of `addr` has been delivered.
+    fn finished(&mut self, addr: &str) {
+        self.in_flight.remove(addr);
+    }
+}
+
+/// NET-11: whether a `Peers` answer may feed the new table — only when the
+/// request it answers was our `GetPeers` and the answering peer is one we ask
+/// for addresses (outbound full-relay or manual: Core reads `addr` from
+/// neither inbound nor block-relay-only peers). A `Peers` answer to any other
+/// request (every connection gets a `GetTips` on connect, block-relay-only
+/// peers one per poll) is ignored.
+fn solicited_peers_answer(req: Option<&sync_rr::SyncRequest>, role: Option<ConnKind>) -> bool {
+    matches!(req, Some(sync_rr::SyncRequest::GetPeers)) && role.is_some_and(|k| k.sends_getaddr())
 }
 
 /// Core's cached `getaddr` answer (`m_addr_response_caches`): the sample of
@@ -2815,32 +2927,38 @@ async fn resolve_dial_addr(addr: &str, allow_private: bool) -> Option<Multiaddr>
     }
     match tokio::net::lookup_host(format!("{}:0", host)).await {
         Ok(answers) => {
-            let mut answers: Vec<std::net::IpAddr> = answers.map(|sa| sa.ip()).collect();
-            // IPv4 first for `/dns` (Core prefers what it can reach).
-            answers.sort_by_key(|ip| !ip.is_ipv4());
-            for ip in answers {
-                let family_ok = (ip.is_ipv4() && want_v4) || (ip.is_ipv6() && want_v6);
-                if !family_ok {
-                    continue;
-                }
-                if !is_acceptable_ip(ip, allow_private) {
-                    warn!("resolve: {} → {} is not an acceptable peer address; skipped", host, ip);
-                    continue;
-                }
-                parts[0] = match ip {
-                    std::net::IpAddr::V4(v4) => Protocol::Ip4(v4),
-                    std::net::IpAddr::V6(v6) => Protocol::Ip6(v6),
-                };
-                return Some(parts.into_iter().collect());
-            }
-            warn!("resolve: no acceptable address for '{}'; not dialing {}", host, addr);
-            None
+            let answers: Vec<std::net::IpAddr> = answers.map(|sa| sa.ip()).collect();
+            let Some(ip) = pick_resolved_ip(&answers, want_v4, want_v6, allow_private) else {
+                warn!("resolve: no acceptable address for '{}' among {:?}; not dialing {}", host, answers, addr);
+                return None;
+            };
+            parts[0] = match ip {
+                std::net::IpAddr::V4(v4) => Protocol::Ip4(v4),
+                std::net::IpAddr::V6(v6) => Protocol::Ip6(v6),
+            };
+            Some(parts.into_iter().collect())
         }
         Err(e) => {
             warn!("resolve: DNS lookup for '{}' failed: {}; not dialing {}", host, e, addr);
             None
         }
     }
+}
+
+/// The DNS answer [`resolve_dial_addr`] dials: the first of the wanted family
+/// (IPv4 first, as Core prefers what it can reach) that
+/// [`is_acceptable_ip`]`(ip, allow_private)` accepts.
+fn pick_resolved_ip(
+    answers: &[std::net::IpAddr],
+    want_v4: bool,
+    want_v6: bool,
+    allow_private: bool,
+) -> Option<std::net::IpAddr> {
+    let mut v: Vec<std::net::IpAddr> = answers.to_vec();
+    v.sort_by_key(|ip| !ip.is_ipv4());
+    v.into_iter().find(|ip| {
+        ((ip.is_ipv4() && want_v4) || (ip.is_ipv6() && want_v6)) && is_acceptable_ip(*ip, allow_private)
+    })
 }
 
 /// PROPAGAÇÃO-CHURN fix (2026-08-09): the ONE canonical string form of a
@@ -3282,24 +3400,94 @@ mod tests {
         assert_eq!(out, Some("/ip4/127.0.0.1/tcp/1".parse().unwrap()));
     }
 
-    /// B1-T8: a host name never resolves into an address the node would not
-    /// dial — `localhost` (127.0.0.1) is refused unless private addresses are
-    /// allowed; with them it is resolved, the rest of the address kept.
-    /// Before the fix every `/dns4` name was turned into whatever IPv4 it
-    /// resolved to, unfiltered (and known peers could hold names).
+    /// B1-T8, as production uses it: OPERATOR-configured names (`--peer`,
+    /// the shipped seeds — both callers pass `allow_private = true`, like an
+    /// operator's IP literal, which is dialed as given) may resolve to a
+    /// private or loopback address (docker / LAN setups), but NEVER into an
+    /// invalid range (link-local / cloud metadata, multicast, unspecified,
+    /// documentation, broadcast, …), whatever `allow_private` says. The
+    /// `allow_private = false` branch (refuses loopback / private too) is kept
+    /// for callers that screen like learned addresses. Before the fix every
+    /// `/dns4` name was turned into whatever IPv4 it resolved to, unfiltered.
     #[tokio::test]
-    async fn resolved_host_names_are_screened_like_learned_addresses() {
+    async fn operator_host_names_never_resolve_into_invalid_ranges() {
+        use std::net::IpAddr;
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // What production does (allow_private = true): invalid ranges are
+        // skipped, private / loopback accepted, IPv4 preferred.
+        let invalid = ["169.254.169.254", "224.0.0.1", "0.0.0.0", "192.0.2.7", "255.255.255.255", "ff02::1", "2001:db8::1", "::"];
+        for bad in invalid {
+            assert_eq!(pick_resolved_ip(&[ip(bad)], true, true, true), None, "{bad} is never dialed");
+        }
+        assert_eq!(pick_resolved_ip(&[ip("169.254.169.254"), ip("10.0.0.5")], true, true, true), Some(ip("10.0.0.5")));
+        assert_eq!(pick_resolved_ip(&[ip("2606:4700::1"), ip("80.78.28.142")], true, true, true), Some(ip("80.78.28.142")));
+        assert_eq!(pick_resolved_ip(&[ip("80.78.28.142")], false, true, true), None, "/dns6 wants IPv6 only");
+        // The screened branch: loopback / private refused as well.
+        assert_eq!(pick_resolved_ip(&[ip("127.0.0.1"), ip("10.0.0.5")], true, true, false), None);
+
         let id = PeerId::random();
         let named = format!("/dns4/localhost/tcp/17110/p2p/{id}");
-        assert_eq!(resolve_dial_addr(&named, false).await, None, "a name resolving to loopback is refused");
         assert_eq!(
             resolve_dial_addr(&named, true).await,
             Some(format!("/ip4/127.0.0.1/tcp/17110/p2p/{id}").parse().unwrap()),
-            "allowed in dev mode, and only the host part changes"
+            "an operator name may resolve to loopback; only the host part changes"
         );
+        assert_eq!(resolve_dial_addr(&named, false).await, None, "the screened branch refuses loopback");
         // Websocket addresses keep their name (the ws transport resolves it).
         let ws = format!("/dns4/localhost/tcp/17111/ws/p2p/{id}");
         assert_eq!(resolve_dial_addr(&ws, false).await, Some(ws.parse().unwrap()));
+    }
+
+    /// NET-11 review: a `Peers` answer feeds the new table only when it
+    /// answers OUR GetPeers sent to an outbound full-relay or manual peer.
+    /// Before the fix any `Peers` answer was ingested: an inbound or
+    /// block-relay-only peer answered the connect-time / poll `GetTips` with
+    /// `Peers { attacker addresses }` and they entered the table.
+    #[test]
+    fn only_answers_to_our_get_peers_feed_the_address_table() {
+        use sync_rr::SyncRequest;
+        let get_peers = SyncRequest::GetPeers;
+        let get_tips = SyncRequest::GetTips;
+        let get_headers = SyncRequest::GetHeaders { from_blue_score: 0, limit: 1 };
+        for role in [ConnKind::OutboundFullRelay, ConnKind::Manual] {
+            assert!(solicited_peers_answer(Some(&get_peers), Some(role)), "{role:?} answering our GetPeers");
+            assert!(!solicited_peers_answer(Some(&get_tips), Some(role)), "{role:?}: Peers answering GetTips");
+            assert!(!solicited_peers_answer(Some(&get_headers), Some(role)));
+        }
+        for role in [ConnKind::Inbound, ConnKind::BlockRelayOnly, ConnKind::Feeler] {
+            assert!(!solicited_peers_answer(Some(&get_peers), Some(role)), "{role:?} never relays addresses");
+            assert!(!solicited_peers_answer(Some(&get_tips), Some(role)));
+        }
+        assert!(!solicited_peers_answer(None, Some(ConnKind::OutboundFullRelay)), "no matching request");
+        assert!(!solicited_peers_answer(Some(&get_peers), None), "peer gone");
+    }
+
+    /// B1-T9 / M-11 review: heartbeat re-dials of configured peers never
+    /// await a DNS lookup on the network loop. `request` returns at once even
+    /// when the lookup never completes, starts at most one lookup per address,
+    /// bounds it with the timeout (a `None` answer arrives), and delivers a
+    /// finished lookup's address over the channel. Before the fix the
+    /// heartbeat awaited `resolve_dial_addr` inline for every disconnected
+    /// configured peer, freezing the swarm loop for the whole lookup.
+    #[tokio::test]
+    async fn heartbeat_redial_lookups_run_off_the_network_loop() {
+        let (mut r, mut rx) = ManualResolver::new(Duration::from_millis(300));
+        let slow = "/dns4/down.example/tcp/17110";
+        let t = std::time::Instant::now();
+        assert!(r.request(slow, |_| std::future::pending::<Option<Multiaddr>>()));
+        assert!(t.elapsed() < Duration::from_millis(100), "request never waits for the lookup");
+        assert!(!r.request(slow, |_| std::future::pending::<Option<Multiaddr>>()), "one lookup per address at a time");
+        let fast = "/ip4/80.78.28.142/tcp/17110";
+        assert!(r.request(fast, |p| async move { resolve_dial_addr(&p, true).await }));
+        let mut got = std::collections::HashMap::new();
+        for _ in 0..2 {
+            let (p, a) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+            r.finished(&p);
+            got.insert(p, a);
+        }
+        assert_eq!(got[fast], Some(fast.parse().unwrap()));
+        assert_eq!(got[slow], None, "a lookup that never completes times out");
+        assert!(r.request(slow, |_| async { None }), "a finished address can be looked up again");
     }
 
     // ─── Sprint CC regression: dynamic PeerTip construction ──────────────

@@ -359,8 +359,11 @@ async fn live_full_inbound_evicts_an_unprotected_peer_instead_of_refusing() {
 
 /// NET-11 (b)+(d) (live). V starts with B in `anchors.json` (Core's
 /// anchors.dat). V dials B first, as a BLOCK-RELAY-ONLY connection: no gossip
-/// runs on it (B's gossiped block never reaches V that way), while V still
-/// learns B's frontier through directed `GetTips` polls. V persists its
+/// runs on it (B's gossiped block never reaches V that way), while V keeps
+/// learning B's frontier through the PERIODIC directed `GetTips` polls (the
+/// poll period is shortened to 1 s here; several Tips answers must arrive,
+/// not only the one-off connect-time exchange). Such a peer is not reported
+/// to the processor as a peer (the miner's no-peer gate). V persists its
 /// block-relay-only peers as the new anchors; after a restart (same data dir)
 /// V dials B again. Before the fix `anchors.json` did not exist and V never
 /// connected to B.
@@ -370,11 +373,13 @@ async fn live_anchor_is_redialed_after_restart_as_block_relay_only() {
     let b = spawn_node(new_dir(), vec![], 8).await;
     let v_dir = new_dir();
     std::fs::write(v_dir.path().join("anchors.json"), serde_json::to_string(&vec![b.full_addr()]).unwrap()).unwrap();
-    let v = spawn_node(v_dir.clone(), vec![], 8).await;
+    let fast_poll = |n: &mut NetworkNode| n.set_block_relay_poll_interval(Duration::from_secs(1));
+    let v = spawn_node_with(v_dir.clone(), vec![], 8, fast_poll).await;
     assert!(wait_for(15, || v.is_connected_to(&b.peer_id)).await, "V dials its anchor B at start-up");
 
-    // Block relay over the anchor works by directed frontier polls...
-    assert!(wait_for(15, || v.tips.load(Ordering::Relaxed) > 0).await, "V polls B's frontier (GetTips)");
+    // Block relay over the anchor works by periodic directed frontier polls
+    // (the connect-time GetTips alone would give exactly one answer)...
+    assert!(wait_for(20, || v.tips.load(Ordering::Relaxed) >= 3).await, "V keeps polling B's frontier (GetTips)");
     // ...but no gossip runs on it: B's gossiped block does not reach V.
     let payload = vec![1u8, 2, 3];
     b.outbound_tx
@@ -383,6 +388,9 @@ async fn live_anchor_is_redialed_after_restart_as_block_relay_only() {
         .unwrap();
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(v.blocks.load(Ordering::Relaxed), 0, "a block-relay-only connection carries no gossip");
+    // Nothing V publishes reaches B either, so V must not count B as a peer
+    // for its miner / relay (its reported peer count never left 0).
+    assert_eq!(v.rises_from_zero.load(Ordering::SeqCst), 0, "a block-relay-only peer is not a relay peer");
 
     // The anchors file now names B (written by V itself).
     let anchors_path = v_dir.path().join("anchors.json");
@@ -395,7 +403,7 @@ async fn live_anchor_is_redialed_after_restart_as_block_relay_only() {
     v.task.abort();
     let _ = v.task.await;
     assert!(wait_for(15, || !b.is_connected_to(&v.peer_id)).await, "B sees V go away");
-    let v2 = spawn_node(v_dir.clone(), vec![], 8).await;
+    let v2 = spawn_node_with(v_dir.clone(), vec![], 8, fast_poll).await;
     assert_eq!(v2.peer_id, v.peer_id, "same identity after restart");
     assert!(wait_for(15, || v2.is_connected_to(&b.peer_id)).await, "the anchor survives the restart");
     drop(v.dir);

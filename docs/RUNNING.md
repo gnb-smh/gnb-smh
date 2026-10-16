@@ -43,9 +43,13 @@ Settings:
   `-addnode`). It is dialed at start-up and re-dialed every 30 s while it is
   not connected (an entry without `/p2p/<id>` is re-dialed while no manual
   connection is up). It never uses an automatic outbound slot. A host name is
-  resolved by the node; it may resolve to a private address (docker / LAN
-  setups) but never into an invalid range (unspecified, multicast,
-  documentation, link-local such as 169.254.169.254, …).
+  resolved by the node; like an IP literal given here, it may resolve to a
+  private or loopback address (docker / LAN setups) whatever
+  `--allow-private-peers` says, but never into an invalid range (unspecified,
+  multicast, documentation, link-local such as 169.254.169.254, …). The
+  30 s re-dial resolves names on a separate task (at most 10 s per lookup),
+  so a configured host that is down or slow to resolve never stalls the
+  node's network loop.
 - `--dns-seed <host[:port]>` (repeatable, opt-in): resolved at start-up and
   dialed as manual connections. Answers that are not routable public
   addresses are ignored unless `--allow-private-peers` is set.
@@ -63,7 +67,12 @@ address tables, half the time from the tried table and half from the new
 table; at most one automatic outbound peer per netgroup (an IPv4 /16, an
 IPv6 /32; an IPv6 literal that embeds an IPv4 — `::ffff:a.b.c.d`, 6to4,
 Teredo, NAT64 — counts as that IPv4's /16); an address tried in the last 10
-minutes is not tried again.
+minutes is not tried again. Small-network fallback (not in Core, which
+relies on seeds; this network ships with none): when neither table holds a
+candidate outside the netgroups already used, a full-relay slot may take a
+peer in a used netgroup, up to 4 automatic outbound peers per netgroup, so
+nodes hosted in one /16 still connect to each other after a restart.
+Block-relay-only slots never relax the one-per-netgroup rule.
 
 Inbound connections. When a new inbound connection finds the `--max-peers`
 slots full, an existing inbound peer is evicted, chosen as Core's
@@ -90,7 +99,11 @@ P2P identity key, never sent anywhere), as in Core's addrman: the addresses
 one peer's netgroup sends can only reach 4 of the 64 new buckets, and one
 netgroup can hold at most 16 tried entries. A full tried bucket never evicts
 on the spot: the occupant is tested first by a feeler connection and kept if
-it answers (Core's test-before-evict). The node asks for addresses only on
+it answers (Core's test-before-evict); it is also kept, and the newcomer
+dropped, if its feeler fails but it connected successfully in the last 4
+hours (Core's `ADDRMAN_REPLACEMENT`; entries loaded from `known_peers.json`
+count as successful at start-up). Addresses are read only from the answer to
+the node's own `GetPeers`; a `Peers` answer to any other request is ignored. The node asks for addresses only on
 its outbound full-relay and manual connections and answers only inbound
 peers, once per connection, from a sample of the tried table cached for 21
 to 27 hours (Core's getaddr cache), so asking repeatedly reveals no more of
@@ -112,7 +125,12 @@ transaction or address relay. The node learns blocks over them by polling
 the peer's frontier (`GetTips` every 30 s) and pulling what it lacks. Their
 addresses are saved in `anchors.json` (at most 2) whenever that set changes;
 at start-up the file is read once, deleted, and its peers are re-dialed
-first as block-relay-only connections (Core's `anchors.dat`).
+first as block-relay-only connections (Core's `anchors.dat`). Nothing the
+node publishes crosses a block-relay-only connection (the remote treats it
+as an ordinary inbound peer without gossip and does not poll us), so these
+peers are left out of the peer count the node reports (RPC `peers`, and the
+miner's wait-for-peers check): a node connected only to its anchors does not
+mine as if it were on the network.
 
 External address. A peer-reported observed address becomes the node's
 advertised address only when peers in 3 different netgroups report it.

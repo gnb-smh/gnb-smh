@@ -189,6 +189,20 @@ impl NetworkBehaviour for GossipGate {
                     .on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed { remaining_established, ..e }));
             }
             FromSwarm::AddressChange(e) if self.hidden.contains_key(&e.connection_id) => {}
+            // A connection this gate hid can still be DENIED by a behaviour
+            // whose `handle_established_*` runs after ours (the derive macro
+            // calls the fields in order). The swarm then reports a
+            // ListenFailure / DialFailure — never a ConnectionClosed — for
+            // that connection id, so its `hidden` entry must go here, or each
+            // denied connection of a gated peer leaks one entry forever.
+            FromSwarm::ListenFailure(e) => {
+                self.hidden.remove(&e.connection_id);
+                self.inner.on_swarm_event(FromSwarm::ListenFailure(e));
+            }
+            FromSwarm::DialFailure(e) => {
+                self.hidden.remove(&e.connection_id);
+                self.inner.on_swarm_event(FromSwarm::DialFailure(e));
+            }
             other => self.inner.on_swarm_event(other),
         }
     }
@@ -207,5 +221,59 @@ impl NetworkBehaviour for GossipGate {
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         self.inner.poll(cx).map(|ev| ev.map_in(Either::Left))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libp2p::swarm::behaviour::{DialFailure, ListenFailure};
+    use libp2p::swarm::{DialError, ListenError};
+
+    fn gate() -> GossipGate {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let inner = gossipsub::Behaviour::new(
+            gossipsub::MessageAuthenticity::Signed(key),
+            gossipsub::Config::default(),
+        )
+        .expect("gossipsub");
+        GossipGate::new(inner)
+    }
+
+    /// NET-11 (d) review: a gated (block-relay-only / feeler) peer's
+    /// connection that a LATER behaviour denies (connection_limits: per-peer
+    /// or incoming cap) is reported as a ListenFailure / DialFailure, not a
+    /// ConnectionClosed. Before the fix its `hidden` entry stayed forever: a
+    /// gated attacker looping denied inbound connections grew the map
+    /// without bound.
+    #[test]
+    fn denied_connections_of_a_gated_peer_leave_no_hidden_entry() {
+        let mut g = gate();
+        let peer = PeerId::random();
+        g.gate_peer(peer);
+        let local: Multiaddr = "/ip4/127.0.0.1/tcp/1".parse().unwrap();
+        let remote: Multiaddr = "/ip4/127.0.0.1/tcp/2".parse().unwrap();
+        for i in 0..100usize {
+            let id = ConnectionId::new_unchecked(i);
+            assert!(g.handle_established_inbound_connection(id, peer, &local, &remote).is_ok());
+            let error = ListenError::Denied { cause: ConnectionDenied::new("connection limit") };
+            g.on_swarm_event(FromSwarm::ListenFailure(ListenFailure {
+                local_addr: &local,
+                send_back_addr: &remote,
+                error: &error,
+                connection_id: id,
+                peer_id: Some(peer),
+            }));
+        }
+        assert_eq!(g.hidden_connections(), 0, "denied inbound connections must not leak");
+        let id = ConnectionId::new_unchecked(1000);
+        assert!(g
+            .handle_established_outbound_connection(id, peer, &remote, Endpoint::Dialer, PortUse::Reuse)
+            .is_ok());
+        assert_eq!(g.hidden_connections(), 1);
+        let error = DialError::Denied { cause: ConnectionDenied::new("connection limit") };
+        g.on_swarm_event(FromSwarm::DialFailure(DialFailure { peer_id: Some(peer), error: &error, connection_id: id }));
+        assert_eq!(g.hidden_connections(), 0, "a denied outbound connection must not leak");
+        assert!(g.is_gated(&peer), "the gate itself stays until the peer's last connection closes");
     }
 }

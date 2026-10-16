@@ -70,6 +70,12 @@ pub const TRIED_COLLISION_TTL: Duration = Duration::from_secs(40 * 60);
 /// Core's `ThreadOpenConnections` rule: an address tried less than this long
 /// ago is not selected again.
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// Core's `ADDRMAN_REPLACEMENT`: a tried occupant that connected
+/// successfully less than this long ago is never replaced by a collision
+/// newcomer, even if its test-before-evict feeler fails (it may be
+/// restarting, briefly unreachable, or DoSed by the attacker who wants its
+/// slot).
+pub const ADDRMAN_REPLACEMENT: Duration = Duration::from_secs(4 * 60 * 60);
 
 const _: () = assert!(NEW_BUCKET_COUNT * NEW_BUCKET_SIZE == NEW_TABLE_CAP);
 const _: () = assert!(TRIED_BUCKET_COUNT * TRIED_BUCKET_SIZE == KNOWN_PEERS_CAP);
@@ -258,36 +264,6 @@ impl AddrBook {
     pub fn select<R: Rng + ?Sized>(&self, rng: &mut R, accept: impl Fn(&str) -> bool) -> Option<String> {
         pick(rng, self.entries.keys(), accept)
     }
-
-    /// Remove and return up to `n` dial candidates in random order, at most
-    /// one per netgroup. Entries for which `skip` returns true (already
-    /// connected, already known, ourselves) are dropped from the table as
-    /// well — there is no reason to dial them later either.
-    pub fn take_dial_candidates<F: Fn(&str) -> bool>(&mut self, n: usize, skip: F) -> Vec<String> {
-        use rand::seq::SliceRandom;
-        let mut order: Vec<(String, String)> = self.entries.iter().map(|(a, e)| (a.clone(), e.group.clone())).collect();
-        order.shuffle(&mut rand::rng());
-        let mut groups_used = HashSet::new();
-        let mut out = Vec::new();
-        let mut stale = Vec::new();
-        for (addr, group) in order {
-            if out.len() >= n {
-                break;
-            }
-            if skip(&addr) {
-                stale.push(addr);
-                continue;
-            }
-            if !groups_used.insert(group) {
-                continue;
-            }
-            out.push(addr);
-        }
-        for a in out.iter().chain(stale.iter()) {
-            self.remove(a);
-        }
-        out
-    }
 }
 
 // ── Tried table ──────────────────────────────────────────────────────────────
@@ -296,6 +272,8 @@ impl AddrBook {
 struct TriedEntry {
     slot: usize,
     last_try: Option<Instant>,
+    /// Last successful outbound connection (Core's `nLastSuccess`).
+    last_success: Option<Instant>,
 }
 
 /// Result of [`TriedTable::insert`].
@@ -338,12 +316,18 @@ impl TriedTable {
 
     /// Load persisted entries: each is placed by the key; entries whose
     /// bucket is already full are dropped (as Core does when it re-buckets).
+    ///
+    /// The persisted form (`known_peers.json`, a plain address list) carries
+    /// no success time; every loaded entry did connect successfully in an
+    /// earlier run, and counts as having succeeded at load time, so for
+    /// [`ADDRMAN_REPLACEMENT`] after a restart no collision can displace it.
     pub fn load<I: IntoIterator<Item = String>>(key: AddrKey, addrs: I) -> Self {
         let mut t = Self::with_key(key);
         let mut sorted: Vec<String> = addrs.into_iter().collect();
         sorted.sort();
+        let now = Instant::now();
         for a in sorted {
-            let _ = t.place(&a);
+            let _ = t.place(&a, now);
         }
         t
     }
@@ -379,8 +363,9 @@ impl TriedTable {
 
     /// Place without queuing a collision (load path). `Err(Some(occupant))`
     /// for a full bucket, `Err(None)` for an address with no netgroup.
-    fn place(&mut self, addr: &str) -> Result<bool, Option<String>> {
-        if self.index.contains_key(addr) {
+    fn place(&mut self, addr: &str, success: Instant) -> Result<bool, Option<String>> {
+        if let Some(e) = self.index.get_mut(addr) {
+            e.last_success = Some(e.last_success.map_or(success, |t| t.max(success)));
             return Ok(false);
         }
         let Some(group) = netgroup(addr) else { return Err(None) };
@@ -389,7 +374,7 @@ impl TriedTable {
         match free_slot(&self.slots, bucket, TRIED_BUCKET_SIZE, pos) {
             Ok(slot) => {
                 self.slots[slot] = Some(addr.to_string());
-                self.index.insert(addr.to_string(), TriedEntry { slot, last_try: None });
+                self.index.insert(addr.to_string(), TriedEntry { slot, last_try: None, last_success: Some(success) });
                 Ok(true)
             }
             Err(keyed) => Err(self.slots[keyed].clone()),
@@ -400,7 +385,7 @@ impl TriedTable {
     /// full bucket never evicts on the spot: the pair is queued for a feeler
     /// test of the occupant ([`TriedInsert::Collision`]).
     pub fn insert(&mut self, addr: &str, now: Instant) -> TriedInsert {
-        match self.place(addr) {
+        match self.place(addr, now) {
             Ok(false) => TriedInsert::Present,
             Ok(true) => TriedInsert::Inserted,
             Err(None) => TriedInsert::Refused,
@@ -443,15 +428,23 @@ impl TriedTable {
 
     /// Outcome of the feeler test of `occupant` for `newcomer` (Core's
     /// `ResolveCollisions`): a reachable occupant stays and the newcomer is
-    /// dropped; an unreachable one is replaced by the newcomer (it takes the
-    /// occupant's slot — same bucket by construction).
-    pub fn resolve_collision(&mut self, newcomer: &str, occupant: &str, occupant_reachable: bool) {
+    /// dropped. An unreachable occupant is replaced by the newcomer (it takes
+    /// the occupant's slot — same bucket by construction) only if it has not
+    /// connected successfully in the last [`ADDRMAN_REPLACEMENT`]; a recently
+    /// good occupant stays and the newcomer is dropped (one failed dial —
+    /// a restart, or a DoS timed by the attacker — must not hand its slot
+    /// over).
+    pub fn resolve_collision(&mut self, newcomer: &str, occupant: &str, occupant_reachable: bool, now: Instant) {
         self.collisions.retain(|(n, e, _)| !(n == newcomer && e == occupant));
-        if occupant_reachable || !self.index.contains_key(occupant) || self.index.contains_key(newcomer) {
+        if occupant_reachable || self.index.contains_key(newcomer) {
+            return;
+        }
+        let Some(entry) = self.index.get(occupant) else { return };
+        if entry.last_success.is_some_and(|t| now.saturating_duration_since(t) < ADDRMAN_REPLACEMENT) {
             return;
         }
         self.remove(occupant);
-        let _ = self.place(newcomer);
+        let _ = self.place(newcomer, now);
     }
 
     /// Queued collisions (tests / diagnostics).
@@ -586,14 +579,54 @@ mod tests {
 
         // Test-before-evict: a reachable occupant stays...
         let (newcomer, occupant) = t.pending_collision(now).unwrap();
-        t.resolve_collision(&newcomer, &occupant, true);
+        t.resolve_collision(&newcomer, &occupant, true, now);
         assert!(t.contains(&occupant) && !t.contains(&newcomer));
-        // ...an unreachable one is replaced.
+        // ...an unreachable one that has not succeeded for ADDRMAN_REPLACEMENT
+        // is replaced.
         let (newcomer, occupant) = t.pending_collision(now).unwrap();
-        t.resolve_collision(&newcomer, &occupant, false);
+        t.resolve_collision(&newcomer, &occupant, false, now + ADDRMAN_REPLACEMENT);
         assert!(!t.contains(&occupant) && t.contains(&newcomer));
         // Stale collisions expire (the occupant stays).
         assert!(t.pending_collision(now + TRIED_COLLISION_TTL).is_none());
+    }
+
+    /// Core's `ADDRMAN_REPLACEMENT`: a tried occupant that connected
+    /// successfully within the last 4 hours survives a failed
+    /// test-before-evict feeler (the newcomer is dropped); one whose last
+    /// success is older is replaced. Before the fix ONE failed dial handed
+    /// the occupant's slot to the newcomer.
+    #[test]
+    fn recently_good_occupant_survives_a_failed_feeler() {
+        let t0 = Instant::now();
+        // A full bucket with one queued (newcomer, occupant) collision.
+        let setup = || {
+            let mut t = TriedTable::with_key(random_key());
+            for i in 0..50u8 {
+                t.insert(&addr(&format!("45.77.{}.1", i)), t0);
+            }
+            let (newcomer, occupant) = t.pending_collision(t0).unwrap();
+            (t, newcomer, occupant)
+        };
+        // The occupant connected again 3 h later; its feeler fails 1 h after.
+        let (mut t, newcomer, occupant) = setup();
+        let later = t0 + Duration::from_secs(3 * 3600);
+        assert_eq!(t.insert(&occupant, later), TriedInsert::Present);
+        t.resolve_collision(&newcomer, &occupant, false, later + Duration::from_secs(3600));
+        assert!(t.contains(&occupant), "a recently good occupant stays");
+        assert!(!t.contains(&newcomer), "the newcomer is dropped");
+        // Within ADDRMAN_REPLACEMENT of its last success: kept.
+        let (mut t, newcomer, occupant) = setup();
+        t.resolve_collision(&newcomer, &occupant, false, t0 + ADDRMAN_REPLACEMENT - Duration::from_secs(1));
+        assert!(t.contains(&occupant) && !t.contains(&newcomer), "still within the grace period");
+        // Past it: a failed test replaces the occupant.
+        let (mut t, newcomer, occupant) = setup();
+        t.resolve_collision(&newcomer, &occupant, false, t0 + ADDRMAN_REPLACEMENT);
+        assert!(!t.contains(&occupant) && t.contains(&newcomer), "a stale occupant is replaced");
+        // Entries loaded from disk count as good at load time.
+        let mut loaded = TriedTable::load(random_key(), [addr("80.1.1.1")]);
+        let a = loaded.addresses()[0].clone();
+        loaded.resolve_collision(&addr("80.1.2.2"), &a, false, Instant::now());
+        assert!(loaded.contains(&a), "a persisted entry is not displaced right after a restart");
     }
 
     /// The persisted tried table reloads into the same layout with the same

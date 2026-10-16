@@ -12,7 +12,14 @@
 //!   the automatic slots.
 //! * **Outbound netgroup diversity**: at most one automatic outbound
 //!   (full-relay or block-relay-only) peer per netgroup (Core's
-//!   `setConnected` rule in `ThreadOpenConnections`).
+//!   `setConnected` rule in `ThreadOpenConnections`), see
+//!   [`select_outbound_candidate`]. Deviation for small networks (this one
+//!   ships with no seeds): when neither address table holds a candidate
+//!   outside the current outbound netgroups, a FULL-RELAY slot may take a
+//!   second to [`FALLBACK_MAX_PER_NETGROUP`]-th peer of an already used
+//!   netgroup, so a few nodes hosted in one /16 still connect to each other
+//!   after a restart instead of splitting into out-degree-1 components.
+//!   Block-relay-only slots never relax the rule.
 //! * **Inbound eviction** (NET-11 a): when a new inbound connection finds the
 //!   inbound slots full, an existing inbound peer is evicted by
 //!   [`select_node_to_evict`] (Core's `SelectNodeToEvict`): peers in a few
@@ -40,8 +47,10 @@ use libp2p::swarm::ConnectionId;
 use libp2p::{Multiaddr, PeerId};
 use log::warn;
 
-use super::addrbook::{keyed_u64, AddrKey};
-use super::pex_validator::{is_valid_public_multiaddr, netgroup_of};
+use rand::Rng;
+
+use super::addrbook::{keyed_u64, AddrBook, AddrKey, TriedTable};
+use super::pex_validator::{is_valid_public_multiaddr, netgroup, netgroup_of};
 
 /// Core's `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`.
 pub const OUTBOUND_FULL_RELAY_TARGET: usize = 8;
@@ -65,6 +74,11 @@ pub const ANCHORS_FILE: &str = "anchors.json";
 /// (8 full-relay + 2 block-relay-only + 1 feeler + manual peers), so the
 /// swarm-wide connection cap can never be reached by inbound connections.
 pub const OUTBOUND_CONNECTION_HEADROOM: usize = 32;
+
+/// Small-network fallback (see the module docs): at most this many
+/// automatic outbound peers per netgroup when no candidate outside the
+/// current outbound netgroups exists (full-relay slots only).
+pub const FALLBACK_MAX_PER_NETGROUP: usize = 4;
 
 /// Core's eviction protection sizes (`SelectNodeToEvict`).
 pub const EVICT_PROTECT_NETGROUP: usize = 4;
@@ -300,6 +314,16 @@ impl ConnManager {
         self.peers.len()
     }
 
+    /// Distinct connected peers that our blocks and transactions can reach:
+    /// every peer except block-relay-only ones (a block-relay-only link
+    /// carries no gossip in either direction and the remote never polls us,
+    /// so nothing we publish crosses it). This is the count the processor
+    /// sees (the miner's no-peer gate, RPC `peers`): a node holding only
+    /// anchors must not believe it is connected to the network.
+    pub fn relay_peer_count(&self) -> usize {
+        self.peers.values().filter(|i| i.role != ConnKind::BlockRelayOnly).count()
+    }
+
     /// Peers whose role is `kind`.
     pub fn count(&self, kind: ConnKind) -> usize {
         self.peers.values().filter(|i| i.role == kind).count()
@@ -328,16 +352,23 @@ impl ConnManager {
     /// Netgroups of the automatic outbound peers and pending automatic dials:
     /// a new automatic outbound dial must be outside all of them.
     pub fn outbound_groups(&self) -> std::collections::HashSet<String> {
-        let mut g: std::collections::HashSet<String> = self
-            .peers
-            .values()
-            .filter(|i| matches!(i.role, ConnKind::OutboundFullRelay | ConnKind::BlockRelayOnly))
-            .map(|i| i.netgroup.clone())
-            .collect();
+        self.outbound_group_counts().into_keys().collect()
+    }
+
+    /// Automatic outbound peers (full-relay and block-relay-only, established
+    /// and pending) per netgroup. Manual, inbound and feeler connections do
+    /// not count.
+    pub fn outbound_group_counts(&self) -> HashMap<String, usize> {
+        let mut g: HashMap<String, usize> = HashMap::new();
+        for i in self.peers.values() {
+            if matches!(i.role, ConnKind::OutboundFullRelay | ConnKind::BlockRelayOnly) {
+                *g.entry(i.netgroup.clone()).or_insert(0) += 1;
+            }
+        }
         for i in self.pending.values() {
             if matches!(i.kind, ConnKind::OutboundFullRelay | ConnKind::BlockRelayOnly) {
                 if let Some(gr) = &i.group {
-                    g.insert(gr.clone());
+                    *g.entry(gr.clone()).or_insert(0) += 1;
                 }
             }
         }
@@ -544,6 +575,55 @@ pub fn next_outbound_action(
     }
 }
 
+/// A random entry of the tried or the new table accepted by `accept` (50/50
+/// which table is asked first, as Core's `Select`).
+fn select_from_tables<R: Rng + ?Sized>(
+    rng: &mut R,
+    tried: &TriedTable,
+    new: &AddrBook,
+    accept: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    if rng.random_bool(0.5) {
+        tried.select(rng, accept).or_else(|| new.select(rng, accept))
+    } else {
+        new.select(rng, accept).or_else(|| tried.select(rng, accept))
+    }
+}
+
+/// The address for the next automatic outbound dial of `kind`
+/// (full-relay or block-relay-only) — Core's selection loop in
+/// `ThreadOpenConnections`. `eligible` holds the per-address checks (valid,
+/// not connected, not ourselves, not tried recently); `group_counts` is
+/// [`ConnManager::outbound_group_counts`].
+///
+/// 1. A candidate OUTSIDE every netgroup in `group_counts` (Core: one
+///    automatic outbound peer per netgroup).
+/// 2. Only for a full-relay slot, and only when step 1 finds nothing in
+///    either table: a candidate whose netgroup holds fewer than
+///    [`FALLBACK_MAX_PER_NETGROUP`] automatic outbound peers (small-network
+///    fallback, see the module docs).
+pub fn select_outbound_candidate<R: Rng + ?Sized>(
+    rng: &mut R,
+    tried: &TriedTable,
+    new: &AddrBook,
+    kind: ConnKind,
+    group_counts: &HashMap<String, usize>,
+    eligible: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let diverse = |a: &str| eligible(a) && netgroup(a).is_some_and(|g| !group_counts.contains_key(&g));
+    if let Some(a) = select_from_tables(rng, tried, new, &diverse) {
+        return Some(a);
+    }
+    if kind != ConnKind::OutboundFullRelay {
+        return None;
+    }
+    let relaxed = |a: &str| {
+        eligible(a)
+            && netgroup(a).is_some_and(|g| group_counts.get(&g).copied().unwrap_or(0) < FALLBACK_MAX_PER_NETGROUP)
+    };
+    select_from_tables(rng, tried, new, &relaxed)
+}
+
 /// An exponentially distributed delay with the given mean from a uniform
 /// `u` in `[0, 1)` (Core's `GetExponentialRand`), capped at 20 means.
 pub fn exponential_delay(mean: Duration, u: f64) -> Duration {
@@ -695,6 +775,185 @@ mod tests {
         let c = base();
         let victim = select_node_to_evict(c).unwrap();
         assert!(victim < 15, "only the younger half can be evicted, got {victim}");
+    }
+
+    /// Step 6 picks the LARGEST netgroup, not merely the youngest peer: here
+    /// the youngest remaining peers are honest (distinct netgroups, connected
+    /// recently) and the big netgroup is older. Evicting "the youngest
+    /// remaining peer" would hit an honest peer; Core evicts from the
+    /// attacker's group (its youngest member).
+    #[test]
+    fn evicts_from_the_largest_netgroup_even_when_it_is_not_the_youngest() {
+        let now = Instant::now() + Duration::from_secs(1_000_000);
+        // 20 honest peers, each its own netgroup, connected 100..119 s ago.
+        let mut c: Vec<_> = (0..20u32).map(|i| cand(i, 100 + i as u64, 1000 + i as u64, now)).collect();
+        // 30 attacker peers in ONE netgroup (lowest keyed value), connected
+        // 10_000..10_029 s ago — older than every honest peer.
+        c.extend((100..130u32).map(|i| cand(i, 10_000 + (i - 100) as u64, 0, now)));
+        let victim = select_node_to_evict(c).unwrap();
+        assert!((100..130).contains(&victim), "the victim comes from the largest netgroup, got {victim}");
+        assert_eq!(victim, 100, "its youngest member");
+    }
+
+    /// Step 5 alone (the longest-connected half of what remains) protects
+    /// P: no ping, transaction or block data, all connected at distinct
+    /// times. P and an older peer Q share the only 2-member netgroup, so
+    /// without step 5 the largest netgroup is theirs and P (its younger
+    /// member) is evicted; with it both are in the protected older half and
+    /// the youngest single-member peer goes.
+    #[test]
+    fn the_longest_connected_half_of_the_rest_is_protected() {
+        let now = Instant::now() + Duration::from_secs(1_000_000);
+        // 12 peers with the highest keyed netgroups (steps 1-2 protect them).
+        let mut c: Vec<_> = (0..12u32).map(|i| cand(i, 50 + i as u64, 10_000 + i as u64, now)).collect();
+        // 18 low-keyed peers, ages 1000..1017 s (id 100 is the youngest);
+        // steps 3-4 protect the 8 oldest of them (ids 110..117).
+        c.extend((100..118u32).map(|i| cand(i, 1000 + (i - 100) as u64, (i - 100) as u64 + 1, now)));
+        // P = id 108 and Q = id 109: the 9th and 10th oldest, one netgroup.
+        for e in c.iter_mut() {
+            if e.id == 108 || e.id == 109 {
+                e.keyed_netgroup = 500;
+            }
+        }
+        let victim = select_node_to_evict(c).unwrap();
+        assert_ne!(victim, 108, "P is protected by uptime alone");
+        assert_eq!(victim, 100, "the youngest unprotected peer is evicted");
+    }
+
+    /// B1-T9 review: the outbound netgroup set is built from the automatic
+    /// outbound peers AND the pending automatic dials; manual, inbound and
+    /// feeler connections are not in it.
+    #[test]
+    fn outbound_groups_hold_automatic_outbound_peers_and_pending_dials() {
+        let now = Instant::now();
+        let mut m = ConnManager::new(random_key(), 8);
+        let g = netgroup_of(&ip_addr("80.1.1.1")).unwrap();
+        let h = netgroup_of(&ip_addr("80.2.1.1")).unwrap();
+        // A pending full-relay dial in G.
+        m.register_dial(
+            ConnectionId::new_unchecked(1),
+            DialIntent { kind: ConnKind::OutboundFullRelay, group: Some(g.clone()), ..DialIntent::manual() },
+        );
+        // An established block-relay-only peer in H.
+        let c = ConnectionId::new_unchecked(2);
+        m.register_dial(c, DialIntent { kind: ConnKind::BlockRelayOnly, group: Some(h.clone()), ..DialIntent::manual() });
+        m.on_established(c, PeerId::random(), true, &ip_addr("80.2.1.1"), now);
+        // Manual, inbound, pending manual and feeler: not counted.
+        let c = ConnectionId::new_unchecked(3);
+        m.register_dial(c, DialIntent::manual());
+        m.on_established(c, PeerId::random(), true, &ip_addr("80.3.1.1"), now);
+        m.on_established(ConnectionId::new_unchecked(4), PeerId::random(), false, &ip_addr("80.4.1.1"), now);
+        m.register_dial(
+            ConnectionId::new_unchecked(5),
+            DialIntent { kind: ConnKind::Manual, group: Some("ip4:80.5".into()), ..DialIntent::manual() },
+        );
+        let c = ConnectionId::new_unchecked(6);
+        m.register_dial(c, DialIntent { kind: ConnKind::Feeler, group: Some("ip4:80.6".into()), ..DialIntent::manual() });
+        m.on_established(c, PeerId::random(), true, &ip_addr("80.6.1.1"), now);
+        let want: std::collections::HashSet<String> = [g.clone(), h.clone()].into_iter().collect();
+        assert_eq!(m.outbound_groups(), want);
+        assert_eq!(m.outbound_group_counts(), [(g, 1), (h, 1)].into_iter().collect());
+    }
+
+    fn table_addr(ip: &str) -> String {
+        format!("/ip4/{ip}/tcp/17110/p2p/{}", PeerId::random())
+    }
+
+    /// B1-T9 review: the production candidate selection is netgroup-diverse
+    /// — with a netgroup already used by an automatic outbound peer, the
+    /// candidate from another netgroup is always picked, from either table,
+    /// for both slot kinds.
+    #[test]
+    fn outbound_candidates_are_netgroup_diverse() {
+        let used = table_addr("45.77.1.1");
+        let same = table_addr("45.77.9.9");
+        let other = table_addr("80.78.1.1");
+        let counts: HashMap<String, usize> = [(netgroup(&used).unwrap(), 1)].into_iter().collect();
+        let mut rng = rand::rng();
+        for _ in 0..50 {
+            for kind in [ConnKind::OutboundFullRelay, ConnKind::BlockRelayOnly] {
+                // Both candidates in the tried table...
+                let tried = TriedTable::load(random_key(), [same.clone(), other.clone()]);
+                let new = AddrBook::with_key(random_key());
+                assert_eq!(select_outbound_candidate(&mut rng, &tried, &new, kind, &counts, |_| true), Some(other.clone()));
+                // ...or in the new table.
+                let tried = TriedTable::with_key(random_key());
+                let mut new = AddrBook::with_key(random_key());
+                assert!(new.add(&same) && new.add(&other));
+                assert_eq!(select_outbound_candidate(&mut rng, &tried, &new, kind, &counts, |_| true), Some(other.clone()));
+            }
+        }
+    }
+
+    /// B1-T9 review (small network): with NO candidate outside the used
+    /// netgroups, a full-relay slot falls back to a same-netgroup candidate
+    /// (up to FALLBACK_MAX_PER_NETGROUP per netgroup) instead of staying
+    /// empty — five nodes hosted in one /16 reconnect to each other after a
+    /// restart. Block-relay-only slots never relax the rule.
+    #[test]
+    fn full_relay_falls_back_to_a_used_netgroup_only_without_diverse_candidates() {
+        let peers: Vec<String> = (1..=4u8).map(|i| table_addr(&format!("80.78.{i}.1"))).collect();
+        let g = netgroup(&peers[0]).unwrap();
+        let tried = TriedTable::load(random_key(), peers.clone());
+        let new = AddrBook::with_key(random_key());
+        let mut rng = rand::rng();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut connected: Vec<String> = Vec::new();
+        for _ in 0..4 {
+            let not_connected = |a: &str| !connected.iter().any(|c| c == a);
+            let pick = select_outbound_candidate(&mut rng, &tried, &new, ConnKind::OutboundFullRelay, &counts, not_connected)
+                .expect("a full-relay slot takes a same-netgroup peer when nothing else exists");
+            assert_eq!(
+                select_outbound_candidate(&mut rng, &tried, &new, ConnKind::BlockRelayOnly, &counts, |a: &str| !connected.iter().any(|c| c == a))
+                    .is_some(),
+                counts.is_empty(),
+                "block-relay-only slots stay strictly diverse"
+            );
+            connected.push(pick);
+            *counts.entry(g.clone()).or_insert(0) += 1;
+        }
+        let mut all = connected.clone();
+        all.sort();
+        let mut want = peers.clone();
+        want.sort();
+        assert_eq!(all, want, "every node of the /16 is reached");
+        // The per-netgroup cap of the fallback.
+        let more = TriedTable::load(random_key(), [table_addr("80.78.200.1")]);
+        assert_eq!(
+            select_outbound_candidate(&mut rng, &more, &new, ConnKind::OutboundFullRelay, &counts, |_| true),
+            None,
+            "at most FALLBACK_MAX_PER_NETGROUP automatic outbound peers per netgroup"
+        );
+        // A diverse candidate always wins over the fallback.
+        let diverse = table_addr("45.1.1.1");
+        let mixed = TriedTable::load(random_key(), [table_addr("80.78.201.1"), diverse.clone()]);
+        let one: HashMap<String, usize> = [(g, 1)].into_iter().collect();
+        for _ in 0..20 {
+            assert_eq!(
+                select_outbound_candidate(&mut rng, &mixed, &new, ConnKind::OutboundFullRelay, &one, |_| true),
+                Some(diverse.clone())
+            );
+        }
+    }
+
+    /// NET-11 review: block-relay-only peers are not reported as relay peers
+    /// (nothing we publish crosses such a link), every other peer is.
+    #[test]
+    fn relay_peer_count_leaves_out_block_relay_only_peers() {
+        let now = Instant::now();
+        let mut m = ConnManager::new(random_key(), 8);
+        for (i, ip) in ["80.1.1.1", "80.2.1.1"].iter().enumerate() {
+            let c = ConnectionId::new_unchecked(i);
+            m.register_dial(c, DialIntent { kind: ConnKind::BlockRelayOnly, ..DialIntent::manual() });
+            m.on_established(c, PeerId::random(), true, &ip_addr(ip), now);
+        }
+        assert_eq!(m.peer_count(), 2);
+        assert_eq!(m.relay_peer_count(), 0, "a node holding only anchors has no relay peer");
+        m.on_established(ConnectionId::new_unchecked(10), PeerId::random(), false, &ip_addr("80.3.1.1"), now);
+        let c = ConnectionId::new_unchecked(11);
+        m.register_dial(c, DialIntent { kind: ConnKind::OutboundFullRelay, ..DialIntent::manual() });
+        m.on_established(c, PeerId::random(), true, &ip_addr("80.4.1.1"), now);
+        assert_eq!(m.relay_peer_count(), 2);
     }
 
     /// The netgroup protection order is keyed: two nodes protect different
