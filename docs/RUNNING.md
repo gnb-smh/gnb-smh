@@ -1,55 +1,64 @@
 # Running a GnB node
 
-## Hardening activation: upgrade before mainnet height 110,000
+## Hardening activation: upgrade before mainnet height 17,500
 
 > **Every mainnet node and miner must run this release before the chain
-> reaches height 110,000.** The deadline is the height: watch `getdaginfo`
-> `next_block_height`. On the ASERT schedule (genesis time + 110,000 × 30 s)
-> that is **2026-11-18 07:07 UTC**, but the chain runs ahead of the schedule
+> reaches height 17,500.** The deadline is the height: watch `getdaginfo`
+> `next_block_height`. On the ASERT schedule (genesis time + 17,500 × 30 s)
+> that is **2026-10-17 04:17 UTC**, but the chain runs ahead of the schedule
 > by about 240 blocks (2 h) per doubling of the network hashrate above about
 > 600 GnB-SMH v3 evaluations/s (8 h early at 16 times that), so do not wait
-> for the date.
+> for the date. Below that hashrate it arrives later, and blocks after it
+> are slower (release check below).
 
-- From height 110,000 the consensus rules of the 2026-10-14 audit apply on
+- From height 17,500 the consensus rules of the 2026-10-14 audit apply on
   mainnet (`docs/CONSENSUS.md`, "Activation"; testnet and regtest apply them
   from genesis). The height is `MAINNET_HARDENING_ACTIVATION_HEIGHT` in
   `crates/gnb-crypto/src/core/activation.rs`.
 - A node that has not upgraded by then keeps the old rules: it accepts
   blocks and transactions the upgraded nodes reject (and the reverse), so it
   splits from the upgraded network at the activation block and follows a
-  separate chain.
-- Check the upgrade on each node: `getnetworkinfo` reports `version` 0.1.1
-  and `hardening_activation_height` 110000, and `getdaginfo` the same height
-  and `hardening_active` for `next_block_height` (builds before 0.1.1 do not
-  report the height there; `getblocktemplate` does). Peers see the identify
-  agent `gnb/0.1.1/...`; the RPC does not list peers' agents (`getpeerinfo`
-  reports only counts), so network-wide adoption cannot be read from one
-  node.
+  separate chain. A build made before the 2026-10-16 decision activates at
+  110,000 (version 0.1.0) and splits the same way: upgrade it too. (Version
+  0.1.1 builds of the hardening branch activate at 25,800 and carry the
+  pre-relaunch genesis: they do not follow this chain at all.)
+- Check the upgrade on each node: `getnetworkinfo` reports `version` 0.1.2
+  and `hardening_activation_height` 17500, and `getdaginfo` the same height
+  and `hardening_active` for `next_block_height`. A node reporting another
+  version or height, or no `hardening_activation_height` there, is a build
+  from before the move (`getblocktemplate` shows 110000 on the 0.1.0 build
+  of the audit merge, and nothing on the pre-hardening release) and must be
+  replaced. Peers see the identify agent `gnb/0.1.2/...`; the RPC does not
+  list peers' agents (`getpeerinfo` reports only counts), so network-wide
+  adoption cannot be read from one node.
 - Miners: a template for the activation block and after must come from an
   upgraded node. `getblocktemplate` reports `hardening_activation_height`
-  (110000 on mainnet) and `hardening_active` for the template's height.
+  (17500 on mainnet) and `hardening_active` for the template's height.
 - Wallets sign version-3 transactions from the activation height on; a
   wallet built before this release (including a web-wallet core compiled
   with another height) signs version 1 there, which every upgraded node
-  refuses. The committed web-wallet core (`site/wallet/gnb_wallet.wasm`)
-  compiles the height in; the site must be deployed from this release before
-  the activation.
+  refuses. The committed web-wallet core (`site/wallet/gnb_wallet.wasm`) is
+  built with 17,500; the site must be deployed from this release before the
+  activation.
 - Transactions signed before the activation (version 1) that are still
-  unconfirmed when `next_block_height` reaches 110,000 are dropped from every
+  unconfirmed when `next_block_height` reaches 17,500 are dropped from every
   upgraded node's mempool and refused from then on (no transaction is valid
   under both regimes: `docs/CONSENSUS.md`, "Transaction signatures" and
   "Which height"). Services holding pending or pre-signed payments must
   sign them again, as version 3, after the activation.
 - Release check (before tagging, by whoever ships it): read the mainnet tip
   (`getdaginfo` `tip_height`, `next_block_height`) and the current `bits`
-  (`getblocktemplate`) from a mainnet node. The tip must be well below
-  110,000, and (110,000 - `next_block_height`) × the observed block interval
-  is the real time left. If the template's `bits` are easier than
-  `0x1f03a40d`, the genesis target shifted for GnB-SMH v3 (network hashrate
-  below about 600 v3 evaluations/s), blocks after the activation slow to
-  about 30 s × (that target's work / current work) until the hashrate rises
-  (POW-3, `docs/CONSENSUS.md`, "Activation"): record the expected interval
-  here, or reconsider the timing.
+  (`getblocktemplate`) from a mainnet node. The height 17,500 was derived
+  from the schedule, not from an observed tip (`docs/CONSENSUS.md`,
+  "Activation"; the tips recorded on 2026-10-12 and 2026-10-14 lagged the
+  schedule by 909 and 574 blocks). The tip must be well below 17,500, and
+  (17,500 - `next_block_height`) × the observed block interval is the real
+  time left. If the template's `bits` are easier than `0x1f03a40d`, the
+  genesis target shifted for GnB-SMH v3 (network hashrate below about 600
+  v3 evaluations/s), blocks after the activation slow to about 30 s × (that
+  target's work / current work) until the hashrate rises (POW-3,
+  `docs/CONSENSUS.md`, "Activation"): record the expected interval here, or
+  reconsider the timing.
 - If the release ships later than planned, or the chain is too close to the
   height, the height must be moved again before the chain reaches it: the
   constant `MAINNET_HARDENING_ACTIVATION_HEIGHT`, its copies in
