@@ -216,24 +216,30 @@ class GnbTestFramework:
 
     # ── Synchronisation helpers ──────────────────────────────────────────
 
-    def wait_for_peers(self, nodes=None, pairs=None, timeout: float = 60) -> None:
+    def wait_for_peers(self, nodes=None, pairs=None, timeout: float = 60,
+                       *, deadline: float | None = None) -> None:
         """Wait until every pair (default: all pairs of `nodes`) is connected
         both ways, from the nodes' logs (which name the peer; the RPC peer
         count, updated on every connect and disconnect, only counts them),
         then give gossipsub two of its 1 s heartbeats to exchange
-        subscriptions and graft the mesh."""
+        subscriptions and graft the mesh. All directions and settling share
+        one deadline, capped by an explicit caller deadline when supplied."""
+        relative_deadline = time.monotonic() + timeout * util.TIMEOUT_FACTOR
+        deadline = relative_deadline if deadline is None else min(deadline, relative_deadline)
         nodes = nodes or self.nodes
         if pairs is None:
             pairs = [(a, b) for i, a in enumerate(nodes) for b in nodes[i + 1:]]
         for a, b in pairs:
             for x, y in ((a, b), (b, a)):
                 pid = y.peer_id()
-                wait_until(lambda x=x, pid=pid: x.sees_peer(pid), timeout=timeout,
+                wait_until(lambda x=x, pid=pid: x.sees_peer(pid), timeout=timeout, deadline=deadline,
                            desc=f"node{x.index} connected to node{y.index} ({pid[:16]}...)")
         if pairs:
-            time.sleep(2)
+            settled = time.monotonic() + 2
+            wait_until(lambda: time.monotonic() >= settled, deadline=deadline,
+                       desc="peer subscriptions and mesh settle")
 
-    def sync_blocks(self, nodes=None, timeout: float = 90) -> None:
+    def sync_blocks(self, nodes=None, timeout: float = 90, *, deadline: float | None = None) -> None:
         """Wait until every node has the same selected tip and the same valid
         tips (template parents). Disqualified blocks a node keeps in its DAG
         (DAG-1) are not compared: only the node that saw one has it."""
@@ -242,7 +248,7 @@ class GnbTestFramework:
         def same():
             views = [(n.tip(), tuple(n.valid_tips())) for n in nodes]
             return all(v == views[0] for v in views)
-        wait_until(same, timeout=timeout, desc="nodes agree on tip and valid tips")
+        wait_until(same, timeout=timeout, deadline=deadline, desc="nodes agree on tip and valid tips")
 
     def sync_mempools(self, nodes=None, timeout: float = 60) -> None:
         nodes = nodes or self.nodes

@@ -173,6 +173,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Functional harness unit tests (no node build required)
+        run: python3 -m unittest discover -s test/functional/unit -v
       - uses: actions/cache@v4
         with:
           path: |
@@ -184,7 +186,7 @@ jobs:
         run: cargo build -p gnb --features test-pow-limit --bin gnb --bin gnb-cli --locked
       - name: Functional tests
         run: >
-          python3 test/functional/test_runner.py --no-build --jobs 2 --timeout 300
+          python3 test/functional/test_runner.py --ci --no-build --jobs 2 --timeout 300
           --tmpdir "$RUNNER_TEMP/functional" --cachedir "$RUNNER_TEMP/functional-cache" --keep-failed
       - name: Node logs of failed tests
         if: failure()

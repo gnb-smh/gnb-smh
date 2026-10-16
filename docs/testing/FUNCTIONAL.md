@@ -20,20 +20,35 @@ python3 test/functional/test_runner.py rpc_auth.py mempool_tx_relay.py
 python3 test/functional/test_runner.py --jobs 4 --timeout 300
 python3 test/functional/test_runner.py --bindir /path/to/test-build
 
+# Local exploratory run: explicitly accept skips, always counted separately
+python3 test/functional/test_runner.py --allow-skips
+
 # One test on its own (same options; --nocleanup keeps its temp dir and logs)
 python3 test/functional/feature_partition_heal.py --nocleanup
 ```
 
 `test_runner.py` options: `--jobs` (parallel tests, default half the CPUs, at
 most 4), `--timeout` (seconds per test, default 240), `--timeout-factor`
-(scales every wait inside the tests), `--bindir` / `--no-build`,
+(scales relative waits once, including the partition's shared heal budget), `--bindir` / `--no-build`,
 `--cachedir`, `--tmpdir`, `--keep-failed` (keep the temp dir of a failed
-test), `--list`. Each test accepts `--bindir`, `--no-build`, `--cachedir`,
+test), `--list`, `--ci` (explicit strict mode, also the default),
+`--allow-skips` (local mode, incompatible with `--ci`). Each test accepts `--bindir`, `--no-build`, `--cachedir`,
 `--tmpdir`, `--nocleanup`, `--keep-failed`, `--portseed`,
 `--timeout-factor` and `--loglevel`.
 
-Exit codes follow Bitcoin Core: 0 passed, 1 failed, 77 skipped. The runner
-exits 0 only when every test passed or was skipped.
+Individual scenario exit codes follow Bitcoin Core: 0 passed, 1 failed,
+77 skipped. The runner reports passed, skipped and failed counts separately.
+By default and in `--ci` mode, it exits 0 only when every selected scenario
+executed and passed; even one skip makes the run incomplete. Only an explicit
+local `--allow-skips` run accepts skips, without counting them as passes.
+
+The harness has deterministic unit tests that need neither node binaries nor
+network sockets. They exercise the real runner and partition/wait logic with
+simulated process results, nodes and a monotonic clock:
+
+```sh
+python3 -m unittest discover -s test/functional/unit -v
+```
 
 ## The test-only build
 
@@ -171,16 +186,26 @@ tests running in parallel share it. Only `db/` is copied into a node (its
 
 ### Synchronisation helpers
 
-- `wait_until(predicate, timeout=...)`: polls; every timeout scales with
-  `--timeout-factor`.
+- `wait_until(predicate, timeout=..., deadline=...)`: polls; relative timeouts
+  scale once with `--timeout-factor`. An optional absolute monotonic deadline
+  caps the relative timeout and is never scaled. The predicate must finish
+  successfully before that deadline. A synchronous RPC already in progress
+  cannot be interrupted by this helper: it may return late, but its late
+  result is rejected. The runner's process timeout remains the outer bound.
 - `wait_for_peers(pairs=...)`: both ends log `✓ connected: <peer id>`, then
-  two gossipsub heartbeats. (The RPC peer count, distinct peers, is updated
+  two gossipsub heartbeats. All peer directions and settling share one
+  deadline; `deadline=...` can also cap it. (The RPC peer count, distinct peers, is updated
   on every connect and disconnect; the log line is still the earliest
   signal.)
 - `sync_blocks()`: same selected tip and same valid tips
   (`getblocktemplate` parents) on every node. `getdaginfo.tips` also lists
   disqualified blocks a node keeps in its DAG (DAG-1), which only the node
-  that saw them has.
+  that saw them has. The partition scenario gives peer waits, settling and
+  `sync_blocks` the same deadline, 30 seconds after node2's restart returns
+  at the default factor. An explicit `--timeout-factor` scales this budget
+  once when the deadline is created; inner waits cannot rescale or renew it.
+  It cannot pass with an observation at or after that deadline. CI keeps
+  the default factor of one.
 - `sync_mempools()`, `assert_same_chain_state(addresses)`: same tip, valid
   tips, height, blue work, and the exact UTXO list (txid, index, value) of
   every given address. The RPC has no UTXO-set digest; per-address
@@ -215,7 +240,7 @@ types the password at the prompt, exactly as a user would:
 
 The whole suite takes about 75 s with two jobs (plus about 100 s once to
 build the cached chain); no test takes more than about 25 s. CI (`.github/workflows/ci.yml`, job `functional`) builds the test
-binaries and runs `test_runner.py --jobs 2 --timeout 300`, uploading the logs
+binaries, runs the harness unit tests and runs `test_runner.py --ci --jobs 2 --timeout 300`, uploading the logs
 of failed tests.
 
 ## Behaviour the tests rely on (and document)

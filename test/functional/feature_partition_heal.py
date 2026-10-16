@@ -25,6 +25,7 @@
 
 import time
 
+from test_framework import util
 from test_framework.authproxy import JSONRPCException
 from test_framework.messages import hash_to_address
 from test_framework.test_framework import GnbTestFramework
@@ -77,11 +78,16 @@ class PartitionHealTest(GnbTestFramework):
         assert_not_equal(n0.tip(), n2.tip())
         assert_true(not n0.has_block(b_blocks[0]) and not n2.has_block(a_blocks[0]), "sides are disjoint")
 
-        self.log.info("heal: node2 dials both; all nodes converge within %d s", HEAL_TIMEOUT)
+        heal_timeout = HEAL_TIMEOUT * util.TIMEOUT_FACTOR
+        self.log.info("heal: node2 dials both; all nodes converge within %.1f s", heal_timeout)
         n2.restart(peers=[n0.p2p_addr, n1.p2p_addr])
         healed = time.monotonic()
-        self.wait_for_peers(pairs=[(n2, n0), (n2, n1)])
-        self.sync_blocks(timeout=max(1, HEAL_TIMEOUT - (time.monotonic() - healed)))
+        # R1-FUNC-2: one absolute acceptance deadline includes every peer
+        # wait, mesh settling and the final synchronization observation.
+        # Scale the 30-second budget once, never again in the inner waits.
+        deadline = healed + heal_timeout
+        self.wait_for_peers(pairs=[(n2, n0), (n2, n1)], deadline=deadline)
+        self.sync_blocks(deadline=deadline)
         self.log.info("converged %.1f s after the restart", time.monotonic() - healed)
         for n in self.nodes:
             assert_equal(n.tip(), b_blocks[-1], f"node{n.index}: the branch with more blue work is selected")
