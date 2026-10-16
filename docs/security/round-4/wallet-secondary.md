@@ -59,12 +59,12 @@ The round coordinator must repin JS integrity metadata and run the integrated
 site suite. Three independent review lenses remain required; no CI or release
 approval is implied by the local checks.
 
-## Final production-only reversal evidence
+## Initial production-only reversal evidence
 
-Run `python3 docs/security/round-4/replay-wallet-secondary.py /path/to/node`
-in a dedicated worktree. The script restores production in `finally`, checks
-the unchanged final test SHA-256, and records the exact failed test names and
-log hashes in `wallet-secondary-reversals.json`.
+The initial replay used the committed `8be30ee` test suite. Its records are
+preserved in `wallet-secondary-reversals.json`, with original local log files
+unchanged. The script restores production in `finally` and checks the unchanged
+test SHA-256 through every run.
 
 | Production fragment restored to baseline | Passed | Failed | Exit |
 | --- | ---: | ---: | ---: |
@@ -87,3 +87,38 @@ support the three bounded fixes; they are not a full mutation-testing claim.
 
 Local implementation status: corrected with final focused tests **16/16**;
 independent re-review and round integration are pending. No PR/push/merge.
+
+## Review follow-up: attempted calls and immutable evidence
+
+Lens 3 identified that the initial `planned`/`paid` arrays recorded successful
+returns only. The test adapter now counts attempts **before** calling the actual
+WASM. Invalid/missing height and immature/malformed coinbase rows must produce
+zero plan/pay attempts. Positive controls check one of each. Wrong-network and
+invalid supplied-transaction cases reach the core and are refused there; they
+do not claim zero calls or instrument the internal signing code.
+
+The replay now requires an explicit new directory:
+
+```
+python3 docs/security/round-4/replay-wallet-secondary.py /path/to/node --output /new/evidence/directory
+```
+
+Any existing output directory is refused before touching production. Logs and
+`manifest.json` are written only there; no repository evidence is overwritten
+automatically. The coordinator can intentionally retain a manifest after
+checking its results. This follow-up changes tests/tooling only, with no
+production, pin or WASM change.
+
+Replay of the strengthened tests at `7e01bf5` repeated all three reversals:
+payment **7/9**, create **13/3**, open **11/5** (passed/failed, each exit 1).
+The restored production passed **16/16**, exit 0. Tests stayed unchanged at
+SHA-256 `9f14e304ff234b684eaa156f048307f601760b8796784d44a1ffd98ba90ed889`.
+The manifest was intentionally copied to
+`wallet-secondary-attempt-reversals.json`; its source is
+`/private/tmp/gnb-r4-wallet-secondary-attempt-replay-20261016/manifest.json`.
+The restored log SHA-256 is
+`22ff6bed47f3d306405ecf4b35046a5e0ca48397c4be7d38d06108740127863a`.
+All four original reversal logs were rechecked against their original hashes
+and remain intact. Missing `--output` (exit 2) and an existing output directory
+(exit 1) were also checked: production/test hashes remained unchanged, with
+records in the new output directory's `cli-preflight-checks.json`.
