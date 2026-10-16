@@ -2,6 +2,8 @@
 
 Only local synthetic public address data is used. No builds or network calls.
 Each corpus case is decoded, and each positive case is separately encoded.
+Bounded JSON-envelope cases also compare null/absent semantics, unknown-field
+rejection, missing fields and invalid field types.
 """
 from __future__ import annotations
 
@@ -13,6 +15,38 @@ import subprocess
 
 import address_v2 as a
 import address_v2_vectors as v
+
+
+def envelope_requests():
+    address = "gnb1zqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdaq6uw"
+    decode = {"op": "decode", "address": address}
+    encode = {"op": "encode", "network": "mainnet", "kind": "single-key", "hash_hex": "00" * 20}
+    cases = [
+        ("control-decode", decode, True),
+        ("control-encode", encode, True),
+        ("decode-null-expected-network", {**decode, "expected_network": None}, True),
+        ("decode-unknown-field", {**decode, "unknown": 1}, False),
+        ("encode-unknown-field", {**encode, "unknown": 1}, False),
+    ]
+    for index, value in enumerate([None, [], "decode", {}, {"op": None}, {"op": "other"}]):
+        cases.append((f"invalid-object-or-op-{index}", value, False))
+    for field in ("op", "address"):
+        cases.append((f"decode-missing-{field}", {key: value for key, value in decode.items() if key != field}, False))
+    for field in encode:
+        cases.append((f"encode-missing-{field}", {key: value for key, value in encode.items() if key != field}, False))
+    for index, value in enumerate([None, False, 7, [], {}]):
+        cases.append((f"decode-address-type-{index}", {**decode, "address": value}, False))
+        for field in ("network", "kind", "hash_hex"):
+            cases.append((f"encode-{field}-type-{index}", {**encode, field: value}, False))
+    for index, value in enumerate([False, 7, [], {}, "unknown"]):
+        cases.append((f"decode-expected-network-type-{index}", {**decode, "expected_network": value}, False))
+    result = []
+    for name, request, accepted in cases:
+        expected = a.oracle(request)
+        if expected["ok"] != accepted:
+            raise AssertionError("Python disagrees with envelope contract: " + name)
+        result.append(("envelope/" + name, request, expected))
+    return result
 
 
 def requests():
@@ -35,7 +69,7 @@ def requests():
             if encoded != expected:
                 raise AssertionError("Python encoder disagrees with corpus: " + case["name"])
             result.append((case["name"] + "/encode", request, encoded))
-    return result
+    return result + envelope_requests()
 
 
 def main():
@@ -55,6 +89,7 @@ def main():
             raise SystemExit(f"Divergence in {name}: Python={expected!r}; Rust={actual!r}")
     print(json.dumps({
         "requests": len(rows), "divergences": 0,
+        "envelope_requests": len(envelope_requests()),
         "corpus_sha256": hashlib.sha256(v.VECTOR_FILE.read_bytes()).hexdigest(),
         "rust_binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "python_oracle_sha256": hashlib.sha256(Path(a.__file__).read_bytes()).hexdigest(),

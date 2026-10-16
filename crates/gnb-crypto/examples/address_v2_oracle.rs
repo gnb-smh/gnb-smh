@@ -31,10 +31,16 @@ fn response(net: Network, script: &[u8]) -> Option<Value> {
 }
 
 fn run(request: &Value) -> Option<Value> {
+    let fields = request.as_object()?;
     match request.get("op")?.as_str()? {
         "decode" => {
+            if fields.keys().any(|key| !["op", "address", "expected_network"].contains(&key.as_str())) {
+                return None;
+            }
             let (net, script) = destination_script(request.get("address")?.as_str()?).ok()?;
-            if let Some(expected) = request.get("expected_network") {
+            // Match the Python envelope contract: null and absence both mean
+            // no expected-network constraint; other values must name a network.
+            if let Some(expected) = request.get("expected_network").filter(|value| !value.is_null()) {
                 if network(expected)? != net {
                     return None;
                 }
@@ -42,6 +48,9 @@ fn run(request: &Value) -> Option<Value> {
             response(net, &script)
         }
         "encode" => {
+            if fields.keys().any(|key| !["op", "network", "kind", "hash_hex"].contains(&key.as_str())) {
+                return None;
+            }
             let net = network(request.get("network")?)?;
             let encoded = request.get("hash_hex")?.as_str()?;
             if encoded
@@ -72,4 +81,78 @@ fn main() -> io::Result<()> {
         println!("{}", value.unwrap_or_else(|| json!({"ok": false})));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const ADDRESS: &str = "gnb1zqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdaq6uw";
+
+    fn decode_request() -> Value {
+        json!({"op": "decode", "address": ADDRESS})
+    }
+
+    fn encode_request() -> Value {
+        json!({"op": "encode", "network": "mainnet", "kind": "single-key", "hash_hex": "00".repeat(20)})
+    }
+
+    #[test]
+    fn oracle_valid_decode_and_encode_remain_equivalent() {
+        let decoded = run(&decode_request()).expect("valid address control");
+        assert_eq!(decoded["address"], ADDRESS);
+        assert_eq!(run(&encode_request()), Some(decoded));
+    }
+
+    #[test]
+    fn oracle_null_expected_network_means_absent() {
+        let mut request = decode_request();
+        request["expected_network"] = Value::Null;
+        assert_eq!(run(&request), run(&decode_request()));
+    }
+
+    #[test]
+    fn oracle_unknown_decode_field_is_rejected() {
+        let mut request = decode_request();
+        request["unknown"] = json!(1);
+        assert!(run(&request).is_none());
+    }
+
+    #[test]
+    fn oracle_unknown_encode_field_is_rejected() {
+        let mut request = encode_request();
+        request["unknown"] = json!(1);
+        assert!(run(&request).is_none());
+    }
+
+    #[test]
+    fn oracle_missing_fields_and_invalid_types_are_rejected() {
+        for request in [Value::Null, json!([]), json!("decode"), json!({}), json!({"op": null})] {
+            assert!(run(&request).is_none());
+        }
+        for field in ["op", "address"] {
+            let mut request = decode_request();
+            request.as_object_mut().unwrap().remove(field);
+            assert!(run(&request).is_none());
+        }
+        for field in ["op", "network", "kind", "hash_hex"] {
+            let mut request = encode_request();
+            request.as_object_mut().unwrap().remove(field);
+            assert!(run(&request).is_none());
+        }
+        for invalid in [Value::Null, json!(false), json!(7), json!([]), json!({})] {
+            let mut request = decode_request();
+            request["address"] = invalid.clone();
+            assert!(run(&request).is_none());
+            for field in ["network", "kind", "hash_hex"] {
+                let mut request = encode_request();
+                request[field] = invalid.clone();
+                assert!(run(&request).is_none());
+            }
+            if !invalid.is_null() {
+                let mut request = decode_request();
+                request["expected_network"] = invalid;
+                assert!(run(&request).is_none());
+            }
+        }
+    }
 }

@@ -146,7 +146,8 @@ python3 reference/address_v2_vectors.py --check
 ```
 
 For a built Rust `address_v2_oracle` binary, compare all corpus decodes and
-all 128 positive encodes (630 requests):
+all 128 positive encodes (630 requests), plus 42 bounded JSON-envelope cases
+(672 requests total):
 
 ```sh
 python3 reference/address_v2_differential.py /path/to/address_v2_oracle
@@ -154,16 +155,23 @@ python3 reference/address_v2_differential.py /path/to/address_v2_oracle
 
 The differential driver requires exact verdicts and exact decoded fields,
 reports the binary/reference/corpus hashes, and exits with failure on any
-disagreement. A reported zero means zero differences in this corpus only.
+disagreement. A reported zero means zero differences in this finite corpus
+and envelope set only.
 
 The reference also exposes a JSON-lines oracle on standard input. Requests
 are either `{"op":"decode","address":"...","expected_network":"mainnet"}`
-(the expected network may be omitted) or
+(the expected network may be omitted or `null`, both meaning unconstrained) or
 `{"op":"encode","network":"mainnet","kind":"single-key","hash_hex":"..."}`.
 Hash input uses lowercase even-length hexadecimal. The kind is `single-key`
 or `policy`; the network is `mainnet` or `testnet`. Success returns `ok: true`
 and `address`, `network`, `kind`, `hash_hex`, `script_hex`; rejection returns
 only `{"ok":false}`. Error wording is not part of the contract.
+Requests must be objects. The decode operation permits exactly `op`, `address`
+and optional `expected_network`; the encode operation requires exactly `op`,
+`network`, `kind` and `hash_hex`. Unknown fields, missing required fields and
+incorrect field types are rejected. Apart from optional `expected_network`,
+the fields above must be strings; `null` is not a substitute for a required
+string. These rules describe the local test adapters, not a node RPC method.
 
 ## Compatibility and scope
 
