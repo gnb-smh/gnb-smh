@@ -201,7 +201,10 @@ pub fn handle(req: &Value) -> Result<Value, String> {
             Ok(out)
         }
         "create" => {
-            let with_phrase = req.get("mnemonic").and_then(Value::as_bool).unwrap_or(true);
+            // `testnet: true` makes a random testnet key (no phrase: the
+            // phrase derivation is mainnet).
+            let testnet = req.get("testnet").and_then(Value::as_bool).unwrap_or(false);
+            let with_phrase = !testnet && req.get("mnemonic").and_then(Value::as_bool).unwrap_or(true);
             if with_phrase {
                 let (kp, phrase) = generate_mnemonic_keypair(Network::Mainnet).map_err(|e| e.to_string())?;
                 let words = Zeroizing::new(phrase.words().join(" "));
@@ -212,7 +215,7 @@ pub fn handle(req: &Value) -> Result<Value, String> {
                 set_session(kp);
                 Ok(out)
             } else {
-                let kp = generate_keypair(false);
+                let kp = generate_keypair(testnet);
                 let out = json!({ "address": kp.address, "public_key": hex::encode(&kp.public_key) });
                 set_session(kp);
                 Ok(out)
@@ -226,6 +229,28 @@ pub fn handle(req: &Value) -> Result<Value, String> {
             Ok(out)
         }
         "address" => with_session(|kp| Ok(json!({ "address": kp.address }))),
+        // Use the unlocked key on mainnet or testnet: the address prefix
+        // picks the chain id every signature commits to.
+        "setnetwork" => {
+            let testnet = req.get("testnet").and_then(Value::as_bool).ok_or("missing bool `testnet`")?;
+            let mut s = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+            let kp = s.as_mut().ok_or("wallet is locked")?;
+            kp.address = gnb_crypto::crypto::address_from_pubkey(&kp.public_key, testnet);
+            Ok(json!({ "address": kp.address }))
+        }
+        // Lock GNB in the Bloch bridge vault for an L2 (0x…) address: vault
+        // in output 0, the 20-byte destination marker in output 1, change
+        // last. Version and sighash follow `next_height` as for `pay`.
+        "bridgelock" => {
+            let next_height = parse_height(req)?;
+            let utxos = parse_spendable_utxos(req.get("utxos").ok_or("missing `utxos`")?, next_height)?;
+            let amount = parse_amount(req, "amount")?;
+            let fee = parse_amount(req, "fee")?;
+            let vault = hex::decode(s(req, "vault_script")?).map_err(|_| "vault_script must be hex")?;
+            let l2: [u8; 20] = hex::decode(s(req, "l2")?.trim().trim_start_matches("0x")).ok()
+                .and_then(|v| v.try_into().ok()).ok_or("L2 address must be 0x + 40 hex digits")?;
+            with_session(|kp| bridge_lock(kp, &utxos, &vault, amount, l2, fee, next_height))
+        }
         "export" => {
             let pw = secret(req, "password")?;
             with_session(|kp| kp.to_encrypted_json(&pw).map(|j| json!({ "keystore": j })))
@@ -294,6 +319,41 @@ pub fn handle(req: &Value) -> Result<Value, String> {
         }
         other => Err(format!("unknown op `{other}`")),
     }
+}
+
+fn bridge_lock(kp: &Keypair, utxos: &[Utxo], vault: &[u8], amount: u64, l2: [u8; 20],
+               mut fee: u64, next_height: u64) -> Result<Value, String> {
+    if gnb_crypto::core::policy::output_kind(vault) != Some(gnb_crypto::core::policy::OutputKind::Policy) {
+        return Err("the vault must be a policy address".into());
+    }
+    let rows: Vec<(Vec<u8>, u32, TxOutput)> = utxos.iter()
+        .map(|u| (u.txid.to_vec(), u.index, u.output.clone()))
+        .collect();
+    let outputs = gnb_crypto::bridge::lock_outputs(vault, amount, l2);
+    // Falcon signatures vary in length: the fee only ever rises, to the
+    // largest minimum seen, so this settles within a few builds.
+    let mut tx = None;
+    for _ in 0..16 {
+        let built = TxBuilder::build_outputs(kp, &rows, outputs.clone(), fee, next_height)?;
+        let min = tokenomics::min_tx_fee_sat(built.to_wire_bytes(true).len());
+        if fee >= min {
+            tx = Some(built);
+            break;
+        }
+        fee = fee.max(min);
+    }
+    let tx = tx.ok_or("could not settle the fee")?;
+    // Never hand back something the signers would not recognise as a lock.
+    let lock = gnb_crypto::bridge::parse_lock(&tx.outputs, vault, 0)?;
+    let raw = tx.to_wire_bytes(true);
+    if raw.len() > gnb_crypto::wallet::payment::MAX_STANDARD_TX_BYTES {
+        return Err("this lock needs too many inputs; lock a smaller amount".into());
+    }
+    Ok(json!({
+        "raw": hex::encode(&raw), "txid": hex::encode(tx.txid()), "size": raw.len(), "fee": fee.to_string(),
+        "inputs": tx.inputs.len(), "amount": lock.amount.to_string(), "version": tx.version,
+        "l2_recipient": format!("0x{}", hex::encode(lock.l2_recipient)), "lock_vout": 0,
+    }))
 }
 
 /// The key of an `open` request (CRY-7): the page states the network it
@@ -744,4 +804,28 @@ mod tests {
         assert_eq!(req["words"], "");
         assert!(handle_owned(json!({"op": "minfee", "size": 10, "password": "x"})).is_ok());
     }
+
+    #[test]
+    fn bridgelock_signs_the_version_of_the_target_height() {
+        let _session = SESSION_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let created = handle(&json!({"op": "create", "mnemonic": false})).unwrap();
+        let addr = created["address"].as_str().unwrap().to_string();
+        let spk = Address::parse(&addr).unwrap().hash().to_vec();
+        let keys = vec![gnb_crypto::crypto::generate_keypair().0];
+        let vault = gnb_crypto::core::policy::SpendPolicy::new(1, keys, 0, 0).unwrap().script_pubkey();
+        let act = gnb_crypto::core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
+        for (next, version) in [(act - 1, 1u32), (act, 3)] {
+            let utxos = json!([{"txid": "44".repeat(32), "index": 0, "value": "500000000", "script_pubkey": hex::encode(&spk)}]);
+            let r = handle(&json!({"op": "bridgelock", "utxos": utxos, "vault_script": hex::encode(&vault),
+                "amount": "100000000", "l2": format!("0x{}", "ab".repeat(20)), "fee": "0", "next_height": next})).unwrap();
+            assert_eq!(r["version"], version, "next_height {next}");
+            let tx = gnb_crypto::core::Transaction::from_wire_bytes(&hex::decode(r["raw"].as_str().unwrap()).unwrap()).unwrap();
+            assert_eq!(tx.outputs[0].script_pubkey, vault);
+            assert_eq!(r["l2_recipient"], format!("0x{}", "ab".repeat(20)));
+        }
+        assert!(handle(&json!({"op": "bridgelock", "utxos": [], "vault_script": hex::encode(&vault),
+            "amount": "1", "l2": "0x00", "fee": "0"})).unwrap_err().contains("next_height"));
+        handle(&json!({"op": "wipe"})).unwrap();
+    }
+
 }
