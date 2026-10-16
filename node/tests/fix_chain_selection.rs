@@ -71,6 +71,7 @@ impl Builder {
             blue_score: height,
             height,
             shielded_transactions: Vec::new(),
+            powit: Default::default(),
         };
         // The coinbase commitment and Merkle root of the block's height
         // (hardening block rules at/after the activation, package P1).
@@ -1682,6 +1683,7 @@ fn junk_orphan(j: u64, height: u64) -> Block {
         blue_score: height,
         height,
         shielded_transactions: Vec::new(),
+        powit: Default::default(),
     };
     blk.header.merkle_root = blk.body_merkle_root();
     blk.test_only_assume_pow_valid();

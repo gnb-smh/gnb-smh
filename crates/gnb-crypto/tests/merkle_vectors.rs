@@ -120,6 +120,7 @@ fn block_commitments_match() {
             blue_score: height,
             height,
             shielded_transactions: vec![],
+            powit: Default::default(),
         };
         assert_eq!(hex::encode(block_rules::expected_coinbase_commitment(&block)), v["coinbase_commitment"].as_str().unwrap());
         assert_eq!(block.body_merkle_root_at(0).0, h32(&v["tagged_header_root"]));

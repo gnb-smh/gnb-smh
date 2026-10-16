@@ -170,6 +170,7 @@ fn dag2_template_parents_are_capped_at_max_parents() {
             },
             transactions: vec![coinbase(&format!("tip-{i}"), 0, vec![0x01; 20])],
             blue_score: 1, height: 1, shielded_transactions: vec![],
+            powit: Default::default(),
         };
         let h = b.block_hash();
         // Varying work so the blue-work order is non-trivial.
@@ -178,7 +179,9 @@ fn dag2_template_parents_are_capped_at_max_parents() {
     }
     assert_eq!(n.dag.read().tips().len(), 300);
     let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
-    assert_eq!(tmpl.parents.len(), core::MAX_PARENTS);
+    // At most MAX_PARENTS, and within this chain's mergeset limit (64
+    // merged tips besides the selected parent).
+    assert_eq!(tmpl.parents.len(), core::MAX_PARENTS.min(gnb::consensus::MERGESET_SIZE_LIMIT + 1));
     assert_eq!(tmpl.parents[0], n.dag.read().selected_tip().unwrap(), "selected parent first");
     let works: Vec<u128> = tmpl.parents.iter()
         .map(|p| n.dag.read().get_block_data(p).unwrap().blue_work).collect();
@@ -409,7 +412,7 @@ fn mem7_reinjection_runs_maturity_and_fee_checks() {
 
 // ── VAL-11 / VAL-12 ──────────────────────────────────────────────────────────
 
-/// VAL-12: an in-process block with a 12.6 kB script_sig passes
+/// VAL-12: an in-process block with a script_sig over the parser cap passes
 /// `validate_structure` but is refused by the acceptance path's canonical
 /// limits and is NOT stored (pre-fix it was accepted, persisted, and then
 /// could not be read back from disk).
@@ -421,7 +424,8 @@ fn val12_oversized_script_block_is_refused_and_not_stored() {
     let fund = ([0x4Fu8; 32], 0u32, out(1_000_000, &k.spk));
     let n = node_with(&genesis, &[fund.clone()]);
     let mut t = signed_spend(&k, &[(fund.0, 0)], vec![out(900_000, &[0x11; 20])]);
-    t.inputs[0].script_sig.extend_from_slice(&[0u8; 4096]);
+    // Past this chain's script_sig cap (the largest policy witness).
+    t.inputs[0].script_sig.extend_from_slice(&vec![0u8; core::limits::MAX_SCRIPT_SIG_SIZE]);
     let sub = core::tokenomics::block_subsidy_sat(1);
     let x = mk_block(&n, vec![gh], vec![coinbase("x12", sub + 100_000, vec![0xAA; 20]), t]);
     let err = accept(&n, &x).expect_err("canonical limits");

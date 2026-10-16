@@ -39,7 +39,9 @@ use pex_validator::{
     PEX_BATCH_LIMIT, KNOWN_PEERS_CAP,
 };
 
-use crate::transport::upgrade::KyberConfig;
+use std::sync::Arc;
+use crate::transport::identity::{PeerPins, PqIdentity};
+use crate::transport::upgrade::PqConfig;
 
 pub const TOPIC_BLOCKS: &str = "gnb/blocks/1";
 pub const TOPIC_TXS:    &str = "gnb/txs/1";
@@ -251,7 +253,10 @@ pub fn gossip_disposition(msg: &NetworkMessage, validator_attached: bool, claim_
         // MEM-5 / NET-2 / NET-4 (audit): transactions are judged by the
         // processor (shared admission, signatures last, per-connection budget —
         // `mempool::relay`) BEFORE gossipsub relays them, exactly like blocks.
-        NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. } => {
+        // PoWit items (shares, attestations, equivocation proofs) are relayed
+        // like transactions: only once the processor admitted them.
+        NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. }
+        | NetworkMessage::NewPowitItem { .. } => {
             if validator_attached { DeliverDeferred } else { Deliver(GossipVerdict::Accept) }
         }
         // Tip claims: consumed locally (author-attributed), never relayed —
@@ -374,6 +379,10 @@ pub enum NetworkMessage {
         timestamp:  u64,
     },
     VersionAck,
+    /// PoWit item (witness share, attestation or equivocation proof), relayed
+    /// like a transaction: only after the node validated it. Appended last so
+    /// older peers decode it as malformed (ignored), never as another variant.
+    NewPowitItem { id: [u8; 32], kind: u8, data: Vec<u8> },
 }
 
 
@@ -396,6 +405,7 @@ impl NetworkMessage {
         match self {
             NetworkMessage::NewBlock { .. } => "NewBlock",
             NetworkMessage::NewTransaction { .. } => "NewTransaction",
+            NetworkMessage::NewPowitItem { .. } => "NewPowitItem",
             NetworkMessage::PeerTip { .. } => "PeerTip",
             NetworkMessage::PeerExchange { .. } => "PeerExchange",
             NetworkMessage::PeerRequest => "PeerRequest",
@@ -473,6 +483,9 @@ pub const MAX_WIRE_LOCATOR: usize = 64;
 pub const MAX_WIRE_GETHEADERS_LIMIT: u32 = 2000;
 /// Max user_agent length in a Version handshake.
 pub const MAX_WIRE_USER_AGENT_LEN: usize = 128;
+/// Largest PoWit gossip item: an equivocation proof (two attestations, each
+/// with an 8 KiB key and signature bound) fits well inside.
+pub const MAX_WIRE_POWIT_ITEM: usize = 40 * 1024;
 /// Max peer_id string length in a PeerTip (base58 libp2p PeerIds are ~52 chars).
 pub const MAX_WIRE_PEER_ID_LEN: usize = 128;
 
@@ -572,7 +585,8 @@ pub fn decode_wire_message(data: &[u8]) -> Result<NetworkMessage, WireDecodeErro
     match bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {
         Ok(canonical) if canonical == data => Ok(msg),
         _ => Err(WireDecodeError::NonCanonical {
-            relayable: matches!(msg, NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. }),
+            relayable: matches!(msg, NetworkMessage::NewBlock { .. } | NetworkMessage::NewTransaction { .. }
+                                     | NetworkMessage::NewPowitItem { .. }),
         }),
     }
 }
@@ -602,6 +616,14 @@ fn validate_wire_bounds(msg: &NetworkMessage) -> Result<(), WireDecodeError> {
         NetworkMessage::NewTransaction { tx_data, .. } => {
             if tx_data.len() > MAX_WIRE_BYTES {
                 return Err(Bounds("tx_data larger than MAX_WIRE_BYTES"));
+            }
+        }
+        NetworkMessage::NewPowitItem { data, kind, .. } => {
+            if data.len() > MAX_WIRE_POWIT_ITEM {
+                return Err(Bounds("PoWit item larger than MAX_WIRE_POWIT_ITEM"));
+            }
+            if !(1..=3).contains(kind) {
+                return Err(Bounds("unknown PoWit item kind"));
             }
         }
         NetworkMessage::PeerTip { peer_id, .. } => {
@@ -1061,6 +1083,10 @@ pub struct NetworkNode {
     pub peer_id: PeerId,
     pub config:  NetworkConfig,
     local_key:   identity::Keypair,
+    /// Hybrid ML-DSA-65 ‖ Falcon-1024 transport identity.
+    pq_identity: Arc<PqIdentity>,
+    /// Per-peer PQ key pins (trust on first use).
+    pq_pins:     Arc<PeerPins>,
     control_rx:  Option<mpsc::Receiver<NetworkControl>>,
     peer_events: Option<mpsc::Sender<PeerEvent>>,
     /// (full-relay, block-relay-only) automatic outbound slot targets.
@@ -1078,8 +1104,14 @@ impl NetworkNode {
         let local_key = load_or_create_identity(&key_path)?;
         let peer_id   = PeerId::from(local_key.public());
         info!("P2P identity: {} ({})", peer_id, key_path.display());
+        let pq_path = config.data_dir.join("p2p_pq_identity.bin");
+        let pq_identity = Arc::new(PqIdentity::load_or_create(&pq_path)
+            .map_err(NetworkError::StartFailed)?);
+        info!("P2P PQ identity fingerprint: {}", hex::encode(pq_identity.fingerprint()));
+        let pq_pins = Arc::new(PeerPins::load(&config.data_dir.join("p2p_pq_pins.json"))
+            .map_err(NetworkError::StartFailed)?);
         Ok(Self {
-            peer_id, config, local_key, control_rx: None, peer_events: None,
+            peer_id, config, local_key, pq_identity, pq_pins, control_rx: None, peer_events: None,
             outbound_targets: (connmgr::OUTBOUND_FULL_RELAY_TARGET, connmgr::BLOCK_RELAY_ONLY_TARGET),
             feeler_interval: connmgr::FEELER_INTERVAL,
             block_relay_poll_interval: connmgr::BLOCK_RELAY_POLL_INTERVAL,
@@ -1278,19 +1310,21 @@ impl NetworkNode {
         let enable_mdns = self.config.enable_mdns;
         let archive = self.config.archive;
 
+        let (pq_tcp, pins_tcp) = (self.pq_identity.clone(), self.pq_pins.clone());
+        let (pq_ws, pins_ws) = (self.pq_identity.clone(), self.pq_pins.clone());
         let mut swarm = SwarmBuilder::with_existing_identity(self.local_key.clone())
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),
-                |keys: &identity::Keypair| -> Result<KyberConfig, std::convert::Infallible> {
-                    Ok(KyberConfig::new(keys))
+                move |keys: &identity::Keypair| -> Result<PqConfig, std::convert::Infallible> {
+                    Ok(PqConfig::new(keys, pq_tcp, pins_tcp))
                 },
                 yamux_config,
             )
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?
             .with_websocket(
-                |keys: &identity::Keypair| -> Result<KyberConfig, std::convert::Infallible> {
-                    Ok(KyberConfig::new(keys))
+                move |keys: &identity::Keypair| -> Result<PqConfig, std::convert::Infallible> {
+                    Ok(PqConfig::new(keys, pq_ws, pins_ws))
                 },
                 yamux_config,
             )
@@ -1640,8 +1674,11 @@ impl NetworkNode {
                             match gossip_disposition(&msg, sink.validator_attached(), claim_ok) {
                                 GossipDisposition::DeliverDeferred => {
                                     // NET-11 (a): remember the frame kind; the
-                                    // processor's Accept marks a novel block / tx.
-                                    note_pending_kind(&mut novel_kinds, &message_id, matches!(msg, NetworkMessage::NewBlock { .. }));
+                                    // processor's Accept marks a novel block / tx
+                                    // (a PoWit item earns no protection).
+                                    if let Some(is_block) = novel_kind(&msg) {
+                                        note_pending_kind(&mut novel_kinds, &message_id, is_block);
+                                    }
                                     let origin = InboundOrigin::Gossip {
                                         propagation_source, author, pending: Some(message_id.clone()), received_at: now,
                                     };
@@ -2169,7 +2206,8 @@ impl NetworkNode {
                     }
                     let (topic, topic_name) = match &msg {
                         NetworkMessage::NewBlock { .. }        => (block_t.clone(), "blocks"),
-                        NetworkMessage::NewTransaction { .. }  => (tx_t.clone(),    "txs"),
+                        NetworkMessage::NewTransaction { .. }
+                        | NetworkMessage::NewPowitItem { .. }  => (tx_t.clone(),    "txs"),
                         _                                      => (sync_t.clone(),  "sync"),
                     };
                     if let Ok(data) = bincode::serde::encode_to_vec(&msg, bincode::config::standard()) {
@@ -2385,6 +2423,22 @@ const _: () = assert!(HEARTBEAT_PERIOD.as_secs() == connmgr::BLOCK_RELAY_POLL_IN
 /// just dialed (two connections per peer).
 fn new_heartbeat() -> tokio::time::Interval {
     tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT_PERIOD, HEARTBEAT_PERIOD)
+}
+
+/// NET-11 (a): which eviction protection an accepted gossip frame earns its
+/// delivering peer: `Some(true)` a novel block, `Some(false)` a novel
+/// transaction (Core's `m_last_block_time` / `m_last_tx_time`), `None` none.
+/// PoWit items (shares, attestations, equivocation proofs) are relayed like
+/// transactions but are neither: Core protects only for novel blocks and
+/// transactions, and an item (a witness share is 1/16 of a block's work and
+/// pays no fee) would otherwise compete for the 4 novel-transaction
+/// protections.
+fn novel_kind(msg: &NetworkMessage) -> Option<bool> {
+    match msg {
+        NetworkMessage::NewBlock { .. } => Some(true),
+        NetworkMessage::NewTransaction { .. } => Some(false),
+        _ => None,
+    }
 }
 
 /// Remember whether a gossip frame awaiting the processor's verdict is a block
@@ -4344,5 +4398,22 @@ mod tests {
         assert_eq!(start.elapsed(), HEARTBEAT_PERIOD);
         hb.tick().await;
         assert_eq!(start.elapsed(), 2 * HEARTBEAT_PERIOD);
+    }
+
+    /// NET-11 (a): only novel blocks and transactions earn inbound-eviction
+    /// protection. PoWit items (main's `NewPowitItem`) are deferred to the
+    /// processor like transactions, but an accepted one protects nobody.
+    #[test]
+    fn only_blocks_and_transactions_earn_novel_delivery_protection() {
+        let block = NetworkMessage::NewBlock { block_hash: [1; 32], blue_score: 1, height: 1, block_data: vec![] };
+        let tx = NetworkMessage::NewTransaction { txid: [2; 32], tx_data: vec![] };
+        assert_eq!(novel_kind(&block), Some(true));
+        assert_eq!(novel_kind(&tx), Some(false));
+        for kind in 1..=3u8 {
+            let item = NetworkMessage::NewPowitItem { id: [3; 32], kind, data: vec![0; 8] };
+            assert_eq!(gossip_disposition(&item, true, false), GossipDisposition::DeliverDeferred);
+            assert_eq!(novel_kind(&item), None, "a PoWit item (kind {kind}) earns no eviction protection");
+        }
+        assert_eq!(novel_kind(&NetworkMessage::GetTips), None);
     }
 }

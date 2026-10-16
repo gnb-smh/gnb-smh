@@ -17,7 +17,7 @@
 #   block_parse       Block::from_wire_bytes (+ idempotence)
 #   header_parse      BlockHeader::from_wire_bytes (+ idempotence)
 #   netmsg_decode     gnb::network::decode_wire_message (gossip frames)
-#   handshake_decode  transport handshake messages (upgrade::HandshakeInitLp / HandshakeRespLp)
+#   handshake_decode  transport handshake messages (upgrade::Init / Resp / Finish)
 #   pow_decode        compact bits <-> target, chain work, ASERT (vs a U512 oracle)
 #   pow_verify        GnB-SMH output vs target (small scratchpad), hybrid signature verify
 #   merkle_path       coherence_core::verify_path
@@ -218,6 +218,48 @@ bench = false
 [[bin]]
 name = "accept_dag"
 path = "fuzz_targets/accept_dag.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_decode"
+path = "fuzz_targets/sync_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pq_handshake_decode"
+path = "fuzz_targets/pq_handshake_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_validate"
+path = "fuzz_targets/block_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tx_validate"
+path = "fuzz_targets/tx_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_witness_decode"
+path = "fuzz_targets/policy_witness_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "script_sig_verify"
+path = "fuzz_targets/script_sig_verify.rs"
 test = false
 doc = false
 bench = false

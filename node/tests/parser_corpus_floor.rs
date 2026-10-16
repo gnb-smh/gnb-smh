@@ -28,7 +28,7 @@ use gnb::coherence::ShieldedTx;
 use gnb::core::{Block, BlockHeader, Transaction, TxInput, TxOutput};
 use gnb::mempool::Mempool;
 use gnb::network::{NetworkMessage, SyncEntry};
-use gnb::transport::upgrade::{HandshakeInitLp, HandshakeRespLp};
+use gnb::transport::upgrade::{Finish, Init, Resp};
 
 // ── deterministic PRNG ────────────────────────────────────────────────────────
 
@@ -127,7 +127,7 @@ fn rand_block(r: &mut Rng) -> Vec<u8> {
         transactions: vec![cb],
         blue_score: r.next(),
         height: r.next(),
-        shielded_transactions: shielded,
+        shielded_transactions: shielded, powit: Default::default(),
     };
     block.to_wire_bytes()
 }
@@ -171,24 +171,28 @@ fn rand_netmsg(r: &mut Rng) -> Vec<u8> {
 }
 
 fn rand_handshake_init(r: &mut Rng) -> Vec<u8> {
-    // The LIVE handshake message (`transport::upgrade::read_msg` decodes it).
-    let init = HandshakeInitLp {
-        version: 1,
-        kyber_pk: r.bytes_rand(0, 64),
-        identity_pk_proto: r.bytes_rand(0, 64),
+    let init = Init {
+        version: 2,
+        mlkem_pk: r.bytes_rand(0, 64),
+        x25519_pk: r.arr32(),
+        ed_pk: r.bytes_rand(0, 64),
+        pq_pk: r.bytes_rand(0, 64),
         nonce: r.arr32(),
-        signature: r.bytes_rand(0, 64),
     };
-    bincode::serde::encode_to_vec(&init, bincfg()).expect("encode HandshakeInitLp")
+    bincode::serde::encode_to_vec(&init, bincfg()).expect("encode Init")
 }
 
 fn rand_handshake_resp(r: &mut Rng) -> Vec<u8> {
-    let resp = HandshakeRespLp {
-        ciphertext: r.bytes_rand(0, 64),
-        identity_pk_proto: r.bytes_rand(0, 64),
-        signature: r.bytes_rand(0, 64),
+    let resp = Resp {
+        mlkem_ct: r.bytes_rand(0, 64),
+        x25519_pk: r.arr32(),
+        ed_pk: r.bytes_rand(0, 64),
+        pq_pk: r.bytes_rand(0, 64),
+        nonce: r.arr32(),
+        ed_sig: r.bytes_rand(0, 64),
+        pq_sig: r.bytes_rand(0, 64),
     };
-    bincode::serde::encode_to_vec(&resp, bincfg()).expect("encode HandshakeRespLp")
+    bincode::serde::encode_to_vec(&resp, bincfg()).expect("encode Resp")
 }
 
 /// A valid `pow_decode` seed: exactly `N = 256` signed bytes in [-2, 2].
@@ -335,8 +339,9 @@ fn floor_netmsg_decode_no_panic() {
 #[test]
 fn floor_handshake_decode_no_panic() {
     assert_no_panic("handshake_decode", rand_handshake_init, |d| {
-        let _ = bincode::serde::decode_from_slice::<HandshakeInitLp, _>(d, bincfg());
-        let _ = bincode::serde::decode_from_slice::<HandshakeRespLp, _>(d, bincfg());
+        let _ = bincode::serde::decode_from_slice::<Init, _>(d, bincfg());
+        let _ = bincode::serde::decode_from_slice::<Resp, _>(d, bincfg());
+        let _ = bincode::serde::decode_from_slice::<Finish, _>(d, bincfg());
     });
 }
 

@@ -58,7 +58,7 @@ fn mk_block(h: u64, parent: [u8; 32]) -> Block {
         transactions: vec![cb],
         blue_score:   h.saturating_sub(1),
         height:       h,
-        shielded_transactions: Vec::new(),
+        shielded_transactions: Vec::new(), powit: Default::default(),
     }
 }
 
@@ -186,7 +186,7 @@ fn roundtrip_preserves_multi_parent_block() {
         transactions: vec![cb],
         blue_score:   4,
         height:       5,
-        shielded_transactions: Vec::new(),
+        shielded_transactions: Vec::new(), powit: Default::default(),
     };
     let hash = block.block_hash();
 

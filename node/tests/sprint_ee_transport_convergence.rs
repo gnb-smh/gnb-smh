@@ -45,6 +45,8 @@
 //! The reaction to invalid/oversized frames is asserted deterministically (no
 //! swarm) against the extracted `WirePenaltyTracker` unit in src/network/mod.rs.
 
+mod common;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,9 +169,8 @@ async fn spawn_node(bootstrap_peers: Vec<String>, max_peers: usize) -> Harness {
                     seen.fetch_add(1, Ordering::Relaxed);
                 }
                 if let NetworkMessage::NewBlock { block_data, .. } = msg {
-                    if let Ok((p, _)) = bincode::serde::decode_from_slice::<SimPayload, _>(
-                        &block_data,
-                        bincode::config::standard(),
+                    if let Some(Ok((p, _))) = common::sim_block::unwrap(&block_data).map(|raw|
+                        bincode::serde::decode_from_slice::<SimPayload, _>(&raw, bincode::config::standard())
                     ) {
                         orphans.push(p);
                         // Fixpoint: apply every buffered block whose parents
@@ -264,7 +265,8 @@ async fn propagate_block(producer: &Harness, receivers: &[&Harness], p: &SimPayl
                 .expect("producer add_block");
         }
     }
-    let data = bincode::serde::encode_to_vec(p, bincode::config::standard()).expect("encode payload");
+    let data = common::sim_block::wrap(
+        &bincode::serde::encode_to_vec(p, bincode::config::standard()).expect("encode payload"));
     let (blue_score, height) = {
         let d = producer.dag.read();
         (d.tip_blue_score(), d.block_count() as u64)
@@ -445,3 +447,4 @@ async fn eclipse_inbound_slots_bounded_by_connection_limits() {
         "{attackers_connected_to_victim} attackers connected; cap is {VICTIM_MAX_PEERS}"
     );
 }
+

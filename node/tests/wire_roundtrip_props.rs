@@ -89,7 +89,7 @@ fn block_with_shielded_wire_round_trips_for_random_values() {
             transactions: vec![cb],
             blue_score: r.next(),
             height: r.next(),
-            shielded_transactions: shielded.clone(),
+            shielded_transactions: shielded.clone(), powit: Default::default(),
         };
         let bytes = block.to_wire_bytes();
         let parsed = Block::from_wire_bytes(&bytes).expect("valid block must parse");

@@ -71,6 +71,7 @@ fn raw_block(n: &Node, parents: Vec<BlockHash>, txs: Vec<Transaction>) -> Block 
         blue_score: height,
         height,
         shielded_transactions: Vec::new(),
+        powit: Default::default(),
     }
 }
 
@@ -150,9 +151,11 @@ fn val2_duplicate_coinbase_accepted_before_activation_rejected_after() {
             assert_eq!(n.store.get_coinbase_height(&c).unwrap(), Some(1));
             assert_eq!(applied_tip(&n), Some(b1.block_hash()));
         } else {
-            accept(&n, &b2).expect("old rules: a duplicate coinbase is valid");
-            assert_eq!(applied_tip(&n), Some(b2.block_hash()));
-            assert_eq!(n.store.get_coinbase_height(&c).unwrap(), Some(2), "the coin was overwritten");
+            // This chain enforces BIP30 at every height: the copy is invalid.
+            let err = accept(&n, &b2).unwrap_err();
+            assert!(err.contains("BIP30"), "{err}");
+            assert_eq!(applied_tip(&n), Some(b1.block_hash()));
+            assert_eq!(n.store.get_coinbase_height(&c).unwrap(), Some(1), "the coin was not overwritten");
         }
     }
 }
@@ -206,12 +209,14 @@ fn val2_bip30_overwrite_of_an_unspent_coin_is_invalid_after_activation() {
             assert!(err.contains("BIP30"), "{err}");
             assert_eq!(applied_tip(&n), Some(gh), "nothing connected");
             assert_eq!(n.store.get_utxo(&b.transactions[0].txid(), 0).unwrap().unwrap().value, 777);
-            // Without the colliding coins the same block connects.
-            assert!(pipeline::validate_block_in_view_at(view, &b, activation::NEVER).is_ok());
+            // This chain's BIP30 applies below the activation too.
+            assert!(pipeline::validate_block_in_view_at(view, &b, activation::NEVER).unwrap_err().starts_with("BIP30"));
         } else {
-            shared.expect("old rules: overwriting is allowed");
-            accept(&n, &b).expect("old rules");
-            assert_eq!(n.store.get_utxo(&spend.txid(), 0).unwrap().unwrap().value, 1_900_000, "overwritten");
+            // BIP30 at every height on this chain.
+            assert!(shared.unwrap_err().starts_with("BIP30"));
+            let err = accept(&n, &b).unwrap_err();
+            assert!(err.contains("BIP30"), "{err}");
+            assert_eq!(n.store.get_utxo(&spend.txid(), 0).unwrap().unwrap().value, 777, "not overwritten");
         }
     }
 }
@@ -224,6 +229,7 @@ fn val2_bip30_overwrite_of_an_unspent_coin_is_invalid_after_activation() {
 /// rollback deleted B1's coin and its coinbase row: a later spend of it was
 /// valid on B and invalid on A (chain split).
 #[test]
+#[ignore = "BIP30 is consensus at every height on this chain: no block can overwrite a coin"]
 fn val2_overwrite_then_rollback_converges_with_a_node_that_never_applied_it() {
     let _g = activation::scoped_override(activation::NEVER);
     let genesis = mk_genesis(unix_now() - 10_000);
@@ -282,6 +288,7 @@ fn val2_storage_rollback_restores_the_overwritten_rows() {
         blue_score: height,
         height,
         shielded_transactions: vec![],
+        powit: Default::default(),
     };
     let (b1, b2) = (mk(1, 1), mk(2, 2));
     store.put_block(&b1).unwrap();
@@ -311,6 +318,7 @@ fn val2_storage_rollback_restores_the_overwritten_rows() {
 /// recomputation; the start-up check needs no rebuild; a rebuild changes
 /// nothing).
 #[test]
+#[ignore = "BIP30 is consensus at every height on this chain: no block can overwrite a coin"]
 fn val2_overwritten_coin_restore_keeps_the_explorer_aggregates() {
     use std::sync::atomic::AtomicBool;
     let _g = activation::scoped_override(activation::NEVER);
@@ -356,6 +364,7 @@ fn val2_overwritten_coin_restore_keeps_the_explorer_aggregates() {
         blue_score: height,
         height,
         shielded_transactions: vec![],
+        powit: Default::default(),
     };
     store.put_utxo(&fund.0, 0, &fund.2).unwrap();
     store.put_utxo(&spend.txid(), 0, &out(777, &old_owner)).unwrap();
@@ -398,12 +407,14 @@ fn val3_same_block_coinbase_spend_on_the_extension_and_connect_paths() {
         let n = node_with(&genesis, &[]);
         let x = same_block_coinbase_spend(&n, &k, genesis.block_hash(), b"legacy".to_vec());
         let view: &Storage = &n.store;
-        pipeline::validate_block_in_view_at(view, &x, activation::NEVER).expect("old rules: valid");
+        // No own-coinbase spend at every height on this chain.
+        let err = pipeline::validate_block_in_view_at(view, &x, activation::NEVER).unwrap_err();
+        assert!(err.contains("spends the coinbase of its own block"), "{err}");
         let err = pipeline::validate_block_in_view_at(view, &x, 0).unwrap_err();
         assert!(err.contains("spends the coinbase of its own block"), "{err}");
         let err = pipeline::validate_block_in_view_at(view, &x, 1).unwrap_err();
         assert!(err.contains("spends the coinbase of its own block"), "height 1 >= activation 1: {err}");
-        pipeline::validate_block_in_view_at(view, &x, 2).expect("height 1 < activation 2");
+        assert!(pipeline::validate_block_in_view_at(view, &x, 2).is_err(), "height 1 < activation 2: still invalid here");
     }
     // Acceptance (extension) path.
     for hardened in [false, true] {
@@ -427,10 +438,10 @@ fn val3_same_block_coinbase_spend_on_the_extension_and_connect_paths() {
             assert!(err.contains("witness commitment"), "{err}");
             assert_not_stored(&n, &x);
         } else {
-            accept(&n, &x).expect("old rules: same-block coinbase spend is valid");
-            assert_eq!(applied_tip(&n), Some(x.block_hash()));
-            assert!(n.store.get_utxo(&x.transactions[0].txid(), 0).unwrap().is_none(), "spent in its block");
-            assert!(n.store.get_utxo(&spend_txid, 0).unwrap().is_some());
+            let err = accept(&n, &x).unwrap_err();
+            assert!(err.contains("spends the coinbase of its own block"), "{err}");
+            assert_eq!(applied_tip(&n), Some(gh));
+            assert!(n.store.get_utxo(&spend_txid, 0).unwrap().is_none());
         }
     }
 }
@@ -455,14 +466,15 @@ fn val3_same_block_coinbase_spend_on_the_reorg_path() {
         accept(&n, &x).expect("fork-loser: stored, not evaluated");
         assert_eq!(applied_tip(&n), Some(m1.block_hash()));
         let x2 = build(&n, vec![x.block_hash()], vec![coinbase("x2", subsidy(2), vec![0x02; 20])]);
-        accept(&n, &x2).expect("reorg onto the branch with the same-block coinbase spend");
-        assert_eq!(applied_tip(&n), Some(x2.block_hash()));
-        assert!(n.store.get_utxo(&x.transactions[1].txid(), 0).unwrap().is_some());
+        // This chain's rule at every height: the branch is invalid.
+        assert!(accept(&n, &x2).is_err(), "the branch with the same-block coinbase spend is invalid");
+        assert_eq!(applied_tip(&n), Some(m1.block_hash()));
+        assert!(n.store.get_utxo(&x.transactions[1].txid(), 0).unwrap().is_none());
     }
     // New rules: the reorg connect (`reorg::connect_plan` with the
     // pipeline's validator) refuses the same block and commits nothing. (The
     // pipeline itself never stores such a block after the activation.)
-    for (act, ok) in [(activation::NEVER, true), (0, false)] {
+    for (act, ok) in [(activation::NEVER, false), (0, false)] {
         let _g = activation::scoped_override(act);
         let genesis = mk_genesis(unix_now() - 10_000);
         let gh = genesis.block_hash();
@@ -567,8 +579,13 @@ fn cry1_witness_padding_and_swap_rejected_without_storing_the_block() {
             accept(&n, &honest).expect("the honest copy of the same id is still accepted");
             assert_eq!(applied_tip(&n), Some(honest.block_hash()));
         } else {
-            accept(&n, &padded).expect("old rules: nothing commits to witnesses");
-            assert_eq!(applied_tip(&n), Some(padded.block_hash()));
+            // This chain's v2 witness framing is exact: the padded copy's
+            // body is refused (witness-dependent: the id stays acceptable)
+            // and the honest copy of the same id is accepted afterwards.
+            let err = accept(&n, &padded).unwrap_err();
+            assert!(err.contains("body rejected"), "{err}");
+            accept(&n, &honest).expect("the honest copy of the same id is accepted");
+            assert_eq!(applied_tip(&n), Some(honest.block_hash()));
         }
     }
 }
@@ -610,9 +627,14 @@ fn val10_64_byte_transaction_is_rejected_after_activation() {
             assert_eq!(tmpl.transactions.len(), 1);
             assert_eq!(tmpl.transactions[0].0.txid(), ok.txid());
         } else {
-            admission::admit(&n.store, &n.mempool, tx64.clone(), &policy).expect("old rules: admitted");
-            accept(&n, &b).expect("old rules: a 64-byte transaction is valid");
-            assert_eq!(applied_tip(&n), Some(b.block_hash()));
+            // On this chain a 64-byte transaction cannot exist below the
+            // activation either: it would need a 5-byte output script, and
+            // only 20-byte key hashes and 33-byte policies are outputs.
+            let err = admission::admit(&n.store, &n.mempool, tx64.clone(), &policy).unwrap_err();
+            assert!(err.to_string().contains("unsupported script_pubkey"), "{err}");
+            let err = accept(&n, &b).unwrap_err();
+            assert!(err.contains("unsupported script_pubkey"), "{err}");
+            assert_eq!(applied_tip(&n), Some(gh));
         }
     }
 }
@@ -710,7 +732,8 @@ fn val12_block_size_is_measured_on_the_wire_after_activation() {
         let b = build(&n, vec![gh], vec![
             coinbase("v12", subsidy(1), vec![0xA3; 20]), many_outputs(1, 65_000), many_outputs(2, 65_000),
         ]);
-        assert!(b.size_bytes() < core::MAX_BLOCK_SIZE, "bincode {}", b.size_bytes());
+        let bincode_len = bincode::serde::encode_to_vec(&b, bincode::config::standard()).unwrap().len();
+        assert!(bincode_len < core::MAX_BLOCK_SIZE, "bincode {}", bincode_len);
         assert!(b.wire_size() > core::MAX_BLOCK_SIZE, "wire {}", b.wire_size());
         assert_eq!(b.wire_size(), b.to_wire_bytes().len());
         if hardened {
@@ -719,7 +742,8 @@ fn val12_block_size_is_measured_on_the_wire_after_activation() {
             assert!(err.contains("block too large"), "{err}");
             assert_not_stored(&n, &b);
         } else {
-            assert_eq!(b.validate_structure_without_pow(), Ok(()), "bincode measure: within the limit");
+            // This chain measures the wire encoding at every height.
+            assert_eq!(b.validate_structure_without_pow(), Err("block too large"));
         }
     }
 }
@@ -820,6 +844,7 @@ fn getblocktemplate_max_coinbase_extra_fits_a_full_template() {
                 blue_score: tmpl.blue_score,
                 height: tmpl.height,
                 shielded_transactions: vec![],
+                powit: Default::default(),
             }
         };
         let ok = external(max_extra);
@@ -850,10 +875,15 @@ fn pow3_pow_limit_clamp_at_the_activation_boundary() {
     for act in [2u64, 1_000, activation::MAINNET_HARDENING_ACTIVATION_HEIGHT] {
         let below = core::expected_bits_at(late, act - 1, act).unwrap();
         let at = core::expected_bits_at(late, act, act).unwrap();
-        assert_eq!(below, core::target_to_bits(&core::bits_to_target(core::POW_LIMIT_BITS)), "act {act}");
-        assert_eq!(at, core::GENESIS_BITS, "act {act}");
-        assert_eq!(core::bits_to_work(at), 4_500, "the cheapest block from the activation costs ~4,500 evaluations");
-        assert_eq!(core::bits_to_work(below), 1);
+        // From powit_height (10,000 on mainnet) GnB-SMH v3 targets are
+        // POW_V3_DIFFICULTY_SHIFT bits harder than the ASERT schedule.
+        let adj = |bits: u32, h: u64| core::adjust_bits_for_algo(bits, core::pow_algo(h));
+        assert_eq!(below, adj(core::target_to_bits(&core::bits_to_target(core::POW_LIMIT_BITS)), act - 1), "act {act}");
+        assert_eq!(at, adj(core::GENESIS_BITS, act), "act {act}");
+        if core::pow_algo(act) == gnb_smh::Algo::V1 {
+            assert_eq!(core::bits_to_work(at), 4_500, "the cheapest block from the activation costs ~4,500 evaluations");
+            assert_eq!(core::bits_to_work(below), 1);
+        }
         let limit = core::bits_to_target(core::POW_LIMIT_BITS);
         assert!(Block::target_within_pow_limit_at(&limit, act - 1, act));
         assert!(!Block::target_within_pow_limit_at(&limit, act, act));
@@ -985,7 +1015,8 @@ fn witness_corrupted_copy_then_honest_copy_ends_on_the_honest_block() {
         ("signature byte flipped", |ss| ss[100] ^= 0x01, "invalid signature"),
         ("public key byte flipped", |ss| { let i = ss.len() - 10; ss[i] ^= 0x01 }, "pubkey mismatch"),
         ("script_sig truncated", |ss| ss.truncate(6), "malformed script_sig"),
-        ("witness padded past the minimum fee", |ss| ss.extend_from_slice(&[0u8; 1_000]), "below consensus minimum"),
+        // This chain's exact v2 framing refuses the padding itself.
+        ("witness padded past the minimum fee", |ss| ss.extend_from_slice(&[0u8; 1_000]), "malformed script_sig"),
     ];
     for (what, corrupt, expect) in corruptions {
         let n = node_with(&genesis, std::slice::from_ref(&fund));
@@ -1561,10 +1592,17 @@ fn unsealed_block_at(height: u64, spend: &Transaction, fee: u64) -> Block {
             version: 1, parents: vec![], merkle_root: MerkleRoot::ZERO,
             timestamp: 0, bits: core::GENESIS_BITS, nonce: 0,
         },
-        transactions: vec![coinbase("in-block", subsidy(height) + fee, vec![0xC1; 20]), spend.clone()],
+        // From powit_height the coinbase pays the miner's share of the
+        // subsidy (`Block::coinbase_outputs`, no witness shares here).
+        transactions: vec![{
+            let mut cb = coinbase("in-block", 0, vec![0xC1; 20]);
+            cb.outputs = Block::coinbase_outputs(height, vec![0xC1; 20], fee, &[]);
+            cb
+        }, spend.clone()],
         blue_score: height,
         height,
         shielded_transactions: Vec::new(),
+        powit: Default::default(),
     }
 }
 
@@ -1647,8 +1685,9 @@ fn in_block_helper_applies_bip30_to_its_transaction() {
             assert!(helper.unwrap_err().contains("BIP30"));
             assert!(connect.unwrap_err().contains("BIP30"));
         } else {
-            helper.expect("old rules: no BIP30");
-            connect.expect("old rules: no BIP30");
+            // BIP30 at every height on this chain.
+            assert!(helper.unwrap_err().contains("BIP30"));
+            assert!(connect.unwrap_err().contains("BIP30"));
         }
     }
 }

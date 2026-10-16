@@ -15,15 +15,15 @@
 //!   evicted (Bitcoin Core's `AttemptToEvictConnection`).
 //! * NET-11 (b)/(d): anchors (Core's `anchors.dat`) — block-relay-only
 //!   outbound peers are persisted and re-dialed first after a restart, and a
-//!   block-relay-only connection carries no gossip (no transaction or address
-//!   relay); blocks are learned from it by directed frontier polls.
+//!   block-relay-only connection carries no gossip (no transaction, PoWit item
+//!   or address relay); blocks are learned from it by directed frontier polls.
 //!
 //! The live tests run real `NetworkNode` swarms (and, for the inbound flood,
 //! minimal libp2p swarms with the node's transport) on loopback.
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -31,7 +31,8 @@ use gnb::consensus::GhostDAG;
 use gnb::network::pex_validator::{is_valid_public_multiaddr, netgroup};
 use gnb::network::{yamux_config, NetworkConfig, NetworkMessage, NetworkNode};
 use gnb::sync::peer_state::PeerStateTable;
-use gnb::transport::upgrade::KyberConfig;
+use gnb::transport::identity::{PeerPins, PqIdentity};
+use gnb::transport::upgrade::PqConfig;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{identity, tcp, Multiaddr, PeerId, SwarmBuilder};
 use parking_lot::RwLock;
@@ -136,6 +137,10 @@ struct Node {
     peer_state: Arc<PeerStateTable>,
     /// Gossip `NewBlock` frames delivered to this node's processor.
     blocks: Arc<AtomicUsize>,
+    /// Gossip `NewTransaction` frames delivered to this node's processor.
+    txs: Arc<AtomicUsize>,
+    /// Gossip `NewPowitItem` frames delivered to this node's processor.
+    powit: Arc<AtomicUsize>,
     /// Directed `Tips` answers delivered to this node's processor.
     tips: Arc<AtomicUsize>,
     /// Times the peer count rose from 0 (a first peer connected).
@@ -202,16 +207,25 @@ async fn spawn_node_with(
         })
     };
     let blocks = Arc::new(AtomicUsize::new(0));
+    let txs = Arc::new(AtomicUsize::new(0));
+    let powit = Arc::new(AtomicUsize::new(0));
     let tips = Arc::new(AtomicUsize::new(0));
     let rises_from_zero = Arc::new(AtomicUsize::new(0));
     {
-        let (blocks, tips, rises) = (blocks.clone(), tips.clone(), rises_from_zero.clone());
+        let (blocks, txs, powit, tips, rises) =
+            (blocks.clone(), txs.clone(), powit.clone(), tips.clone(), rises_from_zero.clone());
         tokio::spawn(async move {
             let mut last_count = 0usize;
             while let Some(msg) = block_rx.recv().await {
                 match msg {
                     NetworkMessage::NewBlock { .. } => {
                         blocks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    NetworkMessage::NewTransaction { .. } => {
+                        txs.fetch_add(1, Ordering::Relaxed);
+                    }
+                    NetworkMessage::NewPowitItem { .. } => {
+                        powit.fetch_add(1, Ordering::Relaxed);
                     }
                     NetworkMessage::Tips { .. } => {
                         tips.fetch_add(1, Ordering::Relaxed);
@@ -238,7 +252,7 @@ async fn spawn_node_with(
     })
     .await
     .expect("listen addr");
-    Node { peer_id, addr, outbound_tx, peer_state, blocks, tips, rises_from_zero, task, dir }
+    Node { peer_id, addr, outbound_tx, peer_state, blocks, txs, powit, tips, rises_from_zero, task, dir }
 }
 
 fn new_dir() -> Arc<tempfile::TempDir> {
@@ -266,12 +280,21 @@ struct Bare {
     _task: tokio::task::JoinHandle<()>,
 }
 
+/// The `/gnb/pq/2.0.0` PQ identity of every bare swarm (one key: its
+/// generation is slow in a debug build, and the node pins PQ keys per
+/// `PeerId`, so bare swarms with distinct libp2p identities may share it).
+fn bare_pq_identity() -> Arc<PqIdentity> {
+    static PQ: OnceLock<Arc<PqIdentity>> = OnceLock::new();
+    PQ.get_or_init(|| Arc::new(PqIdentity::generate().expect("PQ identity"))).clone()
+}
+
 async fn spawn_bare(target: Multiaddr) -> Bare {
+    let (pq, pins) = (bare_pq_identity(), Arc::new(PeerPins::in_memory()));
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
-            |keys: &identity::Keypair| -> Result<KyberConfig, Infallible> { Ok(KyberConfig::new(keys)) },
+            move |keys: &identity::Keypair| -> Result<PqConfig, Infallible> { Ok(PqConfig::new(keys, pq, pins)) },
             yamux_config,
         )
         .expect("tcp")
@@ -359,7 +382,8 @@ async fn live_full_inbound_evicts_an_unprotected_peer_instead_of_refusing() {
 
 /// NET-11 (b)+(d) (live). V starts with B in `anchors.json` (Core's
 /// anchors.dat). V dials B first, as a BLOCK-RELAY-ONLY connection: no gossip
-/// runs on it (B's gossiped block never reaches V that way), while V keeps
+/// runs on it (B's gossiped block, transactions and PoWit items never reach V
+/// that way, while W, an ordinary peer of B, receives them), while V keeps
 /// learning B's frontier through the PERIODIC directed `GetTips` polls (the
 /// poll period is shortened to 1 s here; several Tips answers must arrive,
 /// not only the one-off connect-time exchange). Such a peer is not reported
@@ -386,8 +410,25 @@ async fn live_anchor_is_redialed_after_restart_as_block_relay_only() {
         .send(NetworkMessage::NewBlock { block_hash: [0xB1; 32], blue_score: 1, height: 1, block_data: payload })
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Nor do B's gossiped transactions and PoWit items (main's NewPowitItem,
+    // relayed on the transaction topic), which W, an ordinary (manual) peer
+    // of B, does receive: B publishes until W has both kinds.
+    let w = spawn_node(new_dir(), vec![b.full_addr()], 8).await;
+    assert!(wait_for(15, || w.is_connected_to(&b.peer_id)).await, "W connects to B");
+    let mut n = 0u8;
+    let w_got_both = wait_for(30, || {
+        n = n.wrapping_add(1);
+        let _ = b.outbound_tx.try_send(NetworkMessage::NewTransaction { txid: [n; 32], tx_data: vec![n; 16] });
+        let _ = b.outbound_tx.try_send(NetworkMessage::NewPowitItem { id: [n; 32], kind: 1 + n % 3, data: vec![n; 16] });
+        w.txs.load(Ordering::Relaxed) > 0 && w.powit.load(Ordering::Relaxed) > 0
+    })
+    .await;
+    assert!(w_got_both, "B's transactions and PoWit items reach its ordinary peer W");
+    tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(v.blocks.load(Ordering::Relaxed), 0, "a block-relay-only connection carries no gossip");
+    assert_eq!(v.txs.load(Ordering::Relaxed), 0, "a block-relay-only connection carries no transactions");
+    assert_eq!(v.powit.load(Ordering::Relaxed), 0, "a block-relay-only connection carries no PoWit items");
+    assert!(!v.is_connected_to(&w.peer_id), "V has no other path to B's gossip");
     // Nothing V publishes reaches B either, so V must not count B as a peer
     // for its miner / relay (its reported peer count never left 0).
     assert_eq!(v.rises_from_zero.load(Ordering::SeqCst), 0, "a block-relay-only peer is not a relay peer");

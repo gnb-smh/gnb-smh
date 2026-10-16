@@ -145,10 +145,17 @@ us (we poll them every 30 s); no extra rotating block-relay-only peer or
 stale-tip extra outbound connection; anchors are written when the set
 changes rather than at shutdown (the node has no orderly network shutdown).
 
+Block-relay-only connections carry no PoWit items either: witness shares,
+attestations and equivocation proofs (`NewPowitItem`) are gossiped on the
+transaction topic, and gossipsub never sees those connections. A PoWit item
+accepted from a peer does not count as a novel transaction for the inbound
+eviction protection (Core protects for novel blocks and transactions only).
+
 Transaction privacy: transactions are gossiped from the node that creates
 them; the origin IP is not hidden (the unused Dandelion++ sketch was removed,
-NET-17). Peer authentication on the P2P transport is Ed25519 (libp2p
-identity); session keys use Kyber-768.
+NET-17). The P2P transport (`/gnb/pq/2.0.0`, `docs/P2P.md`) authenticates
+each peer with its Ed25519 libp2p key and its hybrid ML-DSA-65 ‖ Falcon-1024
+key, and derives session keys from ML-KEM-768 and X25519.
 
 ## Genesis
 

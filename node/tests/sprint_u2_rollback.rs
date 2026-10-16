@@ -60,7 +60,7 @@ fn mk_block(height: u64, transactions: Vec<Transaction>) -> Block {
         transactions,
         blue_score: height,
         height,
-        shielded_transactions: Vec::new(),
+        shielded_transactions: Vec::new(), powit: Default::default(),
     }
 }
 

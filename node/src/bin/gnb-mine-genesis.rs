@@ -66,7 +66,7 @@ fn main() {
     let mut start = cli.start_nonce;
     const CHUNK: u64 = 256;
     let nonce = loop {
-        if let Some(n) = gnb::pow::mine_parallel(&preimage, bits, start, CHUNK, threads, None) {
+        if let Some(n) = gnb::pow::mine_parallel(&preimage, bits, 0, start, CHUNK, threads, None) {
             break n;
         }
         start = start.wrapping_add(CHUNK * threads as u64);

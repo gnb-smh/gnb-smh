@@ -1,402 +1,427 @@
-//! Sprint A2 Phase 2 — libp2p upgrade integration.
+//! Post-quantum libp2p security upgrade, protocol `/gnb/pq/2.0.0`.
 //!
-//! Wraps the Sprint A1 post-quantum primitives + Sprint A2 Phase 1 stream
-//! adapter into a libp2p-compatible security upgrade.
+//! # Construction
 //!
-//! # Hybrid post-quantum model
-//!
-//! This upgrade uses:
-//!
-//! - **Kyber768 KEM** for session key establishment (post-quantum
-//!   confidentiality: "harvest now, decrypt later" resistant).
-//! - **libp2p identity signatures** (Ed25519 in practice, whatever the
-//!   node's keypair is) for authenticating peer identities during the
-//!   handshake.
-//! - **ChaCha20-Poly1305** for the resulting session cipher, with the
-//!   monotonic-counter nonce scheme from Sprint A1.
-//!
-//! This matches the "hybrid PQ" pattern deployed by AWS/Cloudflare/Google
-//! in TLS 1.3 — PQ for the parts where retrospective attacks matter,
-//! classical for the parts where only real-time forgery matters.
-//!
-//! ML-DSA-65 post-quantum signatures remain in use at the consensus layer
-//! (blocks, transactions, addresses). This transport upgrade and the
-//! consensus signatures are orthogonal.
-//!
-//! # Handshake
+//! - **Key exchange: hybrid ML-KEM-768 (FIPS 203) + X25519.** Both shared
+//!   secrets feed the key schedule, so a session stays confidential unless
+//!   BOTH are broken — the same combination TLS 1.3 deploys as
+//!   `X25519MLKEM768`. Ephemeral keys on both sides: forward secrecy.
+//! - **Authentication: hybrid Ed25519 + ML-DSA-65 ‖ Falcon-1024.** Each side
+//!   signs the transcript with its libp2p identity key (Ed25519; libp2p
+//!   derives the `PeerId` from it) AND with its PQ identity key (the same
+//!   hybrid scheme as consensus, verified in the strict enveloped, canonical
+//!   form). The PQ key is pinned per `PeerId` on first contact
+//!   ([`PeerPins`]), so a forged Ed25519 signature alone cannot impersonate a
+//!   known peer.
+//! - **Mutual transcript authentication (SIGMA-style).** The responder signs
+//!   the transcript of both opening messages; the initiator then signs the
+//!   complete transcript in a third message. Neither side accepts the
+//!   connection before verifying the other's signatures over everything both
+//!   sent.
+//! - **Session cipher:** ChaCha20-Poly1305 with monotonic counters
+//!   ([`KyberStream`], unchanged), keys from HKDF-SHA256 over
+//!   `ss_mlkem ‖ ss_x25519` salted with the transcript hash.
 //!
 //! ```text
-//!     INITIATOR                                    RESPONDER
-//!     generate ephemeral Kyber keypair (sk, pk)
-//!     t1 = H(MAGIC || v || kyber_pk || id_pk_i || nonce)
-//!     sig_i = libp2p_sign(id_sk_i, t1)
-//!     ──── HandshakeInitLp { kyber_pk, id_pk_i_pb, nonce, sig_i } ──>
-//!                                                verify sig_i w/ id_pk_i
-//!                                                (ss, ct) = Kyber_enc(kyber_pk)
-//!                                                t2 = H(t1 || ct || id_pk_r)
-//!                                                sig_r = libp2p_sign(id_sk_r, t2)
-//!                                                derive session keys (ss, t2)
-//!     <───── HandshakeRespLp { ct, id_pk_r_pb, sig_r } ─────
-//!     verify sig_r w/ id_pk_r
-//!     ss = Kyber_dec(sk, ct)
-//!     derive session keys (ss, t2)
-//!     [wrap socket in KyberStream; return (peer_id, stream)]
+//!   INITIATOR                                          RESPONDER
+//!   Init { v, mlkem_pk, x25519_i, ed_pk_i, pq_pk_i, nonce_i } ──>
+//!                                       (ss_m, ct) = ML-KEM.Encaps(mlkem_pk)
+//!                                       ss_x = X25519(x_r, x25519_i)
+//!                                       th_r = H(th_i, ct, x25519_r, ed_pk_r, pq_pk_r, nonce_r)
+//!   <── Resp { ct, x25519_r, ed_pk_r, pq_pk_r, nonce_r,
+//!              Ed25519(th_r), PQ(th_r) }
+//!   verify both sigs, pin pq_pk_r
+//!   ss_m = Decaps(ct); ss_x = X25519(x_i, x25519_r)
+//!   th_f = H(th_r)
+//!   Finish { Ed25519(th_f), PQ(th_f) } ──>
+//!                                       verify both sigs, pin pq_pk_i
+//!   keys = HKDF(salt = th_r, ss_m ‖ ss_x)         keys = HKDF(…)
 //! ```
+//!
+//! Not claimed: identity hiding (identities travel in clear), traffic-analysis
+//! resistance, post-compromise security within a session, a formal proof, or
+//! a third-party audit.
 
-use std::pin::Pin;
 use std::future::Future;
 use std::iter;
+use std::pin::Pin;
+use std::sync::Arc;
 
-use futures::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
-
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use hkdf::Hkdf;
 use libp2p::core::upgrade::{InboundConnectionUpgrade, OutboundConnectionUpgrade, UpgradeInfo};
 use libp2p::identity;
 use libp2p::PeerId;
-
-use pqcrypto_kyber::kyber768;
-#[allow(unused_imports)]
-use pqcrypto_traits::kem::{PublicKey as _, SharedSecret as _, Ciphertext as _};
-
+use pqcrypto_mlkem::mlkem768;
+use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SharedSecret as _};
 use rand::RngCore;
-use serde::{Serialize, Deserialize};
-use sha3::{Sha3_256, Digest};
-
-use crate::transport::{
-    stream::KyberStream,
-    TxStream, RxStream,
-    DOMAIN_MAGIC, PQ_PROTOCOL_VERSION,
-    KYBER768_PK_SIZE, KYBER768_CT_SIZE,
-    HANDSHAKE_NONCE_SIZE, STREAM_KEY_SIZE, TRANSCRIPT_SIZE,
-    LABEL_I2R, LABEL_R2I,
-};
-use hkdf::Hkdf;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use sha3::{Digest, Sha3_256};
+use zeroize::Zeroizing;
 
-// ── Protocol identifier ─────────────────────────────────────────────────────
+use crate::crypto;
+use crate::transport::identity::{fingerprint, PeerPins, PinError, PqIdentity};
+use crate::transport::{stream::KyberStream, RxStream, TxStream, STREAM_KEY_SIZE};
 
-/// The multistream-select protocol identifier for this transport.
-/// Version 1.0.0: initial hybrid Kyber + libp2p-identity handshake.
-pub const KYBER_PROTOCOL_ID: &str = "/gnb/kyber/1.0.0";
+// ── Protocol constants ──────────────────────────────────────────────────────
 
-/// Maximum serialized handshake message size (defensive bound).
-/// Kyber768 pk (1184) + libp2p pubkey (~42 bytes for Ed25519, more for RSA)
-/// + nonce (32) + sig (64 for Ed25519, more for others) + bincode overhead.
-/// 16 KiB leaves huge headroom and rejects absurd messages.
-pub const MAX_HANDSHAKE_MSG_SIZE: u32 = 16 * 1024;
+/// multistream-select protocol id.
+pub const PQ_PROTOCOL_ID: &str = "/gnb/pq/2.0.0";
+
+/// Handshake version carried in `Init`.
+pub const PQ_HANDSHAKE_VERSION: u8 = 2;
+
+const DOMAIN: &[u8] = b"GNB-P2P-PQ-v2";
+const LABEL_I2R: &[u8] = b"GNB-P2P-PQ-v2 i->r";
+const LABEL_R2I: &[u8] = b"GNB-P2P-PQ-v2 r->i";
+
+/// ML-KEM-768 (FIPS 203) sizes.
+pub const MLKEM768_PK_SIZE: usize = 1184;
+pub const MLKEM768_CT_SIZE: usize = 1088;
+const NONCE_SIZE: usize = 32;
+
+/// Defensive bound on one handshake message. The largest (`Resp`) carries an
+/// ML-KEM ciphertext, a PQ public key and a PQ signature: about 9.7 KB.
+/// Public so the `handshake_decode` fuzz target applies the same bound.
+pub const MAX_HANDSHAKE_MSG_SIZE: u32 = 32 * 1024;
 
 // ── Wire messages ───────────────────────────────────────────────────────────
-//
-// Public so the `handshake_decode` fuzz target and the parser corpus floor
-// (node/tests/parser_corpus_floor.rs) decode exactly these types, the ones
-// `read_msg` decodes off the wire (NET-17: they used to fuzz the removed,
-// never-used ML-DSA handshake types instead).
 
-/// The dialer's handshake message (decoded by `read_msg`).
 #[derive(Serialize, Deserialize)]
-pub struct HandshakeInitLp {
-    pub version:             u8,
-    pub kyber_pk:            Vec<u8>,
-    /// libp2p `PublicKey::encode_protobuf()` bytes.
-    pub identity_pk_proto:   Vec<u8>,
-    pub nonce:               [u8; HANDSHAKE_NONCE_SIZE],
-    /// libp2p signature over transcript hash t1.
-    pub signature:           Vec<u8>,
+pub struct Init {
+    pub version: u8,
+    pub mlkem_pk: Vec<u8>,
+    pub x25519_pk: [u8; 32],
+    /// libp2p `PublicKey::encode_protobuf()`.
+    pub ed_pk: Vec<u8>,
+    /// Hybrid ML-DSA-65 ‖ Falcon-1024 public key (enveloped).
+    pub pq_pk: Vec<u8>,
+    pub nonce: [u8; NONCE_SIZE],
 }
 
-/// The listener's handshake answer (decoded by `read_msg`).
 #[derive(Serialize, Deserialize)]
-pub struct HandshakeRespLp {
-    pub ciphertext:          Vec<u8>,
-    pub identity_pk_proto:   Vec<u8>,
-    pub signature:           Vec<u8>,
+pub struct Resp {
+    pub mlkem_ct: Vec<u8>,
+    pub x25519_pk: [u8; 32],
+    pub ed_pk: Vec<u8>,
+    pub pq_pk: Vec<u8>,
+    pub nonce: [u8; NONCE_SIZE],
+    pub ed_sig: Vec<u8>,
+    pub pq_sig: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Finish {
+    pub ed_sig: Vec<u8>,
+    pub pq_sig: Vec<u8>,
 }
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-/// Security upgrade configuration. Holds the local node's libp2p identity
-/// keypair — required for signing handshake transcripts.
+/// Security upgrade: the node's two identities and its peer pins.
 #[derive(Clone)]
-pub struct KyberConfig {
+pub struct PqConfig {
     keypair: identity::Keypair,
+    pq: Arc<PqIdentity>,
+    pins: Arc<PeerPins>,
 }
 
-impl KyberConfig {
-    /// Construct a new config from a libp2p identity keypair. Usually
-    /// called via the SwarmBuilder closure.
-    pub fn new(keypair: &identity::Keypair) -> Self {
-        Self { keypair: keypair.clone() }
+impl PqConfig {
+    pub fn new(keypair: &identity::Keypair, pq: Arc<PqIdentity>, pins: Arc<PeerPins>) -> Self {
+        Self { keypair: keypair.clone(), pq, pins }
     }
 }
 
-// ── UpgradeInfo ─────────────────────────────────────────────────────────────
-
-impl UpgradeInfo for KyberConfig {
+impl UpgradeInfo for PqConfig {
     type Info = &'static str;
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(KYBER_PROTOCOL_ID)
+        iter::once(PQ_PROTOCOL_ID)
     }
 }
 
-// ── Error type ──────────────────────────────────────────────────────────────
-
 #[derive(Debug, thiserror::Error)]
-pub enum KyberUpgradeError {
+pub enum PqUpgradeError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("message too large ({got} bytes, max {max})")]
     MessageTooLarge { got: u32, max: u32 },
-    #[error("bincode serialization: {0}")]
+    #[error("serialization: {0}")]
     Serialize(String),
-    #[error("bincode deserialization: {0}")]
+    #[error("deserialization: {0}")]
     Deserialize(String),
-    #[error("unsupported protocol version: {0}")]
+    #[error("unsupported handshake version: {0}")]
     UnsupportedVersion(u8),
-    #[error("invalid Kyber public key")]
-    BadKyberPk,
-    #[error("invalid Kyber ciphertext")]
-    BadKyberCt,
+    #[error("invalid ML-KEM public key")]
+    BadKemPk,
+    #[error("invalid ML-KEM ciphertext")]
+    BadKemCt,
+    #[error("X25519 exchange is not contributory (low-order point)")]
+    WeakX25519,
     #[error("invalid libp2p identity public key: {0}")]
     BadIdentityPk(String),
-    #[error("bad initiator signature")]
-    BadInitiatorSignature,
+    #[error("PQ identity key is not a hybrid ML-DSA-65 ‖ Falcon-1024 key")]
+    BadPqPk,
     #[error("bad responder signature")]
     BadResponderSignature,
+    #[error("bad initiator signature")]
+    BadInitiatorSignature,
+    #[error("peer connected to itself")]
+    SelfConnection,
+    #[error("{0}")]
+    Pin(PinError),
     #[error("signing failed: {0}")]
     SigningFailed(String),
-    #[error("transport error: {0}")]
-    Transport(#[from] crate::transport::TransportError),
 }
 
-// ── Transcript helpers (local to this module — Ed25519/libp2p-sig variant) ──
+// ── Transcript and keys ─────────────────────────────────────────────────────
 
-fn lp_transcript_t1(
-    version:     u8,
-    kyber_pk:    &[u8],
-    id_pk_proto: &[u8],
-    nonce:       &[u8; HANDSHAKE_NONCE_SIZE],
-) -> [u8; TRANSCRIPT_SIZE] {
-    let mut h = Sha3_256::new();
-    h.update(DOMAIN_MAGIC);
-    h.update(b"-libp2p"); // distinguish from Sprint A1 ML-DSA handshake
-    h.update([version]);
-    h.update(kyber_pk);
-    h.update(id_pk_proto);
-    h.update(nonce);
-    h.finalize().into()
+/// Length-prefixed transcript hashing (no field can shift into another).
+struct Transcript(Sha3_256);
+
+impl Transcript {
+    fn new(label: &[u8]) -> Self {
+        let mut t = Transcript(Sha3_256::new());
+        t.put(DOMAIN);
+        t.put(label);
+        t
+    }
+    fn put(&mut self, field: &[u8]) {
+        self.0.update((field.len() as u64).to_le_bytes());
+        self.0.update(field);
+    }
+    fn finish(self) -> [u8; 32] {
+        self.0.finalize().into()
+    }
 }
 
-fn lp_transcript_t2(
-    t1:          &[u8; TRANSCRIPT_SIZE],
-    ciphertext:  &[u8],
-    id_pk_proto: &[u8],
-) -> [u8; TRANSCRIPT_SIZE] {
-    let mut h = Sha3_256::new();
-    h.update(t1);
-    h.update(ciphertext);
-    h.update(id_pk_proto);
-    h.finalize().into()
+fn th_init(m: &Init) -> [u8; 32] {
+    let mut t = Transcript::new(b"init");
+    t.put(&[m.version]);
+    t.put(&m.mlkem_pk);
+    t.put(&m.x25519_pk);
+    t.put(&m.ed_pk);
+    t.put(&m.pq_pk);
+    t.put(&m.nonce);
+    t.finish()
 }
 
-/// Derive session keys. Same key schedule as Sprint A1 but does not derive
-/// a confirmation key (we omit explicit confirmation — first encrypted
-/// yamux frame serves as implicit confirmation, matching libp2p Noise XX).
-fn lp_derive_session_keys(
-    shared_secret: &[u8],
-    t2:            &[u8; TRANSCRIPT_SIZE],
-) -> ([u8; STREAM_KEY_SIZE], [u8; STREAM_KEY_SIZE]) {
-    let hkdf = Hkdf::<Sha256>::new(Some(t2), shared_secret);
+fn th_resp(th_i: &[u8; 32], m: &Resp) -> [u8; 32] {
+    let mut t = Transcript::new(b"resp");
+    t.put(th_i);
+    t.put(&m.mlkem_ct);
+    t.put(&m.x25519_pk);
+    t.put(&m.ed_pk);
+    t.put(&m.pq_pk);
+    t.put(&m.nonce);
+    t.finish()
+}
+
+fn th_finish(th_r: &[u8; 32]) -> [u8; 32] {
+    let mut t = Transcript::new(b"finish");
+    t.put(th_r);
+    t.finish()
+}
+
+/// Session keys from both shared secrets, salted with the transcript.
+fn derive_keys(ss_mlkem: &[u8], ss_x25519: &[u8; 32], th_r: &[u8; 32])
+    -> ([u8; STREAM_KEY_SIZE], [u8; STREAM_KEY_SIZE])
+{
+    let mut ikm = Zeroizing::new(Vec::with_capacity(ss_mlkem.len() + 32));
+    ikm.extend_from_slice(ss_mlkem);
+    ikm.extend_from_slice(ss_x25519);
+    let hk = Hkdf::<Sha256>::new(Some(th_r), &ikm);
     let mut k_i2r = [0u8; STREAM_KEY_SIZE];
     let mut k_r2i = [0u8; STREAM_KEY_SIZE];
-    hkdf.expand(LABEL_I2R, &mut k_i2r).expect("HKDF i2r");
-    hkdf.expand(LABEL_R2I, &mut k_r2i).expect("HKDF r2i");
+    hk.expand(LABEL_I2R, &mut k_i2r).expect("HKDF output length is valid");
+    hk.expand(LABEL_R2I, &mut k_r2i).expect("HKDF output length is valid");
     (k_i2r, k_r2i)
 }
 
-// ── Wire I/O helpers ────────────────────────────────────────────────────────
+fn x25519_ephemeral() -> (x25519_dalek::StaticSecret, [u8; 32]) {
+    let mut seed = Zeroizing::new([0u8; 32]);
+    rand::rng().fill_bytes(seed.as_mut());
+    let sk = x25519_dalek::StaticSecret::from(*seed);
+    let pk = x25519_dalek::PublicKey::from(&sk).to_bytes();
+    (sk, pk)
+}
 
-/// Write one length-prefixed bincode-encoded message to an async stream.
-async fn write_msg<S, T>(stream: &mut S, msg: &T) -> Result<(), KyberUpgradeError>
-where
-    S: AsyncWrite + Unpin,
-    T: Serialize,
-{
-    let bytes = bincode::serde::encode_to_vec(msg, bincode::config::standard())
-        .map_err(|e| KyberUpgradeError::Serialize(e.to_string()))?;
-    if bytes.len() > MAX_HANDSHAKE_MSG_SIZE as usize {
-        return Err(KyberUpgradeError::MessageTooLarge {
-            got: bytes.len() as u32,
-            max: MAX_HANDSHAKE_MSG_SIZE,
-        });
+fn x25519_shared(sk: &x25519_dalek::StaticSecret, peer: &[u8; 32]) -> Result<[u8; 32], PqUpgradeError> {
+    let ss = sk.diffie_hellman(&x25519_dalek::PublicKey::from(*peer));
+    if !ss.was_contributory() {
+        return Err(PqUpgradeError::WeakX25519);
     }
-    let len_prefix = (bytes.len() as u32).to_be_bytes();
-    stream.write_all(&len_prefix).await?;
-    stream.write_all(&bytes).await?;
-    stream.flush().await?;
+    Ok(ss.to_bytes())
+}
+
+/// Decode and check a peer's two identity keys.
+fn peer_identity(ed_pk: &[u8], pq_pk: &[u8]) -> Result<identity::PublicKey, PqUpgradeError> {
+    let ed = identity::PublicKey::try_decode_protobuf(ed_pk)
+        .map_err(|e| PqUpgradeError::BadIdentityPk(e.to_string()))?;
+    if !crypto::is_hybrid_public_key(pq_pk) {
+        return Err(PqUpgradeError::BadPqPk);
+    }
+    Ok(ed)
+}
+
+fn verify_both(ed: &identity::PublicKey, pq_pk: &[u8], msg: &[u8; 32], ed_sig: &[u8], pq_sig: &[u8]) -> bool {
+    // Both are always evaluated; the result is the AND.
+    let ed_ok = ed.verify(msg, ed_sig);
+    let pq_ok = crypto::verify_enveloped_canonical(pq_pk, msg, pq_sig);
+    ed_ok & pq_ok
+}
+
+fn sign_both(cfg: &PqConfig, msg: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>), PqUpgradeError> {
+    let ed = cfg.keypair.sign(msg).map_err(|e| PqUpgradeError::SigningFailed(e.to_string()))?;
+    let pq = cfg.pq.sign(msg).map_err(PqUpgradeError::SigningFailed)?;
+    Ok((ed, pq))
+}
+
+// ── Wire I/O ────────────────────────────────────────────────────────────────
+
+async fn write_msg<S: AsyncWrite + Unpin, T: Serialize>(s: &mut S, msg: &T) -> Result<(), PqUpgradeError> {
+    let bytes = bincode::serde::encode_to_vec(msg, bincode::config::standard())
+        .map_err(|e| PqUpgradeError::Serialize(e.to_string()))?;
+    if bytes.len() > MAX_HANDSHAKE_MSG_SIZE as usize {
+        return Err(PqUpgradeError::MessageTooLarge { got: bytes.len() as u32, max: MAX_HANDSHAKE_MSG_SIZE });
+    }
+    s.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+    s.write_all(&bytes).await?;
+    s.flush().await?;
     Ok(())
 }
 
-/// Read one length-prefixed bincode-encoded message from an async stream.
-async fn read_msg<S, T>(stream: &mut S) -> Result<T, KyberUpgradeError>
-where
-    S: AsyncRead + Unpin,
-    T: for<'de> Deserialize<'de>,
-{
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf);
+async fn read_msg<S: AsyncRead + Unpin, T: for<'de> Deserialize<'de>>(s: &mut S) -> Result<T, PqUpgradeError> {
+    let mut len = [0u8; 4];
+    s.read_exact(&mut len).await?;
+    let len = u32::from_be_bytes(len);
     if len > MAX_HANDSHAKE_MSG_SIZE {
-        return Err(KyberUpgradeError::MessageTooLarge {
-            got: len,
-            max: MAX_HANDSHAKE_MSG_SIZE,
-        });
+        return Err(PqUpgradeError::MessageTooLarge { got: len, max: MAX_HANDSHAKE_MSG_SIZE });
     }
     let mut body = vec![0u8; len as usize];
-    stream.read_exact(&mut body).await?;
-    let (msg, _) = bincode::serde::decode_from_slice(&body, bincode::config::standard())
-        .map_err(|e| KyberUpgradeError::Deserialize(e.to_string()))?;
+    s.read_exact(&mut body).await?;
+    let (msg, used) = bincode::serde::decode_from_slice(&body, bincode::config::standard())
+        .map_err(|e| PqUpgradeError::Deserialize(e.to_string()))?;
+    if used != body.len() {
+        return Err(PqUpgradeError::Deserialize("trailing bytes".into()));
+    }
     Ok(msg)
 }
 
-// ── Outbound upgrade (initiator / dialer) ───────────────────────────────────
+// ── Initiator (dialer) ──────────────────────────────────────────────────────
 
-impl<T> OutboundConnectionUpgrade<T> for KyberConfig
+impl<T> OutboundConnectionUpgrade<T> for PqConfig
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     type Output = (PeerId, KyberStream<T>);
-    type Error  = KyberUpgradeError;
+    type Error = PqUpgradeError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
 
     fn upgrade_outbound(self, mut socket: T, _info: Self::Info) -> Self::Future {
         Box::pin(async move {
-            // 1. Generate ephemeral Kyber keypair.
-            let (kpk, ksk) = kyber768::keypair();
-            let kyber_pk_bytes = kpk.as_bytes().to_vec();
-
-            // 2. Fresh 32-byte nonce.
-            let mut nonce = [0u8; HANDSHAKE_NONCE_SIZE];
+            let (kem_pk, kem_sk) = mlkem768::keypair();
+            let (x_sk, x_pk) = x25519_ephemeral();
+            let mut nonce = [0u8; NONCE_SIZE];
             rand::rng().fill_bytes(&mut nonce);
-
-            // 3. Encode our identity pubkey as protobuf for the wire.
-            let id_pk = self.keypair.public();
-            let id_pk_proto = id_pk.encode_protobuf();
-
-            // 4. Compute transcript t1 and sign.
-            let t1 = lp_transcript_t1(PQ_PROTOCOL_VERSION, &kyber_pk_bytes, &id_pk_proto, &nonce);
-            let signature = self.keypair.sign(&t1)
-                .map_err(|e| KyberUpgradeError::SigningFailed(e.to_string()))?;
-
-            // 5. Send HandshakeInitLp.
-            let init = HandshakeInitLp {
-                version:           PQ_PROTOCOL_VERSION,
-                kyber_pk:          kyber_pk_bytes,
-                identity_pk_proto: id_pk_proto,
+            let init = Init {
+                version: PQ_HANDSHAKE_VERSION,
+                mlkem_pk: kem_pk.as_bytes().to_vec(),
+                x25519_pk: x_pk,
+                ed_pk: self.keypair.public().encode_protobuf(),
+                pq_pk: self.pq.public_key().to_vec(),
                 nonce,
-                signature,
             };
+            let th_i = th_init(&init);
             write_msg(&mut socket, &init).await?;
 
-            // 6. Read HandshakeRespLp.
-            let resp: HandshakeRespLp = read_msg(&mut socket).await?;
-
-            if resp.ciphertext.len() != KYBER768_CT_SIZE {
-                return Err(KyberUpgradeError::BadKyberCt);
+            let resp: Resp = read_msg(&mut socket).await?;
+            if resp.mlkem_ct.len() != MLKEM768_CT_SIZE {
+                return Err(PqUpgradeError::BadKemCt);
             }
-
-            // 7. Verify responder signature.
-            let resp_pk = identity::PublicKey::try_decode_protobuf(&resp.identity_pk_proto)
-                .map_err(|e| KyberUpgradeError::BadIdentityPk(e.to_string()))?;
-            let t2 = lp_transcript_t2(&t1, &resp.ciphertext, &resp.identity_pk_proto);
-            if !resp_pk.verify(&t2, &resp.signature) {
-                return Err(KyberUpgradeError::BadResponderSignature);
+            let peer_ed = peer_identity(&resp.ed_pk, &resp.pq_pk)?;
+            let peer_id = peer_ed.to_peer_id();
+            if peer_id == self.keypair.public().to_peer_id() {
+                return Err(PqUpgradeError::SelfConnection);
             }
+            let th_r = th_resp(&th_i, &resp);
+            if !verify_both(&peer_ed, &resp.pq_pk, &th_r, &resp.ed_sig, &resp.pq_sig) {
+                return Err(PqUpgradeError::BadResponderSignature);
+            }
+            self.pins.check_and_pin(&peer_id, fingerprint(&resp.pq_pk)).map_err(PqUpgradeError::Pin)?;
 
-            // 8. Kyber decapsulate → shared secret.
-            let ct = kyber768::Ciphertext::from_bytes(&resp.ciphertext)
-                .map_err(|_| KyberUpgradeError::BadKyberCt)?;
-            let ss = kyber768::decapsulate(&ct, &ksk);
+            let ct = mlkem768::Ciphertext::from_bytes(&resp.mlkem_ct).map_err(|_| PqUpgradeError::BadKemCt)?;
+            let ss_m = mlkem768::decapsulate(&ct, &kem_sk);
+            let ss_x = Zeroizing::new(x25519_shared(&x_sk, &resp.x25519_pk)?);
 
-            // 9. Derive session keys.
-            let (k_i2r, k_r2i) = lp_derive_session_keys(ss.as_bytes(), &t2);
+            let (ed_sig, pq_sig) = sign_both(&self, &th_finish(&th_r))?;
+            write_msg(&mut socket, &Finish { ed_sig, pq_sig }).await?;
 
-            // 10. Wrap socket. Initiator: tx=i2r, rx=r2i.
-            let stream = KyberStream::new(
-                socket,
-                TxStream::new(k_i2r),
-                RxStream::new(k_r2i),
-            );
-            let peer_id = resp_pk.to_peer_id();
-            Ok((peer_id, stream))
+            let (k_i2r, k_r2i) = derive_keys(ss_m.as_bytes(), &ss_x, &th_r);
+            Ok((peer_id, KyberStream::new(socket, TxStream::new(k_i2r), RxStream::new(k_r2i))))
         })
     }
 }
 
-// ── Inbound upgrade (responder / listener) ──────────────────────────────────
+// ── Responder (listener) ────────────────────────────────────────────────────
 
-impl<T> InboundConnectionUpgrade<T> for KyberConfig
+impl<T> InboundConnectionUpgrade<T> for PqConfig
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     type Output = (PeerId, KyberStream<T>);
-    type Error  = KyberUpgradeError;
+    type Error = PqUpgradeError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
 
     fn upgrade_inbound(self, mut socket: T, _info: Self::Info) -> Self::Future {
         Box::pin(async move {
-            // 1. Read HandshakeInitLp.
-            let init: HandshakeInitLp = read_msg(&mut socket).await?;
-
-            if init.version != PQ_PROTOCOL_VERSION {
-                return Err(KyberUpgradeError::UnsupportedVersion(init.version));
+            let init: Init = read_msg(&mut socket).await?;
+            if init.version != PQ_HANDSHAKE_VERSION {
+                return Err(PqUpgradeError::UnsupportedVersion(init.version));
             }
-            if init.kyber_pk.len() != KYBER768_PK_SIZE {
-                return Err(KyberUpgradeError::BadKyberPk);
+            if init.mlkem_pk.len() != MLKEM768_PK_SIZE {
+                return Err(PqUpgradeError::BadKemPk);
             }
-
-            // 2. Decode initiator's identity pubkey.
-            let init_pk = identity::PublicKey::try_decode_protobuf(&init.identity_pk_proto)
-                .map_err(|e| KyberUpgradeError::BadIdentityPk(e.to_string()))?;
-
-            // 3. Verify initiator's signature over t1.
-            let t1 = lp_transcript_t1(init.version, &init.kyber_pk, &init.identity_pk_proto, &init.nonce);
-            if !init_pk.verify(&t1, &init.signature) {
-                return Err(KyberUpgradeError::BadInitiatorSignature);
+            let peer_ed = peer_identity(&init.ed_pk, &init.pq_pk)?;
+            let peer_id = peer_ed.to_peer_id();
+            if peer_id == self.keypair.public().to_peer_id() {
+                return Err(PqUpgradeError::SelfConnection);
             }
+            let th_i = th_init(&init);
 
-            // 4. Kyber encapsulate against initiator's ephemeral pk.
-            let kpk = kyber768::PublicKey::from_bytes(&init.kyber_pk)
-                .map_err(|_| KyberUpgradeError::BadKyberPk)?;
-            let (ss, ct) = kyber768::encapsulate(&kpk);
-            let ciphertext = ct.as_bytes().to_vec();
+            let kem_pk = mlkem768::PublicKey::from_bytes(&init.mlkem_pk).map_err(|_| PqUpgradeError::BadKemPk)?;
+            let (ss_m, ct) = mlkem768::encapsulate(&kem_pk);
+            let (x_sk, x_pk) = x25519_ephemeral();
+            let ss_x = Zeroizing::new(x25519_shared(&x_sk, &init.x25519_pk)?);
+            let mut nonce = [0u8; NONCE_SIZE];
+            rand::rng().fill_bytes(&mut nonce);
 
-            // 5. Encode own pubkey, compute t2, sign.
-            let own_pk = self.keypair.public();
-            let own_pk_proto = own_pk.encode_protobuf();
-            let t2 = lp_transcript_t2(&t1, &ciphertext, &own_pk_proto);
-            let signature = self.keypair.sign(&t2)
-                .map_err(|e| KyberUpgradeError::SigningFailed(e.to_string()))?;
-
-            // 6. Send HandshakeRespLp.
-            let resp = HandshakeRespLp {
-                ciphertext,
-                identity_pk_proto: own_pk_proto,
-                signature,
+            let mut resp = Resp {
+                mlkem_ct: ct.as_bytes().to_vec(),
+                x25519_pk: x_pk,
+                ed_pk: self.keypair.public().encode_protobuf(),
+                pq_pk: self.pq.public_key().to_vec(),
+                nonce,
+                ed_sig: Vec::new(),
+                pq_sig: Vec::new(),
             };
+            let th_r = th_resp(&th_i, &resp);
+            let (ed_sig, pq_sig) = sign_both(&self, &th_r)?;
+            resp.ed_sig = ed_sig;
+            resp.pq_sig = pq_sig;
             write_msg(&mut socket, &resp).await?;
 
-            // 7. Derive session keys.
-            let (k_i2r, k_r2i) = lp_derive_session_keys(ss.as_bytes(), &t2);
+            // The initiator is accepted only after it signs the FULL transcript.
+            let fin: Finish = read_msg(&mut socket).await?;
+            if !verify_both(&peer_ed, &init.pq_pk, &th_finish(&th_r), &fin.ed_sig, &fin.pq_sig) {
+                return Err(PqUpgradeError::BadInitiatorSignature);
+            }
+            self.pins.check_and_pin(&peer_id, fingerprint(&init.pq_pk)).map_err(PqUpgradeError::Pin)?;
 
-            // 8. Wrap socket. Responder: rx=i2r, tx=r2i.
-            let stream = KyberStream::new(
-                socket,
-                TxStream::new(k_r2i),
-                RxStream::new(k_i2r),
-            );
-            let peer_id = init_pk.to_peer_id();
-            Ok((peer_id, stream))
+            let (k_i2r, k_r2i) = derive_keys(ss_m.as_bytes(), &ss_x, &th_r);
+            Ok((peer_id, KyberStream::new(socket, TxStream::new(k_r2i), RxStream::new(k_i2r))))
         })
     }
 }

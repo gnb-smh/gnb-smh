@@ -43,6 +43,7 @@ pub mod encryption;
 #[cfg(feature = "node")]
 pub mod client;
 pub mod errors;
+pub mod policy_spend;   // multi-party spends from policy (multisig/timelock) addresses
 pub mod http_rpc;
 pub mod disclosure;
 pub mod payment;
@@ -1539,9 +1540,6 @@ impl TxBuilder {
         amount_sats.checked_add(fee_sats).ok_or("amount + fee overflow")?;
         let to_bytes = hex::decode(to_address_hex)
             .map_err(|_| "invalid destination address hex")?;
-        if to_bytes.len() != 20 {
-            return Err("destination address hash must contain exactly 20 bytes".into());
-        }
         let utxos = Self::utxos_from_rows(available_utxos)?;
         let opts = PaymentOptions {
             fee: FeeChoice::Exact(fee_sats),
@@ -1549,6 +1547,93 @@ impl TxBuilder {
             ..PaymentOptions::default()
         };
         Self::build_payment_to_spk(keypair, &utxos, &to_bytes, amount_sats, &opts).map(|p| p.tx)
+    }
+
+    /// Build and sign a transaction paying exactly `outputs` (in order),
+    /// change last, back to the wallet. Every output must be a valid script
+    /// (a 20-byte key hash or a 33-byte policy script) and at least the dust
+    /// threshold. `next_block_height` selects the transaction version and
+    /// sighash, as in [`Self::build`].
+    pub fn build_outputs(
+        keypair:         &Keypair,
+        available_utxos: &[(Vec<u8>, u32, TxOutput)],
+        outputs:         Vec<TxOutput>,
+        fee_sats:        u64,
+        next_block_height: u64,
+    ) -> Result<Transaction, String> {
+        if outputs.is_empty() {
+            return Err("no outputs".into());
+        }
+        let mut amount_sats: u64 = 0;
+        for o in &outputs {
+            // A 20-byte key hash or a 33-byte policy script (core::policy).
+            if crate::core::policy::output_kind(&o.script_pubkey).is_none() {
+                return Err("destination must be a 20-byte key hash or a 33-byte policy script".into());
+            }
+            if o.value < crate::core::DUST_THRESHOLD {
+                return Err("output below the dust threshold".into());
+            }
+            amount_sats = amount_sats.checked_add(o.value).ok_or("output total overflow")?;
+        }
+        let total_needed = amount_sats.checked_add(fee_sats)
+            .ok_or("amount + fee overflow")?;
+        let mut outpoints = std::collections::BTreeSet::new();
+        for (txid, index, _) in available_utxos {
+            if txid.len() != 32 {
+                return Err("UTXO transaction ID must contain exactly 32 bytes".into());
+            }
+            if !outpoints.insert((txid.as_slice(), *index)) {
+                return Err("duplicate UTXO outpoint".into());
+            }
+        }
+
+        // Coin selection: greedy, smallest-first
+        let mut selected: Vec<&(Vec<u8>, u32, TxOutput)> = vec![];
+        let mut selected_total = 0u64;
+        let mut sorted = available_utxos.iter().collect::<Vec<_>>();
+        sorted.sort_by_key(|(_, _, o)| o.value);
+
+        for utxo in &sorted {
+            selected.push(utxo);
+            selected_total = selected_total.checked_add(utxo.2.value)
+                .ok_or("selected UTXO value overflow")?;
+            if selected_total >= total_needed { break; }
+        }
+
+        if selected_total < total_needed {
+            return Err(format!(
+                "insufficient funds: have {} sats, need {} sats",
+                selected_total, total_needed
+            ));
+        }
+
+        // Build inputs (script_sig empty for now — filled after sighash)
+        let inputs: Vec<TxInput> = selected.iter().map(|(txid, idx, _)| {
+            let mut prev_txid = [0u8; 32];
+            prev_txid.copy_from_slice(txid);
+            TxInput { prev_txid, prev_index: *idx, script_sig: vec![], sequence: u32::MAX }
+        }).collect();
+
+        // Outputs (validated above), then change.
+        let mut outputs = outputs;
+
+        // Change output
+        let change = selected_total - total_needed;
+        if change > 546 { // dust threshold
+            outputs.push(TxOutput {
+                value:         change,
+                script_pubkey: keypair.address_bytes(),
+            });
+        }
+
+        let chain_id = crate::core::ChainId::for_network(keypair.network()?);
+        let opts = PaymentOptions { next_block_height: Some(next_block_height), ..PaymentOptions::default() };
+        let version = opts.tx_version(chain_id)?;
+        let mut tx = Transaction { version, inputs, outputs, locktime: 0 };
+        let spent: Vec<TxOutput> = selected.iter().map(|(_, _, o)| o.clone()).collect();
+        payment::sign_inputs(&mut tx, &spent, &keypair.public_key, chain_id,
+                             &|digest, version| keypair.sign_tx_digest(digest, version))?;
+        Ok(tx)
     }
 
     /// Convert `(txid, index, output)` rows, refusing malformed txids.

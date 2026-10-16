@@ -11,6 +11,47 @@ refuses it. A change to a rule the vectors exercise changes a verdict, or the
 stage that reaches it, and fails a runner (see "Effectiveness" for the
 mutations checked).
 
+## This chain's rules (mainnet line, 2026-10)
+
+The vectors were written by the 2026-10 audit for the pre-relaunch rules and
+migrated to the rules this chain has enforced at every height since before
+its 2026-10-14 reset. Where those differ from the audit's "below the
+activation" regime, the vectors pin this chain's rule:
+
+- **BIP30 and no spend of the block's own coinbase at every height**
+  (`bip30`, `same-block-coinbase` below the activation too).
+- **Exact v2 witness framing**: no bytes after the public key
+  (`witness-malformed` below the activation), and Falcon's compact encoding
+  is part of the v2 signature check (`crypto::verify_canonical`: the
+  zero-padded 1,280-byte form is `bad-signature`). An unenveloped
+  (carried-over raw) signature stays valid below the activation.
+- **Sighash v2 over the wire encoding** with version byte 0x02
+  (`reference/gnb_sighash.py`).
+- **Block size on the wire encoding at every height** (`block-size`); no
+  vector records a bincode size any more.
+- **Finality and output kinds** (`node/src/blockval.rs`): a transaction is
+  valid only in a block at height >= `locktime` (`non-final`), and every
+  output, the coinbase's included, is a 20-byte key hash or a 33-byte spend
+  policy (`bad-output-script`). So no 64-byte transaction exists on this
+  chain: the audit's 64-byte cases (a 5-byte script) are `bad-output-script`
+  below the activation and `tx-64-bytes` (the context-free rule, first) from
+  it; the 10,000-byte output script is `bad-output-script`.
+- **Caps**: `script_sig` up to 114,834 bytes (the largest policy witness),
+  `script_pubkey` up to 10,000; `MAX_SUPPLY_SAT` 12,500,000 GNB; genesis
+  timestamp 1,791,685,648.
+- **PoW + PoWit from height 10,000** (mainnet): the block encoding and body
+  root carry the PoWit section (`reference/gnb_merkle.py` `header_root`),
+  and a coinbase may pay the miner at most the subsidy minus its 20% witness
+  pool, plus fees (the halving, pow and mainnet-boundary cases).
+- **The `|wc:` witness commitment** from height 5,000 up to the hardening
+  activation (`witness-commitment-suffix`: the mainnet 109,999 cases).
+
+Dropped premises: the audit's "valid below the activation" cases for
+overwriting an unspent coin, spending the own coinbase, lenient witness
+padding, a zero-padded Falcon half, a bincode-measured size and the
+`locktime = 2^32-1` "no lock-time rule" case are kept with this chain's
+verdict instead (no case was removed).
+
 What the vectors do NOT pin:
 
 - **Header-chain context.** `accept_block`'s checks against the DAG (parents
@@ -64,8 +105,9 @@ GNB_WRITE_VECTORS=1 cargo test -p gnb-crypto --test gen_consensus_vectors -- --i
    The generator never calls a validation function to decide a verdict, and
    boundary values (dust 546,
    maturity 100, minimum fee `max(10,000, ceil(size x 2,000 / 1,000))`, the
-   subsidy schedule, `MAX_SUPPLY_SAT`, the 1,000,000-byte limit, the
-   10,000-byte script cap) come from the generator's own constants, not from
+   subsidy schedule and the PoWit miner share, `MAX_SUPPLY_SAT`, the
+   1,000,000-byte limit, the script caps) come from the generator's own
+   constants, not from
    the code under test. Regenerating after a rule change therefore does not
    move a vector; the runners fail instead. Mining does not use a validation
    function either: the `pow: full` nonces come from the GnB-SMH hash with
@@ -79,8 +121,8 @@ GNB_WRITE_VECTORS=1 cargo test -p gnb-crypto --test gen_consensus_vectors -- --i
    current code.
 3. **The Python check** re-derives every derived value and every
    non-signature verdict from the specification (`docs/CONSENSUS.md`), with
-   its own decoder, Merkle trees, commitment, both sighash digests, bincode
-   size model, Falcon compact-encoding parser and validity rules
+   its own decoder, Merkle trees, commitments, both sighash digests,
+   Falcon compact-encoding parser and validity rules
    (`reference/gnb_validity.py`), and evaluates the GnB-SMH proof of the
    `pow: full` blocks with `reference/gnb_smh.py` (about 2 s each). It cannot
    verify ML-DSA-65 / Falcon-1024 signatures, so a case whose class is
@@ -183,9 +225,11 @@ in the node's order:
    the acceptance pipeline calls for an extension and for every block of a
    reorg; the case's activation height installed, or the schedule's) on a
    RocksDB store holding
-   exactly the `utxo` prevouts: at/after the activation BIP30 and no spend of
-   the block's own coinbase; coinbase maturity; double spends; missing
-   inputs; input MoneyRange; the version rule; witnesses; public-key hashes;
+   exactly the `utxo` prevouts: BIP30 and the coinbase's own finality and
+   output kinds; no spend of the block's own coinbase; coinbase maturity;
+   once every prevout is found, finality (`locktime`) and output kinds;
+   double spends; missing inputs; input MoneyRange; the version rule;
+   witnesses; public-key hashes;
    signatures (sighash v2 or v3 as the version rule selects); value; the
    consensus minimum fee; the coinbase value.
 
@@ -208,8 +252,9 @@ The gnb-crypto runner evaluates step 2 through gnb-crypto's own functions in
 the node's order (`core::check_coinbase_maturity`, the input sum with
 `limits::money_add`, `core::sighash::verify_tx_scripts`,
 `limits::check_tx_money_range`, inputs >= outputs, `core::check_min_fee`).
-BIP30, the same-block coinbase rule, duplicate inputs and missing inputs are
-implemented in `node/src/accept.rs`, so for the 7 cases of those classes it
+BIP30, the same-block coinbase rule, duplicate inputs and missing inputs
+(`node/src/accept.rs`) and finality and output kinds (`node/src/blockval.rs`)
+are node rules, so for the 21 cases of those classes it
 checks every earlier rule and lists the case as deferred to the node runner
 (`TX_DEFERRED_TO_NODE`; the test asserts that every case is either decided or
 deferred, and prints the deferred ones).
@@ -223,22 +268,22 @@ consensus-invalid case is always refused. Admission runs its relay-policy
 rules before its copies of the consensus rules (structure, already
 confirmed, MoneyRange / dust / zero value, the witness framing of every
 input and then the hybrid suite, the version rule and policy, the 64-byte
-rule, duplicate inputs, presence, maturity, value, the minimum fee, the
-relay fee, signatures: `docs/MEMPOOL.md` section 1), so 21 of the 121
-invalid cases are refused by an earlier admission rule, whose class differs
-from the consensus class:
+rule, duplicate inputs, presence, maturity, finality and output kinds,
+value, the minimum fee, the relay fee, signatures: `docs/MEMPOOL.md`
+section 1), so 28 of the 140 invalid cases are refused by an earlier
+admission rule, whose class differs from the consensus class:
 
-- 17 by relay policy (`NonStandard`): 13 `non-standard-witness` (a
+- 22 by relay policy (`NonStandard`): 18 `non-standard-witness` (a
   non-canonical witness where it is not the consensus rule: below the
   activation, or on a version other than 3), 3 `non-standard-suite` (a
   0x0002 key) and 1 `non-standard-version`;
 - 2 by admission's own consensus rule "no inputs" (`Rejected`, class
   `no-inputs`: a zero fee is below the consensus minimum, so the consensus
   class of `struct/no-inputs/*` is `min-fee`);
-- 1 as `missing-input` (`MissingInputs`: the block's own coinbase) and 1 as
-  `already-confirmed` (`Duplicate`: the BIP30 case).
+- 2 as `missing-input` (`MissingInputs`: the block's own coinbase) and 2 as
+  `already-confirmed` (`Duplicate`: the BIP30 cases).
 
-The other 100 are refused by the admission's own copy of the violated
+The other 112 are refused by the admission's own copy of the violated
 rule, with the consensus class. That includes the 17 post-activation cases
 whose version-3 witness is not canonical: from the activation the witness
 check of admission is the consensus rule for version 3 (CRY-1,
@@ -249,8 +294,8 @@ and two cases pin it from both sides:
 `witness/version-1-one-trailing-byte-from-the-activation/post` (version 1
 at the activation: consensus `bad-version`, refused as
 `non-standard-witness`) and `witness/version-3-sighash-v2-one-trailing-byte/pre`
-(version 3 below the activation: consensus-valid, refused as
-`non-standard-witness`). The node runner fails on a different class, and on
+(version 3 below the activation: consensus `witness-malformed` under this
+chain's exact v2 framing, refused as `non-standard-witness`). The node runner fails on a different class, and on
 a storage or pool error.
 
 The node runner also pins the relay verdict of every refusal, the
@@ -290,7 +335,7 @@ input's coin is not in `prevouts`). The Python check recomputes them with
       or "block_parts": [ { "hex", "repeat" } ]   concatenation of each part repeated (1 MB blocks)
     "expected": { "verdict", "error_class" },
     "derived":  null (undecodable) | { "block_hash", "txids", "legacy_merkle_root", "tagged_merkle_root",
-                "witness_root", "parents_commitment", "subsidy", "wire_size", "bincode_size" }
+                "witness_root", "parents_commitment", "subsidy", "wire_size" }
   } ]
 }
 ```
@@ -341,29 +386,32 @@ from in `consensus_vectors_common::classify`):
 
 | Class | Rule | Node error (contains) |
 | --- | --- | --- |
-| `decode` | the bytes are not a canonical encoding: truncated, trailing bytes, non-minimal varint, a count or length above the decoder caps (100,000 inputs / outputs, 10,000-byte scripts, 256 parents) | decoder error |
+| `decode` | the bytes are not a canonical encoding: truncated, trailing bytes, non-minimal varint, a count or length above the decoder caps (100,000 inputs / outputs, a 114,834-byte `script_sig`, a 10,000-byte `script_pubkey`, 256 parents) | decoder error |
 | `coinbase-format` | first transaction not a coinbase, or a second coinbase-shaped transaction, or no transactions | `invalid coinbase format` |
 | `tx-64-bytes` | at/after the activation, a txid preimage of exactly 64 bytes (VAL-10) | `64-byte transaction` |
 | `dust` | a non-coinbase output with 0 < value < 546 | `below dust threshold` |
 | `value-out-of-range` | MoneyRange: an output, an output sum, an input sum or the block total above `MAX_SUPPLY_SAT` (VAL-11) | `MAX_SUPPLY_SAT`, `overflows u64` |
-| `bip30` | at/after the activation, an output at the outpoint of an unspent coin (VAL-2) | `BIP30` |
-| `same-block-coinbase` | at/after the activation, a spend of the block's own coinbase (VAL-3) | `spends the coinbase of its own block` |
+| `bip30` | an output at the outpoint of an unspent coin (every height on this chain; VAL-2) | `BIP30` |
+| `same-block-coinbase` | a spend of the block's own coinbase (every height on this chain; VAL-3) | `spends the coinbase of its own block` |
+| `non-final` | `locktime` above the block height | `non-final: locktime` |
+| `bad-output-script` | an output (the coinbase's included) that is neither a 20-byte key hash nor a 33-byte spend policy | `unsupported script_pubkey` |
+| `witness-commitment-suffix` | from height 5,000 below the activation, the coinbase `script_sig` does not end with `|wc:` and the witness root | `coinbase does not commit to the block's witnesses` |
 | `immature-coinbase` | a coinbase spent before depth 100 | `coinbase maturity` |
 | `double-spend` | an outpoint spent twice in a transaction or a block | `double-spend` |
 | `missing-input` | the outpoint is not in the view nor created earlier in the block | `UTXO ... not found` |
 | `bad-version` | at/after the activation, version != 3 | `bad-txns-version` |
-| `witness-malformed` | below the activation, the lenient witness framing does not parse | `malformed script_sig` |
+| `witness-malformed` | below the activation, the exact v2 witness framing does not parse (or leaves bytes after the key) | `malformed script_sig` |
 | `witness-non-canonical` | at/after the activation, not exactly `[u32 sig_len][sig][u32 pk_len][pk]` or not the canonical signature encoding | `non-canonical` |
 | `pubkey-mismatch` | SHA3-256(public key)[0..20] differs from the coin's script | `pubkey mismatch` |
 | `bad-signature` | a signature does not verify under the digest and binding of the regime | `invalid signature` |
 | `inputs-below-outputs` | outputs exceed inputs | `inputs ... < outputs ...` |
 | `min-fee` | fee below `max(10,000, ceil(wire size x 2,000 / 1,000))` | `below consensus minimum` |
-| `block-size` | above 1,000,000 bytes: bincode below the activation, wire encoding from it (VAL-12) | `block too large` |
+| `block-size` | above 1,000,000 bytes on the wire encoding (every height on this chain) | `block too large` |
 | `bad-merkle-root` | the header root is not the regime's root (legacy below, tagged from the activation) | `invalid merkle root` |
 | `duplicate-tx` | the same txid twice (CVE-2012-2459) | `duplicate transaction in block` |
 | `cb-commitment-missing`, `cb-commitment-tag`, `cb-height`, `cb-parents`, `witness-commitment` | the 80-byte coinbase commitment: shorter than 80 bytes, wrong tag, wrong height, wrong parent list, wrong witness root (VAL-2, CRY-1) | `coinbase commitment missing`, `bad coinbase commitment tag`, `bad-cb-height`, `bad coinbase parents commitment`, `bad witness commitment` |
-| `coinbase-output-count` | the coinbase does not have exactly one output | `coinbase must have 1 output` |
-| `coinbase-value` | the coinbase claims more than subsidy + fees | `miner coinbase output exceeds allowed amount` |
+| `coinbase-output-count` | the coinbase does not have exactly one output (from the PoWit height: one plus one per witness share) | `coinbase must have 1 output`, `coinbase must have 1 miner output` |
+| `coinbase-value` | the coinbase claims more than subsidy + fees (from the PoWit height: the miner share of the subsidy + fees) | `miner coinbase output exceeds allowed amount` |
 | `pow-limit` | the target is above the pow limit of the height (POW-3) | runner (`pow_limit_bits_at`) |
 | `bad-bits` | the compact bits do not decode | runner (`try_bits_to_target`) |
 | `bad-pow` | the GnB-SMH output is not below the target of the bits | `Block::validate_pow` false |

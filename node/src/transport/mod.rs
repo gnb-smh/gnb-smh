@@ -1,86 +1,26 @@
-//! Bloch-SIS Protocol — Post-Quantum Transport Primitives (Sprint A1)
+//! GnB P2P transport: post-quantum security upgrade and session cipher.
 //!
-//! # Scope
+//! - [`upgrade`]: the libp2p security upgrade `/gnb/pq/2.0.0` — hybrid
+//!   ML-KEM-768 (FIPS 203) + X25519 key exchange, hybrid Ed25519 +
+//!   ML-DSA-65 ‖ Falcon-1024 mutual authentication, PQ key pinning.
+//! - [`identity`]: the node's PQ identity and the per-peer PQ key pins.
+//! - [`stream`] and the types below: the ChaCha20-Poly1305 session cipher
+//!   with monotonic nonce counters (replay and reorder rejected) and
+//!   length-prefixed framing whose length is bound into the AEAD.
 //!
-//! The live P2P transport is the libp2p security upgrade in
-//! [`upgrade`]: an ephemeral **Kyber-768** key exchange authenticated by the
-//! node's **libp2p identity key (Ed25519)**, followed by a
-//! ChaCha20-Poly1305 stream ([`stream::KyberStream`]). This module holds
-//! the pieces that upgrade is built from: the protocol constants and HKDF
-//! labels, the one-directional AEAD stream halves ([`TxStream`] /
-//! [`RxStream`]) with monotonic nonce counters, and the reference encoding
-//! of the length-prefixed frame format ([`frame_seal`] / [`frame_open`]:
-//! `KyberStream` writes the same format, and its tests decode it with them).
-//!
-//! M-4 (audit): the KEM here is **Kyber-768, NOT ML-KEM-768 / NIST
-//! FIPS 203**. The two schemes are not the same thing and are **NOT
-//! interoperable** — the key/ciphertext sizes coincide (1184/1088
-//! bytes) because ML-KEM's parameter set descends from round-3 Kyber,
-//! but round-3 Kyber additionally hashes the ciphertext into the
-//! shared secret during encapsulation, which ML-KEM (finalized as
-//! FIPS 203) does not; a node built against `pqcrypto-mlkem` cannot
-//! complete a handshake with this one. `pqcrypto-kyber` wraps PQClean's
-//! `kyber768`, a distinct (and, since FIPS 203 finalized, superseded)
-//! implementation; PQClean ships ML-KEM separately, wrapped by the
-//! different crate `pqcrypto-mlkem`. Migrating to `pqcrypto-mlkem` is a
-//! wire-breaking flag day, not a rename, and is not scheduled by anything in
-//! this tree.
-//!
-//! NET-17 (audit, re-audit): this module used to also carry a second,
-//! ML-DSA-65-authenticated handshake (`Initiator` / `PendingResponder` /
-//! `SessionConfirm`) that nothing in the node ever used — peers have always
-//! been authenticated by their Ed25519 libp2p identity, never by ML-DSA. That
-//! dead code was removed so no reader takes it for the transport (git history
-//! keeps it). Peer authentication is therefore classical (Ed25519);
-//! post-quantum protection covers the session KEYS (Kyber), not the peer
-//! identities. ML-DSA-65 ‖ Falcon-1024 signatures are used at the consensus
-//! layer (transactions, blocks), which is orthogonal to this transport.
-//!
-//! # Security properties claimed (of the primitives here)
-//!
-//! - Session nonce non-reuse: u64 monotonic counter; refuses to overflow
-//! - In-session replay/reorder: rx counter must advance monotonically
-//! - Frame length bound into the AEAD (truncation is detected)
-//!
-//! # Security properties NOT claimed
-//!
-//! - Side-channel resistance of pqcrypto-kyber (KyberSlash was patched in
-//!   upstream reference code Dec 2023; this crate may or may not track it).
-//! - Post-compromise security within a session (no ratcheting).
-//! - Traffic analysis resistance (no padding; message sizes leak).
-//! - Post-quantum peer AUTHENTICATION (identities are Ed25519).
-//! - Formal proof of handshake security. No third-party audit.
+//! The round-3 Kyber handshake that used to live here (`Initiator` /
+//! `PendingResponder` / `SessionConfirm`, ML-DSA-65 authenticated; never wired
+//! into the network, audit NET-17) was removed together with the
+//! `pqcrypto-kyber` dependency.
 
+pub mod identity;
 pub mod stream;
 pub mod upgrade;
 
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, aead::{Aead, KeyInit, Payload}};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // ── Constants ───────────────────────────────────────────────────────────────
-
-/// Protocol version for the PQ transport.
-pub const PQ_PROTOCOL_VERSION: u8 = 1;
-
-/// Domain-separation magic mixed into the initiator transcript hash.
-pub const DOMAIN_MAGIC: &[u8] = b"BLOCH-PQ-v1-handshake";
-
-/// HKDF label for the initiator→responder stream key.
-pub const LABEL_I2R: &[u8] = b"BLOCH-PQ-v1 i->r stream";
-/// HKDF label for the responder→initiator stream key.
-pub const LABEL_R2I: &[u8] = b"BLOCH-PQ-v1 r->i stream";
-
-/// Kyber768 public key size.
-///
-/// M-4 (audit): this is CRYSTALS-Kyber round 3 (PQClean, via `pqcrypto-kyber`
-/// 0.8.1), NOT ML-KEM-768 / NIST FIPS 203. The sizes happen to coincide
-/// (ML-KEM-768 also uses 1184-byte public keys) because ML-KEM's parameter
-/// set descends from round-3 Kyber, but the two schemes differ in the KEM's
-/// key-derivation step and are NOT wire-interoperable. This constant was
-/// previously (incorrectly) annotated "(FIPS 203)".
-pub const KYBER768_PK_SIZE: usize = 1184;
-/// Kyber768 ciphertext size. Same FIPS-203 caveat as [`KYBER768_PK_SIZE`]:
-/// this is round-3 Kyber's ciphertext, not ML-KEM's.
-pub const KYBER768_CT_SIZE: usize = 1088;
 
 /// Size of stream cipher keys (ChaCha20-Poly1305: 256 bits).
 pub const STREAM_KEY_SIZE: usize = 32;
@@ -89,14 +29,10 @@ pub const NONCE_SIZE: usize = 12;
 /// Poly1305 AEAD tag size (128 bits).
 pub const TAG_SIZE: usize = 16;
 
-/// Handshake nonce size (prevents replay of full handshakes).
-pub const HANDSHAKE_NONCE_SIZE: usize = 32;
-/// Transcript hash size (SHA3-256).
-pub const TRANSCRIPT_SIZE: usize = 32;
-
 // ── Stream cipher ───────────────────────────────────────────────────────────
 
-/// Sender half of a one-directional cipher stream.
+/// Sender half of a one-directional cipher stream. The key is wiped on drop.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct TxStream {
     key:     [u8; STREAM_KEY_SIZE],
     counter: u64,
@@ -127,6 +63,8 @@ impl TxStream {
 }
 
 /// Receiver half. Enforces monotonic counter — rejects replay + reorder.
+/// The key is wiped on drop.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct RxStream {
     key:          [u8; STREAM_KEY_SIZE],
     next_counter: u64,

@@ -60,7 +60,7 @@ fn make_mined_block(parent: &Block, miner_spk: &[u8; 20]) -> Block {
         transactions: vec![coinbase],
         blue_score: parent.blue_score + 1,
         height:     parent.height + 1,
-        shielded_transactions: Vec::new(),
+        shielded_transactions: Vec::new(), powit: Default::default(),
     }
 }
 
