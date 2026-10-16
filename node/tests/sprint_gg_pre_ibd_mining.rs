@@ -31,6 +31,7 @@ fn new_node_state() -> Arc<RwLock<NodeState>> {
         best_announced_blue_score: 0,
         peer_addresses: Vec::new(),
         version:        "test".to_string(),
+        min_work_watch: Default::default(),
     }))
 }
 

@@ -19,6 +19,11 @@
 //!
 //! Under `test-pow-limit` every expected target is the pow limit, so every
 //! block carries the same work and "heavier" means "more blue blocks".
+//!
+//! These chains (work 1 per block) are far below mainnet's minimum chain
+//! work, the default of an ingress core in this (mainnet-regime) binary, so
+//! every core here is built with `with_minimum_chain_work(0)`: what is tested
+//! is chain selection, not initial block download (fix_ingress_dos.rs).
 
 mod fix_common;
 use fix_common::*;
@@ -469,7 +474,7 @@ fn dag6_reorg_through_pruned_bodies_is_exact() {
     // new block gets, and the chain is connected once the last one is back —
     // with the UTXO set of a node that never left it.
     let more = b.chain(honest.last().unwrap().block_hash(), 4, "ph-more"); // 64 > 62
-    let mut core = BlockIngress::new();
+    let mut core = BlockIngress::new().with_minimum_chain_work(0);
     let mut refetched = 0;
     for blk in &more {
         match feed(&mut core, &x, blk) {
@@ -538,7 +543,7 @@ fn pruned_then_reorged(tag: &str, fund_byte: u8) -> PrunedReorged {
 fn dag6_restored_body_is_bound_to_the_dag_height() {
     let mut f = pruned_then_reorged("rh", 0x71);
     let more = f.b.chain(f.honest.last().unwrap().block_hash(), 4, "rh-more"); // A: 64 > 62
-    let mut core = BlockIngress::new();
+    let mut core = BlockIngress::new().with_minimum_chain_work(0);
     // A grows past B: the first block that makes it the heaviest is accepted,
     // but its chain cannot be connected yet; the pruned bodies it needs wait
     // for one and are named for the caller to request.
@@ -634,7 +639,7 @@ fn dag6_unrequested_old_bodies_are_known_without_any_work() {
         assert!(t.validate_structure_without_pow().is_err(), "the tampered copy fails the first check");
         t
     };
-    let mut core = BlockIngress::new();
+    let mut core = BlockIngress::new().with_minimum_chain_work(0);
     let len = |b: &Block| b.to_wire_bytes().len();
     for blk in [&b10, &a10] {
         let t = tamper(blk);
@@ -796,7 +801,7 @@ fn dag6_operator_overrides_on_a_pruned_node_refetch_bodies_and_retry() {
             assert!(matches!(feed(core, n, body), BlockOutcome::BodyRestored));
         }
     };
-    let mut core = BlockIngress::new();
+    let mut core = BlockIngress::new().with_minimum_chain_work(0);
 
     // invalidateblock B1: the best remaining chain is A, whose bodies below
     // 40 were pruned.
@@ -838,7 +843,7 @@ fn dag6_operator_overrides_on_a_pruned_node_refetch_bodies_and_retry() {
     };
     assert_eq!(missing.len(), 35, "a5..a39");
     assert!(y.store.invalid_block_reason(&a5).unwrap().is_some(), "the mark is kept until it succeeds");
-    let mut core_y = BlockIngress::new();
+    let mut core_y = BlockIngress::new().with_minimum_chain_work(0);
     restore(&mut core_y, &y, &missing, &f.honest);
     let r = reconsider(&y, a5).expect("the retried reconsiderblock succeeds");
     assert_eq!(r.tip, a_tip);
@@ -873,7 +878,7 @@ fn merge_witness_rejected_body_is_refetched_through_the_ingress_core() {
     assert_eq!(bad.block_hash(), id, "same id: the witness is not committed below the activation");
 
     let n = node_with(&genesis, std::slice::from_ref(&fund));
-    let mut core = BlockIngress::new();
+    let mut core = BlockIngress::new().with_minimum_chain_work(0);
     match feed_as(&mut core, &n, &bad, None, false, bad.to_wire_bytes().len()) {
         BlockOutcome::Processed { result: Err(e), missing_bodies, .. } => {
             assert!(e.contains("body rejected"), "{e}");
@@ -1067,7 +1072,7 @@ fn merge_reconsidered_mark_is_kept_until_its_block_is_revalidated() {
     // The honest body arrives as the answer to the node's pull: stored, but
     // R stays disqualified, as on disk. Pre-fix: B connected here with the
     // mark still on disk.
-    let mut core = BlockIngress::new();
+    let mut core = BlockIngress::new().with_minimum_chain_work(0);
     assert!(matches!(feed(&mut core, &n, &r), BlockOutcome::BodyRestored));
     assert!(n.store.has_block_body(&rh).unwrap());
     assert_eq!(tip_meta(&n), a_tip, "a persisted mark keeps its block off the chain");
@@ -1420,7 +1425,7 @@ fn pow3_low_work_flood_is_refused_before_pow_storage_or_insertion() {
     }
     let mut core = BlockIngress::with_limits(OrphanLimits {
         max_entries: 200, max_bytes: 64 << 20, max_entries_per_peer: 200, max_bytes_per_peer: 64 << 20,
-    });
+    }).with_minimum_chain_work(0);
     let t = std::time::Instant::now();
     for blk in &flood {
         assert!(matches!(feed(&mut core, &x, blk), BlockOutcome::Dropped(DropReason::LowWork)));
@@ -1558,7 +1563,7 @@ fn pow3_heavier_fork_branching_deep_is_followed_tip_first() {
     }
     let mut core = BlockIngress::with_limits(OrphanLimits {
         max_entries: 400, max_bytes: 64 << 20, max_entries_per_peer: 400, max_bytes_per_peer: 64 << 20,
-    });
+    }).with_minimum_chain_work(0);
     let (admissions, drops, rounds) = sync_tip_first(&mut core, &x, &by_hash, fork_tip);
     println!("POW-3 deep fork: followed after {} announcement(s); {} admissions; drops {:?}",
         rounds, admissions.len(), drops);
@@ -1594,7 +1599,7 @@ fn pow3_merge_backed_deep_blocks_are_rationed() {
     for blk in &honest {
         accept(&x, blk).unwrap();
     }
-    let mut core = BlockIngress::new();
+    let mut core = BlockIngress::new().with_minimum_chain_work(0);
     let mut tip = honest.last().unwrap().block_hash();
     let mut admitted = 0;
     for i in 0..(ingress::DEEP_BACKFILL_BURST as usize + 1) {
@@ -1669,7 +1674,7 @@ fn pow3_heavier_dag_shaped_fork_is_followed_under_the_hardened_rules() {
     assert_eq!(ingress::anti_dos_work_threshold(&x.dag.read()), 640 * unit);
     let mut core = BlockIngress::with_limits(OrphanLimits {
         max_entries: 300, max_bytes: 64 << 20, max_entries_per_peer: 300, max_bytes_per_peer: 64 << 20,
-    });
+    }).with_minimum_chain_work(0);
     let (admissions, drops, rounds) = sync_tip_first(&mut core, &x, &by_hash, top.block_hash());
     println!("POW-3 DAG-shaped fork: followed after {rounds} announcement(s); {} admissions", admissions.len());
     assert!(drops.is_empty(), "no fork block was refused: {drops:?}");
@@ -1743,7 +1748,7 @@ fn pow3_remembered_work_survives_a_parent_key_flood() {
     }
     let mut core = BlockIngress::with_limits(OrphanLimits {
         max_entries: 10_000, max_bytes: 64 << 20, max_entries_per_peer: 100, max_bytes_per_peer: 16 << 20,
-    });
+    }).with_minimum_chain_work(0);
     core.orphans.set_remembered_capacity(1_024);
     let attacker = Some(libp2p::PeerId::random());
     let flood: Vec<Block> = (0..12).map(|j| junk_orphan(j, 600)).collect();

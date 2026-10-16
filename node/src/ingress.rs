@@ -264,24 +264,26 @@ pub fn bits_meet_floor(bits: u32, floor: &[u8; 32]) -> bool {
 // threshold is the victim's own (low) tip work.
 
 /// Minimum chain work (blue work, `u128`) of mainnet: the blue work of a
-/// recent block of the real chain, below which a node considers itself in
-/// initial block download (Bitcoin Core's `nMinimumChainWork`).
+/// block of the real chain somewhat below its tip at release time, below
+/// which a node considers itself in initial block download (Bitcoin Core's
+/// `nMinimumChainWork`).
 ///
-/// It IS `core::MIN_CHAIN_WORK`, the one constant a release raises: the same
-/// value turns finality, the reorg depth cap and pruning on
-/// (`core::finality_active`), so the two node-local uses can never disagree.
-/// Still 0: the newest chain data the repository carries is the reading in
-/// docs/MAINNET-READINESS.md §1 (14 Oct 2026, tip height 8,302, blue work
-/// 7,782,451, one node), whose proposed release value (7,000,000) is marked
-/// there as a release decision not yet taken; a value that the real chain
-/// does not reach would stop every new node from syncing. The release
-/// process raises it (docs/RUNNING.md, "Minimum chain work"): before each
-/// release, read the `tip_blue_work` of the selected-chain block about a
-/// week below the tip from several independent nodes (`getdaginfo`), check
-/// they agree, and set `core::MIN_CHAIN_WORK` to it, rounded down. Blue work
-/// is continuous across the GnB-SMH v1 -> v3 switch (`core::block_work`), so
-/// readings from either side compare. Operators can set it at run time with
-/// `--minimumchainwork`.
+/// It IS `core::MIN_CHAIN_WORK` (7,000,000 = 0x6acfc0: derived from the
+/// mainnet reading of docs/MAINNET-READINESS.md §1, tip height 8,302 and
+/// blue work 7,782,451 on 2026-10-14, see its documentation), the one
+/// constant a release raises. It gates this node's initial-block-download
+/// state, its unrequested-block rule and `submitblock`, nothing else: no
+/// verdict on a block, no GhostDAG data and no fork choice (the PoWit
+/// finalized checkpoint included) reads it, so a node with another value
+/// (`--minimumchainwork`, an older release, main's 0) reaches the same
+/// verdicts on the same blocks. The release process raises it
+/// (docs/RUNNING.md, "Initial sync and minimum chain work";
+/// `tools/release/min_chain_work.py` reads the blue work of the
+/// selected-chain block 2,880 blocks, about a day, below the tip from two or
+/// more independent nodes and prints the value to set). A value the real
+/// chain does not reach would keep every new node in initial block download
+/// (the node warns, [`MinimumWorkWatch`]); operators can lower it at run
+/// time with `--minimumchainwork`.
 pub const MAINNET_MINIMUM_CHAIN_WORK: u128 = core::MIN_CHAIN_WORK;
 /// Testnet: 0 (a public test network is reset at will; no requirement).
 pub const TESTNET_MINIMUM_CHAIN_WORK: u128 = 0;
@@ -314,6 +316,111 @@ pub fn parse_minimum_chain_work(s: &str) -> Result<u128, String> {
         return Ok(0);
     }
     u128::from_str_radix(digits, 16).map_err(|e| format!("invalid minimum chain work {s:?}: {e}"))
+}
+
+/// The minimum chain work a node runs with, as chosen at start-up:
+/// `--minimumchainwork` when given, else the network's default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MinimumChainWorkSetting {
+    /// The value in force.
+    pub value: u128,
+    /// The network's default ([`default_minimum_chain_work`]).
+    pub default: u128,
+    /// Set by `--minimumchainwork`.
+    pub overridden: bool,
+}
+
+impl MinimumChainWorkSetting {
+    /// Resolve `--minimumchainwork` (`arg`, hexadecimal) against the
+    /// default of `net`.
+    pub fn resolve(arg: Option<&str>, net: core::activation::ActivationNetwork) -> Result<Self, String> {
+        let default = default_minimum_chain_work(net);
+        Ok(match arg {
+            Some(s) => MinimumChainWorkSetting { value: parse_minimum_chain_work(s)?, default, overridden: true },
+            None => MinimumChainWorkSetting { value: default, default, overridden: false },
+        })
+    }
+
+    /// The start-up warning of Bitcoin Core (`init.cpp`: "nMinimumChainWork
+    /// set below default value of ..."), when the override lowers the
+    /// release value: the node then leaves initial block download, and
+    /// processes unrequested blocks, on a chain the release would not trust.
+    pub fn below_default_warning(&self) -> Option<String> {
+        (self.value < self.default).then(|| format!(
+            "--minimumchainwork {:#x} is below this network's default {:#x}: initial block download ends, \
+             and unrequested blocks are processed, on chains with less work than the release value",
+            self.value, self.default))
+    }
+}
+
+/// How long the selected tip may stay below the minimum chain work before
+/// the node warns ([`MinimumWorkWatch`]), and the interval between
+/// warnings. Reaching the mainnet value from genesis verifies some 7,400
+/// GnB-SMH v1 proofs (64 MiB, about half a second each on one core, on up to
+/// four threads); a node still below it after this long is slow, stuck, or
+/// on a chain (or network) whose work is below the value. Each warning says
+/// how much work the tip gained since the previous one.
+pub const MIN_WORK_WARNING_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// Watches how long the selected tip stays below the minimum chain work.
+/// Bitcoin Core reports such a node as in initial block download (it stays
+/// there until a chain with that much work arrives); the node logs
+/// [`MinimumWorkWarning`] every [`MIN_WORK_WARNING_INTERVAL`] while it lasts.
+#[derive(Clone, Debug, Default)]
+pub struct MinimumWorkWatch {
+    below_since: Option<Instant>,
+    /// When the last warning was issued, and the tip work it reported.
+    last_warning: Option<(Instant, u128)>,
+}
+
+/// A warning of [`MinimumWorkWatch::observe`]; its `Display` is the log line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MinimumWorkWarning {
+    /// How long the tip has been below the minimum.
+    pub below_for: Duration,
+    pub tip_work: u128,
+    pub min_chain_work: u128,
+    /// Tip work gained since the previous warning (`None` for the first).
+    pub gained: Option<u128>,
+}
+
+impl MinimumWorkWatch {
+    /// Record the selected tip's work at `now`; `Some` when a warning is due:
+    /// the tip has been below `min_chain_work` for at least
+    /// [`MIN_WORK_WARNING_INTERVAL`], and as long since the previous warning.
+    /// Reaching the minimum resets the watch.
+    pub fn observe(&mut self, tip_work: u128, min_chain_work: u128, now: Instant) -> Option<MinimumWorkWarning> {
+        if tip_work >= min_chain_work {
+            *self = MinimumWorkWatch::default();
+            return None;
+        }
+        let since = *self.below_since.get_or_insert(now);
+        let below_for = now.saturating_duration_since(since);
+        let last = self.last_warning.map_or(since, |(at, _)| at);
+        if now.saturating_duration_since(last) < MIN_WORK_WARNING_INTERVAL {
+            return None;
+        }
+        let gained = self.last_warning.map(|(_, w)| tip_work.saturating_sub(w));
+        self.last_warning = Some((now, tip_work));
+        Some(MinimumWorkWarning { below_for, tip_work, min_chain_work, gained })
+    }
+}
+
+impl std::fmt::Display for MinimumWorkWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pct = self.tip_work.saturating_mul(100) / self.min_chain_work.max(1);
+        write!(f, "the selected tip's chain work {:#x} ({pct}% of the minimum chain work {:#x}) has been below \
+            the minimum for {} min", self.tip_work, self.min_chain_work, self.below_for.as_secs() / 60)?;
+        match self.gained {
+            Some(0) => write!(f, ", with no progress since the last warning")?,
+            Some(g) => write!(f, " ({g:#x} gained since the last warning)")?,
+            None => {}
+        }
+        write!(f, ": this node stays in initial block download (the miner paused, unrequested blocks refused) \
+            until it syncs a chain with at least that much work. If its peers serve the real chain, keep it \
+            running; if this network's chain carries less work than this value, restart it with a lower \
+            --minimumchainwork <hex> (0 turns the minimum off)")
+    }
 }
 
 static MINIMUM_CHAIN_WORK: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
@@ -3224,7 +3331,72 @@ mod tests {
         assert!(parse_minimum_chain_work("").is_err());
         assert!(parse_minimum_chain_work("12g").is_err());
         assert_eq!(MAINNET_MINIMUM_CHAIN_WORK, core::MIN_CHAIN_WORK,
-            "one release constant for the IBD rules and finality (docs/RUNNING.md)");
+            "one release constant (docs/RUNNING.md)");
+    }
+
+    /// The network defaults (mainnet: the release constant derived from the
+    /// 2026-10-14 reading; testnet and regtest: 0) and `--minimumchainwork`,
+    /// which replaces the default either way, with Bitcoin Core's warning
+    /// when it lowers it.
+    #[test]
+    fn minimum_chain_work_defaults_and_the_override() {
+        use crate::core::activation::ActivationNetwork as Net;
+        assert_eq!(MAINNET_MINIMUM_CHAIN_WORK, 7_000_000);
+        assert_eq!(parse_minimum_chain_work("6acfc0"), Ok(MAINNET_MINIMUM_CHAIN_WORK), "RUNNING.md's hex form");
+        assert_eq!(default_minimum_chain_work(Net::Mainnet), 7_000_000);
+        assert_eq!(default_minimum_chain_work(Net::Testnet), 0);
+        assert_eq!(default_minimum_chain_work(Net::Regtest), 0);
+        assert_eq!(default_minimum_chain_work(core::ChainId::Mainnet.into()), 7_000_000);
+        assert_eq!(default_minimum_chain_work(core::ChainId::Testnet.into()), 0);
+
+        let d = MinimumChainWorkSetting::resolve(None, Net::Mainnet).unwrap();
+        assert_eq!(d, MinimumChainWorkSetting { value: 7_000_000, default: 7_000_000, overridden: false });
+        assert_eq!(d.below_default_warning(), None);
+        let off = MinimumChainWorkSetting::resolve(Some("0"), Net::Mainnet).unwrap();
+        assert_eq!((off.value, off.overridden), (0, true));
+        let w = off.below_default_warning().expect("lowering the release value warns");
+        assert!(w.contains("0x6acfc0") && w.contains("below this network's default"), "{w}");
+        let up = MinimumChainWorkSetting::resolve(Some("0x7000000"), Net::Mainnet).unwrap();
+        assert_eq!(up.value, 0x700_0000);
+        assert_eq!(up.below_default_warning(), None, "raising it is the operator's choice");
+        let t = MinimumChainWorkSetting::resolve(Some("ff"), Net::Testnet).unwrap();
+        assert_eq!((t.value, t.default, t.below_default_warning()), (255, 0, None));
+        assert!(MinimumChainWorkSetting::resolve(Some("7,000,000"), Net::Mainnet).is_err(), "hex only");
+    }
+
+    /// The long-IBD warning: none while the tip is above the minimum or has
+    /// been below it for less than the interval; then one per interval, each
+    /// with the work gained since the previous one; reaching the minimum
+    /// resets the watch.
+    #[test]
+    fn minimum_work_watch_warns_when_the_tip_stays_below() {
+        let min = MAINNET_MINIMUM_CHAIN_WORK;
+        let iv = MIN_WORK_WARNING_INTERVAL;
+        let t0 = Instant::now();
+        let mut w = MinimumWorkWatch::default();
+        assert_eq!(w.observe(min, min, t0), None, "at the minimum: not in IBD");
+        assert_eq!(w.observe(1_000, min, t0), None, "just fell below");
+        assert_eq!(w.observe(2_000, min, t0 + iv - Duration::from_secs(1)), None);
+        let first = w.observe(3_500_000, min, t0 + iv).expect("below for the whole interval");
+        assert_eq!(first, MinimumWorkWarning { below_for: iv, tip_work: 3_500_000, min_chain_work: min, gained: None });
+        let line = first.to_string();
+        assert!(line.contains("50% of the minimum chain work 0x6acfc0") && line.contains("for 30 min"), "{line}");
+        assert!(line.contains("initial block download") && line.contains("--minimumchainwork"), "{line}");
+        assert_eq!(w.observe(3_600_000, min, t0 + iv + iv / 2), None, "one warning per interval");
+        let second = w.observe(3_600_000, min, t0 + 2 * iv).expect("next interval");
+        assert_eq!((second.below_for, second.gained), (2 * iv, Some(100_000)));
+        let third = w.observe(3_600_000, min, t0 + 3 * iv).expect("still below");
+        assert_eq!(third.gained, Some(0));
+        assert!(third.to_string().contains("no progress"), "{third}");
+        // Reaching the minimum resets the watch: a later dip starts over.
+        assert_eq!(w.observe(min + 1, min, t0 + 4 * iv), None);
+        assert_eq!(w.observe(5, min, t0 + 5 * iv), None);
+        assert_eq!(w.observe(5, min, t0 + 6 * iv - Duration::from_secs(1)), None);
+        assert!(w.observe(5, min, t0 + 6 * iv).is_some());
+        // A node whose minimum is 0 (testnet, or --minimumchainwork 0) never warns.
+        let mut z = MinimumWorkWatch::default();
+        assert_eq!(z.observe(0, 0, t0), None);
+        assert_eq!(z.observe(0, 0, t0 + 10 * iv), None);
     }
 
     /// POW-3 (Phase 4): Bitcoin Core's unrequested-block rule.
