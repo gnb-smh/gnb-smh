@@ -90,6 +90,25 @@ pub fn pruned_body_key(hash: &BlockHash) -> Vec<u8> {
     k
 }
 
+/// CF_META key prefix of a hardened-body marker: `hardened_body/<hash>` (empty
+/// value) is written, in the same batch that prunes the body, when the pruned
+/// body passed every context-free hardening block rule as if active
+/// (`accept::classify_stored_block` at activation 0). Those rules are gated
+/// on the block's own header height only, so the marker answers "would this
+/// body pass the start-up hardening recheck" for EVERY activation at or below
+/// its height. The recheck reads it for a candidate whose body is gone
+/// (re-audit B2-T1 follow-up): a body pruned after it was checked is not
+/// disqualified when the recheck runs again under another activation height.
+/// It lives in CF_META, which a chain-state rebuild never clears.
+pub const HARDENED_BODY_PREFIX: &[u8] = b"hardened_body/";
+
+/// CF_META key of `hash`'s hardened-body marker.
+pub fn hardened_body_key(hash: &BlockHash) -> Vec<u8> {
+    let mut k = HARDENED_BODY_PREFIX.to_vec();
+    k.extend_from_slice(hash);
+    k
+}
+
 /// What disconnecting a selected-chain block needs from its body, kept when
 /// the body is pruned (audit DAG-6): the UTXO effects are reversed from the
 /// undo record, which is never pruned; the address-history rows to delete and
@@ -1590,6 +1609,7 @@ impl Storage {
         let cf_blocks = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
         let cf_height = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
         let cf_undo = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
+        let cf_meta = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
         let mut pruned = 0usize;
 
         for h in 0..below_height {
@@ -1621,6 +1641,13 @@ impl Storage {
                         addr_history_keys: indexer::addr_history_keys(&body, &spent),
                     };
                     batch.put_cf(&cf_undo, pruned_body_key(&hash), encode(&rec)?);
+                    // Re-audit B2-T1 follow-up: remember that this body passed
+                    // the hardening block rules before it goes (see
+                    // [`HARDENED_BODY_PREFIX`]).
+                    if matches!(crate::accept::classify_stored_block(&body, 0),
+                                crate::accept::StoredBlockCheck::Valid) {
+                        batch.put_cf(&cf_meta, hardened_body_key(&hash), [0u8; 0]);
+                    }
                 }
                 Err(e) => log::warn!(
                     "prune: body of {} does not decode ({}); pruned without a rollback record",
@@ -1636,6 +1663,16 @@ impl Storage {
             self.put_meta("pruned_height", &below_height.to_le_bytes())?;
         }
         Ok(pruned)
+    }
+
+    /// True iff `hash`'s body was pruned after passing every context-free
+    /// hardening block rule (see [`HARDENED_BODY_PREFIX`]).
+    pub fn has_hardened_body_marker(&self, hash: &BlockHash) -> Result<bool, StorageError> {
+        self.note_reads(1);
+        let cf = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        self.db.get_cf(&cf, hardened_body_key(hash))
+            .map(|v| v.is_some())
+            .map_err(|e| StorageError::ReadFailed(e.to_string()))
     }
 
     /// The rollback record written when `hash`'s body was pruned, if any.

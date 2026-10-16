@@ -1801,6 +1801,10 @@ pub struct RecheckReport {
     /// Of `disqualified`, the candidates without a stored body (pruned by
     /// the pre-upgrade binary), disqualified conservatively (re-audit B2-T1).
     pub disqualified_without_body: usize,
+    /// Candidates without a stored body whose body passed the hardening
+    /// rules when it was pruned (`Storage::has_hardened_body_marker`): left
+    /// valid.
+    pub pruned_after_check: usize,
 }
 
 /// Prefix of the error [`reconcile_on_startup`] returns when the hardening
@@ -1828,7 +1832,11 @@ pub const HARDENING_RECHECK_FAILED: &str = "hardening recheck of stored blocks f
 ///
 /// A candidate whose body is gone (the pre-upgrade binary pruned it) is
 /// disqualified conservatively, like an id-committed failure (re-audit
-/// B2-T1). The recheck runs at the first start of a binary with these rules,
+/// B2-T1), unless its body was pruned after passing these rules (a
+/// hardened-body marker, `Storage::has_hardened_body_marker`: the recheck
+/// runs again after a switch between builds with different activation
+/// heights, and blocks this node accepted under the rules and pruned since
+/// must stay valid). The recheck runs at the first start of a binary with these rules,
 /// before any block is accepted ([`reconcile_on_startup`] refuses to go on
 /// when it fails), so every candidate was stored by a binary without them,
 /// which checked the LEGACY header root against the body before storing it:
@@ -1862,6 +1870,17 @@ pub fn recheck_stored_blocks_under_hardening(
         }
         let body = match store.get_block(&h).map_err(|e| e.to_string())? {
             Some(b) => b,
+            // Pruned by a binary that checked the body first (the marker is
+            // written with the pruning, see `storage::HARDENED_BODY_PREFIX`).
+            // The recheck runs again whenever the activation height differs
+            // from the recorded one (a switch between builds), and this body
+            // may have been accepted and pruned under the hardening rules
+            // themselves: disqualifying it would fork the node off a valid
+            // chain for good.
+            None if store.has_hardened_body_marker(&h).map_err(|e| e.to_string())? => {
+                report.pruned_after_check += 1;
+                continue;
+            }
             None => {
                 let marked = dag.write().mark_invalid_all_edges(h);
                 error!(

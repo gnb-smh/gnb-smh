@@ -1475,6 +1475,55 @@ fn pruned_legacy_blocks_above_the_activation_are_disqualified_at_startup() {
     assert_eq!(applied_tip(&n), Some(m2.block_hash()));
 }
 
+/// Re-audit B2-T1 follow-up (review): the recheck runs again whenever the
+/// recorded activation differs from the binary's, i.e. after a switch between
+/// builds with different activation heights (LOW -> HIGH -> LOW). Blocks the
+/// LOW build accepted under the hardening rules and pruned since have no body
+/// at the second LOW recheck; they must stay valid (their bodies passed the
+/// rules when they were pruned: `Storage::has_hardened_body_marker`), or the
+/// node disqualifies the valid chain and forks itself off for good.
+#[test]
+fn a_recheck_rerun_after_an_activation_switch_keeps_pruned_checked_blocks() {
+    const LOW: u64 = 2;
+    const HIGH: u64 = 1_000;
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let low = activation::scoped_override(LOW);
+    let mut n = node_with(&genesis, &[]);
+    restart(&mut n);
+    let meta = |n: &Node| n.store.get_meta(pipeline::HARDENING_RECHECK_META).unwrap();
+    assert_eq!(meta(&n), Some(LOW.to_le_bytes().to_vec()), "the LOW build's first start");
+    let mut chain = Vec::new();
+    let mut parent = genesis.block_hash();
+    for i in 1..=5u64 {
+        let b = build(&n, vec![parent], vec![coinbase(&format!("b2t1-switch-{i}"), subsidy(i), vec![0xD0 + i as u8; 20])]);
+        accept(&n, &b).expect("a tagged-root block above LOW");
+        parent = b.block_hash();
+        chain.push(b);
+    }
+    // The LOW build prunes heights 0..=3 (2 and 3 are at or above LOW).
+    n.store.prune_blocks_below(4).unwrap();
+    for b in &chain[1..3] {
+        assert!(b.height >= LOW);
+        assert!(n.store.get_block(&b.block_hash()).unwrap().is_none(), "pruned");
+        assert!(n.store.has_hardened_body_marker(&b.block_hash()).unwrap(), "checked before pruning");
+    }
+    drop(low);
+    {
+        let _high = activation::scoped_override(HIGH);
+        restart(&mut n);
+        assert_eq!(meta(&n), Some(HIGH.to_le_bytes().to_vec()), "the HIGH build ran once");
+    }
+    let _low = activation::scoped_override(LOW);
+    restart(&mut n);
+    assert_eq!(meta(&n), Some(LOW.to_le_bytes().to_vec()), "the recheck ran again at LOW");
+    for b in &chain {
+        assert!(!n.dag.read().is_invalid(&b.block_hash()), "h={} stays valid", b.height);
+        assert_eq!(n.store.invalid_block_reason(&b.block_hash()).unwrap(), None, "h={}", b.height);
+    }
+    let tip = chain.last().unwrap().block_hash();
+    assert_eq!((sel_tip(&n), applied_tip(&n)), (Some(tip), Some(tip)));
+}
+
 /// P1 x P2: the template's parent predicate (a stored body must pass the
 /// hardening block rules of its height, defense in depth behind the start-up
 /// recheck) lives in `template::template_parents_and_height`, the ONE source

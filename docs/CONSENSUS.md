@@ -1382,7 +1382,15 @@ used to be counted as unchecked while the recheck still recorded itself as
 done, so a pruned legacy block stayed valid and could become the best valid
 tip once its unpruned descendants were disqualified (Bitcoin Core likewise
 never trusts blocks connected without a newly activated deployment's checks:
-`NeedsRedownload` requires them to be validated again). If the recheck itself
+`NeedsRedownload` requires them to be validated again). The recheck runs
+again whenever the recorded activation height differs from the binary's (a
+switch between builds with different activation heights), when the candidates
+can include blocks this node accepted under the rules and pruned since. So
+pruning writes, in the batch that deletes a body, a marker (CF_META key
+`hardened_body/<hash>`) when that body passed every context-free rule above as
+if active; these rules depend only on the block's own height, so the marker
+holds for every activation at or below it. A body-less candidate with the
+marker stays valid; one without it is disqualified as above. If the recheck itself
 fails (a storage error), nothing is recorded and the node refuses to start,
 so it never stores a block before the recheck has completed. A failure the
 block id commits to (legacy or wrong header root, coinbase format, a 64-byte
