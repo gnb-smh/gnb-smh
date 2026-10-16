@@ -151,10 +151,15 @@ pub fn hash(header: &[u8], nonce: u64) -> [u8; 32] {
 mod tests {
     use super::*;
 
+    /// One SHA-256 compression takes about 0.2 s under Miri (measured,
+    /// docs/testing/SANITIZERS.md), so the hashing tests below run a few
+    /// iterations there and the full count natively.
+    const HASH_TRIALS: u32 = if cfg!(miri) { 3 } else { 200 };
+
     /// The single-compression step must equal FIPS 180-4 SHA256(x || u32le(i) || tag).
     #[test]
     fn step_matches_sha256() {
-        for trial in 0u32..200 {
+        for trial in 0u32..HASH_TRIALS {
             let mut x = [0u8; BLOCK];
             for (k, b) in x.iter_mut().enumerate() {
                 *b = (trial.wrapping_mul(0x9E37_79B9) >> (k % 24)) as u8 ^ k as u8;
@@ -175,7 +180,8 @@ mod tests {
 
     #[test]
     fn nonce_and_header_change_output() {
-        let mut sp = Scratchpad::new(8);
+        // 2^8 blocks natively; 2 blocks (still both phases, both tags) under Miri.
+        let mut sp = Scratchpad::new(if cfg!(miri) { MIN_LOG2_N } else { 8 });
         let a = hash_with(&mut sp, b"gnb", 0);
         assert_ne!(a, hash_with(&mut sp, b"gnb", 1));
         assert_ne!(a, hash_with(&mut sp, b"gnc", 0));

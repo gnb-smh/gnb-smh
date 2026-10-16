@@ -220,7 +220,7 @@ miri() {
   # large to interpret (the test never ends: with_miri_timeout). A new test
   # in gnb-smh or in the gnb-crypto modules selected below needs one if it
   # does either.
-  expect_passed 30 with_miri_timeout cargo +"$nightly" miri test --locked -p gnb-smh
+  expect_passed 36 with_miri_timeout cargo +"$nightly" miri test --locked -p gnb-smh
   expect_passed 42 with_miri_timeout cargo +"$nightly" miri test --locked -p gnb-crypto --lib -- \
     core::limits:: core::tokenomics:: core::block_rules:: core::sighash:: core::activation::
   # Library tests only: tests/vendor_pin.rs reads files (Miri isolation) and
@@ -232,9 +232,10 @@ miri_cross() {
   export CARGO_TARGET_DIR="$root/miri"
   export MIRIFLAGS="${MIRIFLAGS:--Zmiri-strict-provenance}"
   # gnb-smh has no C code, so Miri can interpret it for any target. Its Python
-  # PoW vectors (log2_n <= 2) check every byte-order site on s390x.
+  # PoW vectors (v1 log2_n <= 2, v2 and v3 log2_n = 4) check every byte-order
+  # site on s390x.
   for t in i686-unknown-linux-gnu s390x-unknown-linux-gnu; do
-    expect_passed 30 with_miri_timeout cargo +"$nightly" miri test --locked -p gnb-smh --target "$t"
+    expect_passed 36 with_miri_timeout cargo +"$nightly" miri test --locked -p gnb-smh --target "$t"
   done
   # The wasm wallet's C ABI (gnb_alloc / gnb_call / gnb_free) packs a 32-bit
   # pointer into a u64, so its round trip runs on a 32-bit target. Its
