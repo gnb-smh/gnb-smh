@@ -94,6 +94,7 @@ test("descriptor rejects an own toJSON hook before it can wipe an active session
 
 test("descriptor ignores inherited toJSON dispatch redirection without changing legacy bindings", async () => {
   const core = await coreInstance();
+  assert.equal(typeof core.descriptor, "function");
   const wallet = core.create();
   const previous = Object.getOwnPropertyDescriptor(Object.prototype, "toJSON");
   try {
