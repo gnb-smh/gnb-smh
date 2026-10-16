@@ -3,6 +3,18 @@
 // JSON requests and responses. Randomness comes from crypto.getRandomValues.
 const WASI_EBADF = 8, WASI_ESUCCESS = 0;
 
+// A number may already have lost integer precision before JSON serialization.
+// PQ-PSBT context values use exact decimal strings at the WASM boundary.
+function exactContextInteger(value, name) {
+  if (typeof value === "number" && !Number.isSafeInteger(value)) {
+    throw new Error(`${name} must be an exact integer; use a decimal string`);
+  }
+  if (!["string", "number", "bigint"].includes(typeof value) || !/^(0|[1-9][0-9]*)$/.test(String(value))) {
+    throw new Error(`${name} must be an unsigned decimal integer`);
+  }
+  return String(value);
+}
+
 // WAL-5: the SHA-256 of the binary is mandatory; app.js passes the hash that
 // scripts/build-wallet-wasm.sh pins, and any other binary is refused.
 export async function loadCore(url, sha256Hex) {
@@ -77,6 +89,17 @@ export async function loadCore(url, sha256Hex) {
     address: () => call({ op: "address" }).address,
     normalize: (address) => call({ op: "normalize", address }).address,
     minFee: (size) => call({ op: "minfee", size }).fee,
+    // BIP174-style public roles; the document remains a string so duplicate
+    // JSON fields reach the strict shared parser. Caller-supplied `op` cannot
+    // redirect this public-data binding to an operation using the session key.
+    pqpsbt: (request) => call({ ...request, op: "pqpsbt" }),
+    // Offline context is supplied by the signer. The core checks commitments
+    // and fee/height/network, but cannot attest current chain unspentness.
+    signPqPsbt: (hex, network, nextHeight, maxFee) => call({
+      op: "pqpsbt_sign", hex, network,
+      next_height: exactContextInteger(nextHeight, "nextHeight"),
+      max_fee: exactContextInteger(maxFee, "maxFee"),
+    }),
     wipe: () => call({ op: "wipe" }),
   };
 }

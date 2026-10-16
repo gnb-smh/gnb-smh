@@ -243,11 +243,35 @@ jobs:
           mkdir -p "$RUNNER_TEMP/wasi-sdk"
           tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP/wasi-sdk" --strip-components=1
       - name: Rebuild the wallet core and compare with the pin
+        id: wallet-rebuild
         run: |
           pinned=$(sed -n 's/^const WASM_SHA256 = "\([0-9a-f]*\)";/\1/p' site/wallet/app.js)
           committed=$(sha256sum site/wallet/gnb_wallet.wasm | cut -d' ' -f1)
           WASI_SDK="$RUNNER_TEMP/wasi-sdk" sh scripts/build-wallet-wasm.sh
           rebuilt=$(sha256sum site/wallet/gnb_wallet.wasm | cut -d' ' -f1)
+          # Keep the successful canonical Linux build reviewable even if its
+          # new hash needs an explicit maintainer repin. The comparison below
+          # still fails: uploading an artifact never turns a mismatch green.
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, platform, shutil, subprocess
+          digest = lambda p: hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+          out = pathlib.Path(os.environ["RUNNER_TEMP"]) / "wallet-build"
+          out.mkdir()
+          shutil.copyfile("site/wallet/gnb_wallet.wasm", out / "gnb_wallet.wasm")
+          manifest = {
+              "schema": 1, "revision": os.environ["GITHUB_SHA"],
+              "host": platform.system() + "-" + platform.machine(),
+              "target": "wasm32-wasip1",
+              "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
+              "wasi_sdk_version": os.environ["WASI_SDK_VERSION"],
+              "wasi_sdk_archive_sha256": os.environ["WASI_SDK_SHA256"],
+              "cargo_lock_sha256": digest("Cargo.lock"),
+              "build_script_sha256": digest("scripts/build-wallet-wasm.sh"),
+              "wasm_sha256": digest(out / "gnb_wallet.wasm"),
+          }
+          (out / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+          PY
+          echo "artifact_ready=true" >> "$GITHUB_OUTPUT"
           echo "pinned    $pinned"
           echo "committed $committed"
           echo "rebuilt   $rebuilt"
@@ -256,6 +280,14 @@ jobs:
           test "$rebuilt" = "$pinned"
           # The script re-pins and refreshes the SRI hashes: nothing may change.
           git diff --exit-code -- site/
+      - name: Preserve rebuilt wallet and source manifest
+        if: ${{ always() && steps.wallet-rebuild.outputs.artifact_ready == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wallet-wasm-${{ github.sha }}
+          path: ${{ runner.temp }}/wallet-build/
+          if-no-files-found: error
+          retention-days: 14
 
   # The site's JavaScript tests (site/tests, Node's built-in runner, no npm
   # dependencies): the committed wallet core loaded as the page loads it
