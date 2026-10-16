@@ -1,4 +1,10 @@
 // Bounded address fixtures for the RPC boundary; no network traffic is sent.
+// Literal v2 vectors were generated independently by the Python reference.
+const ADDRESS_V2_MAIN_42: &str = "gnb1zq9g4z52329g4z52329g4z52329g4z5232lk8szw";
+const ADDRESS_V2_TEST_42: &str = "tgnb1zq9g4z52329g4z52329g4z52329g4z5232ed3tuc";
+const POLICY_V2_MAIN_44: &str = "gnb1zp9skzctpv9skzctpv9skzctpv9skzctpv9skzctpv9skzctpv9skqamypv7";
+const POLICY_V2_TEST_44: &str = "tgnb1zp9skzctpv9skzctpv9skzctpv9skzctpv9skzctpv9skzctpv9skqzctyfu";
+
 #[tokio::test]
 async fn address_frontends_queries_reject_wrong_network_before_storage() {
     use crate::address::{Address, Network, PolicyAddress};
@@ -76,6 +82,62 @@ async fn address_frontends_validators_share_legacy_alias_parser() {
     for (method, field) in [("validateaddress", "isvalid"), ("validateaddressverbose", "valid")] {
         assert_eq!(dispatch(method, Some(&json!([main])), &state).await[field], true);
         assert_eq!(dispatch(method, Some(&json!([bloch])), &state).await[field], true, "{method} must use the already accepted alias parser");
+    }
+}
+
+#[tokio::test]
+async fn address_frontends_v2_aliases_keep_existing_index_identity() {
+    use crate::address::{Address, Network, PolicyAddress};
+    let (_tmp, state) = state_with_chain(1);
+    let legacy = Address::from_hash([42; 20], Network::Mainnet).to_string();
+    state.store.put_utxo(&[43; 32], 0, &TxOutput { value: 12_345, script_pubkey: vec![42; 20] }).unwrap();
+    let tx = Transaction { version: 1, inputs: vec![],
+        outputs: vec![TxOutput { value: 12_345, script_pubkey: vec![42; 20] }], locktime: 0 };
+    state.store.index_tx_addresses(&tx, 0, 0).unwrap();
+    for method in ["getbalance", "getutxos", "getaddressinfo", "getaddresshistory", "listtransactions", "getaddressbalance_at_height"] {
+        let mut old = dispatch(method, Some(&json!([legacy])), &state).await;
+        assert!(old.get("error").is_none(), "legacy positive {method}: {old}");
+        let mut new = dispatch(method, Some(&json!([ADDRESS_V2_MAIN_42])), &state).await;
+        assert!(new.get("error").is_none(), "v2 {method}: {new}");
+        old.as_object_mut().unwrap().remove("address");
+        new.as_object_mut().unwrap().remove("address");
+        assert_eq!(old, new, "{method}: aliases must query the same index identity");
+    }
+    assert_eq!(dispatch("getaddresscount", None, &state).await["addresses_with_balance"], 1);
+    let script = [vec![crate::core::policy::POLICY_TAG], vec![44; 32]].concat();
+    let policy = PolicyAddress::from_script(&script, Network::Mainnet).unwrap();
+    state.store.put_utxo(&[45; 32], 0, &TxOutput { value: 23_456, script_pubkey: script }).unwrap();
+    let old = dispatch("getutxos", Some(&json!([policy.to_string()])), &state).await;
+    let new = dispatch("getutxos", Some(&json!([POLICY_V2_MAIN_44])), &state).await;
+    assert_eq!(new["satoshis"], "23456", "{new}");
+    assert_eq!(old["utxos"], new["utxos"]);
+    assert_eq!(old["returned"], new["returned"]);
+    for other in [ADDRESS_V2_TEST_42, POLICY_V2_TEST_44] {
+        let before = state.store.storage_reads();
+        assert_eq!(dispatch("getutxos", Some(&json!([other])), &state).await["error"],
+            "address is for Testnet, expected Mainnet");
+        assert_eq!(state.store.storage_reads() - before, 0);
+    }
+}
+
+#[tokio::test]
+async fn address_frontends_explicit_v2_conversion_preserves_legacy_default() {
+    use crate::address::{Address, Network, PolicyAddress};
+    let (_tmp, state) = state_with_chain(1);
+    let single = Address::from_hash([42; 20], Network::Mainnet).to_string();
+    let script = [vec![crate::core::policy::POLICY_TAG], vec![44; 32]].concat();
+    let policy = PolicyAddress::from_script(&script, Network::Mainnet).unwrap().to_string();
+    for (legacy, v2) in [(&single, ADDRESS_V2_MAIN_42), (&policy, POLICY_V2_MAIN_44)] {
+        for (method, field) in [("validateaddress", "isvalid"), ("validateaddressverbose", "valid")] {
+            for input in [legacy.as_str(), v2] {
+                let response = dispatch(method, Some(&json!([input])), &state).await;
+                assert_eq!(response[field], true, "{method}: {response}");
+                assert_eq!(response["address"], input);
+                assert_eq!(response["canonical_address"], *legacy);
+                assert_eq!(response["bech32m"], v2, "{method}: {response}");
+                assert_eq!(response["network"], "mainnet");
+            }
+        }
     }
 }
 
