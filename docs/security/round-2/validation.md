@@ -145,6 +145,11 @@ UTC. Its fuzz job was still running when inspected. These later results do
 not imply green CI at merge, and the Linux passes do not close either local
 macOS finding or establish the cause of the full-template timeout.
 
+The subsequent query of [PR run 38919107108](https://github.com/gnb-smh/gnb-smh/actions/runs/38919107108)
+returned `status: completed`, `conclusion: success`, with no pending jobs.
+This closes the remote CI gate for the published PR head `88d0e93`, after
+the owner had already merged it; it does not change the local failure record.
+
 Do not infer passing tests from compilation, source definitions, workflow
 configuration or an earlier revision. Preserve failures and skipped counts.
 Green CI for the exact proposed head is required before the next merge.
