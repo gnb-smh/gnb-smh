@@ -1328,7 +1328,14 @@ node without that field) and produces version 3 with
 sighash v3 and bound signatures at/after the activation of its chain, and
 version 1 with sighash v2 below it. Without the height they refuse to sign.
 Below the activation, wallets still fetch the previous transactions to verify
-claimed values; under v3 that is unnecessary.
+claimed values; under v3 that is unnecessary. An input whose previous
+transaction the node does not serve is signed on the claimed value only after
+an explicit acknowledgement (wallet-local, every height below the
+activation): the web wallet's checkbox, the `gnb-cli send` / `gnb-wallet
+send` confirmation or `--allow-unverified-inputs`, and for the library path
+`WalletClient::send_payment_with` with `SendOptions::allow_unverified_inputs`
+(`WalletClient::send` and `send_payment` refuse such inputs before signing;
+WAL-1 residual).
 
 ### Vectors
 
