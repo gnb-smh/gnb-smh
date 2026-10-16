@@ -21,7 +21,13 @@
 //! Core stops processing a peer's `getdata` while its send buffer is over
 //! `-maxsendbuffer`, `fPauseSend`). Answers to a peer that does not read are
 //! given up after `sync_rr::RESPONSE_WRITE_TIMEOUT`, and a block is sent as
-//! its stored bytes (no decode and re-encode, no second copy).
+//! its stored bytes (no decode and re-encode, no second copy). The last
+//! [`PROTECTED_SEND_RESERVE`] of the global budget is kept for peers we
+//! dialed and `--peer` peers, so identities that connect to us and never read
+//! cannot get every peer answered Busy (Bitcoin Core exempts peers with the
+//! download permission from its upload limit).
+
+use std::collections::HashSet;
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -41,6 +47,9 @@ use super::{SyncEntry, MAX_WIRE_GETHEADERS_LIMIT, MAX_WIRE_TIPS};
 pub const PER_PEER_SEND_BUDGET: usize = 4 * 1024 * 1024;
 /// Bytes of unwritten answers all peers together may have.
 pub const GLOBAL_SEND_BUDGET: usize = 64 * 1024 * 1024;
+/// The part of [`GLOBAL_SEND_BUDGET`] only protected peers (dialed by us, or
+/// `--peer`) may use: the others together stop at the rest.
+pub const PROTECTED_SEND_RESERVE: usize = 16 * 1024 * 1024;
 /// Requests computed at once (blocking-pool tasks).
 pub const MAX_SERVE_WORKERS: usize = 2;
 /// Requests of one peer waiting for a worker (above: Busy). An honest client
@@ -96,9 +105,14 @@ pub struct ServeQueue<R, C> {
     rr: VecDeque<PeerId>,
     queued: usize,
     peers: HashMap<PeerId, PeerServe>,
-    /// Unwritten answer bytes per request.
-    charged: HashMap<R, (PeerId, usize)>,
+    /// Unwritten answer bytes per request (and whether its peer was
+    /// protected when charged).
+    charged: HashMap<R, (PeerId, usize, bool)>,
     total_unwritten: usize,
+    /// Of `total_unwritten`, the bytes of unprotected peers.
+    unprotected_unwritten: usize,
+    /// Connected peers we dialed or named with `--peer`.
+    protected: HashSet<PeerId>,
     computing: usize,
 }
 
@@ -117,15 +131,30 @@ impl<R: Copy + Eq + Hash, C> ServeQueue<R, C> {
             peers: HashMap::new(),
             charged: HashMap::new(),
             total_unwritten: 0,
+            unprotected_unwritten: 0,
+            protected: HashSet::new(),
             computing: 0,
         }
     }
 
-    /// Whether `peer` may be sent another answer now (its unwritten bytes
-    /// and everyone's are under budget).
+    /// `peer` connected (`protected`: we dialed it, or it is a `--peer`), or
+    /// disconnected (`false`).
+    pub fn set_protected(&mut self, peer: PeerId, protected: bool) {
+        if protected {
+            self.protected.insert(peer);
+        } else {
+            self.protected.remove(&peer);
+        }
+    }
+
+    /// Whether `peer` may be sent another answer now: its unwritten bytes
+    /// and everyone's are under budget, and, for an unprotected peer, the
+    /// unprotected peers' bytes leave [`PROTECTED_SEND_RESERVE`] free.
     pub fn has_send_budget(&self, peer: &PeerId) -> bool {
         self.total_unwritten < GLOBAL_SEND_BUDGET
             && self.peers.get(peer).map_or(0, |p| p.unwritten) < PER_PEER_SEND_BUDGET
+            && (self.protected.contains(peer)
+                || self.unprotected_unwritten < GLOBAL_SEND_BUDGET - PROTECTED_SEND_RESERVE)
     }
 
     /// Queue a request for a worker. `Err(job)`: answer it Busy now (queue
@@ -183,17 +212,24 @@ impl<R: Copy + Eq + Hash, C> ServeQueue<R, C> {
         }
         self.peers.entry(peer).or_default().unwritten += bytes;
         self.total_unwritten += bytes;
-        self.charged.insert(id, (peer, bytes));
+        let protected = self.protected.contains(&peer);
+        if !protected {
+            self.unprotected_unwritten += bytes;
+        }
+        self.charged.insert(id, (peer, bytes, protected));
         OUTSTANDING.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     /// The answer to request `id` was written, or failed: its bytes are free.
     pub fn release(&mut self, id: &R) {
-        let Some((peer, bytes)) = self.charged.remove(id) else { return };
+        let Some((peer, bytes, protected)) = self.charged.remove(id) else { return };
         if let Some(p) = self.peers.get_mut(&peer) {
             p.unwritten = p.unwritten.saturating_sub(bytes);
         }
         self.total_unwritten = self.total_unwritten.saturating_sub(bytes);
+        if !protected {
+            self.unprotected_unwritten = self.unprotected_unwritten.saturating_sub(bytes);
+        }
         OUTSTANDING.fetch_sub(bytes as u64, Ordering::Relaxed);
         self.gc_peer(&peer);
     }
@@ -383,6 +419,36 @@ mod tests {
         }
         assert_eq!(q.unwritten(&slow), 0);
         assert!(q.submit(job(slow, 200)).is_ok());
+    }
+
+    /// Review of B1-T18: identities that connected to us and never read
+    /// fill only the unprotected part of the global budget; a peer we dialed
+    /// (or a `--peer`) is still served. Before, 16 such identities got every
+    /// peer answered Busy.
+    #[test]
+    fn non_reading_inbound_identities_cannot_starve_protected_peers() {
+        let mut q: ServeQueue<u32, ()> = ServeQueue::new();
+        let outbound = PeerId::random();
+        q.set_protected(outbound, true);
+        let mut id = 0u32;
+        let mut filled = 0usize;
+        // Inbound identities each take their full per-peer budget and never read.
+        for _ in 0..(GLOBAL_SEND_BUDGET / PER_PEER_SEND_BUDGET) {
+            let p = PeerId::random();
+            if !q.has_send_budget(&p) {
+                break;
+            }
+            id += 1;
+            q.charge(p, id, PER_PEER_SEND_BUDGET);
+            filled += 1;
+        }
+        assert_eq!(filled * PER_PEER_SEND_BUDGET, GLOBAL_SEND_BUDGET - PROTECTED_SEND_RESERVE);
+        assert!(!q.has_send_budget(&PeerId::random()), "another inbound identity is refused");
+        assert!(q.has_send_budget(&outbound), "a peer we dialed is still served");
+        q.submit(job(outbound, 9_999)).expect("its request is queued, not Busy");
+        // The protected peers' own use is bounded by the global budget.
+        q.set_protected(outbound, false);
+        assert!(!q.has_send_budget(&outbound), "unprotected once disconnected");
     }
 
     /// Workers are bounded and peers are served round-robin.

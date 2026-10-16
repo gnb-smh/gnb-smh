@@ -172,19 +172,36 @@ As a client the node:
   addresses for an address request, or Busy. Any other answer is a protocol
   violation: it is dropped, the request goes to another peer, and the peer
   is penalized;
-- sends a block request first to the peer whose answer announced the block,
-  never twice to the same peer, to at most 8 peers, with a growing delay
-  from the third attempt on (250 ms doubling, at most 4 s), and drops it
-  after 10 minutes or once every connected peer has answered it; a
-  "not found" ranks the answering peer down (it is taken back if nobody has
-  the block), and a peer that keeps answering uselessly is asked only when
-  no better peer could take the request at all;
+- sends a block request first to the peer whose answer announced the block
+  (peers it dialed before peers that connected to it), never again to a
+  peer that answered it (a Busy answer or a closed connection excepted: the
+  peer may be asked again after its back-off or once reconnected), to at
+  most 8 peers, with a growing delay from the third attempt on (250 ms
+  doubling, at most 4 s), and drops it after 10 minutes or once every
+  connected peer has answered it;
+- ranks a peer down for a "not found" to one of its own requests (taken
+  back when every peer asked answered "not found" and the request ran out
+  of peers or attempts), never for a "not found" to a block another peer
+  announced (that announcer is ranked down instead when nobody serves the
+  block), for an empty header answer after claiming to be ahead, and for
+  each Busy back-off after the first two in a row without a useful answer;
+  a peer that keeps answering uselessly is asked only when no better peer
+  could take the request at all;
+- sends a header request first to up to 4 peers that recently claimed to
+  be ahead (in an order keyed by a per-node secret, peers it dialed first);
+  a shorter answer than asked from one of them is used and the request also
+  goes to the next of them;
 - keeps each peer's cooldown, scores and rotation slot when it disconnects
   (up to 1,024 peers), so reconnecting does not clear a stall cooldown
   (60 s, doubling for repeat offenders up to 16 minutes);
 - lets the answers of one peer start at most 1,024 of the 4,096 queued
-  block requests and at most 64 of the 512 frontier tips in flight, and
-  always admits its own requests (orphan parents, the 30 s nudge);
+  block requests, those of all peers that connected to it together at most
+  2,048, and at most 64 of the 512 frontier tips in flight; when the queue
+  is full, its own requests (orphan parents, the 30 s nudge) take the place
+  of a queued request another peer's answer announced, and a request
+  announced by a peer it dialed takes the place of one announced by a peer
+  that connected to it; otherwise the request is refused and re-issued
+  later;
 - counts a "not found" toward abandoning an advertised frontier tip only
   from a peer it dialed, and forgets an abandoned tip after one hour.
 
@@ -195,7 +212,9 @@ round-robin across peers. Per peer it answers at most 64 block requests in
 a burst then 8 per second, 16 header requests then 2 per second, 8 tips
 requests then one per 2 s, 4 address requests then one per 10 s, and 256
 requests per second in all; a peer whose unwritten answers reach 4 MiB, or
-all peers' 64 MiB, gets Busy without the answer being computed. An answer
+all peers' 64 MiB, gets Busy without the answer being computed. Peers that
+connected to the node share only 48 MiB of that: the last 16 MiB is kept
+for peers it dialed and `--peer` peers. An answer
 not written within 15 s is dropped, and a connection keeps at most 64
 directed-sync streams open. Blocks are sent as stored. The tips answer is
 the selected tip and the best other valid tips by blue work, at most 256,

@@ -16,21 +16,33 @@
 //! * Every answer is bound to its request (`sync_rr::check_response`): any
 //!   other answer is a protocol violation — not delivered, the pull not
 //!   completed, the peer put on cooldown, and the caller penalizes it.
-//! * A pull prefers the peers that announced the block (its hints), is never
-//!   sent twice to the same peer, is retried with a growing delay (the first
-//!   retry at once), is dropped after [`MAX_PULL_ATTEMPTS`] peers, when no
-//!   connected peer is left to ask, or after [`MAX_PULL_AGE`]. Busy is
-//!   back-pressure: it neither uses an attempt nor excludes the peer.
-//! * NotFound counts against the answering peer (it ranks down), and is
-//!   refunded if the pull is dropped (then nobody had the block: the answer
-//!   was true). Only a NotFound from a peer we dialed is delivered (it may
-//!   count toward abandoning a frontier tip: free inbound identities cannot
-//!   abandon one).
-//! * One source's answers cannot fill the shared queue: pulls attributed to
-//!   the peer whose answer announced them are capped per source
-//!   ([`MAX_PENDING_PER_SOURCE`]), and the node's own pulls are always
-//!   admitted (they evict an attributed one when the queue is full). The same
-//!   block is pulled once however many answers name it.
+//! * A pull prefers the peers that announced the block (its hints; peers we
+//!   dialed first), is never sent again to a peer that answered it (a Busy
+//!   answer or a closed connection excepted: the peer said nothing about
+//!   it), is retried with a growing delay (the first retry at once), is
+//!   dropped after [`MAX_PULL_ATTEMPTS`] peers, when no connected peer is
+//!   left to ask, or after [`MAX_PULL_AGE`]. Busy is back-pressure: it
+//!   neither uses an attempt nor excludes the peer, but a peer that answers
+//!   only Busy ranks down (`sync_rr::FREE_BUSY_EPISODES`).
+//! * NotFound for one of the node's own pulls counts against the answering
+//!   peer (it ranks down); the charge is refunded when every peer asked
+//!   answered NotFound and the pull ran out of peers or attempts (nobody had
+//!   the block: the answers were true). NotFound for a block another peer
+//!   announced costs the answering peer nothing (it may truly not have it):
+//!   the announcer pays one useless answer when nobody serves the block.
+//!   Only a NotFound from a peer we dialed is delivered (it may count toward
+//!   abandoning a frontier tip: free inbound identities cannot abandon one).
+//! * A GetHeaders answered short (fewer entries than asked, none at all
+//!   included) by a peer that claimed to be ahead is delivered and also
+//!   asked of the next such peer: one claimer cannot hold header sync back.
+//! * Answers cannot fill the shared queue: pulls attributed to the peer whose
+//!   answer announced them are capped per source ([`MAX_PENDING_PER_SOURCE`])
+//!   and, for sources that connected to us (free identities), all together
+//!   ([`MAX_PENDING_INBOUND_ATTRIBUTED`]). When the queue is full, the node's
+//!   own pulls evict a queued attributed one (inbound sources first), and
+//!   pulls announced by a peer we dialed evict one announced by an inbound
+//!   source; otherwise the pull is refused. The same block is pulled once
+//!   however many answers name it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
@@ -46,6 +58,11 @@ pub const MAX_PENDING_PULLS: usize = 4096;
 /// B1-T2: max queued or in-flight pulls attributed to ONE source (the peer
 /// whose Headers or Tips answer announced them).
 pub const MAX_PENDING_PER_SOURCE: usize = MAX_PENDING_PULLS / 4;
+/// B1-T2 (review): max queued or in-flight pulls attributed to sources that
+/// connected to us, all together: a handful of free inbound identities, each
+/// under [`MAX_PENDING_PER_SOURCE`], used to fill the whole queue and get
+/// every pull announced by an honest peer refused.
+pub const MAX_PENDING_INBOUND_ATTRIBUTED: usize = MAX_PENDING_PULLS / 2;
 /// A pull is sent to at most this many different peers (the processor's own
 /// retry paths — frontier expiry, orphan sweep, the 30 s nudge — re-issue
 /// anything still needed after that). B1-T6: was 3, with no spacing and
@@ -72,7 +89,9 @@ pub enum Enqueued {
     Queued,
     /// The same block is already queued or in flight.
     Duplicate,
-    /// Queue full, or its source is over [`MAX_PENDING_PER_SOURCE`].
+    /// Queue full (and nothing it may evict), or its source is over
+    /// [`MAX_PENDING_PER_SOURCE`], or it is an inbound source and those are
+    /// over [`MAX_PENDING_INBOUND_ATTRIBUTED`].
     Refused,
 }
 
@@ -112,8 +131,14 @@ struct PendingPull {
     pinned: bool,
     /// Peers that answered or failed it: never asked again.
     tried: Vec<PeerId>,
-    /// Peers that answered NotFound (refunded if the pull is dropped).
+    /// Peers charged for a NotFound to this (local) pull: refunded when
+    /// every peer asked answered NotFound and the pull is dropped.
     not_found: Vec<PeerId>,
+    /// `source` connected to us (counted in
+    /// [`MAX_PENDING_INBOUND_ATTRIBUTED`]).
+    inbound_source: bool,
+    /// `source` already paid for this pull (its own NotFound).
+    source_charged: bool,
     attempts: u8,
     not_before: Instant,
     created: Instant,
@@ -126,6 +151,17 @@ impl PendingPull {
             _ => None,
         }
     }
+}
+
+/// Why a pull is dropped (what its NotFound charges and its announcer owe).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropKind {
+    /// Out of peers or attempts.
+    NobodyServed,
+    /// Older than [`MAX_PULL_AGE`].
+    TooOld,
+    /// Evicted to admit another pull: nobody's fault.
+    Evicted,
 }
 
 /// Spacing before attempt `attempts + 1`: none for the first retry, then
@@ -149,6 +185,8 @@ pub struct PullScheduler<I> {
     wanted: HashSet<[u8; 32]>,
     /// Queued or in-flight pulls per source.
     per_source: HashMap<PeerId, usize>,
+    /// Queued or in-flight pulls attributed to inbound sources.
+    inbound_attributed: usize,
     dropped: u64,
     last_expiry: Option<Instant>,
 }
@@ -161,6 +199,7 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
             inflight: HashMap::new(),
             wanted: HashSet::new(),
             per_source: HashMap::new(),
+            inbound_attributed: 0,
             dropped: 0,
             last_expiry: None,
         }
@@ -198,8 +237,11 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
     }
 
     /// Queue a pull. `source`: the peer whose answer announced it (charged
-    /// against [`MAX_PENDING_PER_SOURCE`]; `None` for the node's own pulls).
-    /// `hints`: peers believed to have it, asked first.
+    /// against [`MAX_PENDING_PER_SOURCE`] and, if it connected to us,
+    /// [`MAX_PENDING_INBOUND_ATTRIBUTED`]; `None` for the node's own pulls).
+    /// `hints`: peers believed to have it, asked first (the first
+    /// [`MAX_HINTS`] distinct ones, peers we dialed before peers that
+    /// connected to us).
     pub fn enqueue(&mut self, req: SyncRequest, source: Option<PeerId>, hints: &[PeerId], now: Instant) -> Enqueued {
         if matches!(req, SyncRequest::Malformed) {
             return Enqueued::Refused;
@@ -209,16 +251,37 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
                 return Enqueued::Duplicate;
             }
         }
+        let inbound_source = source.is_some_and(|s| !self.selector.is_outbound(&s));
         if let Some(s) = source {
-            if self.per_source.get(&s).copied().unwrap_or(0) >= MAX_PENDING_PER_SOURCE {
+            if self.per_source.get(&s).copied().unwrap_or(0) >= MAX_PENDING_PER_SOURCE
+                || (inbound_source && self.inbound_attributed >= MAX_PENDING_INBOUND_ATTRIBUTED)
+            {
                 return Enqueued::Refused;
             }
         }
-        if self.pending.len() >= MAX_PENDING_PULLS && !(source.is_none() && self.evict_one_attributed(now)) {
-            return Enqueued::Refused;
+        if self.pending.len() >= MAX_PENDING_PULLS {
+            // The node's own pulls and those a peer we dialed announced may
+            // evict one announced by an inbound source; the node's own may
+            // also evict one a dialed peer announced.
+            let evicted = match source {
+                None => self.evict_one_attributed(true, now) || self.evict_one_attributed(false, now),
+                Some(_) if !inbound_source => self.evict_one_attributed(true, now),
+                Some(_) => false,
+            };
+            if !evicted {
+                return Enqueued::Refused;
+            }
         }
-        let mut h: Vec<PeerId> = hints.iter().copied().take(MAX_HINTS).collect();
-        h.dedup();
+        let mut h: Vec<PeerId> = Vec::with_capacity(MAX_HINTS);
+        for p in hints.iter().take(4 * MAX_HINTS) {
+            if !h.contains(p) {
+                h.push(*p);
+            }
+        }
+        // B1-T6 review: a peer we dialed before an identity that connected
+        // to us (stable: the caller's order within each group).
+        h.sort_by_key(|p| !self.selector.is_outbound(p));
+        h.truncate(MAX_HINTS);
         let p = PendingPull {
             req,
             source,
@@ -226,6 +289,8 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
             pinned: false,
             tried: Vec::new(),
             not_found: Vec::new(),
+            inbound_source,
+            source_charged: false,
             attempts: 0,
             not_before: now,
             created: now,
@@ -241,6 +306,9 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
         }
         if let Some(s) = p.source {
             *self.per_source.entry(s).or_insert(0) += 1;
+            if p.inbound_source {
+                self.inbound_attributed += 1;
+            }
         }
     }
 
@@ -255,31 +323,49 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
                     self.per_source.remove(&s);
                 }
             }
+            if p.inbound_source {
+                self.inbound_attributed = self.inbound_attributed.saturating_sub(1);
+            }
         }
     }
 
-    /// Drop a pull for good: its NotFound answers were true (refund them).
-    fn drop_pull(&mut self, p: PendingPull, now: Instant, why: &str) {
-        debug!("directed pull [{}] dropped ({why}) after {} attempt(s)", p.req.kind_name(), p.attempts);
-        for peer in &p.not_found {
-            self.selector.refund_useless(peer, now, 1.0);
+    /// Drop a pull for good. Its NotFound charges are refunded only when it
+    /// ran out of peers or attempts and every peer asked answered NotFound
+    /// (nobody had the block: the answers were true); a timeout or a broken
+    /// answer among them, an expiry or an eviction refunds nothing. A block
+    /// announced by a still-connected peer that nobody served costs that
+    /// announcer one useless answer (unless its own NotFound already did),
+    /// except on eviction.
+    fn drop_pull(&mut self, p: PendingPull, now: Instant, kind: DropKind) {
+        debug!("directed pull [{}] dropped ({kind:?}) after {} attempt(s)", p.req.kind_name(), p.attempts);
+        if kind == DropKind::NobodyServed && p.tried.iter().all(|t| p.not_found.contains(t)) {
+            for peer in &p.not_found {
+                self.selector.refund_useless(peer, now, 1.0);
+            }
+        }
+        if kind != DropKind::Evicted && !p.source_charged {
+            if let Some(s) = p.source.filter(|s| self.selector.is_connected(s)) {
+                self.selector.charge_useless(&s, now, 1.0);
+            }
         }
         self.release(&p);
         self.dropped += 1;
     }
 
-    /// Make room for one of the node's own pulls: remove the most recently
-    /// queued pull of the source with the most pulls charged.
-    fn evict_one_attributed(&mut self, now: Instant) -> bool {
+    /// Make room in a full queue: remove the most recently queued pull of
+    /// the source with the most pulls charged, among inbound sources only
+    /// when `inbound_only`.
+    fn evict_one_attributed(&mut self, inbound_only: bool, now: Instant) -> bool {
         let heaviest = self
             .pending
             .iter()
+            .filter(|p| !inbound_only || p.inbound_source)
             .filter_map(|p| p.source)
             .max_by_key(|s| (self.per_source.get(s).copied().unwrap_or(0), s.to_bytes()));
         let Some(s) = heaviest else { return false };
         let Some(i) = self.pending.iter().rposition(|p| p.source == Some(s)) else { return false };
         let Some(p) = self.pending.remove(i) else { return false };
-        self.drop_pull(p, now, "evicted for a local pull");
+        self.drop_pull(p, now, DropKind::Evicted);
         true
     }
 
@@ -296,6 +382,8 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
             pinned: true,
             tried: vec![peer],
             not_found: Vec::new(),
+            inbound_source: false,
+            source_charged: false,
             attempts: 0,
             not_before: now,
             created: now,
@@ -315,7 +403,7 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
             }
             let Some(p) = self.pending.pop_front() else { break };
             if !p.tried.is_empty() && !self.selector.has_untried(&p.tried) {
-                self.drop_pull(p, now, "no connected peer left to ask");
+                self.drop_pull(p, now, DropKind::NobodyServed);
                 continue;
             }
             if p.not_before > now {
@@ -344,7 +432,7 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
         let mut keep = VecDeque::with_capacity(self.pending.len());
         while let Some(p) = self.pending.pop_front() {
             if now.saturating_duration_since(p.created) >= MAX_PULL_AGE {
-                self.drop_pull(p, now, "too old");
+                self.drop_pull(p, now, DropKind::TooOld);
             } else {
                 keep.push_back(p);
             }
@@ -371,7 +459,7 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
         }
         p.attempts = p.attempts.saturating_add(1);
         if p.attempts >= MAX_PULL_ATTEMPTS {
-            self.drop_pull(p, now, "attempts used up");
+            self.drop_pull(p, now, DropKind::NobodyServed);
             return;
         }
         p.not_before = now + retry_delay(p.attempts);
@@ -406,16 +494,48 @@ impl<I: Copy + Eq + Hash> PullScheduler<I> {
         }
         match resp {
             SyncResponse::BlockNotFound { .. } => {
-                self.selector.on_useless(&peer, now, 1.0);
-                p.not_found.push(peer);
+                match p.source {
+                    // B1-T6 review: a block another peer announced. This
+                    // peer may truly not have it: no charge (the announcer
+                    // pays if nobody serves it, `drop_pull`). Charging it
+                    // let an attacker announce made-up blocks and turn every
+                    // honest peer into a poor one with their true NotFounds.
+                    Some(s) if s != peer => self.selector.on_closed(&peer),
+                    Some(_) => {
+                        // The announcer itself cannot serve what it announced.
+                        self.selector.on_useless(&peer, now, 1.0);
+                        p.source_charged = true;
+                    }
+                    None => {
+                        self.selector.on_useless(&peer, now, 1.0);
+                        p.not_found.push(peer);
+                    }
+                }
                 let deliver = self.counts_for_abandonment(&peer);
                 self.retry(p, peer, now);
                 ResponseAction { deliver, violation: None }
             }
-            SyncResponse::Headers { entries } if entries.is_empty() && p.hints.contains(&peer) => {
-                // It claimed to be ahead of `from` and has nothing above it.
-                self.selector.on_useless(&peer, now, 1.0);
-                self.release(&p);
+            SyncResponse::Headers { entries } if p.hints.contains(&peer) => {
+                // It claimed to be ahead of `from`. Nothing above it is a
+                // useless answer; fewer entries than asked may be honest (it
+                // is near its tip) but must not hold header sync back: the
+                // entries are delivered, and the request also goes to the
+                // next peer that claimed to be ahead, if one is left.
+                if entries.is_empty() {
+                    self.selector.on_useless(&peer, now, 1.0);
+                } else {
+                    self.selector.on_success(&peer);
+                }
+                let asked = match p.req {
+                    SyncRequest::GetHeaders { limit, .. } => limit as usize,
+                    _ => 0,
+                };
+                let next_hint = p.hints.iter().any(|h| *h != peer && !p.tried.contains(h) && self.selector.is_connected(h));
+                if entries.len() < asked && next_hint && usize::from(p.attempts) + 1 < MAX_HINTS {
+                    self.retry(p, peer, now);
+                } else {
+                    self.release(&p);
+                }
                 ResponseAction { deliver: true, violation: None }
             }
             _ => {

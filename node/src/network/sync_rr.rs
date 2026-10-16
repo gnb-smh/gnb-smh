@@ -898,6 +898,12 @@ pub const MAX_STALL_COOLDOWN: Duration = Duration::from_secs(16 * 60);
 pub const COOLDOWN_MEMORY: Duration = Duration::from_secs(30 * 60);
 /// NET-5: short back-off after a `Busy` answer (honest back-pressure).
 pub const BUSY_COOLDOWN: Duration = Duration::from_secs(2);
+/// B1-T6 (review): Busy back-off episodes in a row (no useful answer in
+/// between) that cost nothing. Each further episode counts as one useless
+/// answer: an honest server under load alternates Busy with answers (its
+/// limiter refills), a peer that answers only Busy becomes a poor peer
+/// instead of staying the "better peer" every pull waits for.
+pub const FREE_BUSY_EPISODES: u32 = 2;
 /// B1-T6: half-life of a peer's stall and useless-answer scores.
 pub const SCORE_HALF_LIFE: Duration = Duration::from_secs(60);
 /// B1-T6: a peer whose penalty (useless answers + 2 x stall score) reaches
@@ -928,6 +934,9 @@ struct PullPeer {
     last_cooldown: Option<std::time::Instant>,
     last_selected: Option<std::time::Instant>,
     disconnected_at: Option<std::time::Instant>,
+    /// Busy back-off episodes since its last useful answer
+    /// ([`FREE_BUSY_EPISODES`]).
+    busy_streak: u32,
 }
 
 impl PullPeer {
@@ -981,8 +990,10 @@ fn penalty_rank(p: f64) -> u32 {
 /// 2. the peers the pull names as having the block (the peer whose answer
 ///    announced it — Bitcoin Core downloads a block from a peer whose headers
 ///    chain contains it);
-/// 3. a lower penalty class: useless answers (NotFound, an empty answer from
-///    a peer that claimed more) and twice the stall score (timeouts,
+/// 3. a lower penalty class: useless answers (NotFound to the node's own
+///    pull, an empty answer from a peer that claimed more, an announced block
+///    nobody served, each Busy episode after [`FREE_BUSY_EPISODES`] in a row)
+///    and twice the stall score (timeouts,
 ///    violations), both decaying with [`SCORE_HALF_LIFE`] — so a peer that
 ///    answers fast with nothing, which always has the fewest pulls in flight,
 ///    no longer wins by being fast;
@@ -1117,6 +1128,17 @@ impl PullPeerSelector {
     pub fn on_success(&mut self, peer: &PeerId) {
         if let Some(s) = self.peers.get_mut(peer) {
             s.in_flight = s.in_flight.saturating_sub(1);
+            s.busy_streak = 0;
+        }
+    }
+
+    /// Charge `peer` one or more useless answers without touching its
+    /// in-flight count (B1-T6 review: the announcer of a block nobody
+    /// served).
+    pub fn charge_useless(&mut self, peer: &PeerId, now: std::time::Instant, weight: f64) {
+        if let Some(s) = self.peers.get_mut(peer) {
+            s.decay(now);
+            s.useless += weight;
         }
     }
 
@@ -1142,10 +1164,21 @@ impl PullPeerSelector {
         }
     }
 
-    /// `peer` answered `Busy`: back off briefly, no failure recorded.
+    /// `peer` answered `Busy`: back off briefly. Free for the first
+    /// [`FREE_BUSY_EPISODES`] back-off episodes in a row; each further one
+    /// (still no useful answer) counts as one useless answer (B1-T6 review:
+    /// a peer answering only Busy used to cost nothing and stay preferred,
+    /// so pulls waited on it while honest peers sat idle).
     pub fn on_busy(&mut self, peer: &PeerId, now: std::time::Instant) {
         if let Some(s) = self.peers.get_mut(peer) {
             s.in_flight = s.in_flight.saturating_sub(1);
+            if s.cooldown_until.is_none_or(|t| now >= t) {
+                s.busy_streak = s.busy_streak.saturating_add(1);
+                if s.busy_streak > FREE_BUSY_EPISODES {
+                    s.decay(now);
+                    s.useless += 1.0;
+                }
+            }
             let until = now + BUSY_COOLDOWN;
             s.cooldown_until = Some(s.cooldown_until.map_or(until, |t| t.max(until)));
         }
@@ -1194,6 +1227,11 @@ impl PullPeerSelector {
     #[allow(dead_code)] // library API and tests; the node binary compiles this module too
     pub fn is_cooling_down(&self, peer: &PeerId, now: std::time::Instant) -> bool {
         self.peers.get(peer).and_then(|s| s.cooldown_until).is_some_and(|t| now < t)
+    }
+
+    /// True while `peer` is connected.
+    pub fn is_connected(&self, peer: &PeerId) -> bool {
+        self.peers.get(peer).is_some_and(|s| s.connected)
     }
 
     /// True while `peer` is connected through a connection we dialed.

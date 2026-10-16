@@ -152,8 +152,9 @@ pub enum NetworkControl {
     /// B1-T2: GetBlock pulls for blocks that `source`'s directed Headers or
     /// Tips answer announced (the processor found them missing). Queued
     /// with `source` as the preferred peer and charged to its quota
-    /// (`pull::MAX_PENDING_PER_SOURCE`), so one peer's answers cannot fill
-    /// the shared pull queue.
+    /// (`pull::MAX_PENDING_PER_SOURCE`; with every other source that
+    /// connected to us, `pull::MAX_PENDING_INBOUND_ATTRIBUTED`), so peers'
+    /// answers cannot fill the shared pull queue.
     Fetch { source: PeerId, hashes: Vec<[u8; 32]> },
 }
 
@@ -1420,8 +1421,9 @@ impl NetworkNode {
         // stall- and usefulness-aware peer choice, per-source queue quotas,
         // never the same peer twice for one pull, spaced retries — never
         // re-published on gossip (NET-7).
+        let explicit_ids = sync_rr::explicit_peer_ids(&self.config.bootstrap_peers);
         let mut pulls: pull::PullScheduler<libp2p::request_response::OutboundRequestId> =
-            pull::PullScheduler::new(sync_rr::explicit_peer_ids(&self.config.bootstrap_peers));
+            pull::PullScheduler::new(explicit_ids.clone());
 
         // Re-gossip rate-limit: suppress re-publishes of the SAME block within
         // the duplicate-cache window (a guaranteed local `Duplicate` anyway).
@@ -1598,6 +1600,11 @@ impl NetworkNode {
                             // NET-9 residual: we dialed it (counts toward
                             // abandoning a frontier tip) or it dialed us.
                             pulls.on_connect(peer_id, endpoint.is_dialer(), Instant::now());
+                            // B1-T18 review: peers we dialed and `--peer` peers
+                            // keep a reserved part of the send budget.
+                            if endpoint.is_dialer() || explicit_ids.contains(&peer_id) {
+                                serve_q.set_protected(peer_id, true);
+                            }
                             // PROPAGAÇÃO-CHURN fix: persist only the canonical form of
                             // a DIALED address (the Listener's send_back_addr is an
                             // ephemeral socket). NET-11: confirmed addresses enter
@@ -1706,6 +1713,7 @@ impl NetworkNode {
                                 let now = Instant::now();
                                 pulls.on_disconnect(&peer_id, now);
                                 serve_q.forget_queued(&peer_id);
+                                serve_q.set_protected(peer_id, false);
                                 if let Some(tx) = &self.peer_events {
                                     let _ = tx.try_send(PeerEvent::Disconnected(peer_id));
                                 }
@@ -1993,11 +2001,14 @@ impl NetworkNode {
                     if let Some(req) = sync_rr::as_pull_request(&msg) {
                         let now = Instant::now();
                         // B1-T6: a GetHeaders prefers the peers whose (fresh,
-                        // clamped) claim is ahead of `from`; an empty answer
-                        // from one of them counts as useless.
+                        // clamped) claim is ahead of `from`, in a per-node
+                        // secret order, the peers we dialed first (the
+                        // scheduler keeps `pull::MAX_HINTS` of them); an empty
+                        // answer from one of them counts as useless, and a
+                        // short one also goes to the next of them.
                         let hints = match &req {
                             sync_rr::SyncRequest::GetHeaders { from_blue_score, .. } => {
-                                peer_state.claiming_above(*from_blue_score, now, pull::MAX_HINTS)
+                                peer_state.claiming_above(*from_blue_score, now, 4 * pull::MAX_HINTS)
                             }
                             _ => Vec::new(),
                         };

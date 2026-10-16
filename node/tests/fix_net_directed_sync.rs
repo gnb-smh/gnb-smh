@@ -19,9 +19,14 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use gnb::network::pull::{Enqueued, FailureKind, PullScheduler, MAX_PENDING_PULLS};
-use gnb::network::sync_rr::{SyncRequest, SyncRequestLimiter, SyncResponse, MAX_INFLIGHT_PER_PEER, STALL_FAILURES};
+use gnb::network::pull::{
+    Enqueued, FailureKind, PullScheduler, MAX_PENDING_INBOUND_ATTRIBUTED, MAX_PENDING_PER_SOURCE, MAX_PENDING_PULLS,
+};
+use gnb::network::sync_rr::{
+    SyncRequest, SyncRequestLimiter, SyncResponse, MAX_INFLIGHT_PER_PEER, STALL_FAILURES,
+};
 use gnb::network::SyncEntry;
+use gnb::sync::peer_state::PeerStateTable;
 use gnb::sync::frontier::{FrontierState, ABANDONED_TTL, MAX_FRONTIER_IN_FLIGHT, MAX_NEW_TIPS_PER_RESPONSE};
 use libp2p::PeerId;
 
@@ -344,6 +349,177 @@ fn duplicate_block_pulls_are_coalesced() {
     assert_eq!(s.pending_len(), 1);
 }
 
+/// Review of B1-T2: free inbound identities, each under its own quota,
+/// together hold at most half the queue; a pull announced by a peer we
+/// dialed is still admitted when the queue is full (it evicts one an inbound
+/// source announced), and so is the node's own. Before, five identities
+/// filled the queue and every honest peer's announced pull was refused.
+#[test]
+fn inbound_identities_cannot_fill_the_pull_queue() {
+    let t0 = Instant::now();
+    let mut s: PullScheduler<u64> = PullScheduler::new(HashSet::new());
+    let honest = PeerId::random();
+    s.on_connect(honest, true, t0);
+    let sybils: Vec<PeerId> = (0..6).map(|_| PeerId::random()).collect();
+    let mut next = 0u32;
+    let mut queued = 0usize;
+    for sy in &sybils {
+        s.on_connect(*sy, false, t0);
+        for _ in 0..MAX_PENDING_PER_SOURCE {
+            next += 1;
+            if s.enqueue(get_block(next), Some(*sy), &[*sy], t0) == Enqueued::Queued {
+                queued += 1;
+            }
+        }
+    }
+    assert_eq!(queued, MAX_PENDING_INBOUND_ATTRIBUTED, "inbound identities together queued {queued}");
+    // The node's own pulls fill the rest of the queue.
+    while s.pending_len() < MAX_PENDING_PULLS {
+        next += 1;
+        assert_eq!(s.enqueue(get_block(next), None, &[], t0), Enqueued::Queued);
+    }
+    // Full queue: a pull a dialed peer announced still gets in.
+    for i in 0..64 {
+        assert_eq!(
+            s.enqueue(get_block(5_000_000 + i), Some(honest), &[honest], t0),
+            Enqueued::Queued,
+            "an honest peer's announced pull was refused"
+        );
+    }
+    assert_eq!(s.pending_len(), MAX_PENDING_PULLS);
+    assert_eq!(s.enqueue(get_block(6_000_000), None, &[], t0), Enqueued::Queued, "a local pull was refused");
+    // An inbound identity evicts nothing.
+    let late = PeerId::random();
+    s.on_connect(late, false, t0);
+    assert_eq!(s.enqueue(get_block(7_000_000), Some(late), &[late], t0), Enqueued::Refused);
+}
+
+/// Review of B1-T6: a NotFound for a block ANOTHER peer announced costs the
+/// answering peer nothing (it may truly not have it); the announcer pays
+/// when nobody serves the block. Before, an attacker's made-up announcements
+/// were answered NotFound by every honest peer, and each answer ranked that
+/// honest peer down until all of them were poor peers.
+#[test]
+fn not_found_for_a_block_another_peer_announced_is_charged_to_the_announcer() {
+    let t0 = Instant::now();
+    let (mut s, p) = scheduler(3, t0);
+    let announcer = p[0];
+    let mut id = 0;
+    s.on_misbehaving(&announcer, t0); // on cooldown: the pull goes to the others
+    s.enqueue(get_block(42), Some(announcer), &[announcer], t0);
+    let mut now = t0;
+    for _ in 0..2 {
+        let sent = drain(&mut s, now, &mut id);
+        let (peer, rid, _) = sent[0].clone();
+        assert_ne!(peer, announcer);
+        s.on_response(rid, peer, &SyncResponse::BlockNotFound { block_hash: h(42) }, now);
+        assert_eq!(s.selector().penalty(&peer, now), 0.0, "a true NotFound for another peer's announcement was charged");
+        now += Duration::from_millis(10);
+    }
+    // Then the announcer itself says NotFound: it pays, and the pull is dropped.
+    let mut rid = None;
+    for step in 0..40 {
+        let t = t0 + Duration::from_secs(61 + 15 * step);
+        if let Some((peer, r, _)) = drain(&mut s, t, &mut id).first().cloned() {
+            assert_eq!(peer, announcer);
+            rid = Some((r, t));
+            break;
+        }
+    }
+    let (r, t) = rid.expect("the pull went back to its announcer once its cooldown ended");
+    s.on_response(r, announcer, &SyncResponse::BlockNotFound { block_hash: h(42) }, t);
+    drain(&mut s, t, &mut id);
+    assert_eq!(s.dropped(), 1);
+    assert!(s.selector().penalty(&announcer, t) > 0.0, "the announcer did not pay for its unservable announcement");
+}
+
+/// Review of B1-T6: a NotFound charge on the node's own pull is refunded
+/// only when every peer asked answered NotFound; a pull that also timed out
+/// on a peer (the block may exist there) refunds nothing.
+#[test]
+fn not_found_is_refunded_only_when_every_peer_asked_said_not_found() {
+    let t0 = Instant::now();
+    let (mut s, p) = scheduler(2, t0);
+    let mut id = 0;
+    s.enqueue(get_block(77), None, &[p[0]], t0);
+    let (peer, rid, _) = drain(&mut s, t0, &mut id)[0].clone();
+    assert_eq!(peer, p[0]);
+    s.on_response(rid, peer, &SyncResponse::BlockNotFound { block_hash: h(77) }, t0);
+    let (peer, rid, _) = drain(&mut s, t0, &mut id)[0].clone();
+    assert_eq!(peer, p[1]);
+    s.on_failure(rid, peer, FailureKind::Transport, t0);
+    drain(&mut s, t0, &mut id);
+    assert_eq!(s.dropped(), 1, "nobody is left to ask");
+    assert!(s.selector().penalty(&p[0], t0) > 0.0, "the NotFound was refunded although another peer timed out");
+}
+
+/// Review of B1-T6: a GetHeaders that a peer which claimed to be ahead
+/// answers short (nothing, or fewer entries than asked) is delivered and also
+/// sent to the next such peer: one claimer cannot hold header sync back.
+/// Before, a short or empty answer completed the pull.
+#[test]
+fn short_headers_answer_goes_to_the_next_claimer() {
+    for short in [0u32, 7] {
+        let t0 = Instant::now();
+        let (mut s, p) = scheduler(3, t0);
+        let mut id = 0;
+        let req = SyncRequest::GetHeaders { from_blue_score: 100, limit: 500 };
+        s.enqueue(req.clone(), None, &[p[0], p[1]], t0);
+        let (peer, rid, _) = drain(&mut s, t0, &mut id)[0].clone();
+        let act = s.on_response(rid, peer, &SyncResponse::Headers { entries: (0..short).map(entry).collect() }, t0);
+        assert!(act.deliver && act.violation.is_none());
+        let again = drain(&mut s, t0, &mut id);
+        assert_eq!(again.len(), 1, "a short answer ({short}) completed the GetHeaders");
+        let (next, rid, _) = again[0].clone();
+        assert!(next != peer && [p[0], p[1]].contains(&next), "the retry went to {next}, not the other claimer");
+        // A full answer completes it.
+        let act = s.on_response(rid, next, &SyncResponse::Headers { entries: (0..500).map(entry).collect() }, t0);
+        assert!(act.deliver);
+        assert!(drain(&mut s, t0, &mut id).is_empty());
+        assert_eq!((s.pending_len(), s.in_flight_len()), (0, 0));
+    }
+}
+
+/// Review of B1-T6: hints are not ranked by grindable PeerId bytes or by the
+/// size of an unverified claim: equal claims are taken in a per-node secret
+/// order, and the scheduler puts the peers we dialed first.
+#[test]
+fn header_hints_are_not_grindable_and_prefer_dialed_peers() {
+    let now = Instant::now();
+    let peers: Vec<PeerId> = (0..64).map(|_| PeerId::random()).collect();
+    let mut by_bytes = peers.clone();
+    by_bytes.sort_by_key(|p| p.to_bytes());
+    let lowest: HashSet<PeerId> = by_bytes[..4].iter().copied().collect();
+    let mut differs = false;
+    for _ in 0..4 {
+        let table = PeerStateTable::new();
+        for (i, p) in peers.iter().enumerate() {
+            table.on_connect(*p, now);
+            // The lowest-byte identities claim the most.
+            let claim = if lowest.contains(p) { 1_000_000 } else { 200 + i as u64 };
+            table.observe(*p, claim, claim, &[], now);
+        }
+        let got: HashSet<PeerId> = table.claiming_above(100, now, 4).into_iter().collect();
+        assert_eq!(got.len(), 4);
+        differs |= got != lowest;
+    }
+    assert!(differs, "the lowest-byte, highest-claim identities always took every hint slot");
+    // Dialed peers first among the hints.
+    let t0 = Instant::now();
+    let mut s: PullScheduler<u64> = PullScheduler::new(HashSet::new());
+    let inbound: Vec<PeerId> = (0..4).map(|_| PeerId::random()).collect();
+    let outbound = PeerId::random();
+    for p in &inbound {
+        s.on_connect(*p, false, t0);
+    }
+    s.on_connect(outbound, true, t0);
+    let mut hints = inbound.clone();
+    hints.push(outbound);
+    s.enqueue(SyncRequest::GetHeaders { from_blue_score: 1, limit: 500 }, None, &hints, t0);
+    let mut id = 0;
+    assert_eq!(drain(&mut s, t0, &mut id)[0].0, outbound, "the dialed claimer must be asked first");
+}
+
 /// NET-9 residual: a NotFound from a peer that connected to US (an identity
 /// that costs nothing) never counts toward abandoning a frontier tip; one
 /// from a peer we dialed does.
@@ -376,6 +552,9 @@ enum Role {
     WrongVariant,
     /// Never answers (the request times out after 30 s).
     Staller,
+    /// Connects to us, announces 64 made-up blocks (a pinned GetTips answer)
+    /// every 30 s, and answers every request Busy.
+    BusyForever,
 }
 
 struct SimPeer {
@@ -399,6 +578,11 @@ struct Outcome {
     to_attackers: usize,
     sent: usize,
     finished_after: Duration,
+    /// Answered requests (Busy excepted) that went to a peer which had
+    /// already answered the same pull.
+    repeated: usize,
+    /// Made-up blocks announced (`Role::BusyForever`).
+    phantoms: u64,
 }
 
 /// `n` GetBlock pulls of blocks every honest server has, from a node
@@ -419,11 +603,16 @@ fn simulate(n: u32, honest: usize, honest_latency: Duration, attackers: &[(Role,
         .collect();
     let index: HashMap<PeerId, usize> = peers.iter().enumerate().map(|(i, p)| (p.id, i)).collect();
     let mut s: PullScheduler<u64> = PullScheduler::new(HashSet::new());
-    // Attackers connect first (the order of a node's connections is theirs to choose).
+    // Attackers connect first (the order of a node's connections is theirs to
+    // choose); a Busy-only announcer connects to us.
     for p in peers.iter().rev() {
-        s.on_connect(p.id, true, t0);
+        s.on_connect(p.id, p.role != Role::BusyForever, t0);
     }
     let wanted: HashMap<[u8; 32], u32> = (0..n).map(|i| (h(i), i)).collect();
+    let mut answered: HashSet<([u8; 32], usize)> = HashSet::new();
+    let mut repeated = 0usize;
+    let mut phantoms = 0u64;
+    let mut next_feed = Duration::ZERO;
     for i in 0..n {
         let hints = if hinted { vec![peers[i as usize % honest].id] } else { vec![] };
         assert_eq!(s.enqueue(get_block(i), None, &hints, t0), Enqueued::Queued);
@@ -431,6 +620,8 @@ fn simulate(n: u32, honest: usize, honest_latency: Duration, attackers: &[(Role,
     let mut queue: BinaryHeap<Reverse<(Duration, u64)>> = BinaryHeap::new();
     let mut events: HashMap<u64, Ev> = HashMap::new();
     let mut inflight: HashMap<u64, usize> = HashMap::new();
+    // Request id → the block it pulls.
+    let mut pulled: HashMap<u64, [u8; 32]> = HashMap::new();
     let (mut seq, mut next_id) = (0u64, 0u64);
     let mut completed: HashSet<u32> = HashSet::new();
     let (mut to_attackers, mut sent) = (0usize, 0usize);
@@ -438,6 +629,16 @@ fn simulate(n: u32, honest: usize, honest_latency: Duration, attackers: &[(Role,
     let tick = Duration::from_millis(250);
     loop {
         let now = t0 + at;
+        if at >= next_feed {
+            next_feed = at + Duration::from_secs(30);
+            for p in peers.iter().filter(|p| p.role == Role::BusyForever && p.connected) {
+                for _ in 0..64 {
+                    phantoms += 1;
+                    let fake = h(50_000_000 + phantoms as u32);
+                    s.enqueue(SyncRequest::GetBlock { block_hash: fake }, Some(p.id), &[p.id], now);
+                }
+            }
+        }
         s.drain(now, |peer, req| {
             next_id += 1;
             let pi = index[&peer];
@@ -454,11 +655,14 @@ fn simulate(n: u32, honest: usize, honest_latency: Duration, attackers: &[(Role,
                 Role::Honest => {
                     let resp = if !p.limiter.allow_at(me, now) {
                         SyncResponse::Busy
-                    } else {
+                    } else if wanted.contains_key(&hash) {
                         SyncResponse::Block { block_hash: hash, blue_score: 1, height: 1, block_data: vec![1] }
+                    } else {
+                        SyncResponse::BlockNotFound { block_hash: hash }
                     };
                     (p.latency, Ev::Answer { id: next_id, peer: pi, resp })
                 }
+                Role::BusyForever => (p.latency, Ev::Answer { id: next_id, peer: pi, resp: SyncResponse::Busy }),
                 Role::NotFoundLiar => (p.latency, Ev::Answer { id: next_id, peer: pi, resp: SyncResponse::BlockNotFound { block_hash: hash } }),
                 Role::WrongVariant => (
                     p.latency,
@@ -470,6 +674,7 @@ fn simulate(n: u32, honest: usize, honest_latency: Duration, attackers: &[(Role,
             queue.push(Reverse((at + delay, seq)));
             events.insert(seq, ev);
             inflight.insert(next_id, pi);
+            pulled.insert(next_id, hash);
             next_id
         });
         if completed.len() == n as usize {
@@ -496,6 +701,9 @@ fn simulate(n: u32, honest: usize, honest_latency: Duration, attackers: &[(Role,
                         continue; // its connection was closed meanwhile
                     }
                     let pid = peers[pi].id;
+                    if !matches!(resp, SyncResponse::Busy) && !answered.insert((pulled[&id], pi)) {
+                        repeated += 1;
+                    }
                     let act = s.on_response(id, pid, &resp, now);
                     if act.violation.is_some() {
                         // (The scheduler already put the peer on cooldown;
@@ -520,20 +728,23 @@ fn simulate(n: u32, honest: usize, honest_latency: Duration, attackers: &[(Role,
                 }
                 Ev::Timeout { id, peer: pi } => {
                     if inflight.remove(&id).is_some() {
+                        if !answered.insert((pulled[&id], pi)) {
+                            repeated += 1;
+                        }
                         s.on_failure(id, peers[pi].id, FailureKind::Transport, now);
                     }
                 }
             }
         }
     }
-    Outcome { completed: completed.len(), dropped: s.dropped(), to_attackers, sent, finished_after: at }
+    Outcome { completed: completed.len(), dropped: s.dropped(), to_attackers, sent, finished_after: at, repeated, phantoms }
 }
 
-fn assert_all_honest_pulls_complete(o: &Outcome, n: u32, attackers: usize) {
+fn assert_all_honest_pulls_complete(o: &Outcome, n: u32, _attackers: usize) {
     eprintln!("{o:?}");
     assert_eq!(o.completed, n as usize, "honest pulls did not all complete: {o:?}");
     assert_eq!(o.dropped, 0, "pulls were dropped: {o:?}");
-    assert!(o.to_attackers <= n as usize * attackers, "a pull was sent twice to the same attacker: {o:?}");
+    assert_eq!(o.repeated, 0, "a pull went back to a peer that had already answered it: {o:?}");
     assert!(o.finished_after < Duration::from_secs(300), "too slow: {o:?}");
 }
 
@@ -585,6 +796,33 @@ fn hinted_pulls_bypass_the_fast_liar() {
     let o = simulate(2_000, 4, HONEST, &[(Role::NotFoundLiar, FAST)], true);
     assert_all_honest_pulls_complete(&o, 2_000, 1);
     assert!(o.to_attackers * 10 < o.sent, "the liar received {} of {} requests", o.to_attackers, o.sent);
+}
+
+/// Review of B1-T6: one free identity announces 64 made-up blocks every
+/// 30 s and answers everything Busy. Before, the honest peers' true
+/// NotFounds for the made-up blocks made all of them poor peers, while the
+/// Busy-only peer, which cost nothing, stayed the "better peer" every pull
+/// waited for: directed sync stalled for minutes per feed. The made-up
+/// announcements now cost the announcer (not the honest peers), and a peer
+/// that answers only Busy ranks down.
+#[test]
+fn busy_only_announcer_cannot_stall_honest_pulls() {
+    let o = simulate(2_000, 4, HONEST, &[(Role::BusyForever, FAST)], false);
+    eprintln!("{o:?}");
+    assert!(o.phantoms >= 64);
+    assert_eq!(o.completed, 2_000, "honest pulls did not all complete: {o:?}");
+    assert_eq!(o.repeated, 0, "{o:?}");
+    assert!(o.finished_after < Duration::from_secs(120), "directed sync stalled: {o:?}");
+}
+
+/// The same with one honest server (the node's only source of blocks).
+#[test]
+fn busy_only_announcer_with_one_honest_server() {
+    let o = simulate(1_000, 1, HONEST, &[(Role::BusyForever, FAST)], true);
+    eprintln!("{o:?}");
+    assert_eq!(o.completed, 1_000, "honest pulls did not all complete: {o:?}");
+    assert_eq!(o.repeated, 0, "{o:?}");
+    assert!(o.finished_after < Duration::from_secs(240), "directed sync stalled: {o:?}");
 }
 
 // ── NET-10 / NET-9 residuals: the frontier tracker ─────────────────────────

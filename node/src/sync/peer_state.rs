@@ -35,11 +35,14 @@ pub struct PeerChainState {
 /// Shared as `Arc<PeerStateTable>`. Locking is internal (single `RwLock`).
 pub struct PeerStateTable {
     inner: RwLock<HashMap<PeerId, PeerChainState>>,
+    /// Per-node secret keys ordering [`Self::claiming_above`] (B1-T6
+    /// review: ties used to be broken by PeerId bytes, which anyone can grind).
+    hint_order: std::collections::hash_map::RandomState,
 }
 
 impl PeerStateTable {
     pub fn new() -> Self {
-        Self { inner: RwLock::new(HashMap::new()) }
+        Self { inner: RwLock::new(HashMap::new()), hint_order: std::collections::hash_map::RandomState::new() }
     }
 
     /// P4: on `SwarmEvent::ConnectionEstablished`.
@@ -200,18 +203,23 @@ impl PeerStateTable {
     }
 
     /// B1-T6: up to `max` connected peers whose fresh claim (within
-    /// [`CLAIM_TTL`]) is above `score`, highest claim first: the peers a
-    /// GetHeaders from `score` is best sent to. Claims are clamped
-    /// announcements, so this only orders peers; it is never trusted.
+    /// [`CLAIM_TTL`]) is above `score`: the peers a GetHeaders from `score`
+    /// is best sent to. Claims are clamped, unverified announcements, so the
+    /// size of a claim never ranks a peer (B1-T6 review: highest claim first
+    /// and ties by PeerId bytes let a few ground identities that claim the
+    /// clamp's maximum take every hint slot): the claimers are taken in an
+    /// order keyed by a per-node secret. The pull scheduler then puts the
+    /// peers we dialed first (`network::pull::PullScheduler::enqueue`).
     pub fn claiming_above(&self, score: u64, now: Instant, max: usize) -> Vec<PeerId> {
+        use std::hash::BuildHasher;
         let g = self.inner.read();
         let mut v: Vec<(u64, PeerId)> = g
             .iter()
             .filter(|(_, s)| s.connected && s.announced_blue_score > score)
             .filter(|(_, s)| s.claimed_at.is_some_and(|t| now.saturating_duration_since(t) < CLAIM_TTL))
-            .map(|(p, s)| (s.announced_blue_score, *p))
+            .map(|(p, _)| (self.hint_order.hash_one(p.to_bytes()), *p))
             .collect();
-        v.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.to_bytes().cmp(&b.1.to_bytes())));
+        v.sort_unstable_by_key(|(k, _)| *k);
         v.into_iter().take(max).map(|(_, p)| p).collect()
     }
 
