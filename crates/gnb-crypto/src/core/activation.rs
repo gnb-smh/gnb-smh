@@ -15,6 +15,13 @@
 //! | testnet | [`TESTNET_HARDENING_ACTIVATION_HEIGHT`] = 0 (active from genesis) |
 //! | regtest | [`REGTEST_HARDENING_ACTIVATION_HEIGHT`] = 0 (active from genesis) |
 //!
+//! A second upgrade ("hardening 2", the Phase-5 audit fixes) has its own
+//! schedule with the same API suffixed `2` / `_v2`
+//! ([`hardening2_activation_height`], [`hardening2_active_at`],
+//! [`scoped_override_v2`]): mainnet [`MAINNET_HARDENING2_ACTIVATION_HEIGHT`]
+//! = [`NEVER`] until the owner schedules it, testnet and regtest 0. Its rules
+//! build on the first upgrade's and activate at or after it on every network.
+//!
 //! A gated rule applies to a block iff `block_height >= activation_height`
 //! ([`is_active_at`]). Below the activation height the old behaviour must be
 //! reproduced *exactly*, including its bugs.
@@ -276,6 +283,98 @@ pub fn scoped_override(activation_height: u64) -> OverrideGuard {
     OverrideGuard { previous }
 }
 
+// ---------------------------------------------------------------------------
+// Second hardening upgrade
+// ---------------------------------------------------------------------------
+
+/// Second hardening upgrade: consensus fixes from the Phase-5 audit
+/// (2026-10-16) of the relaunched mainnet line (PoWit accountability and
+/// finality, spend-policy key normalisation). It builds on the first
+/// hardening rules, so on every network it activates at or after
+/// [`MAINNET_HARDENING_ACTIVATION_HEIGHT`] and its counterparts.
+///
+/// Mainnet is not scheduled yet ([`NEVER`]): the owner sets the height at
+/// release, with the same derivation as the first upgrade (a height on the
+/// ASERT schedule far enough ahead for every node to upgrade, checked
+/// against the real tip; see [`MAINNET_HARDENING_ACTIVATION_HEIGHT`]).
+pub const MAINNET_HARDENING2_ACTIVATION_HEIGHT: u64 = NEVER;
+
+/// Testnet activates the second hardening rules from genesis.
+pub const TESTNET_HARDENING2_ACTIVATION_HEIGHT: u64 = 0;
+
+/// Regtest activates the second hardening rules from genesis.
+pub const REGTEST_HARDENING2_ACTIVATION_HEIGHT: u64 = 0;
+
+/// Second hardening activation height for a network.
+pub const fn hardening2_activation_height_for_network(net: ActivationNetwork) -> u64 {
+    match net {
+        ActivationNetwork::Mainnet => MAINNET_HARDENING2_ACTIVATION_HEIGHT,
+        ActivationNetwork::Testnet => TESTNET_HARDENING2_ACTIVATION_HEIGHT,
+        ActivationNetwork::Regtest => REGTEST_HARDENING2_ACTIVATION_HEIGHT,
+    }
+}
+
+/// Second hardening activation height for a chain id.
+pub const fn hardening2_activation_height_for_chain(id: ChainId) -> u64 {
+    match id {
+        ChainId::Mainnet => MAINNET_HARDENING2_ACTIVATION_HEIGHT,
+        ChainId::Testnet => TESTNET_HARDENING2_ACTIVATION_HEIGHT,
+    }
+}
+
+thread_local! {
+    static THREAD_OVERRIDE_V2: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// The process-wide second hardening activation height. Same precedence as
+/// [`hardening_activation_height`]: a [`scoped_override_v2`] on the calling
+/// thread, then the node's chain id, then the mainnet height.
+pub fn hardening2_activation_height() -> u64 {
+    if let Some(h) = THREAD_OVERRIDE_V2.with(|c| c.get()) {
+        return h;
+    }
+    match super::NODE_CHAIN_ID.get() {
+        Some(id) => hardening2_activation_height_for_chain(*id),
+        None => MAINNET_HARDENING2_ACTIVATION_HEIGHT,
+    }
+}
+
+/// Second hardening activation height for a signer of chain `id` (see
+/// [`hardening_activation_height_for_signer`]).
+pub fn hardening2_activation_height_for_signer(id: ChainId) -> u64 {
+    if let Some(h) = THREAD_OVERRIDE_V2.with(|c| c.get()) {
+        return h;
+    }
+    hardening2_activation_height_for_chain(id)
+}
+
+/// `true` iff the second hardening rules apply at `height` under the
+/// process-wide second activation height.
+pub fn hardening2_active_at(height: u64) -> bool {
+    is_active_at(height, hardening2_activation_height())
+}
+
+/// Guard returned by [`scoped_override_v2`]; restores the previous value on drop.
+#[must_use = "the override ends when the guard is dropped"]
+pub struct OverrideGuardV2 {
+    previous: Option<u64>,
+}
+
+impl Drop for OverrideGuardV2 {
+    fn drop(&mut self) {
+        let prev = self.previous;
+        THREAD_OVERRIDE_V2.with(|c| c.set(prev));
+    }
+}
+
+/// Override [`hardening2_activation_height`] on the **calling thread** until
+/// the returned guard is dropped (tests only; see [`scoped_override`]). It is
+/// independent of the first upgrade's override.
+pub fn scoped_override_v2(activation_height: u64) -> OverrideGuardV2 {
+    let previous = THREAD_OVERRIDE_V2.with(|c| c.replace(Some(activation_height)));
+    OverrideGuardV2 { previous }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +471,44 @@ mod tests {
             assert!(!hardening_active_at(MAINNET_HARDENING_ACTIVATION_HEIGHT - 1));
             assert!(hardening_active_at(MAINNET_HARDENING_ACTIVATION_HEIGHT));
         }
+    }
+
+    #[test]
+    fn second_upgrade_follows_the_first_on_every_network() {
+        assert_eq!(MAINNET_HARDENING2_ACTIVATION_HEIGHT, NEVER);
+        assert_eq!(TESTNET_HARDENING2_ACTIVATION_HEIGHT, 0);
+        assert_eq!(REGTEST_HARDENING2_ACTIVATION_HEIGHT, 0);
+        for net in [ActivationNetwork::Mainnet, ActivationNetwork::Testnet, ActivationNetwork::Regtest] {
+            assert!(hardening2_activation_height_for_network(net) >= hardening_activation_height_for_network(net));
+        }
+        for id in [ChainId::Mainnet, ChainId::Testnet] {
+            assert_eq!(
+                hardening2_activation_height_for_chain(id),
+                hardening2_activation_height_for_network(ActivationNetwork::from(id))
+            );
+        }
+    }
+
+    #[test]
+    fn second_upgrade_override_is_scoped_and_independent() {
+        if chain_id_unset() {
+            assert_eq!(hardening2_activation_height(), MAINNET_HARDENING2_ACTIVATION_HEIGHT);
+            assert!(!hardening2_active_at(u64::MAX - 1));
+        }
+        let first = hardening_activation_height();
+        let before = hardening2_activation_height();
+        {
+            let _g = scoped_override_v2(5);
+            assert_eq!(hardening2_activation_height(), 5);
+            assert!(!hardening2_active_at(4));
+            assert!(hardening2_active_at(5));
+            assert_eq!(hardening2_activation_height_for_signer(ChainId::Mainnet), 5);
+            assert_eq!(hardening_activation_height(), first);
+            let other = std::thread::spawn(hardening2_activation_height).join().unwrap();
+            assert_eq!(other, before);
+        }
+        assert_eq!(hardening2_activation_height(), before);
+        assert_eq!(hardening2_activation_height_for_signer(ChainId::Testnet), TESTNET_HARDENING2_ACTIVATION_HEIGHT);
     }
 
     fn chain_id_unset() -> bool {
