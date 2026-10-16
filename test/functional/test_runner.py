@@ -47,6 +47,7 @@ ALL_TESTS = [
     "mempool_tx_relay.py",
     "mempool_replacement.py",
     "mining_getblocktemplate_submitblock.py",
+    "rpc_gettxoutsetinfo.py",
     "rpc_auth.py",
     "feature_test_build_guard.py",
 ]

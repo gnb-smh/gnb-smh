@@ -26,6 +26,8 @@
 //!   merkle_root -> coinbase txid (a coinbase txid covers its `script_sig`).
 //! * **Block size (VAL-12)**: `MAX_BLOCK_SIZE` is measured on the canonical
 //!   wire encoding (`Block::wire_size`), the encoding fee rates use.
+//! * **Distinct parents (B2-T10)**: the header lists each parent once
+//!   ([`check_parents_distinct`]).
 //!
 //! In-context rules live in the node's `validate_block_in_view` (BIP30
 //! no-overwrite, no spend of the same block's coinbase) and the pow limit in
@@ -361,10 +363,11 @@ pub const fn pow_limit_bits_at(height: u64, activation_height: u64) -> u32 {
 // ── The context-free hardening checks ───────────────────────────────────────
 
 /// The context-free rules added at the activation, for a block whose coinbase
-/// format is valid: no 64-byte transaction, then the coinbase commitment
-/// (tag, height, parents, witness root). Run by `Block::validate_structure`
-/// and by `accept_block`.
+/// format is valid: distinct parents (B2-T10), no 64-byte transaction, then
+/// the coinbase commitment (tag, height, parents, witness root). Run by
+/// `Block::validate_structure` and by `accept_block`.
 pub fn check_hardened_body(block: &Block) -> Result<(), &'static str> {
+    check_parents_distinct(&block.header.parents)?;
     for tx in &block.transactions {
         check_tx_not_64_bytes(tx)?;
     }
@@ -372,8 +375,8 @@ pub fn check_hardened_body(block: &Block) -> Result<(), &'static str> {
 }
 
 /// Every context-free rule that changes at the activation, in cheap-first
-/// order: wire size, tagged Merkle root, coinbase format, 64-byte
-/// transactions, coinbase commitment. `Ok(())` for a block below the
+/// order: wire size, tagged Merkle root, coinbase format, distinct parents,
+/// 64-byte transactions, coinbase commitment. `Ok(())` for a block below the
 /// activation (the legacy structural rules are `Block::validate_structure`'s).
 /// `accept_block` runs this BEFORE storing the block, so a block whose
 /// witnesses were altered in transit (same block id, different `script_sig`
@@ -392,6 +395,23 @@ pub fn check_block_hardened_at(block: &Block, activation_height: u64) -> Result<
         return Err("invalid coinbase format");
     }
     check_hardened_body(block)
+}
+
+// ── Parent list (audit B2-T10) ──────────────────────────────────────────────
+
+/// From the activation, a header lists each parent once (Kaspa rejects a
+/// repeated parent too). A repeated parent is never useful: the DAG treats
+/// the list as a set, so `[X, X, Y]` has the GhostDAG data of `[X, Y]`, while
+/// the block id and the coinbase parents commitment hash the list as written.
+/// O(n log n) over at most `MAX_PARENTS` ids. Parents in the past of another
+/// parent stay valid (docs/CONSENSUS.md, "Parent list").
+pub fn check_parents_distinct(parents: &[[u8; 32]]) -> Result<(), &'static str> {
+    let mut sorted: Vec<&[u8; 32]> = parents.iter().collect();
+    sorted.sort_unstable();
+    if sorted.windows(2).any(|w| w[0] == w[1]) {
+        return Err("duplicate parent");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -669,6 +689,35 @@ mod tests {
         assert_eq!(check_block_hardened_at(&b64, 0), Err("64-byte transaction (txid preimage of exactly 64 bytes)"));
         assert_eq!(check_hardened_body(&b64), Err("64-byte transaction (txid preimage of exactly 64 bytes)"));
         assert_eq!(check_hardened_body(&b), Ok(()));
+    }
+
+    /// B2-T10: a repeated parent anywhere in the list is refused from the
+    /// activation (and by `check_hardened_body` first, before the 64-byte
+    /// and commitment rules); below it the check does not run.
+    #[test]
+    fn repeated_parent_is_refused_from_the_activation() {
+        assert_eq!(check_parents_distinct(&[]), Ok(()));
+        assert_eq!(check_parents_distinct(&[id(1)]), Ok(()));
+        assert_eq!(check_parents_distinct(&[id(2), id(1), id(3)]), Ok(()));
+        assert_eq!(check_parents_distinct(&[id(1), id(1)]), Err("duplicate parent"));
+        assert_eq!(check_parents_distinct(&[id(3), id(1), id(2), id(1)]), Err("duplicate parent"));
+        let mut differ_last = id(1);
+        differ_last[31] = 2;
+        assert_eq!(check_parents_distinct(&[id(1), differ_last]), Ok(()));
+        let mut b = hardened_block(5, 0, vec![spend(1, 20)]);
+        b.header.parents = vec![[0x11; 32], [0x22; 32], [0x11; 32]];
+        let c = expected_coinbase_commitment(&b);
+        b.transactions[0].inputs[0].script_sig = coinbase_script_sig(&c, b"extranonce");
+        b.header.merkle_root = b.body_merkle_root_at(0);
+        assert_eq!(check_coinbase_commitment(&b), Ok(()), "the commitment covers the list as written");
+        assert_eq!(check_block_hardened_at(&b, 0), Err("duplicate parent"));
+        assert_eq!(check_block_hardened_at(&b, 5), Err("duplicate parent"), "height 5 >= activation 5");
+        assert_eq!(check_hardened_body(&b), Err("duplicate parent"));
+        assert_eq!(b.validate_structure_without_pow_at(0), Err("duplicate parent"));
+        // Below the activation (legacy root) the list is not checked.
+        b.header.merkle_root = b.body_merkle_root_at(6);
+        assert_eq!(check_block_hardened_at(&b, 6), Ok(()));
+        assert_eq!(b.validate_structure_without_pow_at(6), Ok(()));
     }
 
     #[test]

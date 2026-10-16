@@ -478,14 +478,14 @@ impl BlockHeader {
         gnb_smh::hash_algo(pow_algo(height), &self.pow_preimage(), self.nonce)
     }
 
-    /// Cheap header digest used for DAG indexing: SHA3-256 over every header
-    /// field including the nonce.
-    pub fn dag_hash(&self) -> [u8; 32] {
-        let mut h = Sha3_256::new();
-        h.update(self.pow_preimage());
-        h.update(self.nonce.to_le_bytes());
-        h.finalize().into()
-    }
+    // Audit POW-9: `dag_hash`, a SHA3-256 header digest nothing but a test
+    // called, was removed. Blocks are identified, indexed, stored and relayed
+    // by `Block::block_hash` only (docs/CONSENSUS.md, "Block header and proof
+    // of work"). These comment lines keep the line numbers of the code below
+    // that the browser wallet core compiles: panic locations are part of the
+    // reproducible WASM (audit WAL-5).
+    //
+    //
 
     /// Wire serialization: `pow_preimage` fields, then the nonce, then the
     /// DAG metadata carried with the block (blue_score, height).
@@ -1332,14 +1332,14 @@ impl Block {
 
     /// GnB-SMH proof of work: GnB-SMH(pow_preimage, nonce) < target(bits).
     ///
-    /// Malformed or zero `bits` never validate. This checks the proof against
-    /// the header's own `bits`; that `bits` equals the consensus-expected
-    /// value is checked by the caller (`expected_bits`) — and should be
-    /// checked first, since it is cheap and this is not.
+    /// Malformed, zero or non-canonical (POW-9) `bits` never validate. This
+    /// checks the proof against the header's own `bits`; that `bits` equals
+    /// the consensus-expected value is checked by the caller (`expected_bits`,
+    /// always canonical) — first, since it is cheap and this is not.
     pub fn validate_pow(&self) -> bool {
-        let target = match gnb_smh::difficulty::try_bits_to_target(self.header.bits) {
-            Ok(t) => t,
-            Err(_) => return false,
+        let target = match gnb_smh::difficulty::try_canonical_bits_to_target(self.header.bits) {
+            Some(t) => t,
+            None => return false,
         };
         // POW-9 (audit): explicit `target <= pow_limit`. Below the hardening
         // activation the largest decodable compact target IS the pow limit,

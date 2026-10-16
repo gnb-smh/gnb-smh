@@ -285,7 +285,8 @@ pub fn decode_tx(bytes: &[u8]) -> Option<Transaction> {
 /// The pow-limit rule (`pow: limit` / `full`): bits must decode and the
 /// target must be within the pow limit of the block's height.
 pub fn pow_limit(block: &Block, activation: u64) -> Result<(), &'static str> {
-    let target = gnb_smh::difficulty::try_bits_to_target(block.header.bits).map_err(|_| "bad-bits")?;
+    // Malformed or non-canonical bits (audit POW-9), as `Block::validate_pow`.
+    let target = gnb_smh::difficulty::try_canonical_bits_to_target(block.header.bits).ok_or("bad-bits")?;
     if !Block::target_within_pow_limit_at(&target.0, block.height, activation) {
         return Err("pow-limit");
     }
@@ -297,7 +298,7 @@ pub fn pow_limit(block: &Block, activation: u64) -> Result<(), &'static str> {
 /// `value-out-of-range` is context-free on the output side only
 /// ([`outputs_out_of_range`]); every other class is connect-time.
 pub const CONTEXT_FREE_CLASSES: &[&str] = &[
-    "decode", "too-many-parents", "block-size", "bad-merkle-root", "coinbase-format", "tx-64-bytes",
+    "decode", "too-many-parents", "duplicate-parent", "block-size", "bad-merkle-root", "coinbase-format", "tx-64-bytes",
     "cb-commitment-missing", "cb-commitment-tag", "cb-height", "cb-parents", "witness-commitment",
     "duplicate-tx", "dust", "witness-commitment-suffix", "pow-limit", "bad-bits", "bad-pow", "canonical-limit",
 ];
@@ -405,6 +406,8 @@ pub fn classify(reason: &str) -> &'static str {
         "block-size"
     } else if has("too many parents") {
         "too-many-parents"
+    } else if has("duplicate parent") {
+        "duplicate-parent"
     } else if has("coinbase commitment missing") {
         "cb-commitment-missing"
     } else if has("bad coinbase commitment tag") {

@@ -572,6 +572,8 @@ def check_structure(b: Block, activation: int) -> None:
     if not b.txs or not b.txs[0].is_coinbase() or any(t.is_coinbase() for t in b.txs[1:]):
         raise Invalid("coinbase-format")
     if hardened:
+        if len(set(b.header.parents)) != len(b.header.parents):  # audit B2-T10
+            raise Invalid("duplicate-parent")
         if any(mk.is_forbidden_64(t) for t in b.txs):
             raise Invalid("tx-64-bytes")
         reason = mk.check_coinbase_commitment(b.height, b.header.parents, b.txs)
@@ -592,6 +594,8 @@ def check_pow_limit(b: Block, activation: int) -> None:
     try:
         target = df.bits_to_target(b.header.bits)
     except df.BitsError:
+        raise Invalid("bad-bits")
+    if not df.is_canonical_bits(b.header.bits):  # audit POW-9, all heights
         raise Invalid("bad-bits")
     limit = HARDENED_POW_LIMIT_BITS if block_rules_active(b.height, activation) else POW_LIMIT_BITS
     if target > df.bits_to_target(limit):

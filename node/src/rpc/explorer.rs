@@ -1,9 +1,10 @@
 //! Read-only explorer RPCs: DAG-aware block, chain, address and holder views.
 //!
-//! The height index in storage is last-write-wins (any block at a height), so
-//! these methods never use it for chain membership. They walk the GhostDAG
-//! instead: the selected chain is the selected-parent chain from the selected
-//! tip, cached and extended incrementally as the tip moves.
+//! These methods walk the GhostDAG for chain membership: the selected chain
+//! is the selected-parent chain from the selected tip, cached and extended
+//! incrementally as the tip moves. (The height index in storage holds the
+//! APPLIED selected chain by position since audit DAG-8; it was keyed by
+//! header height before, where two chain blocks could share a row.)
 
 use super::*;
 use crate::consensus::GhostdagData;

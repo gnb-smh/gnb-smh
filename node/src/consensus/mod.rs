@@ -13,8 +13,11 @@
 //!   - Both candidate and existing blue blocks satisfy the K constraint
 //!
 //! Performance:
-//!   - is_ancestor: O(height_diff) with blue_score/height shortcuts (vs O(DAG) naive)
-//!   - past_blue_set: bounded to K*100 depth on selected chain (audit H-5)
+//!   - ancestry: the interval reachability index (`reachability`), live for
+//!     every block (`CORRECTED_COLORING_ACTIVATION_HEIGHT = 0`), O(log) per
+//!     query; the bounded legacy `is_ancestor` (blue_work shortcut, DAG-8)
+//!     and the k*100-bounded `past_blue_set` serve only the Legacy coloring,
+//!     which the activation gate never selects on GnB
 //!   - blue_work: cumulative work; see the hardening activation note below
 //!
 //! Hardening activation (audit 2026-10-14, DAG-3 / DAG-4 / DAG-7):
@@ -263,9 +266,37 @@ pub struct LoadedIntegrity {
     pub fresh_map:     Option<std::collections::HashMap<BlockHash, [u8; 32]>>,
 }
 
-/// Errors that can be returned by `load_persisted_validated`. Every
-/// variant is, in the intended threat model, fatal: the caller should
-/// log loudly and exit rather than continue with an unverifiable DAG.
+/// The header fields a block's GhostDAG data are computed from (what
+/// `accept_block` passes to `add_block`): its parents, its timestamp and the
+/// work of its bits.
+#[derive(Debug, Clone)]
+pub struct StoredHeader {
+    pub parents: Vec<BlockHash>,
+    pub timestamp: u64,
+    pub work: u128,
+}
+
+/// Outcome of [`GhostDAG::load_persisted_repairing`] (audit DAG-11).
+#[derive(Debug, Default)]
+pub struct DagRepair {
+    /// Blocks loaded into the DAG.
+    pub blocks_loaded: usize,
+    /// Records kept as stored whose integrity link was re-derived.
+    pub relinked: Vec<BlockHash>,
+    /// Blocks whose GhostDAG data were recomputed from their stored header
+    /// (no record, or a record matching no integrity link), with the data.
+    pub recomputed: Vec<(BlockHash, GhostdagData)>,
+    /// Blocks not loaded (no header to recompute from, or an unloadable
+    /// parent), every descendant of one included.
+    pub dropped: Vec<BlockHash>,
+    /// The re-derived integrity hash of every loaded block.
+    pub integrity: HashMap<BlockHash, [u8; 32]>,
+}
+
+/// Errors that can be returned by `load_persisted_validated`. In the
+/// original threat model every variant was fatal; the start-up path now
+/// repairs the footprints a pre-fix binary left
+/// ([`GhostDAG::load_persisted_repairing`], audit DAG-11) instead of exiting.
 #[derive(Debug)]
 pub enum IntegrityError {
     /// Some blocks have integrity records and some don't. Ambiguous —
@@ -459,34 +490,6 @@ fn compute_past(store: &DagStore, b: &BlockHash) -> HashSet<BlockHash> {
     past
 }
 
-/// Compute the blue set of block B (all blue blocks in past(B))
-#[allow(dead_code)]
-fn compute_blue_set(store: &DagStore, b: &BlockHash) -> HashSet<BlockHash> {
-    let past = compute_past(store, b);
-    let mut blue_set = HashSet::new();
-    for h in &past {
-        if let Some(_data) = store.get(h) {
-            // A block is in the blue set if it appears in any ancestor's mergeset_blues
-            // or is the genesis
-            blue_set.insert(*h); // simplified: walk selected parent chain
-        }
-    }
-    // More precisely: walk selected parent chain + collect mergeset_blues
-    let mut blue = HashSet::new();
-    let mut cur = Some(*b);
-    while let Some(h) = cur {
-        if let Some(data) = store.get(&h) {
-            for mb in &data.mergeset_blues {
-                blue.insert(*mb);
-            }
-            cur = data.selected_parent;
-        } else {
-            break;
-        }
-    }
-    blue
-}
-
 // ── Mergeset computation ──────────────────────────────────────────────────────
 
 /// Compute mergeset(B, selected_parent):
@@ -526,7 +529,15 @@ fn compute_mergeset(
     topological_sort(store, mergeset_set.into_iter().collect())
 }
 
-/// Topological sort: ancestors first, descendants last
+/// The coloring order of a mergeset (consensus, audit B2-T9; specified in
+/// docs/CONSENSUS.md, "Coloring", executable in reference/gnb_ghostdag.py):
+/// Kahn's algorithm with a FIFO queue. The in-degree of a block counts its
+/// parents inside `blocks`; the queue starts with the blocks of in-degree 0
+/// in ascending byte order of their ids; each block taken from the FRONT
+/// appends the blocks it makes ready at the BACK, in ascending id order. It
+/// is NOT "the lowest id among the blocks ready now": a block that becomes
+/// ready later comes after every block already queued, whatever its id
+/// (`node/tests/ghostdag_vectors.rs`, case `order/fifo-not-lowest-id`).
 fn topological_sort(store: &DagStore, blocks: Vec<BlockHash>) -> Vec<BlockHash> {
     // Build in-degree map within this set
     let set: HashSet<BlockHash> = blocks.iter().cloned().collect();
@@ -993,10 +1004,18 @@ impl GhostDAG {
         self.reach.take_persist_delta()
     }
 
-    /// Undo [`Self::reach_take_delta`] when its write failed (see
-    /// `ReachabilityIndex::restore_persist_delta`).
-    pub fn reach_restore_delta(&mut self, upserts: &[(BlockHash, Vec<u8>)], removals: &[BlockHash]) {
-        self.reach.restore_persist_delta(upserts, removals)
+    /// The pending reachability delta, NOT drained (audit DAG-11): stage it
+    /// with the block's CF_DAG record and call
+    /// [`reach_mark_persisted`](Self::reach_mark_persisted) once the batch has
+    /// committed; a batch that fails leaves it pending.
+    pub fn reach_peek_delta(&self) -> (Vec<(BlockHash, Vec<u8>)>, Vec<BlockHash>) {
+        self.reach.peek_persist_delta()
+    }
+
+    /// Clear what a committed batch wrote from the pending reachability delta
+    /// (see [`ReachabilityStore::mark_persisted`]).
+    pub fn reach_mark_persisted(&mut self, upserts: &[(BlockHash, Vec<u8>)], deletes: &[BlockHash]) {
+        self.reach.mark_persisted(upserts, deletes)
     }
 
     /// The current reachability root (genesis), for persisting the meta tag.
@@ -1329,6 +1348,190 @@ impl GhostDAG {
             self_healed:   self_heal,
             fresh_map:     if self_heal { Some(computed) } else { None },
         })
+    }
+
+    /// Load persisted entries whose integrity chain does NOT verify, repairing
+    /// what the pre-fix binary left behind (audit DAG-11), instead of refusing
+    /// to start. The pre-fix commit wrote a block's CF_DAG record and
+    /// integrity link with `.ok()`-ignored errors and zero-filled a missing
+    /// parent link, so a node that lost one DAG write kept running and stored
+    /// descendants chaining to a missing record or a zero link;
+    /// [`load_persisted_validated`](Self::load_persisted_validated) then fails
+    /// (`ParentNotLoaded`, `ChainMismatch`, `PartialCoverage`, `MissingEntry`).
+    ///
+    /// Blocks are processed in a topological order (parents first), and each
+    /// one's data is decided as follows:
+    ///
+    /// * the stored integrity matches the chain link re-derived from its
+    ///   selected parent: kept as is;
+    /// * otherwise, if the stored record is consistent with its OWN integrity
+    ///   hash (linked to the selected parent's STORED integrity, or to the
+    ///   pre-fix zero link), or has no integrity record at all: the stored
+    ///   data are kept and only the link is re-derived (`relinked`). The data
+    ///   were computed by the node when the block arrived; recomputing them
+    ///   could only disagree with the history the network holds;
+    /// * otherwise (no record: a lost write; or a record that matches no link:
+    ///   corrupted), the data are recomputed with the consensus code from the
+    ///   block's stored header (`header_of`), whose parents, timestamp and
+    ///   bits the proof of work commits to (`recomputed`);
+    /// * with no header to recompute from, or a parent that could not be
+    ///   loaded, the block and every block that descends from it are dropped
+    ///   (`dropped`): the node fetches them again from its peers.
+    ///
+    /// The DAG must be empty. The reachability index is rebuilt alongside;
+    /// the caller persists the repair (`Storage::stage_dag_repair`), which
+    /// also makes the next start rebuild the persisted index.
+    pub fn load_persisted_repairing<F>(
+        &mut self,
+        entries: Vec<(BlockHash, GhostdagData)>,
+        integrity_map: HashMap<BlockHash, [u8; 32]>,
+        header_of: F,
+    ) -> Result<DagRepair, String>
+    where
+        F: Fn(&BlockHash) -> Option<StoredHeader>,
+    {
+        if !self.store.data.is_empty() {
+            return Err("load_persisted_repairing needs an empty DAG".into());
+        }
+        let records: HashMap<BlockHash, GhostdagData> = entries.into_iter().collect();
+        // Blocks referenced as parents without a record (lost writes), and
+        // their own record-less ancestors, recoverable from their headers.
+        let mut headers: HashMap<BlockHash, StoredHeader> = HashMap::new();
+        let mut stack: Vec<BlockHash> = records.values()
+            .flat_map(|d| d.parents.iter().copied())
+            .filter(|p| !records.contains_key(p))
+            .collect();
+        while let Some(p) = stack.pop() {
+            if records.contains_key(&p) || headers.contains_key(&p) {
+                continue;
+            }
+            if let Some(h) = header_of(&p) {
+                stack.extend(h.parents.iter().copied().filter(|q| !records.contains_key(q)));
+                headers.insert(p, h);
+            }
+        }
+        // Kahn order over records ∪ recoverable headers (ties by id).
+        let parents_of = |h: &BlockHash| -> Vec<BlockHash> {
+            let ps = match records.get(h) {
+                Some(d) => d.parents.clone(),
+                None => headers.get(h).map(|x| x.parents.clone()).unwrap_or_default(),
+            };
+            let mut seen = HashSet::new();
+            ps.into_iter().filter(|p| seen.insert(*p)).collect()
+        };
+        let universe: Vec<BlockHash> = records.keys().chain(headers.keys()).copied().collect();
+        let known: HashSet<BlockHash> = universe.iter().copied().collect();
+        let mut indegree: HashMap<BlockHash, usize> = HashMap::new();
+        let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
+        for h in &universe {
+            let ps: Vec<BlockHash> = parents_of(h).into_iter().filter(|p| known.contains(p)).collect();
+            indegree.insert(*h, ps.len());
+            for p in ps {
+                children.entry(p).or_default().push(*h);
+            }
+        }
+        let mut ready: std::collections::BTreeSet<BlockHash> =
+            indegree.iter().filter(|(_, d)| **d == 0).map(|(h, _)| *h).collect();
+        let mut order = Vec::with_capacity(universe.len());
+        while let Some(h) = ready.pop_first() {
+            order.push(h);
+            for c in children.get(&h).cloned().unwrap_or_default() {
+                if let Some(d) = indegree.get_mut(&c) {
+                    *d -= 1;
+                    if *d == 0 {
+                        ready.insert(c);
+                    }
+                }
+            }
+        }
+
+        let mut rep = DagRepair::default();
+        self.reach = ReachabilityStore::new();
+        let index = self.maintains_reachability_index();
+        for h in order {
+            let parents = parents_of(&h);
+            if parents.iter().any(|p| !self.store.has(p)) {
+                rep.dropped.push(h);
+                continue;
+            }
+            let link = |sp: &Option<BlockHash>, integ: &HashMap<BlockHash, [u8; 32]>| -> Option<[u8; 32]> {
+                match sp {
+                    None => Some([0u8; 32]),
+                    Some(s) => integ.get(s).copied(),
+                }
+            };
+            let stored = records.get(&h);
+            let stored_int = integrity_map.get(&h);
+            let mut decided: Option<GhostdagData> = None;
+            if let Some(d) = stored {
+                let chained = link(&d.selected_parent, &rep.integrity)
+                    .map(|l| compute_integrity_hash(&h, d, &l));
+                if chained.is_some() && stored_int == chained.as_ref() {
+                    decided = Some(d.clone());
+                } else {
+                    let self_consistent = match stored_int {
+                        None => true,
+                        Some(si) => {
+                            *si == compute_integrity_hash(&h, d, &[0u8; 32])
+                                || link(&d.selected_parent, &integrity_map)
+                                    .is_some_and(|l| *si == compute_integrity_hash(&h, d, &l))
+                        }
+                    };
+                    let sp_loaded = d.selected_parent.is_none_or(|s| self.store.has(&s));
+                    if self_consistent && sp_loaded {
+                        rep.relinked.push(h);
+                        decided = Some(d.clone());
+                    }
+                }
+            }
+            let data = match decided {
+                Some(d) => d,
+                None => match header_of(&h) {
+                    Some(hdr) if hdr.parents.is_empty() => {
+                        let d = GhostdagData { timestamp: hdr.timestamp, ..GhostdagData::genesis() };
+                        rep.recomputed.push((h, d.clone()));
+                        d
+                    }
+                    Some(hdr) if hdr.parents.iter().all(|p| self.store.has(p)) => {
+                        match self.compute_block(&hdr.parents, hdr.timestamp, hdr.work) {
+                            Ok(c) => {
+                                rep.recomputed.push((h, c.data.clone()));
+                                c.data
+                            }
+                            Err(_) => {
+                                rep.dropped.push(h);
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {
+                        rep.dropped.push(h);
+                        continue;
+                    }
+                },
+            };
+            let parent_link = link(&data.selected_parent, &rep.integrity).unwrap_or([0u8; 32]);
+            rep.integrity.insert(h, compute_integrity_hash(&h, &data, &parent_link));
+            if index {
+                match data.selected_parent {
+                    None => self.reach.add_genesis(h),
+                    Some(sp) => {
+                        let mut mergeset = data.mergeset_blues.clone();
+                        mergeset.extend_from_slice(&data.mergeset_reds);
+                        self.reach.add_block(h, &sp, &mergeset);
+                    }
+                }
+            }
+            if data.parents.is_empty() {
+                self.store.genesis = Some(h);
+            }
+            self.store.insert(h, data);
+            rep.blocks_loaded += 1;
+        }
+        self.recompute_tips();
+        // The caller makes the next start rebuild the persisted index.
+        let _ = self.reach.take_persist_delta();
+        Ok(rep)
     }
 
     /// Add a new block and compute its full GhostDAG data.
@@ -1974,9 +2177,10 @@ impl GhostDAG {
     /// Exact GHOSTDAG coloring (PHANTOM paper, Kaspa's algorithm) for blocks at
     /// or above the hardening activation (audit DAG-4).
     ///
-    /// Candidates are taken in the deterministic mergeset order (ancestors
-    /// first, hash tie-break). With `blue` = blue(selected_parent) ∪
-    /// {selected_parent} ∪ the candidates already coloured blue, a candidate
+    /// Candidates are taken in the mergeset order of [`topological_sort`]
+    /// (FIFO Kahn, ids ascending among the blocks each step makes ready).
+    /// With `blue` = blue(selected_parent) ∪ {selected_parent} ∪ the
+    /// candidates already coloured blue, a candidate
     /// `c` is blue iff
     ///   (a) |anticone(c) ∩ blue| ≤ k, and
     ///   (b) every `x ∈ anticone(c) ∩ blue` has |anticone(x) ∩ blue| + 1 ≤ k.
@@ -3011,31 +3215,43 @@ impl GhostDAG {
         chain
     }
 
-    /// Is `hash` in the blue set of the current DAG?
-    /// Bounded check: walks selected chain up to 2*K depth.
+    /// Is `hash` in the blue set of the selected tip, i.e. in
+    /// `blue(tip) ∪ {tip}`: the selected chain from the tip down to genesis
+    /// and every mergeset blue of a block on it? Exact at any depth (audit
+    /// DAG-12: it used the legacy `past_blue_set` walk, bounded to k * 100
+    /// chain blocks, and missed the selected chain itself).
+    ///
+    /// The walk down the selected chain stops at the first chain block whose
+    /// `blue_work` is below `hash`'s: `blue_work` never decreases along a
+    /// parent edge (a block's is at least its selected parent's, the
+    /// heaviest of its parents), so neither that block nor anything below it
+    /// has `hash` in its past or mergeset. Diagnostics and tests only; no
+    /// consensus or relay decision calls it.
     pub fn is_blue(&self, hash: &BlockHash) -> bool {
-        if let Some(tip) = self.selected_tip() {
-            let blue = self.past_blue_set(&tip);
-            return blue.contains(hash);
+        let (Some(tip), Some(target)) = (self.selected_tip(), self.store.get(hash)) else {
+            return false;
+        };
+        let mut cur = Some(tip);
+        while let Some(h) = cur {
+            if h == *hash {
+                return true;
+            }
+            let Some(d) = self.store.get(&h) else { return false };
+            if d.mergeset_blues.contains(hash) {
+                return true;
+            }
+            if d.blue_work < target.blue_work {
+                return false;
+            }
+            cur = d.selected_parent;
         }
         false
     }
 
-    /// Informational confirmation depth: true when `hash`'s blue_score is more
-    /// than `CHECKPOINT_DEPTH` below the current tip.
-    ///
-    /// Audit DAG-6: this is NOT finality. The node has no finality checkpoint
-    /// and no reorg-depth limit; a heavier valid chain is followed at any
-    /// depth, so a "final" block can still be reorganized out by a chain with
-    /// more work (as in Bitcoin). Kept for diagnostics only.
-    pub fn is_final(&self, hash: &BlockHash) -> bool {
-        let tip_score = self.tip_blue_score();
-        if let Some(data) = self.store.get(hash) {
-            tip_score.saturating_sub(data.blue_score) > crate::core::CHECKPOINT_DEPTH
-        } else {
-            false
-        }
-    }
+    // (Audit DAG-12: `is_final`, a diagnostic that compared a blue-score gap
+    // with the header-height constant `CHECKPOINT_DEPTH` and that nothing
+    // called, was removed. There is no finality: docs/CONSENSUS.md, "Selected
+    // parent and fork choice".)
 
     /// Ordered block hashes from blue_score `from` for IBD sync.
     ///

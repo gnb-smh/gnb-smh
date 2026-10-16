@@ -411,6 +411,34 @@ fn shift_to_u256(v: &[u64; WIDE_LIMBS], net: i128) -> Option<[u8; 32]> {
     Some(out)
 }
 
+// ── Canonical compact encoding (audit POW-9) ────────────────────────────────
+//
+// `try_bits_to_target` keeps Bitcoin Core's `SetCompact` semantics: it decodes
+// every well-formed encoding, canonical or not (17.7 M of the 268 M accepted
+// values are non-canonical, e.g. `0x21007fff` and `0x207fff00` are the same
+// target), exactly like Core, whose consensus then compares `nBits` with the
+// expected value as a u32. These helpers name the canonical subset: the
+// encodings `target_to_bits` produces. (Placed after the code above so its
+// line numbers do not move.)
+
+/// `true` iff `bits` decodes and is the encoding [`target_to_bits`] produces
+/// for the target it decodes to (`target_to_bits(target(bits)) == bits`).
+/// Every value [`target_to_bits`] returns for a non-zero target is canonical,
+/// hence so is every expected `bits` of the difficulty schedule.
+pub fn is_canonical_bits(bits: u32) -> bool {
+    match try_bits_to_target(bits) {
+        Ok(t) => target_to_bits(&t) == bits,
+        Err(_) => false,
+    }
+}
+
+/// [`try_bits_to_target`] restricted to canonical encodings
+/// ([`is_canonical_bits`]): `None` for a malformed or a non-canonical value.
+pub fn try_canonical_bits_to_target(bits: u32) -> Option<Target> {
+    let t = try_bits_to_target(bits).ok()?;
+    (target_to_bits(&t) == bits).then_some(t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +538,28 @@ mod tests {
         assert_eq!(try_bits_to_target(0x2201_0000), Err(BitsError::MantissaOverflow));
         assert_eq!(try_bits_to_target(0x0100_0001), Err(BitsError::ZeroTarget));
         assert_eq!(bits_to_target(0xFF00_FFFF), Target::ZERO);
+    }
+
+    /// Audit POW-9: the canonical subset is exactly the set of
+    /// `target_to_bits` outputs; decoding stays Core-compatible.
+    #[test]
+    fn canonical_bits_are_the_encoder_outputs() {
+        for (bits, canonical) in [
+            (0x207F_FF00, true), (0x2100_7FFF, false), // same target
+            (0x1F0E_9036, true), (0x2100_FFFF, true), (0x1D00_FFFF, true),
+            (0x0201_0000, true), (0x0400_0001, false), // target 256 both
+            (0x1F00_0E90, false), (0x1E0E_9000, true), // same target
+            (0x0480_0001, false), (0x2000_0000, false), (0x0100_0001, false), (0, false),
+        ] {
+            assert_eq!(is_canonical_bits(bits), canonical, "{bits:#x}");
+            assert_eq!(try_canonical_bits_to_target(bits).is_some(), canonical, "{bits:#x}");
+            if canonical {
+                assert_eq!(try_canonical_bits_to_target(bits), try_bits_to_target(bits).ok());
+            }
+        }
+        assert_eq!(try_bits_to_target(0x2100_7FFF), try_bits_to_target(0x207F_FF00));
+        assert_eq!(try_bits_to_target(0x0400_0001), try_bits_to_target(0x0201_0000));
+        assert_eq!(try_bits_to_target(0x1F00_0E90), try_bits_to_target(0x1E0E_9000));
     }
 
     #[test]

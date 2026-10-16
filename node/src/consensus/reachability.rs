@@ -15,12 +15,32 @@
 //!
 //! # Consensus status
 //!
-//! The index is on the live consensus path: GnB colors every block with it
-//! (`CORRECTED_COLORING_ACTIVATION_HEIGHT = 0`, `GhostDAG::maintains_reachability_index`),
-//! and the mergeset, the exact coloring and the merge-depth check of hardened
-//! blocks query it. Only its ANSWERS matter (`is_chain_ancestor`,
-//! `is_dag_ancestor`); the interval layout is a private, rebuildable cache
-//! that never enters `GhostdagData` or the integrity chain. Any layout that
+//! On GnB this index IS on the live consensus path, for every block from
+//! genesis (audit DAG-12: this paragraph used to say the opposite, which was
+//! Bloch's state before its flag day). `CORRECTED_COLORING_ACTIVATION_HEIGHT`
+//! is `0`, so `GhostDAG::maintains_reachability_index()` is always true:
+//! `add_block` registers every block here, the mergeset walk
+//! (`compute_mergeset_bounded`) and both colorings (the pre-activation
+//! `classify_mergeset_fast` and the exact post-activation
+//! `classify_mergeset_exact`) and the merge-depth check of hardened blocks
+//! answer every ancestry query from it, and its records are committed in the
+//! same RocksDB batch as the block's CF_DAG record (CF_REACHABILITY). It is never consensus STATE: nothing it holds is
+//! hashed into `GhostdagData` or the integrity chain, and it can be rebuilt
+//! from CF_DAG at any time by replaying insertions in topological order
+//! (the boot path does so when the stored index is missing, partial, of
+//! another schema version, or fails its sampled self-check against
+//! [`brute_force_is_ancestor`]).
+//!
+//! What a wrong answer would cost: a mis-labeled interval or a stale future
+//! covering set colors blocks differently from every other node, which is a
+//! consensus split. Hence the oracle harness below and the boot-time sample.
+//! The bounded legacy `is_ancestor` it replaced is kept only for the `Legacy`
+//! coloring, which the gate never selects on GnB
+//! (`tests/ghostdag_differential.rs` compares the two).
+//!
+//! Only its ANSWERS matter (`is_chain_ancestor`, `is_dag_ancestor`); the
+//! interval layout is a private, rebuildable cache that never enters
+//! `GhostdagData` or the integrity chain. Any layout that
 //! answers exactly gives bit-identical GhostDAG output, which is what the
 //! differential and replay tests check.
 //!
@@ -366,6 +386,19 @@ impl ReachabilityStore {
         self.note_work();
         self.interval.insert(h, iv);
         self.mark_dirty(h);
+        // The tree parent's record carries the free interval after its LAST
+        // child (`remaining_after`, `encode_record`), derived from that
+        // child's interval: a reindex that moves the last child changes the
+        // parent's record although the parent's own interval may not change
+        // (`propagate_interval` keeps the interval of the block it re-lays
+        // out). Marking it keeps the persisted index byte-identical to the
+        // one in memory (audit DAG-11: a failed commit's pending delta must
+        // name every record that differs from disk).
+        if let Some(p) = self.tree_parent.get(&h).copied() {
+            if self.children.get(&p).and_then(|c| c.last()) == Some(&h) {
+                self.mark_dirty(p);
+            }
+        }
     }
 
     fn parent_of(&self, h: &BlockHash) -> Res<BlockHash> {
@@ -1141,17 +1174,35 @@ impl ReachabilityStore {
         (upserts, deletes)
     }
 
-    /// Put a drained delta back after the write that should have persisted it
-    /// failed: every block it named is re-marked from its CURRENT in-memory
-    /// state (dirty if still indexed, tombstone if not), so the next drain
-    /// persists what memory now holds.
-    pub fn restore_persist_delta(&mut self, upserts: &[(BlockHash, Vec<u8>)], deletes: &[BlockHash]) {
-        for h in upserts.iter().map(|(h, _)| h).chain(deletes) {
-            if self.interval.contains_key(h) {
-                self.mark_dirty(*h);
-            } else {
+    /// The pending durability delta WITHOUT draining it (audit DAG-11): what
+    /// [`take_persist_delta`](Self::take_persist_delta) would return. A caller
+    /// stages it into a batch and, once that batch has committed, calls
+    /// [`mark_persisted`](Self::mark_persisted). If the batch fails, nothing
+    /// is lost: the delta stays pending for the next successful write (a
+    /// drained delta used to be lost with the batch, leaving the stale
+    /// intervals of a reindex on disk).
+    pub fn peek_persist_delta(&self) -> (Vec<(BlockHash, Vec<u8>)>, Vec<BlockHash>) {
+        let mut dirty: Vec<BlockHash> = self.dirty.iter().copied().collect();
+        dirty.sort_unstable();
+        let upserts = dirty.into_iter().filter_map(|h| self.encode_record(&h).map(|r| (h, r))).collect();
+        let mut deletes: Vec<BlockHash> = self.tombstones.iter().copied().collect();
+        deletes.sort_unstable();
+        (upserts, deletes)
+    }
+
+    /// Clear the pending entries a committed batch wrote: an upserted record
+    /// stops being dirty only if its current encoding is still the one that
+    /// was written, a delete stops being pending only if the block is still
+    /// removed. Anything that changed since the peek stays pending.
+    pub fn mark_persisted(&mut self, upserts: &[(BlockHash, Vec<u8>)], deletes: &[BlockHash]) {
+        for (h, rec) in upserts {
+            if self.encode_record(h).as_deref() == Some(rec.as_slice()) {
                 self.dirty.remove(h);
-                self.tombstones.insert(*h);
+            }
+        }
+        for h in deletes {
+            if !self.interval.contains_key(h) {
+                self.tombstones.remove(h);
             }
         }
     }

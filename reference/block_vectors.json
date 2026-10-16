@@ -2989,6 +2989,122 @@
    "derived": null
   },
   {
+   "id": "parents/duplicate/pre",
+   "description": "The header lists parent p1 twice (p1, p2, p1); from the activation the coinbase commitment covers that list. Valid below the activation (the DAG treats the list as a set), invalid from it.",
+   "network": "mainnet",
+   "activation_height": "1000",
+   "activation_source": "explicit",
+   "height": "999",
+   "regime": "pre-activation",
+   "scope": "full",
+   "pow": "skip",
+   "prevouts": [],
+   "block": "01000000033a4fcd317475f0734a21a5bb2b56ed0857ef5fccdb212a77ef51627abc8885fe854846e1f931b6c473d7fac1fe5e3ea4a66c201d46daa799fa4ccba6fafe0d5c3a4fcd317475f0734a21a5bb2b56ed0857ef5fccdb212a77ef51627abc8885fe10a35e4e4612f4413b599a187f74e1404ff3acbd450e13913df54747018a80252269cb6a00000000ffff00210000000000000000e703000000000000e7030000000000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2e676e622d626c6f636b2d766563746f72732f626c6f636b2f706172656e74732f6475706c69636174652f7072652fffffffff01030161060000000014147f88537a1f7e5f0cf340d2b396cd19d173fadd0000000000",
+   "expected": {
+    "verdict": "valid",
+    "error_class": null
+   },
+   "derived": {
+    "block_hash": "f5d97abab12ed0aaed3982cffc9284b50fad9de875b7d73c181f8c63233eec77",
+    "txids": [
+     "10a35e4e4612f4413b599a187f74e1404ff3acbd450e13913df54747018a8025"
+    ],
+    "legacy_merkle_root": "10a35e4e4612f4413b599a187f74e1404ff3acbd450e13913df54747018a8025",
+    "tagged_merkle_root": "a4a3f00c7a7b1289ec50e939deb6c2bb326d32ceb18c7a69f5ead72c09e78415",
+    "witness_root": "d970168d7ab96cf00e27d7600b8ba51e294ef1708fc990ef1758792061211826",
+    "parents_commitment": "85fae1626739ec2ce4f85a86be7034c8575a3f9849405e134e6f42a8323690cd",
+    "subsidy": "107020547",
+    "wire_size": 297
+   }
+  },
+  {
+   "id": "parents/duplicate/post",
+   "description": "The header lists parent p1 twice (p1, p2, p1); from the activation the coinbase commitment covers that list. Valid below the activation (the DAG treats the list as a set), invalid from it.",
+   "network": "mainnet",
+   "activation_height": "1000",
+   "activation_source": "explicit",
+   "height": "1000",
+   "regime": "post-activation",
+   "scope": "full",
+   "pow": "skip",
+   "prevouts": [],
+   "block": "01000000033a4fcd317475f0734a21a5bb2b56ed0857ef5fccdb212a77ef51627abc8885fe854846e1f931b6c473d7fac1fe5e3ea4a66c201d46daa799fa4ccba6fafe0d5c3a4fcd317475f0734a21a5bb2b56ed0857ef5fccdb212a77ef51627abc8885fe605b5523e753a5a2c82101f6c00a34a3bc0097313e941cbd24f855cc133da8e74069cb6a0000000036900e1f0000000000000000e803000000000000e8030000000000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff7f474e422d43423031e80300000000000085fae1626739ec2ce4f85a86be7034c8575a3f9849405e134e6f42a8323690cdd970168d7ab96cf00e27d7600b8ba51e294ef1708fc990ef1758792061211826676e622d626c6f636b2d766563746f72732f626c6f636b2f706172656e74732f6475706c69636174652f706f73742fffffffff01030161060000000014a40aa9a0331b5de8d23b1c08d470aff4dc64da780000000000",
+   "expected": {
+    "verdict": "invalid",
+    "error_class": "duplicate-parent"
+   },
+   "derived": {
+    "block_hash": "190efb55a789faf9988f9572594483038f6d395c6390e6a5f237a97164e1ea39",
+    "txids": [
+     "1090497177a68d2c7bf2c176ad0bd7f41359ae3306e39a31eb35afd3540f7a44"
+    ],
+    "legacy_merkle_root": "1090497177a68d2c7bf2c176ad0bd7f41359ae3306e39a31eb35afd3540f7a44",
+    "tagged_merkle_root": "605b5523e753a5a2c82101f6c00a34a3bc0097313e941cbd24f855cc133da8e7",
+    "witness_root": "d970168d7ab96cf00e27d7600b8ba51e294ef1708fc990ef1758792061211826",
+    "parents_commitment": "85fae1626739ec2ce4f85a86be7034c8575a3f9849405e134e6f42a8323690cd",
+    "subsidy": "107020547",
+    "wire_size": 378
+   }
+  },
+  {
+   "id": "parents/duplicate-at-mainnet-height-17499",
+   "description": "Parent p1 listed twice at height 17499 under the mainnet schedule (activation 17,500).",
+   "network": "mainnet",
+   "activation_height": "17500",
+   "activation_source": "schedule",
+   "height": "17499",
+   "regime": "pre-activation",
+   "scope": "full",
+   "pow": "skip",
+   "prevouts": [],
+   "block": "01000000023a4fcd317475f0734a21a5bb2b56ed0857ef5fccdb212a77ef51627abc8885fe3a4fcd317475f0734a21a5bb2b56ed0857ef5fccdb212a77ef51627abc8885fef9b595db017efebbe8192c17d98e5f27d76931d6c420758bd1029987f2496c4bbaf6d26a00000000ffff002100000000000000005b440000000000005b440000000000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff5c676e622d626c6f636b2d766563746f72732f626c6f636b2f706172656e74732f6475706c69636174652f6d61696e6e65742d31373439392f7c77633a0000000000000000000000000000000000000000000000000000000000000000ffffffff0136671a050000000014297fa321cb9106ade9b5929654aa11e3a74e433a0000000000000000",
+   "expected": {
+    "verdict": "valid",
+    "error_class": null
+   },
+   "derived": {
+    "block_hash": "84e4bc55618ab56c02919d7f83c1fd66db1b9ee6e55c60b00353ccdc6c3343dc",
+    "txids": [
+     "4ba65f20e642fae606c058270ca1b98ed487664b3d943ecfeb1c5a45091b3402"
+    ],
+    "legacy_merkle_root": "4ba65f20e642fae606c058270ca1b98ed487664b3d943ecfeb1c5a45091b3402",
+    "tagged_merkle_root": "a4ab4228c187b575dad135ebb5ff6c9589cc8ca064703ec3ca6b99a0b6da3088",
+    "witness_root": "d970168d7ab96cf00e27d7600b8ba51e294ef1708fc990ef1758792061211826",
+    "parents_commitment": "f9a52b7106f7fb32cecc3723456c3044119ae0834b5c3d41064ddb365989cdf2",
+    "subsidy": "107020547",
+    "wire_size": 314
+   }
+  },
+  {
+   "id": "parents/duplicate-at-mainnet-height-17500",
+   "description": "Parent p1 listed twice at height 17500 under the mainnet schedule (activation 17,500).",
+   "network": "mainnet",
+   "activation_height": "17500",
+   "activation_source": "schedule",
+   "height": "17500",
+   "regime": "post-activation",
+   "scope": "full",
+   "pow": "skip",
+   "prevouts": [],
+   "block": "01000000023a4fcd317475f0734a21a5bb2b56ed0857ef5fccdb212a77ef51627abc8885fe3a4fcd317475f0734a21a5bb2b56ed0857ef5fccdb212a77ef51627abc8885fee47128ef01bfc411b31fb6f0f2b09096ba5d7f0f63d580e1c9c0d05dee0e8622d8f6d26a0000000036900e1f00000000000000005c440000000000005c440000000000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff88474e422d434230315c44000000000000f9a52b7106f7fb32cecc3723456c3044119ae0834b5c3d41064ddb365989cdf2d970168d7ab96cf00e27d7600b8ba51e294ef1708fc990ef1758792061211826676e622d626c6f636b2d766563746f72732f626c6f636b2f706172656e74732f6475706c69636174652f6d61696e6e65742d31373530302fffffffff0136671a0500000000141c1d0e0ed411b576b2dbae2a00327b9a1d874f240000000000000000",
+   "expected": {
+    "verdict": "invalid",
+    "error_class": "duplicate-parent"
+   },
+   "derived": {
+    "block_hash": "97ded4a13cba8044f288abbd25c6cb475abfa8e9b2a553fc13acb6cef780349d",
+    "txids": [
+     "a93bd6b0c1346c705cace56e6b1a1d174db3ea87f24eb503a5ee8e2c6b501c69"
+    ],
+    "legacy_merkle_root": "a93bd6b0c1346c705cace56e6b1a1d174db3ea87f24eb503a5ee8e2c6b501c69",
+    "tagged_merkle_root": "cbb1a2cb2419bd9ed46d629a7e74f58a4c7483f64e9b2c6ca9675c1977fc2f16",
+    "witness_root": "d970168d7ab96cf00e27d7600b8ba51e294ef1708fc990ef1758792061211826",
+    "parents_commitment": "f9a52b7106f7fb32cecc3723456c3044119ae0834b5c3d41064ddb365989cdf2",
+    "subsidy": "107020547",
+    "wire_size": 358
+   }
+  },
+  {
    "id": "decode/non-minimal-tx-count/post",
    "description": "The two-parent commitment base block with its transaction count written as FD 02 00 (same block id and contents): not the minimal encoding of 2, the decoder refuses the bytes.",
    "network": "mainnet",
@@ -3518,6 +3634,35 @@
     "parents_commitment": "5a508f0bb132ab3f9ed46448f7a89f695bf1415e9916844c3903673f535e608a",
     "subsidy": "107020547",
     "wire_size": 238
+   }
+  },
+  {
+   "id": "pow/non-canonical-bits",
+   "description": "bits 0x21007fff decode (as Bitcoin Core's SetCompact decodes them) to 0x7fff << 240, within the pow limit, but the canonical encoding of that target is 0x207fff00: non-canonical bits never validate (audit POW-9), at every height. No block an expected_bits check accepts is affected (expected bits are always canonical).",
+   "network": "mainnet",
+   "activation_height": "1000",
+   "activation_source": "explicit",
+   "height": "999",
+   "regime": "pre-activation",
+   "scope": "full",
+   "pow": "limit",
+   "prevouts": [],
+   "block": "01000000013a4fcd317475f0734a21a5bb2b56ed0857ef5fccdb212a77ef51627abc8885fe2408fcd68b15dfd925f76e22d86c0bbbfff8ca9e5575cac4d36119b4221358d12269cb6a00000000ff7f00210000000000000000e703000000000000e7030000000000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2f676e622d626c6f636b2d766563746f72732f626c6f636b2f706f772f6e6f6e2d63616e6f6e6963616c2d626974732fffffffff01030161060000000014c40bed0aae69ce05de9d6f67fa92e42d573a36190000000000",
+   "expected": {
+    "verdict": "invalid",
+    "error_class": "bad-bits"
+   },
+   "derived": {
+    "block_hash": "fd51b4b7edeeec126f13c8819de956d0d0ff8c833850d62cc5cbebe540d78127",
+    "txids": [
+     "2408fcd68b15dfd925f76e22d86c0bbbfff8ca9e5575cac4d36119b4221358d1"
+    ],
+    "legacy_merkle_root": "2408fcd68b15dfd925f76e22d86c0bbbfff8ca9e5575cac4d36119b4221358d1",
+    "tagged_merkle_root": "0304ed373bd8a8dbf1ea51be034852b5f29c2e3254e1de3cec5109ca435f2a27",
+    "witness_root": "d970168d7ab96cf00e27d7600b8ba51e294ef1708fc990ef1758792061211826",
+    "parents_commitment": "5a508f0bb132ab3f9ed46448f7a89f695bf1415e9916844c3903673f535e608a",
+    "subsidy": "107020547",
+    "wire_size": 234
    }
   },
   {

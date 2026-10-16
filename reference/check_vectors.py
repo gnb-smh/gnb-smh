@@ -10,6 +10,7 @@ import pathlib
 import sys
 
 import gen_difficulty_vectors
+import gen_ghostdag_vectors
 import gen_merkle_vectors
 import gnb_smh as ref
 
@@ -52,6 +53,13 @@ def main() -> int:
     bad = int(stored != fresh)
     failures += bad
     print(f"{'ok  ' if not bad else 'FAIL'} merkle / block-rule vectors")
+
+    # GhostDAG: candidate order, coloring, heights (audit B2-T9, B2-T10).
+    stored = json.loads((HERE / "ghostdag_vectors.json").read_text())
+    fresh = gen_ghostdag_vectors.build()
+    bad = int(stored != fresh)
+    failures += bad
+    print(f"{'ok  ' if not bad else 'FAIL'} GhostDAG vectors ({len(fresh['cases'])} cases)")
     return 1 if failures else 0
 
 

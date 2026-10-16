@@ -204,8 +204,10 @@ pub fn awaits_body_in(d: &consensus::GhostDAG, store: &storage::Storage, hash: &
     };
     // Pruning removes a body once the cursor passes the height it was
     // indexed at, which is never below the block's DAG height (B1-T17,
-    // `Storage::put_block_body_at`): a block whose DAG height is at or above
-    // the pruning cursor was never pruned.
+    // `Storage::put_block_body_at`; the cursor is a chain position, a DAG
+    // height, audit DAG-8; releases before both pruned selected-chain bodies
+    // by header height, which is >= the DAG height): a block whose DAG
+    // height is at or above the pruning cursor was never pruned.
     dag_height >= store.pruned_height() && matches!(store.has_block_body(hash), Ok(false))
 }
 
@@ -228,16 +230,26 @@ pub fn is_known_block_in(d: &consensus::GhostDAG, store: &storage::Storage, hash
     d.has_block(hash) && !awaits_body_in(d, store, hash)
 }
 
+/// The reachability records a batch carries: `(upserts, deletes)`.
+type ReachDelta = (Vec<(BlockHash, Vec<u8>)>, Vec<BlockHash>);
+
 /// Stage the CF_DAG (+ integrity, + reachability delta) record of `hash`. If
 /// the selected parent is the genesis and its integrity record was never
 /// written (fixture stores), the genesis record is staged lazily in the same
 /// batch; any other missing parent record is an error (DAG-11).
+///
+/// The reachability delta is staged but NOT drained (audit DAG-11): the
+/// caller passes the returned delta to [`reach_committed`] once the batch has
+/// committed. A batch that is dropped or fails leaves the delta pending, so
+/// the next committed DAG record writes it (a delta drained here was lost
+/// with a failed batch, and the intervals a reindex had moved stayed stale on
+/// disk: rolling the insertion back only re-marks the removed leaf's parent).
 fn stage_dag_record_for(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
     batch: &mut rocksdb::WriteBatch,
     hash: &BlockHash,
-) -> Result<(), String> {
+) -> Result<ReachDelta, String> {
     let data = dag.read().get_block_data(hash).cloned()
         .ok_or_else(|| format!("block {} vanished from the DAG", hex::encode(&hash[..8])))?;
     let mut parent_override = None;
@@ -251,8 +263,6 @@ fn stage_dag_record_for(
                 .map_err(|e| e.to_string())?;
             parent_override = Some(gi);
         } else if missing {
-            // Checked BEFORE draining the reachability delta below, so a
-            // refused batch does not lose it.
             return Err(format!(
                 "DAG record: integrity record of selected parent {} is missing; refusing to \
                  write a zero-filled chain link",
@@ -261,13 +271,21 @@ fn stage_dag_record_for(
         }
     }
     let (ups, rems) = if dag.read().maintains_reachability_index() {
-        dag.write().reach_take_delta()
+        dag.read().reach_peek_delta()
     } else {
         (Vec::new(), Vec::new())
     };
     store.stage_dag_record(batch, hash, &data, &ups, &rems, parent_override)
-        .map(|_| ())
-        .map_err(|e| format!("DAG record: {}", e))
+        .map_err(|e| format!("DAG record: {}", e))?;
+    Ok((ups, rems))
+}
+
+/// A batch carrying `delta` (from [`stage_dag_record_for`]) has committed:
+/// clear what it wrote from the pending reachability delta.
+fn reach_committed(dag: &Arc<RwLock<consensus::GhostDAG>>, delta: &ReachDelta) {
+    if !delta.0.is_empty() || !delta.1.is_empty() {
+        dag.write().reach_mark_persisted(&delta.0, &delta.1);
+    }
 }
 
 // ── In-context block validation ──────────────────────────────────────────────
@@ -753,21 +771,25 @@ struct TriggerRecord<'a> {
     powit: Option<&'a core::powit::PowitState>,
 }
 
-/// Stage `t`'s DAG record and PoWit state (if it is still in the DAG).
+/// Stage `t`'s DAG record, the pending reachability delta and its PoWit
+/// state (if it is still in the DAG). Returns the staged reachability delta
+/// (`None` when nothing was staged): the caller clears it with
+/// [`reach_committed`] only once the batch has committed (audit DAG-11), so
+/// a chunk that fails to commit leaves it pending.
 fn stage_trigger_record(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
     batch: &mut rocksdb::WriteBatch,
     t: &TriggerRecord<'_>,
-) -> Result<(), String> {
+) -> Result<Option<ReachDelta>, String> {
     if !dag.read().has_block(&t.hash) {
-        return Ok(());
+        return Ok(None);
     }
-    stage_dag_record_for(dag, store, batch, &t.hash)?;
+    let delta = stage_dag_record_for(dag, store, batch, &t.hash)?;
     if let Some(st) = t.powit {
         crate::powit::stage_state(store, batch, &t.hash, st)?;
     }
-    Ok(())
+    Ok(Some(delta))
 }
 
 /// Why one chunk of a chain move did not commit (nothing of it was written).
@@ -782,11 +804,13 @@ enum ChunkFailure {
 
 /// Commit ONE chunk (`sub`, at most `reorg::MAX_BLOCKS_PER_COMMIT` blocks)
 /// of a chain move in one atomic batch: its UTXO effects, undo records and
-/// chain indexes (`reorg::connect_plan`), its shielded state (COH-2), the
-/// tip pointer at the chunk's end, the persisted marks of `log_invalid`, the
-/// removal of the marks of every block it applies, and — when given — the
-/// trigger's DAG record with its PoWit state ([`TriggerRecord`]) and the
-/// operator's `clears_always`.
+/// chain indexes keyed by chain position (`reorg::connect_plan`, audit
+/// DAG-8), its shielded state (COH-2), the tip pointer at the chunk's end,
+/// the persisted marks of `log_invalid`, the removal of the marks of every
+/// block it applies, and — when given — the trigger's DAG record with the
+/// pending reachability delta and its PoWit state ([`TriggerRecord`]) and
+/// the operator's `clears_always`. The reachability delta leaves the
+/// in-memory pending set only once this batch has committed (audit DAG-11).
 fn commit_chunk(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
@@ -820,9 +844,13 @@ fn commit_chunk(
         }
     };
     let new_tip = sub.target();
+    // The reachability delta staged with the trigger's DAG record, cleared
+    // only once THIS chunk's batch has committed (audit DAG-11): a chunk
+    // that fails leaves it pending for the next committed DAG record.
+    let staged_reach: std::cell::RefCell<Option<ReachDelta>> = std::cell::RefCell::new(None);
     let stage_extra = |st: &storage::Storage, batch: &mut rocksdb::WriteBatch| -> Result<(), String> {
         if let Some(t) = &trigger {
-            stage_trigger_record(dag, st, batch, t)?;
+            *staged_reach.borrow_mut() = stage_trigger_record(dag, st, batch, t)?;
         }
         // Operator `reconsiderblock`: the marks it removes in any case.
         for h in clears_always {
@@ -857,7 +885,12 @@ fn commit_chunk(
     let hooks = ConnectHooks { validate: &validate, stage_extra: &stage_extra };
     let result = reorg::connect_plan(store, sub, &hooks);
     match &result {
-        Ok(_) => shielded.write().commit_staged(staged_shielded),
+        Ok(_) => {
+            shielded.write().commit_staged(staged_shielded);
+            if let Some(delta) = staged_reach.borrow_mut().take() {
+                reach_committed(dag, &delta);
+            }
+        }
         Err(_) => shielded.write().revert_staged(staged_shielded),
     }
     match result {
@@ -1137,10 +1170,11 @@ fn stage_invalid_marks(
     Ok(())
 }
 
-/// Persist the trigger's DAG record and PoWit state (if it is still in the
-/// DAG, [`TriggerRecord`]), the removal of every `cleared` mark and every
-/// pending invalid mark in one batch — used when the applied chain did not
-/// move.
+/// Persist the trigger's DAG record, the pending reachability delta and its
+/// PoWit state (if it is still in the DAG, [`TriggerRecord`]), the removal of
+/// every `cleared` mark and every pending invalid mark in one batch — used
+/// when the applied chain did not move. The delta is cleared from memory only
+/// once the batch has committed (audit DAG-11).
 fn persist_unchanged(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
@@ -1149,14 +1183,19 @@ fn persist_unchanged(
     cleared: &[BlockHash],
 ) -> Result<(), String> {
     let mut batch = rocksdb::WriteBatch::default();
+    let mut delta = None;
     if let Some(t) = &trigger {
-        stage_trigger_record(dag, store, &mut batch, t)?;
+        delta = stage_trigger_record(dag, store, &mut batch, t)?;
     }
     for h in cleared {
         store.stage_clear_invalid_block(&mut batch, h).map_err(|e| e.to_string())?;
     }
     stage_invalid_marks(dag, store, &mut batch, invalid_log)?;
-    store.write_batch(batch).map_err(|e| e.to_string())
+    store.write_batch(batch).map_err(|e| e.to_string())?;
+    if let Some(delta) = delta {
+        reach_committed(dag, &delta);
+    }
+    Ok(())
 }
 
 /// What one or more acceptance calls did to the applied (selected) chain:
@@ -1430,12 +1469,18 @@ pub fn accept_block_tracking(
     if old_tip.is_none() {
         return Err("consensus rejection: DAG has no genesis".into());
     }
-    // The block the UTXO set sits on: the persisted tip pointer, which every
-    // chain-move commit writes with its UTXO effects (audit B2-T0: a move
-    // stopped by a storage failure leaves it on an intermediate block, which
-    // is not the DAG's selected tip). Data dirs and fixtures without the
-    // pointer fall back to the selected tip.
-    let applied_tip = store.get_meta("tip_hash").ok().flatten()
+    // The APPLIED tip is the block the UTXO set (and the shielded state) sit
+    // on: the persisted tip pointer, written in the same batch as every
+    // chain-move commit. The DAG's selected tip is only the best candidate;
+    // it differs from the applied tip whenever a move to the best block could
+    // not be committed: a failed start-up reconnect or a storage error (audit
+    // DAG-11), or a chunked move stopped after committed chunks, which leaves
+    // the pointer on an intermediate block (audit B2-T0). A plan computed
+    // from the selected tip started where the state is not, so every later
+    // connect was refused until a restart. Bitcoin Core likewise extends from
+    // its active chain tip, never from the best header. A store without a
+    // tip pointer the DAG knows (fixtures) falls back to the selected tip.
+    let applied_tip = store.get_meta("tip_hash").map_err(|e| e.to_string())?
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
         .filter(|t| dag.read().has_block(t))
         .or(old_tip)
@@ -1736,6 +1781,13 @@ pub fn classify_stored_block(b: &core::Block, activation_height: u64) -> StoredB
         Ok(()) => return StoredBlockCheck::Valid,
         Err(e) => e,
     };
+    // A repeated parent (B2-T10) is in the header: every body of this id
+    // fails.
+    if block_rules::rules_active_at(b.height, activation_height)
+        && block_rules::check_parents_distinct(&b.header.parents).is_err()
+    {
+        return StoredBlockCheck::IdCommitted(reason);
+    }
     if !b.validate_merkle_at(activation_height) {
         // The header root is not the tagged root of these txids. If it is
         // their LEGACY root, the id commits to a legacy-format block, which
@@ -1913,6 +1965,9 @@ pub fn reconcile_on_startup(
 ) -> Result<(), String> {
     let _guard = store.acceptance_lock();
     ensure_invalid_set_loaded(dag, store);
+    // DAG-8: a data dir written before the selected-chain indexes were keyed
+    // by chain position is migrated before anything moves the chain.
+    migrate_chain_indexes(dag, store)?;
     let recheck = match recheck_stored_blocks_under_hardening(
         dag, store, core::activation::hardening_activation_height(),
     ) {
@@ -1933,20 +1988,7 @@ pub fn reconcile_on_startup(
     }
 
     // Step 2: applied-but-unrecorded blocks.
-    let mut orphan_applied: Vec<(u64, BlockHash)> = Vec::new();
-    let mut orphan_parents: Vec<BlockHash> = Vec::new();
-    let undo_hashes = store.undo_block_hashes().map_err(|e| e.to_string())?;
-    for &h in &undo_hashes {
-        if !dag.read().has_block(&h) {
-            if let Ok(Some(b)) = store.get_block(&h) {
-                orphan_applied.push((b.height, h));
-                orphan_parents.extend_from_slice(&b.header.parents);
-            } else {
-                warn!("reconcile: undo record for unknown block {} without a body; ignoring",
-                    hex::encode(&h[..8]));
-            }
-        }
-    }
+    let UnrecordedApplied { mut orphan_applied, back_to } = unrecorded_applied_blocks(dag, store, true)?;
     if !orphan_applied.is_empty() {
         orphan_applied.sort_by(|a, b| b.cmp(a)); // tip-first
         let to_rollback: Vec<BlockHash> = orphan_applied.iter().map(|(_, h)| *h).collect();
@@ -1970,11 +2012,6 @@ pub fn reconcile_on_startup(
         // none; a chain connected before undo records existed neither) the
         // unrecorded blocks sit on their selected parent. Step 4 then moves
         // the chain from this real applied tip to the best valid block.
-        let back_to = {
-            let d = dag.read();
-            let recorded: Vec<BlockHash> = undo_hashes.iter().copied().filter(|h| d.has_block(h)).collect();
-            d.heaviest_among(&recorded).or_else(|| d.heaviest_among(&orphan_parents))
-        };
         let Some(back_to) = back_to else {
             return Err(format!(
                 "reconcile: {} block(s) have applied UTXO effects but no DAG record, and the DAG holds \
@@ -2072,6 +2109,237 @@ pub fn reconcile_on_startup(
         }
     }
     Ok(())
+}
+
+/// Reconciliation step 2's input: the blocks with applied UTXO effects (an
+/// undo record and a body) but no DAG record, highest header height first,
+/// and the block the UTXO set sits on once they are rolled back (`None` when
+/// there are none, or when the DAG holds neither an applied block nor one of
+/// their parents). Shared by step 2 and the DAG-8 index migration, which must
+/// index the chain step 2 leaves applied.
+struct UnrecordedApplied {
+    orphan_applied: Vec<(u64, BlockHash)>,
+    back_to: Option<BlockHash>,
+}
+
+fn unrecorded_applied_blocks(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    log_ignored: bool,
+) -> Result<UnrecordedApplied, String> {
+    let mut orphan_applied: Vec<(u64, BlockHash)> = Vec::new();
+    let mut orphan_parents: Vec<BlockHash> = Vec::new();
+    let undo_hashes = store.undo_block_hashes().map_err(|e| e.to_string())?;
+    for &h in &undo_hashes {
+        if !dag.read().has_block(&h) {
+            if let Ok(Some(b)) = store.get_block(&h) {
+                orphan_applied.push((b.height, h));
+                orphan_parents.extend_from_slice(&b.header.parents);
+            } else if log_ignored {
+                warn!("reconcile: undo record for unknown block {} without a body; ignoring",
+                    hex::encode(&h[..8]));
+            }
+        }
+    }
+    if orphan_applied.is_empty() {
+        return Ok(UnrecordedApplied { orphan_applied, back_to: None });
+    }
+    // Once they are gone, the UTXO set describes the chain of the DAG blocks
+    // that still hold an undo record (see step 2).
+    let back_to = {
+        let d = dag.read();
+        let recorded: Vec<BlockHash> = undo_hashes.iter().copied().filter(|h| d.has_block(h)).collect();
+        d.heaviest_among(&recorded).or_else(|| d.heaviest_among(&orphan_parents))
+    };
+    Ok(UnrecordedApplied { orphan_applied, back_to })
+}
+
+// ── Selected-chain index layout (DAG-8) ──────────────────────────────────────
+
+/// Migrate the selected-chain indexes (CF_HEIGHT, CF_TIMESTAMPS, address
+/// history) of a data dir written before audit DAG-8 from header-height keys
+/// to selected-chain positions (DAG heights), once: a versioned schema step
+/// (`storage::CHAIN_INDEX_VERSION`). Run by [`reconcile_on_startup`] before
+/// anything moves the chain, through [`rebuild_chain_indexes`]. Returns
+/// whether it migrated.
+pub fn migrate_chain_indexes(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+) -> Result<bool, String> {
+    if store.chain_index_version().map_err(|e| e.to_string())? == storage::CHAIN_INDEX_VERSION {
+        return Ok(false);
+    }
+    let r = rebuild_chain_indexes(dag, store)?;
+    warn!("DAG-8: selected-chain indexes migrated to chain positions: {} block(s), {} address-history \
+           row(s){}{}", r.blocks, r.rows,
+           if r.lost > 0 {
+               format!(", {} row(s) of pruned blocks not recoverable (overwritten by an earlier release, \
+                        or not attributable to a block)", r.lost)
+           } else { String::new() },
+           if r.unresolved > 0 {
+               format!(", {} input(s) without an undo record to resolve their spend", r.unresolved)
+           } else { String::new() });
+    Ok(true)
+}
+
+/// `--reindex-addresses`: rebuild the selected-chain indexes (the address
+/// history `getaddresshistory` serves, the position -> hash and position ->
+/// timestamp rows) from the applied chain, under the acceptance lock. The
+/// same rebuild as the DAG-8 migration ([`rebuild_chain_indexes`],
+/// `Storage::rebuild_chain_indexes`), in the same layout (rows keyed by
+/// chain position, exactly what a connect writes), so the flag and the
+/// migration can never produce two layouts. Fixes histories that lost their
+/// spends to reorgs on releases before the address rows were written at
+/// apply time; spends are resolved from each block's undo record, which
+/// holds every output the block spent (genesis-ledger outputs included).
+pub fn reindex_chain_indexes(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+) -> Result<storage::ChainIndexRebuild, String> {
+    let _guard = store.acceptance_lock();
+    rebuild_chain_indexes(dag, store)
+}
+
+/// Rebuild the selected-chain indexes from the applied chain (one batch,
+/// `Storage::rebuild_chain_indexes`). The applied chain is the one
+/// reconciliation leaves the UTXO set on before it reconnects: when step 2
+/// will roll back applied blocks without a DAG record, the chain of the block
+/// it re-tips to ([`unrecorded_applied_blocks`], the same decision);
+/// otherwise the selected-parent chain of the tip pointer (or, when the DAG
+/// does not know it, of the heaviest DAG block holding an undo record).
+fn rebuild_chain_indexes(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+) -> Result<storage::ChainIndexRebuild, String> {
+    // Step 2 moves the tip pointer to `back_to` before step 4 connects
+    // anything; the pointer on disk may still name a block of another branch
+    // (a pre-fix reorg that crashed before its DAG and tip writes).
+    let retip = unrecorded_applied_blocks(dag, store, false)?.back_to;
+    let chain: Vec<(BlockHash, u64, u64)> = {
+        let d = dag.read();
+        let tip = retip
+            .or(store.get_meta("tip_hash").map_err(|e| e.to_string())?
+                .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+                .filter(|t| d.has_block(t)))
+            .or_else(|| {
+                let undo = store.undo_block_hashes().ok()?;
+                let recorded: Vec<BlockHash> = undo.into_iter().filter(|h| d.has_block(h)).collect();
+                d.heaviest_among(&recorded)
+            })
+            .or(d.store.genesis);
+        let mut out = Vec::new();
+        let mut cur = tip;
+        while let Some(h) = cur {
+            let Some(data) = d.get_block_data(&h) else { break };
+            out.push((h, data.height, data.timestamp));
+            cur = data.selected_parent;
+        }
+        out.reverse();
+        out
+    };
+    store.rebuild_chain_indexes(&chain).map_err(|e| e.to_string())
+}
+
+// ── Start-up DAG load and repair (DAG-11 residual) ───────────────────────────
+
+/// What the DAG repair recomputes a block's record from: its stored
+/// header, with the work `accept_block` inserted it with (normalised across
+/// the GnB-SMH v1 -> v3 switch, `core::block_work`; the raw `work_from_bits`
+/// of a v3 block is four times that, and a record recomputed with it carries
+/// another blue work than every other node's).
+pub fn repair_header(b: &core::Block) -> consensus::StoredHeader {
+    consensus::StoredHeader {
+        parents: b.header.parents.clone(),
+        timestamp: b.header.timestamp,
+        work: pow::block_work(b.header.bits, b.height),
+    }
+}
+
+/// What [`load_dag`] did.
+#[derive(Debug, Default)]
+pub struct DagLoadReport {
+    /// Blocks loaded into the DAG (0: nothing persisted yet).
+    pub blocks_loaded: usize,
+    /// No integrity record existed (a data dir from before the integrity
+    /// chain); they were computed and written.
+    pub self_healed: bool,
+    /// The integrity chain did not verify and the repair ran.
+    pub repair: Option<consensus::DagRepair>,
+}
+
+/// Load the persisted DAG into the (empty) `dag` at start-up.
+///
+/// The integrity chain over every block's GhostDAG data is verified first
+/// (`GhostDAG::load_persisted_validated`). If it does not verify, the node
+/// used to exit with a tampering message, before reconciliation could run and
+/// with no repair but a resync (audit DAG-11), and the footprint a pre-fix
+/// binary leaves after losing one DAG write (a missing record, descendants
+/// chained to a zero-filled link) triggers exactly that. The DAG is now
+/// repaired instead (`GhostDAG::load_persisted_repairing`): records
+/// consistent with their own integrity hash are kept and relinked, missing
+/// or corrupted ones are recomputed from the stored block headers with the
+/// consensus code, and what cannot be recomputed is dropped with its
+/// descendants and fetched again from peers, like Bitcoin Core's
+/// `-reindex` rebuilding its block index from the block files. The repair is
+/// committed in one batch, and the next start verifies strictly.
+///
+/// The UTXO set must not keep the effects of a block the repaired DAG no
+/// longer has and that cannot be rolled back: if a dropped block was applied
+/// (it has an undo record) the repair is refused and the data dir must be
+/// resynchronized. (Applied blocks are only dropped when their bodies are
+/// gone; a pruned node's footprint in its pruned range is the one case.)
+pub fn load_dag(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+) -> Result<DagLoadReport, String> {
+    let entries = store.load_all_dag_data().map_err(|e| format!("CF_DAG read failed: {e}"))?;
+    if entries.is_empty() {
+        return Ok(DagLoadReport::default());
+    }
+    let integrity_map = match store.load_all_integrity_hashes() {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("failed to read CF_DAG_INTEGRITY ({e}); assuming a data dir from before the integrity chain");
+            HashMap::new()
+        }
+    };
+    let verified = dag.write().load_persisted_validated(entries.clone(), integrity_map.clone());
+    match verified {
+        Ok(loaded) => {
+            if let Some(fresh) = loaded.fresh_map.as_ref().filter(|_| loaded.self_healed) {
+                let mut batch = rocksdb::WriteBatch::default();
+                store.stage_dag_repair(&mut batch, &[], fresh, &[]).map_err(|e| e.to_string())?;
+                store.write_batch(batch).map_err(|e| format!("self-heal: integrity records not written: {e}"))?;
+            }
+            Ok(DagLoadReport { blocks_loaded: loaded.blocks_loaded, self_healed: loaded.self_healed, repair: None })
+        }
+        Err(e) => {
+            warn!("GhostDAG integrity check failed: {e}. Repairing the DAG records from the stored records \
+                   and block headers (audit DAG-11) instead of refusing to start.");
+            let header_of = |h: &BlockHash| -> Option<consensus::StoredHeader> {
+                store.get_block(h).ok().flatten().map(|b| repair_header(&b))
+            };
+            let repair = dag.write().load_persisted_repairing(entries, integrity_map, header_of)?;
+            for h in &repair.dropped {
+                if store.has_undo_data(h).map_err(|e| e.to_string())? {
+                    return Err(format!(
+                        "DAG repair: block {} is applied (it has an undo record) but its DAG record cannot be \
+                         recovered (no stored body to recompute it from); the UTXO set cannot be repaired \
+                         in place. Resynchronize this data directory (a fresh --data-dir with \
+                         --carryover-snapshot, or an archival node's data dir).",
+                        hex::encode(&h[..8])));
+                }
+            }
+            let mut batch = rocksdb::WriteBatch::default();
+            store.stage_dag_repair(&mut batch, &repair.recomputed, &repair.integrity, &repair.dropped)
+                .map_err(|e| e.to_string())?;
+            store.write_batch(batch).map_err(|e| format!("DAG repair not written: {e}"))?;
+            warn!("DAG repaired: {} block(s) loaded, {} relinked, {} recomputed from their headers, {} dropped \
+                   (fetched again from peers)", repair.blocks_loaded, repair.relinked.len(),
+                   repair.recomputed.len(), repair.dropped.len());
+            Ok(DagLoadReport { blocks_loaded: repair.blocks_loaded, self_healed: false, repair: Some(repair) })
+        }
+    }
 }
 
 // ── Start-up chain-state check and rebuild (DAG-11 residual) ─────────────────
@@ -2297,7 +2565,7 @@ pub fn rebuild_chain_state(
             let cleared_rows = store.stage_clear_chain_state(&mut batch).map_err(|e| e.to_string())?;
             seed(store, &mut batch)?;
             if let Some(gb) = store.get_block(&genesis).map_err(|e| e.to_string())? {
-                store.stage_chain_index(&mut batch, &gb, &HashMap::new()).map_err(|e| e.to_string())?;
+                store.stage_chain_index(&mut batch, &gb, 0, &HashMap::new()).map_err(|e| e.to_string())?;
             }
             for (h, _) in &drop {
                 store.stage_clear_invalid_block(&mut batch, h).map_err(|e| e.to_string())?;

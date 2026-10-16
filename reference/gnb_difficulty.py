@@ -137,6 +137,19 @@ def target_to_bits(target: int) -> int:
     return (size << 24) | (mantissa & 0x007FFFFF)
 
 
+def is_canonical_bits(bits: int) -> bool:
+    """Audit POW-9: `bits` decodes and is the encoding `target_to_bits`
+    produces for its target. `bits_to_target` keeps Bitcoin Core's
+    SetCompact semantics (it decodes non-canonical encodings too, e.g.
+    0x21007fff and 0x207fff00 are the same target); `Block::validate_pow`
+    accepts canonical encodings only. Every expected bits value of the
+    schedule is canonical (it is a `target_to_bits` output)."""
+    try:
+        return target_to_bits(bits_to_target(bits)) == bits
+    except BitsError:
+        return False
+
+
 # ── Chain work ───────────────────────────────────────────────────────────────
 
 def work(target: int) -> int:

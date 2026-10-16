@@ -55,10 +55,10 @@ use crate::consensus::GhostdagData;
 /// Layout version of the aggregate keys.
 pub const AGG_VERSION: u32 = 1;
 
-const K_VERSION: &[u8] = b"agg/version";
+pub(crate) const K_VERSION: &[u8] = b"agg/version";
 const K_CHAIN: &[u8] = b"agg/chain";
 const K_CONN: &[u8] = b"agg/conn";
-const K_TIERS: &[u8] = b"agg/tiers";
+pub(crate) const K_TIERS: &[u8] = b"agg/tiers";
 const P_CUM: &[u8] = b"agg/cum/";
 const P_BAL: &[u8] = b"agg/bal/";
 const P_RICH: &[u8] = b"agg/rich/";
@@ -202,7 +202,7 @@ fn enc_tiers(t: &[TierTotals]) -> Vec<u8> {
     v
 }
 
-fn dec_tiers(v: &[u8]) -> Option<Vec<TierTotals>> {
+pub(crate) fn dec_tiers(v: &[u8]) -> Option<Vec<TierTotals>> {
     if v.len() != TIERS.len() * 24 {
         return None;
     }

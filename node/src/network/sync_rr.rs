@@ -574,10 +574,14 @@ impl SyncRequestLimiter {
 
 /// Build the request-response behaviour for `/gnb/sync/1`. `Full` support =
 /// this node both serves inbound pulls and issues outbound pulls.
-pub fn new_behaviour() -> Behaviour {
+///
+/// `protocol` is the network's directed-sync protocol: each network has its
+/// own (audit POW-9, `network::chain_separation`); [`SYNC_PROTOCOL`] is
+/// mainnet's.
+pub fn new_behaviour(protocol: StreamProtocol) -> Behaviour {
     Behaviour::with_codec(
         BlochSyncCodec,
-        std::iter::once((SYNC_PROTOCOL, ProtocolSupport::Full)),
+        std::iter::once((protocol, ProtocolSupport::Full)),
         RrConfig::default()
             .with_request_timeout(Duration::from_secs(30))
             .with_max_concurrent_streams(MAX_CONCURRENT_SYNC_STREAMS),

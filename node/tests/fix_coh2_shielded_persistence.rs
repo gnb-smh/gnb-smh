@@ -218,7 +218,8 @@ fn disconnect_through_pruned_bodies_uses_the_pruned_record_and_the_undo() {
     let mut batch = rocksdb::WriteBatch::default();
     for h in [f.genesis, b1, b2, b3] {
         let blk = f.store.get_block(&h).unwrap().unwrap();
-        f.store.stage_chain_index(&mut batch, &blk, &std::collections::HashMap::new()).unwrap();
+        // A linear chain: each block's position is its header height.
+        f.store.stage_chain_index(&mut batch, &blk, blk.height, &std::collections::HashMap::new()).unwrap();
     }
     f.store.write_batch(batch).unwrap();
     assert_eq!(f.store.prune_blocks_below(3).unwrap(), 3, "genesis, b1 and b2 pruned");
@@ -418,6 +419,65 @@ fn pipeline_persists_the_shielded_tip_with_the_utxo_tip_and_restart_reloads_it()
     let f4 = empty_child(&n, f3.block_hash(), "f4");
     accept(&n, &f4).unwrap();
     assert_eq!(persisted(&n), Some(f4.block_hash()));
+}
+
+/// COH-2 challenge: the test above reads the persisted tip through
+/// `ShieldedPool::load`, which falls back to the UTXO tip when no shielded
+/// tip is stored, so it passed with the pipeline's shielded writes removed.
+/// This test reads the raw CF_SHIELDED rows `"T"` (tip) and `"V"` (schema
+/// version) right after each `accept_block` and after the start-up
+/// reconciliation's re-tip: they must exist and name the applied tip.
+/// Revert-checked: deleting `staged_shielded.stage_into(st, batch)?` from
+/// `accept::resolve_best_chain` fails the first assertion, deleting it from
+/// `reconcile_on_startup`'s step 2 fails the last block.
+#[test]
+fn pipeline_writes_the_shielded_tip_and_version_rows_in_the_connect_batch() {
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let mut n = node_with(&genesis, &[]);
+    let rows = |n: &Node| {
+        let tip = n.store.get_shielded(b"T").unwrap();
+        let version = n.store.get_shielded(b"V").unwrap();
+        (tip, version)
+    };
+    let version = Some(gnb::coherence::persist::SHIELDED_SCHEMA_VERSION.to_le_bytes().to_vec());
+    assert_eq!(rows(&n), (None, None), "a fresh data dir has no shielded rows");
+
+    // An extension.
+    let m1 = empty_child(&n, gh, "rows-m1");
+    accept(&n, &m1).unwrap();
+    assert_eq!(rows(&n), (Some(m1.block_hash().to_vec()), version.clone()), "written with the extension");
+    // A fork-loser moves nothing.
+    let f1 = mk_block_where(&n, vec![gh], vec![fix_common::coinbase("rows-f1", gnb::core::tokenomics::block_subsidy_sat(1), vec![0xF1; 20])],
+        |h| *h < m1.block_hash());
+    accept(&n, &f1).unwrap();
+    assert_eq!(applied_tip(&n), Some(m1.block_hash()));
+    assert_eq!(rows(&n).0, Some(m1.block_hash().to_vec()));
+    // A reorg to the fork.
+    let f2 = empty_child(&n, f1.block_hash(), "rows-f2");
+    accept(&n, &f2).unwrap();
+    assert_eq!(applied_tip(&n), Some(f2.block_hash()));
+    assert_eq!(rows(&n), (Some(f2.block_hash().to_vec()), version.clone()), "written with the reorg");
+
+    // Start-up reconciliation step 2 (a pre-fix crash between the UTXO
+    // effects and the DAG write of x) re-tips the shielded state in its
+    // batch: the row names the block the UTXO set is rolled back onto.
+    let x = empty_child(&n, f2.block_hash(), "rows-x");
+    n.store.put_block(&x).unwrap();
+    gnb::reorg::apply_block_utxo_mutations(&n.store, &x).unwrap();
+    n.store.put_meta("tip_hash", &x.block_hash()).unwrap();
+    {
+        // Drop the rows the earlier commits wrote, so only the re-tip can
+        // bring them back.
+        let db = n.store.db();
+        let cf = db.cf_handle("shielded").unwrap();
+        db.delete_cf(&cf, b"T").unwrap();
+        db.delete_cf(&cf, b"V").unwrap();
+    }
+    assert_eq!(rows(&n), (None, None));
+    restart(&mut n);
+    assert_eq!(applied_tip(&n), Some(f2.block_hash()));
+    assert_eq!(rows(&n), (Some(f2.block_hash().to_vec()), version), "written by the reconciliation's re-tip");
 }
 
 /// A block carrying shielded transactions is still rejected context-free

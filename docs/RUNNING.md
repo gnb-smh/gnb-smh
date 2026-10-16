@@ -92,6 +92,31 @@ The node verifies the snapshot, writes the 452,725 carryover UTXOs, verifies
 the genesis proof of work and starts syncing. Later boots only need
 `--data-dir`; a data-dir from another chain or genesis is refused.
 
+Use one data dir per network. Mainnet and testnet (`--testnet`) share the
+genesis block, so the genesis check alone cannot tell their data dirs apart;
+the data dir records the chain id of the network it was first started on
+(CF_META `chain_id`), and a node of the other network refuses it with "this
+data dir belongs to chain id ...". A data dir from an earlier release has no
+marker yet; it is not simply marked for the network that opens it first:
+when it holds chain blocks, the node reads their network from the blocks
+(below height 17,500, the mainnet hardening activation, a mainnet block
+follows the pre-activation rules and a testnet block the hardening rules,
+which exclude each other: only a testnet coinbase carries the hardened
+coinbase commitment, whatever either network's PoWit height) and refuses to
+start on the other network with "this data dir has no chain id marker yet,
+but its block ... belongs to chain id ...". A testnet data dir from before
+testnet's hardening reads as mainnet-shaped: its blocks fail the testnet
+rules anyway, so start testnet with a new `--data-dir`. Only a data dir
+whose recent blocks are all at or above height 17,500 (or that holds only
+the genesis) is marked for the running network without this check. The two
+networks also use different gossip topics and sync protocols, and a node
+disconnects a peer of the other network after the identify exchange
+(docs/CONSENSUS.md, "Networks"). A dialed address enters `known_peers.json`
+only once the peer's identify shows it runs the same network; an address of
+the other network is removed from it (entries saved by an earlier release,
+when both networks shared topics and peer exchange, included) and is not
+dialed again from peer exchange during that run.
+
 ## Mining
 
 ```sh
@@ -118,6 +143,39 @@ Transaction relay and mempool policy (unconfirmed chains, child-pays-for-parent
 templates, full-RBF, orphan transactions): `docs/MEMPOOL.md`;
 `getmempoolinfo` reports the parameters in force.
 
+Heights in `getblockhash`, `getblockbyheight`, `getrecentblocks`,
+`getblock` given a number, the address history (`listtransactions`'
+`block_height`, `getaddressbalance_at_height`) and the pruning cursor
+(`pruned_height`) are positions on the applied selected chain: the DAG
+height, 0 for the genesis and one more per selected-parent step (audit DAG-8),
+like Bitcoin Core's active-chain heights. `getblockhash N` names exactly one
+block, the selected-chain block at position N. A block's header height
+(`getblock`'s `height`, the height its difficulty and coinbase commitment
+use) can be larger than its position when it merges a parent with a greater
+DAG height; header heights can repeat along the selected chain, which is why
+the indexes are not keyed by them. A data dir from an earlier release (keyed
+by header height, where two chain blocks could share a row) is migrated once
+at start-up (log line "DAG-8: selected-chain indexes migrated …"), before
+reconciliation moves the chain, over the chain reconciliation leaves applied
+(the block it re-tips to when it rolls back blocks that have UTXO effects but
+no DAG record). The address history of a block whose body is stored is
+rebuilt from the body; that of a pruned block is moved to its position, from
+its pruned-body record, or, for a body pruned by a release before that
+record existed, from the rows themselves (each attributed to its block
+through the transaction index; a record naming them is written so that a
+later reorg deletes them). A row that an earlier release had overwritten
+with another block's, or that cannot be attributed to a block, cannot be
+recovered and is reported as lost. The rebuild also drops the rows earlier
+releases wrote for blocks that never joined the chain and restores the spend
+rows of bodied blocks that a reorg had deleted (each block's undo record
+holds the outputs it spent). `--reindex-addresses` runs the same rebuild on
+demand at start-up, after reconciliation, over the applied chain ("address
+history rebuilt: N blocks, R rows, U unresolved inputs"); it needs no
+`--carryover-snapshot`, since spends of genesis-ledger outputs are resolved
+from the undo records too. The rows are always exactly what connecting the
+block writes, keyed by chain position, so the migration and the flag can
+never produce two layouts.
+
 The explorer statistics (`getchainstats`, `gethashrate`, `getrichlist`,
 `getsupplydistribution`, `getaddresscount`) are served from aggregates the
 node keeps in the same write batches as its UTXO set. A data directory
@@ -134,6 +192,59 @@ and red blocks they merge, `avg_dag_block_interval_secs`);
 `avg_block_time_secs` is the interval between selected-chain blocks. A
 storage failure behind any of these methods is answered with the generic
 `STORAGE_ERROR` response; the detail only goes to the node's log.
+
+### Supply audit: `gettxoutsetinfo` (audit VAL-11)
+
+`gettxoutsetinfo` is the counterpart of Bitcoin Core's method of the same
+name. It reads the whole UTXO set and every undo record in one RocksDB
+snapshot (a block connected meanwhile is wholly in the answer or not at all)
+and answers:
+
+| Field | Meaning |
+|---|---|
+| `height`, `bestblock` | the applied tip and its chain position |
+| `txouts`, `total_amount_sat` | unspent outputs and their total |
+| `hash_serialized` | SHA3-256 of the UTXO rows in key order (domain `gnb/utxo-set/v1`; each row `u32 LE len ‖ key ‖ u32 LE len ‖ value`). Two nodes with the same set report the same hash; compare it across nodes at the same `bestblock` |
+| `applied_blocks`, `undo_off_chain`, `chain_without_undo`, `chain_ok` | blocks with an undo record (the connected chain, genesis excluded); of those, the ones not on the selected chain of `bestblock` (a stale record, whose subsidy would inflate `max_supply_sat`); the blocks of that chain without a record (their subsidy is missing from it; a chain whose walk stops at a missing DAG record counts one more); `chain_ok` when the records are exactly that chain (both counts 0 and `applied_blocks` = `height`) |
+| `expected.carryover_sat` | the genesis ledger's verified Bloch carryover |
+| `expected.locked_sat` | the genesis ledger's locked team and founder allocations (2 × 1,250,000 GNB in 72 timelocked policy outputs, `core::vesting`; in the set whether unlocked or not) |
+| `expected.subsidy_sat` | the subsidy of every connected block, at the header height its coinbase was checked against |
+| `expected.max_supply_sat` | carryover + locked + subsidy: the most the set may hold |
+| `expected.schedule_issued_sat` | `issued_through_sat(height)`, the schedule through the tip's position, an upper bound of `subsidy_sat` |
+| `unclaimed_sat` | `max_supply_sat - total_amount_sat`, `null` when the set holds more |
+| `supply_ok` | the set holds no more than `max_supply_sat` and every row decodes |
+| `aggregates` | the scan's count and total over address (20-byte) scripts against the aggregates the node keeps in the same write batches as the UTXO set |
+| `ok` | all of the above hold |
+
+`unclaimed_sat` is value that can never be spent, and is expected to be
+positive and to grow: a miner that claims less than its allowance burns the
+difference (consensus allows it); from the PoWit activation (mainnet height
+10,000) 20% of each subsidy is reserved for 16 witness-share slots, and the
+slots a block leaves empty, with the rounding of the split, are never issued
+(`witness_share::split_subsidy`; the shares that are paid are coinbase
+outputs like the miner's, in the total); and value that enters the shielded
+pool leaves the transparent set (no shielded transaction is valid while the
+pool is inactive). No coin is ever overwritten: BIP30 is enforced at every
+height. Fees are not issuance: they move value from transaction outputs to
+the coinbase, and the proof of work (GnB-SMH v3 from the PoWit activation)
+does not change the subsidy. Outputs paying unspendable scripts (the genesis
+coinbase creates none) stay in the set and in the total, as in Core. Policy
+outputs (multisig, timelocks, the locked tranches) are in the total but not
+in `aggregates`, which counts address (20-byte) scripts only. A total above
+`max_supply_sat` (`supply_ok: false`) means inflation or a corrupted set; an
+aggregates mismatch with the supply bound intact means a UTXO row changed
+outside the node (disk corruption, an edited data dir). Either way stop the
+node and resync from a fresh `--data-dir` (or an archival node's data dir):
+the node has no `-reindex-chainstate` yet, and the start-up rebuild of
+"Chain-state check at start-up" only runs when it finds an interrupted
+commit.
+
+The method is in the heavy class (one computation at a time; a result is
+cached for 30 s per applied tip, so a block connected or disconnected since
+is never answered from the cache, and `bestblock` says which chain it
+describes) and is
+cancelled at the RPC deadline (25 s inside the 30 s request timeout),
+answering `{"error":"cancelled"}`; it never blocks block acceptance.
 
 The node serves plain HTTP. To reach a remote node, put a TLS reverse proxy in
 front of its RPC port or use an SSH tunnel
@@ -219,6 +330,28 @@ its parents, difficulty, timestamp, proof of work, the witness commitment
 rules) before it is stored.
 
 ## Chain-state check at start-up
+
+Before anything else the node verifies the integrity chain over its stored
+GhostDAG records. A data dir written by a release from before the 2026-10
+audit fixes can fail it without any tampering: that release ignored a failed
+DAG write and zero-filled the missing parent link of the next block. The
+node then repairs the records instead of refusing to start (audit DAG-11): a
+record consistent with its own integrity hash is kept and relinked, a
+missing or corrupted record is recomputed from the stored block header with
+the consensus code, and a block that cannot be recomputed (its body is gone
+too) is dropped together with its descendants and fetched again from peers.
+The log says how many blocks were relinked, recomputed and dropped, and the
+next start verifies strictly. If a block that would be dropped is applied
+(on a pruned node, a lost record in the pruned range), the UTXO set cannot be
+repaired in place and the node refuses to start: resync from a fresh
+`--data-dir` (or an archival node's data dir).
+
+If start-up reconciliation cannot connect the best valid chain (a storage
+error), the node refuses to start ("Refusing to start: the best valid chain
+cannot be connected"), as Bitcoin Core does when it fails to connect the
+best block at init; fix the cause it names (disk space, permissions) and
+restart. Later acceptances always connect from the applied tip recorded on
+disk, so a move that failed once is retried by the next block.
 
 At every start the node checks its chain state for the footprint of an
 interrupted or failed commit written by releases before the 2026-10 audit

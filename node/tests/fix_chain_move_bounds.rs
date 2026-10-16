@@ -710,3 +710,128 @@ fn b1_t20_readmission_into_a_full_pool_trims_once_and_keeps_the_best() {
     assert_eq!(re, 1);
     assert!(mempool.contains(&id));
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// B2-T0 with DAG-8 and DAG-11: what each chunk's batch carries
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Every row of the selected-chain index column families (position -> hash,
+/// position -> timestamp, address history).
+fn chain_index_rows(n: &Node) -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+    let db = n.store.db();
+    let mut out = Vec::new();
+    for cf in ["height", "timestamps", "addr_tx_history"] {
+        let h = db.cf_handle(cf).unwrap();
+        for r in db.iterator_cf(&h, rocksdb::IteratorMode::Start) {
+            let (k, v) = r.unwrap();
+            out.push((cf, k.to_vec(), v.to_vec()));
+        }
+    }
+    out
+}
+
+/// The position index is exactly the selected chain of the APPLIED tip, each
+/// block at its DAG height, and every chain coinbase's history row is at the
+/// block's position (audit DAG-8): nothing of a rolled-back block and nothing
+/// of a block the move has not reached yet.
+fn assert_indexes_follow_the_applied_tip(n: &Node, coinbases: &std::collections::HashMap<[u8; 32], BlockHash>,
+                                         what: &str) {
+    let tip = applied_tip(n).unwrap();
+    let mut chain = Vec::new();
+    let mut cur = Some(tip);
+    while let Some(h) = cur {
+        chain.push(h);
+        cur = n.dag.read().get_block_data(&h).and_then(|d| d.selected_parent);
+    }
+    chain.reverse();
+    for (pos, h) in chain.iter().enumerate() {
+        assert_eq!(n.store.get_block_hash_at_height(pos as u64).unwrap(), Some(*h), "{what}: position {pos}");
+    }
+    assert_eq!(n.store.get_block_hash_at_height(chain.len() as u64).unwrap(), None, "{what}: nothing above the tip");
+    let rows = n.store.query_address_history(&[0xC0; 20], 0, u64::MAX, 100_000, 0).unwrap();
+    let mut expected: Vec<(u64, [u8; 32])> = Vec::new();
+    for (pos, h) in chain.iter().enumerate().skip(1) {
+        let (txid, _) = coinbases.iter().find(|(_, b)| *b == h).expect("a builder block");
+        expected.push((pos as u64, *txid));
+    }
+    let mut got: Vec<(u64, [u8; 32])> = rows.iter().map(|e| (e.height, e.txid)).collect();
+    got.sort();
+    expected.sort();
+    assert_eq!(got, expected, "{what}: the address history is the applied chain's, at its positions");
+}
+
+/// Audit B2-T0 (R4) with DAG-8 and DAG-11 (R1b): a chunked chain move whose
+/// SECOND commit fails (simulated crash between chunks). The first chunk's
+/// one batch carries everything of its blocks and of the arriving block: the
+/// UTXO effects, the chain-index rows keyed by chain position (rollback
+/// chunks un-index at `lca + len - j` of their own sub-plan, apply chunks
+/// index from the block the previous chunk ended at), the tip pointer, the
+/// arriving block's DAG record with the pending reachability delta, which
+/// leaves the in-memory pending set once that batch committed (not at the
+/// end of the whole move, which never comes here). After the restart the
+/// move resumes and every index row equals that of a node fed in order.
+#[test]
+fn b2_t0_each_chunk_commits_its_position_index_rows_and_the_reachability_delta() {
+    let _guard = NoFaults;
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let a = b.chain(gh, 60, "a");
+    let fork = b.chain(gh, 64, "b");
+    let coinbases: std::collections::HashMap<[u8; 32], BlockHash> = a.iter().chain(fork.iter())
+        .map(|x| (x.transactions[0].txid(), x.block_hash())).collect();
+
+    let reference = node_with(&genesis, &[]);
+    deliver_all(&reference, &a);
+    deliver_all(&reference, &fork);
+    assert_indexes_follow_the_applied_tip(&reference, &coinbases, "reference");
+
+    let mut n = node_with(&genesis, &[]);
+    deliver_all(&n, &a);
+    let a_tip = a.last().unwrap().block_hash();
+    deliver_all(&n, &fork[..59]);
+    assert_eq!(applied_tip(&n), Some(a_tip));
+    assert_indexes_follow_the_applied_tip(&n, &coinbases, "before the move");
+
+    // The first chunk commits; the second "crashes" before its commit.
+    reorg::fault_injection::fail_after_commits(Some(1));
+    let mut trigger = None;
+    for blk in fork.iter().skip(59).take(2) {
+        let _ = accept(&n, blk);
+        if applied_tip(&n) != Some(a_tip) {
+            trigger = Some(blk.block_hash());
+            break;
+        }
+    }
+    let trigger = trigger.expect("the reorg started and committed its first chunk");
+    reorg::fault_injection::fail_after_commits(None);
+    let mid = applied_tip(&n).unwrap();
+    assert!(n.dag.read().is_on_selected_chain_of(&mid, &a_tip), "one rollback chunk committed: {}",
+        hex::encode(&mid[..4]));
+    assert_eq!(n.dag.read().get_block_data(&mid).unwrap().height, 60 - reorg::MAX_BLOCKS_PER_COMMIT as u64);
+    assert_indexes_follow_the_applied_tip(&n, &coinbases, "after the first chunk");
+
+    // DAG-11: the trigger's DAG record and its reachability records went to
+    // disk with the first chunk, and the pending delta was cleared then.
+    assert!(n.store.get_dag_data(&trigger).unwrap().is_some(), "the DAG record committed with the first chunk");
+    let pending = n.dag.read().reach_peek_delta();
+    assert!(pending.0.is_empty() && pending.1.is_empty(),
+        "the delta the committed chunk wrote is no longer pending ({} upserts)", pending.0.len());
+    let disk: std::collections::HashMap<BlockHash, Vec<u8>> = n.store.load_all_reachability().unwrap().into_iter().collect();
+    let mem: std::collections::HashMap<BlockHash, Vec<u8>> = n.dag.read().reach_export_all().into_iter().collect();
+    assert_eq!(disk, mem, "the reachability index on disk is the one in memory");
+
+    // Crash and restart: the move resumes from the committed chunk.
+    reload(&mut n);
+    accept::reconcile_on_startup(&n.dag, &n.store, &n.shielded).expect("reconcile resumes the move");
+    for blk in &fork {
+        if !n.dag.read().has_block(&blk.block_hash()) {
+            accept(&n, blk).expect("later blocks connect normally");
+        }
+    }
+    assert_eq!(applied_tip(&n), Some(fork.last().unwrap().block_hash()));
+    assert_indexes_follow_the_applied_tip(&n, &coinbases, "after the resumed move");
+    assert_eq!(chain_index_rows(&n), chain_index_rows(&reference),
+        "every position, timestamp and history row equals that of a node fed in order");
+    assert_eq!(digest(&n), digest(&reference));
+}
