@@ -132,7 +132,7 @@ impl PendingTried {
             }
             if let Some(a) = &dialed {
                 addr_book.remove(a);
-                if let super::addrbook::TriedInsert::Collision { existing } = tried.insert(a, now) {
+                if let super::pex_validator::TriedInsert::Collision { existing } = tried.insert(a, now) {
                     log::debug!("tried table: {} collides with {}; the occupant will be tested", a, existing);
                 }
             }

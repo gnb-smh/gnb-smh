@@ -38,7 +38,7 @@ use sha2::{Sha256, Digest};
 
 use connmgr::{ConnKind, ConnManager, DialIntent, OutboundAction};
 use pex_validator::{
-    PexRateLimiter, PexStats, AddrBook, TriedInsert, TriedTable,
+    PexRateLimiter, PexStats, AddrBook, TriedTable,
     is_valid_public_multiaddr, is_lan_multiaddr, is_acceptable_ip, enforce_cap, prune_invalid, addr_peer_id,
     netgroup, normalize_peer_addr,
     PEX_BATCH_LIMIT, KNOWN_PEERS_CAP,

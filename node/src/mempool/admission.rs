@@ -921,8 +921,9 @@ fn next_block_dag_height(store: &Storage) -> Result<u64, crate::reorg::ViewError
 
 /// The `coinbase_height` `getutxos` reports for an output of the coinbase
 /// `txid` (`None`: not a coinbase), for wallets, which treat such an output
-/// as spendable in the next block iff `next_block_height - coinbase_height
-/// >= COINBASE_MATURITY` (`wallet::send::utxo_row_spendable_at`,
+/// as spendable in the next block iff
+/// `next_block_height - coinbase_height >= COINBASE_MATURITY`
+/// (`wallet::send::utxo_row_spendable_at`,
 /// `next_block_height` from `getdaginfo`): below the activation (of the next
 /// block) the header height of the coinbase's block, as before; from it
 /// `next_block_height` minus the coinbase's selected-chain depth at the next
