@@ -100,7 +100,7 @@ test-only revision and cached dependencies:
 ```sh
 python3 node/tests/support/address_frontends_reversal.py \
   --worktree /path/to/isolated/worktree \
-  --baseline 23237fff9531cba78461fd4a6b6c2d748564ad2c \
+  --baseline ce61d7e \
   --output /private/tmp/gnb-r4-address-frontends-replay
 ```
 

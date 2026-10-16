@@ -63,3 +63,24 @@ the existing canonical Linux rebuild/comparison gate.
 Status: local focused implementation checks pass; production-only reversals,
 independent reviews, integrated suite and canonical CI rebuild remain pending.
 No acceptance or score claim.
+
+Production-only reversals were subsequently completed at `299389a`:
+removing the Rust format arm (with an actual script rebuild), JS forwarding,
+or alternate-page pin each causes 5 pass/1 fail with the same final tests.
+All restored controls pass 6/6. `address-wasm-reversals.json` records eight
+executions (three failures, three passing controls and two rebuilds), hashes,
+and exact restoration. `replay-address-wasm.py` reproduces this offline.
+
+The test-strength review identified a separate generator coverage gap:
+checking already-pinned artifacts did not exercise the script's second pin
+update. `site/tests/wallet-build-pin.test.mjs` now executes the actual script
+with `--pin-only` in a disposable file fixture with both pins stale. Removing
+only `pin_entry site/wallet/main.js CORE_SHA256` fails that unchanged test;
+restoration passes. See `pin-generator-reversal.json`. This adds regression
+coverage; it does not claim a new production vulnerability.
+
+Integrated site and API checks passed 50 and 21 tests respectively at the
+pre-secondary-wallet-fix snapshot. The path reviewer then reproduced missing
+height forwarding and ignored testnet creation in `main.js`/`core.js`; those
+medium findings remain open until their separate package and three reviews
+finish. Passing the pin test does not prove both full wallet journeys.
