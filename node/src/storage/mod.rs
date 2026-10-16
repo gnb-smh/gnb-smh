@@ -1200,20 +1200,72 @@ impl Storage {
     /// row still belongs to it (a row an earlier release overwrote with
     /// another block's cannot be recovered without the body); the record is
     /// rewritten with the new keys so a later rollback deletes the right
-    /// rows. Returns `(chain blocks, address rows written, rows lost)`.
+    /// rows. A body pruned by a release before audit DAG-6 left its rows but
+    /// no record: those rows are attributed to their block through the
+    /// transaction index (the row's txid), moved to its position, and a
+    /// record naming them is written (its `had_shielded` from the shielded
+    /// undo record, the rule `ShieldedPool::stage_plan` applies to a missing
+    /// record), so neither the history nor a later rollback loses them. A
+    /// row of such a block that cannot be attributed is counted as lost.
+    /// Returns `(chain blocks, address rows written, rows lost)`.
     pub fn migrate_chain_indexes(&self, chain: &[(BlockHash, u64, u64)]) -> Result<(usize, usize, usize), StorageError> {
         let cf_ai = self.db.cf_handle(CF_ADDR_TX_HISTORY)
             .ok_or(StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
         let cf_undo = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
         let mut batch = rocksdb::WriteBatch::default();
+        // Chain blocks whose body was pruned without a record (a release
+        // before audit DAG-6): their rows are the only copy of their history.
+        let mut unrecorded: std::collections::HashMap<BlockHash, u64> = std::collections::HashMap::new();
+        for (hash, position, _) in chain {
+            if self.get_block(hash)?.is_none() && self.get_pruned_body_record(hash)?.is_none() {
+                unrecorded.insert(*hash, *position);
+            }
+        }
+        // (block, new key, value) of their rows, re-keyed below.
+        let mut rekeyed: Vec<(BlockHash, Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut lost = 0usize;
         for name in [CF_HEIGHT, CF_TIMESTAMPS, CF_ADDR_TX_HISTORY] {
             let cf = self.db.cf_handle(name).ok_or(StorageError::CfNotFound(name.into()))?;
             for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
-                let (k, _) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+                let (k, v) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
                 batch.delete_cf(&cf, &k);
+                if name != CF_ADDR_TX_HISTORY || unrecorded.is_empty() {
+                    continue;
+                }
+                let block = match indexer::parse_value(&v) {
+                    Some((txid, _, _)) => self.get_tx_location(&txid)?.map(|(b, _)| b),
+                    None => None,
+                };
+                match block {
+                    Some(b) => {
+                        if let Some(position) = unrecorded.get(&b) {
+                            rekeyed.push((b, indexer::with_position(&k, *position), v.to_vec()));
+                        }
+                    }
+                    // Not attributable to any block: it may have belonged to
+                    // one of the record-less pruned blocks.
+                    None => lost += 1,
+                }
             }
         }
-        let (mut written, mut lost) = (0usize, 0usize);
+        let mut written = 0usize;
+        let mut record_keys: std::collections::HashMap<BlockHash, Vec<Vec<u8>>> = std::collections::HashMap::new();
+        for (block, key, value) in rekeyed {
+            batch.put_cf(&cf_ai, &key, &value);
+            written += 1;
+            record_keys.entry(block).or_default().push(key);
+        }
+        for hash in unrecorded.keys() {
+            let Some(undo) = self.get_undo_data(hash)? else { continue };
+            let rec = PrunedBodyRecord {
+                height: undo.block_height,
+                had_shielded: crate::coherence::persist::read_undo(self, hash)
+                    .map_err(StorageError::ReadFailed)?
+                    .is_some(),
+                addr_history_keys: record_keys.remove(hash).unwrap_or_default(),
+            };
+            batch.put_cf(&cf_undo, pruned_body_key(hash), encode(&rec)?);
+        }
         for (hash, position, timestamp) in chain {
             match self.get_block(hash)? {
                 Some(body) => {

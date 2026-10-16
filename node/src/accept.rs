@@ -1704,20 +1704,7 @@ pub fn reconcile_on_startup(
     }
 
     // Step 2: applied-but-unrecorded blocks.
-    let mut orphan_applied: Vec<(u64, BlockHash)> = Vec::new();
-    let mut orphan_parents: Vec<BlockHash> = Vec::new();
-    let undo_hashes = store.undo_block_hashes().map_err(|e| e.to_string())?;
-    for &h in &undo_hashes {
-        if !dag.read().has_block(&h) {
-            if let Ok(Some(b)) = store.get_block(&h) {
-                orphan_applied.push((b.height, h));
-                orphan_parents.extend_from_slice(&b.header.parents);
-            } else {
-                warn!("reconcile: undo record for unknown block {} without a body; ignoring",
-                    hex::encode(&h[..8]));
-            }
-        }
-    }
+    let UnrecordedApplied { mut orphan_applied, back_to } = unrecorded_applied_blocks(dag, store, true)?;
     if !orphan_applied.is_empty() {
         orphan_applied.sort_by(|a, b| b.cmp(a)); // tip-first
         let to_rollback: Vec<BlockHash> = orphan_applied.iter().map(|(_, h)| *h).collect();
@@ -1741,11 +1728,6 @@ pub fn reconcile_on_startup(
         // none; a chain connected before undo records existed neither) the
         // unrecorded blocks sit on their selected parent. Step 4 then moves
         // the chain from this real applied tip to the best valid block.
-        let back_to = {
-            let d = dag.read();
-            let recorded: Vec<BlockHash> = undo_hashes.iter().copied().filter(|h| d.has_block(h)).collect();
-            d.heaviest_among(&recorded).or_else(|| d.heaviest_among(&orphan_parents))
-        };
         let Some(back_to) = back_to else {
             return Err(format!(
                 "reconcile: {} block(s) have applied UTXO effects but no DAG record, and the DAG holds \
@@ -1826,16 +1808,62 @@ pub fn reconcile_on_startup(
     Ok(())
 }
 
+/// Reconciliation step 2's input: the blocks with applied UTXO effects (an
+/// undo record and a body) but no DAG record, highest header height first,
+/// and the block the UTXO set sits on once they are rolled back (`None` when
+/// there are none, or when the DAG holds neither an applied block nor one of
+/// their parents). Shared by step 2 and the DAG-8 index migration, which must
+/// index the chain step 2 leaves applied.
+struct UnrecordedApplied {
+    orphan_applied: Vec<(u64, BlockHash)>,
+    back_to: Option<BlockHash>,
+}
+
+fn unrecorded_applied_blocks(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    log_ignored: bool,
+) -> Result<UnrecordedApplied, String> {
+    let mut orphan_applied: Vec<(u64, BlockHash)> = Vec::new();
+    let mut orphan_parents: Vec<BlockHash> = Vec::new();
+    let undo_hashes = store.undo_block_hashes().map_err(|e| e.to_string())?;
+    for &h in &undo_hashes {
+        if !dag.read().has_block(&h) {
+            if let Ok(Some(b)) = store.get_block(&h) {
+                orphan_applied.push((b.height, h));
+                orphan_parents.extend_from_slice(&b.header.parents);
+            } else if log_ignored {
+                warn!("reconcile: undo record for unknown block {} without a body; ignoring",
+                    hex::encode(&h[..8]));
+            }
+        }
+    }
+    if orphan_applied.is_empty() {
+        return Ok(UnrecordedApplied { orphan_applied, back_to: None });
+    }
+    // Once they are gone, the UTXO set describes the chain of the DAG blocks
+    // that still hold an undo record (see step 2).
+    let back_to = {
+        let d = dag.read();
+        let recorded: Vec<BlockHash> = undo_hashes.iter().copied().filter(|h| d.has_block(h)).collect();
+        d.heaviest_among(&recorded).or_else(|| d.heaviest_among(&orphan_parents))
+    };
+    Ok(UnrecordedApplied { orphan_applied, back_to })
+}
+
 // ── Selected-chain index layout (DAG-8) ──────────────────────────────────────
 
 /// Migrate the selected-chain indexes (CF_HEIGHT, CF_TIMESTAMPS, address
 /// history) of a data dir written before audit DAG-8 from header-height keys
 /// to selected-chain positions (DAG heights), once: a versioned schema step
 /// (`storage::CHAIN_INDEX_VERSION`). Run by [`reconcile_on_startup`] before
-/// anything moves the chain. The applied chain is the selected-parent chain
-/// of the tip pointer (or, when the DAG does not know it, of the heaviest DAG
-/// block holding an undo record, as reconciliation's step 2 decides).
-/// Returns whether it migrated.
+/// anything moves the chain. The applied chain is the one reconciliation
+/// leaves the UTXO set on before it reconnects: when step 2 will roll back
+/// applied blocks without a DAG record, the chain of the block it re-tips to
+/// ([`unrecorded_applied_blocks`], the same decision); otherwise the
+/// selected-parent chain of the tip pointer (or, when the DAG does not know
+/// it, of the heaviest DAG block holding an undo record). Returns whether it
+/// migrated.
 pub fn migrate_chain_indexes(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
@@ -1843,11 +1871,16 @@ pub fn migrate_chain_indexes(
     if store.chain_index_version().map_err(|e| e.to_string())? == storage::CHAIN_INDEX_VERSION {
         return Ok(false);
     }
+    // Step 2 moves the tip pointer to `back_to` before step 4 connects
+    // anything; the pointer on disk may still name a block of another branch
+    // (a pre-fix reorg that crashed before its DAG and tip writes).
+    let retip = unrecorded_applied_blocks(dag, store, false)?.back_to;
     let chain: Vec<(BlockHash, u64, u64)> = {
         let d = dag.read();
-        let tip = store.get_meta("tip_hash").map_err(|e| e.to_string())?
-            .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
-            .filter(|t| d.has_block(t))
+        let tip = retip
+            .or(store.get_meta("tip_hash").map_err(|e| e.to_string())?
+                .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+                .filter(|t| d.has_block(t)))
             .or_else(|| {
                 let undo = store.undo_block_hashes().ok()?;
                 let recorded: Vec<BlockHash> = undo.into_iter().filter(|h| d.has_block(h)).collect();
@@ -1867,7 +1900,8 @@ pub fn migrate_chain_indexes(
     let (blocks, rows, lost) = store.migrate_chain_indexes(&chain).map_err(|e| e.to_string())?;
     warn!("DAG-8: selected-chain indexes migrated to chain positions: {blocks} block(s), {rows} address-history \
            row(s){}", if lost > 0 {
-               format!(", {lost} row(s) of pruned blocks not recoverable (overwritten by an earlier release)")
+               format!(", {lost} row(s) of pruned blocks not recoverable (overwritten by an earlier release, \
+                        or not attributable to a block)")
            } else { String::new() });
     Ok(true)
 }

@@ -69,9 +69,17 @@ use) can be larger than its position when it merges a parent with a greater
 DAG height; header heights can repeat along the selected chain, which is why
 the indexes are not keyed by them. A data dir from an earlier release (keyed
 by header height, where two chain blocks could share a row) is migrated once
-at start-up (log line "DAG-8: selected-chain indexes migrated …"); a
-pruned block's address-history row that an earlier release had overwritten
-with another block's cannot be recovered and is reported as lost.
+at start-up (log line "DAG-8: selected-chain indexes migrated …"), before
+reconciliation moves the chain, over the chain reconciliation leaves applied
+(the block it re-tips to when it rolls back blocks that have UTXO effects but
+no DAG record). The address history of a block whose body is stored is
+rebuilt from the body; that of a pruned block is moved to its position, from
+its pruned-body record, or, for a body pruned by a release before that
+record existed, from the rows themselves (each attributed to its block
+through the transaction index; a record naming them is written so that a
+later reorg deletes them). A row that an earlier release had overwritten
+with another block's, or that cannot be attributed to a block, cannot be
+recovered and is reported as lost.
 
 The explorer statistics (`getchainstats`, `gethashrate`, `getrichlist`,
 `getsupplydistribution`, `getaddresscount`) are served from aggregates the

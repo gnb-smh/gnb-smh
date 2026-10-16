@@ -16,6 +16,7 @@ use fix_common::*;
 use gnb::accept;
 use gnb::consensus::BlockHash;
 use gnb::core::{activation, Block};
+use gnb::reorg;
 
 const ADDR: [u8; 20] = [0xC0; 20];
 
@@ -250,4 +251,144 @@ fn chain_indexes_are_keyed_by_the_selected_chain_position() {
     for (i, x) in ms.iter().enumerate() {
         assert!(h.iter().any(|(pos, t)| *t == cb(x) && *pos == i as u64 + 1), "M{i} at position {}", i + 1);
     }
+}
+
+/// DAG-8 migration (review): a release before audit DAG-6 pruned bodies
+/// without a pruned-body record and kept their address-history rows (keyed
+/// by header height). The migration deleted every row and rebuilt only those
+/// of bodied blocks and of blocks with a record, so the whole pruned range's
+/// history was lost, silently. Such rows are now attributed to their block
+/// through the transaction index, moved to its position, and a record
+/// naming them is written, so a later rollback deletes them.
+#[test]
+fn an_old_layout_pruned_block_without_a_record_keeps_its_history() {
+    let _g = activation::scoped_override(0);
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let mut n = node_with(&genesis, &[]);
+    let (s, b, c, d, ms) = dag8_shape(&n, [0xD0; 20]);
+    let chain: Vec<BlockHash> = {
+        let mut v = n.dag.read().selected_chain();
+        v.reverse();
+        v
+    };
+    let p = n.store.get_block(&chain[1]).unwrap().unwrap(); // the P S selects
+    let bodies: Vec<Block> = chain.iter().map(|h| n.store.get_block(h).unwrap().unwrap()).collect();
+
+    // The pre-DAG-6 prune: bodies gone, rows kept, no record.
+    assert_eq!(n.store.prune_blocks_below(4).unwrap(), 4, "G, P, S and B pruned");
+    {
+        let db = n.store.db();
+        for h in &chain[..4] {
+            db.delete_cf(&db.cf_handle("undo").unwrap(), gnb::storage::pruned_body_key(h)).unwrap();
+        }
+        for cf in ["height", "timestamps", "addr_tx_history"] {
+            let h = db.cf_handle(cf).unwrap();
+            let keys: Vec<Vec<u8>> = db.iterator_cf(&h, rocksdb::IteratorMode::Start).map(|r| r.unwrap().0.to_vec()).collect();
+            for k in keys {
+                db.delete_cf(&h, &k).unwrap();
+            }
+        }
+        db.delete_cf(&db.cf_handle("meta").unwrap(), gnb::storage::CHAIN_INDEX_VERSION_META).unwrap();
+    }
+    // The old layout, written by the connects in chain order (header-height
+    // keys; D's height row replaces B's).
+    for body in &bodies {
+        let mut batch = rocksdb::WriteBatch::default();
+        if body.header.parents.is_empty() {
+            n.store.stage_chain_position(&mut batch, 0, &body.block_hash(), body.header.timestamp).unwrap();
+        } else {
+            n.store.stage_chain_index(&mut batch, body, body.height, &Default::default()).unwrap();
+        }
+        n.store.write_batch(batch).unwrap();
+    }
+    for x in [&p, &s, &b] {
+        assert!(!n.store.has_block_body(&x.block_hash()).unwrap());
+        assert!(n.store.get_pruned_body_record(&x.block_hash()).unwrap().is_none(), "no record (pre-DAG-6)");
+    }
+    assert_eq!(n.store.chain_index_version().unwrap(), 1, "old layout");
+    assert!(history(&n).iter().any(|(pos, t)| *t == cb(&b) && *pos == 5), "old layout: B's row at its header height");
+
+    restart(&mut n); // reconcile_on_startup migrates first
+    assert_eq!(n.store.chain_index_version().unwrap(), gnb::storage::CHAIN_INDEX_VERSION);
+    assert_index_is_the_chain(&n, "migrated");
+    let h = history(&n);
+    for (x, pos) in [(&p, 1u64), (&s, 2), (&b, 3), (&c, 4)] {
+        assert_eq!(h.iter().filter(|(_, t)| *t == cb(x)).count(), 1, "one row of {}", hex::encode(&x.block_hash()[..4]));
+        assert!(h.iter().any(|(q, t)| *t == cb(x) && *q == pos),
+            "the row of {} is at its position {pos}: {h:?}", hex::encode(&x.block_hash()[..4]));
+    }
+    // A record naming the moved rows is written for each such block.
+    for (x, pos) in [(&p, 1u64), (&s, 2), (&b, 3)] {
+        let rec = n.store.get_pruned_body_record(&x.block_hash()).unwrap().expect("record written");
+        assert_eq!(rec.height, x.height);
+        assert_eq!(rec.addr_history_keys, vec![gnb::storage::indexer::make_key(&ADDR, pos, 0, 0)]);
+    }
+
+    // The records drive a later rollback: invalidating S rolls back D, C, B,
+    // S and P (the M branch is the best chain then) and deletes their rows.
+    accept::invalidate_block(s.block_hash(), &n.dag, &n.store, &n.mempool, &n.node_state, None, &n.shielded)
+        .expect("invalidate S");
+    assert_index_is_the_chain(&n, "after invalidating S");
+    let h = history(&n);
+    for x in [&p, &s, &b, &c] {
+        assert!(!h.iter().any(|(_, t)| *t == cb(x)), "rolled-back row of {} removed", hex::encode(&x.block_hash()[..4]));
+    }
+    for (i, x) in ms.iter().enumerate() {
+        assert!(h.iter().any(|(pos, t)| *t == cb(x) && *pos == i as u64 + 1), "M{i} at position {}", i + 1);
+    }
+    let _ = d;
+}
+
+/// DAG-8 migration (review): the migration ran before reconciliation's step
+/// 2 and indexed the chain of meta `tip_hash`, while step 2 re-tips to the
+/// block the UTXO set really sits on. Footprint of a pre-fix reorg that
+/// crashed before its DAG and tip writes: the UTXO set moved from A1 to
+/// B1 + B2, B2 has no DAG record, `tip_hash` still names A1. A1 is
+/// disqualified (an operator mark of an earlier run), so the best chain
+/// without B2 is B1's and step 4 does not move the chain. The migration
+/// indexed A1 at position 1 (with A1's address history) and nothing ever
+/// rewrote it; it now indexes the chain step 2 leaves applied, B1's.
+#[test]
+fn the_migration_indexes_the_chain_reconciliation_leaves_applied() {
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let mut n = node_with(&genesis, &[]);
+    let sub1 = gnb::core::tokenomics::block_subsidy_sat(1);
+    let a1 = mk_block(&n, vec![gh], vec![coinbase("a1", sub1, vec![0xA1; 20])]);
+    let b1 = mk_block_where(&n, vec![gh], vec![coinbase("b1", sub1, vec![0xB1; 20])], |h| *h < a1.block_hash());
+    accept(&n, &a1).unwrap();
+    accept(&n, &b1).unwrap();
+    assert_eq!(applied_tip(&n), Some(a1.block_hash()), "B1 is a fork-loser");
+    let b2 = mk_block(&n, vec![b1.block_hash()],
+        vec![coinbase("b2", gnb::core::tokenomics::block_subsidy_sat(2), vec![0xB2; 20])]);
+
+    // The pre-fix reorg path, up to the crash point.
+    n.store.put_block(&b2).unwrap();
+    let plan = reorg::ReorgPlan {
+        lca: gh, to_rollback: vec![a1.block_hash()], to_apply: vec![b1.block_hash(), b2.block_hash()],
+    };
+    let validate = |_: &dyn reorg::UtxoView, _: &Block| -> Result<(), String> { Ok(()) };
+    let stage_extra = |_: &gnb::storage::Storage, _: &mut rocksdb::WriteBatch| -> Result<(), String> { Ok(()) };
+    reorg::connect_plan(&n.store, &plan, &reorg::ConnectHooks { validate: &validate, stage_extra: &stage_extra })
+        .unwrap();
+    assert_eq!(applied_tip(&n), Some(a1.block_hash()), "crash state: tip pointer not rewritten");
+    let mut batch = rocksdb::WriteBatch::default();
+    n.store.stage_invalid_block(&mut batch, &a1.block_hash(), accept::OPERATOR_INVALIDATE_REASON).unwrap();
+    n.store.write_batch(batch).unwrap();
+    {
+        let db = n.store.db();
+        db.delete_cf(&db.cf_handle("meta").unwrap(), gnb::storage::CHAIN_INDEX_VERSION_META).unwrap();
+    }
+    assert_eq!(n.store.chain_index_version().unwrap(), 1, "a data dir of an earlier release");
+
+    restart(&mut n);
+    assert_eq!(n.store.chain_index_version().unwrap(), gnb::storage::CHAIN_INDEX_VERSION);
+    assert_eq!(applied_tip(&n), Some(b1.block_hash()), "step 2 re-tipped to B1");
+    assert_eq!(sel_tip(&n), Some(b1.block_hash()), "and B1 is the best block");
+    assert_eq!(n.store.get_block_hash_at_height(1).unwrap(), Some(b1.block_hash()), "position 1 is B1, not A1");
+    assert_index_is_the_chain(&n, "after reconciliation");
+    let rows = |a: [u8; 20]| n.store.query_address_history(&a, 0, u64::MAX, 100, 0).unwrap();
+    assert!(rows([0xA1; 20]).is_empty(), "no history of the unapplied A1");
+    assert!(rows([0xB1; 20]).iter().any(|e| e.txid == cb(&b1) && e.height == 1), "B1's history at position 1");
+    assert!(rows([0xB2; 20]).is_empty(), "B2 rolled back");
 }
