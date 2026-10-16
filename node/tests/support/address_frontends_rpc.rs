@@ -34,6 +34,17 @@ async fn address_frontends_queries_reject_wrong_network_before_storage() {
     if rejected["error"] != "address is for Testnet, expected Mainnet" || reads != 0 {
         failures.push(format!("policy getutxos: {rejected}; storage reads {reads}"));
     }
+    state.store.put_meta("tip_hash", &[1; 32]).unwrap();
+    state.store.put_tx_index(&[43; 32], &[1; 32], 1).unwrap();
+    let selected = json!([{"txid": hex::encode([43; 32]), "index": 0}]);
+    let positive = dispatch("getutxos", Some(&json!([main, 1, selected])), &state).await;
+    assert_eq!(positive["utxos"][0]["value"], "12345", "selected positive: {positive}");
+    let before = state.store.storage_reads();
+    let rejected = dispatch("getutxos", Some(&json!([other, 1, selected])), &state).await;
+    let reads = state.store.storage_reads() - before;
+    if rejected["error"] != "address is for Testnet, expected Mainnet" || reads != 0 {
+        failures.push(format!("selected getutxos: {rejected}; storage reads {reads}"));
+    }
     assert!(failures.is_empty(), "wrong-network queries were accepted:\n{}", failures.join("\n"));
 }
 
@@ -137,6 +148,25 @@ async fn address_frontends_explicit_v2_conversion_preserves_legacy_default() {
                 assert_eq!(response["bech32m"], v2, "{method}: {response}");
                 assert_eq!(response["network"], "mainnet");
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn address_frontends_malformed_inputs_remain_invalid() {
+    use crate::address::{Address, Network};
+    let (_tmp, state) = state_with_chain(1);
+    let mut bad_checksum = Address::from_hash([42; 20], Network::Mainnet).to_string();
+    let replacement = if bad_checksum.ends_with('0') { "1" } else { "0" };
+    bad_checksum.replace_range(bad_checksum.len() - 1.., replacement);
+    for input in ["", "gnb1q00", bad_checksum.as_str()] {
+        for method in ["getbalance", "getutxos", "getaddressinfo", "getaddresshistory", "listtransactions", "getaddressbalance_at_height"] {
+            assert_eq!(dispatch(method, Some(&json!([input])), &state).await["error"], "invalid address", "{method}");
+        }
+        for (method, field) in [("validateaddress", "isvalid"), ("validateaddressverbose", "valid")] {
+            let response = dispatch(method, Some(&json!([input])), &state).await;
+            assert_eq!(response[field], false);
+            assert!(response.get("bech32m").is_none());
         }
     }
 }
