@@ -119,3 +119,29 @@ differential. The dedicated fuzz workspace type-check is an integration check,
 not claimed by this package's `gnb-crypto` tests. Repository-wide `AddressError`
 match inventory found only this target's exhaustive cloning match requiring
 the new variant. Independent three-lens review and release CI remain required.
+
+## Independent finding R4-V2: local oracle envelope
+
+The verdict reviewer found three JSON adapter disagreements after the original
+630-request comparison: `expected_network: null` was rejected by Rust but
+accepted by Python, while unknown decode/encode fields were accepted only by
+Rust. These are low-severity inconsistencies in the local test adapter; the
+address codec and consensus were unaffected. They are not omitted from the
+evidence merely because the earlier corpus did not cover request envelopes.
+
+The final five example tests first ran against the original adapter: 2 controls
+passed and the 3 exact disagreements failed at runtime. Correction `04b9348`
+makes null equivalent to absence and rejects unknown fields before dispatch.
+The request contract is explicit in `docs/ADDRESS-V2.md`. All five example tests
+then passed. A production-only reversal retained the exact final test bytes,
+reproduced 2 passes / 3 failures, and restored byte-for-byte to 5 passing tests.
+
+The differential now includes 42 bounded envelope cases as well as the original
+630 codec requests: **672 requests, zero divergences** after the final rebuild.
+The unchanged Python codec's 13 tests and exact corpus reproduction passed.
+The library source and its 479-pass / 4-ignore verification remain unchanged;
+the full crypto suite was not repeated for this example/driver-only correction.
+See [`address-oracle-evidence.json`](address-oracle-evidence.json),
+[`address-oracle-reversals.json`](address-oracle-reversals.json) and
+[`replay-address-oracle.py`](replay-address-oracle.py). Independent recheck by
+the original reviewer remains separate from this implementer's result.
