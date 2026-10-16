@@ -111,6 +111,21 @@ fn body_index_key(height: u64, hash: &BlockHash) -> Vec<u8> {
     k
 }
 
+/// CF_META key prefix of the body index's reverse rows (audit B1-T17):
+/// `body_hk/` ‖ block hash → the height (u64 BE) of the hash's one current
+/// [`BODY_INDEX_PREFIX`] row. A body write moves the row (the old one is
+/// deleted in the same batch), a body deletion removes it, and pruning skips
+/// a row the reverse row does not point at, so a stale row left at a lower
+/// height can never prune a body that was re-stored to be kept longer.
+const BODY_INDEX_HEIGHT_PREFIX: &[u8] = b"body_hk/";
+
+fn body_index_height_key(hash: &BlockHash) -> Vec<u8> {
+    let mut k = Vec::with_capacity(BODY_INDEX_HEIGHT_PREFIX.len() + 32);
+    k.extend_from_slice(BODY_INDEX_HEIGHT_PREFIX);
+    k.extend_from_slice(hash);
+    k
+}
+
 /// What disconnecting a selected-chain block needs from its body, kept when
 /// the body is pruned (audit DAG-6): the UTXO effects are reversed from the
 /// undo record, which is never pruned; the address-history rows to delete and
@@ -330,6 +345,7 @@ impl Storage {
                 },
             };
             batch.put_cf(&cf_m, body_index_key(height, &hash), []);
+            batch.put_cf(&cf_m, body_index_height_key(&hash), height.to_be_bytes());
             rows += 1;
             if rows.is_multiple_of(4096) {
                 self.db.write(std::mem::take(&mut batch)).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
@@ -392,6 +408,30 @@ impl Storage {
 
     /// Write a block and all of its derived index rows atomically.
     ///
+    /// The height of `hash`'s current body-index row (its reverse row), if any.
+    fn body_index_height(&self, hash: &BlockHash) -> Result<Option<u64>, StorageError> {
+        let cf_m = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        let v = self.db.get_cf(&cf_m, body_index_height_key(hash))
+            .map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+        Ok(v.and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok()).map(u64::from_be_bytes))
+    }
+
+    /// Stage `hash`'s body-index row at `height` (and its reverse row),
+    /// deleting the row of an earlier write at another height (B1-T17).
+    fn stage_body_index(&self, batch: &mut rocksdb::WriteBatch, hash: &BlockHash, height: u64)
+        -> Result<(), StorageError>
+    {
+        let cf_m = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        if let Some(old) = self.body_index_height(hash)? {
+            if old != height {
+                batch.delete_cf(&cf_m, body_index_key(old, hash));
+            }
+        }
+        batch.put_cf(&cf_m, body_index_key(height, hash), []);
+        batch.put_cf(&cf_m, body_index_height_key(hash), height.to_be_bytes());
+        Ok(())
+    }
+
     /// P0 crash-consistency (roadmap §3.2): previously this issued 4+ separate
     /// `put_cf` calls (block body, height→hash, timestamp, per-tx address
     /// index). A crash between any two left height→hash pointing at a block
@@ -418,8 +458,7 @@ impl Storage {
         batch.put_cf(&cf_h, &block.height.to_be_bytes(), &hash);
         batch.put_cf(&cf_t, &block.height.to_be_bytes(), &block.header.timestamp.to_le_bytes());
         // B1-T17: body-index row (header height, never below the DAG height).
-        let cf_m = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
-        batch.put_cf(&cf_m, body_index_key(block.height, &hash), []);
+        self.stage_body_index(&mut batch, &hash, block.height)?;
 
         // Sprint F: index address touches for each tx in this block. These were
         // previously best-effort (errors ignored). Folding them into the same
@@ -471,21 +510,31 @@ impl Storage {
     pub fn put_block_body_at(&self, block: &Block, prune_height: u64) -> Result<(), StorageError> {
         let hash = block.block_hash();
         let cf_b = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
-        let cf_m = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
         let mut batch = rocksdb::WriteBatch::default();
         batch.put_cf(&cf_b, hash, block.to_wire_bytes());
-        batch.put_cf(&cf_m, body_index_key(prune_height, &hash), []);
+        // One row per body: a re-stored body's earlier row (left by a write
+        // at another height) goes in the same batch.
+        self.stage_body_index(&mut batch, &hash, prune_height)?;
         let written = self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()));
         self.forget_body_verdict(&hash);
         written
     }
 
-    /// Delete a block body (CF_BLOCKS only). Used to drop the body of a block
-    /// whose DAG insertion was rolled back (refused by policy), so nothing
-    /// unreferenced is left behind.
+    /// Delete a block body (CF_BLOCKS) and its body-index rows (B1-T17), in
+    /// one batch. Used to drop the body of a block whose DAG insertion was
+    /// rolled back (refused by policy) or whose body was rejected, so nothing
+    /// unreferenced is left behind — in particular no index row that would
+    /// later prune a replacement body stored to be kept longer.
     pub fn delete_block_body(&self, hash: &[u8; 32]) -> Result<(), StorageError> {
         let cf_b = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
-        let deleted = self.db.delete_cf(&cf_b, hash).map_err(|e| StorageError::WriteFailed(e.to_string()));
+        let cf_m = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_cf(&cf_b, hash);
+        if let Some(h) = self.body_index_height(hash)? {
+            batch.delete_cf(&cf_m, body_index_key(h, hash));
+            batch.delete_cf(&cf_m, body_index_height_key(hash));
+        }
+        let deleted = self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()));
         self.forget_body_verdict(hash);
         deleted
     }
@@ -1694,7 +1743,7 @@ impl Storage {
         let cf_undo = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
         let cf_meta = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
         let end = body_index_key(below_height, &[0u8; 32]);
-        let mut rows: Vec<(Vec<u8>, BlockHash)> = Vec::new();
+        let mut rows: Vec<(Vec<u8>, u64, BlockHash)> = Vec::new();
         let iter = self.db.iterator_cf(&cf_meta,
             IteratorMode::From(BODY_INDEX_PREFIX, rocksdb::Direction::Forward));
         for item in iter {
@@ -1702,15 +1751,28 @@ impl Storage {
             if !k.starts_with(BODY_INDEX_PREFIX) || k.as_ref() >= end.as_slice() {
                 break;
             }
-            if let Ok(hash) = <BlockHash>::try_from(&k[BODY_INDEX_PREFIX.len() + 8..]) {
-                rows.push((k.to_vec(), hash));
+            let p = BODY_INDEX_PREFIX.len();
+            let height = k.get(p..p + 8).and_then(|b| <[u8; 8]>::try_from(b).ok());
+            let hash = k.get(p + 8..).and_then(|b| <BlockHash>::try_from(b).ok());
+            if let (Some(h), Some(hash)) = (height, hash) {
+                rows.push((k.to_vec(), u64::from_be_bytes(h), hash));
             }
         }
 
         let mut pruned = 0usize;
-        for (key, hash) in rows {
+        for (key, row_height, hash) in rows {
             let mut batch = rocksdb::WriteBatch::default();
             batch.delete_cf(&cf_meta, &key);
+            match self.body_index_height(&hash)? {
+                // A stale row: the body was re-stored (or deleted and
+                // re-stored) under another height since; that row decides.
+                Some(current) if current != row_height => {
+                    self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+                    continue;
+                }
+                Some(_) => batch.delete_cf(&cf_meta, body_index_height_key(&hash)),
+                None => {}
+            }
             let raw = self.db.get_cf(&cf_blocks, hash).map_err(|e| StorageError::ReadFailed(e.to_string()))?;
             if let Some(raw) = raw {
                 batch.delete_cf(&cf_blocks, hash);

@@ -55,7 +55,7 @@ fn b1_t17_pruning_removes_merged_fork_loser_and_junk_bodies() {
     let genesis = mk_genesis(unix_now() - 100_000);
     let gh = genesis.block_hash();
     let mut b = Builder::new(&genesis);
-    let n = node_with(&genesis, &[]);
+    let mut n = node_with(&genesis, &[]);
 
     let mut chain: Vec<Block> = Vec::new();
     let mut tip = gh;
@@ -112,6 +112,105 @@ fn b1_t17_pruning_removes_merged_fork_loser_and_junk_bodies() {
     let next = b.block(vec![tip], "c31");
     accept(&n, &next).unwrap();
     assert_eq!(applied_tip(&n), Some(next.block_hash()));
+    assert!(gnb::accept::check_chain_state(&n.dag, &n.store).unwrap().is_empty());
+    restart(&mut n);
+    assert_eq!(applied_tip(&n), Some(next.block_hash()));
+    assert!(gnb::accept::check_chain_state(&n.dag, &n.store).unwrap().is_empty(),
+        "start-up finds nothing to repair after the non-selected bodies were pruned");
+    let next2 = b.block(vec![next.block_hash()], "c32");
+    accept(&n, &next2).unwrap();
+    assert_eq!(applied_tip(&n), Some(next2.block_hash()));
+}
+
+/// Review finding on B1-T17: a body that is deleted (a rejected body,
+/// `accept::drop_body_and_wait`, or a rolled-back insertion) lost its body but
+/// kept its body-index row, and a re-stored body got a second row. The stale
+/// LOW row then pruned the re-stored body, which the node had indexed higher
+/// to keep it until the chain through it connects. Every body now has
+/// exactly one row: a write moves it, a deletion removes it, and pruning
+/// ignores a row that is not the body's current one.
+#[test]
+fn b1_t17_a_re_stored_body_is_pruned_by_its_current_index_row_only() {
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let n = node_with(&genesis, &[]);
+    let x = b.block(vec![gh], "x");
+    let y = b.block(vec![gh], "y");
+    let z = b.block(vec![gh], "z");
+
+    // Deleted, then re-stored higher: the old row goes with the deletion.
+    n.store.put_block_body_at(&x, 5).unwrap();
+    n.store.delete_block_body(&x.block_hash()).unwrap();
+    n.store.put_block_body_at(&x, 50).unwrap();
+    // Re-stored higher without a deletion: the write moves the row.
+    n.store.put_block_body_at(&y, 5).unwrap();
+    n.store.put_block_body_at(&y, 50).unwrap();
+    // Re-stored LOWER: the latest write decides.
+    n.store.put_block_body_at(&z, 50).unwrap();
+    n.store.put_block_body_at(&z, 5).unwrap();
+
+    n.store.prune_blocks_below(6).unwrap();
+    assert!(n.store.has_block_body(&x.block_hash()).unwrap(), "no stale row prunes the re-stored body");
+    assert!(n.store.has_block_body(&y.block_hash()).unwrap(), "the row moved with the second write");
+    assert!(!n.store.has_block_body(&z.block_hash()).unwrap(), "indexed at 5 by its last write");
+    n.store.prune_blocks_below(51).unwrap();
+    for h in [x.block_hash(), y.block_hash()] {
+        assert!(!n.store.has_block_body(&h).unwrap(), "pruned once the cursor passes its current row");
+    }
+    let rows = {
+        let db = n.store.db();
+        let cf = db.cf_handle("meta").unwrap();
+        db.prefix_iterator_cf(cf, b"body_h")
+            .map(|kv| kv.unwrap().0.to_vec())
+            .take_while(|k| k.starts_with(b"body_h"))
+            .filter(|k| [x.block_hash(), y.block_hash(), z.block_hash()].iter().any(|h| k.ends_with(h)))
+            .count()
+    };
+    assert_eq!(rows, 0, "no index row (forward or reverse) outlives its body");
+}
+
+/// Review finding on B1-T17, through the acceptance pipeline: a body the
+/// node wants back (here: its stored body was deleted, as
+/// `drop_body_and_wait` does, below the pruning cursor's next step) is
+/// re-stored by the replacing path indexed at max(own DAG height, selected
+/// tip height), so the next pruning step past its own height keeps it until
+/// the cursor passes the tip it was stored at.
+#[test]
+fn b1_t17_a_body_fetched_back_is_kept_until_the_tip_it_was_stored_at() {
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let n = node_with(&genesis, &[]);
+    let mut tip = gh;
+    let mut chain = Vec::new();
+    for i in 1..=30u32 {
+        let blk = b.block(vec![tip], &format!("k{i}"));
+        accept(&n, &blk).unwrap();
+        tip = blk.block_hash();
+        chain.push(blk);
+    }
+    let f = b.block(vec![chain[1].block_hash()], "f");
+    let fh = f.block_hash();
+    accept(&n, &f).expect("stored as a fork-loser");
+    assert_eq!(n.dag.read().get_block_data(&fh).unwrap().height, 3);
+
+    // Its body is dropped (a witness-dependent rejection deletes it); the
+    // node wants a copy and takes the next one.
+    n.store.delete_block_body(&fh).unwrap();
+    assert!(gnb::accept::awaits_body(&n.dag, &n.store, &fh));
+    accept(&n, &f).expect("the replacement body is taken");
+    assert!(n.store.has_block_body(&fh).unwrap());
+    assert!(!gnb::accept::awaits_body(&n.dag, &n.store, &fh));
+
+    n.store.prune_blocks_below(4).unwrap();
+    assert!(n.store.has_block_body(&fh).unwrap(),
+        "indexed at the selected tip's height (30), not its own (3): kept past the next pruning step");
+    assert!(!n.store.has_block_body(&chain[1].block_hash()).unwrap(), "the chain below 4 is pruned");
+    n.store.prune_blocks_below(30).unwrap();
+    assert!(n.store.has_block_body(&fh).unwrap());
+    n.store.prune_blocks_below(31).unwrap();
+    assert!(!n.store.has_block_body(&fh).unwrap(), "pruned once the cursor passes the tip height");
 }
 
 /// A database written before the body height index existed (no index rows,
@@ -146,6 +245,15 @@ fn b1_t17_an_older_database_is_backfilled_then_pruned() {
             .collect();
         assert!(keys.len() >= 13, "every accepted body was indexed ({} rows)", keys.len());
         for k in keys {
+            db.delete_cf(cf, k).unwrap();
+        }
+        // ...and the reverse rows (`body_hk/` ‖ hash).
+        let reverse: Vec<Vec<u8>> = db.prefix_iterator_cf(cf, b"body_hk/")
+            .map(|kv| kv.unwrap().0.to_vec())
+            .take_while(|k| k.starts_with(b"body_hk/"))
+            .collect();
+        assert!(reverse.len() >= 13);
+        for k in reverse {
             db.delete_cf(cf, k).unwrap();
         }
         db.delete_cf(cf, b"body_index_v1").unwrap();
