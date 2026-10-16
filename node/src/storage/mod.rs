@@ -178,6 +178,8 @@ impl Storage {
     #[inline]
     fn note_reads(&self, n: u64) {
         self.reads.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        READ_PROBE.with(|p| if let Some(f) = p.borrow().as_ref() { f() });
     }
 
     /// NET-12: total storage reads served by this handle so far (point
@@ -351,16 +353,21 @@ impl Storage {
         // batch keeps the same entries but makes them crash-consistent with the
         // block body. An entry-computation error for one tx skips only that tx's
         // rows (matching the old best-effort semantics) rather than aborting.
+        // B1-T11: the per-address history counters in the same batch.
+        let _agg = self.agg_lock();
+        let mut history = aggregates::HistoryDeltas::default();
         for (tx_idx, tx) in block.transactions.iter().enumerate() {
             match self.addr_index_entries(tx, block.height, tx_idx as u32) {
                 Ok(entries) => {
                     for (key, val) in entries {
+                        history.put(&key);
                         batch.put_cf(&cf_ai, &key, &val);
                     }
                 }
                 Err(e) => log::warn!("addr-index skipped for tx {}: {}", tx_idx, e),
             }
         }
+        self.stage_history_deltas(&mut batch, &history)?;
 
         self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         self.forget_body_verdict(&hash);
@@ -631,6 +638,17 @@ impl Storage {
 
     /// O(k) balance query via address index (was O(n) full UTXO scan)
     pub fn get_balance(&self, address_bytes: &[u8]) -> Result<(u64, usize), StorageError> {
+        self.get_balance_cancellable(address_bytes, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// [`Self::get_balance`] that checks `cancel` on every UTXO (B1-T11: the
+    /// RPC uses the O(1) holder aggregate, [`Self::address_balance`]; this
+    /// walk is its fallback while the aggregates are rebuilt).
+    pub fn get_balance_cancellable(
+        &self,
+        address_bytes: &[u8],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(u64, usize), StorageError> {
         if address_bytes.len() < 20 {
             return Ok((0, 0)); // invalid address length
         }
@@ -641,6 +659,9 @@ impl Storage {
         let (mut total, mut count) = (0u64, 0usize);
         let iter = self.db.prefix_iterator_cf(&cf_ai, &prefix);
         for item in iter {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(aggregates::cancelled());
+            }
             self.note_reads(2);
             if let Ok((k, _)) = item {
                 // Stop when prefix no longer matches
@@ -1031,11 +1052,16 @@ impl Storage {
     /// height→hash, height→timestamp and the address-history rows. Input rows
     /// resolve the spent output through `spent` (the block's undo capture), so
     /// they are byte-identical to what `rollback_block` later un-indexes.
+    ///
+    /// B1-T11: every history row staged is recorded in `history`; the caller
+    /// stages the per-address counters ([`Self::stage_history_deltas`]) into
+    /// the same batch before writing it.
     pub fn stage_chain_index(
         &self,
         batch: &mut rocksdb::WriteBatch,
         block: &Block,
         spent: &std::collections::HashMap<([u8; 32], u32), TxOutput>,
+        history: &mut aggregates::HistoryDeltas,
     ) -> Result<(), StorageError> {
         let hash = block.block_hash();
         let cf_h = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
@@ -1050,9 +1076,9 @@ impl Storage {
                 if out.script_pubkey.len() >= 20 {
                     let mut addr = [0u8; 20];
                     addr.copy_from_slice(&out.script_pubkey[..20]);
-                    batch.put_cf(&cf_ai,
-                        indexer::make_key(&addr, block.height, tx_idx as u32, vout as u32),
-                        indexer::make_value(&txid, indexer::DIR_OUT, out.value));
+                    let key = indexer::make_key(&addr, block.height, tx_idx as u32, vout as u32);
+                    history.put(&key);
+                    batch.put_cf(&cf_ai, key, indexer::make_value(&txid, indexer::DIR_OUT, out.value));
                 }
             }
             if !tx.is_coinbase() {
@@ -1061,9 +1087,9 @@ impl Storage {
                         if prev.script_pubkey.len() >= 20 {
                             let mut addr = [0u8; 20];
                             addr.copy_from_slice(&prev.script_pubkey[..20]);
-                            batch.put_cf(&cf_ai,
-                                indexer::make_key(&addr, block.height, tx_idx as u32, 0x8000_0000 | vin as u32),
-                                indexer::make_value(&txid, indexer::DIR_IN, prev.value));
+                            let key = indexer::make_key(&addr, block.height, tx_idx as u32, 0x8000_0000 | vin as u32);
+                            history.put(&key);
+                            batch.put_cf(&cf_ai, key, indexer::make_value(&txid, indexer::DIR_IN, prev.value));
                         }
                     }
                 }
@@ -1768,6 +1794,13 @@ fn addr_utxo_key(address: &[u8], txid: &[u8], index: u32) -> Vec<u8> {
     k
 }
 
+#[cfg(test)]
+thread_local! {
+    /// NET-15 tests: called on every instrumented storage read (the
+    /// `storage_reads` counter) made by this thread.
+    pub(crate) static READ_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("open: {0}")]        OpenFailed(String),
@@ -2031,6 +2064,53 @@ mod shielded_cf_tests {
         let err = DB::open_cf_descriptors(&opts, tmp.path(), old).expect_err("an earlier release cannot open it");
         assert!(err.to_string().contains("Column families not opened: shielded"), "{err}");
         drop(Storage::open(tmp.path()).expect("this release still opens it"));
+    }
+
+    /// B1-T11: the per-address history counter equals the number of index
+    /// rows through indexing, re-indexing the same rows (idempotent: a key
+    /// counts once), un-indexing and `put_block`; a data directory written
+    /// with aggregate layout 1 (no counters) reports no count until the
+    /// start-up rebuild, which restores the exact counts.
+    #[test]
+    fn b1_t11_history_counter_tracks_the_index_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = [0x31u8; 20];
+        let mk_tx_coinbase = |_: u8, value: u64| crate::core::Transaction {
+            version: 1,
+            inputs: vec![crate::core::TxInput { prev_txid: [0; 32], prev_index: u32::MAX, script_sig: b"cb".to_vec(), sequence: u32::MAX }],
+            outputs: vec![TxOutput { value, script_pubkey: a.to_vec() }],
+            locktime: 0,
+        };
+        let rows = |s: &Storage| s.count_address_history(&a, 0, u64::MAX).unwrap();
+        {
+            let store = Storage::open(tmp.path()).unwrap();
+            assert!(store.aggregates_ready());
+            assert_eq!(store.address_history_count(&a).unwrap(), Some(0));
+            for h in 1..=5u64 {
+                store.index_tx_addresses(&mk_tx_coinbase(0x31, h), h, 0).unwrap();
+            }
+            assert_eq!(store.address_history_count(&a).unwrap(), Some(5));
+            store.index_tx_addresses(&mk_tx_coinbase(0x31, 3), 3, 0).unwrap();
+            assert_eq!((store.address_history_count(&a).unwrap(), rows(&store)), (Some(5), 5), "same key counts once");
+            store.unindex_tx_addresses(&mk_tx_coinbase(0x31, 3), 3, 0, &std::collections::HashMap::new()).unwrap();
+            store.unindex_tx_addresses(&mk_tx_coinbase(0x31, 3), 3, 0, &std::collections::HashMap::new()).unwrap();
+            assert_eq!((store.address_history_count(&a).unwrap(), rows(&store)), (Some(4), 4));
+            let mut genesis = crate::core::genesis_block();
+            genesis.transactions[0].outputs[0].script_pubkey = a.to_vec();
+            store.put_block(&genesis).unwrap();
+            assert_eq!((store.address_history_count(&a).unwrap(), rows(&store)), (Some(5), 5), "put_block counts");
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            assert_eq!(store.aggregate_snapshot().unwrap(), store.recompute_aggregates(&cancel).unwrap());
+            // Simulate a layout-1 data directory: no counters, version 1.
+            let cf = store.db.cf_handle(CF_META).unwrap();
+            store.db.delete_cf(cf, [&b"agg/hist/"[..], &a[..]].concat()).unwrap();
+            store.db.put_cf(cf, b"agg/version", 1u32.to_le_bytes()).unwrap();
+        }
+        let store = Storage::open(tmp.path()).unwrap();
+        assert!(!store.aggregates_ready());
+        assert_eq!(store.address_history_count(&a).unwrap(), None, "no count while incomplete");
+        assert!(store.ensure_aggregates().unwrap(), "the upgrade rebuilds the aggregates");
+        assert_eq!(store.address_history_count(&a).unwrap(), Some(5));
     }
 }
 

@@ -1384,9 +1384,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         // ── Wallet: balance query ────────────────────────────────────
         "getbalance" => {
             let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
-            let addr_bytes = parse_address(addr);
+            // B1-T11: one read of the holder aggregate (was a walk of every
+            // UTXO of the address, ~426,000 for the carryover address).
+            let addr_bytes = parse_address(addr).and_then(|b| <[u8; 20]>::try_from(b).ok());
             match addr_bytes {
-                Some(ab) => match state.store.get_balance(&ab) {
+                Some(ab) => match state.store.address_balance(&ab, &state.cancel) {
                     // R3 (docs/specs/BLOCH-RPC-V4.md): satoshi amounts are
                     // decimal STRINGS on the wire — V4's supply exceeds both
                     // i64::MAX and JS Number.MAX_SAFE_INTEGER. Display-only
@@ -1807,7 +1809,9 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let start_height = params.and_then(|p| p.get(2)).and_then(|v| v.as_u64()).unwrap_or(0);
             let end_height = params.and_then(|p| p.get(3)).and_then(|v| v.as_u64())
                 .unwrap_or_else(|| state.node_state.read().block_count);
-            let offset = params.and_then(|p| p.get(4)).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            // B1-T11: the skipped prefix is bounded like getaddresshistory's.
+            let offset = params.and_then(|p| p.get(4)).and_then(|v| v.as_u64()).unwrap_or(0)
+                .min(crate::storage::indexer::MAX_HISTORY_OFFSET as u64) as usize;
 
             let addr_bytes = parse_address(addr);
             match addr_bytes {
@@ -1821,7 +1825,22 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     match state.store.query_address_history(&addr_hash, start_height, end_height, limit, offset) {
                         Ok(entries) => {
                             let tip = selected_tip_height(&state);
-                            let total = state.store.count_address_history(&addr_hash, start_height, end_height).unwrap_or(0);
+                            // B1-T11: the whole history is counted by the
+                            // per-address counter (one read); a narrower range
+                            // is counted by a cancellable walk.
+                            let counter = if start_height == 0 && end_height >= tip {
+                                state.store.address_history_count(&addr_hash).ok().flatten()
+                            } else {
+                                None
+                            };
+                            let total = match counter {
+                                Some(n) => n,
+                                None => match state.store.count_address_history_cancellable(&addr_hash, start_height, end_height, &state.cancel) {
+                                    Ok(n) => n,
+                                    Err(_) if state.cancel.load(std::sync::atomic::Ordering::Relaxed) => return json!({ "error": "cancelled" }),
+                                    Err(e) => return storage_err_response(&e),
+                                },
+                            };
                             let txs: Vec<serde_json::Value> = entries.iter().map(|e| {
                                 let timestamp = state.store.get_block_timestamp_at_height(e.height).unwrap_or(None).unwrap_or(0);
                                 json!({
@@ -2217,7 +2236,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     // NET-12: streamed and cancellable (heavy method).
                     match state.store.balance_at_height_cancellable(&addr_hash, height, &state.cancel) {
                         Ok((balance, _)) => {
-                            let tx_count = state.store.count_address_history(&addr_hash, 0, height).unwrap_or(0);
+                            let tx_count = match state.store.count_address_history_cancellable(&addr_hash, 0, height, &state.cancel) {
+                                Ok(n) => n,
+                                Err(_) => return json!({ "error": "cancelled" }),
+                            };
                             json!({
                                 "address":               addr,
                                 "height":                height,
@@ -3168,6 +3190,94 @@ mod audit_2026_10_rpc_tests {
         assert_eq!(gate.run("k".into(), || json!(7)), json!(7), "the failure was not cached");
     }
 
+    /// B1-T11 + NET-12 challenge: `getaddresshistory` and `getbalance` on an
+    /// address with a long history and many UTXOs (the carryover address
+    /// holds about 426,000) read a bounded number of entries: the balance and
+    /// UTXO count come from the holder aggregate, the total from the
+    /// per-address history counter, and a page walks the index newest-first
+    /// from its end (or from the opaque cursor the previous page returned)
+    /// instead of counting every entry and skipping from the oldest one;
+    /// the offset is capped and the walk is cancellable. Pre-fix, page 0
+    /// alone cost about 2 × history + 2 × UTXOs reads.
+    #[tokio::test]
+    async fn b1_t11_address_endpoints_read_bounded_entries() {
+        const N: u32 = 3_000;
+        let (_tmp, state) = state_with_chain(5);
+        let addr = [0x5Au8; 20];
+        let testnet = crate::core::node_chain_id() == crate::core::ChainId::Testnet;
+        let addr_s = crate::crypto::address_from_hash(&addr, testnet);
+        // History: N rows over 30 heights (one 100-output transaction each).
+        for h in 0..N / 100 {
+            let tx = Transaction {
+                version: 1,
+                inputs: vec![TxInput { prev_txid: [0; 32], prev_index: u32::MAX, script_sig: format!("h{h}").into_bytes(), sequence: u32::MAX }],
+                outputs: (0..100u64).map(|i| TxOutput { value: 1_000 + i, script_pubkey: addr.to_vec() }).collect(),
+                locktime: 0,
+            };
+            state.store.index_tx_addresses(&tx, 10 + h as u64, 0).unwrap();
+        }
+        for i in 0..N {
+            state.store.put_utxo(&[(i % 251) as u8; 32], i, &TxOutput { value: 7, script_pubkey: addr.to_vec() }).unwrap();
+        }
+        for (params, bound) in [(json!([addr_s, 25, 0]), 40u64), (json!([addr_s, 25, 1_000]), 1_040)] {
+            let r0 = state.store.storage_reads();
+            let r = dispatch("getaddresshistory", Some(&params), &state).await;
+            let reads = state.store.storage_reads() - r0;
+            assert!(r.get("error").is_none(), "{r}");
+            assert_eq!(r["total"], N, "{params}");
+            assert_eq!(r["items"].as_array().unwrap().len(), 25);
+            assert_eq!((r["balance"].as_str(), r["utxo_count"].as_u64()), (Some(&*(7 * N as u64).to_string()), Some(N as u64)));
+            assert!(reads <= bound, "getaddresshistory {params}: {reads} reads > {bound}");
+        }
+        let r0 = state.store.storage_reads();
+        let r = dispatch("getbalance", Some(&json!([addr_s])), &state).await;
+        let reads = state.store.storage_reads() - r0;
+        assert_eq!((r["satoshis"].as_str(), r["utxo_count"].as_u64()), (Some(&*(7 * N as u64).to_string()), Some(N as u64)), "{r}");
+        assert!(reads <= 2, "getbalance: {reads} reads");
+
+        // Cursor paging visits every row exactly once, newest first, each
+        // page at a bounded cost.
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut last_height = u64::MAX;
+        loop {
+            let mut params = json!([addr_s, 100, 0]);
+            if let Some(c) = &cursor {
+                params.as_array_mut().unwrap().push(json!(c));
+            }
+            let r0 = state.store.storage_reads();
+            let r = dispatch("getaddresshistory", Some(&params), &state).await;
+            let reads = state.store.storage_reads() - r0;
+            assert!(reads <= 110, "page {params}: {reads} reads");
+            let items = r["items"].as_array().unwrap_or_else(|| panic!("{r}"));
+            for it in items {
+                let h = it["height"].as_u64().unwrap();
+                assert!(h <= last_height, "newest first");
+                last_height = h;
+                assert!(seen.insert((it["txid"].as_str().unwrap().to_string(), it["amount"].as_str().unwrap().to_string())), "row seen twice");
+            }
+            match r["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+            assert!(seen.len() <= N as usize);
+        }
+        assert_eq!(seen.len(), N as usize, "every row exactly once");
+        assert_eq!(last_height, 10, "ends at the oldest row");
+
+        // Offsets are capped (the explorer API accepts exactly this range).
+        let r = dispatch("getaddresshistory", Some(&json!([addr_s, 25, 1_000_000_000u64])), &state).await;
+        assert_eq!(r["offset"], crate::storage::indexer::MAX_HISTORY_OFFSET, "{r}");
+        assert_eq!(r["items"].as_array().map(|a| a.len()), Some(0));
+        let r = dispatch("getaddresshistory", Some(&json!([addr_s, 25, 0, "zz"])), &state).await;
+        assert_eq!(r["error"], "invalid cursor");
+        // A cancelled request stops walking.
+        let mut cancelled = state.clone();
+        cancelled.cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let r = dispatch("getaddresshistory", Some(&json!([addr_s, 25, 2_000])), &cancelled).await;
+        assert_eq!(r["error"], "cancelled", "{r}");
+    }
+
     /// Review finding (chain_tail): a cancelled request is an ERROR for the
     /// two selected-chain walks, also when the flag was set while the
     /// request waited for the DAG lock, and HeavyGate never caches it — the
@@ -3362,9 +3472,9 @@ mod audit_2026_10_rpc_tests {
         assert_eq!(status, StatusCode::OK);
         assert!(r["result"]["txid"].is_string(), "{r}");
         // Two forged transactions, from two clients, are verified and refused...
-        for i in 0..2 {
+        for (i, tx) in forged.iter().enumerate().take(2) {
             let (_, r) = post_raw(&state, "127.0.0.1:5000", &[("x-forwarded-for", &from(10 + i as u8))],
-                send(&forged[i])).await;
+                send(tx)).await;
             let e = r["result"]["error"].as_str().unwrap_or_default();
             assert!(!e.is_empty() && !e.starts_with("busy"), "{r}");
         }
@@ -3461,6 +3571,85 @@ mod audit_2026_10_rpc_tests {
         assert_eq!(r["error"], "block not found");
         // A writer can take the lock right after a read returns.
         drop(state.dag.try_write().expect("DAG lock must be free after an explorer read"));
+    }
+
+    /// NET-15 (re-audit): no explorer method reads storage while it holds
+    /// the DAG read lock. A probe runs on every instrumented storage read of
+    /// this thread and records a read made with the DAG locked; moving any
+    /// storage access back into a `with_chain` closure makes this fail.
+    #[test]
+    fn net15_no_storage_read_runs_under_the_dag_lock() {
+        let (_tmp, state) = state_with_chain(30);
+        let addr = crate::crypto::address_from_hash(&[0x11; 20], crate::core::node_chain_id() == crate::core::ChainId::Testnet);
+        let under_lock = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let (dag, u, r) = (state.dag.clone(), under_lock.clone(), reads.clone());
+        crate::storage::READ_PROBE.with(|p| *p.borrow_mut() = Some(Box::new(move || {
+            r.set(r.get() + 1);
+            if dag.is_locked() { u.set(u.get() + 1); }
+        })));
+        let chain_block = hex::encode([7u8; 32]);
+        for (name, v) in [
+            ("getselectedchain", explorer::get_selected_chain(Some(&json!([0, 10])), &state)),
+            ("getblockdag", explorer::get_block_dag(Some(&json!([chain_block])), &state)),
+            ("gettransactionfull", explorer::get_transaction_full(Some(&json!([hex::encode([9u8; 32])])), &state)),
+            ("getdagwindow", explorer::get_dag_window(Some(&json!([50])), &state)),
+            ("getaddresshistory", explorer::get_address_history(Some(&json!([addr])), &state)),
+            ("getdifficultyhistory", explorer::get_difficulty_history(Some(&json!([5])), &state)),
+        ] {
+            assert!(v.is_object(), "{name}");
+        }
+        crate::storage::READ_PROBE.with(|p| *p.borrow_mut() = None);
+        assert!(reads.get() >= 10, "the probe saw the explorer's storage reads ({})", reads.get());
+        assert_eq!(under_lock.get(), 0, "storage reads made under the DAG read lock");
+    }
+
+    /// NET-15 residual: the explorer's selected-chain cache follows a tip
+    /// change incrementally (work proportional to the blocks that left and
+    /// joined the chain) and its first build takes the DAG read lock for a
+    /// bounded number of blocks at a time. Pre-fix every tip change cloned
+    /// the cached chain and rebuilt its position map (O(chain) under the
+    /// DAG read lock), and the first call walked the whole chain under it.
+    #[test]
+    fn net15_chain_cache_follows_the_tip_incrementally() {
+        const LEN: u32 = 2_000;
+        let (_tmp, state) = state_with_chain(1);
+        let h = |i: u32, side: u8| { let mut b = [side; 32]; b[..4].copy_from_slice(&i.to_be_bytes()); b[4] = 0xC5; b };
+        {
+            let mut dag = state.dag.write();
+            let mut parent = [1u8; 32];
+            for i in 2..=LEN {
+                dag.add_block(h(i, 0), vec![parent], 1_000 + 30 * i as u64, 1).unwrap();
+                parent = h(i, 0);
+            }
+        }
+        let fresh_chain = |state: &AppState| { let mut c = state.dag.read().selected_chain(); c.reverse(); c };
+        let check = |state: &AppState, bound: usize, what: &str| {
+            let r = explorer::get_selected_chain(Some(&json!([0, 3])), state);
+            let expect = fresh_chain(state);
+            assert_eq!(r["chain_length"], expect.len(), "{what}");
+            assert_eq!(r["blocks"][0]["hash"], hex::encode(expect.last().unwrap()), "{what}");
+            let (chain, work) = explorer::chain_cache_probe(state).expect("cache built");
+            assert_eq!(chain, expect, "{what}: cache equals the selected chain");
+            assert!(work <= bound, "{what}: {work} blocks handled under one DAG lock hold > {bound}");
+        };
+        // First build: chunked, never the whole chain under one lock hold.
+        check(&state, explorer::CHAIN_BUILD_CHUNK + 2, "first build");
+        // One new block: constant work.
+        state.dag.write().add_block(h(LEN + 1, 0), vec![h(LEN, 0)], 1_000 + 30 * (LEN as u64 + 1), 1).unwrap();
+        check(&state, 4, "one block");
+        // A reorg of depth 6 replaced by 10 side blocks: work ~ 16.
+        {
+            let mut dag = state.dag.write();
+            let mut parent = h(LEN - 5, 0);
+            for i in LEN - 4..=LEN + 6 {
+                dag.add_block(h(i, 0xAB), vec![parent], 1_000 + 30 * i as u64 + 1, 1).unwrap();
+                parent = h(i, 0xAB);
+            }
+        }
+        check(&state, 40, "reorg");
+        let r = explorer::get_block_dag(Some(&json!([hex::encode(h(LEN, 0))])), &state);
+        assert_ne!(r["colour"], "chain", "a block that left the chain is no longer reported on it");
     }
 
     /// CRY-3 / WAL-1: `getdaginfo` reports the height of the next block the

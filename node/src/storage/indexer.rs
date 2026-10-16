@@ -25,6 +25,19 @@ pub const CF_ADDR_TX_HISTORY: &str = "addr_tx_history";
 /// (deploy/explorer-api: HISTORY_OFFSET) accepts exactly this range.
 pub const MAX_HISTORY_OFFSET: usize = 10_000;
 
+/// B1-T11: length of an address-history cursor: the key suffix after the
+/// address (height BE ‖ tx_index BE ‖ io_index BE) of the last entry a page
+/// returned. The next page starts strictly before it.
+pub const HISTORY_CURSOR_LEN: usize = 16;
+
+/// One newest-first page of an address's history.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryPage {
+    pub entries:     Vec<AddrHistoryEntry>,
+    /// Cursor of the next (older) page; None when this page is the last.
+    pub next_cursor: Option<[u8; HISTORY_CURSOR_LEN]>,
+}
+
 // Entry size: 32 (txid) + 1 (direction) + 8 (amount) = 41 bytes
 pub const ENTRY_SIZE: usize = 41;
 pub const DIR_IN: u8 = 0;
@@ -193,11 +206,16 @@ impl Storage {
     pub fn index_tx_addresses(&self, tx: &Transaction, height: u64, tx_index: u32) -> Result<(), StorageError> {
         let cf = self.db.cf_handle(CF_ADDR_TX_HISTORY)
             .ok_or_else(|| StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
+        // B1-T11: the rows and the per-address history counters in one batch.
+        let _agg = self.agg_lock();
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut deltas = super::aggregates::HistoryDeltas::default();
         for (key, val) in self.addr_index_entries(tx, height, tx_index)? {
-            self.db.put_cf(&cf, &key, &val)
-                .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+            deltas.put(&key);
+            batch.put_cf(&cf, &key, &val);
         }
-        Ok(())
+        self.stage_history_deltas(&mut batch, &deltas)?;
+        self.write_batch(batch)
     }
 
     /// Sprint U.2 — Inverse of `index_tx_addresses`. Called by `rollback_block`
@@ -222,13 +240,18 @@ impl Storage {
     ) -> Result<(), StorageError> {
         let cf = self.db.cf_handle(CF_ADDR_TX_HISTORY)
             .ok_or_else(|| StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
+        // B1-T11: the deletions and the per-address history counters in one
+        // batch.
+        let _agg = self.agg_lock();
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut deltas = super::aggregates::HistoryDeltas::default();
 
         // Unindex outputs (DIR_OUT entries created by index_tx_addresses)
         for (vout_idx, output) in tx.outputs.iter().enumerate() {
             if let Some(addr) = Self::script_pubkey_to_addr_hash(&output.script_pubkey) {
                 let key = make_key(&addr, height, tx_index, vout_idx as u32);
-                self.db.delete_cf(&cf, &key)
-                    .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+                deltas.delete(&key);
+                batch.delete_cf(&cf, &key);
             }
         }
 
@@ -239,8 +262,8 @@ impl Storage {
                     if let Some(addr) = Self::script_pubkey_to_addr_hash(&prev_output.script_pubkey) {
                         // Mirror index_tx_addresses's bit-31 IN marker.
                         let key = make_key(&addr, height, tx_index, 0x80000000 | vin_idx as u32);
-                        self.db.delete_cf(&cf, &key)
-                            .map_err(|e| StorageError::WriteFailed(e.to_string()))?;
+                        deltas.delete(&key);
+                        batch.delete_cf(&cf, &key);
                     }
                 }
                 // If not in spent_lookup (e.g. intra-block chain that was never
@@ -248,7 +271,8 @@ impl Storage {
             }
         }
 
-        Ok(())
+        self.stage_history_deltas(&mut batch, &deltas)?;
+        self.write_batch(batch)
     }
     pub fn get_utxo_including_spent(&self, prev_txid: &[u8; 32], prev_index: u32)
         -> Result<Option<crate::core::TxOutput>, StorageError>
@@ -364,6 +388,129 @@ impl Storage {
             count += 1;
         }
         Ok(count)
+    }
+
+    /// [`Self::count_address_history`] that checks `cancel` on every entry
+    /// (B1-T11: the RPC callers of a range count).
+    pub fn count_address_history_cancellable(
+        &self,
+        addr_hash: &[u8; 20],
+        start_height: u64,
+        end_height: u64,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<u64, StorageError> {
+        let cf = self.db.cf_handle(CF_ADDR_TX_HISTORY)
+            .ok_or_else(|| StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
+        let mut lower = Vec::with_capacity(36);
+        lower.extend_from_slice(addr_hash);
+        lower.extend_from_slice(&start_height.to_be_bytes());
+        lower.extend_from_slice(&[0u8; 8]);
+        let mut upper = Vec::with_capacity(36);
+        upper.extend_from_slice(addr_hash);
+        upper.extend_from_slice(&end_height.saturating_add(1).to_be_bytes());
+        upper.extend_from_slice(&[0u8; 8]);
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_iterate_upper_bound(upper);
+        let iter = self.db.iterator_cf_opt(&cf, read_opts, IteratorMode::From(&lower, rocksdb::Direction::Forward));
+        let mut count = 0u64;
+        for item in iter {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(super::aggregates::cancelled());
+            }
+            self.note_reads(1);
+            let (key, _) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            if key.len() < 20 || &key[..20] != addr_hash { break; }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// B1-T11: one newest-first page of `addr_hash`'s history: the entries
+    /// strictly older than `before` (a cursor a previous page returned; None
+    /// = from the newest), skipping `offset` (capped at
+    /// [`MAX_HISTORY_OFFSET`]) and returning at most `limit`.
+    ///
+    /// A reverse iterator from the end of the address's key range: the cost
+    /// is `offset + limit + 1` index steps, whatever the length of the
+    /// history (the previous form counted every entry and skipped forward
+    /// from the oldest one). `cancel` is checked on every step. Modelled on
+    /// the electrs/esplora address APIs (last-seen cursor, hard limits).
+    pub fn address_history_page(
+        &self,
+        addr_hash: &[u8; 20],
+        before: Option<&[u8; HISTORY_CURSOR_LEN]>,
+        offset: usize,
+        limit: usize,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<HistoryPage, StorageError> {
+        let cf = self.db.cf_handle(CF_ADDR_TX_HISTORY)
+            .ok_or_else(|| StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
+        let offset = offset.min(MAX_HISTORY_OFFSET);
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_iterate_lower_bound(addr_hash.to_vec());
+        // Total order: the reverse walk must not depend on the prefix
+        // extractor's seek mode.
+        read_opts.set_total_order_seek(true);
+        let mut it = self.db.raw_iterator_cf_opt(&cf, read_opts);
+        let mut target = Vec::with_capacity(20 + HISTORY_CURSOR_LEN + 1);
+        target.extend_from_slice(addr_hash);
+        match before {
+            Some(c) => target.extend_from_slice(c),
+            // Greater than every 36-byte key of the address.
+            None => target.extend_from_slice(&[0xFF; HISTORY_CURSOR_LEN + 1]),
+        }
+        it.seek_for_prev(&target);
+        if before.is_some() && it.key() == Some(target.as_slice()) {
+            it.prev();
+        }
+        let mut page = HistoryPage::default();
+        let mut skipped = 0usize;
+        let mut more = false;
+        while let (Some(key), Some(value)) = (it.key(), it.value()) {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(super::aggregates::cancelled());
+            }
+            self.note_reads(1);
+            if key.len() < 20 || &key[..20] != addr_hash { break; }
+            if skipped < offset {
+                skipped += 1;
+            } else if page.entries.len() >= limit {
+                more = true;
+                break;
+            } else if let (Some((a, h, ti, ii)), Some((txid, dir, amt))) = (parse_key(key), parse_value(value)) {
+                page.entries.push(AddrHistoryEntry {
+                    addr_hash: a, height: h, tx_index: ti, io_index: ii, txid, direction: dir, amount: amt,
+                });
+            }
+            it.prev();
+        }
+        it.status().map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+        if more {
+            page.next_cursor = page.entries.last().map(|e| {
+                let mut c = [0u8; HISTORY_CURSOR_LEN];
+                c[..8].copy_from_slice(&e.height.to_be_bytes());
+                c[8..12].copy_from_slice(&e.tx_index.to_be_bytes());
+                c[12..].copy_from_slice(&e.io_index.to_be_bytes());
+                c
+            });
+        }
+        Ok(page)
+    }
+
+    /// B1-T11: balance and UTXO count of `addr` — one read of the holder
+    /// aggregate (`storage::aggregates`, updated in the same batch as every
+    /// UTXO change). While the aggregates are being rebuilt (start-up after
+    /// an upgrade) it falls back to the walk of the address's UTXOs, which
+    /// checks `cancel`.
+    pub fn address_balance(
+        &self,
+        addr: &[u8; 20],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(u64, u64), StorageError> {
+        if self.aggregates_ready() {
+            return Ok(self.holder(addr)?.map(|h| (h.balance, h.utxos)).unwrap_or((0, 0)));
+        }
+        self.get_balance_cancellable(addr, cancel).map(|(b, n)| (b, n as u64))
     }
 
     /// Compute balance at a specific height by replaying the address history.

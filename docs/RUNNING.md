@@ -64,6 +64,19 @@ and red blocks they merge, `avg_dag_block_interval_secs`);
 storage failure behind any of these methods is answered with the generic
 `STORAGE_ERROR` response; the detail only goes to the node's log.
 
+The per-address reads are bounded the same way (audit B1-T11): `getbalance`
+and the balance in `getaddresshistory` are one read of the holder aggregate,
+the history `total` is a per-address counter kept in the same batches as the
+address index (aggregate layout 2: a data directory written by an earlier
+release rebuilds its aggregates once at start-up, and `total` is `null`
+until then), and a `getaddresshistory [address, limit<=100, offset, cursor]`
+page walks the index newest-first from its end, or from `cursor` (the
+`next_cursor` of the previous page, 32 hex characters, `null` on the last
+page). `offset` is capped at 10,000 (`max_offset`, clamped like
+`getrichlist`'s); deeper pages use the cursor. `listtransactions` caps its
+offset the same way. The explorer's selected-chain cache follows the tip
+incrementally and never walks the whole chain under the DAG lock (NET-15).
+
 The node serves plain HTTP. To reach a remote node, put a TLS reverse proxy in
 front of its RPC port or use an SSH tunnel
 (`ssh -L 17210:127.0.0.1:17210 host`). Both CLI wallets speak HTTPS (audit

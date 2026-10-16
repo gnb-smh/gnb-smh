@@ -546,7 +546,7 @@ pub fn forwarded_client(headers: &axum::http::HeaderMap) -> Option<ForwardedClie
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
         .filter(|s| !s.trim().is_empty())
-        .last()
+        .next_back()
         .and_then(parse_forwarded_addr);
     let single = ["x-real-ip", "cf-connecting-ip", "true-client-ip", "x-client-ip",
                   "fastly-client-ip", "x-cluster-client-ip"]
