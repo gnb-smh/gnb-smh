@@ -72,6 +72,10 @@ jobs:
         run: |
           python3 reference/address_v2_test.py -v
           python3 reference/address_v2_vectors.py --check
+      - name: Public descriptor reference and reproducible vectors
+        run: |
+          python3 reference/descriptor_test.py -v
+          python3 reference/descriptor_vectors.py --check
 
   rust:
     runs-on: ubuntu-latest
@@ -155,6 +159,11 @@ jobs:
           cargo test -p gnb-crypto --locked --example address_v2_oracle
           cargo build -p gnb-crypto --locked --example address_v2_oracle
           python3 reference/address_v2_differential.py target/debug/examples/address_v2_oracle
+      - name: Public descriptor Rust versus independent Python reference
+        run: |
+          cargo test -p gnb-crypto --locked --example descriptor_oracle
+          cargo build -p gnb-crypto --locked --example descriptor_oracle
+          python3 reference/descriptor_differential.py target/debug/examples/descriptor_oracle
       - name: The real-ASERT test ran and was not ignored
         run: |
           cargo test -p gnb-crypto --locked --lib expected_bits_at_schedule_is_genesis_bits 2>&1 \

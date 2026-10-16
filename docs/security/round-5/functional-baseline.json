@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "test_commit": "80bdfb5",
+  "baseline_source": "366e75fb90ace89db3434ce935b7c9de3582c13c",
+  "baseline_tree_equals_r5_base": true,
+  "exit_code": 1,
+  "positive_control": "getbalance on descriptor address returns zero",
+  "failure": "getdescriptorinfo: unknown method: \"getdescriptorinfo\" (code=None, http=200)",
+  "files": {
+    "baseline_log": {
+      "path": "/private/tmp/gnb-r5-descriptor-functional-baseline.log",
+      "sha256": "472ccea043ee6e510e9b92d9c93737c17179cb404eb8ca429d688e22da6c848f"
+    },
+    "functional_test": {
+      "path": "/Users/tiagobulhoes/worktrees/gnb-security-round-5/test/functional/wallet_descriptor_restore.py",
+      "sha256": "99905c50f9e698b4a7654b71a5198b0adf012a52770cfc08d00b32a0549c3b69"
+    },
+    "baseline_node": {
+      "path": "/private/tmp/gnb-security-target-r4-integration/debug/gnb",
+      "sha256": "2a38234386e2283b2a67b5bd758c0ebeb6269d77f1ffd8eb3d635b3f4b894bb9"
+    },
+    "baseline_cli": {
+      "path": "/private/tmp/gnb-security-target-r4-integration/debug/gnb-cli",
+      "sha256": "7555d4e3c970f6bc1bae0a0c4f87b29fce9623b4aa06cee3568f50c2ae3cf47f"
+    }
+  }
+}

@@ -46,6 +46,7 @@ ALL_TESTS = [
     "feature_invalidateblock.py",
     "p2p_invalid_blocks_txs.py",
     "wallet_coinbase_maturity.py",
+    "wallet_descriptor_restore.py",
     "mempool_tx_relay.py",
     "mempool_replacement.py",
     "mining_getblocktemplate_submitblock.py",
