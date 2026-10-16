@@ -1789,8 +1789,32 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         let mut b = raw_block(h, ACT, one_parent(), vec![coinbase(subsidy(h) + 200_000, &l("block-total"), b""), t1, t2]);
         seal(&mut b, ACT);
         c.push("value/block-output-total-above-max-supply", r,
-            "Two spends of MAX_SUPPLY_SAT coins, each paying MAX_SUPPLY_SAT - 100,000: every transaction is in the money range, the block's output total is not (the block-wide MoneyRange of VAL-11, a context-free rule).",
-            b, vec![p1, p2], Some("value-out-of-range"));
+            "Two spends of MAX_SUPPLY_SAT coins, each paying MAX_SUPPLY_SAT - 100,000: every transaction is in the money range and the block's outputs sum to about twice MAX_SUPPLY_SAT, which no rule bounds (re-audit B1-T1: like Bitcoin Core, MoneyRange applies to each output, each transaction's output and input totals and the accumulated fees, never to the sum of a block's outputs).",
+            b, vec![p1, p2], None);
+
+        // Re-audit B1-T1: chained spends inside the block move the same coins
+        // once per hop. Three hops of 4,000,000 GNB: outputs sum to about
+        // 12,000,000 GNB, above the 10,000,000 GNB supply, in a valid block.
+        let v = 400_000_000_000_000u64;
+        let keys = [ka, kb, &k.c, ka];
+        let p0 = fund(&l("chained-total"), v, &keys[0].spk());
+        let mut prev = p0.clone();
+        let mut hops = Vec::new();
+        for i in 0..3 {
+            let mut t = unsigned(r.version(), &[&prev], vec![TxOutput { value: prev.amount - 100_000, script_pubkey: keys[i + 1].spk() }]);
+            sign_all(&mut t, &[keys[i]], &[prev.out()], r.how(), ChainId::Mainnet, &l(&format!("chained-total/{i}")));
+            prev = Prev { txid: t.txid(), vout: 0, amount: prev.amount - 100_000, spk: keys[i + 1].spk(), coinbase_height: None, block_coinbase: false };
+            hops.push(t);
+        }
+        let total: u128 = hops.iter().flat_map(|t| &t.outputs).map(|o| u128::from(o.value)).sum();
+        assert!(total > u128::from(MAX_SUPPLY_SAT));
+        let mut txs = vec![coinbase(subsidy(h) + 300_000, &l("chained-total"), b"")];
+        txs.extend(hops);
+        let mut b = raw_block(h, ACT, one_parent(), txs);
+        seal(&mut b, ACT);
+        c.push("value/chained-spends-output-total-above-max-supply", r,
+            "Three chained spends of a 4,000,000 GNB coin inside the block (each spends the previous transaction's output, fee 100,000 each): every transaction is in the money range, the outputs sum to about 12,000,000 GNB, above MAX_SUPPLY_SAT. Valid in both regimes (re-audit B1-T1: the block-wide output total the VAL-11 remediation added rejected it).",
+            b, vec![p0], None);
 
         // Dust and in-block value rules.
         let pdust = fund(&l("dust"), FUND, &ka.spk());

@@ -562,10 +562,11 @@ def check_pow_proof(b: Block) -> None:
 
 def check_context_free(b: Block) -> None:
     """`limits::check_block_context_free` (the encoding caps hold for every
-    decoded block): MoneyRange of every output, transaction and the block."""
-    total = 0
+    decoded block): MoneyRange of every output and every transaction's output
+    total. There is no block-wide output total (re-audit B1-T1): chained
+    in-block spends move the same coins once per hop."""
     for t in b.txs:
-        total = money_add(total, tx_money_range(t))
+        tx_money_range(t)
 
 
 def validate_block(b: Block, view: View, activation: int, scope: str, pow_mode: str, out: Outcome) -> None:

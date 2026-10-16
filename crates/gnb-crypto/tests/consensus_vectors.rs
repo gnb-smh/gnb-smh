@@ -341,6 +341,13 @@ fn vector_coverage() {
     let hard = |c: &&BlockVector| c.pow == "full" && Block::from_wire_bytes(&c.bytes).is_ok_and(|blk| blk.header.bits <= 0x1F0E_9036);
     assert!(b.iter().filter(hard).any(|c| c.error.is_none()), "no valid mined proof at the genesis target");
     assert!(b.iter().filter(hard).any(|c| c.error.as_deref() == Some("bad-pow")), "no failing proof at the genesis target");
-    // The block-wide output total of VAL-11 with every transaction in range.
-    assert!(b.iter().any(|c| c.error.as_deref() == Some("value-out-of-range") && c.id.starts_with("value/block-output-total")));
+    // Re-audit B1-T1: blocks whose outputs sum above MAX_SUPPLY_SAT with
+    // every transaction in range are valid, chained in-block spends
+    // included, on both sides of the activation.
+    for id in ["value/block-output-total-above-max-supply", "value/chained-spends-output-total-above-max-supply"] {
+        for r in ["pre", "post"] {
+            let full = format!("{id}/{r}");
+            assert!(b.iter().any(|c| c.id == full && c.error.is_none()), "{full} must be a valid case");
+        }
+    }
 }

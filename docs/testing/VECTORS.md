@@ -408,7 +408,7 @@ Transactions (187: 98 pre-activation, 89 post-activation; 66 valid; 182 on mainn
 | `tx64/` | 8 | 63 / 64 / 65-byte txid preimages in both regimes; the mainnet boundary |
 | `bip30/` | 2 | an output on an unspent coin's outpoint (valid pre, invalid post) |
 
-Blocks (106: 46 pre-activation, 60 post-activation; 36 valid):
+Blocks (108: 47 pre-activation, 61 post-activation; 40 valid):
 
 | Area | Cases | What |
 | --- | --- | --- |
@@ -420,15 +420,17 @@ Blocks (106: 46 pre-activation, 60 post-activation; 36 valid):
 | `same-block-coinbase/` | 3 | valid pre; `connect` scope post; `full` scope post (the commitment cannot match) |
 | `pow/` | 13 | the GnB-SMH proof at the genesis target: a mined nonce (valid) and a failing nonce (`bad-pow`), post; 0x2100ffff evaluated pre (limit only), refused post; the genesis target exactly and one unit above, in both regimes; the mainnet boundary; four malformed bits |
 | `size/` | 10 | 1 MB blocks: wire 1,000,001 with bincode below (valid pre, invalid post), wire exactly 1,000,000 (valid post), bincode measure 1,000,001 with wire below (invalid pre, valid post), bincode measure exactly 1,000,000 (valid pre; its plain bincode length with `blue_score` 999 is 1,000,002); the last two again under the same block id with `blue_score` 0 and `u64::MAX` (`*-blue-score-0/pre`, `*-blue-score-max/pre`): same verdicts (re-audit B1-T0 / B2-T8) |
-| `value/`, `maturity/`, `sig/`, `tx64/`, `bip30/`, `version/`, `witness/` | 18 | the transaction rules inside a block: dust, the block-wide output total above `MAX_SUPPLY_SAT` with every transaction in range (VAL-11), an immature spend, a bad signature, a 64-byte transaction, BIP30 on a spend's and on the coinbase's output, the version rule, a padded witness under the same block id (valid pre, witness commitment post) |
+| `value/`, `maturity/`, `sig/`, `tx64/`, `bip30/`, `version/`, `witness/` | 20 | the transaction rules inside a block: dust, outputs summing above `MAX_SUPPLY_SAT` with every transaction in range (valid: no block-wide output total, re-audit B1-T1) and three chained in-block spends of 4,000,000 GNB summing above it (valid in both regimes), an immature spend, a bad signature, a 64-byte transaction, BIP30 on a spend's and on the coinbase's output, the version rule, a padded witness under the same block id (valid pre, witness commitment post) |
 
 `crates/gnb-crypto/tests/consensus_vectors.rs::vector_coverage` fails if a
 class, a policy class, a network x regime pair, a network's schedule case, a
 version x regime pair, either side of the witness refusal's version gate (a
 `non-standard-witness` refusal on a version other than 3 at/after the
 activation, and on version 3 below it), a raw key, a 0x0002 key, the mined and the failing
-proof at the genesis target or the block-total MoneyRange case disappears
-from the files.
+proof at the genesis target, or one of the two valid blocks whose outputs
+sum above `MAX_SUPPLY_SAT` (`value/block-output-total-above-max-supply/*`,
+`value/chained-spends-output-total-above-max-supply/*`, re-audit B1-T1)
+disappears from the files or stops being valid.
 
 ## Adding a case
 
@@ -584,6 +586,19 @@ version 1 at it.
   `legacy_size` and on the verdicts of `size/bincode-exactly-1000000/pre` and
   `size/bincode-exactly-1000000-blue-score-max/pre`. No transaction case and
   no other block verdict changed.
+
+- **Re-audit B1-T1 (phase 4): no block-wide output total.** The VAL-11
+  remediation's block-wide output-total MoneyRange rule is removed (chained
+  in-block spends count coins once per hop; Bitcoin Core has no such sum).
+  `value/block-output-total-above-max-supply/{pre,post}` changed from
+  `value-out-of-range` to valid, and
+  `value/chained-spends-output-total-above-max-supply/{pre,post}` (three
+  chained spends of a 4,000,000 GNB coin, outputs summing to about
+  12,000,000 GNB) are new and valid. The effectiveness rows above that name
+  the block-wide sum ("block-wide output total not summed", and that case in
+  the `check_block_money_range` row) describe the rule as it was; the runners
+  now require both cases to be valid (`vector_coverage`), and restoring the
+  block-wide sum fails both runners on the four cases. No other case changed.
 
 ## Findings while building the vectors
 

@@ -132,6 +132,37 @@ its parents (`max(parent blue_score) + 1`), whichever path delivered it
 miner), so every node stores, serves and relays the same bytes for one block
 id (POW-8; re-audit B1-T0).
 
+## Value ranges (MoneyRange, all heights)
+
+`MAX_SUPPLY_SAT = 10,000,000 GNB = 10^15` base units. A block is invalid if
+any of these values leaves `0..=MAX_SUPPLY_SAT` (a sum that overflows u64 is
+out of range too):
+
+- every output value of every transaction, the coinbase included
+  (context-free: `limits::check_block_context_free`, before the block is
+  stored; also mempool admission and the template self-check);
+- each transaction's output total (context-free, same check);
+- each shielded transaction's fee (context-free);
+- each non-coinbase transaction's input total (connect time);
+- the block's accumulated fees, the sum over its non-coinbase transactions
+  of inputs minus outputs (connect time).
+
+These are Bitcoin Core's bounds (`nValueOut` in CheckTransaction, `nValueIn`
+and the fee in CheckTxInputs, `bad-txns-accumulated-fee-outofrange` in
+ConnectBlock). Each is a sum of distinct coins (a transaction's inputs are
+distinct outpoints, its outputs at most its inputs, fees are conserved along
+in-block chains), so a block whose amounts are conserved never violates
+them. The sum of ALL outputs of a block is not bounded: a chain of in-block
+spends moves the same coins once per hop, so the outputs of a valid block
+can sum above the supply (three hops of 4,000,000 GNB: 12,000,000 GNB).
+The VAL-11 remediation (commit e3e45df) had also bounded that sum; the rule
+rejected such valid blocks at every height and made the template
+self-check refuse every template carrying such a mempool chain, so it is
+removed (re-audit B1-T1): only a node running e3e45df rejects such a block.
+Vectors: `value/*`, among them
+`value/chained-spends-output-total-above-max-supply/*` (valid in both
+regimes) and `value/block-output-total-above-max-supply/*` (valid).
+
 ## Wire encoding (all heights)
 
 Blocks are relayed (gossip `NewBlock`, `/gnb/sync/1` block responses,
@@ -321,6 +352,9 @@ did not give one verdict per block id (nodes could disagree on the same
 block, a split): the bincode block-size measure writes the uncommitted
 `blue_score` as 0 (re-audit B1-T0 / B2-T8). It is the deterministic rule
 that keeps every block any release accepted valid ("Block size (VAL-12)").
+And the block-wide output total that the VAL-11 remediation (e3e45df)
+introduced at every height is removed, which restores the verdict every
+earlier release gives ("Value ranges").
 
 ### Selected parent and fork choice
 

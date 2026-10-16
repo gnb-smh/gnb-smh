@@ -6,11 +6,18 @@
 //! value conservation; nothing compared amounts with
 //! [`tokenomics::MAX_SUPPLY_SAT`] at validation time. [`money_range`] and the
 //! `check_*_money_range` helpers below are the Bitcoin-Core-style defence in
-//! depth: every individual amount and every running sum must stay within
-//! `0..=MAX_SUPPLY_SAT`. No block that can reach a node today violates them
-//! (no amount can exceed the issued supply), so adding them changes no
-//! validity outcome; they only turn a hypothetical future arithmetic bug into
-//! a clean rejection instead of an inflation.
+//! depth, on exactly the sums Bitcoin Core bounds: every output, each
+//! transaction's output total (here), each transaction's input total and the
+//! block's accumulated fees (the connect path, `node/src/accept.rs`) must
+//! stay within `0..=MAX_SUPPLY_SAT`. Each of these is a sum of DISTINCT coins
+//! (a transaction's inputs are distinct outpoints, its outputs at most its
+//! inputs, and fees are conserved along in-block chains), so no valid block
+//! violates them and adding them changes no validity outcome; they only turn
+//! a hypothetical future arithmetic bug into a clean rejection instead of an
+//! inflation. A block-wide output total is NOT such a sum: chained in-block
+//! spends count the same coins once per hop. The VAL-11 remediation had added
+//! one, which rejected valid blocks at every height; it was removed
+//! (re-audit B1-T1, [`check_block_money_range`]).
 //!
 //! # VAL-12: canonical-encoding size rules
 //!
@@ -90,13 +97,23 @@ pub fn check_tx_money_range(tx: &Transaction) -> Result<u64, String> {
     Ok(total)
 }
 
-/// MoneyRange over every transaction of a block (coinbase included), plus the
-/// block-wide output total.
+/// MoneyRange over every transaction of a block (coinbase included): each
+/// output and each transaction's output total (`check_tx_money_range`), and
+/// each shielded fee.
+///
+/// There is NO block-wide output total (re-audit B1-T1). The value moving
+/// through a chain of in-block spends is counted once per hop, so the
+/// outputs of a valid block can sum far above the supply (three hops of
+/// 4,000,000 GNB sum to 12,000,000); the sum bounds nothing. The remaining
+/// bounds are Bitcoin Core's: `nValueOut` per transaction (CheckTransaction),
+/// the input total per transaction (CheckTxInputs, `accept.rs`) and the
+/// accumulated block fees (ConnectBlock, `bad-txns-accumulated-fee-
+/// outofrange`, `accept.rs`), a conserved quantity. A block-wide output sum
+/// briefly existed (VAL-11 remediation): it rejected valid blocks at every
+/// height and poisoned templates carrying such a mempool chain.
 pub fn check_block_money_range(block: &Block) -> Result<(), String> {
-    let mut block_total: u64 = 0;
     for (i, tx) in block.transactions.iter().enumerate() {
-        let t = check_tx_money_range(tx).map_err(|e| format!("tx[{i}]: {e}"))?;
-        block_total = money_add(block_total, t).map_err(|e| format!("block output total: {e}"))?;
+        check_tx_money_range(tx).map_err(|e| format!("tx[{i}]: {e}"))?;
     }
     for (i, stx) in block.shielded_transactions.iter().enumerate() {
         if !money_range(stx.fee) {
@@ -368,11 +385,36 @@ mod tests {
         two.outputs.push(two.outputs[0].clone());
         assert!(check_tx_money_range(&two).is_err(), "sum of two in-range outputs above the cap");
 
-        // Block-wide: two transactions whose combined outputs exceed the cap.
+        // Block-wide: no rule bounds the sum of all outputs of a block
+        // (re-audit B1-T1); each transaction is checked on its own.
         let b = block_with(vec![tx(1, 20, cap / 2 + 1), tx(2, 20, cap / 2 + 1)]);
-        assert!(check_block_money_range(&b).is_err());
+        assert_eq!(check_block_money_range(&b), Ok(()));
         let ok = block_with(vec![tx(1, 20, 1_000), tx(2, 20, 2_000)]);
         assert!(check_block_money_range(&ok).is_ok());
+        let bad = block_with(vec![tx(1, 20, 1_000), tx(2, 20, cap + 1)]);
+        assert_eq!(check_block_money_range(&bad), Err("tx[1]: output 0 value 1000000000000001 exceeds MAX_SUPPLY_SAT".into()));
+    }
+
+    /// Re-audit B1-T1: a chain of in-block spends moves the same coins once
+    /// per hop. Three hops of 4,000,000 GNB (12,000,000 GNB of outputs, above
+    /// the 10,000,000 GNB supply) are within every MoneyRange rule; the
+    /// block-wide output total the VAL-11 remediation added refused it.
+    #[test]
+    fn chained_spends_above_the_supply_in_total_are_in_range() {
+        let v = 4_000_000 * tokenomics::SAT_PER_GNB;
+        let mut txs = Vec::new();
+        let mut prev = [0x31u8; 32];
+        for hop in 0..3u64 {
+            let mut t = tx(hop as usize + 1, 20, v - 100_000 * (hop + 1));
+            t.inputs[0].prev_txid = prev;
+            prev = t.txid();
+            txs.push(t);
+        }
+        let total: u128 = txs.iter().flat_map(|t| &t.outputs).map(|o| u128::from(o.value)).sum();
+        assert!(total > u128::from(tokenomics::MAX_SUPPLY_SAT));
+        let b = block_with(txs);
+        assert_eq!(check_block_money_range(&b), Ok(()));
+        assert_eq!(check_block_context_free(&b), Ok(()));
     }
 
     fn shielded(fee: u64) -> coherence_core::ShieldedTx {

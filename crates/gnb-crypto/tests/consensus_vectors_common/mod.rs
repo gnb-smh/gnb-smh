@@ -310,22 +310,18 @@ pub const CONNECT_CLASSES: &[&str] = &[
     "inputs-below-outputs", "min-fee", "coinbase-output-count", "coinbase-value",
 ];
 
-/// Whether an output, a transaction's output total or the block's output
-/// total exceeds `max_supply` (u128 arithmetic on the data alone, not the
-/// code under test). Such a block fails the context-free MoneyRange of
+/// Whether an output or a transaction's output total exceeds `max_supply`
+/// (u128 arithmetic on the data alone, not the code under test). Such a
+/// block fails the context-free MoneyRange of
 /// `limits::check_block_context_free` (VAL-11); an input-side MoneyRange
-/// failure is connect-time.
+/// failure is connect-time. The block's output total is not bounded
+/// (re-audit B1-T1: chained in-block spends count coins once per hop).
 pub fn outputs_out_of_range(block: &Block, max_supply: u64) -> bool {
     let max = u128::from(max_supply);
-    let mut block_total = 0u128;
-    for tx in &block.transactions {
+    block.transactions.iter().any(|tx| {
         let tx_total: u128 = tx.outputs.iter().map(|o| u128::from(o.value)).sum();
-        if tx.outputs.iter().any(|o| u128::from(o.value) > max) || tx_total > max {
-            return true;
-        }
-        block_total += tx_total;
-    }
-    block_total > max
+        tx.outputs.iter().any(|o| u128::from(o.value) > max) || tx_total > max
+    })
 }
 
 /// The verdict the context-free stages must give for a case whose expected
