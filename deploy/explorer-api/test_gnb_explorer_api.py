@@ -46,12 +46,23 @@ class ApiServer:
         conn.close()
         return r.status, json.loads(body) if body else None
 
+    def post(self, path, body, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", path, body=body.encode(),
+                     headers={"x-gnb-key": KEY, "content-type": "application/json", **(headers or {})})
+        r = conn.getresponse()
+        data = r.read()
+        conn.close()
+        return r.status, json.loads(data) if data else None
+
 
 class ExplorerApiTests(unittest.TestCase):
     def setUp(self):
         api._cache.clear()
         api.GET_LIMIT = api.RateLimiter(1000)
         api.POST_LIMIT = api.RateLimiter(1000)
+        if hasattr(api, "ByteBudget"):
+            api.POST_BYTES = api.ByteBudget(10**9)
         self.server = ApiServer()
 
     def tearDown(self):
@@ -156,6 +167,121 @@ class ExplorerApiTests(unittest.TestCase):
         self.assertEqual(self.server.get("/v1/getblockcount", a)[0], 200)
         self.assertEqual(self.server.get("/v1/getblockcount", a)[0], 429)
         self.assertEqual(self.server.get("/v1/getblockcount", b)[0], 200)
+
+    # ── B1-T10 / B2-T4: limiter keyed by allocation, never fails closed ──────
+
+    def test_ipv6_clients_are_keyed_by_their_64(self):
+        """One IPv6 /64 is one client: rotating the source address inside it
+        no longer mints fresh clients (the previous per-/128 key let 100 of
+        100 broadcasts through where one client gets 6)."""
+        api.POST_LIMIT = api.RateLimiter(6)
+        body = json.dumps({"hex": "ab" * 100})
+        ok = 0
+        for i in range(100):
+            status, _ = self.server.post("/v1/sendrawtransaction", body,
+                                         {"x-gnb-client-ip": f"2001:db8:1:2::{i:x}"})
+            ok += status == 200
+        self.assertEqual(ok, 6)
+        # Another /64 (same /48) is another client; IPv4 is keyed per address.
+        status, _ = self.server.post("/v1/sendrawtransaction", body, {"x-gnb-client-ip": "2001:db8:1:3::1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(api.client_key("2001:db8:1:2:ffff:ffff:ffff:ffff"), api.client_key("2001:db8:1:2::1"))
+        self.assertNotEqual(api.client_key("198.51.100.7"), api.client_key("198.51.100.8"))
+        self.assertEqual(api.client_key("::ffff:198.51.100.7"), "198.51.100.7")
+
+    def test_a_full_table_never_refuses_a_new_client_and_stays_cheap(self):
+        """A table full of one attacker's addresses used to refuse EVERY new
+        client for the rest of the minute, rebuilding the whole table under
+        the lock on each refusal (about 14 ms at 50,000 entries). Now the
+        least recently seen client is evicted in O(1)."""
+        limiter = api.RateLimiter(240, max_clients=50_000)
+        t0 = 1_000_000.0
+        for i in range(50_000):
+            self.assertTrue(limiter.allow(api.client_key(f"2001:db8:{i >> 16:x}:{i & 0xffff:x}::1"), now=t0))
+        self.assertTrue(limiter.allow(api.client_key("203.0.113.9"), now=t0 + 1),
+                        "a first-time visitor must not be refused because the table is full")
+        start = time.monotonic()
+        refused = sum(not limiter.allow(f"198.18.{i >> 8}.{i & 0xff}", now=t0 + 2) for i in range(2_000))
+        elapsed = time.monotonic() - start
+        self.assertEqual(refused, 0)
+        self.assertLessEqual(len(limiter.windows), 50_000)
+        self.assertLess(elapsed, 1.0, f"2,000 checks on a full table took {elapsed:.3f} s")
+        # A client still in the table keeps its count: no fresh window.
+        busy = api.RateLimiter(2, max_clients=3)
+        self.assertTrue(busy.allow("a", now=t0) and busy.allow("a", now=t0))
+        self.assertFalse(busy.allow("a", now=t0))
+        self.assertTrue(busy.allow("b", now=t0) and busy.allow("c", now=t0))
+        self.assertFalse(busy.allow("a", now=t0), "a tracked client keeps its count")
+        self.assertTrue(busy.allow("a", now=t0 + 60), "next window")
+
+    def test_requests_are_counted_only_once_validated(self):
+        """Unknown methods and invalid parameters are answered before the
+        limiter: they can neither use up a client's budget nor occupy a slot
+        of the table."""
+        api.GET_LIMIT = api.RateLimiter(2)
+        a = {"x-gnb-client-ip": "198.51.100.7"}
+        for path in ["/v1/zz", "/v1/getblockdag?p=[1]", "/v1/getutxos?p=[\"x\"]", "/v2/getblockcount"]:
+            self.assertIn(self.server.get(path, a)[0], (400, 404))
+        self.assertEqual(len(api.GET_LIMIT.windows), 0, "no limiter entry for invalid requests")
+        self.assertEqual(self.server.get("/v1/getblockcount", a)[0], 200)
+        self.assertEqual(self.server.get("/v1/getblockcount", a)[0], 200)
+        self.assertEqual(self.server.get("/v1/getblockcount", a)[0], 429)
+
+    def test_broadcasts_are_counted_only_once_validated(self):
+        """A malformed broadcast (empty body, no JSON, no hex) is answered 400
+        before the limiter: it neither creates a limiter entry nor uses up the
+        client's broadcasts (it was counted before the body was checked)."""
+        api.POST_LIMIT = api.RateLimiter(2)
+        a = {"x-gnb-client-ip": "198.51.100.8"}
+        for body in ["", "{", json.dumps({"hex": "zz"}), json.dumps({"hex": "abc"}), json.dumps([1])]:
+            self.assertEqual(self.server.post("/v1/sendrawtransaction", body, a)[0], 400, body)
+        self.assertEqual(len(api.POST_LIMIT.windows), 0, "no limiter entry for invalid broadcasts")
+        tx = json.dumps({"hex": "ab" * 10})
+        self.assertEqual([self.server.post("/v1/sendrawtransaction", tx, a)[0] for _ in range(3)], [200, 200, 429])
+
+    def test_broadcast_verification_budget_is_api_wide(self):
+        """Every broadcast costs the node signature verification; one byte
+        budget for all clients bounds that work whatever the number of
+        client addresses."""
+        api.POST_BYTES = api.ByteBudget(10_000)
+        tx = json.dumps({"hex": "ab" * 4_000})
+        statuses = [self.server.post("/v1/sendrawtransaction", tx, {"x-gnb-client-ip": f"198.51.100.{i}"})[0]
+                    for i in range(1, 4)]
+        self.assertEqual(statuses, [200, 200, 429])
+        budget = api.ByteBudget(600)
+        self.assertTrue(budget.take(600, now=budget.last))
+        self.assertFalse(budget.take(1, now=budget.last))
+        self.assertTrue(budget.take(10, now=budget.last + 1), "refills at per_min / 60 per second")
+
+    # ── B2-T3 / B1-T11: parameter windows agree with their clients ──────────
+
+    def test_getutxos_accepts_the_web_wallets_wide_window(self):
+        """The web wallet widens a truncated 50-row window to UTXO_WIDE_WINDOW
+        rows (site/wallet/core.js); the API refused anything above 50 with a
+        400, so the wallet of a miner never showed a balance."""
+        root = os.path.dirname(os.path.dirname(HERE))
+        with open(os.path.join(root, "site", "wallet", "core.js"), encoding="utf-8") as fh:
+            m = re.search(r"export const [^;]*\bUTXO_WIDE_WINDOW = (\d+)[,;]", fh.read())
+        self.assertIsNotNone(m, "core.js exports UTXO_WIDE_WINDOW")
+        wide = int(m.group(1))
+        addr = "gnb1q" + "00" * 24
+        status, doc = self.server.get(f'/v1/getutxos?p=["{addr}",{wide}]')
+        self.assertEqual(status, 200, doc)
+        self.assertEqual(doc["result"]["params"], [addr, wide])
+        self.assertEqual(self.server.get(f'/v1/getutxos?p=["{addr}",{wide + 1}]')[0], 400)
+
+    def test_getaddresshistory_offset_is_capped_and_a_cursor_is_accepted(self):
+        root = os.path.dirname(os.path.dirname(HERE))
+        with open(os.path.join(root, "node", "src", "storage", "indexer.rs"), encoding="utf-8") as fh:
+            m = re.search(r"pub const MAX_HISTORY_OFFSET: usize = ([0-9_]+);", fh.read())
+        node_max = int(m.group(1).replace("_", ""))
+        addr = "gnb1q" + "00" * 24
+        cursor = "0" * 31 + "1"
+        status, doc = self.server.get(f'/v1/getaddresshistory?p=["{addr}",25,{node_max},"{cursor}"]')
+        self.assertEqual(status, 200, doc)
+        self.assertEqual(doc["result"]["params"], [addr, 25, node_max, cursor])
+        self.assertEqual(self.server.get(f'/v1/getaddresshistory?p=["{addr}",25,{node_max + 1}]')[0], 400)
+        self.assertEqual(self.server.get(f'/v1/getaddresshistory?p=["{addr}",25,0,"zz"]')[0], 400)
 
     def test_node_errors_are_not_cached(self):
         # A cancelled heavy read on the node is an error; the next caller

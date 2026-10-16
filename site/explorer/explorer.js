@@ -115,7 +115,8 @@ async function overview() {
   const [dag, hr, sup, pct, pw, mp, chain, diff, win] = await Promise.all([
     api("getdaginfo"), api("gethashrate"), api("getsupplyinfo"), api("getblocktimepercentiles"),
     api("getpowitinfo").catch(() => null), api("getmempoolstats"), api("getselectedchain", [0, 12]),
-    api("getdifficultyhistory", [200]).catch(() => null), api("getdagwindow", [60]).catch(() => null),
+    // At most 100 points: the explorer API (and the node) refuse more (B2-T3).
+    api("getdifficultyhistory", [100]).catch(() => null), api("getdagwindow", [60]).catch(() => null),
   ]);
   const fin = pw && pw.finalized, jus = pw && pw.justified;
   app.innerHTML = `

@@ -235,6 +235,56 @@ impl std::fmt::Debug for SeedPhrase {
     }
 }
 
+/// Bytes [`phrase_grid`] writes for `words` (each number takes at least two
+/// columns and each word at least ten).
+fn phrase_grid_len(words: &[&str], indent: &str) -> usize {
+    let rows = words.len().div_ceil(4);
+    let cells: usize = words.iter().enumerate()
+        .map(|(i, w)| (i + 1).to_string().len().max(2) + 2 + w.len().max(10))
+        .sum();
+    // One separator between cells of a row, the indent and a newline per row.
+    cells + words.len().saturating_sub(rows) + rows * (indent.len() + 1)
+}
+
+/// The numbered grid in which the CLIs show a recovery phrase: rows of four
+/// `{n:2}. {word:<10}` cells separated by one space, each row prefixed by
+/// `indent` and ended by a newline.
+///
+/// CRY-4: built in ONE wiping buffer of exactly the size it needs (no
+/// reallocation, so no freed copy is left behind), with the formatter
+/// writing straight into it: the previous `format!` / `join` printing left
+/// plain `String` copies of every word on the heap.
+pub fn phrase_grid(words: &[&str], indent: &str) -> Zeroizing<Vec<u8>> {
+    use std::io::Write as _;
+    let mut buf = Zeroizing::new(Vec::with_capacity(phrase_grid_len(words, indent)));
+    for (row, chunk) in words.chunks(4).enumerate() {
+        buf.extend_from_slice(indent.as_bytes());
+        for (j, word) in chunk.iter().enumerate() {
+            if j > 0 {
+                buf.push(b' ');
+            }
+            // Writing to a Vec<u8> cannot fail.
+            let _ = write!(&mut *buf, "{:2}. {:<10}", row * 4 + j + 1, word);
+        }
+        buf.push(b'\n');
+    }
+    buf
+}
+
+/// Print [`phrase_grid`] on standard output. The output buffer is flushed
+/// first, so the grid (which ends with a newline) goes straight to the file
+/// descriptor in one write instead of through the process's stdout buffer,
+/// which is never wiped.
+pub fn print_phrase_grid(words: &[&str], indent: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let grid = phrase_grid(words, indent);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    out.flush()?;
+    out.write_all(&grid)?;
+    out.flush()
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -486,5 +536,31 @@ mod tests {
         let debug_str = format!("{:?}", seed);
         assert!(debug_str.contains("redacted"));
         assert!(!debug_str.contains(&seed.phrase));
+    }
+
+    /// CRY-4: the recovery-phrase grid the CLIs print is byte-identical to
+    /// the previous `format!` / `join` output, and is built in one buffer of
+    /// exactly its final size (a reallocation would leave a freed, unwiped
+    /// copy of the phrase behind).
+    #[test]
+    fn phrase_grid_matches_the_printed_layout_without_reallocating() {
+        let seed = SeedPhrase::generate().unwrap();
+        let words = seed.words();
+        let mut long = words.clone();
+        long[5] = "abcdefghijklmn"; // wider than the column
+        for words in [words, long] {
+            let mut expected = String::new();
+            for (row, chunk) in words.chunks(4).enumerate() {
+                let line: Vec<String> = chunk.iter().enumerate()
+                    .map(|(j, w)| format!("{:2}. {:<10}", row * 4 + j + 1, w)).collect();
+                expected.push_str(&format!("  {}\n", line.join(" ")));
+            }
+            let grid = phrase_grid(&words, "  ");
+            assert_eq!(std::str::from_utf8(&grid).unwrap(), expected);
+            assert_eq!(grid.len(), grid.capacity(), "one exact allocation, never grown");
+        }
+        let odd = ["alpha"; 6];
+        let grid = phrase_grid(&odd, "");
+        assert_eq!(grid.len(), grid.capacity());
     }
 }

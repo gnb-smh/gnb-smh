@@ -12,7 +12,7 @@
 // are backed by a 24-word recovery phrase (WAL-7). Only coins spendable in the
 // next block reach the core: an immature coinbase output is neither counted as
 // spendable nor offered to the core (core.js splitByMaturity).
-import { loadCore, spendableWindow, splitByMaturity, COINBASE_MATURITY } from "/wallet/core.js";
+import { loadCore, spendableWindow, splitByMaturity, getutxosFetcher, COINBASE_MATURITY, UTXO_WINDOW, UTXO_WIDE_WINDOW } from "/wallet/core.js";
 import { html, raw, isAddress, isHex64, num, sats } from "/assets/safe.js";
 
 // SHA-256 of /wallet/gnb_wallet.wasm. Written by scripts/build-wallet-wasm.sh
@@ -20,10 +20,8 @@ import { html, raw, isAddress, isHex64, num, sats } from "/assets/safe.js";
 const WASM_SHA256 = "bd335806b1b2651a66b96c416abed8dacf135216b4bb7701a2fc0fc26f80ae32";
 
 const SAT = 100000000n;
-// One payment spends at most this many outputs (each input carries an
-// ~8.5 kB post-quantum signature); getutxos is asked for this many, and for
-// UTXO_WIDE_WINDOW when immature coinbase outputs took part of a cut-short list.
-const UTXO_WINDOW = 50, UTXO_WIDE_WINDOW = 1000;
+// UTXO_WINDOW / UTXO_WIDE_WINDOW (core.js): rows asked of getutxos, the same
+// constants the explorer API's parameter check is tested against (B2-T3).
 const IDLE_LOCK_MS = 10 * 60 * 1000;
 const app = document.getElementById("app");
 const lockBtn = document.getElementById("lock");
@@ -218,9 +216,10 @@ async function refresh() {
   if (state.mode === "locked") return;
   try {
     const address = state.address;
+    const fetchUtxos = getutxosFetcher(api, address);
     const fetchRows = async (limit) => {
-      const r = await api("getutxos", [address, limit]);
-      return { rows: cleanUtxos(r.utxos), truncated: r.truncated === true };
+      const r = await fetchUtxos(limit);
+      return { rows: cleanUtxos(r.rows), truncated: r.truncated };
     };
     const [bal, next] = await Promise.all([api("getbalance", [address]), nextBlockHeight()]);
     const coins = await spendableWindow(fetchRows, next, UTXO_WINDOW, UTXO_WIDE_WINDOW);
@@ -230,7 +229,7 @@ async function refresh() {
     state.utxoTotal = total(coins.spendable);
     state.immature = coins.immature;
     state.immatureTotal = total(coins.immature);
-    state.utxosTruncated = coins.truncated;
+    state.utxosTruncated = coins.truncated || coins.widenFailed;
     state.utxoCount = count(bal.utxo_count ?? coins.listed);
     paintSlab();
     if (state.tab === "activity") paintActivity();

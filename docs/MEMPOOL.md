@@ -322,3 +322,14 @@ is an admission decision (`Mempool::add_with_replacement`).
   rate and this policy's parameters under `policy`.
 * `estimatefee` returns a fee rate never below the consensus minimum nor the
   rolling minimum.
+* `estimatefeeadvanced [n_inputs=1, n_outputs=2]` (re-audit B1-T21) returns
+  ABSOLUTE fees for a transaction of that shape (`tx_bytes`,
+  `Transaction::estimate_size`): `slow_priority` at the floor rate (the
+  consensus minimum rate or the rolling minimum, whichever is higher),
+  `medium_priority` (also `mempool_median` and `recommended_gnb`) at the
+  median pooled fee rate, `next_block_sats` at the 75th-percentile pooled
+  rate, none of them below `min_tx_fee_sat(tx_bytes)`; the rates are reported
+  under `feerate_sat_per_kb`. It used to return raw absolute-fee percentiles
+  that ignored the size, and 5,000 / 1,000 sat on a quiet pool, below the
+  10,000-sat consensus minimum. The wallet client floors whatever a node
+  answers at the consensus minimum.

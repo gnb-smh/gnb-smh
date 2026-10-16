@@ -564,6 +564,9 @@ struct ReorgBatch<'a> {
     tx_index_overlay: HashMap<[u8; 32], Option<([u8; 32], u64)>>,
     /// NET-12: net holder changes of every staged UTXO mutation.
     holders: crate::storage::aggregates::HolderDeltas,
+    /// B1-T11: every address-history row staged (put or delete), for the
+    /// per-address history counters.
+    history: crate::storage::aggregates::HistoryDeltas,
     /// NET-12: running connected-chain totals.
     chain: crate::storage::aggregates::ChainTotals,
     /// NET-12: running XOR of the connected blocks' hashes (`agg/conn`).
@@ -583,6 +586,7 @@ impl<'a> ReorgBatch<'a> {
             coinbase_overlay: HashMap::new(),
             tx_index_overlay: HashMap::new(),
             holders: Default::default(),
+            history: Default::default(),
             chain,
             conn,
             _agg: agg,
@@ -715,6 +719,7 @@ impl<'a> ReorgBatch<'a> {
     fn delete_addr_history_key(&mut self, key: &[u8]) -> Result<(), String> {
         let cf = self.cf(CF_ADDR_TX_HISTORY)?;
         self.batch.delete_cf(cf, key);
+        self.history.delete(key);
         Ok(())
     }
 
@@ -740,6 +745,8 @@ impl<'a> ReorgBatch<'a> {
     /// last, from the committed values plus this batch's net changes.
     fn commit(mut self) -> Result<(), String> {
         self.store.stage_holder_deltas(&mut self.batch, &self.holders)
+            .map_err(|e| format!("reorg batch: aggregates: {}", e))?;
+        self.store.stage_history_deltas(&mut self.batch, &self.history)
             .map_err(|e| format!("reorg batch: aggregates: {}", e))?;
         self.store.stage_chain_totals(&mut self.batch, self.chain, &self.conn)
             .map_err(|e| format!("reorg batch: aggregates: {}", e))?;
@@ -896,7 +903,7 @@ fn apply_block_utxo_mutations_batched(
         let spent: HashMap<([u8; 32], u32), TxOutput> = undo.spent_utxos.iter()
             .map(|e| ((e.prev_txid, e.prev_index), e.output.clone()))
             .collect();
-        batch.store.stage_chain_index(&mut batch.batch, block, position, &spent)
+        batch.store.stage_chain_index(&mut batch.batch, block, position, &spent, &mut batch.history)
             .map_err(|e| format!("apply: chain index failed: {}", e))
     };
 

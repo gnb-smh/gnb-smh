@@ -155,7 +155,7 @@ fn an_old_layout_data_dir_is_migrated_at_start_up() {
         match n.store.get_block(h).unwrap() {
             Some(body) => {
                 let mut batch = rocksdb::WriteBatch::default();
-                n.store.stage_chain_index(&mut batch, &body, body.height, &Default::default()).unwrap();
+                n.store.stage_chain_index(&mut batch, &body, body.height, &Default::default(), &mut Default::default()).unwrap();
                 n.store.write_batch(batch).unwrap();
             }
             None => {
@@ -197,6 +197,7 @@ fn an_old_layout_data_dir_is_migrated_at_start_up() {
     assert!(h.iter().any(|(pos, t)| *t == cb(&b) && *pos == 3), "pruned B's row moved to its position");
     assert!(h.iter().any(|(pos, t)| *t == cb(&c) && *pos == 4), "bodied C's row at its position");
     assert!(!accept::migrate_chain_indexes(&n.dag, &n.store).unwrap(), "migrates once");
+    assert_aggregates_exact(&n, "migrated");
 
     // The migrated pruned-body records drive a later rollback correctly
     // (the M branch's pruned bodies are fetched back first).
@@ -328,7 +329,7 @@ fn an_old_layout_pruned_block_without_a_record_keeps_its_history() {
         if body.header.parents.is_empty() {
             n.store.stage_chain_position(&mut batch, 0, &body.block_hash(), body.header.timestamp).unwrap();
         } else {
-            n.store.stage_chain_index(&mut batch, body, body.height, &Default::default()).unwrap();
+            n.store.stage_chain_index(&mut batch, body, body.height, &Default::default(), &mut Default::default()).unwrap();
         }
         n.store.write_batch(batch).unwrap();
     }
@@ -438,6 +439,17 @@ fn index_rows(n: &Node) -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
     out
 }
 
+/// Package R5 (B1-T11) x DAG-8: the explorer aggregates, the per-address
+/// history counters among them, equal a recomputation from the rows (the
+/// counters follow every history row the connects, the chunked chain moves
+/// and the DAG-8 rebuild write or delete).
+fn assert_aggregates_exact(n: &Node, what: &str) {
+    assert!(n.store.aggregates_ready(), "{what}: aggregates complete");
+    let full = n.store.recompute_aggregates(&std::sync::atomic::AtomicBool::new(false)).unwrap();
+    assert!(full.history.contains_key(&ADDR), "{what}: ADDR has history rows");
+    assert_eq!(n.store.aggregate_snapshot().unwrap(), full, "{what}: stored aggregates");
+}
+
 /// `--reindex-addresses` (main's d400bd0, "keep spends in the address
 /// history across reorgs") is the DAG-8 rebuild, not a second layout: on a
 /// chain with pruned blocks and a spend of a genesis-ledger output (an
@@ -468,6 +480,7 @@ fn reindex_addresses_rebuilds_exactly_what_the_connects_wrote() {
     accept(&n, &e).unwrap();
     assert_eq!(applied_tip(&n), Some(e.block_hash()));
     assert_eq!(n.store.prune_blocks_below(4).unwrap(), BODIES_BELOW_4, "G, a P, S and B among them");
+    assert_aggregates_exact(&n, "connected, moved and pruned");
     let k_addr: [u8; 20] = k.spk[..20].try_into().unwrap();
     let spent_row = make_key(&k_addr, dag_height(&n, &e.block_hash()), 1, 0x8000_0000);
     let connected = index_rows(&n);
@@ -489,6 +502,9 @@ fn reindex_addresses_rebuilds_exactly_what_the_connects_wrote() {
         db.put_cf(&cf, make_key(&[0xEE; 20], 1, 0, 0), make_value(&cb(&ms[0]), DIR_OUT, 1)).unwrap();
     }
     assert_ne!(index_rows(&n), connected);
+    let damaged = n.store.recompute_aggregates(&std::sync::atomic::AtomicBool::new(false)).unwrap();
+    assert_ne!(n.store.aggregate_snapshot().unwrap().history, damaged.history, "the rows changed under the counters");
+    assert_eq!(damaged.history.get(&[0xEE; 20]), Some(&1), "a row of the off-chain M1");
 
     let r = accept::reindex_chain_indexes(&n.dag, &n.store).unwrap();
     assert_eq!((r.blocks, r.lost, r.unresolved), (7, 0, 0), "G, P, S, B, C, D, E; {r:?}");
@@ -496,6 +512,9 @@ fn reindex_addresses_rebuilds_exactly_what_the_connects_wrote() {
     assert_eq!(n.store.chain_index_version().unwrap(), gnb::storage::CHAIN_INDEX_VERSION);
     assert_index_is_the_chain(&n, "reindexed");
     assert!(history(&n).iter().any(|(pos, t)| *t == cb(&s) && *pos == 2), "pruned S's row kept");
+    assert_aggregates_exact(&n, "reindexed");
+    assert_eq!(n.store.address_history_count(&[0xEE; 20]).unwrap(), Some(0), "no row of the off-chain M1 is counted");
     assert_eq!(accept::reindex_chain_indexes(&n.dag, &n.store).unwrap(), r);
     assert_eq!(index_rows(&n), connected, "idempotent");
+    assert_aggregates_exact(&n, "reindexed twice");
 }

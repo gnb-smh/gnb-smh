@@ -425,45 +425,66 @@ pub fn address_info(
 // Fee estimation (advanced)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// `estimatefeeadvanced`: absolute fees for one transaction of `tx_bytes`
+/// wire bytes, in satoshis, every one at least the consensus minimum for that
+/// size and the mempool's rolling minimum (B1-T21 / MEM-6).
 pub struct FeeEstimate {
+    /// Wire size the fees are computed for.
+    pub tx_bytes:         usize,
+    /// The fee rates (sat per 1,000 wire bytes) behind the three tiers.
+    pub floor_rate_per_kb: u64,
+    pub next_block_rate_per_kb: u64,
+    pub medium_rate_per_kb: u64,
     pub next_block_sats:  u64,
     pub medium_priority:  u64,
     pub slow_priority:    u64,
+    /// The median pooled fee rate applied to `tx_bytes` (equals
+    /// `medium_priority`; kept for older clients).
     pub mempool_median:   u64,
     pub mempool_size:     usize,
 }
 
-pub fn estimate_fee_advanced(mempool: &Mempool) -> FeeEstimate {
-    let entries = mempool.entries();
-    let mut fees: Vec<u64> = entries.iter().map(|(_, fee, _)| *fee).collect();
-    fees.sort_by(|a, b| b.cmp(a)); // highest first
+/// Largest input / output count `estimatefeeadvanced` prices (far beyond any
+/// standard transaction; keeps the size arithmetic exact).
+pub const FEE_ESTIMATE_MAX_IO: u64 = 10_000;
 
-    let mempool_size = fees.len();
-
-    // Pessimistic default if mempool is sparse
-    if mempool_size < 3 {
-        return FeeEstimate {
-            next_block_sats: 10_000,
-            medium_priority: 5_000,
-            slow_priority:   1_000,
-            mempool_median:  if mempool_size > 0 { fees[0] } else { 1_000 },
-            mempool_size,
-        };
-    }
-
-    // Top 25% → next block
-    // Top 50% → medium
-    // Bottom 25% → slow
-    let p25_idx = mempool_size / 4;
-    let p50_idx = mempool_size / 2;
-    let p75_idx = (mempool_size * 3) / 4;
-
+/// B1-T21 / MEM-6: the advanced estimate is derived from fee RATES, like
+/// `estimatefee`, and from the size of the transaction being priced
+/// (`tx_bytes`). The floor rate is the consensus minimum rate or the
+/// mempool's rolling minimum, whichever is higher
+/// (`Mempool::estimate_fee_rate_per_kb`'s floor); `slow` pays the floor,
+/// `medium` the median pooled rate, `next_block` the 75th-percentile pooled
+/// rate, none below the floor. Each tier's fee is
+/// `max(min_tx_fee_sat(tx_bytes), ceil(tx_bytes × rate / 1000))`, so no field
+/// is ever below the consensus minimum for that size. (The previous estimate
+/// returned raw ABSOLUTE-fee percentiles that ignored the size, and on a
+/// quiet pool 5,000 and 1,000 sat against the 10,000-sat minimum.) Bitcoin
+/// Core's `estimatesmartfee` likewise never returns a rate below
+/// max(minrelaytxfee, mempoolminfee).
+pub fn estimate_fee_advanced(mempool: &Mempool, tx_bytes: usize) -> FeeEstimate {
+    let floor = crate::core::tokenomics::MIN_FEE_RATE_SAT_PER_KB
+        .max(mempool.rolling_min_fee_rate().saturating_mul(1000));
+    let rates = mempool.fee_rates_per_kb();
+    let pct = |p: usize| -> u64 {
+        if rates.is_empty() { 0 } else { rates[((rates.len() - 1) * p / 100).min(rates.len() - 1)] }
+    };
+    let medium_rate = pct(50).max(floor);
+    let next_rate = pct(75).max(medium_rate);
+    let fee_at = |rate: u64| -> u64 {
+        crate::core::tokenomics::min_tx_fee_sat(tx_bytes)
+            .max((tx_bytes as u64).saturating_mul(rate).div_ceil(1000))
+    };
+    let medium = fee_at(medium_rate);
     FeeEstimate {
-        next_block_sats: fees.get(p25_idx).copied().unwrap_or(10_000),
-        medium_priority: fees.get(p50_idx).copied().unwrap_or(5_000),
-        slow_priority:   fees.get(p75_idx).copied().unwrap_or(1_000),
-        mempool_median:  fees.get(p50_idx).copied().unwrap_or(1_000),
-        mempool_size,
+        tx_bytes,
+        floor_rate_per_kb: floor,
+        next_block_rate_per_kb: next_rate,
+        medium_rate_per_kb: medium_rate,
+        next_block_sats: fee_at(next_rate),
+        medium_priority: medium,
+        slow_priority: fee_at(floor),
+        mempool_median: medium,
+        mempool_size: rates.len(),
     }
 }
 

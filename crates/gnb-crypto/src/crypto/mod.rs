@@ -231,10 +231,13 @@ pub fn signed_message_digest(message: &[u8]) -> [u8; 32] {
 /// The v1 tag above carries no chain identifier, so a v1 message signature
 /// verifies identically on Bloch, GnB mainnet and GnB testnet, which share
 /// keys. New signatures use this v2 domain, which appends the 4-byte chain id
-/// ([`crate::core::ChainId`]) before the length-prefixed message. Wallets keep
-/// VERIFYING v1 for signatures made before the change (see
-/// `wallet::Keypair::verify_message`). Like v1, the tag is not a prefix of any
-/// other signing domain in the codebase and none of them is a prefix of it.
+/// ([`crate::core::ChainId`]) before the length-prefixed message. No default
+/// GnB verifier accepts v1 (re-audit CRY-8: a Bloch v1 signature verified as
+/// a GnB mainnet and testnet proof); only the explicit legacy mode
+/// `wallet::Keypair::verify_message_allowing_legacy_v1` (`gnb-wallet
+/// verify-message --legacy-v1`) does, and never a canonical verifier. Like
+/// v1, the tag is not a prefix of any other signing domain in the codebase
+/// and none of them is a prefix of it.
 pub const SIGNED_MESSAGE_DOMAIN_V2: &[u8] = b"GNB-SIGNED-MESSAGE-v2";
 
 /// The digest a v2 "sign this message" flow signs:
@@ -371,6 +374,23 @@ fn parse_envelope_or_legacy(b: &[u8]) -> (u16, &[u8]) {
 /// legacy-vs-enveloped with no ambiguity — see [`parse_pubkey_envelope_or_legacy`].
 fn legacy_hybrid_pubkey_len() -> usize {
     MLDSA_PUBKEY_LEN.saturating_add(falcon::pubkey_len())
+}
+
+/// Exact byte length of a raw (non-enveloped) SECRET key of `suite`:
+/// `mldsa_sk(4,032) ‖ falcon_sk(2,305)` = 6,337 for suite 0x0001 (the
+/// pre-envelope founder / Bloch v2 keystores store this), the bare ML-DSA-65
+/// secret (4,032) for suite 0x0002. An enveloped secret of the same suite is
+/// exactly `SUITE_HEADER_LEN` bytes longer, so the two never collide on
+/// length (B2-T2: the wallet signer classifies secrets by these lengths, as
+/// consensus classifies public keys, never by their leading bytes). `None`
+/// for any other suite.
+pub(crate) fn raw_secret_key_len(suite: u16) -> Option<usize> {
+    match suite {
+        SUITE_MLDSA65_FALCON1024 => Some(MLDSA_SECRET_LEN.saturating_add(
+            pqcrypto_falcon::falcon1024::secret_key_bytes())),
+        SUITE_MLDSA65_ONLY => Some(MLDSA_SECRET_LEN),
+        _ => None,
+    }
 }
 
 /// Public-key-specific version of [`parse_envelope_or_legacy`] (audit A4

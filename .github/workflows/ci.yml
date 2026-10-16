@@ -264,6 +264,23 @@ jobs:
       - name: node --test site/tests
         run: node --test site/tests/*.test.mjs
 
+  # Deployment files (audit OPS-3): the systemd units keep their sandboxing
+  # and separate users (systemd-analyze security / verify), the shell
+  # scripts pass ShellCheck; and the explorer API's own unit tests (limiter,
+  # broadcast budget, parameter validation). ubuntu-latest ships
+  # systemd-analyze and shellcheck; GNB_REQUIRE_TOOLS=1 fails instead of
+  # skipping when either is missing.
+  deploy-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deploy/test_deploy_files.py
+        env:
+          GNB_REQUIRE_TOOLS: "1"
+        run: python3 deploy/test_deploy_files.py -v
+      - name: explorer API unit tests
+        run: python3 deploy/explorer-api/test_gnb_explorer_api.py -v
+
   clippy:
     runs-on: ubuntu-latest
     steps:
@@ -286,9 +303,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Audit OPS-2: exact tool releases (the ones the policy was last
+      # verified with), so a new cargo-deny/cargo-audit release cannot change
+      # what the job checks without a reviewed bump here. The advisory
+      # database itself is fetched fresh on every run.
+      # node/tests/supply_chain_lockfile_guard.rs checks these pins.
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-audit
+          tool: cargo-deny@0.20.2,cargo-audit@0.22.2
+      # deny.toml [graph] all-features = true: every feature's graph (e.g.
+      # the node's sev-snp) is held to the policy.
       - name: cargo deny (advisories, bans, licenses, sources; deny.toml)
         run: cargo deny check
       - name: cargo audit (exceptions in .cargo/audit.toml)

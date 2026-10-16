@@ -138,6 +138,11 @@ enum Cmd {
         /// Require suite envelopes and canonical signature encoding.
         #[arg(long)]
         canonical: bool,
+        /// CRY-8: ALSO accept a chain-less v1 signature (Bloch, or GnB before
+        /// v2). A v1 signature binds no network: it is valid for Bloch, GnB
+        /// mainnet and GnB testnet alike. Never combined with --canonical.
+        #[arg(long, conflicts_with = "canonical")]
+        legacy_v1: bool,
     },
     /// P4.3 — Create a signed selective-disclosure bundle (view/audit key).
     /// Prompts for the BIP39 seed phrase; discloses ONLY the given receive
@@ -237,12 +242,12 @@ pub fn main() {
         }
 
         Cmd::Address { keystore } => {
-            let kp = load_kp(&keystore);
+            let kp = load_kp(&keystore, stated_network(cli.testnet, cli.mainnet));
             println!("  {}", amber(&kp.address));
         }
 
         Cmd::Pubkey { keystore } => {
-            let kp = load_kp(&keystore);
+            let kp = load_kp(&keystore, stated_network(cli.testnet, cli.mainnet));
             let hex = hex::encode(&kp.public_key);
             // Public-key export must include every byte for native script hashing.
             println!("{hex}");
@@ -450,7 +455,7 @@ pub fn main() {
             }
         }
 
-        Cmd::VerifyMessage { pubkey, message, signature, canonical } => {
+        Cmd::VerifyMessage { pubkey, message, signature, canonical, legacy_v1 } => {
             let pk = match hex::decode(&pubkey) {
                 Ok(b) => b,
                 Err(e) => { err(&format!("Invalid pubkey hex: {}", e)) }
@@ -461,8 +466,15 @@ pub fn main() {
             };
             // Same domain-separated digest `sign` uses — never hex-decode
             // `message` either; verification must mirror signing exactly.
-            // CRY-8: a v2 signature must name this network's chain id.
-            if verify_message_on_network(cli_network(cli.testnet), &pk, message.as_bytes(), &sig, canonical) {
+            // CRY-8: a v2 signature must name this network's chain id; a
+            // chain-less v1 signature only with --legacy-v1.
+            let network = cli_network(cli.testnet);
+            if legacy_v1 && crate::wallet::Keypair::verify_message_allowing_legacy_v1(
+                Some(network), &pk, message.as_bytes(), &sig)
+            {
+                ok("signature verifies for this message and public key (legacy v1 accepted: \
+                    a v1 signature does not say which network it was made for)");
+            } else if verify_message_on_network(network, &pk, message.as_bytes(), &sig, canonical) {
                 ok("signature verifies for this message and public key");
             } else {
                 err("signature does NOT verify for this message and public key");
@@ -486,19 +498,21 @@ fn verify_bundle_with_policy(
     }
 }
 
-/// Network-agnostic policy view (any GnB chain or v1); the command itself
-/// uses [`verify_message_on_network`].
+/// The two encoding policies the message verifiers apply, on one digest:
+/// compatible (enveloped, raw hybrid, generic) or canonical (envelopes and
+/// canonical encoding only). Which digests are acceptable (v2 of a chain;
+/// v1 only in the explicit legacy mode, CRY-8) is the verifiers' concern.
 #[cfg(test)]
-fn verify_message_with_policy(
+fn verify_digest_with_policy(
     public_key: &[u8],
-    message: &[u8],
+    digest: &[u8; 32],
     signature: &[u8],
     canonical: bool,
 ) -> bool {
     if canonical {
-        crate::wallet::Keypair::verify_message_canonical(public_key, message, signature)
+        crate::crypto::verify_enveloped_canonical(public_key, digest, signature)
     } else {
-        crate::wallet::Keypair::verify_message(public_key, message, signature)
+        crate::wallet::Keypair::verify_digest_compat(public_key, digest, signature)
     }
 }
 
@@ -525,10 +539,9 @@ fn cli_network(testnet: bool) -> crate::address::Network {
 fn show_recovery_phrase(phrase: &crate::wallet::SeedPhrase) {
     println!("  {}RECOVERY PHRASE — write these 24 words down, offline:{}", BOLD, RESET);
     println!();
-    for (row, chunk) in phrase.words().chunks(4).enumerate() {
-        let line: Vec<String> = chunk.iter().enumerate()
-            .map(|(j, w)| format!("{:2}. {:<10}", row * 4 + j + 1, w)).collect();
-        println!("  {}", line.join(" "));
+    // CRY-4: one wiping buffer, written straight to the terminal.
+    if let Err(e) = crate::wallet::print_phrase_grid(&phrase.words(), "  ") {
+        err(&format!("cannot print the recovery phrase: {e}"));
     }
     println!();
     println!("  {}Anyone with these words controls the funds. They are not stored.{}", MUTED, RESET);
@@ -615,13 +628,19 @@ fn finish_keystore_migration(pending: Option<crate::wallet::PendingKeystoreMigra
     }
 }
 
-fn load_kp(path: &PathBuf) -> crate::wallet::Keypair {
+/// Open a keystore without spending (CRY-7): a v3 file authenticates its
+/// network (and must be the stated one, if any); a v2 file opens only for
+/// the network stated with --mainnet / --testnet.
+fn load_kp(path: &PathBuf, network: Option<crate::address::Network>) -> crate::wallet::Keypair {
     let pw = prompt_password(&format!("  {}password:{} ", MUTED, RESET));
-    let loaded = crate::wallet::Keypair::load_encrypted(path, &pw);
+    let loaded = match network {
+        Some(n) => crate::wallet::Keypair::load_encrypted_on(path, &pw, n),
+        None => crate::wallet::Keypair::load_encrypted(path, &pw),
+    };
     drop(pw);
     match loaded {
         Ok(kp) => { ok("keystore decrypted"); println!(); kp }
-        Err(e) => { err(&format!("Load failed: {}", e)) }
+        Err(e) => { err(&format!("Load failed: {e} (pass --mainnet or --testnet for a v2 keystore)")) }
     }
 }
 
@@ -1023,18 +1042,8 @@ mod audit_cli_input_tests {
         let enveloped_sig = pqcrypto_internals::with_seeded_rng_scope(&signing_seed, || {
             crate::crypto::sign(&enveloped_sk, &digest).unwrap()
         });
-        assert!(verify_message_with_policy(
-            &enveloped_pk,
-            message,
-            &enveloped_sig,
-            false,
-        ));
-        assert!(verify_message_with_policy(
-            &enveloped_pk,
-            message,
-            &enveloped_sig,
-            true,
-        ));
+        assert!(verify_digest_with_policy(&enveloped_pk, &digest, &enveloped_sig, false));
+        assert!(verify_digest_with_policy(&enveloped_pk, &digest, &enveloped_sig, true));
 
         let raw_pk = &enveloped_pk[crate::crypto::SUITE_HEADER_LEN..];
         let raw_sig = &enveloped_sig[crate::crypto::SUITE_HEADER_LEN..];
@@ -1044,13 +1053,21 @@ mod audit_cli_input_tests {
             "generic autodetection must misclassify this genuine raw signature"
         );
         assert!(
-            verify_message_with_policy(raw_pk, message, raw_sig, false),
+            verify_digest_with_policy(raw_pk, &digest, raw_sig, false),
             "compatible wallet policy must use the explicit raw format first"
         );
         assert!(
-            !verify_message_with_policy(raw_pk, message, raw_sig, true),
+            !verify_digest_with_policy(raw_pk, &digest, raw_sig, true),
             "canonical product policy must reject legacy raw records"
         );
+        // The fixture is a v1 (chain-less) message signature: CRY-8 accepts
+        // it only in the explicit legacy mode, in the compatible encoding.
+        use crate::wallet::Keypair;
+        for (pk, sig) in [(&enveloped_pk[..], &enveloped_sig[..]), (raw_pk, raw_sig)] {
+            assert!(!Keypair::verify_message(pk, message, sig));
+            assert!(!Keypair::verify_message_canonical(pk, message, sig));
+            assert!(Keypair::verify_message_allowing_legacy_v1(None, pk, message, sig));
+        }
     }
 }
 
@@ -1112,7 +1129,8 @@ mod audit_2026_10_cli_tests {
         assert!(cli.testnet && matches!(cli.cmd, Cmd::Restore { .. }));
     }
 
-    /// CRY-8: the CLI verifier is chain-bound for v2 signatures.
+    /// CRY-8: the CLI verifier is chain-bound for v2 signatures, and a v1
+    /// signature needs --legacy-v1 (which --canonical excludes).
     #[test]
     fn verify_message_is_network_bound() {
         let kp = crate::wallet::generate_keypair(true);
@@ -1120,5 +1138,12 @@ mod audit_2026_10_cli_tests {
         assert!(verify_message_on_network(cli_network(true), &kp.public_key, b"cli", &sig, false));
         assert!(!verify_message_on_network(cli_network(false), &kp.public_key, b"cli", &sig, false));
         assert!(verify_message_on_network(cli_network(true), &kp.public_key, b"cli", &sig, true));
+        let v1 = kp.sign_message_v1(b"cli").unwrap();
+        for canonical in [false, true] {
+            assert!(!verify_message_on_network(cli_network(true), &kp.public_key, b"cli", &v1, canonical));
+        }
+        let cli = Cli::try_parse_from(["gnb-wallet", "verify-message", "00", "m", "00", "--legacy-v1"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::VerifyMessage { legacy_v1: true, canonical: false, .. }));
+        assert!(Cli::try_parse_from(["gnb-wallet", "verify-message", "00", "m", "00", "--legacy-v1", "--canonical"]).is_err());
     }
 }

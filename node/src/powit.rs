@@ -451,7 +451,9 @@ impl WitnessDuty {
     /// Load a KES witness key (`gnb-cli witnesskeygen`); the password is read
     /// from `password_file` (first line), never from the command line.
     pub fn load(key: &Path, password_file: &Path, payout_script: Vec<u8>, data_dir: &Path) -> Result<Self, String> {
-        let pw = std::fs::read_to_string(password_file).map_err(|e| format!("witness password file: {e}"))?;
+        // CRY-4: the file's contents are wiped once the first line is copied.
+        let pw = zeroize::Zeroizing::new(
+            std::fs::read_to_string(password_file).map_err(|e| format!("witness password file: {e}"))?);
         let password = zeroize::Zeroizing::new(pw.lines().next().unwrap_or("").trim().to_string());
         let file = gnb_crypto::core::kes::KesKeyFile::load(key)?;
         let signer = file.open(&password)?;

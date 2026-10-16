@@ -424,6 +424,24 @@ describes) and is
 cancelled at the RPC deadline (25 s inside the 30 s request timeout),
 answering `{"error":"cancelled"}`; it never blocks block acceptance.
 
+The per-address reads are bounded the same way (audit B1-T11): `getbalance`
+and the balance in `getaddresshistory` are one read of the holder aggregate,
+the history `total` is a per-address counter kept in the same batches as the
+address index (aggregate layout 2: a data directory written by an earlier
+release rebuilds its aggregates once at start-up, and `total` is `null`
+until then), and a `getaddresshistory [address, limit<=100, offset, cursor]`
+page walks the index newest-first from its end, or from `cursor` (the
+`next_cursor` of the previous page, 32 hex characters, `null` on the last
+page). `offset` is at most 10,000 (`max_offset`); a larger one is refused
+with an error that names the cursor (it is not clamped: a clamped offset
+returned the page at 10,000 again and again), and deeper pages use the
+cursor. `listtransactions` refuses an offset above 10,000 the same way; over
+a height range other than the whole history it counts at most 11,000 entries
+(`total_available` is `null` above that, and `total_at_least` gives the
+count it reached). The explorer's selected-chain cache follows the tip
+incrementally and takes the DAG lock for at most 4,096 blocks at a time, also
+when it catches up after a long gap (NET-15).
+
 The node serves plain HTTP. To reach a remote node, put a TLS reverse proxy in
 front of its RPC port or use an SSH tunnel
 (`ssh -L 17210:127.0.0.1:17210 host`). Both CLI wallets speak HTTPS (audit
@@ -437,6 +455,77 @@ to loopback addresses. Each call has one 30-second deadline covering name
 resolution, connect, the TLS handshake, the request and the response; every
 socket read and write gets only the time left, so a server that stalls or
 drips its answer cannot hold the wallet longer than that.
+
+### Remote RPC through a proxy or tunnel (audit B2-T11)
+
+A reverse proxy or a tunnel delivers every remote request from loopback, so
+the node cannot tell its operator from anyone the proxy serves by the
+connection alone. Any setup that exposes the RPC port this way MUST:
+
+1. set an API key (`--rpc-api-key-file <file>`) and require it for writes
+   (`--rpc-require-auth-for-writes`), so `sendrawtransaction`, `submitblock`,
+   `submitpowititem` and the administrative methods need the key (Bitcoin
+   Core never serves RPC without credentials);
+2. NOT use `--rpc-trust-loopback`. The node never extends that trust to a
+   request that carries a forwarding header, but a proxy that adds none (a
+   raw TCP forward, an SSH tunnel from another user) would make every remote
+   caller an administrator;
+3. have the proxy append the client's address to `X-Forwarded-For` (nginx
+   `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`, HAProxy
+   `option forwardfor`, Caddy and cloudflared by default), or, if it writes
+   another header, name that header with `--rpc-proxy-client-header`
+   (`x-real-ip`, `cf-connecting-ip`, `forwarded`, ...). The node reads the
+   client from that one header only: a proxy that sets only `X-Real-IP`
+   passes a client's own `X-Forwarded-For` through, so with the default the
+   client would name its own bucket.
+
+A request carrying any forwarding header (`X-Forwarded-For`, `X-Real-IP`,
+`True-Client-IP`, `CF-Connecting-IP`, `Forwarded`, ... : `FORWARDING_HEADERS`
+in `node/src/rpc/auth.rs`) is treated as a remote request even when it
+arrives from loopback, and it is never a trusted caller. When the proxy
+connects from loopback (or from a trusted private range with
+`--rpc-trust-private-ranges`), the request is rate-limited in the bucket of
+the client named by `--rpc-proxy-client-header` (for `X-Forwarded-For` and
+`Forwarded` the last entry, the one the nearest proxy wrote; a request
+without a parsable address there shares the proxy's own bucket). A request
+from any other address is limited in the bucket of that address, whatever
+its headers say, so a remote client cannot pick a fresh bucket per request.
+A caller that presents the API key is the operator and is not rate-limited
+(the pool polling `getblocktemplate` through the proxy must still get its
+`submitblock` through). Direct loopback callers without a forwarding header
+(the operator's `gnb-cli`, a co-located pool) keep the loopback exemption.
+The header is never trusted for authorization: it can only take trust away.
+
+`submitblock` runs the cheap checks first (structure without the proof of
+work, known parents, height, expected bits, timestamp) and evaluates the
+64 MiB proof of work last, as gossip ingress does, so an invalid submission
+costs no proof evaluation unless it is otherwise a valid next block.
+
+### Request bodies (audit B1-T4)
+
+RPC request bodies are capped at 1 MiB, except `submitblock`, whose body
+carries the block as hex (twice its wire size): it may be up to 4 MiB, room
+for a full 1,000,000-byte block. At most four bodies above 1 MiB are read at
+a time (the rest are answered HTTP 503, JSON-RPC -32005, "busy"), plus two
+more reserved for the operator's callers (a caller that presents the API key,
+or a direct loopback caller without forwarding headers): the method is only
+known once the body is read, so anonymous uploads that stall could otherwise
+hold every permit and lock the operator's miner out of full-block
+`submitblock`. A body that is not `submitblock` and exceeds 1 MiB is answered
+HTTP 413. Bitcoin Core accepts bodies up to 32 MiB.
+
+### Anonymous transaction submissions (audit B1-T10)
+
+`sendrawtransaction` from a caller that is not trusted (no API key, not a
+trusted direct caller) is charged to one node-wide budget by its size before
+its signatures are verified: 2,000,000 bytes, refilled at 50,000 bytes per
+second. An admitted transaction is refunded, so the budget only runs out
+under transactions the node refuses (a flood of forged signatures relayed
+by the explorer API, from any number of addresses). `submitpowititem` (a
+PoWit share, attestation or equivocation proof, whose KES signature is
+checked) is charged to the same budget the same way. While it is exhausted,
+anonymous submissions are answered "busy: ..."; callers presenting the API
+key are never charged.
 
 ## Chain selection and operator recovery
 
@@ -667,12 +756,25 @@ genesis record) and keeps answering exactly.
 Every front end writes keystore **v3**, which authenticates the network and
 the address in the AES-GCM associated data. Older **v2** files, from Bloch
 or from GnB before the fix, authenticate neither: editing `gnb1q…` to
-`gnb1t…` in a v2 file still loads the key for the other network. The CLIs
-therefore unlock a v2 keystore for spending (`gnb-cli send`) or signing
-(`gnb-wallet send` / `sign`) only when the network is stated with `--mainnet`
-or `--testnet`. The stored address must be a valid address of that network
-and match the decrypted key, and the file's `network` field must not name the
-other network. The file is then rewritten as v3 under the same password,
+`gnb1t…` (and the `network` field) in a v2 file used to load the key for the
+other network. Every path that opens a keystore therefore authenticates the
+network (re-audit CRY-7): a v3 file proves its own; a v2 file opens only for
+a network the caller states, on every path, not only for spending:
+`gnb-cli send`, `keyinfo`, `importfounder` and `pubkey` (`--mainnet` /
+`--testnet`), `gnb-cli policysign` and `vaultlock` (the network of the spend
+or vault file), `gnb-wallet send`, `sign`, `address` and `pubkey` (same
+flags), the web
+wallet's `open` (the page states mainnet; this takes effect with the
+rebuilt `site/wallet/gnb_wallet.wasm`: the file the site serves, pinned in
+`site/wallet/app.js`, was built before this fix, and the same holds for the
+wallet fixes B2-T2, CRY-4 and CRY-8, so the WASM must be rebuilt and
+re-pinned before release), and the library
+(`Keypair::from_encrypted_bytes_on` / `load_encrypted_on`;
+`from_encrypted_bytes` / `load_encrypted` open v3 files only). The stored
+address must be a valid address of that network and match the decrypted
+key, and the file's `network` field must not name the other network; an HD
+wallet refuses to import a key of the other network. When it is unlocked
+for spending or signing, a v2 file is then rewritten as v3 under the same password,
 but only once the command went ahead: after the send was checked and
 confirmed (`send`) or the message was signed (`sign`); an aborted command
 leaves the v2 file as it was. Before the rewrite the original v2 file is
@@ -689,3 +791,43 @@ calls are `Keypair::unlock_for_spending` (verify in memory, then
 once) and, for front ends without a filesystem,
 `Keypair::unlock_for_spending_bytes` (a front end that stores the v3 JSON
 must also keep, or offer for download, the original v2 bytes).
+
+### Address checksum and the network (CRY-7)
+
+A GnB address is `gnb1q` (mainnet) or `gnb1t` (testnet) followed by the hex
+of the 20-byte key hash and a 4-byte checksum, `SHA3-256(SHA3-256(hash))[..4]`.
+The checksum does not cover the prefix, so `gnb1q…` and `gnb1t…` forms of one
+hash both pass `Address::parse`. A new address version whose checksum commits
+to the network (bech32m-style) was evaluated and is **not** introduced:
+
+- it could only be emitted where every consumer parses it, and they do not:
+  every released GnB wallet and node, the Bloch wallets that share these keys,
+  the explorer and its API (`^gnb1[qt][0-9a-f]{48}$`), the Cloudflare Worker's
+  path filter and third-party integrations would all reject it, so a payment
+  to a new-format address from any of them fails;
+- parsing both forms while emitting only the old one adds nothing: the old
+  form would stay the one users copy;
+- the risk it would remove is already closed where it matters: every payment
+  path compares the destination's network with the wallet's own network,
+  which is authenticated (keystore v3, keyfile v1, or the network the caller
+  states for a v2 file): `TxBuilder::build_payment`, `Wallet` payments,
+  `gnb-cli send`, `gnb-wallet send` and the web wallet's `pay` refuse a
+  destination of the other network, and the node's `--miner-address` uses
+  `Address::parse_for_network`. The policy and bridge-vault commands do the
+  same against the network of the spend: `gnb-cli policyspend` (the network
+  stated with `--testnet` / `--mainnet`, mainnet by default),
+  `vaultrelease`, `vaultrecover` and `vaultcheckrelease` (the vault file's
+  network) refuse a destination of the other network, `vaultlock` opens the
+  paying keystore for the vault's network and `policysign` for the spend's.
+  A prefix typo therefore fails before anything
+  is signed, and a transaction signed for one chain is invalid on the other
+  (the chain id is in every sighash).
+
+Policy addresses (multisig / timelocks: `gnb1m` mainnet, `gnb1n` testnet,
+`address::PolicyAddress`) are newer and already commit to the network: their
+checksum is `SHA3-256(SHA3-256(prefix ‖ hash))[..4]`, so the other network's
+prefix on the same hash fails to parse.
+
+Read-only RPC methods (`getbalance`, `getutxos`, `validateaddress`) accept
+either prefix for the same hash; `validateaddress` reports the prefix's
+network.

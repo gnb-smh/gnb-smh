@@ -31,9 +31,40 @@ use tower_http::timeout::TimeoutLayer;
 use tower::limit::GlobalConcurrencyLimitLayer;
 
 /// P0 RPC hardening (roadmap §1.6 / §4.3).
-/// Max request body: JSON-RPC calls are tiny; 1 MiB is generous and tighter
-/// than axum's 2 MiB default. Blocks oversized-payload memory abuse.
+/// Max request body of every method but `submitblock`: JSON-RPC calls are
+/// tiny; 1 MiB is generous and tighter than axum's 2 MiB default. Blocks
+/// oversized-payload memory abuse.
 const RPC_MAX_BODY_BYTES: usize = 1024 * 1024;
+/// B1-T4: largest body of a `submitblock` request. The block travels as the
+/// hex of its wire bytes, about twice their size, and a block built from a
+/// full template is up to `MAX_BLOCK_SIZE` (1,000,000 bytes): 4 MiB is that
+/// twice over plus the JSON envelope, with margin (the same 4 MiB as a gossip
+/// or sync frame). Every other method keeps `RPC_MAX_BODY_BYTES`.
+const RPC_MAX_SUBMITBLOCK_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// B1-T4: bodies above `RPC_MAX_BODY_BYTES` buffered at once (each holds a
+/// permit from `AppState::large_bodies` until its request is answered), so a
+/// flood of large bodies cannot pin `RPC_MAX_CONCURRENCY` × 4 MiB.
+const RPC_LARGE_BODY_PERMITS: usize = 4;
+/// B1-T4 (review): further large-body permits only the operator's callers
+/// may take (a caller that presents the API key, or a direct loopback /
+/// trusted-range caller that did not come through a proxy). The shared
+/// permits are taken before the request is authorized (the method is in the
+/// body), so four anonymous slow uploads could hold all of them for the 30 s
+/// request timeout, again and again, and the operator's miner got 503 for
+/// every full-block `submitblock`.
+const RPC_LARGE_BODY_RESERVED_PERMITS: usize = 2;
+/// B1-T11 (review): most index entries `listtransactions` counts for a
+/// height range other than the whole history (the deepest page it serves,
+/// `MAX_HISTORY_OFFSET` + its 1,000-entry limit, is countable exactly).
+const LISTTX_COUNT_CAP: u64 = if cfg!(test) { 500 } else { crate::storage::indexer::MAX_HISTORY_OFFSET as u64 + 1_000 };
+/// B1-T10: burst of the node-wide budget for transactions submitted by
+/// untrusted callers (`sendrawtransaction`, wire bytes): five
+/// maximum-size (400 KiB) transactions.
+const ANON_TX_VERIFY_BURST_BYTES: u64 = 2_000_000;
+/// B1-T10: refill of that budget, bytes per second (3 MB a minute, about 350
+/// hybrid inputs a second). Admitted transactions are refunded, so it only
+/// ever runs out under transactions the node refuses.
+const ANON_TX_VERIFY_BYTES_PER_SEC: u64 = 50_000;
 /// Global cap on concurrently in-flight RPC handlers, shared across all
 /// connections (GlobalConcurrencyLimitLayer holds one Arc'd semaphore). Bounds
 /// how many expensive storage-scanning methods can pile up at once. Value is a
@@ -93,8 +124,9 @@ pub struct NodeState {
 /// messages (see main.rs B5f), so external pools mine full SIS blocks and
 /// hand them in over RPC instead. main.rs wires this with a closure that
 /// mirrors the gossipsub NewBlock path: `Block::block_hash()` identity,
-/// `validate_structure()` (PoW witness + merkle + coinbase), then the same
-/// `accept_block` consensus pipeline, then network broadcast.
+/// `validate_structure_without_pow()` (merkle, coinbase, size...), then the
+/// same `accept_block` consensus pipeline — known parents, height, bits and
+/// timestamp before the proof of work (B2-T11) — then network broadcast.
 ///
 /// `None` (tests, or callers that don't wire it) makes `submitblock` return
 /// a "not wired" error instead of silently accepting.
@@ -149,6 +181,12 @@ pub struct RpcConfig {
     /// the operator's machine connects from 127.0.0.1 — the blanket bypass
     /// made every local web page an authenticated operator).
     pub trust_loopback:            bool,
+    /// B2-T11 (review): the one forwarding header the reverse proxy in front
+    /// of this RPC writes, read for the client address of proxied requests
+    /// (`--rpc-proxy-client-header`, lower case; default `x-forwarded-for`,
+    /// its last hop). Any other forwarding header only marks the request as
+    /// proxied.
+    pub proxy_client_header:       String,
 }
 
 impl Default for RpcConfig {
@@ -164,6 +202,7 @@ impl Default for RpcConfig {
             allowed_origins:           Vec::new(),
             allowed_hosts:             Vec::new(),
             trust_loopback:            false,
+            proxy_client_header:       auth::DEFAULT_PROXY_CLIENT_HEADER.into(),
         }
     }
 }
@@ -206,6 +245,22 @@ struct AppState {
     cancel:                  Arc<std::sync::atomic::AtomicBool>,
     // Audit DAG-6: invalidateblock / reconsiderblock hook.
     chain_admin:             Option<Arc<ChainAdminFn>>,
+    /// B1-T4: permits for request bodies above `RPC_MAX_BODY_BYTES` (only
+    /// `submitblock` may be that large), `RPC_LARGE_BODY_PERMITS` of them.
+    large_bodies:            Arc<tokio::sync::Semaphore>,
+    /// B1-T4 (review): `RPC_LARGE_BODY_RESERVED_PERMITS` more, for the
+    /// operator's callers only (`read_rpc_body`).
+    large_bodies_reserved:   Arc<tokio::sync::Semaphore>,
+    /// B2-T11 (review): `RpcConfig::proxy_client_header`.
+    proxy_client_header:     Arc<str>,
+    /// B1-T10: node-wide verification budget (wire bytes) of transactions
+    /// and PoWit items submitted by untrusted callers (`sendrawtransaction`,
+    /// `submitpowititem`).
+    tx_verify_budget:        Arc<auth::ByteBudget>,
+    /// B1-T10: THIS request's caller presented the API key or is a fully
+    /// trusted direct caller (set per request, like `cancel`); such callers
+    /// are not charged to `tx_verify_budget`.
+    caller_trusted:          bool,
 }
 
 // ─── R3-audit H-R3-5 / L-8: bound the expensive analytics + template RPCs ───
@@ -454,6 +509,29 @@ fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
     }
 }
 
+/// The RPC service: one route, the CORS layer, the body limit, the global
+/// concurrency limit and the per-request timeout, around [`handle_rpc`].
+///
+/// P0 RPC hardening (roadmap §1.6 / §4.3): body-size cap, global concurrency
+/// limit, and a per-request timeout on top of the existing per-IP
+/// auth/rate-limit. R3-audit H-R3-5: the CORS layer is restrictive (see
+/// build_cors_layer); Host/Origin are additionally checked per request in
+/// handle_rpc.
+///
+/// B1-T4: `handle_rpc` reads its body itself (`read_rpc_body`), because the
+/// limit depends on the method: `RPC_MAX_SUBMITBLOCK_BODY_BYTES` for
+/// `submitblock`, `RPC_MAX_BODY_BYTES` for everything else. The
+/// `DefaultBodyLimit` below is the outer bound for any body extractor.
+fn build_router(app_state: AppState, allowed_origins: &[String]) -> Router {
+    Router::new()
+        .route("/", post(handle_rpc))
+        .layer(build_cors_layer(allowed_origins))
+        .layer(DefaultBodyLimit::max(RPC_MAX_SUBMITBLOCK_BODY_BYTES))
+        .layer(GlobalConcurrencyLimitLayer::new(RPC_MAX_CONCURRENCY))
+        .layer(TimeoutLayer::new(std::time::Duration::from_secs(RPC_REQUEST_TIMEOUT_SECS)))
+        .with_state(app_state)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn start_rpc_server(
     config:      RpcConfig,
@@ -537,20 +615,20 @@ pub async fn start_rpc_server(
         submit_block,
         cancel:                  Arc::new(std::sync::atomic::AtomicBool::new(false)),
         chain_admin,
+        large_bodies:            Arc::new(tokio::sync::Semaphore::new(RPC_LARGE_BODY_PERMITS)),
+        large_bodies_reserved:   Arc::new(tokio::sync::Semaphore::new(RPC_LARGE_BODY_RESERVED_PERMITS)),
+        proxy_client_header:     match auth::validate_proxy_client_header(&config.proxy_client_header) {
+            Ok(h) => h.into(),
+            Err(e) => {
+                log::error!("{e}; using {}", auth::DEFAULT_PROXY_CLIENT_HEADER);
+                auth::DEFAULT_PROXY_CLIENT_HEADER.into()
+            }
+        },
+        tx_verify_budget:        Arc::new(auth::ByteBudget::new(ANON_TX_VERIFY_BURST_BYTES, ANON_TX_VERIFY_BYTES_PER_SEC)),
+        caller_trusted:          false,
     };
 
-    // P0 RPC hardening (roadmap §1.6 / §4.3): body-size cap, global
-    // concurrency limit, and a per-request timeout on top of the existing
-    // per-IP auth/rate-limit.
-    // R3-audit H-R3-5: the CORS layer is restrictive (see build_cors_layer);
-    // Host/Origin are additionally checked per request in handle_rpc.
-    let app = Router::new()
-        .route("/", post(handle_rpc))
-        .layer(build_cors_layer(&config.allowed_origins))
-        .layer(DefaultBodyLimit::max(RPC_MAX_BODY_BYTES))
-        .layer(GlobalConcurrencyLimitLayer::new(RPC_MAX_CONCURRENCY))
-        .layer(TimeoutLayer::new(std::time::Duration::from_secs(RPC_REQUEST_TIMEOUT_SECS)))
-        .with_state(app_state);
+    let app = build_router(app_state, &config.allowed_origins);
 
     info!("RPC on {} (auth={}, require_auth_writes={}, trust_private={}, trust_loopback={}, origins={:?}, hosts={:?}, limits: {}r/min, {}w/min)",
         addr,
@@ -835,12 +913,104 @@ fn gated_dispatch<F: FnOnce() -> Value>(method: &str, params: Option<&Value>, st
     }
 }
 
+/// A transport-level JSON-RPC error response.
+fn rpc_transport_error(status: StatusCode, code: i64, message: &str) -> (StatusCode, Json<Value>) {
+    (status, Json(json!({ "jsonrpc": "2.0", "id": Value::Null, "error": { "code": code, "message": message } })))
+}
+
+/// Read and parse a request body under the B1-T4 limits. A body grows past
+/// `RPC_MAX_BODY_BYTES` only under one of the `RPC_LARGE_BODY_PERMITS`
+/// permits (taken up front when the declared length is larger, else when the
+/// stream crosses the cap), and never past `RPC_MAX_SUBMITBLOCK_BODY_BYTES`;
+/// once parsed, only `submitblock` may keep a body above
+/// `RPC_MAX_BODY_BYTES`. Returns the request and the permit (held until the
+/// request is answered). `operator` (the caller presented the API key, or is
+/// a direct loopback / trusted-range caller, known from the headers alone)
+/// may also take one of the `RPC_LARGE_BODY_RESERVED_PERMITS` when the
+/// shared ones are all held, so anonymous slow uploads cannot lock the
+/// operator's miner out of full-block `submitblock` (B1-T4 review).
+async fn read_rpc_body(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    body: axum::body::Body,
+    operator: bool,
+) -> Result<(Value, Option<tokio::sync::OwnedSemaphorePermit>), (StatusCode, Json<Value>)> {
+    // Same media-type rule as axum's `Json` extractor, which this replaces.
+    let json_type = headers.get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(|m| {
+            let m = m.trim().to_ascii_lowercase();
+            m == "application/json" || (m.starts_with("application/") && m.ends_with("+json"))
+        })
+        .unwrap_or(false);
+    if !json_type {
+        return Err(rpc_transport_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, -32600,
+            "Invalid Request: expected `Content-Type: application/json`"));
+    }
+    let declared = headers.get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let too_large = || rpc_transport_error(StatusCode::PAYLOAD_TOO_LARGE, -32600,
+        "Invalid Request: body too large (submitblock: 4 MiB, other methods: 1 MiB)");
+    if declared.is_some_and(|n| n > RPC_MAX_SUBMITBLOCK_BODY_BYTES as u64) {
+        return Err(too_large());
+    }
+    let take_permit = || state.large_bodies.clone().try_acquire_owned()
+        .or_else(|e| if operator { state.large_bodies_reserved.clone().try_acquire_owned() } else { Err(e) })
+        .map_err(|_| rpc_transport_error(
+            StatusCode::SERVICE_UNAVAILABLE, -32005, "busy: too many large requests in flight; retry shortly"));
+    let mut permit = match declared {
+        Some(n) if n > RPC_MAX_BODY_BYTES as u64 => Some(take_permit()?),
+        _ => None,
+    };
+    let mut bytes: Vec<u8> = Vec::with_capacity(declared.unwrap_or(0).min(RPC_MAX_BODY_BYTES as u64) as usize);
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        let chunk = chunk.map_err(|_| rpc_transport_error(StatusCode::BAD_REQUEST, -32600,
+            "Invalid Request: the body could not be read"))?;
+        let len = bytes.len().saturating_add(chunk.len());
+        if len > RPC_MAX_SUBMITBLOCK_BODY_BYTES {
+            return Err(too_large());
+        }
+        if len > RPC_MAX_BODY_BYTES && permit.is_none() {
+            permit = Some(take_permit()?);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let req: Value = serde_json::from_slice(&bytes).map_err(|_| rpc_transport_error(
+        StatusCode::BAD_REQUEST, -32700, "Parse error: the body is not valid JSON"))?;
+    if bytes.len() > RPC_MAX_BODY_BYTES && req.get("method").and_then(Value::as_str) != Some("submitblock") {
+        return Err(too_large());
+    }
+    Ok((req, permit))
+}
+
 async fn handle_rpc(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
-    Json(req):    Json<Value>,
+    body: axum::body::Body,
 ) -> (StatusCode, Json<Value>) {
+    let client_ip = addr.ip();
+    let presented_key = auth::extract_api_key(&headers);
+    // B2-T11: a request that came through a reverse proxy (forwarding
+    // headers) is a remote request whatever its TCP peer: rate-limited per
+    // the client the proxy names (when the peer is a proxy) and never fully
+    // trusted.
+    let forwarded = auth::forwarded_client(&headers, &state.proxy_client_header);
+    // B1-T4: the body limit depends on the method (`read_rpc_body`); the
+    // operator's callers (known from the headers) have reserved permits.
+    let operator = matches!((presented_key, state.api_key.as_deref()), (Some(p), Some(c)) if auth::keys_match(p, c))
+        || (forwarded.is_none() && auth::is_trusted_local_ip(client_ip, state.trust_private_ranges));
+    let (req, _large_body_permit) = match read_rpc_body(&state, &headers, body, operator).await {
+        Ok(r) => r,
+        Err(refusal) => {
+            crate::metrics::inc_rpc_request("unknown", "invalid_request");
+            log::info!("rpc denied ip={} reason=body status={}", addr.ip(), refusal.0);
+            return refusal;
+        }
+    };
     // L-11 (audit): a top-level JSON ARRAY (a JSON-RPC 2.0 batch request,
     // which this server does not implement) used to fall through silently:
     // `req["method"]` on a `Value::Array` indexes to `Null` (the `&str`
@@ -866,9 +1036,6 @@ async fn handle_rpc(
     // `cap_echoed_id` enforces exactly that shape and bounds the string case.
     let id     = cap_echoed_id(req.get("id").cloned().unwrap_or(json!(null)));
     let params = req.get("params");
-
-    let client_ip = addr.ip();
-    let presented_key = auth::extract_api_key(&headers);
 
     // R3-audit H-R3-5: Host + Origin gate BEFORE auth/rate-limit. Refuses
     // DNS-rebinding (hostile hostname in Host) and browser-borne CSRF (an
@@ -897,8 +1064,9 @@ async fn handle_rpc(
         );
     }
 
-    let decision = auth::authorize_with_read_policy(
+    let decision = auth::authorize_request(
         client_ip,
+        forwarded,
         method,
         presented_key,
         state.api_key.as_deref(),
@@ -943,6 +1111,14 @@ async fn handle_rpc(
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut d_state = state.clone();
             d_state.cancel = cancel.clone();
+            d_state.caller_trusted = auth::caller_is_trusted(
+                client_ip,
+                forwarded,
+                presented_key,
+                state.api_key.as_deref(),
+                state.trust_private_ranges,
+                state.trust_loopback,
+            );
             let d_method = method.to_string();
             let d_params = params.cloned();
             let d_handle = tokio::runtime::Handle::current();
@@ -1311,9 +1487,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         // ── Wallet: balance query ────────────────────────────────────
         "getbalance" => {
             let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
-            let addr_bytes = parse_address(addr);
+            // B1-T11: one read of the holder aggregate (was a walk of every
+            // UTXO of the address, ~426,000 for the carryover address).
+            let addr_bytes = parse_address(addr).and_then(|b| <[u8; 20]>::try_from(b).ok());
             match addr_bytes {
-                Some(ab) => match state.store.get_balance(&ab) {
+                Some(ab) => match state.store.address_balance(&ab, &state.cancel) {
                     // R3 (docs/specs/BLOCH-RPC-V4.md): satoshi amounts are
                     // decimal STRINGS on the wire — V4's supply exceeds both
                     // i64::MAX and JS Number.MAX_SAFE_INTEGER. Display-only
@@ -1422,6 +1600,22 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     Err(_)  => json!({ "error": "deserialise failed" }),
                     Ok(tx)  => {
                         if tx.is_coinbase() { return json!({ "error": "coinbase not accepted" }); }
+                        // B1-T10: an untrusted caller's transaction is charged
+                        // to the node-wide verification budget by its wire
+                        // size BEFORE any signature is checked, and refunded
+                        // once admitted, so only refused transactions use it
+                        // up. The per-IP limiter cannot do this: behind the
+                        // explorer API every caller arrives from loopback, and
+                        // a forged-signature flood from many addresses would
+                        // otherwise cost the node unbounded verification work
+                        // (Bitcoin Core bounds the same work per peer through
+                        // its misbehaviour handling; MEM-5 does it for gossip).
+                        let charged = if state.caller_trusted { 0 } else { raw.len() };
+                        if charged > 0 && !state.tx_verify_budget.take(charged) {
+                            return json!({ "error": "busy: the node's transaction-verification budget for \
+                                unauthenticated callers is exhausted (it refills within a minute); retry \
+                                shortly, or authenticate with the API key" });
+                        }
                         // MEM-1/4/5: the SAME admission function as gossip and
                         // reorg re-injection. Version and maturity are evaluated
                         // at the next block's height (the node's next template
@@ -1447,6 +1641,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             Err(e)      => json!({ "error": format!("verify task failed: {}", e) }),
                             Ok(Err(e))  => json!({ "error": e.to_string() }),
                             Ok(Ok(_))   => {
+                                state.tx_verify_budget.refund(charged);
                                 let _ = state.outbound_tx.try_send(NetworkMessage::NewTransaction {
                                     txid, tx_data: raw,
                                 });
@@ -1749,12 +1944,24 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 return json!({ "error": "bad kind or item too large" });
             }
             let kind = kind as u8;
+            // B1-T10: the same node-wide budget as `sendrawtransaction`. An
+            // untrusted caller's item is charged by its size before its KES
+            // signature is checked (under the DAG read lock), and refunded
+            // once admitted: items the node refuses cannot buy unbounded
+            // verification work from many addresses behind a proxy.
+            let charged = if state.caller_trusted { 0 } else { data.len() };
+            if charged > 0 && !state.tx_verify_budget.take(charged) {
+                return json!({ "accepted": false, "error": "busy: the node's verification budget for \
+                    unauthenticated callers is exhausted (it refills within a minute); retry shortly, \
+                    or authenticate with the API key" });
+            }
             let res = {
                 let dag = state.dag.read();
                 crate::powit::admit_item(kind, &data, &dag, &state.store)
             };
             match res {
                 Ok(()) => {
+                    state.tx_verify_budget.refund(charged);
                     let id = crate::powit::item_id(kind, &data);
                     let _ = state.outbound_tx.try_send(NetworkMessage::NewPowitItem { id, kind, data });
                     json!({ "accepted": true, "id": hex::encode(id) })
@@ -1812,7 +2019,13 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let start_height = params.and_then(|p| p.get(2)).and_then(|v| v.as_u64()).unwrap_or(0);
             let end_height = params.and_then(|p| p.get(3)).and_then(|v| v.as_u64())
                 .unwrap_or_else(|| state.node_state.read().block_count);
-            let offset = params.and_then(|p| p.get(4)).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            // B1-T11: the skipped prefix is bounded like getaddresshistory's
+            // (a larger offset is refused, never clamped to another page).
+            let offset = params.and_then(|p| p.get(4)).and_then(|v| v.as_u64()).unwrap_or(0);
+            if offset > crate::storage::indexer::MAX_HISTORY_OFFSET as u64 {
+                return explorer::offset_too_large();
+            }
+            let offset = offset as usize;
 
             let addr_bytes = parse_address(addr);
             match addr_bytes {
@@ -1826,7 +2039,30 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     match state.store.query_address_history(&addr_hash, start_height, end_height, limit, offset) {
                         Ok(entries) => {
                             let tip = selected_tip_height(&state);
-                            let total = state.store.count_address_history(&addr_hash, start_height, end_height).unwrap_or(0);
+                            // B1-T11: the whole history is counted by the
+                            // per-address counter (one read); a narrower range
+                            // by a cancellable walk that stops at
+                            // LISTTX_COUNT_CAP entries (review: it walked the
+                            // whole range, ~426,000 rows for the carryover
+                            // address, on every anonymous call). Above the cap
+                            // `total_available` is null and `total_at_least`
+                            // says how many there are at least.
+                            let counter = if start_height == 0 && end_height >= tip {
+                                state.store.address_history_count(&addr_hash).ok().flatten()
+                            } else {
+                                None
+                            };
+                            let total = match counter {
+                                Some(n) => Some(n),
+                                None => match state.store.count_address_history_capped(
+                                    &addr_hash, start_height, end_height, LISTTX_COUNT_CAP, &state.cancel)
+                                {
+                                    Ok(n) if n >= LISTTX_COUNT_CAP => None,
+                                    Ok(n) => Some(n),
+                                    Err(_) if state.cancel.load(std::sync::atomic::Ordering::Relaxed) => return json!({ "error": "cancelled" }),
+                                    Err(e) => return storage_err_response(&e),
+                                },
+                            };
                             let txs: Vec<serde_json::Value> = entries.iter().map(|e| {
                                 let timestamp = state.store.get_block_timestamp_at_height(e.height).unwrap_or(None).unwrap_or(0);
                                 json!({
@@ -1844,6 +2080,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                                 "address":         addr,
                                 "count":           txs.len(),
                                 "total_available": total,
+                                "total_at_least":  total.unwrap_or(LISTTX_COUNT_CAP),
                                 "start_height":    start_height,
                                 "end_height":      end_height,
                                 "limit":           limit,
@@ -2060,8 +2297,27 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             }
         }
 
+        // B1-T21 / MEM-6: `[n_inputs=1, n_outputs=2]`. Every field is the
+        // ABSOLUTE fee of a transaction of that shape (`tx_bytes`), from fee
+        // rates, never below `min_tx_fee_sat(tx_bytes)` or the rolling
+        // minimum (`analytics::estimate_fee_advanced`).
         "estimatefeeadvanced" => {
-            let fee = crate::analytics::estimate_fee_advanced(&state.mempool);
+            let count = |i: usize, default: u64| -> Result<usize, Value> {
+                match params.and_then(|p| p.get(i)) {
+                    None | Some(Value::Null) => Ok(default as usize),
+                    Some(v) => match v.as_u64() {
+                        Some(n) if n <= crate::analytics::FEE_ESTIMATE_MAX_IO => Ok(n as usize),
+                        _ => Err(json!({ "error": format!(
+                            "params: [n_inputs, n_outputs], integers in [0, {}]",
+                            crate::analytics::FEE_ESTIMATE_MAX_IO) })),
+                    },
+                }
+            };
+            let (n_in, n_out) = match (count(0, 1), count(1, 2)) {
+                (Ok(i), Ok(o)) => (i, o),
+                (Err(e), _) | (_, Err(e)) => return e,
+            };
+            let fee = crate::analytics::estimate_fee_advanced(&state.mempool, Transaction::estimate_size(n_in, n_out));
             json!({
                 // R3: satoshi amounts → decimal strings.
                 "next_block_sats":  fee.next_block_sats.to_string(),
@@ -2070,6 +2326,17 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 "mempool_median":   fee.mempool_median.to_string(),
                 "mempool_size":     fee.mempool_size,
                 "recommended_gnb": format!("{:.8}", fee.medium_priority as f64 / 1e8),
+                "tx_bytes":         fee.tx_bytes,
+                "inputs":           n_in,
+                "outputs":          n_out,
+                "min_fee_sat":      crate::core::tokenomics::min_tx_fee_sat(fee.tx_bytes).to_string(),
+                "feerate_sat_per_kb": {
+                    "floor":      fee.floor_rate_per_kb.to_string(),
+                    "medium":     fee.medium_rate_per_kb.to_string(),
+                    "next_block": fee.next_block_rate_per_kb.to_string(),
+                },
+                "note": "absolute fees for a transaction of tx_bytes wire bytes (params [n_inputs, n_outputs], default [1, 2]); \
+                         none below the consensus minimum for that size or the mempool's rolling minimum",
             })
         }
 
@@ -2203,7 +2470,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     // NET-12: streamed and cancellable (heavy method).
                     match state.store.balance_at_height_cancellable(&addr_hash, height, &state.cancel) {
                         Ok((balance, _)) => {
-                            let tx_count = state.store.count_address_history(&addr_hash, 0, height).unwrap_or(0);
+                            let tx_count = match state.store.count_address_history_cancellable(&addr_hash, 0, height, &state.cancel) {
+                                Ok(n) => n,
+                                Err(_) => return json!({ "error": "cancelled" }),
+                            };
                             json!({
                                 "address":               addr,
                                 "height":                height,
@@ -2812,6 +3082,11 @@ mod audit_2026_10_rpc_tests {
             submit_block: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             chain_admin: None,
+            large_bodies: Arc::new(tokio::sync::Semaphore::new(RPC_LARGE_BODY_PERMITS)),
+            large_bodies_reserved: Arc::new(tokio::sync::Semaphore::new(RPC_LARGE_BODY_RESERVED_PERMITS)),
+            proxy_client_header: auth::DEFAULT_PROXY_CLIENT_HEADER.into(),
+            tx_verify_budget: Arc::new(auth::ByteBudget::new(ANON_TX_VERIFY_BURST_BYTES, ANON_TX_VERIFY_BYTES_PER_SEC)),
+            caller_trusted: false,
         };
         (tmp, state)
     }
@@ -3180,6 +3455,114 @@ mod audit_2026_10_rpc_tests {
         assert_eq!(gate.run("k".into(), || json!(7)), json!(7), "the failure was not cached");
     }
 
+    /// B1-T11 + NET-12 challenge: `getaddresshistory` and `getbalance` on an
+    /// address with a long history and many UTXOs (the carryover address
+    /// holds about 426,000) read a bounded number of entries: the balance and
+    /// UTXO count come from the holder aggregate, the total from the
+    /// per-address history counter, and a page walks the index newest-first
+    /// from its end (or from the opaque cursor the previous page returned)
+    /// instead of counting every entry and skipping from the oldest one;
+    /// the offset is capped and the walk is cancellable. Pre-fix, page 0
+    /// alone cost about 2 × history + 2 × UTXOs reads.
+    #[tokio::test]
+    async fn b1_t11_address_endpoints_read_bounded_entries() {
+        const N: u32 = 3_000;
+        let (_tmp, state) = state_with_chain(5);
+        let addr = [0x5Au8; 20];
+        let testnet = crate::core::node_chain_id() == crate::core::ChainId::Testnet;
+        let addr_s = crate::crypto::address_from_hash(&addr, testnet);
+        // History: N rows over 30 heights (one 100-output transaction each).
+        for h in 0..N / 100 {
+            let tx = Transaction {
+                version: 1,
+                inputs: vec![TxInput { prev_txid: [0; 32], prev_index: u32::MAX, script_sig: format!("h{h}").into_bytes(), sequence: u32::MAX }],
+                outputs: (0..100u64).map(|i| TxOutput { value: 1_000 + i, script_pubkey: addr.to_vec() }).collect(),
+                locktime: 0,
+            };
+            state.store.index_tx_addresses(&tx, 10 + h as u64, 0).unwrap();
+        }
+        for i in 0..N {
+            state.store.put_utxo(&[(i % 251) as u8; 32], i, &TxOutput { value: 7, script_pubkey: addr.to_vec() }).unwrap();
+        }
+        for (params, bound) in [(json!([addr_s, 25, 0]), 40u64), (json!([addr_s, 25, 1_000]), 1_040)] {
+            let r0 = state.store.storage_reads();
+            let r = dispatch("getaddresshistory", Some(&params), &state).await;
+            let reads = state.store.storage_reads() - r0;
+            assert!(r.get("error").is_none(), "{r}");
+            assert_eq!(r["total"], N, "{params}");
+            assert_eq!(r["items"].as_array().unwrap().len(), 25);
+            assert_eq!((r["balance"].as_str(), r["utxo_count"].as_u64()), (Some(&*(7 * N as u64).to_string()), Some(N as u64)));
+            assert!(reads <= bound, "getaddresshistory {params}: {reads} reads > {bound}");
+        }
+        let r0 = state.store.storage_reads();
+        let r = dispatch("getbalance", Some(&json!([addr_s])), &state).await;
+        let reads = state.store.storage_reads() - r0;
+        assert_eq!((r["satoshis"].as_str(), r["utxo_count"].as_u64()), (Some(&*(7 * N as u64).to_string()), Some(N as u64)), "{r}");
+        assert!(reads <= 2, "getbalance: {reads} reads");
+
+        // Cursor paging visits every row exactly once, newest first, each
+        // page at a bounded cost.
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut last_height = u64::MAX;
+        loop {
+            let mut params = json!([addr_s, 100, 0]);
+            if let Some(c) = &cursor {
+                params.as_array_mut().unwrap().push(json!(c));
+            }
+            let r0 = state.store.storage_reads();
+            let r = dispatch("getaddresshistory", Some(&params), &state).await;
+            let reads = state.store.storage_reads() - r0;
+            assert!(reads <= 110, "page {params}: {reads} reads");
+            let items = r["items"].as_array().unwrap_or_else(|| panic!("{r}"));
+            for it in items {
+                let h = it["height"].as_u64().unwrap();
+                assert!(h <= last_height, "newest first");
+                last_height = h;
+                assert!(seen.insert((it["txid"].as_str().unwrap().to_string(), it["amount"].as_str().unwrap().to_string())), "row seen twice");
+            }
+            match r["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+            assert!(seen.len() <= N as usize);
+        }
+        assert_eq!(seen.len(), N as usize, "every row exactly once");
+        assert_eq!(last_height, 10, "ends at the oldest row");
+
+        // Offsets are capped (the explorer API accepts exactly this range).
+        // Review: a larger offset is refused with an error that names the
+        // cursor; it was clamped, so offset paging (offset += limit until
+        // `items` is empty) got the page at 10,000 forever.
+        let max = crate::storage::indexer::MAX_HISTORY_OFFSET as u64;
+        let r = dispatch("getaddresshistory", Some(&json!([addr_s, 25, max])), &state).await;
+        assert_eq!((r["offset"].as_u64(), r["items"].as_array().map(|a| a.len())), (Some(max), Some(0)), "{r}");
+        for method in ["getaddresshistory", "listtransactions"] {
+            let params = if method == "listtransactions" { json!([addr_s, 25, 0, 100, max + 1]) } else { json!([addr_s, 25, max + 1]) };
+            let r = dispatch(method, Some(&params), &state).await;
+            assert!(r["error"].as_str().is_some_and(|e| e.contains("cursor")), "{method}: {r}");
+            assert!(r.get("items").is_none() && r.get("transactions").is_none(), "{method}: no other page: {r}");
+        }
+        // Review: listtransactions over a height range other than the whole
+        // history counted every entry in it (no counter), on every call. The
+        // count now stops at LISTTX_COUNT_CAP.
+        let r0 = state.store.storage_reads();
+        let r = dispatch("listtransactions", Some(&json!([addr_s, 1, 10, 39])), &state).await;
+        let reads = state.store.storage_reads() - r0;
+        assert_eq!(r["count"], 1, "{r}");
+        assert!(r["total_available"].is_null() && r["total_at_least"] == LISTTX_COUNT_CAP, "{r}");
+        assert!(reads <= LISTTX_COUNT_CAP + 10, "ranged listtransactions: {reads} reads for {N} rows");
+        let r = dispatch("listtransactions", Some(&json!([addr_s, 1, 10, 11])), &state).await;
+        assert_eq!((r["total_available"].as_u64(), r["total_at_least"].as_u64()), (Some(200), Some(200)), "{r}");
+        let r = dispatch("getaddresshistory", Some(&json!([addr_s, 25, 0, "zz"])), &state).await;
+        assert_eq!(r["error"], "invalid cursor");
+        // A cancelled request stops walking.
+        let mut cancelled = state.clone();
+        cancelled.cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let r = dispatch("getaddresshistory", Some(&json!([addr_s, 25, 2_000])), &cancelled).await;
+        assert_eq!(r["error"], "cancelled", "{r}");
+    }
+
     /// Review finding (chain_tail): a cancelled request is an ERROR for the
     /// two selected-chain walks, also when the flag was set while the
     /// request waited for the DAG lock, and HeavyGate never caches it — the
@@ -3276,6 +3659,333 @@ mod audit_2026_10_rpc_tests {
         assert_eq!(run([1; 32], 4)["n"], 1, "back on the first tip (a reorg): its own answer");
     }
 
+    // ── The real router (body limits, auth layer) through tower::oneshot ──
+
+    /// One POST through the real router, from `peer`, with extra headers.
+    /// Returns the status and the body (JSON when it parses, else a string).
+    async fn post_raw(state: &AppState, peer: &str, headers: &[(&str, &str)], body: Vec<u8>) -> (StatusCode, Value) {
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let peer: std::net::SocketAddr = peer.parse().unwrap();
+        let router = build_router(state.clone(), &[])
+            .layer(axum::extract::connect_info::MockConnectInfo(peer));
+        let mut req = Request::builder().method("POST").uri("/")
+            .header("host", "127.0.0.1:17210")
+            .header("content-type", "application/json");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = router.oneshot(req.body(axum::body::Body::from(body)).unwrap()).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into()));
+        (status, body)
+    }
+
+    fn rpc_body(method: &str, params: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})).unwrap()
+    }
+
+    /// B1-T4: `submitblock` carries a block as hex, about twice its wire
+    /// size, so a block built from a full template (about 1 MB) needs a body
+    /// of about 2 MB. Every body was capped at 1 MiB, so the block and its
+    /// proof of work were refused with HTTP 413 before dispatch. Bitcoin Core
+    /// accepts RPC bodies up to 32 MiB.
+    #[tokio::test]
+    async fn submitblock_body_carries_a_full_block() {
+        let (_tmp, state) = state_with_chain(1);
+        // 1,000,000 bytes of "block" (MAX_BLOCK_SIZE) as hex: a ~2 MB body.
+        let body = rpc_body("submitblock", json!(["00".repeat(crate::core::MAX_BLOCK_SIZE)]));
+        assert!(body.len() > 2 * 1024 * 1024 - 100_000 && body.len() > RPC_MAX_BODY_BYTES);
+        let (status, resp) = post_raw(&state, "127.0.0.1:5000", &[], body).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        // It reached dispatch: the bytes are not a block.
+        assert!(resp["result"]["error"].as_str().unwrap_or("").contains("deserialise failed"), "{resp}");
+    }
+
+    /// B1-T4: only `submitblock` gets the larger body; every other method
+    /// keeps the 1 MiB cap, and nothing exceeds the submitblock cap.
+    #[tokio::test]
+    async fn other_methods_keep_the_small_body_cap() {
+        let (_tmp, state) = state_with_chain(1);
+        let padded = rpc_body("getblockcount", json!(["a".repeat(RPC_MAX_BODY_BYTES + 10)]));
+        let (status, _) = post_raw(&state, "127.0.0.1:5000", &[], padded).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let huge = rpc_body("submitblock", json!(["00".repeat(RPC_MAX_SUBMITBLOCK_BODY_BYTES / 2 + 10)]));
+        let (status, _) = post_raw(&state, "127.0.0.1:5000", &[], huge).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let (status, resp) = post_raw(&state, "127.0.0.1:5000", &[], rpc_body("getblockcount", json!([]))).await;
+        assert_eq!((status, resp["result"].clone()), (StatusCode::OK, json!(0)));
+    }
+
+    /// B1-T4: at most RPC_LARGE_BODY_PERMITS bodies above the 1 MiB cap are
+    /// buffered at once for anonymous callers, plus at most
+    /// RPC_LARGE_BODY_RESERVED_PERMITS for the operator's (a flood of 4 MiB
+    /// bodies cannot pin 256 × 4 MiB); small requests are unaffected.
+    /// (Review: this test used a direct loopback caller for the refused
+    /// request, which pinned the lock-out of the operator's miner.)
+    #[tokio::test]
+    async fn large_bodies_are_bounded_in_number() {
+        let (_tmp, state) = state_with_chain(1);
+        let anon = [("x-forwarded-for", "198.51.100.61")];
+        let held: Vec<_> = (0..RPC_LARGE_BODY_PERMITS)
+            .map(|_| state.large_bodies.clone().try_acquire_owned().unwrap()).collect();
+        let body = rpc_body("submitblock", json!(["00".repeat(crate::core::MAX_BLOCK_SIZE)]));
+        let (status, resp) = post_raw(&state, "127.0.0.1:5000", &anon, body.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{resp}");
+        let (status, _) = post_raw(&state, "127.0.0.1:5000", &anon, rpc_body("getblockcount", json!([]))).await;
+        assert_eq!(status, StatusCode::OK);
+        let reserved: Vec<_> = (0..RPC_LARGE_BODY_RESERVED_PERMITS)
+            .map(|_| state.large_bodies_reserved.clone().try_acquire_owned().unwrap()).collect();
+        let (status, resp) = post_raw(&state, "127.0.0.1:5000", &[], body.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "the operator's permits are bounded too: {resp}");
+        drop((held, reserved));
+        let (status, _) = post_raw(&state, "127.0.0.1:5000", &anon, body).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// B1-T4 (review): large-body permits are taken before the request is
+    /// authorized (its method is in the body). Four anonymous uploads that
+    /// declare `Content-Length: 4000000` and then stall held every permit
+    /// until the 30 s request timeout (and again after reconnecting), and
+    /// the operator's `submitblock` of a full block got 503 every time. The
+    /// operator's callers (API key, or direct loopback) now have reserved
+    /// permits; anonymous callers still cannot get a fifth.
+    #[tokio::test]
+    async fn anonymous_slow_bodies_cannot_lock_out_the_operators_submitblock() {
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let (_tmp, mut state) = state_with_chain(1);
+        let key = "k".repeat(32);
+        state.api_key = Some(key.clone());
+        let stalled = |state: AppState, i: u8| tokio::spawn(async move {
+            let router = build_router(state, &[])
+                .layer(axum::extract::connect_info::MockConnectInfo("127.0.0.1:5000".parse::<std::net::SocketAddr>().unwrap()));
+            let stream = futures::StreamExt::chain(
+                futures::stream::once(async { Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{\"jsonrpc\"")) }),
+                futures::stream::pending());
+            let req = Request::builder().method("POST").uri("/")
+                .header("host", "127.0.0.1:17210")
+                .header("content-type", "application/json")
+                .header("content-length", "4000000")
+                .header("x-forwarded-for", format!("198.51.100.{i}"))
+                .body(axum::body::Body::from_stream(stream)).unwrap();
+            let _ = router.oneshot(req).await;
+        });
+        let tasks: Vec<_> = (0..RPC_LARGE_BODY_PERMITS as u8).map(|i| stalled(state.clone(), i)).collect();
+        for _ in 0..200 {
+            if state.large_bodies.available_permits() == 0 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(state.large_bodies.available_permits(), 0, "the stalled uploads hold every shared permit");
+        let block = rpc_body("submitblock", json!(["00".repeat(crate::core::MAX_BLOCK_SIZE)]));
+        let (status, resp) = post_raw(&state, "127.0.0.1:5000", &[("x-forwarded-for", "203.0.113.70")], block.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "an anonymous caller gets no fifth permit: {resp}");
+        let (status, resp) = post_raw(&state, "127.0.0.1:5000", &[], block.clone()).await;
+        assert_eq!(status, StatusCode::OK, "direct loopback (the co-located miner): {resp}");
+        let (status, resp) = post_raw(&state, "127.0.0.1:5000",
+            &[("x-forwarded-for", "203.0.113.71"), ("x-api-key", &key)], block).await;
+        assert_eq!(status, StatusCode::OK, "the keyed pool behind the proxy: {resp}");
+        assert!(resp["result"]["error"].as_str().unwrap_or("").contains("deserialise failed"), "{resp}");
+        for t in tasks { t.abort(); }
+    }
+
+    /// B2-T11: a request that reached a loopback RPC through a reverse proxy
+    /// (forwarding headers) is a remote request: it is rate-limited (per the
+    /// client the proxy names) and never fully trusted, also with
+    /// `--rpc-trust-loopback`. Before, every proxied client shared the
+    /// loopback exemption: unlimited anonymous `submitblock`, and with
+    /// `--rpc-trust-loopback` anonymous `invalidateblock`.
+    #[tokio::test]
+    async fn proxied_requests_are_neither_exempt_nor_trusted() {
+        let (_tmp, mut state) = state_with_chain(1);
+        state.rate_limiter = Arc::new(auth::RateLimiterSet::new(60, 2));
+        let proxied = [("x-forwarded-for", "198.51.100.23")];
+        let submit = || rpc_body("submitblock", json!(["00"]));
+        let mut statuses = Vec::new();
+        for _ in 0..4 {
+            statuses.push(post_raw(&state, "127.0.0.1:5000", &proxied, submit()).await.0);
+        }
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::OK, StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::TOO_MANY_REQUESTS], "proxied writes are rate-limited");
+        // Another client behind the same proxy has its own bucket.
+        let (status, _) = post_raw(&state, "127.0.0.1:5000", &[("x-forwarded-for", "203.0.113.9")], submit()).await;
+        assert_eq!(status, StatusCode::OK);
+        // A direct loopback caller (the operator, the co-located pool) keeps
+        // its exemption.
+        for _ in 0..4 {
+            assert_eq!(post_raw(&state, "127.0.0.1:5000", &[], submit()).await.0, StatusCode::OK);
+        }
+        // --rpc-trust-loopback does not extend to proxied requests.
+        state.trust_loopback = true;
+        state.rate_limiter = Arc::new(auth::RateLimiterSet::new(60, 60));
+        let admin = rpc_body("invalidateblock", json!([hex::encode([7u8; 32])]));
+        let (status, resp) = post_raw(&state, "127.0.0.1:5000", &[("x-real-ip", "198.51.100.23")], admin.clone()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{resp}");
+        let (status, resp) = post_raw(&state, "127.0.0.1:5000", &[], admin).await;
+        assert_eq!(status, StatusCode::OK, "direct loopback stays trusted: {resp}");
+    }
+
+    /// A one-input spend of a fresh 100,000-sat outpoint `tag`, with a valid
+    /// hybrid signature, or one with a corrupted signature when `forge`.
+    fn signed_spend(state: &AppState, tag: u8, forge: bool) -> Vec<u8> {
+        use sha3::{Digest as _, Sha3_256};
+        let (pk, sk) = crate::crypto::generate_keypair();
+        let prev_txid = [tag; 32];
+        state.store.put_utxo(&prev_txid, 0,
+            &TxOutput { value: 100_000, script_pubkey: Sha3_256::digest(&pk)[..20].to_vec() }).unwrap();
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid, prev_index: 0, script_sig: vec![], sequence: u32::MAX }],
+            outputs: vec![TxOutput { value: 70_000, script_pubkey: vec![7u8; 20] }],
+            locktime: 0,
+        };
+        let mut sighash = tx.sighash(0, crate::core::node_chain_id());
+        if forge {
+            sighash[0] ^= 1;
+        }
+        let sig = crate::crypto::sign(&sk, &sighash).unwrap();
+        tx.inputs[0].script_sig = Transaction::build_script_sig(&sig, &pk);
+        tx.to_wire_bytes(true)
+    }
+
+    /// B1-T10: transactions from untrusted callers are charged, by wire
+    /// size and before their signatures are verified, to ONE node-wide
+    /// budget; admitted transactions are refunded. Before, the only bound
+    /// was the per-IP write limiter, which the explorer API bypasses by
+    /// design (every caller arrives from loopback): a flood of forged
+    /// transactions from any number of addresses cost the node unbounded
+    /// signature verification.
+    #[tokio::test]
+    async fn anonymous_transaction_verification_is_bounded_node_wide() {
+        let (_tmp, mut state) = state_with_chain(1);
+        state.rate_limiter = Arc::new(auth::RateLimiterSet::new(600, 600));
+        state.api_key = Some("operator-key".into());
+        let valid = signed_spend(&state, 0x51, false);
+        let forged: Vec<Vec<u8>> = (0..3u8).map(|i| signed_spend(&state, 0x61 + i, true)).collect();
+        // Room for two forged transactions and no refill.
+        state.tx_verify_budget = Arc::new(auth::ByteBudget::new(2 * forged[0].len() as u64 + 16, 0));
+        let send = |raw: &[u8]| rpc_body("sendrawtransaction", json!([hex::encode(raw)]));
+        let from = |i: u8| format!("198.51.100.{i}");
+
+        // A valid transaction is admitted and refunded.
+        let (status, r) = post_raw(&state, "127.0.0.1:5000", &[("x-forwarded-for", &from(1))], send(&valid)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(r["result"]["txid"].is_string(), "{r}");
+        // Two forged transactions, from two clients, are verified and refused...
+        for (i, tx) in forged.iter().enumerate().take(2) {
+            let (_, r) = post_raw(&state, "127.0.0.1:5000", &[("x-forwarded-for", &from(10 + i as u8))],
+                send(tx)).await;
+            let e = r["result"]["error"].as_str().unwrap_or_default();
+            assert!(!e.is_empty() && !e.starts_with("busy"), "{r}");
+        }
+        // ...and the third is refused before verification, from any client,
+        // also from a direct loopback caller (the explorer API itself).
+        for (peer, hdrs) in [("127.0.0.1:5000", vec![("x-forwarded-for", from(12))]), ("127.0.0.1:5001", vec![])] {
+            let hdrs: Vec<(&str, &str)> = hdrs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let (_, r) = post_raw(&state, peer, &hdrs, send(&forged[2])).await;
+            assert!(r["result"]["error"].as_str().unwrap_or_default().starts_with("busy"), "{r}");
+        }
+        // The operator (API key) is not charged.
+        let (_, r) = post_raw(&state, "127.0.0.1:5000", &[("x-api-key", "operator-key")], send(&forged[2])).await;
+        let e = r["result"]["error"].as_str().unwrap_or_default();
+        assert!(!e.is_empty() && !e.starts_with("busy"), "{r}");
+    }
+
+    /// B1-T10 on main's `submitpowititem` (a write method that checks a KES
+    /// signature under the DAG read lock): an untrusted caller's item is
+    /// charged to the same node-wide verification budget as a transaction,
+    /// before it is decoded or verified; the operator is not charged.
+    #[tokio::test]
+    async fn anonymous_powit_items_share_the_verification_budget() {
+        let (_tmp, mut state) = state_with_chain(1);
+        state.rate_limiter = Arc::new(auth::RateLimiterSet::new(600, 600));
+        state.api_key = Some("operator-key".into());
+        let item = vec![0u8; 600];
+        assert!(item.len() <= crate::network::MAX_WIRE_POWIT_ITEM);
+        // Room for two items and no refill.
+        state.tx_verify_budget = Arc::new(auth::ByteBudget::new(2 * item.len() as u64 + 16, 0));
+        let submit = || rpc_body("submitpowititem", json!([2, hex::encode(&item)]));
+        for i in 0..2u8 {
+            let (status, r) = post_raw(&state, "127.0.0.1:5000",
+                &[("x-forwarded-for", &format!("198.51.100.{}", 20 + i))], submit()).await;
+            assert_eq!(status, StatusCode::OK, "{r}");
+            let e = r["result"]["error"].as_str().unwrap_or_default();
+            assert!(r["result"]["accepted"] == false && !e.is_empty() && !e.starts_with("busy"), "refused on its merits: {r}");
+        }
+        for (peer, hdrs) in [("127.0.0.1:5000", vec![("x-forwarded-for", "198.51.100.30")]), ("127.0.0.1:5001", vec![])] {
+            let (_, r) = post_raw(&state, peer, &hdrs, submit()).await;
+            assert!(r["result"]["error"].as_str().unwrap_or_default().starts_with("busy"), "{r}");
+        }
+        let (_, r) = post_raw(&state, "127.0.0.1:5000", &[("x-api-key", "operator-key")], submit()).await;
+        let e = r["result"]["error"].as_str().unwrap_or_default();
+        assert!(!e.is_empty() && !e.starts_with("busy"), "the operator is not charged: {r}");
+    }
+
+    /// B1-T21 / MEM-6: `estimatefeeadvanced` never recommends a fee the
+    /// network refuses. On a quiet pool it answered 5,000 sat (medium,
+    /// `recommended_gnb`) and 1,000 sat (slow) against the 10,000-sat
+    /// consensus minimum, and it ignored the transaction size (a 47-input
+    /// payment needs about 800,000 sat). Every field is now an absolute fee
+    /// for the stated size, from the fee-rate estimate, floored at
+    /// `min_tx_fee_sat(size)` and the rolling minimum.
+    #[tokio::test]
+    async fn estimatefeeadvanced_never_recommends_less_than_the_consensus_minimum() {
+        use crate::core::tokenomics::{min_tx_fee_sat, MIN_TX_FEE_SAT};
+        let (_tmp, state) = state_with_chain(1);
+        let sat = |v: &Value, k: &str| -> u64 { v[k].as_str().unwrap_or_else(|| panic!("{k}: {v}")).parse().unwrap() };
+        let fields = ["next_block_sats", "medium_priority", "slow_priority", "mempool_median"];
+        let typical = Transaction::estimate_size(1, 2);
+        let r = dispatch("estimatefeeadvanced", None, &state).await;
+        for k in fields {
+            assert!(sat(&r, k) >= min_tx_fee_sat(typical).max(MIN_TX_FEE_SAT), "{k}: {r}");
+        }
+        let recommended: f64 = r["recommended_gnb"].as_str().unwrap().parse().unwrap();
+        assert!(recommended * 1e8 >= MIN_TX_FEE_SAT as f64 - 0.5, "{r}");
+        // Size-aware: a 47-input, 2-output payment.
+        let big = Transaction::estimate_size(47, 2);
+        let r = dispatch("estimatefeeadvanced", Some(&json!([47, 2])), &state).await;
+        assert_eq!(r["tx_bytes"], big);
+        for k in fields {
+            assert!(sat(&r, k) >= min_tx_fee_sat(big), "{k}: {r}");
+        }
+        assert!(sat(&r, "next_block_sats") >= sat(&r, "medium_priority"));
+        assert!(sat(&r, "medium_priority") >= sat(&r, "slow_priority"));
+        // Absurd sizes are refused, not overflowed.
+        let r = dispatch("estimatefeeadvanced", Some(&json!([u64::MAX, 2])), &state).await;
+        assert!(r["error"].is_string(), "{r}");
+
+        // A busy pool paying 100 sat/byte: the tiers follow its rates.
+        for i in 0..4u8 {
+            let tx = Transaction {
+                version: 1,
+                inputs: vec![TxInput { prev_txid: [0x60 + i; 32], prev_index: 0, script_sig: vec![1; 100], sequence: 0 }],
+                outputs: vec![TxOutput { value: 50_000, script_pubkey: vec![2; 20] }],
+                locktime: 0,
+            };
+            let fee = tx.to_wire_bytes(true).len() as u64 * 100;
+            state.mempool.add(tx, fee).expect("pool accepts the fixture");
+        }
+        // Review: the rates come from the wire size cached at admission; the
+        // estimate re-encoded every pooled transaction under the pool's read
+        // lock on each call. (A cached size changed behind the pool's back is
+        // what the estimate must report: it never re-encodes.)
+        let txid = *state.mempool.txids().first().expect("pooled");
+        let wire = state.mempool.get_entry(&txid).unwrap().wire_size;
+        assert_eq!(wire, state.mempool.get_entry(&txid).unwrap().tx.to_wire_bytes(true).len());
+        state.mempool.set_cached_wire_size(&txid, wire * 1000);
+        let rates = state.mempool.fee_rates_per_kb();
+        assert_eq!(rates.len(), 4);
+        assert!(rates[0] < 1_000, "the cached size is used, not a fresh encoding: {rates:?}");
+        state.mempool.set_cached_wire_size(&txid, wire);
+        let r = dispatch("estimatefeeadvanced", None, &state).await;
+        assert_eq!(r["mempool_size"], 4);
+        let medium_rate: u64 = r["feerate_sat_per_kb"]["medium"].as_str().unwrap().parse().unwrap();
+        assert!((99_000..=100_000).contains(&medium_rate), "{r}");
+        assert!(sat(&r, "medium_priority") >= (typical as u64 * medium_rate).div_ceil(1000));
+        assert_eq!(sat(&r, "slow_priority"), min_tx_fee_sat(typical), "slow pays the floor");
+    }
+
     /// MEM-6: `getmempoolinfo` reports the relay policy in force.
     #[tokio::test]
     async fn mem6_getmempoolinfo_reports_the_policy() {
@@ -3304,6 +4014,106 @@ mod audit_2026_10_rpc_tests {
         assert_eq!(r["error"], "block not found");
         // A writer can take the lock right after a read returns.
         drop(state.dag.try_write().expect("DAG lock must be free after an explorer read"));
+    }
+
+    /// NET-15 (re-audit): no explorer method reads storage while it holds
+    /// the DAG read lock. A probe runs on every instrumented storage read of
+    /// this thread and records a read made with the DAG locked; moving any
+    /// storage access back into a `with_chain` closure makes this fail.
+    #[test]
+    fn net15_no_storage_read_runs_under_the_dag_lock() {
+        let (_tmp, state) = state_with_chain(30);
+        // Review: a confirmed transaction in a stored chain block, so
+        // gettransactionfull reaches its `with_chain` colour lookup (with an
+        // unknown txid it returned before it).
+        let block = crate::core::genesis_block();
+        let (bh, txid) = (block.block_hash(), block.transactions[0].txid());
+        state.store.put_block(&block).unwrap();
+        state.store.put_tx_index(&txid, &bh, 31).unwrap();
+        state.dag.write().add_block(bh, vec![[30u8; 32]], 1_000 + 31 * 60, 1).unwrap();
+        let addr = crate::crypto::address_from_hash(&[0x11; 20], crate::core::node_chain_id() == crate::core::ChainId::Testnet);
+        let under_lock = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let (dag, u, r) = (state.dag.clone(), under_lock.clone(), reads.clone());
+        crate::storage::READ_PROBE.with(|p| *p.borrow_mut() = Some(Box::new(move || {
+            r.set(r.get() + 1);
+            if dag.is_locked() { u.set(u.get() + 1); }
+        })));
+        let chain_block = hex::encode([7u8; 32]);
+        for (name, v) in [
+            ("getselectedchain", explorer::get_selected_chain(Some(&json!([0, 10])), &state)),
+            ("getblockdag", explorer::get_block_dag(Some(&json!([chain_block])), &state)),
+            ("gettransactionfull", {
+                let r = explorer::get_transaction_full(Some(&json!([hex::encode(txid)])), &state);
+                assert_eq!((r["status"].as_str(), r["block_colour"].as_str()), (Some("confirmed"), Some("chain")), "{r}");
+                r
+            }),
+            ("getdagwindow", explorer::get_dag_window(Some(&json!([50])), &state)),
+            ("getaddresshistory", explorer::get_address_history(Some(&json!([addr])), &state)),
+            ("getdifficultyhistory", explorer::get_difficulty_history(Some(&json!([5])), &state)),
+        ] {
+            assert!(v.is_object(), "{name}");
+        }
+        crate::storage::READ_PROBE.with(|p| *p.borrow_mut() = None);
+        assert!(reads.get() >= 10, "the probe saw the explorer's storage reads ({})", reads.get());
+        assert_eq!(under_lock.get(), 0, "storage reads made under the DAG read lock");
+    }
+
+    /// NET-15 residual: the explorer's selected-chain cache follows a tip
+    /// change incrementally (work proportional to the blocks that left and
+    /// joined the chain) and its first build takes the DAG read lock for a
+    /// bounded number of blocks at a time. Pre-fix every tip change cloned
+    /// the cached chain and rebuilt its position map (O(chain) under the
+    /// DAG read lock), and the first call walked the whole chain under it.
+    #[test]
+    fn net15_chain_cache_follows_the_tip_incrementally() {
+        const LEN: u32 = 2_000;
+        let (_tmp, state) = state_with_chain(1);
+        let h = |i: u32, side: u8| { let mut b = [side; 32]; b[..4].copy_from_slice(&i.to_be_bytes()); b[4] = 0xC5; b };
+        {
+            let mut dag = state.dag.write();
+            let mut parent = [1u8; 32];
+            for i in 2..=LEN {
+                dag.add_block(h(i, 0), vec![parent], 1_000 + 30 * i as u64, 1).unwrap();
+                parent = h(i, 0);
+            }
+        }
+        let fresh_chain = |state: &AppState| { let mut c = state.dag.read().selected_chain(); c.reverse(); c };
+        let check = |state: &AppState, bound: usize, what: &str| {
+            let r = explorer::get_selected_chain(Some(&json!([0, 3])), state);
+            let expect = fresh_chain(state);
+            assert_eq!(r["chain_length"], expect.len(), "{what}");
+            assert_eq!(r["blocks"][0]["hash"], hex::encode(expect.last().unwrap()), "{what}");
+            let (chain, work) = explorer::chain_cache_probe(state).expect("cache built");
+            assert_eq!(chain, expect, "{what}: cache equals the selected chain");
+            assert!(work <= bound, "{what}: {work} blocks handled under one DAG lock hold > {bound}");
+        };
+        // First build: chunked, never the whole chain under one lock hold.
+        check(&state, explorer::CHAIN_BUILD_CHUNK + 2, "first build");
+        // One new block: constant work.
+        state.dag.write().add_block(h(LEN + 1, 0), vec![h(LEN, 0)], 1_000 + 30 * (LEN as u64 + 1), 1).unwrap();
+        check(&state, 4, "one block");
+        // Review: a long gap with no explorer request (the node synced many
+        // blocks meanwhile) is caught up in chunks too, not under one hold.
+        {
+            let mut dag = state.dag.write();
+            for i in LEN + 2..=LEN + 300 {
+                dag.add_block(h(i, 0), vec![h(i - 1, 0)], 1_000 + 30 * i as u64, 1).unwrap();
+            }
+        }
+        check(&state, explorer::CHAIN_BUILD_CHUNK + 2, "long gap");
+        // A reorg of depth 6 replaced by 10 side blocks: work ~ 16.
+        {
+            let mut dag = state.dag.write();
+            let mut parent = h(LEN + 295, 0);
+            for i in LEN + 296..=LEN + 306 {
+                dag.add_block(h(i, 0xAB), vec![parent], 1_000 + 30 * i as u64 + 1, 1).unwrap();
+                parent = h(i, 0xAB);
+            }
+        }
+        check(&state, 40, "reorg");
+        let r = explorer::get_block_dag(Some(&json!([hex::encode(h(LEN + 300, 0))])), &state);
+        assert_ne!(r["colour"], "chain", "a block that left the chain is no longer reported on it");
     }
 
     /// CRY-3 / WAL-1: `getdaginfo` reports the height of the next block the
@@ -3418,6 +4228,11 @@ mod block_rules_template_tests {
             submit_block: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             chain_admin: None,
+            large_bodies: Arc::new(tokio::sync::Semaphore::new(RPC_LARGE_BODY_PERMITS)),
+            large_bodies_reserved: Arc::new(tokio::sync::Semaphore::new(RPC_LARGE_BODY_RESERVED_PERMITS)),
+            proxy_client_header: auth::DEFAULT_PROXY_CLIENT_HEADER.into(),
+            tx_verify_budget: Arc::new(auth::ByteBudget::new(ANON_TX_VERIFY_BURST_BYTES, ANON_TX_VERIFY_BYTES_PER_SEC)),
+            caller_trusted: false,
         };
         (tmp, state)
     }

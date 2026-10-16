@@ -260,6 +260,8 @@ impl Storage {
     #[inline]
     fn note_reads(&self, n: u64) {
         self.reads.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        READ_PROBE.with(|p| if let Some(f) = p.borrow().as_ref() { f() });
     }
 
     /// NET-12: total storage reads served by this handle so far (point
@@ -511,16 +513,21 @@ impl Storage {
         // batch keeps the same entries but makes them crash-consistent with the
         // block body. An entry-computation error for one tx skips only that tx's
         // rows (matching the old best-effort semantics) rather than aborting.
+        // B1-T11: the per-address history counters in the same batch.
+        let _agg = self.agg_lock();
+        let mut history = aggregates::HistoryDeltas::default();
         for (tx_idx, tx) in block.transactions.iter().enumerate() {
             match self.addr_index_entries(tx, block.height, tx_idx as u32) {
                 Ok(entries) => {
                     for (key, val) in entries {
+                        history.put(&key);
                         batch.put_cf(&cf_ai, &key, &val);
                     }
                 }
                 Err(e) => log::warn!("addr-index skipped for tx {}: {}", tx_idx, e),
             }
         }
+        self.stage_history_deltas(&mut batch, &history)?;
 
         self.db.write(batch).map_err(|e| StorageError::WriteFailed(e.to_string()))?;
         self.forget_body_verdict(&hash);
@@ -830,6 +837,17 @@ impl Storage {
 
     /// O(k) balance query via address index (was O(n) full UTXO scan)
     pub fn get_balance(&self, address_bytes: &[u8]) -> Result<(u64, usize), StorageError> {
+        self.get_balance_cancellable(address_bytes, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// [`Self::get_balance`] that checks `cancel` on every UTXO (B1-T11: the
+    /// RPC uses the O(1) holder aggregate, [`Self::address_balance`]; this
+    /// walk is its fallback while the aggregates are rebuilt).
+    pub fn get_balance_cancellable(
+        &self,
+        address_bytes: &[u8],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(u64, usize), StorageError> {
         if address_bytes.len() < 20 {
             return Ok((0, 0)); // invalid address length
         }
@@ -840,6 +858,9 @@ impl Storage {
         let (mut total, mut count) = (0u64, 0usize);
         let iter = self.db.prefix_iterator_cf(&cf_ai, &prefix);
         for item in iter {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(aggregates::cancelled());
+            }
             self.note_reads(2);
             if let Ok((k, _)) = item {
                 // Stop when prefix no longer matches
@@ -1296,12 +1317,17 @@ impl Storage {
     /// row of a block still on the chain. Positions are unique along the
     /// selected chain, like Bitcoin Core's active-chain heights
     /// ([`CHAIN_INDEX_VERSION`]).
+    ///
+    /// B1-T11: every history row staged is recorded in `history`; the caller
+    /// stages the per-address counters ([`Self::stage_history_deltas`]) into
+    /// the same batch before writing it.
     pub fn stage_chain_index(
         &self,
         batch: &mut rocksdb::WriteBatch,
         block: &Block,
         position: u64,
         spent: &std::collections::HashMap<([u8; 32], u32), TxOutput>,
+        history: &mut aggregates::HistoryDeltas,
     ) -> Result<(), StorageError> {
         let hash = block.block_hash();
         self.stage_chain_position(batch, position, &hash, block.header.timestamp)?;
@@ -1314,9 +1340,9 @@ impl Storage {
                 if out.script_pubkey.len() >= 20 {
                     let mut addr = [0u8; 20];
                     addr.copy_from_slice(&out.script_pubkey[..20]);
-                    batch.put_cf(&cf_ai,
-                        indexer::make_key(&addr, position_key, tx_idx as u32, vout as u32),
-                        indexer::make_value(&txid, indexer::DIR_OUT, out.value));
+                    let key = indexer::make_key(&addr, position_key, tx_idx as u32, vout as u32);
+                    history.put(&key);
+                    batch.put_cf(&cf_ai, key, indexer::make_value(&txid, indexer::DIR_OUT, out.value));
                 }
             }
             if !tx.is_coinbase() {
@@ -1325,9 +1351,9 @@ impl Storage {
                         if prev.script_pubkey.len() >= 20 {
                             let mut addr = [0u8; 20];
                             addr.copy_from_slice(&prev.script_pubkey[..20]);
-                            batch.put_cf(&cf_ai,
-                                indexer::make_key(&addr, position_key, tx_idx as u32, 0x8000_0000 | vin as u32),
-                                indexer::make_value(&txid, indexer::DIR_IN, prev.value));
+                            let key = indexer::make_key(&addr, position_key, tx_idx as u32, 0x8000_0000 | vin as u32);
+                            history.put(&key);
+                            batch.put_cf(&cf_ai, key, indexer::make_value(&txid, indexer::DIR_IN, prev.value));
                         }
                     }
                 }
@@ -1407,11 +1433,22 @@ impl Storage {
     /// record), so neither the history nor a later rollback loses them. A
     /// row of such a block that cannot be attributed is counted as lost.
     /// Idempotent on a data dir already in the position layout.
+    ///
+    /// Audit B1-T11: the per-address history counters (`agg/hist/`, the
+    /// `total` of `getaddresshistory` and `listtransactions`) must equal the
+    /// rows, and the rows are rewritten outside the connect path that keeps
+    /// them. So the same batch marks the aggregates incomplete (counters are
+    /// then neither read nor updated; a crash before the end leaves the
+    /// version marker absent and start-up rebuilds them), and once it has
+    /// committed they are rebuilt from the new rows, if they were complete
+    /// before (otherwise start-up's `ensure_aggregates` builds them).
     pub fn rebuild_chain_indexes(&self, chain: &[(BlockHash, u64, u64)]) -> Result<ChainIndexRebuild, StorageError> {
         let cf_ai = self.db.cf_handle(CF_ADDR_TX_HISTORY)
             .ok_or(StorageError::CfNotFound(CF_ADDR_TX_HISTORY.into()))?;
         let cf_undo = self.db.cf_handle(CF_UNDO).ok_or(StorageError::CfNotFound(CF_UNDO.into()))?;
         let mut batch = rocksdb::WriteBatch::default();
+        let counters_were_ready = self.aggregates_ready();
+        self.stage_aggregates_incomplete(&mut batch)?;
         // Chain blocks whose body was pruned without a record (a release
         // before audit DAG-6): their rows are the only copy of their history.
         let mut unrecorded: std::collections::HashMap<BlockHash, u64> = std::collections::HashMap::new();
@@ -1481,7 +1518,8 @@ impl Storage {
                         .filter(|i| !spent.contains_key(&(i.prev_txid, i.prev_index)))
                         .count();
                     written += indexer::addr_history_keys(&body, *position, &spent).len();
-                    self.stage_chain_index(&mut batch, &body, *position, &spent)?;
+                    // The aggregates are incomplete (above): no counter delta.
+                    self.stage_chain_index(&mut batch, &body, *position, &spent, &mut Default::default())?;
                 }
                 None => {
                     self.stage_chain_position(&mut batch, *position, hash, *timestamp)?;
@@ -1512,6 +1550,11 @@ impl Storage {
         let cf_meta = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
         batch.put_cf(&cf_meta, CHAIN_INDEX_VERSION_META.as_bytes(), CHAIN_INDEX_VERSION.to_le_bytes());
         self.write_batch(batch)?;
+        if counters_were_ready {
+            // B1-T11: the counters recounted from the rows just written (with
+            // every other aggregate, which this rebuild did not change).
+            self.rebuild_aggregates(&std::sync::atomic::AtomicBool::new(false))?;
+        }
         Ok(ChainIndexRebuild { blocks: chain.len(), rows: written, lost, unresolved })
     }
 
@@ -2347,6 +2390,13 @@ fn addr_utxo_key(address: &[u8], txid: &[u8], index: u32) -> Vec<u8> {
     k
 }
 
+#[cfg(test)]
+thread_local! {
+    /// NET-15 tests: called on every instrumented storage read (the
+    /// `storage_reads` counter) made by this thread.
+    pub(crate) static READ_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("open: {0}")]        OpenFailed(String),
@@ -2645,6 +2695,119 @@ mod shielded_cf_tests {
         let err = DB::open_cf_descriptors(&opts, tmp.path(), old).expect_err("an earlier release cannot open it");
         assert!(err.to_string().contains("Column families not opened: shielded"), "{err}");
         drop(Storage::open(tmp.path()).expect("this release still opens it"));
+    }
+
+    /// B1-T11: the per-address history counter equals the number of index
+    /// rows through indexing, re-indexing the same rows (idempotent: a key
+    /// counts once), un-indexing and `put_block`; a data directory written
+    /// with aggregate layout 1 (no counters) reports no count until the
+    /// start-up rebuild, which restores the exact counts.
+    #[test]
+    fn b1_t11_history_counter_tracks_the_index_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = [0x31u8; 20];
+        let mk_tx_coinbase = |_: u8, value: u64| crate::core::Transaction {
+            version: 1,
+            inputs: vec![crate::core::TxInput { prev_txid: [0; 32], prev_index: u32::MAX, script_sig: b"cb".to_vec(), sequence: u32::MAX }],
+            outputs: vec![TxOutput { value, script_pubkey: a.to_vec() }],
+            locktime: 0,
+        };
+        let rows = |s: &Storage| s.count_address_history(&a, 0, u64::MAX).unwrap();
+        {
+            let store = Storage::open(tmp.path()).unwrap();
+            assert!(store.aggregates_ready());
+            assert_eq!(store.address_history_count(&a).unwrap(), Some(0));
+            for h in 1..=5u64 {
+                store.index_tx_addresses(&mk_tx_coinbase(0x31, h), h, 0).unwrap();
+            }
+            assert_eq!(store.address_history_count(&a).unwrap(), Some(5));
+            store.index_tx_addresses(&mk_tx_coinbase(0x31, 3), 3, 0).unwrap();
+            assert_eq!((store.address_history_count(&a).unwrap(), rows(&store)), (Some(5), 5), "same key counts once");
+            store.unindex_tx_addresses(&mk_tx_coinbase(0x31, 3), 3, 0, &std::collections::HashMap::new()).unwrap();
+            store.unindex_tx_addresses(&mk_tx_coinbase(0x31, 3), 3, 0, &std::collections::HashMap::new()).unwrap();
+            assert_eq!((store.address_history_count(&a).unwrap(), rows(&store)), (Some(4), 4));
+            let mut genesis = crate::core::genesis_block();
+            genesis.transactions[0].outputs[0].script_pubkey = a.to_vec();
+            store.put_block(&genesis).unwrap();
+            assert_eq!((store.address_history_count(&a).unwrap(), rows(&store)), (Some(5), 5), "put_block counts");
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            assert_eq!(store.aggregate_snapshot().unwrap(), store.recompute_aggregates(&cancel).unwrap());
+            // Simulate a layout-1 data directory: no counters, version 1.
+            let cf = store.db.cf_handle(CF_META).unwrap();
+            store.db.delete_cf(cf, [&b"agg/hist/"[..], &a[..]].concat()).unwrap();
+            store.db.put_cf(cf, b"agg/version", 1u32.to_le_bytes()).unwrap();
+        }
+        let store = Storage::open(tmp.path()).unwrap();
+        assert!(!store.aggregates_ready());
+        assert_eq!(store.address_history_count(&a).unwrap(), None, "no count while incomplete");
+        assert!(store.ensure_aggregates().unwrap(), "the upgrade rebuilds the aggregates");
+        assert_eq!(store.address_history_count(&a).unwrap(), Some(5));
+    }
+
+    /// B1-T11 (R5) with `--reindex-addresses` (main d400bd0), which since
+    /// DAG-8 (R1b) is `rebuild_chain_indexes`, the one rebuild of the
+    /// selected-chain indexes (also the start-up migration): it rewrites the
+    /// history rows outside the indexing paths that keep the per-address
+    /// counters, so it rebuilds the counters from the new rows: afterwards
+    /// every counter equals its address's rows (receipts AND spends, the rows
+    /// the rebuild restores from the undo record), the aggregates are
+    /// complete again and equal a full recomputation, and the rows are keyed
+    /// by chain position.
+    #[test]
+    fn b1_t11_reindex_addresses_keeps_the_history_counters_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Storage::open(tmp.path()).unwrap();
+        let (a, b) = ([0x41u8; 20], [0x42u8; 20]);
+        let coinbase = |tag: &str, to: [u8; 20], value: u64| crate::core::Transaction {
+            version: 1,
+            inputs: vec![crate::core::TxInput { prev_txid: [0; 32], prev_index: u32::MAX, script_sig: tag.as_bytes().to_vec(), sequence: u32::MAX }],
+            outputs: vec![TxOutput { value, script_pubkey: to.to_vec() }],
+            locktime: 0,
+        };
+        let mut b0 = crate::core::genesis_block();
+        b0.transactions = vec![coinbase("b0", a, 50)];
+        let pay = crate::core::Transaction {
+            version: 1,
+            inputs: vec![crate::core::TxInput { prev_txid: b0.transactions[0].txid(), prev_index: 0, script_sig: vec![1], sequence: u32::MAX }],
+            outputs: vec![TxOutput { value: 30, script_pubkey: b.to_vec() }, TxOutput { value: 19, script_pubkey: a.to_vec() }],
+            locktime: 0,
+        };
+        let mut b1 = b0.clone();
+        b1.header.parents = vec![b0.block_hash()];
+        b1.height = 1;
+        b1.transactions = vec![coinbase("b1", b, 50), pay];
+        store.put_block(&b0).unwrap();
+        store.put_block(&b1).unwrap();
+        // b1's undo record: what its connect spent (the rebuild resolves the
+        // spend row from it).
+        let mut undo = crate::core::UndoData::new(b1.block_hash(), 1);
+        undo.spent_utxos.push(crate::core::UndoEntry {
+            prev_txid: b0.transactions[0].txid(), prev_index: 0, output: b0.transactions[0].outputs[0].clone(),
+        });
+        store.put_undo_data(&b1.block_hash(), &undo).unwrap();
+        // A history that lost its spend row (the pre-d400bd0 reorg defect):
+        // the counter follows the deletion through the indexing path.
+        let spend_row = indexer::make_key(&a, 1, 1, 0x8000_0000);
+        store.unindex_tx_addresses(&b1.transactions[1], 1, 1,
+            &[((b0.transactions[0].txid(), 0), b0.transactions[0].outputs[0].clone())].into_iter().collect()).unwrap();
+        let rows = |s: &Storage, x: &[u8; 20]| s.count_address_history(x, 0, u64::MAX).unwrap();
+        assert_eq!((store.address_history_count(&a).unwrap(), rows(&store, &a)), (Some(1), 1));
+        let cf = store.db.cf_handle(indexer::CF_ADDR_TX_HISTORY).unwrap();
+        assert!(store.db.get_cf(cf, &spend_row).unwrap().is_none());
+        assert!(store.aggregates_ready());
+
+        let r = store.rebuild_chain_indexes(&[
+            (b0.block_hash(), 0, b0.header.timestamp),
+            (b1.block_hash(), 1, b1.header.timestamp),
+        ]).unwrap();
+        assert_eq!((r.blocks, r.rows, r.lost, r.unresolved), (2, 5, 0, 0));
+        assert!(store.db.get_cf(cf, &spend_row).unwrap().is_some(), "the spend row is back, at b1's position");
+        assert!(store.aggregates_ready(), "complete again after the rebuild");
+        for (x, n) in [(a, 3u64), (b, 2)] {
+            assert_eq!((store.address_history_count(&x).unwrap(), rows(&store, &x)), (Some(n), n));
+        }
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(store.aggregate_snapshot().unwrap(), store.recompute_aggregates(&cancel).unwrap());
     }
 }
 

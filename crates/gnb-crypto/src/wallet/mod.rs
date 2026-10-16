@@ -49,7 +49,7 @@ pub mod disclosure;
 pub mod payment;
 pub mod send;
 
-pub use seed::{SeedPhrase, SeedVersion};
+pub use seed::{SeedPhrase, SeedVersion, phrase_grid, print_phrase_grid};
 pub use payment::{
     BuiltPayment, FeeChoice, FeePolicy, PaymentOptions, PrevTxs, DUST_THRESHOLD_SATS,
     MAX_STANDARD_TX_BYTES,
@@ -918,18 +918,38 @@ impl Keypair {
 
     /// Run `f` with the secret key in its enveloped form (wrapping a legacy
     /// raw key under the public key's suite in zeroizing storage).
+    ///
+    /// B2-T2: the encoding is decided from exact lengths, never from leading
+    /// bytes. The suite is the public key's (`crypto::public_key_suite`: the
+    /// exact raw hybrid length is suite 0x0001, otherwise its envelope);
+    /// a secret of exactly that suite's raw length is a raw key and is
+    /// wrapped; otherwise it must be a well-formed envelope of that same
+    /// suite with a body of exactly the raw length. Guessing from the first
+    /// two bytes misread 1 in 65,536 raw keys (an ML-DSA secret starts with
+    /// the uniformly random `rho`) as enveloped under a bogus suite, and such
+    /// a wallet could never sign. Bitcoin Core takes a key's type from its
+    /// size and metadata in the same way, never from its first bytes.
     fn with_enveloped_secret(
         &self,
         f: impl FnOnce(&[u8]) -> Result<Vec<u8>, crypto::CryptoError>,
     ) -> Result<Vec<u8>, String> {
-        if crypto::parse_envelope(&self.private_key).is_some() {
-            f(&self.private_key).map_err(|e| e.to_string())
-        } else {
-            let suite = crypto::parse_envelope(&self.public_key)
-                .map(|(s, _)| s)
-                .unwrap_or(crypto::SUITE_MLDSA65_FALCON1024);
-            let sk = Zeroizing::new(crypto::wrap_envelope(suite, &self.private_key));
-            f(&sk).map_err(|e| e.to_string())
+        let suite = crypto::public_key_suite(&self.public_key).ok_or_else(|| {
+            "public key is neither the raw hybrid encoding nor a supported suite envelope".to_string()
+        })?;
+        let raw_len = crypto::raw_secret_key_len(suite)
+            .ok_or_else(|| format!("public key suite {suite:#06x} has no secret-key encoding"))?;
+        let sk = &self.private_key;
+        if sk.len() == raw_len {
+            let wrapped = Zeroizing::new(crypto::wrap_envelope(suite, sk));
+            return f(&wrapped).map_err(|e| e.to_string());
+        }
+        match crypto::parse_envelope(sk) {
+            Some((s, body)) if s == suite && body.len() == raw_len => f(sk).map_err(|e| e.to_string()),
+            Some((s, _)) if s != suite => Err(format!(
+                "secret key envelope names suite {s:#06x}, the public key suite {suite:#06x}")),
+            _ => Err(format!(
+                "secret key ({} bytes) is neither the raw encoding ({raw_len} bytes) nor the envelope \
+                 of the public key's suite {suite:#06x}", sk.len())),
         }
     }
 
@@ -957,18 +977,22 @@ impl Keypair {
     /// 32-byte tx sighash / disclosure digest / PoS signing root. Pair with
     /// [`Self::verify_message_on`] (or [`Self::verify_message`]).
     ///
-    /// CRY-8: new signatures use the chain-bound v2 domain
+    /// CRY-8: signatures use the chain-bound v2 domain
     /// ([`crypto::signed_message_digest_v2`]) with the chain of this
     /// keypair's network, so they do not carry over between GnB mainnet,
-    /// GnB testnet and Bloch (which share keys). Verifiers still accept v1.
+    /// GnB testnet and Bloch (which share keys). Verifiers accept only v2 of
+    /// the chain they check, unless a caller explicitly opts into the legacy
+    /// v1 domain ([`Self::verify_message_allowing_legacy_v1`]).
     pub fn sign_message(&self, message: &[u8]) -> Result<Vec<u8>, String> {
         let chain = crate::core::ChainId::for_network(self.network()?);
         let digest = crypto::signed_message_digest_v2(chain, message);
         self.sign(&digest)
     }
 
-    /// Sign under the legacy v1 message domain (no chain id). Only for
-    /// interoperability with verifiers that predate v2.
+    /// Sign under the legacy v1 message domain (no chain id), which Bloch
+    /// signers still use. Only for interoperability with verifiers that
+    /// predate v2: a v1 signature proves nothing about which chain it was
+    /// meant for, and no default GnB verifier accepts it (CRY-8).
     pub fn sign_message_v1(&self, message: &[u8]) -> Result<Vec<u8>, String> {
         let digest = crypto::signed_message_digest(message);
         self.sign(&digest)
@@ -983,9 +1007,10 @@ impl Keypair {
             || crypto::verify(pk, digest, sig)
     }
 
-    /// Message digests a verifier for `network` accepts: v2 for that chain,
-    /// then the legacy v1 domain.
-    fn message_digests(network: Option<Network>, message: &[u8]) -> Vec<[u8; 32]> {
+    /// Message digests a verifier accepts: the v2 digest of `network`'s
+    /// chain (of either GnB chain for `None`) and, only with `legacy_v1`, the
+    /// chain-less v1 digest.
+    fn message_digests(network: Option<Network>, message: &[u8], legacy_v1: bool) -> Vec<[u8; 32]> {
         use crate::core::ChainId;
         let mut digests = match network {
             Some(n) => vec![crypto::signed_message_digest_v2(ChainId::for_network(n), message)],
@@ -994,37 +1019,51 @@ impl Keypair {
                 crypto::signed_message_digest_v2(ChainId::Testnet, message),
             ],
         };
-        digests.push(crypto::signed_message_digest(message));
+        if legacy_v1 {
+            digests.push(crypto::signed_message_digest(message));
+        }
         digests
     }
 
     /// Verify a signature produced by [`Self::sign_message`] over `message`
-    /// under public key `pk` while preserving historical wallet compatibility.
+    /// under public key `pk` (compatible key and signature encodings).
     ///
-    /// Accepts a v2 signature for EITHER GnB chain and a legacy v1 signature;
-    /// callers that know the chain should use [`Self::verify_message_on`].
+    /// Accepts a v2 signature for EITHER GnB chain, never a chain-less v1
+    /// one (CRY-8: a Bloch v1 signature verified as a GnB proof); callers
+    /// that know the chain should use [`Self::verify_message_on`].
     pub fn verify_message(pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
-        Self::message_digests(None, message).iter().any(|d| Self::verify_digest_compat(pk, d, sig))
+        Self::message_digests(None, message, false).iter().any(|d| Self::verify_digest_compat(pk, d, sig))
     }
 
-    /// Verify a message signature for a specific network: a v2 signature
-    /// must name that network's chain id; legacy v1 signatures (no chain id)
-    /// are still accepted.
+    /// Verify a message signature for a specific network: the v2 signature
+    /// must name that network's chain id. Legacy v1 signatures (no chain id)
+    /// are refused (CRY-8).
     pub fn verify_message_on(network: Network, pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
-        Self::message_digests(Some(network), message).iter().any(|d| Self::verify_digest_compat(pk, d, sig))
+        Self::message_digests(Some(network), message, false).iter().any(|d| Self::verify_digest_compat(pk, d, sig))
+    }
+
+    /// Explicit legacy mode (CRY-8): like [`Self::verify_message_on`] (or
+    /// [`Self::verify_message`] for `None`), but ALSO accepts a chain-less
+    /// v1 signature. A v1 signature binds no network: one made on Bloch, on
+    /// GnB mainnet or on GnB testnet verifies here for all of them, so a
+    /// caller must only use this to check old v1 records whose meaning does
+    /// not depend on the chain. Never used by any default verifier.
+    pub fn verify_message_allowing_legacy_v1(network: Option<Network>, pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
+        Self::message_digests(network, message, true).iter().any(|d| Self::verify_digest_compat(pk, d, sig))
     }
 
     /// Verify a newly-issued wallet message using the strict modern policy.
     /// Both objects must carry suite envelopes and the signature encoding must
-    /// be canonical; legacy raw and mixed-format records are rejected.
+    /// be canonical; legacy raw and mixed-format records, and v1 signatures,
+    /// are rejected.
     pub fn verify_message_canonical(pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
-        Self::message_digests(None, message).iter()
+        Self::message_digests(None, message, false).iter()
             .any(|d| crypto::verify_enveloped_canonical(pk, d, sig))
     }
 
     /// [`Self::verify_message_canonical`] for a specific network.
     pub fn verify_message_canonical_on(network: Network, pk: &[u8], message: &[u8], sig: &[u8]) -> bool {
-        Self::message_digests(Some(network), message).iter()
+        Self::message_digests(Some(network), message, false).iter()
             .any(|d| crypto::verify_enveloped_canonical(pk, d, sig))
     }
 
@@ -1125,27 +1164,68 @@ impl Keypair {
         serde_json::to_string_pretty(&ks).map_err(|e| e.to_string())
     }
 
+    /// Open a keystore file whose format authenticates its network
+    /// (keystore v3). A v2 file is refused: open it with
+    /// [`Self::load_encrypted_on`] and the network it belongs to (CRY-7).
     pub fn load_encrypted(path: &Path, password: &str) -> Result<Self, String> {
         Self::load_encrypted_with_file_limit(path, password, crate::util::DEFAULT_WALLET_FILE_LIMIT)
     }
 
-    /// Explicit bounded recovery override for authentic large keystores (maximum 512 MiB).
+    /// Open a keystore file of `network`: a v3 file must be that network's
+    /// (authenticated); a v2 file, which authenticates nothing, must record an
+    /// address of that network (prefix and checksum) and must not name the
+    /// other network (CRY-7).
+    pub fn load_encrypted_on(path: &Path, password: &str, network: Network) -> Result<Self, String> {
+        let bytes = crate::util::read_wallet_file(path, crate::util::DEFAULT_WALLET_FILE_LIMIT)
+            .map_err(|e| e.to_string())?;
+        Self::from_encrypted_bytes_on(&bytes, password, network)
+    }
+
+    /// Explicit bounded recovery override for authentic large keystores
+    /// (maximum 512 MiB). Same network rule as [`Self::load_encrypted`].
     pub fn load_encrypted_with_file_limit(path: &Path, password: &str, max_bytes: usize) -> Result<Self, String> {
         let bytes = crate::util::read_wallet_file(path, max_bytes).map_err(|e| e.to_string())?;
         Self::from_encrypted_bytes(&bytes, password)
     }
 
-    /// Open keystore v2 or v3 JSON bytes (no filesystem). Same checks as
-    /// `load_encrypted`; inputs above the default wallet file limit are refused.
+    /// [`Self::load_encrypted_with_file_limit`] for a stated network
+    /// ([`Self::load_encrypted_on`]).
+    pub fn load_encrypted_with_file_limit_on(path: &Path, password: &str, max_bytes: usize, network: Network)
+        -> Result<Self, String>
+    {
+        let bytes = crate::util::read_wallet_file(path, max_bytes).map_err(|e| e.to_string())?;
+        Self::from_encrypted_bytes_on(&bytes, password, network)
+    }
+
+    /// Open keystore v3 JSON bytes (no filesystem); inputs above the default
+    /// wallet file limit are refused.
     ///
-    /// Residual risk (CRY-7, documented): a v2 file authenticates neither its
-    /// `network` field nor its address prefix, and the address checksum does
-    /// not cover the prefix, so editing `gnb1q…` to `gnb1t…` in a v2 file still
-    /// loads the key for the other network here. Spending paths therefore use
-    /// [`Self::load_for_spending`], which makes the caller state the network
-    /// for a v2 file, verifies the stored address against it and rewrites the
-    /// file as v3.
+    /// CRY-7 (re-audit): every open path authenticates the network. A v3
+    /// file authenticates its network and address (AEAD associated data). A
+    /// v2 file authenticates neither, and the address checksum does not cover
+    /// the prefix, so editing `gnb1q…` to `gnb1t…` (and its `network` field)
+    /// loaded the key for the other network on every path that did not use
+    /// the spending unlock (the web wallet's `open`, `gnb-cli import-founder`
+    /// and `keyinfo`). A v2 file is therefore refused here, before any key
+    /// derivation; [`Self::from_encrypted_bytes_on`] opens it for a network
+    /// the caller states.
     pub fn from_encrypted_bytes(bytes: &[u8], password: &str) -> Result<Self, String> {
+        Self::open_keystore_bytes(bytes, password, None)
+    }
+
+    /// Open keystore v2 or v3 JSON bytes for `network`: a v3 file must be
+    /// that network's (authenticated); a v2 file must record an address of
+    /// that network (prefix and checksum, checked before any key derivation)
+    /// whose public key it holds, and must not name the other network in its
+    /// `network` field. Nothing is rewritten ([`Self::load_for_spending`]
+    /// also migrates a v2 file to v3).
+    pub fn from_encrypted_bytes_on(bytes: &[u8], password: &str, network: Network) -> Result<Self, String> {
+        Self::open_keystore_bytes(bytes, password, Some(network))
+    }
+
+    /// The one keystore decoder (v2 / v3) behind every open path; `stated`
+    /// is the network the caller expects (required for v2, CRY-7).
+    fn open_keystore_bytes(bytes: &[u8], password: &str, stated: Option<Network>) -> Result<Self, String> {
         if bytes.len() > crate::util::DEFAULT_WALLET_FILE_LIMIT {
             return Err("keystore exceeds the wallet file size limit".into());
         }
@@ -1153,6 +1233,7 @@ impl Keypair {
         if ks.version != LEGACY_KEYSTORE_VERSION_V2 && ks.version != KEYSTORE_VERSION_V3 {
             return Err("unsupported keystore version".into());
         }
+        let name = |n: Network| if n == Network::Testnet { "testnet" } else { "mainnet" };
         // v3: the AAD binds version, network and address. Both cleartext
         // fields must be canonical and agree before they are authenticated.
         let aad = if ks.version == KEYSTORE_VERSION_V3 {
@@ -1166,8 +1247,30 @@ impl Keypair {
             if address.to_string() != ks.address {
                 return Err("keystore v3 address is not in canonical GnB form".into());
             }
+            if let Some(stated) = stated {
+                if stated != network {
+                    return Err(format!(
+                        "keystore is a {} key (authenticated) but {} was requested",
+                        name(network), name(stated)));
+                }
+            }
             keystore_v3_aad(&ks.network, &ks.address)
         } else {
+            // v2 authenticates nothing: the network comes from the caller,
+            // and the cleartext fields must agree with it (the address is
+            // also bound to the decrypted public key below).
+            let stated = stated.ok_or_else(|| {
+                "keystore v2 does not authenticate its network: state the network (mainnet or \
+                 testnet) to open it (Keypair::from_encrypted_bytes_on / load_encrypted_on)".to_string()
+            })?;
+            let address = crate::address::normalize_legacy_address(&ks.address);
+            Address::parse_for_network(&address, stated).map_err(|e| format!(
+                "keystore v2 address {} is not a {} address: {e}", address, name(stated)))?;
+            let other = name(if stated == Network::Testnet { Network::Mainnet } else { Network::Testnet });
+            if ks.network == other {
+                return Err(format!(
+                    "keystore v2 records network {:?} but {} was requested", ks.network, name(stated)));
+            }
             Vec::new()
         };
 
@@ -1290,34 +1393,13 @@ impl Keypair {
         -> Result<(Self, Option<String>), String>
     {
         let header: EncryptedKeystore = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-        let kp = Self::from_encrypted_bytes(bytes, password)?;
-        let actual = kp.network()?;
-        let name = |n: Network| if n == Network::Testnet { "testnet" } else { "mainnet" };
+        // The shared decoder applies the network rules (CRY-7): a v3 key must
+        // be of the stated network, a v2 file needs one.
+        let kp = Self::open_keystore_bytes(bytes, password, network)?;
         match header.version {
-            KEYSTORE_VERSION_V3 => {
-                if let Some(stated) = network {
-                    if stated != actual {
-                        return Err(format!(
-                            "keystore is a {} key (authenticated) but {} was requested",
-                            name(actual), name(stated)));
-                    }
-                }
-                Ok((kp, None))
-            }
+            KEYSTORE_VERSION_V3 => Ok((kp, None)),
             LEGACY_KEYSTORE_VERSION_V2 => {
-                let stated = network.ok_or_else(|| {
-                    "keystore v2 does not authenticate its network: state the network (mainnet or \
-                     testnet) to unlock it for spending; it is then rewritten as keystore v3"
-                        .to_string()
-                })?;
-                Address::parse_for_network(&kp.address, stated).map_err(|e| format!(
-                    "keystore v2 address {} is not a {} address: {e}", kp.address, name(stated)))?;
-                let other = name(if stated == Network::Testnet { Network::Mainnet } else { Network::Testnet });
-                if header.network == other {
-                    return Err(format!(
-                        "keystore v2 records network {:?} but {} was requested; refusing to migrate",
-                        header.network, name(stated)));
-                }
+                let stated = network.ok_or("keystore v2 needs a stated network")?;
                 let json = kp.to_encrypted_json_with_policy(password, KEYSTORE_VERSION_V3, false)?;
                 let check = Self::from_encrypted_bytes(json.as_bytes(), password)?;
                 if check.private_key != kp.private_key || check.public_key != kp.public_key
@@ -1937,7 +2019,9 @@ mod legacy_keystore_tests {
         for (kdf_params, expected) in cases {
             let keystore = EncryptedKeystore {
                 version: 2,
-                address: "unused".into(),
+                // CRY-7: a v2 file opens for a stated network, and its
+                // address must belong to it (checked before the KDF bounds).
+                address: Address::from_hash([0x77; 20], Network::Mainnet).to_string(),
                 network: "mainnet".into(),
                 crypto: KeystoreCrypto {
                     cipher: "aes-256-gcm".into(),
@@ -1954,7 +2038,7 @@ mod legacy_keystore_tests {
             let bytes = serde_json::to_vec(&keystore).unwrap();
             std::fs::write(&path, &bytes).unwrap();
             assert_eq!(
-                Keypair::load_encrypted_with_file_limit(&path, password, bytes.len())
+                Keypair::load_encrypted_with_file_limit_on(&path, password, bytes.len(), Network::Mainnet)
                     .unwrap_err(),
                 expected
             );
@@ -1990,7 +2074,7 @@ mod legacy_keystore_tests {
         };
         let bytes = serde_json::to_vec(&keystore).unwrap();
         std::fs::write(&path, &bytes).unwrap();
-        let loaded = Keypair::load_encrypted_with_file_limit(&path, password, bytes.len())
+        let loaded = Keypair::load_encrypted_with_file_limit_on(&path, password, bytes.len(), Network::Mainnet)
             .unwrap();
         assert_eq!(loaded.private_key, keypair.private_key);
         assert_eq!(loaded.public_key, keypair.public_key);
@@ -2044,10 +2128,11 @@ mod legacy_keystore_tests {
         let load = |keystore: &EncryptedKeystore| {
             let bytes = serde_json::to_vec(keystore).unwrap();
             std::fs::write(&path, &bytes).unwrap();
-            Keypair::load_encrypted_with_file_limit(
+            Keypair::load_encrypted_with_file_limit_on(
                 &path,
                 password,
                 bytes.len(),
+                Network::Mainnet,
             )
         };
 
@@ -2434,6 +2519,119 @@ mod legacy_sign_tests {
         let (other_env, _) = crypto::generate_keypair();
         assert!(!crypto::verify(&other_env[4..], sighash, &sig), "a different pubkey must NOT verify");
     }
+
+    /// The raw (pre-envelope) keypair of seed 22561: its ML-DSA `rho`, the
+    /// first bytes of both the raw public and the raw secret key, starts with
+    /// the envelope magic `B1 0C` (probability 2^-16 for a random key).
+    fn raw_keypair_with_magic_prefix() -> (Vec<u8>, Vec<u8>) {
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&22561u64.to_le_bytes());
+        let (pk_env, sk_env) = crypto::generate_keypair_from_seed(&seed).unwrap();
+        let raw_pk = pk_env[crypto::SUITE_HEADER_LEN..].to_vec();
+        let raw_sk = sk_env[crypto::SUITE_HEADER_LEN..].to_vec();
+        assert_eq!(&raw_pk[..4], &[0xB1, 0x0C, 0x8B, 0x1E], "fixture: raw pk starts with the magic");
+        assert_eq!(&raw_sk[..4], &[0xB1, 0x0C, 0x8B, 0x1E], "fixture: raw sk starts with the magic");
+        (raw_pk, raw_sk)
+    }
+
+    /// B2-T2: the signer classified a secret key as enveloped from its first
+    /// two bytes, so a raw key whose `rho` starts with `B1 0C` was read as
+    /// enveloped under the bogus suite `0x1e8b` and could never sign (sign,
+    /// sign_bound, sign_message and every payment failed), although consensus
+    /// accepts its signatures. Exact lengths decide now, as they do in
+    /// consensus (`crypto::public_key_suite`).
+    #[test]
+    fn raw_key_starting_with_the_envelope_magic_signs_everything() {
+        let (raw_pk, raw_sk) = raw_keypair_with_magic_prefix();
+        let kp = Keypair {
+            private_key: raw_sk.clone(),
+            public_key: raw_pk.clone(),
+            address: crypto::address_from_pubkey(&raw_pk, false),
+        };
+        let sig = kp.sign(b"founder-message").expect("sign");
+        assert!(crypto::verify(&raw_pk, b"founder-message", &sig));
+        let digest = [0x5Au8; 32];
+        let sig = kp.sign_bound(&digest).expect("sign_bound");
+        assert!(crypto::verify_bound(&raw_pk, &digest, &sig));
+        let sig = kp.sign_message(b"I own this address").expect("sign_message");
+        assert!(Keypair::verify_message_on(Network::Mainnet, &raw_pk, b"I own this address", &sig));
+
+        // A payment at a version-1 height and at the hardening activation
+        // (version 3, sighash v3).
+        let spk: [u8; 20] = kp.address_bytes().try_into().unwrap();
+        let utxos = vec![Utxo {
+            txid: [0x31; 32], index: 0,
+            output: TxOutput { value: 5_000_000_000, script_pubkey: spk.to_vec() },
+        }];
+        let to = Address::from_hash([7u8; 20], Network::Mainnet);
+        for height in [10, crate::core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT] {
+            let opts = PaymentOptions { next_block_height: Some(height), ..PaymentOptions::default() };
+            let paid = TxBuilder::build_payment(&kp, &utxos, &to, 100_000_000, &opts)
+                .unwrap_or_else(|e| panic!("payment at height {height}: {e}"));
+            let spent = [utxos[0].output.clone()];
+            crate::core::sighash::verify_tx_scripts(&paid.tx, &spent, crate::core::ChainId::Mainnet,
+                height, crate::core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT)
+                .unwrap_or_else(|e| panic!("consensus refuses the payment at height {height}: {e:?}"));
+        }
+
+        // Main's multisig / timelock signing paths, same raw secret: a payment
+        // to a policy script (TxBuilder::build_outputs) and its signature on a
+        // 1-of-1 policy spend (PolicySpend::sign_digest with sign_tx_digest),
+        // at both heights. A policy names its keys enveloped (its sighash-v2
+        // witnesses are verified with the enveloped canonical verifier).
+        let policy_pk = crypto::wrap_envelope(crypto::SUITE_MLDSA65_FALCON1024, &raw_pk);
+        let policy_signer = Keypair {
+            private_key: raw_sk.clone(),
+            public_key: policy_pk.clone(),
+            address: crypto::address_from_pubkey(&policy_pk, false),
+        };
+        let policy = crate::core::policy::SpendPolicy::new(1, vec![policy_pk], 0, 0).expect("hybrid key");
+        let rows = vec![(utxos[0].txid.to_vec(), 0u32, utxos[0].output.clone())];
+        for height in [10, crate::core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT] {
+            let out = TxOutput { value: 100_000_000, script_pubkey: policy.script_pubkey() };
+            let tx = TxBuilder::build_outputs(&kp, &rows, vec![out.clone()], 100_000, height)
+                .unwrap_or_else(|e| panic!("build_outputs at height {height}: {e}"));
+            crate::core::sighash::verify_tx_scripts(&tx, &[utxos[0].output.clone()], crate::core::ChainId::Mainnet,
+                height, crate::core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT)
+                .unwrap_or_else(|e| panic!("consensus refuses build_outputs at height {height}: {e:?}"));
+            let mut spend = policy_spend::PolicySpend::new(Network::Mainnet, policy.clone(),
+                &[(tx.txid(), 0, out.value)], spk.to_vec(), 50_000_000, 0, 0).expect("policy spend");
+            spend.target_height(height).unwrap();
+            spend.sign_digest(&policy_signer.public_key, |d, v| policy_signer.sign_tx_digest(d, v))
+                .unwrap_or_else(|e| panic!("policy signature at height {height}: {e}"));
+            spend.finalize().unwrap_or_else(|e| panic!("finalize at height {height}: {e}"));
+        }
+
+        // The same raw secret with the enveloped public key, and the
+        // enveloped secret with the raw public key, sign as well.
+        let env_pk = crypto::wrap_envelope(crypto::SUITE_MLDSA65_FALCON1024, &raw_pk);
+        let env_sk = crypto::wrap_envelope(crypto::SUITE_MLDSA65_FALCON1024, &raw_sk);
+        for (sk, pk) in [(raw_sk.clone(), env_pk.clone()), (env_sk.clone(), raw_pk.clone()), (env_sk, env_pk)] {
+            let kp = Keypair { private_key: sk, public_key: pk.clone(), address: crypto::address_from_pubkey(&pk, false) };
+            let sig = kp.sign(b"m").expect("mixed encodings sign");
+            assert!(crypto::verify(&pk, b"m", &sig));
+        }
+    }
+
+    /// B2-T2: a secret that is neither the exact raw hybrid encoding nor a
+    /// well-formed envelope of the public key's suite is refused before any
+    /// signing, instead of being guessed at.
+    #[test]
+    fn secret_key_encoding_is_classified_by_exact_lengths() {
+        let (raw_pk, raw_sk) = raw_keypair_with_magic_prefix();
+        let env_pk = crypto::wrap_envelope(crypto::SUITE_MLDSA65_FALCON1024, &raw_pk);
+        let refused = |sk: Vec<u8>, pk: &[u8]| {
+            let kp = Keypair { private_key: sk, public_key: pk.to_vec(), address: crypto::address_from_pubkey(pk, false) };
+            kp.sign(b"m").unwrap_err()
+        };
+        // One byte short of the raw length: neither encoding.
+        assert!(refused(raw_sk[..raw_sk.len() - 1].to_vec(), &raw_pk).contains("secret key"));
+        // An envelope naming another suite than the public key's.
+        let wrong_suite = crypto::wrap_envelope(crypto::SUITE_MLDSA65_ONLY, &raw_sk);
+        assert!(refused(wrong_suite, &env_pk).contains("suite"));
+        // A public key that names no suite at all.
+        assert!(refused(raw_sk.clone(), &raw_pk[..100]).contains("public key"));
+    }
 }
 
 #[cfg(test)]
@@ -2543,7 +2741,9 @@ mod bloch_keystore_compat_tests {
         let body = kp.address.strip_prefix(crate::core::MAINNET_PREFIX).unwrap();
         let bloch_path = dir.join("bloch.json");
         std::fs::write(&bloch_path, json.replace(&kp.address, &format!("bloch1q{body}"))).unwrap();
-        let loaded = Keypair::load_encrypted(&bloch_path, "correct horse battery 9!").unwrap();
+        // CRY-7: a v2 file opens for a stated network only.
+        assert!(Keypair::load_encrypted(&bloch_path, "correct horse battery 9!").is_err());
+        let loaded = Keypair::load_encrypted_on(&bloch_path, "correct horse battery 9!", Network::Mainnet).unwrap();
         assert_eq!(loaded.address, kp.address);
         assert_eq!(loaded.public_key, kp.public_key);
 
@@ -2552,7 +2752,7 @@ mod bloch_keystore_compat_tests {
         other.push(if last == '0' { '1' } else { '0' });
         let bad_path = dir.join("bad.json");
         std::fs::write(&bad_path, json.replace(&kp.address, &format!("bloch1q{other}"))).unwrap();
-        assert!(Keypair::load_encrypted(&bad_path, "correct horse battery 9!").is_err());
+        assert!(Keypair::load_encrypted_on(&bad_path, "correct horse battery 9!", Network::Mainnet).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2604,14 +2804,17 @@ mod audit_2026_10_wallet_fixes {
         assert!(Keypair::from_encrypted_bytes(downgraded.as_bytes(), PW).is_err());
     }
 
-    /// v2 keystores keep loading (documented residual risk: unauthenticated).
+    /// v2 keystores keep loading, for the network the caller states (CRY-7:
+    /// a v2 file authenticates no network, so none is taken from it).
     #[test]
-    fn keystore_v2_still_loads() {
+    fn keystore_v2_loads_for_its_stated_network() {
         let kp = generate_keypair(true);
         let json = kp.to_encrypted_json_version(PW, LEGACY_KEYSTORE_VERSION_V2).unwrap();
-        let loaded = Keypair::from_encrypted_bytes(json.as_bytes(), PW).unwrap();
+        assert!(Keypair::from_encrypted_bytes(json.as_bytes(), PW).is_err());
+        let loaded = Keypair::from_encrypted_bytes_on(json.as_bytes(), PW, Network::Testnet).unwrap();
         assert_eq!(loaded.address, kp.address);
         assert_eq!(loaded.network().unwrap(), Network::Testnet);
+        assert!(Keypair::from_encrypted_bytes_on(json.as_bytes(), PW, Network::Mainnet).is_err());
     }
 
     fn temp_keystore(tag: &str, contents: &str) -> std::path::PathBuf {
@@ -2698,6 +2901,44 @@ mod audit_2026_10_wallet_fixes {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// CRY-7 (re-audit): EVERY open path authenticates the network, not
+    /// only the spending unlock. A v2 file authenticates neither its
+    /// `network` field nor its address prefix: with both edited to testnet
+    /// (the checksum does not cover the prefix), `from_encrypted_bytes` /
+    /// `load_encrypted` (the web wallet's `open`, `gnb-cli import-founder`
+    /// and `keyinfo`) loaded a mainnet key as a testnet key. A v2 file now
+    /// opens only for a stated network; v3 files authenticate their own.
+    #[test]
+    fn every_open_path_authenticates_the_network() {
+        let kp = generate_keypair(false); // mainnet
+        let v2 = kp.to_encrypted_json_version(PW, LEGACY_KEYSTORE_VERSION_V2).unwrap();
+        let flipped = format!("gnb1t{}", &kp.address[5..]);
+        let forged = v2.replace(&kp.address, &flipped).replace("\"network\": \"mainnet\"", "\"network\": \"testnet\"");
+        assert!(forged.contains(&flipped) && forged.contains("\"testnet\""), "fixture");
+        for bytes in [v2.as_bytes(), forged.as_bytes()] {
+            let err = Keypair::from_encrypted_bytes(bytes, PW).unwrap_err();
+            assert!(err.contains("state the network"), "{err}");
+            let path = temp_keystore("open", std::str::from_utf8(bytes).unwrap());
+            assert!(Keypair::load_encrypted(&path, PW).unwrap_err().contains("state the network"));
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+        // The owner's network opens the genuine file, never the forged one.
+        let opened = Keypair::from_encrypted_bytes_on(v2.as_bytes(), PW, Network::Mainnet).unwrap();
+        assert_eq!((opened.address.as_str(), opened.network().unwrap()), (kp.address.as_str(), Network::Mainnet));
+        assert!(Keypair::from_encrypted_bytes_on(forged.as_bytes(), PW, Network::Mainnet).is_err());
+        assert!(Keypair::from_encrypted_bytes_on(v2.as_bytes(), PW, Network::Testnet).is_err());
+        let path = temp_keystore("open-on", &v2);
+        assert_eq!(Keypair::load_encrypted_on(&path, PW, Network::Mainnet).unwrap().address, kp.address);
+        assert!(Keypair::load_encrypted_on(&path, PW, Network::Testnet).is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        // v3 authenticates its network: opens without a stated network, and
+        // refuses another stated network.
+        let v3 = kp.to_encrypted_json(PW).unwrap();
+        assert_eq!(Keypair::from_encrypted_bytes(v3.as_bytes(), PW).unwrap().address, kp.address);
+        assert!(Keypair::from_encrypted_bytes_on(v3.as_bytes(), PW, Network::Mainnet).is_ok());
+        assert!(Keypair::from_encrypted_bytes_on(v3.as_bytes(), PW, Network::Testnet).is_err());
+    }
+
     /// Bloch v2 keystores (bloch1q… addresses) migrate under their GnB
     /// address; a v2 password below today's policy is kept (not refused).
     #[test]
@@ -2748,7 +2989,7 @@ mod audit_2026_10_wallet_fixes {
         #[cfg(unix)]
         assert_eq!(mode_of(&first), 0o600);
         // The backup still opens as the v2 keystore it was.
-        let reopened = Keypair::from_encrypted_bytes(&std::fs::read(&first).unwrap(), PW).unwrap();
+        let reopened = Keypair::from_encrypted_bytes_on(&std::fs::read(&first).unwrap(), PW, Network::Mainnet).unwrap();
         assert_eq!(reopened.address, kp.address);
 
         // The same v2 file migrated again (e.g. restored from the backup):
@@ -2854,18 +3095,38 @@ mod audit_2026_10_wallet_fixes {
         assert!(err.contains("guard"), "{err}");
     }
 
-    /// CRY-8: message signatures are chain-bound (v2) and v1 still verifies.
+    /// CRY-8: message signatures are chain-bound (v2), and a chain-less v1
+    /// signature (what Bloch signers still produce, with the same keys) is
+    /// accepted by no default verifier and never by a canonical one: it used
+    /// to verify as a GnB mainnet AND testnet proof. Only the explicit legacy
+    /// mode accepts it.
     #[test]
-    fn message_signatures_are_chain_bound_and_v1_still_verifies() {
+    fn message_signatures_are_chain_bound_and_v1_needs_the_legacy_flag() {
         let kp = generate_keypair(false);
+        let pk = &kp.public_key;
         let sig = kp.sign_message(b"hello").unwrap();
-        assert!(Keypair::verify_message_on(Network::Mainnet, &kp.public_key, b"hello", &sig));
-        assert!(!Keypair::verify_message_on(Network::Testnet, &kp.public_key, b"hello", &sig));
-        assert!(Keypair::verify_message_canonical_on(Network::Mainnet, &kp.public_key, b"hello", &sig));
-        assert!(!crypto::verify(&kp.public_key, &crypto::signed_message_digest(b"hello"), &sig));
+        assert!(Keypair::verify_message_on(Network::Mainnet, pk, b"hello", &sig));
+        assert!(!Keypair::verify_message_on(Network::Testnet, pk, b"hello", &sig));
+        assert!(Keypair::verify_message_canonical_on(Network::Mainnet, pk, b"hello", &sig));
+        assert!(Keypair::verify_message(pk, b"hello", &sig));
+        assert!(!crypto::verify(pk, &crypto::signed_message_digest(b"hello"), &sig));
+
+        // A Bloch / v1 signature over the same message with the same key.
         let v1 = kp.sign_message_v1(b"hello").unwrap();
-        assert!(Keypair::verify_message_on(Network::Testnet, &kp.public_key, b"hello", &v1));
-        assert!(Keypair::verify_message(&kp.public_key, b"hello", &v1));
+        assert!(crypto::verify(pk, &crypto::signed_message_digest(b"hello"), &v1), "fixture: a genuine v1 signature");
+        for n in [Network::Mainnet, Network::Testnet] {
+            assert!(!Keypair::verify_message_on(n, pk, b"hello", &v1), "v1 accepted as a {n:?} proof");
+            assert!(!Keypair::verify_message_canonical_on(n, pk, b"hello", &v1));
+        }
+        assert!(!Keypair::verify_message(pk, b"hello", &v1));
+        assert!(!Keypair::verify_message_canonical(pk, b"hello", &v1));
+        // Explicit legacy mode only.
+        assert!(Keypair::verify_message_allowing_legacy_v1(Some(Network::Mainnet), pk, b"hello", &v1));
+        assert!(Keypair::verify_message_allowing_legacy_v1(None, pk, b"hello", &v1));
+        assert!(Keypair::verify_message_allowing_legacy_v1(Some(Network::Mainnet), pk, b"hello", &sig));
+        assert!(!Keypair::verify_message_allowing_legacy_v1(Some(Network::Testnet), pk, b"hello", &sig),
+            "the legacy mode still binds a v2 signature to its chain");
+        assert!(!Keypair::verify_message_allowing_legacy_v1(None, pk, b"other", &v1));
     }
 
     /// CRY-5 through the wallet: a corrupted Falcon secret never signs.

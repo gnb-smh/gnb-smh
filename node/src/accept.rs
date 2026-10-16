@@ -2565,7 +2565,10 @@ pub fn rebuild_chain_state(
             let cleared_rows = store.stage_clear_chain_state(&mut batch).map_err(|e| e.to_string())?;
             seed(store, &mut batch)?;
             if let Some(gb) = store.get_block(&genesis).map_err(|e| e.to_string())? {
-                store.stage_chain_index(&mut batch, &gb, 0, &HashMap::new()).map_err(|e| e.to_string())?;
+                // The aggregates were just marked incomplete (rebuilt at the end):
+                // no history counter is staged (B1-T11).
+                store.stage_chain_index(&mut batch, &gb, 0, &HashMap::new(), &mut Default::default())
+                    .map_err(|e| e.to_string())?;
             }
             for (h, _) in &drop {
                 store.stage_clear_invalid_block(&mut batch, h).map_err(|e| e.to_string())?;
