@@ -396,7 +396,17 @@ pub fn address_info(
     addr_str: &str,
     addr_hash: &[u8; 20],
 ) -> Result<AddressInfo, String> {
-    let (balance_sats, utxo_count) = storage.get_balance(addr_hash).map_err(|e| e.to_string())?;
+    // B1-R2-11: this endpoint's work is O(mempool inputs + outputs), not
+    // O(confirmed address UTXOs). The holder record is maintained in the
+    // same batch as UTXO changes. Refuse while it is being rebuilt instead
+    // of falling back to an unbounded confirmed-UTXO scan.
+    if !storage.aggregates_ready() {
+        return Err(NOT_READY.into());
+    }
+    let (balance_sats, utxo_count) = storage.holder(addr_hash).map_err(|e| e.to_string())?
+        .map(|h| (h.balance, h.utxos)).unwrap_or((0, 0));
+    let utxo_count = usize::try_from(utxo_count)
+        .map_err(|_| "address UTXO count exceeds platform limit".to_string())?;
 
     // Pending balance from mempool
     let utxo_lookup = |txid: &[u8; 32], index: u32| -> Option<crate::core::TxOutput> {

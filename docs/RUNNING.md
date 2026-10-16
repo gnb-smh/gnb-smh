@@ -554,9 +554,25 @@ the client named by `--rpc-proxy-client-header` (for `X-Forwarded-For` and
 without a parsable address there shares the proxy's own bucket). A request
 from any other address is limited in the bucket of that address, whatever
 its headers say, so a remote client cannot pick a fresh bucket per request.
-A caller that presents the API key is the operator and is not rate-limited
-(the pool polling `getblocktemplate` through the proxy must still get its
-`submitblock` through). Direct loopback callers without a forwarding header
+A caller that presents the API key through a proxy skips the separate
+read/write method buckets. Every remote or forwarded request first consumes
+a source token **before key verification and body parsing**, including
+malformed requests and requests with a correct key. This pre-authentication
+budget is the sum of the configured read and write rates (each at least one),
+**65 requests/minute by default**, with a burst of the same size and continuous
+refill. Once exhausted, it refuses **all** methods with HTTP 429, including a
+valid `submitblock`. Size `--rpc-rate-limit-reads` and `--rpc-rate-limit-writes`
+for the pool's combined polling/submission rate and leave headroom for found
+blocks. Template polling below this overall bound does not consume the
+write-method bucket. This is a deliberate availability tradeoff: checking a
+key cannot bypass the budget that bounds the work of checking keys.
+
+Named clients of a trusted proxy retain separate source budgets. Unnamed
+forwarded clients share the proxy address's budget. IPv4 and its IPv4-mapped
+IPv6 spelling share the same /32 budget; unrelated mapped IPv4 clients are
+independent. Native IPv6 sources share their /64 budget.
+
+Direct loopback callers without a forwarding header
 (the operator's `gnb-cli`, a co-located pool) keep the loopback exemption.
 The header is never trusted for authorization: it can only take trust away.
 
