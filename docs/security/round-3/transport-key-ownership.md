@@ -153,5 +153,55 @@ independence of separate sessions. No tests were skipped, weakened or removed;
 the new unit module adds five tests. `git diff --check` passes. Existing
 unrelated compiler warnings remain outside this package's scope.
 
-Three independent reviews, complete round-3 integration and final remote CI
-remain required. These local package checks do not complete CRY-4 as a whole.
+## Controlled replay provenance
+
+The original cycle above had logs and inline commands. A subsequent controlled
+replay preserves the reversal procedure in the versioned
+[local driver](replay-transport-key-ownership.py) and records its inputs,
+snapshots, commands, hashes and results in the
+[committed manifest](transport-key-ownership-replay.json).
+
+Executed on 2026-10-16, 15:21:25–15:23:02 UTC, from this package's worktree:
+
+```sh
+python3 docs/security/round-3/replay-transport-key-ownership.py \
+  --output-dir /private/tmp/gnb-r3-key-ownership-replay-20261016
+```
+
+For another run, choose a fresh output directory directly under `/private/tmp`;
+the driver refuses to overwrite an existing directory. It is pinned to this
+worktree, the CGU47 target, base `b425436` and corrected source bytes from
+`4ef8664`. It refuses implementation/test changes before writing anything to
+the source files. The only tests executed are the five package tests, with one
+test thread to make individual results unambiguous in the logs.
+
+The evidence directory contains ten snapshots: driver, final test suffix,
+both base files, both corrected input files, both production-reversed files,
+and both restored files. The reversal is checked as the exact base `mod.rs`
+and the exact base `upgrade.rs` plus the unchanged final test suffix. A
+`finally` block restores and verifies both original files before the final
+green run. A separate byte-checking script run by the implementer verified
+every snapshot hash, these byte concatenation/equality relationships, and
+equality of the executed driver snapshot with the committed driver. This check
+is not an independent reviewer attestation.
+
+| Replay stage | Required and observed result | Evidence file |
+| --- | --- | --- |
+| Production reversed, final tests retained | Exit 101; four named controls pass; only `derived_keys_require_drop_cleanup` fails at runtime with `(false, false)` versus `(true, true)` | `reversal.log` |
+| Corrected sources restored byte for byte | Exit 0; all five tests pass, none ignored | `restored.log` |
+
+Both verbose Cargo logs confirm `--test -C codegen-units=47`. The driver exits
+zero only after checking these runtime results and the final source bytes.
+The manifest records `status: complete` and
+`restoration_verified_byte_for_byte: true`. Its committed copy is byte-identical
+to the output `manifest.json`, SHA-256
+`2b6b509f6c1aa359b6419dd8494a45705ef49dfd4235797551f31f7240a5ba3a`.
+The executed driver SHA-256 is
+`21f85195a46db5151975d1fb2229f5d5f3861d435898f7c6fa366cfa3689f948`.
+Snapshot and log hashes are recorded individually in that manifest.
+
+This replay changed neither implementation nor tests, used no other worktree
+or target, and did not rerun the broader suite. The three code reviews approved
+the implementation with its stated limits; replay-evidence review, complete
+round-3 integration and final remote CI remain required. These local package
+checks do not complete CRY-4 as a whole.
