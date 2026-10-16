@@ -119,6 +119,33 @@ fn descriptor_cli_import_rejects_duplicate_fields_and_other_network() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("duplicate"));
 }
 
+#[test]
+fn descriptor_cli_policy_and_tree_export_keep_exact_scripts_and_activation_notice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("body.txt");
+    let list = tmp.path().join("descriptors.json");
+    let key = "42".repeat(3745);
+    let policy = format!("policy(1,0,0,{key})");
+    for (network, flag) in [("mainnet", "--mainnet"), ("testnet", "--testnet")] {
+        let mut entries = Vec::new();
+        for (kind, expr) in [("policy", policy.clone()), ("tree", format!("tree({policy},policy(1,1,0,{key}))"))] {
+            std::fs::write(&input, format!("gnbd1({network},{expr})")).unwrap();
+            let entry = ok(run(&["descriptor", "create", input.to_str().unwrap(), flag]));
+            assert_eq!(entry["kind"], kind);
+            assert_eq!(entry["requires_policy_tree_activation"], kind == "tree");
+            std::fs::write(&input, entry["descriptor"].as_str().unwrap()).unwrap();
+            assert_eq!(ok(run(&["descriptor", "inspect", input.to_str().unwrap(), flag])), entry);
+            entries.push(entry);
+        }
+        let output = tmp.path().join(format!("{network}.json"));
+        let descriptors: Vec<_> = entries.iter().map(|e| e["descriptor"].clone()).collect();
+        std::fs::write(&list, json!(descriptors).to_string()).unwrap();
+        let exported = ok(run(&["descriptor", "export", list.to_str().unwrap(), output.to_str().unwrap(), flag]));
+        assert_eq!(exported["entries"], json!(entries));
+        assert_eq!(ok(run(&["descriptor", "import", output.to_str().unwrap(), flag])), exported);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn descriptor_cli_export_refuses_existing_symlink() {
