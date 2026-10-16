@@ -1,0 +1,317 @@
+{
+  "source_revision": "326e2922a72ce124622be70b5aa633d2941cfe6d",
+  "env": {
+    "CARGO_TARGET_DIR": "/private/tmp/gnb-r5-target-descriptor-core",
+    "CARGO_PROFILE_DEV_CODEGEN_UNITS": "139",
+    "CARGO_PROFILE_TEST_CODEGEN_UNITS": "139",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_BUILD_JOBS": "2"
+  },
+  "source_hashes": {
+    "crates/gnb-crypto/src/wallet/descriptor.rs": "2dda2ed111b8fcbbfd1a653b629db3707864392c685c76c3f26cac1f7fae18e3",
+    "crates/gnb-wallet-wasm/src/lib.rs": "dd759ae4cd2909bd48913934f5f878cce7edef7f37055983f0ce4ee576a4b0cd"
+  },
+  "test_hashes": {
+    "crates/gnb-crypto/tests/public_descriptors.rs": "24bddd287140e57f5dbedf66ee8352221a35c0dff2305dfa3aa6a0b4d1467afa",
+    "crates/gnb-wallet-wasm/tests/public_descriptors.rs": "4631d4dadee315360fe1f39812f27abc1ba4bb80b994ad4be593b5f400290a93"
+  },
+  "records": [
+    {
+      "case": "wasm-dispatch",
+      "phase": "reversed",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-wallet-wasm",
+        "--test",
+        "public_descriptors",
+        "--locked",
+        "--offline",
+        "public_descriptor_creation_preserves_existing_script_without_a_session",
+        "--",
+        "--exact"
+      ],
+      "exit": 101,
+      "log": "/private/tmp/gnb-r5-descriptor-core-reversals/wasm-dispatch-reversed.log",
+      "sha256": "0ab6ffe7f8b1f7c940d7eb2b8ba81d9dbda3de743dbbb3edb8647f355471dd9c",
+      "production_sha256": "cbcba84c8b3a4c320ed63675664512d12619f391eb77a4b994043c10b39e7de0"
+    },
+    {
+      "case": "wasm-dispatch",
+      "phase": "restored",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-wallet-wasm",
+        "--test",
+        "public_descriptors",
+        "--locked",
+        "--offline",
+        "public_descriptor_creation_preserves_existing_script_without_a_session",
+        "--",
+        "--exact"
+      ],
+      "exit": 0,
+      "log": "/private/tmp/gnb-r5-descriptor-core-reversals/wasm-dispatch-restored.log",
+      "sha256": "0bcfd96ec8394f85e2825f30cee8e16033fc51b5dbc092a0d93fd94567467ec9",
+      "production_sha256": "dd759ae4cd2909bd48913934f5f878cce7edef7f37055983f0ce4ee576a4b0cd"
+    },
+    {
+      "case": "checksum",
+      "phase": "reversed",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--test",
+        "public_descriptors",
+        "--locked",
+        "--offline",
+        "checksum_is_mandatory_and_binds_network_and_every_key_byte",
+        "--",
+        "--exact"
+      ],
+      "exit": 101,
+      "log": "/private/tmp/gnb-r5-descriptor-core-reversals/checksum-reversed.log",
+      "sha256": "064efbe279719cdaf4da6529177339f416d07848ef9c9be630af2a4c98acb655",
+      "production_sha256": "c26206ae3e4f25cb41b7a902cc6740fa8ca9dc743ee4787e2aa5e707b794c4a7"
+    },
+    {
+      "case": "checksum",
+      "phase": "restored",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--test",
+        "public_descriptors",
+        "--locked",
+        "--offline",
+        "checksum_is_mandatory_and_binds_network_and_every_key_byte",
+        "--",
+        "--exact"
+      ],
+      "exit": 0,
+      "log": "/private/tmp/gnb-r5-descriptor-core-reversals/checksum-restored.log",
+      "sha256": "d7ba0fe50800218fe2460b98107a65bfefcc5f060558f48c6e5a3913eaf92983",
+      "production_sha256": "2dda2ed111b8fcbbfd1a653b629db3707864392c685c76c3f26cac1f7fae18e3"
+    },
+    {
+      "case": "request-network",
+      "phase": "reversed",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--test",
+        "public_descriptors",
+        "--locked",
+        "--offline",
+        "shared_request_rejects_wrong_network_types_fields_and_session_actions",
+        "--",
+        "--exact"
+      ],
+      "exit": 101,
+      "log": "/private/tmp/gnb-r5-descriptor-core-reversals/request-network-reversed.log",
+      "sha256": "5fc0d84b6f0ac62bf87ea465fd8eb1765e500a515fe863d4be26ea90d3a76057",
+      "production_sha256": "766648802f0fd099734a32949c89a3803c4d69118707170f6feb73e7e03e4393"
+    },
+    {
+      "case": "request-network",
+      "phase": "restored",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--test",
+        "public_descriptors",
+        "--locked",
+        "--offline",
+        "shared_request_rejects_wrong_network_types_fields_and_session_actions",
+        "--",
+        "--exact"
+      ],
+      "exit": 0,
+      "log": "/private/tmp/gnb-r5-descriptor-core-reversals/request-network-restored.log",
+      "sha256": "494dd44e088277ccdddb2ee14c24efffc03693eae77868e9a32b9b9b07e20a36",
+      "production_sha256": "2dda2ed111b8fcbbfd1a653b629db3707864392c685c76c3f26cac1f7fae18e3"
+    },
+    {
+      "case": "pool-raw-limit",
+      "phase": "reversed",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--test",
+        "public_descriptors",
+        "--locked",
+        "--offline",
+        "pool_entry_and_raw_byte_limits_have_positive_controls",
+        "--",
+        "--exact"
+      ],
+      "exit": 101,
+      "log": "/private/tmp/gnb-r5-descriptor-core-reversals/pool-raw-limit-reversed.log",
+      "sha256": "c572026e8d28b391e66dcf7f5663d6e213c68f5f3e293be9254b53b8697043d6",
+      "production_sha256": "d6345407ee8a8dad3103fcc267a6b9f1a74841108e8a9456ba396df3517a7486"
+    },
+    {
+      "case": "pool-raw-limit",
+      "phase": "restored",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--test",
+        "public_descriptors",
+        "--locked",
+        "--offline",
+        "pool_entry_and_raw_byte_limits_have_positive_controls",
+        "--",
+        "--exact"
+      ],
+      "exit": 0,
+      "log": "/private/tmp/gnb-r5-descriptor-core-reversals/pool-raw-limit-restored.log",
+      "sha256": "4bb4b03779d167ea99188731fa95608650721ec8ab255419480511b7549d9544",
+      "production_sha256": "2dda2ed111b8fcbbfd1a653b629db3707864392c685c76c3f26cac1f7fae18e3"
+    },
+    {
+      "case": "pool-duplicates",
+      "phase": "reversed",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--test",
+        "public_descriptors",
+        "--locked",
+        "--offline",
+        "pool_rejects_duplicate_unknown_fields_trailing_bytes_and_duplicate_scripts",
+        "--",
+        "--exact"
+      ],
+      "exit": 101,
+      "log": "/private/tmp/gnb-r5-descriptor-core-reversals/pool-duplicates-reversed.log",
+      "sha256": "3ab43f405b63218dc675485c66a0740894e39a758581b366645c3138bda3fbbc",
+      "production_sha256": "513a6b66a52d14e646db21ce55daa8a26e07ed2b2ca556da8afc90f4bca80431"
+    },
+    {
+      "case": "pool-duplicates",
+      "phase": "restored",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--test",
+        "public_descriptors",
+        "--locked",
+        "--offline",
+        "pool_rejects_duplicate_unknown_fields_trailing_bytes_and_duplicate_scripts",
+        "--",
+        "--exact"
+      ],
+      "exit": 0,
+      "log": "/private/tmp/gnb-r5-descriptor-core-reversals/pool-duplicates-restored.log",
+      "sha256": "8e8697f6fb18e954988d11650a67ecd2bc9719f8c81ead9f0cd5f46b5bef6eff",
+      "production_sha256": "2dda2ed111b8fcbbfd1a653b629db3707864392c685c76c3f26cac1f7fae18e3"
+    },
+    {
+      "case": "pool-script-uniqueness",
+      "phase": "reversed",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--test",
+        "public_descriptors",
+        "--locked",
+        "--offline",
+        "pool_rejects_duplicate_unknown_fields_trailing_bytes_and_duplicate_scripts",
+        "--",
+        "--exact"
+      ],
+      "exit": 101,
+      "log": "/private/tmp/gnb-r5-descriptor-core-reversals/pool-script-uniqueness-reversed.log",
+      "sha256": "5625063365908cd7ac0e79a5ca07b73bcba6c8d58ba415cf51a209b850a496a0",
+      "production_sha256": "3b0c649086d98051e35633fcd1d38784de274578498b70e24bb697b3b549082b"
+    },
+    {
+      "case": "pool-script-uniqueness",
+      "phase": "restored",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--test",
+        "public_descriptors",
+        "--locked",
+        "--offline",
+        "pool_rejects_duplicate_unknown_fields_trailing_bytes_and_duplicate_scripts",
+        "--",
+        "--exact"
+      ],
+      "exit": 0,
+      "log": "/private/tmp/gnb-r5-descriptor-core-reversals/pool-script-uniqueness-restored.log",
+      "sha256": "3bea4f97430e7c5f4eb605cd377b37117b0aac3382b5079a2b37697310701bb2",
+      "production_sha256": "2dda2ed111b8fcbbfd1a653b629db3707864392c685c76c3f26cac1f7fae18e3"
+    },
+    {
+      "case": "raw-operation-gate",
+      "phase": "reversed",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-wallet-wasm",
+        "--test",
+        "public_descriptors",
+        "--locked",
+        "--offline",
+        "raw_public_envelopes_cannot_redirect_or_mutate_a_live_session",
+        "--",
+        "--exact"
+      ],
+      "exit": 101,
+      "log": "/private/tmp/gnb-r5-descriptor-core-reversals/raw-operation-gate-reversed.log",
+      "sha256": "1353923d1a68297eb3ac3f932e34e3ab2d6b02752afeec3de16364049fee43be",
+      "production_sha256": "9d77e0d49133cb384ecf7bf1dc443fc9334ae174f14783ca7c02a38ac4ca3496"
+    },
+    {
+      "case": "raw-operation-gate",
+      "phase": "restored",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-wallet-wasm",
+        "--test",
+        "public_descriptors",
+        "--locked",
+        "--offline",
+        "raw_public_envelopes_cannot_redirect_or_mutate_a_live_session",
+        "--",
+        "--exact"
+      ],
+      "exit": 0,
+      "log": "/private/tmp/gnb-r5-descriptor-core-reversals/raw-operation-gate-restored.log",
+      "sha256": "980511f438281213815fefc2140510479366c00e5f9eaf523a197bf18af9173b",
+      "production_sha256": "dd759ae4cd2909bd48913934f5f878cce7edef7f37055983f0ce4ee576a4b0cd"
+    }
+  ],
+  "restored": true
+}
