@@ -1817,3 +1817,7 @@ mod audit_send_inputs {
 #[cfg(test)]
 #[path = "../../tests/support/pqpsbt_cli_unit.rs"]
 mod pqpsbt_cli_tests;
+
+#[cfg(test)]
+#[path = "../../tests/support/address_frontends_cli.rs"]
+mod address_frontends_tests;
