@@ -146,10 +146,18 @@ POW-9):
   `gnb-testnet/...`), so neither network subscribes to, pulls from or serves
   the other's frames, and a peer that identifies with another network's
   protocol version is disconnected (`node/tests/fix_pow9_network_separation.rs`).
+  A dialed address enters the tried table (`known_peers`) only after a
+  same-network identify, as Core marks an address good only after the
+  version handshake; another network's address is removed from it.
 - **A data directory belongs to one network**: the genesis check at start-up
   cannot tell the networks apart, so the data dir records its chain id in
   CF_META (`chain_id`, written on its first start) and a node of the other
-  network refuses it (`Storage::check_chain_marker`; docs/RUNNING.md).
+  network refuses it (`Storage::check_chain_marker`; docs/RUNNING.md). A
+  data dir without the marker (from an earlier release) that holds chain
+  blocks is marked only for the network its blocks follow: the first stored
+  body among the highest chain-index rows at header height 1..109,999 passes
+  `check_block_hardened_at(block, 0)` on testnet and fails it on mainnet
+  (`Storage::stored_chain_network`); a node of the other network is refused.
 
 ## Acceptance order
 

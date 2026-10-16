@@ -90,6 +90,10 @@ pub const CHAIN_INDEX_VERSION_META: &str = "chain_index_version";
 /// [`Storage::migrate_chain_indexes`]).
 pub const CHAIN_INDEX_VERSION: u32 = 2;
 
+/// Selected-chain index rows, from the top, that
+/// [`Storage::stored_chain_network`] reads at most.
+pub const CHAIN_SHAPE_SCAN: usize = 64;
+
 /// CF_UNDO key prefix of a [`PrunedBodyRecord`]. Undo records are keyed by
 /// the bare 32-byte block hash; these keys are longer, so
 /// `Storage::undo_block_hashes` never mistakes one for an undo record.
@@ -1586,12 +1590,41 @@ impl Storage {
     /// apart (opening a mainnet data dir on testnet would recheck its blocks
     /// under testnet's activation schedule and disqualify them). The data dir
     /// records the chain id it was created for: `Ok(true)` when the marker
-    /// was absent and has been written (a new data dir, or one created before
-    /// the marker existed), `Ok(false)` when it matches, `Err` when it names
-    /// another network.
+    /// was absent and has been written, `Ok(false)` when it matches, `Err`
+    /// when it names another network.
+    ///
+    /// A data dir without the marker (a new one, or one written before the
+    /// marker existed: every data dir of an earlier release) is not marked
+    /// for whatever network opens it first: when it holds chain blocks, the
+    /// network they belong to is read from the blocks themselves
+    /// ([`Storage::stored_chain_network`]) and a node of the other network is
+    /// refused, so a mainnet node restarted with `--testnet` by mistake
+    /// neither marks the dir as testnet nor disqualifies its blocks.
     pub fn check_chain_marker(&self, chain_id: u32) -> Result<bool, String> {
         match self.get_meta(Self::CHAIN_ID_META).map_err(|e| e.to_string())? {
             None => {
+                if let Some((found, block, height)) = self.stored_chain_network().map_err(|e| e.to_string())? {
+                    if found.to_u32() != chain_id {
+                        return Err(format!(
+                            "this data dir has no chain id marker yet, but its block {} (height {}) follows the \
+                             {} rules below the mainnet hardening activation, so it belongs to chain id {:#010x}{}; \
+                             the node runs chain id {:#010x}",
+                            hex::encode(&block[..8]), height,
+                            match found {
+                                crate::core::ChainId::Mainnet => "pre-activation (legacy)",
+                                crate::core::ChainId::Testnet => "hardened",
+                            },
+                            found.to_u32(),
+                            match found {
+                                crate::core::ChainId::Mainnet => " (or to a testnet started before testnet's \
+                                    hardening, whose blocks the testnet rules reject anyway: start testnet with \
+                                    a new --data-dir)",
+                                crate::core::ChainId::Testnet => "",
+                            },
+                            chain_id,
+                        ));
+                    }
+                }
                 self.put_meta(Self::CHAIN_ID_META, &chain_id.to_le_bytes()).map_err(|e| e.to_string())?;
                 Ok(true)
             }
@@ -1604,6 +1637,38 @@ impl Storage {
                 chain_id,
             )),
         }
+    }
+
+    /// The network the stored chain of an unmarked data dir belongs to
+    /// (POW-9 review), with the block that tells: the first block with a
+    /// stored body among the [`CHAIN_SHAPE_SCAN`] highest selected-chain
+    /// index rows whose header height is in `1..110,000` (the mainnet
+    /// hardening activation). Below it a mainnet block follows the
+    /// pre-activation rules (legacy Merkle root, free-form coinbase) and a
+    /// testnet block the hardening rules (testnet activates them at 0),
+    /// which exclude each other (docs/CONSENSUS.md, "Networks"), so
+    /// `block_rules::check_block_hardened_at(block, 0)` tells them apart.
+    /// `None`: no such block (a dir holding only the genesis, or whose
+    /// recent bodies are all at or above the activation or pruned); the
+    /// running network is then adopted. Pruning keeps the bodies of the
+    /// most recent 10,000 positions, so the highest rows have bodies.
+    pub fn stored_chain_network(&self) -> Result<Option<(crate::core::ChainId, BlockHash, u64)>, StorageError> {
+        use crate::core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
+        let cf = self.db.cf_handle(CF_HEIGHT).ok_or(StorageError::CfNotFound(CF_HEIGHT.into()))?;
+        for item in self.db.iterator_cf(&cf, IteratorMode::End).take(CHAIN_SHAPE_SCAN) {
+            let (_, v) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            let Ok(hash) = <BlockHash>::try_from(v.as_ref()) else { continue };
+            let Ok(Some(block)) = self.get_block(&hash) else { continue };
+            if block.height == 0 || block.height >= MAINNET_HARDENING_ACTIVATION_HEIGHT {
+                continue;
+            }
+            let chain = match crate::core::block_rules::check_block_hardened_at(&block, 0) {
+                Ok(()) => crate::core::ChainId::Testnet,
+                Err(_) => crate::core::ChainId::Mainnet,
+            };
+            return Ok(Some((chain, hash, block.height)));
+        }
+        Ok(None)
     }
 
     // ── Sprint U.1: Undo data for reorg rollback ─────────────────────────

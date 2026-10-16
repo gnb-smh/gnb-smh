@@ -69,6 +69,91 @@ pub fn same_network(ours: &ChainProtocols, theirs: &str) -> bool {
     theirs == ours.identify
 }
 
+/// Dialed addresses waiting for the peer's identify before they enter the
+/// "tried" table (`known_peers`). An outbound connection proves the address
+/// reaches A node, not a node of THIS network: a node of the other network
+/// accepts the connection and is dropped only when its identify arrives.
+/// Bitcoin Core marks an address good (`CAddrMan::Good`) only after the
+/// VERSION handshake, whose message start already carried the network's
+/// magic; here the address is promoted on a same-network identify, and on
+/// another network's it is removed from the tried table and the address
+/// book, so it is neither saved to `known_peers.json`, redialed at start nor
+/// served to `GetPeers`, and never evicts a same-netgroup address of this
+/// network. The peer is also remembered (bounded) as one of another
+/// network, so an address of it that peer exchange offers again is not
+/// dialed during this run ([`PendingTried::is_other_network`]).
+#[derive(Debug, Default)]
+pub struct PendingTried {
+    by_peer: std::collections::HashMap<libp2p::PeerId, String>,
+    other_network: std::collections::HashSet<libp2p::PeerId>,
+    other_order: std::collections::VecDeque<libp2p::PeerId>,
+}
+
+/// At most this many dialed addresses wait for identify (one per
+/// connection; the connection limits keep it far below).
+pub const PENDING_TRIED_CAP: usize = 1_024;
+
+/// At most this many peers are remembered as another network's (oldest
+/// forgotten first).
+pub const OTHER_NETWORK_CAP: usize = 1_024;
+
+impl PendingTried {
+    /// An outbound connection to `peer` at the canonical `addr` is up.
+    pub fn on_dialed(&mut self, peer: libp2p::PeerId, addr: String) {
+        if self.by_peer.len() < PENDING_TRIED_CAP || self.by_peer.contains_key(&peer) {
+            self.by_peer.insert(peer, addr);
+        }
+    }
+
+    /// The last connection to `peer` closed before (or after) identify.
+    pub fn on_closed(&mut self, peer: &libp2p::PeerId) {
+        self.by_peer.remove(peer);
+    }
+
+    /// `peer` identified. Same network: its dialed address (if any) enters
+    /// the tried table (`pex_validator::add_tried`). Another network: every address
+    /// of it is dropped from the tried table and the address book. Returns
+    /// the dialed address it acted on.
+    pub fn on_identified(
+        &mut self,
+        peer: &libp2p::PeerId,
+        same_network: bool,
+        known_peers: &mut std::collections::HashSet<String>,
+        addr_book: &mut super::pex_validator::AddrBook,
+    ) -> Option<String> {
+        let dialed = self.by_peer.remove(peer);
+        if same_network {
+            if self.other_network.remove(peer) {
+                self.other_order.retain(|p| p != peer);
+            }
+            if let Some(a) = &dialed {
+                super::pex_validator::add_tried(known_peers, a.clone());
+            }
+        } else {
+            let suffix = format!("/p2p/{peer}");
+            known_peers.retain(|a| !a.ends_with(&suffix) && Some(a) != dialed.as_ref());
+            if let Some(a) = &dialed {
+                addr_book.remove(a);
+            }
+            if self.other_network.insert(*peer) {
+                self.other_order.push_back(*peer);
+                if self.other_order.len() > OTHER_NETWORK_CAP {
+                    if let Some(old) = self.other_order.pop_front() {
+                        self.other_network.remove(&old);
+                    }
+                }
+            }
+        }
+        dialed
+    }
+
+    /// `peer` identified as a node of another network during this run: an
+    /// address of it is not dialed from the address book.
+    pub fn is_other_network(&self, peer: &libp2p::PeerId) -> bool {
+        self.other_network.contains(peer)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +193,60 @@ mod tests {
         assert!(!same_network(&TESTNET, "/gnb/1.0.0"));
         assert!(!same_network(&MAINNET, ""));
         assert!(!same_network(&MAINNET, "/ipfs/0.1.0"));
+    }
+
+    /// POW-9 (review): a dialed address enters the tried table only once
+    /// identify confirms the network; one of another network is removed
+    /// from it (an entry an earlier release saved included) and from the
+    /// address book.
+    #[test]
+    fn a_dialed_address_is_tried_only_after_a_same_network_identify() {
+        use std::collections::HashSet;
+        let (ours, theirs) = (libp2p::PeerId::random(), libp2p::PeerId::random());
+        let ours_addr = format!("/ip4/1.2.3.4/tcp/17110/p2p/{ours}");
+        let theirs_addr = format!("/ip4/1.2.9.9/tcp/17110/p2p/{theirs}");
+        let mut known: HashSet<String> = HashSet::new();
+        let mut book = crate::network::pex_validator::AddrBook::new();
+        let mut p = PendingTried::default();
+
+        p.on_dialed(ours, ours_addr.clone());
+        p.on_dialed(theirs, theirs_addr.clone());
+        assert!(known.is_empty(), "nothing is tried before identify");
+        assert_eq!(p.on_identified(&ours, true, &mut known, &mut book), Some(ours_addr.clone()));
+        assert!(known.contains(&ours_addr));
+
+        // Saved by an earlier release (both networks shared topics and PEX).
+        known.insert(theirs_addr.clone());
+        assert!(book.add(&theirs_addr));
+        assert_eq!(p.on_identified(&theirs, false, &mut known, &mut book), Some(theirs_addr.clone()));
+        assert!(!known.contains(&theirs_addr), "another network's address leaves the tried table");
+        assert!(!book.contains(&theirs_addr), "and the address book");
+        assert!(known.contains(&ours_addr));
+
+        // It is not dialed again from the address book during this run.
+        assert!(p.is_other_network(&theirs) && !p.is_other_network(&ours));
+
+        // A connection that closes before identify leaves nothing behind.
+        p.on_dialed(theirs, theirs_addr.clone());
+        p.on_closed(&theirs);
+        assert_eq!(p.on_identified(&theirs, true, &mut known, &mut book), None);
+        assert!(!known.contains(&theirs_addr));
+        assert!(!p.is_other_network(&theirs), "a same-network identify clears the mark");
+    }
+
+    /// The set of other-network peers is bounded (oldest forgotten first).
+    #[test]
+    fn other_network_peers_are_bounded() {
+        let mut known = std::collections::HashSet::new();
+        let mut book = crate::network::pex_validator::AddrBook::new();
+        let mut p = PendingTried::default();
+        let first = libp2p::PeerId::random();
+        p.on_identified(&first, false, &mut known, &mut book);
+        for _ in 0..OTHER_NETWORK_CAP {
+            p.on_identified(&libp2p::PeerId::random(), false, &mut known, &mut book);
+        }
+        assert!(!p.is_other_network(&first));
+        assert_eq!(p.other_network.len(), OTHER_NETWORK_CAP);
+        assert_eq!(p.other_order.len(), OTHER_NETWORK_CAP);
     }
 }

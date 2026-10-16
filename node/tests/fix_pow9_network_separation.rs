@@ -21,13 +21,21 @@ use libp2p::PeerId;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
+mod fix_common;
+
 const GENESIS: [u8; 32] = [0xCB; 32];
+
+/// `PeerCount` reports: (peer count, tried table at that moment).
+type Reports = Arc<RwLock<Vec<(usize, Vec<String>)>>>;
 
 struct Harness {
     peer_id: PeerId,
     addr: libp2p::Multiaddr,
     dag: Arc<RwLock<GhostDAG>>,
     outbound_tx: mpsc::Sender<NetworkMessage>,
+    /// Every `PeerCount` report the node delivered: the peer count and the
+    /// tried table (`known_peers`) at that moment.
+    reports: Reports,
     _dir: tempfile::TempDir,
 }
 
@@ -68,6 +76,7 @@ async fn spawn_node(chain: ChainId, bootstrap_peers: Vec<String>) -> Harness {
     let (block_tx, mut block_rx) = mpsc::channel::<NetworkMessage>(1024);
     let (outbound_tx, outbound_rx) = mpsc::channel::<NetworkMessage>(1024);
     let (addr_tx, mut addr_rx) = mpsc::unbounded_channel::<libp2p::Multiaddr>();
+    let reports: Reports = Arc::default();
     {
         let (dag, ps, store) = (dag.clone(), peer_state.clone(), store.clone());
         tokio::spawn(async move {
@@ -75,9 +84,12 @@ async fn spawn_node(chain: ChainId, bootstrap_peers: Vec<String>) -> Harness {
         });
     }
     {
-        let dag = dag.clone();
+        let (dag, reports) = (dag.clone(), reports.clone());
         tokio::spawn(async move {
             while let Some(msg) = block_rx.recv().await {
+                if let NetworkMessage::PeerCount { count, addresses } = &msg {
+                    reports.write().push((*count, addresses.clone()));
+                }
                 if let NetworkMessage::NewBlock { block_data, .. } = msg {
                     if let Ok((p, _)) =
                         bincode::serde::decode_from_slice::<SimPayload, _>(&block_data, bincode::config::standard())
@@ -102,7 +114,7 @@ async fn spawn_node(chain: ChainId, bootstrap_peers: Vec<String>) -> Harness {
     })
     .await
     .expect("listen addr");
-    Harness { peer_id, addr, dag, outbound_tx, _dir: dir }
+    Harness { peer_id, addr, dag, outbound_tx, reports, _dir: dir }
 }
 
 async fn publish_block(h: &Harness, hash: [u8; 32], ts: u64) {
@@ -175,4 +187,120 @@ async fn two_testnet_nodes_exchange_gossip() {
     let a = spawn_node(ChainId::Testnet, vec![]).await;
     let b = spawn_node(ChainId::Testnet, vec![full_addr(&a)]).await;
     assert!(mesh_carries(&a, &b, 0xC1, 10).await, "testnet -> testnet gossip works");
+}
+
+/// Wait until `cond` holds on `h`'s reports, for at most `secs`.
+async fn reports_reach(h: &Harness, secs: u64, cond: impl Fn(&[(usize, Vec<String>)]) -> bool) -> bool {
+    tokio::time::timeout(Duration::from_secs(secs), async {
+        loop {
+            if cond(&h.reports.read()) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// POW-9 (review): a dialed address enters the tried table (`known_peers`,
+/// saved to known_peers.json, redialed at start, served to `GetPeers`) only
+/// after the peer's identify shows it runs this network. A testnet node
+/// that dials a mainnet node is dropped on identify and never records the
+/// mainnet address (it used to record it at the connection, before
+/// identify, and keep it after the disconnect); a mainnet node that dials
+/// the same address records it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_address_of_the_other_network_never_enters_the_tried_table() {
+    let main_a = spawn_node(ChainId::Mainnet, vec![]).await;
+    let test_b = spawn_node(ChainId::Testnet, vec![full_addr(&main_a)]).await;
+    let main_c = spawn_node(ChainId::Mainnet, vec![full_addr(&main_a)]).await;
+    let a_id = format!("/p2p/{}", main_a.peer_id);
+    let names_a = |r: &(usize, Vec<String>)| r.1.iter().any(|x| x.ends_with(&a_id));
+
+    // The testnet node connects, identifies the mainnet node and drops it:
+    // a disconnect report (count back to 0 after a connection).
+    assert!(
+        reports_reach(&test_b, 20, |r| {
+            r.iter().position(|(c, _)| *c >= 1).is_some_and(|i| r[i..].iter().any(|(c, _)| *c == 0))
+        })
+        .await,
+        "the testnet node connected to the mainnet node and was dropped: {:?}",
+        test_b.reports.read()
+    );
+    // The heartbeat (30 s) reports the tried table of both dialers.
+    assert!(
+        reports_reach(&main_c, 45, |r| r.iter().any(names_a)).await,
+        "a mainnet dialer records the mainnet address once identify confirms it: {:?}",
+        main_c.reports.read()
+    );
+    assert!(
+        reports_reach(&test_b, 10, |r| r.iter().filter(|(c, _)| *c == 0).count() >= 2).await,
+        "the testnet node reported its tried table again: {:?}",
+        test_b.reports.read()
+    );
+    let reports = test_b.reports.read().clone();
+    assert!(
+        !reports.iter().any(names_a),
+        "the mainnet address entered the testnet node's tried table: {reports:?}"
+    );
+}
+
+/// POW-9 (review): a data dir without the chain id marker (every data dir of
+/// an earlier release) used to be marked for whichever network opened it
+/// first, so a mainnet node restarted with `--testnet` by mistake marked its
+/// dir as testnet (and the hardening recheck then disqualified its blocks
+/// below 110,000). The network is now read from the stored blocks: below
+/// the mainnet activation a mainnet block follows the pre-activation rules
+/// and a testnet block the hardening rules, and the other network is
+/// refused without marking anything.
+#[test]
+fn an_unmarked_data_dir_is_marked_only_for_the_network_its_blocks_follow() {
+    use gnb::core::activation;
+    use gnb::storage::Storage;
+    let (main, test) = (ChainId::Mainnet.to_u32(), ChainId::Testnet.to_u32());
+    let genesis = fix_common::mk_genesis(fix_common::unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let two_blocks = |n: &fix_common::Node| {
+        let b1 = fix_common::empty_child(n, gh, "b1");
+        fix_common::accept(n, &b1).unwrap();
+        let b2 = fix_common::empty_child(n, b1.block_hash(), "b2");
+        fix_common::accept(n, &b2).unwrap();
+        (b1, b2)
+    };
+
+    // Only the genesis: nothing tells, the running network is adopted.
+    let n = fix_common::node_with(&genesis, &[]);
+    assert_eq!(n.store.stored_chain_network().unwrap(), None);
+    assert_eq!(n.store.check_chain_marker(test), Ok(true));
+
+    // A mainnet data dir (pre-activation rules below 110,000).
+    {
+        let _g = activation::scoped_override(activation::MAINNET_HARDENING_ACTIVATION_HEIGHT);
+        let n = fix_common::node_with(&genesis, &[]);
+        let (b1, b2) = two_blocks(&n);
+        assert_eq!(n.store.stored_chain_network().unwrap(), Some((ChainId::Mainnet, b2.block_hash(), 2)));
+        let err = n.store.check_chain_marker(test).unwrap_err();
+        assert!(err.contains("no chain id marker") && err.contains("0x474e0001") && err.contains("0x474e0002"), "{err}");
+        assert_eq!(n.store.get_meta(Storage::CHAIN_ID_META).unwrap(), None, "the refused open marks nothing");
+        // The tip's body pruned: the next row with a body tells.
+        n.store.delete_block_body(&b2.block_hash()).unwrap();
+        assert_eq!(n.store.stored_chain_network().unwrap(), Some((ChainId::Mainnet, b1.block_hash(), 1)));
+        assert!(n.store.check_chain_marker(test).is_err());
+        assert_eq!(n.store.check_chain_marker(main), Ok(true), "the right network marks it");
+        assert_eq!(n.store.check_chain_marker(main), Ok(false));
+        assert!(n.store.check_chain_marker(test).unwrap_err().contains("belongs to chain id 0x474e0001"));
+    }
+
+    // A testnet data dir (hardening rules from height 1).
+    {
+        let _g = activation::scoped_override(activation::TESTNET_HARDENING_ACTIVATION_HEIGHT);
+        let n = fix_common::node_with(&genesis, &[]);
+        let (_, b2) = two_blocks(&n);
+        assert_eq!(n.store.stored_chain_network().unwrap(), Some((ChainId::Testnet, b2.block_hash(), 2)));
+        let err = n.store.check_chain_marker(main).unwrap_err();
+        assert!(err.contains("no chain id marker") && err.contains("hardened"), "{err}");
+        assert_eq!(n.store.get_meta(Storage::CHAIN_ID_META).unwrap(), None);
+        assert_eq!(n.store.check_chain_marker(test), Ok(true));
+    }
 }

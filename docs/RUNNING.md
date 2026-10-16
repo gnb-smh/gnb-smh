@@ -24,12 +24,25 @@ the genesis proof of work and starts syncing. Later boots only need
 Use one data dir per network. Mainnet and testnet (`--testnet`) share the
 genesis block, so the genesis check alone cannot tell their data dirs apart;
 the data dir records the chain id of the network it was first started on
-(CF_META `chain_id`; a data dir from an earlier release is marked with the
-network of its first start under this release), and a node of the other
-network refuses it with "this data dir belongs to chain id ...". The two
+(CF_META `chain_id`), and a node of the other network refuses it with "this
+data dir belongs to chain id ...". A data dir from an earlier release has no
+marker yet; it is not simply marked for the network that opens it first:
+when it holds chain blocks, the node reads their network from the blocks
+(below height 110,000 a mainnet block follows the pre-activation rules and a
+testnet block the hardening rules, which exclude each other) and refuses to
+start on the other network with "this data dir has no chain id marker yet,
+but its block ... belongs to chain id ...". A testnet data dir from before
+testnet's hardening reads as mainnet-shaped: its blocks fail the testnet
+rules anyway, so start testnet with a new `--data-dir`. Only a data dir
+whose recent blocks are all at or above height 110,000 (or that holds only
+the genesis) is marked for the running network without this check. The two
 networks also use different gossip topics and sync protocols, and a node
 disconnects a peer of the other network after the identify exchange
-(docs/CONSENSUS.md, "Networks").
+(docs/CONSENSUS.md, "Networks"). A dialed address enters `known_peers.json`
+only once the peer's identify shows it runs the same network; an address of
+the other network is removed from it (entries saved by an earlier release,
+when both networks shared topics and peer exchange, included) and is not
+dialed again from peer exchange during that run.
 
 ## Mining
 

@@ -26,7 +26,7 @@ use sha2::{Sha256, Digest};
 
 use pex_validator::{
     PexRateLimiter, PexStats, AddrBook,
-    is_valid_public_multiaddr, is_lan_multiaddr, enforce_cap, prune_invalid, add_tried, addr_peer_id,
+    is_valid_public_multiaddr, is_lan_multiaddr, enforce_cap, prune_invalid, addr_peer_id,
     PEX_BATCH_LIMIT, KNOWN_PEERS_CAP,
 };
 
@@ -1330,6 +1330,8 @@ impl NetworkNode {
         let mut pex_limiter = PexRateLimiter::new();
         let mut pex_stats   = PexStats::new();
         let mut addr_book   = AddrBook::new();
+        // POW-9: dialed addresses enter the tried table after identify.
+        let mut pending_tried = chain_separation::PendingTried::default();
         let allow_private   = self.config.allow_private_peers;
 
         // C1 / NET-4 / NET-8: cumulative, decaying, bounded app-score
@@ -1576,7 +1578,8 @@ impl NetworkNode {
                             // PROPAGAÇÃO-CHURN fix: persist only the canonical form of
                             // a DIALED address (the Listener's send_back_addr is an
                             // ephemeral socket). NET-11: confirmed addresses enter
-                            // the netgroup-capped "tried" table.
+                            // the netgroup-capped "tried" table — POW-9: once the
+                            // peer's identify shows it runs this network.
                             let addr_to_remember = match &endpoint {
                                 libp2p::core::ConnectedPoint::Dialer { address, .. } => {
                                     Some(canonical_peer_addr(address, &peer_id))
@@ -1584,9 +1587,8 @@ impl NetworkNode {
                                 libp2p::core::ConnectedPoint::Listener { .. } => None,
                             };
                             if let Some(addr_str) = addr_to_remember {
-                                addr_book.remove(&addr_str);
                                 if is_valid_public_multiaddr(&addr_str, allow_private) {
-                                    add_tried(&mut known_peers, addr_str);
+                                    pending_tried.on_dialed(peer_id, addr_str);
                                 } else {
                                     debug!("not adding peer to known_peers (validator rejected): {}",
                                         truncate_utf8(&addr_str, 80));
@@ -1678,6 +1680,9 @@ impl NetworkNode {
                         }
                         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                             info!("✗ disconnected: {}", peer_id);
+                            if num_established == 0 {
+                                pending_tried.on_closed(&peer_id);
+                            }
                             if let Some(count) = peer_count_after_disconnect(peer_count, num_established) {
                                 peer_count = count;
                                 crate::metrics::set_peer_count(peer_count as i64);
@@ -1733,8 +1738,15 @@ impl NetworkNode {
                             // GnB at all) is dropped, as Bitcoin Core drops a
                             // connection carrying another network's magic. Its
                             // observed address of us is not counted either.
-                            if !chain_separation::same_network(&protos, &info.protocol_version) {
-                                info!("peer {} identifies as {:?}, not {:?}: another network; disconnecting",
+                            let same = chain_separation::same_network(&protos, &info.protocol_version);
+                            if let Some(a) = pending_tried.on_identified(&peer_id, same, &mut known_peers, &mut addr_book) {
+                                if same {
+                                    addr_book.remove(&a);
+                                }
+                            }
+                            if !same {
+                                info!("peer {} identifies as {:?}, not {:?}: another network; disconnecting \
+                                       (its address leaves the tried table)",
                                     peer_id, truncate_utf8(&info.protocol_version, 64), protos.identify);
                                 let _ = swarm.disconnect_peer_id(peer_id);
                                 continue;
@@ -1948,9 +1960,13 @@ impl NetworkNode {
                     if peer_count < self.config.max_peers {
                         let want = if peer_count < PEX_LOW_PEER_THRESHOLD { PEX_DIALS_WHEN_LOW } else { 1 };
                         let me = self.peer_id;
+                        // POW-9: a peer that identified as another network's
+                        // during this run is not dialed again.
                         let cands = addr_book.take_dial_candidates(want, |a| {
                             known_peers.contains(a)
-                                || addr_peer_id(a).is_none_or(|p| p == me || swarm.is_connected(&p))
+                                || addr_peer_id(a).is_none_or(|p| {
+                                    p == me || swarm.is_connected(&p) || pending_tried.is_other_network(&p)
+                                })
                         });
                         for a in cands {
                             if let Ok(addr) = a.parse::<libp2p::Multiaddr>() {
