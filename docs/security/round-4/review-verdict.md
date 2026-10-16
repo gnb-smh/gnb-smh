@@ -8,7 +8,9 @@ debug information and incremental compilation disabled. No production file
 was changed by this reviewer. Only public synthetic addresses and local
 transactions were exercised; no broadcast or external service was used.
 
-**Disposition: changes requested for the two low-severity findings below.**
+**Initial disposition: changes requested for the two low-severity findings below.**
+The follow-up at the end records their closure and two separately confirmed
+medium-severity UI findings; initial observations are preserved.
 No numeric score or whole-round acceptance is assigned. No consensus verdict
 change or wrong-script mapping was identified in the reviewed diff and finite
 tests. That observation is not an exhaustive proof or approval of other work.
@@ -157,3 +159,79 @@ closure are still required before delivery acceptance.
 - policy route reproduction: `/private/tmp/gnb-r4-review-verdict-policy-route.log` — SHA-256 `a6f5036e8ae6602970356b89c4b540bbb233a72be52917e12f3a40646366fe36`.
 - real WASM watch checks: `/private/tmp/gnb-r4-review-verdict-real-watch.log` — SHA-256 `934e47dbe843b453ea726d05a06fba6f7653ce2d77d3ff89164b18865999d470`.
 - oracle request divergence: `/private/tmp/gnb-r4-review-verdict-oracle-shape.json` — SHA-256 `d64d70454f030ca88da14566a9e43a1af792613ec484ad8d2bd99409831a856a`.
+
+## Follow-up: original findings resolved; secondary wallet findings confirmed
+
+Reviewed `4037bba`, `04b9348` and `27b22d4` as integrated at `f1b3abe`.
+Those existing commits were merged into this reviewer worktree without
+editing production; the report's initial evidence is retained above.
+
+**R4-V1 resolved within the documented capability scope.** The main explorer
+now renders an explicit policy-history-unavailable message before attempting
+the single-key index. It does not assert an empty history or that the valid
+address is invalid. The tests enforce that no history query occurs for that
+kind. Both watch boot adapters now call the real pinned WASM and correctly
+assert policy rejection/fallback. Independently reran the revised web suite:
+**7 passed, exit 0**. Policy history and policy wallet watch support remain
+unimplemented, as the corrected tests and UI now state.
+
+**R4-V2 resolved for the specified JSON-envelope contract.** The Rust adapter
+now rejects unknown fields and matches the Python null/absent network
+semantics. The documented contract includes required fields/types, and the
+differential adds 42 envelope requests, including all three reviewer cases.
+Independently ran the updated driver against the supplied candidate binary:
+**672 requests, 42 envelope cases, zero differences, exit 0**. Its reported
+SHA-256 is `c0837c304051f6716ab58c102b1918eb150c5f92f2b4ddc2242b7fc338bfeb40`,
+matching the coordinator's frozen artifact. Also independently compiled and
+ran the example unit tests in the reviewer's CGU107 target: **5 passed,
+exit 0**. Neither result claims arbitrary JSON grammar fuzz coverage.
+
+As the second reviewer for `review-paths.md` findings, I inspected the actual
+caller and independently ran only bounded local fixtures with real WASM:
+
+- **R4-PATH-1 — medium, confirmed open.** The actual `viewSend` Review callback
+  in `site/wallet/main.js:314` omits `nextHeight`; the wrapper serializes
+  `undefined`, and the WASM returns `invalid next_height`. The identical local
+  key, single synthetic UTXO and recipient produce a v3 payment with an
+  explicit height 17500, proving the fixture itself is usable. The callback
+  shows the error and no confirmation button. The reproduction completed
+  successfully because it asserts the observed defect; it does not claim a
+  working UI. This is an availability/integration failure, not acceptance of
+  an invalid transaction or demonstrated fund loss.
+- **R4-PATH-2 — medium, confirmed open.** Beyond rerunning the initial direct
+  wrapper observation, I executed the actual registered `#create` callback
+  (`site/wallet/main.js:239`) using the real WASM and real keystore export.
+  A mainnet control produces `gnb1q`; setting `net.testnet=true` still produces
+  `gnb1q` and enters key mode. Both download calls were captured locally, not
+  written or transmitted; no secrets were logged. The existing wrapper's
+  zero-argument `create` drops the boolean. This confirms the displayed
+  testnet creation workflow selects the wrong network, but does not establish
+  a wrong-network spending bypass.
+
+Commands use Node 22.23.3:
+
+```sh
+node /private/tmp/gnb-r4-review-main-wallet.mjs <review-worktree>
+node /private/tmp/gnb-r4-review-verdict-create-callback.mjs <review-worktree>
+```
+
+Both observational scripts exit 0 on `f1b3abe` while asserting the defects.
+No broadcast was attempted; the payment adapter rejects any broadcast call.
+A new correction package is pending. Its actual UI callbacks must be tested
+with the real core, including H-1/H, explicit selected network and existing
+maturity/previous-output checks before these findings can close. Merely
+passing direct-core address tests cannot close these caller defects.
+
+Current verdict: the two original low findings are resolved; the two medium
+secondary-wallet findings remain open at this reviewed revision. Canonical
+Linux WASM reconstruction, final integrated/native tests and CI remain
+separate delivery requirements. No numerical score or overall approval.
+
+Follow-up evidence SHA-256:
+
+- `/private/tmp/gnb-r4-review-verdict-web-followup.log` — `6653947bfcc2a781ac8369f2863d12b718ab0f6daa3d9ecedacc51c558f01e93`.
+- `/private/tmp/gnb-r4-review-verdict-oracle-followup.log` — `5dd16c7ad56c7f2d5f62764187db7a206eeca6529a1b68f1fb0d7ba8b2d50d50`.
+- `/private/tmp/gnb-r4-review-verdict-oracle-followup-unit.log` — `d4ea69e342ba65384c766cd90f3074049bf0bcad30d2ffff8bcf364e688bf99f`.
+- `/private/tmp/gnb-r4-review-verdict-secondary-confirm.log` — `64f29adacd06be01676b6017c9859323de4426ee5f8d3ee6fe66792cae266538`.
+- `/private/tmp/gnb-r4-review-verdict-create-callback.mjs` — `de3dbe542889f15fb09a54267af2c717b7188966154a114a6232f7f8a93dd05c`.
+- `/private/tmp/gnb-r4-review-verdict-create-callback.log` — `a046f8495c72af930c6c2731b2f6a4d323b1929b5dc3b31f31413720a2dda0af`.
