@@ -439,6 +439,19 @@ selected parent first, adds the other tips by decreasing blue work while the
 mergeset fits, and drops tips that would break the merge depth. Before
 activation it returns the heaviest `MAX_PARENTS` tips.
 
+A tip that is not the lowest possible merge-depth root of the template (the
+root of a block with no mergeset blue: `blue_score = sp.blue_score + 1`) and
+not in its future can never be merged again (audit B1-T15): it is red (in the
+anticone of every chain block from the root to the selected parent) and, being
+a tip, in no block's past, so nothing kosherizes it; its whole branch is below
+the root. Such tips are skipped with one reachability query each, before their
+bodies are looked up and before any mergeset work, and one final
+`compute_block` checks the result (Kaspa filters virtual-parent candidates the
+same way). They stay in the DAG and among the valid tips: chain selection is
+unchanged. Previously each one cost a full `compute_block` and a stored-body
+lookup at every template computation (twice per accepted block), forever.
+This is template policy: no verdict changes.
+
 ### Ledger semantics: selected-chain-only
 
 This is the specification at every height, before and after the activation.
@@ -471,22 +484,38 @@ These changes leave every result unchanged and apply at all heights:
   selected-chain blocks that merged nothing.
 - Reachability reindexing computes subtree sizes once per reindex instead of
   once per visited node.
+- Reachability reindexing follows Kaspa's reindex-root scheme (audit DAG-7
+  residual, `node/src/consensus/reachability.rs`): a selected-chain block
+  100 to 200 blocks below the heaviest tip is the reindex root; when it
+  advances (in jumps of 100), the chain from the old root to the new one is
+  concentrated, with 4,096 free slots reserved around the children of every
+  chain block. A block above the root is reindexed inside that window; a
+  deep side block or a genesis sibling reclaims slack along the chain toward
+  the root and re-lays out only its own branch and the side branches it
+  shifts. The previous scheme re-laid out the whole subtree under the first
+  ancestor with room: O(DAG) for one such block, under the DAG write lock.
+  The answers of the index are exact under any layout, so GhostDAG's output
+  is unchanged; the reindex root is a performance hint persisted with the
+  root's reachability record.
 
 At the audit's 12,000-block scenario (dev profile), these changes reduced a
 deep side block from 10–26 s to 50–84 ms, a genesis sibling that forces a
 reindex from 46 s to 0.1 s, and the 1,000-block side-chain merge from 35 s to
 29 ms. After activation, that merge is rejected in under 1 ms.
 
-What remained proportional to the DAG is the reachability reindex that one
-genesis sibling or one deep side block triggers on insertion (about 100 ms at
-12,000 blocks, dev profile) and, before activation, the coloring walk for a
-candidate that forks deep. Neither block is inserted any more unless a chain
-carrying enough work backs it: the node-local anti-DoS work rule below runs
-before the proof of work, storage or insertion of every block whose parents
-are known. GhostDAG's results and the reachability index are unchanged by
-it. Measured in `node/tests/fix_ghostdag_dag7_perf.rs` (80 such blocks,
-dev profile): 747 ms of insertions at 12,000 blocks become 0.5 ms of
-refusals.
+Before the reindex-root scheme, the reachability reindex that one genesis
+sibling or one deep side block triggers on insertion stayed proportional to
+the DAG (about 100 ms at 12,000 blocks, dev profile); counted in
+`node/tests/fix_dag_hot_path_cost.rs`, the largest of 83 such insertions
+re-laid out 18,009 nodes of an 8,000-block DAG (4,509 at 2,000 blocks), and
+now 101 at both sizes. What remains, before activation, is the coloring walk
+for a candidate that forks deep. Such blocks are not inserted unless a chain
+carrying enough work backs them: the node-local anti-DoS work rule below
+runs before the proof of work, storage or insertion of every block whose
+parents are known. GhostDAG's results and the reachability index's answers
+are unchanged by it. Measured in `node/tests/fix_ghostdag_dag7_perf.rs` (80
+such blocks, dev profile): 747 ms of insertions at 12,000 blocks become
+0.5 ms of refusals.
 
 Why a peer cannot reach the pre-activation coloring walk without passing the
 work rule:

@@ -13,24 +13,41 @@
 //! technique from Sompolinsky/Wyborski/Zohar and its implementation in
 //! kaspanet/rusty-kaspa (`consensus/src/processes/reachability`).
 //!
-//! # SAFETY / consensus status
+//! # Consensus status
 //!
-//! This index is **NOT wired into the live consensus hot path.** It is used
-//! only by `GhostDAG` when its `ColoringMode` is set to `Fast`, which is an
-//! opt-in mode exercised by the differential test (`tests/ghostdag_differential.rs`).
+//! The index is on the live consensus path: GnB colors every block with it
+//! (`CORRECTED_COLORING_ACTIVATION_HEIGHT = 0`, `GhostDAG::maintains_reachability_index`),
+//! and the mergeset, the exact coloring and the merge-depth check of hardened
+//! blocks query it. Only its ANSWERS matter (`is_chain_ancestor`,
+//! `is_dag_ancestor`); the interval layout is a private, rebuildable cache
+//! that never enters `GhostdagData` or the integrity chain. Any layout that
+//! answers exactly gives bit-identical GhostDAG output, which is what the
+//! differential and replay tests check.
 //!
-//! The reason is spelled out in the implementation plan: replacing the bounded
-//! `is_ancestor` with a *correct* unbounded one is only a pure-performance,
-//! result-identical change **if** the bound never actually bit on the real
-//! chain. The bounded path can, in principle, produce a different (bug-compatible)
-//! blue set / blue_score than the correct path on pathological deep+wide DAGs.
-//! Adopting the correct answer where they differ would be a **consensus rule
-//! change / fork** and must go behind an activation-height gate with network
-//! coordination — never baked silently into the hot path.
+//! # Reindexing (audit DAG-7 residual)
 //!
-//! The differential test is what proves, per DAG shape, whether legacy and
-//! fast agree byte-for-byte. On the real ≥397k mainnet history that proof must
-//! be run against a snapshot before this index can be promoted to the default.
+//! A block takes half of the free interval after its parent's last child. When
+//! the parent has none left the index is reindexed, following Kaspa's
+//! reindex-root scheme (`tree.rs` / `reindex.rs`): a chain block
+//! [`REINDEX_DEPTH`] blocks below the selected tip is the *reindex root*; when
+//! it advances, the chain from the old root to the new one is *concentrated*
+//! (the siblings of each chain block are packed tightly, the chain block gets
+//! the rest of its parent's interval, and [`REINDEX_SLACK`] free slots are
+//! reserved on both sides of every concentrated parent's children). A block
+//! in the reindex root's future is reindexed inside that bounded window; a
+//! block below it — a deep side block, a genesis sibling — reclaims slack
+//! along the chain toward the root (reserving fresh slack on the way back),
+//! so it re-lays out only its own branch and the side branches it shifts,
+//! never the subtree of the whole chain above it. The previous scheme
+//! re-laid out the whole subtree under the first ancestor with room: one
+//! genesis sibling or deep side block cost O(DAG) under the DAG write lock.
+//!
+//! The reindex root is persisted as a trailer of the tree root's record (a
+//! reader that does not know it ignores it). A layout loaded without one (an
+//! older data dir) is re-laid out once and concentrated before the first
+//! advance. Every step uses checked arithmetic; an inconsistency falls back to
+//! a full re-layout from the tree root (the previous behaviour) instead of a
+//! panic.
 //!
 //! # Correctness harness
 //!
@@ -39,28 +56,130 @@
 //! A mis-labeled interval or a stale FCS silently mis-colors blocks, so this
 //! oracle equivalence is the single highest-value guard in the whole change.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use super::{BlockHash, DagStore};
 
 /// A half-open-free interval `[start, end]` (both inclusive) in the reachability
 /// labeling. A node's own identity point is its `end`; its tree-children are
 /// laid out within `[start, end-1]`. Thus node `a` is a *chain* (selected-parent
 /// tree) ancestor of node `b` iff `a`'s interval strictly contains `b`'s.
+/// An empty interval is `end = start - 1` (Kaspa's convention).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Interval {
     pub start: u64,
     pub end: u64,
 }
 
+/// An inconsistency met while reindexing (the caller falls back to a full
+/// re-layout from the tree root).
+#[derive(Debug)]
+struct ReindexError(&'static str);
+
+type Res<T> = Result<T, ReindexError>;
+
+fn err<T>(why: &'static str) -> Res<T> {
+    Err(ReindexError(why))
+}
+
 impl Interval {
+    fn new(start: u64, end: u64) -> Res<Self> {
+        if start == 0 || end.checked_add(1).is_none_or(|e1| e1 < start) {
+            return err("malformed interval");
+        }
+        Ok(Interval { start, end })
+    }
+
     #[inline]
     fn contains(&self, other: &Interval) -> bool {
         self.start <= other.start && other.end <= self.end
     }
+
     #[inline]
-    fn capacity(&self) -> u64 {
-        // number of integer slots this interval can host, inclusive
-        self.end - self.start + 1
+    fn strictly_contains(&self, other: &Interval) -> bool {
+        self.start <= other.start && other.end < self.end
+    }
+
+    /// Number of integer slots, inclusive (0 for an empty interval).
+    #[inline]
+    fn size(&self) -> u64 {
+        (self.end + 1).saturating_sub(self.start)
+    }
+
+    fn increase(&self, o: u64) -> Res<Self> {
+        Self::new(self.start.checked_add(o).ok_or(ReindexError("overflow"))?,
+                  self.end.checked_add(o).ok_or(ReindexError("overflow"))?)
+    }
+    fn decrease(&self, o: u64) -> Res<Self> {
+        Self::new(self.start.checked_sub(o).ok_or(ReindexError("underflow"))?,
+                  self.end.checked_sub(o).ok_or(ReindexError("underflow"))?)
+    }
+    fn increase_start(&self, o: u64) -> Res<Self> {
+        Self::new(self.start.checked_add(o).ok_or(ReindexError("overflow"))?, self.end)
+    }
+    fn decrease_start(&self, o: u64) -> Res<Self> {
+        Self::new(self.start.checked_sub(o).ok_or(ReindexError("underflow"))?, self.end)
+    }
+    fn increase_end(&self, o: u64) -> Res<Self> {
+        Self::new(self.start, self.end.checked_add(o).ok_or(ReindexError("overflow"))?)
+    }
+    fn decrease_end(&self, o: u64) -> Res<Self> {
+        Self::new(self.start, self.end.checked_sub(o).ok_or(ReindexError("underflow"))?)
+    }
+
+    /// The left half (rounded up) of the interval.
+    fn left_half(&self) -> Res<Self> {
+        let left = self.size().div_ceil(2);
+        Self::new(self.start, self.start + left - 1)
+    }
+
+    /// Exactly `sizes.len()` consecutive parts of these sizes (their sum must
+    /// be the interval's size).
+    fn split_exact(&self, sizes: &[u64]) -> Res<Vec<Self>> {
+        let sum = sizes.iter().try_fold(0u64, |a, s| a.checked_add(*s)).ok_or(ReindexError("overflow"))?;
+        if sum != self.size() {
+            return err("split_exact: sizes do not add up to the interval");
+        }
+        let mut start = self.start;
+        let mut out = Vec::with_capacity(sizes.len());
+        for s in sizes {
+            out.push(Self::new(start, (start + s).checked_sub(1).ok_or(ReindexError("underflow"))?)?);
+            start += s;
+        }
+        Ok(out)
+    }
+
+    /// Kaspa's `split_exponential`: every part gets at least its size, and
+    /// the remaining slots are biased toward the larger subtrees, as
+    /// `2^size` (the subtree that grows the most — the selected chain — gets
+    /// almost all of them).
+    fn split_exponential(&self, sizes: &[u64]) -> Res<Vec<Self>> {
+        let total = self.size();
+        let sum = sizes.iter().try_fold(0u64, |a, s| a.checked_add(*s)).ok_or(ReindexError("overflow"))?;
+        if sum == 0 || total < sum {
+            return err("split_exponential: interval smaller than the subtrees");
+        }
+        if total == sum {
+            return self.split_exact(sizes);
+        }
+        let mut remaining_bias = total - sum;
+        let total_bias = remaining_bias as f64;
+        let max = sizes.iter().copied().max().unwrap_or(0);
+        let mut fractions: Vec<f64> = sizes.iter().map(|s| 1f64 / 2f64.powf((max - s) as f64)).collect();
+        let fsum: f64 = fractions.iter().sum();
+        for f in &mut fractions {
+            *f /= fsum;
+        }
+        let mut biased = Vec::with_capacity(sizes.len());
+        for (i, f) in fractions.iter().enumerate() {
+            let bias = if i == fractions.len() - 1 {
+                remaining_bias
+            } else {
+                remaining_bias.min((total_bias * f).round() as u64)
+            };
+            biased.push(sizes[i] + bias);
+            remaining_bias -= bias;
+        }
+        self.split_exact(&biased)
     }
 }
 
@@ -68,6 +187,20 @@ impl Interval {
 /// DAG, reindexing is rare and never runs out of address space.
 const ROOT_END: u64 = 1u64 << 62;
 const ROOT_START: u64 = 1;
+
+/// Kaspa's `DEFAULT_REINDEX_DEPTH`: the reindex root trails the selected tip
+/// by this many chain blocks; reindexing above it stays inside this window.
+pub const REINDEX_DEPTH: u64 = 100;
+
+/// Kaspa's `DEFAULT_REINDEX_SLACK`: free slots reserved on each side of the
+/// children of every concentrated chain block (room for side blocks without a
+/// reindex), and the height lead a competing chain needs before the reindex
+/// root follows it (alternating reorgs cannot make it oscillate). 2^12 per
+/// chain block leaves room for 2^49 chain blocks in the 2^62 root interval.
+pub const REINDEX_SLACK: u64 = 1 << 12;
+
+/// Trailer tag of the tree root's record carrying the reindex root.
+const REINDEX_ROOT_TAG: u8 = b'R';
 
 /// Interval-labeling + future-covering-set reachability index.
 ///
@@ -77,16 +210,20 @@ const ROOT_START: u64 = 1;
 pub struct ReachabilityStore {
     interval: HashMap<BlockHash, Interval>,
     tree_parent: HashMap<BlockHash, BlockHash>,
+    /// Tree children in insertion order, which is also the order of their
+    /// intervals (every reindex operation preserves it).
     children: HashMap<BlockHash, Vec<BlockHash>>,
-    /// Free trailing sub-range within a node's `[start, end-1]` not yet handed
-    /// out to children: `(next_free_start, last_free_end)`. When `lo > hi` the
-    /// node is full and a reindex is required to make room.
-    remaining: HashMap<BlockHash, (u64, u64)>,
+    /// Tree height (the GhostDAG height: selected parent + 1, root 0).
+    height: HashMap<BlockHash, u64>,
     /// Future covering set per block: blocks `b` for which this block is in
     /// `mergeset(b)`. Kept sorted by interval start. Used to answer non-tree
     /// (merge-edge) ancestry.
     fcs: HashMap<BlockHash, Vec<BlockHash>>,
     root: Option<BlockHash>,
+    /// The reindex root (see the module docs). `None` = the layout is not
+    /// managed by the reindex-root scheme yet (fresh index, or one loaded
+    /// from an older data dir): the first advance re-lays it out first.
+    reindex_root: Option<BlockHash>,
     /// Durability tracking (Phase 1 — persistent reachability index).
     ///
     /// `dirty` holds every block whose persisted record (interval / remaining /
@@ -102,12 +239,17 @@ pub struct ReachabilityStore {
     /// NOT consensus state, and are empty on a freshly-loaded index.
     dirty: std::collections::HashSet<BlockHash>,
     tombstones: std::collections::HashSet<BlockHash>,
+    /// Instrumentation (audit DAG-7): nodes visited by reindexing (subtree
+    /// counting and interval assignment), cumulative. Not persisted.
+    work: std::sync::atomic::AtomicU64,
 }
 
 /// Version tag for the serialized per-block reachability record layout. Bumped
 /// whenever [`ReachabilityStore::encode_record`] / [`decode_record`] change
 /// incompatibly, so a boot against an older on-disk index triggers a rebuild
 /// rather than mis-decoding. Persisted as `reachability/meta/version` in CF_META.
+/// (The reindex-root trailer of the root's record is a compatible extension:
+/// a version-1 reader ignores trailing bytes.)
 pub const REACHABILITY_RECORD_VERSION: u32 = 1;
 
 impl Default for ReachabilityStore {
@@ -116,23 +258,49 @@ impl Default for ReachabilityStore {
     }
 }
 
+/// Per-operation cache of subtree sizes (Kaspa's `ReindexOperationContext`).
+#[derive(Default)]
+struct Ctx {
+    sizes: HashMap<BlockHash, u64>,
+}
+
 impl ReachabilityStore {
     pub fn new() -> Self {
         Self {
             interval: HashMap::new(),
             tree_parent: HashMap::new(),
             children: HashMap::new(),
-            remaining: HashMap::new(),
+            height: HashMap::new(),
             fcs: HashMap::new(),
             root: None,
+            reindex_root: None,
             dirty: std::collections::HashSet::new(),
             tombstones: std::collections::HashSet::new(),
+            work: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Nodes visited by reindexing (subtree counting and interval
+    /// assignment) since this index was created: the cost tests of audit
+    /// DAG-7 compare it before and after an insertion.
+    pub fn reindex_work(&self) -> u64 {
+        self.work.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn note_work(&self) {
+        self.work.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The root (genesis) block of the labeling, if registered.
     pub fn root(&self) -> Option<BlockHash> {
         self.root
+    }
+
+    /// The current reindex root (`None` until the index is managed by the
+    /// reindex-root scheme).
+    pub fn reindex_root(&self) -> Option<BlockHash> {
+        self.reindex_root
     }
 
     #[inline]
@@ -159,9 +327,10 @@ impl ReachabilityStore {
         let iv = Interval { start: ROOT_START, end: ROOT_END };
         self.interval.insert(hash, iv);
         self.children.insert(hash, Vec::new());
-        self.remaining.insert(hash, (iv.start, iv.end - 1));
+        self.height.insert(hash, 0);
         self.fcs.insert(hash, Vec::new());
         self.root = Some(hash);
+        self.reindex_root = Some(hash);
         self.mark_dirty(hash);
     }
 
@@ -185,176 +354,599 @@ impl ReachabilityStore {
         }
     }
 
+    // ── store accessors ─────────────────────────────────────────────────────
+
+    fn iv(&self, h: &BlockHash) -> Res<Interval> {
+        self.interval.get(h).copied().ok_or(ReindexError("block not in the index"))
+    }
+
+    fn set_interval(&mut self, h: BlockHash, iv: Interval) {
+        self.note_work();
+        self.interval.insert(h, iv);
+        self.mark_dirty(h);
+    }
+
+    fn parent_of(&self, h: &BlockHash) -> Res<BlockHash> {
+        self.tree_parent.get(h).copied().ok_or(ReindexError("block has no tree parent"))
+    }
+
+    fn height_of(&self, h: &BlockHash) -> Res<u64> {
+        self.height.get(h).copied().ok_or(ReindexError("block has no height"))
+    }
+
+    fn children_of(&self, h: &BlockHash) -> Vec<BlockHash> {
+        self.children.get(h).cloned().unwrap_or_default()
+    }
+
+    /// The slots available to `h`'s tree children: its interval minus its own
+    /// end point.
+    fn children_capacity(&self, h: &BlockHash) -> Res<Interval> {
+        self.iv(h)?.decrease_end(1)
+    }
+
+    /// Free slots before `h`'s first child (all of the capacity if none).
+    fn remaining_before(&self, h: &BlockHash) -> Res<Interval> {
+        let cap = self.children_capacity(h)?;
+        match self.children.get(h).and_then(|c| c.first()) {
+            Some(first) => Interval::new(cap.start, self.iv(first)?.start.checked_sub(1).ok_or(ReindexError("underflow"))?),
+            None => Ok(cap),
+        }
+    }
+
+    /// Free slots after `h`'s last child (all of the capacity if none): where
+    /// a new child is allocated.
+    fn remaining_after(&self, h: &BlockHash) -> Res<Interval> {
+        let cap = self.children_capacity(h)?;
+        match self.children.get(h).and_then(|c| c.last()) {
+            Some(last) => Interval::new(self.iv(last)?.end + 1, cap.end),
+            None => Ok(cap),
+        }
+    }
+
+    /// Non-strict chain ancestry from intervals (`a` = `b` counts).
+    fn chain_ancestor_or_self(&self, a: &BlockHash, b: &BlockHash) -> Res<bool> {
+        Ok(self.iv(a)?.contains(&self.iv(b)?))
+    }
+
+    fn strict_chain_ancestor(&self, a: &BlockHash, b: &BlockHash) -> Res<bool> {
+        Ok(self.iv(a)?.strictly_contains(&self.iv(b)?))
+    }
+
+    /// The child of `ancestor` on the tree path to `descendant` (binary search
+    /// of the ordered children by interval; Kaspa's
+    /// `get_next_chain_ancestor_unchecked`).
+    fn next_chain_ancestor(&self, descendant: &BlockHash, ancestor: &BlockHash) -> Res<BlockHash> {
+        let d = self.iv(descendant)?;
+        let children = self.children.get(ancestor).ok_or(ReindexError("no children"))?;
+        let mut lo = 0usize;
+        let mut hi = children.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.iv(&children[mid])?.start <= d.end {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            return err("next chain ancestor not found");
+        }
+        let c = children[lo - 1];
+        if self.iv(&c)?.contains(&d) {
+            Ok(c)
+        } else {
+            err("next chain ancestor not found")
+        }
+    }
+
     // ── tree interval maintenance ───────────────────────────────────────────
 
+    /// Kaspa's `add_tree_block`: the new child gets the left half of the free
+    /// interval after its parent's last child; with none left it gets the
+    /// empty interval at the end of the parent's capacity and the index is
+    /// reindexed around the current reindex root.
     fn add_tree_block(&mut self, child: BlockHash, parent: &BlockHash) {
+        let remaining = self.remaining_after(parent);
         self.tree_parent.insert(child, *parent);
         self.children.entry(*parent).or_default().push(child);
         self.children.entry(child).or_default();
         self.fcs.entry(child).or_default();
-
-        // Try to carve a slice from the parent's trailing free range.
-        let (lo, hi) = *self.remaining.get(parent).unwrap_or(&(1, 0));
-        if lo <= hi {
-            // Exponential allocation: give the new child up to half of the
-            // parent's remaining space, keeping the rest for future siblings.
-            let span = hi - lo + 1;
-            let give = (span / 2).max(1);
-            let child_start = lo;
-            let child_end = lo + give - 1;
-            let iv = Interval { start: child_start, end: child_end };
-            self.interval.insert(child, iv);
-            self.remaining.insert(child, (iv.start, iv.end.saturating_sub(1)));
-            self.remaining.insert(*parent, (child_end + 1, hi));
-            self.mark_dirty(child);
-            self.mark_dirty(*parent);
-        } else {
-            // Parent is out of room — reindex its subtree (or a higher ancestor
-            // with slack) so the new child gets a valid interval.
-            self.interval.insert(child, Interval { start: 0, end: 0 }); // placeholder
-            self.remaining.insert(child, (1, 0));
-            self.mark_dirty(child);
-            self.mark_dirty(*parent);
-            self.reindex(*parent);
-        }
-    }
-
-    /// Recompute the interval labeling for `node`'s entire subtree, in place,
-    /// within `node`'s current interval. If `node`'s interval is too small to
-    /// hold its subtree, first reindex `node`'s parent to enlarge `node`.
-    /// Walk UP to the nearest ancestor with room, then re-lay out from there.
-    ///
-    /// Iterative on purpose. The recursive version overflowed the stack on a
-    /// real 408,482-block DAG during the one-time index rebuild — the node
-    /// aborted at startup, which is exactly what every operator is instructed to
-    /// do when the reachability soft-fork activates. A chain this deep is nearly
-    /// linear, so "one level up" is not a shallow hop: it is a walk of the whole
-    /// chain.
-    ///
-    /// Audit DAG-7: subtree sizes are computed once per reindex, in one
-    /// post-order pass, and stored in a map shared by the walk up and by
-    /// [`assign_subtree`](Self::assign_subtree). The old code recounted the
-    /// subtree of every node it visited, O(subtree × depth) on a chain-shaped
-    /// tree (seconds per deep side block or genesis sibling at 12k blocks); this
-    /// is O(subtree). The sizes are the same numbers, so the resulting
-    /// intervals are identical.
-    fn reindex(&mut self, node: BlockHash) {
-        let mut sizes: HashMap<BlockHash, u64> = HashMap::new();
-        let mut cur = node;
-        loop {
-            let size = self.subtree_size_memo(&cur, &mut sizes);
-            let cap = self.interval.get(&cur).map(|iv| iv.capacity()).unwrap_or(0);
-            if cap >= size { break; }
-            match self.tree_parent.get(&cur).copied() {
-                Some(parent) => cur = parent,
-                None => {
-                    // At the root with insufficient capacity: only for
-                    // astronomically large DAGs (> 2^62 blocks). Grow the root.
-                    let iv = Interval { start: ROOT_START, end: ROOT_END.max(size + ROOT_START) };
-                    self.interval.insert(cur, iv);
-                    break;
+        let ph = self.height.get(parent).copied().unwrap_or(0);
+        self.height.insert(child, ph + 1);
+        self.mark_dirty(*parent);
+        self.mark_dirty(child);
+        match remaining {
+            Ok(r) if r.size() > 0 => {
+                match r.left_half() {
+                    Ok(iv) => {
+                        self.interval.insert(child, iv);
+                    }
+                    Err(e) => self.full_relayout(e),
                 }
             }
-        }
-        let iv = *self.interval.get(&cur).expect("node has interval");
-        self.assign_subtree(cur, iv, &sizes);
-    }
-
-    /// Lay out `node` and all its tree-descendants within `iv` using a
-    /// count-based proportional split, distributing slack in proportion to
-    /// subtree sizes. `node`'s own identity point is `iv.end`. `sizes` holds the
-    /// subtree size of every node below `node` (filled by `reindex`); a missing
-    /// entry is counted directly.
-    fn assign_subtree(&mut self, node: BlockHash, iv: Interval, sizes: &HashMap<BlockHash, u64>) {
-        // EXPLICIT STACK, not recursion. The recursive form descended once per
-        // block in the subtree, and this chain is nearly linear — rebuilding the
-        // index over 408,482 blocks overflowed the 8 MB main stack and aborted
-        // the process before it finished booting. Since the reachability
-        // soft-fork tells every operator to perform exactly this rebuild on
-        // their first armed boot, that crash would have taken the network down
-        // at activation rather than fixing it.
-        let mut work: Vec<(BlockHash, Interval)> = vec![(node, iv)];
-        while let Some((node, iv)) = work.pop() {
-            self.interval.insert(node, iv);
-            // This node's interval (and, below, its `remaining`) just changed, so
-            // its persisted record is stale — flag it for the next durable flush.
-            self.mark_dirty(node);
-            let children = self.children.get(&node).cloned().unwrap_or_default();
-            if children.is_empty() {
-                self.remaining.insert(node, (iv.start, iv.end.saturating_sub(1)));
-                continue;
+            Ok(r) => {
+                // The empty interval exactly at the end of the capacity.
+                self.interval.insert(child, r);
+                let root = self.reindex_root.or(self.root).unwrap_or(child);
+                let mut ctx = Ctx::default();
+                if let Err(e) = self.reindex_intervals(&mut ctx, child, root) {
+                    self.full_relayout(e);
+                }
             }
-            // Children occupy [iv.start, iv.end-1]; iv.end reserved for `node`.
-            let region_start = iv.start;
-            let region_len = iv.end - iv.start; // slots available to children
-            let child_sizes: Vec<u64> = children
-                .iter()
-                .map(|c| sizes.get(c).copied().unwrap_or_else(|| self.subtree_size(c)))
-                .collect();
-            let total: u64 = child_sizes.iter().sum::<u64>().max(1);
-            let slack = region_len.saturating_sub(total);
-
-            let mut cursor = region_start;
-            for (c, &sz) in children.iter().zip(child_sizes.iter()) {
-                // proportional share of slack, plus the child's own subtree size
-                let extra = if total > 0 { slack.saturating_mul(sz) / total } else { 0 };
-                let child_len = (sz + extra).max(1);
-                let child_start = cursor;
-                let child_end = (cursor + child_len - 1).min(iv.end - 1);
-                let child_iv = Interval { start: child_start, end: child_end.max(child_start) };
-                cursor = child_end + 1;
-                work.push((*c, child_iv));
+            Err(e) => {
+                // Parent unknown to the index: give the child a placeholder
+                // and re-lay out everything (never on a consistent index).
+                self.interval.insert(child, Interval { start: ROOT_END, end: ROOT_END - 1 });
+                self.full_relayout(e);
             }
-            // Any trailing slots stay free on `node` for future children.
-            self.remaining.insert(node, (cursor, iv.end.saturating_sub(1)));
         }
     }
 
-    /// Subtree size of `node`, computing and recording in `memo` the size of
-    /// every node of its subtree not already there (iterative post-order, each
-    /// node visited once). Used by `reindex`; same numbers as `subtree_size`.
-    fn subtree_size_memo(&self, node: &BlockHash, memo: &mut HashMap<BlockHash, u64>) -> u64 {
-        if let Some(s) = memo.get(node) {
-            return *s;
+    /// The previous behaviour, as a last resort: re-lay out the whole tree
+    /// from the root (O(index)). Only reached on an inconsistent layout.
+    fn full_relayout(&mut self, why: ReindexError) {
+        let Some(root) = self.root else { return };
+        log::warn!("reachability: {} during a reindex; re-laying out the whole index", why.0);
+        let mut ctx = Ctx::default();
+        self.interval.insert(root, Interval { start: ROOT_START, end: ROOT_END });
+        self.mark_dirty(root);
+        if let Err(e) = self.propagate_interval(&mut ctx, root) {
+            // More than 2^62 blocks: impossible in practice.
+            log::error!("reachability: full re-layout failed: {}", e.0);
         }
-        let mut stack: Vec<(BlockHash, bool)> = vec![(*node, false)];
+    }
+
+    /// Kaspa's `reindex_intervals`: find the nearest ancestor of `new_child`
+    /// with room for its subtree and re-lay that subtree out, unless the walk
+    /// leaves the reindex root's future first, in which case slack is
+    /// reclaimed along the chain toward the root.
+    fn reindex_intervals(&mut self, ctx: &mut Ctx, new_child: BlockHash, reindex_root: BlockHash) -> Res<()> {
+        let mut current = new_child;
+        loop {
+            let iv = self.iv(&current)?;
+            let size = self.count_subtrees(ctx, current)?;
+            if iv.size() >= size {
+                break;
+            }
+            let parent = self.parent_of(&current)?;
+            if current == reindex_root {
+                return err("the reindex root is out of capacity");
+            }
+            if self.strict_chain_ancestor(&parent, &reindex_root)? {
+                // `parent` is on the chain below the reindex root: reclaim
+                // slack along the chain instead of re-laying out the subtree
+                // above `parent` (which holds the root and most recent
+                // blocks). Doubles `current`'s capacity.
+                return self.reindex_intervals_earlier_than_root(ctx, current, reindex_root, parent, size);
+            }
+            current = parent;
+        }
+        self.propagate_interval(ctx, current)
+    }
+
+    /// Subtree sizes of `block`'s subtree into `ctx` (iterative; Kaspa's
+    /// `count_subtrees`). Returns the size of `block`'s subtree.
+    fn count_subtrees(&self, ctx: &mut Ctx, block: BlockHash) -> Res<u64> {
+        if let Some(s) = ctx.sizes.get(&block) {
+            return Ok(*s);
+        }
+        let mut stack: Vec<(BlockHash, bool)> = vec![(block, false)];
         while let Some((n, children_done)) = stack.pop() {
-            if memo.contains_key(&n) {
+            if ctx.sizes.contains_key(&n) {
                 continue;
             }
+            self.note_work();
             let children = self.children.get(&n);
             if children_done {
-                let below: u64 = children
-                    .map(|ch| ch.iter().map(|c| memo.get(c).copied().unwrap_or(0)).sum())
-                    .unwrap_or(0);
-                memo.insert(n, 1 + below);
+                let mut below = 0u64;
+                if let Some(ch) = children {
+                    for c in ch {
+                        below += ctx.sizes.get(c).copied().ok_or(ReindexError("subtree size missing"))?;
+                    }
+                }
+                ctx.sizes.insert(n, below + 1);
             } else {
                 stack.push((n, true));
                 if let Some(ch) = children {
                     for c in ch {
-                        if !memo.contains_key(c) {
+                        if !ctx.sizes.contains_key(c) {
                             stack.push((*c, false));
                         }
                     }
                 }
             }
         }
-        memo.get(node).copied().unwrap_or(1)
+        ctx.sizes.get(&block).copied().ok_or(ReindexError("subtree size missing"))
     }
 
-    fn subtree_size(&self, node: &BlockHash) -> u64 {
-        // iterative DFS to avoid stack overflow on deep chains
-        let mut count = 0u64;
-        let mut stack = vec![*node];
-        while let Some(n) = stack.pop() {
-            count += 1;
-            if let Some(ch) = self.children.get(&n) {
-                for c in ch {
-                    stack.push(*c);
+    /// Kaspa's `propagate_interval`: re-lay out `block`'s subtree inside its
+    /// current interval (BFS; each node's children split its capacity with
+    /// `split_exponential`).
+    fn propagate_interval(&mut self, ctx: &mut Ctx, block: BlockHash) -> Res<()> {
+        self.count_subtrees(ctx, block)?;
+        let mut queue = VecDeque::from([block]);
+        while let Some(current) = queue.pop_front() {
+            let children = self.children_of(&current);
+            if children.is_empty() {
+                continue;
+            }
+            let sizes: Vec<u64> = children.iter()
+                .map(|c| ctx.sizes.get(c).copied().ok_or(ReindexError("subtree size missing")))
+                .collect::<Res<_>>()?;
+            let parts = self.children_capacity(&current)?.split_exponential(&sizes)?;
+            for (c, iv) in children.iter().zip(parts) {
+                self.set_interval(*c, iv);
+            }
+            queue.extend(children);
+        }
+        Ok(())
+    }
+
+    /// `allocation_block` (a child of `common_ancestor`, which is on the chain
+    /// below `reindex_root`) needs `required` more slots.
+    fn reindex_intervals_earlier_than_root(
+        &mut self,
+        ctx: &mut Ctx,
+        allocation_block: BlockHash,
+        reindex_root: BlockHash,
+        common_ancestor: BlockHash,
+        required: u64,
+    ) -> Res<()> {
+        let chosen = self.next_chain_ancestor(&reindex_root, &common_ancestor)?;
+        if self.iv(&allocation_block)?.start < self.iv(&chosen)?.start {
+            self.reclaim_interval_before(ctx, allocation_block, common_ancestor, chosen, reindex_root, required)
+        } else {
+            self.reclaim_interval_after(ctx, allocation_block, common_ancestor, chosen, reindex_root, required)
+        }
+    }
+
+    fn reclaim_interval_before(
+        &mut self,
+        ctx: &mut Ctx,
+        allocation_block: BlockHash,
+        common_ancestor: BlockHash,
+        chosen: BlockHash,
+        reindex_root: BlockHash,
+        required: u64,
+    ) -> Res<()> {
+        let mut slack_sum = 0u64;
+        let mut path_len = 0u64;
+        let mut path_slack_alloc = 0u64;
+        let mut current = chosen;
+        // Walk the chain from the chosen child toward the reindex root.
+        loop {
+            if current == reindex_root {
+                // The root holds plenty of room: take what is still missing
+                // plus fresh slack for every chain block walked.
+                let offset = required.checked_add(REINDEX_SLACK.checked_mul(path_len).ok_or(ReindexError("overflow"))?)
+                    .and_then(|x| x.checked_sub(slack_sum)).ok_or(ReindexError("underflow"))?;
+                self.apply_and_propagate(ctx, current, offset, Interval::increase_start)?;
+                self.offset_siblings_before(ctx, allocation_block, current, offset)?;
+                path_slack_alloc = REINDEX_SLACK;
+                break;
+            }
+            let slack = self.remaining_before(&current)?.size();
+            slack_sum += slack;
+            if slack_sum >= required {
+                let offset = slack - (slack_sum - required);
+                self.apply(current, offset, Interval::increase_start)?;
+                self.offset_siblings_before(ctx, allocation_block, current, offset)?;
+                break;
+            }
+            current = self.next_chain_ancestor(&reindex_root, &current)?;
+            path_len += 1;
+        }
+        // Back down toward the common ancestor, passing the reclaimed room on.
+        loop {
+            current = self.parent_of(&current)?;
+            if current == common_ancestor {
+                break;
+            }
+            let slack = self.remaining_before(&current)?.size();
+            let offset = slack.checked_sub(path_slack_alloc).ok_or(ReindexError("underflow"))?;
+            self.apply(current, offset, Interval::increase_start)?;
+            self.offset_siblings_before(ctx, allocation_block, current, offset)?;
+        }
+        Ok(())
+    }
+
+    fn reclaim_interval_after(
+        &mut self,
+        ctx: &mut Ctx,
+        allocation_block: BlockHash,
+        common_ancestor: BlockHash,
+        chosen: BlockHash,
+        reindex_root: BlockHash,
+        required: u64,
+    ) -> Res<()> {
+        let mut slack_sum = 0u64;
+        let mut path_len = 0u64;
+        let mut path_slack_alloc = 0u64;
+        let mut current = chosen;
+        loop {
+            if current == reindex_root {
+                let offset = required.checked_add(REINDEX_SLACK.checked_mul(path_len).ok_or(ReindexError("overflow"))?)
+                    .and_then(|x| x.checked_sub(slack_sum)).ok_or(ReindexError("underflow"))?;
+                self.apply_and_propagate(ctx, current, offset, Interval::decrease_end)?;
+                self.offset_siblings_after(ctx, allocation_block, current, offset)?;
+                path_slack_alloc = REINDEX_SLACK;
+                break;
+            }
+            let slack = self.remaining_after(&current)?.size();
+            slack_sum += slack;
+            if slack_sum >= required {
+                let offset = slack - (slack_sum - required);
+                self.apply(current, offset, Interval::decrease_end)?;
+                self.offset_siblings_after(ctx, allocation_block, current, offset)?;
+                break;
+            }
+            current = self.next_chain_ancestor(&reindex_root, &current)?;
+            path_len += 1;
+        }
+        loop {
+            current = self.parent_of(&current)?;
+            if current == common_ancestor {
+                break;
+            }
+            let slack = self.remaining_after(&current)?.size();
+            let offset = slack.checked_sub(path_slack_alloc).ok_or(ReindexError("underflow"))?;
+            self.apply(current, offset, Interval::decrease_end)?;
+            self.offset_siblings_after(ctx, allocation_block, current, offset)?;
+        }
+        Ok(())
+    }
+
+    /// Shift the siblings before `current` up by `offset`, giving the room to
+    /// `allocation_block` when it is one of them.
+    fn offset_siblings_before(&mut self, ctx: &mut Ctx, allocation_block: BlockHash, current: BlockHash, offset: u64) -> Res<()> {
+        let parent = self.parent_of(&current)?;
+        let children = self.children_of(&parent);
+        let pos = children.iter().position(|c| *c == current).ok_or(ReindexError("child not found"))?;
+        for sibling in children[..pos].iter().rev() {
+            if *sibling == allocation_block {
+                self.apply_and_propagate(ctx, allocation_block, offset, Interval::increase_end)?;
+                break;
+            }
+            self.apply_and_propagate(ctx, *sibling, offset, Interval::increase)?;
+        }
+        Ok(())
+    }
+
+    /// Shift the siblings after `current` down by `offset`, giving the room
+    /// to `allocation_block` when it is one of them.
+    fn offset_siblings_after(&mut self, ctx: &mut Ctx, allocation_block: BlockHash, current: BlockHash, offset: u64) -> Res<()> {
+        let parent = self.parent_of(&current)?;
+        let children = self.children_of(&parent);
+        let pos = children.iter().position(|c| *c == current).ok_or(ReindexError("child not found"))?;
+        for sibling in &children[pos + 1..] {
+            if *sibling == allocation_block {
+                self.apply_and_propagate(ctx, allocation_block, offset, Interval::decrease_start)?;
+                break;
+            }
+            self.apply_and_propagate(ctx, *sibling, offset, Interval::decrease)?;
+        }
+        Ok(())
+    }
+
+    fn apply(&mut self, block: BlockHash, offset: u64, op: fn(&Interval, u64) -> Res<Interval>) -> Res<()> {
+        let iv = op(&self.iv(&block)?, offset)?;
+        self.set_interval(block, iv);
+        Ok(())
+    }
+
+    fn apply_and_propagate(
+        &mut self,
+        ctx: &mut Ctx,
+        block: BlockHash,
+        offset: u64,
+        op: fn(&Interval, u64) -> Res<Interval>,
+    ) -> Res<()> {
+        self.apply(block, offset, op)?;
+        self.propagate_interval(ctx, block)
+    }
+
+    // ── reindex root (Kaspa's `try_advancing_reindex_root`) ────────────────
+
+    /// Hint that `hint` is (a candidate for) the selected tip. Moves the
+    /// reindex root to the chain block `REINDEX_DEPTH` below it, concentrating
+    /// the intervals of the chain from the old root to the new one. Only a
+    /// performance hint: the answers of the index never depend on it.
+    pub fn hint_virtual_selected_parent(&mut self, hint: &BlockHash) {
+        if !self.has(hint) || self.root.is_none() {
+            return;
+        }
+        if self.reindex_root.is_none() {
+            // A layout not managed by this scheme yet (loaded from an older
+            // data dir): lay it out afresh from the tree root, then
+            // concentrate from there.
+            let mut ctx = Ctx::default();
+            let root = self.root.expect("checked above");
+            self.interval.insert(root, Interval { start: ROOT_START, end: ROOT_END });
+            self.mark_dirty(root);
+            if let Err(e) = self.propagate_interval(&mut ctx, root) {
+                log::error!("reachability: re-layout for the reindex root failed: {}", e.0);
+                return;
+            }
+            self.set_reindex_root(root);
+        }
+        if let Err(e) = self.try_advancing_reindex_root(*hint) {
+            // Re-lay out from scratch and concentrate from the tree root
+            // once; the index answers exactly either way.
+            self.full_relayout(e);
+            if let Some(root) = self.root {
+                self.set_reindex_root(root);
+                if let Err(e2) = self.try_advancing_reindex_root(*hint) {
+                    log::warn!("reachability: reindex root not advanced ({})", e2.0);
+                    self.full_relayout(e2);
+                    self.set_reindex_root(root);
                 }
             }
         }
-        count
+    }
+
+    fn set_reindex_root(&mut self, r: BlockHash) {
+        if self.reindex_root != Some(r) {
+            self.reindex_root = Some(r);
+            // Persisted as a trailer of the tree root's record.
+            if let Some(root) = self.root {
+                self.mark_dirty(root);
+            }
+        }
+    }
+
+    fn try_advancing_reindex_root(&mut self, hint: BlockHash) -> Res<()> {
+        let current = self.reindex_root.or(self.root).ok_or(ReindexError("no root"))?;
+        let (mut ancestor, next) = self.find_next_reindex_root(current, hint)?;
+        if current == next {
+            return Ok(());
+        }
+        while ancestor != next {
+            let child = self.next_chain_ancestor(&next, &ancestor)?;
+            let mut ctx = Ctx::default();
+            self.concentrate_interval(&mut ctx, ancestor, child, child == next)?;
+            ancestor = child;
+        }
+        self.set_reindex_root(next);
+        Ok(())
+    }
+
+    /// Kaspa's `find_next_reindex_root`: (the block to concentrate from, the
+    /// new reindex root).
+    fn find_next_reindex_root(&self, current: BlockHash, hint: BlockHash) -> Res<(BlockHash, BlockHash)> {
+        if current == hint {
+            return Ok((current, current));
+        }
+        let hint_height = self.height_of(&hint)?;
+        let mut ancestor = current;
+        let mut next = current;
+        if self.chain_ancestor_or_self(&current, &hint)? {
+            // Hysteresis (GnB): advance only once the root trails the hint by
+            // 2 x REINDEX_DEPTH, then jump REINDEX_DEPTH at once. Moving one
+            // block per block (Kaspa) re-lays out the window under the new
+            // root every other block (the propagation gives each chain block
+            // its parent's whole capacity, so the next root is not inside its
+            // slack-narrowed allocation); jumping does it once per
+            // REINDEX_DEPTH blocks. The window above the root stays bounded
+            // (at most 2 x REINDEX_DEPTH chain blocks).
+            let current_height = self.height_of(&current)?;
+            if hint_height.saturating_sub(current_height) < 2 * REINDEX_DEPTH {
+                return Ok((current, current));
+            }
+        } else {
+            // A reorg: follow the other chain only once it leads by
+            // REINDEX_SLACK (alternating reorgs cannot make the root
+            // oscillate); then concentrate from the fork point.
+            let current_height = self.height_of(&current)?;
+            if hint_height < current_height || hint_height - current_height < REINDEX_SLACK {
+                return Ok((current, current));
+            }
+            let common = self.find_common_tree_ancestor(hint, current)?;
+            ancestor = common;
+            next = common;
+        }
+        loop {
+            if next == hint {
+                break;
+            }
+            let child = self.next_chain_ancestor(&hint, &next)?;
+            let child_height = self.height_of(&child)?;
+            if hint_height < child_height {
+                return err("hint below its chain ancestor");
+            }
+            if hint_height - child_height < REINDEX_DEPTH {
+                break;
+            }
+            next = child;
+        }
+        Ok((ancestor, next))
+    }
+
+    fn find_common_tree_ancestor(&self, block: BlockHash, reindex_root: BlockHash) -> Res<BlockHash> {
+        let mut current = block;
+        loop {
+            if self.chain_ancestor_or_self(&current, &reindex_root)? {
+                return Ok(current);
+            }
+            current = self.parent_of(&current)?;
+        }
+    }
+
+    /// Kaspa's `concentrate_interval`: pack `child`'s siblings tightly at the
+    /// two ends of `parent`'s interval (keeping `REINDEX_SLACK` free slots
+    /// outside them) and give `child` everything in between.
+    fn concentrate_interval(&mut self, ctx: &mut Ctx, parent: BlockHash, child: BlockHash, is_final: bool) -> Res<()> {
+        let children = self.children_of(&parent);
+        let pos = children.iter().position(|c| *c == child).ok_or(ReindexError("child not found"))?;
+        let before_sum = self.tighten_before(ctx, parent, &children[..pos])?;
+        let after_sum = self.tighten_after(ctx, parent, &children[pos + 1..])?;
+        self.expand_to_chosen(ctx, parent, child, before_sum, after_sum, is_final)
+    }
+
+    fn tighten_before(&mut self, ctx: &mut Ctx, parent: BlockHash, siblings: &[BlockHash]) -> Res<u64> {
+        let sizes: Vec<u64> = siblings.iter().map(|b| self.count_subtrees(ctx, *b)).collect::<Res<_>>()?;
+        let sum: u64 = sizes.iter().sum();
+        if sum == 0 {
+            return Ok(0);
+        }
+        let iv = self.iv(&parent)?;
+        let start = iv.start.checked_add(REINDEX_SLACK).ok_or(ReindexError("overflow"))?;
+        let region = Interval::new(start, start + sum - 1)?;
+        if region.end >= iv.end {
+            return err("parent too small for its siblings");
+        }
+        for (c, civ) in siblings.iter().zip(region.split_exact(&sizes)?) {
+            self.set_interval(*c, civ);
+            self.propagate_interval(ctx, *c)?;
+        }
+        Ok(sum)
+    }
+
+    fn tighten_after(&mut self, ctx: &mut Ctx, parent: BlockHash, siblings: &[BlockHash]) -> Res<u64> {
+        let sizes: Vec<u64> = siblings.iter().map(|b| self.count_subtrees(ctx, *b)).collect::<Res<_>>()?;
+        let sum: u64 = sizes.iter().sum();
+        if sum == 0 {
+            return Ok(0);
+        }
+        let iv = self.iv(&parent)?;
+        let end = iv.end.checked_sub(REINDEX_SLACK + 1).ok_or(ReindexError("underflow"))?;
+        let start = (end + 1).checked_sub(sum).ok_or(ReindexError("underflow"))?;
+        let region = Interval::new(start, end)?;
+        if region.start < iv.start {
+            return err("parent too small for its siblings");
+        }
+        for (c, civ) in siblings.iter().zip(region.split_exact(&sizes)?) {
+            self.set_interval(*c, civ);
+            self.propagate_interval(ctx, *c)?;
+        }
+        Ok(sum)
+    }
+
+    fn expand_to_chosen(
+        &mut self,
+        ctx: &mut Ctx,
+        parent: BlockHash,
+        child: BlockHash,
+        before_sum: u64,
+        after_sum: u64,
+        is_final: bool,
+    ) -> Res<()> {
+        let iv = self.iv(&parent)?;
+        let start = iv.start.checked_add(before_sum + REINDEX_SLACK).ok_or(ReindexError("overflow"))?;
+        let end = iv.end.checked_sub(after_sum + REINDEX_SLACK + 1).ok_or(ReindexError("underflow"))?;
+        let allocation = Interval::new(start, end)?;
+        let current = self.iv(&child)?;
+        if is_final && !allocation.contains(&current) {
+            // Lay the new root's subtree out with slack on both sides, so the
+            // next advance most likely finds it inside its allocation.
+            let narrowed = Interval::new(
+                allocation.start.checked_add(REINDEX_SLACK).ok_or(ReindexError("overflow"))?,
+                allocation.end.checked_sub(REINDEX_SLACK).ok_or(ReindexError("underflow"))?,
+            )?;
+            self.set_interval(child, narrowed);
+            self.propagate_interval(ctx, child)?;
+        }
+        self.set_interval(child, allocation);
+        Ok(())
     }
 
     // ── future covering set maintenance ─────────────────────────────────────
@@ -433,9 +1025,10 @@ impl ReachabilityStore {
         false
     }
 
-    /// Remove a childless leaf, exactly inverting a just-performed `add_block`.
-    /// Used by the reorg-undo path. Returns `false` (no mutation) if the block
-    /// is unknown or still has tree children.
+    /// Remove a childless leaf, exactly inverting a just-performed `add_block`
+    /// (its slots go back to the free space of its parent). Used by the
+    /// reorg-undo path. Returns `false` (no mutation) if the block is unknown
+    /// or still has tree children.
     pub fn remove_leaf(&mut self, hash: &BlockHash, mergeset: &[BlockHash]) -> bool {
         if self.children.get(hash).map_or(false, |c| !c.is_empty()) {
             return false;
@@ -453,7 +1046,8 @@ impl ReachabilityStore {
             }
         }
         // Undo tree edge.
-        if let Some(parent) = self.tree_parent.remove(hash) {
+        let parent = self.tree_parent.remove(hash);
+        if let Some(parent) = parent {
             if let Some(ch) = self.children.get_mut(&parent) {
                 if let Some(pos) = ch.iter().position(|x| x == hash) {
                     ch.remove(pos);
@@ -461,8 +1055,14 @@ impl ReachabilityStore {
             }
             self.mark_dirty(parent);
         }
+        if self.reindex_root == Some(*hash) {
+            self.reindex_root = parent.or(self.root);
+            if let Some(root) = self.root {
+                self.mark_dirty(root);
+            }
+        }
         self.interval.remove(hash);
-        self.remaining.remove(hash);
+        self.height.remove(hash);
         self.children.remove(hash);
         self.fcs.remove(hash);
         // Removal wins over any pending dirty flag for this block.
@@ -481,15 +1081,21 @@ impl ReachabilityStore {
     /// [parent_tag u8][parent 32B]           // tag 0 = no tree parent (root)
     /// [children_len u32][children 32B*]      // insertion order preserved
     /// [fcs_len u32][fcs 32B*]                // interval-start-sorted order
+    /// ['R' u8][reindex root 32B]             // tree root's record only (DAG-7)
     /// ```
-    /// Byte-for-byte reproducible from equal in-memory state. Returns `None`
-    /// if the block has no interval (never registered / already removed).
+    /// `rem_lo..rem_hi` is the free interval after the last child (derived;
+    /// kept for the layout's stability). Byte-for-byte reproducible from equal
+    /// in-memory state. Returns `None` if the block has no interval (never
+    /// registered / already removed).
     fn encode_record(&self, hash: &BlockHash) -> Option<Vec<u8>> {
         let iv = self.interval.get(hash)?;
-        let (lo, hi) = self.remaining.get(hash).copied().unwrap_or((1, 0));
+        let (lo, hi) = match self.remaining_after(hash) {
+            Ok(r) => (r.start, r.end),
+            Err(_) => (1, 0),
+        };
         let children = self.children.get(hash).cloned().unwrap_or_default();
         let fcs = self.fcs.get(hash).cloned().unwrap_or_default();
-        let mut out = Vec::with_capacity(41 + 4 + children.len() * 32 + 4 + fcs.len() * 32);
+        let mut out = Vec::with_capacity(41 + 4 + children.len() * 32 + 4 + fcs.len() * 32 + 33);
         out.extend_from_slice(&iv.start.to_le_bytes());
         out.extend_from_slice(&iv.end.to_le_bytes());
         out.extend_from_slice(&lo.to_le_bytes());
@@ -502,6 +1108,12 @@ impl ReachabilityStore {
         for c in &children { out.extend_from_slice(c); }
         out.extend_from_slice(&(fcs.len() as u32).to_le_bytes());
         for f in &fcs { out.extend_from_slice(f); }
+        if Some(*hash) == self.root {
+            if let Some(r) = self.reindex_root {
+                out.push(REINDEX_ROOT_TAG);
+                out.extend_from_slice(&r);
+            }
+        }
         Some(out)
     }
 
@@ -539,7 +1151,10 @@ impl ReachabilityStore {
     /// Rebuild the whole index in-memory from persisted records + the stored
     /// root. Replaces any current state. Returns `Err` on a malformed record.
     /// After this the dirty/tombstone sets are empty (the on-disk copy is
-    /// authoritative and already matches memory).
+    /// authoritative and already matches memory). Tree heights are recomputed;
+    /// the reindex root comes from the root's record (absent in a data dir
+    /// written before audit DAG-7's reindex-root scheme: the first advance
+    /// then re-lays the index out once).
     pub fn load_from_records(
         &mut self,
         records: &[(BlockHash, Vec<u8>)],
@@ -548,29 +1163,45 @@ impl ReachabilityStore {
         self.interval.clear();
         self.tree_parent.clear();
         self.children.clear();
-        self.remaining.clear();
+        self.height.clear();
         self.fcs.clear();
         self.dirty.clear();
         self.tombstones.clear();
         self.root = root;
+        self.reindex_root = None;
+        let mut reindex_root = None;
         for (h, bytes) in records {
-            let (iv, rem, parent, children, fcs) = decode_record(bytes)
+            let (iv, _rem, parent, children, fcs, rr) = decode_record(bytes)
                 .map_err(|e| format!("reachability record for {} malformed: {e}", hex::encode(&h[..4])))?;
             self.interval.insert(*h, iv);
-            self.remaining.insert(*h, rem);
             if let Some(p) = parent { self.tree_parent.insert(*h, p); }
             self.children.insert(*h, children);
             self.fcs.insert(*h, fcs);
+            if Some(*h) == root {
+                reindex_root = rr;
+            }
         }
+        // Heights: breadth-first from the root.
+        if let Some(r) = root {
+            let mut queue = VecDeque::from([(r, 0u64)]);
+            while let Some((h, d)) = queue.pop_front() {
+                self.height.insert(h, d);
+                if let Some(ch) = self.children.get(&h) {
+                    queue.extend(ch.iter().map(|c| (*c, d + 1)));
+                }
+            }
+        }
+        self.reindex_root = reindex_root.filter(|r| self.interval.contains_key(r));
         Ok(())
     }
 }
 
+/// A decoded record: interval, stored free range, tree parent, children,
+/// future covering set, and (tree root only) the reindex root.
+type DecodedRecord = (Interval, (u64, u64), Option<BlockHash>, Vec<BlockHash>, Vec<BlockHash>, Option<BlockHash>);
+
 /// Decode a record produced by `ReachabilityStore::encode_record`.
-#[allow(clippy::type_complexity)]
-fn decode_record(
-    b: &[u8],
-) -> Result<(Interval, (u64, u64), Option<BlockHash>, Vec<BlockHash>, Vec<BlockHash>), String> {
+fn decode_record(b: &[u8]) -> Result<DecodedRecord, String> {
     let mut o = 0usize;
     let rd_u64 = |b: &[u8], o: &mut usize| -> Result<u64, String> {
         if *o + 8 > b.len() { return Err("truncated u64".into()); }
@@ -599,7 +1230,16 @@ fn decode_record(
     let flen = u32::from_le_bytes(b[o..o + 4].try_into().map_err(|_| "fcs len slice".to_string())?) as usize; o += 4;
     let mut fcs = Vec::with_capacity(flen);
     for _ in 0..flen { fcs.push(rd_hash(b, &mut o)?); }
-    Ok((Interval { start, end }, (lo, hi), parent, children, fcs))
+    let reindex_root = if b.len() >= o + 33 && b[o] == REINDEX_ROOT_TAG {
+        o += 1;
+        Some(rd_hash(b, &mut o)?)
+    } else {
+        None
+    };
+    if start == 0 || end.checked_add(1).is_none_or(|e1| e1 < start) {
+        return Err("malformed interval".into());
+    }
+    Ok((Interval { start, end }, (lo, hi), parent, children, fcs, reindex_root))
 }
 
 /// `Vec` partition point where the elements form a prefix satisfying `pred`.
@@ -745,23 +1385,53 @@ mod tests {
         }
     }
 
-    /// DAG-7: the memoized subtree sizes used by `reindex` are the numbers the
-    /// old per-node recount produced, for every node, whatever order the memo
-    /// is filled in. `assign_subtree` only changed where it reads sizes from,
-    /// so equal sizes mean an identical interval layout.
+    /// The structural invariant every answer relies on: each child's interval
+    /// is non-empty and inside its parent's children capacity, and siblings
+    /// are disjoint, in child order.
+    fn check_layout(r: &ReachabilityStore) {
+        for (p, children) in &r.children {
+            let cap = r.children_capacity(p).expect("parent interval");
+            let mut prev_end: Option<u64> = None;
+            for c in children {
+                let iv = r.iv(c).expect("child interval");
+                assert!(iv.size() > 0, "empty interval");
+                assert!(cap.contains(&iv), "child outside its parent's capacity");
+                if let Some(e) = prev_end {
+                    assert!(e < iv.start, "siblings overlap or are out of order");
+                }
+                prev_end = Some(iv.end);
+            }
+        }
+    }
+
+    fn tree_ancestor(r: &ReachabilityStore, a: &BlockHash, b: &BlockHash) -> bool {
+        let mut x = *b;
+        while let Some(p) = r.tree_parent.get(&x) {
+            if p == a {
+                return true;
+            }
+            x = *p;
+        }
+        false
+    }
+
+    /// A random tree — mostly extending a recent block, with deep side blocks
+    /// and genesis siblings — grown with the selected-tip hint the GhostDAG
+    /// gives (the newest deepest block): every layout the reindexing produces
+    /// is well formed, `count_subtrees` matches a direct count, and the index
+    /// answers exactly.
     #[test]
-    fn memoized_subtree_sizes_match_direct_count() {
+    fn random_tree_with_hints_answers_exactly() {
         let mut r = ReachabilityStore::new();
         let g = h(0);
         r.add_genesis(g);
         let mut all = vec![g];
+        let mut deepest = g;
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
-        for i in 1..=600u16 {
+        for i in 1..=1_500u16 {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            // Mostly extend a recent block (deep chains, many reindexes), with
-            // occasional deep side blocks and genesis siblings.
             let parent = match state % 10 {
                 0 => g,
                 1 => all[(state as usize / 10) % all.len()],
@@ -770,23 +1440,95 @@ mod tests {
             let b = h(i);
             r.add_block(b, &parent, &[]);
             all.push(b);
+            if r.height[&b] > r.height[&deepest] {
+                deepest = b;
+                r.hint_virtual_selected_parent(&b);
+            }
         }
-        let mut shared = HashMap::new();
+        check_layout(&r);
+        let mut ctx = Ctx::default();
         for n in all.iter().rev() {
-            let direct = r.subtree_size(n);
-            assert_eq!(r.subtree_size_memo(n, &mut HashMap::new()), direct);
-            assert_eq!(r.subtree_size_memo(n, &mut shared), direct);
+            let mut direct = 0u64;
+            let mut stack = vec![*n];
+            while let Some(x) = stack.pop() {
+                direct += 1;
+                stack.extend(r.children[&x].iter().copied());
+            }
+            assert_eq!(r.count_subtrees(&mut ctx, *n).unwrap(), direct);
         }
-        // The index built through all those reindexes still answers exactly.
         for a in all.iter().step_by(7) {
             for b in all.iter().step_by(5) {
-                let mut x = *b;
-                let mut expect = false;
-                while let Some(p) = r.tree_parent.get(&x) {
-                    if p == a { expect = true; break; }
-                    x = *p;
-                }
-                assert_eq!(r.is_dag_ancestor(a, b), expect);
+                assert_eq!(r.is_dag_ancestor(a, b), tree_ancestor(&r, a, b));
+            }
+        }
+        let root = r.reindex_root().expect("managed");
+        assert!(r.height[&deepest] - r.height[&root] < 2 * REINDEX_DEPTH, "the reindex root trails the tip");
+    }
+
+    /// Audit DAG-7: on a 6,000-block chain whose reindex root follows the tip,
+    /// a deep side block, many side blocks under the same parent and a
+    /// genesis sibling each cost a bounded amount of reindexing (the old
+    /// scheme re-laid out the whole subtree under the parent: thousands of
+    /// nodes), and the root's record carries the reindex root through a
+    /// persistence round trip.
+    #[test]
+    fn deep_side_blocks_reindex_a_bounded_window() {
+        let mut r = ReachabilityStore::new();
+        let g = h(0);
+        r.add_genesis(g);
+        let mut chain = vec![g];
+        for i in 1..=6_000u16 {
+            let b = h(i);
+            r.add_block(b, chain.last().unwrap(), &[]);
+            r.hint_virtual_selected_parent(&b);
+            chain.push(b);
+        }
+        let root = r.reindex_root().expect("managed");
+        assert!(r.height[&root] >= 6_000 - 2 * REINDEX_DEPTH, "the reindex root follows the tip");
+        let mut n = 10_000u16;
+        let mut worst = 0u64;
+        let mut add = |r: &mut ReachabilityStore, parent: BlockHash| {
+            n += 1;
+            let before = r.reindex_work();
+            r.add_block(h(n), &parent, &[]);
+            worst = worst.max(r.reindex_work() - before);
+        };
+        add(&mut r, chain[3_000]);
+        add(&mut r, g);
+        for _ in 0..50 {
+            add(&mut r, chain[2_000]);
+        }
+        for _ in 0..50 {
+            add(&mut r, g);
+        }
+        assert!(worst <= 500, "one deep insertion cost {worst} reindex steps");
+        check_layout(&r);
+        for a in chain.iter().step_by(97) {
+            for b in chain.iter().step_by(89) {
+                assert_eq!(r.is_dag_ancestor(a, b), tree_ancestor(&r, a, b));
+            }
+        }
+
+        let rr = r.reindex_root();
+        let records = r.export_all();
+        let mut back = ReachabilityStore::new();
+        back.load_from_records(&records, r.root()).unwrap();
+        assert_eq!(back.reindex_root(), rr, "persisted with the root's record");
+        assert_eq!(back.export_all(), records);
+        // A record set without the trailer (an older data dir) loads
+        // unmanaged; the first hint re-lays it out and keeps answering.
+        let stripped: Vec<(BlockHash, Vec<u8>)> = records.iter().map(|(k, v)| {
+            if Some(*k) == r.root() { (*k, v[..v.len() - 33].to_vec()) } else { (*k, v.clone()) }
+        }).collect();
+        let mut old = ReachabilityStore::new();
+        old.load_from_records(&stripped, r.root()).unwrap();
+        assert_eq!(old.reindex_root(), None);
+        old.hint_virtual_selected_parent(chain.last().unwrap());
+        assert!(old.reindex_root().is_some());
+        check_layout(&old);
+        for a in chain.iter().step_by(101) {
+            for b in chain.iter().step_by(83) {
+                assert_eq!(old.is_dag_ancestor(a, b), tree_ancestor(&old, a, b));
             }
         }
     }

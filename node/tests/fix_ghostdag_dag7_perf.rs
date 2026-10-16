@@ -132,9 +132,11 @@ fn dag7_profile_post_activation() {
 }
 
 /// DAG-7 residual (package P3). After the earlier fixes, inserting a genesis
-/// sibling still costs a reachability reindex proportional to the whole DAG,
-/// and a deep side block one proportional to the subtree under its parent.
-/// The bound is the POW-3 anti-DoS work rule
+/// sibling still cost a reachability reindex proportional to the whole DAG,
+/// and a deep side block one proportional to the subtree under its parent
+/// (since package R4 the reindex is bounded by the reindex-root window:
+/// `node/tests/fix_dag_hot_path_cost.rs`). The other bound is the POW-3
+/// anti-DoS work rule
 /// (`gnb::ingress::BlockIngress::work_check`, run on every block whose
 /// parents are known before its proof of work, storage or insertion): a
 /// block whose selected parent is so deep that its chain cannot come within

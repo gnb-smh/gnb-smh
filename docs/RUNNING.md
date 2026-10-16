@@ -182,6 +182,14 @@ shielded`), so the earlier release stops at start-up. To downgrade, restore a
 copy of the data directory taken before the upgrade (with the node stopped)
 or resynchronize from a new data directory.
 
+The first block a node accepts after upgrading to a release with the
+reindex-root reachability layout (2026-10 phase-4 fixes, audit DAG-7)
+re-lays out the reachability index once, from genesis, and writes every
+record of it with that block (one pass over the index; later blocks rewrite
+only the few records a reindex touches). The index is a cache: an earlier
+release reads the new records (it ignores the reindex-root trailer of the
+genesis record) and keeps answering exactly.
+
 ## Wallet keystores (audit CRY-7)
 
 Every front end writes keystore **v3**, which authenticates the network and
