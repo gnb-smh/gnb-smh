@@ -15,16 +15,23 @@
 //!   (`admission::admit_gated`, the same rules as RPC and reorg
 //!   re-injection), cheapest checks first;
 //! * the signature step — the only expensive one — runs LAST and is charged
-//!   to the DELIVERING CONNECTION's token bucket ([`SIG_BUDGET_BURST`] input
-//!   signatures, refilled at [`SIG_BUDGET_REFILL_PER_SEC`]). Never to the
-//!   signed gossip author: one connection can sign every frame with a fresh
-//!   keypair, and a fresh key was a fresh full bucket (review finding). The
-//!   tokens are refunded when the transaction enters the pool, so a
-//!   connection pays only for verification that did not lead to admission
-//!   (an invalid signature, a full pool, a failed orphan re-try), and an
-//!   honest relay forwarding valid traffic is never throttled. A connection
-//!   out of budget is answered `Ignore` without any signature work; its
-//!   bucket and its orphans are dropped when it disconnects;
+//!   to the DELIVERING CONNECTION's token bucket ([`SIG_BUDGET_BURST`]
+//!   tokens, refilled at [`SIG_BUDGET_REFILL_PER_SEC`]) AND to one node-wide
+//!   bucket shared by every connection ([`NODE_SIG_BUDGET_BURST`],
+//!   [`NODE_SIG_BUDGET_REFILL_PER_SEC`]). Never to the signed gossip author:
+//!   one connection can sign every frame with a fresh keypair, and a fresh
+//!   key was a fresh full bucket (review finding). B1-T19 (Phase 4): a token
+//!   pays for one input signature OR [`SIG_BUDGET_BYTES_PER_TOKEN`] bytes
+//!   hashed, and the gate is priced in both ([`signature_gate_cost`]: under
+//!   sighash v2 every input hashes the whole transaction); the frame's
+//!   decoding, canonical check and single wtxid hash are charged before
+//!   decoding ([`frame_cost`]). The tokens are refunded when the transaction
+//!   enters the pool, so a connection pays only for verification that did
+//!   not lead to admission (an invalid signature, a full pool, a failed
+//!   orphan re-try), and an honest relay forwarding valid traffic is never
+//!   throttled. A connection out of budget is answered `Ignore` without any
+//!   signature work; its bucket and its orphans are dropped when it
+//!   disconnects;
 //! * the verdict is `Accept` (relayed by gossipsub) only for a transaction
 //!   that entered the pool; `Ignore` (not relayed, not penalised) for policy
 //!   refusals, duplicates, recently rejected ids, missing inputs and rate
@@ -74,11 +81,58 @@ use crate::network::ratelimit::TokenBuckets;
 use crate::network::{GossipVerdict, GOSSIP_HISTORY_LENGTH};
 use crate::storage::Storage;
 
-/// Per-connection burst of input-signature verifications (a hybrid
-/// ML-DSA-65 + Falcon-1024 check per input).
+/// Per-connection burst of verification tokens. A token pays for one input
+/// signature check (a hybrid ML-DSA-65 + Falcon-1024 verification) or for
+/// [`SIG_BUDGET_BYTES_PER_TOKEN`] bytes decoded or hashed (B1-T19:
+/// [`signature_gate_cost`], [`frame_cost`]).
 pub const SIG_BUDGET_BURST: u32 = 400;
-/// Per-connection sustained input-signature verifications per second.
+/// Per-connection sustained tokens per second.
 pub const SIG_BUDGET_REFILL_PER_SEC: f64 = 20.0;
+/// B1-T19: bytes of digest preimage (or of frame decoded and hashed) one
+/// token pays for: about the cost of one hybrid signature verification
+/// (SHA3-256 runs at roughly 0.4 GB/s here: 64 KiB in about 0.15 ms).
+pub const SIG_BUDGET_BYTES_PER_TOKEN: usize = 64 * 1024;
+/// B1-T19: node-wide budget of verification tokens, shared by every
+/// connection (the per-connection budget alone let 50 inbound connections
+/// spend 50 bursts at once): burst and sustained rate.
+pub const NODE_SIG_BUDGET_BURST: u32 = 4_000;
+pub const NODE_SIG_BUDGET_REFILL_PER_SEC: f64 = 400.0;
+/// Bytes hashed per input by the sighash v3 digest besides the shared
+/// precomputed midstates (outpoint, amount and script commitments, index,
+/// suite: a fixed-size preimage), rounded up.
+pub const V3_PER_INPUT_PREIMAGE_BYTES: usize = 256;
+
+/// Tokens for `bytes` decoded or hashed (rounded up).
+pub fn bytes_tokens(bytes: usize) -> usize {
+    bytes.div_ceil(SIG_BUDGET_BYTES_PER_TOKEN)
+}
+
+/// B1-T19: tokens charged BEFORE a gossip transaction frame is decoded —
+/// its decoding, the canonical-encoding check and the one wtxid hash are
+/// proportional to its size, and used to run for free, also for frames then
+/// refused for an exhausted budget.
+pub fn frame_cost(frame_len: usize) -> usize {
+    bytes_tokens(frame_len)
+}
+
+/// B1-T19: tokens charged at the signature gate for verifying `tx` (canonical
+/// wire size `wire_len`) for a block at `next_block_height` under the
+/// hardening activation `act`: one per input signature, plus the bytes its
+/// digests hash. Under sighash v2 (below the activation; mainnet's regime
+/// until 110,000) EVERY input clones the whole transaction and re-encodes
+/// and hashes it (outputs included), so the bytes are inputs × size — a
+/// 1-input transaction carrying 390 kB of outputs used to cost one token and
+/// hash 390 kB; under v3 the transaction is hashed once into precomputed
+/// midstates plus a fixed preimage per input.
+pub fn signature_gate_cost(tx: &Transaction, wire_len: usize, next_block_height: u64, act: u64) -> usize {
+    let inputs = tx.inputs.len().max(1);
+    let hashed = if crate::core::activation::is_active_at(next_block_height, act) {
+        wire_len.saturating_add(inputs.saturating_mul(V3_PER_INPUT_PREIMAGE_BYTES))
+    } else {
+        inputs.saturating_mul(wire_len)
+    };
+    inputs.saturating_add(bytes_tokens(hashed))
+}
 /// Bound on the number of connections whose budget is tracked (far above
 /// the connection limit: a live connection is never evicted).
 pub const SIG_BUDGET_TRACK_CAP: usize = 4096;
@@ -377,6 +431,8 @@ pub fn default_penalty_height(activation_height: u64) -> u64 {
 /// the orphanage. Owned by the message processor.
 pub struct TxRelay {
     budget: TokenBuckets<Option<PeerId>>,
+    /// B1-T19: the node-wide verification budget (one key).
+    node_budget: TokenBuckets<()>,
     orphans: TxOrphanage<PeerId>,
     /// Round-robin position of the periodic sweep (an orphan sequence
     /// number).
@@ -401,10 +457,35 @@ impl TxRelay {
     pub fn with_limits(burst: u32, refill_per_sec: f64, orphan_limits: OrphanLimits) -> Self {
         Self {
             budget: TokenBuckets::new(burst, refill_per_sec, SIG_BUDGET_TRACK_CAP),
+            node_budget: TokenBuckets::new(NODE_SIG_BUDGET_BURST, NODE_SIG_BUDGET_REFILL_PER_SEC, 1),
             orphans: TxOrphanage::new(orphan_limits),
             sweep_cursor: 0,
             penalty_height: default_penalty_height(crate::core::activation::hardening_activation_height()),
         }
+    }
+
+    /// Replace the node-wide verification budget (tests).
+    pub fn with_node_budget(mut self, burst: u32, refill_per_sec: f64) -> Self {
+        self.node_budget = TokenBuckets::new(burst, refill_per_sec, 1);
+        self
+    }
+
+    /// Take `n` tokens from the connection's budget AND the node-wide one,
+    /// all or nothing.
+    fn take_tokens(&mut self, peer: Option<PeerId>, n: usize, now: Instant) -> bool {
+        if !self.budget.try_take_n_at(peer, n, now) {
+            return false;
+        }
+        if !self.node_budget.try_take_n_at((), n, now) {
+            self.budget.refund_n(peer, n);
+            return false;
+        }
+        true
+    }
+
+    fn refund_tokens(&mut self, peer: Option<PeerId>, n: usize) {
+        self.budget.refund_n(peer, n);
+        self.node_budget.refund_n((), n);
     }
 
     /// Penalise invalid frames from next-block height `height` on instead of
@@ -486,7 +567,17 @@ impl TxRelay {
                 format!("transaction of {} bytes exceeds the relay limit {}", tx_data.len(), MAX_TX_SIZE)), events);
         }
         let penalise = self.penalties_in_force(next_block_height);
-        let tx = match admission::decode_tx_strict(tx_data) {
+        // B1-T19: decoding, the canonical check and the wtxid hash cost time
+        // in proportion to the frame; they are charged first (refunded with
+        // the rest if the transaction is admitted), so a connection out of
+        // budget costs nothing but this check.
+        let pre = frame_cost(tx_data.len());
+        if !self.take_tokens(peer, pre, now) {
+            return done(GossipTxOutcome::verdict(GossipVerdict::Ignore, format!(
+                "verification budget of {} exhausted (frame of {} bytes)",
+                peer.map(|p| p.to_string()).unwrap_or_else(|| "an unknown connection".into()), tx_data.len())), events);
+        }
+        let tx = match admission::decode_tx_canonical(tx_data) {
             Ok(t) => t,
             Err(e) => return done(GossipTxOutcome::invalid(penalise, format!("malformed transaction: {}", e)), events),
         };
@@ -496,15 +587,17 @@ impl TxRelay {
                 format!("frame claims txid {} but the transaction hashes to {}",
                     hex::encode(&claimed_txid[..8]), hex::encode(&txid[..8]))), events);
         }
-        let wtxid = admission::wtxid(&tx);
+        // B1-T19: the wtxid once per frame, from the canonical bytes received.
+        let wtxid = admission::wtxid_of_canonical_bytes(tx_data);
         if self.orphans.contains(&wtxid) {
             let mut o = GossipTxOutcome::verdict(GossipVerdict::Ignore, "already buffered as an orphan");
             o.wtxid = wtxid;
             return done(o, events);
         }
         let policy = AdmissionPolicy::relay(next_block_height);
-        let mut out = match self.admit_charged(store, mempool, tx.clone(), &policy, peer, now) {
+        let mut out = match self.admit_charged(store, mempool, tx.clone(), &wtxid, tx_data.len(), &policy, peer, now) {
             Ok(()) => {
+                self.refund_tokens(peer, pre);
                 // Other encodings of this txid can never be admitted now.
                 events.dropped.extend(self.orphans.erase_txid(&txid));
                 let mut budget = MAX_ORPHAN_RETRY_INPUTS_PER_EVENT;
@@ -668,36 +761,49 @@ impl TxRelay {
         OrphanEvents { dropped: self.orphans.erase_peer(Some(peer)), ..Default::default() }
     }
 
-    /// Admission with the delivering connection's signature budget as the
-    /// gate; the tokens are refunded when the transaction enters the pool.
+    /// Admission with the delivering connection's and the node-wide
+    /// verification budgets as the gate (B1-T19: priced by
+    /// [`signature_gate_cost`], in signatures AND bytes hashed); the tokens
+    /// are refunded when the transaction enters the pool. `tx_wtxid` is the
+    /// transaction's wtxid, `wire_len` its canonical size.
+    #[allow(clippy::too_many_arguments)]
     fn admit_charged(
         &mut self,
         store: &Storage,
         mempool: &Mempool,
         tx: Transaction,
+        tx_wtxid: &[u8; 32],
+        wire_len: usize,
         policy: &AdmissionPolicy,
         peer: Option<PeerId>,
         now: Instant,
     ) -> Result<(), AdmissionError> {
         let mut charged = 0usize;
+        let act = crate::core::activation::hardening_activation_height();
         let result = {
             let budget = &mut self.budget;
+            let node_budget = &mut self.node_budget;
             let charged = &mut charged;
             let mut gate = |t: &Transaction| -> Result<(), AdmissionError> {
-                let cost = t.inputs.len().max(1);
-                if budget.try_take_n_at(peer, cost, now) {
-                    *charged = cost;
-                    Ok(())
-                } else {
-                    Err(AdmissionError::RateLimited(format!(
-                        "signature budget of {} exhausted ({} input signature(s) asked)",
-                        peer.map(|p| p.to_string()).unwrap_or_else(|| "an unknown connection".into()), cost)))
+                let cost = signature_gate_cost(t, wire_len, policy.next_block_height, act);
+                if !budget.try_take_n_at(peer, cost, now) {
+                    return Err(AdmissionError::RateLimited(format!(
+                        "signature budget of {} exhausted ({} token(s) asked: {} input signature(s), {} bytes)",
+                        peer.map(|p| p.to_string()).unwrap_or_else(|| "an unknown connection".into()),
+                        cost, t.inputs.len(), wire_len)));
                 }
+                if !node_budget.try_take_n_at((), cost, now) {
+                    budget.refund_n(peer, cost);
+                    return Err(AdmissionError::RateLimited(format!(
+                        "node-wide signature budget exhausted ({cost} token(s) asked)")));
+                }
+                *charged = cost;
+                Ok(())
             };
-            admission::admit_gated(store, mempool, tx, policy, &mut gate).map(|_| ())
+            admission::admit_gated_with_wtxid(store, mempool, tx, tx_wtxid, policy, &mut gate).map(|_| ())
         };
         if result.is_ok() && charged > 0 {
-            self.budget.refund_n(peer, charged);
+            self.refund_tokens(peer, charged);
         }
         result
     }
@@ -720,7 +826,7 @@ impl TxRelay {
             return None;
         }
         let o = self.orphans.remove(wtxid)?;
-        match self.admit_charged(store, mempool, o.tx.clone(), policy, o.peer, now) {
+        match self.admit_charged(store, mempool, o.tx.clone(), &o.wtxid, o.bytes, policy, o.peer, now) {
             Ok(()) => {
                 events.dropped.extend(self.orphans.erase_txid(&o.txid));
                 Some(o.tx)
