@@ -69,7 +69,41 @@ impl Fixture {
         }
     }
 
-    fn rpc(&self, method: &str, _: &Value) -> Result<Value, String> {
+    fn rpc(&self, method: &str, params: &Value) -> Result<Value, String> {
+        match method {
+            "getnetworkinfo" | "getdaginfo" => assert_eq!(params, &Value::Null),
+            "getutxos" => {
+                let address = gnb::address::PolicyAddress::from_script(
+                    &self.spend.locking_script(),
+                    self.spend.network,
+                )
+                .unwrap();
+                let selected: Vec<_> = self.spend.tx.inputs.iter().map(|input|
+                    json!({"txid":hex::encode(input.prev_txid),"index":input.prev_index})).collect();
+                assert_eq!(
+                    params,
+                    &json!([
+                        address.to_string(),
+                        gnb::wallet::send::GETUTXOS_MAX_ROWS,
+                        selected
+                    ]),
+                    "UTXO proof must request the document's address and selected outpoints"
+                );
+            }
+            "getrawtransaction" | "gettransaction" => {
+                let arguments = params.as_array().expect("transaction query arguments");
+                assert_eq!(arguments.len(), 1);
+                assert!(
+                    self.spend
+                        .tx
+                        .inputs
+                        .iter()
+                        .any(|input| arguments[0] == hex::encode(input.prev_txid)),
+                    "previous-transaction proof must request a selected input's transaction"
+                );
+            }
+            _ => panic!("unexpected fixture RPC {method}"),
+        }
         self.calls.borrow_mut().push(method.to_owned());
         self.replies
             .get(method)
@@ -228,7 +262,15 @@ fn online_policy_preflight_checks_h_minus_one_h_and_never_changes_a_signed_versi
     .unwrap();
     assert_eq!(calls.get(), 1);
     fixture.replies.get_mut("getdaginfo").unwrap()["next_block_height"] = json!(17500);
-    fixture.refused_before_signer();
+    fixture.replies.get_mut("getutxos").unwrap()["next_block_height"] = json!(17500);
+    fixture.replies.get_mut("getutxos").unwrap()["utxos"][0]["confirmations_at_next_block"] =
+        json!(17400);
+    let refusal = fixture.refused_before_signer();
+    assert!(refusal.starts_with("bad-txns-version:"), "{refusal}");
+    assert!(
+        refusal.contains("version 1 is invalid at height 17500"),
+        "{refusal}"
+    );
     assert_eq!(fixture.spend.tx.to_wire_bytes(true), original);
 }
 

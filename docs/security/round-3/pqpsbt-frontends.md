@@ -137,10 +137,11 @@ The offline core has larger limits and supports documents the RPC refuses.
 
 The core's test-only counters on the actual verification functions measured
 48 calls for four inputs with sixteen valid partials (three finalization
-passes), and zero when either transport count limit was exceeded. Frontend
-router tests will additionally exercise the full positive budget, refusal,
-authentication, body limit and permit release; timing is local evidence, not
-a production latency promise.
+passes), and zero when either transport count limit was exceeded. These are
+strict signature-verifier function invocations, not individual lattice
+primitive calls. Frontend router tests also exercised the full positive budget,
+refusal, authentication, body limit and permit release; timing is local
+evidence, not a production latency promise.
 
 ## Evidence status
 
@@ -179,14 +180,40 @@ For 80 returned ordinary UTXOs, default reads were 240. Selecting 64 added
 66 reads before activation (306 total) and 258 after activation (498 total).
 The tests count real storage reads, use consensus selected-depth metadata,
 and refuse malformed/duplicate/65-input selections before storage access.
-The positive full RPC finalization measured approximately 157–168 ms in these
+The positive full RPC finalization measured approximately 157–211 ms in these
 local runs. This is not a production latency guarantee; the hard work bound
 is the core's actual count of at most 48 verification calls and single flight.
 
 `node/tests/support/pqpsbt_reversal.py` is the hash-guarded production-only
 reversal driver. It preserves the final tests and restores source bytes in
 `finally`, recording pre/reversed/restored hashes and runtime return codes.
-Its execution and a restored green run are pending at this checkpoint.
+Both reversals executed at production revision `c3a6140`: the CLI control
+passed and the regression failed (1/1); four metadata tests failed for the
+removed contract. Both runs returned 101 after executing runtime assertions.
+The driver returned success, preserved test sources, and restored both source
+hashes exactly. Restored green logs are
+`/private/tmp/gnb-pqpsbt-cli-restored-green.log` (2+1 passed) and
+`/private/tmp/gnb-pqpsbt-rpc-restored-green.log` (7 passed).
+
+Review then strengthened the H-1/H unit fixture: getdaginfo and getutxos now
+report matching height/hash at 17,500, and the assertion requires
+`bad-txns-version` for version 1 at that height. The valid 17,499 control and
+original transaction bytes remain. The fixture now also asserts the actual
+RPC parameters: the policy script/network-derived address, exact selected
+outpoints and window limit, and selected previous-transaction txids. These
+are coverage improvements, not newly reproduced production defects. All 15
+CLI tests passed again in
+`/private/tmp/gnb-pqpsbt-cli-reviewed-params-green.log`. This test-only follow-up does
+not alter production or any test executed by the reversal filters.
+
+Hashes, exact runtime summaries and the restoration manifest are retained in
+[`pqpsbt-frontends-evidence.json`](pqpsbt-frontends-evidence.json). The gate's
+permit retention after an outer deadline follows ownership in the existing
+blocking worker; this package did not add a runtime expiration/cancellation
+scenario, and does not equate response timeout with cancellation of I/O.
+Real synthetic-key callback signing and the CLI guard against premature
+wallet access were exercised; an interactive encrypted-keystore/TTY password
+journey was not executed in this package.
 
 Three independent reviews, full integration and CI remain separate pending
 gates; this package does not assign an audit score. Blocked PoWit/R7

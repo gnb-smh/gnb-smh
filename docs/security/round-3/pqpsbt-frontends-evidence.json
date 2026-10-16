@@ -1,0 +1,177 @@
+{
+  "production_revision": "c3a6140d895afb8565de86b6715f83682c1cdc95",
+  "base": "f06b7f8dc05af107fd16f2cebdd89d62a360662a",
+  "upstream_core_commits": [
+    "26a4212",
+    "68f4a91",
+    "8cdb075"
+  ],
+  "environment": {
+    "CARGO_TARGET_DIR": "/private/tmp/gnb-technology-target-pqpsbt-frontends",
+    "CARGO_PROFILE_DEV_CODEGEN_UNITS": "61",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_BUILD_JOBS": "1"
+  },
+  "source_sha256": {
+    "node/src/bin/gnb-cli.rs": "565da0eb1c7d9775ef339bb0dd901d855686b836d8371436d637690c836b01de",
+    "node/src/rpc/mod.rs": "6390e7950a9e49f7b50fd0d0422e1c609143872564ac93001b662b0a0c4a2170"
+  },
+  "logs": {
+    "baseline_cli": {
+      "path": "/private/tmp/gnb-pqpsbt-frontends-red-confirmed.log",
+      "sha256": "d18ffc9bade0bb5fc68667a77502b9a28298837cacc3207b900648b75c15050e",
+      "runtime_results": [
+        "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s"
+      ]
+    },
+    "baseline_metadata": {
+      "path": "/private/tmp/gnb-pqpsbt-metadata-red.log",
+      "sha256": "7b9b9400ad6359cb3830d2908f2daf9740592a3d7995c7e9d374f296fb7fcfca",
+      "runtime_results": [
+        "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 467 filtered out; finished in 0.96s"
+      ]
+    },
+    "final_entrypoints": {
+      "path": "/private/tmp/gnb-pqpsbt-cli-entry-green-final.log",
+      "sha256": "d9bdbcab7ad8fb5a53aec48aa70bf46187e453778e8cbe10ff298ee96cd2e526",
+      "runtime_results": [
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.72s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.81s"
+      ]
+    },
+    "final_cli_unit": {
+      "path": "/private/tmp/gnb-pqpsbt-cli-reviewed-green.log",
+      "sha256": "99b3455e782a989a098d3d0a39335b1724ff840d7c36fbd89edd0e45e9e1a544",
+      "runtime_results": [
+        "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.59s"
+      ]
+    },
+    "final_rpc": {
+      "path": "/private/tmp/gnb-pqpsbt-rpc-auth-complete.log",
+      "sha256": "3075f3897c5057c033e2267a6b8323a082901701982cda2afba25c869ddcd205",
+      "runtime_results": [
+        "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 467 filtered out; finished in 6.63s"
+      ]
+    },
+    "utxo_regressions": {
+      "path": "/private/tmp/gnb-pqpsbt-utxo-regressions.log",
+      "sha256": "1688a804a7336395806afba507c3f49cc252632d333c5bd029a0fe44ff46b28a",
+      "runtime_results": [
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 469 filtered out; finished in 1.62s"
+      ]
+    },
+    "dispatch_registry": {
+      "path": "/private/tmp/gnb-pqpsbt-dispatch-registry.log",
+      "sha256": "0b76ea6790a5555e746f54afaefab6293370f95a239bfe304223088427728292",
+      "runtime_results": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 473 filtered out; finished in 0.01s"
+      ]
+    },
+    "reversal_cli": {
+      "path": "/private/tmp/gnb-pqpsbt-frontends-reversal/cli-reversal.log",
+      "sha256": "512f2f5dce6a7419c7652264709e334bcc664c81f83c679035b9748c59fa0d15",
+      "runtime_results": [
+        "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.70s"
+      ]
+    },
+    "reversal_metadata": {
+      "path": "/private/tmp/gnb-pqpsbt-frontends-reversal/metadata-reversal.log",
+      "sha256": "f1834dff72c0ec645bb6cb180f5023ac981a04c79d2256ef45aca4443e7d280e",
+      "runtime_results": [
+        "test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 470 filtered out; finished in 0.37s"
+      ]
+    },
+    "restored_entrypoints": {
+      "path": "/private/tmp/gnb-pqpsbt-cli-restored-green.log",
+      "sha256": "eb027b3b48c768b854ffd3bf89d465a8663242d68c6796780c0c573023e02631",
+      "runtime_results": [
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.25s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.14s"
+      ]
+    },
+    "restored_rpc": {
+      "path": "/private/tmp/gnb-pqpsbt-rpc-restored-green.log",
+      "sha256": "24e6bca6a340660beb93089dce296e2151a4cdc68f645ef1d18ff262d6dfb6e0",
+      "runtime_results": [
+        "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 467 filtered out; finished in 9.97s"
+      ]
+    },
+    "reviewed_parameter_bindings": {
+      "path": "/private/tmp/gnb-pqpsbt-cli-reviewed-params-green.log",
+      "sha256": "3b436ef3cdfabfcf9915bb0e7b5c5f9143560dea5fa32a38552e382c4b644cdb",
+      "runtime_results": [
+        "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.04s"
+      ]
+    }
+  },
+  "baseline_sources": {
+    "base": "f06b7f8dc05af107fd16f2cebdd89d62a360662a",
+    "source_hashes": {
+      "node/src/bin/gnb-cli.rs": "c3e9bba2be3ea7070c7f98e0aa3b6ef1eb01d79e1ed6152e33b38ea184b5390e",
+      "node/src/rpc/mod.rs": "615949206b95fea63420aac3b314aecc20b3ae6deb01296b4b8ae95c49071148",
+      "node/tests/pqpsbt_cli_preflight.rs": "90d96e5ed91d0c9d68614ca2dc866923b636cf1c0566d5c81ae4c3b947ae6c74"
+    },
+    "log_hashes": {
+      "/private/tmp/gnb-pqpsbt-frontends-red-confirmed.log": "d18ffc9bade0bb5fc68667a77502b9a28298837cacc3207b900648b75c15050e",
+      "/private/tmp/gnb-pqpsbt-metadata-red.log": "7b9b9400ad6359cb3830d2908f2daf9740592a3d7995c7e9d374f296fb7fcfca"
+    },
+    "cli": "1 positive passed; 1 regression failed (no RPC before wallet prompt)",
+    "metadata": "default positive control passed; 2 regressions failed (metadata missing, 65 accepted)",
+    "excluded_attempts": [
+      "sandbox bind EPERM",
+      "macOS fixture inherited nonblocking socket; positive failed"
+    ]
+  },
+  "reversal": {
+    "source_hashes": {
+      "cli": "565da0eb1c7d9775ef339bb0dd901d855686b836d8371436d637690c836b01de",
+      "metadata": "6390e7950a9e49f7b50fd0d0422e1c609143872564ac93001b662b0a0c4a2170"
+    },
+    "runs": [
+      {
+        "mode": "cli",
+        "returncode": 101,
+        "log": "/private/tmp/gnb-pqpsbt-frontends-reversal/cli-reversal.log",
+        "reversed_sha256": "694259b1ce5037087c4c8e1173f1183b371747064032638a53ac5f7e5fa42ddc"
+      },
+      {
+        "mode": "metadata",
+        "returncode": 101,
+        "log": "/private/tmp/gnb-pqpsbt-frontends-reversal/metadata-reversal.log",
+        "reversed_sha256": "077ebcc280d5919d58177f4fd771691261855ede592fe7954509dd1d71b13cdf"
+      }
+    ],
+    "restored_source_hashes": {
+      "cli": "565da0eb1c7d9775ef339bb0dd901d855686b836d8371436d637690c836b01de",
+      "metadata": "6390e7950a9e49f7b50fd0d0422e1c609143872564ac93001b662b0a0c4a2170"
+    },
+    "tests_unchanged": true
+  },
+  "review_followup": {
+    "file": "node/tests/support/pqpsbt_cli_unit.rs",
+    "change": "Make H-1/H fixture snapshots consistent and require the activation/version-specific error; positive H-1 and original bytes retained. Fixture RPC now asserts exact policy address, selected outpoints, row limit and previous-transaction query txid.",
+    "production_changed": false,
+    "reversal_executed_tests_changed": false,
+    "verification": "15 CLI tests passed in reviewed_parameter_bindings"
+  },
+  "review_limitations": [
+    "48 is actual strict signature-verifier function invocations, not lattice primitive calls; measured in core cfg(test), not exported to node.",
+    "Timeout permit retention follows RAII in the blocking worker; no new expiration/cancellation runtime scenario was executed.",
+    "Full integration, independent review closure and CI belong to the parent task; no audit score assigned.",
+    "Real synthetic-key callback signing and CLI negative key-access guard were executed; a live encrypted-keystore/TTY password journey was not executed."
+  ],
+  "final_test_source_sha256": {
+    "node/tests/pqpsbt_cli_preflight.rs": "d3c356db58f60c6cfd9ea57b9439f9949f3af1e675be0dc53c3b230cc7b03df9",
+    "node/tests/pqpsbt_public_roles.rs": "2e92e76f5011db54ed36d861ea8288f97f71aa0b4c67061faefbedbe3d981c83",
+    "node/tests/support/pqpsbt_cli_unit.rs": "5be2c712ed4e0df79a2b6448b60f4a59976a09b9964e11a861135fc88c1558c9",
+    "node/tests/support/pqpsbt_rpc_unit.rs": "90fa32f5d3588e0e8117bf4973543ce7a418cca031d621567a95624b7b7ebbfb",
+    "node/tests/support/pqpsbt_reversal.py": "b88eef04baf574978da9bf9dabea5259dc79b70adc4bd86e773ed41ee1a0b2d7"
+  },
+  "reversal_executed_test_sources_match_final": {
+    "node/tests/pqpsbt_cli_preflight.rs": true,
+    "node/tests/pqpsbt_public_roles.rs": true,
+    "node/tests/support/pqpsbt_rpc_unit.rs": true,
+    "node/tests/support/pqpsbt_reversal.py": true
+  }
+}
