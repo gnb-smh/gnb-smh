@@ -39,7 +39,11 @@ prompt before mainnet activation, and recommended before relaunch/bridge.
 
 ## Delivery status
 
-Implementation and review are in progress. The Linux WASM was rebuilt and
-repinned with actual browser tests; a fresh CI comparison remains required.
-Full integration, independent scorecards and exact-head CI remain gates.
-No PR for this round has been opened and no completion claim is made.
+The implemented packages, [usage guide](../../PQ-PSBT-USAGE.md), review
+ledger and independent scorecard are ready for a **draft PR**. Branch CI at
+`7f72e1b` passed, including the rebuilt/repinned Linux WASM comparison.
+Local integration records an unresolved peer-persistence failure and a
+partition/reconnection failure; subsequent scoped passes do not erase them.
+The core's entry-path review remains incomplete. See the exact results in
+[validation](validation.md); final PR-head CI is a separate gate.
+This round makes no completion, mainnet readiness or superiority claim.

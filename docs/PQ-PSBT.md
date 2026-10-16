@@ -6,6 +6,8 @@ contains no private keys. This is a new GnB wallet format, **not Bitcoin PSBT
 wire compatibility**, and does not change consensus, activation heights,
 transaction IDs or signature messages.
 
+For CLI, RPC and WASM examples, see [PQ-PSBT usage](PQ-PSBT-USAGE.md).
+
 The role separation and checking a supplied previous transaction against its
 outpoint follow the rationale in [BIP174, Roles and Signer](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#roles).
 Explicit format versioning, distinct from the transaction version, follows

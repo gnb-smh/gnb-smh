@@ -1,7 +1,8 @@
 # Round 3 validation record
 
 This record distinguishes intermediate builds from the final reviewed PR.
-No final integrated pass or merge readiness is established yet.
+The branch CI is green for the revision identified below. Local failures and
+the incomplete review remain open; no merge readiness is established.
 
 ## Canonical WASM build delivery
 
@@ -76,7 +77,101 @@ An authorized rerun of only those two suites at `cfaacec` passed:
 revisions is documentation only. Deployment checks retain their three
 Linux-only skips on macOS; the Linux CI job is a separate platform check.
 
-Final node, separate crypto, Python, site/deploy, functional, review and
-exact-head CI results will be recorded after integration. Earlier round 2
-platform failures remain in the scorecard and are not erased by these
-intermediate checks.
+## Integrated node failure and separate crypto result
+
+The integrated driver began at `03757cc`, with codegen-units 59 and isolated
+target `/private/tmp/gnb-security-target-r3-integration`. Later commits changed
+documentation, browser fixtures/pins and two CLI unit fixtures, not native
+production. The ordinary `cargo test -p gnb --locked --offline` invocation
+exited 101 after 1,172.08 seconds: **1,464 passed, one failed, seven ignored**
+across 66 completed summaries. It stopped in `peer_addr_churn_lab` before
+36 integration binaries seen in round 2 and the doc-tests were reached.
+This is not a full node pass.
+
+**R3-NODE-1 remains open, cause undetermined.**
+`live_connection_persists_only_canonical_addrs` observed an empty address
+list after its existing 70-second wait and failed at
+`node/tests/peer_addr_churn_lab.rs:313`. The independent read-only triage
+found that the harness does not first establish a connection event, discards
+the network task result and maps file-read/JSON errors to an empty list.
+The output therefore does not distinguish connection, identification,
+persistence or file-read failures. The test and network module are unchanged
+from the baseline; that does not establish or exclude a causal relationship
+to the transport change. No production or fixture correction was made.
+
+The coordinator ran only that existing test in the same Cargo-built binary,
+`peer_addr_churn_lab-fcf5ee4894b9578e`, with `--exact --nocapture`:
+**one passed**, exit 0, 71.10 seconds. The original failure and isolated pass
+are both retained in `/private/tmp/gnb-r3-integration/node.log` and
+`/private/tmp/gnb-r3-peer-persistence-isolated.log`. The pass does not prove
+intermittence, explain the failure or close the finding.
+
+The separate `cargo test -p gnb-crypto --locked --offline` invocation
+completed with exit 0 in 277.69 seconds: **468 passed, zero failed, four
+ignored** across twelve summaries. Functional build succeeded and the
+14-scenario live run completed as recorded below. Remaining node coverage and
+CI results are recorded separately; earlier round 2 platform failures remain
+in the scorecard.
+
+At head `7f72e1b`, fork run
+[38935414889](https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38935414889)
+completed **successfully**: 15 jobs succeeded, including workspace tests,
+separate consensus crates, functional, Miri, sanitizers, site/deploy,
+references, i686 crates and the fresh Linux WASM rebuild/pin comparison.
+The full-node i686 and fuzz jobs were skipped by their existing event
+conditions on this push. A PR event additionally runs the fuzz job. This is
+not proof of the requested complete platform matrix or cross-host byte
+reproducibility. Later documentation-only changes still require their own
+PR-head CI; a prior green run does not replace it.
+
+## Completion of initially unexecuted node targets
+
+After the functional run finished, the continuation driver used Cargo
+metadata to enumerate every integration target and compare it with the
+initial run's reached targets. It selected the **38 not yet reached**
+(36 already present in round 2 and the two new PQ-PSBT targets), reran the
+complete `peer_addr_churn_lab` binary, and ran `gnb-cli` with its final unit
+fixtures. The source revision was `7f72e1b`, still codegen-units 59, and Cargo
+used `--no-fail-fast` without a test-name filter.
+
+The continuation passed: **307 passed, zero failed, one ignored**, 40
+summaries, exit 0, 169.07 seconds. The peer-address binary passed all five
+tests. The subsequent explicit `cargo test -p gnb --locked --offline --doc`
+completed with exit 0 in 4.01 seconds, reporting zero doc-tests. The dedicated
+stream, upgrade and transport-convergence targets are included in the
+completed continuation. Together the invocations reached every declared
+integration target; their overlapping CLI/peer tests must not be counted as
+new distinct tests. The initial node exit 101 remains a failed complete-suite
+attempt, not a green run assembled by adding later passes. R3-NODE-1 remains
+open without a cause or production correction.
+
+Exact commands, target lists and log hashes are retained in
+`/private/tmp/gnb-r3-node-continuation/results.json` and the versioned
+[integrated validation manifest](integrated-validation.json). The runtime
+driver is `/private/tmp/gnb-r3-finish-node-tests.py`; it made no source edits.
+
+## Local live functional result
+
+The runner completed **all 14 scenarios: 13 passed, zero skipped, one failed**,
+exit 1, 661.54 seconds including cache/start-state preparation. It used one
+scenario at a time and the unchanged 300-second per-scenario deadline.
+The full results/log are under `/private/tmp/gnb-r3-integration`; failed node
+logs are retained under `/private/tmp/gnb-r3-functional`.
+
+`feature_partition_heal.py` failed in 49.5 seconds. Its node log again records
+`Address already in use (os error 48)` when reconnecting after restart, before
+the existing convergence deadline. R1-FUNC-1 remains open; the successful
+Linux functional job does not explain or fix the local result.
+
+`mining_full_template.py` passed in 180.2 seconds. This includes its actual
+large-template assertions, rather than stopping during prerequisite mining.
+R2-FUNC-3 was therefore **not reproduced in this run**. No production fix was
+made. This run used one scenario at a time whereas round 2 used two; that
+difference alone does not establish the cause of the earlier timeout.
+The earlier 300-second timeout and its unexecuted assertions remain recorded.
+
+All other local scenarios passed: activation, restart persistence,
+invalidation, test-build guard, transaction relay/replacement, ordinary
+mining, block propagation, invalid blocks/transactions, RPC authentication,
+UTXO-set information and coinbase maturity. These 14 live scenarios are
+separate from the 22 harness unit tests; their counts are not combined.
