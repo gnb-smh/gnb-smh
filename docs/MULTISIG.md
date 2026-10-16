@@ -60,7 +60,7 @@ it grows with both `n` and `m`. Measured (`node/tests/policy_spend_transport.rs`
 | 7-of-7 | 58,402 B |
 
 The transaction decoder accepts a `script_sig` up to
-`MAX_SCRIPT_SIG_LEN` = `policy::MAX_POLICY_WITNESS_LEN` (114,768 B), the
+`MAX_SCRIPT_SIG_LEN` = `policy::MAX_POLICY_WITNESS_LEN` (114,834 B), the
 largest witness the policy parser can accept. Before this limit was tied to
 the parser it was 10,000 B, so every policy with more than one key was valid
 by consensus but could not be relayed, mined or stored. That test round-trips
