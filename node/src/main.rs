@@ -1223,23 +1223,31 @@ async fn main() {
                 // frontier gap no longer latches IBD by itself — the fetched tips
                 // do, if they arrive as full-difficulty orphans well ahead of us.
                 network::NetworkMessage::Tips { tips, .. } => {
-                    if !origin.is_solicited() {
+                    // B1-T2 / NET-10: the network loop delivers a directed
+                    // Tips only as the answer to one of our GetTips
+                    // (`sync_rr::check_response`).
+                    let Some(peer) = origin.peer().filter(|_| origin.is_solicited()) else {
                         debug!("unsolicited Tips ignored");
                         continue;
-                    }
+                    };
                     let advertised: Vec<[u8; 32]> = tips.iter().map(|e| e.hash).collect();
                     let now = std::time::Instant::now();
+                    // NET-10 residual: at most MAX_FRONTIER_IN_FLIGHT_PER_PEER
+                    // tips in flight on behalf of one peer's answers.
                     let to_req = {
                         let d = dag2.read();
-                        frontier2.lock().to_request_capped(
+                        frontier2.lock().request_from(
+                            peer,
                             &advertised,
                             |h| accept::is_known_block_in(&d, &store2, h) || ingress_core.orphans.contains(h),
                             now,
                             sync::frontier::MAX_NEW_TIPS_PER_RESPONSE,
                         )
                     };
-                    for h in &to_req {
-                        let _ = otx2.send(network::NetworkMessage::GetBlock { block_hash: *h, nonce: getblock_nonce() }).await;
+                    if !to_req.is_empty() {
+                        // Pulled from the peer that advertised them first,
+                        // charged to its pull quota (B1-T2 / B1-T6).
+                        let _ = net_ctl_tx.send(network::NetworkControl::Fetch { source: peer, hashes: to_req }).await;
                     }
                     maybe_release_ibd(&dag2, &peer_state2, &frontier2, &state2);
                 }
@@ -1249,11 +1257,17 @@ async fn main() {
                 // Headers are no longer delivered; an overheard stream must
                 // never drive the pipeline).
                 network::NetworkMessage::Headers { entries } => {
-                    if !origin.is_solicited() {
+                    // B1-T2: the network loop delivers a directed Headers
+                    // only as the answer to one of our GetHeaders, with at
+                    // most the requested count, none below the requested
+                    // blue score (`sync_rr::check_response`); a Headers
+                    // answer to GetPeers / GetTips / GetBlock used to be
+                    // acted on here (2,000 GetBlocks per frame).
+                    let Some(peer) = origin.peer().filter(|_| origin.is_solicited()) else {
                         debug!("unsolicited Headers ignored ({} entries)", entries.len());
                         continue;
-                    }
-                    let missing: Vec<[u8; 32]> = {
+                    };
+                    let mut missing: Vec<[u8; 32]> = {
                         let d = dag2.read();
                         entries.iter()
                             .filter(|e| !accept::is_known_block_in(&d, &store2, &e.hash) && !ingress_core.orphans.contains(&e.hash))
@@ -1261,9 +1275,12 @@ async fn main() {
                     };
                     if !missing.is_empty() {
                         info!("IBD: need {}/{} blocks", missing.len(), entries.len());
-                    }
-                    for hash in missing {
-                        let _ = otx2.send(network::NetworkMessage::GetBlock { block_hash: hash, nonce: getblock_nonce() }).await;
+                        // One answer never asks for more than one batch, and
+                        // its pulls go first to the peer that announced them,
+                        // charged to that peer's quota of the shared pull
+                        // queue (`network::pull::MAX_PENDING_PER_SOURCE`).
+                        missing.truncate(MAX_FETCH_PER_ANSWER);
+                        let _ = net_ctl_tx.send(network::NetworkControl::Fetch { source: peer, hashes: missing }).await;
                     }
                     let recent_request = {
                         let sent = getheaders_sent2.load(std::sync::atomic::Ordering::Relaxed);
@@ -1402,6 +1419,15 @@ async fn main() {
                                 warn!("block {} rejected ({})", hex::encode(&block_hash[..8]), reason);
                                 network::GossipVerdict::Reject
                             }
+                            ingress::BlockOutcome::BodyRefused(reason) => {
+                                // B1-T2 review: a Reject here penalizes the
+                                // peer that served the body
+                                // (`directed_block_penalty`): only for what
+                                // the block id commits to.
+                                warn!("wanted body of block {} h={} not stored: {}",
+                                    hex::encode(&block_hash[..8]), height, reason);
+                                ingress::verdict_for_accept_error(&reason)
+                            }
                             ingress::BlockOutcome::Buffered { request, evidence, evicted } => {
                                 if evicted > 0 {
                                     debug!("orphan pool full: evicted {} oldest orphan(s)", evicted);
@@ -1467,6 +1493,11 @@ async fn main() {
                         }
                     };
                     report_verdict(&vtx2, &origin, verdict);
+                    // B1-T2: an invalid block sent as the ANSWER to one of our
+                    // pulls costs its sender a misbehaviour penalty.
+                    if let Some(peer) = directed_block_penalty(verdict, &origin) {
+                        let _ = net_ctl_tx.try_send(network::NetworkControl::PenalizePeer(peer));
+                    }
                     // A body rejected for a witness-dependent reason, or found
                     // missing (pruned, DAG-6) during this acceptance: ask peers
                     // for it now; the orphan sweep retries with backoff.
@@ -2428,6 +2459,10 @@ fn getblock_nonce() -> u64 {
 /// never starve itself; a SYNCED node stops reacting to overheard streams.
 const HEADERS_SOLICITED_WINDOW_MS: u64 = 60_000;
 
+/// B1-T2: most block pulls one directed Headers answer may start: one batch
+/// (the `limit` every GetHeaders of this node asks for).
+const MAX_FETCH_PER_ANSWER: usize = 500;
+
 // `ARCHIVE_MODE` and `accept_block` moved to `accept.rs` (audit
 // DAG-1/DAG-10/DAG-11); imported at the top of this file. `FINALITY_FROZEN`
 // was removed with the finality checkpoint (audit DAG-6).
@@ -2542,6 +2577,21 @@ fn announce_txs(otx: &mpsc::Sender<network::NetworkMessage>, txs: &[core::Transa
             txid: tx.txid(),
             tx_data: tx.to_wire_bytes(true),
         });
+    }
+}
+
+/// B1-T2: the peer to penalize for a block judged `verdict`: the sender of
+/// an invalid block (`Reject`, the same judgement as for a gossip copy) that
+/// came as the ANSWER to one of our directed pulls. A gossip copy's sender is
+/// penalized by gossipsub through the reported `Reject` (and the network
+/// loop adds it to the shared misbehaviour score); a directed answer has no
+/// gossip frame, so the processor asks the network loop to
+/// (`NetworkControl::PenalizePeer`). It used to cost nothing, so a peer
+/// could answer every pull with an invalid block and keep being asked.
+fn directed_block_penalty(verdict: network::GossipVerdict, origin: &network::InboundOrigin) -> Option<libp2p::PeerId> {
+    match (verdict, origin) {
+        (network::GossipVerdict::Reject, network::InboundOrigin::Directed { peer }) => Some(*peer),
+        _ => None,
     }
 }
 
@@ -2681,6 +2731,27 @@ mod ingress_processor_tests {
     //! and the evidence-driven IBD latch release (NET-6).
     use super::*;
     use crate::ingress::{normalize_wire_metadata, process_orphans};
+
+    /// B1-T2: an invalid block that answered one of our pulls costs its
+    /// sender a penalty; a valid or ignored one does not, and a gossip copy
+    /// is penalized through its reported Reject instead (not twice).
+    #[test]
+    fn invalid_block_answering_our_pull_is_penalized() {
+        use network::{GossipVerdict, InboundOrigin};
+        let peer = libp2p::PeerId::random();
+        let directed = InboundOrigin::Directed { peer };
+        assert_eq!(directed_block_penalty(GossipVerdict::Reject, &directed), Some(peer));
+        assert_eq!(directed_block_penalty(GossipVerdict::Ignore, &directed), None);
+        assert_eq!(directed_block_penalty(GossipVerdict::Accept, &directed), None);
+        let gossip = InboundOrigin::Gossip {
+            propagation_source: peer,
+            author: None,
+            pending: None,
+            received_at: std::time::Instant::now(),
+        };
+        assert_eq!(directed_block_penalty(GossipVerdict::Reject, &gossip), None);
+        assert_eq!(directed_block_penalty(GossipVerdict::Reject, &InboundOrigin::Local), None);
+    }
 
     fn unix_now() -> u64 {
         std::time::SystemTime::now()

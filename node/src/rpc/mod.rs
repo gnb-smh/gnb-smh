@@ -1771,9 +1771,14 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         "getdaginfo" => {
             let dag = state.dag.read();
             let tips = dag.tips();
-            let chain = dag.selected_chain();
             let tip = dag.selected_tip();
             let tip_data = tip.and_then(|h| dag.get_block_data(&h).cloned());
+            // B2-T5: the selected chain is the selected-parent chain from the
+            // selected tip to genesis, and a block's DAG height is its
+            // selected parent's + 1 (genesis 0), so its length is the tip's
+            // height + 1. It used to be counted by walking the whole chain
+            // under the DAG read lock on every call.
+            let chain_length = tip_data.as_ref().map_or(0, |d| d.height + 1);
             // The header height of the next block mempool admission targets
             // (the node's next template height): wallets sign for it (version
             // 3 / sighash v3 from the hardening activation). Not always
@@ -1796,7 +1801,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 "block_count":    dag.block_count(),
                 "tip_count":      tips.len(),
                 "tips":           tips.iter().map(|h| hex::encode(h)).collect::<Vec<_>>(),
-                "chain_length":   chain.len(),
+                "chain_length":   chain_length,
                 "k":              crate::core::GHOSTDAG_K,
             })
         }
@@ -3342,6 +3347,34 @@ mod audit_2026_10_rpc_tests {
         let _g = activation::scoped_override(0);
         let r = dispatch("getdaginfo", None, &state).await;
         assert_eq!(r["hardening_activation_height"], 0);
+    }
+
+    /// B2-T5: `getdaginfo` used to walk the whole selected chain (under the
+    /// DAG read lock) for `chain_length` on every call. Its DAG work no
+    /// longer grows with the chain, and `chain_length` is still the number
+    /// of blocks on the selected chain, genesis included.
+    #[tokio::test]
+    async fn getdaginfo_work_does_not_grow_with_the_chain() {
+        let mut work = Vec::new();
+        for extra in [0u32, 2_000] {
+            let (_tmp, state) = state_with_chain(5);
+            {
+                let mut d = state.dag.write();
+                let mut prev = [5u8; 32];
+                for i in 0..extra {
+                    let mut h = [0xA0u8; 32];
+                    h[..4].copy_from_slice(&i.to_be_bytes());
+                    d.add_block(h, vec![prev], 10_000 + u64::from(i), 1).unwrap();
+                    prev = h;
+                }
+            }
+            let before = state.dag.read().query_visits();
+            let r = dispatch("getdaginfo", None, &state).await;
+            work.push(state.dag.read().query_visits() - before);
+            assert_eq!(r["chain_length"], 6 + extra as u64, "genesis + 5 + {extra}");
+            assert_eq!(r["tip_height"], 5 + extra as u64);
+        }
+        assert!(work[1] <= work[0] + 4, "getdaginfo work grew with the chain: {work:?}");
     }
 }
 

@@ -27,6 +27,11 @@ pub const MAX_FRONTIER_ABANDONED: usize = 4096;
 pub const ABANDONED_TTL: Duration = Duration::from_secs(3600);
 /// NET-10: max new tips taken from ONE Tips response (per-peer bound).
 pub const MAX_NEW_TIPS_PER_RESPONSE: usize = 64;
+/// NET-10 residual (re-audit): max tips in flight on behalf of ONE peer's
+/// Tips answers. Each answer adds at most [`MAX_NEW_TIPS_PER_RESPONSE`], but
+/// with no per-peer total a single peer filled all
+/// [`MAX_FRONTIER_IN_FLIGHT`] slots and crowded out every honest frontier.
+pub const MAX_FRONTIER_IN_FLIGHT_PER_PEER: usize = 64;
 
 /// Pure: tips we should advertise, bounded to MAX_ADVERTISED_TIPS. Input is
 /// `consensus::GhostDAG::tips()`. Deterministic order (sorted) for testability.
@@ -72,6 +77,11 @@ pub struct FrontierState {
     /// tip hash -> (time we last (re)requested it via GetBlock, attempt count).
     /// Bounded by [`MAX_FRONTIER_IN_FLIGHT`].
     in_flight: HashMap<[u8; 32], (Instant, u32)>,
+    /// The peer whose Tips answer put an in-flight tip there (absent for
+    /// tips requested without attribution) and the per-peer counts, bounded
+    /// by [`MAX_FRONTIER_IN_FLIGHT_PER_PEER`].
+    owner: HashMap<[u8; 32], libp2p::PeerId>,
+    per_peer: HashMap<libp2p::PeerId, usize>,
     /// tips given up on after MAX_TIP_ATTEMPTS timed-out re-requests. They no
     /// longer count as outstanding and `reconciled` treats them as resolved.
     /// A tip leaves this set the instant its block actually arrives
@@ -112,9 +122,22 @@ impl FrontierState {
 
     fn abandon(&mut self, h: [u8; 32], now: Instant) {
         self.in_flight.remove(&h);
+        self.release_owner(&h);
         self.not_found_by.remove(&h);
         self.abandoned.insert(h, now);
         self.prune_abandoned(now);
+    }
+
+    /// Free the per-peer slot of an in-flight tip that left the set.
+    fn release_owner(&mut self, h: &[u8; 32]) {
+        if let Some(p) = self.owner.remove(h) {
+            if let Some(n) = self.per_peer.get_mut(&p) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    self.per_peer.remove(&p);
+                }
+            }
+        }
     }
 
     /// NET-10: drop abandoned entries older than [`ABANDONED_TTL`] and, if
@@ -136,9 +159,23 @@ impl FrontierState {
         self.in_flight.len()
     }
 
-    /// True if we gave up fetching this tip (declared it unreachable).
+    /// Tips in flight on behalf of `peer`'s Tips answers.
+    pub fn in_flight_from(&self, peer: &libp2p::PeerId) -> usize {
+        self.per_peer.get(peer).copied().unwrap_or(0)
+    }
+
+    /// True if we gave up fetching this tip (declared it unreachable) less
+    /// than [`ABANDONED_TTL`] ago.
     pub fn is_abandoned(&self, hash: &[u8; 32]) -> bool {
-        self.abandoned.contains_key(hash)
+        self.is_abandoned_at(hash, Instant::now())
+    }
+
+    /// [`Self::is_abandoned`] with an explicit clock. NET-9 residual
+    /// (re-audit): an abandoned tip expires at its TTL by itself; pruning
+    /// used to run only inside `abandon`, so a tip stayed abandoned until
+    /// some later tip was abandoned too.
+    pub fn is_abandoned_at(&self, hash: &[u8; 32], now: Instant) -> bool {
+        self.abandoned.get(hash).is_some_and(|t| now.saturating_duration_since(*t) < ABANDONED_TTL)
     }
 
     /// Newly-missing tips to GetBlock: diff_missing MINUS in-flight MINUS
@@ -161,14 +198,47 @@ impl FrontierState {
         now: Instant,
         max_new: usize,
     ) -> Vec<[u8; 32]> {
+        self.take_new(None, advertised, has_block, now, max_new)
+    }
+
+    /// NET-10 residual (re-audit): [`Self::to_request_capped`] for the tips
+    /// `peer` advertised in a Tips answer: also at most
+    /// [`MAX_FRONTIER_IN_FLIGHT_PER_PEER`] in flight on its behalf, so one
+    /// peer cannot take the slots of every other frontier.
+    pub fn request_from<F: Fn(&[u8; 32]) -> bool>(
+        &mut self,
+        peer: libp2p::PeerId,
+        advertised: &[[u8; 32]],
+        has_block: F,
+        now: Instant,
+        max_new: usize,
+    ) -> Vec<[u8; 32]> {
+        self.take_new(Some(peer), advertised, has_block, now, max_new)
+    }
+
+    fn take_new<F: Fn(&[u8; 32]) -> bool>(
+        &mut self,
+        peer: Option<libp2p::PeerId>,
+        advertised: &[[u8; 32]],
+        has_block: F,
+        now: Instant,
+        max_new: usize,
+    ) -> Vec<[u8; 32]> {
+        self.prune_abandoned(now);
         let missing = diff_missing(advertised, has_block);
         let mut out = Vec::new();
         for h in missing {
-            if out.len() >= max_new || self.in_flight.len() >= MAX_FRONTIER_IN_FLIGHT {
+            let peer_full = peer.is_some_and(|p| self.in_flight_from(&p) >= MAX_FRONTIER_IN_FLIGHT_PER_PEER);
+            if out.len() >= max_new || self.in_flight.len() >= MAX_FRONTIER_IN_FLIGHT || peer_full {
                 break;
             }
-            if !self.in_flight.contains_key(&h) && !self.abandoned.contains_key(&h) {
+            if !self.in_flight.contains_key(&h) && !self.is_abandoned_at(&h, now) {
+                self.abandoned.remove(&h);
                 self.in_flight.insert(h, (now, 1));
+                if let Some(p) = peer {
+                    self.owner.insert(h, p);
+                    *self.per_peer.entry(p).or_insert(0) += 1;
+                }
                 out.push(h);
             }
         }
@@ -179,10 +249,10 @@ impl FrontierState {
     /// that finally arrives heals. No-op if neither in flight nor abandoned.
     pub fn note_received(&mut self, hash: &[u8; 32]) {
         self.in_flight.remove(hash);
+        self.release_owner(hash);
         self.abandoned.remove(hash);
         self.not_found_by.remove(hash);
     }
-
     /// A peer answered GetBlock with an explicit `BlockNotFound` — a DEFINITIVE
     /// "I don't hold this body" (pruned/unknown), unlike a silent timeout. Count
     /// it toward abandonment AGGRESSIVELY: an unreachable tip that peers NotFound
@@ -226,6 +296,8 @@ impl FrontierState {
     /// in-flight, NOT returned). Otherwise its timestamp refreshes and it is
     /// returned so P5 re-sends GetBlock.
     pub fn expired(&mut self, timeout: Duration, now: Instant) -> Vec<[u8; 32]> {
+        // Called every 30 s (the IBD nudge): also forget expired abandons.
+        self.prune_abandoned(now);
         let stale: Vec<[u8; 32]> = self
             .in_flight
             .iter()
