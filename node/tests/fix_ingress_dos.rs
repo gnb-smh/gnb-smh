@@ -929,6 +929,69 @@ fn b1t19_gate_is_priced_in_bytes_hashed() {
         10 + (10 * wire).div_ceil(relay::SIG_BUDGET_BYTES_PER_TOKEN), "v2: inputs x size");
 }
 
+/// Audit F5: the gate charged one token per INPUT, but an input spending a
+/// policy output carries up to `MAX_POLICY_KEYS` (7) hybrid signatures, each
+/// verified: a 7-of-7 spend bought 7 verifications for the price of one.
+/// The gate now counts the policy witness's signatures (decoded, not
+/// verified). Frames of 1-input 7-of-7 spends, each with a matching policy
+/// and junk signatures, through the real relay: the burst buys
+/// `400 / (frame + 7 + bytes)` of them (pre-fix `400 / (frame + 1 + bytes)`).
+#[test]
+fn f5_gate_counts_every_policy_signature() {
+    use gnb::core::policy::{PolicyWitness, SpendPolicy, MAX_POLICY_KEYS};
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let keys: Vec<Vec<u8>> = (0..MAX_POLICY_KEYS).map(|_| key().pk).collect();
+    let m = MAX_POLICY_KEYS as u8;
+    let policy = SpendPolicy::new(m, keys, 0, 0).unwrap();
+    let funds: Vec<_> = (0..60u32).map(|i| {
+        let mut t = [0x91u8; 32];
+        t[..4].copy_from_slice(&i.to_le_bytes());
+        (t, 0u32, out(10_000_000_000, &policy.script_pubkey()))
+    }).collect();
+    let n = node_with(&genesis, &funds);
+    let witness = |sigs: u8| PolicyWitness {
+        policy: policy.clone(),
+        signatures: (0..sigs).map(|i| (i, vec![0x5A; 64])).collect(),
+    }.encode();
+    let txs: Vec<Transaction> = funds.iter().map(|f| Transaction {
+        version: 1,
+        inputs: vec![core::TxInput { prev_txid: f.0, prev_index: 0, script_sig: witness(m), sequence: u32::MAX }],
+        outputs: vec![out(9_000_000_000, &[0x12; 20])],
+        locktime: 0,
+    }).collect();
+    let next = admission::next_block_height(&n.dag.read());
+    let act = core::activation::hardening_activation_height();
+    let wire = txs[0].to_wire_bytes(true).len();
+    let bytes = wire.div_ceil(relay::SIG_BUDGET_BYTES_PER_TOKEN);
+    assert_eq!(relay::signature_gate_cost(&txs[0], wire, next, act), MAX_POLICY_KEYS + bytes);
+    assert_eq!(relay::input_signature_count(&witness(m)), MAX_POLICY_KEYS);
+    // A key-hash witness, or bytes that are no policy witness, count one.
+    let k = key();
+    let kh = signed_spend(&k, &[([1; 32], 0)], vec![out(1_000, &[2; 20])]);
+    assert_eq!(relay::input_signature_count(&kh.inputs[0].script_sig), 1);
+    assert_eq!(relay::input_signature_count(&[]), 1);
+    let two = Transaction { inputs: vec![txs[0].inputs[0].clone(), kh.inputs[0].clone()], ..txs[0].clone() };
+    assert_eq!(relay::signature_gate_cost(&two, wire, next, act), MAX_POLICY_KEYS + 1 + (2 * wire).div_ceil(relay::SIG_BUDGET_BYTES_PER_TOKEN));
+
+    let per_frame = relay::frame_cost(wire) + relay::signature_gate_cost(&txs[0], wire, next, act);
+    let mut relay = TxRelay::with_limits(400, 0.0, TxOrphanLimits::default()).with_node_budget(1_000_000, 0.0);
+    let peer = Some(libp2p::PeerId::random());
+    let mut verified = 0usize;
+    for tx in &txs {
+        let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &tx.txid(), &tx.to_wire_bytes(true), peer,
+            Instant::now(), unix_now());
+        assert_ne!(o.verdict, GossipVerdict::Accept, "{}", o.detail);
+        if o.invalid {
+            assert!(o.detail.contains("signature"), "{}", o.detail);
+            verified += 1;
+        } else {
+            assert!(o.detail.contains("budget"), "{}", o.detail);
+        }
+    }
+    assert_eq!(verified, 400 / per_frame, "{per_frame} tokens a frame");
+    assert!(verified < 400 / (relay::frame_cost(wire) + 1 + bytes), "fewer than when an input cost one token");
+}
+
 /// B1-T19: the per-connection budget alone let every inbound connection
 /// spend a full burst at once; a node-wide budget now bounds them together.
 /// 20 connections, each with a fresh 400-token burst, share a node-wide

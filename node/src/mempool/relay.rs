@@ -124,14 +124,36 @@ pub fn frame_cost(frame_len: usize) -> usize {
 /// 1-input transaction carrying 390 kB of outputs used to cost one token and
 /// hash 390 kB; under v3 the transaction is hashed once into precomputed
 /// midstates plus a fixed preimage per input.
+///
+/// Audit F5: an input spending a policy output carries up to
+/// `core::policy::MAX_POLICY_KEYS` (7) hybrid signatures, each verified
+/// (`core::sighash::verify_input_signatures`), so the signature part counts
+/// signatures, not inputs ([`input_signature_count`]).
 pub fn signature_gate_cost(tx: &Transaction, wire_len: usize, next_block_height: u64, act: u64) -> usize {
     let inputs = tx.inputs.len().max(1);
+    let signatures = tx.inputs.iter()
+        .map(|i| input_signature_count(&i.script_sig))
+        .fold(0usize, usize::saturating_add)
+        .max(1);
     let hashed = if crate::core::activation::is_active_at(next_block_height, act) {
         wire_len.saturating_add(inputs.saturating_mul(V3_PER_INPUT_PREIMAGE_BYTES))
     } else {
         inputs.saturating_mul(wire_len)
     };
-    inputs.saturating_add(bytes_tokens(hashed))
+    signatures.saturating_add(bytes_tokens(hashed))
+}
+
+/// Audit F5: the signatures verifying an input with `script_sig` can cost:
+/// a policy witness's (`core::policy::AnyPolicyWitness::signatures`, exactly
+/// the policy's threshold, at most `MAX_POLICY_KEYS`; decoded, not verified:
+/// whether the input spends a policy output is not known before its prevout
+/// is read), otherwise one. A key-hash `script_sig` that also decodes as a
+/// policy witness is charged as one: it pays for at most what it could cost.
+pub fn input_signature_count(script_sig: &[u8]) -> usize {
+    match crate::core::policy::AnyPolicyWitness::decode(script_sig) {
+        Ok(w) => w.signatures().len().max(1),
+        Err(_) => 1,
+    }
 }
 /// Bound on the number of connections whose budget is tracked (far above
 /// the connection limit: a live connection is never evicted).

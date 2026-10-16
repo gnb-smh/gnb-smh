@@ -423,6 +423,10 @@ pub fn build_block_template_with(
 ) -> Result<BlockTemplate, String> {
     let coinbase_reserve = options.coinbase_reserve;
     let _guard = store.acceptance_lock();
+    // Audit F1: a stopped node (`accept`'s no-verdict guard) builds nothing.
+    if let Some(m) = store.abort_reason() {
+        return Err(format!("node stopped: {m}"));
+    }
     let activation_height = core::activation::hardening_activation_height();
 
     let (parents, height, blue_score, parent_ts) = {

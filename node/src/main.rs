@@ -2470,6 +2470,27 @@ async fn main() {
         crate::metrics::install(metrics_state.clone());
     }
 
+    // Audit F1: Bitcoin Core's `AbortNode`. A block whose validation keeps
+    // ending without a verdict (the chain state cannot be read consistently)
+    // stops the node (`accept::NO_VERDICT_ABORT_AFTER`): acceptance and
+    // templates refuse at once, and the process exits here with the
+    // operator's message, under the acceptance lock (no chain move in
+    // flight; every commit is one atomic batch). A restart that meets the
+    // same failure refuses to start with it.
+    let store_for_abort = store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if let Some(reason) = store_for_abort.abort_reason() {
+                let _guard = store_for_abort.acceptance_lock();
+                error!("FATAL: stopping the node: {reason}");
+                eprintln!("❌ gnb stopped: {reason}");
+                std::process::exit(1);
+            }
+        }
+    });
+
     // Periodic sync of gauges from NodeState to Prometheus.
     // Runs every 5s. Cheap — just atomic reads + atomic gauge sets.
     let state_for_metrics = node_state.clone();

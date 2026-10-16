@@ -551,6 +551,11 @@ pub trait UtxoView {
     /// The persisted GhostDAG record of `block` (blocks are persisted when
     /// accepted, before any later block is connected on them).
     fn view_dag_data(&self, block: &BlockHash) -> Result<Option<GhostdagData>, ViewError>;
+    /// Whether `txid` is the txid of a genesis-ledger output (the carryover,
+    /// the locked vesting tranches: `Storage::is_genesis_ledger_txid`). Such
+    /// an output has no tx-index row; it is confirmed at the genesis (audit
+    /// F1, `accept::confirmations_in_view`). Never changed by a chain move.
+    fn view_genesis_ledger(&self, txid: &[u8; 32]) -> Result<bool, ViewError>;
 }
 
 impl UtxoView for Storage {
@@ -568,6 +573,9 @@ impl UtxoView for Storage {
     }
     fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
         self.get_tx_location(txid).map(|o| o.map(|(_, h)| h)).map_err(|e| ViewError(e.to_string()))
+    }
+    fn view_genesis_ledger(&self, txid: &[u8; 32]) -> Result<bool, ViewError> {
+        self.is_genesis_ledger_txid(txid).map_err(|e| ViewError(e.to_string()))
     }
 }
 
@@ -592,6 +600,10 @@ impl<'a> UtxoView for ReorgBatch<'a> {
     }
     fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
         self.get_tx_location(txid).map(|o| o.map(|(_, h)| h)).map_err(ViewError)
+    }
+    fn view_genesis_ledger(&self, txid: &[u8; 32]) -> Result<bool, ViewError> {
+        // Written with the genesis ledger, never by a chain move.
+        self.store.is_genesis_ledger_txid(txid).map_err(|e| ViewError(e.to_string()))
     }
 }
 
