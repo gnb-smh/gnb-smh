@@ -294,9 +294,9 @@ Decided on 2026-10-17:
 - ObenBlock gets a new repository.
 
 - The carry-over is paid as in GnB's genesis, to the same keys (§3).
-- The repository is https://github.com/gnb-smh/ObenBlock. Work is committed
-  and merged in the GnB repository first, then merged into ObenBlock with one
-  sync pull request per change.
+- The repository `gnb-smh/gnb-smh` was renamed `gnb-smh/ObenBlock`
+  (https://github.com/gnb-smh/ObenBlock; GitHub redirects the old name), so
+  history, pull requests and CI carry on in one repository.
 
 Open:
 1. Access to the Bloch repository, for the anchor registry (§8).
