@@ -3,13 +3,13 @@
 //! This module wraps the JSON-RPC handler with:
 //!   1. Per-IP rate limiting (reads vs writes, separate buckets)
 //!   2. Optional API key authentication (constant-time comparison)
-//!   3. Localhost exemption (127.0.0.1 / ::1 bypass all checks)
+//!   3. Explicit local trust policy and a direct-loopback rate exemption
 //!
 //! Security properties:
 //!   - API key comparison uses `subtle::ConstantTimeEq` to prevent timing attacks
-//!   - Rate limits are per-IP (IPv4 /32, IPv6 /128); no per-subnet aggregation
-//!   - `sendrawtransaction` is the only "write" method; everything else is a read
-//!   - Localhost always allowed (operator tools, miners)
+//!   - Rate limits use IPv4 /32 (including mapped IPv6) and native IPv6 /64
+//!   - A separate source budget bounds work before body parsing and key hashing
+//!   - `WRITE_METHODS` selects the tighter method budget
 //!
 //! See docs/THREAT_MODEL.md section 4 for threat analysis.
 
@@ -44,6 +44,17 @@ const RL_GC_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// "however many distinct sources an attacker can mint before the next GC".
 const MAX_TRACKED_KEYS: usize = 100_000;
 
+/// B1-R2-10: one identity for IPv4 and mapped IPv4 at BOTH trust and rate
+/// boundaries. Never apply IPv6 /64 aggregation to a trust decision.
+/// Bitcoin Core's CNetAddr::SetLegacyIPv6 classifies mapped IPv4 likewise:
+/// https://github.com/bitcoin/bitcoin/blob/master/src/netaddress.cpp
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        _ => ip,
+    }
+}
+
 /// M-2 (audit): normalize a source IP to its rate-limit key. IPv4 is
 /// unchanged — a single address IS the smallest unit an operator can be
 /// assigned (`/32`). IPv6 is aggregated to its `/64` network prefix: `/64`
@@ -54,8 +65,8 @@ const MAX_TRACKED_KEYS: usize = 100_000;
 /// to `/64` means every address within one customer's allocation shares one
 /// bucket, matching the real-world cost of acquiring that allocation.
 fn rate_limit_key(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V4(_) => ip,
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
         IpAddr::V6(v6) => {
             let mut octets = v6.octets();
             for b in &mut octets[8..] {
@@ -109,10 +120,18 @@ pub const ADMIN_METHODS: &[&str] = &[
 /// Type alias for a direct (non-keyed) in-memory rate limiter.
 type IpRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
+#[derive(Clone, Copy)]
+enum Bucket {
+    Read,
+    Write,
+    BeforeAuth,
+}
+
 /// Per-IP rate-limit buckets plus a last-seen timestamp for eviction.
 struct IpEntry {
     reads:     Arc<IpRateLimiter>,
     writes:    Arc<IpRateLimiter>,
+    before_auth: Arc<IpRateLimiter>,
     last_seen: Instant,
 }
 
@@ -123,15 +142,16 @@ struct Inner {
     last_gc: Instant,
     /// M-2: shared fallback buckets used ONLY once `buckets` is at
     /// [`MAX_TRACKED_KEYS`] and a request arrives from a key not already
-    /// tracked. Every such "overflow" source shares these two buckets, so
+    /// tracked. Every such "overflow" source shares these buckets, so
     /// the map's memory is bounded by the cap regardless of how many
     /// distinct (post-aggregation) sources actually show up.
     overflow_reads:  Arc<IpRateLimiter>,
     overflow_writes: Arc<IpRateLimiter>,
+    overflow_before_auth: Arc<IpRateLimiter>,
 }
 
-/// Per-IP rate-limit state. Each IP gets two buckets: one for reads, one for
-/// writes, created lazily on first hit.
+/// Per-source rate-limit state. Each source gets read, write, and pre-auth
+/// buckets, created lazily on first hit and subject to the same map cap.
 ///
 /// P0 (roadmap §1.6 / §4.3): the map is now bounded by *time*. Previously it
 /// never evicted, so a spoofed-source-IP or many-client flood grew it forever
@@ -147,6 +167,8 @@ impl RateLimiterSet {
     pub fn new(reads_per_min: u32, writes_per_min: u32) -> Self {
         let reads = Quota::per_minute(NonZeroU32::new(reads_per_min.max(1)).unwrap());
         let writes = Quota::per_minute(NonZeroU32::new(writes_per_min.max(1)).unwrap());
+        let before_auth = Quota::per_minute(NonZeroU32::new(
+            reads_per_min.max(1).saturating_add(writes_per_min.max(1))).unwrap());
         Self {
             reads_per_min,
             writes_per_min,
@@ -155,6 +177,7 @@ impl RateLimiterSet {
                 last_gc: Instant::now(),
                 overflow_reads:  Arc::new(RateLimiter::direct(reads)),
                 overflow_writes: Arc::new(RateLimiter::direct(writes)),
+                overflow_before_auth: Arc::new(RateLimiter::direct(before_auth)),
             }),
         }
     }
@@ -163,6 +186,7 @@ impl RateLimiterSet {
     /// `is_write` selects which bucket. Caller should have already
     /// determined whether the method is a write (see `WRITE_METHODS`).
     pub fn check(&self, ip: IpAddr, is_write: bool) -> bool {
+        let ip = canonical_ip(ip);
         // Localhost bypass
         if ip.is_loopback() {
             return true;
@@ -175,6 +199,10 @@ impl RateLimiterSet {
     /// is limited per the client the proxy names, and an unnamed proxied
     /// client shares the bucket of the proxy's own (loopback) address.
     pub fn check_key(&self, ip: IpAddr, is_write: bool) -> bool {
+        self.check_bucket(ip, if is_write { Bucket::Write } else { Bucket::Read })
+    }
+
+    fn check_bucket(&self, ip: IpAddr, bucket: Bucket) -> bool {
         // M-2: aggregate IPv6 to its /64 allocation before using it as a key.
         let key = rate_limit_key(ip);
 
@@ -193,7 +221,11 @@ impl RateLimiterSet {
         // overflow bucket instead, so the map can never grow past
         // MAX_TRACKED_KEYS regardless of source churn between GC sweeps.
         if !inner.buckets.contains_key(&key) && inner.buckets.len() >= MAX_TRACKED_KEYS {
-            let limiter = if is_write { inner.overflow_writes.clone() } else { inner.overflow_reads.clone() };
+            let limiter = match bucket {
+                Bucket::Read => inner.overflow_reads.clone(),
+                Bucket::Write => inner.overflow_writes.clone(),
+                Bucket::BeforeAuth => inner.overflow_before_auth.clone(),
+            };
             drop(inner);
             return limiter.check().is_ok();
         }
@@ -206,15 +238,22 @@ impl RateLimiterSet {
             let writes = Quota::per_minute(
                 NonZeroU32::new(writes_pm.max(1)).unwrap()
             );
+            let before_auth = Quota::per_minute(NonZeroU32::new(
+                reads_pm.max(1).saturating_add(writes_pm.max(1))).unwrap());
             IpEntry {
                 reads:     Arc::new(RateLimiter::direct(reads)),
                 writes:    Arc::new(RateLimiter::direct(writes)),
+                before_auth: Arc::new(RateLimiter::direct(before_auth)),
                 last_seen: now,
             }
         });
         entry.last_seen = now;
 
-        let limiter = if is_write { &entry.writes } else { &entry.reads };
+        let limiter = match bucket {
+            Bucket::Read => &entry.reads,
+            Bucket::Write => &entry.writes,
+            Bucket::BeforeAuth => &entry.before_auth,
+        };
         limiter.check().is_ok()
     }
 
@@ -232,10 +271,17 @@ impl RateLimiterSet {
 /// the presented key looks like; equality of the digests is equality of the
 /// keys (collision resistance).
 pub fn keys_match(presented: &str, configured: &str) -> bool {
+    #[cfg(test)]
+    KEY_HASH_BYTES.with(|n| n.set(n.get() + presented.len() + configured.len()));
     use sha2::{Digest, Sha256};
     let p: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
     let c: [u8; 32] = Sha256::digest(configured.as_bytes()).into();
     p.ct_eq(&c).unwrap_u8() == 1
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static KEY_HASH_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Authentication decision for a single incoming request.
@@ -269,6 +315,7 @@ pub enum AuthDecision {
 ///   - IPv4 link-local 169.254.0.0/16 (spoofable, APIPA)
 ///   - Carrier-grade NAT 100.64.0.0/10 (shared with other tenants by definition)
 pub fn is_trusted_local_ip(ip: IpAddr, trust_private_ranges: bool) -> bool {
+    let ip = canonical_ip(ip);
     if ip.is_loopback() {
         return true;
     }
@@ -315,6 +362,7 @@ pub fn authorize_with_policy(
     trust_loopback_auth: bool,
     rate_limiter: &RateLimiterSet,
 ) -> AuthDecision {
+    let ip = canonical_ip(ip);
     let fully_trusted = if ip.is_loopback() {
         trust_loopback_auth
     } else {
@@ -374,6 +422,7 @@ pub fn authorize_with_trust(
     trust_private_ranges: bool,
     rate_limiter: &RateLimiterSet,
 ) -> AuthDecision {
+    let ip = canonical_ip(ip);
     if is_trusted_local_ip(ip, trust_private_ranges) {
         return AuthDecision::Allow;
     }
@@ -441,6 +490,7 @@ pub fn authorize_with_read_policy(
     trust_loopback_auth: bool,
     rate_limiter: &RateLimiterSet,
 ) -> AuthDecision {
+    let ip = canonical_ip(ip);
     let fully_trusted = if ip.is_loopback() {
         trust_loopback_auth
     } else {
@@ -602,7 +652,36 @@ pub fn forwarded_client(headers: &axum::http::HeaderMap, client_header: &str) ->
 /// client that rotates `X-Forwarded-For` cannot mint a bucket per request or
 /// fill the limiter's table).
 pub fn peer_may_name_client(peer: IpAddr, trust_private_ranges: bool) -> bool {
+    let peer = canonical_ip(peer);
     peer.is_loopback() || is_trusted_local_ip(peer, trust_private_ranges)
+}
+
+fn request_source(peer: IpAddr, forwarded: Option<ForwardedClient>, trust_private_ranges: bool) -> IpAddr {
+    match forwarded {
+        Some(ForwardedClient::Client(ip)) if peer_may_name_client(peer, trust_private_ranges) => canonical_ip(ip),
+        _ => canonical_ip(peer),
+    }
+}
+
+/// B1-R2-9: admit a source BEFORE hashing a key or reading its body. The
+/// independent budget is reads/min + writes/min (each at least one), and
+/// applies even if the request later presents a correct key. Trust cannot
+/// be established by doing the very work this budget is meant to bound.
+/// Direct local exemptions match the existing method-rate policy.
+///
+/// Bitcoin Core checks ClientAllowed and a bounded WorkQueue before its
+/// RPC authentication handler; GnB's public reads additionally need a
+/// per-source budget: https://github.com/bitcoin/bitcoin/blob/v30.0/src/httpserver.cpp#L275-L316
+pub(crate) fn admit_before_auth(
+    peer: IpAddr,
+    forwarded: Option<ForwardedClient>,
+    trust_private_ranges: bool,
+    rate_limiter: &RateLimiterSet,
+) -> bool {
+    if forwarded.is_none() && is_trusted_local_ip(peer, trust_private_ranges) {
+        return true;
+    }
+    rate_limiter.check_bucket(request_source(peer, forwarded, trust_private_ranges), Bucket::BeforeAuth)
 }
 
 /// True when the caller is the operator for the purpose of node-wide
@@ -617,6 +696,7 @@ pub fn caller_is_trusted(
     trust_private_ranges: bool,
     trust_loopback_auth: bool,
 ) -> bool {
+    let peer = canonical_ip(peer);
     if let (Some(p), Some(c)) = (presented_key, configured_key) {
         if keys_match(p, c) {
             return true;
@@ -681,15 +761,38 @@ impl ByteBudget {
 /// remote one whatever its TCP peer: never fully trusted (no loopback /
 /// private-range bypass, `--rpc-trust-loopback` included). A caller that
 /// presents the configured API key is the operator (its pool behind the
-/// TLS proxy polling `getblocktemplate`): allowed without the limiter, as
-/// Bitcoin Core never rate-limits an authenticated RPC caller, so template
-/// polling can never use up the write bucket its `submitblock` needs.
+/// TLS proxy polling `getblocktemplate`): it skips the method limiter but
+/// still consumes the separate budget enforced before key verification.
 /// Anyone else is rate-limited in the bucket of the client the proxy named
 /// (IPv6 by /64) when the peer is a proxy ([`peer_may_name_client`]), else
 /// in the bucket of the peer address itself (a proxied request that names no
 /// client shares it); the API-key policy is unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn authorize_request(
+    peer: IpAddr,
+    forwarded: Option<ForwardedClient>,
+    method: &str,
+    presented_key: Option<&str>,
+    configured_key: Option<&str>,
+    require_auth_for_writes: bool,
+    require_auth_for_reads: bool,
+    trust_private_ranges: bool,
+    trust_loopback_auth: bool,
+    rate_limiter: &RateLimiterSet,
+) -> AuthDecision {
+    if !admit_before_auth(peer, forwarded, trust_private_ranges, rate_limiter) {
+        return AuthDecision::RateLimited;
+    }
+    authorize_admitted_request(peer, forwarded, method, presented_key, configured_key,
+        require_auth_for_writes, require_auth_for_reads, trust_private_ranges,
+        trust_loopback_auth, rate_limiter)
+}
+
+/// The HTTP handler already admitted the request before buffering its body.
+/// Keep that path from charging the same request twice. All other callers
+/// must use `authorize_request`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn authorize_admitted_request(
     peer: IpAddr,
     forwarded: Option<ForwardedClient>,
     method: &str,
@@ -713,10 +816,7 @@ pub fn authorize_request(
         }
     }
     let is_write = WRITE_METHODS.contains(&method);
-    let key = match forwarded {
-        ForwardedClient::Client(ip) if peer_may_name_client(peer, trust_private_ranges) => ip,
-        _ => peer,
-    };
+    let key = request_source(peer, Some(forwarded), trust_private_ranges);
     if !rate_limiter.check_key(key, is_write) {
         return AuthDecision::RateLimited;
     }
@@ -724,7 +824,7 @@ pub fn authorize_request(
         || (!is_write && require_auth_for_reads)
         || ADMIN_METHODS.contains(&method);
     match (presented_key, configured_key) {
-        (Some(p), Some(c)) if keys_match(p, c) => AuthDecision::Allow,
+        // A present key was already checked above; do not hash it twice.
         (Some(_), Some(_)) => AuthDecision::Unauthorized,
         _ if requires_key => AuthDecision::Unauthorized,
         _ => AuthDecision::Allow,
@@ -982,6 +1082,106 @@ mod tests {
 
     fn rl() -> RateLimiterSet {
         RateLimiterSet::new(60, 5)
+    }
+
+    #[test]
+    fn r7_mapped_ipv4_shares_only_its_native_bucket() {
+        for is_write in [false, true] {
+            let rl = RateLimiterSet::new(1, 1);
+            let native: IpAddr = "198.51.100.7".parse().unwrap();
+            let mapped: IpAddr = "::ffff:198.51.100.7".parse().unwrap();
+            assert!(rl.check_key(native, is_write));
+            assert!(!rl.check_key(mapped, is_write), "mapped spelling must not mint a second budget");
+            assert!(rl.check_key("::ffff:198.51.100.8".parse().unwrap(), is_write),
+                "unrelated IPv4 clients must not share the ::/64 bucket");
+            assert_eq!(rl.tracked_ips(), 2);
+        }
+    }
+
+    #[test]
+    fn r7_distinct_mapped_ipv4_clients_have_independent_budgets() {
+        let rl = RateLimiterSet::new(1, 1);
+        assert!(rl.check_key("::ffff:198.51.100.7".parse().unwrap(), false));
+        assert!(rl.check_key("::ffff:198.51.100.8".parse().unwrap(), false),
+            "one mapped client must not exhaust every other IPv4 client's budget");
+        assert!(rl.check_key("::1".parse().unwrap(), false),
+            "mapped clients must not share the native IPv6 ::/64 budget");
+        assert_eq!(rl.tracked_ips(), 3);
+    }
+
+    #[test]
+    fn r7_forwarded_key_hash_work_is_bounded() {
+        let rl = RateLimiterSet::new(2, 1);
+        let key = "k".repeat(32);
+        let attack = "x".repeat(8192);
+        KEY_HASH_BYTES.with(|n| n.set(0));
+        for _ in 0..100 {
+            authorize_request("127.0.0.1".parse().unwrap(),
+                Some(ForwardedClient::Client("198.51.100.7".parse().unwrap())),
+                "submitblock", Some(&attack), Some(&key), true, false, false, false, &rl);
+        }
+        let hashed = KEY_HASH_BYTES.with(|n| n.get());
+        assert!(hashed <= 3 * (attack.len() + key.len()), "pre-auth budget exceeded: {hashed} hashed bytes");
+    }
+
+    #[test]
+    fn r7_valid_key_cannot_bypass_pre_auth_budget() {
+        let rl = RateLimiterSet::new(2, 1);
+        let key = "k".repeat(32);
+        let authorize = || authorize_request("127.0.0.1".parse().unwrap(),
+            Some(ForwardedClient::Client("198.51.100.7".parse().unwrap())),
+            "submitblock", Some(&key), Some(&key), true, false, false, false, &rl);
+        for _ in 0..3 { assert_eq!(authorize(), AuthDecision::Allow); }
+        assert_eq!(authorize(), AuthDecision::RateLimited);
+    }
+
+    #[test]
+    fn r7_proxy_clients_keep_independent_pre_auth_budgets() {
+        let rl = RateLimiterSet::new(2, 1);
+        let key = "k".repeat(32);
+        for client in ["198.51.100.7", "198.51.100.8", "2001:db8:1::7"] {
+            let authorize = || authorize_request("127.0.0.1".parse().unwrap(),
+                Some(ForwardedClient::Client(client.parse().unwrap())),
+                "submitblock", Some(&key), Some(&key), true, false, false, false, &rl);
+            for _ in 0..3 { assert_eq!(authorize(), AuthDecision::Allow, "client {client} has its own quota"); }
+            assert_eq!(authorize(), AuthDecision::RateLimited);
+        }
+        assert_eq!(rl.tracked_ips(), 3, "the proxy socket is not a shared quota");
+    }
+
+    #[test]
+    fn r7_mapped_proxy_peers_preserve_client_budgets() {
+        for (peer, trust_private) in [("::ffff:127.0.0.1", false), ("::ffff:10.0.0.1", true)] {
+            let rl = RateLimiterSet::new(2, 1);
+            let key = "k".repeat(32);
+            for client in ["198.51.100.7", "198.51.100.8"] {
+                let authorize = || authorize_request(peer.parse().unwrap(),
+                    Some(ForwardedClient::Client(client.parse().unwrap())),
+                    "submitblock", Some(&key), Some(&key), true, false, trust_private, false, &rl);
+                for _ in 0..3 { assert_eq!(authorize(), AuthDecision::Allow, "peer {peer}, client {client}"); }
+                assert_eq!(authorize(), AuthDecision::RateLimited);
+            }
+            assert_eq!(rl.tracked_ips(), 2);
+        }
+    }
+
+    #[test]
+    fn r7_mapped_loopback_preserves_explicit_auth_policy() {
+        for address in ["127.0.0.1", "::ffff:127.0.0.1"] {
+            let ip = address.parse().unwrap();
+            let rl = RateLimiterSet::new(1, 1);
+            // Normalizing only inside is_trusted_local_ip would bypass
+            // this guard by classifying mapped loopback as a private peer.
+            assert_eq!(authorize_with_policy(ip, "submitblock", None, Some("key"), true, true, false, &rl),
+                AuthDecision::Unauthorized, "loopback trust remains opt-in for {address}");
+            assert_eq!(authorize_with_read_policy(ip, "getblockcount", None, Some("key"), true, true, true, false, &rl),
+                AuthDecision::Unauthorized, "read auth also remains required for {address}");
+            assert!(!caller_is_trusted(ip, None, None, None, true, false));
+            assert_eq!(authorize_with_policy(ip, "submitblock", None, Some("key"), true, false, true, &rl),
+                AuthDecision::Allow, "explicit loopback trust applies to {address}");
+            assert!(caller_is_trusted(ip, None, None, None, false, true));
+            for _ in 0..3 { assert!(rl.check(ip, true), "direct loopback retains its rate exemption"); }
+        }
     }
 
     #[test]
@@ -1803,12 +2003,12 @@ mod b2_t11_proxy_tests {
         assert!(peer_may_name_client(lan, true) && !peer_may_name_client(lan, false));
     }
 
-    /// B2-T11 (review): an operator's pool behind the TLS proxy presents the
-    /// API key and polls `getblocktemplate` (a write method) every few
-    /// seconds; its `submitblock` must never be refused because the polling
-    /// used up the write bucket. A wrong key is still limited.
+    /// A keyed pool skips the method buckets, so template polling leaves
+    /// the write-method budget untouched. B1-R2-9 still charges every
+    /// request to the pre-auth budget: exhausting it blocks submitblock
+    /// too. Operators must size the quotas for their combined request rate.
     #[test]
-    fn a_keyed_proxied_caller_is_not_rate_limited() {
+    fn a_keyed_proxy_skips_method_buckets_within_the_pre_auth_budget() {
         let lo: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
         let rl = RateLimiterSet::new(60, 5);
         let key = "k".repeat(32);
@@ -1818,7 +2018,15 @@ mod b2_t11_proxy_tests {
                 AuthDecision::Allow);
         }
         assert_eq!(authorize_request(lo, fwd, "submitblock", Some(&key), Some(&key), true, false, false, false, &rl),
-            AuthDecision::Allow, "the found block reaches the node");
+            AuthDecision::Allow, "the found block reaches the node below the pre-auth bound");
+        for _ in 21..64 {
+            assert_eq!(authorize_request(lo, fwd, "getblocktemplate", Some(&key), Some(&key), true, false, false, false, &rl),
+                AuthDecision::Allow);
+        }
+        assert_eq!(authorize_request(lo, fwd, "submitblock", Some(&key), Some(&key), true, false, false, false, &rl),
+            AuthDecision::Allow, "the last available pre-auth token admits a block");
+        assert_eq!(authorize_request(lo, fwd, "submitblock", Some(&key), Some(&key), true, false, false, false, &rl),
+            AuthDecision::RateLimited, "an exhausted pre-auth budget blocks every method, even with the correct key");
         let other = Some(ForwardedClient::Client("198.51.100.78".parse().unwrap()));
         let wrong: Vec<_> = (0..7).map(|_| authorize_request(lo, other, "submitblock", Some("wrong"), Some(&key),
             true, false, false, false, &rl)).collect();

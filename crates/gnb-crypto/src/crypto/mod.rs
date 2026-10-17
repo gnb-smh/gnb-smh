@@ -475,6 +475,8 @@ pub fn verify_enveloped_canonical(
     message: &[u8],
     signature_bytes: &[u8],
 ) -> bool {
+    #[cfg(test)]
+    POLICY_VERIFICATION_CALLS.with(|n| n.set(n.get() + 1));
     let Some((pk_suite, pk_body)) = parse_envelope(public_key_bytes) else {
         return false;
     };
@@ -830,6 +832,8 @@ pub fn sign_bound_checked(
 /// key's suite must equal the signature's, and every component must verify
 /// over its [`bound_component_message`]. Never panics.
 pub fn verify_bound(public_key_bytes: &[u8], digest: &[u8; 32], signature_bytes: &[u8]) -> bool {
+    #[cfg(test)]
+    POLICY_VERIFICATION_CALLS.with(|n| n.set(n.get() + 1));
     if !is_canonical_signature_encoding(signature_bytes) {
         return false;
     }
@@ -2530,4 +2534,11 @@ mod mldsa_one_verdict {
             );
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Actual strict policy verifier calls, including the consensus witness
+    /// check. Thread-local so parallel tests cannot contaminate cost evidence.
+    pub(crate) static POLICY_VERIFICATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

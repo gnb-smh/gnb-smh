@@ -34,9 +34,20 @@ Implementation choices that refine the design below:
 - **Witness node.** `--witness-wallet <gnb-cli wallet> --witness-password-file <f>`
   mines shares paying that key (`--share-threads`, default 2) and signs the
   newest checkpoint once it is a member, with a persistent vote record that
-  refuses any double or surround vote, across restarts and reorgs.
+  refuses any double or surround vote, across restarts and reorgs (written
+  durably; an unreadable record refuses to start; the highest signed source
+  and target heights are also kept beside the key file and enforced).
 - **Node finality.** The node never reorganises below the height of the block
   its tip's chain finalized (`finalized_height`), in addition to the depth rule.
+  (As implemented now: there is no depth rule, audit DAG-6, and the pin is
+  `GhostDAG::set_finalized` from the applied tip's witness set, taken and
+  restored only while the tip's blue work reaches the node's minimum chain
+  work (`MIN_CHAIN_WORK` or `--minimumchainwork`; `powit::pin_finalized_of`,
+  PoWit audit finding 3): a cheap chain an eclipsing peer feeds a node in
+  initial block download is neither pinned, mined on nor advertised,
+  docs/CONSENSUS.md. A fork's witness set still comes from the fork's own
+  shares, not from finalized history; that is a consensus change for a
+  later activation.)
 
 Parameters (`core::powit::MAINNET_PARAMS` / `TESTNET_PARAMS`):
 

@@ -116,6 +116,9 @@ pub struct NodeState {
     pub best_announced_blue_score: u64,
     pub peer_addresses: Vec<String>,
     pub version:        String,
+    /// How long the selected tip has stayed below the minimum chain work
+    /// (the IBD latch's long-sync warning, `maybe_release_ibd`).
+    pub min_work_watch: crate::ingress::MinimumWorkWatch,
 }
 
 /// Block-submission hook — the B5f pool seam.
@@ -238,6 +241,8 @@ struct AppState {
     /// L-8: `getblocktemplate`'s own cache and build permit
     /// (`gated_dispatch`), so an analytics scan never answers a miner "busy".
     template_gate:           Arc<HeavyGate>,
+    /// One public PQ-PSBT operation; the blocking worker owns its permit.
+    pqpsbt_gate:             Arc<tokio::sync::Semaphore>,
     // B5f pool seam: submitblock hook (None = method returns "not wired").
     submit_block:            Option<Arc<SubmitBlockFn>>,
     // NET-12: cancellation flag of THIS request (a fresh flag per request,
@@ -261,6 +266,10 @@ struct AppState {
     /// trusted direct caller (set per request, like `cancel`); such callers
     /// are not charged to `tx_verify_budget`.
     caller_trusted:          bool,
+    /// POW-3: the node's minimum chain work (`ingress::minimum_chain_work`
+    /// at start-up). `getdaginfo` reports it; below it `getblocktemplate`
+    /// refuses (initial block download, `ingress::ibd_template_refusal`).
+    min_chain_work:          u128,
 }
 
 // ─── R3-audit H-R3-5 / L-8: bound the expensive analytics + template RPCs ───
@@ -310,7 +319,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getblockbyheight", "getrecentblocks", "gettransaction", "getrawtransaction", "getbalance",
     "getaddresscount", "getutxos", "sendrawtransaction", "validateaddress", "estimatefee",
     "getrawmempool", "decoderawtransaction", "getblocktemplate", "submitblock", "getdaginfo",
-    "submitpowititem", "getpowitinfo",
+    "submitpowititem", "getpowitinfo", "pqpsbt", "getdescriptorinfo", "deriveaddresses",
     "listtransactions", "getpeerinfo", "getpeers", "getsupplyinfo", "getchainstats",
     "getsupplydistribution", "getselectedchain", "getblockdag", "gettransactionfull",
     "getdagwindow", "getaddresshistory", "getrichlist", "gethashrate", "getdifficultyhistory",
@@ -612,6 +621,7 @@ pub async fn start_rpc_server(
         trust_loopback:          config.trust_loopback,
         heavy_gate:              Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
         template_gate:           Arc::new(HeavyGate::for_templates()),
+            pqpsbt_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         submit_block,
         cancel:                  Arc::new(std::sync::atomic::AtomicBool::new(false)),
         chain_admin,
@@ -626,6 +636,7 @@ pub async fn start_rpc_server(
         },
         tx_verify_budget:        Arc::new(auth::ByteBudget::new(ANON_TX_VERIFY_BURST_BYTES, ANON_TX_VERIFY_BYTES_PER_SEC)),
         caller_trusted:          false,
+        min_chain_work:          crate::ingress::minimum_chain_work(),
     };
 
     let app = build_router(app_state, &config.allowed_origins);
@@ -999,6 +1010,13 @@ async fn handle_rpc(
     // the client the proxy names (when the peer is a proxy) and never fully
     // trusted.
     let forwarded = auth::forwarded_client(&headers, &state.proxy_client_header);
+    // B1-R2-9: the method is in the untrusted body and operator status
+    // requires hashing a key. Bound both before doing either operation.
+    if !auth::admit_before_auth(client_ip, forwarded, state.trust_private_ranges, &state.rate_limiter) {
+        crate::metrics::inc_rpc_request("unknown", "rate_limited");
+        return rpc_transport_error(StatusCode::TOO_MANY_REQUESTS, -32002,
+            "rate limit exceeded; retry after a minute");
+    }
     // B1-T4: the body limit depends on the method (`read_rpc_body`); the
     // operator's callers (known from the headers) have reserved permits.
     let operator = matches!((presented_key, state.api_key.as_deref()), (Some(p), Some(c)) if auth::keys_match(p, c))
@@ -1064,16 +1082,16 @@ async fn handle_rpc(
         );
     }
 
-    let decision = auth::authorize_request(
+    let decision = auth::authorize_admitted_request(
         client_ip,
         forwarded,
         method,
         presented_key,
         state.api_key.as_deref(),
         state.require_auth_for_writes,
-        state.require_auth_for_reads,
-        state.trust_private_ranges,
-        state.trust_loopback,
+        state.require_auth_for_reads || method == "pqpsbt",
+        state.trust_private_ranges && method != "pqpsbt",
+        state.trust_loopback && method != "pqpsbt",
         &state.rate_limiter,
     );
 
@@ -1238,6 +1256,46 @@ fn chain_admin_call(op: ChainAdminOp, params: Option<&Value>, state: &AppState) 
             Err(e) => json!({ "error": e }),
         },
     }
+}
+
+/// Public PQ-PSBT work is limited independently of the core's offline limits.
+/// Three verification passes in finalization yield at most 48 partial-signature
+/// checks. The gate is held by the blocking worker until it actually finishes;
+/// a response timeout does not admit replacement work while it keeps running.
+const PQPSBT_RPC_MAX_INPUTS: usize = 4;
+const PQPSBT_RPC_MAX_SIGNATURES: usize = 16;
+const POLICY_SELECTED_INPUTS_MAX: usize = 64;
+
+fn selected_policy_outpoints(params: Option<&Value>)
+    -> Result<Option<std::collections::BTreeSet<([u8;32],u32)>>, String>
+{
+    let Some(value) = params.and_then(|p| p.get(2)) else { return Ok(None); };
+    let rows = value.as_array().ok_or("selected outpoints must be an array")?;
+    if rows.len() > POLICY_SELECTED_INPUTS_MAX { return Err("at most 64 selected outpoints are allowed".into()); }
+    let mut selected = std::collections::BTreeSet::new();
+    for row in rows {
+        let object = row.as_object().ok_or("selected outpoint must be an object")?;
+        if object.len() != 2 { return Err("selected outpoint needs exactly txid and index".into()); }
+        let txid = row.get("txid").and_then(Value::as_str).filter(|s| s.len() == 64)
+            .and_then(|s| hex::decode(s).ok()).and_then(|b| b.try_into().ok())
+            .ok_or("selected txid must be 32-byte hex")?;
+        let index = row.get("index").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok())
+            .ok_or("selected index must fit u32")?;
+        if !selected.insert((txid,index)) { return Err("duplicate selected outpoint".into()); }
+    }
+    Ok(Some(selected))
+}
+
+/// A short reference read, never held during signature checks or row reads.
+/// Admission's selected-depth helpers use the applied storage tip; require
+/// that it agrees with the DAG tip reported by getdaginfo before exposing it.
+fn policy_rpc_snapshot(state: &AppState) -> Result<(u64,[u8;32]), Value> {
+    let dag = state.dag.read();
+    let tip = dag.selected_tip().ok_or_else(|| json!({"error":"node has no selected tip"}))?;
+    let applied = state.store.get_meta("tip_hash").map_err(|e| storage_err_response(&e))?
+        .and_then(|b| <[u8;32]>::try_from(b).ok());
+    if applied != Some(tip) { return Err(json!({"error":"node applied and selected tips differ; retry preflight"})); }
+    Ok((crate::mempool::admission::pool_next_height(&dag,&state.store,&state.mempool),tip))
 }
 
 async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Value {
@@ -1489,9 +1547,9 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
             // B1-T11: one read of the holder aggregate (was a walk of every
             // UTXO of the address, ~426,000 for the carryover address).
-            let addr_bytes = parse_address(addr).and_then(|b| <[u8; 20]>::try_from(b).ok());
+            let addr_bytes = parse_address(addr);
             match addr_bytes {
-                Some(ab) => match state.store.address_balance(&ab, &state.cancel) {
+                Ok(ab) => match state.store.address_balance(&ab, &state.cancel) {
                     // R3 (docs/specs/BLOCH-RPC-V4.md): satoshi amounts are
                     // decimal STRINGS on the wire — V4's supply exceeds both
                     // i64::MAX and JS Number.MAX_SAFE_INTEGER. Display-only
@@ -1504,7 +1562,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     }),
                     Err(e) => storage_err_response(&e),
                 },
-                None => json!({ "error": "invalid address" }),
+                Err(error) => json!({ "error": error }),
             }
         }
 
@@ -1522,9 +1580,54 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             }
         }
 
+        "getdescriptorinfo" => {
+            match inspect_rpc_descriptor(params) {
+                Ok(info) => info,
+                Err(error) => json!({"error": error}),
+            }
+        }
+        "deriveaddresses" => {
+            match inspect_rpc_descriptor(params) {
+                Ok(info) => json!([info["address"]]),
+                Err(error) => json!({"error": error}),
+            }
+        }
+
+        "pqpsbt" => {
+            if state.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return json!({"error":"request cancelled"});
+            }
+            let _permit = match state.pqpsbt_gate.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => return json!({"error":"PQ-PSBT worker busy; retry later"}),
+            };
+            match gnb_crypto::wallet::pqpsbt::public_request_with_limits(
+                params.unwrap_or(&Value::Null), PQPSBT_RPC_MAX_INPUTS, PQPSBT_RPC_MAX_SIGNATURES) {
+                Ok(result) => result,
+                Err(error) => json!({"error":error}),
+            }
+        }
+
         // ── Wallet: list UTXOs for address (needed by wallet CLI) ────
         "getutxos" => {
+            // Optional third parameter requests consensus/mempool metadata
+            // for at most 64 selected inputs. Refuse malformed selections
+            // before any storage work; the default endpoint is unchanged.
+            let selected = match selected_policy_outpoints(params) {
+                Ok(s) => s,
+                Err(error) => return json!({"error":error}),
+            };
             let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+            let spk = match parse_rpc_destination(addr) {
+                Ok(script) => script,
+                Err(error) => return json!({"error":error}),
+            };
+            let snapshot = if selected.is_some() {
+                match policy_rpc_snapshot(state) {
+                    Ok(s) => Some(s),
+                    Err(error) => return error,
+                }
+            } else { None };
             // Optional 2nd param: max UTXOs to return. A wallet with hundreds of
             // thousands of UTXOs (e.g. the carry-over founder set) otherwise serializes
             // a multi-MB response that overflows clients; a spender only needs enough
@@ -1546,9 +1649,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // script) address. The address index is keyed by the FULL script,
             // so the lookup must use all of it (a 20-byte prefix never matches
             // a policy entry); results are still filtered on the full script.
-            let script = crate::address::destination_script(addr).ok().map(|(_, spk)| spk);
-            match script {
-                Some(spk) => match state.store.get_utxos_for_address_limited(&spk, limit) {
+            match state.store.get_utxos_for_address_limited(&spk, limit) {
                     Ok((utxos, truncated)) => {
                         let utxos: Vec<_> = utxos.into_iter()
                             .filter(|(_, _, o)| o.script_pubkey == spk)
@@ -1568,10 +1669,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         // `admission::coinbase_height_for_wallets`). A height
                         // that cannot be read fails the call (never "not a
                         // coinbase", re-audit B1-T12).
-                        let next_block_height = {
+                        let next_block_height = snapshot.map(|s| s.0).unwrap_or_else(|| {
                             let dag = state.dag.read();
                             crate::mempool::admission::pool_next_height(&dag, &state.store, &state.mempool)
-                        };
+                        });
                         let rows: Result<Vec<Value>, crate::storage::StorageError> = utxos.iter().map(|(txid, idx, out)| {
                             let mut row = json!({
                                 "txid": hex::encode(txid), "index": idx,
@@ -1583,6 +1684,13 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                                 if let Some(h) = h {
                                     row["coinbase_height"] = json!(h);
                                 }
+                                if selected.as_ref().is_some_and(|s| s.contains(&(t,*idx))) {
+                                    row["spent_in_mempool"] = json!(state.mempool.spends_outpoint(&(t,*idx)));
+                                    let confirmations = crate::mempool::admission::confirmations_for_next_block(
+                                        &state.store,&t,next_block_height)
+                                        .map_err(|e| crate::storage::StorageError::ReadFailed(e.0))?;
+                                    row["confirmations_at_next_block"] = json!(confirmations);
+                                }
                             }
                             Ok(row)
                         }).collect();
@@ -1590,7 +1698,14 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             Ok(l) => l,
                             Err(e) => return storage_err_response(&e),
                         };
-                        json!({
+                        if let Some(initial) = snapshot {
+                            match policy_rpc_snapshot(state) {
+                                Ok(current) if current == initial => {},
+                                Ok(_) => return json!({"error":"node snapshot changed during UTXO lookup; retry preflight"}),
+                                Err(error) => return error,
+                            }
+                        }
+                        let mut result = json!({
                             "address":    addr,
                             "utxo_count": list.len(),
                             "returned":   list.len(),
@@ -1598,11 +1713,14 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             "satoshis":   total.to_string(),
                             "gnb":       total as f64 / 1e8,
                             "utxos":      list,
-                        })
+                        });
+                        if let Some((height,tip)) = snapshot {
+                            result["next_block_height"] = json!(height);
+                            result["tip"] = json!(hex::encode(tip));
+                        }
+                        result
                     },
                     Err(e) => storage_err_response(&e),
-                },
-                None => json!({ "error": "invalid address" }),
             }
         }
 
@@ -1673,33 +1791,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         // ── Phase 2: validateaddress ─────────────────────────────────
         "validateaddress" => {
             let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
-            let is_mainnet = addr.starts_with(MAINNET_PREFIX);
-            let is_testnet = addr.starts_with(TESTNET_PREFIX);
-            let valid_prefix = is_mainnet || is_testnet;
-            let stripped = addr.trim_start_matches(MAINNET_PREFIX).trim_start_matches(TESTNET_PREFIX);
-            // Expect 40 hex (20-byte hash) + 8 hex (4-byte checksum) = 48 hex chars
-            let valid_len = stripped.len() == 48;
-            let valid_hex = hex::decode(stripped).is_ok();
-
-            // Verify checksum
-            let valid_checksum = if valid_prefix && valid_len && valid_hex {
-                let bytes = hex::decode(stripped).unwrap_or_default();
-                let payload = &bytes[..20];
-                use sha3::{Sha3_256, Digest};
-                let inner = Sha3_256::digest(payload);
-                let outer = Sha3_256::digest(inner);
-                &outer[..4] == &bytes[20..24]
-            } else {
-                false
-            };
-
-            let is_valid = valid_prefix && valid_len && valid_hex && valid_checksum;
-            json!({
-                "address":    addr,
-                "isvalid":    is_valid,
-                "network":    if is_mainnet { "mainnet" } else if is_testnet { "testnet" } else { "unknown" },
-                "checksum":   valid_checksum,
-            })
+            validate_rpc_address(addr, false)
         }
 
         // ── Phase 2: estimatefee ─────────────────────────────────────
@@ -1801,6 +1893,14 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // (BIP22: 1-based positions in `transactions`): a block built from
             // a subset of the entries must keep every dependency of every
             // entry it keeps.
+            //
+            // POW-3: no template while the selected tip is below the minimum
+            // chain work (Bitcoin Core: "in initial sync and waiting for
+            // blocks"): it may be a chain this node's own pulls fetched from
+            // an eclipsing peer, not one to mine on.
+            if let Some(e) = crate::ingress::ibd_template_refusal(&state.dag.read(), state.min_chain_work) {
+                return json!({ "error": e });
+            }
             let tmpl = match crate::template::build_block_template(
                 &state.dag, &state.store, &state.mempool,
                 crate::template::EXTERNAL_COINBASE_RESERVE,
@@ -2016,10 +2116,17 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // apply at next_block_height, as getblocktemplate reports them
             // for its template's height.
             let activation_height = crate::core::activation::hardening_activation_height();
+            // POW-3: the minimum chain work in force (default or
+            // `--minimumchainwork`), in the unit and format of
+            // `tip_blue_work`; below it the node is in initial block download.
+            let min_chain_work = state.min_chain_work;
+            let tip_work = tip_data.as_ref().map_or(0, |d| d.blue_work);
             json!({
                 "tip":            tip.map(|h| hex::encode(h)),
                 "tip_blue_score": tip_data.as_ref().map(|d| d.blue_score).unwrap_or(0),
                 "tip_blue_work":  tip_data.as_ref().map(|d| d.blue_work.to_string()).unwrap_or_default(),
+                "minimum_chain_work": min_chain_work.to_string(),
+                "below_minimum_chain_work": tip_work < min_chain_work,
                 "tip_height":     tip_data.as_ref().map(|d| d.height).unwrap_or(0),
                 "next_block_height": next_block_height,
                 "hardening_activation_height": activation_height,
@@ -2048,13 +2155,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
             let addr_bytes = parse_address(addr);
             match addr_bytes {
-                Some(ab) => {
-                    let mut addr_hash = [0u8; 20];
-                    if ab.len() >= 20 {
-                        addr_hash.copy_from_slice(&ab[..20]);
-                    } else {
-                        return json!({ "error": "invalid address (too short)" });
-                    }
+                Ok(addr_hash) => {
                     match state.store.query_address_history(&addr_hash, start_height, end_height, limit, offset) {
                         Ok(entries) => {
                             let tip = selected_tip_height(&state);
@@ -2110,7 +2211,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         Err(e) => storage_err_response(&e),
                     }
                 }
-                None => json!({ "error": "invalid address" }),
+                Err(error) => json!({ "error": error }),
             }
         }
 
@@ -2294,12 +2395,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let addr_bytes = match parse_address(addr_str) {
-                Some(b) if b.len() == 20 => b,
-                _ => return json!({ "error": "invalid address" }),
+            let addr_hash = match parse_address(addr_str) {
+                Ok(hash) => hash,
+                Err(error) => return json!({ "error": error }),
             };
-            let mut addr_hash = [0u8; 20];
-            addr_hash.copy_from_slice(&addr_bytes);
 
             match crate::analytics::address_info(&state.store, &state.mempool, addr_str, &addr_hash) {
                 Ok(info) => json!({
@@ -2384,20 +2483,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            match crate::address::Address::parse(addr_str) {
-                Ok(a) => json!({
-                    "valid":    true,
-                    "address":  addr_str,
-                    "network":  if a.is_mainnet() { "mainnet" } else { "testnet" },
-                    "hash_hex": hex::encode(a.hash()),
-                    "prefix":   if a.is_mainnet() { crate::core::MAINNET_PREFIX } else { crate::core::TESTNET_PREFIX },
-                }),
-                Err(e) => json!({
-                    "valid":   false,
-                    "address": addr_str,
-                    "reason":  format!("{}", e),
-                }),
-            }
+            validate_rpc_address(addr_str, true)
         }
 
         // ── End of Sprint B additions ──────────────────────────────────────
@@ -2479,13 +2565,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
             let addr_bytes = parse_address(addr);
             match addr_bytes {
-                Some(ab) => {
-                    let mut addr_hash = [0u8; 20];
-                    if ab.len() >= 20 {
-                        addr_hash.copy_from_slice(&ab[..20]);
-                    } else {
-                        return json!({ "error": "invalid address" });
-                    }
+                Ok(addr_hash) => {
                     // NET-12: streamed and cancellable (heavy method).
                     match state.store.balance_at_height_cancellable(&addr_hash, height, &state.cancel) {
                         Ok((balance, _)) => {
@@ -2505,7 +2585,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         Err(e) => storage_err_response(&e),
                     }
                 }
-                None => json!({ "error": "invalid address" }),
+                Err(error) => json!({ "error": error }),
             }
         }
 
@@ -2526,16 +2606,110 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Parse a gnb1q/gnb1t address to 20-byte pubkey hash
-/// Sprint K: Checksum-validated address parsing.
-/// Delegates to `Address::parse()` from Sprint A — enforces full 54-char
-/// checksummed format (gnb1q + 20-byte hash + 4-byte checksum, hex-encoded).
-/// Rejects the legacy 46-char checksum-less form that the previous implementation
-/// silently accepted.
-fn parse_address(addr: &str) -> Option<Vec<u8>> {
-    crate::address::Address::parse(addr)
-        .ok()
-        .map(|a| a.hash().to_vec())
+/// Read-only static descriptor inspection; all syntax and script derivation
+/// use the same codec as offline CLI and WASM. The caller cannot choose a
+/// different network, import a pool, or mutate a wallet through these RPCs.
+fn inspect_rpc_descriptor(params: Option<&Value>) -> Result<Value, String> {
+    let args = params.and_then(Value::as_array).filter(|args| args.len() == 1)
+        .ok_or("expected exactly one checksummed descriptor in an array")?;
+    let descriptor = args[0].as_str().ok_or("descriptor must be a string")?;
+    let network = match crate::core::node_chain_id() {
+        crate::core::ChainId::Mainnet => "mainnet",
+        crate::core::ChainId::Testnet => "testnet",
+    };
+    gnb_crypto::wallet::descriptor::public_request(&json!({
+        "action": "inspect", "network": network, "descriptor": descriptor,
+    }))
+}
+
+fn rpc_address_network() -> crate::address::Network {
+    match crate::core::node_chain_id() {
+        crate::core::ChainId::Mainnet => crate::address::Network::Mainnet,
+        crate::core::ChainId::Testnet => crate::address::Network::Testnet,
+    }
+}
+
+/// Local RPC policy, not a transaction or block rule. All address entry
+/// points use the same check before querying this chain's indices.
+/// Modeled on Bitcoin Core v30.0 DecodeDestination / IsValidDestinationString:
+/// the decoder checks prefixes and HRPs against the selected chain parameters.
+/// https://github.com/bitcoin/bitcoin/blob/v30.0/src/key_io.cpp#L76-L128
+fn require_rpc_address_network(network: crate::address::Network) -> Result<(), crate::address::AddressError> {
+    let expected = rpc_address_network();
+    if network != expected {
+        return Err(crate::address::AddressError::WrongNetwork { expected, got: network });
+    }
+    Ok(())
+}
+
+fn address_query_error(error: crate::address::AddressError) -> String {
+    match error {
+        crate::address::AddressError::WrongNetwork { .. } => error.to_string(),
+        _ => "invalid address".into(),
+    }
+}
+
+/// The legacy holder/history index is keyed by a single-key hash, never the
+/// textual encoding. Policy scripts remain outside these 20-byte indices.
+fn parse_address(addr: &str) -> Result<[u8; 20], String> {
+    let address = crate::address::Address::parse(addr).map_err(address_query_error)?;
+    require_rpc_address_network(address.network()).map_err(address_query_error)?;
+    Ok(*address.hash())
+}
+
+/// UTXO indices use the full output script, including the policy tag/hash.
+fn parse_rpc_destination(addr: &str) -> Result<Vec<u8>, String> {
+    let (network, script) = crate::address::destination_script(addr).map_err(address_query_error)?;
+    require_rpc_address_network(network).map_err(address_query_error)?;
+    Ok(script)
+}
+
+/// `valid`/`isvalid` means usable on this node's network. `checksum` remains
+/// syntactic: a well-formed address for the other network has checksum=true,
+/// validity=false and a reason. Conversion fields are only emitted on success.
+fn validate_rpc_address(addr: &str, verbose: bool) -> Value {
+    use crate::address::{Address, Network, PolicyAddress};
+    let field = if verbose { "valid" } else { "isvalid" };
+    let mut result = json!({ "address": addr });
+    result[field] = json!(false);
+    let (network, script) = match crate::address::destination_script(addr) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            result["reason"] = json!(error.to_string());
+            if !verbose {
+                // Preserve the legacy malformed-address network hint.
+                result["network"] = json!(if addr.starts_with(MAINNET_PREFIX) { "mainnet" }
+                    else if addr.starts_with(TESTNET_PREFIX) { "testnet" } else { "unknown" });
+                result["checksum"] = json!(false);
+            }
+            return result;
+        }
+    };
+    result["network"] = json!(match network { Network::Mainnet => "mainnet", Network::Testnet => "testnet" });
+    if !verbose { result["checksum"] = json!(true); }
+    if let Err(error) = require_rpc_address_network(network) {
+        result["reason"] = json!(error.to_string());
+        return result;
+    }
+    let (canonical, bech32m, hash, prefix) = if let Ok(hash) = <[u8; 20]>::try_from(script.as_slice()) {
+        let address = Address::from_hash(hash, network);
+        (address.to_string(), address.to_bech32m(), hex::encode(hash), network.prefix())
+    } else if let Some(address) = PolicyAddress::from_script(&script, network) {
+        (address.to_string(), address.to_bech32m(), hex::encode(&script[1..]),
+            match network { Network::Mainnet => crate::address::POLICY_MAINNET_PREFIX,
+                Network::Testnet => crate::address::POLICY_TESTNET_PREFIX })
+    } else {
+        result["reason"] = json!("unsupported address script");
+        return result;
+    };
+    result[field] = json!(true);
+    result["canonical_address"] = json!(canonical);
+    result["bech32m"] = json!(bech32m);
+    if verbose {
+        result["hash_hex"] = json!(hash);
+        result["prefix"] = json!(prefix);
+    }
+    result
 }
 
 /// Format a transaction for JSON output
@@ -3065,6 +3239,9 @@ mod h_r3_5_tests {
 // ── 2026-10 audit regressions: NET-12, NET-13, NET-14, NET-15, WAL-1 ───────
 #[cfg(test)]
 mod audit_2026_10_rpc_tests {
+    include!("../../tests/support/pqpsbt_rpc_unit.rs");
+    include!("../../tests/support/address_frontends_rpc.rs");
+    include!("../../tests/support/descriptor_rpc.rs");
     use super::*;
     use crate::core::{Block, BlockHeader, MerkleRoot, TxInput, TxOutput};
     use tempfile::TempDir;
@@ -3098,6 +3275,7 @@ mod audit_2026_10_rpc_tests {
             trust_loopback: false,
             heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
             template_gate: Arc::new(HeavyGate::for_templates()),
+            pqpsbt_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             submit_block: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             chain_admin: None,
@@ -3106,6 +3284,10 @@ mod audit_2026_10_rpc_tests {
             proxy_client_header: auth::DEFAULT_PROXY_CLIENT_HEADER.into(),
             tx_verify_budget: Arc::new(auth::ByteBudget::new(ANON_TX_VERIFY_BURST_BYTES, ANON_TX_VERIFY_BYTES_PER_SEC)),
             caller_trusted: false,
+            // These fixture chains (work 1 per block) are far below
+            // mainnet's minimum chain work; the test of `getdaginfo`'s
+            // `minimum_chain_work` sets it.
+            min_chain_work: 0,
         };
         (tmp, state)
     }
@@ -3408,6 +3590,42 @@ mod audit_2026_10_rpc_tests {
         }
     }
 
+    #[tokio::test]
+    async fn pqpsbt_getutxos_selected_metadata_matches_the_node_snapshot() {
+        let (_tmp, state) = state_with_chain(5);
+        state.store.put_meta("tip_hash", &[5; 32]).unwrap();
+        let address = crate::address::Address::from_hash([41; 20], crate::address::Network::Mainnet);
+        state.store.put_utxo(&[42; 32], 0, &TxOutput { value: 1_000, script_pubkey: vec![41;20] }).unwrap();
+        state.store.put_tx_index(&[42;32], &[2;32], 2).unwrap();
+        // Independent positive control: the old endpoint really returns the
+        // requested output, without the optional metadata contract.
+        let plain = dispatch("getutxos",Some(&json!([address.to_string(),1])),&state).await;
+        assert_eq!(plain["utxos"][0]["value"],"1000");
+        assert!(plain.get("tip").is_none());
+        let snapshot = dispatch("getdaginfo",None,&state).await;
+        let selected = json!([{"txid":hex::encode([42;32]),"index":0}]);
+        let before = state.store.storage_reads();
+        let result = dispatch("getutxos",Some(&json!([address.to_string(),1,selected])),&state).await;
+        let reads = state.store.storage_reads()-before;
+        assert_eq!(result["utxos"][0]["spent_in_mempool"],false,
+            "selected inputs need an explicit mempool-spend verdict, got {result}");
+        assert_eq!(result["next_block_height"],snapshot["next_block_height"]);
+        assert_eq!(result["tip"],snapshot["tip"]);
+        assert_eq!(result["utxos"][0]["confirmations_at_next_block"],snapshot["next_block_height"].as_u64().unwrap()-2);
+        assert!(reads <= 24,"one selected input performed {reads} storage reads");
+    }
+
+    #[tokio::test]
+    async fn pqpsbt_getutxos_rejects_more_than_64_selected_inputs_before_storage() {
+        let (_tmp, state) = state_with_chain(1);
+        let address = crate::address::Address::from_hash([41;20],crate::address::Network::Mainnet);
+        let selected: Vec<_> = (0..65u32).map(|i| json!({"txid":hex::encode([42;32]),"index":i})).collect();
+        let before = state.store.storage_reads();
+        let result = dispatch("getutxos",Some(&json!([address.to_string(),1,selected])),&state).await;
+        assert!(result["error"].is_string(),"65 selected inputs must be refused: {result}");
+        assert_eq!(state.store.storage_reads()-before,0,"refusal precedes storage work");
+    }
+
     /// NET-12: the chain-walking statistics read only the requested window.
     #[tokio::test]
     async fn block_time_percentiles_walk_only_the_window() {
@@ -3683,6 +3901,10 @@ mod audit_2026_10_rpc_tests {
     /// One POST through the real router, from `peer`, with extra headers.
     /// Returns the status and the body (JSON when it parses, else a string).
     async fn post_raw(state: &AppState, peer: &str, headers: &[(&str, &str)], body: Vec<u8>) -> (StatusCode, Value) {
+        post_body(state, peer, headers, axum::body::Body::from(body)).await
+    }
+
+    async fn post_body(state: &AppState, peer: &str, headers: &[(&str, &str)], body: axum::body::Body) -> (StatusCode, Value) {
         use axum::http::Request;
         use tower::util::ServiceExt;
         let peer: std::net::SocketAddr = peer.parse().unwrap();
@@ -3694,7 +3916,7 @@ mod audit_2026_10_rpc_tests {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        let resp = router.oneshot(req.body(axum::body::Body::from(body)).unwrap()).await.unwrap();
+        let resp = router.oneshot(req.body(body).unwrap()).await.unwrap();
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into()));
@@ -3703,6 +3925,68 @@ mod audit_2026_10_rpc_tests {
 
     fn rpc_body(method: &str, params: Value) -> Vec<u8> {
         serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn r7_rpc_rejects_key_flood_before_body_and_hash_work() {
+        let (_tmp, mut state) = state_with_chain(1);
+        state.api_key = Some("k".repeat(32));
+        state.rate_limiter = Arc::new(auth::RateLimiterSet::new(2, 1));
+        auth::KEY_HASH_BYTES.with(|n| n.set(0));
+        let attack = "x".repeat(8192);
+        let mut refused = 0;
+        let body_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for i in 0..100 {
+            // Malformed JSON used to hash the key before rejecting the body,
+            // never reaching authorize_request or consuming any token.
+            let polls = body_polls.clone();
+            let body = axum::body::Body::from_stream(futures::stream::once(async move {
+                polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{"))
+            }));
+            let (status, _) = post_body(&state, "127.0.0.1:5000",
+                &[("x-forwarded-for", "198.51.100.7"), ("x-api-key", &attack)], body).await;
+            if i < 3 { assert_eq!(status, StatusCode::BAD_REQUEST, "admitted requests still reach the parser"); }
+            if i >= 3 && status == StatusCode::TOO_MANY_REQUESTS { refused += 1; }
+        }
+        let hashed = auth::KEY_HASH_BYTES.with(|n| n.get());
+        let polled = body_polls.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("r7 router cost: {hashed} key bytes hashed, {polled} body chunks polled");
+        assert_eq!(polled, 3, "rate-limited requests must not poll their body");
+        assert!(hashed <= 3 * (attack.len() + 32), "pre-auth budget exceeded: {hashed} hashed bytes");
+        assert_eq!(refused, 97, "must refuse before parsing the body");
+    }
+
+    #[tokio::test]
+    async fn r7_getaddressinfo_storage_work_is_independent_of_confirmed_utxos() {
+        let (_tmp, state) = state_with_chain(1);
+        state.store.ensure_aggregates().unwrap();
+        let address = [7u8; 20];
+        for i in 0..256 {
+            state.store.put_utxo(&[1u8; 32], i, &TxOutput { value: 1000, script_pubkey: address.to_vec() }).unwrap();
+        }
+        let start = state.store.storage_reads();
+        let response = dispatch("getaddressinfo", Some(&json!([crate::address::Address::from_hash(address, crate::address::Network::Mainnet).to_string()])), &state).await;
+        let reads = state.store.storage_reads() - start;
+        assert_eq!(response["balance_sats"], "256000", "{response}");
+        assert_eq!(response["utxo_count"], 256);
+        assert!(reads <= 1, "empty mempool must need at most one storage read, observed {reads}");
+    }
+
+    #[tokio::test]
+    async fn r7_getaddressinfo_does_not_scan_during_aggregate_rebuild() {
+        let (_tmp, state) = state_with_chain(1);
+        let address = [7u8; 20];
+        state.store.put_utxo(&[1u8; 32], 0, &TxOutput { value: 1000, script_pubkey: address.to_vec() }).unwrap();
+        let mut batch = rocksdb::WriteBatch::default();
+        state.store.stage_aggregates_incomplete(&mut batch).unwrap();
+        state.store.write_batch(batch).unwrap();
+        assert!(!state.store.aggregates_ready());
+        let start = state.store.storage_reads();
+        let response = dispatch("getaddressinfo", Some(&json!([crate::address::Address::from_hash(address, crate::address::Network::Mainnet).to_string()])), &state).await;
+        let reads = state.store.storage_reads() - start;
+        assert_eq!(reads, 0, "unavailable aggregates must not trigger a fallback UTXO scan");
+        assert!(response["error"].as_str().unwrap_or("").contains("aggregates"), "{response}");
     }
 
     /// B1-T4: `submitblock` carries a block as hex, about twice its wire
@@ -4178,6 +4462,42 @@ mod audit_2026_10_rpc_tests {
         assert_eq!(r["hardening_activation_height"], 0);
     }
 
+    /// POW-3: `getdaginfo` reports the node's minimum chain work (here
+    /// mainnet's release value, what `start_rpc_server` takes from
+    /// `ingress::minimum_chain_work` on a mainnet node without
+    /// `--minimumchainwork`), in `tip_blue_work`'s unit and decimal format,
+    /// and whether the selected tip is below it (initial block download), so
+    /// an operator sees why a node does not leave IBD and the release tool
+    /// (tools/release/min_chain_work.py) prints the value a node runs.
+    /// Below it `getblocktemplate` refuses, as Bitcoin Core's does in
+    /// initial block download: the tip may be a cheap chain the node's own
+    /// pulls fetched from an eclipsing peer.
+    #[tokio::test]
+    async fn getdaginfo_and_getblocktemplate_apply_the_minimum_chain_work() {
+        let (_tmp, mut state) = state_with_chain(5);
+        assert_eq!(crate::ingress::minimum_chain_work(), crate::core::MIN_CHAIN_WORK, "the process default");
+        state.min_chain_work = crate::core::MIN_CHAIN_WORK;
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["minimum_chain_work"], "7000000");
+        assert_eq!(r["below_minimum_chain_work"], true, "a 5-block test chain");
+        let t = dispatch("getblocktemplate", None, &state).await;
+        let e = t["error"].as_str().unwrap_or_default();
+        assert!(e.contains("initial block download") && e.contains("0x6acfc0"), "{t}");
+        let tip_work: u128 = r["tip_blue_work"].as_str().unwrap().parse().unwrap();
+        state.dag.write().add_block([0xD7; 32], vec![[5u8; 32]], 20_000, crate::core::MIN_CHAIN_WORK - tip_work)
+            .unwrap();
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["tip_blue_work"], "7000000");
+        assert_eq!(r["below_minimum_chain_work"], false, "at the minimum: out of IBD");
+        let t = dispatch("getblocktemplate", None, &state).await;
+        let e = t["error"].as_str().unwrap_or_default();
+        assert!(!e.contains("initial block download"), "{t}");
+        // With no minimum (testnet, `--minimumchainwork 0`) nothing is gated.
+        let (_tmp0, state0) = state_with_chain(5);
+        let r = dispatch("getdaginfo", None, &state0).await;
+        assert_eq!((r["minimum_chain_work"].as_str(), r["below_minimum_chain_work"].as_bool()), (Some("0"), Some(false)));
+    }
+
     /// B2-T5: `getdaginfo` used to walk the whole selected chain (under the
     /// DAG read lock) for `chain_length` on every call. Its DAG work no
     /// longer grows with the chain, and `chain_length` is still the number
@@ -4244,6 +4564,7 @@ mod block_rules_template_tests {
             trust_loopback: false,
             heavy_gate: Arc::new(HeavyGate::new(HEAVY_READ_CACHE_TTL)),
             template_gate: Arc::new(HeavyGate::for_templates()),
+            pqpsbt_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             submit_block: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             chain_admin: None,
@@ -4252,6 +4573,10 @@ mod block_rules_template_tests {
             proxy_client_header: auth::DEFAULT_PROXY_CLIENT_HEADER.into(),
             tx_verify_budget: Arc::new(auth::ByteBudget::new(ANON_TX_VERIFY_BURST_BYTES, ANON_TX_VERIFY_BYTES_PER_SEC)),
             caller_trusted: false,
+            // These fixture chains (work 1 per block) are far below
+            // mainnet's minimum chain work; the test of `getdaginfo`'s
+            // `minimum_chain_work` sets it.
+            min_chain_work: 0,
         };
         (tmp, state)
     }

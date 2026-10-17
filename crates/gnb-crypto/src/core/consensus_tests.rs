@@ -252,6 +252,7 @@ fn non_canonical_bits_never_validate() {
 /// and the constants.
 #[test]
 fn expected_bits_are_always_canonical() {
+    super::powit_pow_tests::activate();
     use gnb_smh::difficulty::{is_canonical_bits, target_to_bits, Target};
     for bits in [POW_LIMIT_BITS, GENESIS_BITS, block_rules::HARDENED_POW_LIMIT_BITS] {
         assert!(is_canonical_bits(bits), "{bits:#x}");
@@ -270,12 +271,17 @@ fn expected_bits_are_always_canonical() {
         let bits = target_to_bits(&Target(t));
         assert!(is_canonical_bits(bits), "target_to_bits({}) = {bits:#x} is not canonical", hex::encode(t));
     }
-    // Both proofs of work: from POWIT_HEIGHT_MAINNET the ASERT bits are
+    // Both proofs of work: from this binary's shared activation the ASERT bits are
     // shifted for GnB-SMH v3 (`adjust_bits_for_algo`), re-encoded with
     // `target_to_bits` too.
-    let switch = POWIT_HEIGHT_MAINNET;
-    let heights = [1u64, 2, 1_000, switch - 1, switch, switch + 1, 500_000];
-    assert_eq!(pow_algo(switch), gnb_smh::Algo::V3, "the node chain id of the tests is mainnet's");
+    let switch = super::powit_pow_tests::TEST_ACTIVATION;
+    let heights = [
+        1u64, 2, 1_000, POWIT_HEIGHT_MAINNET - 1, POWIT_HEIGHT_MAINNET,
+        POWIT_HEIGHT_MAINNET + 1, 500_000, switch - 1, switch, switch + 1,
+    ];
+    assert_eq!(pow_algo(switch - 1), gnb_smh::Algo::V1);
+    assert_eq!(pow_algo(switch), gnb_smh::Algo::V3);
+    assert_eq!(pow_algo(switch + 1), gnb_smh::Algo::V3);
     for (act, heights) in [(0u64, heights), (activation::NEVER, heights)] {
         for h in heights {
             for dt in [-1_000_000i64, -7_200, -30, 0, 30, 7_200, 1_000_000, 50_000_000] {
@@ -285,6 +291,76 @@ fn expected_bits_are_always_canonical() {
             }
         }
     }
+}
+
+// ── The real-ASERT test seam (re-audit POW-5) ────────────────────────────────
+//
+// The node's real-ASERT tests (node/tests/fix_pow_real_asert*.rs) hold
+// `scoped_real_expected_bits()` to lift the `test-pow-limit` pin on their
+// thread. If the seam leaked or ignored its scope, those tests would check
+// the pinned pow limit (and every other node test the real rule) without
+// failing for that reason, so the scope itself is pinned here. These tests
+// run with and without the feature; the mutation gate runs them without it.
+
+/// The pin is lifted on the calling thread exactly while a guard is held.
+#[test]
+fn real_expected_bits_scope_lifts_the_pin_until_the_guard_drops() {
+    assert!(pow_limit_pinned_on_this_thread(), "pinned outside any scope");
+    let guard = scoped_real_expected_bits();
+    assert!(!pow_limit_pinned_on_this_thread(), "lifted inside the scope");
+    drop(guard);
+    assert!(pow_limit_pinned_on_this_thread(), "pinned again once the guard drops");
+}
+
+/// Each guard restores the mode it found: dropping an inner guard keeps the
+/// outer scope's real rule.
+#[test]
+fn real_expected_bits_scopes_nest() {
+    let outer = scoped_real_expected_bits();
+    let inner = scoped_real_expected_bits();
+    assert!(!pow_limit_pinned_on_this_thread());
+    drop(inner);
+    assert!(!pow_limit_pinned_on_this_thread(), "the outer guard still holds");
+    drop(outer);
+    assert!(pow_limit_pinned_on_this_thread());
+}
+
+/// A panic inside the scope (a failed assertion) drops the guard while
+/// unwinding, and the scope belongs to its thread: another thread stays
+/// pinned.
+#[test]
+fn real_expected_bits_scope_unwinds_and_is_per_thread() {
+    let unwound = std::panic::catch_unwind(|| {
+        let _real = scoped_real_expected_bits();
+        assert!(!pow_limit_pinned_on_this_thread());
+        // No panic hook: the test output stays quiet.
+        std::panic::resume_unwind(Box::new("inside the scope"));
+    });
+    assert!(unwound.is_err());
+    assert!(pow_limit_pinned_on_this_thread(), "the guard dropped while unwinding");
+    let _real = scoped_real_expected_bits();
+    let other = std::thread::spawn(pow_limit_pinned_on_this_thread).join().unwrap();
+    assert!(other, "another thread keeps the pin");
+    assert!(!pow_limit_pinned_on_this_thread());
+}
+
+/// `expected_bits` itself: with `test-pow-limit` the pinned pow limit
+/// outside the scope and the real ASERT bits inside it; without the feature
+/// the real rule either way.
+#[test]
+fn expected_bits_follows_the_real_expected_bits_scope() {
+    let (ts, height) = (GENESIS_TIMESTAMP, 1);
+    let real = expected_bits_at(ts, height, activation::hardening_activation_height()).unwrap();
+    let pinned = target_to_bits(&bits_to_target(POW_LIMIT_BITS));
+    assert_eq!(real, GENESIS_BITS);
+    assert_ne!(real, pinned, "the two modes must be told apart");
+    let outside = if TEST_POW_LIMIT { pinned } else { real };
+    assert_eq!(expected_bits(ts, height).unwrap(), outside);
+    {
+        let _real = scoped_real_expected_bits();
+        assert_eq!(expected_bits(ts, height).unwrap(), real);
+    }
+    assert_eq!(expected_bits(ts, height).unwrap(), outside);
 }
 
 // ── Coinbase, dust, duplicates, timestamps, fees, maturity ───────────────────
@@ -450,9 +526,8 @@ fn size_verdict_does_not_depend_on_the_uncommitted_blue_score() {
 /// equal to the hardened measure `wire_size()`.
 #[test]
 fn legacy_block_size_is_the_wire_length_whatever_the_blue_score() {
-    // The PoWit activation of this test binary (`powit_pow_tests`).
-    let powit = 1u64 << 40;
-    super::set_powit_height_override(powit).expect("one PoWit height per test binary");
+    super::powit_pow_tests::activate();
+    let powit = super::powit_pow_tests::TEST_ACTIVATION;
     for (height, n_shielded) in [(1u64, 0usize), (300, 2), (70_000, 1), (powit - 1, 0), (powit, 1)] {
         let mut b = valid_block(height, vec![[2; 32], [3; 32]], 20, vec![spend_tx(4, &[1_000, 2_000])], activation::NEVER);
         b.shielded_transactions = (0..n_shielded).map(|i| shielded(i as u8, 2, 1, 50)).collect();

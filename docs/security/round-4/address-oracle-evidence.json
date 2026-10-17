@@ -1,0 +1,129 @@
+{
+  "finding": "R4-V2",
+  "severity": "low",
+  "scope": "Local JSONL test adapter only, not node RPC or consensus",
+  "source_commit": "04b9348cecca54df6230e101701ee740d72eb6b5",
+  "baseline_adapter_revision": "4b32fb6e7f3b6166b36bf9d09a221b5843f39efb",
+  "source_sha256": {
+    "crates/gnb-crypto/examples/address_v2_oracle.rs": "9bbf6135714193c3ec9330c3db414f0d690207c8490a4094d4142fe38cc07152",
+    "reference/address_v2_differential.py": "bea7ad8e920d918d83e99e5d4df6f4bb8a420c1438eed4e87563e504de958cc3",
+    "reference/address_v2.py": "6d0c511b1c61845a3e096a5e742745947b8286b181a395ab6d3103671722c2a9",
+    "docs/ADDRESS-V2.md": "75562e03e14e388547cca1de2081fcae54440bb0daa3ebb15cc4a3b028e56e6e",
+    "docs/security/round-4/replay-address-oracle.py": "5e3cbfeb8f6b8d8b9303455cff5d3bdd229d4497df249f75e5d90477f5b2aac1"
+  },
+  "independent_reproduction": {
+    "path": "/private/tmp/gnb-r4-review-verdict-oracle-shape.json",
+    "sha256": "d64d70454f030ca88da14566a9e43a1af792613ec484ad8d2bd99409831a856a"
+  },
+  "contract": "decode expected_network null is equivalent to absence; both operations reject unknown fields and require correctly typed mandatory fields",
+  "runtime_red": {
+    "passed": 2,
+    "failed": 3,
+    "tests_sha256": "65d98de3c82acab3c3328e472d11b9397e5a83681ff7c44e8a7d7f6631285396"
+  },
+  "example_green": {
+    "passed": 5,
+    "failed": 0
+  },
+  "logs": [
+    {
+      "name": "exact-final-tests-red",
+      "path": "/private/tmp/gnb-r4-address-oracle-shape-final-tests-red.log",
+      "exit": 101,
+      "sha256": "197b7392a45255c466578775348e639fc2afaa515fded6635ba74a0ce9dbc39f"
+    },
+    {
+      "name": "envelope-differential-red",
+      "path": "/private/tmp/gnb-r4-address-oracle-envelope-red.log",
+      "exit": 1,
+      "sha256": "0a4c1214f5de1f85e81ccffa7331b1b4c07f02e6f18c7640f86241e90888b422"
+    },
+    {
+      "name": "example-green",
+      "path": "/private/tmp/gnb-r4-address-oracle-shape-green.log",
+      "exit": 0,
+      "sha256": "f1b2880bda5e30754e3d1fb191a9430da562786e045af0687262899d8867d679"
+    },
+    {
+      "name": "python-tests",
+      "path": "/private/tmp/gnb-r4-address-reference-after-envelope.log",
+      "exit": 0,
+      "sha256": "a99b2021d9d638667a02d2ff002bdcd042380ee87f5a3c6d4608d767666419c1"
+    },
+    {
+      "name": "corpus-reproducibility",
+      "path": "/private/tmp/gnb-r4-address-reference-corpus-after-envelope.log",
+      "exit": 0,
+      "sha256": "4ffe3027ccffaa7ca64b79f812f95cd8d745b82994e44ee159c6dd72a3b69903"
+    },
+    {
+      "name": "final-build",
+      "path": "/private/tmp/gnb-r4-address-oracle-final-build.log",
+      "exit": 0,
+      "sha256": "39b6556b3ef6c03c2e333b8cee8765d1b228e773605b9b416c0516f23ccc409d"
+    },
+    {
+      "name": "final-differential",
+      "path": "/private/tmp/gnb-r4-address-oracle-envelope-final.log",
+      "exit": 0,
+      "sha256": "5dd16c7ad56c7f2d5f62764187db7a206eeca6529a1b68f1fb0d7ba8b2d50d50"
+    }
+  ],
+  "reversal_manifest": {
+    "path": "docs/security/round-4/address-oracle-reversals.json",
+    "sha256": "80117dd38532e2a3247598b5b234b30b62b4a162b3f0e2fa6887e7b97e5efbd5",
+    "runtime_red": "2 passed; 3 failed",
+    "restored_green": "5 passed; 0 failed",
+    "tests_unchanged": true,
+    "production_bytes_restored": true
+  },
+  "differential": {
+    "corpus_sha256": "26c1d23ebeb765961bcab1930f0555b9c54252e750d7be139b713191d8d0ee1c",
+    "divergences": 0,
+    "envelope_requests": 42,
+    "python_oracle_sha256": "6d0c511b1c61845a3e096a5e742745947b8286b181a395ab6d3103671722c2a9",
+    "requests": 672,
+    "rust_binary_sha256": "c0837c304051f6716ab58c102b1918eb150c5f92f2b4ddc2242b7fc338bfeb40"
+  },
+  "commands": [
+    [
+      "cargo",
+      "test",
+      "-p",
+      "gnb-crypto",
+      "--locked",
+      "--offline",
+      "--example",
+      "address_v2_oracle"
+    ],
+    [
+      "cargo",
+      "build",
+      "-p",
+      "gnb-crypto",
+      "--locked",
+      "--offline",
+      "--example",
+      "address_v2_oracle"
+    ],
+    [
+      "python3",
+      "reference/address_v2_differential.py",
+      "/private/tmp/gnb-r4-target-address-core/debug/examples/address_v2_oracle"
+    ],
+    [
+      "python3",
+      "reference/address_v2_test.py",
+      "-v"
+    ],
+    [
+      "python3",
+      "reference/address_v2_vectors.py",
+      "--check"
+    ]
+  ],
+  "codegen_units": 79,
+  "python_tests": 13,
+  "library_verification": "479 pass / 4 existing ignores remain evidence for unchanged codec source at4b32fb6; full crypto suite intentionally not repeated for example/driver-only correction",
+  "independent_recheck": "Requested from original verdict reviewer; not asserted by implementer"
+}

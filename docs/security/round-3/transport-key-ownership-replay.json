@@ -1,0 +1,91 @@
+{
+  "base_commit": "b425436fbb5c24f215c8b85a08a0fb4ec557292e",
+  "build_environment": {
+    "CARGO_BUILD_JOBS": "1",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_CODEGEN_UNITS": "47",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_TARGET_DIR": "/private/tmp/gnb-security-target-r3-transport-key-ownership"
+  },
+  "cargo": "cargo 1.94.1 (29ea6fb6a 2026-03-24)",
+  "command": [
+    "cargo",
+    "test",
+    "--locked",
+    "-v",
+    "-p",
+    "gnb",
+    "--lib",
+    "transport::upgrade::key_ownership_tests",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "correction_commit": "4ef8664f1261d0147e42d72ca1eab1bdac87f9f2",
+  "final_test_suffix_sha256": "1c33c262b38efd8b21b276ef4b2bd666356081975192330ad67d2fac86cca9cd",
+  "finished_utc": "2026-10-16T15:23:02.753639+00:00",
+  "head_at_start": "4ef8664f1261d0147e42d72ca1eab1bdac87f9f2",
+  "platform": "macOS-26.6.2-x86_64-i386-64bit",
+  "restoration_verified_byte_for_byte": true,
+  "runs": {
+    "restored": {
+      "exit_code": 0,
+      "log": "restored.log",
+      "log_sha256": "32aceef6b6a77059d1ab3611cad07ace9ef56c9e8ed354437ab1245db7de2921",
+      "validated_five_passes": true
+    },
+    "reversal": {
+      "exit_code": 101,
+      "log": "reversal.log",
+      "log_sha256": "ad16e2a7e63b54cfdc819ac3f101bf7891f58bea294b429d1ea8e29262fab7f7",
+      "validated_expected_runtime_failure": true
+    }
+  },
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "schema": 1,
+  "snapshots": {
+    "base/mod.rs": {
+      "bytes": 6821,
+      "sha256": "658bdaa2addb23dcaf124e47dbc8c2f1c079fc6cfb408151b92fd8bc7cb738bb"
+    },
+    "base/upgrade.rs": {
+      "bytes": 17048,
+      "sha256": "2038f579f42fff3ba0a9915e21f5bb70ca88caad914396eb5ea0ddd193bb6339"
+    },
+    "before/mod.rs": {
+      "bytes": 7268,
+      "sha256": "388717ade9015ce1f610b3454eadfb534010d72e2cbed271129ed31bca0b93c6"
+    },
+    "before/upgrade.rs": {
+      "bytes": 20845,
+      "sha256": "ac46804508191109e6c382b15cfa6042c465e325f6c5032e1a1311540727421b"
+    },
+    "driver.py": {
+      "bytes": 8764,
+      "sha256": "21f85195a46db5151975d1fb2229f5d5f3861d435898f7c6fa366cfa3689f948"
+    },
+    "restored/mod.rs": {
+      "bytes": 7268,
+      "sha256": "388717ade9015ce1f610b3454eadfb534010d72e2cbed271129ed31bca0b93c6"
+    },
+    "restored/upgrade.rs": {
+      "bytes": 20845,
+      "sha256": "ac46804508191109e6c382b15cfa6042c465e325f6c5032e1a1311540727421b"
+    },
+    "reversed/mod.rs": {
+      "bytes": 6821,
+      "sha256": "658bdaa2addb23dcaf124e47dbc8c2f1c079fc6cfb408151b92fd8bc7cb738bb"
+    },
+    "reversed/upgrade.rs": {
+      "bytes": 20382,
+      "sha256": "65bc12fd8d2c5b8f554a14c830817be0598d0b1efe371106729b03e6b431abba"
+    },
+    "tests/final-suffix.rs": {
+      "bytes": 3334,
+      "sha256": "1c33c262b38efd8b21b276ef4b2bd666356081975192330ad67d2fac86cca9cd"
+    }
+  },
+  "started_utc": "2026-10-16T15:21:25.228419+00:00",
+  "status": "complete",
+  "worktree": "/Users/tiagobulhoes/worktrees/gnb-security-r3-transport-key-ownership"
+}

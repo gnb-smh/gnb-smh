@@ -1,0 +1,47 @@
+{
+  "production_commit": "8525a0e64ee1b4f2f244ab0d2cb952ffc4c3bb2c",
+  "logs": [
+    {
+      "path": "/private/tmp/gnb-r4-address-web-red.log",
+      "sha256": "ce3c3329e10dae90f51f12bb76b3fab991d4b32b25146ec854ba11f35afa508c"
+    },
+    {
+      "path": "/private/tmp/gnb-r4-address-python-red.log",
+      "sha256": "0459ff60299859eba22c262d0f0c4d2f9e6a80f3a511e665a72a58930d665d99"
+    },
+    {
+      "path": "/private/tmp/gnb-r4-address-web-case-regression.log",
+      "sha256": "aba39038548d949868664d5d40d6886c677bbd5938d06c3b9924001b0702cd92"
+    },
+    {
+      "path": "/private/tmp/gnb-r4-address-web-green.log",
+      "sha256": "43be8c13b0e70344e212c729b207e2132e41e7ad6230ac0868b1a1302e1d5b72"
+    },
+    {
+      "path": "/private/tmp/gnb-r4-address-python-green.log",
+      "sha256": "81c27e51af4dc30a48826a53c08764b4c9358d0e7836e9818880f961b5e1da33"
+    },
+    {
+      "path": "/private/tmp/gnb-r4-address-web-site.log",
+      "sha256": "811b727889b90384c9902a85fc9f3241000c9cef88295a13f8e497204f844e5a"
+    },
+    {
+      "path": "/private/tmp/gnb-r4-address-web-site-rerun.log",
+      "sha256": "072094c5527cb08a63708dcfdc4c4aebf4f758b0279b6ee5bcd43e70e3e9bc81"
+    },
+    {
+      "path": "/private/tmp/gnb-r4-address-web-api.log",
+      "sha256": "4b65f89108f2e5e6128dbeef132d4dcc086c33ab70e48f3f30fb7460f0dccdff"
+    },
+    {
+      "path": "/private/tmp/gnb-r4-address-web-api-unsandboxed.log",
+      "sha256": "164f0d1790d3be4de351f003bbdf87fa36ae41f5d6422f143e789de248f1060a"
+    },
+    {
+      "path": "/private/tmp/gnb-r4-address-web-site-socket-retry.log",
+      "sha256": "9c92b168560f5c03b179dd48fc2dc5db1a50ce0ac31f55fc18f826ce5cd16d98"
+    }
+  ],
+  "reversal_manifest_sha256": "8498a820ad989b1e9fcc81c87ec0bfbeec5ed98cbc207cedf53589781b7d3ae4",
+  "reversal_driver_sha256": "fabcbf990ca9b37cebd84dd633e5b3275e0cb84ec8a26d26a4728c935b0a0f8d"
+}

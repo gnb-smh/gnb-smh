@@ -1,0 +1,23 @@
+{
+  "test_sha256": "24f14cfe0ef201d811e797fe2a8691aea643d6cb79c12dd076f2ea5860e870e3",
+  "production_sha256": "201aa76b18d1e2c942deb4a8cd5788c8e35dc17c0e32827f9bc309bec2d780a6",
+  "tests_unchanged": true,
+  "restored_exactly": true,
+  "results": [
+    {
+      "name": "control",
+      "exit_code": 0,
+      "log_sha256": "d80e5abf94a3ac2da42741011da1a6b2db67f6cd9f4df0467753d5e18ea9fb65"
+    },
+    {
+      "name": "removed",
+      "exit_code": 1,
+      "log_sha256": "32755c24cd1987c1c035008fdd3e7fbd2265a880b38e0bbad5397b5c489482f5"
+    },
+    {
+      "name": "restored",
+      "exit_code": 0,
+      "log_sha256": "10589e5a8095cf28fa17c66d4b8781305f096e4cb887dbefa9d6ed5832c2e795"
+    }
+  ]
+}

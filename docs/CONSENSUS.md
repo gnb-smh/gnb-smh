@@ -181,6 +181,43 @@ PoWit height (GnB-SMH v3 and PoWit: mainnet 10,000; testnet off unless
   body root is the v2 commitment, and which heights that covers depends on
   the running node's PoWit height, not on the stored chain's.
 
+## Genesis ledger
+
+The genesis ledger is the set of outputs that exist from the genesis without
+a transaction creating them, written into the UTXO set before block 0
+(`Storage::ingest_carryover`, one atomic batch): the converted Bloch
+Genesis-3 carryover (`core::carryover`: 20-byte key-hash outputs only, the
+snapshot format admits no other script, at their Bloch outpoints) and the 72
+locked team and founder vesting tranches (`core::vesting`: 33-byte policy
+outputs, each with an absolute timelock `after` = its unlock height and no
+relative timelock, `older = 0`, at synthetic outpoints `txid = SHA3-256(
+"GNB-VESTING-v1" ‖ role ‖ k ‖ policy hash)`, `vout = 0`). Both sets are
+consensus constants (`CARRYOVER_SNAPSHOT_SHA3`, `VESTING_SPEC_SHA3`).
+
+**Confirmation point (audit F1).** A genesis-ledger output is confirmed at
+the genesis: header height 0, DAG height 0, chain position 0. A rule that
+counts its confirmations at a block B (a relative timelock: "Coinbase
+maturity", **Timelocks**) counts `B.height` below the activation and
+`dag_height(B)` from it. No transaction created these outputs, so they have
+no transaction-index row; the node records their txids instead
+(`genesis_ledger/<txid>` rows in CF_META, written with the ledger and, for a
+data dir ingested by an earlier release, at start-up by
+`Storage::migrate_genesis_ledger_index`: the vesting tranches from the
+embedded specification, the carryover from the key-hash outputs, unspent or
+spent by an applied block, that have no transaction-index row), and the one
+confirmation lookup of the connect, reorg, mempool and template paths
+(`accept::confirmations_in_view`, through `UtxoView::view_genesis_ledger`)
+answers the genesis for them. Before, an output found in the UTXO set without
+a transaction-index row was "confirmation unknown", a read failure (no
+verdict, "Coinbase commitment"), and a made-up policy could ask for it (see
+**Timelocks**).
+
+This changes no verdict of any block on this chain: the only genesis-ledger
+outputs a confirmation-reading rule can reach are policy outputs (maturity
+reads coinbases only, relative timelocks policy outputs only), i.e. the
+vesting tranches, whose policies all have `older = 0`, and a spend that
+reveals another policy fails the policy hash before any timelock is read.
+
 ## Acceptance order
 
 `accept_block` runs the cheap checks first and the proof of work last:
@@ -622,7 +659,11 @@ witness set has finalized pins fork choice: a block whose selected-parent
 chain does not pass through it is never selected, nor offered as a template
 parent (`GhostDAG::set_finalized`; docs/DESIGN-pow-powit.md). It restricts
 which blocks are selectable, never a block's GhostDAG data (selected parent,
-coloring, blue work). The
+coloring, blue work). A node takes or advances the pin only while the chain
+whose state finalized it has at least the node's minimum chain work
+(node-local, "Minimum chain work and unrequested blocks" below): a cheap fork
+carries its own witness set, so its finality pins nothing while the node may
+still be syncing a low-work chain. The
 former 1,000-block `MAX_REORG_DEPTH` and the `finalized_height` gate compared
 a fork with the node's own history, so nodes that received the same blocks in
 different orders could end on different chains. As in Bitcoin Core (no depth
@@ -989,17 +1030,38 @@ Bitcoin Core's defences, adapted (`ingress::unrequested_block_admission`):
   `ingress::MAINNET_MINIMUM_CHAIN_WORK` (testnet and regtest: 0), or
   `--minimumchainwork <hex>`. While the selected tip's blue work is below it
   the node is in initial block download: it latches the IBD state (the
-  miner stays paused) and processes no block it did not ask for, unless that
-  block's own bound reaches the minimum. Mainnet's value is
-  `core::MIN_CHAIN_WORK`, the one release constant that also turns finality,
-  the reorg depth cap and pruning on (`core::finality_active`), 0 today: the
-  newest chain data the repository carries is the reading of
-  docs/MAINNET-READINESS.md §1 (one node, 14 Oct 2026), whose proposed value
-  is a release decision not yet taken, and a value the real chain does not
-  reach would stop every new node from syncing; docs/RUNNING.md gives the
-  release step that raises it. Block work bounds (`lb`, the announced work
-  of orphans) count each block as `accept_block` adds it to the DAG,
-  `core::block_work`: normalised across the GnB-SMH v1 -> v3 switch.
+  miner stays paused, stalled sync or not) and processes no block it did
+  not ask for, unless that block's own bound reaches the minimum. Mainnet's
+  value is `core::MIN_CHAIN_WORK` = 7,000,000, derived from the mainnet
+  reading of docs/MAINNET-READINESS.md §1 (tip height 8,302, blue work
+  7,782,451, 14 Oct 2026; 10% below it, and far below the tip of the
+  release); docs/RUNNING.md gives the release step that raises it. Its unit
+  is the selected tip's blue work, the sum of `core::block_work`: a block's
+  `bits_to_work` (the genesis target 4,500, the pre-activation pow limit
+  1), divided by 4 for GnB-SMH v3 blocks, whose target is 4 times harder,
+  so the sum is continuous across the v1 -> v3 switch (below the hardening
+  activation the selected chain's blocks, from it the merged blues too).
+  Block work bounds (`lb`, the announced work of orphans) count each block
+  as `accept_block` adds it to the DAG. The minimum is not consensus: no
+  block's validity, GhostDAG data or the heaviest-chain choice among the
+  blocks a node holds reads it, so nodes with other values (an override, a
+  release without it) reach the same verdicts on the same blocks. One
+  node-local fork-choice input does read it: no PoWit finality pin is taken
+  or restored below the minimum (`powit::pin_finalized_of`, PoWit audit
+  finding 3), so a cheap chain pulled during initial sync cannot pin a
+  node; a node running a lower override can pin earlier than its peers,
+  which, like every pin, only affects that node's own choice.
+- **Below the minimum, no chain of record**: blocks the node requested are
+  processed below the minimum (as in Core), so an eclipsing peer that
+  answers its pulls can make a cheap chain its selected tip (no header chain
+  with proofs tells the node a chain's work before it downloads it, as
+  Core's headers presync does). While the tip is below the minimum the node
+  therefore mines nothing and `getblocktemplate` refuses
+  (`ingress::ibd_template_refusal`), a witness node neither attests
+  checkpoints nor mines shares, and GetTips / GetHeaders are answered
+  empty (`network::serve::serve_sync_request`; Core ignores `getheaders` in
+  initial block download), so such a chain is neither mined on nor
+  advertised to peers; blocks it stores are still served by GetBlock.
 - **Unrequested blocks** (Core's `AcceptBlock`, `!fRequested`): a block that
   is neither the answer to one of this node's directed pulls nor a block it
   has an outstanding request for (whoever delivers it) is processed only if
@@ -1023,16 +1085,23 @@ Bitcoin Core's defences, adapted (`ingress::unrequested_block_admission`):
   block by block). A deep-fork block is cheap below the activation, so a
   public RPC should run with `--rpc-require-auth-for-writes`.
 
-What remains: with the mainnet minimum at 0, a node that is behind but not
-below the minimum is protected only by the rules relative to its tip, so a
-block A as above and its cheap children (each costing one evaluation) are
-processed — at most at the rate the attacker evaluates proofs, and within
-the per-peer and per-network-group proof-of-work budgets below; raising the
-minimum at each release closes this for every node that has not reached it.
-Blocks this node requested (IBD pulls answered by an attacker's header list)
-are not checked against the minimum: that needs a header chain with proofs
-(Core's headers presync), which the sync protocol (`/gnb/sync/1`
-`Headers`: ids and claimed scores only) does not carry.
+What remains: a node that is behind but above the minimum is protected
+only by the rules relative to its tip, so a block A as above and its cheap
+children (each costing one evaluation) are processed — at most at the rate
+the attacker evaluates proofs, and within the per-peer and per-network-group
+proof-of-work budgets below; raising the minimum at each release closes
+this for every node that has not reached it. Blocks this node requested
+(IBD pulls answered by an attacker's header list) are not checked against
+the minimum: that needs a header chain with proofs (Core's headers
+presync), which the sync protocol (`/gnb/sync/1` `Headers`: ids and claimed
+scores only) does not carry. Such a chain can become the selected tip of an
+eclipsed node below the minimum, but not its chain of record (above): it is
+neither mined on nor advertised, and the node stays in initial block
+download, so it moves to the real chain when that chain's blocks arrive
+(the heavier chain wins at any depth), unless a PoWit finalized checkpoint
+of the cheap chain pins its fork choice: a chain past the PoWit height can
+carry one, and the pin does not read the minimum chain work here
+(docs/DESIGN-pow-powit.md, "Node finality").
 
 ### Gossip penalties and proof-of-work budgets (node-local policy, not consensus)
 
@@ -1624,11 +1693,12 @@ detected malleation):
   `script_pubkey` (the key lives in the `script_sig`), a signature that does
   not verify (sighash v2: below the activation every transaction version is
   verified with it, under the lenient witness framing), a policy-spend rule
-  (`blockval::check_policy_spends`: the policy witness's framing, a
+  (`blockval::check_policy_spends`: the policy witness's framing, the
+  revealed policy's (or branch's) hash against the 33-byte policy output, a
   policy-tree branch before `powit_height()`, the revealed policy's
   absolute or relative timelock; the policy, its branch and so its
-  timelocks are revealed by the `script_sig`, whose hash match with the
-  33-byte policy output is checked with the scripts), and the size-based
+  timelocks are revealed by the `script_sig`; the hash is checked FIRST,
+  before any field of the revealed policy is read, audit F1), and the size-based
   consensus minimum fee (measured on the wire size, `script_sig` included)
   when the fee reaches the floor below. Size limits measured with witnesses
   are context-free and checked before a block is stored, so they never
@@ -1660,7 +1730,8 @@ of every transaction in block order (same-block coinbase spend and maturity,
 once every prevout is found this chain's context-free rules, inputs,
 version rule, values, the fee floor, prevout output kinds), then the
 coinbase value; then the witness checks of every transaction in block
-order (the policy-spend rules, the scripts, then the size-based minimum
+order (the policy-spend rules, the revealed policy checked against the
+spent output before its timelocks, the scripts, then the size-based minimum
 fee). A block with a bad
 signature in one transaction and an overspend in a later one is therefore
 id-committed. The verdict is the one of any order (every rule must hold);
@@ -1678,15 +1749,35 @@ block-validity rules and never reach this classification.
 
 A failure to READ the node's own UTXO view while a block is validated (an
 I/O error, a corrupted or undecodable row, a coin row without its index
-row, a confirmed policy coin without its tx-index row when a relative
-timelock needs its confirmation) is neither: it is no verdict at all, at
-every height (re-audit B1-T12). The connect is abandoned before anything is written, nothing is
-marked or persisted, the triggering block is rolled back out of the DAG,
-and the block is validated again when it is next received or the node
-restarts. A coinbase-height row that cannot be read is never taken for "not
-a coinbase" (which skipped the maturity rule). Bitcoin Core draws the same
-line: a coins-database read error aborts the node
+row, a policy coin with neither a tx-index row nor a genesis-ledger row when
+the relative timelock of the policy it commits to needs its confirmation)
+is neither: it is no verdict at all, at every height (re-audit B1-T12). No
+block can cause one: every coin a transaction creates is written with its
+tx-index row in one batch, a genesis-ledger coin is confirmed at the genesis
+("Genesis ledger"), and only the policy the coin commits to is read (audit
+F1: a made-up policy with `older != 0` spending a vesting tranche used to
+ask for a confirmation that did not exist, so any block carrying that free
+transaction could not be judged). The connect is abandoned before anything
+of it is written, nothing is marked or persisted, the triggering block is
+rolled back out of the DAG, and the block is validated again when it is next
+received or the node restarts. A coinbase-height row that cannot be read is
+never taken for "not a coinbase" (which skipped the maturity rule). Bitcoin
+Core draws the same line: a coins-database read error aborts the node
 (`CCoinsViewErrorCatcher`), it is never cached as an invalid block.
+
+A no-verdict is never a silent permanent stall (node-local, audit F1). A
+chain move commits in chunks (rollbacks first); when it has committed its
+rollback chunks and then cannot judge a block of the first apply chunk, the
+disconnected blocks are applied again (`accept::restore_applied_tip`), so
+the applied tip stays the best valid block it was instead of an ancestor of
+both branches. A block whose validation ends without a verdict
+`accept::NO_VERDICT_ABORT_AFTER` (3) times in a row, with no validation of
+it reaching a verdict in between, stops the node like Core's `AbortNode`:
+acceptance and templates refuse at once, the `gnb` process exits with an
+operator message naming the block, and a restart that meets the same
+failure refuses to start (start-up reconciliation fails), still on the
+restored tip. Nothing is marked, so a failure that clears (a repaired disk
+or index) leaves no trace.
 
 An id-committed failure disqualifies the block and its selected-chain
 descendants and is persisted (`invalid_block/<id>`), as before. A
@@ -1829,9 +1920,13 @@ counts, and the same measure decides it (`accept::MaturityRule`,
 header height the transaction index records for the spent output's
 transaction (this chain's rule, kept exactly); from the activation
 `dag_height(B)` minus the DAG height of the block the transaction index
-names for it. An output created earlier in B itself has 0 confirmations in
-both regimes; an output of an unconfirmed transaction has none (a relative
-timelock on it is not met). The connect path, mempool admission and the
+names for it. A genesis-ledger output is confirmed at the genesis (header
+and DAG height 0, "Genesis ledger"). An output created earlier in B itself
+has 0 confirmations in both regimes; an output of an unconfirmed transaction
+has none (a relative timelock on it is not met). The timelocks read are
+those of the policy the spent output commits to: the revealed policy (or
+branch) must hash to the output before any of its fields is read (audit
+F1). The connect path, mempool admission and the
 template self-check use it (`admission::confirmations_for_next_block` for
 a block not yet built). Absolute heights are not depths: the locktime
 finality rule (`locktime <= B.height`) and a policy's absolute timelock

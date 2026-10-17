@@ -1,0 +1,103 @@
+{
+  "base": "35ccd62",
+  "production_revision": "326e292",
+  "test_first_commits": [
+    "b2fb43b",
+    "f925d0d",
+    "09dc947"
+  ],
+  "env": {
+    "CARGO_TARGET_DIR": "/private/tmp/gnb-r5-target-descriptor-core",
+    "CARGO_PROFILE_DEV_CODEGEN_UNITS": "139",
+    "CARGO_PROFILE_TEST_CODEGEN_UNITS": "139",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_BUILD_JOBS": "2"
+  },
+  "logs": [
+    {
+      "path": "/private/tmp/gnb-r5-descriptor-core-evidence/baseline.log",
+      "sha256": "15bedc072dfa2f0369c5a47e1abe35106e62c97c8c41b7577121caeba698dfb0",
+      "exit": 101,
+      "note": "Incorrect legacy fixture; not credited",
+      "summaries": [
+        "test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "path": "/private/tmp/gnb-r5-descriptor-core-evidence/baseline-corrected.log",
+      "sha256": "c6d13ba8e155d8961e6e0432abe705170fa075261b768d2ef105e8a3f3703ec6",
+      "exit": 101,
+      "note": "Legacy control passes; key shape later corrected; not credited as valid-key test",
+      "summaries": [
+        "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "path": "/private/tmp/gnb-r5-descriptor-core-evidence/implemented-host.log",
+      "sha256": "49d2fafa9e08898673d5442606f94cb54f1608ddb8e3cdce03a6141e2d0b67c9",
+      "exit": 101,
+      "note": "First draft exposes wrong synthetic key fixture; retained",
+      "summaries": [
+        "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "path": "/private/tmp/gnb-r5-descriptor-core-evidence/baseline-valid-key.log",
+      "sha256": "bcb5e4da16c6639f7399c23cc75ee574506f9d047f05c52c96e8a47e182ae655",
+      "exit": 101,
+      "note": "Credited original-production run at tests-only09dc947:1pass2fail",
+      "summaries": [
+        "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "path": "/private/tmp/gnb-r5-descriptor-core-evidence/focused-crypto.log",
+      "sha256": "9649f6edc434c5c05edb7f70abd9045516eabf36b8542b5348323689b4086e61",
+      "exit": 0,
+      "note": "11 focused crypto tests plus2 explicit oracle tests",
+      "summaries": [
+        "test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.66s",
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+      ]
+    },
+    {
+      "path": "/private/tmp/gnb-r5-descriptor-core-evidence/oracle-build.log",
+      "sha256": "2808957017b4a9683e3e4532f6fe2d39a7de990a3ead1cee558d90a4ef3186c2",
+      "exit": 0,
+      "note": "Prebuilt independent differential oracle",
+      "summaries": []
+    },
+    {
+      "path": "/private/tmp/gnb-r5-descriptor-core-evidence/final-host.log",
+      "sha256": "97881e8d232a78bdecc9f277ce861aaf9a4b09da7dc97bdfc0f56340acab47d9",
+      "exit": 0,
+      "note": "4 host dispatcher tests",
+      "summaries": [
+        "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s"
+      ]
+    }
+  ],
+  "source_hashes": {
+    "crates/gnb-crypto/src/wallet/descriptor.rs": "2dda2ed111b8fcbbfd1a653b629db3707864392c685c76c3f26cac1f7fae18e3",
+    "crates/gnb-crypto/src/wallet/mod.rs": "bbd8b7ec2a5e3e3de572ed21971ad001c59779874a541e1a8d0f7c7ef23c0bdd",
+    "crates/gnb-wallet-wasm/src/lib.rs": "dd759ae4cd2909bd48913934f5f878cce7edef7f37055983f0ce4ee576a4b0cd",
+    "crates/gnb-crypto/examples/descriptor_oracle.rs": "99a1748736554b61ca5c79c9d918556b9ad2d212c05d0f2f044eb3e57553a964",
+    "crates/gnb-crypto/tests/public_descriptors.rs": "24bddd287140e57f5dbedf66ee8352221a35c0dff2305dfa3aa6a0b4d1467afa",
+    "crates/gnb-wallet-wasm/tests/public_descriptors.rs": "4631d4dadee315360fe1f39812f27abc1ba4bb80b994ad4be593b5f400290a93"
+  },
+  "reversal_manifest": "core-reversals.json",
+  "reversal_pairs": 7,
+  "full_crypto_run": "Not run by core package; delegated to root integration in a separate invocation",
+  "actual_wasm": "Not built by core package; root owns rebuild/pins and actual browser tests",
+  "independent_differential": {
+    "reference_evidence_commit": "9724599",
+    "requests": 490,
+    "accepted": 122,
+    "rejected": 368,
+    "divergences": 0,
+    "oracle_sha256": "aca9de614c159e7ccd7b63891f5e27cfb68b0c36ce8d1c395b3a0ff6e838b49a",
+    "log_sha256": "9196f9f1195374741e4c72e5e04bf617494f76c0b27612889be4ac1288594bff"
+  }
+}

@@ -216,6 +216,204 @@ fn pow3_ibd_node_refuses_the_unrequested_cheap_chain() {
     assert!(matches!(gossip(&mut core0, &y, &a), BlockOutcome::Processed { result: Ok(_), .. }));
 }
 
+/// POW-3 (verifier finding): blocks this node requested skip the
+/// unrequested-block rule, as in Bitcoin Core, so a fresh node (mainnet's
+/// minimum chain work, the default here) whose pulls an eclipsing peer
+/// answers with a cheap chain processes that chain and selects it: it is the
+/// only chain the node holds (no headers-first sync tells it the chain's
+/// work in advance, as Core's headers presync does). Before the fix that
+/// tip was the node's chain of record: GetTips advertised it to peers,
+/// GetHeaders served it and a block template was built on it (the
+/// `getblocktemplate` RPC, and the internal miner once its sync-stall
+/// release fired). Now, while the tip is below the minimum, the node
+/// advertises no frontier or headers and refuses templates, as Core does in
+/// initial block download; GetBlock still serves the bodies it stores. The
+/// PoWit finalized checkpoint is gated by the minimum separately (the
+/// fix/powit-dos change, `ingress::minimum_chain_work`). Once the tip
+/// reaches the minimum all of it applies again.
+#[test]
+fn pow3_a_pulled_chain_below_the_minimum_is_not_the_chain_of_record() {
+    use gnb::network::{serve::serve_sync_request, sync_rr::{SyncRequest, SyncResponse}};
+    let genesis = mk_genesis(unix_now() - 500_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let x = node_on(&genesis, &[]);
+    let min = ingress::minimum_chain_work();
+    assert_eq!(min, core::MIN_CHAIN_WORK, "mainnet's release value is the default");
+    let mut core = BlockIngress::new();
+    assert_eq!(core.minimum_chain_work(), min);
+    let cheap = b.chain(gh, 30, "eclipse");
+    // Unrequested, the cheap chain is refused; requested, it is processed.
+    assert!(matches!(gossip(&mut core, &x, &cheap[0]), BlockOutcome::Dropped(DropReason::BelowMinimumChainWork)));
+    for blk in &cheap {
+        assert!(matches!(pulled(&mut core, &x, blk), BlockOutcome::Processed { result: Ok(_), .. }));
+    }
+    let tip = cheap.last().unwrap().block_hash();
+    assert_eq!(sel_tip(&x), Some(tip), "the only chain the node holds");
+    assert!(core.in_initial_download(&x.dag.read()));
+    let tips = |min| match serve_sync_request(&x.dag, &x.store, &SyncRequest::GetTips, min) {
+        SyncResponse::Tips { tips, .. } => tips.into_iter().map(|t| t.hash).collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    let headers = |min| match serve_sync_request(&x.dag, &x.store, &SyncRequest::GetHeaders { from_blue_score: 0, limit: 500 }, min) {
+        SyncResponse::Headers { entries } => entries.len(),
+        other => panic!("{other:?}"),
+    };
+    // Not advertised, no headers, no template.
+    assert!(tips(min).is_empty(), "no frontier advertised below the minimum");
+    assert_eq!(headers(min), 0, "no headers served below the minimum");
+    let refusal = ingress::ibd_template_refusal(&x.dag.read(), min).expect("no template below the minimum");
+    assert!(refusal.contains("initial block download"), "{refusal}");
+    // The bodies it stores are still served (Core serves blocks in IBD).
+    assert!(matches!(serve_sync_request(&x.dag, &x.store, &SyncRequest::GetBlock { block_hash: tip }, min),
+        SyncResponse::Block { .. }));
+    // At a minimum this chain reaches (`--minimumchainwork`, or testnet's
+    // 0), it is the chain of record: advertised, served, mined on.
+    let work = tip_work(&x);
+    for m in [0, work] {
+        assert_eq!(tips(m), vec![tip]);
+        assert_eq!(headers(m), 31, "genesis and 30 blocks");
+        assert_eq!(ingress::ibd_template_refusal(&x.dag.read(), m), None);
+    }
+    assert!(gnb::template::build_block_template(&x.dag, &x.store, &x.mempool, gnb::template::EXTERNAL_COINBASE_RESERVE)
+        .is_ok_and(|t| t.parents == vec![tip]), "the builder itself is ungated; its callers check");
+}
+
+/// POW-3 with mainnet's release value (`core::MIN_CHAIN_WORK`, the default
+/// of an ingress core in this mainnet-regime binary, no override): the
+/// challenger's flood (one block A on the victim's tip stamped "now", then
+/// its near-free children) against a node whose 100-block chain is far below
+/// the minimum. Everything unrequested is dropped before structure, proof
+/// or storage; a requested block is processed.
+#[test]
+fn pow3_mainnet_minimum_chain_work_keeps_a_low_work_node_in_ibd() {
+    let genesis = mk_genesis(unix_now() - 500_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let honest = b.chain(gh, 100, "h");
+    let x = node_on(&genesis, &honest);
+    let mut core = BlockIngress::new();
+    assert_eq!(core.minimum_chain_work(), core::MIN_CHAIN_WORK);
+    assert_eq!(core::MIN_CHAIN_WORK, 7_000_000);
+    assert!(core.in_initial_download(&x.dag.read()), "tip work {} is below the minimum", tip_work(&x));
+    let before = x.dag.read().block_count();
+    let tip = honest.last().unwrap().block_hash();
+    let a = b.empty_at(vec![tip], "attacker-a", Some(unix_now()), true);
+    assert!(matches!(gossip(&mut core, &x, &a), BlockOutcome::Dropped(DropReason::BelowMinimumChainWork)));
+    for i in 0..20 {
+        let c = b.unmarked(vec![a.block_hash()], &format!("cheap{i}"), Some(unix_now()));
+        assert!(matches!(gossip(&mut core, &x, &c), BlockOutcome::Dropped(DropReason::BelowMinimumChainWork)));
+    }
+    assert_eq!(x.dag.read().block_count(), before, "nothing stored");
+    assert!(core.orphans.is_empty(), "nothing buffered");
+    assert!(matches!(pulled(&mut core, &x, &a), BlockOutcome::Processed { result: Ok(_), .. }),
+        "the node syncs by its own pulls");
+    assert!(core.in_initial_download(&x.dag.read()));
+}
+
+/// POW-3: a chain that reaches mainnet's minimum chain work takes the node
+/// out of initial block download. Real ASERT targets (`scoped_real_expected_bits`),
+/// genesis at the real `GENESIS_TIMESTAMP`, one second per block: the chain
+/// runs ahead of the schedule, so each block's work grows from the genesis
+/// target's 4,500 (doubling every ~248 blocks) and some 600 blocks carry
+/// 7,000,000. Below the minimum an unrequested block is refused and the
+/// same block requested is processed; the block whose own chain reaches the
+/// minimum is processed even unrequested (Core: its chain work is at least
+/// `nMinimumChainWork`); from there the node is out of initial block
+/// download: unrequested blocks near the tip are processed, its frontier is
+/// served, templates are built, while a cheap fork from genesis is still
+/// refused unrequested.
+#[test]
+fn pow3_a_chain_that_reaches_the_mainnet_minimum_leaves_ibd() {
+    use gnb::network::{serve::serve_sync_request, sync_rr::{SyncRequest, SyncResponse}};
+    let _real = core::scoped_real_expected_bits();
+    let genesis = mk_genesis(core::GENESIS_TIMESTAMP);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let x = node_on(&genesis, &[]);
+    let min = core::MIN_CHAIN_WORK;
+    let mut core = BlockIngress::new();
+    assert_eq!(core.minimum_chain_work(), min);
+    let (mut p, mut n) = (gh, 0usize);
+    loop {
+        let blk = b.empty(vec![p], &format!("m{n}"));
+        n += 1;
+        assert!(n < 800, "the minimum is reached within ~600 blocks");
+        let lb = ingress::block_work_lower_bound(&x.dag.read(), &blk.header.parents, blk.header.bits, blk.height)
+            .expect("parent known");
+        assert!(core.in_initial_download(&x.dag.read()));
+        if lb >= min {
+            match gossip(&mut core, &x, &blk) {
+                BlockOutcome::Processed { result: Ok(_), .. } => break,
+                other => panic!("the block reaching the minimum is processed unrequested: {other:?}"),
+            }
+        }
+        assert!(matches!(gossip(&mut core, &x, &blk), BlockOutcome::Dropped(DropReason::BelowMinimumChainWork)));
+        assert!(ingress::ibd_template_refusal(&x.dag.read(), min).is_some());
+        assert!(matches!(pulled(&mut core, &x, &blk), BlockOutcome::Processed { result: Ok(_), .. }));
+        p = blk.block_hash();
+    }
+    assert!((550..=650).contains(&n), "{n} blocks to 7,000,000 one second apart from genesis");
+    let tip = sel_tip(&x).unwrap();
+    assert!(tip_work(&x) >= min);
+    assert!(!core.in_initial_download(&x.dag.read()), "out of initial block download");
+    assert_eq!(ingress::ibd_template_refusal(&x.dag.read(), min), None);
+    match serve_sync_request(&x.dag, &x.store, &SyncRequest::GetTips, min) {
+        SyncResponse::Tips { tips, .. } => assert_eq!(tips.iter().map(|t| t.hash).collect::<Vec<_>>(), vec![tip]),
+        other => panic!("{other:?}"),
+    }
+    let next = b.empty(vec![tip], "after");
+    assert!(matches!(gossip(&mut core, &x, &next), BlockOutcome::Processed { result: Ok(_), .. }),
+        "an unrequested block extending the tip");
+    let cheap = b.empty(vec![gh], "cheap-fork");
+    assert!(matches!(gossip(&mut core, &x, &cheap), BlockOutcome::Dropped(DropReason::BelowMinimumChainWork)));
+}
+
+/// POW-3: the minimum chain work is node-local, not consensus. Two nodes,
+/// one with no minimum (main's release, testnet, `--minimumchainwork 0`)
+/// and one with mainnet's, fed the same blocks as answers to their own
+/// pulls (how a node in initial block download receives them): an honest
+/// chain, a heavier fork branching 30 blocks below its tip, a block with
+/// wrong bits. Both reach the same verdict on every block, the same
+/// selected tip, blue work and applied chain, and neither has a PoWit
+/// finalized checkpoint. The minimum changes only which UNREQUESTED blocks
+/// a node processes (here the gossiped next block).
+#[test]
+fn pow3_the_minimum_chain_work_changes_no_verdict_or_fork_choice() {
+    let genesis = mk_genesis(unix_now() - 50_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let honest = b.chain(gh, 40, "h");
+    let fork = b.chain(honest[9].block_hash(), 45, "f");
+    let mut bad = b.empty_at(vec![honest[20].block_hash()], "bad-bits", None, false);
+    bad.header.bits = core::GENESIS_BITS;
+    commit_block(&mut bad);
+    bad.test_only_assume_pow_valid();
+    let blocks: Vec<&Block> = honest.iter().chain(fork.iter()).chain(std::iter::once(&bad)).collect();
+    let run = |min: u128| {
+        let x = node_on(&genesis, &[]);
+        let mut core = BlockIngress::new().with_minimum_chain_work(min);
+        let verdicts: Vec<String> = blocks.iter().map(|blk| format!("{:?}", pulled(&mut core, &x, blk))).collect();
+        let tip = sel_tip(&x);
+        let work = tip_work(&x);
+        let finalized = x.dag.read().finalized();
+        let applied = x.store.get_meta("tip_hash").unwrap();
+        (x, core, verdicts, tip, work, finalized, applied)
+    };
+    let (x0, mut core0, v0, tip0, w0, f0, a0) = run(0);
+    let (xm, mut corem, vm, tipm, wm, fm, am) = run(core::MIN_CHAIN_WORK);
+    assert_eq!(v0, vm, "same verdict on every block");
+    assert!(v0.last().unwrap().contains("Invalid") || v0.last().unwrap().contains("Err"), "{}", v0.last().unwrap());
+    assert_eq!(tip0, Some(fork.last().unwrap().block_hash()), "the heavier fork");
+    assert_eq!((tip0, w0, f0, a0.clone()), (tipm, wm, fm, am), "same fork choice and applied chain");
+    assert_eq!(f0, None);
+    assert!(a0.is_some());
+    // The difference: an unrequested block on the tip.
+    let gossip_next = b.empty(vec![fork.last().unwrap().block_hash()], "next");
+    assert!(matches!(gossip(&mut core0, &x0, &gossip_next), BlockOutcome::Processed { result: Ok(_), .. }));
+    assert!(matches!(gossip(&mut corem, &xm, &gossip_next), BlockOutcome::Dropped(DropReason::BelowMinimumChainWork)));
+}
+
 /// POW-3: a block this node has an outstanding request for counts as
 /// requested whoever delivers it (Core's `IsBlockRequested`): the parent of a
 /// buffered orphan, delivered by gossip, is processed in IBD.
@@ -927,6 +1125,69 @@ fn b1t19_gate_is_priced_in_bytes_hashed() {
     let ten_inputs = Transaction { inputs: vec![txs[0].inputs[0].clone(); 10], ..txs[0].clone() };
     assert_eq!(relay::signature_gate_cost(&ten_inputs, wire, next, act),
         10 + (10 * wire).div_ceil(relay::SIG_BUDGET_BYTES_PER_TOKEN), "v2: inputs x size");
+}
+
+/// Audit F5: the gate charged one token per INPUT, but an input spending a
+/// policy output carries up to `MAX_POLICY_KEYS` (7) hybrid signatures, each
+/// verified: a 7-of-7 spend bought 7 verifications for the price of one.
+/// The gate now counts the policy witness's signatures (decoded, not
+/// verified). Frames of 1-input 7-of-7 spends, each with a matching policy
+/// and junk signatures, through the real relay: the burst buys
+/// `400 / (frame + 7 + bytes)` of them (pre-fix `400 / (frame + 1 + bytes)`).
+#[test]
+fn f5_gate_counts_every_policy_signature() {
+    use gnb::core::policy::{PolicyWitness, SpendPolicy, MAX_POLICY_KEYS};
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let keys: Vec<Vec<u8>> = (0..MAX_POLICY_KEYS).map(|_| key().pk).collect();
+    let m = MAX_POLICY_KEYS as u8;
+    let policy = SpendPolicy::new(m, keys, 0, 0).unwrap();
+    let funds: Vec<_> = (0..60u32).map(|i| {
+        let mut t = [0x91u8; 32];
+        t[..4].copy_from_slice(&i.to_le_bytes());
+        (t, 0u32, out(10_000_000_000, &policy.script_pubkey()))
+    }).collect();
+    let n = node_with(&genesis, &funds);
+    let witness = |sigs: u8| PolicyWitness {
+        policy: policy.clone(),
+        signatures: (0..sigs).map(|i| (i, vec![0x5A; 64])).collect(),
+    }.encode();
+    let txs: Vec<Transaction> = funds.iter().map(|f| Transaction {
+        version: 1,
+        inputs: vec![core::TxInput { prev_txid: f.0, prev_index: 0, script_sig: witness(m), sequence: u32::MAX }],
+        outputs: vec![out(9_000_000_000, &[0x12; 20])],
+        locktime: 0,
+    }).collect();
+    let next = admission::next_block_height(&n.dag.read());
+    let act = core::activation::hardening_activation_height();
+    let wire = txs[0].to_wire_bytes(true).len();
+    let bytes = wire.div_ceil(relay::SIG_BUDGET_BYTES_PER_TOKEN);
+    assert_eq!(relay::signature_gate_cost(&txs[0], wire, next, act), MAX_POLICY_KEYS + bytes);
+    assert_eq!(relay::input_signature_count(&witness(m)), MAX_POLICY_KEYS);
+    // A key-hash witness, or bytes that are no policy witness, count one.
+    let k = key();
+    let kh = signed_spend(&k, &[([1; 32], 0)], vec![out(1_000, &[2; 20])]);
+    assert_eq!(relay::input_signature_count(&kh.inputs[0].script_sig), 1);
+    assert_eq!(relay::input_signature_count(&[]), 1);
+    let two = Transaction { inputs: vec![txs[0].inputs[0].clone(), kh.inputs[0].clone()], ..txs[0].clone() };
+    assert_eq!(relay::signature_gate_cost(&two, wire, next, act), MAX_POLICY_KEYS + 1 + (2 * wire).div_ceil(relay::SIG_BUDGET_BYTES_PER_TOKEN));
+
+    let per_frame = relay::frame_cost(wire) + relay::signature_gate_cost(&txs[0], wire, next, act);
+    let mut relay = TxRelay::with_limits(400, 0.0, TxOrphanLimits::default()).with_node_budget(1_000_000, 0.0);
+    let peer = Some(libp2p::PeerId::random());
+    let mut verified = 0usize;
+    for tx in &txs {
+        let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &tx.txid(), &tx.to_wire_bytes(true), peer,
+            Instant::now(), unix_now());
+        assert_ne!(o.verdict, GossipVerdict::Accept, "{}", o.detail);
+        if o.invalid {
+            assert!(o.detail.contains("signature"), "{}", o.detail);
+            verified += 1;
+        } else {
+            assert!(o.detail.contains("budget"), "{}", o.detail);
+        }
+    }
+    assert_eq!(verified, 400 / per_frame, "{per_frame} tokens a frame");
+    assert!(verified < 400 / (relay::frame_cost(wire) + 1 + bytes), "fewer than when an input cost one token");
 }
 
 /// B1-T19: the per-connection budget alone let every inbound connection

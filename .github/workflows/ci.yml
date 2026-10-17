@@ -64,6 +64,18 @@ jobs:
       # `pow: full` proofs, ~2 s each).
       - name: Consensus tx/block vectors against the Python references
         run: python3 reference/check_consensus_vectors.py
+      - name: PQ-PSBT independent reference and reproducible differential corpus
+        run: |
+          python3 reference/pqpsbt_test.py
+          python3 reference/pqpsbt_vectors.py --check
+      - name: Address-v2 independent reference and reproducible vectors
+        run: |
+          python3 reference/address_v2_test.py -v
+          python3 reference/address_v2_vectors.py --check
+      - name: Public descriptor reference and reproducible vectors
+        run: |
+          python3 reference/descriptor_test.py -v
+          python3 reference/descriptor_vectors.py --check
 
   rust:
     runs-on: ubuntu-latest
@@ -142,6 +154,16 @@ jobs:
         run: cargo test -p gnb-smh --locked
       - name: gnb-crypto (real ASERT; test-pow-limit must be off)
         run: cargo test -p gnb-crypto --locked
+      - name: Address-v2 Rust versus independent Python reference
+        run: |
+          cargo test -p gnb-crypto --locked --example address_v2_oracle
+          cargo build -p gnb-crypto --locked --example address_v2_oracle
+          python3 reference/address_v2_differential.py target/debug/examples/address_v2_oracle
+      - name: Public descriptor Rust versus independent Python reference
+        run: |
+          cargo test -p gnb-crypto --locked --example descriptor_oracle
+          cargo build -p gnb-crypto --locked --example descriptor_oracle
+          python3 reference/descriptor_differential.py target/debug/examples/descriptor_oracle
       - name: The real-ASERT test ran and was not ignored
         run: |
           cargo test -p gnb-crypto --locked --lib expected_bits_at_schedule_is_genesis_bits 2>&1 \
@@ -173,6 +195,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Functional harness unit tests (no node build required)
+        run: python3 -m unittest discover -s test/functional/unit -v
       - uses: actions/cache@v4
         with:
           path: |
@@ -184,7 +208,7 @@ jobs:
         run: cargo build -p gnb --features test-pow-limit --bin gnb --bin gnb-cli --locked
       - name: Functional tests
         run: >
-          python3 test/functional/test_runner.py --no-build --jobs 2 --timeout 300
+          python3 test/functional/test_runner.py --ci --no-build --jobs 2 --timeout 300
           --tmpdir "$RUNNER_TEMP/functional" --cachedir "$RUNNER_TEMP/functional-cache" --keep-failed
       - name: Node logs of failed tests
         if: failure()
@@ -237,11 +261,35 @@ jobs:
           mkdir -p "$RUNNER_TEMP/wasi-sdk"
           tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP/wasi-sdk" --strip-components=1
       - name: Rebuild the wallet core and compare with the pin
+        id: wallet-rebuild
         run: |
           pinned=$(sed -n 's/^const WASM_SHA256 = "\([0-9a-f]*\)";/\1/p' site/wallet/app.js)
           committed=$(sha256sum site/wallet/gnb_wallet.wasm | cut -d' ' -f1)
           WASI_SDK="$RUNNER_TEMP/wasi-sdk" sh scripts/build-wallet-wasm.sh
           rebuilt=$(sha256sum site/wallet/gnb_wallet.wasm | cut -d' ' -f1)
+          # Keep the successful canonical Linux build reviewable even if its
+          # new hash needs an explicit maintainer repin. The comparison below
+          # still fails: uploading an artifact never turns a mismatch green.
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, platform, shutil, subprocess
+          digest = lambda p: hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+          out = pathlib.Path(os.environ["RUNNER_TEMP"]) / "wallet-build"
+          out.mkdir()
+          shutil.copyfile("site/wallet/gnb_wallet.wasm", out / "gnb_wallet.wasm")
+          manifest = {
+              "schema": 1, "revision": os.environ["GITHUB_SHA"],
+              "host": platform.system() + "-" + platform.machine(),
+              "target": "wasm32-wasip1",
+              "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
+              "wasi_sdk_version": os.environ["WASI_SDK_VERSION"],
+              "wasi_sdk_archive_sha256": os.environ["WASI_SDK_SHA256"],
+              "cargo_lock_sha256": digest("Cargo.lock"),
+              "build_script_sha256": digest("scripts/build-wallet-wasm.sh"),
+              "wasm_sha256": digest(out / "gnb_wallet.wasm"),
+          }
+          (out / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+          PY
+          echo "artifact_ready=true" >> "$GITHUB_OUTPUT"
           echo "pinned    $pinned"
           echo "committed $committed"
           echo "rebuilt   $rebuilt"
@@ -250,6 +298,14 @@ jobs:
           test "$rebuilt" = "$pinned"
           # The script re-pins and refreshes the SRI hashes: nothing may change.
           git diff --exit-code -- site/
+      - name: Preserve rebuilt wallet and source manifest
+        if: ${{ always() && steps.wallet-rebuild.outputs.artifact_ready == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wallet-wasm-${{ github.sha }}
+          path: ${{ runner.temp }}/wallet-build/
+          if-no-files-found: error
+          retention-days: 14
 
   # The site's JavaScript tests (site/tests, Node's built-in runner, no npm
   # dependencies): the committed wallet core loaded as the page loads it
@@ -282,6 +338,10 @@ jobs:
         run: python3 deploy/test_deploy_files.py -v
       - name: explorer API unit tests
         run: python3 deploy/explorer-api/test_gnb_explorer_api.py -v
+      - name: Address-v2 explorer aliases and carryover identity
+        run: python3 deploy/explorer-api/test_address_v2.py -v
+      - name: release tool unit tests (minimum chain work)
+        run: python3 tools/release/test_min_chain_work.py -v
 
   clippy:
     runs-on: ubuntu-latest

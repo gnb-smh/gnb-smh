@@ -1,0 +1,30 @@
+{
+  "source_commit": "8cdb075d4dabb4f478a2f7624eb2b5f316baadab",
+  "baseline": "f06b7f8dc05af107fd16f2cebdd89d62a360662a",
+  "codegen_units": 53,
+  "sources": {
+    "crates/gnb-crypto/src/wallet/pqpsbt.rs": "9c02cb50c0b06ffb2de703dbb6905ff6aab259f2f99a88f3b6bf96a11859b00f",
+    "crates/gnb-crypto/src/wallet/policy_spend.rs": "12e23c5bab2b26261e875fb6ffbfc6f54eecf1921af7f3ae00cdc26aa49a2bf5",
+    "crates/gnb-crypto/src/wallet/mod.rs": "15d26bb940ed612af8f25c764667189895e3586db7004100e9965a4ea64552e7",
+    "crates/gnb-crypto/src/crypto/mod.rs": "4a9d6274f18f967a69814be93cbd15f40526c7899ca2b746e3e3ebc634b42b12",
+    "crates/gnb-crypto/tests/pqpsbt_vectors.rs": "bc16bd6912f11d9ac9b5c496cb6ccf213ca36886a74180ddfda6cdc441599e16",
+    "crates/gnb-wallet-wasm/src/lib.rs": "0483c533728037c28d39288c59e7c5782afde67f26d7f41fda8daed4ca34704a"
+  },
+  "reversal_driver_sha256": "27e6f9be2d2260223ead313146b5fc8e68c6a6175c9cbf247ecfd04c1879cb7e",
+  "reversal_manifest_sha256": "1792ac3264cb9f562cdca92ff2e7d9a15b3d212e853baf4eb837951e2801c197",
+  "miri_driver_sha256": "ce7a4b88b9b7e49953468c2cc167e4c51cfa54c02668d979e3cb9241d40219e4",
+  "miri_manifest_sha256": "37769494cb1189bff3189354e3826377f2e5603ebe892a3bb4757fd6687112b3",
+  "reversal_logs": {
+    "reversal-candidate-size.log": "d9bb04c8b574d52e9af0093f8d65c22beacf22b1c8bf61996ade24c858dd13bf",
+    "reversal-fee-ceiling.log": "069a444af40ded8a5a7d443ab369c92495b31b74117c42f2734f33a452a0d443",
+    "reversal-fee-floor.log": "68a57bb6cb5c303fd09e158084a3eeacb7b8c3e2248c7fef28f25195bbcd6a6f",
+    "reversal-final-fee.log": "0dd45f71881c4e532a9479b57d30b2aa0bfe0495939277b708ced2548f0b8f74",
+    "reversal-json-cap.log": "1a1307f147db676ad3bfd8023d73bcddf954af91dd8d723388bd974b955c8086",
+    "reversal-money-range.log": "f0e4b39a6f5245d19b5e41cba8a18725d257f68aa85cdece6e37f3c4f643fc7a",
+    "reversal-policy-shape.log": "f148c9fe57c87efe53e825aace8f1d36b44ab637bcc2a651eb420345cfd5b6fa",
+    "reversal-request-fields.log": "6dcefd9e37368449f140736a99d8bad534020d84be37dbc125eff89d21eda1e5",
+    "reversal-verification-budget.log": "d62412511ea0b051c0a7beae2a84640828e2b1fa3b6ef8dee5920d6bb27ad404",
+    "reversal-wasm-public.log": "2fd7384d855bbc69fd796f558bcca883f7e04a11e417ab9cacf566c5f0e57b99",
+    "reversal-wasm-session-network.log": "67f0efded64ed84d8dbef2d13909d2ecf8910018a6402b3f1310e1184058bf5e"
+  }
+}

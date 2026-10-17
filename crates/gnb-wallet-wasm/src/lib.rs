@@ -156,7 +156,11 @@ fn serialize_exact(v: &Value) -> Box<[u8]> {
 /// returned buffer is the only copy left; the page frees it through
 /// `gnb_free`, which wipes it.
 pub fn call_bytes(input: &[u8]) -> Box<[u8]> {
-    let mut req = serde_json::from_slice::<Value>(input);
+    let mut req = if gnb_crypto::wallet::descriptor::mentions_descriptor_operation(input) {
+        gnb_crypto::wallet::descriptor::request_from_json(input)
+    } else {
+        serde_json::from_slice::<Value>(input).map_err(|e| e.to_string())
+    };
     let mut out = match &mut req {
         Ok(req) => match dispatch_wiping(req) {
             Ok(v) => json!({ "ok": v }),
@@ -194,6 +198,20 @@ fn observe_wiped(req: Option<&Value>, out: &Value) {
 /// Dispatch one request. Pure Rust, testable on the host.
 pub fn handle(req: &Value) -> Result<Value, String> {
     match s(req, "op")? {
+        "descriptor" => gnb_crypto::wallet::descriptor::public_request(req),
+        "pqpsbt" => gnb_crypto::wallet::pqpsbt::public_request(req),
+        "pqpsbt_sign" => {
+            use gnb_crypto::wallet::pqpsbt::{self, PqPsbt};
+            pqpsbt::check_request_fields(req, &["op", "hex", "network", "next_height", "max_fee"])?;
+            let context = pqpsbt::context_from_request(req)?;
+            let mut document = PqPsbt::from_bytes(&pqpsbt::decode_hex(s(req, "hex")?, pqpsbt::MAX_BYTES)?)?;
+            let review = document.review(&context)?;
+            let key_index = with_session(|kp| {
+                Address::parse_for_network(&kp.address, context.network).map_err(|e| e.to_string())?;
+                document.sign(&context, &kp.public_key, |digest, version| kp.sign_tx_digest(digest, version))
+            })?;
+            Ok(json!({"hex": hex::encode(document.to_bytes()?), "key_index": key_index, "review": review.to_json()}))
+        }
         "open" => {
             let kp = open_keypair(req)?;
             let out = json!({ "address": kp.address, "public_key": hex::encode(&kp.public_key) });
@@ -201,7 +219,10 @@ pub fn handle(req: &Value) -> Result<Value, String> {
             Ok(out)
         }
         "create" => {
-            let with_phrase = req.get("mnemonic").and_then(Value::as_bool).unwrap_or(true);
+            // `testnet: true` makes a random testnet key (no phrase: the
+            // phrase derivation is mainnet).
+            let testnet = req.get("testnet").and_then(Value::as_bool).unwrap_or(false);
+            let with_phrase = !testnet && req.get("mnemonic").and_then(Value::as_bool).unwrap_or(true);
             if with_phrase {
                 let (kp, phrase) = generate_mnemonic_keypair(Network::Mainnet).map_err(|e| e.to_string())?;
                 let words = Zeroizing::new(phrase.words().join(" "));
@@ -212,7 +233,7 @@ pub fn handle(req: &Value) -> Result<Value, String> {
                 set_session(kp);
                 Ok(out)
             } else {
-                let kp = generate_keypair(false);
+                let kp = generate_keypair(testnet);
                 let out = json!({ "address": kp.address, "public_key": hex::encode(&kp.public_key) });
                 set_session(kp);
                 Ok(out)
@@ -226,6 +247,28 @@ pub fn handle(req: &Value) -> Result<Value, String> {
             Ok(out)
         }
         "address" => with_session(|kp| Ok(json!({ "address": kp.address }))),
+        // Use the unlocked key on mainnet or testnet: the address prefix
+        // picks the chain id every signature commits to.
+        "setnetwork" => {
+            let testnet = req.get("testnet").and_then(Value::as_bool).ok_or("missing bool `testnet`")?;
+            let mut s = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+            let kp = s.as_mut().ok_or("wallet is locked")?;
+            kp.address = gnb_crypto::crypto::address_from_pubkey(&kp.public_key, testnet);
+            Ok(json!({ "address": kp.address }))
+        }
+        // Lock GNB in the Bloch bridge vault for an L2 (0x…) address: vault
+        // in output 0, the 20-byte destination marker in output 1, change
+        // last. Version and sighash follow `next_height` as for `pay`.
+        "bridgelock" => {
+            let next_height = parse_height(req)?;
+            let utxos = parse_spendable_utxos(req.get("utxos").ok_or("missing `utxos`")?, next_height)?;
+            let amount = parse_amount(req, "amount")?;
+            let fee = parse_amount(req, "fee")?;
+            let vault = hex::decode(s(req, "vault_script")?).map_err(|_| "vault_script must be hex")?;
+            let l2: [u8; 20] = hex::decode(s(req, "l2")?.trim().trim_start_matches("0x")).ok()
+                .and_then(|v| v.try_into().ok()).ok_or("L2 address must be 0x + 40 hex digits")?;
+            with_session(|kp| bridge_lock(kp, &utxos, &vault, amount, l2, fee, next_height))
+        }
         "export" => {
             let pw = secret(req, "password")?;
             with_session(|kp| kp.to_encrypted_json(&pw).map(|j| json!({ "keystore": j })))
@@ -282,9 +325,19 @@ pub fn handle(req: &Value) -> Result<Value, String> {
             *s = None;
             Ok(json!({ "locked": true }))
         }
-        "normalize" => Address::parse(s(req, "address")?.trim())
-            .map(|a| json!({ "address": a.to_string() }))
-            .map_err(|e| format!("invalid address: {e:?}")),
+        "normalize" => {
+            let address = Address::parse(s(req, "address")?.trim())
+                .map_err(|e| format!("invalid address: {e:?}"))?;
+            // Formatting is opt-in. Default output keeps existing wallet and
+            // carryover identities stable; BIP350 HRPs bind v2 to the network.
+            let formatted = match req.get("format") {
+                None => address.to_string(),
+                Some(Value::String(format)) if format == "legacy" => address.to_string(),
+                Some(Value::String(format)) if format == "bech32m" => address.to_bech32m(),
+                _ => return Err("unsupported address format; expected legacy or bech32m".into()),
+            };
+            Ok(json!({ "address": formatted }))
+        }
         "minfee" => {
             let size = req.get("size").and_then(Value::as_u64).ok_or("missing `size`")?;
             // CRY-8: `as usize` wrapped modulo 2^32 on wasm32 and quoted the
@@ -294,6 +347,41 @@ pub fn handle(req: &Value) -> Result<Value, String> {
         }
         other => Err(format!("unknown op `{other}`")),
     }
+}
+
+fn bridge_lock(kp: &Keypair, utxos: &[Utxo], vault: &[u8], amount: u64, l2: [u8; 20],
+               mut fee: u64, next_height: u64) -> Result<Value, String> {
+    if gnb_crypto::core::policy::output_kind(vault) != Some(gnb_crypto::core::policy::OutputKind::Policy) {
+        return Err("the vault must be a policy address".into());
+    }
+    let rows: Vec<(Vec<u8>, u32, TxOutput)> = utxos.iter()
+        .map(|u| (u.txid.to_vec(), u.index, u.output.clone()))
+        .collect();
+    let outputs = gnb_crypto::bridge::lock_outputs(vault, amount, l2);
+    // Falcon signatures vary in length: the fee only ever rises, to the
+    // largest minimum seen, so this settles within a few builds.
+    let mut tx = None;
+    for _ in 0..16 {
+        let built = TxBuilder::build_outputs(kp, &rows, outputs.clone(), fee, next_height)?;
+        let min = tokenomics::min_tx_fee_sat(built.to_wire_bytes(true).len());
+        if fee >= min {
+            tx = Some(built);
+            break;
+        }
+        fee = fee.max(min);
+    }
+    let tx = tx.ok_or("could not settle the fee")?;
+    // Never hand back something the signers would not recognise as a lock.
+    let lock = gnb_crypto::bridge::parse_lock(&tx.outputs, vault, 0)?;
+    let raw = tx.to_wire_bytes(true);
+    if raw.len() > gnb_crypto::wallet::payment::MAX_STANDARD_TX_BYTES {
+        return Err("this lock needs too many inputs; lock a smaller amount".into());
+    }
+    Ok(json!({
+        "raw": hex::encode(&raw), "txid": hex::encode(tx.txid()), "size": raw.len(), "fee": fee.to_string(),
+        "inputs": tx.inputs.len(), "amount": lock.amount.to_string(), "version": tx.version,
+        "l2_recipient": format!("0x{}", hex::encode(lock.l2_recipient)), "lock_vout": 0,
+    }))
 }
 
 /// The key of an `open` request (CRY-7): the page states the network it
@@ -447,6 +535,49 @@ mod tests {
 
     /// The session is process-global: tests that change it take this lock.
     static SESSION_TESTS: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn pqpsbt_public_decode_reaches_the_format_parser() {
+        let err = handle(&json!({"op": "pqpsbt", "action": "decode", "hex": ""})).unwrap_err();
+        assert!(err.contains("PQ-PSBT magic"), "missing public decoder: {err}");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "key generation, signing and verification run the PQClean ML-DSA-65 and Falcon-1024 C code, which Miri cannot execute")]
+    fn pqpsbt_wasm_roles_sign_in_session_and_reject_bad_context() {
+        use gnb_crypto::core::policy::SpendPolicy;
+        use gnb_crypto::wallet::{policy_spend::PolicySpend, pqpsbt::PqPsbt};
+        let _session = SESSION_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut keys = (0..3).map(|_| generate_keypair(false)).collect::<Vec<_>>();
+        let policy = SpendPolicy::new(2, keys.iter().map(|k| k.public_key.clone()).collect(), 0, 0).unwrap();
+        let mut spend = PolicySpend::new(Network::Mainnet, policy, &[([7;32],0,5_000_000)], vec![9;20], 1_000_000,0,0).unwrap();
+        spend.target_height(17_500).unwrap();
+        let document=PqPsbt::from_policy_spend(spend).unwrap();
+        let hex=hex::encode(document.to_bytes().unwrap());
+        let public=json!({"op":"pqpsbt","action":"decode","hex":hex});
+        let decoded=handle(&public).unwrap();
+        assert_eq!(handle(&json!({"op":"pqpsbt","action":"encode","json":decoded["json"]})).unwrap()["hex"],hex);
+        let sign=json!({"op":"pqpsbt_sign","hex":hex,"network":"mainnet","next_height":"17500","max_fee":"5000000"});
+        handle(&json!({"op":"wipe"})).unwrap();
+        assert!(handle(&sign).unwrap_err().contains("locked"));
+        set_session(keys.remove(0));
+        for (field,value) in [("max_fee","0"),("network","testnet"),("next_height","17499")] {
+            let mut bad=sign.clone(); bad[field]=value.into(); assert!(handle(&bad).is_err());
+        }
+        handle(&json!({"op":"setnetwork","testnet":true})).unwrap();
+        assert!(handle(&sign).is_err(),"session network must be independently checked");
+        handle(&json!({"op":"setnetwork","testnet":false})).unwrap();
+        let first=handle(&sign).unwrap();
+        assert_eq!(first["review"]["current_unspentness"],"not_checked_offline");
+        set_session(keys.remove(1));
+        let second=handle(&sign).unwrap();
+        let combined=handle(&json!({"op":"pqpsbt","action":"combine","hex":first["hex"],"other_hex":second["hex"]})).unwrap();
+        let finalized=handle(&json!({"op":"pqpsbt","action":"finalize","hex":combined["hex"],"network":"mainnet","next_height":"17500","max_fee":"5000000"})).unwrap();
+        let tx=Transaction::from_wire_bytes(&hex::decode(finalized["hex"].as_str().unwrap()).unwrap()).unwrap();
+        assert!(!tx.inputs[0].script_sig.is_empty());
+        assert_eq!(finalized["txid"],hex::encode(document.spend.tx.txid()));
+        handle(&json!({"op":"wipe"})).unwrap();
+    }
 
     // The session is process-global: keep every flow in one test.
     #[test]
@@ -744,4 +875,29 @@ mod tests {
         assert_eq!(req["words"], "");
         assert!(handle_owned(json!({"op": "minfee", "size": 10, "password": "x"})).is_ok());
     }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "bridgelock runs PQClean keygen and signing via unsupported C FFI")]
+    fn bridgelock_signs_the_version_of_the_target_height() {
+        let _session = SESSION_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let created = handle(&json!({"op": "create", "mnemonic": false})).unwrap();
+        let addr = created["address"].as_str().unwrap().to_string();
+        let spk = Address::parse(&addr).unwrap().hash().to_vec();
+        let keys = vec![gnb_crypto::crypto::generate_keypair().0];
+        let vault = gnb_crypto::core::policy::SpendPolicy::new(1, keys, 0, 0).unwrap().script_pubkey();
+        let act = gnb_crypto::core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
+        for (next, version) in [(act - 1, 1u32), (act, 3)] {
+            let utxos = json!([{"txid": "44".repeat(32), "index": 0, "value": "500000000", "script_pubkey": hex::encode(&spk)}]);
+            let r = handle(&json!({"op": "bridgelock", "utxos": utxos, "vault_script": hex::encode(&vault),
+                "amount": "100000000", "l2": format!("0x{}", "ab".repeat(20)), "fee": "0", "next_height": next})).unwrap();
+            assert_eq!(r["version"], version, "next_height {next}");
+            let tx = gnb_crypto::core::Transaction::from_wire_bytes(&hex::decode(r["raw"].as_str().unwrap()).unwrap()).unwrap();
+            assert_eq!(tx.outputs[0].script_pubkey, vault);
+            assert_eq!(r["l2_recipient"], format!("0x{}", "ab".repeat(20)));
+        }
+        assert!(handle(&json!({"op": "bridgelock", "utxos": [], "vault_script": hex::encode(&vault),
+            "amount": "1", "l2": "0x00", "fee": "0"})).unwrap_err().contains("next_height"));
+        handle(&json!({"op": "wipe"})).unwrap();
+    }
+
 }

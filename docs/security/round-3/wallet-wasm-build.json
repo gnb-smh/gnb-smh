@@ -1,0 +1,12 @@
+{
+  "build_script_sha256": "a6771395591a5aa9f69a82c7d6faf80e28a2ba3215ebc40994bbe5995ba24792",
+  "cargo_lock_sha256": "2edda7ed73536ed13a7ad22ec01aab6ee66b4de06ac9aad19cb43ec1c080a779",
+  "host": "Linux-x86_64",
+  "revision": "342e2f401415509cbb827a01ca0834b5c3b44351",
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "schema": 1,
+  "target": "wasm32-wasip1",
+  "wasi_sdk_archive_sha256": "52640dde13599bf127a95499e61d6d640256119456d1af8897ab6725bcf3d89c",
+  "wasi_sdk_version": "25",
+  "wasm_sha256": "4571dbc61ed91468fc8841f60af55fc0a9a49065d82ffb00391f44007075e3a7"
+}

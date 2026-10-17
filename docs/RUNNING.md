@@ -136,27 +136,72 @@ before it mines, so it never forks from genesis.
 
 ## Initial sync and minimum chain work
 
-`--minimumchainwork <hex>` (Bitcoin Core's option of the same name) sets the
-blue work, in hexadecimal (at most 32 digits, `0x` optional), below which
-the node treats itself as in initial block download: it does not mine and
-processes no block it did not request unless that block's chain reaches the
-value (docs/CONSENSUS.md, "Minimum chain work and unrequested blocks"). The
-default is the network's `ingress::*_MINIMUM_CHAIN_WORK`; mainnet's is
-`core::MIN_CHAIN_WORK`, the same constant that turns finality, the reorg
-depth cap and pruning on (`core::finality_active`). It is 0 on every network
-today. Set it to the blue work of a block you know is on the real chain (a
-trusted node's `getdaginfo` reports `tip_blue_work` in decimal; give it in
-hexadecimal) to protect a fresh sync; a value the network has not reached
-keeps the node syncing forever.
+A mainnet node has a minimum chain work (Bitcoin Core's `nMinimumChainWork`):
+the blue work, in the unit of `getdaginfo`'s `tip_blue_work`, below which
+the node is in initial block download. Mainnet's default is
+`core::MIN_CHAIN_WORK` = 7,000,000 (`0x6acfc0`), derived from the mainnet
+reading of 2026-10-14 (tip height 8,302, blue work 7,782,451;
+docs/MAINNET-READINESS.md §1); testnet's is 0. While the selected tip
+carries less, the node:
 
-Release step: before each mainnet release, set `core::MIN_CHAIN_WORK`
-(`crates/gnb-crypto/src/core/mod.rs`) to the blue work of a selected-chain
-block about a week (~20,160 blocks) below the tip at release time, read from
-several independent nodes and rounded down (Bitcoin Core sets
-`nMinimumChainWork` the same way; docs/MAINNET-READINESS.md §1 holds the
-latest reading and proposal), and confirm with a fresh sync from the seeds.
-Blue work is continuous across the GnB-SMH v1 -> v3 switch, so the value
-needs no adjustment for it.
+- processes no block it did not request unless that block's own chain
+  reaches the value (docs/CONSENSUS.md, "Minimum chain work and unrequested
+  blocks"), and refuses such blocks from `submitblock`;
+- does not mine, even when the sync stalls, and `getblocktemplate` answers
+  "in initial block download" (Bitcoin Core's miners get no template there
+  either); a witness node (`--witness-wallet`) neither attests checkpoints
+  nor mines shares;
+- advertises no frontier or headers to peers (GetTips / GetHeaders are
+  answered empty, as Core ignores `getheaders` in initial block download),
+  while still serving the blocks it stores: blocks it requested are
+  processed below the minimum, so its tip may be a cheap chain an eclipsing
+  peer fed it, and that chain is not passed on;
+- reports `syncing: true` (`getnetworkinfo`) and
+  `below_minimum_chain_work: true` (`getdaginfo`, next to
+  `minimum_chain_work`, both decimal).
+
+It logs at start-up when its chain is below the value, and warns every 30
+minutes while it stays below it ("has been below the minimum for N min ...
+restart it with a lower --minimumchainwork"). A fresh mainnet node reaches
+the value after about 7,400 blocks of the mainnet chain.
+
+`--minimumchainwork <hex>` (hexadecimal, at most 32 digits, `0x` optional)
+replaces the default: a higher value (the blue work of a block you know is
+on the real chain, e.g. a trusted node's `tip_blue_work` converted to hex)
+protects a fresh sync further; a lower one, `0` to turn it off, is for a
+node that must leave initial block download on a chain with less work,
+for example the only node of a network restarted from an empty data dir
+with no peer to sync from. The node warns at start-up when the value is below
+the default, as Core does. A value the network has not reached keeps the
+node in initial block download for good.
+
+The minimum is node-local policy, not consensus: no block's validity, no
+GhostDAG data and no fork choice among the blocks a node holds depend on
+it, so nodes with different values (an override, or a release before this
+one, which has none) reach the same verdicts on the same blocks.
+
+Release step (each mainnet release, as Bitcoin Core's release process sets
+`nMinimumChainWork`): read the value from at least two independent nodes
+(different operators and machines) that are in sync, with
+
+```sh
+python3 tools/release/min_chain_work.py \
+    --rpc http://127.0.0.1:17210 --rpc https://node2.example:17210
+```
+
+It reads, on each node, the selected-chain block 2,880 blocks (about a day)
+below the tip (`getselectedchain`, `getblockdag`), takes the LOWER reading,
+checks that its block is on every node's selected chain with the same blue
+work, rounds it down to two significant digits, refuses a value below the
+one the nodes already run, and prints the line for `core::MIN_CHAIN_WORK`
+(`crates/gnb-crypto/src/core/mod.rs`) and its `--minimumchainwork` hex form
+(`--depth 20160` takes a block a week deep; deeper is only lower). Update the
+reading in the constant's documentation, docs/MAINNET-READINESS.md §1 and
+the test `min_chain_work_cross_check`, then confirm that a node started on
+an empty data dir syncs from the seeds and leaves initial block download.
+Blue work is continuous across the GnB-SMH v1 -> v3 switch and the hardening
+activation (it only gains the merged blues), so the value needs no
+adjustment for either.
 
 Block proofs of work (GnB-SMH v1, 64 MiB, below the PoW + PoWit activation;
 v3, 4 MiB, from it) are evaluated on a bounded pool of threads (half the
@@ -179,6 +224,18 @@ pool (half the block pool, at least one thread) with their own per-peer and
 per-network-group budgets of failed verifications; an item whose id or
 encoding is wrong, or whose share proof or witness signature is invalid,
 counts against its sender like an invalid block.
+
+The PoWit pool that holds them is bounded and follows the selected tip on
+every node (not only witnesses): each tip change forgets shares out of the
+window, attestations no next block can include and proofs against barred
+keys. An attestation is held only by a member of its target's witness set,
+for a checkpoint slot at most one interval above the tip and not expired,
+from the tip's justified checkpoint; a key holds at most two (its newest
+targets). An equivocation proof is held and relayed only against a key in a
+recent witness set (checked before its signatures; a refused proof keeps its
+sender's verification-budget charge, as a forged one is free to make), at
+most 256 of them, one per key, and templates take the heaviest witnesses'
+proofs first. Full pools evict their worst entry for a better one.
 
 ## Peers and connections
 
@@ -497,9 +554,25 @@ the client named by `--rpc-proxy-client-header` (for `X-Forwarded-For` and
 without a parsable address there shares the proxy's own bucket). A request
 from any other address is limited in the bucket of that address, whatever
 its headers say, so a remote client cannot pick a fresh bucket per request.
-A caller that presents the API key is the operator and is not rate-limited
-(the pool polling `getblocktemplate` through the proxy must still get its
-`submitblock` through). Direct loopback callers without a forwarding header
+A caller that presents the API key through a proxy skips the separate
+read/write method buckets. Every remote or forwarded request first consumes
+a source token **before key verification and body parsing**, including
+malformed requests and requests with a correct key. This pre-authentication
+budget is the sum of the configured read and write rates (each at least one),
+**65 requests/minute by default**, with a burst of the same size and continuous
+refill. Once exhausted, it refuses **all** methods with HTTP 429, including a
+valid `submitblock`. Size `--rpc-rate-limit-reads` and `--rpc-rate-limit-writes`
+for the pool's combined polling/submission rate and leave headroom for found
+blocks. Template polling below this overall bound does not consume the
+write-method bucket. This is a deliberate availability tradeoff: checking a
+key cannot bypass the budget that bounds the work of checking keys.
+
+Named clients of a trusted proxy retain separate source budgets. Unnamed
+forwarded clients share the proxy address's budget. IPv4 and its IPv4-mapped
+IPv6 spelling share the same /32 budget; unrelated mapped IPv4 clients are
+independent. Native IPv6 sources share their /64 budget.
+
+Direct loopback callers without a forwarding header
 (the operator's `gnb-cli`, a co-located pool) keep the loopback exemption.
 The header is never trusted for authorization: it can only take trust away.
 
@@ -835,6 +908,24 @@ Policy addresses (multisig / timelocks: `gnb1m` mainnet, `gnb1n` testnet,
 checksum is `SHA3-256(SHA3-256(prefix ‖ hash))[..4]`, so the other network's
 prefix on the same hash fails to parse.
 
-Read-only RPC methods (`getbalance`, `getutxos`, `validateaddress`) accept
-either prefix for the same hash; `validateaddress` reports the prefix's
-network.
+Address RPCs now require the node's selected network, including read-only
+queries. A mainnet node rejects a valid testnet address, and conversely, before
+querying address storage. This is local RPC policy; it changes no transaction
+or block rule. The previous read-only behavior accepted either network prefix.
+
+`validateaddress` (`gnb-cli validateaddress ADDRESS`) and
+`validateaddressverbose` use the shared address parser for legacy GnB, legacy
+Bloch single-key aliases and optional v2 Bech32m addresses. `isvalid` / `valid`
+means valid **for this node's network**. They retain `network` as the recognized
+address network; `validateaddress.checksum` describes syntactic validation, so
+a valid address of the other network has `checksum: true`, `isvalid: false`
+and a `reason`. Successful results additionally return `canonical_address`
+(the existing legacy GnB string) and `bech32m` (the optional network-bound v2
+string). The `address` field continues to echo the supplied string. Conversion
+fields are absent on failure. Default address generation and persisted wallet
+strings are unchanged.
+
+Equivalent encodings query the same existing hash or full-script index; they
+do not create additional balances. `getutxos` accepts both single-key and
+policy addresses. The existing balance, holder and history APIs remain
+single-key only and reject policy addresses in either encoding.

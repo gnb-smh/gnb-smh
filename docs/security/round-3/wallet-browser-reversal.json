@@ -1,0 +1,16 @@
+{
+  "reversal_exit": 1,
+  "restored_exit": 0,
+  "test_sha256": "17b842fcf104daa292b9e61f4f661da64ae687ca001b084d57839223afe4d753",
+  "fixed_sha256": "02d746bada661e188a8846f1f1e45e468d2ccd880f9458f79811c9fd579c8e55",
+  "reverted_sha256": "01b60e5f2f0ef34dcd8153aba5bc15c2d3184b04a067106ecabd78321fca4a89",
+  "wasm_sha256": "4571dbc61ed91468fc8841f60af55fc0a9a49065d82ffb00391f44007075e3a7",
+  "source_restored_byte_exact": true,
+  "tests_unchanged": true,
+  "binary_build_revision": "342e2f401415509cbb827a01ca0834b5c3b44351",
+  "ci_build_run": 38931632695,
+  "logs": {
+    "reversal.log": "7db1df4dbd91d3d84f6aeeb1f1ba4c7a3e26981723b6113756afaa7693fef332",
+    "restored.log": "08caa9ba4ce9666c2dea91fa3a61c5cbf4417e7f471d1067ef6a5f1e3b639a1b"
+  }
+}

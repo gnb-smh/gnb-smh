@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
@@ -212,16 +213,255 @@ pub fn block_state(block: &Block, block_hash: &Hash, dag: &GhostDAG, store: &Sto
 }
 
 // ── Pools ────────────────────────────────────────────────────────────────────
+//
+// Every structure here is bounded, and what a gossiped item costs to check is
+// paid only after the cheap context checks pass (PoWit audit, findings 1, 5
+// and 7), as Bitcoin Core bounds what it keeps for peers (the orphan pool,
+// `DEFAULT_MAX_ORPHAN_TRANSACTIONS`, with eviction; the mempool, `-maxmempool`
+// and `TrimToSize`) and checks everything that costs nothing before scripts
+// and signatures (`PreChecks` before `CheckInputScripts`):
+//
+// - an equivocation proof or an attestation is considered only for a key in a
+//   recent witness set of this node's tip, checked BEFORE any signature (a
+//   proof costs an attacker two signatures once, then one SHA3 per re-rooted
+//   KES key: `attestation_message` does not bind the key);
+// - an attestation must target an open checkpoint slot (a slot, at most one
+//   interval above the tip, includable by the next block) from the tip's
+//   justified checkpoint; a key holds at most `ATTESTATIONS_PER_KEY` of them;
+// - a full pool evicts its worst entry for a better one, deterministically;
+// - templates take proofs against the heaviest witnesses first;
+// - the pool follows the selected tip on EVERY node: each use with a new tip
+//   first forgets what that tip made stale (`PowitPool::follow`), and main
+//   also refreshes it on every tip change, off the acceptance lock.
 
 const POOL_CAP: usize = 4_096;
+/// Equivocation proofs held, one per key.
+const EVIDENCE_CAP: usize = 256;
+/// A key's equivocation is held and relayed while the key is in the witness
+/// set of the next block's epoch or of one of this many epochs before it.
+const EVIDENCE_MEMBER_EPOCHS: u64 = 4;
+/// Pending attestations per key (an honest witness signs one link per
+/// checkpoint slot, all from the justified checkpoint): the newest targets.
+const ATTESTATIONS_PER_KEY: usize = 2;
+/// Links remembered per witness, and in total, to build equivocation proofs
+/// from gossip; the oldest go first.
+const SEEN_LINKS_PER_KEY: usize = 16;
+const SEEN_LINKS_CAP: usize = 2_048;
+
+/// `admit_evidence`'s refusal of a proof against a key outside the recent
+/// witness sets: this node's view, never a misbehaviour (`ingress` charges
+/// the deliverer's verification budget for it without a refund).
+pub const EVIDENCE_NOT_A_WITNESS: &str = "equivocation proof against a key outside the recent witness sets";
+
+/// What the pool needs of a tip's PoWit state, computed once per tip: the
+/// justified checkpoint, the barred keys, and the witness sets of every
+/// epoch a gossiped item may concern (`witness_set` is O(N log N) in the
+/// share keys; it was recomputed for every gossiped attestation).
+pub struct TipWitnesses {
+    pub tip: Hash,
+    pub tip_h: u64,
+    activation: u64,
+    justified: Checkpoint,
+    banned: BTreeMap<KeyId, u64>,
+    /// Epoch of the next block.
+    epoch: u64,
+    /// W(e) for the epochs from `EVIDENCE_MEMBER_EPOCHS` (or the oldest open
+    /// target) before the next block's to the newest open target's.
+    sets: BTreeMap<u64, HashMap<KeyId, u128>>,
+}
+
+impl TipWitnesses {
+    pub fn of(tip: Hash, tip_h: u64, st: &PowitState, p: &PowitParams) -> Self {
+        let act = st.activation;
+        let next = tip_h.max(act) + 1;
+        let epoch = p.epoch(act, next);
+        let oldest_open = p.epoch(act, next.saturating_sub(p.vote_ttl).max(act));
+        let lo = epoch.saturating_sub(EVIDENCE_MEMBER_EPOCHS).min(oldest_open);
+        let hi = p.epoch(act, tip_h.max(act) + p.checkpoint_interval).max(epoch);
+        let sets = (lo..=hi).map(|e| (e, st.witness_set(p, e).into_iter().collect())).collect();
+        TipWitnesses { tip, tip_h, activation: act, justified: st.justified, banned: st.banned.clone(), epoch, sets }
+    }
+
+    /// `key`'s weight in W(`epoch`), if it is a member.
+    pub fn weight_in(&self, epoch: u64, key: &KeyId) -> Option<u128> {
+        self.sets.get(&epoch)?.get(key).copied()
+    }
+
+    /// `key`'s highest weight over the recent witness sets, if it is in one.
+    pub fn recent_weight(&self, key: &KeyId) -> Option<u128> {
+        self.sets.values().filter_map(|s| s.get(key)).max().copied()
+    }
+
+    fn is_banned(&self, key: &KeyId) -> bool {
+        self.banned.get(key).is_some_and(|&until| self.epoch < until)
+    }
+
+    /// A target the next block (or the one after, from a peer one block
+    /// ahead) may include: a checkpoint slot at most one interval above the
+    /// tip, not yet expired for the next block.
+    fn open_target(&self, p: &PowitParams, t: &Checkpoint) -> bool {
+        p.is_checkpoint(self.activation, t.height)
+            && t.height <= self.tip_h + p.checkpoint_interval
+            && self.tip_h < t.height + p.vote_ttl
+    }
+}
+
+struct PendingAttestation {
+    att: Attestation,
+    key: KeyId,
+    weight: u128,
+}
+
+struct HeldEvidence {
+    ev: Equivocation,
+    weight: u128,
+}
+
+/// Links seen per witness (gossip), oldest evicted first, per key and in
+/// total; never wiped wholesale (that dropped the honest links double votes
+/// are caught against).
+#[derive(Default)]
+struct SeenLinks {
+    by_key: HashMap<KeyId, std::collections::VecDeque<(u64, Attestation)>>,
+    /// Arrival sequence -> key, oldest first.
+    order: BTreeMap<u64, KeyId>,
+    next: u64,
+}
+
+impl SeenLinks {
+    fn of(&self, key: &KeyId) -> impl Iterator<Item = &Attestation> {
+        self.by_key.get(key).into_iter().flat_map(|v| v.iter().map(|(_, a)| a))
+    }
+
+    fn record(&mut self, key: KeyId, att: &Attestation) {
+        let links = self.by_key.entry(key).or_default();
+        if links.iter().any(|(_, a)| a == att) {
+            return;
+        }
+        let seq = self.next;
+        self.next += 1;
+        links.push_back((seq, att.clone()));
+        self.order.insert(seq, key);
+        if links.len() > SEEN_LINKS_PER_KEY {
+            if let Some((old, _)) = links.pop_front() {
+                self.order.remove(&old);
+            }
+        }
+        while self.order.len() > SEEN_LINKS_CAP {
+            let Some((old, k)) = self.order.pop_first() else { break };
+            if let Some(v) = self.by_key.get_mut(&k) {
+                v.retain(|(s, _)| *s != old);
+                if v.is_empty() {
+                    self.by_key.remove(&k);
+                }
+            }
+        }
+    }
+
+    fn retain_keys(&mut self, keep: impl Fn(&KeyId) -> bool) {
+        self.by_key.retain(|k, _| keep(k));
+        self.order.retain(|_, k| keep(k));
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
+/// Two links, both already verified, that one witness must never have
+/// signed together (the shape `Equivocation::verify` checks after the
+/// signatures).
+fn links_conflict(a: &Attestation, b: &Attestation) -> bool {
+    let double = a.target.height == b.target.height && a.target != b.target;
+    let surround = (a.source.height < b.source.height && b.target.height < a.target.height)
+        || (b.source.height < a.source.height && a.target.height < b.target.height);
+    a.witness == b.witness && a != b && (double || surround)
+}
 
 #[derive(Default)]
 struct PoolInner {
     shares: BTreeMap<Hash, (WitnessShare, u64)>,
-    attestations: BTreeMap<Hash, Attestation>,
-    evidence: BTreeMap<KeyId, Equivocation>,
-    /// Links seen per key (gossip or blocks), to build equivocation proofs.
-    seen_links: HashMap<KeyId, Vec<Attestation>>,
+    attestations: BTreeMap<Hash, PendingAttestation>,
+    evidence: BTreeMap<KeyId, HeldEvidence>,
+    /// Links seen per witness-set member (gossip), to build equivocation proofs.
+    seen_links: SeenLinks,
+    /// The tip the pool was last pruned for, and its witness sets (`None`
+    /// below the PoWit activation).
+    followed: Option<Hash>,
+    view: Option<Arc<TipWitnesses>>,
+}
+
+impl PoolInner {
+    /// Hold `ev` against `key`. Full: the lightest key's proof (then the
+    /// greatest KeyId's) makes room for a heavier one, never the reverse.
+    fn insert_evidence(&mut self, key: KeyId, ev: Equivocation, weight: u128) -> Result<(), String> {
+        if self.evidence.contains_key(&key) {
+            return Ok(());
+        }
+        if self.evidence.len() >= EVIDENCE_CAP {
+            let rank = |k: &KeyId, w: u128| (w, std::cmp::Reverse(*k));
+            let worst = self.evidence.iter().map(|(k, h)| (*k, rank(k, h.weight))).min_by_key(|(_, r)| *r);
+            match worst {
+                Some((k, r)) if rank(&key, weight) > r => {
+                    self.evidence.remove(&k);
+                }
+                _ => return Err("evidence pool full".into()),
+            }
+        }
+        self.evidence.insert(key, HeldEvidence { ev, weight });
+        Ok(())
+    }
+
+    /// Hold an admissible attestation: a key keeps its newest
+    /// `ATTESTATIONS_PER_KEY` targets; a full pool drops its entry closest to
+    /// expiry (lowest target, then lightest key, then greatest id) for a
+    /// better one.
+    fn insert_attestation(&mut self, id: Hash, pa: PendingAttestation) -> Result<(), String> {
+        let mine: Vec<(u64, Hash)> = self.attestations.iter()
+            .filter(|(_, x)| x.key == pa.key)
+            .map(|(i, x)| (x.att.target.height, *i))
+            .collect();
+        if mine.len() >= ATTESTATIONS_PER_KEY {
+            let &(oldest_h, oldest) = mine.iter().min().expect("non-empty");
+            if pa.att.target.height <= oldest_h {
+                return Err("witness already has pending attestations for newer checkpoints".into());
+            }
+            self.attestations.remove(&oldest);
+        }
+        if self.attestations.len() >= POOL_CAP {
+            let rank = |x: &PendingAttestation, i: &Hash| (x.att.target.height, x.weight, std::cmp::Reverse(*i));
+            let worst = self.attestations.iter().map(|(i, x)| (*i, rank(x, i))).min_by_key(|(_, r)| *r);
+            match worst {
+                Some((i, r)) if rank(&pa, &id) > r => {
+                    self.attestations.remove(&i);
+                }
+                _ => return Err("attestation pool full".into()),
+            }
+        }
+        self.attestations.insert(id, pa);
+        Ok(())
+    }
+
+    /// Forget what the tip at `tip_h` (witness sets `view`) made stale.
+    fn prune_to(&mut self, view: Option<&TipWitnesses>, tip_h: u64, p: &PowitParams) {
+        self.shares.retain(|_, (_, ah)| tip_h < *ah + SHARE_WINDOW);
+        let Some(v) = view else { return };
+        self.attestations.retain(|_, x| {
+            let t = x.att.target;
+            if x.att.source != v.justified || !v.open_target(p, &t) {
+                return false;
+            }
+            match v.weight_in(p.epoch(v.activation, t.height), &x.key) {
+                Some(w) => {
+                    x.weight = w;
+                    true
+                }
+                None => false,
+            }
+        });
+        self.evidence.retain(|k, _| !v.is_banned(k));
+        self.seen_links.retain_keys(|k| v.recent_weight(k).is_some());
+    }
 }
 
 /// Validated PoWit items waiting for a block.
@@ -265,10 +505,52 @@ impl PowitPool {
         (g.shares.len(), g.attestations.len(), g.evidence.len())
     }
 
+    /// Links remembered for equivocation detection (tests, metrics).
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn seen_links_len(&self) -> usize {
+        self.inner.lock().seen_links.len()
+    }
+
+    /// Follow the tip `tip` at `tip_h`: when it is not the tip the pool was
+    /// last pruned for, decode its PoWit state and compute its witness sets
+    /// (outside the pool lock), then forget what it made stale. Returns its
+    /// witness sets (`None` below the PoWit activation).
+    fn follow(&self, tip: Hash, tip_h: u64, store: &Storage) -> Option<Arc<TipWitnesses>> {
+        {
+            let g = self.inner.lock();
+            if g.followed == Some(tip) {
+                return g.view.clone();
+            }
+        }
+        let p = powit::params();
+        let view = load_state(store, &tip).map(|st| Arc::new(TipWitnesses::of(tip, tip_h, &st, &p)));
+        let mut g = self.inner.lock();
+        g.prune_to(view.as_deref(), tip_h, &p);
+        // An activated tip whose state is not readable yet is retried on the
+        // next use rather than followed as "no PoWit" until the next tip.
+        if view.is_some() || !core::powit_active(tip_h) {
+            g.followed = Some(tip);
+        }
+        g.view = view.clone();
+        view
+    }
+
+    fn follow_tip(&self, dag: &GhostDAG, store: &Storage) -> Option<Arc<TipWitnesses>> {
+        let (tip, tip_h) = tip_context(dag)?;
+        self.follow(tip, tip_h, store)
+    }
+
+    /// The witness sets of `tip` if the pool currently follows it.
+    fn view_of(&self, tip: &Hash) -> Option<Arc<TipWitnesses>> {
+        let g = self.inner.lock();
+        g.view.as_ref().filter(|v| v.tip == *tip).cloned()
+    }
+
     /// Admit a gossiped or locally mined share for the next block on the
     /// current tip. Cheap checks first; the proof (~90 ms) last.
     pub fn admit_share(&self, share: WitnessShare, dag: &GhostDAG, store: &Storage) -> Result<Hash, String> {
         let id = witness_share::share_id(&share);
+        self.follow_tip(dag, store);
         if self.inner.lock().shares.contains_key(&id) {
             return Ok(id);
         }
@@ -289,81 +571,101 @@ impl PowitPool {
         Ok(id)
     }
 
-    /// Admit an attestation that links from the tip's justified checkpoint,
-    /// by a member of the target's witness set. Conflicts with a link the
-    /// same key already signed become an equivocation proof.
+    /// Admit an attestation by a member of its target's witness set, for an
+    /// open checkpoint slot (`TipWitnesses::open_target`), linking from the
+    /// tip's justified checkpoint. Membership and the target are checked
+    /// before the signature. A conflict with a link the same witness was seen
+    /// signing becomes an equivocation proof.
     pub fn admit_attestation(&self, att: Attestation, dag: &GhostDAG, store: &Storage) -> Result<Hash, String> {
         let id = att.id();
+        let view = self.follow_tip(dag, store).ok_or("PoWit not active at the tip")?;
+        if self.inner.lock().attestations.contains_key(&id) {
+            return Ok(id);
+        }
         let chain = core::node_chain_id();
         let p = powit::params();
         let act = core::powit_height();
-        if !att.verify_signature(chain, &p, act) {
+        let t = att.target;
+        // What `verify_signature` refuses before any signature check: a
+        // link that is never valid anywhere.
+        if t.height <= att.source.height || t.height < view.activation {
             return Err("invalid attestation signature".into());
         }
         let key = att.key_id();
+        let weight = view.weight_in(p.epoch(view.activation, t.height), &key)
+            .ok_or("attester is not in the witness set")?;
+        if !view.open_target(&p, &t) {
+            return Err("attestation target is not an open checkpoint slot".into());
+        }
+        if !att.verify_signature(chain, &p, act) {
+            return Err("invalid attestation signature".into());
+        }
         {
             let mut g = self.inner.lock();
             if g.attestations.contains_key(&id) {
                 return Ok(id);
             }
-            // Equivocation detection against every link this node has seen.
-            let conflicting = g.seen_links.get(&key).and_then(|v| v.iter().find(|o| {
-                Equivocation { a: (*o).clone(), b: att.clone() }.verify(chain, &p, act).is_ok()
-            }).cloned());
+            // Every recorded link passed `verify_signature`: the shape check
+            // is the rest of `Equivocation::verify`.
+            let conflicting = g.seen_links.of(&key).find(|o| links_conflict(o, &att)).cloned();
             if let Some(o) = conflicting {
-                g.evidence.entry(key).or_insert(Equivocation { a: o, b: att.clone() });
+                let _ = g.insert_evidence(key, Equivocation { a: o, b: att.clone() }, weight);
             }
-            let links = g.seen_links.entry(key).or_default();
-            if links.len() < 64 && !links.contains(&att) {
-                links.push(att.clone());
-            }
+            g.seen_links.record(key, &att);
         }
-        let (tip, _) = tip_context(dag).ok_or("no tip")?;
-        let st = load_state(store, &tip).ok_or("PoWit not active at the tip")?;
-        if att.source != st.justified {
+        if att.source != view.justified {
             return Err("attestation source is not the tip's justified checkpoint".into());
         }
-        let te = p.epoch(st.activation, att.target.height);
-        if !st.witness_set(&p, te).iter().any(|(k, _)| *k == key) {
-            return Err("attester is not in the witness set".into());
-        }
-        let mut g = self.inner.lock();
-        if g.attestations.len() >= POOL_CAP {
-            return Err("attestation pool full".into());
-        }
-        g.attestations.insert(id, att);
+        self.inner.lock().insert_attestation(id, PendingAttestation { att, key, weight })?;
         Ok(id)
     }
 
-    /// Admit an equivocation proof (verified).
-    pub fn admit_evidence(&self, ev: Equivocation) -> Result<KeyId, String> {
-        let key = ev.verify(core::node_chain_id(), &powit::params(), core::powit_height()).map_err(|e| e.to_string())?;
-        self.inner.lock().evidence.entry(key).or_insert(ev);
+    /// Admit an equivocation proof against a key in a recent witness set of
+    /// the tip (checked before the signatures), not yet barred, whose proof
+    /// the pool does not hold yet; then verified.
+    pub fn admit_evidence(&self, ev: Equivocation, dag: &GhostDAG, store: &Storage) -> Result<KeyId, String> {
+        if ev.a.witness != ev.b.witness {
+            return Err("equivocation: different witnesses".into());
+        }
+        let key = ev.a.key_id();
+        let view = self.follow_tip(dag, store).ok_or("PoWit not active at the tip")?;
+        let weight = view.recent_weight(&key).ok_or(EVIDENCE_NOT_A_WITNESS)?;
+        if view.is_banned(&key) {
+            return Err("equivocation proof against an already barred key".into());
+        }
+        if self.inner.lock().evidence.contains_key(&key) {
+            return Err("equivocation proof for this key already held".into());
+        }
+        let k = ev.verify(core::node_chain_id(), &powit::params(), core::powit_height()).map_err(|e| e.to_string())?;
+        debug_assert_eq!(k, key);
+        self.inner.lock().insert_evidence(key, ev, weight)?;
         Ok(key)
     }
 
-    /// Forget what a new tip made stale or included.
+    /// Forget what the current selected tip made stale (also done by every
+    /// admission against a new tip).
     pub fn prune(&self, dag: &GhostDAG, store: &Storage) {
-        let Some((tip, tip_h)) = tip_context(dag) else { return };
-        let st = load_state(store, &tip);
-        let p = powit::params();
-        let mut g = self.inner.lock();
-        g.shares.retain(|_, (_, ah)| tip_h < *ah + SHARE_WINDOW);
-        if let Some(st) = &st {
-            g.attestations.retain(|_, a| a.source == st.justified && tip_h <= a.target.height + p.vote_ttl);
-            let e = st.epoch;
-            g.evidence.retain(|k, _| !st.is_banned(k, e));
-        }
-        if g.seen_links.len() > POOL_CAP {
-            g.seen_links.clear();
+        self.follow_tip(dag, store);
+    }
+
+    /// [`Self::prune`] for main's tip-change task: the DAG read lock is held
+    /// only to read the tip; the state decode and witness sets run without it.
+    pub fn follow_selected_tip(&self, dag: &parking_lot::RwLock<GhostDAG>, store: &Storage) {
+        let tip = tip_context(&dag.read());
+        if let Some((tip, tip_h)) = tip {
+            self.follow(tip, tip_h, store);
         }
     }
 
+    /// Shares; attestations by target height; proofs heaviest key first
+    /// (then KeyId), by the weights of the tip they were admitted at.
     pub fn snapshot(&self) -> (Vec<WitnessShare>, Vec<Attestation>, Vec<Equivocation>) {
         let g = self.inner.lock();
-        let mut atts: Vec<Attestation> = g.attestations.values().cloned().collect();
+        let mut atts: Vec<Attestation> = g.attestations.values().map(|x| x.att.clone()).collect();
         atts.sort_by_key(|a| a.target.height);
-        (g.shares.values().map(|(s, _)| s.clone()).collect(), atts, g.evidence.values().cloned().collect())
+        let mut ev: Vec<(&KeyId, &HeldEvidence)> = g.evidence.iter().collect();
+        ev.sort_by(|a, b| b.1.weight.cmp(&a.1.weight).then(a.0.cmp(b.0)));
+        (g.shares.values().map(|(s, _)| s.clone()).collect(), atts, ev.into_iter().map(|(_, h)| h.ev.clone()).collect())
     }
 }
 
@@ -371,6 +673,8 @@ impl PowitPool {
 
 /// PoWit section for a template extending `tip` at `height`: every item is
 /// re-checked against the template's own context, so the section is valid.
+/// Equivocation proofs go by the key's witness weight on `tip` (heaviest
+/// first, then KeyId): a KeyId is free to grind, a weight is not.
 pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Hash, height: u64) -> PowitBody {
     if !core::powit_active(height) {
         return PowitBody::default();
@@ -381,7 +685,15 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
     let epoch = p.epoch(base.activation, height);
     let recent = selected_chain_since(dag, Some(tip), height.saturating_sub(SHARE_WINDOW));
     let Ok(included) = included_share_ids(store, &recent) else { return PowitBody::default() };
-    let (shares, atts, evidence) = pool.snapshot();
+    let (shares, atts, mut evidence) = pool.snapshot();
+    if !evidence.is_empty() {
+        let tip_h = dag.get_block_data(&tip).map(|d| d.height).unwrap_or(height.saturating_sub(1));
+        let w = pool.view_of(&tip).unwrap_or_else(|| Arc::new(TipWitnesses::of(tip, tip_h, &base, &p)));
+        evidence.sort_by_cached_key(|e| {
+            let k = e.a.key_id();
+            (std::cmp::Reverse(w.recent_weight(&k).unwrap_or(0)), k)
+        });
+    }
 
     let mut body = PowitBody::default();
     let mut share_work = Vec::new();
@@ -433,10 +745,80 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
 
 // ── Witness duty ─────────────────────────────────────────────────────────────
 
+/// Write `bytes` to `path` so that it survives a crash or a power loss:
+/// a temp file in the same directory, fsync'd, renamed over `path`, then the
+/// directory fsync'd (the rename itself is durable only then). Owner-only
+/// permissions (the KES key file holds the encrypted seed).
+fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let name = path.file_name().ok_or_else(|| format!("{}: not a file path", path.display()))?;
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let io = |what: &str, e: std::io::Error| format!("{what} {}: {e}", tmp.display());
+    let mut f = opts.open(&tmp).map_err(|e| io("create", e))?;
+    f.write_all(bytes).map_err(|e| io("write", e))?;
+    f.sync_all().map_err(|e| io("fsync", e))?;
+    drop(f);
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(dir).and_then(|d| d.sync_all())
+        .map_err(|e| format!("fsync directory {}: {e}", dir.display()))
+}
+
+/// Read a JSON file that may be absent (`None`), refusing one that exists but
+/// cannot be read or parsed: an unreadable vote record must never read as
+/// "no votes" (that re-opens every link the key signed).
+fn read_json_if_present<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> Result<Option<T>, String> {
+    match std::fs::read(path) {
+        Ok(b) => serde_json::from_slice(&b).map(Some).map_err(|e| format!(
+            "{what} {} is corrupt ({e}); refusing to sign: restore it from a backup (deleting it can make \
+             this key sign a double vote and be barred)", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{what} {} is unreadable ({e}); refusing to sign", path.display())),
+    }
+}
+
+/// The highest source and target heights a key ever signed (EIP-3076's
+/// minimal slashing protection): a link with a lower source or a target not
+/// above it is never signed, so no double or surround vote is possible even
+/// if the full record is lost. Kept in the record and, so that it moves with
+/// the key on a failover onto a fresh data directory, beside the key file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct HighWater {
+    source: u64,
+    target: u64,
+}
+
+impl HighWater {
+    fn of(signed: &[(Checkpoint, Checkpoint)]) -> Self {
+        signed.iter().fold(HighWater::default(), |h, (s, t)| h.max(&HighWater { source: s.height, target: t.height }))
+    }
+    fn max(self, o: &HighWater) -> Self {
+        HighWater { source: self.source.max(o.source), target: self.target.max(o.target) }
+    }
+    fn allows(&self, source: &Checkpoint, target: &Checkpoint) -> bool {
+        source.height >= self.source && target.height > self.target
+    }
+}
+
 /// A witness's forward-secure KES key, its payout script and its persistent
 /// vote record. The KES state evolves to each target's epoch (erasing every
 /// earlier seed, on disk first) before signing, and the record makes a double
-/// or surround vote impossible even across restarts and reorgs.
+/// or surround vote impossible even across restarts and reorgs. Both files
+/// are written durably (`write_durable`) before a signature is released; a
+/// record that exists but cannot be read refuses to load; the highest
+/// signed heights (`HighWater`) are enforced and kept beside the key too.
 pub struct WitnessDuty {
     pub key_id: KeyId,
     pub payout_script: Vec<u8>,
@@ -444,12 +826,15 @@ pub struct WitnessDuty {
     password: zeroize::Zeroizing<String>,
     signer: Mutex<gnb_crypto::core::kes::KesSigner>,
     record_path: PathBuf,
-    signed: Mutex<Vec<(Checkpoint, Checkpoint)>>,
+    highwater_path: PathBuf,
+    signed: Mutex<(Vec<(Checkpoint, Checkpoint)>, HighWater)>,
 }
 
 impl WitnessDuty {
     /// Load a KES witness key (`gnb-cli witnesskeygen`); the password is read
     /// from `password_file` (first line), never from the command line.
+    /// Refuses a vote record or high-water file that exists but cannot be
+    /// read (it would otherwise read as "never signed").
     pub fn load(key: &Path, password_file: &Path, payout_script: Vec<u8>, data_dir: &Path) -> Result<Self, String> {
         // CRY-4: the file's contents are wiped once the first line is copied.
         let pw = zeroize::Zeroizing::new(
@@ -459,8 +844,14 @@ impl WitnessDuty {
         let signer = file.open(&password)?;
         let key_id = signer.public().witness_id();
         let record_path = data_dir.join(format!("powit-votes-{}.json", hex::encode(key_id)));
-        let signed: Vec<(Checkpoint, Checkpoint)> = std::fs::read(&record_path).ok()
-            .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let mut hw_name = key.file_name().ok_or("witness key path has no file name")?.to_os_string();
+        hw_name.push(".votes-highwater.json");
+        let highwater_path = key.with_file_name(hw_name);
+        let signed: Vec<(Checkpoint, Checkpoint)> =
+            read_json_if_present(&record_path, "witness vote record")?.unwrap_or_default();
+        let beside_key: HighWater =
+            read_json_if_present(&highwater_path, "witness vote high-water file")?.unwrap_or_default();
+        let hw = HighWater::of(&signed).max(&beside_key);
         Ok(WitnessDuty {
             key_id,
             payout_script,
@@ -468,12 +859,14 @@ impl WitnessDuty {
             password,
             signer: Mutex::new(signer),
             record_path,
-            signed: Mutex::new(signed),
+            highwater_path,
+            signed: Mutex::new((signed, hw)),
         })
     }
 
     fn conflicts(&self, source: &Checkpoint, target: &Checkpoint) -> bool {
-        self.signed.lock().iter().any(|(s, t)| {
+        let g = self.signed.lock();
+        !g.1.allows(source, target) || g.0.iter().any(|(s, t)| {
             (t.height == target.height && t != target)
                 || (s.height < source.height && target.height < t.height)
                 || (source.height < s.height && t.height < target.height)
@@ -505,7 +898,7 @@ impl WitnessDuty {
         let Some(hash) = view.selected_at(slot) else { return Ok(None) };
         let target = Checkpoint { height: slot, hash };
         let source = st.justified;
-        if self.signed.lock().iter().any(|(s, t)| *s == source && *t == target) {
+        if self.signed.lock().0.iter().any(|(s, t)| *s == source && *t == target) {
             return Ok(None);
         }
         if self.conflicts(&source, &target) {
@@ -516,21 +909,25 @@ impl WitnessDuty {
             return Ok(None); // that epoch's leaf is gone: forward security
         }
         if te > signer.epoch() {
-            // Erase every earlier seed, ON DISK FIRST, then in memory.
+            // Erase every earlier seed, ON DISK FIRST (durably), then in memory.
             let mut next_state = gnb_crypto::core::kes::KesKeyFile::load(&self.key_path)?.open(&self.password)?;
             next_state.evolve_to(te)?;
-            gnb_crypto::core::kes::KesKeyFile::seal(&next_state, &self.password)?.save(&self.key_path)?;
+            let sealed = gnb_crypto::core::kes::KesKeyFile::seal(&next_state, &self.password)?;
+            let json = serde_json::to_vec_pretty(&sealed).map_err(|e| format!("kes save: {e}"))?;
+            write_durable(&self.key_path, &json).map_err(|e| format!("kes save: {e}"))?;
             *signer = next_state;
         }
         let att = Attestation::sign(core::node_chain_id(), source, target, &signer)?;
         {
             let mut g = self.signed.lock();
-            g.push((source, target));
-            let bytes = serde_json::to_vec(&*g).map_err(|e| e.to_string())?;
-            // Persist BEFORE releasing the signature.
-            let tmp = self.record_path.with_extension("json.tmp");
-            std::fs::write(&tmp, &bytes).map_err(|e| format!("witness vote record: {e}"))?;
-            std::fs::rename(&tmp, &self.record_path).map_err(|e| format!("witness vote record: {e}"))?;
+            g.0.push((source, target));
+            g.1 = g.1.max(&HighWater { source: source.height, target: target.height });
+            // Persist BEFORE releasing the signature: the record, then the
+            // high-water mark beside the key.
+            let bytes = serde_json::to_vec(&g.0).map_err(|e| e.to_string())?;
+            write_durable(&self.record_path, &bytes).map_err(|e| format!("witness vote record: {e}"))?;
+            let hw = serde_json::to_vec(&g.1).map_err(|e| e.to_string())?;
+            write_durable(&self.highwater_path, &hw).map_err(|e| format!("witness vote high-water file: {e}"))?;
         }
         Ok(Some(att))
     }
@@ -632,7 +1029,7 @@ pub fn admit_item(kind: u8, data: &[u8], dag: &GhostDAG, store: &Storage) -> Res
         ITEM_EVIDENCE => {
             let e = Equivocation::read_wire(&mut cur)?;
             done(&cur)?;
-            pool().admit_evidence(e).map(|_| ())
+            pool().admit_evidence(e, dag, store).map(|_| ())
         }
         _ => Err("unknown PoWit item kind".into()),
     }
@@ -675,14 +1072,152 @@ pub fn update_finalized(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage) {
 /// it resumes a stopped move. A no-op when `tip` has no PoWit state or its
 /// state finalized nothing beyond the activation checkpoint; never moves the
 /// pin back (`GhostDAG::set_finalized`).
+///
+/// Also a no-op while `tip`'s chain has less work than the node's minimum
+/// chain work (`ingress::minimum_chain_work()`: `core::MIN_CHAIN_WORK` or
+/// `--minimumchainwork`; PoWit audit finding 3, node-local part): a cheap
+/// fork carries its own witness set (W comes from the fork's own shares), so
+/// its finality proves nothing until its work does. Below the minimum the
+/// node keeps following the most work at any depth, as Bitcoin Core treats
+/// a chain below `nMinimumChainWork` (initial block download: nothing about
+/// it is trusted); the pin is taken once the chain reaches the minimum. The
+/// start-up restore goes through here too, so it applies the same gate.
 pub fn pin_finalized_of(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage, tip: &Hash) {
+    pin_finalized_with(dag, store, tip, crate::ingress::minimum_chain_work());
+}
+
+/// [`pin_finalized_of`] against an explicit minimum chain work.
+pub fn pin_finalized_with(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage, tip: &Hash, min_chain_work: u128) {
     let fin = {
         let d = dag.read();
+        let enough_work = d.get_block_data(tip)
+            .is_some_and(|bd| bd.blue_work >= min_chain_work);
+        if !enough_work {
+            return;
+        }
         load_state(store, tip)
             .filter(|st| st.finalized.height > st.activation)
             .and_then(|st| d.get_block_data(&st.finalized.hash).map(|bd| (st.finalized.hash, bd.height)))
     };
     if let Some((hash, height)) = fin {
         dag.write().set_finalized(hash, height);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gnb_crypto::core::kes::{KesPublic, KesSignature};
+
+    /// A link by witness `w` (unsigned: these tests exercise the pool's
+    /// bounded structures, which hold items only after verification).
+    fn link(w: u64, n: u64, target: u64) -> Attestation {
+        let mut root = [0u8; 32];
+        root[..8].copy_from_slice(&w.to_le_bytes());
+        let mut hash = [0u8; 32];
+        hash[..8].copy_from_slice(&n.to_le_bytes());
+        Attestation {
+            source: Checkpoint { height: 1, hash: [0; 32] },
+            target: Checkpoint { height: target, hash },
+            witness: KesPublic { depth: 1, root },
+            sig: KesSignature { index: 0, leaf_pk: vec![], sig: n.to_le_bytes().to_vec(), path: vec![] },
+        }
+    }
+
+    fn proof(w: u64) -> (KeyId, Equivocation) {
+        let a = link(w, 0, 10);
+        (a.key_id(), Equivocation { a, b: link(w, 1, 10) })
+    }
+
+    /// A full evidence pool makes room for a heavier key's proof by evicting
+    /// the lightest key's, and refuses a proof lighter than everything held.
+    #[test]
+    fn a_full_evidence_pool_evicts_the_lightest_key() {
+        let mut g = PoolInner::default();
+        for w in 0..EVIDENCE_CAP as u64 {
+            let (k, ev) = proof(w);
+            g.insert_evidence(k, ev, 10 + u128::from(w)).unwrap();
+        }
+        let (lightest, _) = proof(0);
+        let (heavy, ev) = proof(10_000);
+        g.insert_evidence(heavy, ev, 1_000_000).unwrap();
+        assert_eq!(g.evidence.len(), EVIDENCE_CAP);
+        assert!(g.evidence.contains_key(&heavy) && !g.evidence.contains_key(&lightest));
+        let (light, ev) = proof(10_001);
+        assert!(g.insert_evidence(light, ev, 1).is_err(), "lighter than every proof held");
+        assert_eq!(g.evidence.len(), EVIDENCE_CAP);
+    }
+
+    /// A full attestation pool evicts the entry closest to expiry (lowest
+    /// target) for a newer target instead of refusing it; per key, the two
+    /// newest targets are kept.
+    #[test]
+    fn a_full_attestation_pool_evicts_the_oldest_target() {
+        let mut g = PoolInner::default();
+        for w in 0..POOL_CAP as u64 {
+            let a = link(w, 0, 100 + w % 7);
+            g.insert_attestation(a.id(), PendingAttestation { key: a.key_id(), att: a, weight: 5 }).unwrap();
+        }
+        let newer = link(1_000_000, 0, 200);
+        let (id, key) = (newer.id(), newer.key_id());
+        g.insert_attestation(id, PendingAttestation { att: newer, key, weight: 5 }).expect("evicts an old target");
+        assert_eq!(g.attestations.len(), POOL_CAP);
+        assert_eq!(g.attestations.values().filter(|x| x.att.target.height == 100).count(),
+                   (POOL_CAP as u64).div_ceil(7) as usize - 1, "one entry at the lowest target went");
+        let older = link(1_000_001, 0, 99);
+        let (id, key) = (older.id(), older.key_id());
+        assert!(g.insert_attestation(id, PendingAttestation { att: older, key, weight: 5 }).is_err());
+
+        let mut g = PoolInner::default();
+        for t in [50, 60, 55, 40] {
+            let a = link(7, t, t);
+            let _ = g.insert_attestation(a.id(), PendingAttestation { key: a.key_id(), att: a, weight: 1 });
+        }
+        let mut kept: Vec<u64> = g.attestations.values().map(|x| x.att.target.height).collect();
+        kept.sort();
+        assert_eq!(kept, vec![55, 60]);
+    }
+
+    /// Seen links: at most `SEEN_LINKS_PER_KEY` per witness and
+    /// `SEEN_LINKS_CAP` in total, the oldest evicted first; never wiped.
+    #[test]
+    fn seen_links_evict_the_oldest_per_key_and_in_total() {
+        let mut s = SeenLinks::default();
+        let first = link(1, 0, 10);
+        let k1 = first.key_id();
+        for n in 0..=SEEN_LINKS_PER_KEY as u64 {
+            s.record(k1, &link(1, n, 10 + n));
+        }
+        assert_eq!(s.of(&k1).count(), SEEN_LINKS_PER_KEY);
+        assert!(!s.of(&k1).any(|a| *a == first), "its oldest link went");
+        s.record(k1, &link(1, 5, 15));
+        assert_eq!(s.len(), SEEN_LINKS_PER_KEY, "a duplicate is not recorded twice");
+
+        let mut w = 2;
+        while s.len() < SEEN_LINKS_CAP {
+            let a = link(w, 0, 10);
+            s.record(a.key_id(), &a);
+            w += 1;
+        }
+        let a = link(w, 0, 10);
+        s.record(a.key_id(), &a);
+        assert_eq!(s.len(), SEEN_LINKS_CAP);
+        assert_eq!(s.of(&k1).count(), SEEN_LINKS_PER_KEY - 1, "the globally oldest link went");
+        assert_eq!(s.of(&a.key_id()).count(), 1, "the newest is kept");
+        assert_eq!(s.by_key.values().map(|v| v.len()).sum::<usize>(), SEEN_LINKS_CAP);
+    }
+
+    /// The links that make an equivocation: a double vote or a surround vote
+    /// by one witness; not two different witnesses, not one link twice.
+    #[test]
+    fn links_conflict_matches_the_equivocation_shapes() {
+        let a = link(1, 0, 20);
+        assert!(links_conflict(&a, &link(1, 1, 20)), "double vote");
+        assert!(!links_conflict(&a, &a.clone()));
+        assert!(!links_conflict(&a, &link(2, 1, 20)), "another witness");
+        assert!(!links_conflict(&a, &link(1, 1, 25)), "same source, another height");
+        let mut inner = link(1, 2, 15);
+        inner.source.height = 5;
+        assert!(links_conflict(&a, &inner) && links_conflict(&inner, &a), "surround vote");
     }
 }

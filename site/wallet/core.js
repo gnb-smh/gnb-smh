@@ -3,6 +3,18 @@
 // JSON requests and responses. Randomness comes from crypto.getRandomValues.
 const WASI_EBADF = 8, WASI_ESUCCESS = 0;
 
+// A number may already have lost integer precision before JSON serialization.
+// PQ-PSBT context values use exact decimal strings at the WASM boundary.
+function exactContextInteger(value, name) {
+  if (typeof value === "number" && !Number.isSafeInteger(value)) {
+    throw new Error(`${name} must be an exact integer; use a decimal string`);
+  }
+  if (!["string", "number", "bigint"].includes(typeof value) || !/^(0|[1-9][0-9]*)$/.test(String(value))) {
+    throw new Error(`${name} must be an unsigned decimal integer`);
+  }
+  return String(value);
+}
+
 // WAL-5: the SHA-256 of the binary is mandatory; app.js passes the hash that
 // scripts/build-wallet-wasm.sh pins, and any other binary is refused.
 export async function loadCore(url, sha256Hex) {
@@ -60,9 +72,16 @@ export async function loadCore(url, sha256Hex) {
     return out.ok;
   }
   return {
-    open: (json, password) => call({ op: "open", json, password }),
-    // WAL-7: phrase-backed by default; returns { address, public_key, words }.
-    create: () => call({ op: "create", mnemonic: true }),
+    open: (json, password, network = "mainnet") => {
+      if (network !== "mainnet" && network !== "testnet") throw new Error("unknown wallet network");
+      return call({ op: "open", json, password, network });
+    },
+    // WAL-7: mainnet remains phrase-backed by default. The existing Rust
+    // testnet path returns a random key backed up by its encrypted keystore.
+    create: (testnet = false) => {
+      if (typeof testnet !== "boolean") throw new Error("testnet must be a boolean");
+      return call({ op: "create", mnemonic: true, testnet });
+    },
     restore: (words) => call({ op: "restore", words }),
     exportKeystore: (password) => call({ op: "export", password }).keystore,
     // WAL-1: `nextHeight` is the node's getdaginfo next_block_height; it selects
@@ -75,8 +94,31 @@ export async function loadCore(url, sha256Hex) {
     // signature commits to every spent value, so nothing needs fetching.
     pay: (utxos, to, amount, fee, nextHeight, prevtxs = {}) => call({ op: "pay", utxos, to, amount: String(amount), fee: String(fee), next_height: String(nextHeight), prevtxs }),
     address: () => call({ op: "address" }).address,
-    normalize: (address) => call({ op: "normalize", address }).address,
+    normalize: (address, format = "legacy") => call({ op: "normalize", address, format }).address,
     minFee: (size) => call({ op: "minfee", size }).fee,
+    // BIP174-style public roles; the document remains a string so duplicate
+    // JSON fields reach the strict shared parser. Caller-supplied `op` cannot
+    // redirect this public-data binding to an operation using the session key.
+    pqpsbt: (request) => call({ ...request, op: "pqpsbt" }),
+    // Public identities only; importing a pool never opens a signing session.
+    // R5-VERDICT-1: JSON.stringify calls toJSON before encoding. A caller's
+    // own or inherited hook must not replace this envelope with {op:"wipe"}.
+    descriptor: (request) => {
+      if (!request || typeof request !== "object" || Array.isArray(request)) {
+        throw new Error("descriptor request must be an object");
+      }
+      const message = Object.assign(Object.create(null), request);
+      if (Object.hasOwn(message, "toJSON")) throw new Error("unknown descriptor request field: toJSON");
+      message.op = "descriptor";
+      return call(message);
+    },
+    // Offline context is supplied by the signer. The core checks commitments
+    // and fee/height/network, but cannot attest current chain unspentness.
+    signPqPsbt: (hex, network, nextHeight, maxFee) => call({
+      op: "pqpsbt_sign", hex, network,
+      next_height: exactContextInteger(nextHeight, "nextHeight"),
+      max_fee: exactContextInteger(maxFee, "maxFee"),
+    }),
     wipe: () => call({ op: "wipe" }),
   };
 }

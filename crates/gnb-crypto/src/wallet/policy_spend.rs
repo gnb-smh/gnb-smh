@@ -208,7 +208,7 @@ impl PolicySpend {
     }
 
     /// The digest `public_key` signs for input `i`.
-    fn digest(&self, i: usize, public_key: &[u8]) -> Result<[u8; 32], String> {
+    pub(super) fn digest(&self, i: usize, public_key: &[u8]) -> Result<[u8; 32], String> {
         let chain_id = self.chain_id();
         match self.sighash_version() {
             SighashVersion::V2 => Ok(self.tx.sighash(i, chain_id)),
@@ -228,7 +228,7 @@ impl PolicySpend {
         }
     }
 
-    fn verifies(&self, public_key: &[u8], digest: &[u8; 32], sig: &[u8]) -> bool {
+    pub(super) fn verifies(&self, public_key: &[u8], digest: &[u8; 32], sig: &[u8]) -> bool {
         match self.sighash_version() {
             SighashVersion::V2 => crypto::verify_enveloped_canonical(public_key, digest, sig),
             SighashVersion::V3 => crypto::verify_bound(public_key, digest, sig),
@@ -258,6 +258,7 @@ impl PolicySpend {
         public_key: &[u8],
         sign: impl Fn(&[u8; 32], SighashVersion) -> Result<Vec<u8>, String>,
     ) -> Result<u8, String> {
+        self.check_signing_shape()?;
         let idx = self.policy.pubkeys.iter().position(|k| k == public_key)
             .ok_or("this key is not part of the policy")? as u8;
         let version = self.sighash_version();
@@ -287,6 +288,7 @@ impl PolicySpend {
 
     /// Build the witnesses from the `threshold` lowest-indexed signers.
     pub fn finalize(&self) -> Result<Transaction, String> {
+        self.check_signing_shape()?;
         let need = self.policy.threshold as usize;
         let signers = self.signers();
         if signers.len() < need {
@@ -316,6 +318,63 @@ impl PolicySpend {
             };
         }
         Ok(tx)
+    }
+
+    /// Wallet boundary, not a new consensus rule. Imported JSON and public
+    /// fields can bypass the constructor. BIP174's signer input validation
+    /// must happen before any signing callback, not after a partial signature:
+    /// https://bips.dev/174/#data-signers-check-for
+    pub(super) fn check_signing_shape(&self) -> Result<(), String> {
+        let check_policy = |p: &SpendPolicy| -> Result<(), String> {
+            if p.pubkeys.len() > core::policy::MAX_POLICY_KEYS || p.pubkeys.iter().any(|k| k.len() > 8192) {
+                return Err("policy exceeds wallet limits".into());
+            }
+            SpendPolicy::decode(&p.encode()).map_err(|e| format!("policy: {e}"))?;
+            Ok(())
+        };
+        check_policy(&self.policy)?;
+        if let Some((tree, branch)) = &self.tree {
+            if !(2..=core::policy::MAX_POLICY_BRANCHES).contains(&tree.branches.len()) {
+                return Err("invalid policy tree size".into());
+            }
+            for p in &tree.branches { check_policy(p)?; }
+            if tree.branches.get(*branch as usize) != Some(&self.policy) {
+                return Err("policy does not match tree branch".into());
+            }
+        }
+        let n = self.tx.inputs.len();
+        if n == 0 || self.tx.outputs.is_empty() || self.tx.is_coinbase()
+            || self.amounts.len() != n || self.signatures.len() != n {
+            return Err("policy spend input/output metadata shape mismatch".into());
+        }
+        if !matches!(self.tx.version, 1 | 3) {
+            return Err("policy wallet supports only transaction versions 1 and 3".into());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for input in &self.tx.inputs {
+            if !input.script_sig.is_empty() || !seen.insert((input.prev_txid, input.prev_index)) {
+                return Err("policy spend must be unsigned with distinct outpoints".into());
+            }
+        }
+        for signatures in &self.signatures {
+            if signatures.iter().any(|(i, s)| *i as usize >= self.policy.pubkeys.len() || s.is_empty() || s.len() > 8192) {
+                return Err("invalid partial signature index or size".into());
+            }
+        }
+        for out in &self.tx.outputs {
+            if core::policy::output_kind(&out.script_pubkey).is_none() || out.value < core::DUST_THRESHOLD {
+                return Err("invalid policy spend output".into());
+            }
+        }
+        if self.tx.locktime < self.policy.after {
+            return Err("policy absolute timelock is not satisfied by locktime".into());
+        }
+        let input_total = self.amounts.iter().try_fold(0u64, |sum, v| sum.checked_add(*v))
+            .ok_or("policy input total overflows")?;
+        let output_total = self.tx.outputs.iter().try_fold(0u64, |sum, o| sum.checked_add(o.value))
+            .ok_or("policy output total overflows")?;
+        input_total.checked_sub(output_total).ok_or("policy outputs exceed declared inputs")?;
+        Ok(())
     }
 
     pub fn to_json(&self) -> Result<String, String> {
@@ -452,5 +511,22 @@ mod tests {
         tx.outputs[1].script_pubkey = vec![6u8; 20];
         f["tx"] = serde_json::Value::String(hex::encode(tx.to_wire_bytes(true)));
         assert!(PolicySpend::from_json(&f.to_string()).is_err());
+    }
+
+    #[test]
+    fn pqpsbt_policy_signer_checks_all_amounts_before_the_signing_callback() {
+        let (keys, policy) = setup(1, 1, 0);
+        let mut spend = PolicySpend::new(Network::Mainnet, policy,
+            &[([1; 32], 0, 5_000_000)], vec![9; 20], 1_000_000, 0, 0).unwrap();
+        // The public object / imported coordinator file can contradict the
+        // original constructor. No secret operation should run in that case.
+        spend.amounts[0] = 1;
+        let callbacks = std::cell::Cell::new(0);
+        let result = spend.sign_digest(&keys[0].0, |digest, _| {
+            callbacks.set(callbacks.get() + 1);
+            crypto::sign(&keys[0].1, digest).map_err(|e| format!("{e:?}"))
+        });
+        assert_eq!(callbacks.get(), 0, "an inconsistent imported spend reached the signer");
+        assert!(result.is_err());
     }
 }

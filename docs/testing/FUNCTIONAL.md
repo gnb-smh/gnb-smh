@@ -20,20 +20,35 @@ python3 test/functional/test_runner.py rpc_auth.py mempool_tx_relay.py
 python3 test/functional/test_runner.py --jobs 4 --timeout 300
 python3 test/functional/test_runner.py --bindir /path/to/test-build
 
+# Local exploratory run: explicitly accept skips, always counted separately
+python3 test/functional/test_runner.py --allow-skips
+
 # One test on its own (same options; --nocleanup keeps its temp dir and logs)
 python3 test/functional/feature_partition_heal.py --nocleanup
 ```
 
 `test_runner.py` options: `--jobs` (parallel tests, default half the CPUs, at
 most 4), `--timeout` (seconds per test, default 240), `--timeout-factor`
-(scales every wait inside the tests), `--bindir` / `--no-build`,
+(scales relative waits once, including the partition's shared heal budget), `--bindir` / `--no-build`,
 `--cachedir`, `--tmpdir`, `--keep-failed` (keep the temp dir of a failed
-test), `--list`. Each test accepts `--bindir`, `--no-build`, `--cachedir`,
+test), `--list`, `--ci` (explicit strict mode, also the default),
+`--allow-skips` (local mode, incompatible with `--ci`). Each test accepts `--bindir`, `--no-build`, `--cachedir`,
 `--tmpdir`, `--nocleanup`, `--keep-failed`, `--portseed`,
 `--timeout-factor` and `--loglevel`.
 
-Exit codes follow Bitcoin Core: 0 passed, 1 failed, 77 skipped. The runner
-exits 0 only when every test passed or was skipped.
+Individual scenario exit codes follow Bitcoin Core: 0 passed, 1 failed,
+77 skipped. The runner reports passed, skipped and failed counts separately.
+By default and in `--ci` mode, it exits 0 only when every selected scenario
+executed and passed; even one skip makes the run incomplete. Only an explicit
+local `--allow-skips` run accepts skips, without counting them as passes.
+
+The harness has deterministic unit tests that need neither node binaries nor
+network sockets. They exercise the real runner and partition/wait logic with
+simulated process results, nodes and a monotonic clock:
+
+```sh
+python3 -m unittest discover -s test/functional/unit -v
+```
 
 ## The test-only build
 
@@ -60,9 +75,11 @@ timestamp, the template's bits, the ingress orphan floor as
 `BlockIngress::handle_block` computes it from the selected tip's height) are exercised with
 the real ASERT rule by `node/tests/fix_pow_real_asert.rs` (re-audit POW-5):
 the test-only seam `core::scoped_real_expected_bits()`, compiled only with
-this feature, makes `expected_bits` compute the real rule on the calling
-thread, and the tests reject bits computed for the wrong height or parent
-timestamp. The GnB-SMH v3 switch (`core::adjust_bits_for_algo`: from
+this feature or in gnb-crypto's own unit tests (which pin its scope: the
+pin is lifted on the calling thread while the guard is held and restored
+when it drops, also when unwinding), makes `expected_bits` compute the real rule on
+the calling thread, and the tests reject bits computed for the wrong height
+or parent timestamp. The GnB-SMH v3 switch (`core::adjust_bits_for_algo`: from
 `powit_height()`, 10,000 on mainnet, the ASERT target is 4x harder) is
 covered twice: at the mainnet height for the rule and the ingress reference
 (`expected_bits_switch_to_v3_at_the_mainnet_powit_height`), and at the call
@@ -169,16 +186,26 @@ tests running in parallel share it. Only `db/` is copied into a node (its
 
 ### Synchronisation helpers
 
-- `wait_until(predicate, timeout=...)`: polls; every timeout scales with
-  `--timeout-factor`.
+- `wait_until(predicate, timeout=..., deadline=...)`: polls; relative timeouts
+  scale once with `--timeout-factor`. An optional absolute monotonic deadline
+  caps the relative timeout and is never scaled. The predicate must finish
+  successfully before that deadline. A synchronous RPC already in progress
+  cannot be interrupted by this helper: it may return late, but its late
+  result is rejected. The runner's process timeout remains the outer bound.
 - `wait_for_peers(pairs=...)`: both ends log `✓ connected: <peer id>`, then
-  two gossipsub heartbeats. (The RPC peer count, distinct peers, is updated
+  two gossipsub heartbeats. All peer directions and settling share one
+  deadline; `deadline=...` can also cap it. (The RPC peer count, distinct peers, is updated
   on every connect and disconnect; the log line is still the earliest
   signal.)
 - `sync_blocks()`: same selected tip and same valid tips
   (`getblocktemplate` parents) on every node. `getdaginfo.tips` also lists
   disqualified blocks a node keeps in its DAG (DAG-1), which only the node
-  that saw them has.
+  that saw them has. The partition scenario gives peer waits, settling and
+  `sync_blocks` the same deadline, 30 seconds after node2's restart returns
+  at the default factor. An explicit `--timeout-factor` scales this budget
+  once when the deadline is created; inner waits cannot rescale or renew it.
+  It cannot pass with an observation at or after that deadline. CI keeps
+  the default factor of one.
 - `sync_mempools()`, `assert_same_chain_state(addresses)`: same tip, valid
   tips, height, blue work, and the exact UTXO list (txid, index, value) of
   every given address. The RPC has no UTXO-set digest; per-address
@@ -211,10 +238,12 @@ types the password at the prompt, exactly as a user would:
 | `p2p_invalid_blocks_txs.py` | 3 | Invalid transactions (malformed, coinbase, duplicate input, missing input, outputs above inputs, dust, version 1, forged signature, conflicts under full-RBF: one at T's fee rate fails the replacement rules before any signature work, one paying more fails the signature check; duplicate) and invalid blocks (malformed, bad / legacy Merkle root, every coinbase-commitment defect, no / two coinbases, duplicate tx, undecodable or unexpected bits, wrong height, unknown parent, timestamps, coinbase over-claim, two coinbase outputs, a confirmed tx again: BIP30) are rejected with the right reason and never move the tip. None of them is delivered to the observer node: checked on its receipt trace (every gossiped block is logged at info, every gossiped transaction with the debug target `gnb_gossip_rx_tx`), not on its storage, since the observer would drop most of them itself; the trace does show the valid transaction and blocks node0 relays. |
 | `feature_activation_testnet.py` | 2 | Testnet activation 0: the template announces the hardened rules at height 1; the pre-activation block format, and each half of the change alone, is rejected at height 1; the hardened block is accepted; blocks from the internal miner satisfy the rules, checked in Python. |
 
-The whole suite takes about 75 s with two jobs (plus about 100 s once to
-build the cached chain); no test takes more than about 25 s. CI (`.github/workflows/ci.yml`, job `functional`) builds the test
-binaries and runs `test_runner.py --jobs 2 --timeout 300`, uploading the logs
-of failed tests.
+Runtime depends on the host, cached chain and scenario. The runner reports
+each scenario's duration and the total; the [round 2 execution record](../security/round-2/validation.md)
+includes a Linux baseline run of 249 seconds, with the longest scenario at
+146 seconds. CI (`.github/workflows/ci.yml`, job `functional`) builds the test
+binaries, runs the harness unit tests and runs
+`test_runner.py --ci --jobs 2 --timeout 300`, uploading the logs of failed tests.
 
 ## Behaviour the tests rely on (and document)
 
@@ -299,6 +328,13 @@ minutes, wait with `wait_until` / the sync helpers instead of sleeping, and
 prefer `generate` over the internal miner unless the miner is what is tested.
 
 ## Follow-ups
+
+`wallet_descriptor_restore.py` exercises the public descriptor RPCs and offline
+CLI against a live testnet node. It exports a public pool, funds the independently
+pinned identity, imports the pool again and observes the same output. It also
+checks wrong-network restoration and preservation of an existing output file.
+This proves public identity restoration only: no spending key, transaction
+history scan or persistent watch-only wallet index is restored.
 
 Added after the operator-RPC (P3) and mempool-policy (P4) merges:
 `feature_invalidateblock.py` and `mempool_replacement.py` above. Still to add,

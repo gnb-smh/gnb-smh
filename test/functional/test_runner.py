@@ -12,8 +12,9 @@ once; then run each test script as its own process group with its own port
 window and temp dir. A test that exceeds --timeout is terminated (SIGTERM,
 then SIGKILL to the whole group); after every test, any process still running
 from its temp dir is killed and the temp dir removed (kept with
---keep-failed for a failed test). Exit code 0 iff every test passed or was
-skipped.
+--keep-failed for a failed test). Exit code 0 requires every selected test
+to pass. Local runs may explicitly accept skips with --allow-skips; CI uses
+--ci, which cannot be combined with that local mode.
 """
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ ALL_TESTS = [
     "feature_invalidateblock.py",
     "p2p_invalid_blocks_txs.py",
     "wallet_coinbase_maturity.py",
+    "wallet_descriptor_restore.py",
     "mempool_tx_relay.py",
     "mempool_replacement.py",
     "mining_getblocktemplate_submitblock.py",
@@ -145,6 +147,9 @@ def main() -> int:
                    os.path.join(tempfile.gettempdir(), f"gnb-functional-cache-{os.getuid()}"))
     p.add_argument("--tmpdir", help="root for the run's temp dirs (default: a new system temp dir)")
     p.add_argument("--keep-failed", action="store_true", help="keep the temp dir (logs) of failed tests")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--ci", action="store_true", help="require every selected test to pass (the default)")
+    mode.add_argument("--allow-skips", action="store_true", help="local runs only: accept skips, reported separately")
     p.add_argument("--list", action="store_true", help="list the tests and exit")
     args = p.parse_args()
 
@@ -191,7 +196,7 @@ def main() -> int:
                     running.remove(job)
                     done.append(job)
                     log.info("%-42s %-8s %6.1fs", job.name, job.status, job.duration)
-                    if job.status not in ("Passed", "Skipped"):
+                    if job.status != "Passed" and not (args.allow_skips and job.status == "Skipped"):
                         with open(job.log_path, "rb") as f:
                             sys.stdout.write(f.read().decode("utf-8", "replace")[-20000:])
                         sys.stdout.flush()
@@ -206,18 +211,25 @@ def main() -> int:
             kill_strays(job.tmpdir)
         return 1
 
+    passed = [j for j in done if j.status == "Passed"]
+    skipped = [j for j in done if j.status == "Skipped"]
     failed = [j for j in done if j.status not in ("Passed", "Skipped")]
+    complete = len(done) == len(tests)
+    successful = complete and not failed and (not skipped or args.allow_skips)
     print("\n" + "-" * 64)
     for j in sorted(done, key=lambda j: j.name):
         print(f"{j.name:<44} {j.status:<8} {j.duration:6.1f}s")
     print("-" * 64)
-    print(f"{'ALL' if not failed else 'FAILED'}: {len(done) - len(failed)}/{len(done)} passed "
-          f"in {time.monotonic() - started:.0f}s")
-    if not args.tmpdir and not failed:
+    print(f"{'SUCCESS' if successful else 'FAILED'}: {len(passed)} passed, {len(skipped)} skipped, "
+          f"{len(failed)} failed; {len(done)}/{len(tests)} completed in {time.monotonic() - started:.0f}s")
+    if skipped:
+        print("skips explicitly allowed for this local run" if args.allow_skips else
+              "skips are not passes: every selected CI scenario must execute and pass")
+    if not args.tmpdir and successful:
         shutil.rmtree(tmproot, ignore_errors=True)
-    elif failed:
+    elif not successful:
         print(f"logs: {tmproot}")
-    return 1 if failed else 0
+    return 0 if successful else 1
 
 
 if __name__ == "__main__":

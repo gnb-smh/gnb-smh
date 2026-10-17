@@ -1,0 +1,48 @@
+{
+  "baseline": "2848dcf6bd89a85afe4828042227c9a2c2b433f0",
+  "native_cgu": 151,
+  "test_sha256_before": {
+    "node/tests/descriptor_cli.rs": "617a5303e7d21a23f936ad4f13c79619f3036ddfb510b251ef32da9ce36d2e4b",
+    "node/tests/support/descriptor_rpc.rs": "4695586a5a26ea9901d51dac0a5ba8e9a0e5332729efbd6d797a2846bcf601a5",
+    "site/tests/wallet-descriptor.test.mjs": "c87deea0b0950f86561781b4690a0d89c10825ac5e9e84bdc251f30ab3f17e36"
+  },
+  "test_sha256_after": {
+    "node/tests/descriptor_cli.rs": "617a5303e7d21a23f936ad4f13c79619f3036ddfb510b251ef32da9ce36d2e4b",
+    "node/tests/support/descriptor_rpc.rs": "4695586a5a26ea9901d51dac0a5ba8e9a0e5332729efbd6d797a2846bcf601a5",
+    "site/tests/wallet-descriptor.test.mjs": "c87deea0b0950f86561781b4690a0d89c10825ac5e9e84bdc251f30ab3f17e36"
+  },
+  "runs": [
+    {
+      "part": "js",
+      "phase": "reverted",
+      "command": [
+        "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+        "--test",
+        "site/tests/wallet-descriptor.test.mjs"
+      ],
+      "exit_code": 1,
+      "seconds": 0.919,
+      "log": "js-reverted.log",
+      "sha256": "91c5ea3da13ad9c6d067a5b2a3208c8893eeed0cef9bb3dc5b1ec7f2ada520f6",
+      "log_path": "/private/tmp/gnb-r5-js-reversal/js-reverted.log",
+      "log_text": "TAP version 13\n# Subtest: descriptor public frontend retains existing normalization control\nok 1 - descriptor public frontend retains existing normalization control\n  ---\n  duration_ms: 74.342094\n  type: 'test'\n  ...\n# Subtest: pinned WASM creates all static descriptor kinds and restores public identities on mainnet\nnot ok 2 - pinned WASM creates all static descriptor kinds and restores public identities on mainnet\n  ---\n  duration_ms: 17.113375\n  type: 'test'\n  location: '/Users/tiagobulhoes/worktrees/gnb-security-round-5/site/tests/wallet-descriptor.test.mjs:27:3'\n  failureType: 'testCodeFailure'\n  error: 'core.descriptor is not a function'\n  code: 'ERR_TEST_FAILURE'\n  name: 'TypeError'\n  stack: |-\n    file:///Users/tiagobulhoes/worktrees/gnb-security-round-5/site/tests/wallet-descriptor.test.mjs:32:25\n    Array.map (<anonymous>)\n    TestContext.<anonymous> (file:///Users/tiagobulhoes/worktrees/gnb-security-round-5/site/tests/wallet-descriptor.test.mjs:31:31)\n    async Test.run (node:internal/test_runner/test:1054:7)\n    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)\n  ...\n# Subtest: pinned WASM creates all static descriptor kinds and restores public identities on testnet\nnot ok 3 - pinned WASM creates all static descriptor kinds and restores public identities on testnet\n  ---\n  duration_ms: 13.089422\n  type: 'test'\n  location: '/Users/tiagobulhoes/worktrees/gnb-security-round-5/site/tests/wallet-descriptor.test.mjs:27:3'\n  failureType: 'testCodeFailure'\n  error: 'core.descriptor is not a function'\n  code: 'ERR_TEST_FAILURE'\n  name: 'TypeError'\n  stack: |-\n    file:///Users/tiagobulhoes/worktrees/gnb-security-round-5/site/tests/wallet-descriptor.test.mjs:32:25\n    Array.map (<anonymous>)\n    TestContext.<anonymous> (file:///Users/tiagobulhoes/worktrees/gnb-security-round-5/site/tests/wallet-descriptor.test.mjs:31:31)\n    async Test.run (node:internal/test_runner/test:1054:7)\n    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)\n  ...\n# Subtest: descriptor binding forces a public operation and preserves an unlocked session\nnot ok 4 - descriptor binding forces a public operation and preserves an unlocked session\n  ---\n  duration_ms: 178.737631\n  type: 'test'\n  location: '/Users/tiagobulhoes/worktrees/gnb-security-round-5/site/tests/wallet-descriptor.test.mjs:55:1'\n  failureType: 'testCodeFailure'\n  error: 'core.descriptor is not a function'\n  code: 'ERR_TEST_FAILURE'\n  name: 'TypeError'\n  stack: |-\n    TestContext.<anonymous> (file:///Users/tiagobulhoes/worktrees/gnb-security-round-5/site/tests/wallet-descriptor.test.mjs:60:27)\n    async Test.run (node:internal/test_runner/test:1054:7)\n    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)\n  ...\n# Subtest: descriptor pool preserves raw/enveloped identity and refuses malformed imports\nnot ok 5 - descriptor pool preserves raw/enveloped identity and refuses malformed imports\n  ---\n  duration_ms: 14.793647\n  type: 'test'\n  location: '/Users/tiagobulhoes/worktrees/gnb-security-round-5/site/tests/wallet-descriptor.test.mjs:71:1'\n  failureType: 'testCodeFailure'\n  error: 'core.descriptor is not a function'\n  code: 'ERR_TEST_FAILURE'\n  name: 'TypeError'\n  stack: |-\n    TestContext.<anonymous> (file:///Users/tiagobulhoes/worktrees/gnb-security-round-5/site/tests/wallet-descriptor.test.mjs:73:21)\n    async Test.run (node:internal/test_runner/test:1054:7)\n    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)\n  ...\n# Subtest: descriptor rejects an own toJSON hook before it can wipe an active session\nnot ok 6 - descriptor rejects an own toJSON hook before it can wipe an active session\n  ---\n  duration_ms: 101.454542\n  type: 'test'\n  location: '/Users/tiagobulhoes/worktrees/gnb-security-round-5/site/tests/wallet-descriptor.test.mjs:81:1'\n  failureType: 'testCodeFailure'\n  error: |-\n    The input did not match the regular expression /toJSON|field/i. Input:\n    \n    'core.descriptor is not a function'\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected:\n  actual: 'core.descriptor is not a function'\n  operator: 'match'\n  stack: |-\n    TestContext.<anonymous> (file:///Users/tiagobulhoes/worktrees/gnb-security-round-5/site/tests/wallet-descriptor.test.mjs:91:12)\n    async Test.run (node:internal/test_runner/test:1054:7)\n    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)\n  ...\n# Subtest: descriptor ignores inherited toJSON dispatch redirection without changing legacy bindings\nnot ok 7 - descriptor ignores inherited toJSON dispatch redirection without changing legacy bindings\n  ---\n  duration_ms: 13.841558\n  type: 'test'\n  location: '/Users/tiagobulhoes/worktrees/gnb-security-round-5/site/tests/wallet-descriptor.test.mjs:95:1'\n  failureType: 'testCodeFailure'\n  error: |-\n    Expected values to be strictly equal:\n    + actual - expected\n    \n    + 'undefined'\n    - 'function'\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected: 'function'\n  actual: 'undefined'\n  operator: 'strictEqual'\n  stack: |-\n    TestContext.<anonymous> (file:///Users/tiagobulhoes/worktrees/gnb-security-round-5/site/tests/wallet-descriptor.test.mjs:97:10)\n    async Test.run (node:internal/test_runner/test:1054:7)\n    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)\n  ...\n1..7\n# tests 7\n# suites 0\n# pass 1\n# fail 6\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 624.633705\n"
+    },
+    {
+      "part": "js",
+      "phase": "restored",
+      "command": [
+        "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+        "--test",
+        "site/tests/wallet-descriptor.test.mjs"
+      ],
+      "exit_code": 0,
+      "seconds": 0.859,
+      "log": "js-restored.log",
+      "sha256": "88af365b2a120e3e89eff7c2827083019b0b0cbb1ecca8ca46967892abace642",
+      "log_path": "/private/tmp/gnb-r5-js-reversal/js-restored.log",
+      "log_text": "TAP version 13\n# Subtest: descriptor public frontend retains existing normalization control\nok 1 - descriptor public frontend retains existing normalization control\n  ---\n  duration_ms: 65.905748\n  type: 'test'\n  ...\n# Subtest: pinned WASM creates all static descriptor kinds and restores public identities on mainnet\nok 2 - pinned WASM creates all static descriptor kinds and restores public identities on mainnet\n  ---\n  duration_ms: 55.420811\n  type: 'test'\n  ...\n# Subtest: pinned WASM creates all static descriptor kinds and restores public identities on testnet\nok 3 - pinned WASM creates all static descriptor kinds and restores public identities on testnet\n  ---\n  duration_ms: 37.189754\n  type: 'test'\n  ...\n# Subtest: descriptor binding forces a public operation and preserves an unlocked session\nok 4 - descriptor binding forces a public operation and preserves an unlocked session\n  ---\n  duration_ms: 140.348567\n  type: 'test'\n  ...\n# Subtest: descriptor pool preserves raw/enveloped identity and refuses malformed imports\nok 5 - descriptor pool preserves raw/enveloped identity and refuses malformed imports\n  ---\n  duration_ms: 23.28053\n  type: 'test'\n  ...\n# Subtest: descriptor rejects an own toJSON hook before it can wipe an active session\nok 6 - descriptor rejects an own toJSON hook before it can wipe an active session\n  ---\n  duration_ms: 79.470301\n  type: 'test'\n  ...\n# Subtest: descriptor ignores inherited toJSON dispatch redirection without changing legacy bindings\nok 7 - descriptor ignores inherited toJSON dispatch redirection without changing legacy bindings\n  ---\n  duration_ms: 96.732666\n  type: 'test'\n  ...\n1..7\n# tests 7\n# suites 0\n# pass 7\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 703.653258\n"
+    }
+  ],
+  "failures": [],
+  "note": "Only the JS part executed here; no native build or CGU was used by this replay. Tests were unchanged while the public binding was removed and restored."
+}

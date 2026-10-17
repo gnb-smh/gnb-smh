@@ -114,7 +114,20 @@ def _re(rx, what):
 
 
 HASH = _re(HEX64, "64-char lowercase hex")
-ADDRESS = _re(ADDR, "gnb1q/gnb1t/gnb1m/gnb1n address")
+# Routing is syntax-only. BIP350 checksum/network validation is performed by
+# the RPC; carryover is local and therefore uses _carryover_address below.
+V2_ADDR = re.compile(r"(?:t?gnb1zq[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{38}|t?gnb1zp[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58})")
+
+
+def ADDRESS(value):
+    if isinstance(value, str):
+        if ADDR.fullmatch(value):
+            return value
+        if (value == value.lower() or value == value.upper()) and V2_ADDR.fullmatch(value.lower()):
+            return value
+    raise ValueError("GnB address expected")
+
+
 U32 = _int(0, 2**32 - 1)
 PAGE = _int(1, 100)
 OFFSET = _int(0, 10**9)
@@ -336,7 +349,50 @@ def load_carryover(path):
     _carry.update(out)
 
 
+def _carryover_address(value):
+    """Verify a v2 alias and derive the existing carryover key, without RPC.
+
+    Standalone deployment: no import from the uninstalled reference tree.
+    BIP350 https://github.com/bitcoin/bips/blob/master/bip-0350.mediawiki
+    Application framing is docs/ADDRESS-V2.md; this is not Bitcoin Segwit.
+    """
+    ADDRESS(value)
+    if ADDR.fullmatch(value):
+        return value  # Existing legacy behavior and table keys are unchanged.
+    lower = value.lower()
+    hrp, data = lower.rsplit("1", 1)
+    alphabet = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+    words = [alphabet.index(c) for c in data]
+    checksum = 1
+    expanded = [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+    for word in expanded + words:
+        top = checksum >> 25
+        checksum = ((checksum & 0x1ffffff) << 5) ^ word
+        for bit, generator in enumerate((0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3)):
+            if top & (1 << bit):
+                checksum ^= generator
+    if checksum != 0x2bc830a3:
+        raise ValueError("invalid Bech32m checksum")
+    # ADDRESS already checks known HRP, version 2, kind and encoded length.
+    kind = words[1]
+    acc = bits = 0
+    payload = bytearray()
+    for word in words[2:-6]:
+        acc = ((acc << 5) | word) & 0xfff
+        bits += 5
+        if bits >= 8:
+            bits -= 8
+            payload.append((acc >> bits) & 0xff)
+    if bits >= 5 or (acc & ((1 << bits) - 1)) or len(payload) != (20 if kind == 0 else 32):
+        raise ValueError("invalid address padding or length")
+    prefix = ("gnb1t" if hrp == "tgnb" else "gnb1q") if kind == 0 else ("gnb1n" if hrp == "tgnb" else "gnb1m")
+    checksum_input = (prefix.encode("ascii") if kind == 1 else b"") + payload
+    legacy_checksum = hashlib.sha3_256(hashlib.sha3_256(checksum_input).digest()).digest()[:4]
+    return prefix + (payload + legacy_checksum).hex()
+
+
 def carryover_of(address):
+    address = _carryover_address(address)
     v = _carry.get(address)
     if not v:
         return {"result": {"address": address, "in_carryover": False}}

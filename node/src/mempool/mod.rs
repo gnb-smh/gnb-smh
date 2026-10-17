@@ -1398,6 +1398,10 @@ impl Mempool {
             };
 
             if incoming > 0 || outgoing > 0 {
+                #[cfg(test)]
+                ADDRESS_TX_CLONED_BYTES.with(|n| n.set(n.get()
+                    + entry.tx.inputs.iter().map(|i| i.script_sig.len()).sum::<usize>()
+                    + entry.tx.outputs.iter().map(|o| o.script_pubkey.len()).sum::<usize>()));
                 results.push(AddressTxInfo {
                     txid:     *txid,
                     tx:       entry.tx.clone(),
@@ -1420,10 +1424,71 @@ impl Mempool {
         addr_hash: &[u8; 20],
         utxo_lookup: Option<&dyn Fn(&[u8; 32], u32) -> Option<crate::core::TxOutput>>,
     ) -> (u64, u64) {
-        let txs = self.txs_affecting_address(addr_hash, utxo_lookup);
-        let incoming: u64 = txs.iter().map(|t| t.incoming).sum();
-        let outgoing: u64 = txs.iter().map(|t| t.outgoing).sum();
+        // B1-R2-11: totals need no history vector, cloned PQ signatures,
+        // or timestamp sort. O(total inputs + outputs), constant auxiliary
+        // space; preserve the history query's matching/missing-input and
+        // checked-u64 arithmetic semantics.
+        let g = self.inner.read();
+        let (mut incoming, mut outgoing) = (0u64, 0u64);
+        for entry in g.txs.values() {
+            incoming += entry.tx.outputs.iter()
+                .filter(|o| o.script_pubkey.as_slice() == addr_hash.as_slice())
+                .map(|o| o.value)
+                .sum::<u64>();
+            if let Some(lookup) = utxo_lookup {
+                outgoing += entry.tx.inputs.iter()
+                    .filter_map(|inp| lookup(&inp.prev_txid, inp.prev_index))
+                    .filter(|o| o.script_pubkey.as_slice() == addr_hash.as_slice())
+                    .map(|o| o.value)
+                    .sum::<u64>();
+            }
+        }
         (incoming, outgoing)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Payload bytes actually copied into the address-history result.
+    static ADDRESS_TX_CLONED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod r7_pending_tests {
+    use super::*;
+    use crate::core::TxInput;
+
+    #[test]
+    fn r7_pending_balance_does_not_clone_mempool_payloads() {
+        let pool = Mempool::new();
+        let address = [7u8; 20];
+        for i in 0..32u8 {
+            let tx = Transaction {
+                version: 1,
+                inputs: vec![TxInput { prev_txid: [i; 32], prev_index: 0,
+                    script_sig: vec![1; 16 * 1024], sequence: u32::MAX }],
+                outputs: vec![TxOutput { value: 1000, script_pubkey: address.to_vec() }],
+                locktime: 0,
+            };
+            pool.add(tx, 100_000).unwrap();
+        }
+        let reads = std::cell::Cell::new(0);
+        let lookup = |_: &[u8; 32], _: u32| {
+            reads.set(reads.get() + 1);
+            Some(TxOutput { value: 2000, script_pubkey: address.to_vec() })
+        };
+        ADDRESS_TX_CLONED_BYTES.with(|n| n.set(0));
+        assert_eq!(pool.pending_balance_for(&address, Some(&lookup)), (32_000, 64_000));
+        assert_eq!(reads.get(), 32, "at most one lookup per input");
+        let cloned = ADDRESS_TX_CLONED_BYTES.with(|n| n.get());
+        assert_eq!(cloned, 0, "an aggregate must not retain cloned transaction payloads");
+        // Positive control: the probe observes real copies on the history API.
+        assert_eq!(pool.txs_affecting_address(&address, None).len(), 32);
+        assert_eq!(ADDRESS_TX_CLONED_BYTES.with(|n| n.get()), 32 * (16 * 1024 + 20));
+        assert_eq!(pool.pending_balance_for(&address, None), (32_000, 0));
+        assert_eq!(pool.pending_balance_for(&[8; 20], Some(&lookup)), (0, 0));
+        let missing = |_: &[u8; 32], _: u32| None;
+        assert_eq!(pool.pending_balance_for(&address, Some(&missing)), (32_000, 0));
     }
 }
 

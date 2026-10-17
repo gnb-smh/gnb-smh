@@ -1,0 +1,8 @@
+{
+  "source": "/private/tmp/gnb-pqpsbt-miri-source/crates/gnb-wallet-wasm/src/lib.rs",
+  "before_sha256": "0483c533728037c28d39288c59e7c5782afde67f26d7f41fda8daed4ca34704a",
+  "mutated_sha256": "927d1723ffd229de074401c093cfb29c49c96f03fc5dc1fa6e8b74b5e2f347cf",
+  "restored_sha256": "0483c533728037c28d39288c59e7c5782afde67f26d7f41fda8daed4ca34704a",
+  "reversal_exit": 1,
+  "restored_exit": 0
+}

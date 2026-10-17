@@ -1,0 +1,189 @@
+{
+  "package": "r5-independent-descriptor-reference",
+  "base": "35ccd62552f6ee1b72064fe82b0a18f03dba1900",
+  "test_only_commit": "a8821cffce8e160259ac79ab3d4b4d90bb655c59",
+  "implementation_commit": "0cb5993bd7a72200e432d8f68409f2e04bc9538e",
+  "generated_campaign_commit": "d78a6c2bc34dcf0616fa35fe875665fc26b56478",
+  "native_codegen_units": 149,
+  "native_builds": 0,
+  "python": "Python 3.9.6",
+  "reference_tests": {
+    "passed": 13,
+    "failed": 0
+  },
+  "pinned_cases": {
+    "total": 362,
+    "accepted": 58,
+    "rejected": 304
+  },
+  "differential": {
+    "core_source_revision": "326e2922a72ce124622be70b5aa633d2941cfe6d",
+    "build_source_note": "Core owner reports binary compiled from these unchanged production files before committing; SHA is independently recorded by differential driver. No Rust source was read by this package.",
+    "execution": {
+      "command": [
+        "python3",
+        "reference/descriptor_differential.py",
+        "/private/tmp/gnb-r5-target-descriptor-core/debug/examples/descriptor_oracle"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 170.359,
+      "log": "/private/tmp/gnb-r5-reference-evidence/differential.log",
+      "log_sha256": "9196f9f1195374741e4c72e5e04bf617494f76c0b27612889be4ac1288594bff"
+    },
+    "summary": {
+      "accepted": 122,
+      "corpus_sha256": "c89da6ace011f18aa2cf81da9ce7700d093b268a99676f544baab36ed83c0c77",
+      "divergences": 0,
+      "generated_requests": 128,
+      "generated_seed": 306255643701,
+      "generated_sha256": "c08bd6d6133854b9a5b20195cd25e1bd4d5e2ad52d8d6031fe96659bbaff4760",
+      "pinned_requests": 362,
+      "python_oracle_sha256": "97099729fb21ab6838a67398ad1f077b1e9319d9629aa078fdc41d67bc74ab0d",
+      "rejected": 368,
+      "requests": 490,
+      "rust_binary_sha256": "aca9de614c159e7ccd7b63891f5e27cfb68b0c36ce8d1c395b3a0ff6e838b49a"
+    }
+  },
+  "initial_checks": {
+    "revision": "0cb5993bd7a72200e432d8f68409f2e04bc9538e",
+    "python": "Python 3.9.6",
+    "results": [
+      {
+        "name": "unit",
+        "command": [
+          "python3",
+          "reference/descriptor_test.py"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 9.652,
+        "log": "/private/tmp/gnb-r5-reference-evidence/unit.log",
+        "log_sha256": "0949b72e2bf6d9d9a144e8925e15e959c4a6a7f816b6e28ee3f5a04a7fd1953c"
+      },
+      {
+        "name": "vectors",
+        "command": [
+          "python3",
+          "reference/descriptor_vectors.py",
+          "--check"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 46.303,
+        "log": "/private/tmp/gnb-r5-reference-evidence/vectors.log",
+        "log_sha256": "ad604206b1c84fb10aebb23f3dfd8493e3819365ac7452f6cff5cc37aff2d997"
+      },
+      {
+        "name": "compile",
+        "command": [
+          "python3",
+          "-m",
+          "py_compile",
+          "reference/descriptor.py",
+          "reference/descriptor_test.py",
+          "reference/descriptor_vectors.py",
+          "reference/descriptor_differential.py"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 0.166,
+        "log": "/private/tmp/gnb-r5-reference-evidence/compile.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "diff-check",
+        "command": [
+          "git",
+          "diff",
+          "--check"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 0.05,
+        "log": "/private/tmp/gnb-r5-reference-evidence/diff-check.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ],
+    "source_sha256": {
+      "reference/descriptor.py": "97099729fb21ab6838a67398ad1f077b1e9319d9629aa078fdc41d67bc74ab0d",
+      "reference/descriptor_differential.py": "534b293027bd2eac4fd10cd240108988e47a57932017efdc378c6ae7ed9a6b45",
+      "reference/descriptor_test.py": "9a314f1c8e6356590c7f7d2dae27ebe4b62114e6b7993d4e7e7e0da56f9afecc",
+      "reference/descriptor_vectors.json": "c89da6ace011f18aa2cf81da9ce7700d093b268a99676f544baab36ed83c0c77",
+      "reference/descriptor_vectors.py": "b18884565d787d54cc08c790221c151f486ea94e5ab47a5c423d1dfbc5947935"
+    }
+  },
+  "final_checks": {
+    "revision": "d78a6c2bc34dcf0616fa35fe875665fc26b56478",
+    "results": [
+      {
+        "name": "unit-final",
+        "command": [
+          "python3",
+          "reference/descriptor_test.py"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 35.939,
+        "log": "/private/tmp/gnb-r5-reference-evidence/unit-final.log",
+        "log_sha256": "72a21390dcf15eb1f6cdbe9f1a7ac8c012e65e149e243bad2b4c6c45a1d9c5ea"
+      },
+      {
+        "name": "compile-final",
+        "command": [
+          "python3",
+          "-m",
+          "py_compile",
+          "reference/descriptor.py",
+          "reference/descriptor_test.py",
+          "reference/descriptor_vectors.py",
+          "reference/descriptor_differential.py",
+          "reference/descriptor_generated.py"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 0.195,
+        "log": "/private/tmp/gnb-r5-reference-evidence/compile-final.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  "source_sha256": {
+    "reference/descriptor.py": "97099729fb21ab6838a67398ad1f077b1e9319d9629aa078fdc41d67bc74ab0d",
+    "reference/descriptor_differential.py": "59fcbc31891d95e0f6a6617ed19504f64ad7aced9254b7040cc6b9065244a66d",
+    "reference/descriptor_generated.py": "9fe525567dbc3da3bd2e5582f8a0bb79d41dea2b9f0422ec0a7a4e86ac14a081",
+    "reference/descriptor_test.py": "921b4cc0329a6f1a93900cc81db30bf7fe32bd3e5361f91e449081a49961764b",
+    "reference/descriptor_vectors.json": "c89da6ace011f18aa2cf81da9ce7700d093b268a99676f544baab36ed83c0c77",
+    "reference/descriptor_vectors.py": "b18884565d787d54cc08c790221c151f486ea94e5ab47a5c423d1dfbc5947935"
+  },
+  "logs": {
+    "compile-final.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "text": ""
+    },
+    "compile.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "text": ""
+    },
+    "diff-check.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "text": ""
+    },
+    "differential.log": {
+      "sha256": "9196f9f1195374741e4c72e5e04bf617494f76c0b27612889be4ac1288594bff",
+      "text": "{\"accepted\": 122, \"corpus_sha256\": \"c89da6ace011f18aa2cf81da9ce7700d093b268a99676f544baab36ed83c0c77\", \"divergences\": 0, \"generated_requests\": 128, \"generated_seed\": 306255643701, \"generated_sha256\": \"c08bd6d6133854b9a5b20195cd25e1bd4d5e2ad52d8d6031fe96659bbaff4760\", \"pinned_requests\": 362, \"python_oracle_sha256\": \"97099729fb21ab6838a67398ad1f077b1e9319d9629aa078fdc41d67bc74ab0d\", \"rejected\": 368, \"requests\": 490, \"rust_binary_sha256\": \"aca9de614c159e7ccd7b63891f5e27cfb68b0c36ce8d1c395b3a0ff6e838b49a\"}\n"
+    },
+    "unit-final.log": {
+      "sha256": "72a21390dcf15eb1f6cdbe9f1a7ac8c012e65e149e243bad2b4c6c45a1d9c5ea",
+      "text": ".............\n----------------------------------------------------------------------\nRan 13 tests in 35.730s\n\nOK\n"
+    },
+    "unit.log": {
+      "sha256": "0949b72e2bf6d9d9a144e8925e15e959c4a6a7f816b6e28ee3f5a04a7fd1953c",
+      "text": "............\n----------------------------------------------------------------------\nRan 12 tests in 9.473s\n\nOK\n"
+    },
+    "vectors.log": {
+      "sha256": "ad604206b1c84fb10aebb23f3dfd8493e3819365ac7452f6cff5cc37aff2d997",
+      "text": "descriptor vectors: reproducible\n"
+    }
+  },
+  "limitations": [
+    "Python test-only commit defines reference contract and is not product runtime reproduction. Core dispatcher reproduction is separate.",
+    "Public key fixtures satisfy current format predicate only; no private keys or cryptographic key validity are claimed.",
+    "Generated deterministic comparison is not a coverage-guided fuzzing campaign or full consensus equivalence proof.",
+    "No final CI, integrated WASM or independent three-lens review is claimed by this package.",
+    "Static public descriptors only; PF-4 and inherited findings remain open; no score."
+  ]
+}

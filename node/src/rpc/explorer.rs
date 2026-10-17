@@ -521,8 +521,9 @@ pub(super) fn get_dag_window(params: Option<&Value>, state: &AppState) -> Value 
 pub(super) fn get_address_history(params: Option<&Value>, state: &AppState) -> Value {
     use crate::storage::indexer::{HISTORY_CURSOR_LEN, MAX_HISTORY_OFFSET};
     let addr = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
-    let Some(hash) = parse_address(addr).and_then(|b| <[u8; 20]>::try_from(b).ok()) else {
-        return json!({ "error": "invalid address" });
+    let hash = match parse_address(addr) {
+        Ok(hash) => hash,
+        Err(error) => return json!({ "error": error }),
     };
     let limit = (params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).unwrap_or(25) as usize).clamp(1, MAX_PAGE);
     let offset = params.and_then(|p| p.get(2)).and_then(|v| v.as_u64()).unwrap_or(0);

@@ -1,14 +1,15 @@
 // GnB Wallet: the sidechain-of-Bloch wallet. Keys are decrypted and used only
 // inside the WebAssembly core (core.js + gnb_wallet.wasm); this file never sees
 // a private key. Chain data comes from the site's read-only /api.
-import { loadCore } from "./core.js";
+import { watchAddress } from "../assets/safe.js";
+import { loadCore, splitByMaturity } from "./core.js";
 import { api, broadcast, addressToScript, gnb, short, ago, esc } from "../shared/gnb.js";
 
 const SAT = 100000000n;
 const IDLE_LOCK_MS = 10 * 60 * 1000;
 const MAX_INPUTS = 50;            // each input carries ~8.5 kB of post-quantum signature
 const PRE_POWIT_DEPTH = 1000;     // signers' rule before PoWit finality is active
-const CORE_SHA256 = "7dfc9c4fce92e74ed8bf2410ced99d8ffe21dc2be3d6d6fa1dcf8390155a3290";
+const CORE_SHA256 = "29cf8b3f7c1e20345758faec3595cc83763c0c9880c9f3e057567eae72cb29a3";
 
 const $ = (s, el = document) => el.querySelector(s);
 const content = $("#content");
@@ -223,7 +224,7 @@ function renderGate() {
     if (!fileText) { msg.innerHTML = errBox("Choose a keystore file first."); return; }
     busy(btn, "Decrypting (a few seconds)…"); await nextFrame();
     try {
-      const c = await getCore(); const r = c.open(fileText, $("#pw").value);
+      const c = await getCore(); const r = c.open(fileText, $("#pw").value, net.testnet ? "testnet" : "mainnet");
       $("#pw").value = ""; fileText = null;
       const testnetKey = /^gnb1t/.test(r.address);
       enter("keys", r.address, net.ok && testnetKey !== net.testnet ? `This key is for ${testnetKey ? "testnet" : "mainnet"}; the node is ${net.network}.` : null);
@@ -290,6 +291,34 @@ function viewWallet() {
 }
 
 // ── send ─────────────────────────────────────────────────────────────────────
+// Match the height used by the node's mempool and template. In a DAG this
+// cannot be inferred from the displayed tip height; missing metadata fails
+// closed before planning or signing a transaction.
+async function nextPaymentHeight() {
+  const dag = await api("getdaginfo");
+  const value = dag?.next_block_height;
+  if ((typeof value !== "number" && typeof value !== "string") || !/^[1-9][0-9]*$/.test(String(value))) {
+    throw new Error("The node did not report a valid next block height.");
+  }
+  const next = Number(value);
+  if (!Number.isSafeInteger(next)) throw new Error("The node reported an invalid next block height.");
+  return next;
+}
+
+// WAL-1: before sighash v3, verify the selected input values against their
+// creating transactions. Unavailable/pruned records stay explicitly marked
+// unverified; any supplied bytes must pass the core's txid/value checks.
+async function paymentPrevTxs(txids) {
+  const previous = {};
+  await Promise.all(txids.filter(id => /^[0-9a-f]{64}$/i.test(id)).map(async id => {
+    try {
+      const tx = await api("getrawtransaction", [id]);
+      if (typeof tx?.hex === "string") previous[id] = tx.hex;
+    } catch {}
+  }));
+  return previous;
+}
+
 function viewSend() {
   content.innerHTML = `${hero()}<section class="card"><h2>Send GNB</h2><div class="form">
    <label>To<input id="to" spellcheck="false" placeholder="${net.testnet ? "gnb1t…" : "gnb1q… (a bloch1q… address is accepted)"}"></label>
@@ -309,16 +338,30 @@ function viewSend() {
       const amount = parseGnb($("#amt").value);
       if (amount <= 0n) throw new Error("Enter an amount above zero.");
       if (!st.spendable.length) throw new Error("No mature outputs to spend yet.");
-      busy(btn, "Building and signing…"); await nextFrame();
-      const tx = c.pay(st.spendable, to, amount.toString(), "0");
+      busy(btn, "Verifying inputs and signing…"); await nextFrame();
+      const next = await nextPaymentHeight();
+      const coins = splitByMaturity(st.spendable, next).spendable;
+      if (!coins.length) throw new Error("No spendable outputs at the next block; refresh and try again.");
+      const plan = c.plan(coins, to, amount.toString(), "0", next);
+      const prevtxs = await paymentPrevTxs(plan.prev_txids || []);
+      const tx = c.pay(coins, to, amount.toString(), "0", next, prevtxs);
+      const unverified = tx.unverified_inputs || 0;
       unbusy(btn);
       out.innerHTML = `<div class="review">
         <div><span>To</span><b>${esc(to)}</b></div><div><span>Amount</span><b>${esc(fmt(tx.amount))} GNB</b></div>
         <div><span>Network fee</span><b>${esc(fmt(tx.fee))} GNB</b></div><div><span>Inputs · size</span><b>${tx.inputs} · ${(tx.size / 1024).toFixed(1)} kB</b></div>
+        ${tx.amounts_committed === true
+          ? `<div><span>Input values</span><b>committed by the signature (version 3)</b></div>`
+          : `<div><span>Inputs verified against their transactions</span><b>${tx.verified_inputs} of ${tx.inputs}</b></div>`}
         <div><span>Change back to you</span><b>${esc(fmt(tx.change))} GNB</b></div></div>
-        <div class="row" style="margin-top:12px"><button class="btn" id="confirm">Confirm and send</button><button class="btn ghost" id="cancel">Cancel</button></div>`;
+        ${unverified ? `<div class="alert bad" style="margin-top:12px">${unverified} input value(s) come only from the server (genesis carryover or pruned history) and could not be checked against their transaction. If the server lied, the difference would be paid as fee.
+          <label class="check"><input type="checkbox" id="accept-unverified"> I accept the unverified input value(s) shown above.</label></div>` : ""}
+        <div class="row" style="margin-top:12px"><button class="btn" id="confirm" ${unverified ? "disabled" : ""}>Confirm and send</button><button class="btn ghost" id="cancel">Cancel</button></div>`;
+      const confirm = $("#confirm");
+      $("#accept-unverified")?.addEventListener("change", e => { confirm.disabled = !e.target.checked; });
       $("#cancel").addEventListener("click", () => (out.innerHTML = ""));
-      $("#confirm").addEventListener("click", async (e2) => {
+      confirm.addEventListener("click", async (e2) => {
+        if (unverified && !$("#accept-unverified")?.checked) return;
         const b2 = e2.currentTarget; busy(b2, "Broadcasting…");
         try {
           await broadcast(tx.raw);
@@ -530,8 +573,8 @@ function viewBackup() {
 // Shareable watch links: #watch/<address>
 (async function boot() {
   await pollNetwork();
-  const m = location.hash.match(/^#watch\/(gnb1[qt][0-9a-f]{48}|bloch1[qt][0-9a-f]{48})$/);
-  if (m) { try { const c = await getCore(); history.replaceState(null, "", location.pathname + location.search + "#/wallet"); return enter("watch", c.normalize(m[1])); } catch {} }
+  const address = watchAddress(location.hash);
+  if (address) { try { const c = await getCore(); history.replaceState(null, "", location.pathname + location.search + "#/wallet"); return enter("watch", c.normalize(address)); } catch {} }
   route();
   setInterval(() => { if (st.mode === "locked") pollNetwork(); }, 30000);
 })();

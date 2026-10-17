@@ -1,0 +1,531 @@
+{
+  "schema": 1,
+  "scope": "Recorded executions; unresolved failures remain release gates, no numerical score or complete-program approval.",
+  "source_revision": "c66fa0008b1aa1ca22c622c892955d8b1ffa7b91",
+  "primary": {
+    "revision": "2cb99803160b51d6d428f2c5be26a3b3b88e2ce7",
+    "codegen_units": 97,
+    "results": {
+      "node": {
+        "exit_code": 101,
+        "seconds": 2126.35,
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "gnb",
+          "--locked",
+          "--offline",
+          "--no-fail-fast"
+        ]
+      },
+      "crypto": {
+        "exit_code": 0,
+        "seconds": 313.06,
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "gnb-crypto",
+          "--locked",
+          "--offline"
+        ]
+      },
+      "functional-build": {
+        "exit_code": 0,
+        "seconds": 104.4,
+        "command": [
+          "cargo",
+          "build",
+          "-p",
+          "gnb",
+          "--features",
+          "test-pow-limit",
+          "--bin",
+          "gnb",
+          "--bin",
+          "gnb-cli",
+          "--locked",
+          "--offline"
+        ]
+      },
+      "functional": {
+        "exit_code": 1,
+        "seconds": 735.93,
+        "command": [
+          "/Users/tiagobulhoes/.local/share/uv/python/cpython-3.12.15-macos-x86_64-none/bin/python3",
+          "test/functional/test_runner.py",
+          "--ci",
+          "--no-build",
+          "--jobs",
+          "1",
+          "--timeout",
+          "300",
+          "--tmpdir",
+          "/private/tmp/gnb-r4-functional",
+          "--cachedir",
+          "/private/tmp/gnb-r4-functional-cache",
+          "--keep-failed"
+        ]
+      }
+    }
+  },
+  "references": {
+    "revision": "92348b5af49d87eec8dbe8572bd8f7017c4d44bb",
+    "results": {
+      "address-reference": 0,
+      "address-vectors": 0,
+      "pqpsbt-vectors": 0,
+      "pow-reference": 0,
+      "consensus-reference": 0,
+      "pqpsbt-reference": 0,
+      "ledger-reference": 0,
+      "deploy": 0,
+      "release-tools": 0,
+      "harness": 0
+    }
+  },
+  "logs": {
+    "node": {
+      "path": "/private/tmp/gnb-r4-integration/node.log",
+      "sha256": "4189737491959d1d0e7d29d879fc176de24a2c2116d13e304066c7821358171f",
+      "cargo_summary_totals": {
+        "passed": 1771,
+        "failed": 1,
+        "ignored": 8,
+        "summaries": 105
+      }
+    },
+    "crypto": {
+      "path": "/private/tmp/gnb-r4-integration/crypto.log",
+      "sha256": "df5f3dead0ed46303551b0439e4fc4c1037aebef9eb68f7cd9975b300c55024f",
+      "cargo_summary_totals": {
+        "passed": 479,
+        "failed": 0,
+        "ignored": 4,
+        "summaries": 14
+      }
+    },
+    "functional-build": {
+      "path": "/private/tmp/gnb-r4-integration/functional-build.log",
+      "sha256": "8a9cd96cf92a6a7d6e3d5519cd25f6941f6efe7f144ab5c6abe7ef0b92223c7c"
+    },
+    "functional": {
+      "path": "/private/tmp/gnb-r4-integration/functional.log",
+      "sha256": "1fd2e50483825f798502bac716aca368f5286b4948af91c1740dd34881aaf0ee"
+    },
+    "address-reference": {
+      "path": "/private/tmp/gnb-r4-integrated-checks/address-reference.log",
+      "sha256": "3ef2390daaac688849b64af72629daf7523b3fa51ec49c131fe8e8c9f6a22bbe"
+    },
+    "address-vectors": {
+      "path": "/private/tmp/gnb-r4-integrated-checks/address-vectors.log",
+      "sha256": "4ffe3027ccffaa7ca64b79f812f95cd8d745b82994e44ee159c6dd72a3b69903"
+    },
+    "pqpsbt-vectors": {
+      "path": "/private/tmp/gnb-r4-integrated-checks/pqpsbt-vectors.log",
+      "sha256": "751c3ec9cd55ba3f58c6b1e0c33d921563c8c8bae50879c35d7b80a9733aa682"
+    },
+    "pow-reference": {
+      "path": "/private/tmp/gnb-r4-integrated-checks/pow-reference.log",
+      "sha256": "7df7489f32edfbfa9fb712b4e29c4fce273a1cabd7521f772e8c8f0986bad134"
+    },
+    "consensus-reference": {
+      "path": "/private/tmp/gnb-r4-integrated-checks/consensus-reference.log",
+      "sha256": "d360d0d90dd53288180fa7019b23d04ef82f317d6f99c68b35ab245df44d5f7e"
+    },
+    "pqpsbt-reference": {
+      "path": "/private/tmp/gnb-r4-integrated-checks/pqpsbt-reference.log",
+      "sha256": "b261e47aab8e3e96c5a16351737396823a01abfe32ea3dfc63862c757136d3de"
+    },
+    "ledger-reference": {
+      "path": "/private/tmp/gnb-r4-integrated-checks/ledger-reference.log",
+      "sha256": "8d2771d0e8a42c0eb2e25ec51644f067747850f2677d1aff6952ae773ccdbb61"
+    },
+    "deploy": {
+      "path": "/private/tmp/gnb-r4-integrated-checks/deploy.log",
+      "sha256": "9cf00b955fd7cf3e7f381127de9efb271336a5ad23ed36c0acf871f3646bb918"
+    },
+    "release-tools": {
+      "path": "/private/tmp/gnb-r4-integrated-checks/release-tools.log",
+      "sha256": "b80c9207c1712584af43367bfb3654e50ccc87bfb484e6fa4455b894b19c19fb"
+    },
+    "harness": {
+      "path": "/private/tmp/gnb-r4-integrated-checks/harness.log",
+      "sha256": "c5c25a7e55e9f5f976c6b0ae2f62a54239435002fb49351753b46e875f468421"
+    },
+    "site": {
+      "path": "/private/tmp/gnb-r4-site-canonical-final.log",
+      "sha256": "c594888069fb0616dc366b7692c624e1c10bf89fe440a117b4dd78f7e4bd3dac"
+    },
+    "explorer": {
+      "path": "/private/tmp/gnb-r4-explorer-integrated.log",
+      "sha256": "239c2b7ceefa2c0a8e010d4ef2271548d9590fee04a45bcc17f2e954f4b86add"
+    },
+    "oracle_tests": {
+      "path": "/private/tmp/gnb-r4-integrated-oracle-tests.log",
+      "sha256": "6cd15378a0b71219902dee3b976d38e55b9e4fc045a3a0ee81f6c5a13ae1e6bf",
+      "cargo_summary_totals": {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0,
+        "summaries": 1
+      }
+    },
+    "oracle_build": {
+      "path": "/private/tmp/gnb-r4-integrated-oracle-build.log",
+      "sha256": "fe368598dee37a838fc947bb61fdf7683a67dd9c56d87bf1c158f0d080cf0571"
+    },
+    "differential": {
+      "path": "/private/tmp/gnb-r4-integrated-differential.log",
+      "sha256": "7bcc8eb1242ba4c727bcfc2c7f6850b4ad4f6b0b5cce8b4d233ee2e5b0c9d10c"
+    },
+    "fuzz_typecheck": {
+      "path": "/private/tmp/gnb-r4-address-fuzz-typecheck.log",
+      "sha256": "2c06b4e938179f3a0ee0ac24ead1b2a684e2a0c29686d205becc262210972645"
+    }
+  },
+  "source_notes": [
+    "The serial driver began at 2cb9980. Node production did not change thereafter. The only subsequent node diff was the additional repeated-prefix test; its execution appears in the full log.",
+    "The separate crypto invocation ran after oracle adapter updates. Its default Cargo suite does not execute example unit tests; those have their own recorded invocation.",
+    "Cargo totals count executions across targets, including repeated modules and the isolated testnet subprocess; they are not counts of distinct functional scenarios.",
+    "Only already-authorized whole suites ran. The R4-NODE-1 ingress assertion was not isolated or changed; its cause remains undetermined."
+  ],
+  "site": {
+    "exit_code": 0,
+    "passed": 67,
+    "failed": 0,
+    "skipped": 0,
+    "canonical_wasm_sha256": "f184981b63377d286dabd792d375e2f2daaa337d27c7a50bb64c96d5f3d4b0d5"
+  },
+  "explorer": {
+    "exit_code": 0,
+    "passed": 21,
+    "failed": 0
+  },
+  "oracle_tests": {
+    "command": "cargo test -p gnb-crypto --locked --offline --example address_v2_oracle",
+    "exit_code": 0,
+    "passed": 5,
+    "failed": 0,
+    "codegen_units": 97
+  },
+  "fuzz_typecheck": {
+    "command": "cargo check --manifest-path node/fuzz/Cargo.toml --bin address_parse --locked --offline",
+    "exit_code": 0,
+    "codegen_units": 131,
+    "scope": "Typecheck only; no local fuzz campaign."
+  },
+  "differential": {
+    "corpus_sha256": "26c1d23ebeb765961bcab1930f0555b9c54252e750d7be139b713191d8d0ee1c",
+    "divergences": 0,
+    "envelope_requests": 42,
+    "python_oracle_sha256": "6d0c511b1c61845a3e096a5e742745947b8286b181a395ab6d3103671722c2a9",
+    "requests": 672,
+    "rust_binary_sha256": "9bfb3f07c2c6548a6c5b6d61ca98130b23bd4d919fb6dd5a8a0829b4fe97b958"
+  },
+  "wasm_manifest": {
+    "build_script_sha256": "201aa76b18d1e2c942deb4a8cd5788c8e35dc17c0e32827f9bc309bec2d780a6",
+    "cargo_lock_sha256": "2edda7ed73536ed13a7ad22ec01aab6ee66b4de06ac9aad19cb43ec1c080a779",
+    "host": "Linux-x86_64",
+    "revision": "9226dadf88033b3ca10bebd459512b1889d18062",
+    "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+    "schema": 1,
+    "target": "wasm32-wasip1",
+    "wasi_sdk_archive_sha256": "52640dde13599bf127a95499e61d6d640256119456d1af8897ab6725bcf3d89c",
+    "wasi_sdk_version": "25",
+    "wasm_sha256": "f184981b63377d286dabd792d375e2f2daaa337d27c7a50bb64c96d5f3d4b0d5"
+  },
+  "ci": {
+    "initial": {
+      "databaseId": 38946123375,
+      "headSha": "9226dadf88033b3ca10bebd459512b1889d18062",
+      "status": "completed",
+      "conclusion": "failure",
+      "record_sha256": "8bd7992018ed972cf7bd8d08df0cd225533a335634b6033b4934b35d6aa1b104",
+      "jobs": [
+        {
+          "name": "wasm-reproducible",
+          "status": "completed",
+          "conclusion": "failure",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560198",
+          "startedAt": "2026-10-16T18:17:03Z",
+          "completedAt": "2026-10-16T18:18:09Z"
+        },
+        {
+          "name": "vendored-guards",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560224",
+          "startedAt": "2026-10-16T18:17:02Z",
+          "completedAt": "2026-10-16T18:17:53Z"
+        },
+        {
+          "name": "clippy",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560248",
+          "startedAt": "2026-10-16T18:17:02Z",
+          "completedAt": "2026-10-16T18:21:38Z"
+        },
+        {
+          "name": "consensus-crates",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560299",
+          "startedAt": "2026-10-16T18:17:02Z",
+          "completedAt": "2026-10-16T18:24:51Z"
+        },
+        {
+          "name": "functional",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560322",
+          "startedAt": "2026-10-16T18:17:02Z",
+          "completedAt": "2026-10-16T18:25:40Z"
+        },
+        {
+          "name": "deploy-files",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560422",
+          "startedAt": "2026-10-16T18:17:02Z",
+          "completedAt": "2026-10-16T18:17:20Z"
+        },
+        {
+          "name": "site-tests",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560427",
+          "startedAt": "2026-10-16T18:17:02Z",
+          "completedAt": "2026-10-16T18:17:10Z"
+        },
+        {
+          "name": "miri",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560436",
+          "startedAt": "2026-10-16T18:17:03Z",
+          "completedAt": "2026-10-16T18:33:24Z"
+        },
+        {
+          "name": "i686",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560447",
+          "startedAt": "2026-10-16T18:17:03Z",
+          "completedAt": "2026-10-16T18:24:03Z"
+        },
+        {
+          "name": "audit-harness",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560454",
+          "startedAt": "2026-10-16T18:17:02Z",
+          "completedAt": "2026-10-16T18:18:29Z"
+        },
+        {
+          "name": "workspace-test",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560516",
+          "startedAt": "2026-10-16T18:17:02Z",
+          "completedAt": "2026-10-16T18:36:53Z"
+        },
+        {
+          "name": "python-reference",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560648",
+          "startedAt": "2026-10-16T18:17:03Z",
+          "completedAt": "2026-10-16T18:17:42Z"
+        },
+        {
+          "name": "sanitizers",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560650",
+          "startedAt": "2026-10-16T18:17:02Z",
+          "completedAt": "2026-10-16T18:28:46Z"
+        },
+        {
+          "name": "supply-chain",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560680",
+          "startedAt": "2026-10-16T18:17:03Z",
+          "completedAt": "2026-10-16T18:17:34Z"
+        },
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125560682",
+          "startedAt": "2026-10-16T18:17:02Z",
+          "completedAt": "2026-10-16T18:17:34Z"
+        },
+        {
+          "name": "fuzz",
+          "status": "completed",
+          "conclusion": "skipped",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125562107",
+          "startedAt": "2026-10-16T18:16:59Z",
+          "completedAt": "2026-10-16T18:16:59Z"
+        },
+        {
+          "name": "i686-node",
+          "status": "completed",
+          "conclusion": "skipped",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38946123375/job/117125562314",
+          "startedAt": "2026-10-16T18:17:00Z",
+          "completedAt": "2026-10-16T18:16:59Z"
+        }
+      ]
+    },
+    "canonical": {
+      "databaseId": 38948115956,
+      "headSha": "1f55f934833fbdcff9d835072d05a5766934f087",
+      "status": "completed",
+      "conclusion": "success",
+      "record_sha256": "c48963e7321cb71df604301c686e99b17cb05f6fcb5c27619cf3b6c2434b23e0",
+      "jobs": [
+        {
+          "name": "functional",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132311429",
+          "startedAt": "2026-10-16T18:32:26Z",
+          "completedAt": "2026-10-16T18:37:32Z"
+        },
+        {
+          "name": "vendored-guards",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132311693",
+          "startedAt": "2026-10-16T18:32:26Z",
+          "completedAt": "2026-10-16T18:33:18Z"
+        },
+        {
+          "name": "workspace-test",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132311721",
+          "startedAt": "2026-10-16T18:32:27Z",
+          "completedAt": "2026-10-16T18:55:42Z"
+        },
+        {
+          "name": "consensus-crates",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132311753",
+          "startedAt": "2026-10-16T18:32:26Z",
+          "completedAt": "2026-10-16T18:38:31Z"
+        },
+        {
+          "name": "python-reference",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132311834",
+          "startedAt": "2026-10-16T18:32:26Z",
+          "completedAt": "2026-10-16T18:33:02Z"
+        },
+        {
+          "name": "wasm-reproducible",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132311875",
+          "startedAt": "2026-10-16T18:32:26Z",
+          "completedAt": "2026-10-16T18:33:31Z"
+        },
+        {
+          "name": "rust",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132311991",
+          "startedAt": "2026-10-16T18:32:27Z",
+          "completedAt": "2026-10-16T18:33:07Z"
+        },
+        {
+          "name": "audit-harness",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132312049",
+          "startedAt": "2026-10-16T18:32:26Z",
+          "completedAt": "2026-10-16T18:33:25Z"
+        },
+        {
+          "name": "site-tests",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132312111",
+          "startedAt": "2026-10-16T18:32:26Z",
+          "completedAt": "2026-10-16T18:32:44Z"
+        },
+        {
+          "name": "deploy-files",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132312113",
+          "startedAt": "2026-10-16T18:32:27Z",
+          "completedAt": "2026-10-16T18:32:45Z"
+        },
+        {
+          "name": "clippy",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132312115",
+          "startedAt": "2026-10-16T18:32:26Z",
+          "completedAt": "2026-10-16T18:33:40Z"
+        },
+        {
+          "name": "sanitizers",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132312139",
+          "startedAt": "2026-10-16T18:32:26Z",
+          "completedAt": "2026-10-16T18:43:18Z"
+        },
+        {
+          "name": "supply-chain",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132312204",
+          "startedAt": "2026-10-16T18:32:27Z",
+          "completedAt": "2026-10-16T18:32:56Z"
+        },
+        {
+          "name": "miri",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132312261",
+          "startedAt": "2026-10-16T18:32:26Z",
+          "completedAt": "2026-10-16T18:49:14Z"
+        },
+        {
+          "name": "i686",
+          "status": "completed",
+          "conclusion": "success",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132312299",
+          "startedAt": "2026-10-16T18:32:27Z",
+          "completedAt": "2026-10-16T18:36:28Z"
+        },
+        {
+          "name": "i686-node",
+          "status": "completed",
+          "conclusion": "skipped",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132313655",
+          "startedAt": "2026-10-16T18:32:24Z",
+          "completedAt": "2026-10-16T18:32:23Z"
+        },
+        {
+          "name": "fuzz",
+          "status": "completed",
+          "conclusion": "skipped",
+          "url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38948115956/job/117132314717",
+          "startedAt": "2026-10-16T18:32:24Z",
+          "completedAt": "2026-10-16T18:32:23Z"
+        }
+      ]
+    }
+  }
+}

@@ -28,7 +28,9 @@ A policy is:
 - **`after`** (absolute timelock): spendable only by a transaction whose
   `locktime ≥ after`. `0` = none;
 - **`older`** (relative timelock): spendable only `older` blocks after the
-  output confirmed. `0` = none.
+  output confirmed (counted in the depth measure of the spending block's
+  regime, docs/CONSENSUS.md, "Coinbase maturity"; an output of the genesis
+  ledger, such as a vesting tranche, is confirmed at the genesis). `0` = none.
 
 The output commits only to the policy's hash. The spender reveals the policy
 and exactly `m` signatures, tagged with strictly increasing key indices, in
@@ -49,11 +51,23 @@ built only from transactions valid together at the template height, and
 invalid mempool entries are evicted, so a time-locked or conflicting
 transaction can never make a mined block invalid.
 
-The hash of a block does not commit to signatures (the txid excludes
-`script_sig`). Failures that depend on the revealed witness (policy,
-signatures) therefore reject the copy received but never mark the block
-invalid. Timelock failures are checked after the policy matches the
-committed output, so they are failures over committed data.
+The txid excludes `script_sig`. The block id commits to every witness from
+`WITNESS_COMMITMENT_HEIGHT` (5,000; the coinbase's `|wc:` suffix) and at/after
+the hardening activation (the coinbase commitment), so there every failure
+marks the block invalid. Only a block below both heights can be re-sent with
+other witness bytes under the same id: there a failure that depends on the
+revealed witness (the policy's framing, its hash, its timelocks and branch,
+the signatures) rejects the copy received but never marks the block invalid
+(docs/CONSENSUS.md, "Coinbase commitment").
+
+The revealed policy (or policy-tree branch with its Merkle path) is checked
+against the spent output first, before any of its fields is read; the
+timelocks are those of the policy the output commits to. A made-up policy is
+the same witness failure as a bad signature (audit F1: it used to be read
+first, and a made-up `older` asked for the confirmation of an output that
+has no transaction, such as a vesting tranche, which stopped the node).
+Timelock failures are witness failures too, classified like the signatures
+(another branch of a policy tree may satisfy them).
 
 ## Witness sizes
 

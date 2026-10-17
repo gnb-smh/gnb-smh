@@ -1,0 +1,425 @@
+{
+  "schema": 1,
+  "scope": "Static public descriptor frontends only; no score, consensus verdict or key restoration claim",
+  "source_revision": "0898b010125a31594079479da046dfd8eea433a3",
+  "base": "35ccd62",
+  "baseline_production_ancestor": "2848dcf6bd89a85afe4828042227c9a2c2b433f0",
+  "native_environment": {
+    "CARGO_TARGET_DIR": "/private/tmp/gnb-r5-target-descriptor-frontends",
+    "CARGO_PROFILE_DEV_CODEGEN_UNITS": "151",
+    "CARGO_PROFILE_TEST_CODEGEN_UNITS": "151",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_BUILD_JOBS": "2"
+  },
+  "baseline_and_hook_logs": [
+    {
+      "name": "cli-baseline",
+      "exit_code": 101,
+      "passed": 1,
+      "failed": 6,
+      "path": "/private/tmp/gnb-r5-frontends-cli-baseline.log",
+      "sha256": "1c3982a4ffc16eddcf63b5a22d7593408377605c96233533207aa3110e9fcdbf"
+    },
+    {
+      "name": "rpc-baseline",
+      "exit_code": 101,
+      "passed": 1,
+      "failed": 4,
+      "path": "/private/tmp/gnb-r5-frontends-rpc-baseline.log",
+      "sha256": "39fd0cad8ed05772e6d718e3380dbc1097bf223ceb74ca96d0b48b906701a557"
+    },
+    {
+      "name": "wasm-baseline",
+      "exit_code": 1,
+      "passed": 1,
+      "failed": 4,
+      "path": "/private/tmp/gnb-r5-frontends-wasm-baseline.log",
+      "sha256": "9c864d4ad5d4db59d49641b946c6593add1d285db4939f3387674cae56a3108f"
+    },
+    {
+      "name": "wasm-old-dispatch",
+      "exit_code": 1,
+      "passed": 1,
+      "failed": 4,
+      "path": "/private/tmp/gnb-r5-frontends-wasm-old-dispatch.log",
+      "sha256": "d65f6dbabf0682f007732cb2d592bfe463fc8fcd36e28b88f3dae81e3003f2c3"
+    },
+    {
+      "name": "tojson-baseline",
+      "exit_code": 1,
+      "passed": 1,
+      "failed": 2,
+      "path": "/private/tmp/gnb-r5-frontends-tojson-baseline.log",
+      "sha256": "14406cc1b384074a06dc34618e5423579cb04092db2bd32e95662563d1161b9b"
+    },
+    {
+      "name": "tojson-fixed",
+      "exit_code": 0,
+      "passed": 3,
+      "failed": 0,
+      "path": "/private/tmp/gnb-r5-frontends-tojson-fixed.log",
+      "sha256": "e3cd652db88fcceaaa729f0313b42b6009b01223b6922148813899835448b0df"
+    }
+  ],
+  "baseline_commands": {
+    "cli": [
+      "cargo",
+      "test",
+      "-p",
+      "gnb",
+      "--test",
+      "descriptor_cli",
+      "--locked",
+      "--offline",
+      "--",
+      "--nocapture"
+    ],
+    "rpc": [
+      "cargo",
+      "test",
+      "-p",
+      "gnb",
+      "--lib",
+      "descriptor_rpc",
+      "--locked",
+      "--offline",
+      "--",
+      "--nocapture"
+    ],
+    "wasm": [
+      "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+      "--test",
+      "site/tests/wallet-descriptor.test.mjs"
+    ],
+    "serialization_hooks": [
+      "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+      "--test",
+      "--test-name-pattern",
+      "normalization control|toJSON",
+      "site/tests/wallet-descriptor.test.mjs"
+    ]
+  },
+  "historical_js_baseline_test_count": 5,
+  "final_js_test_count": 7,
+  "baseline_and_hook_wasm_sha256": "f184981b63377d286dabd792d375e2f2daaa337d27c7a50bb64c96d5f3d4b0d5",
+  "full_descriptor_wasm_validation": "Integration-owned: this worktree does not rebuild or repin WASM.",
+  "native_final": {
+    "path": "/private/tmp/gnb-r5-frontends-final/results.json",
+    "sha256": "d3bdd1bf024bb7e53d4855d762b148fe423c45f2d233970dc50af2de2bd3fcd8",
+    "data": [
+      {
+        "name": "cli",
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "gnb",
+          "--test",
+          "descriptor_cli",
+          "--locked",
+          "--offline",
+          "--",
+          "--nocapture"
+        ],
+        "exit_code": 0,
+        "seconds": 86.839,
+        "log": "/private/tmp/gnb-r5-frontends-final/cli.log",
+        "sha256": "3d2930974be7825732673d7f94dac2641ad4f369833a1c18913a628065c562e3"
+      },
+      {
+        "name": "rpc",
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "gnb",
+          "--lib",
+          "descriptor_rpc",
+          "--locked",
+          "--offline",
+          "--",
+          "--nocapture"
+        ],
+        "exit_code": 0,
+        "seconds": 40.532,
+        "log": "/private/tmp/gnb-r5-frontends-final/rpc.log",
+        "sha256": "15a3586ba3d6306c9bed0743e169277eeba57fdee1aefe23232eaafe818b3b21"
+      },
+      {
+        "name": "rpc-methods",
+        "command": [
+          "cargo",
+          "test",
+          "-p",
+          "gnb",
+          "--lib",
+          "known_methods_list_matches_dispatch",
+          "--locked",
+          "--offline"
+        ],
+        "exit_code": 0,
+        "seconds": 1.75,
+        "log": "/private/tmp/gnb-r5-frontends-final/rpc-methods.log",
+        "sha256": "2d5c72e8259c1843e1c55663519236454bce378f7e4ee2e60905ebe2c4e715a0"
+      }
+    ]
+  },
+  "native_reversals": [
+    {
+      "path": "/private/tmp/gnb-r5-frontends-reversal-cli/results.json",
+      "sha256": "b6be251a62b447684c4b36c4c6dd454b008e584e77bff82bc86feac7f70b2c97",
+      "data": {
+        "baseline": "2848dcf6bd89a85afe4828042227c9a2c2b433f0",
+        "native_cgu": 151,
+        "test_sha256_before": {
+          "node/tests/descriptor_cli.rs": "617a5303e7d21a23f936ad4f13c79619f3036ddfb510b251ef32da9ce36d2e4b",
+          "node/tests/support/descriptor_rpc.rs": "4695586a5a26ea9901d51dac0a5ba8e9a0e5332729efbd6d797a2846bcf601a5",
+          "site/tests/wallet-descriptor.test.mjs": "c87deea0b0950f86561781b4690a0d89c10825ac5e9e84bdc251f30ab3f17e36"
+        },
+        "test_sha256_after": {
+          "node/tests/descriptor_cli.rs": "617a5303e7d21a23f936ad4f13c79619f3036ddfb510b251ef32da9ce36d2e4b",
+          "node/tests/support/descriptor_rpc.rs": "4695586a5a26ea9901d51dac0a5ba8e9a0e5332729efbd6d797a2846bcf601a5",
+          "site/tests/wallet-descriptor.test.mjs": "c87deea0b0950f86561781b4690a0d89c10825ac5e9e84bdc251f30ab3f17e36"
+        },
+        "runs": [
+          {
+            "part": "cli",
+            "phase": "reverted",
+            "command": [
+              "cargo",
+              "test",
+              "-p",
+              "gnb",
+              "--test",
+              "descriptor_cli",
+              "--locked",
+              "--offline",
+              "--",
+              "--nocapture"
+            ],
+            "exit_code": 101,
+            "seconds": 5.977,
+            "log": "cli-reverted.log",
+            "sha256": "52a9a4486563ac9a0286abe74b456e7de8f8eefb30d14e6bea87151c15116ff0"
+          },
+          {
+            "part": "cli",
+            "phase": "restored",
+            "command": [
+              "cargo",
+              "test",
+              "-p",
+              "gnb",
+              "--test",
+              "descriptor_cli",
+              "--locked",
+              "--offline",
+              "--",
+              "--nocapture"
+            ],
+            "exit_code": 0,
+            "seconds": 6.612,
+            "log": "cli-restored.log",
+            "sha256": "b24a234987a70cced6d49e1bb5b12fff0969863d3e41050183bd1595bef8d417"
+          }
+        ],
+        "failures": []
+      }
+    },
+    {
+      "path": "/private/tmp/gnb-r5-frontends-reversal-rpc/results.json",
+      "sha256": "fddf7bb3a3974359e3cd54537c8670f97e85a8e4ff501307784d7ca9ebc5bcbc",
+      "data": {
+        "baseline": "2848dcf6bd89a85afe4828042227c9a2c2b433f0",
+        "native_cgu": 151,
+        "test_sha256_before": {
+          "node/tests/descriptor_cli.rs": "617a5303e7d21a23f936ad4f13c79619f3036ddfb510b251ef32da9ce36d2e4b",
+          "node/tests/support/descriptor_rpc.rs": "4695586a5a26ea9901d51dac0a5ba8e9a0e5332729efbd6d797a2846bcf601a5",
+          "site/tests/wallet-descriptor.test.mjs": "c87deea0b0950f86561781b4690a0d89c10825ac5e9e84bdc251f30ab3f17e36"
+        },
+        "test_sha256_after": {
+          "node/tests/descriptor_cli.rs": "617a5303e7d21a23f936ad4f13c79619f3036ddfb510b251ef32da9ce36d2e4b",
+          "node/tests/support/descriptor_rpc.rs": "4695586a5a26ea9901d51dac0a5ba8e9a0e5332729efbd6d797a2846bcf601a5",
+          "site/tests/wallet-descriptor.test.mjs": "c87deea0b0950f86561781b4690a0d89c10825ac5e9e84bdc251f30ab3f17e36"
+        },
+        "runs": [
+          {
+            "part": "rpc",
+            "phase": "reverted",
+            "command": [
+              "cargo",
+              "test",
+              "-p",
+              "gnb",
+              "--lib",
+              "descriptor_rpc",
+              "--locked",
+              "--offline",
+              "--",
+              "--nocapture"
+            ],
+            "exit_code": 101,
+            "seconds": 37.827,
+            "log": "rpc-reverted.log",
+            "sha256": "4acb5c02a4dbd58d70b99515f0f2d16cb310d3d535db22b5e5517c34e91db460"
+          },
+          {
+            "part": "rpc",
+            "phase": "restored",
+            "command": [
+              "cargo",
+              "test",
+              "-p",
+              "gnb",
+              "--lib",
+              "descriptor_rpc",
+              "--locked",
+              "--offline",
+              "--",
+              "--nocapture"
+            ],
+            "exit_code": 0,
+            "seconds": 39.82,
+            "log": "rpc-restored.log",
+            "sha256": "612092213206117c57904e9b183514a0f638c50ac751ef6bec51ec6beb7f4bb4"
+          }
+        ],
+        "failures": []
+      }
+    }
+  ],
+  "file_guard_mutation": {
+    "path": "/private/tmp/gnb-r5-frontends-file-guard/results.json",
+    "sha256": "939dbbd9736c31d594df96065873a61875cf8a248d5f21f4369a73506ca9ed23",
+    "data": {
+      "mutation": "replace create_new(true) by create(true).truncate(true)",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb",
+        "--test",
+        "descriptor_cli",
+        "--locked",
+        "--offline",
+        "--",
+        "--nocapture"
+      ],
+      "test_sha256_before": "617a5303e7d21a23f936ad4f13c79619f3036ddfb510b251ef32da9ce36d2e4b",
+      "test_sha256_after": "617a5303e7d21a23f936ad4f13c79619f3036ddfb510b251ef32da9ce36d2e4b",
+      "runs": [
+        {
+          "phase": "mutated",
+          "exit_code": 101,
+          "seconds": 70.493,
+          "log": "/private/tmp/gnb-r5-frontends-file-guard/mutated.log",
+          "sha256": "67e5bf3dda88627b5b948ccba6971839b6967a36ec85b8476aa26792238830b4"
+        },
+        {
+          "phase": "restored",
+          "exit_code": 0,
+          "seconds": 10.86,
+          "log": "/private/tmp/gnb-r5-frontends-file-guard/restored.log",
+          "sha256": "f1c2cb2485622ca7d040cf32d0777ae0f7d6ad2c3c42e38978aa2543e889c31c"
+        }
+      ]
+    }
+  },
+  "serialization_hook_reversal": {
+    "path": "/private/tmp/gnb-r5-frontends-tojson-reversal.json",
+    "sha256": "004cb82dff6feef1ab3d55a7456944727191c22bbcb0a978d9d095743f05f7a6",
+    "data": {
+      "baseline_binding": "f79421b",
+      "test_sha256_before": "c87deea0b0950f86561781b4690a0d89c10825ac5e9e84bdc251f30ab3f17e36",
+      "test_sha256_after": "c87deea0b0950f86561781b4690a0d89c10825ac5e9e84bdc251f30ab3f17e36",
+      "command": [
+        "/private/tmp/gnb-r1-node/node-v22.23.3-darwin-x64/bin/node",
+        "--test",
+        "--test-name-pattern",
+        "normalization control|toJSON",
+        "site/tests/wallet-descriptor.test.mjs"
+      ],
+      "runs": [
+        {
+          "phase": "reverted",
+          "exit_code": 1,
+          "log": "/private/tmp/gnb-r5-frontends-tojson-reverted.log",
+          "sha256": "dc20b355ea1cd0a96418e173498652a87c264c0bb1f20bf8586138d11d7b1f54"
+        },
+        {
+          "phase": "restored",
+          "exit_code": 0,
+          "log": "/private/tmp/gnb-r5-frontends-tojson-restored.log",
+          "sha256": "033537e49824a86757f29555819219e571cff085cb843b3b13b579128f9999b5"
+        }
+      ]
+    }
+  },
+  "replay_preflight": {
+    "path": "/private/tmp/gnb-r5-frontends-replay-preflight.json",
+    "sha256": "3ee5b295e340f30862065e1ced2fca4f34951dd5faa3b49b3c8a6c76cdf2fcc4",
+    "data": {
+      "runs": [
+        {
+          "case": "missing",
+          "exit_code": 2,
+          "log": "/private/tmp/gnb-r5-frontends-replay-preflight-missing.log",
+          "sha256": "ffec6c864812a26ae62604662590a75f58b8b7a04dd37d16c804a2ee44fec556"
+        },
+        {
+          "case": "existing",
+          "exit_code": 1,
+          "log": "/private/tmp/gnb-r5-frontends-replay-preflight-existing.log",
+          "sha256": "22876aac4ab6490b07c1e47d2296992cb7348a032fb3a7ec7b5ff5188bb4bf4a"
+        }
+      ],
+      "before": {
+        "node/src/bin/gnb-cli.rs": "6502deac9f33c9cd6e8f733a76eda513994298503e6b4883ca2e3008bd8f2f7a",
+        "node/src/rpc/mod.rs": "dddf2f04e8b3c98960b12c37555788fb3a3d5eb10b94b517577d477e8e7570e5",
+        "site/wallet/core.js": "5fcf820c6067ee1b448f4b59914ef46695e1952c386136c15182196f12d8a3b6"
+      },
+      "after": {
+        "node/src/bin/gnb-cli.rs": "6502deac9f33c9cd6e8f733a76eda513994298503e6b4883ca2e3008bd8f2f7a",
+        "node/src/rpc/mod.rs": "dddf2f04e8b3c98960b12c37555788fb3a3d5eb10b94b517577d477e8e7570e5",
+        "site/wallet/core.js": "5fcf820c6067ee1b448f4b59914ef46695e1952c386136c15182196f12d8a3b6"
+      },
+      "sentinel_preserved": true
+    }
+  },
+  "final_file_sha256": {
+    "node/tests/descriptor_cli.rs": "617a5303e7d21a23f936ad4f13c79619f3036ddfb510b251ef32da9ce36d2e4b",
+    "node/tests/support/descriptor_rpc.rs": "4695586a5a26ea9901d51dac0a5ba8e9a0e5332729efbd6d797a2846bcf601a5",
+    "site/tests/wallet-descriptor.test.mjs": "c87deea0b0950f86561781b4690a0d89c10825ac5e9e84bdc251f30ab3f17e36",
+    "node/src/bin/gnb-cli.rs": "36e2dc40402e7418ca56de6eed0bc08ebfef6b8ee61449a626db53e77f8031bd",
+    "node/src/rpc/mod.rs": "84154a968284b7edaf2dc6dffd71c4fe9d3b3b6677676071967906c81333217f",
+    "site/wallet/core.js": "75666887425649c53ead092581012597731d2b3fa807a265d9d52e5349914caf",
+    "docs/security/round-5/replay-descriptor-frontends.py": "829631737698892155e290eb736957c4a0d01ad54a2392cf707319e2c4e65a3d"
+  },
+  "finding": {
+    "id": "R5-VERDICT-1",
+    "test_first": "4d83579",
+    "fix": "2ba4c6a",
+    "scope": "caller-owned JavaScript serialization hooks; does not establish remote execution or arbitrary getter protection; legacy bindings unchanged"
+  },
+  "test_binary_snapshot_provenance": {
+    "snapshot_directory": "/private/tmp/gnb-r5-descriptor-cache/bin-0d9ec5e6c3140463",
+    "snapshot_digest": "0d9ec5e6c3140463",
+    "binary_sha256": {
+      "gnb": "1fb378e6038ff0e2c8f4ad84ae6eb1f03781a6a434497aeeae6fdf37aedd4aba",
+      "gnb-cli": "950884a407aa73dc4e514896fa4af3d18c2f823ddb78999190057da9b462dd50"
+    },
+    "command": [
+      "/private/tmp/gnb-r5-descriptor-cache/bin-0d9ec5e6c3140463/gnb",
+      "--data-dir",
+      "/private/tmp/gnb-r5-frontends-guard-probe/d"
+    ],
+    "exit_code": 2,
+    "guard_message": "refuses to run on mainnet",
+    "data_directory_created": false,
+    "log_path": "/private/tmp/gnb-r5-frontends-test-build-guard.log",
+    "log_sha256": "62bebff69654ea116af87c755047b8e89befd36fd6b2fc94f19cc6a2360450e7",
+    "provenance": "Snapshot produced from CGU151 cargo-test artifacts before the coordinator started its additional explicit feature build. Cargo test enables gnb-crypto/test-pow-limit through node/Cargo.toml dev-dependencies."
+  }
+}
