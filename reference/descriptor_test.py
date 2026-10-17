@@ -45,8 +45,14 @@ class DescriptorTests(unittest.TestCase):
         raw, wrapped = create(), create(expression=f"pkh(b10c0100{key()})")
         self.assertEqual(raw["script_pubkey"], hashlib.sha3_256(bytes.fromhex(key())).digest()[:20].hex())
         self.assertNotEqual(raw["script_pubkey"], wrapped["script_pubkey"])
-        # Existing distinct-key policy semantics compare serialized bytes.
-        create(expression=f"policy(2,0,0,{key()},b10c0100{key()})")
+        # PF-4: a raw key and its envelope are one signer (key identity =
+        # the enveloped encoding), so one policy or branch may not list both.
+        for twin in (f"policy(2,0,0,{key()},b10c0100{key()})", f"policy(1,0,0,b10c0100{key()},{key()})",
+                     f"tree(policy(1,0,0,{key(1)}),policy(2,0,0,{key()},b10c0100{key()}))"):
+            with self.assertRaises(d.DescriptorError):
+                create(expression=twin)
+        # Distinct keys in either encoding are fine.
+        create(expression=f"policy(2,0,0,{key()},b10c0100{key(1)})")
         magic_raw = "b10cffff" + key()[8:]
         create(expression=f"pkh({magic_raw})")
 

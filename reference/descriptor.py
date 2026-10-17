@@ -103,6 +103,17 @@ def public_key(text):
     return raw
 
 
+def key_identity(raw):
+    """PF-4: the identity of a policy key is its enveloped encoding.
+
+    A raw hybrid key (3,745 bytes) and its envelope ``b10c0100 || raw`` are
+    one signer (sighash v3 verifies a signature under either encoding), so a
+    policy may not list both (docs/CONSENSUS.md, "Spend-policy key identity
+    (PF-4)"). Exact raw length takes priority, as in public_key().
+    """
+    return bytes.fromhex("b10c0100") + raw if len(raw) == RAW_KEY_BYTES else raw
+
+
 class _Parser:
     """Fixed-depth grammar: one expression, with only policy leaves in trees."""
 
@@ -144,6 +155,8 @@ class _Parser:
             key = public_key(self.token())
             if key in keys:
                 raise DescriptorError("duplicate serialized key")
+            if key_identity(key) in (key_identity(k) for k in keys):
+                raise DescriptorError("one key in raw and enveloped encodings (PF-4)")
             keys.append(key)
         self.literal(")")
         if not 1 <= threshold <= len(keys):

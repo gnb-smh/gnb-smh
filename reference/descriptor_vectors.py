@@ -40,7 +40,7 @@ def cases():
     def policy(count=1, threshold=1, after=0, older=0):
         return f"policy({threshold},{after},{older},{','.join(keys[f'raw{i}'] for i in range(count))})"
 
-    expressions = {"pkh-raw": f"pkh({k0})", "pkh-envelope": f"pkh({keys['enveloped0']})", "pkh-magic-raw": f"pkh({keys['raw_magic']})", "policy-1": policy(), "policy-2of3": policy(3, 2, 17500, 144), "policy-u32-max-7": policy(7, 7, 0xFFFFFFFF, 0xFFFFFFFF), "policy-exact-key-distinction": f"policy(2,0,0,{k0},{keys['enveloped0']})", "policy-reordered": f"policy(2,17500,144,{keys['raw2']},{k1},{k0})"}
+    expressions = {"pkh-raw": f"pkh({k0})", "pkh-envelope": f"pkh({keys['enveloped0']})", "pkh-magic-raw": f"pkh({keys['raw_magic']})", "policy-1": policy(), "policy-2of3": policy(3, 2, 17500, 144), "policy-u32-max-7": policy(7, 7, 0xFFFFFFFF, 0xFFFFFFFF), "policy-mixed-encodings": f"policy(2,0,0,{k0},b10c0100{k1})", "policy-reordered": f"policy(2,17500,144,{keys['raw2']},{k1},{k0})"}
     for count in (2, 3, 4):
         expressions[f"tree-{count}"] = "tree(" + ",".join(policy(i + 1, 1, i, i * 17) for i in range(count)) + ")"
     expressions["tree-largest-4x7"] = "tree(" + ",".join(policy(7, 7, 0xFFFFFFFF, i) for i in range(4)) + ")"
@@ -52,6 +52,11 @@ def cases():
             descriptors[network, label] = descriptor
             yield row(f"{network}/{label}/create", {"action": "create", "network": network, "body": text}, True)
             yield row(f"{network}/{label}/inspect", {"op": "descriptor", "action": "inspect", "network": network, "descriptor": descriptor}, True)
+        # PF-4: a raw key and its envelope are one signer; no policy or tree
+        # branch may list both.
+        twin = f"policy(2,0,0,{k0},{keys['enveloped0']})"
+        yield row(f"{network}/policy-twin-encoding/create", {"action": "create", "network": network, "body": body(network, twin)}, False)
+        yield row(f"{network}/tree-twin-encoding/create", {"action": "create", "network": network, "body": body(network, f"tree({policy()},{twin})")}, False)
         ds = [descriptors[network, label] for label in ("pkh-raw", "pkh-envelope", "policy-2of3", "tree-3")]
         yield row(f"{network}/export", {"action": "export", "network": network, "descriptors": ds}, True)
         bundle = d.compact({"format": d.POOL_FORMAT, "network": network, "descriptors": ds})

@@ -628,7 +628,12 @@ Core: compressed-only keys in segwit v0 standardness, BIP340 x-only keys in
 tapscript; miniscript refuses duplicate keys). Tools never create one:
 `SpendPolicy::new` (wallets, `gnb-cli policyaddress`, the bridge vault
 `Vault::create`, whose signer/recovery overlap check also compares
-identities) refuses two keys with one identity at every height.
+identities, and the public descriptor parser, `wallet::descriptor`) refuses
+two keys with one identity at every height. The independent Python
+descriptor reference does the same (`reference/descriptor.py`,
+`key_identity`; vectors `policy-twin-encoding` / `tree-twin-encoding` in
+`reference/descriptor_vectors.json`, regenerated with
+`reference/descriptor_vectors.py`).
 
 Vectors (`core::policy::tests::key_identity_vectors_and_the_twin_encoding_policy`):
 for the hybrid key derived from seed `0x42 × 32`

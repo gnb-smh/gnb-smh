@@ -39,9 +39,15 @@ This is the existing shape predicate, not proof that a supplied byte string is
 a usable public key or that someone possesses its private key.
 
 Every byte is preserved when hashing. A raw public key and its envelope are
-different serialized keys and can produce different scripts. Distinct-key
-policy validation compares serialized bytes, as before; **PF-4 remains open**.
-No normalization or signature-verification rule is introduced here.
+different serialized keys and can produce different scripts. They are one
+signer, though (sighash v3 verifies a signature under either encoding), so a
+policy may not list both (PF-4): the parser builds every policy and tree
+branch with `SpendPolicy::new`, which refuses two keys with the same
+`policy::key_identity` (the enveloped encoding) at every height, and
+consensus refuses such a policy spend from the second hardening height
+(`docs/CONSENSUS.md`, "Spend-policy key identity (PF-4)"). The descriptor
+keeps the bytes it was given: no key is normalized and no signature is
+verified here.
 
 ## Checksum
 

@@ -2,8 +2,9 @@
 //!
 //! This is a GnB script language, not Bitcoin script descriptors. Only the
 //! checksum follows BIP380: <https://github.com/bitcoin/bips/blob/master/bip-0380.mediawiki>.
-//! No key derivation or signing occurs. Exact public key bytes are preserved;
-//! the existing policy distinct-key predicate (including PF-4) is unchanged.
+//! No key derivation or signing occurs. Exact public key bytes are preserved.
+//! Policies are built with `SpendPolicy::new`, which also refuses a raw key
+//! and its envelope in one policy (PF-4: one signer in two encodings).
 
 use crate::address::{Address, Network, PolicyAddress};
 use crate::core::policy::{PolicyTree, SpendPolicy, MAX_POLICY_KEYS};

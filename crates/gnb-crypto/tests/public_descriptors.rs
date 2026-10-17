@@ -79,18 +79,22 @@ fn exact_key_bytes_and_branch_order_are_not_normalized() {
         b.script_pubkey(),
         Address::from_pubkey(&envelope, Network::Mainnet).hash()
     );
-    // Preserve the pre-existing distinct-byte semantics; PF-4 is not closed.
+    // PF-4: the raw key and its envelope are one signer, so one policy may
+    // not list both (they used to be accepted as distinct bytes).
     let body = format!(
         "gnbd1(mainnet,policy(2,0,0,{},{}))",
         hex::encode(&raw),
         hex::encode(&envelope)
     );
-    assert_eq!(
-        create(&body).script_pubkey(),
-        SpendPolicy::new(2, vec![raw, envelope], 0, 0)
-            .unwrap()
-            .script_pubkey()
-    );
+    assert!(Descriptor::create(&body).is_err(), "twin-encoding policy descriptor");
+    assert!(Descriptor::create(&format!(
+        "gnbd1(mainnet,tree({},policy(1,0,0,{},{})))",
+        policy(1, 0),
+        hex::encode(&envelope),
+        hex::encode(&raw)
+    ))
+    .is_err(), "twin-encoding tree branch");
+    assert!(SpendPolicy::new(2, vec![raw, envelope], 0, 0).is_err());
     let a = create(&format!(
         "gnbd1(mainnet,tree({},{}))",
         policy(1, 0),
