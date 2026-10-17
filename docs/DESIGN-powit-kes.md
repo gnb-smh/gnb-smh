@@ -1,7 +1,8 @@
 # PoWit KES: forward-secure witness keys ("Proof of Context and Time")
 
 Status: **implemented** (`crates/gnb-crypto/src/core/kes.rs`, commit 7feeb99) and
-consensus from `core::powit_height()`, which is off on mainnet. Tested by
+consensus from `core::powit_height()` (mainnet 10,000; testnet off unless
+`--powit-height`). Tested by
 unit tests and on a 3-node testnet, including signing with a stolen key file.
 
 ## Problem
@@ -73,6 +74,17 @@ mine shares again.
    Identity is separate from money.
 4. **Equivocation proofs:** unchanged in shape. Both attestations must verify
    under the same witness id.
+5. **The signed message commits the key** (from the second hardening
+   activation, for attestations whose target is at or above it; PoWit audit
+   finding 1). `kes::verify` checks only that the leaf hash and the supplied
+   path reach the root, so with a message that does not name the key, one
+   leaf's signature re-rooted under any sibling hash verified as a signature
+   by another key, one SHA3 per key: a single double vote gave an unlimited
+   supply of valid equivocation proofs against keys nobody holds. The v2
+   message adds `u8(depth) ‖ root` (docs/CONSENSUS.md, "PoWit", "Attestation
+   messages"), so a signature is valid for exactly one key; from the same
+   activation a block may carry a proof only against a witness of the
+   evidence epochs.
 
 ## Context binding (transactions, optional, later)
 

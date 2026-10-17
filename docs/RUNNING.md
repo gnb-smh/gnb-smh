@@ -195,7 +195,12 @@ checks that its block is on every node's selected chain with the same blue
 work, rounds it down to two significant digits, refuses a value below the
 one the nodes already run, and prints the line for `core::MIN_CHAIN_WORK`
 (`crates/gnb-crypto/src/core/mod.rs`) and its `--minimumchainwork` hex form
-(`--depth 20160` takes a block a week deep; deeper is only lower). Update the
+(`--depth 20160` takes a block a week deep; deeper is only lower). It also
+prints the assumed-valid block of the release, the same block (Core sets
+`defaultAssumeValid` and `nMinimumChainWork` from one block): the line for
+`MAINNET_ASSUME_VALID` (`node/src/assumevalid.rs`, its id and DAG height)
+and its `--assumevalid` form; reviewers check the id with `getblockdag` on
+their own nodes. Update the
 reading in the constant's documentation, docs/MAINNET-READINESS.md §1 and
 the test `min_chain_work_cross_check`, then confirm that a node started on
 an empty data dir syncs from the seeds and leaves initial block download.
@@ -205,9 +210,15 @@ adjustment for either.
 
 Block proofs of work (GnB-SMH v1, 64 MiB, below the PoW + PoWit activation;
 v3, 4 MiB, from it) are evaluated on a bounded pool of threads (half the
-logical CPUs, 1 to 4), each peer and each network group (IPv4 /16, IPv6 /32)
-with a small budget of failed evaluations. A peer that delivers a block it
-authored that fails validation is disconnected, and both its identity and
+logical CPUs, 1 to 4; while the IBD latch holds and the miner waits, every
+CPU but one, at most 8, which with v1 holds up to 512 MiB of scratchpads),
+each peer and each network group (IPv4 /16, IPv6 /32) with a small budget of
+failed evaluations. A body the node fetches again for a block already in its
+DAG (a pruned body a reorg needs again, or a body rejected for a
+witness-dependent reason) costs no evaluation: the DAG record is the
+verified proof, also after a restart. Proofs are never skipped, not below
+the assumed-valid block either (Bitcoin Core never skips them). A peer that
+delivers a block it authored that fails validation is disconnected, and both its identity and
 its address (IPv4 address, IPv6 /64) are refused for 24 hours; loopback
 addresses are never refused (only disconnected) and `--peer` peers are
 exempt. The same happens to a peer whose misbehaviour score (one shared
@@ -228,14 +239,54 @@ counts against its sender like an invalid block.
 The PoWit pool that holds them is bounded and follows the selected tip on
 every node (not only witnesses): each tip change forgets shares out of the
 window, attestations no next block can include and proofs against barred
-keys. An attestation is held only by a member of its target's witness set,
-for a checkpoint slot at most one interval above the tip and not expired,
-from the tip's justified checkpoint; a key holds at most two (its newest
-targets). An equivocation proof is held and relayed only against a key in a
-recent witness set (checked before its signatures; a refused proof keeps its
-sender's verification-budget charge, as a forged one is free to make), at
-most 256 of them, one per key, and templates take the heaviest witnesses'
-proofs first. Full pools evict their worst entry for a better one.
+keys. An attestation is held only by a member of its target's witness set
+(under the rules of the block that may include it: from the second hardening
+activation every share key with weight is a member), for a checkpoint slot
+at most one interval above the tip and not expired, from the tip's justified
+checkpoint; a key holds at most two (its newest targets), and templates take
+a target's heaviest votes first. An equivocation proof is held and relayed
+only against a key in a recent witness set (from the second hardening
+activation, a member of the next block's evidence epochs, the consensus rule;
+checked before its signatures; a refused proof keeps its sender's
+verification-budget charge, as a forged one is free to make), at most 256 of
+them, one per key, and templates take the heaviest witnesses' proofs first.
+Full pools evict their worst entry for a better one.
+
+### The assumed-valid block (`--assumevalid`)
+
+As Bitcoin Core's `-assumevalid`, a release can name a block of the real
+chain (`assumevalid::MAINNET_ASSUME_VALID`, its id and DAG height). When the
+node connects a block that block vouches for, it does not verify that
+block's transaction signatures; every other check runs as always (proof of
+work, difficulty, height, timestamps, commitments, amounts, UTXO existence,
+double spends, coinbase maturity, timelocks, the public key and policy
+hashes a spend reveals, fees, the coinbase value). A block is vouched for,
+with Bitcoin Core's conditions, when the assumed-valid block is in the
+node's DAG, the block is it or lies on its selected chain and on the
+selected chain of the node's best block, the best block has at least the
+minimum chain work, and the best block is more than two weeks of
+proof-equivalent time above it (its chain work above the block at the best
+block's difficulty, 30 s per block: 40,320 blocks at constant difficulty).
+A block whose id does not commit to its witnesses (below height 5,000 and
+the hardening activation) is always checked in full, and an assumed-valid
+block this node has found invalid (or that the operator invalidated)
+vouches for nothing. The node logs "connecting N block(s) with their
+signatures assumed valid" when it applies.
+
+- `--assumevalid <id>` (64 hex digits, as `getblockdag` prints it) names
+  another block; `--assumevalid 0` checks every signature.
+- Mainnet has no release value yet: the relaunched chain is younger than two
+  weeks, so no block would qualify. The release step above prints one.
+- It is node-local, not consensus: a valid chain is accepted either way; the
+  setting only saves signature checks (docs/CONSENSUS.md, "Assumed-valid
+  block").
+- Where it helps today: the node connects a block as soon as it has its
+  parents (there is no header-first download yet), so during a fresh initial
+  sync the assumed-valid block's header is not known when its ancestors
+  connect and they are checked in full. It applies when the node connects
+  blocks with that block already in its DAG: a chain-state rebuild, the move
+  onto the real chain of a node that sat on another branch (a partition or
+  an eclipse), bodies fetched again, and a restart that resumes a chain move.
 
 ## Peers and connections
 

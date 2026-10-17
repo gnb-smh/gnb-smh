@@ -505,3 +505,28 @@ fn the_relay_budget_prices_conservative_signatures_by_verification_cost() {
     p.inputs[0].script_sig = policy::PolicyWitness { policy: mixed, signatures: vec![(0, sig_h), (1, sig_c)] }.encode();
     assert_eq!(relay::input_verification_tokens(&p.inputs[0].script_sig), 1 + relay::CONSERVATIVE_VERIFY_TOKENS);
 }
+
+/// The assumed-valid path (P5-G, `admission::check_input_scripts_without_signatures_at`,
+/// which a block vouched for by the assumed-valid block runs instead of the
+/// full input-script rule) applies the same witness rules of the block's
+/// height: a conservative spend is refused below the second hardening height
+/// and accepted from it, exactly like the full path. Without the suite rules
+/// there, an assumed-valid block carrying a valid conservative spend would be
+/// refused (the integration of P5-G and P5-S).
+#[test]
+fn the_assumed_valid_path_follows_the_conservative_suite_rule() {
+    let _h1 = activation::scoped_override(H1);
+    let _h2 = activation::scoped_override_v2(H2);
+    let c = conservative(0x3a);
+    let coin = fund(0x3a, 2 * SAT, &c.spk);
+    let tx = key_spend(&c, &coin, vec![out(2 * SAT - FEE, &[0x78; 20])]);
+    let assumed = |h: u64| {
+        admission::check_input_scripts_without_signatures_at(&tx, std::slice::from_ref(&coin.2), h, H1)
+    };
+    assert!(assumed(H2 - 1).is_err(), "below hardening 2 the suite is unknown on the assumed path too");
+    assert!(scripts(&tx, &coin, H2 - 1).is_err());
+    for h in [H2, H2 + 1, 1_000_000] {
+        assert_eq!(assumed(h), Ok(()), "assumed path at {h}");
+        assert_eq!(scripts(&tx, &coin, h), Ok(()), "full path at {h}");
+    }
+}
