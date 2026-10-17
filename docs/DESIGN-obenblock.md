@@ -61,10 +61,11 @@ checkpoints are anchored in **Bloch**.
   - the conservative suite 0x0003.
   None of the legacy regimes is reachable on ObenBlock. The code keeps them
   for GnB.
-- **Allocations**: tokenomics only, no carry-over. The 1,000,000-unit
-  carry-over allocation of GnB is **moved to the mining allocation** (10.0M
-  mined, 1.25M team, 1.25M founder; the supply stays 12,500,000 OBB).
-  *Owner to confirm.*
+- **Allocations**: the four allocations of the tokenomics stay as they are:
+  9.0M mined, 1.0M carry-over, 1.25M team, 1.25M founder, so the supply is
+  12,500,000 OBB (owner, 2026-10-17). The genesis is clean, so no GnB or
+  Bloch balance is paid out at launch. *Owner: who holds the carry-over
+  allocation at genesis (§10).*
 - `MIN_CHAIN_WORK` is 0, and there is no release finality checkpoint or
   assumed-valid block at launch. Each release sets them from independent nodes
   (`tools/release/min_chain_work.py`).
@@ -109,10 +110,21 @@ valid PoW         <=> block_id, read as a 256-bit little-endian integer, <= targ
 - ASERT as today (`gnb_smh::difficulty`, half-life 2 h, 30 s blocks),
   anchored at the genesis block.
 - `pow_limit` = Bitcoin's `0x1d00ffff`.
-- **Genesis difficulty** is set from the hashrate expected at launch,
-  rounded UP. Too hard is harmless: the stall relief in §5.1 makes it
-  easier within hours. Too easy would issue blocks at a burst until ASERT
-  catches up. *Owner: the launch hashrate estimate.*
+- **Launch difficulty** (owner: "the best technique"). Two mechanisms make a
+  wrong guess harmless in either direction, so no exact hashrate estimate is
+  needed:
+  - **Start high.** The genesis target corresponds to 1 EH/s of SHA-256d
+    (`LAUNCH_HASHRATE`, a constant set at launch). If the real hashrate is
+    lower, the stall relief (§5.1) brings the target down in hours instead of
+    letting blocks stall. At 1 PH/s, the first block comes after about 6 h,
+    and blocks are back to schedule within about a day.
+  - **Slow start** (Zcash's technique against an "instamine"). The block
+    subsidy ramps linearly from 0 to its full value over the first 5,760
+    blocks (about 2 days): `subsidy(h) = full × min(1, h / 5,760)`. If the
+    real hashrate is higher than the estimate, the early blocks still arrive
+    too fast while ASERT catches up, but they pay almost nothing. The
+    withheld subsidy (about 3,080 OBB) is never issued; the supply cap stays
+    an upper bound.
 
 ## 5. Liveness: hashrate that arrives and leaves
 
@@ -224,8 +236,7 @@ The other direction already exists: `docs/BLOCH-ANCHOR.md` (PR #20)
 records Bloch's finalized checkpoints in ordinary transactions of this chain.
 That protects Bloch history with this chain's proof of work. The anchors
 below protect ObenBlock history with Bloch's finality. Together they make
-mutual anchoring. *Owner: confirm whether both directions are wanted at
-launch.*
+mutual anchoring. **Both directions are used** (owner, 2026-10-17).
 
 - **What**: for every finalized checkpoint that starts a new epoch (one every
   6 h), an anchor record:
@@ -267,10 +278,18 @@ vectors, three-lens review, full tests, a draft PR.
 
 ## 10. Open points for the owner
 
-1. The carry-over allocation goes to mining (12.5M supply kept)? (§3)
-2. The launch hashrate estimate for the genesis difficulty. (§4.2)
-3. Access to the Bloch repository, for the anchor registry. (§8)
-4. Renaming the GitHub repository and organization: in the repository's
-   Settings; the tooling of this session cannot do it.
-5. Anchoring direction: ObenBlock into Bloch (§8), Bloch into ObenBlock
-   (PR #20, already in the code), or both.
+Decided on 2026-10-17:
+- The allocations are kept (§3).
+- The launch difficulty uses a high start plus slow start (§4.2).
+- Anchoring goes both ways (§8).
+- ObenBlock gets a new repository.
+
+Open:
+1. Who holds the 1.0M carry-over allocation at genesis (§3). For example:
+   - a treasury policy output (multisig), distributed later;
+   - claims by the holders of GnB addresses (`gnb1…`, which stay valid);
+   - left unissued.
+2. Access to the Bloch repository, for the anchor registry (§8).
+3. The new repository: the GitHub integration of the working session cannot
+   create repositories. The owner creates `obenblock` (empty) and installs
+   the Claude GitHub App on it; the code is then pushed with its history.
