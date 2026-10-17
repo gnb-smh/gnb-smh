@@ -608,3 +608,5 @@ fn decayed(w: u128, steps: u32) -> u128 {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod hardening2_tests;
