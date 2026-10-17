@@ -269,11 +269,24 @@ pub struct Storage {
     /// whose reads fail with `StorageError::ReadFailed`. Empty outside
     /// tests; `read_faults_armed` keeps the hot path to one atomic load.
     injected_read_faults: parking_lot::Mutex<std::collections::HashSet<[u8; 32]>>,
+    /// Fault injection ([`Storage::inject_body_read_failure`]): block hashes
+    /// whose body reads (`get_block`, `get_block_wire_bytes`) fail, and block
+    /// hashes whose body presence checks (`has_block_body`) fail, with
+    /// `StorageError::ReadFailed`. Empty outside tests.
+    injected_body_faults: parking_lot::Mutex<InjectedBodyFaults>,
     read_faults_armed: std::sync::atomic::AtomicBool,
     /// Audit F1: set when the node must stop (Bitcoin Core's `AbortNode`):
     /// the reason, for the operator. Acceptance and templates refuse from
     /// then on and the `gnb` binary exits.
     abort_reason: parking_lot::Mutex<Option<String>>,
+}
+
+/// Fault injection ([`Storage::inject_body_read_failure`]): the block hashes
+/// whose body reads fail, and those whose body presence checks fail.
+#[derive(Default)]
+struct InjectedBodyFaults {
+    reads: std::collections::HashSet<[u8; 32]>,
+    presence: std::collections::HashSet<[u8; 32]>,
 }
 
 /// Audit F1 (review finding 2): what the node remembers of a block whose
@@ -331,6 +344,7 @@ impl Storage {
             no_verdicts: Default::default(),
             no_verdict_log: parking_lot::Mutex::new((None, 0)),
             injected_read_faults: Default::default(),
+            injected_body_faults: Default::default(),
             read_faults_armed: std::sync::atomic::AtomicBool::new(false),
             abort_reason: parking_lot::Mutex::new(None),
         }
@@ -411,11 +425,47 @@ impl Storage {
         self.read_faults_armed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Ends [`Storage::inject_utxo_read_failure`].
+    /// Fault injection for tests (review of PR #15, findings 4-6): reads of
+    /// the stored body of `hash` fail with `StorageError::ReadFailed` (an
+    /// engine error) until [`Storage::clear_injected_read_failures`]: its
+    /// presence check ([`Storage::has_block_body`]) when `presence`, else
+    /// its reads ([`Storage::get_block`], [`Storage::get_block_wire_bytes`]).
+    /// The node never calls it.
+    #[allow(dead_code)] // library API (tests)
+    pub fn inject_body_read_failure(&self, hash: [u8; 32], presence: bool) {
+        let mut g = self.injected_body_faults.lock();
+        if presence { g.presence.insert(hash); } else { g.reads.insert(hash); }
+        self.read_faults_armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Ends [`Storage::inject_utxo_read_failure`] and
+    /// [`Storage::inject_body_read_failure`].
     #[allow(dead_code)] // library API (tests)
     pub fn clear_injected_read_failures(&self) {
         self.injected_read_faults.lock().clear();
+        *self.injected_body_faults.lock() = Default::default();
         self.read_faults_armed.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[inline]
+    fn injected_body_failure(&self, hash: &[u8; 32], presence: bool) -> Result<(), StorageError> {
+        if self.read_faults_armed.load(std::sync::atomic::Ordering::Relaxed) {
+            let g = self.injected_body_faults.lock();
+            if (if presence { &g.presence } else { &g.reads }).contains(hash) {
+                return Err(StorageError::ReadFailed("injected body read failure (test fault injection)".into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Make every block parked without a verdict due for its retry at `now`
+    /// (its backoff is cut short; the attempt counts are kept). Tests use it
+    /// to let the next acceptance retry a parked block.
+    #[allow(dead_code)] // library API (tests)
+    pub fn make_no_verdict_retries_due(&self, now: std::time::Instant) {
+        for r in self.no_verdicts.lock().values_mut() {
+            r.retry_at = r.retry_at.min(now);
+        }
     }
 
     #[inline]
@@ -858,6 +908,7 @@ impl Storage {
 
     /// Whether a body is stored for `hash` (no decoding).
     pub fn has_block_body(&self, hash: &[u8; 32]) -> Result<bool, StorageError> {
+        self.injected_body_failure(hash, true)?;
         let cf = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
         Ok(self.db.get_pinned_cf(&cf, hash)
             .map_err(|e| StorageError::ReadFailed(e.to_string()))?
@@ -866,6 +917,7 @@ impl Storage {
 
     pub fn get_block(&self, hash: &[u8; 32]) -> Result<Option<Block>, StorageError> {
         self.note_reads(1);
+        self.injected_body_failure(hash, false)?;
         let cf = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
         match self.db.get_cf(&cf, hash).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) => Ok(Some(
@@ -882,6 +934,7 @@ impl Storage {
     /// it used to decode the block and encode it again for every request).
     pub fn get_block_wire_bytes(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, StorageError> {
         self.note_reads(1);
+        self.injected_body_failure(hash, false)?;
         let cf = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
         self.db.get_cf(&cf, hash).map_err(|e| StorageError::ReadFailed(e.to_string()))
     }

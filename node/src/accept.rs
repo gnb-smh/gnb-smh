@@ -54,7 +54,17 @@
 //! ([`unpark_due_no_verdicts`]). Only storage-engine failures
 //! (`reorg::ViewErrorKind::Io`), [`NO_VERDICT_ABORT_AFTER`] in a row, stop
 //! the node, like Bitcoin Core's `AbortNode`; an inconsistent index never
-//! does ([`note_no_verdict`]).
+//! does ([`note_no_verdict`]), and the RPC warns while such a parked branch
+//! is heavier than the applied tip ([`no_verdict_branch_warning`]). A stored
+//! body of a block to apply that cannot be read is attributed the same way
+//! (review of PR #15, finding 6): an engine error is that block's
+//! no-verdict, a body that does not decode is dropped and fetched again
+//! (`drop_undecodable_body`). A block whose judgement fails is therefore
+//! given a verdict, parked (retried on schedule, counted toward the stop
+//! when the engine failed) or made to wait for a body; what remains (a
+//! failed write, a rollback-only chunk that cannot read a body) fails that
+//! acceptance with an error, and a move stopped after committed chunks
+//! resumes with the next one.
 //!
 //! **Witness-dependent failures below the hardening activation**: there the
 //! block id does not commit to non-coinbase `script_sig` bytes, so a relay
@@ -1200,14 +1210,39 @@ enum ChunkFailure {
     Invalid { block: BlockHash, reason: String, witness: Option<[u8; 32]> },
     /// Storage / missing-data failure. `no_verdict`: the block whose
     /// validation could not be completed (a read failure of the view, no
-    /// verdict, re-audit B1-T12) and the class of that failure, when that is
-    /// what failed.
+    /// verdict, re-audit B1-T12; or a body that could not be read, review of
+    /// PR #15, finding 6) and the class of that failure, when that is what
+    /// failed.
     Failed { reason: String, no_verdict: Option<(BlockHash, ViewErrorKind)> },
+    /// The stored body of `block`, a block of the chunk to apply, does not
+    /// decode (review of PR #15, finding 6). No verdict: the body is dropped
+    /// and fetched again ([`drop_undecodable_body`]).
+    Undecodable { block: BlockHash, reason: String },
 }
 
 impl ChunkFailure {
     fn failed(reason: String) -> Self {
         ChunkFailure::Failed { reason, no_verdict: None }
+    }
+
+    /// Review of PR #15, finding 6: a body read failure of `sub`, attributed
+    /// to the block whose judgement it prevents, so it is never a silent
+    /// stall. A block to APPLY: an engine error is a no-verdict of the
+    /// block (`ViewErrorKind::Io`: parked, counted toward the stop), a body
+    /// that does not decode is dropped and fetched again
+    /// ([`ChunkFailure::Undecodable`]). A block to ROLL BACK: the first block
+    /// the chunk applies cannot be judged without that rollback, so the
+    /// failure is that block's no-verdict, of the same class (the deepest
+    /// rollbacks share their chunk with the first apply blocks,
+    /// `ReorgPlan::chunks_with_rollback_tail`); a chunk that only rolls back
+    /// has no block to attribute it to.
+    fn body_unreadable(sub: &reorg::ReorgPlan, block: BlockHash, applying: bool, error: ViewError) -> Self {
+        let reason = ConnectError::BodyUnreadable { block, applying, error: error.clone() }.to_string();
+        match (applying, error.kind) {
+            (true, ViewErrorKind::Inconsistent) => ChunkFailure::Undecodable { block, reason },
+            (true, kind) => ChunkFailure::Failed { reason, no_verdict: Some((block, kind)) },
+            (false, kind) => ChunkFailure::Failed { reason, no_verdict: sub.to_apply.first().map(|b| (*b, kind)) },
+        }
     }
 }
 
@@ -1290,9 +1325,12 @@ fn note_no_verdict(
 
 /// Review of audit F1, finding 2: unpark every block parked without a
 /// verdict whose retry is due at `now` (`Storage::no_verdict_due`), so the
-/// next resolution validates it again. Called before every acceptance (the
-/// node's own blocks included, so a parked block is retried while the node
-/// mines on the chain it can judge). Returns the blocks unparked.
+/// next resolution validates it again, re-deriving the disqualified set once
+/// for all of them (review of PR #15, finding 1). The acceptance pipeline
+/// calls it right before its resolution (the node's own blocks included, so
+/// a parked block is retried while the node mines on the chain it can
+/// judge) and parks them again ([`repark_no_verdicts`]) if that resolution
+/// fails before judging them. Returns the blocks unparked.
 pub fn unpark_due_no_verdicts(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
     store: &storage::Storage,
@@ -1301,13 +1339,61 @@ pub fn unpark_due_no_verdicts(
     let parked = dag.read().no_verdict_parked();
     let due: Vec<BlockHash> = parked.into_iter().filter(|h| store.no_verdict_due(h, now)).collect();
     if !due.is_empty() {
-        let mut d = dag.write();
-        for h in &due {
-            d.unpark_no_verdict(h);
-        }
+        dag.write().unpark_no_verdicts(&due);
         info!("retrying {} block(s) parked without a verdict (first {})", due.len(), hex::encode(&due[0][..8]));
     }
     due
+}
+
+/// Review of PR #15, finding 1: park `due` (unparked by
+/// [`unpark_due_no_verdicts`] for a resolution that then failed before
+/// judging them) again, so the DAG never selects a branch nobody validated
+/// while the applied tip stays where it is (templates would be refused).
+/// Their records are kept, still due: the next acceptance retries them. A
+/// block whose record is gone (it reached a verdict) stays unparked.
+fn repark_no_verdicts(dag: &Arc<RwLock<consensus::GhostDAG>>, store: &storage::Storage, due: &[BlockHash]) {
+    let mut d = dag.write();
+    for h in due {
+        if !d.is_no_verdict_parked(h) && store.no_verdict_record(h).is_some() {
+            d.park_no_verdict(*h);
+        }
+    }
+}
+
+/// Review of PR #15, finding 2: the operator warning while a branch parked
+/// without a verdict has more chain work than the applied tip. The node then
+/// follows, mines and serves templates on a chain it knows is not the
+/// heaviest, because it could not judge a block of the heavier one; the IBD
+/// latch counts that branch as servable (the node does not claim to be
+/// synced), and `getblocktemplate`, `getdaginfo` and `getnetworkinfo` carry
+/// this text in `warnings` (Bitcoin Core's `GetWarnings`). The node never
+/// stops for it: only repeated storage-engine failures stop it
+/// ([`note_no_verdict`]), so no peer can stop a node with a block.
+pub fn no_verdict_branch_warning(d: &consensus::GhostDAG, store: &storage::Storage) -> Option<String> {
+    let (best, root) = d.best_no_verdict_branch()?;
+    let best_work = d.get_block_data(&best)?.blue_work;
+    let applied = store.get_meta("tip_hash").ok().flatten()
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        .filter(|t| d.has_block(t))
+        .or_else(|| d.selected_tip())?;
+    let applied_work = d.get_block_data(&applied).map_or(0, |x| x.blue_work);
+    if best_work <= applied_work {
+        return None;
+    }
+    let (class, reason, retry) = match store.no_verdict_record(&root) {
+        Some(r) => (
+            if r.last_io { "the storage engine failed" } else { "inconsistent chain state" },
+            r.reason,
+            r.retry_at.saturating_duration_since(std::time::Instant::now()).as_secs(),
+        ),
+        None => ("no verdict", String::new(), 0),
+    };
+    Some(format!(
+        "a branch with more chain work than the applied tip is parked without a verdict: block {} could not \
+         be validated ({}: {}); the node follows and mines on the lighter chain it can judge (applied tip {}, \
+         heaviest parked block {}) and retries it in {} s. See getdaginfo no_verdict and docs/RUNNING.md \
+         (\"Blocks without a verdict\")",
+        hex::encode(&root[..8]), class, reason, hex::encode(&applied[..8]), hex::encode(&best[..8]), retry))
 }
 
 /// Commit ONE chunk (`sub`, at most `reorg::MAX_BLOCKS_PER_COMMIT` blocks)
@@ -1333,6 +1419,9 @@ fn commit_chunk(
         // The shielded bytes are committed by the header root.
         Err(ConnectError::Invalid { block, reason, .. }) => {
             return Err(ChunkFailure::Invalid { block, reason, witness: None });
+        }
+        Err(ConnectError::BodyUnreadable { block, applying, error }) => {
+            return Err(ChunkFailure::body_unreadable(sub, block, applying, error));
         }
         Err(e) => return Err(ChunkFailure::failed(e.to_string())),
     };
@@ -1426,6 +1515,9 @@ fn commit_chunk(
             Err(ChunkFailure::Invalid { block, reason, witness })
         }
         Err(ConnectError::Failed(reason)) => Err(ChunkFailure::Failed { reason, no_verdict: no_verdict.take() }),
+        Err(ConnectError::BodyUnreadable { block, applying, error }) => {
+            Err(ChunkFailure::body_unreadable(sub, block, applying, error))
+        }
     }
 }
 
@@ -1473,16 +1565,20 @@ fn commit_chunk(
 /// move that had committed rollback chunks re-applies the old branch, and
 /// templates are built on it. The parked block is retried on a bounded
 /// schedule ([`unpark_due_no_verdicts`]), and repeated storage-engine
-/// failures stop the node (Bitcoin Core's `AbortNode`). On a pruned node
-/// the re-application needs the old branch's bodies (review of audit F1,
-/// finding 3): when blocks to roll back have none, the rollback from the
-/// tip-most such block down to the LCA (at most
-/// `reorg::MAX_BLOCKS_PER_COMMIT` blocks of it) is committed in ONE batch
-/// with the first apply chunk (`ReorgPlan::chunks_with_rollback_tail`), so
-/// a new branch that cannot be judged leaves it uncommitted. (A bodiless
-/// stretch longer than that is rolled back in earlier chunks, which only a
-/// re-fetch of those bodies can undo: the old branch then waits for them
-/// like any best chain without bodies, `MissingBodies::Wait`.)
+/// failures stop the node (Bitcoin Core's `AbortNode`). A body of a block
+/// to apply that cannot be read is attributed too (review of PR #15,
+/// finding 6): an engine error is that block's no-verdict, a body that does
+/// not decode is dropped and fetched again ([`drop_undecodable_body`]). The
+/// deepest rollbacks (at most `reorg::MAX_BLOCKS_PER_COMMIT`) are committed
+/// in ONE batch with the first apply chunk
+/// (`ReorgPlan::chunks_with_rollback_tail`; review of audit F1, finding 3,
+/// and of PR #15, finding 5), so a reorg up to that depth is one commit: a
+/// first apply chunk that fails, for any reason, never leaves the applied
+/// tip at the fork point, and a pruned node never commits a rollback it
+/// could not undo. (A deeper rollback commits its first part in earlier
+/// chunks; if their bodies were pruned, only a re-fetch can undo it: the old
+/// branch then waits for them like any best chain without bodies,
+/// `MissingBodies::Wait`.)
 ///
 /// PoWit finality (`GhostDAG::set_finalized`): the candidate is always the
 /// best block whose selected chain passes through the pinned checkpoint, and
@@ -1560,10 +1656,34 @@ fn resolve_best_chain(
 
         // A block without a stored body cannot be connected.
         let mut bodiless = Vec::new();
+        let mut unreadable = None;
         for h in &plan.to_apply {
-            if !store.has_block_body(h).map_err(|e| e.to_string())? {
-                bodiless.push(*h);
+            match store.has_block_body(h) {
+                Ok(true) => {}
+                Ok(false) => bodiless.push(*h),
+                Err(e) => {
+                    unreadable = Some((*h, ViewError::from_storage(&e)));
+                    break;
+                }
             }
+        }
+        if let Some((h, e)) = unreadable {
+            // Review of PR #15, findings 4 and 6: the storage engine failed
+            // reading whether a block to apply has a body. No verdict on it:
+            // it is parked and counted toward the stop like any engine
+            // failure (`note_no_verdict`), and the best chain the node can
+            // judge is resolved again. Never a bare `Err` once chunks have
+            // committed: the caller would take the committed move for
+            // nothing (and roll its trigger back).
+            let m = format!("the stored body of block {} could not be read: {}", hex::encode(&h[..8]), e);
+            note_no_verdict(dag, store, &h, e.kind, &m);
+            if store.abort_reason().is_none() {
+                continue 'resolve;
+            }
+            if committed_any {
+                return Ok(finish(&delta, log, Some(m), first_lca));
+            }
+            return Err(m);
         }
         if let Some(first) = bodiless.first() {
             match missing {
@@ -1597,28 +1717,21 @@ fn resolve_best_chain(
         }
         first_lca.get_or_insert(plan.lca);
 
-        // Review of audit F1, finding 3: a rollback that commits before the
-        // first block of the new branch is validated is undone, if that block
-        // has no verdict, by applying the old branch again, which needs its
-        // bodies. The blocks to roll back from the tip-most one without a
-        // body (pruned) down to the LCA go into the batch of the first apply
-        // chunk instead (presence checks only, no decoding).
-        let mut rollback_tail = 0usize;
-        if !plan.to_apply.is_empty() {
-            for (i, h) in plan.to_rollback.iter().enumerate() {
-                if !store.has_block_body(h).map_err(|e| e.to_string())? {
-                    rollback_tail = plan.to_rollback.len() - i;
-                    break;
-                }
-            }
-            if rollback_tail > reorg::MAX_BLOCKS_PER_COMMIT {
-                warn!("chain move: {} block(s) to roll back have no body (pruned) beyond one commit; the \
-                       rollback of {} of them commits before the new branch is validated",
-                    rollback_tail, rollback_tail - reorg::MAX_BLOCKS_PER_COMMIT);
-            }
+        // Review of audit F1, finding 3, and of PR #15, finding 5: a
+        // rollback that commits before the first block of the new branch is
+        // judged leaves the applied tip at the fork point if that chunk then
+        // fails for any reason (an unreadable body, a failed commit), and
+        // undoing it needs the old branch's bodies (gone on a pruned node).
+        // The deepest rollbacks (up to `MAX_BLOCKS_PER_COMMIT`) therefore go
+        // into the batch of the first apply chunk: a reorg up to that depth
+        // is one commit. (Deeper rollbacks commit in earlier chunks, each a
+        // consistent applied tip the move resumes from.)
+        if plan.to_rollback.len() > reorg::MAX_BLOCKS_PER_COMMIT && !plan.to_apply.is_empty() {
+            info!("chain move: the rollback of {} of {} block(s) commits before the new branch is judged",
+                plan.to_rollback.len() - reorg::MAX_BLOCKS_PER_COMMIT, plan.to_rollback.len());
         }
 
-        for sub in plan.chunks_with_rollback_tail(reorg::MAX_BLOCKS_PER_COMMIT, rollback_tail) {
+        for sub in plan.chunks_with_rollback_tail(reorg::MAX_BLOCKS_PER_COMMIT, plan.to_rollback.len()) {
             let t = if trigger_pending { trigger } else { None };
             let always: &[BlockHash] = if clears_pending { &clears.always } else { &[] };
             let log_snapshot = log.invalid.clone();
@@ -1648,6 +1761,12 @@ fn resolve_best_chain(
                             missing == MissingBodies::Stop, &mut log.body_rejected),
                         None => disqualify(dag, block, reason, &mut log.invalid),
                     }
+                    continue 'resolve;
+                }
+                Err(ChunkFailure::Undecodable { block, reason }) => {
+                    if reorg_depth > 0 { crate::metrics::inc_reorg_failure(); }
+                    drop_undecodable_body(dag, store, block, reason, missing == MissingBodies::Stop,
+                        &mut log.body_rejected);
                     continue 'resolve;
                 }
                 Err(ChunkFailure::Failed { reason: m, no_verdict }) => {
@@ -1726,6 +1845,48 @@ fn drop_body_and_wait(
     );
     body_log.push((block, reason));
 }
+
+/// Review of PR #15, finding 6: the stored body of `block`, a block to
+/// apply, does not decode (the row was written that way, or corrupted
+/// before RocksDB checksummed it). That is no verdict on the block (its id
+/// commits to its transactions; the node's copy is bad): nothing is marked
+/// or persisted, the body is deleted, and the block, with its selected-chain
+/// descendants, waits for a copy from peers like a block whose body is
+/// missing (`GhostDAG::mark_body_pending`; the processor requests it while a
+/// chain through it can still become the best one, [`awaits_body`], and the
+/// copy goes through `accept_block`'s body replacement). The node meanwhile
+/// follows the best chain it can judge. Bitcoin Core stops on a block it
+/// cannot read back (`FatalError`); fetching the block again is the repair
+/// a node with peers has, and it keeps the node running.
+fn drop_undecodable_body(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    block: BlockHash,
+    reason: String,
+    operator: bool,
+    body_log: &mut Vec<(BlockHash, String)>,
+) {
+    let marked = {
+        let mut d = dag.write();
+        let marked = d.mark_body_pending(block, None);
+        if operator {
+            d.request_body(block);
+        }
+        marked
+    };
+    if let Err(e) = store.delete_block_body(&block) {
+        error!("could not delete the undecodable body of {}: {}", hex::encode(&block[..8]), e);
+    }
+    error!(
+        "block {} could not be judged: {}. No verdict (it is NOT marked invalid): the stored body is \
+         dropped and fetched again from peers ({} selected-chain descendant(s) wait with it)",
+        hex::encode(&block[..8]), reason, marked.len().saturating_sub(1)
+    );
+    body_log.push((block, format!("{UNDECODABLE_BODY_REASON}: {reason}")));
+}
+
+/// The reason [`drop_undecodable_body`] logs for a dropped body.
+const UNDECODABLE_BODY_REASON: &str = "stored body does not decode";
 
 /// Disqualify `block` (and its selected-chain descendants) in memory and
 /// remember the root + reason for persistence.
@@ -1920,9 +2081,6 @@ pub fn accept_block_tracking(
         return Err(format!("node stopped: {m}"));
     }
     ensure_invalid_set_loaded(dag, store);
-    // Review of audit F1, finding 2: blocks parked without a verdict whose
-    // retry is due compete again in this acceptance's resolution.
-    unpark_due_no_verdicts(dag, store, std::time::Instant::now());
 
     // Sprint 2.c: snapshot the selected tip BEFORE any DAG mutation so we can
     // detect whether this block changed the chain's head.
@@ -2182,6 +2340,13 @@ pub fn accept_block_tracking(
 
     // ── Connect the best valid chain (any depth, audit DAG-6) ────────
     let trigger = (!replacing).then_some(TriggerRecord { hash: block_hash, powit: powit_state.as_ref() });
+    // Review of audit F1, finding 2: blocks parked without a verdict whose
+    // retry is due compete again in this resolution. Unparked HERE (review
+    // of PR #15, finding 1): after every early refusal of the arriving block
+    // (a junk frame unparks nothing) and after `old_tip` was taken (a retry
+    // that moves the selected tip is signalled like any move), and parked
+    // again if the resolution fails before judging them.
+    let due = unpark_due_no_verdicts(dag, store, std::time::Instant::now());
     let resolution = resolve_best_chain(
         dag, store, shielded, applied_tip, trigger,
         &mut log, &MarkClears::default(), MissingBodies::Wait,
@@ -2190,6 +2355,7 @@ pub fn accept_block_tracking(
     let resolution = match resolution {
         Ok(r) => r,
         Err(m) => {
+            repark_no_verdicts(dag, store, &due);
             // Storage failure: roll the in-memory change back (nothing was
             // committed), drop the body, but keep any deterministic invalid
             // marks discovered on the way.
@@ -2280,12 +2446,19 @@ pub fn accept_block_tracking(
             .find(|(h, _)| *h == block_hash)
             .map(|(_, r)| r.clone())
             .unwrap_or_else(|| "body missing".to_string());
-        Some(format!(
-            "consensus rejection: block {} body rejected ({}); the block id commits to no witness \
-             bytes below the hardening activation, so it is not disqualified and a different body \
-             will be re-evaluated",
-            hex::encode(&block_hash[..8]), reason
-        ))
+        if reason.starts_with(UNDECODABLE_BODY_REASON) {
+            // A local fault, not the sender's (review of PR #15, finding 6):
+            // no "consensus rejection" (nothing is penalized for it).
+            Some(format!("block {} could not be judged ({}); it waits for a copy from peers",
+                hex::encode(&block_hash[..8]), reason))
+        } else {
+            Some(format!(
+                "consensus rejection: block {} body rejected ({}); the block id commits to no witness \
+                 bytes below the hardening activation, so it is not disqualified and a different body \
+                 will be re-evaluated",
+                hex::encode(&block_hash[..8]), reason
+            ))
+        }
     } else if dag.read().is_invalid_persistently(&block_hash) {
         let reason = store.invalid_block_reason(&block_hash).ok().flatten()
             .unwrap_or_else(|| "descends from an invalid block".to_string());
@@ -2785,16 +2958,6 @@ pub fn reconcile_on_startup(
                     if !log.invalid.is_empty() {
                         persist_unchanged(dag, store, None, &log.invalid, &[])?;
                     }
-                    // Audit F1 (review, finding 1): a block that could not be
-                    // judged because the storage engine failed refuses the
-                    // start, like Bitcoin Core's init when it cannot connect
-                    // the best block; an inconsistent index does not (the
-                    // block stays parked and is retried while the node runs).
-                    if let Some((b, r)) = store.no_verdict_records().into_iter().find(|(_, r)| r.last_io) {
-                        return Err(format!(
-                            "block {} could not be validated: the storage engine failed (no verdict): {}",
-                            hex::encode(&b[..8]), r.reason));
-                    }
                 }
                 Err(m) => {
                     error!("reconcile: cannot reconnect the best valid chain: {}", m);
@@ -2811,6 +2974,18 @@ pub fn reconcile_on_startup(
                 }
             }
         }
+    }
+    // Audit F1 (review, finding 1): a block that could not be judged because
+    // the storage engine failed refuses the start, like Bitcoin Core's init
+    // when it cannot connect the best block; an inconsistent index does not
+    // (the block stays parked and is retried while the node runs). Checked
+    // whatever the tips (review of PR #15, finding 3): a block parked by the
+    // resolution above, or by a chain-state rebuild that ran before this
+    // call, makes the applied tip the selected one.
+    if let Some((b, r)) = store.no_verdict_records().into_iter().find(|(_, r)| r.last_io) {
+        return Err(format!(
+            "block {} could not be validated: the storage engine failed (no verdict): {}",
+            hex::encode(&b[..8]), r.reason));
     }
     Ok(())
 }
@@ -3302,6 +3477,23 @@ pub fn rebuild_chain_state(
             0
         }
     };
+    // Review of PR #15, finding 3: a block of the best chain that could not
+    // be judged (no verdict, parked) left the rebuild on a shorter chain:
+    // the rebuild is not complete. The flag stays set (the next start
+    // resumes from the applied tip; `check_chain_state` reports
+    // `RebuildInterrupted` meanwhile, so the node never starts on the
+    // shortened chain) and the failure is reported, like Bitcoin Core's
+    // init when a reindex cannot connect the best block.
+    let parked = dag.read().no_verdict_parked();
+    if let Some(first) = parked.first() {
+        let reason = store.no_verdict_record(first).map(|r| r.reason).unwrap_or_default();
+        let at = store.get_meta("tip_hash").ok().flatten()
+            .map(|v| hex::encode(&v[..v.len().min(8)])).unwrap_or_default();
+        return Err(format!(
+            "chain-state rebuild incomplete: {} block(s) could not be validated (no verdict; first {}: {}); \
+             the rebuild stays pending and resumes from the applied tip {} at the next start",
+            parked.len(), hex::encode(&first[..8]), reason, at));
+    }
     store.rebuild_aggregates(&std::sync::atomic::AtomicBool::new(false)).map_err(|e| e.to_string())?;
     store.put_meta(REBUILD_PENDING_META, &[0u8]).map_err(|e| e.to_string())?;
     warn!("chain state rebuilt from block bodies: {} row(s) cleared, {} consensus mark(s) re-derived, \

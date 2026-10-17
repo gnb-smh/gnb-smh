@@ -1707,11 +1707,36 @@ judge from where its applied chain is, exactly as after an invalid block,
 so a move that had committed its rollback chunks re-applies the old branch,
 the parked branch is not selected, and templates are built on the tip the
 node can judge. A parked block is retried on a bounded schedule (1 minute,
-doubling up to 1 hour; `accept::unpark_due_no_verdicts`, run before every
-acceptance, the node's own blocks included) and is shown by `getdaginfo`
-(`no_verdict`: class, attempts, last reason, seconds to the next retry).
+doubling up to 1 hour; `accept::unpark_due_no_verdicts`, the node's own
+blocks included) and is shown by `getdaginfo` (`no_verdict`: class,
+attempts, last reason, seconds to the next retry). The due blocks are
+unparked right before an acceptance's resolution, after the arriving block
+passed its acceptance checks (a frame refused for its height, bits or proof
+of work unparks nothing) and after the selected tip was snapshotted (a retry
+that moves the tip sends `TipChanged` like any move), all at once with one
+re-derivation of the disqualified set; if that resolution fails before
+judging them they are parked again, still due (review of PR #15, finding 1).
 A copy received meanwhile is a known block (it is not processed or
 downloaded again).
+
+A stored BODY of a block to apply that cannot be read is attributed the
+same way (review of PR #15, findings 4 and 6), whether the read is the
+presence check before a move, the shielded staging or the connect itself:
+a storage-engine error is that block's no-verdict (`Io`: parked, counted
+toward the stop below); a body that does not decode is deleted and the
+block, with its selected-chain descendants, waits for a copy from peers
+like a block whose body is missing (`GhostDAG::mark_body_pending`; the
+fetched copy goes through the body replacement of `accept_block`). A body
+of a block to roll back that cannot be read is attributed to the first
+block the same commit applies. Such a failure after committed chunks never
+discards them: the move ends as a stopped move at its last committed chunk.
+
+A parked branch is not a disqualified one (review of PR #15, finding 2): the
+IBD latch counts a peer's tip on it as servable work (one failure during
+sync does not report the node synced), and while it has more chain work
+than the applied tip `getblocktemplate`, `getdaginfo` and `getnetworkinfo`
+carry a warning in `warnings` (`accept::no_verdict_branch_warning`). The
+node never stops for it.
 
 Only storage-engine failures can stop the node: `accept::NO_VERDICT_ABORT_AFTER`
 (3) of them in a row on one block, with no validation of it reaching a
@@ -1719,23 +1744,30 @@ verdict in between, stop it like Core's `AbortNode` / `FatalError`:
 acceptance and templates refuse at once, the `gnb` process exits with an
 operator message naming the block and the recovery (docs/RUNNING.md,
 "Blocks without a verdict"), and a restart that meets a storage-engine
-failure refuses to start. An inconsistent chain state never stops the node: it is logged at
+failure refuses to start, whatever the tips (a parked block makes the
+applied tip the selected one). A chain-state rebuild (`rebuild_chain_state`)
+during which a block has no verdict is not complete: its pending flag stays
+set, it reports the failure, and it resumes from its applied tip at the
+next start (review of PR #15, finding 3). An inconsistent chain state never stops the node: it is logged at
 error level (at most one line a minute) and the block stays parked and
 retried. Nothing is marked, so a failure that clears (a repaired disk or
 index) leaves no trace beyond the record, which goes when the block is
 validated.
 
-On a pruned node, re-applying the old branch needs its bodies. When blocks
-a move rolls back have no body (pruned), the rollback from the tip-most
-such block down to the fork point (at most `reorg::MAX_BLOCKS_PER_COMMIT`
-blocks of it) is committed in ONE batch together with the first apply chunk
-(`reorg::ReorgPlan::chunks_with_rollback_tail`): the first blocks of the new
-branch are validated against that staged rollback before anything of it is
-written, so a new branch that cannot be judged leaves the node on its old
-tip. A longer bodiless stretch (a reorg deeper than the pruning depth by
-more than one commit) is rolled back in earlier chunks; if the new branch
-then cannot be judged, the old branch waits for those bodies from peers
-like any best chain whose bodies are missing.
+The deepest rollbacks of a move, up to `reorg::MAX_BLOCKS_PER_COMMIT`
+(16) blocks, are committed in ONE batch together with the first apply chunk
+(`reorg::ReorgPlan::chunks_with_rollback_tail`; review of audit F1, finding
+3, and of PR #15, finding 5): the first blocks of the new branch are
+validated against that staged rollback before anything of it is written,
+so a reorg up to 16 blocks deep is one commit. A first apply chunk that
+fails for any reason (no verdict, a body that cannot be read, a failed
+write) leaves the node on its old tip, never on the fork point, and a
+pruned node never commits a rollback it could not undo (re-applying the old
+branch needs its bodies). A deeper reorg commits its first rollbacks in
+earlier chunks, each a consistent applied tip; if the new branch then
+cannot be judged, the node re-applies the old branch from there, and if
+those bodies were pruned the old branch waits for them from peers like any
+best chain whose bodies are missing.
 
 An id-committed failure disqualifies the block and its selected-chain
 descendants and is persisted (`invalid_block/<id>`), as before. A
