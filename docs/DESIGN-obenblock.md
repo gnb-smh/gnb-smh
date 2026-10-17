@@ -220,6 +220,13 @@ valid         <=> SHA-256d(share_header) <= target(bits) × SHARE_TARGET_FACTOR 
 
 ## 8. Anchoring in Bloch
 
+The other direction already exists: `docs/BLOCH-ANCHOR.md` (PR #20)
+records Bloch's finalized checkpoints in ordinary transactions of this chain.
+That protects Bloch history with this chain's proof of work. The anchors
+below protect ObenBlock history with Bloch's finality. Together they make
+mutual anchoring. *Owner: confirm whether both directions are wanted at
+launch.*
+
 - **What**: for every finalized checkpoint that starts a new epoch (one every
   6 h), an anchor record:
   `chain_id ‖ slot ‖ block_id ‖ finalized_at ‖ W-digest`.
@@ -265,3 +272,5 @@ vectors, three-lens review, full tests, a draft PR.
 3. Access to the Bloch repository, for the anchor registry. (§8)
 4. Renaming the GitHub repository and organization: in the repository's
    Settings; the tooling of this session cannot do it.
+5. Anchoring direction: ObenBlock into Bloch (§8), Bloch into ObenBlock
+   (PR #20, already in the code), or both.
