@@ -814,10 +814,11 @@ address, which this release does not do.
 
 ## Secret key memory (audit CRY-4)
 
-Every secret key, seed and password GnB keeps lives in its own
-`gnb_secret::SecretBytes` region (crate `crates/gnb-secret`), the analogue
-of Bitcoin Core's secure allocator (`LockedPoolManager`: `mlock`,
-`MADV_DONTDUMP`, `memory_cleanse` before release):
+Every long-lived secret key, seed and password GnB itself keeps lives in
+its own `gnb_secret::SecretBytes` region (crate `crates/gnb-secret`), the
+analogue of Bitcoin Core's secure allocator (`LockedPoolManager`: `mlock`,
+`MADV_DONTDUMP`, `memory_cleanse` before release); the exceptions are listed
+at the end of this section:
 
 - on Unix each region is whole pages of an anonymous mapping, locked in RAM
   with `mlock` (never written to swap) and, on Linux and FreeBSD, left out
@@ -847,9 +848,24 @@ secrets plus two per concurrent P2P handshake, a wallet two per key. When
 `mlock` fails the secret is still wiped on release, the failure is counted
 and logged once ("could not lock secret key memory in RAM"), exactly as
 Core warns. `deploy/gnb-node.service` sets `LimitMEMLOCK=16M`; for a manual
-start raise `ulimit -l` if the warning appears. Short-lived secrets
-(passwords and phrases typed into the CLIs, decrypted keystore buffers) are
-wiped on drop (`Zeroizing`) but not locked.
+start raise `ulimit -l` if the warning appears.
+
+Not in secret memory (wiped on drop where the code owns them, but neither
+locked nor kept out of core dumps):
+
+- short-lived secrets: passwords and phrases typed into the CLIs, decrypted
+  keystore buffers (`Zeroizing`);
+- the node's libp2p Ed25519 identity key (`p2p_identity.bin`, the key of its
+  `PeerId`): libp2p holds it in its own `identity::Keypair` for the whole
+  run, and libp2p offers no way to place it in memory the node allocates.
+  It authenticates the node's libp2p identity only; the post-quantum
+  transport identity (`PqIdentity`) is in secret memory;
+- the ChaCha20-Poly1305 keys of each P2P connection's two cipher streams
+  (`transport::TxStream` / `RxStream`), alive as long as the connection:
+  `Zeroizing`, wiped when the connection closes. Bitcoin Core keeps its
+  BIP324 session keys in ordinary memory the same way (`FSChaCha20Poly1305`,
+  wiped with `memory_cleanse`); only its wallet keys use the secure
+  allocator.
 
 ## Upgrading and downgrading
 

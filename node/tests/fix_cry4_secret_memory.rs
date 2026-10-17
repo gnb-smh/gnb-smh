@@ -1,9 +1,14 @@
 //! CRY-4: the node's long-lived secrets live in secret memory.
 //!
-//! A node keeps two secrets for its whole run besides wallet keys: its P2P
-//! post-quantum identity key (`transport::identity::PqIdentity`) and, on a
-//! witness, the password that re-opens the KES key file at every epoch
-//! (`powit::WitnessDuty`). Both were plain heap buffers (`Zeroizing`):
+//! A node's own code keeps two secrets for its whole run besides wallet
+//! keys: its P2P post-quantum identity key (`transport::identity::
+//! PqIdentity`) and, on a witness, the password that re-opens the KES key
+//! file at every epoch (`powit::WitnessDuty`). (Two more live as long as
+//! the node or a connection but are not in secret memory, documented in
+//! docs/RUNNING.md "Secret key memory": the libp2p Ed25519 identity key,
+//! which libp2p holds itself, and each connection's ChaCha20-Poly1305
+//! stream keys, `Zeroizing` as Bitcoin Core's BIP324 session keys are
+//! ordinary memory.) Both were plain heap buffers (`Zeroizing`):
 //! wiped on drop, but swappable to disk and in core dumps. Like Bitcoin
 //! Core's `secure_allocator` (`LockedPoolManager`: `mlock`, `MADV_DONTDUMP`,
 //! `memory_cleanse` before release) they now live in `gnb_secret::

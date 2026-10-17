@@ -263,14 +263,19 @@ fn the_scanner_sees_production_code_only() {
 // Each test runs the operation under test and then copies the dead stack its
 // frames left below the test's own frame (`gnb_secret::test_support::
 // dead_stack_below_caller`), and looks there for any 16-byte window of the
-// secret. Before CRY-4 every one of them found copies: the `Copy` pqcrypto
-// `SecretKey` values built per signature and returned by key generation, the
-// BIP39 seed returned by value as a `[u8; 64]`, the KES seed taken by value,
-// and the expanded keys and hash states of the C signers and the SHA-3 /
-// PBKDF2 code (now overwritten by `gnb_secret::scrub_stack`).
+// secret. Before CRY-4 they found copies: the `Copy` pqcrypto `SecretKey`
+// values built per signature and returned by key generation, the BIP39 seed
+// returned by value as a `[u8; 64]`, the KES seed taken by value, and the
+// expanded keys and hash states of the C signers and the SHA-3 / PBKDF2 code
+// (now overwritten by `gnb_secret::scrub_stack`). For KES this was checked
+// by running the KES test against the pre-CRY-4 `core/kes.rs` (with the
+// CRY-4 crypto layer): its `generate` and `evolve_to` checks fail there (35
+// and 170 windows of the seed); its `sign` check passes there too (the
+// crypto layer's own scrub covers what KES signing leaves) and guards
+// against a regression of either layer.
 
 use gnb_crypto::crypto::{self, SecretBytes};
-use gnb_secret::test_support::{dead_stack_below_caller, residue};
+use gnb_secret::test_support::{dead_stack_below_caller, residue, RESIDUE_WINDOW};
 
 /// The secret parts of an enveloped hybrid secret key: the ML-DSA-65 key
 /// seed `K` and `s1 ‖ s2 ‖ t0`, and the Falcon-1024 `f ‖ g ‖ F`. (`rho`, `tr`
@@ -284,6 +289,13 @@ fn secret_parts(sk: &[u8]) -> Vec<&[u8]> {
 }
 
 fn assert_no_residue(stack: &[u8], what: &str, parts: &[&[u8]]) {
+    // `residue` skips windows of one repeated byte, so a secret made only of
+    // such windows (a `[0x77; 32]` fixture) could never be found and the
+    // check would pass whatever the stack holds (review finding).
+    for (p, part) in parts.iter().enumerate() {
+        assert!(part.windows(RESIDUE_WINDOW).any(|w| w.iter().any(|&b| b != w[0])),
+            "{what}: secret part {p} has no window `residue` can look for (degenerate fixture)");
+    }
     let hits: Vec<_> = parts.iter().enumerate()
         .flat_map(|(p, s)| residue(stack, s).into_iter().map(move |h| (p, h)))
         .collect();
@@ -376,7 +388,10 @@ fn seed_derivation_leaves_no_seed_in_dead_stack() {
 #[test]
 fn kes_signing_and_evolution_leave_no_seed_in_dead_stack() {
     use gnb_crypto::core::kes::KesSigner;
-    let root = SecretBytes::from_slice(&[0x77; 32]);
+    // A root seed with no repeated-byte window (a `[0x77; 32]` root left the
+    // generate, sign and seed_0 evolve checks unable to fail).
+    let bytes: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+    let root = SecretBytes::from_slice(&bytes);
     let root_arr: &[u8; 32] = root.as_slice().try_into().unwrap();
     gnb_secret::scrub_stack();
     let mut signer = KesSigner::generate(2, root_arr, |_| {}).unwrap();
@@ -389,7 +404,22 @@ fn kes_signing_and_evolution_leave_no_seed_in_dead_stack() {
     let sig = signer.sign(b"epoch 0").unwrap();
     let stack = dead_stack_below_caller();
     assert!(!sig.sig.is_empty());
-    assert_no_residue(&stack, "KesSigner::sign", &[&seed0]);
+    // The epoch-0 leaf secret key signing derived (`leaf_seed = SHA3-256(
+    // "GNB-KES-v1/leaf" ‖ seed_0)`, docs/DESIGN-powit-kes.md) must not be
+    // left behind either.
+    let leaf_seed: [u8; 32] = {
+        use sha3::Digest;
+        let mut h = sha3::Sha3_256::new();
+        h.update(b"GNB-KES-v1/leaf");
+        h.update(&seed0);
+        h.finalize().into()
+    };
+    let (leaf_pk, leaf_sk) = crypto::generate_keypair_from_seed_secret(&leaf_seed).unwrap();
+    assert_eq!(sig.leaf_pk, leaf_pk, "the derived leaf key is the one that signed");
+    let mut parts = secret_parts(&leaf_sk);
+    parts.push(&seed0);
+    parts.push(&leaf_seed);
+    assert_no_residue(&stack, "KesSigner::sign", &parts);
 
     gnb_secret::scrub_stack();
     signer.evolve_to(1).unwrap();
