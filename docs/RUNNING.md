@@ -697,8 +697,42 @@ If start-up reconciliation cannot connect the best valid chain (a storage
 error), the node refuses to start ("Refusing to start: the best valid chain
 cannot be connected"), as Bitcoin Core does when it fails to connect the
 best block at init; fix the cause it names (disk space, permissions) and
-restart. Later acceptances always connect from the applied tip recorded on
-disk, so a move that failed once is retried by the next block.
+restart. If it persists, the data directory is damaged: resynchronize into
+a fresh, empty `--data-dir` (or start from a copy of an archival node's data
+directory). A restart with `--carryover-snapshot` does not help here: the
+start-up rebuild below only runs when the chain-state check finds the
+footprint of an interrupted commit. Later acceptances always connect from
+the applied tip recorded on disk, so a move that failed once is retried by
+the next block.
+
+### Blocks without a verdict, and "gnb stopped"
+
+A block the node cannot judge because it cannot read its own chain state is
+never marked invalid (docs/CONSENSUS.md, the no-verdict paragraphs under
+"Coinbase commitment"). It keeps its body and is parked with its
+descendants: the node stays on (and mines on)
+the best chain it can judge and retries the block after 1 minute, then
+2, 4, ... up to every hour. `getdaginfo` lists such blocks under
+`no_verdict` (`class`, `attempts`, `reason`, `retry_in_secs`) and reports
+`stopped` when the node has stopped.
+
+* `class: "inconsistent-chain-state"` (a row the node's indexes require is
+  missing, or a row does not decode) never stops the node. It is logged at
+  error level ("the local chain state is INCONSISTENT", at most once a
+  minute). A node whose own writes are intact never gets there: report it.
+  If the block stays parked and the network moves on without this node,
+  resynchronize as below.
+* `class: "storage-engine"` (a RocksDB read or write error, a missing column
+  family): three failures in a row on one block stop the node, like Bitcoin
+  Core's `AbortNode`. Acceptance and templates refuse at once and the
+  process exits with `gnb stopped: block <hash> could not be validated 3
+  times in a row because the storage engine failed ...`; a restart that
+  meets the same failure refuses to start. Check the disk (free space,
+  permissions, I/O errors in the system log) and restart. If the failure
+  persists, the data directory is damaged: stop the node and resynchronize
+  into a fresh, empty `--data-dir` (or start from a copy of an archival
+  node's data directory). The node has no `-reindex-chainstate`, and
+  `--carryover-snapshot` alone rebuilds nothing in this case.
 
 At every start the node checks its chain state for the footprint of an
 interrupted or failed commit written by releases before the 2026-10 audit

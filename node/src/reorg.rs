@@ -183,6 +183,44 @@ impl ReorgPlan {
         }
         out
     }
+
+    /// [`chunks`](Self::chunks), except that the last `tail` blocks of
+    /// `to_rollback` (the deepest, at most `max`) are committed TOGETHER with
+    /// the first apply chunk, in one sub-plan, when the plan applies blocks
+    /// (review of audit F1, finding 3). `connect_plan` validates the first
+    /// blocks of the new branch against that staged rollback before anything
+    /// of it is written, so a failure there (an invalid block, or no verdict)
+    /// leaves those rollbacks uncommitted. The acceptance pipeline passes the
+    /// rolled-back blocks whose bodies are gone (pruned): a committed
+    /// rollback of such a block could not be undone by applying it again.
+    /// Memory stays bounded: one sub-plan holds at most `2 * max` blocks.
+    pub fn chunks_with_rollback_tail(&self, max: usize, tail: usize) -> Vec<ReorgPlan> {
+        let max = max.max(1);
+        let tail = tail.min(max).min(self.to_rollback.len());
+        if tail == 0 || self.to_apply.is_empty() {
+            return self.chunks(max);
+        }
+        let head = self.to_rollback.len() - tail;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < head {
+            let j = (i + max).min(head);
+            out.push(ReorgPlan { lca: self.to_rollback[j], to_rollback: self.to_rollback[i..j].to_vec(), to_apply: Vec::new() });
+            i = j;
+        }
+        let first = max.min(self.to_apply.len());
+        out.push(ReorgPlan {
+            lca: self.lca,
+            to_rollback: self.to_rollback[head..].to_vec(),
+            to_apply: self.to_apply[..first].to_vec(),
+        });
+        let mut from = self.to_apply[first - 1];
+        for chunk in self.to_apply[first..].chunks(max) {
+            out.push(ReorgPlan { lca: from, to_rollback: Vec::new(), to_apply: chunk.to_vec() });
+            from = *chunk.last().expect("chunks are non-empty");
+        }
+        out
+    }
 }
 
 /// Audit B2-T0: the most blocks one chain-move commit stages. A move of any
@@ -519,13 +557,65 @@ fn bc_encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, String> {
 /// written, and the block can be validated again once the row reads.
 /// Bitcoin Core makes the same distinction: a coins-database read error goes
 /// to `CCoinsViewErrorCatcher`, which aborts the node, and only genuine
-/// consensus failures are cached as `BLOCK_FAILED_VALID`.
+/// consensus failures are cached as `BLOCK_FAILED_VALID`. Its `kind`
+/// (review of audit F1, finding 1) says whether the node may stop for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ViewError(pub String);
+pub struct ViewError {
+    pub kind: ViewErrorKind,
+    pub msg: String,
+}
+
+/// Which class of failure a [`ViewError`] is (review of audit F1, finding
+/// 1). Only [`ViewErrorKind::Io`] counts toward the node's stop
+/// (`accept::NO_VERDICT_ABORT_AFTER`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewErrorKind {
+    /// The storage engine failed: a RocksDB read or write error (an I/O
+    /// error, or a checksum mismatch RocksDB reports as corruption) or a
+    /// missing column family (`StorageError::ReadFailed`, `WriteFailed`,
+    /// `CfNotFound`, `OpenFailed`). No block can cause it. Bitcoin Core's
+    /// `AbortNode` / `FatalError` class.
+    Io,
+    /// The state read without an engine error but is not what the
+    /// invariants promise: a row they require is absent (a coin without its
+    /// tx-index row, a block without its DAG record) or a row does not
+    /// decode (RocksDB's checksums turn media corruption into an engine
+    /// error, so such a row was written that way by this software). A logic
+    /// class: if such a miss ever became reachable from block data, one
+    /// block could stop every node that receives it, so it never counts
+    /// toward the stop; the block is kept, without a verdict, and retried.
+    Inconsistent,
+}
+
+impl ViewError {
+    /// A storage-engine failure ([`ViewErrorKind::Io`]).
+    pub fn io(msg: impl Into<String>) -> Self {
+        ViewError { kind: ViewErrorKind::Io, msg: msg.into() }
+    }
+
+    /// An inconsistent index or row ([`ViewErrorKind::Inconsistent`]).
+    pub fn inconsistent(msg: impl Into<String>) -> Self {
+        ViewError { kind: ViewErrorKind::Inconsistent, msg: msg.into() }
+    }
+
+    /// A typed storage error, classified: a row that does not (de)serialize
+    /// is [`ViewErrorKind::Inconsistent`], every engine error
+    /// [`ViewErrorKind::Io`].
+    pub fn from_storage(e: &crate::storage::StorageError) -> Self {
+        use crate::storage::StorageError as E;
+        match e {
+            E::DeserializeFailed(_) | E::SerializeFailed(_) => ViewError::inconsistent(e.to_string()),
+            E::OpenFailed(_) | E::CfNotFound(_) | E::WriteFailed(_) | E::ReadFailed(_) => ViewError::io(e.to_string()),
+        }
+    }
+}
 
 impl std::fmt::Display for ViewError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "storage read failed: {}", self.0)
+        match self.kind {
+            ViewErrorKind::Io => write!(f, "storage read failed: {}", self.msg),
+            ViewErrorKind::Inconsistent => write!(f, "storage read failed (inconsistent chain state): {}", self.msg),
+        }
     }
 }
 
@@ -560,34 +650,42 @@ pub trait UtxoView {
 
 impl UtxoView for Storage {
     fn view_utxo(&self, txid: &[u8; 32], index: u32) -> Result<Option<TxOutput>, ViewError> {
-        self.get_utxo(txid, index).map_err(|e| ViewError(e.to_string()))
+        self.get_utxo(txid, index).map_err(|e| ViewError::from_storage(&e))
     }
     fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
-        self.get_coinbase_height(txid).map_err(|e| ViewError(e.to_string()))
+        self.get_coinbase_height(txid).map_err(|e| ViewError::from_storage(&e))
     }
     fn view_tx_block(&self, txid: &[u8; 32]) -> Result<Option<BlockHash>, ViewError> {
-        self.get_tx_location(txid).map(|l| l.map(|(b, _)| b)).map_err(|e| ViewError(e.to_string()))
+        self.get_tx_location(txid).map(|l| l.map(|(b, _)| b)).map_err(|e| ViewError::from_storage(&e))
     }
     fn view_dag_data(&self, block: &BlockHash) -> Result<Option<GhostdagData>, ViewError> {
-        self.get_dag_data(block).map_err(|e| ViewError(e.to_string()))
+        self.get_dag_data(block).map_err(|e| ViewError::from_storage(&e))
     }
     fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
-        self.get_tx_location(txid).map(|o| o.map(|(_, h)| h)).map_err(|e| ViewError(e.to_string()))
+        self.get_tx_location(txid).map(|o| o.map(|(_, h)| h)).map_err(|e| ViewError::from_storage(&e))
     }
     fn view_genesis_ledger(&self, txid: &[u8; 32]) -> Result<bool, ViewError> {
-        self.is_genesis_ledger_txid(txid).map_err(|e| ViewError(e.to_string()))
+        self.is_genesis_ledger_txid(txid).map_err(|e| ViewError::from_storage(&e))
     }
 }
 
 impl<'a> UtxoView for ReorgBatch<'a> {
+    // The overlay first, then the store, keeping the store's error class
+    // (`ViewError::from_storage`; the batch's own getters flatten it).
     fn view_utxo(&self, txid: &[u8; 32], index: u32) -> Result<Option<TxOutput>, ViewError> {
-        self.get_utxo(txid, index).map_err(ViewError)
+        if let Some(staged) = self.utxo_overlay.get(&utxo_key(txid, index)) {
+            return Ok(staged.clone());
+        }
+        self.store.get_utxo(txid, index).map_err(|e| ViewError::from_storage(&e))
     }
     fn view_coinbase_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
-        self.get_coinbase_height(txid).map_err(ViewError)
+        if let Some(staged) = self.coinbase_overlay.get(txid) {
+            return Ok(*staged);
+        }
+        self.store.get_coinbase_height(txid).map_err(|e| ViewError::from_storage(&e))
     }
     fn view_tx_block(&self, txid: &[u8; 32]) -> Result<Option<BlockHash>, ViewError> {
-        self.get_tx_location(txid).map(|l| l.map(|(b, _)| b)).map_err(ViewError)
+        self.view_tx_location(txid).map(|l| l.map(|(b, _)| b))
     }
     fn view_dag_data(&self, block: &BlockHash) -> Result<Option<GhostdagData>, ViewError> {
         // DAG records are never staged by a connect plan: every block of the
@@ -596,14 +694,24 @@ impl<'a> UtxoView for ReorgBatch<'a> {
         // reads the DAG records of a block's PARENTS and of the blocks whose
         // coinbases it spends, all accepted before it; no block spends its
         // own coinbase from the activation, VAL-3).
-        self.store.get_dag_data(block).map_err(|e| ViewError(e.to_string()))
+        self.store.get_dag_data(block).map_err(|e| ViewError::from_storage(&e))
     }
     fn view_tx_height(&self, txid: &[u8; 32]) -> Result<Option<u64>, ViewError> {
-        self.get_tx_location(txid).map(|o| o.map(|(_, h)| h)).map_err(ViewError)
+        self.view_tx_location(txid).map(|o| o.map(|(_, h)| h))
     }
     fn view_genesis_ledger(&self, txid: &[u8; 32]) -> Result<bool, ViewError> {
         // Written with the genesis ledger, never by a chain move.
-        self.store.is_genesis_ledger_txid(txid).map_err(|e| ViewError(e.to_string()))
+        self.store.is_genesis_ledger_txid(txid).map_err(|e| ViewError::from_storage(&e))
+    }
+}
+
+impl ReorgBatch<'_> {
+    /// Overlay-aware tx-index read with the store's error class.
+    fn view_tx_location(&self, txid: &[u8; 32]) -> Result<Option<([u8; 32], u64)>, ViewError> {
+        if let Some(staged) = self.tx_index_overlay.get(txid) {
+            return Ok(*staged);
+        }
+        self.store.get_tx_location(txid).map_err(|e| ViewError::from_storage(&e))
     }
 }
 
@@ -1383,7 +1491,7 @@ impl From<String> for ValidationFailure {
 
 impl From<ViewError> for ValidationFailure {
     fn from(e: ViewError) -> Self {
-        ValidationFailure::Storage(e.0)
+        ValidationFailure::Storage(e.msg)
     }
 }
 

@@ -796,7 +796,7 @@ pub fn check_transaction_gated_with_wtxid(
     // not satisfied. Relative timelocks count confirmations in the connect
     // path's measure for the next block (re-audit B1-T14).
     let confirmations = |t: &[u8; 32]| -> Result<Option<u64>, String> {
-        confirmations_for_next_block(store, t, policy.next_block_height).map_err(|e| e.0)
+        confirmations_for_next_block(store, t, policy.next_block_height).map_err(|e| e.msg)
     };
     crate::blockval::check_tx_chain_rules_with_confirmations(tx, &prevouts, policy.next_block_height, &confirmations)
         .map_err(|e| if e.starts_with(crate::blockval::STORAGE_ERR) {
@@ -881,7 +881,7 @@ pub fn coinbase_maturity_for_next_block(
         MaturityRule::HeaderHeights(next_block_height)
     };
     check_coinbase_maturity_in_view(tx, store, rule)
-        .map_err(|e| crate::storage::StorageError::ReadFailed(e.0))
+        .map_err(|e| crate::storage::StorageError::ReadFailed(e.msg))
 }
 
 /// The confirmations the outputs of the confirmed transaction `txid` have at
@@ -911,11 +911,11 @@ pub fn confirmations_for_next_block(
 /// record) plus one.
 fn next_block_dag_height(store: &Storage) -> Result<u64, crate::reorg::ViewError> {
     use crate::reorg::{UtxoView, ViewError};
-    let tip = store.get_meta("tip_hash").map_err(|e| ViewError(e.to_string()))?
+    let tip = store.get_meta("tip_hash").map_err(|e| ViewError::from_storage(&e))?
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
-        .ok_or_else(|| ViewError("no applied tip pointer".into()))?;
+        .ok_or_else(|| ViewError::inconsistent("no applied tip pointer"))?;
     let data = store.view_dag_data(&tip)?
-        .ok_or_else(|| ViewError(format!("applied tip {} has no DAG record", hex::encode(&tip[..8]))))?;
+        .ok_or_else(|| ViewError::inconsistent(format!("applied tip {} has no DAG record", hex::encode(&tip[..8]))))?;
     Ok(data.height + 1)
 }
 
@@ -935,7 +935,7 @@ pub fn coinbase_height_for_wallets(
     next_block_height: u64,
 ) -> Result<Option<u64>, crate::storage::StorageError> {
     use crate::reorg::UtxoView;
-    let read = |e: crate::reorg::ViewError| crate::storage::StorageError::ReadFailed(e.0);
+    let read = |e: crate::reorg::ViewError| crate::storage::StorageError::ReadFailed(e.msg);
     if next_block_height == 0 || !core::block_rules::rules_active_at(next_block_height, activation_height()) {
         return store.view_coinbase_height(txid).map_err(read);
     }

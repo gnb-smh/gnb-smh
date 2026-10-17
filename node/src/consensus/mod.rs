@@ -1016,6 +1016,14 @@ pub struct GhostDAG {
     /// ([`request_body`](Self::request_body)): wanted whatever the weight of
     /// their chain, until a body arrives. A subset of `body_pending`'s keys.
     body_requested: HashSet<BlockHash>,
+    /// Blocks parked without a verdict (review of audit F1, finding 2): their
+    /// validation could not be completed (a read failure of the chain state,
+    /// `accept`'s no-verdict guard). Like `body_pending`, roots of `invalid`
+    /// (with their selected-chain descendants) in memory only, so the best
+    /// chain the node CAN judge is selected and mined on meanwhile; nothing
+    /// is persisted and the block keeps its body. The acceptance pipeline
+    /// unparks a block when its retry is due.
+    no_verdict: HashSet<BlockHash>,
 }
 
 /// Rejected-body witness roots remembered per body-pending block.
@@ -1052,6 +1060,7 @@ impl GhostDAG {
             reach_hint: None,
             query_visits: std::sync::atomic::AtomicU64::new(0),
             body_requested: HashSet::new(),
+            no_verdict: HashSet::new(),
         }
     }
 
@@ -1974,6 +1983,7 @@ impl GhostDAG {
         self.invalid_all_edges.remove(hash);
         self.body_pending.remove(hash);
         self.body_requested.remove(hash);
+        self.no_verdict.remove(hash);
         if self.reach_hint == Some(*hash) {
             self.reach_hint = None;
         }
@@ -3000,6 +3010,41 @@ impl GhostDAG {
         self.mark_body_pending(hash, None)
     }
 
+    /// Park `hash` without a verdict (see the `no_verdict` field): it and its
+    /// selected-chain descendants are disqualified IN MEMORY ONLY until
+    /// [`unpark_no_verdict`](Self::unpark_no_verdict). Returns the blocks
+    /// newly marked invalid. Unknown hashes are ignored.
+    pub fn park_no_verdict(&mut self, hash: BlockHash) -> Vec<BlockHash> {
+        if !self.store.has(&hash) {
+            return Vec::new();
+        }
+        self.no_verdict.insert(hash);
+        self.propagate_invalid(hash)
+    }
+
+    /// Unpark `hash` (its retry is due) and re-derive the disqualified set,
+    /// so it and the blocks parked only through it are candidates again.
+    /// `false` when it was not parked.
+    pub fn unpark_no_verdict(&mut self, hash: &BlockHash) -> bool {
+        if !self.no_verdict.remove(hash) {
+            return false;
+        }
+        self.recompute_invalid();
+        true
+    }
+
+    /// True iff `hash` itself is parked without a verdict.
+    pub fn is_no_verdict_parked(&self, hash: &BlockHash) -> bool {
+        self.no_verdict.contains(hash)
+    }
+
+    /// The blocks parked without a verdict, sorted.
+    pub fn no_verdict_parked(&self) -> Vec<BlockHash> {
+        let mut v: Vec<BlockHash> = self.no_verdict.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
     /// True iff `hash` waits for a body (see `mark_body_pending`).
     pub fn is_body_pending(&self, hash: &BlockHash) -> bool {
         self.body_pending.contains_key(hash)
@@ -3225,6 +3270,7 @@ impl GhostDAG {
         }
         let mut roots: Vec<BlockHash> = self.invalid_roots.iter()
             .chain(self.body_pending.keys())
+            .chain(self.no_verdict.iter())
             .copied()
             .collect();
         roots.sort_unstable();

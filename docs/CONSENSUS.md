@@ -1681,26 +1681,61 @@ tx-index row in one batch, a genesis-ledger coin is confirmed at the genesis
 F1: a made-up policy with `older != 0` spending a vesting tranche used to
 ask for a confirmation that did not exist, so any block carrying that free
 transaction could not be judged). The connect is abandoned before anything
-of it is written, nothing is marked or persisted, the triggering block is
-rolled back out of the DAG, and the block is validated again when it is next
-received or the node restarts. A coinbase-height row that cannot be read is
-never taken for "not a coinbase" (which skipped the maturity rule). Bitcoin
-Core draws the same line: a coins-database read error aborts the node
-(`CCoinsViewErrorCatcher`), it is never cached as an invalid block.
+of it is written and nothing is marked or persisted. A coinbase-height row
+that cannot be read is never taken for "not a coinbase" (which skipped the
+maturity rule). Bitcoin Core draws the same line: a coins-database read
+error aborts the node (`CCoinsViewErrorCatcher`), it is never cached as an
+invalid block.
 
-A no-verdict is never a silent permanent stall (node-local, audit F1). A
-chain move commits in chunks (rollbacks first); when it has committed its
-rollback chunks and then cannot judge a block of the first apply chunk, the
-disconnected blocks are applied again (`accept::restore_applied_tip`), so
-the applied tip stays the best valid block it was instead of an ancestor of
-both branches. A block whose validation ends without a verdict
-`accept::NO_VERDICT_ABORT_AFTER` (3) times in a row, with no validation of
-it reaching a verdict in between, stops the node like Core's `AbortNode`:
+A no-verdict is never a silent permanent stall, and never a way to stop a
+node from outside (node-local, audit F1 and its review; no verdict
+changes). Two classes are told apart (`reorg::ViewErrorKind`):
+
+* a storage-engine failure (`Io`: a RocksDB read or write error, which
+  includes the corruption RocksDB's checksums detect, or a missing column
+  family), which no block can cause;
+* an inconsistent chain state (`Inconsistent`: a row an invariant requires
+  is absent, such as a coin without its tx-index row or a block without its
+  DAG record, or a row that does not decode). This is a logic class: if any
+  such miss ever became reachable from block data, one block could stop
+  every node that receives it.
+
+Either way the block keeps its body, is not marked, and is PARKED in
+memory with its selected-chain descendants (`GhostDAG::park_no_verdict`,
+like a block waiting for a body). The node resolves the best chain it can
+judge from where its applied chain is, exactly as after an invalid block,
+so a move that had committed its rollback chunks re-applies the old branch,
+the parked branch is not selected, and templates are built on the tip the
+node can judge. A parked block is retried on a bounded schedule (1 minute,
+doubling up to 1 hour; `accept::unpark_due_no_verdicts`, run before every
+acceptance, the node's own blocks included) and is shown by `getdaginfo`
+(`no_verdict`: class, attempts, last reason, seconds to the next retry).
+A copy received meanwhile is a known block (it is not processed or
+downloaded again).
+
+Only storage-engine failures can stop the node: `accept::NO_VERDICT_ABORT_AFTER`
+(3) of them in a row on one block, with no validation of it reaching a
+verdict in between, stop it like Core's `AbortNode` / `FatalError`:
 acceptance and templates refuse at once, the `gnb` process exits with an
-operator message naming the block, and a restart that meets the same
-failure refuses to start (start-up reconciliation fails), still on the
-restored tip. Nothing is marked, so a failure that clears (a repaired disk
-or index) leaves no trace.
+operator message naming the block and the recovery (docs/RUNNING.md,
+"Blocks without a verdict"), and a restart that meets a storage-engine
+failure refuses to start. An inconsistent chain state never stops the node: it is logged at
+error level (at most one line a minute) and the block stays parked and
+retried. Nothing is marked, so a failure that clears (a repaired disk or
+index) leaves no trace beyond the record, which goes when the block is
+validated.
+
+On a pruned node, re-applying the old branch needs its bodies. When blocks
+a move rolls back have no body (pruned), the rollback from the tip-most
+such block down to the fork point (at most `reorg::MAX_BLOCKS_PER_COMMIT`
+blocks of it) is committed in ONE batch together with the first apply chunk
+(`reorg::ReorgPlan::chunks_with_rollback_tail`): the first blocks of the new
+branch are validated against that staged rollback before anything of it is
+written, so a new branch that cannot be judged leaves the node on its old
+tip. A longer bodiless stretch (a reorg deeper than the pruning depth by
+more than one commit) is rolled back in earlier chunks; if the new branch
+then cannot be judged, the old branch waits for those bodies from peers
+like any best chain whose bodies are missing.
 
 An id-committed failure disqualifies the block and its selected-chain
 descendants and is persisted (`invalid_block/<id>`), as before. A
