@@ -212,7 +212,12 @@ fn main() {
                 eprintln!("epoch {} already erased (key is at {}): forward security", e, signer.epoch());
                 process::exit(1);
             }
-            let att = gnb::core::powit::Attestation::sign(chain, src, tgt, &signer)
+            // The message of the target's height on `chain`'s schedule: from
+            // the second hardening activation it commits the witness key
+            // (PoWit audit finding 1). A signer has no node chain id, so the
+            // schedule comes from the chain named here.
+            let h2 = gnb::core::activation::hardening2_activation_height_for_signer(chain);
+            let att = gnb::core::powit::Attestation::sign_at(chain, h2, src, tgt, &signer)
                 .unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
             println!("{}", hex::encode(att.to_wire_bytes()));
             return;
