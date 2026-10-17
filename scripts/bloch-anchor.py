@@ -35,7 +35,10 @@ def bloch_finalized(url, timeout):
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getchaininfo", "params": []}).encode()
     req = urllib.request.Request(url, body, {"content-type": "application/json", "user-agent": "gnb-bloch-anchor/1"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        res = json.load(r)["result"]
+        reply = json.load(r)
+    if "result" not in reply:
+        raise ValueError(f"no result: {str(reply.get('error', reply))[:200]}")
+    res = reply["result"]
     fin = res["finalized"]
     root = fin["root"].lower()
     if len(root) != 64 or int(root, 16) == 0:
