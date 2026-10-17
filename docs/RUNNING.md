@@ -228,14 +228,18 @@ counts against its sender like an invalid block.
 The PoWit pool that holds them is bounded and follows the selected tip on
 every node (not only witnesses): each tip change forgets shares out of the
 window, attestations no next block can include and proofs against barred
-keys. An attestation is held only by a member of its target's witness set,
-for a checkpoint slot at most one interval above the tip and not expired,
-from the tip's justified checkpoint; a key holds at most two (its newest
-targets). An equivocation proof is held and relayed only against a key in a
-recent witness set (checked before its signatures; a refused proof keeps its
-sender's verification-budget charge, as a forged one is free to make), at
-most 256 of them, one per key, and templates take the heaviest witnesses'
-proofs first. Full pools evict their worst entry for a better one.
+keys. An attestation is held only by a member of its target's witness set
+(under the rules of the block that may include it: from the second hardening
+activation every share key with weight is a member), for a checkpoint slot
+at most one interval above the tip and not expired, from the tip's justified
+checkpoint; a key holds at most two (its newest targets), and templates take
+a target's heaviest votes first. An equivocation proof is held and relayed
+only against a key in a recent witness set (from the second hardening
+activation, a member of the next block's evidence epochs, the consensus rule;
+checked before its signatures; a refused proof keeps its sender's
+verification-budget charge, as a forged one is free to make), at most 256 of
+them, one per key, and templates take the heaviest witnesses' proofs first.
+Full pools evict their worst entry for a better one.
 
 ## Peers and connections
 
