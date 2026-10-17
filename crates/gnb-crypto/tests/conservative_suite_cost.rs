@@ -5,9 +5,10 @@
 //! `CONSERVATIVE_VERIFY_TOKENS`) are derived from.
 //!
 //! `measure_suite_costs` prints the timings (run it with `--ignored
-//! --nocapture`; for production-like numbers build the C and Rust crypto
-//! optimized: `CARGO_PROFILE_DEV_PACKAGE_PQCRYPTO_MLDSA_OPT_LEVEL=3` etc.,
-//! see docs/CONSENSUS.md). The non-ignored test bounds the conservative
+//! --nocapture`; for production numbers in a release build, `cargo test
+//! --release -p gnb-crypto --test conservative_suite_cost -- --ignored
+//! --nocapture`: a dev build with only some crypto packages optimized
+//! overstates the hybrid verification about threefold). The non-ignored test bounds the conservative
 //! verification time so a regression (an unoptimized or pathological build of
 //! the verifier) fails CI instead of slowing block validation unnoticed.
 

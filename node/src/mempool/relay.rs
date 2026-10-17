@@ -99,11 +99,12 @@ pub const NODE_SIG_BUDGET_BURST: u32 = 4_000;
 pub const NODE_SIG_BUDGET_REFILL_PER_SEC: f64 = 400.0;
 /// P5-S: tokens one conservative suite-0x0003 signature check costs
 /// (SLH-DSA-SHAKE-128s AND Falcon-1024), against one token for a hybrid
-/// ML-DSA-65 + Falcon-1024 check. Measured on the reference machine with the
-/// crypto crates optimized (`crates/gnb-crypto/tests/conservative_suite_cost.rs`,
-/// docs/CONSENSUS.md "Conservative suite 0x0003"): about 1.84 ms against
-/// 0.26 ms, a ratio of 7.2, rounded up. Without it a peer could make the node
-/// verify conservative signatures at one hybrid token each, about seven times
+/// ML-DSA-65 + Falcon-1024 check. Measured on the reference machine in a
+/// release build (`crates/gnb-crypto/tests/conservative_suite_cost.rs`,
+/// docs/CONSENSUS.md "Conservative suite 0x0003"): about 1.8 to 2.0 ms
+/// against about 0.25 ms, a ratio of 6.6 to 7.5, rounded up. Without it a
+/// peer could make the node verify conservative signatures at one hybrid
+/// token each, about seven times
 /// the verification time the budget allows (Bitcoin Core prices by
 /// verification cost the same way: BIP342's validation weight charges each
 /// signature check against the witness bytes, and sigops cost weights a

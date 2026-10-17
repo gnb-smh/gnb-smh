@@ -125,6 +125,20 @@ pub fn max_signature_len() -> usize {
         .saturating_add(pqcrypto_falcon::falcon1024::signature_bytes())
 }
 
+/// Maximum encoded signature length of a key whose encoding is
+/// `public_key_len` bytes long: [`CONSERVATIVE_MAX_SIGNATURE_LEN`] for the
+/// conservative key length, otherwise the hybrid maximum
+/// ([`max_signature_len`], at least the maximum of every other suite).
+/// Exact length decides, as for [`public_key_suite`]. Producers size fees
+/// with it before signing.
+pub fn max_signature_len_for_public_key_len(public_key_len: usize) -> usize {
+    if public_key_len == CONSERVATIVE_PUBLIC_KEY_LEN {
+        CONSERVATIVE_MAX_SIGNATURE_LEN
+    } else {
+        max_signature_len()
+    }
+}
+
 /// Maximum encoded signature length of a key of `suite` (`None` for an
 /// unknown suite): the hybrid maximum ([`max_signature_len`]), 3,313 for
 /// suite 0x0002, [`CONSERVATIVE_MAX_SIGNATURE_LEN`] for suite 0x0003.
@@ -328,13 +342,17 @@ impl KeySuite {
         }
     }
 
-    /// The suite of a public key a wallet can sign with (`None` for raw
-    /// legacy keys of other shapes, suite 0x0002 and unknown encodings).
+    /// The suite of a public key a wallet can sign with, by its exact
+    /// encoding: [`is_hybrid_public_key`] (enveloped or raw carry-over) or
+    /// [`is_conservative_public_key`]. `None` for suite 0x0002, a key of
+    /// another length and unknown encodings.
     pub fn of_public_key(public_key_bytes: &[u8]) -> Option<KeySuite> {
-        match public_key_suite_under(public_key_bytes, SuiteRules::HARDENING2) {
-            Some(SUITE_MLDSA65_FALCON1024) => Some(KeySuite::Hybrid),
-            Some(SUITE_SLHDSA128S_FALCON1024) => Some(KeySuite::Conservative),
-            _ => None,
+        if is_hybrid_public_key(public_key_bytes) {
+            Some(KeySuite::Hybrid)
+        } else if is_conservative_public_key(public_key_bytes) {
+            Some(KeySuite::Conservative)
+        } else {
+            None
         }
     }
 
@@ -1130,7 +1148,7 @@ pub fn sign_bound(secret_key_bytes: &[u8], digest: &[u8; 32]) -> Result<Vec<u8>,
         SUITE_SLHDSA128S_FALCON1024 => {
             // Conservative body: slh_sk (64) ‖ falcon_sk (2,305). Produce
             // slh_sig (7,856) ‖ falcon_sig (compact), each component over its
-            // own bound message. SLH-DSA signing takes about a second.
+            // own bound message. SLH-DSA signing takes about 2 s.
             if sk_body.len() != slhdsa::SECRET_KEY_LEN + FALCON_SECRET_LEN {
                 return Err(CryptoError::InvalidKey("conservative secret key wrong length".into()));
             }
@@ -2982,6 +3000,29 @@ mod conservative_suite_tests {
         assert_eq!(KeySuite::parse("Hybrid"), Ok(KeySuite::Hybrid));
         assert!(KeySuite::parse("mldsa").is_err());
         assert_eq!(KeySuite::Conservative.id(), 3);
+        // Producers size fees by the key's exact length.
+        assert_eq!(max_signature_len_for_public_key_len(CONSERVATIVE_PUBLIC_KEY_LEN), 9_322);
+        assert_eq!(max_signature_len_for_public_key_len(HYBRID_PUBLIC_KEY_LEN), max_signature_len());
+        assert_eq!(max_signature_len_for_public_key_len(legacy_hybrid_pubkey_len()), max_signature_len());
+        assert_eq!(max_signature_len_for_public_key_len(CONSERVATIVE_PUBLIC_KEY_LEN + 1), max_signature_len());
+    }
+
+    /// A wallet signs only with a key of an exact hybrid or conservative
+    /// encoding: an envelope naming a suite with a body of another length is
+    /// neither.
+    #[test]
+    fn key_suite_of_public_key_requires_the_exact_encoding() {
+        let (hpk, _) = generate_keypair();
+        assert_eq!(KeySuite::of_public_key(&hpk), Some(KeySuite::Hybrid));
+        assert_eq!(KeySuite::of_public_key(&hpk[SUITE_HEADER_LEN..]), Some(KeySuite::Hybrid), "raw carry-over key");
+        assert_eq!(KeySuite::of_public_key(&hpk[..hpk.len() - 1]), None);
+        let mut long = hpk.clone();
+        long.push(0);
+        assert_eq!(KeySuite::of_public_key(&long), None);
+        let short_conservative = wrap_envelope(SUITE_CONSERVATIVE, &[7u8; 100]);
+        assert_eq!(KeySuite::of_public_key(&short_conservative), None);
+        let mldsa_only = wrap_envelope(SUITE_MLDSA65_ONLY, &[7u8; MLDSA_PUBKEY_LEN]);
+        assert_eq!(KeySuite::of_public_key(&mldsa_only), None);
     }
 
     /// Golden vectors (docs/CONSENSUS.md, "Conservative suite 0x0003"): the
