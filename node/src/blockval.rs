@@ -246,7 +246,7 @@ pub fn validate_block_transactions(
         fn note<T>(&self, r: Result<T, String>) -> Result<T, ViewError> {
             r.map_err(|e| {
                 self.error.borrow_mut().get_or_insert_with(|| e.clone());
-                ViewError(e)
+                ViewError::io(e)
             })
         }
     }
@@ -275,7 +275,7 @@ pub fn validate_block_transactions(
     verdict.map_err(|f| match f {
         crate::accept::ConnectFailure::Invalid(e) if e.witness_dependent => BlockTxError::InvalidWitness(e.reason),
         crate::accept::ConnectFailure::Invalid(e) => BlockTxError::Invalid(e.reason),
-        crate::accept::ConnectFailure::Storage(e) => BlockTxError::Storage(e),
+        crate::accept::ConnectFailure::Storage(e) => BlockTxError::Storage(e.msg),
     })?;
     // The fee total the coinbase may claim (the verdict already checked it).
     let mut created: std::collections::HashMap<([u8; 32], u32), u64> = std::collections::HashMap::new();

@@ -1002,9 +1002,13 @@ async fn main() {
             // with nothing to retry it but the next block; like Bitcoin Core
             // ("Failed to connect best block", an init error), refuse to start.
             error!("start-up chain-state reconciliation failed: {}", e);
+            // Review of audit F1, finding 4: the start-up rebuild only runs
+            // when `check_chain_state` finds faults, which it did not here,
+            // so a restart with --carryover-snapshot would repair nothing.
             error!("Refusing to start: the best valid chain cannot be connected. Fix the cause above \
-                    (disk space, permissions, storage errors) and restart; if it persists, rebuild with \
-                    --carryover-snapshot or resynchronize this data directory.");
+                    (disk space, permissions, storage errors) and restart; if it persists, the data \
+                    directory is damaged: resynchronize into a fresh, empty --data-dir (or start from a \
+                    copy of an archival node's data directory).");
             std::process::exit(1);
         } else {
             for f in &faults {
@@ -2553,12 +2557,14 @@ async fn main() {
     }
 
     // Audit F1: Bitcoin Core's `AbortNode`. A block whose validation keeps
-    // ending without a verdict (the chain state cannot be read consistently)
-    // stops the node (`accept::NO_VERDICT_ABORT_AFTER`): acceptance and
-    // templates refuse at once, and the process exits here with the
-    // operator's message, under the acceptance lock (no chain move in
-    // flight; every commit is one atomic batch). A restart that meets the
-    // same failure refuses to start with it.
+    // ending on a storage-engine failure (the node cannot read its chain
+    // state) stops the node (`accept::NO_VERDICT_ABORT_AFTER`): acceptance
+    // and templates refuse at once, and the process exits here with the
+    // operator's message (`accept::no_verdict_abort_message`), under the
+    // acceptance lock (no chain move in flight; every commit is one atomic
+    // batch). A restart that meets the same failure refuses to start with
+    // it. An inconsistent index never stops the node: the block is parked
+    // and retried (review of audit F1, finding 1; `getdaginfo` no_verdict).
     let store_for_abort = store.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));

@@ -1688,7 +1688,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                                     row["spent_in_mempool"] = json!(state.mempool.spends_outpoint(&(t,*idx)));
                                     let confirmations = crate::mempool::admission::confirmations_for_next_block(
                                         &state.store,&t,next_block_height)
-                                        .map_err(|e| crate::storage::StorageError::ReadFailed(e.0))?;
+                                        .map_err(|e| crate::storage::StorageError::ReadFailed(e.msg))?;
                                     row["confirmations_at_next_block"] = json!(confirmations);
                                 }
                             }
@@ -2121,7 +2121,24 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             // `tip_blue_work`; below it the node is in initial block download.
             let min_chain_work = state.min_chain_work;
             let tip_work = tip_data.as_ref().map_or(0, |d| d.blue_work);
+            // Audit F1 (review, finding 1): the blocks whose validation ended
+            // without a verdict (`accept`'s no-verdict guard), like
+            // getchaintips' per-branch status: parked (not selectable until
+            // the retry), never marked invalid. `stopped`: why the node
+            // stopped (repeated storage-engine failures), if it did.
+            let now = std::time::Instant::now();
+            let no_verdict: Vec<Value> = state.store.no_verdict_records().into_iter().map(|(h, r)| json!({
+                "hash":          hex::encode(h),
+                "status":        if dag.is_no_verdict_parked(&h) { "no-verdict-parked" } else { "no-verdict-retrying" },
+                "class":         if r.last_io { "storage-engine" } else { "inconsistent-chain-state" },
+                "attempts":      r.attempts,
+                "storage_engine_failures_in_a_row": r.io_failures,
+                "reason":        r.reason,
+                "retry_in_secs": r.retry_at.saturating_duration_since(now).as_secs(),
+            })).collect();
             json!({
+                "no_verdict":     no_verdict,
+                "stopped":        state.store.abort_reason(),
                 "tip":            tip.map(|h| hex::encode(h)),
                 "tip_blue_score": tip_data.as_ref().map(|d| d.blue_score).unwrap_or(0),
                 "tip_blue_work":  tip_data.as_ref().map(|d| d.blue_work.to_string()).unwrap_or_default(),
@@ -4460,6 +4477,31 @@ mod audit_2026_10_rpc_tests {
         let _g = activation::scoped_override(0);
         let r = dispatch("getdaginfo", None, &state).await;
         assert_eq!(r["hardening_activation_height"], 0);
+    }
+
+    /// Review of audit F1, finding 1: `getdaginfo` lists the blocks whose
+    /// validation ended without a verdict (class, attempts, reason, parked)
+    /// and why the node stopped, if it did.
+    #[tokio::test]
+    async fn getdaginfo_reports_blocks_without_a_verdict() {
+        let (_tmp, state) = state_with_chain(5);
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["no_verdict"], json!([]));
+        assert_eq!(r["stopped"], Value::Null);
+        let tip = state.dag.read().selected_tip().unwrap();
+        state.store.note_no_verdict(&tip, false, "tx-index row missing", std::time::Instant::now());
+        state.dag.write().park_no_verdict(tip);
+        let r = dispatch("getdaginfo", None, &state).await;
+        let e = &r["no_verdict"][0];
+        assert_eq!(e["hash"], hex::encode(tip));
+        assert_eq!(e["status"], "no-verdict-parked");
+        assert_eq!(e["class"], "inconsistent-chain-state");
+        assert_eq!(e["attempts"], 1);
+        assert_eq!(e["reason"], "tx-index row missing");
+        assert!(e["retry_in_secs"].as_u64().unwrap() > 0);
+        state.store.abort_node("stopped for the test".into());
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["stopped"], "stopped for the test");
     }
 
     /// POW-3: `getdaginfo` reports the node's minimum chain work (here
