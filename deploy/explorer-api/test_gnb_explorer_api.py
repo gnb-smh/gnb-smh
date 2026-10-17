@@ -63,6 +63,8 @@ class ExplorerApiTests(unittest.TestCase):
         api.POST_LIMIT = api.RateLimiter(1000)
         if hasattr(api, "ByteBudget"):
             api.POST_BYTES = api.ByteBudget(10**9)
+        if hasattr(api, "CROSS_SITE_LIMIT"):
+            api.CROSS_SITE_LIMIT = api.RateLimiter(10**6, max_clients=1)
         self.server = ApiServer()
 
     def tearDown(self):
@@ -270,6 +272,35 @@ class ExplorerApiTests(unittest.TestCase):
                         {"content-type": "application/json", "sec-fetch-site": "same-origin"}]:
             self.assertEqual(self.server.post("/v1/sendrawtransaction", tx, {**a, **headers})[0], 200, headers)
         self.assertEqual(calls, ["sendrawtransaction"] * 3)
+
+    def test_cross_site_reads_share_one_budget(self):
+        """Re-audit B2-R2-2, read variant: a page on another site makes each
+        of its visitors' browsers send uncached reads, each charged to that
+        visitor's own GET budget, so the page got a budget per visitor. A
+        read the Worker marks cross-site (X-GnB-Cross-Site: 1) is now also
+        charged to one budget all cross-site reads share; same-origin pages
+        and non-browser clients keep their own budgets only."""
+        self.assertTrue(hasattr(api, "CROSS_SITE_LIMIT"), "a shared cross-site read budget exists")
+        api.CROSS_SITE_LIMIT = api.RateLimiter(3, max_clients=1)
+        path = "/v1/getblockcount"
+        visitors = [{"x-gnb-client-ip": f"198.51.100.{i}", "x-gnb-cross-site": "1"} for i in range(1, 7)]
+        self.assertEqual([self.server.get(path, v)[0] for v in visitors], [200, 200, 200, 429, 429, 429],
+                         "six visitors of one page share the cross-site budget")
+        # The same visitors reading from the site itself (no marker), and a
+        # CLI client, are not affected by it.
+        for i in range(1, 7):
+            self.assertEqual(self.server.get(path, {"x-gnb-client-ip": f"198.51.100.{i}"})[0], 200)
+        # A cross-site read still counts against the visitor's own budget.
+        api.CROSS_SITE_LIMIT = api.RateLimiter(10**6, max_clients=1)
+        api.GET_LIMIT = api.RateLimiter(2)
+        v = {"x-gnb-client-ip": "203.0.113.5", "x-gnb-cross-site": "1"}
+        self.assertEqual([self.server.get(path, v)[0] for _ in range(3)], [200, 200, 429])
+        # Only "1" marks a request; anything else is an ordinary read.
+        api.CROSS_SITE_LIMIT = api.RateLimiter(1, max_clients=1)
+        api.GET_LIMIT = api.RateLimiter(1000)
+        self.assertEqual(self.server.get(path, {"x-gnb-client-ip": "203.0.113.6", "x-gnb-cross-site": "0"})[0], 200)
+        self.assertEqual(self.server.get(path, {"x-gnb-client-ip": "203.0.113.6", "x-gnb-cross-site": "1"})[0], 200)
+        self.assertEqual(self.server.get(path, {"x-gnb-client-ip": "203.0.113.7", "x-gnb-cross-site": "1"})[0], 429)
 
     def test_broadcast_verification_budget_is_api_wide(self):
         """Every broadcast costs the node signature verification; one byte

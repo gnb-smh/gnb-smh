@@ -27,7 +27,12 @@ import { isAddress } from "../site/assets/safe.js";
 //   web page could make its visitors' browsers broadcast through this route
 //   with a CORS "simple request" (text/plain fetch in no-cors mode,
 //   sendBeacon, a form), so the per-client limit counted every visitor and
-//   never the attacker; see broadcastRefusal.
+//   never the attacker; see broadcastRefusal. The read variant of the same
+//   trick (a page making its visitors' browsers send uncached per-address
+//   reads, each charged to that visitor's own budget) is bounded too: a read
+//   a browser marks as cross-site is forwarded with X-GnB-Cross-Site, and
+//   the explorer API charges it to one budget shared by every cross-site
+//   read as well as to the visitor's own (see isCrossSite).
 const NAME = /^[a-z0-9]{2,40}$/;
 
 // Fixed edge TTLs (seconds). Anything not listed uses DEFAULT_TTL.
@@ -69,10 +74,13 @@ export default {
     const hit = await cache.match(cacheKey);
     if (hit) return hit;
 
+    // B2-R2-2 (reads): a cross-site read is charged to the budget all
+    // cross-site reads share as well (deploy/explorer-api, CROSS_SITE_LIMIT).
+    const extra = isCrossSite(request, url) ? { "x-gnb-cross-site": "1" } : {};
     for (const origin of origins) {
       try {
         const r = await fetch(`${origin}/v1/${path}?p=${encodeURIComponent(p)}`, {
-          headers: originHeaders(request, env),
+          headers: originHeaders(request, env, extra),
           cf: { cacheTtl: 0, cacheEverything: false },
           redirect: "manual",
           signal: AbortSignal.timeout(8000),
@@ -100,6 +108,26 @@ function originHeaders(request, env, extra = {}) {
 }
 
 /**
+ * True when a browser marks `request` as made by a page of another site or
+ * origin (re-audit B2-R2-2): Sec-Fetch-Site other than same-origin / none
+ * (sent on every request by current browsers, also no-cors ones such as
+ * <img>, sendBeacon and fetch(..., {mode: "no-cors"})), or an Origin header
+ * that is not this host's (sent on every CORS request). Non-browser clients
+ * (CLI wallets, scripts) send neither and are never cross-site.
+ *
+ * Such a page runs in each visitor's browser, so a per-client limit counts
+ * every visitor and never the page: reads it causes are charged, in the
+ * explorer API, to one budget all cross-site reads share as well; a
+ * broadcast it causes is refused (broadcastRefusal).
+ */
+export function isCrossSite(request, url) {
+  const site = request.headers.get("sec-fetch-site");
+  if (site !== null && site !== "same-origin" && site !== "none") return true;
+  const origin = request.headers.get("origin");
+  return origin !== null && origin !== url.origin;
+}
+
+/**
  * Why a broadcast request must be refused before it costs anything, as
  * `[status, message]`, or null (B2-R2-2).
  *
@@ -122,10 +150,7 @@ function originHeaders(request, env, extra = {}) {
 export function broadcastRefusal(request, url) {
   const type = (request.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
   if (type !== "application/json") return [415, "content-type must be application/json"];
-  const site = request.headers.get("sec-fetch-site");
-  if (site !== null && site !== "same-origin" && site !== "none") return [403, "cross-site broadcast refused"];
-  const origin = request.headers.get("origin");
-  if (origin !== null && origin !== url.origin) return [403, "cross-origin broadcast refused"];
+  if (isCrossSite(request, url)) return [403, "cross-site broadcast refused"];
   return null;
 }
 

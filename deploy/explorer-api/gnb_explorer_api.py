@@ -35,6 +35,12 @@ Hardening (audit WAL-2, WAL-4, NET-12, B1-T10, B2-T4):
     page of another site (re-audit B2-R2-2, broadcast_refusal): a
     cross-site 'simple request' is refused before it is read, counted or
     forwarded;
+  * a read the Worker marks as made by a browser page of another site
+    (X-GnB-Cross-Site: 1, trusted only on requests that carry the shared
+    key) is charged to the visitor's own GET budget AND to one budget that
+    every cross-site read shares (GNB_API_CROSS_SITE_PER_MIN, re-audit
+    B2-R2-2): a page that makes each of its visitors' browsers send
+    uncached per-address reads gets that one budget, not one per visitor;
   * broadcasts also share one API-wide budget of transaction bytes per minute
     (GNB_API_POST_BYTES_PER_MIN): every forwarded transaction costs the node
     signature verification roughly in proportion to its size, so the
@@ -56,6 +62,8 @@ Environment:
     GNB_API_POST_PER_MIN     broadcasts per client per minute (default 6)
     GNB_API_POST_BYTES_PER_MIN  transaction bytes forwarded per minute, all
                              clients together (default 2000000)
+    GNB_API_CROSS_SITE_PER_MIN  GET requests per minute that browser pages of
+                             other sites may cause, all together (default 240)
     GNB_API_MAX_CLIENTS      clients tracked per limiter (default 50000)
     GNB_CARRYOVER            uncompressed Bloch Genesis-3 carryover TSV (optional)
 """
@@ -313,6 +321,9 @@ class ByteBudget:
 GET_LIMIT = RateLimiter(int(os.environ.get("GNB_API_RATE_PER_MIN", "240")))
 POST_LIMIT = RateLimiter(int(os.environ.get("GNB_API_POST_PER_MIN", "6")))
 POST_BYTES = ByteBudget(int(os.environ.get("GNB_API_POST_BYTES_PER_MIN", "2000000")))
+# Re-audit B2-R2-2 (reads): one window shared by every cross-site read.
+CROSS_SITE_LIMIT = RateLimiter(int(os.environ.get("GNB_API_CROSS_SITE_PER_MIN", "240")), max_clients=1)
+CROSS_SITE_KEY = "cross-site"
 
 RATE_LIMITED = {"error": "rate limit exceeded; retry in a minute"}
 
@@ -460,6 +471,22 @@ class Handler(BaseHTTPRequestHandler):
         """Count this (already validated) request; True when over the limit."""
         return not limiter.allow(self.client())
 
+    def cross_site(self):
+        """True when the Worker marks this request as made by a browser page
+        of another site (X-GnB-Cross-Site: 1, worker/index.js isCrossSite).
+        Only called on authorized requests: no one else can set it."""
+        return self.headers.get("x-gnb-cross-site", "").strip() == "1"
+
+    def over_read_limit(self):
+        """Count this (already validated) read; True when over a limit: the
+        client's own GET budget and, for a cross-site read, the one budget
+        all cross-site reads share (re-audit B2-R2-2). A page on another
+        site runs in every visitor's browser, so the per-client budget alone
+        counted each visitor and never the page."""
+        if self.over_limit(GET_LIMIT):
+            return True
+        return self.cross_site() and not CROSS_SITE_LIMIT.allow(CROSS_SITE_KEY)
+
     def do_GET(self):
         if not self.authorized():
             return self.send(403, {"error": "forbidden"})
@@ -473,13 +500,13 @@ class Handler(BaseHTTPRequestHandler):
         # cannot occupy limiter slots.
         try:
             if name == "health" and len(parts) == 2:
-                if self.over_limit(GET_LIMIT):
+                if self.over_read_limit():
                     return self.send(429, RATE_LIMITED)
                 r = rpc("getblockcount", [])
                 return self.send(200, {"ok": "result" in r, "blocks": r.get("result")})
             if name == "carryover" and len(parts) == 3:
                 ADDRESS(parts[2])
-                if self.over_limit(GET_LIMIT):
+                if self.over_read_limit():
                     return self.send(429, RATE_LIMITED)
                 return self.send(200, carryover_of(parts[2]), 300)
             if name not in ALLOWED or len(parts) != 2:
@@ -492,7 +519,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(params, list) or len(params) > len(checkers):
                 raise ValueError("params must be a JSON array")
             params = [check(v) for check, v in zip(checkers, params)]
-            if self.over_limit(GET_LIMIT):
+            if self.over_read_limit():
                 return self.send(429, RATE_LIMITED)
             ck = name + json.dumps(params)
             result = cached(ck, ttl, lambda: rpc(name, params))

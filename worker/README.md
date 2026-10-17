@@ -34,6 +34,16 @@ instead of the attacker's. Broadcast answers carry no
 The explorer API refuses non-JSON and cross-site broadcasts too
 (`broadcast_refusal` in `deploy/explorer-api/gnb_explorer_api.py`).
 
+The read variant of the same trick (a page making its visitors' browsers
+send uncached per-address reads such as `getutxos` with a fresh `p` each
+time, each charged to that visitor's own read budget) is bounded as well: a
+read a browser marks as coming from another site's page (`isCrossSite`: the
+same `Sec-Fetch-Site` / `Origin` test as the broadcast route) is forwarded
+with `X-GnB-Cross-Site: 1`, and the explorer API charges it to one budget
+shared by every cross-site read (`GNB_API_CROSS_SITE_PER_MIN`) as well as to
+the visitor's own. Same-origin pages and non-browser clients are unchanged,
+and read answers keep `access-control-allow-origin: *`.
+
 ## Origin TLS: the zone must use "Full (strict)" (audit WAL-2)
 
 The Worker's `fetch()` to an `https://` origin goes through Cloudflare's edge,

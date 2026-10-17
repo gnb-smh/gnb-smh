@@ -96,7 +96,12 @@ client addresses. The node applies its own budget to anonymous
 whatever its type, so a cross-site "simple request" relayed by a front end
 was broadcast and charged to the visitor. Such requests are answered 415 /
 403 before they are read, counted or forwarded (the Worker refuses them
-first, `worker/README.md`).
+first, `worker/README.md`). A read the Worker marks as made by a browser page
+of another site (`X-GnB-Cross-Site: 1`, trusted only with the shared key) is
+charged to the visitor's own read budget and to one budget all cross-site
+reads share, `GNB_API_CROSS_SITE_PER_MIN` (240; re-audit B2-R2-2): a page
+that makes each of its visitors' browsers send uncached reads gets that one
+budget, not one per visitor.
 
 Run `--archive` on the nodes behind the explorer if possible: wallets verify
 UTXO values against the creating transaction (`getrawtransaction`), which a
