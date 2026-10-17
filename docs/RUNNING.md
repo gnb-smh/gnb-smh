@@ -857,6 +857,61 @@ graylist threshold) the peer is disconnected and its identity refused for
 discourages a misbehaving peer the same way; it also discourages the
 address, which this release does not do.
 
+## Secret key memory (audit CRY-4)
+
+Every long-lived secret key, seed and password GnB itself keeps lives in
+its own `gnb_secret::SecretBytes` region (crate `crates/gnb-secret`), the
+analogue of Bitcoin Core's secure allocator (`LockedPoolManager`: `mlock`,
+`MADV_DONTDUMP`, `memory_cleanse` before release); the exceptions are listed
+at the end of this section:
+
+- on Unix each region is whole pages of an anonymous mapping, locked in RAM
+  with `mlock` (never written to swap) and, on Linux and FreeBSD, left out
+  of core dumps (`MADV_DONTDUMP` / `MADV_NOCORE`); it is wiped with volatile
+  writes before it is unmapped. Other targets (Windows, the WebAssembly
+  wallet) get wiped heap memory;
+- the holders are neither `Copy` nor `Clone` (a static assertion fails the
+  build otherwise): wallet and HD-wallet keys, the BIP39 seed and the HD
+  master key, the node's P2P identity key, the KES witness seed and every
+  leaf key derived from it, the witness key-file password, and the
+  ephemeral ML-KEM-768 key and shared secrets of every P2P handshake;
+- ML-DSA-65, Falcon-1024 and ML-KEM-768 keys are generated and used directly
+  in those regions through PQClean's C functions (`gnb_secret::pq`): the
+  `pqcrypto` wrapper types hold secret keys in `Copy` arrays that every call
+  copies and nothing can wipe, so production code never builds one (the
+  `secret_hygiene` test fails the build if it does). After a signature,
+  key generation or KEM operation the stack the C code and the hash
+  functions used is overwritten (`gnb_secret::scrub_stack`, 128 KiB, like
+  libsodium's `sodium_stackzero`), and tests read the dead stack back to
+  check that no copy of the secret is left. Registers and copies the
+  compiler makes outside these paths are out of reach: this is best effort,
+  like Core's.
+
+Locking is best effort. The locked-memory limit (`ulimit -l`, systemd
+`LimitMEMLOCK`) bounds it: a node needs a few pages for its long-lived
+secrets plus two per concurrent P2P handshake, a wallet two per key. When
+`mlock` fails the secret is still wiped on release, the failure is counted
+and logged once ("could not lock secret key memory in RAM"), exactly as
+Core warns. `deploy/gnb-node.service` sets `LimitMEMLOCK=16M`; for a manual
+start raise `ulimit -l` if the warning appears.
+
+Not in secret memory (wiped on drop where the code owns them, but neither
+locked nor kept out of core dumps):
+
+- short-lived secrets: passwords and phrases typed into the CLIs, decrypted
+  keystore buffers (`Zeroizing`);
+- the node's libp2p Ed25519 identity key (`p2p_identity.bin`, the key of its
+  `PeerId`): libp2p holds it in its own `identity::Keypair` for the whole
+  run, and libp2p offers no way to place it in memory the node allocates.
+  It authenticates the node's libp2p identity only; the post-quantum
+  transport identity (`PqIdentity`) is in secret memory;
+- the ChaCha20-Poly1305 keys of each P2P connection's two cipher streams
+  (`transport::TxStream` / `RxStream`), alive as long as the connection:
+  `Zeroizing`, wiped when the connection closes. Bitcoin Core keeps its
+  BIP324 session keys in ordinary memory the same way (`FSChaCha20Poly1305`,
+  wiped with `memory_cleanse`); only its wallet keys use the secure
+  allocator.
+
 ## Upgrading and downgrading
 
 The upgrade to a release that keeps the shielded-pool state on disk (audit
@@ -922,31 +977,29 @@ must also keep, or offer for download, the original v2 bytes).
 A GnB address is `gnb1q` (mainnet) or `gnb1t` (testnet) followed by the hex
 of the 20-byte key hash and a 4-byte checksum, `SHA3-256(SHA3-256(hash))[..4]`.
 The checksum does not cover the prefix, so `gnb1q…` and `gnb1t…` forms of one
-hash both pass `Address::parse`. A new address version whose checksum commits
-to the network (bech32m-style) was evaluated and is **not** introduced:
+hash both pass `Address::parse`. An opt-in second encoding whose checksum
+commits to the network, address v2 (Bech32m, human-readable part `gnb` /
+`tgnb`, `docs/ADDRESS-V2.md`), is accepted by the node, the wallets, the
+explorer API and the Worker as an additional encoding of the same
+destination. The legacy form stays the default output: released GnB wallets,
+the Bloch wallets that share these keys and third-party integrations parse
+only it.
 
-- it could only be emitted where every consumer parses it, and they do not:
-  every released GnB wallet and node, the Bloch wallets that share these keys,
-  the explorer and its API (`^gnb1[qt][0-9a-f]{48}$`), the Cloudflare Worker's
-  path filter and third-party integrations would all reject it, so a payment
-  to a new-format address from any of them fails;
-- parsing both forms while emitting only the old one adds nothing: the old
-  form would stay the one users copy;
-- the risk it would remove is already closed where it matters: every payment
-  path compares the destination's network with the wallet's own network,
-  which is authenticated (keystore v3, keyfile v1, or the network the caller
-  states for a v2 file): `TxBuilder::build_payment`, `Wallet` payments,
-  `gnb-cli send`, `gnb-wallet send` and the web wallet's `pay` refuse a
-  destination of the other network, and the node's `--miner-address` uses
-  `Address::parse_for_network`. The policy and bridge-vault commands do the
-  same against the network of the spend: `gnb-cli policyspend` (the network
-  stated with `--testnet` / `--mainnet`, mainnet by default),
-  `vaultrelease`, `vaultrecover` and `vaultcheckrelease` (the vault file's
-  network) refuse a destination of the other network, `vaultlock` opens the
-  paying keystore for the vault's network and `policysign` for the spend's.
-  A prefix typo therefore fails before anything
-  is signed, and a transaction signed for one chain is invalid on the other
-  (the chain id is in every sighash).
+The prefix risk is closed where it matters, in either encoding: every payment
+path compares the destination's network with the wallet's own network,
+which is authenticated (keystore v3, keyfile v1, or the network the caller
+states for a v2 file): `TxBuilder::build_payment`, `Wallet` payments,
+`gnb-cli send`, `gnb-wallet send` and the web wallet's `pay` refuse a
+destination of the other network, and the node's `--miner-address` uses
+`Address::parse_for_network`. The policy and bridge-vault commands do the
+same against the network of the spend: `gnb-cli policyspend` (the network
+stated with `--testnet` / `--mainnet`, mainnet by default),
+`vaultrelease`, `vaultrecover` and `vaultcheckrelease` (the vault file's
+network) refuse a destination of the other network, `vaultlock` opens the
+paying keystore for the vault's network and `policysign` for the spend's.
+A prefix typo therefore fails before anything
+is signed, and a transaction signed for one chain is invalid on the other
+(the chain id is in every sighash).
 
 Policy addresses (multisig / timelocks: `gnb1m` mainnet, `gnb1n` testnet,
 `address::PolicyAddress`) are newer and already commit to the network: their

@@ -164,7 +164,11 @@ fn main() {
             rand::fill(&mut seed[..]);
             let total = 1u64 << depth;
             eprintln!("Generating {} epoch keys (hybrid ML-DSA-65 + Falcon-1024)...", total);
-            let signer = gnb::core::kes::KesSigner::generate(depth, *seed, |i| {
+            // CRY-4: the seed is borrowed, never copied out of its wiping
+            // owner (passing the array by value, as clippy suggests for a
+            // `Borrow` argument, would leave an unwiped copy).
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            let signer = gnb::core::kes::KesSigner::generate(depth, &*seed, |i| {
                 if i % 256 == 0 || i == total { eprint!("\r  {}/{}", i, total); }
             }).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
             eprintln!();
