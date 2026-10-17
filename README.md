@@ -2,7 +2,8 @@
 
 ObenBlock (ticker **OBB**, [obenblock.xyz](https://obenblock.xyz)) is a
 post-quantum proof-of-work BlockDAG. It relaunches the GnB code base as a new
-chain with a clean genesis. Blocks are mined with **SHA-256d** on a
+chain. Its genesis carries over none of the GnB chain's history. It pays the
+Bloch carry-over to the same keys as GnB's genesis did. Blocks are mined with **SHA-256d** on a
 Bitcoin-ASIC compatible header. Finality comes from **PoWit** witness votes
 weighted by share work. Transactions carry hybrid post-quantum signatures.
 Finalized checkpoints are anchored in **Bloch**, in both directions. The
@@ -25,7 +26,7 @@ ObenBlock network yet. Pre-release; not externally audited.
 | Signatures | Hybrid ML-DSA-65 ‖ Falcon-1024; opt-in conservative suite SLH-DSA-SHAKE-128s ‖ Falcon-1024 (`0x0003`), valid from genesis | The same suites; `0x0003` only where the second hardening upgrade is active (testnet, regtest; not scheduled on mainnet) |
 | Networks | Mainnet only; regtest for development | Mainnet, testnet, regtest |
 | Addresses | `obb1q…` (key hash), `obb1m…` (spend policy); GnB's `gnb1…` and `bloch1q…` addresses stay valid and are shown as `obb1…` | `gnb1q…`, `gnb1m…` (testnet `gnb1t…`, `gnb1n…`); `bloch1q…` accepted |
-| Genesis and supply | Clean genesis: no balances carried over from GnB or Bloch. Hard cap 12,500,000 OBB, with GnB's carryover share moved to mining (owner to confirm) | Hard cap 12,500,000 GNB: 8% Bloch carryover, 10% team and 10% founder (locked: 1-year cliff, then 36 monthly tranches), 72% mining |
+| Genesis and supply | No balances from the GnB chain; the Bloch carryover is paid as in GnB's genesis (same snapshot, conversion and keys). Hard cap 12,500,000 OBB with GnB's allocations: 72% mining, 8% Bloch carryover, 10% team, 10% founder | Hard cap 12,500,000 GNB: 8% Bloch carryover, 10% team and 10% founder (locked: 1-year cliff, then 36 monthly tranches), 72% mining |
 | Bloch anchoring | Mutual: ObenBlock's finalized checkpoints recorded in Bloch, and Bloch's recorded in ObenBlock | Bloch's finalized checkpoints recorded in ordinary transactions ([docs/BLOCH-ANCHOR.md](docs/BLOCH-ANCHOR.md)); the other direction is package O8 |
 | Unit | 1 OBB = 10^8 base units | 1 GNB = 10^8 base units |
 
@@ -40,7 +41,7 @@ ObenBlock network yet. Pre-release; not externally audited.
 | `crates/gnb-wallet-wasm` | Browser wallet core (keystores, coin selection, hybrid signing) for `wasm32-wasip1` |
 | `site/`, `worker/` | The website: static pages, explorer (`/explorer`) and web wallet (`/wallet`), served by a Cloudflare Worker that also proxies the read-only explorer API |
 | `deploy/` | Node and explorer-API systemd units and install scripts |
-| `genesis/` | The Bloch Genesis-3 terminal snapshot the GnB genesis ledger is built from (ObenBlock's clean genesis does not use it) |
+| `genesis/` | The Bloch Genesis-3 terminal snapshot the GnB genesis ledger is built from; ObenBlock's genesis pays the same carryover from it |
 | `crates/pqcrypto-internals` | Vendored fork (patched in through `[patch.crates-io]`), a workspace member so its guard test runs. (The `libp2p-yamux` fork was retired with libp2p 0.57; `node/tests/supply_chain_lockfile_guard.rs` keeps a single yamux >= 0.13.10 and hickory >= 0.26.1 in `Cargo.lock`.) |
 | `node/fuzz` | cargo-fuzz targets (own workspace, nightly): wire decoders and round trips, difficulty, PoW and signature verify, Merkle paths, mempool, block rules, sighash, witnesses, undo records, keystores, addresses, the sync codec, block acceptance in any arrival order ([docs/testing/FUZZING.md](docs/testing/FUZZING.md)) |
 | `docs/` | Protocol notes: [ObenBlock relaunch design](docs/DESIGN-obenblock.md), [consensus](docs/CONSENSUS.md), [monetary policy and carryover](docs/MONETARY-POLICY.md), [running a node](docs/RUNNING.md), [ledger v1](docs/LEDGER.md), [P2P security](docs/P2P.md), [multisig and timelocks](docs/MULTISIG.md); testing: [sanitizers, Miri, 32-bit](docs/testing/SANITIZERS.md), [fuzzing](docs/testing/FUZZING.md), [functional tests](docs/testing/FUNCTIONAL.md) |
@@ -110,8 +111,12 @@ The relaunch changes ([docs/DESIGN-obenblock.md](docs/DESIGN-obenblock.md)):
   (regtest), P2P protocol `/obenblock/pq/1.0.0`, ports 18110 (P2P) and 18210
   (RPC), so one host can run both chains. No transaction, attestation or
   share is valid on both chains.
-- **Genesis:** clean, with every rule of both hardening upgrades and PoWit
-  active from height 0.
+- **Genesis:**
+  - every rule of both hardening upgrades and PoWit active from height 0;
+  - no balances from the GnB chain;
+  - the Bloch carryover paid exactly as in GnB's genesis, so a Bloch or GnB
+    JSON keystore spends it with the same key;
+  - the subsidy ramps up over the first 5,760 blocks (slow start).
 - **Addresses:** `obb1…`. GnB's `gnb1…` strings (and `bloch1q…`) parse as the
   same script, a GnB keystore opens unchanged, and the same key controls its
   coins on both chains.
