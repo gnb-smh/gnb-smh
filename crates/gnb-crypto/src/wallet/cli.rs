@@ -285,8 +285,7 @@ pub fn main() {
             let fee_policy  = crate::wallet::send::parse_max_fee_arg(max_fee.as_deref())
                 .unwrap_or_else(|message| err(message));
             checked_destination(&to, &kp.address).unwrap_or_else(|message| err(&message));
-            let to_addr = kp.network().and_then(|n| crate::address::Address::parse_for_network(&to, n).map_err(|e| e.to_string()))
-                .unwrap_or_else(|_| err("invalid destination address"));
+            let to_addr = crate::address::Address::parse(&to).unwrap_or_else(|_| err("invalid destination address"));
 
             // 1-4: fetch UTXOs, select, verify claimed values against their
             // transactions (WAL-1), build and sign under the fee guard.
@@ -721,15 +720,10 @@ fn checked_cli_satoshis(value: &str, allow_zero: bool) -> Result<u64, &'static s
     Ok(satoshis)
 }
 
-/// CRY-7: the destination must be an address of the wallet's own network
-/// (the wallet address is authenticated by its keystore), decoded with
-/// `Address::parse_for_network`, never network-agnostically.
 fn checked_destination(destination: &str, source: &str) -> Result<String, String> {
+    let destination = crate::address::Address::parse(destination).map_err(|_| "invalid destination address".to_string())?;
     let source = crate::address::Address::parse(source).map_err(|_| "invalid wallet address".to_string())?;
-    let destination = crate::address::Address::parse_for_network(destination, source.network()).map_err(|e| match e {
-        crate::address::AddressError::WrongNetwork { .. } => "destination address network differs from wallet".to_string(),
-        _ => "invalid destination address".to_string(),
-    })?;
+    if destination.network() != source.network() { return Err("destination address network differs from wallet".into()); }
     Ok(hex::encode(destination.hash()))
 }
 

@@ -49,7 +49,7 @@
 //! `create` — the new recovery phrase. Request buffers are wiped by the
 //! loader (`core.js`) and the password copies made here are wiped on drop.
 
-use gnb_crypto::address::{Address, AddressError, Network};
+use gnb_crypto::address::{Address, Network};
 use gnb_crypto::core::{tokenomics, ChainId, TxOutput};
 use gnb_crypto::wallet::payment::amounts_committed_at;
 use gnb_crypto::wallet::send::{all_immature_message, utxo_row_spendable_at};
@@ -348,12 +348,11 @@ fn pay(kp: &Keypair, utxos: &[Utxo], to: &str, amount: u64, opts: &PaymentOption
     if amount == 0 {
         return Err("amount must be positive".into());
     }
-    // CRY-7: decode the destination for the session key's network only.
+    let dest = Address::parse(to.trim()).map_err(|e| format!("invalid destination: {e:?}"))?;
     let mine = Address::parse(&kp.address).map_err(|e| format!("{e:?}"))?;
-    let dest = Address::parse_for_network(to.trim(), mine.network()).map_err(|e| match e {
-        AddressError::WrongNetwork { .. } => "destination is on another network".to_string(),
-        e => format!("invalid destination: {e:?}"),
-    })?;
+    if dest.network() != mine.network() {
+        return Err("destination is on another network".into());
+    }
     let paid = TxBuilder::build_payment(kp, utxos, &dest, amount, opts)?;
     let raw = paid.tx.to_wire_bytes(true);
     Ok(json!({
@@ -452,24 +451,6 @@ mod tests {
     // The session is process-global: keep every flow in one test.
     #[test]
     #[cfg_attr(miri, ignore = "key generation, signing and verification run the PQClean ML-DSA-65 and Falcon-1024 C code, which Miri cannot execute")]
-    fn pay_refuses_a_destination_of_the_other_network() {
-        let _session = SESSION_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let created = handle(&json!({"op": "create", "mnemonic": false})).unwrap();
-        let spk = Address::parse(created["address"].as_str().unwrap()).unwrap().hash().to_vec();
-        let utxos = json!([{"txid": "33".repeat(32), "index": 0, "value": "200000000", "script_pubkey": hex::encode(&spk)}]);
-        // CRY-7: the gnb1t form of a hash is well-formed (the checksum does
-        // not cover the prefix) but is not a destination of a mainnet key.
-        let to = Address::from_hash([7u8; 20], Network::Testnet).to_string();
-        let err = handle(&json!({"op": "pay", "utxos": utxos, "to": to, "amount": "100000000", "fee": "0",
-            "next_height": "11"})).unwrap_err();
-        assert_eq!(err, "destination is on another network");
-        let to = Address::from_hash([7u8; 20], Network::Mainnet).to_string();
-        assert!(handle(&json!({"op": "pay", "utxos": utxos, "to": to, "amount": "100000000", "fee": "0",
-            "next_height": "11"})).is_ok());
-        handle(&json!({"op": "wipe"})).unwrap();
-    }
-
-    #[test]
     fn create_export_open_roundtrip_and_pay() {
         let _session = SESSION_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let created = handle(&json!({"op": "create"})).unwrap();

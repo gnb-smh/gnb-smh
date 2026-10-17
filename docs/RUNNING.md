@@ -835,18 +835,6 @@ Policy addresses (multisig / timelocks: `gnb1m` mainnet, `gnb1n` testnet,
 checksum is `SHA3-256(SHA3-256(prefix ‖ hash))[..4]`, so the other network's
 prefix on the same hash fails to parse.
 
-Every address-taking RPC method (`getbalance`, `getutxos`, `getaddressinfo`,
-`getaddresshistory`, `listtransactions`, `getaddressbalance_at_height`,
-`validateaddress`, `validateaddressverbose`) accepts only addresses of the
-node's own network (CRY-7): a well-formed address of the other network, such
-as the `gnb1t…` form of a mainnet hash, is answered with an error naming both
-networks (`validateaddress`: `isvalid: false`, `error`, and `network` naming
-the network the prefix denotes; `checksum` still reports the checksum alone).
-Before, these methods answered for the other network's prefix as if it were
-this node's, so a `gnb1t…` address showed mainnet coins as valid. This is how
-Bitcoin Core decodes addresses (`DecodeDestination` with the running chain's
-parameters). `validateaddress` also recognises policy addresses
-(`type: "policy"`; `"pubkeyhash"` for single-key addresses). The wallets'
-destination parsers decode with the wallet's authenticated network
-(`Address::parse_for_network`, `address::destination_script_for_network`);
-`Address::parse` is syntax only and is never used to decide where money goes.
+Read-only RPC methods (`getbalance`, `getutxos`, `validateaddress`) accept
+either prefix for the same hash; `validateaddress` reports the prefix's
+network.
