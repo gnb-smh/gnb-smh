@@ -16,6 +16,13 @@ Rejected outright: other handshake versions, a non-hybrid PQ key, a low-order
 X25519 point, a wrong-size ML-KEM key, oversized handshake frames, and
 connections to oneself.
 
+The ephemeral ML-KEM-768 decapsulation key and both shared secrets live in
+locked, wiped `SecretBytes` regions (audit CRY-4: the `pqcrypto` wrapper's
+were `Copy` arrays kept unwiped in the handshake's state); the
+decapsulation key is wiped as soon as it is used, and the stack the C code
+used is scrubbed after each KEM call. The PQ identity key is held the same
+way for the node's whole run (`docs/RUNNING.md`, "Secret key memory").
+
 ### Identities and pinning
 
 - `p2p_identity.bin`: libp2p Ed25519 key (owner-only permissions).

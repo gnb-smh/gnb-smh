@@ -39,7 +39,12 @@ witness id        = SHA3("GNB-KES-v1/id" ‖ u8(depth) ‖ root)[0..20]
   password (Argon2id + AES-256-GCM, the wallet format).
 - **Evolve to epoch `e`:** replace the stored seed with `seed_e` and write it
   to disk atomically **before** signing anything in `e`. Earlier seeds cannot
-  be recomputed from `seed_e`.
+  be recomputed from `seed_e`. In memory (audit CRY-4) the seed lives in a
+  locked, wiped `SecretBytes` region and each step overwrites it in place;
+  the hash states that held earlier seeds and every leaf key (generated in
+  secret memory for one signature) are wiped, and the stack is scrubbed
+  after key generation, evolution and signing, so an earlier seed is not
+  left in RAM, swap or a core dump (`docs/RUNNING.md`, "Secret key memory").
 - **Sign in epoch `e`:** `(e, pk_e, Sign(leaf_e, msg), auth_path_e)`.
 - **Verify:** `H(pk_e)` and the path must give `root`, `e` must equal the
   epoch of the attestation's target, and the hybrid signature must verify

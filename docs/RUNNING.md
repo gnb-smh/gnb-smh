@@ -812,6 +812,45 @@ graylist threshold) the peer is disconnected and its identity refused for
 discourages a misbehaving peer the same way; it also discourages the
 address, which this release does not do.
 
+## Secret key memory (audit CRY-4)
+
+Every secret key, seed and password GnB keeps lives in its own
+`gnb_secret::SecretBytes` region (crate `crates/gnb-secret`), the analogue
+of Bitcoin Core's secure allocator (`LockedPoolManager`: `mlock`,
+`MADV_DONTDUMP`, `memory_cleanse` before release):
+
+- on Unix each region is whole pages of an anonymous mapping, locked in RAM
+  with `mlock` (never written to swap) and, on Linux and FreeBSD, left out
+  of core dumps (`MADV_DONTDUMP` / `MADV_NOCORE`); it is wiped with volatile
+  writes before it is unmapped. Other targets (Windows, the WebAssembly
+  wallet) get wiped heap memory;
+- the holders are neither `Copy` nor `Clone` (a static assertion fails the
+  build otherwise): wallet and HD-wallet keys, the BIP39 seed and the HD
+  master key, the node's P2P identity key, the KES witness seed and every
+  leaf key derived from it, the witness key-file password, and the
+  ephemeral ML-KEM-768 key and shared secrets of every P2P handshake;
+- ML-DSA-65, Falcon-1024 and ML-KEM-768 keys are generated and used directly
+  in those regions through PQClean's C functions (`gnb_secret::pq`): the
+  `pqcrypto` wrapper types hold secret keys in `Copy` arrays that every call
+  copies and nothing can wipe, so production code never builds one (the
+  `secret_hygiene` test fails the build if it does). After a signature,
+  key generation or KEM operation the stack the C code and the hash
+  functions used is overwritten (`gnb_secret::scrub_stack`, 128 KiB, like
+  libsodium's `sodium_stackzero`), and tests read the dead stack back to
+  check that no copy of the secret is left. Registers and copies the
+  compiler makes outside these paths are out of reach: this is best effort,
+  like Core's.
+
+Locking is best effort. The locked-memory limit (`ulimit -l`, systemd
+`LimitMEMLOCK`) bounds it: a node needs a few pages for its long-lived
+secrets plus two per concurrent P2P handshake, a wallet two per key. When
+`mlock` fails the secret is still wiped on release, the failure is counted
+and logged once ("could not lock secret key memory in RAM"), exactly as
+Core warns. `deploy/gnb-node.service` sets `LimitMEMLOCK=16M`; for a manual
+start raise `ulimit -l` if the warning appears. Short-lived secrets
+(passwords and phrases typed into the CLIs, decrypted keystore buffers) are
+wiped on drop (`Zeroizing`) but not locked.
+
 ## Upgrading and downgrading
 
 The upgrade to a release that keeps the shielded-pool state on disk (audit
