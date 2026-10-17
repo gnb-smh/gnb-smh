@@ -1,11 +1,15 @@
 # Bloch checkpoint anchors
 
-GnB-SMH periodically records the latest **finalized checkpoint of Bloch**
+ObenBlock periodically records the latest **finalized checkpoint of Bloch**
 (FFG `finalized.epoch`, `finalized.root`, `finalized_height`) in an ordinary
-GnB-SMH transaction. Once that transaction is buried under GnB-SMH proof of
-work (and PoWit finality), rewriting Bloch history behind the anchored
-checkpoint also means contradicting a public, timestamped record on another
-chain. Anyone can check an anchor against Bloch with read-only RPC calls.
+transaction. Once that transaction is buried under the chain's proof of work
+(and PoWit finality), rewriting Bloch history behind the anchored checkpoint
+also means contradicting a public, timestamped record on another chain.
+Anyone can check an anchor against Bloch with read-only RPC calls. Until the
+relaunch lands, the code does this on the GnB chain, under GnB-SMH proof of
+work. This is the Bloch-to-ObenBlock half of the mutual anchoring; the other
+half, ObenBlock's finalized checkpoints recorded in Bloch, is specified in
+[DESIGN-obenblock.md](DESIGN-obenblock.md) §8 and not implemented yet.
 
 Nothing here is a consensus rule on either chain. No node needs to upgrade.
 
