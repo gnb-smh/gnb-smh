@@ -823,11 +823,23 @@ pub struct WitnessDuty {
     pub key_id: KeyId,
     pub payout_script: Vec<u8>,
     key_path: PathBuf,
-    password: zeroize::Zeroizing<String>,
+    /// CRY-4: the key-file password is kept for the node's whole run (it
+    /// re-opens the KES key file at every epoch), so it lives in a
+    /// `SecretBytes` region: locked in RAM where the platform allows, wiped
+    /// on drop (Bitcoin Core keeps wallet passphrases in `SecureString`,
+    /// secure-allocator memory, for the same reason).
+    password: gnb_crypto::crypto::SecretBytes,
     signer: Mutex<gnb_crypto::core::kes::KesSigner>,
     record_path: PathBuf,
     highwater_path: PathBuf,
     signed: Mutex<(Vec<(Checkpoint, Checkpoint)>, HighWater)>,
+}
+
+/// The witness password held in secret memory, as the `&str` the key file
+/// API takes. It was read as UTF-8 text and trimmed at character
+/// boundaries, so it is always valid UTF-8.
+fn password_str(password: &gnb_crypto::crypto::SecretBytes) -> &str {
+    std::str::from_utf8(password).expect("the witness password was read as UTF-8")
 }
 
 impl WitnessDuty {
@@ -839,9 +851,10 @@ impl WitnessDuty {
         // CRY-4: the file's contents are wiped once the first line is copied.
         let pw = zeroize::Zeroizing::new(
             std::fs::read_to_string(password_file).map_err(|e| format!("witness password file: {e}"))?);
-        let password = zeroize::Zeroizing::new(pw.lines().next().unwrap_or("").trim().to_string());
+        let password = gnb_crypto::crypto::SecretBytes::from_slice(pw.lines().next().unwrap_or("").trim().as_bytes());
+        drop(pw);
         let file = gnb_crypto::core::kes::KesKeyFile::load(key)?;
-        let signer = file.open(&password)?;
+        let signer = file.open(password_str(&password))?;
         let key_id = signer.public().witness_id();
         let record_path = data_dir.join(format!("powit-votes-{}.json", hex::encode(key_id)));
         let mut hw_name = key.file_name().ok_or("witness key path has no file name")?.to_os_string();
@@ -910,9 +923,10 @@ impl WitnessDuty {
         }
         if te > signer.epoch() {
             // Erase every earlier seed, ON DISK FIRST (durably), then in memory.
-            let mut next_state = gnb_crypto::core::kes::KesKeyFile::load(&self.key_path)?.open(&self.password)?;
+            let password = password_str(&self.password);
+            let mut next_state = gnb_crypto::core::kes::KesKeyFile::load(&self.key_path)?.open(password)?;
             next_state.evolve_to(te)?;
-            let sealed = gnb_crypto::core::kes::KesKeyFile::seal(&next_state, &self.password)?;
+            let sealed = gnb_crypto::core::kes::KesKeyFile::seal(&next_state, password)?;
             let json = serde_json::to_vec_pretty(&sealed).map_err(|e| format!("kes save: {e}"))?;
             write_durable(&self.key_path, &json).map_err(|e| format!("kes save: {e}"))?;
             *signer = next_state;
