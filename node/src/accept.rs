@@ -137,6 +137,7 @@ use log::{error, info, warn};
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
+pub use crate::assumevalid::ScriptChecks;
 use crate::coherence::ShieldedPool;
 use crate::consensus::{self, BlockHash};
 use crate::core;
@@ -672,7 +673,7 @@ fn validate_tx_in_view(
         tx, view, earlier, spent_in_block, block_height, maturity, same_block_coinbase, activation_height,
     )?;
     check_tx_policy_spends(tx, &committed, block_height, view, timelocks)?;
-    check_tx_witnesses(tx, &committed, block_height, activation_height)?;
+    check_tx_witnesses(tx, &committed, block_height, activation_height, ScriptChecks::Full)?;
     Ok(committed.fee)
 }
 
@@ -807,7 +808,11 @@ pub fn validate_block_in_view_at(
 /// whether the block id is disqualified (persisted) or only this body is
 /// dropped, and a read failure of the view ([`ConnectFailure::Storage`]) is
 /// no verdict at all. The verdict (`Ok` / `Err`) is exactly
-/// `validate_block_in_view`'s.
+/// `validate_block_in_view`'s. The pipeline itself calls
+/// [`validate_block_in_view_classified_with`] (the assumed-valid block's
+/// script mode, P5-G); this full-check form is library API
+/// (`blockval::validate_block_transactions`, tests).
+#[allow(dead_code)] // library API; the node binary compiles this module too
 pub fn validate_block_in_view_classified(view: &dyn UtxoView, block: &core::Block) -> Result<(), ConnectFailure> {
     validate_block_in_view_classified_at(view, block, core::activation::hardening_activation_height())
 }
@@ -818,10 +823,32 @@ pub fn validate_block_in_view_classified_at(
     block: &core::Block,
     activation_height: u64,
 ) -> Result<(), ConnectFailure> {
+    validate_block_in_view_classified_with(view, block, activation_height, ScriptChecks::Full)
+}
+
+/// [`validate_block_in_view_classified_at`] with the input scripts checked
+/// as `scripts` says. [`ScriptChecks::SignaturesAssumed`] (the connect path,
+/// for a block the assumed-valid block vouches for, `crate::assumevalid`,
+/// Bitcoin Core's `-assumevalid`) leaves out the signature verification of
+/// every input and nothing else: the version rule, every witness check
+/// (framing, public key hash, policy hash), the policy timelocks, the
+/// size-based minimum fee and every id-committed rule run as always. It
+/// applies only where the block id commits to every witness byte
+/// ([`witnesses_fixed_at`]): below that, a relay can swap `script_sig` bytes
+/// without changing the id, so the body held need not be the one the
+/// assumed-valid chain was validated with, and the block is checked in full.
+/// A valid block gets the same verdict either way.
+pub fn validate_block_in_view_classified_with(
+    view: &dyn UtxoView,
+    block: &core::Block,
+    activation_height: u64,
+    scripts: ScriptChecks,
+) -> Result<(), ConnectFailure> {
     let committed = |reason: String| ConnectFailure::Invalid(BlockInvalidity { reason, witness_dependent: false });
     let height = block.height;
     let hardened = core::block_rules::rules_active_at(height, activation_height);
     let witnesses_fixed = witnesses_fixed_at(height, activation_height);
+    let scripts = if witnesses_fixed { scripts } else { ScriptChecks::Full };
     // BIP30 and no spend of the block's own coinbase: this chain's rules from
     // genesis (the audit's VAL-2 / VAL-3 at the activation), so at every
     // height here. A read failure of the view is no verdict (B1-T12).
@@ -880,7 +907,7 @@ pub fn validate_block_in_view_classified_at(
     // the scripts and the size-based minimum fee.
     for (tx, c) in &checked {
         check_tx_policy_spends(tx, c, height, view, maturity).map_err(|f| f.into_connect(witnesses_fixed))?;
-        check_tx_witnesses(tx, c, height, activation_height).map_err(|f| f.into_connect(witnesses_fixed))?;
+        check_tx_witnesses(tx, c, height, activation_height, scripts).map_err(|f| f.into_connect(witnesses_fixed))?;
     }
     Ok(())
 }
@@ -1259,12 +1286,30 @@ fn commit_chunk(
         Err(e) => return Err(ChunkFailure::failed(e.to_string())),
     };
 
+    // The assumed-valid block (Bitcoin Core's `-assumevalid`, P5-G): the
+    // blocks of this chunk whose signature checks are skipped, decided once
+    // with Core's conditions on the DAG as it stands (the assumed-valid
+    // block's header in the DAG, each block on its selected chain and on the
+    // best block's, the best block at the minimum chain work and two weeks
+    // of proof-equivalent time above the block; `crate::assumevalid`). One
+    // hash lookup without an assumed-valid block or while its header is
+    // unknown.
+    let assumed = crate::assumevalid::assumed_valid_blocks(&dag.read(), &sub.to_apply);
+    if !assumed.is_empty() {
+        info!("connecting {} block(s) with their signatures assumed valid (ancestors of the assumed-valid block)",
+            assumed.len());
+    }
     // The validator reports, beside the verdict, whether the failure
     // depends on witness bytes (block id, witness root of the body).
     let witness_failure: std::cell::Cell<Option<(BlockHash, [u8; 32])>> = std::cell::Cell::new(None);
     let no_verdict: std::cell::Cell<Option<BlockHash>> = std::cell::Cell::new(None);
     let validate = |view: &dyn UtxoView, b: &core::Block| -> Result<(), ValidationFailure> {
-        match validate_block_in_view_classified(view, b) {
+        let scripts = if !assumed.is_empty() && assumed.contains(&b.block_hash()) {
+            ScriptChecks::SignaturesAssumed
+        } else {
+            ScriptChecks::Full
+        };
+        match validate_block_in_view_classified_with(view, b, core::activation::hardening_activation_height(), scripts) {
             Ok(()) => Ok(()),
             Err(ConnectFailure::Invalid(e)) => {
                 witness_failure.set(e.witness_dependent.then(|| {
@@ -3767,7 +3812,7 @@ fn validate_tx_inputs_classified(
     activation_height: u64,
 ) -> Result<u64, TxFailure> {
     let committed = check_tx_inputs_committed(tx, utxo_lookup, spent_set, block_height, activation_height)?;
-    check_tx_witnesses(tx, &committed, block_height, activation_height)?;
+    check_tx_witnesses(tx, &committed, block_height, activation_height, ScriptChecks::Full)?;
     Ok(committed.fee)
 }
 
@@ -3874,15 +3919,26 @@ fn check_tx_inputs_committed(
 /// public key hash, signature; `admission::verify_input_scripts_at`) and the
 /// minimum fee measured on the full wire size (`core::check_min_fee`).
 /// Witness-dependent (the caller clears the flag at/after the activation,
-/// where the block's witness commitment fixes every `script_sig`).
+/// where the block's witness commitment fixes every `script_sig`). With
+/// [`ScriptChecks::SignaturesAssumed`] the signature step is left out
+/// (`admission::check_input_scripts_without_signatures_at`; see
+/// [`validate_block_in_view_classified_with`]).
 fn check_tx_witnesses(
     tx: &core::Transaction,
     committed: &CommittedTx,
     block_height: u64,
     activation_height: u64,
+    scripts: ScriptChecks,
 ) -> Result<(), TxFailure> {
-    admission::verify_input_scripts_at(tx, &committed.prevouts, block_height, activation_height)
-        .map_err(TxFailure::witness)?;
+    match scripts {
+        ScriptChecks::Full => {
+            admission::verify_input_scripts_at(tx, &committed.prevouts, block_height, activation_height)
+        }
+        ScriptChecks::SignaturesAssumed => admission::check_input_scripts_without_signatures_at(
+            tx, &committed.prevouts, block_height, activation_height,
+        ),
+    }
+    .map_err(TxFailure::witness)?;
     core::check_min_fee(tx, committed.fee).map_err(TxFailure::witness)?;
     Ok(())
 }

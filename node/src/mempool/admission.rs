@@ -466,9 +466,11 @@ pub fn verify_input_scripts_gated_with_wtxid_at(
     let witnesses = core::sighash::check_input_witnesses(tx, prevouts, version).map_err(AdmissionError::Rejected)?;
     let key = sig_cache_key_for(tx_wtxid, version, core::activation::is_active_at(block_height, act), prevouts);
     if sig_cache().lock().0.contains(&key) {
+        count_signature_inputs(|c| c.cached += tx.inputs.len() as u64);
         return Ok(());
     }
     gate(tx)?;
+    count_signature_inputs(|c| c.verified += tx.inputs.len() as u64);
     core::sighash::verify_input_signatures(tx, prevouts, &witnesses, version, core::node_chain_id())
         .map_err(AdmissionError::Rejected)?;
     let mut g = sig_cache().lock();
@@ -482,6 +484,61 @@ pub fn verify_input_scripts_gated_with_wtxid_at(
         }
     }
     Ok(())
+}
+
+/// The input-script rule of [`verify_input_scripts_at`] WITHOUT its
+/// signature step: the version rule (`core::sighash::check_tx_version`) and
+/// every witness check (`core::sighash::check_input_witnesses`: the
+/// `script_sig` framing, canonical from the hardening activation; the public
+/// key hashed against the spent 20-byte script; a revealed spend policy
+/// hashed against the spent policy output, its signature count and key
+/// indices). Only `core::sighash::verify_input_signatures` is left out —
+/// exactly what a verified-signature cache hit skips. The block connect runs
+/// this for a block whose signatures are assumed valid (`crate::assumevalid`,
+/// Bitcoin Core's `-assumevalid`); nothing else calls it.
+pub fn check_input_scripts_without_signatures_at(
+    tx: &Transaction,
+    prevouts: &[TxOutput],
+    block_height: u64,
+    act: u64,
+) -> Result<(), String> {
+    let version = core::sighash::check_tx_version(tx.version, block_height, act)?;
+    core::sighash::check_input_witnesses(tx, prevouts, version)?;
+    count_signature_inputs(|c| c.assumed += tx.inputs.len() as u64);
+    Ok(())
+}
+
+/// Inputs whose signature step the calling thread ran, by outcome (P5-G
+/// measurement: what the assumed-valid block saves).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SignatureInputCounts {
+    /// Signature verifications run (`core::sighash::verify_input_signatures`,
+    /// valid or not), counted per input.
+    pub verified: u64,
+    /// Inputs of transactions answered by the verified-signature cache.
+    pub cached: u64,
+    /// Inputs whose signatures were assumed valid
+    /// ([`check_input_scripts_without_signatures_at`]).
+    pub assumed: u64,
+}
+
+thread_local! {
+    static SIGNATURE_INPUTS: std::cell::Cell<SignatureInputCounts> =
+        const { std::cell::Cell::new(SignatureInputCounts { verified: 0, cached: 0, assumed: 0 }) };
+}
+
+fn count_signature_inputs(f: impl FnOnce(&mut SignatureInputCounts)) {
+    SIGNATURE_INPUTS.with(|c| {
+        let mut v = c.get();
+        f(&mut v);
+        c.set(v);
+    });
+}
+
+/// [`SignatureInputCounts`] of the calling thread since it started (block
+/// validation runs on the thread that accepts the block).
+pub fn signature_inputs_on_this_thread() -> SignatureInputCounts {
+    SIGNATURE_INPUTS.with(|c| c.get())
 }
 
 /// Standardness rules that need no chain state (steps 1–3).

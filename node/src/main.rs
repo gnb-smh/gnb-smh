@@ -42,6 +42,7 @@ mod tip;
 mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer
 mod ingress;      // audit fixes: block-ingress / orphan / IBD-latch policy
 mod accept;       // Block acceptance pipeline (accept/connect split, DAG-1)
+mod assumevalid;  // assumed-valid block (Core's -assumevalid), P5-G
 mod template;     // Block templates for the miner + getblocktemplate (MEM-2, DAG-2)
 mod blockval;     // this chain's tx rules on top of the audit set (locktime, policy, BIP30)
 mod powit;        // PoW + PoWit: witness shares, attestations, finality (node side)
@@ -225,6 +226,15 @@ struct Cli {
     /// below the default is logged as a warning. Non-consensus — a
     /// node-local anti-DoS knob.
     #[arg(long = "minimumchainwork")]                    minimum_chain_work: Option<String>,
+    /// Assumed-valid block (Bitcoin Core's `-assumevalid`): the id (64 hex
+    /// digits, as `getblockdag` prints it) of a block whose selected-chain
+    /// ancestors buried two weeks below the best block are connected without
+    /// checking their transaction signatures (every other rule still runs),
+    /// once its header is in the DAG and the best block has the minimum
+    /// chain work. Default: the network's release value
+    /// (`assumevalid::MAINNET_ASSUME_VALID`, none until a release sets it);
+    /// `0` checks every signature. Non-consensus — node-local (docs/RUNNING.md).
+    #[arg(long = "assumevalid")]                         assume_valid: Option<String>,
 
 }
 
@@ -459,6 +469,17 @@ async fn main() {
         if let Some(w) = setting.below_default_warning() {
             warn!("⚠ {w}");
         }
+        // P5-G: the assumed-valid block (Bitcoin Core's -assumevalid), once,
+        // before any block is connected.
+        let av = match assumevalid::AssumeValidSetting::resolve(cli.assume_valid.as_deref(), net.into()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("❌ --assumevalid: {e}");
+                std::process::exit(2);
+            }
+        };
+        let _ = assumevalid::set_assume_valid(av.block);
+        info!("{}", av.describe());
     }
 
     // FIX v0.5.1 BLK-3: apply --rpc-public escape hatch.
