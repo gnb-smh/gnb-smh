@@ -916,31 +916,29 @@ must also keep, or offer for download, the original v2 bytes).
 A GnB address is `gnb1q` (mainnet) or `gnb1t` (testnet) followed by the hex
 of the 20-byte key hash and a 4-byte checksum, `SHA3-256(SHA3-256(hash))[..4]`.
 The checksum does not cover the prefix, so `gnb1q…` and `gnb1t…` forms of one
-hash both pass `Address::parse`. A new address version whose checksum commits
-to the network (bech32m-style) was evaluated and is **not** introduced:
+hash both pass `Address::parse`. An opt-in second encoding whose checksum
+commits to the network, address v2 (Bech32m, human-readable part `gnb` /
+`tgnb`, `docs/ADDRESS-V2.md`), is accepted by the node, the wallets, the
+explorer API and the Worker as an additional encoding of the same
+destination. The legacy form stays the default output: released GnB wallets,
+the Bloch wallets that share these keys and third-party integrations parse
+only it.
 
-- it could only be emitted where every consumer parses it, and they do not:
-  every released GnB wallet and node, the Bloch wallets that share these keys,
-  the explorer and its API (`^gnb1[qt][0-9a-f]{48}$`), the Cloudflare Worker's
-  path filter and third-party integrations would all reject it, so a payment
-  to a new-format address from any of them fails;
-- parsing both forms while emitting only the old one adds nothing: the old
-  form would stay the one users copy;
-- the risk it would remove is already closed where it matters: every payment
-  path compares the destination's network with the wallet's own network,
-  which is authenticated (keystore v3, keyfile v1, or the network the caller
-  states for a v2 file): `TxBuilder::build_payment`, `Wallet` payments,
-  `gnb-cli send`, `gnb-wallet send` and the web wallet's `pay` refuse a
-  destination of the other network, and the node's `--miner-address` uses
-  `Address::parse_for_network`. The policy and bridge-vault commands do the
-  same against the network of the spend: `gnb-cli policyspend` (the network
-  stated with `--testnet` / `--mainnet`, mainnet by default),
-  `vaultrelease`, `vaultrecover` and `vaultcheckrelease` (the vault file's
-  network) refuse a destination of the other network, `vaultlock` opens the
-  paying keystore for the vault's network and `policysign` for the spend's.
-  A prefix typo therefore fails before anything
-  is signed, and a transaction signed for one chain is invalid on the other
-  (the chain id is in every sighash).
+The prefix risk is closed where it matters, in either encoding: every payment
+path compares the destination's network with the wallet's own network,
+which is authenticated (keystore v3, keyfile v1, or the network the caller
+states for a v2 file): `TxBuilder::build_payment`, `Wallet` payments,
+`gnb-cli send`, `gnb-wallet send` and the web wallet's `pay` refuse a
+destination of the other network, and the node's `--miner-address` uses
+`Address::parse_for_network`. The policy and bridge-vault commands do the
+same against the network of the spend: `gnb-cli policyspend` (the network
+stated with `--testnet` / `--mainnet`, mainnet by default),
+`vaultrelease`, `vaultrecover` and `vaultcheckrelease` (the vault file's
+network) refuse a destination of the other network, `vaultlock` opens the
+paying keystore for the vault's network and `policysign` for the spend's.
+A prefix typo therefore fails before anything
+is signed, and a transaction signed for one chain is invalid on the other
+(the chain id is in every sighash).
 
 Policy addresses (multisig / timelocks: `gnb1m` mainnet, `gnb1n` testnet,
 `address::PolicyAddress`) are newer and already commit to the network: their
