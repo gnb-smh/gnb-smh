@@ -2040,7 +2040,12 @@ pub fn accept_block_tracking(
         .map_err(|e| format!("consensus rejection: {}", e))?;
 
     // ── Proof of work (expensive: 64 MiB GnB-SMH, cached by block id) ─
-    if !block.validate_pow() {
+    //    A body for a block already in the DAG (`replacing`: same id, so the
+    //    same proof preimage and nonce, and the height just bound to the
+    //    same parents) carries the proof its DAG record already verified:
+    //    only the cheap checks run again (`pow::proof_recorded_in_dag`, P5-G).
+    let proof_ok = if replacing { pow::proof_recorded_in_dag(block) } else { block.validate_pow() };
+    if !proof_ok {
         return Err("consensus rejection: invalid GnB-SMH proof of work".into());
     }
 

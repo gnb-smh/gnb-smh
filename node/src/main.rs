@@ -1444,6 +1444,7 @@ async fn main() {
             // reported then, or `Ignore` if it waited past gossipsub's cache.
             let mut pow_sched: pow::verifier::PowScheduler<network::Inbound> =
                 pow::verifier::PowScheduler::new(pow::verifier::PowLimits::default());
+            let ibd_pow_workers = pow::verifier::ibd_workers();
             let (pow_done_tx, mut pow_done_rx) = mpsc::unbounded_channel::<PowDone>();
             // B1-T5: the verdicts of buffered orphan frames are withheld until
             // the orphan connects (Accept), is refused, or leaves the pool.
@@ -1909,6 +1910,10 @@ async fn main() {
                     // B1-T5: verdicts of orphans the drain connected, refused or
                     // dropped; and of frames whose orphan left the pool.
                     settle_block_verdicts(&mut ingress_core, &mut deferred_blocks, &vtx2, &net_ctl_tx, &dag2, activation);
+                    // P5-G: while the IBD latch holds (the miner and the
+                    // witness duties wait), proofs are verified on every CPU
+                    // but one (`pow::verifier::ibd_workers`), else on half.
+                    pow_sched.set_initial_block_download(state2.read().is_syncing.then_some(ibd_pow_workers));
                     dispatch_pow(&mut pow_sched, &pow_done_tx, &vtx2);
                     // A body rejected for a witness-dependent reason, or found
                     // missing (pruned, DAG-6) during this acceptance: ask peers
