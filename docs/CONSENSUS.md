@@ -144,9 +144,12 @@ PoWit height (GnB-SMH v3 and PoWit: mainnet 10,000; testnet off unless
   vectors `net/*` in `tx_vectors.json`). A transaction is replayable only
   where its digest is, i.e. on its own network. Policy (multisig, timelock)
   spends sign the same digests. PoWit's own signatures are bound too: a
-  witness attestation signs `attestation_message(chain_id, source, target)`,
-  so it never verifies on the other network even for the same checkpoints,
-  and a witness share commits to a block id of its network.
+  witness attestation signs `attestation_message(chain_id, source, target)`
+  (from the second hardening activation, by target height,
+  `attestation_message_v2(chain_id, key, source, target)`, which also commits
+  the witness key; "PoWit"), so it never verifies on the other network even
+  for the same checkpoints, and a witness share commits to a block id of its
+  network.
 - **Blocks cannot be valid on both networks**, but only because their rules
   differ, not because a block names its network. A block above the genesis
   at header height h < 17,500 follows the pre-activation rules on mainnet
@@ -235,7 +238,14 @@ reveals another policy fails the policy hash before any timelock is read.
    transaction, coinbase commitment), and at every height the block-size
    limit of the block's verified height in the measure of the regime (see
    "Block size (VAL-12)"), before the block is stored;
-6. GnB-SMH proof (64 MiB, cached by block id);
+6. GnB-SMH proof (64 MiB, cached by block id). A body that replaces the
+   body of a block already in the DAG (same id, so the same proof preimage
+   and nonce, and the height just bound to the same parents) carries the
+   proof the DAG record already verified at that height: only the cheap
+   parts run again (canonical bits, target within the pow limit of the
+   height; `pow::proof_recorded_in_dag`, P5-G), never the GnB-SMH
+   evaluation. Same verdict, also after a restart, when the process no
+   longer holds the proof in its cache;
 7. transactions (version rule, witnesses and signatures as specified in
    "Transaction signatures" below, double spends, coinbase maturity and
    relative timelocks in the depth measure of the block's regime ("Coinbase
@@ -243,7 +253,10 @@ reveals another policy fails the policy hash before any timelock is read.
    rules (`node/src/blockval.rs`), consensus minimum fee, BIP30 and no
    same-block coinbase spend, this chain's rules at every height),
    coinbase value (the miner output and, from `powit_height()`, one
-   witness-share output per PoWit share).
+   witness-share output per PoWit share). Step 7 runs when the block is
+   connected; for a block the node's assumed-valid block vouches for, it
+   leaves out the signature verification only (node-local, see "Assumed-valid
+   block" below).
 
 Structural checks (size, merkle root, coinbase shape, duplicates, dust, and
 at/after the activation distinct parents, the 64-byte rule and the coinbase
@@ -574,21 +587,35 @@ B2-T8, "Block size (VAL-12)").
 
 ### Second hardening activation (hardening 2)
 
-The Phase-5 audit (2026-10-16) fixes that change verdicts activate at a
-second height, with the same API suffixed `2` / `_v2` in
-`crates/gnb-crypto/src/core/activation.rs` (`hardening2_activation_height`,
-`hardening2_active_at`, `scoped_override_v2`). It is at or above the first
-upgrade's height on every network.
+The first hardening height (17,500 on mainnet) cannot move again, so the
+consensus fixes of the Phase-5 audit (2026-10-16) take effect at a second
+scheduled height, with the same API in `crates/gnb-crypto/src/core/activation.rs`
+suffixed `2` / `_v2` (`hardening2_activation_height`, `hardening2_active_at`,
+`hardening2_activation_height_for_chain`, `_for_signer`, `scoped_override_v2`):
 
 | Network | Second hardening activation height |
 | --- | --- |
-| mainnet | not scheduled (`MAINNET_HARDENING2_ACTIVATION_HEIGHT` = `NEVER`; the owner sets it at release) |
+| mainnet | not scheduled (`MAINNET_HARDENING2_ACTIVATION_HEIGHT = NEVER`; the owner sets it at release, derived like the first) |
 | testnet | 0 (from genesis) |
 | regtest | 0 (from genesis) |
 
+It is never below the first hardening height on any network. Below it every
+rule is the one that produced the existing chain, bit for bit. The rules:
+
 | Rules | Findings | Height compared | Specified in |
 | --- | --- | --- | --- |
+| PoWit attestation message v2: the signed digest commits the witness's KES key (depth, root) | PoWit audit 1 | the attestation's **target** height (every message checked in a block below the activation is v1) | "PoWit", "Attestation messages" |
+| An equivocation proof is valid only against a member of `W(E-1)`, `W(E)` or `W(E+1)` | PoWit audit 1 | `B.height` of the containing block | "PoWit", "Equivocation proofs" |
+| `W(e)` = every unbarred share key with weight (no 64-key cap); justification = two thirds of the total window weight; decay entries go with their key's share work | PoWit audit 4 | `B.height` | "PoWit", "Witness set and justification" |
 | A revealed spend policy (or policy-tree branch) may not name one key twice in its raw and enveloped encodings | PF-4 | `B.height` of the containing block (mempool and templates: the next block's height) | "Spend-policy key identity (PF-4)" |
+
+The PoWit rules are evaluated by one function for every path that judges a
+block or an item for a block: `PowitState::apply_at` (block acceptance,
+reorg connect and the template's `try_apply`), with the pool and the witness
+duty using its building blocks (`member_weight_h2`, `may_be_proven_h2`,
+`attestation_message_at`) under the rules of the block that may include the
+item (`node/src/powit.rs`). Tests choose the regime with
+`activation::scoped_override_v2(h)` or the explicit `*_at` functions.
 
 #### Spend-policy key identity (PF-4)
 
@@ -1130,6 +1157,73 @@ of the cheap chain pins its fork choice: a chain past the PoWit height can
 carry one, and the pin does not read the minimum chain work here
 (docs/DESIGN-pow-powit.md, "Node finality").
 
+### Assumed-valid block (node-local policy, not consensus)
+
+Package P5-G, Bitcoin Core's `-assumevalid` (`node/src/assumevalid.rs`). A
+release names a block of the real chain, `assumevalid::MAINNET_ASSUME_VALID`
+(its id and DAG height; none yet on mainnet, testnet or regtest), and
+`--assumevalid=<id>` replaces it or `--assumevalid=0` turns it off. When the
+node CONNECTS a block B (`accept::commit_chunk`, the one connect path:
+extensions, reorgs, the start-up reconnection, the chain-state rebuild), it
+skips B's transaction signature verification
+(`core::sighash::verify_input_signatures`) if all of Core's conditions
+(`Chainstate::ConnectBlock`) hold, evaluated once per chain move on the DAG,
+which is GnB's header tree:
+
+1. the assumed-valid block AV is in the DAG (stricter than Core: and carries
+   no persistent verdict on this node, neither a consensus failure of it or
+   of its selected chain nor the operator's `invalidateblock`);
+2. B is AV or lies on AV's selected chain (only selected-chain blocks are
+   connected: a block merged by AV's chain was never validated by the nodes
+   that vouch for AV and is never skipped);
+3. B is the best block (`GhostDAG::selected_tip`, Core's `m_best_header`) or
+   lies on its selected chain;
+4. the best block's blue work is at least the minimum chain work above;
+5. `(blue_work(best) - blue_work(B)) * 30 / work(best) > 1,209,600`
+   (`assumevalid::MIN_BURIAL_SECS`): more than two weeks of
+   proof-equivalent time, Core's `GetBlockProofEquivalentTime` with blue work,
+   the 30 s target spacing and the best block's own work (`core::block_work`
+   of the ASERT bits of its parents, which its header carries);
+
+and one condition Core gets from its witness commitment: B's id commits to
+every witness byte (`accept::witnesses_fixed_at`: from
+`WITNESS_COMMITMENT_HEIGHT` or the hardening activation). Below both, a
+relay can replace `script_sig` bytes without changing the id, so the held
+body need not be the one the assumed-valid chain was validated with, and B is
+checked in full.
+
+Only the signature step is skipped (the step a verified-signature cache hit
+skips, `admission::check_input_scripts_without_signatures_at`): the version
+rule, the witness framing (canonical from the activation), the public key
+hash against the spent script, a revealed policy's hash, signature count and
+key indices, the policy timelocks, amounts and MoneyRange, UTXO existence and
+double spends, coinbase maturity, BIP30, the size-based minimum fee and the
+coinbase value still run, as do every acceptance check (the proof of work
+above all: never skipped, as in Core) and the PoWit state. Mempool admission,
+templates and `blockval::validate_block_transactions` always verify in full.
+
+It changes no verdict on a valid chain: every rule but the signatures runs,
+and a valid chain's signatures are valid. Nodes with different settings
+reach different verdicts only on a chain whose blocks below AV carry invalid
+signatures, i.e. only if AV itself is not a block of a valid chain — the
+trust Core places in its release value, reviewed like any consensus constant
+(`tools/release/min_chain_work.py` prints it from the same block as the
+minimum chain work, read on two or more independent nodes).
+
+Without a header-first download (`/gnb/sync/1` `Headers` carry ids and
+claimed scores, not headers) a block is connected as soon as its parents
+are, so during a fresh initial block download AV's header is not in the DAG
+when its ancestors connect (condition 1) and they are checked in full; with
+condition 5 nothing on a chain younger than two weeks qualifies either. The
+skip applies when the node connects blocks with AV already in its DAG: a
+chain-state rebuild (Core's `-reindex-chainstate`), the move onto the real
+chain of a node that sat on another branch (partition, eclipse), bodies
+that come back (audit DAG-6) and a resumed chain move. What condition 1
+needs during initial sync is a header tree in place before the blocks
+connect (Core's headers-first sync; package P5-B2 adds verified headers to
+`/gnb/sync/1`); the decision reads nothing of that tree but membership,
+selected-chain ancestry, blue work and the best block.
+
 ### Gossip penalties and proof-of-work budgets (node-local policy, not consensus)
 
 Audit NET-2 residual, B1-T7, NET-4 residual (Phase 4).
@@ -1205,6 +1299,19 @@ identities and addresses inside one /16 share eight evaluations, and an
 author that delivers one invalid block of its own is disconnected and its
 address discouraged.
 
+**Proof-of-work cost of sync** (P5-G). Every proof is evaluated once, on the
+worker pool: half the logical CPUs (1 to 4) normally, and while the IBD latch
+holds (the miner and the witness duties wait) every CPU but one, at least
+that and at most eight (`pow::verifier::ibd_workers`; eight GnB-SMH v1
+scratchpads are 512 MiB), as Bitcoin Core verifies with every core during
+IBD. A body fetched again for a block already in the DAG (a pruned body a
+reorg needs, a body rejected for a witness-dependent reason) is never handed
+to the workers and its proof is never evaluated again: the DAG record is the
+verified result of that proof at that height, and it survives restarts
+(acceptance order, step 6). Proofs are never skipped, below the assumed-valid
+block either (Core never skips them): a block's proof is what admits its
+header to the DAG, and no header chain is known before it.
+
 **PoWit gossip** (`NewPowitItem`: witness shares, attestations, equivocation
 proofs; `ingress::PowitIngress`). Merged from the mainnet line, where each
 item was verified with `powit::admit_item` awaited inline on the block
@@ -1232,6 +1339,183 @@ chain or state (a share for a block that is not on its selected chain or is
 outside the share window, an attestation from another justified checkpoint
 or by a key outside the witness set, a full pool) is refunded and answered
 `Ignore`, never penalised.
+
+## PoWit (witness set, attestations and evidence)
+
+From the PoWit height (mainnet 10,000) a block's PoWit section (witness
+shares, attestations, equivocation proofs; `core::powit::PowitBody`) is
+checked in context before the block is stored, and the block's PoWit state is
+`PowitState::apply_at(parent state, block)` (`powit::block_state`), a pure
+function of the block, its selected-parent chain and the parent's state.
+docs/DESIGN-pow-powit.md describes the design; this section specifies the
+rules the second hardening activation changes (PoWit audit findings 1 and
+4), byte for byte where they define encodings. The executable reference is
+`reference/powit_reference.py`, its vectors `reference/powit_vectors.json`
+(regenerated and diffed by CI's `python-reference` job), checked against the
+Rust code by `crates/gnb-crypto/tests/powit_vectors.rs`.
+
+Epochs count from the PoWit activation `act`: `epoch(h) = (h - act) /
+epoch_len`; checkpoint slots are `act + k × checkpoint_interval`. Mainnet:
+epochs of 720 blocks, slots every 60, a 28-epoch window, vote lifetime 720,
+32 attestations and 4 proofs per block; testnet: 20, 5, 3, 20, 32, 4
+(`MAINNET_PARAMS`, `TESTNET_PARAMS`).
+
+### Regime
+
+A block at header height `h` is checked under the old rules (`Regime::V1`)
+when `h < H2` and under the second hardening rules (`Regime::Hardening2`)
+when `h >= H2`, `H2` being the second hardening activation height
+(`Regime::at`). An attestation's message version follows its **target**
+height instead, so that a witness, which signs before any block includes
+its vote, knows what to sign: v2 iff `target.height >= H2`. A block below
+`H2` checks every message as v1, also an equivocation proof's links that
+target a later slot (the old rule, unchanged).
+
+### Attestation messages
+
+```text
+msg_v1 = SHA3-256( u32le(19) ‖ "GNB-POWIT-v1/attest" ‖ u32le(chain_id)
+                   ‖ u64le(source.height) ‖ source.hash[32]
+                   ‖ u64le(target.height) ‖ target.hash[32] )          // 107-byte preimage
+msg_v2 = SHA3-256( u32le(19) ‖ "GNB-POWIT-v2/attest" ‖ u32le(chain_id)
+                   ‖ u8(depth) ‖ root[32]
+                   ‖ u64le(source.height) ‖ source.hash[32]
+                   ‖ u64le(target.height) ‖ target.hash[32] )          // 140-byte preimage
+```
+
+`(depth, root)` is the attestation's KES public key (`KesPublic`, already on
+the wire: no encoding changes); `chain_id` is the network's (0x474E0001
+mainnet, 0x474E0002 testnet). The signature is `kes::verify(witness,
+epoch(target.height), msg, sig)`: the leaf of the target's epoch, its path to
+`root`, and a canonical hybrid signature over `msg`
+(`attestation_message`, `attestation_message_v2`, `attestation_message_at`).
+
+Why v2 (finding 1): `msg_v1` does not depend on the key, and `kes::verify`
+only checks that the leaf hash and the supplied path reach the root, so one
+leaf's signature re-rooted under any sibling hash is a valid signature by
+another key, one SHA3 per key. One leaf's double vote was therefore an
+unlimited supply of valid equivocation proofs against keys nobody holds.
+Committing the key in the signed message (as BIP-340 commits the public key
+in its challenge) makes a signature valid for exactly one key.
+
+### Witness set and justification
+
+`W(e)` of a state, `e >= 2` (`W(0) = W(1) = {}`): for every key with share
+work credited in epochs `max(0, e-1-window) ..= e-2` (the state's
+`epoch_work`), its weight is that work summed (saturating at 2^128-1), after
+`decay[k]` decay steps (`w -= w / 16`, at most 64 steps); keys barred at `e`
+(`banned[k] > e`) and keys of weight 0 are left out; sorted by weight
+descending, then key ascending.
+
+- `Regime::V1`: the first `max_witnesses` (64) of them.
+- `Regime::Hardening2`: all of them (`witness_set_in`, `member_weight_h2`).
+
+An attestation in a block is counted with its key's weight in
+`W(epoch(target))` (a non-member's attestation makes the block invalid). The
+votes for a target `t` from the justified checkpoint justify `t` iff
+`total(W(epoch(t))) != 0` and `3 × votes >= 2 × total` (both sides saturating;
+`powit::two_thirds`): over the 64 heaviest keys under V1, over every key under
+Hardening2 (`total_weight_h2`). The rest of the rule is unchanged: the
+highest such target becomes the justified checkpoint, and a target exactly
+one interval above the justified checkpoint finalizes it.
+
+Inactivity decay at an epoch boundary (nothing finalized for
+`leak_after_epochs` epochs) applies to every member of `W(e)` whose
+attestations were not included in epoch `e`, so from the activation to every
+share key with weight. From the activation the boundary also drops the decay
+entry of every key that has no share work left in the kept epochs
+(`epoch_work` keeps `window + 2` epochs): such a key is a member of no set the
+state can compute, and `decay` stays bounded by the keys of `epoch_work`
+instead of every key a stall ever touched.
+
+Why (finding 4): with W capped at the 64 heaviest keys and two thirds
+measured over them, a minority split over many keys owned W. With 200 honest
+keys of 0.35% of the share work (70%) and an attacker's 30% over 60 keys of
+0.5%, W was the attacker's 60 keys and 4 honest ones: the attacker held 95.5%
+of W and justified alone, and the honest 70% could not vote at all. From the
+activation the threshold is two thirds of all the window weight, as Casper
+FFG counts two thirds of all stake: the attacker (30%) cannot justify alone
+and the honest keys (70%) justify without it (191 of the 200 votes, six
+blocks of 32), which `finding4_a_split_minority_neither_justifies_alone_nor_stalls_from_hardening2`
+runs with real signatures.
+
+### Equivocation proofs
+
+A proof (two attestations by one key, both signatures valid over their own
+messages, forming a double vote — same target height, different targets —
+or a surround vote) bars its key for `ban_epochs` epochs (one `banned` entry
+per key, holding the epoch it expires at; a proof against a barred key is
+invalid). From the activation a block of PoWit epoch `E` (after its epoch
+step) may carry a proof only against a key that is a member of `W(x)` for
+some `x` in `E-1 ..= E+1` (saturating at 0; `PowitState::evidence_epochs`,
+`may_be_proven_h2`), checked before the two signatures; below it, against
+any key. The three sets are exactly the ones the block's state can compute
+(it keeps `window + 2` epochs of share work), they include the target epoch
+of every vote the chain can still include (`vote_ttl <= epoch_len`), and a
+key in one of them is a voter now, was one for the open votes, or is about
+to be one: a key stays provable for the whole window after its last share
+(as Ethereum keeps a validator slashable until it is withdrawable,
+`is_slashable_validator`), and its proof may be about links of any age. A
+proof against a key that holds no share work was valid before the activation
+(finding 1); every node verified, stored and relayed it, and each barred an
+unheld key in every later block's state.
+
+### Producers
+
+Every producer emits what the block that includes it accepts: the witness
+duty (`powit::WitnessDuty::maybe_attest`) signs the message of its target's
+height and is a member under the rules of the next block; from the
+activation it votes for the justified checkpoint's direct child while a
+block can still include that vote, else for the newest slot (below the
+activation, always the newest slot). `gnb-cli powitattest` signs on the
+schedule of the chain it names (`hardening2_activation_height_for_signer`).
+The pool (gossip and the `submitpowititem` RPC, `powit::admit_item`) admits
+an attestation by the rules of a block at `max(target, next height)` and a
+proof by the next block's, and templates re-check every item with
+`apply_at` and take a target's votes heaviest first (node-local). Tests:
+`node/tests/fix_powit_hardening2.rs` (producers at the target heights H-1
+and H, the evidence rule in the pool), `node/tests/fix_powit_hardening2_chain.rs`
+(a chain crossing the activation through the miner's path; replay, restart
+and reorgs in both directions give every node the same state for every
+block).
+
+### Safety and liveness from the activation
+
+- **Accountable safety.** Two different checkpoints justified at one target
+  height (one epoch, so one weight function on both sides when they share
+  the history up to two epochs before it, which the two-epoch lag gives
+  forks shallower than an epoch) need two quorums of two thirds of the same
+  total: keys holding at least a third of ALL the window weight signed both
+  and are provable while they hold weight. Before the activation the bound
+  was a third of the 64 heaviest keys' weight, which finding 4 shows can be
+  a small part of the share work. Surround votes across epochs give the bound
+  up to the weight that entered or left between the two epochs' sets (one
+  epoch of work out of the window, about 1/28 on mainnet, plus decay and
+  bans), as for Gasper with a changing validator set.
+- **Bounded verification.** A block still carries at most 32 attestations and
+  4 proofs: at most 40 KES verifications per block, whatever the number of
+  share keys. Membership and the evidence rule are checked before any
+  signature; the pool keeps two pending votes per key and, full, evicts the
+  entry closest to expiry, lightest first.
+- **Liveness trade-off.** Every key with weight may vote, but at most 32
+  votes fit in a block, and a vote for slot `t` is includable only in blocks
+  `t ..= t + vote_ttl`: at most 32 × (vote_ttl + 1) votes per target (23,072
+  on mainnet, 672 on testnet). Let `K` be the smallest number of keys,
+  heaviest first, holding two thirds of the total. Justifying a slot takes
+  `ceil(K / 32)` blocks of inclusion; finality keeps pace with the chain
+  while that is at most one checkpoint interval (`K <= 1,920` on mainnet,
+  160 on testnet), falls behind and becomes intermittent above it (the duty
+  keeps voting for the justified checkpoint's child until that vote expires,
+  then for the newest slot), and needs the inactivity leak above 32 ×
+  (vote_ttl + 1): after `leak_after_epochs` epochs without finality every key
+  whose votes were not included loses 1/16 of its weight per epoch, so the
+  included voters regain two thirds (Gasper's inactivity leak). The 64-key
+  cap made `K <= 64` always, at the cost of the safety bound above; the
+  second hardening upgrade trades finality latency under extreme dispersion
+  of the share work for a two-thirds-of-all-weight guarantee. An attacker
+  with less than a third of the weight cannot stall finality (the honest keys
+  justify without it, within the bound above), nor crowd honest votes out of
+  honest templates (they take a target's heaviest votes first).
 
 ## Transaction signatures (sighash v2 and v3, hardening activation)
 
