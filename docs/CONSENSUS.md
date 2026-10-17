@@ -235,7 +235,14 @@ reveals another policy fails the policy hash before any timelock is read.
    transaction, coinbase commitment), and at every height the block-size
    limit of the block's verified height in the measure of the regime (see
    "Block size (VAL-12)"), before the block is stored;
-6. GnB-SMH proof (64 MiB, cached by block id);
+6. GnB-SMH proof (64 MiB, cached by block id). A body that replaces the
+   body of a block already in the DAG (same id, so the same proof preimage
+   and nonce, and the height just bound to the same parents) carries the
+   proof the DAG record already verified at that height: only the cheap
+   parts run again (canonical bits, target within the pow limit of the
+   height; `pow::proof_recorded_in_dag`, P5-G), never the GnB-SMH
+   evaluation. Same verdict, also after a restart, when the process no
+   longer holds the proof in its cache;
 7. transactions (version rule, witnesses and signatures as specified in
    "Transaction signatures" below, double spends, coinbase maturity and
    relative timelocks in the depth measure of the block's regime ("Coinbase
@@ -243,7 +250,10 @@ reveals another policy fails the policy hash before any timelock is read.
    rules (`node/src/blockval.rs`), consensus minimum fee, BIP30 and no
    same-block coinbase spend, this chain's rules at every height),
    coinbase value (the miner output and, from `powit_height()`, one
-   witness-share output per PoWit share).
+   witness-share output per PoWit share). Step 7 runs when the block is
+   connected; for a block the node's assumed-valid block vouches for, it
+   leaves out the signature verification only (node-local, see "Assumed-valid
+   block" below).
 
 Structural checks (size, merkle root, coinbase shape, duplicates, dust, and
 at/after the activation distinct parents, the 64-byte rule and the coinbase
@@ -1033,6 +1043,73 @@ of the cheap chain pins its fork choice: a chain past the PoWit height can
 carry one, and the pin does not read the minimum chain work here
 (docs/DESIGN-pow-powit.md, "Node finality").
 
+### Assumed-valid block (node-local policy, not consensus)
+
+Package P5-G, Bitcoin Core's `-assumevalid` (`node/src/assumevalid.rs`). A
+release names a block of the real chain, `assumevalid::MAINNET_ASSUME_VALID`
+(its id and DAG height; none yet on mainnet, testnet or regtest), and
+`--assumevalid=<id>` replaces it or `--assumevalid=0` turns it off. When the
+node CONNECTS a block B (`accept::commit_chunk`, the one connect path:
+extensions, reorgs, the start-up reconnection, the chain-state rebuild), it
+skips B's transaction signature verification
+(`core::sighash::verify_input_signatures`) if all of Core's conditions
+(`Chainstate::ConnectBlock`) hold, evaluated once per chain move on the DAG,
+which is GnB's header tree:
+
+1. the assumed-valid block AV is in the DAG (stricter than Core: and carries
+   no persistent verdict on this node, neither a consensus failure of it or
+   of its selected chain nor the operator's `invalidateblock`);
+2. B is AV or lies on AV's selected chain (only selected-chain blocks are
+   connected: a block merged by AV's chain was never validated by the nodes
+   that vouch for AV and is never skipped);
+3. B is the best block (`GhostDAG::selected_tip`, Core's `m_best_header`) or
+   lies on its selected chain;
+4. the best block's blue work is at least the minimum chain work above;
+5. `(blue_work(best) - blue_work(B)) * 30 / work(best) > 1,209,600`
+   (`assumevalid::MIN_BURIAL_SECS`): more than two weeks of
+   proof-equivalent time, Core's `GetBlockProofEquivalentTime` with blue work,
+   the 30 s target spacing and the best block's own work (`core::block_work`
+   of the ASERT bits of its parents, which its header carries);
+
+and one condition Core gets from its witness commitment: B's id commits to
+every witness byte (`accept::witnesses_fixed_at`: from
+`WITNESS_COMMITMENT_HEIGHT` or the hardening activation). Below both, a
+relay can replace `script_sig` bytes without changing the id, so the held
+body need not be the one the assumed-valid chain was validated with, and B is
+checked in full.
+
+Only the signature step is skipped (the step a verified-signature cache hit
+skips, `admission::check_input_scripts_without_signatures_at`): the version
+rule, the witness framing (canonical from the activation), the public key
+hash against the spent script, a revealed policy's hash, signature count and
+key indices, the policy timelocks, amounts and MoneyRange, UTXO existence and
+double spends, coinbase maturity, BIP30, the size-based minimum fee and the
+coinbase value still run, as do every acceptance check (the proof of work
+above all: never skipped, as in Core) and the PoWit state. Mempool admission,
+templates and `blockval::validate_block_transactions` always verify in full.
+
+It changes no verdict on a valid chain: every rule but the signatures runs,
+and a valid chain's signatures are valid. Nodes with different settings
+reach different verdicts only on a chain whose blocks below AV carry invalid
+signatures, i.e. only if AV itself is not a block of a valid chain — the
+trust Core places in its release value, reviewed like any consensus constant
+(`tools/release/min_chain_work.py` prints it from the same block as the
+minimum chain work, read on two or more independent nodes).
+
+Without a header-first download (`/gnb/sync/1` `Headers` carry ids and
+claimed scores, not headers) a block is connected as soon as its parents
+are, so during a fresh initial block download AV's header is not in the DAG
+when its ancestors connect (condition 1) and they are checked in full; with
+condition 5 nothing on a chain younger than two weeks qualifies either. The
+skip applies when the node connects blocks with AV already in its DAG: a
+chain-state rebuild (Core's `-reindex-chainstate`), the move onto the real
+chain of a node that sat on another branch (partition, eclipse), bodies
+that come back (audit DAG-6) and a resumed chain move. What condition 1
+needs during initial sync is a header tree in place before the blocks
+connect (Core's headers-first sync; package P5-B2 adds verified headers to
+`/gnb/sync/1`); the decision reads nothing of that tree but membership,
+selected-chain ancestry, blue work and the best block.
+
 ### Gossip penalties and proof-of-work budgets (node-local policy, not consensus)
 
 Audit NET-2 residual, B1-T7, NET-4 residual (Phase 4).
@@ -1107,6 +1184,19 @@ zero-cost invalid blocks per libp2p identity, identities being free; now
 identities and addresses inside one /16 share eight evaluations, and an
 author that delivers one invalid block of its own is disconnected and its
 address discouraged.
+
+**Proof-of-work cost of sync** (P5-G). Every proof is evaluated once, on the
+worker pool: half the logical CPUs (1 to 4) normally, and while the IBD latch
+holds (the miner and the witness duties wait) every CPU but one, at least
+that and at most eight (`pow::verifier::ibd_workers`; eight GnB-SMH v1
+scratchpads are 512 MiB), as Bitcoin Core verifies with every core during
+IBD. A body fetched again for a block already in the DAG (a pruned body a
+reorg needs, a body rejected for a witness-dependent reason) is never handed
+to the workers and its proof is never evaluated again: the DAG record is the
+verified result of that proof at that height, and it survives restarts
+(acceptance order, step 6). Proofs are never skipped, below the assumed-valid
+block either (Core never skips them): a block's proof is what admits its
+header to the DAG, and no header chain is known before it.
 
 **PoWit gossip** (`NewPowitItem`: witness shares, attestations, equivocation
 proofs; `ingress::PowitIngress`). Merged from the mainnet line, where each

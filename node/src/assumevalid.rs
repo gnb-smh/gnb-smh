@@ -81,9 +81,11 @@
 //! download: `/gnb/sync/1` `Headers` carry ids and claimed scores, not
 //! headers), so AV's header is not known when its ancestors connect
 //! (condition 1); and with Core's two-week burial nothing on a chain younger
-//! than two weeks plus AV's depth would qualify anyway. A header chain with
-//! proofs (Core's headers-first sync, package P5-B2) makes condition 1 hold
-//! during IBD; the decision function needs nothing else.
+//! than two weeks plus AV's depth would qualify anyway. Condition 1 needs a
+//! header tree in place before the blocks connect (Core's headers-first
+//! sync; package P5-B2 adds verified headers to `/gnb/sync/1`); the
+//! decision reads nothing of that tree but membership, selected-chain
+//! ancestry, blue work and the best block ([`Assumption`]).
 //!
 //! # Not consensus
 //!
