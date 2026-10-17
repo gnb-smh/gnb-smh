@@ -1,0 +1,17 @@
+{
+  "test_source_commit": "80bdfb5",
+  "node_cli_source_commit": "0898b01",
+  "native_codegen_units": 151,
+  "binary_snapshot": "/private/tmp/gnb-r5-descriptor-cache/bin-0d9ec5e6c3140463",
+  "binaries": {
+    "gnb": "1fb378e6038ff0e2c8f4ad84ae6eb1f03781a6a434497aeeae6fdf37aedd4aba",
+    "gnb-cli": "950884a407aa73dc4e514896fa4af3d18c2f823ddb78999190057da9b462dd50"
+  },
+  "test": "wallet_descriptor_restore.py",
+  "exit_code": 0,
+  "seconds_including_cache_preparation": 174.3,
+  "log": "/private/tmp/gnb-r5-descriptor-functional-final.log",
+  "log_sha256": "60da8e7bdac1b3230ddfed5b6772e249f72d2b3f3eaf316be248b8529b4cbfa2",
+  "log_text": "17:42:11.710 WalletDescriptorRestoreTest INFO temp dir: /private/tmp/gnb-r5-descriptor-final/WalletDescriptorRestoreTest-d5ox5mfd\n17:42:15.135 WalletDescriptorRestoreTest INFO cache: building base data dir (genesis + carryover)\n17:42:34.560 WalletDescriptorRestoreTest INFO cache: mining 110 blocks (10 to the cache wallet)\n17:45:02.307 WalletDescriptorRestoreTest INFO the node resolves a checksummed public descriptor on its own network\n17:45:02.849 WalletDescriptorRestoreTest INFO fund the described identity, then restore its public pool from disk\n17:45:05.714 WalletDescriptorRestoreTest INFO wrong-network import and overwriting an existing backup are refused\n17:45:06.041 WalletDescriptorRestoreTest INFO PASSED in 174.3s\n",
+  "note": "A separate snapshot of frontend package binaries; this is not the full integrated 15-scenario CGU157 run. The harness verified test-build mainnet refusal before any node startup."
+}

@@ -329,6 +329,13 @@ prefer `generate` over the internal miner unless the miner is what is tested.
 
 ## Follow-ups
 
+`wallet_descriptor_restore.py` exercises the public descriptor RPCs and offline
+CLI against a live testnet node. It exports a public pool, funds the independently
+pinned identity, imports the pool again and observes the same output. It also
+checks wrong-network restoration and preservation of an existing output file.
+This proves public identity restoration only: no spending key, transaction
+history scan or persistent watch-only wallet index is restored.
+
 Added after the operator-RPC (P3) and mempool-policy (P4) merges:
 `feature_invalidateblock.py` and `mempool_replacement.py` above. Still to add,
 each end to end on three nodes like `mempool_tx_relay.py`: mempool policy

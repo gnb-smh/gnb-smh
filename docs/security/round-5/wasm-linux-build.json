@@ -1,0 +1,17 @@
+{
+  "build_script_sha256": "201aa76b18d1e2c942deb4a8cd5788c8e35dc17c0e32827f9bc309bec2d780a6",
+  "cargo_lock_sha256": "2edda7ed73536ed13a7ad22ec01aab6ee66b4de06ac9aad19cb43ec1c080a779",
+  "host": "Linux-x86_64",
+  "revision": "f44cdef56766c6f8541f90796b36c1ea8f1d1ad6",
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "schema": 1,
+  "target": "wasm32-wasip1",
+  "wasi_sdk_archive_sha256": "52640dde13599bf127a95499e61d6d640256119456d1af8897ab6725bcf3d89c",
+  "wasi_sdk_version": "25",
+  "wasm_sha256": "29cf8b3f7c1e20345758faec3595cc83763c0c9880c9f3e057567eae72cb29a3",
+  "artifact_run_url": "https://github.com/tiagobeltraoacioli-sketch/gnb-smh/actions/runs/38963634413",
+  "artifact_name": "wallet-wasm-f44cdef56766c6f8541f90796b36c1ea8f1d1ad6",
+  "artifact_manifest_sha256": "2a1976a32503f62ff82d2f3ad9161e602af19b443ad5e252d9eb8f435fc3abc3",
+  "macos_wasm_sha256": "d6dc794e7be5f4dfca7f4da05719f05adc4c762a93acd1b396e3a183bdc22569",
+  "cross_host_reproducibility": "not established; different macOS/Linux bytes, R3-BUILD-1 remains open"
+}

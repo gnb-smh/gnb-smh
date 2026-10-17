@@ -1,0 +1,211 @@
+{
+  "driver_start_revision": "0cb572ba01dc69865ad29b21fa87a4b1abb5714a",
+  "codegen_units": 157,
+  "results": {
+    "crypto": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline"
+      ],
+      "exit_code": 0,
+      "seconds": 334.15,
+      "log": "/private/tmp/gnb-r5-integration/crypto.log",
+      "sha256": "93b82dbd8aa6eebe84b4f466460c3bee1b8c77f1166cca91dea659e3e3e83fce",
+      "test_summaries": 15,
+      "executed_pass_fail_ignore": [
+        490,
+        0,
+        4
+      ]
+    },
+    "descriptor-oracle-tests": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--example",
+        "descriptor_oracle"
+      ],
+      "exit_code": 0,
+      "seconds": 2.23,
+      "log": "/private/tmp/gnb-r5-integration/descriptor-oracle-tests.log",
+      "sha256": "8ac6240e4f71ff7f48d03d1fc14ae20e5ad8762e48e992578caa52a72bfd41f8",
+      "test_summaries": 1,
+      "executed_pass_fail_ignore": [
+        2,
+        0,
+        0
+      ]
+    },
+    "descriptor-oracle-build": {
+      "command": [
+        "cargo",
+        "build",
+        "-p",
+        "gnb-crypto",
+        "--locked",
+        "--offline",
+        "--example",
+        "descriptor_oracle"
+      ],
+      "exit_code": 0,
+      "seconds": 0.48,
+      "log": "/private/tmp/gnb-r5-integration/descriptor-oracle-build.log",
+      "sha256": "703e7eca104f790350e17d972e1a99183de1c7b70c586dad54684bf0b710ec76"
+    },
+    "descriptor-differential": {
+      "command": [
+        "/Users/tiagobulhoes/.local/share/uv/python/cpython-3.12.15-macos-x86_64-none/bin/python3",
+        "reference/descriptor_differential.py",
+        "/private/tmp/gnb-r5-target-integration/debug/examples/descriptor_oracle"
+      ],
+      "exit_code": 0,
+      "seconds": 48.39,
+      "log": "/private/tmp/gnb-r5-integration/descriptor-differential.log",
+      "sha256": "f2f68eb4dd958bc805e1190734a951232cfe9cc7ea5e7d98f6f229710143e585"
+    },
+    "wasm-host": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb-wallet-wasm",
+        "--locked",
+        "--offline"
+      ],
+      "exit_code": 0,
+      "seconds": 25.47,
+      "log": "/private/tmp/gnb-r5-integration/wasm-host.log",
+      "sha256": "1bb95962dd8e7245f9cc70245c53f01a68ca1b4b18311849fae651b3ecc4eded",
+      "test_summaries": 3,
+      "executed_pass_fail_ignore": [
+        13,
+        0,
+        0
+      ]
+    },
+    "node": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "gnb",
+        "--locked",
+        "--offline",
+        "--no-fail-fast"
+      ],
+      "exit_code": 0,
+      "seconds": 1275.09,
+      "log": "/private/tmp/gnb-r5-integration/node.log",
+      "sha256": "163b18ef81f81afd0f6193385f3b740ed02b4776741175bb9936abf58d02641a",
+      "test_summaries": 107,
+      "executed_pass_fail_ignore": [
+        1790,
+        0,
+        8
+      ]
+    },
+    "functional-build": {
+      "command": [
+        "cargo",
+        "build",
+        "-p",
+        "gnb",
+        "--features",
+        "test-pow-limit",
+        "--bin",
+        "gnb",
+        "--bin",
+        "gnb-cli",
+        "--locked",
+        "--offline"
+      ],
+      "exit_code": 0,
+      "seconds": 68.25,
+      "log": "/private/tmp/gnb-r5-integration/functional-build.log",
+      "sha256": "0c272406667d051c4dce9539483c4cc4d2ba5b7c47a0a37169d7e96be5fb328c"
+    },
+    "functional": {
+      "command": [
+        "/Users/tiagobulhoes/.local/share/uv/python/cpython-3.12.15-macos-x86_64-none/bin/python3",
+        "test/functional/test_runner.py",
+        "--ci",
+        "--no-build",
+        "--jobs",
+        "1",
+        "--timeout",
+        "300",
+        "--tmpdir",
+        "/private/tmp/gnb-r5-functional",
+        "--cachedir",
+        "/private/tmp/gnb-r5-functional-cache",
+        "--keep-failed"
+      ],
+      "exit_code": 1,
+      "seconds": 718.87,
+      "log": "/private/tmp/gnb-r5-integration/functional.log",
+      "sha256": "9172d23c97e2ac647af5fd42473d9e454782290c22e9471342b326b9cf95e0b4"
+    }
+  },
+  "functional_summary": {
+    "passed": 14,
+    "skipped": 0,
+    "failed": 1,
+    "total": 15,
+    "failure": "feature_partition_heal.py",
+    "known_finding": "R1-FUNC-1",
+    "observed": "wait_for_peers deadline after restart; node2 dial logs report EADDRINUSE",
+    "cause": "undetermined",
+    "descriptor_restore_seconds": 5.1
+  },
+  "additional_logs": {
+    "site_macos_final": {
+      "path": "/private/tmp/gnb-r5-site-tests-final-local.log",
+      "sha256": "67c42519914614a531253566d8fe738b88c9a011f31d852e3bc2d1b27f6a6279"
+    },
+    "site_canonical_linux": {
+      "path": "/private/tmp/gnb-r5-site-tests-linux-artifact.log",
+      "sha256": "ac6d5afcaec5fb781a862645c264e54dec9cf0bfd94721265c84c934c3fd2f28"
+    },
+    "site_sandbox_attempt": {
+      "path": "/private/tmp/gnb-r5-site-tests.log",
+      "sha256": "711c90bd6e51c2cf654ae781a09bec5014aa0b6bddaaab24b71f54b9aa2ed716"
+    },
+    "site_permission_retry": {
+      "path": "/private/tmp/gnb-r5-site-tests-unsandboxed.log",
+      "sha256": "05d2e9ed9893dfd77eaa82a7a7480edfc9599b80df4959873a84335284a2743e"
+    },
+    "explorer_permission_retry": {
+      "path": "/private/tmp/gnb-r5-explorer-unsandboxed.log",
+      "sha256": "ae1fd1dbf2e0b82132d48871514914ea1c51230b724e9dcf9a983a566856105c"
+    },
+    "references_deploy_harness": {
+      "path": "/private/tmp/gnb-r5-checks/results.json",
+      "sha256": "957eb043967e2295dfc02d30444c11d8cdb5a3c5eb73730a6a56bcadf6fedb83"
+    },
+    "fuzz_typecheck_offline_attempt": {
+      "path": "/private/tmp/gnb-r5-fuzz-check.log",
+      "sha256": "8f25230e57670376db1d7601773f04a8be4083a464dabc24c0646b6cea487b24"
+    },
+    "fuzz_typecheck_with_registry": {
+      "path": "/private/tmp/gnb-r5-fuzz-check-network.log",
+      "sha256": "b6804c3d03f00a67aa1053fc693a30d4db874eff6939955b92bfb5450f839b12"
+    },
+    "linux_initial_hash_mismatch": {
+      "path": "/private/tmp/gnb-r5-first-linux-wasm.log",
+      "sha256": "1a3e70a98a723ef7e60a6a7f9061d068806790087f0be34dcbb2474068673450"
+    },
+    "partition_trace": {
+      "path": "/private/tmp/gnb-r5-functional/feature_partition_heal.out",
+      "sha256": "8bed497f40fc513e8fb1d78c4c6aff8c4bf2aeeb6feed692e7ab41e16593d4b0"
+    }
+  },
+  "note": "Ordinary integrated suites only. A subsequent pass does not explain or close an earlier failure. No directed investigation of excluded work was performed. Fuzz type-check is not a completed fuzz campaign."
+}

@@ -100,6 +100,18 @@ export async function loadCore(url, sha256Hex) {
     // JSON fields reach the strict shared parser. Caller-supplied `op` cannot
     // redirect this public-data binding to an operation using the session key.
     pqpsbt: (request) => call({ ...request, op: "pqpsbt" }),
+    // Public identities only; importing a pool never opens a signing session.
+    // R5-VERDICT-1: JSON.stringify calls toJSON before encoding. A caller's
+    // own or inherited hook must not replace this envelope with {op:"wipe"}.
+    descriptor: (request) => {
+      if (!request || typeof request !== "object" || Array.isArray(request)) {
+        throw new Error("descriptor request must be an object");
+      }
+      const message = Object.assign(Object.create(null), request);
+      if (Object.hasOwn(message, "toJSON")) throw new Error("unknown descriptor request field: toJSON");
+      message.op = "descriptor";
+      return call(message);
+    },
     // Offline context is supplied by the signer. The core checks commitments
     // and fee/height/network, but cannot attest current chain unspentness.
     signPqPsbt: (hex, network, nextHeight, maxFee) => call({
