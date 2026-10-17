@@ -622,18 +622,40 @@ height the verdict is unchanged. The rule is
 connect, reorg connect, mempool admission and the template self-check call;
 the check is `SpendPolicy::check_key_identities`.
 
+Relay (node-local): the rule depends on the next block's height and only
+tightens the rules, so a peer one block behind across the height, and every
+release without the rule, relays such a spend honestly. Mempool admission
+therefore classifies a transaction that fails ONLY this rule (it passes
+`blockval::check_tx_chain_rules_without_key_identity_rule`, every other
+chain rule) as a policy refusal (`AdmissionError::NonStandard`, gossip
+verdict `Ignore`, no penalty), and one that also fails another rule as
+consensus-invalid (`Rejected`): Bitcoin Core's split between the standard
+and the mandatory script-verify flags (`PolicyScriptChecks`).
+
 Outputs locked to such a policy become unspendable from the height, the
 behaviour of a new script version that admits one encoding per key (Bitcoin
 Core: compressed-only keys in segwit v0 standardness, BIP340 x-only keys in
 tapscript; miniscript refuses duplicate keys). Tools never create one:
 `SpendPolicy::new` (wallets, `gnb-cli policyaddress`, the bridge vault
 `Vault::create`, whose signer/recovery overlap check also compares
-identities, and the public descriptor parser, `wallet::descriptor`) refuses
-two keys with one identity at every height. The independent Python
+identities, and `Descriptor::create` of the public descriptors,
+`wallet::descriptor`) refuses two keys with one identity at every height.
+Every participant loads a published bridge vault through `Vault::tree`,
+which applies the same key checks to the published tree. The producers of
+spends apply the rule at their target height: `PolicySpend::target_height`
+and the PQ-PSBT roles (`PqPsbt::review`, run by every signer and the
+finalizer, with the node's next block height in `gnb-cli policysign`) refuse
+a spend of such a policy or branch for a block at or above the height, and
+where the height is 0 (testnet, regtest) the spend builders refuse it
+outright. Below the height they build and sign it, so its owner can move the
+funds. An existing descriptor of that shape (the release before PF-4 created
+them) is still restored by `inspect`, `export` and `import`, flagged with
+`twin_key_encodings: true` (`docs/DESCRIPTORS.md`). The independent Python
 descriptor reference does the same (`reference/descriptor.py`,
-`key_identity`; vectors `policy-twin-encoding` / `tree-twin-encoding` in
-`reference/descriptor_vectors.json`, regenerated with
-`reference/descriptor_vectors.py`).
+`key_identity`; vectors `policy-twin-encoding` / `tree-twin-encoding` (create
+refused, inspect accepted and flagged) and `export-twin-encoding` /
+`import-twin-encoding` in `reference/descriptor_vectors.json`, regenerated
+with `reference/descriptor_vectors.py`).
 
 Vectors (`core::policy::tests::key_identity_vectors_and_the_twin_encoding_policy`):
 for the hybrid key derived from seed `0x42 × 32`

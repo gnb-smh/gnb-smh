@@ -103,6 +103,19 @@ pub fn check_policy_spends_with_confirmations(
     height: u64,
     confirmations: &ConfirmationsLookup<'_>,
 ) -> Result<(), String> {
+    check_policy_spends_under(tx, prevouts, height, core::activation::hardening2_active_at(height), confirmations)
+}
+
+/// [`check_policy_spends_with_confirmations`] with the PF-4 key-identity
+/// rule of the second hardening upgrade on (`key_identity_rule`, the
+/// consensus value is `hardening2_active_at(height)`) or off.
+fn check_policy_spends_under(
+    tx: &Transaction,
+    prevouts: &[TxOutput],
+    height: u64,
+    key_identity_rule: bool,
+    confirmations: &ConfirmationsLookup<'_>,
+) -> Result<(), String> {
     for (i, (inp, prev)) in tx.inputs.iter().zip(prevouts).enumerate() {
         if policy::output_kind(&prev.script_pubkey) != Some(policy::OutputKind::Policy) {
             continue;
@@ -121,7 +134,7 @@ pub fn check_policy_spends_with_confirmations(
         // must not name one key twice in its two encodings (raw and
         // enveloped, `policy::key_identity`); under sighash v3 one signer
         // would fill both slots. Below the height: unchanged.
-        if core::activation::hardening2_active_at(height) && pol.check_key_identities().is_err() {
+        if key_identity_rule && pol.check_key_identities().is_err() {
             return Err(format!(
                 "input {}: the revealed policy names the same key twice (raw and enveloped encodings)", i));
         }
@@ -163,6 +176,31 @@ pub fn check_tx_chain_rules_with_confirmations(
 ) -> Result<(), String> {
     check_tx_context_free(tx, height)?;
     check_policy_spends_with_confirmations(tx, prevouts, height, confirmations)
+}
+
+/// [`check_tx_chain_rules_with_confirmations`] WITHOUT the PF-4 key-identity
+/// rule of the second hardening upgrade, for mempool admission only: how to
+/// classify a transaction the full rules refuse (`mempool::admission`).
+///
+/// The identity rule only tightens the rules from a height, so a peer one
+/// block behind across the activation, or a release without the rule,
+/// relays such a transaction honestly. When the full rules fail but these
+/// pass, the only failure is the new rule: admission answers it as a policy
+/// refusal (`AdmissionError::NonStandard`, no penalty for the delivering
+/// peer), never `Rejected`. Bitcoin Core makes the same split: a
+/// transaction that fails `STANDARD_SCRIPT_VERIFY_FLAGS` is re-checked with
+/// `MANDATORY_SCRIPT_VERIFY_FLAGS` alone (`PolicyScriptChecks`), and only a
+/// failure of the mandatory flags is consensus-invalid
+/// (`TX_CONSENSUS`); a failure of the newer soft-fork flags alone is
+/// `TX_NOT_STANDARD` and costs the peer nothing.
+pub fn check_tx_chain_rules_without_key_identity_rule(
+    tx: &Transaction,
+    prevouts: &[TxOutput],
+    height: u64,
+    confirmations: &ConfirmationsLookup<'_>,
+) -> Result<(), String> {
+    check_tx_context_free(tx, height)?;
+    check_policy_spends_under(tx, prevouts, height, false, confirmations)
 }
 
 /// Where a transaction is being validated: the height of the block it is (or

@@ -21,10 +21,13 @@ A policy is:
   encoding of one key are the same signer (`core::policy::key_identity`,
   PF-4). `gnb-cli policyaddress`, `vaultcreate` and every other tool
   (`SpendPolicy::new`) refuse a policy that names one key twice at every
-  height; from the second hardening upgrade such a policy cannot be spent
-  (`docs/CONSENSUS.md`, "Spend-policy key identity"). Below it the old rule
-  holds (byte-wise distinct), under which, with sighash v3, one signer
-  fills both slots of such a key;
+  height, and every vault command refuses a published vault file that does
+  (`Vault::tree`); from the second hardening upgrade such a policy cannot be
+  spent, and the spend tools (`policyspend --next-height`, `policysign`,
+  the PQ-PSBT roles) refuse to build, sign or finalize a spend of it for a
+  block at or above that height (`docs/CONSENSUS.md`, "Spend-policy key
+  identity"). Below it the old rule holds (byte-wise distinct), under
+  which, with sighash v3, one signer fills both slots of such a key;
 - **`after`** (absolute timelock): spendable only by a transaction whose
   `locktime ≥ after`. `0` = none;
 - **`older`** (relative timelock): spendable only `older` blocks after the

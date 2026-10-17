@@ -67,7 +67,9 @@
 //! witnesses below the activation or for a version other than 3, suite
 //! 0x0002, zero-value outputs, size) and every rule whose verdict depends on
 //! the next block's height (the version rule, the 64-byte rule, coinbase
-//! maturity) are policy refusals ([`AdmissionError::NonStandard`] /
+//! maturity, and the PF-4 key-identity rule of the second hardening upgrade
+//! when it is the only rule a transaction fails: `classify_chain_rule_failure`)
+//! are policy refusals ([`AdmissionError::NonStandard`] /
 //! [`AdmissionError::Immature`]): a peer one block behind across the
 //! activation relays such a transaction honestly. A non-canonical witness on
 //! a version-3 transaction for a block at/after the activation is
@@ -154,8 +156,9 @@ pub enum AdmissionError {
     /// outputs, a zero-value output, a non-canonical witness where it is not
     /// a consensus rule, a single-algorithm suite, the version policy) or by
     /// a rule whose verdict depends on this node's next block height (the
-    /// version rule, the 64-byte rule: [`check_tx_for_next_block`]). The
-    /// relay reports `Ignore`.
+    /// version rule, the 64-byte rule: [`check_tx_for_next_block`]; the
+    /// PF-4 key-identity rule of the second hardening upgrade when every
+    /// other chain rule passes). The relay reports `Ignore`.
     NonStandard(String),
     /// An input is neither in the UTXO set nor an output of a pooled
     /// transaction (unknown parent, or already spent by a confirmed
@@ -799,11 +802,7 @@ pub fn check_transaction_gated_with_wtxid(
         confirmations_for_next_block(store, t, policy.next_block_height).map_err(|e| e.0)
     };
     crate::blockval::check_tx_chain_rules_with_confirmations(tx, &prevouts, policy.next_block_height, &confirmations)
-        .map_err(|e| if e.starts_with(crate::blockval::STORAGE_ERR) {
-            AdmissionError::Pool(e)
-        } else {
-            AdmissionError::Rejected(e)
-        })?;
+        .map_err(|e| classify_chain_rule_failure(tx, &prevouts, policy.next_block_height, &confirmations, e))?;
 
     // Value + fees.
     let total_out = core::limits::check_tx_money_range(tx).map_err(AdmissionError::Rejected)?;
@@ -853,6 +852,42 @@ pub fn check_transaction_gated_with_wtxid(
         verify_input_scripts_gated_with_wtxid_at(tx, tx_wtxid, &prevouts, policy.next_block_height, activation_height(), gate)?;
     }
     Ok(fee)
+}
+
+/// The admission error for a failure `e` of this chain's rules
+/// (`blockval::check_tx_chain_rules_with_confirmations`) at the next block's
+/// height: a storage failure is `Pool`; a failure of the PF-4 key-identity
+/// rule of the second hardening upgrade ALONE (the transaction passes every
+/// other chain rule: `blockval::check_tx_chain_rules_without_key_identity_rule`)
+/// is a policy refusal, `NonStandard`; anything else is `Rejected`.
+///
+/// The identity rule depends on the next block's height and only tightens
+/// the rules: a peer one block behind across the hardening-2 height, and
+/// every release without the rule, accepts and relays a spend of a
+/// twin-key policy honestly, so refusing it must not penalise the peer
+/// (module docs; Bitcoin Core's standard / mandatory script-flag split,
+/// `PolicyScriptChecks`). Below the hardening-2 height the rule is off and
+/// the second check is skipped.
+fn classify_chain_rule_failure(
+    tx: &Transaction,
+    prevouts: &[TxOutput],
+    next_block_height: u64,
+    confirmations: &crate::blockval::ConfirmationsLookup<'_>,
+    e: String,
+) -> AdmissionError {
+    if e.starts_with(crate::blockval::STORAGE_ERR) {
+        return AdmissionError::Pool(e);
+    }
+    if core::activation::hardening2_active_at(next_block_height) {
+        match crate::blockval::check_tx_chain_rules_without_key_identity_rule(
+            tx, prevouts, next_block_height, confirmations)
+        {
+            Ok(()) => return AdmissionError::NonStandard(e),
+            Err(other) if other.starts_with(crate::blockval::STORAGE_ERR) => return AdmissionError::Pool(other),
+            Err(_) => {}
+        }
+    }
+    AdmissionError::Rejected(e)
 }
 
 /// Coinbase maturity of `tx` for the next block, at header height

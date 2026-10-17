@@ -29,7 +29,10 @@ use fix_common::*;
 use gnb::blockval::{self, SpendContext};
 use gnb::core::{self, activation, policy, Transaction, TxInput, TxOutput};
 use gnb::crypto;
-use gnb::mempool::admission::{self, AdmissionPolicy};
+use gnb::mempool::admission::{self, AdmissionError, AdmissionPolicy};
+use gnb::mempool::relay::TxRelay;
+use gnb::network::GossipVerdict;
+use libp2p::PeerId;
 
 /// Second hardening height used by the boundary tests.
 const H2: u64 = 40;
@@ -157,24 +160,40 @@ fn a_revealed_branch_is_checked_like_a_policy() {
         }.encode();
         tx
     };
-    // Policy-tree spends need PoWit to be active (core::powit_height()); the
-    // test asks the rule function directly, as connect, mempool and template
-    // do, at a height where both are active.
+    // Policy-tree spends need PoWit to be active (core::powit_height(), 10,000
+    // on the default mainnet chain id); the test asks the rule function
+    // directly, as connect, mempool and template do, at heights where
+    // branches are active, with the hardening-2 height just above the PoWit
+    // height so both regimes are seen with branch spends valid.
     let powit = core::powit_height();
-    let h = powit.max(H2);
+    assert!(powit < u64::MAX - 2, "policy-tree spends must activate on the test chain");
     let attack = branch_spend(0, &twin, &[(&k, 0), (&k, 1)]);
     let honest = branch_spend(1, &other, &[(&k, 0)]);
     let confirm = |_: &[u8; 32]| -> Result<Option<u64>, String> { Ok(Some(0)) };
     let prev = std::slice::from_ref(&coin.2);
-    if h != u64::MAX {
-        let e = blockval::check_policy_spends_with_confirmations(&attack, prev, h, &confirm).unwrap_err();
-        assert!(e.contains("same key"), "{e}");
-        assert_eq!(blockval::check_policy_spends_with_confirmations(&honest, prev, h, &confirm), Ok(()));
+    // Old regime (hardening 2 never active, or one block below it): the
+    // twin-key branch is accepted by the policy-spend rule, as before.
+    {
+        let _never = activation::scoped_override_v2(activation::NEVER);
+        for h in [powit, powit + 1, 1_000_000] {
+            assert_eq!(blockval::check_policy_spends_with_confirmations(&attack, prev, h, &confirm), Ok(()),
+                "old regime at {h}");
+        }
     }
-    // Below hardening 2 only the branch-activation rule applies, as before.
-    let below = blockval::check_policy_spends_with_confirmations(&attack, prev, H2 - 1, &confirm);
-    assert!(below.as_ref().err().is_none_or(|e| !e.contains("same key")), "{below:?}");
-    let _ = l;
+    let h2 = powit + 1;
+    let _h2 = activation::scoped_override_v2(h2);
+    assert_eq!(blockval::check_policy_spends_with_confirmations(&attack, prev, h2 - 1, &confirm), Ok(()),
+        "one block below hardening 2: unchanged");
+    for h in [h2, h2 + 1, 1_000_000] {
+        let e = blockval::check_policy_spends_with_confirmations(&attack, prev, h, &confirm).unwrap_err();
+        assert!(e.contains("same key"), "{h}: {e}");
+        assert_eq!(blockval::check_policy_spends_with_confirmations(&honest, prev, h, &confirm), Ok(()),
+            "the honest branch of the same tree at {h}");
+    }
+    // Branches are independent: the same key in two branches is fine.
+    let across = policy::PolicyTree::new(vec![policy_of(1, vec![raw_of(&k.pk)]), policy_of(1, vec![k.pk.clone(), l.pk.clone()])])
+        .unwrap();
+    assert!(across.branches.iter().all(|b| b.check_key_identities().is_ok()));
 }
 
 /// Mempool admission and block connect call the same rule: from hardening 2
@@ -198,7 +217,10 @@ fn mempool_admission_and_block_connect_apply_the_rule_at_its_height() {
         let admitted = admission::admit(&n.store, &n.mempool, attack.clone(), &AdmissionPolicy::relay(next));
         assert_eq!(admitted.is_err(), refused, "mempool, hardening 2 at {h2}: {admitted:?}");
         if refused {
-            assert!(format!("{:?}", admitted.unwrap_err()).contains("same key"));
+            // A policy refusal, not consensus-invalid: a peer one block
+            // behind across the hardening-2 height relays it honestly.
+            assert!(matches!(&admitted, Err(AdmissionError::NonStandard(m)) if m.contains("same key")),
+                "{admitted:?}");
         }
 
         let mut txs = vec![coinbase("pf4", core::tokenomics::block_subsidy_sat(1) + 1_000_000, vec![0xC3; 20])];
@@ -214,6 +236,67 @@ fn mempool_admission_and_block_connect_apply_the_rule_at_its_height() {
             (r, other) => panic!("connect, hardening 2 at {h2} (refuse: {r}): {other:?}"),
         }
     }
+}
+
+/// Relay classification (review finding): the hardening-2 identity rule only
+/// tightens the rules from a height, so every older release, and an upgraded
+/// node one block below the height, accepts and relays a twin-key spend.
+/// Refusing it must not penalise the delivering peer: the gossip verdict is
+/// `Ignore` (admission answers `NonStandard`), with relay penalties in force.
+/// A twin-key spend that ALSO fails an older consensus rule (here its
+/// absolute timelock) is still consensus-invalid (`Reject`), as in Bitcoin
+/// Core, where only a failure of the mandatory script flags is penalised.
+/// Before the fix every such refusal was `Rejected` and so `Reject`.
+#[test]
+fn a_gossiped_twin_key_spend_at_hardening2_is_ignored_not_penalised() {
+    let _h1 = activation::scoped_override(0);
+    let genesis = mk_genesis(unix_now() - 10_000);
+    let gh = genesis.block_hash();
+    let k = key();
+    let twin = policy_of(2, vec![raw_of(&k.pk), k.pk.clone()]);
+    let coin = ([0xFBu8; 32], 0u32, out(5_000_000, &twin.script_pubkey()));
+    let attack = spend(&twin, &coin, &[(&k, 0), (&k, 1)]);
+    let mut locked = policy_of(2, vec![raw_of(&k.pk), k.pk.clone()]);
+    locked.after = 50;
+    let locked = policy_of_full(locked);
+    let lcoin = ([0xFCu8; 32], 0u32, out(5_000_000, &locked.script_pubkey()));
+    let also_invalid = spend(&locked, &lcoin, &[(&k, 0), (&k, 1)]);
+    assert_eq!(also_invalid.locktime, 0, "below the policy's absolute timelock");
+
+    let _h2 = activation::scoped_override_v2(1);
+    let n = node_with(&genesis, &[coin.clone(), lcoin.clone()]);
+    n.store.put_tx_index(&coin.0, &gh, 0).unwrap();
+    n.store.put_tx_index(&lcoin.0, &gh, 0).unwrap();
+    let next = admission::next_block_height(&n.dag.read());
+    assert_eq!(next, 1, "the next block is at the hardening-2 height");
+    let mut relay = TxRelay::new().with_penalty_height(0);
+    assert!(relay.penalties_in_force(next));
+    let peer = Some(PeerId::random());
+    let wire = |tx: &Transaction| tx.to_wire_bytes(true);
+
+    let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &attack.txid(), &wire(&attack), peer,
+        std::time::Instant::now(), unix_now());
+    assert_eq!(o.verdict, GossipVerdict::Ignore, "{}", o.detail);
+    assert!(!o.invalid, "{}", o.detail);
+    assert!(o.detail.contains("same key"), "{}", o.detail);
+    assert!(!n.mempool.contains(&attack.txid()));
+
+    let o = relay.on_gossip_tx(&n.store, &n.mempool, next, &also_invalid.txid(), &wire(&also_invalid), peer,
+        std::time::Instant::now(), unix_now());
+    assert_eq!(o.verdict, GossipVerdict::Reject, "{}", o.detail);
+    assert!(o.invalid);
+    // The same through admission directly (past the recent-rejects filter
+    // the relay just filled): the older rule's failure classifies.
+    let unfiltered = AdmissionPolicy { use_reject_filter: false, ..AdmissionPolicy::relay(next) };
+    let e = admission::admit(&n.store, &n.mempool, also_invalid.clone(), &unfiltered).unwrap_err();
+    assert!(matches!(&e, AdmissionError::Rejected(m) if m.contains("same key")), "{e:?}");
+    let e = admission::admit(&n.store, &n.mempool, attack.clone(), &unfiltered).unwrap_err();
+    assert!(matches!(&e, AdmissionError::NonStandard(m) if m.contains("same key")), "{e:?}");
+}
+
+/// A policy with every field set by the caller, through consensus decoding.
+fn policy_of_full(p: policy::SpendPolicy) -> policy::SpendPolicy {
+    policy::SpendPolicy::decode(&p.encode()).expect("consensus decoding")
 }
 
 /// Producers: a template for a block below the hardening-2 height includes a
@@ -272,4 +355,49 @@ fn tooling_refuses_to_build_a_policy_with_one_key_twice() {
     let cross = gnb::bridge::Vault::create(net, 1, vec![raw_of(&k.pk), l.pk.clone()], 1, vec![k.pk.clone()], 100);
     assert!(cross.as_ref().is_err_and(|e| e.contains("both a signer and a recovery key")), "{cross:?}");
     assert!(gnb::bridge::Vault::create(net, 1, vec![raw_of(&k.pk), l.pk.clone()], 1, vec![m.pk.clone()], 100).is_ok());
+}
+
+/// PF-4 tooling gap (review finding): `gnb-cli` loads every published vault
+/// file through `Vault::tree` (`load_vault`, before `vaultlock`,
+/// `vaultchecklock`, `vaultrelease`, `vaultrecover`, ...). A hand-made vault
+/// whose release branch is 2-of-[A enveloped, A raw, B] shows signers three
+/// byte-distinct keys while A alone fills two slots; it is now refused like
+/// `Vault::create` refuses it. Before the fix `Vault::tree` only checked that
+/// the tree hashes to the published script, and the CLI went on.
+#[test]
+fn gnb_cli_refuses_a_published_vault_that_lists_one_key_twice() {
+    let (a, b, cold) = (key(), key(), key());
+    let net = gnb::address::Network::Mainnet;
+    let honest = gnb::bridge::Vault::create(net, 2, vec![a.pk.clone(), b.pk.clone()], 1, vec![cold.pk.clone()], 100)
+        .unwrap();
+    let tree = honest.tree().unwrap();
+    let twin_release = policy_of(2, vec![a.pk.clone(), raw_of(&a.pk), b.pk.clone()]);
+    let crafted_tree = policy::PolicyTree { branches: vec![twin_release, tree.branches[1].clone()] };
+    let script = crafted_tree.script_pubkey();
+    let crafted = gnb::bridge::Vault {
+        tree: hex::encode(crafted_tree.encode()),
+        script: hex::encode(&script),
+        address: gnb::address::PolicyAddress::from_script(&script, net).unwrap().to_string(),
+        signers: 3,
+        ..honest.clone()
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = gnb::address::Address::from_hash([7; 20], net).to_string();
+    let run = |vault: &gnb::bridge::Vault, name: &str| {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, serde_json::to_string(vault).unwrap()).unwrap();
+        let out = tmp.path().join(format!("{name}.spend.json"));
+        std::process::Command::new(env!("CARGO_BIN_EXE_gnb-cli"))
+            .args(["vaultrecover", path.to_str().unwrap(), &dest, "0.01",
+                   "--utxo", &format!("{}:0:5000000", "ab".repeat(32)), "--out", out.to_str().unwrap()])
+            .env_remove("GNB_RPC_API_KEY").stdin(std::process::Stdio::null())
+            .output().expect("run gnb-cli")
+    };
+    let ok = run(&honest, "honest.json");
+    assert!(ok.status.success(), "honest vault: {}", String::from_utf8_lossy(&ok.stderr));
+    let refused = run(&crafted, "crafted.json");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "a twin-key vault must not load");
+    assert!(stderr.contains("release branch") && stderr.contains("DuplicateKey"), "{stderr}");
+    assert!(!tmp.path().join("crafted.json.spend.json").exists(), "nothing was written");
 }
