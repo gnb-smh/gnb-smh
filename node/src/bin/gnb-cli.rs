@@ -1870,7 +1870,7 @@ fn is_keystore_v2_or_v3(path: &std::path::Path) -> bool {
 
 fn print_usage() {
     println!(r#"
-  gnb-cli — Bloch-SIS Protocol RPC client
+  gnb-cli — ObenBlock RPC client
 
   NETWORK
     gnb-cli info                          Network info
