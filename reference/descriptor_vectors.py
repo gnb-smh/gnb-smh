@@ -53,10 +53,17 @@ def cases():
             yield row(f"{network}/{label}/create", {"action": "create", "network": network, "body": text}, True)
             yield row(f"{network}/{label}/inspect", {"op": "descriptor", "action": "inspect", "network": network, "descriptor": descriptor}, True)
         # PF-4: a raw key and its envelope are one signer; no policy or tree
-        # branch may list both.
+        # branch may list both in a descriptor being created. An existing one
+        # (an earlier release created it) is still inspected and restored,
+        # flagged with twin_key_encodings.
         twin = f"policy(2,0,0,{k0},{keys['enveloped0']})"
-        yield row(f"{network}/policy-twin-encoding/create", {"action": "create", "network": network, "body": body(network, twin)}, False)
-        yield row(f"{network}/tree-twin-encoding/create", {"action": "create", "network": network, "body": body(network, f"tree({policy()},{twin})")}, False)
+        twins = {"policy-twin-encoding": body(network, twin), "tree-twin-encoding": body(network, f"tree({policy()},{twin})")}
+        for label, text in twins.items():
+            yield row(f"{network}/{label}/create", {"action": "create", "network": network, "body": text}, False)
+            yield row(f"{network}/{label}/inspect", {"op": "descriptor", "action": "inspect", "network": network, "descriptor": d.add_checksum(text)}, True)
+        restored = [descriptors[network, "pkh-raw"], d.add_checksum(twins["policy-twin-encoding"]), d.add_checksum(twins["tree-twin-encoding"])]
+        yield row(f"{network}/export-twin-encoding", {"action": "export", "network": network, "descriptors": restored}, True)
+        yield row(f"{network}/import-twin-encoding", {"action": "import", "network": network, "bundle": d.compact({"format": d.POOL_FORMAT, "network": network, "descriptors": restored})}, True)
         ds = [descriptors[network, label] for label in ("pkh-raw", "pkh-envelope", "policy-2of3", "tree-3")]
         yield row(f"{network}/export", {"action": "export", "network": network, "descriptors": ds}, True)
         bundle = d.compact({"format": d.POOL_FORMAT, "network": network, "descriptors": ds})
@@ -149,7 +156,7 @@ def vectors():
         row = {"name": name, "accepted": accepted, "request_sha256": hashlib.sha256(line.encode()).hexdigest(), "response_sha256": hashlib.sha256(d.compact(actual).encode()).hexdigest()}
         if accepted and "descriptor" in actual["result"]:
             info = actual["result"]
-            row.update({key: info[key] for key in ("network", "kind", "script_pubkey", "address", "bech32m", "requires_policy_tree_activation")})
+            row.update({key: info[key] for key in ("network", "kind", "script_pubkey", "address", "bech32m", "requires_policy_tree_activation", "twin_key_encodings") if key in info})
             row["checksum"] = info["descriptor"][-8:]
         rows.append(row)
     return {"format": "gnb-descriptor-reference-v1", "fixture_note": "Synthetic public byte shapes only; no proof of key possession or spendability.", "public_keys": fixtures(), "cases": rows}
