@@ -208,7 +208,11 @@ fn repeated_storage_engine_failures_stop_the_node() {
     assert_eq!(reason, accept::no_verdict_abort_message(&b_nv.block_hash(), accept::NO_VERDICT_ABORT_AFTER,
         &n.store.no_verdict_record(&b_nv.block_hash()).unwrap().reason));
     assert_kept_without_verdict(&n, &b_nv.block_hash());
-    let e = extend(&n, &mut tip, "after").unwrap_err();
+    // On the applied tip: the move of the stopping acceptance committed
+    // nothing (its rollback of T shares the apply batch, review of PR #15,
+    // finding 5), so its trigger was rolled back with it.
+    let mut on_t = t;
+    let e = extend(&n, &mut on_t, "after").unwrap_err();
     assert!(e.starts_with("node stopped:"), "{e}");
     assert!(build(&n).unwrap_err().starts_with("node stopped:"));
 

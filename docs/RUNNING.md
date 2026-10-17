@@ -714,7 +714,15 @@ descendants: the node stays on (and mines on)
 the best chain it can judge and retries the block after 1 minute, then
 2, 4, ... up to every hour. `getdaginfo` lists such blocks under
 `no_verdict` (`class`, `attempts`, `reason`, `retry_in_secs`) and reports
-`stopped` when the node has stopped.
+`stopped` when the node has stopped. While a parked branch has more chain
+work than the tip the node mines on, `getblocktemplate`, `getdaginfo` and
+`getnetworkinfo` say so in `warnings` ("a branch with more chain work than
+the applied tip is parked without a verdict ..."), and the node does not
+report itself synced to a peer serving that branch (the IBD latch counts it).
+A block whose stored body cannot be read is handled the same way (an engine
+error is its `storage-engine` no-verdict); a stored body that does not
+decode is deleted and fetched again from peers (`getdaginfo` shows nothing
+for it; the log says "the stored body is dropped and fetched again").
 
 * `class: "inconsistent-chain-state"` (a row the node's indexes require is
   missing, or a row does not decode) never stops the node. It is logged at
@@ -732,7 +740,10 @@ the best chain it can judge and retries the block after 1 minute, then
   persists, the data directory is damaged: stop the node and resynchronize
   into a fresh, empty `--data-dir` (or start from a copy of an archival
   node's data directory). The node has no `-reindex-chainstate`, and
-  `--carryover-snapshot` alone rebuilds nothing in this case.
+  `--carryover-snapshot` alone rebuilds nothing in this case. A chain-state
+  rebuild (below) during which a block cannot be validated does not complete:
+  it says `chain-state rebuild incomplete ... the rebuild stays pending`, the
+  node refuses to start, and the next start resumes the rebuild.
 
 At every start the node checks its chain state for the footprint of an
 interrupted or failed commit written by releases before the 2026-10 audit

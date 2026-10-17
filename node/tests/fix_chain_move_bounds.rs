@@ -511,8 +511,9 @@ fn b2_t0_finality_reached_by_a_committed_chunk_binds_the_rest_of_the_move() {
     assert_eq!(n.dag.read().finalized(), None);
 
     // B[44] (equal to A: the tie-break decides) or B[45] makes B the best:
-    // 3 rollback chunks, then B[0..16], B[16..32] (pins B[5]), B[32..]
-    // (fails on B[35]), then B[32..35].
+    // 2 rollback chunks (A's 29 tip-most blocks), then the last 16 rollbacks
+    // with B[0..16] in one batch (review of PR #15, finding 5), B[16..32]
+    // (pins B[5]), B[32..] (fails on B[35]), then B[32..35].
     for blk in &fx.fork[44..] {
         let _ = accept(&n, blk);
     }
@@ -545,8 +546,10 @@ fn b2_t0_crash_resume_restores_the_finality_pin() {
     deliver_all(&n, &fx.fork[..44]);
     let a_tip = fx.a.last().unwrap().block_hash();
 
-    // Commits 1-3 roll A back, 4-5 apply B[0..32]; the next one "crashes".
-    reorg::fault_injection::fail_after_commits(Some(5));
+    // Commits 1-2 roll A's 29 tip-most blocks back, 3 rolls back the last
+    // 16 with B[0..16] (one batch, review of PR #15, finding 5), 4 applies
+    // B[16..32]; the next one "crashes".
+    reorg::fault_injection::fail_after_commits(Some(4));
     for blk in &fx.fork[44..] {
         if applied_tip(&n) != Some(a_tip) {
             break;

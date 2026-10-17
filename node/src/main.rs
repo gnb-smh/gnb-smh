@@ -2922,9 +2922,17 @@ fn maybe_release_ibd_with(
         let our_score = selected.as_ref().map(|n| n.blue_score).unwrap_or(0);
         let our_height = selected.as_ref().map(|n| n.height).unwrap_or(0);
         // Disqualified blocks (DAG-1) are never selectable, so a peer frontier
-        // that only leads to them must not hold the IBD latch.
+        // that only leads to them must not hold the IBD latch. A block parked
+        // without a verdict (and its selected-chain descendants) is NOT
+        // disqualified (review of PR #15, finding 2): this node could not
+        // judge it (a local storage fault), so a peer serving that branch is
+        // ahead of us and holds the latch like any servable tip; one
+        // transient failure during sync must not release it (one-way) and
+        // report the node synced on a stale tip. The internal miner still
+        // resumes after a stall (`SYNC_STALL_SECS`) and the RPC warns
+        // (`accept::no_verdict_branch_warning`); the node never exits for it.
         let servable = peer_state.servable_blue_work(|h| {
-            if d.is_invalid(h) { None } else { d.get_node(h).map(|n| n.blue_work) }
+            if d.is_invalid(h) && !d.is_no_verdict_branch(h) { None } else { d.get_node(h).map(|n| n.blue_work) }
         });
         let advertised = peer_state.connected_advertised_tips();
         let have_frontier = !advertised.is_empty();
@@ -3656,6 +3664,38 @@ mod ingress_processor_tests {
         st.write().is_syncing = true;
         release_without_minimum(&dag, &ps, &fr, &st);
         assert!(!st.read().is_syncing, "a claim alone must not keep the node in IBD");
+    }
+
+    /// Review of PR #15, finding 2: a peer's tip on a branch parked without a
+    /// verdict (this node could not judge a block of it: a local storage
+    /// fault) is servable work, so it keeps the latch; pre-fix it counted as
+    /// a disqualified branch and the first such failure during sync released
+    /// the latch for good. A genuinely disqualified branch still does not.
+    #[test]
+    fn a_branch_parked_without_a_verdict_holds_the_ibd_latch() {
+        let (dag, ps, fr, st) = release_fixture();
+        {
+            let mut d = dag.write();
+            d.add_block([0xA1; 32], vec![[0xAA; 32]], 1_001, 10).expect("our chain");
+            d.add_block([0xB1; 32], vec![[0xAA; 32]], 1_001, 10).expect("the peer's branch");
+            d.add_block([0xB2; 32], vec![[0xB1; 32]], 1_002, 10).expect("the peer's tip");
+            d.park_no_verdict([0xB1; 32]);
+            assert_eq!(d.selected_tip(), Some([0xA1; 32]));
+        }
+        let peer = libp2p::PeerId::random();
+        let now = std::time::Instant::now();
+        ps.on_connect(peer, now);
+        ps.observe(peer, 2, 2, &[[0xB2; 32]], now);
+        // Evidence of a chain ahead: only "verified" can release the latch.
+        fr.lock().set_orphan_evidence(Some(sync::IBD_EXIT_LAG + 100));
+        st.write().is_syncing = true;
+        release_without_minimum(&dag, &ps, &fr, &st);
+        assert!(st.read().is_syncing, "the peer serves more work than our tip: still syncing");
+
+        // The same branch disqualified (a verdict): not servable, released.
+        dag.write().mark_invalid([0xB1; 32]);
+        release_without_minimum(&dag, &ps, &fr, &st);
+        assert!(!st.read().is_syncing);
     }
 
     /// NET-6: work-backed evidence (an orphan claiming to be well ahead) holds

@@ -1301,6 +1301,9 @@ fn policy_rpc_snapshot(state: &AppState) -> Result<(u64,[u8;32]), Value> {
 async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Value {
     match method {
         "getnetworkinfo" => {
+            // Review of PR #15, finding 2 (lock order: dag before node_state).
+            let warnings: Vec<String> =
+                crate::accept::no_verdict_branch_warning(&state.dag.read(), &state.store).into_iter().collect();
             let s = state.node_state.read();
             let pruned_h = state.store.pruned_height();
             json!({
@@ -1334,6 +1337,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 "behind_by":       s.best_announced_blue_score.saturating_sub(s.tip_blue_score),
                 "chain":           "gnb",
                 "pruned_height":   pruned_h,
+                "warnings":        warnings,
             })
         }
         "getblockcount"  => json!(state.node_state.read().block_count),
@@ -1909,6 +1913,10 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 Err(e) => return json!({ "error": e }),
             };
             let tx_entries = template_tx_entries(&tmpl);
+            // Review of PR #15, finding 2: a template on the chain the node
+            // can judge while a heavier branch is parked without a verdict.
+            let warnings: Vec<String> =
+                crate::accept::no_verdict_branch_warning(&state.dag.read(), &state.store).into_iter().collect();
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1980,6 +1988,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 "subsidy_sat":          tmpl.subsidy.to_string(),
                 "total_fees":           tmpl.total_fees.to_string(),
                 "transactions":         tx_entries,
+                "warnings":             warnings,
                 // The block's timestamp must be >= parent_time and at most
                 // MAX_FUTURE_SECS ahead of the validator's clock.
                 "min_time":             tmpl.parent_timestamp,
@@ -2136,9 +2145,14 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 "reason":        r.reason,
                 "retry_in_secs": r.retry_at.saturating_duration_since(now).as_secs(),
             })).collect();
+            // Review of PR #15, finding 2: a heavier branch parked without a
+            // verdict (the node mines on the lighter chain it can judge).
+            let warnings: Vec<String> =
+                crate::accept::no_verdict_branch_warning(&dag, &state.store).into_iter().collect();
             json!({
                 "no_verdict":     no_verdict,
                 "stopped":        state.store.abort_reason(),
+                "warnings":       warnings,
                 "tip":            tip.map(|h| hex::encode(h)),
                 "tip_blue_score": tip_data.as_ref().map(|d| d.blue_score).unwrap_or(0),
                 "tip_blue_work":  tip_data.as_ref().map(|d| d.blue_work.to_string()).unwrap_or_default(),
@@ -4827,5 +4841,44 @@ mod block_rules_template_tests {
             assert_eq!(block.header.merkle_root, core::Transaction::merkle_root(&block.transactions));
             assert_ne!(block.header.merkle_root, MerkleRoot::ZERO);
         }
+    }
+
+    /// Review of PR #15, finding 2: while a branch parked without a verdict
+    /// has more chain work than the applied tip (the node mines on the
+    /// lighter chain it can judge), getblocktemplate, getdaginfo and
+    /// getnetworkinfo say so in `warnings`; not otherwise.
+    #[tokio::test]
+    async fn a_heavier_branch_parked_without_a_verdict_is_warned_about() {
+        let _guard = activation::scoped_override(1);
+        let (_tmp, state) = state_with_genesis();
+        let gh = state.dag.read().selected_tip().unwrap();
+        let ts = state.dag.read().get_block_data(&gh).unwrap().timestamp;
+        for m in ["getblocktemplate", "getdaginfo", "getnetworkinfo"] {
+            let r = dispatch(m, None, &state).await;
+            assert_eq!(r["warnings"], json!([]), "{m}: {r}");
+        }
+        {
+            let mut d = state.dag.write();
+            d.add_block([0xB1; 32], vec![gh], ts + 1, 10).unwrap();
+            d.add_block([0xB2; 32], vec![[0xB1; 32]], ts + 2, 10).unwrap();
+        }
+        state.store.note_no_verdict(&[0xB1; 32], false, "tx-index row missing", std::time::Instant::now());
+        state.dag.write().park_no_verdict([0xB1; 32]);
+        assert_eq!(state.dag.read().selected_tip(), Some(gh));
+        for m in ["getblocktemplate", "getdaginfo", "getnetworkinfo"] {
+            let r = dispatch(m, None, &state).await;
+            let w = r["warnings"][0].as_str().unwrap_or_default();
+            assert!(w.contains("parked without a verdict") && w.contains(&hex::encode([0xB1u8; 8]))
+                && w.contains("tx-index row missing") && w.contains(&hex::encode([0xB2u8; 8])), "{m}: {r}");
+        }
+        let t = dispatch("getblocktemplate", None, &state).await;
+        assert_eq!(t["parents"], json!([hex::encode(gh)]), "the template is still built: {t}");
+        // A heavier chain the node can judge: the parked branch is lighter.
+        {
+            let mut d = state.dag.write();
+            d.add_block([0xC1; 32], vec![gh], ts + 1, 30).unwrap();
+        }
+        let r = dispatch("getdaginfo", None, &state).await;
+        assert_eq!(r["warnings"], json!([]), "{r}");
     }
 }
